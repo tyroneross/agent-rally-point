@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-rally-point"
+version = "0.1.0"
+description = "Local-first coordination point for coding agents working in the same repo: presence, handoffs, verifier gates, conflicts, and closeout without a server."
+requires-python = ">=3.11"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Tyrone Ross" }]
+keywords = ["agent", "coordination", "multi-agent", "claude-code", "codex", "ai-tools", "developer-tools"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+]
+
+[project.scripts]
+agent-rally-point = "agent_rally_point.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/tyroneross/agent-rally-point"
+Repository = "https://github.com/tyroneross/agent-rally-point"
+Issues = "https://github.com/tyroneross/agent-rally-point/issues"
+
+[tool.setuptools.packages.find]
+include = ["agent_rally_point*"]
+exclude = ["agent_rally_point.test_*", "tests*", "docs*"]
