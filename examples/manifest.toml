@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Example global manifest for agent-rally-point.
+# Auto-generated on first `agent-rally discover` invocation at
+# ~/.agent-rally-point/manifest.toml; this file is a checked-in reference
+# of the expected shape and field set.
+
+schema_version = "1.0"
+
+[package]
+name = "agent-rally-point"
+version = "0.2.0"
+installed_at = "2026-05-23T12:00:00Z"
+
+[paths]
+# Canonical channels root. Override per-process with $BUILD_LOOP_APPS_ROOT.
+apps_root = "~/.agent-rally-point/apps"
+
+# Legacy channels root (read-only fallback for sessions that predate
+# the standalone package extraction).
+legacy_apps_root = "~/.build-loop/apps"
+
+[api]
+discover_module = "agent_rally_point.discover"
+cli_entry = "agent-rally"
+schema_doc = "https://github.com/tyroneross/agent-rally-point/blob/main/docs/SCHEMA.md"
+
+[defaults]
+# Presence heartbeat staleness window (minutes). Reaped at checkpoint_read.
+heartbeat_minutes = 15
+
+# Defense-in-depth reaper threshold at run closeout (seconds).
+stale_session_seconds = 3600

@@ -11,7 +11,7 @@ AutoGen tool-callable wrappers, etc.).
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Channel identity
 from .channel_paths import (
@@ -46,6 +46,9 @@ from .post import post
 # Lifecycle hygiene (closeout)
 from . import lifecycle
 
+# Discovery (v0.2: manifest + resolver)
+from .discover import discover
+
 __all__ = [
     "__version__",
     "app_slug",
@@ -61,4 +64,5 @@ __all__ = [
     "checkpoint_read",
     "post",
     "lifecycle",
+    "discover",
 ]

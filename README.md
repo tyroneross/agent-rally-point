@@ -1,3 +1,5 @@
+<!-- build-loop@tyroneross:canary:agent-rally-point -->
+<!-- canary-end -->
 # Agent Rally Point
 
 > **Local-first coordination point for coding agents working in the same repo: presence, handoffs, verifier gates, conflicts, and closeout without a server.**
