@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
 """Idempotent installer for the App Pulse git post-commit capture.
 
 Installs (or chains) ``.git/hooks/post-commit`` in a consumer repo so a

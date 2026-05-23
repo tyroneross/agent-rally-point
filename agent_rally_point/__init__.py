@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+# build-loop@tyroneross:canary:agent-rally-point
+# canary-end
 """Agent Rally Point — local-first coordination point for coding agents.
 
 Public API surface. Most users should reach for the CLI (`agent-rally-point ...`)
