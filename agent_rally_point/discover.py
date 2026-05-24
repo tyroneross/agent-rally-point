@@ -37,6 +37,7 @@ from typing import Any
 
 from .channel_paths import DEFAULT_APPS_ROOT, app_slug
 from .presence import read_active_presence
+from .repo_id import repo_id as compute_repo_id
 from .revision import read_revision
 
 
@@ -246,37 +247,100 @@ def discover(cwd: Path | str | None = None) -> dict[str, Any]:
             overlay_path = candidate
             repo_overlay = _load_toml(candidate)
 
-    # Resolve apps_root + slug + policy with overlay precedence.
+    # Resolve apps_root + slug + policy + repo_id with overlay precedence.
     apps_root_path, apps_root_source = _resolve_apps_root(repo_overlay, global_manifest)
     slug, slug_source = _resolve_slug(cwd_path, repo_overlay)
     policy_mode, policy_source = _resolve_policy(global_manifest, repo_overlay)
 
-    # Canonical channel dir under the resolved apps_root.
-    canonical_channel = apps_root_path / slug
+    # repo_id (alpha-8): worktree-stable, clone-stable channel name under canonical.
+    # Legacy still uses the bare slug since old build-loop callers know nothing about
+    # repo_id. The two name spaces deliberately never overlap.
+    try:
+        rid = compute_repo_id(cwd_path)
+    except Exception:  # noqa: BLE001 — discovery must not crash
+        rid = slug + "-_unknown"
 
-    # Legacy fallback: only if canonical does NOT exist on disk.
+    canonical_channel = apps_root_path / rid
     legacy_root = Path(os.path.expanduser(_LEGACY_APPS_ROOT))
     legacy_channel = legacy_root / slug
+
+    # Policy-aware channel resolution. The hard rule (from
+    # coordination-substrate-canonical.md): coordination_unavailable is
+    # loud-and-degraded, NEVER silent legacy fallback under canonical policy.
+    coordination_unavailable_reason: str | None = None
     channel_dir = canonical_channel
     channel_layout = "canonical"
     channel_source = "default"
-    if not canonical_channel.exists() and legacy_channel.exists():
+    legacy_channel_dir_field: str | None = None
+    merged_view = False
+    active_revision = 0
+    active_peers: list = []
+
+    if policy_mode == "canonical":
+        channel_dir = canonical_channel
+        channel_layout = "canonical"
+        channel_source = (
+            apps_root_source if apps_root_source != "default" else "canonical"
+        )
+        # Probe readability of the canonical root. If it exists but is
+        # unreadable, OR the parent apps_root is missing AND we can't create
+        # it, surface coordination_unavailable LOUDLY. Do NOT fall back to
+        # legacy — that's the v0.12.16 silent-second-universe failure mode.
+        if canonical_channel.exists():
+            if not os.access(str(canonical_channel), os.R_OK):
+                coordination_unavailable_reason = "canonical_unreadable"
+        # Read live state from canonical only.
+        try:
+            active_revision = read_revision(canonical_channel)
+        except Exception:  # noqa: BLE001
+            active_revision = 0
+        try:
+            active_peers = read_active_presence(canonical_channel, exclude_session="")
+        except Exception:  # noqa: BLE001
+            active_peers = []
+
+    elif policy_mode == "legacy-only":
         channel_dir = legacy_channel
         channel_layout = "legacy"
-        channel_source = "legacy-fallback"
-    elif apps_root_source != "default":
-        channel_source = apps_root_source
+        channel_source = "legacy-only"
+        try:
+            active_revision = read_revision(legacy_channel)
+        except Exception:  # noqa: BLE001
+            active_revision = 0
+        try:
+            active_peers = read_active_presence(legacy_channel, exclude_session="")
+        except Exception:  # noqa: BLE001
+            active_peers = []
 
-    # Live state — never blocks, swallows errors.
-    try:
-        active_revision = read_revision(channel_dir)
-    except Exception:  # noqa: BLE001 — discovery must not crash a host
-        active_revision = 0
-    try:
-        # exclude_session=""; discover() is called outside a session context.
-        active_peers = read_active_presence(channel_dir, exclude_session="")
-    except Exception:  # noqa: BLE001
-        active_peers = []
+    else:  # policy_mode == "migration" (default — dual-aware)
+        channel_dir = canonical_channel  # primary write target during dual-write
+        channel_layout = "canonical"  # writes target canonical; reads merge both
+        channel_source = "migration-dual"
+        legacy_channel_dir_field = str(legacy_channel)
+        merged_view = True
+        # Merge live state from BOTH channels. Revision: max of the two.
+        # Peers: union deduped by session_id (canonical wins on conflict).
+        canonical_rev = 0
+        legacy_rev = 0
+        try:
+            canonical_rev = read_revision(canonical_channel)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            legacy_rev = read_revision(legacy_channel)
+        except Exception:  # noqa: BLE001
+            pass
+        active_revision = max(canonical_rev, legacy_rev)
+        peers_by_sid: dict = {}
+        for ch in (legacy_channel, canonical_channel):
+            try:
+                for rec in read_active_presence(ch, exclude_session=""):
+                    sid = rec.get("session_id")
+                    if sid:
+                        peers_by_sid[sid] = rec  # canonical iterates last → wins
+            except Exception:  # noqa: BLE001
+                continue
+        active_peers = list(peers_by_sid.values())
 
     installed = (
         manifest_path.exists()
@@ -286,13 +350,14 @@ def discover(cwd: Path | str | None = None) -> dict[str, Any]:
 
     now_iso = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    return {
+    envelope: dict[str, Any] = {
         "installed": bool(installed),
         "version": _get_version(),
         "schema_version": _SCHEMA_VERSION,
         "protocol_version": _PROTOCOL_VERSION,
         "policy": policy_mode,
         "last_resolved_at": now_iso,
+        "repo_id": rid,
         "channel_dir": str(channel_dir),
         "channel_layout": channel_layout,
         "app_slug": slug,
@@ -314,6 +379,23 @@ def discover(cwd: Path | str | None = None) -> dict[str, Any]:
             "overlay_repo": str(overlay_path) if overlay_path else None,
         },
     }
+
+    # Migration-mode extras: both paths + merged_view flag.
+    if policy_mode == "migration":
+        envelope["legacy_channel_dir"] = legacy_channel_dir_field
+        envelope["canonical_channel_dir"] = str(canonical_channel)
+        envelope["merged_view"] = merged_view
+
+    # Loud coordination_unavailable under canonical policy when canonical
+    # channel is unreadable. Surfaced as a top-level field; consumers MUST
+    # check this before treating channel_dir as writeable.
+    if coordination_unavailable_reason is not None:
+        envelope["coordination_unavailable"] = True
+        envelope["coordination_unavailable_reason"] = coordination_unavailable_reason
+    else:
+        envelope["coordination_unavailable"] = False
+
+    return envelope
 
 
 def _main(argv: list[str] | None = None) -> int:

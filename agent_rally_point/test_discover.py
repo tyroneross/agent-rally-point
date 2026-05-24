@@ -86,12 +86,18 @@ def test_discover_returns_canonical_layout_for_git_repo(fresh_discover, isolated
     info = fresh_discover.discover(cwd=repo)
 
     assert info["app_slug"] == "myproj"
+    # Default policy is "migration" → channel_layout="canonical" (write target),
+    # channel_dir under ~/.agent-rally-point/apps/<repo_id>/ (not /<slug>/).
     assert info["channel_layout"] == "canonical"
-    # Canonical channel: under ~/.agent-rally-point/apps/<slug>/
-    expected = isolated_home / ".agent-rally-point" / "apps" / "myproj"
+    assert info["repo_id"].startswith("myproj-")
+    expected = isolated_home / ".agent-rally-point" / "apps" / info["repo_id"]
     assert Path(info["channel_dir"]) == expected
     assert info["active_revision"] == 0
     assert info["active_peers"] == []
+    # Migration-mode extras present
+    assert info["merged_view"] is True
+    assert info["legacy_channel_dir"] is not None
+    assert info["coordination_unavailable"] is False
 
 
 def test_repo_overlay_overrides_slug(fresh_discover, isolated_home, tmp_path):
@@ -121,43 +127,57 @@ def test_repo_overlay_overrides_apps_root(fresh_discover, isolated_home, tmp_pat
     assert info["sources"]["apps_root"] == "repo"
 
 
-def test_legacy_fallback_when_canonical_absent(fresh_discover, isolated_home, tmp_path):
+def test_migration_merges_revision_from_both_channels(fresh_discover, isolated_home, tmp_path):
+    """Under default (migration) policy, active_revision is max(canonical, legacy)."""
     repo = tmp_path / "myproj"
     repo.mkdir()
     _init_git_repo(repo)
-    # Create a legacy channel for this slug.
+    # Pre-discover to learn repo_id
+    info0 = fresh_discover.discover(cwd=repo)
+    rid = info0["repo_id"]
+    # Create legacy with high revision; canonical absent.
     legacy = isolated_home / ".build-loop" / "apps" / "myproj"
     legacy.mkdir(parents=True)
     (legacy / "revision").write_text("42\n")
 
     info = fresh_discover.discover(cwd=repo)
-    assert info["channel_layout"] == "legacy"
-    assert Path(info["channel_dir"]) == legacy
+    # Migration mode: channel_layout stays "canonical" (write target), but
+    # active_revision merges in legacy's value (42 > canonical's 0).
+    assert info["channel_layout"] == "canonical"
+    assert info["policy"] == "migration"
     assert info["active_revision"] == 42
+    assert info["merged_view"] is True
+    assert Path(info["legacy_channel_dir"]) == legacy
 
 
-def test_canonical_takes_precedence_over_legacy(fresh_discover, isolated_home, tmp_path):
+def test_canonical_revision_wins_when_higher_under_migration(
+    fresh_discover, isolated_home, tmp_path
+):
     repo = tmp_path / "myproj"
     repo.mkdir()
     _init_git_repo(repo)
-    # Create BOTH canonical and legacy.
-    canonical = isolated_home / ".agent-rally-point" / "apps" / "myproj"
+    info0 = fresh_discover.discover(cwd=repo)
+    rid = info0["repo_id"]
+    canonical = isolated_home / ".agent-rally-point" / "apps" / rid
     canonical.mkdir(parents=True)
     (canonical / "revision").write_text("7\n")
     legacy = isolated_home / ".build-loop" / "apps" / "myproj"
     legacy.mkdir(parents=True)
-    (legacy / "revision").write_text("99\n")
+    (legacy / "revision").write_text("3\n")
 
     info = fresh_discover.discover(cwd=repo)
     assert info["channel_layout"] == "canonical"
-    assert info["active_revision"] == 7
+    assert info["active_revision"] == 7  # max(7, 3)
 
 
 def test_active_peers_populated(fresh_discover, isolated_home, tmp_path):
     repo = tmp_path / "myproj"
     repo.mkdir()
     _init_git_repo(repo)
-    channel = isolated_home / ".agent-rally-point" / "apps" / "myproj"
+    # Pre-discover to learn repo_id.
+    info0 = fresh_discover.discover(cwd=repo)
+    rid = info0["repo_id"]
+    channel = isolated_home / ".agent-rally-point" / "apps" / rid
     sessions = channel / "sessions"
     sessions.mkdir(parents=True)
     import time
@@ -330,3 +350,140 @@ def test_compatibility_table_auto_materializes(
     assert data["supported_build_loop_range"].startswith(">=0.12.")
     assert isinstance(data["deprecation_notices"], list)
     assert data["agent_rally_point"]  # filled at write time
+
+
+# -- alpha-3: policy-aware channel resolution + loud coordination_unavailable --
+
+
+def test_canonical_policy_uses_repo_id_path(
+    fresh_discover, isolated_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "myproj"; repo.mkdir(); _init_git_repo(repo)
+    monkeypatch.setenv("AGENT_RALLY_POLICY", "canonical")
+    info = fresh_discover.discover(cwd=repo)
+    assert info["policy"] == "canonical"
+    assert info["channel_layout"] == "canonical"
+    # channel_dir is under canonical apps root keyed by repo_id, not slug.
+    assert "/.agent-rally-point/apps/" in info["channel_dir"]
+    assert info["repo_id"] in info["channel_dir"]
+    # No migration extras under canonical policy.
+    assert "merged_view" not in info or info.get("merged_view") is False
+    # legacy_channel_dir NOT present (single channel under canonical).
+    assert "legacy_channel_dir" not in info
+
+
+def test_legacy_only_policy_resolves_legacy_path(
+    fresh_discover, isolated_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "myproj"; repo.mkdir(); _init_git_repo(repo)
+    monkeypatch.setenv("AGENT_RALLY_POLICY", "legacy-only")
+    legacy = isolated_home / ".build-loop" / "apps" / "myproj"
+    legacy.mkdir(parents=True)
+    (legacy / "revision").write_text("11\n")
+    info = fresh_discover.discover(cwd=repo)
+    assert info["policy"] == "legacy-only"
+    assert info["channel_layout"] == "legacy"
+    assert Path(info["channel_dir"]) == legacy
+    assert info["active_revision"] == 11
+    assert info["sources"]["channel_dir"] == "legacy-only"
+
+
+def test_canonical_policy_no_silent_legacy_fallback(
+    fresh_discover, isolated_home, tmp_path, monkeypatch
+):
+    """Under canonical policy, legacy data MUST NOT be served as a fallback.
+
+    This is the central hard rule from coordination-substrate-canonical.md:
+    coordination_unavailable is loud-and-degraded, never silent.
+    """
+    repo = tmp_path / "myproj"; repo.mkdir(); _init_git_repo(repo)
+    # Create a populated legacy channel — under canonical policy it must be
+    # ignored entirely.
+    legacy = isolated_home / ".build-loop" / "apps" / "myproj"
+    legacy.mkdir(parents=True)
+    (legacy / "revision").write_text("999\n")
+
+    monkeypatch.setenv("AGENT_RALLY_POLICY", "canonical")
+    info = fresh_discover.discover(cwd=repo)
+    assert info["channel_layout"] == "canonical"
+    # channel_dir is canonical (under .agent-rally-point), NOT legacy.
+    assert ".agent-rally-point/apps/" in info["channel_dir"]
+    assert ".build-loop/apps/" not in info["channel_dir"]
+    # Legacy's revision (999) is NOT served.
+    assert info["active_revision"] == 0
+
+
+def test_canonical_unreadable_surfaces_coordination_unavailable(
+    fresh_discover, isolated_home, tmp_path, monkeypatch
+):
+    """Canonical exists but is unreadable → coordination_unavailable=True, no fallback."""
+    repo = tmp_path / "myproj"; repo.mkdir(); _init_git_repo(repo)
+    # Manually create a canonical channel and make it unreadable.
+    # (Pre-discover to learn the repo_id, then chmod the dir.)
+    monkeypatch.setenv("AGENT_RALLY_POLICY", "canonical")
+    info0 = fresh_discover.discover(cwd=repo)
+    rid = info0["repo_id"]
+    canonical = isolated_home / ".agent-rally-point" / "apps" / rid
+    canonical.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(canonical, 0o000)
+        info = fresh_discover.discover(cwd=repo)
+        assert info["coordination_unavailable"] is True
+        assert info["coordination_unavailable_reason"] == "canonical_unreadable"
+        # Did NOT silently fall back to legacy.
+        assert info["channel_layout"] == "canonical"
+    finally:
+        # Restore so pytest can clean up the tmp tree.
+        os.chmod(canonical, 0o755)
+
+
+def test_migration_unions_peers_from_both_channels(
+    fresh_discover, isolated_home, tmp_path
+):
+    """Under migration policy, active_peers = union(canonical, legacy) deduped by session_id."""
+    repo = tmp_path / "myproj"; repo.mkdir(); _init_git_repo(repo)
+    info0 = fresh_discover.discover(cwd=repo)
+    rid = info0["repo_id"]
+    # canonical session
+    canonical = isolated_home / ".agent-rally-point" / "apps" / rid / "sessions"
+    canonical.mkdir(parents=True)
+    import time as _t
+    (canonical / "sess-canonical.json").write_text(json.dumps({
+        "session_id": "sess-canonical", "tool": "claude_code", "model": "m",
+        "run_id": "r", "heartbeat_ts": _t.time(),
+    }))
+    # legacy session
+    legacy = isolated_home / ".build-loop" / "apps" / "myproj" / "sessions"
+    legacy.mkdir(parents=True)
+    (legacy / "sess-legacy.json").write_text(json.dumps({
+        "session_id": "sess-legacy", "tool": "codex", "model": "m",
+        "run_id": "r", "heartbeat_ts": _t.time(),
+    }))
+
+    info = fresh_discover.discover(cwd=repo)
+    sids = {p["session_id"] for p in info["active_peers"]}
+    assert sids == {"sess-canonical", "sess-legacy"}
+
+
+def test_migration_envelope_has_both_paths_and_merged_view(
+    fresh_discover, isolated_home, tmp_path
+):
+    repo = tmp_path / "myproj"; repo.mkdir(); _init_git_repo(repo)
+    info = fresh_discover.discover(cwd=repo)
+    assert info["policy"] == "migration"
+    assert "canonical_channel_dir" in info
+    assert "legacy_channel_dir" in info
+    assert info["merged_view"] is True
+    assert info["sources"]["channel_dir"] == "migration-dual"
+    # Both paths point to the right places.
+    assert ".agent-rally-point/apps/" in info["canonical_channel_dir"]
+    assert ".build-loop/apps/" in info["legacy_channel_dir"]
+
+
+def test_envelope_protocol_version_is_one_zero(
+    fresh_discover, isolated_home, tmp_path
+):
+    repo = tmp_path / "p"; repo.mkdir(); _init_git_repo(repo)
+    info = fresh_discover.discover(cwd=repo)
+    assert info["protocol_version"] == "1.0"
+    assert info["repo_id"]  # non-empty
