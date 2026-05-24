@@ -8,31 +8,61 @@ Two or more AI agent CLIs (Claude Code, Codex, peer Claude sessions, CI verifier
 
 ## Status
 
-**v0.1.0 — alpha, skeleton release** (2026-05-20). Channel primitives extracted from [build-loop](https://github.com/tyroneross/build-loop) v0.12.8 verbatim. 55/55 tests passing in standalone repo. CLI + validators land in v0.2.0; full constitution + docs in v0.3.0.
+**v0.3.0 — canonical substrate** (2026-05-24). Adds: canonical channel layout at `~/.agent-rally-point/apps/<repo_id>/`, three-mode policy (canonical/migration/legacy-only), versioned discover envelope (`protocol_version: "1.0"`), repo_id normalization (worktree-stable + clone-stable), legacy → canonical migration tool with 4-condition cutover verifier, long-running presence-watcher with parent-liveness check. 104/104 tests pass.
+
+Earlier: v0.2.x added the discovery layer + manifest. v0.1.0 (2026-05-20) extracted channel primitives from [build-loop](https://github.com/tyroneross/build-loop) v0.12.8.
 
 ## What it does
 
-- **Presence**: agents heartbeat into `~/.agent-rally-point/apps/<slug>/sessions/`; peers see each other via `read_active_presence()`.
+- **Presence**: agents heartbeat into `~/.agent-rally-point/apps/<repo_id>/sessions/`; peers see each other via `read_active_presence()`. Long-running sessions use `run_refresh_loop()` (60s default cadence, exits when parent process dies).
 - **Channel**: append-only event log (`changes.jsonl`) with monotonic revision counter; readers compute deltas via `checkpoint_read()`.
 - **Canonical post**: single `post()` helper that bumps revision + appends record atomically (prevents the silent-no-op bug).
+- **Discovery**: `agent-rally-discover` resolves channel layout + active state via manifest with three-mode policy. Build-loop's discovery bridge reads `~/.agent-rally-point/compatibility.json` for the protocol handshake.
+- **Migration**: `agent-rally-migrate` walks legacy `~/.build-loop/apps/*` → `~/.agent-rally-point/apps/<repo_id>/` with append-only audit log + sha256 integrity. `verify-cutover` returns the 4-condition can-promote verdict (legacy_fully_copied + integrity_verified + no_fresh_writes_within_ttl + downstream_ready).
 - **Lifecycle hygiene**: explicit session reap on closeout; optional `changes.jsonl` rotation when log grows.
-- **Worktree-aware identity**: `app_slug(cwd)` derives from `git rev-parse --git-common-dir` so main checkout + all worktrees + every clone of the same canonical repo share ONE channel.
-
-Coordination tooling (status sensor, MECE-brief validator, release-surface verifier) lands in v0.2.
+- **Repo identity**: `repo_id(cwd)` derives `<slug>-<8hex>` from normalized git remote URL — same id across clones, worktrees, HTTPS vs SSH forms. Frozen as part of `protocol_version 1.0`.
 
 ## Install
 
+The standalone CLIs (`agent-rally-discover`, `agent-rally-migrate`) are best installed via [pipx](https://pipx.pypa.io) so they live on your `$PATH` regardless of which virtualenv you happen to be in:
+
 ```bash
-uv pip install agent-rally-point   # or: pip install agent-rally-point
+# Recommended — pipx puts the CLIs on PATH globally:
+pipx install agent-rally-point
+
+# Verify (this MUST resolve from a fresh shell, not just inside .venv):
+which agent-rally-discover
+which agent-rally-migrate
 ```
 
-PyPI publication pending. Until then, install from source:
+PyPI publication is pending; until then, install from the local checkout:
 
 ```bash
 git clone https://github.com/tyroneross/agent-rally-point.git
-cd agent-rally-point
-uv pip install -e .
+pipx install ./agent-rally-point      # global CLIs
+# OR, for library use only (no global CLI):
+uv pip install -e ./agent-rally-point
 ```
+
+If `which agent-rally-discover` does NOT resolve from a fresh shell, the consuming build-loop session will fail its protocol-version handshake and proceed in degraded coordination_unavailable mode. The shell-level resolution is part of the integration contract, not optional.
+
+### Migrating from v0.2.x
+
+```bash
+# 1. Dry-run scan of legacy channels:
+agent-rally-migrate scan
+
+# 2. Apply the migration (writes audit log + advisory marker):
+agent-rally-migrate apply
+
+# 3. Verify the 4 cutover conditions:
+agent-rally-migrate verify-cutover
+
+# 4. Once verify-cutover returns can_promote: true, edit
+#    ~/.agent-rally-point/manifest.toml: change [policy] mode = "canonical".
+```
+
+The default policy stays at `migration` (dual-aware: reads merge both paths, writes mirror to both) until the manual cutover edit lands.
 
 ## Quickstart (Python API)
 

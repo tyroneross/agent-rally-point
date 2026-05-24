@@ -2,24 +2,34 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Example global manifest for agent-rally-point.
-# Auto-generated on first `agent-rally discover` invocation at
+# Auto-generated on first `agent-rally-discover` invocation at
 # ~/.agent-rally-point/manifest.toml; this file is a checked-in reference
 # of the expected shape and field set.
 
 schema_version = "1.0"
+protocol_version = "1.0"
 
 [package]
 name = "agent-rally-point"
-version = "0.2.0"
-installed_at = "2026-05-23T12:00:00Z"
+version = "0.3.0"
+installed_at = "2026-05-24T12:00:00Z"
 
 [paths]
 # Canonical channels root. Override per-process with $BUILD_LOOP_APPS_ROOT.
 apps_root = "~/.agent-rally-point/apps"
 
-# Legacy channels root (read-only fallback for sessions that predate
-# the standalone package extraction).
+# Legacy channels root (read-only during migration, retired at cutover).
 legacy_apps_root = "~/.build-loop/apps"
+
+[policy]
+# Coordination substrate policy. Values:
+#   canonical    — write only to ~/.agent-rally-point/apps/<repo_id>/
+#   migration    — DUAL-AWARE: write to both canonical and legacy,
+#                  discover returns both paths + merged_view.
+#   legacy-only  — write only to ~/.build-loop/apps/<slug>/
+# Default: migration. Promote to canonical only after
+# `agent-rally-point migrate verify-cutover` returns can_promote=true.
+mode = "migration"
 
 [api]
 discover_module = "agent_rally_point.discover"

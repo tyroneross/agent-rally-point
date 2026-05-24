@@ -22,19 +22,24 @@ Before this layer, every consuming tool hardcoded `~/.build-loop/apps/<slug>/` a
 
 Path: `~/.agent-rally-point/manifest.toml`
 
-Auto-created on first `agent-rally discover` invocation (or any package operation that requires the global root). Idempotent.
+Auto-created on first `agent-rally-discover` invocation (or any package operation that requires the global root). Idempotent.
 
 ```toml
 schema_version = "1.0"
+protocol_version = "1.0"
 
 [package]
 name = "agent-rally-point"
-version = "0.2.0"
-installed_at = "2026-05-23T12:00:00Z"
+version = "0.3.0"
+installed_at = "2026-05-24T12:00:00Z"
 
 [paths]
 apps_root = "~/.agent-rally-point/apps"
 legacy_apps_root = "~/.build-loop/apps"
+
+[policy]
+# canonical | migration | legacy-only. Default: migration (dual-aware).
+mode = "migration"
 
 [api]
 discover_module = "agent_rally_point.discover"
@@ -133,33 +138,75 @@ info = discover()  # cwd defaults to os.getcwd()
 
 `discover(cwd=None)` returns a dict with these top-level keys:
 
-| Key                | Type     | Description |
-|--------------------|----------|-------------|
-| `installed`        | bool     | True if any layer (canonical or legacy) resolved. |
-| `version`          | string   | Package version (from `agent_rally_point.__version__`). |
-| `schema_version`   | string   | Manifest schema version (currently `"1.0"`). |
-| `channel_dir`      | string   | Absolute path to this repo's channel directory. |
-| `channel_layout`   | string   | `"canonical"` (under `~/.agent-rally-point/apps/`) or `"legacy"` (under `~/.build-loop/apps/`). |
-| `app_slug`         | string   | The resolved slug for this cwd. |
-| `apps_root`        | string   | Resolved apps root (after overlays + env). |
-| `active_revision`  | integer  | Current revision counter for this channel (0 if absent). |
-| `active_peers`     | list     | List of session dicts (`session_id`, `tool`, `heartbeat_ts`, `branch_name`, `cwd`) — see `presence.read_active_presence`. |
-| `schema_doc_url`   | string   | URL to `docs/SCHEMA.md`. |
-| `apis`             | dict     | `{"post": "agent_rally_point.post:post", "checkpoint_read": "agent_rally_point.checkpoint:checkpoint_read"}` |
-| `sources`          | dict     | Per-field source provenance: `{"channel_dir": "repo" | "global" | "default", ...}` |
+| Key                          | Type     | Description |
+|------------------------------|----------|-------------|
+| `installed`                  | bool     | True if any layer (canonical or legacy) resolved. |
+| `version`                    | string   | Package version (from `agent_rally_point.__version__`). |
+| `schema_version`             | string   | Manifest schema version (currently `"1.0"`). |
+| `protocol_version`           | string   | Discovery-envelope contract version. Frozen at `"1.0"`. |
+| `policy`                     | string   | Active substrate policy: `"canonical"` \| `"migration"` \| `"legacy-only"`. |
+| `last_resolved_at`           | string   | ISO8601 UTC timestamp of this `discover()` call. |
+| `repo_id`                    | string   | Worktree-stable, clone-stable repo identifier. `<slug>-<8hex>`. |
+| `channel_dir`                | string   | Absolute path to this repo's primary channel directory. |
+| `channel_layout`             | string   | `"canonical"` or `"legacy"`. Under `policy: migration` this is `"canonical"` (write target). |
+| `app_slug`                   | string   | The resolved slug for this cwd (basename-derived, not repo_id). |
+| `apps_root`                  | string   | Resolved apps root (after overlays + env). |
+| `active_revision`            | integer  | Current revision counter. Under `policy: migration` this is `max(canonical, legacy)`. |
+| `active_peers`               | list     | List of session dicts. Under `policy: migration` this is the union of both channels deduped by `session_id`. |
+| `coordination_unavailable`   | bool     | True iff substrate is in loud-degraded mode. Consumer MUST check before treating `channel_dir` as writeable. |
+| `coordination_unavailable_reason` | string | Present only when `coordination_unavailable: true`. Currently: `"canonical_unreadable"`. |
+| `schema_doc_url`             | string   | URL to `docs/SCHEMA.md`. |
+| `apis`                       | dict     | Resolution map for callable surfaces. |
+| `sources`                    | dict     | Per-field source provenance: `{"channel_dir": "canonical" \| "migration-dual" \| "legacy-only" \| ..., "policy": ..., ...}` |
+
+#### Migration-policy extras
+
+When `policy == "migration"` (the default), the envelope additionally carries:
+
+| Key                       | Type     | Description |
+|---------------------------|----------|-------------|
+| `canonical_channel_dir`   | string   | The canonical write target (`~/.agent-rally-point/apps/<repo_id>/`). Same as `channel_dir`. |
+| `legacy_channel_dir`      | string   | The legacy read target (`~/.build-loop/apps/<slug>/`). Mirror-write target. |
+| `merged_view`             | bool     | Always `true` under migration policy. Reads merge both channels. |
+
+These keys are absent under `policy: canonical` or `policy: legacy-only` (single channel).
 
 When `installed: false` (no manifest, no legacy channel, not in a git repo), the dict still returns these keys with sensible defaults (`channel_dir` resolves to where it *would* live under canonical paths; `active_revision: 0`; `active_peers: []`). This keeps callers branch-free: they can always read the structure, then check `installed`.
 
 ## Resolution order
 
-For `channel_dir` and `apps_root`:
+`apps_root` (per-process override → repo overlay → global manifest → built-in default).
 
-1. **Repo-level `.agent-rally.toml`** at the canonical repo root (from `git rev-parse --show-toplevel`). If `paths.apps_root` is set, use it. If `channel.slug` is set, use it instead of auto-deriving.
-2. **Global `~/.agent-rally-point/manifest.toml`**. If absent, auto-create with defaults.
-3. **Canonical default**: `~/.agent-rally-point/apps/<slug>/`.
-4. **Legacy fallback**: if the canonical channel directory does not exist on disk AND `~/.build-loop/apps/<slug>/` does exist, return the legacy path with `channel_layout: "legacy"`. This preserves backward compatibility for sessions that started before the package was extracted from build-loop.
+`app_slug` (repo overlay → derived from `git rev-parse --git-common-dir` basename).
 
-Step 4 is read-only — discovery does not migrate legacy channels to canonical. Use `agent-rally-point migrate` (future) or move them manually.
+`repo_id` (normalized git remote URL + 8-hex sha256; falls back to path hash when no remote). See `agent_rally_point/repo_id.py`.
+
+`policy` (`$AGENT_RALLY_POLICY` env → repo overlay `[policy].mode` → global manifest `[policy].mode` → default `"migration"`).
+
+`channel_dir` resolution then depends on the resolved policy:
+
+| Policy        | `channel_dir`                                            | Reads                              | Writes                                  |
+|---------------|----------------------------------------------------------|------------------------------------|-----------------------------------------|
+| `canonical`   | `<apps_root>/<repo_id>/`                                 | canonical only                     | canonical only                          |
+| `migration`   | `<apps_root>/<repo_id>/` (primary write target)          | merged union of canonical + legacy | canonical AND mirror-write to legacy    |
+| `legacy-only` | `~/.build-loop/apps/<slug>/`                             | legacy only                        | legacy only                             |
+
+### Hard rule: no silent fallback
+
+Under `policy: canonical`, if the canonical channel is unreadable, `discover()` returns `coordination_unavailable: true` and a non-empty `coordination_unavailable_reason`. It does **not** silently serve legacy data. Consumers in canonical-policy mode must check `coordination_unavailable` before treating `channel_dir` as a working write target. Rally Point is awareness, not enforcement — the build proceeds in degraded mode without coordination.
+
+Source: `coordination-substrate-canonical.md` (the v0.12.16 silent-second-universe defect class is exactly what this rule prevents).
+
+### Cutover from migration to canonical
+
+The package ships defaulting to `policy: migration`. Promote to `policy: canonical` only after `agent-rally-point migrate verify-cutover` confirms all four conditions:
+
+1. Legacy state fully copied to canonical.
+2. Migration verifier shape + integrity checks pass.
+3. No fresh legacy writes detected within one heartbeat TTL (15 min).
+4. Downstream callers (build-loop ≥ 0.12.17) installed or retired.
+
+The promotion is a manual edit to `[policy] mode` in the manifest, *after* `verify-cutover` returns `can_promote: true`. The verifier itself never writes the manifest.
 
 ## Versioning
 

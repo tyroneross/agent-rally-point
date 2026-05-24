@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-rally-point"
-version = "0.2.1"
+version = "0.3.0"
 description = "Local-first coordination point for coding agents working in the same repo: presence, handoffs, verifier gates, conflicts, and closeout without a server."
 requires-python = ">=3.11"
 readme = "README.md"
@@ -32,6 +32,7 @@ test = [
 [project.scripts]
 agent-rally-point = "agent_rally_point.cli:main"
 agent-rally-discover = "agent_rally_point.discover:_main"
+agent-rally-migrate = "agent_rally_point.migrate:_main"
 
 [project.urls]
 Homepage = "https://github.com/tyroneross/agent-rally-point"
@@ -41,3 +42,8 @@ Issues = "https://github.com/tyroneross/agent-rally-point/issues"
 [tool.setuptools.packages.find]
 include = ["agent_rally_point*"]
 exclude = ["agent_rally_point.test_*", "tests*", "docs*"]
+
+[tool.pytest.ini_options]
+# Restrict default pytest collection to the package's own tests; docs tests
+# and ad-hoc scripts are deferred and excluded from baseline runs.
+testpaths = ["agent_rally_point"]

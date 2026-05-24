@@ -236,6 +236,112 @@ def get_cursor(channel_dir: Path, session_id: str) -> dict:
         return dict(_ZERO_CURSOR)
 
 
+# ---------------------------------------------------------------------------
+# Long-running session refresh loop (alpha-7).
+#
+# Closes the staleness gap observed 2026-05-23: a session's presence record
+# expires after 15 min if its watcher doesn't refresh, even though the session
+# is alive. ``run_refresh_loop`` heartbeats the FULL envelope (not just
+# heartbeat_ts) so phase/files_in_flight/branch state stay accurate.
+#
+# Plus the parent-liveness check (per coordination-substrate-canonical.md
+# alpha-7): if the parent session PID is dead, the watcher stops refreshing
+# and lets the record expire — prevents detached watchers from keeping dead
+# sessions falsely alive.
+# ---------------------------------------------------------------------------
+
+
+def _process_is_alive(pid: int) -> bool:
+    """Return True iff process ``pid`` exists and is reachable.
+
+    Uses signal 0 — kernel checks for process existence but delivers no
+    signal. Raises ProcessLookupError if dead, PermissionError if alive but
+    foreign (Permission error still means *alive*). Any other OSError is
+    treated conservatively as "alive" so a transient kernel hiccup doesn't
+    cause a premature exit.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # foreign process — alive, just not owned by us
+    except OSError:
+        return True  # transient — be conservative, treat as alive
+    return True
+
+
+def run_refresh_loop(
+    channel_dir: Path,
+    *,
+    session_id: str,
+    tool: str,
+    model: str,
+    run_id: str,
+    app_slug: str,
+    phase_provider=None,
+    files_provider=None,
+    interval: float = 60.0,
+    parent_pid: int | None = None,
+    cwd: Path | None = None,
+    max_iterations: int | None = None,
+    sleep_fn=time.sleep,
+) -> int:
+    """Refresh presence every ``interval`` seconds while parent is alive.
+
+    Calls ``write_presence(...)`` on each tick with the FULL envelope, where
+    the current ``phase`` and ``files_in_flight`` come from caller-supplied
+    callables (so a long-running watcher can reflect the session's evolving
+    state, not a frozen snapshot).
+
+    Exits cleanly when:
+      - ``parent_pid`` is supplied and that process is dead
+        (``ProcessLookupError`` on ``os.kill(pid, 0)``).
+      - ``max_iterations`` is supplied and reached (testing aid).
+
+    Never raises. Fire-and-forget per package contract — if write_presence
+    swallows its own errors, this loop simply ticks past them.
+
+    Returns the number of refresh ticks performed (testing/diagnostic aid).
+    """
+    ticks = 0
+    while True:
+        if parent_pid is not None and not _process_is_alive(parent_pid):
+            # Parent dead — stop refreshing. Let the existing record expire
+            # naturally; do NOT delete it (another reader might still be
+            # midway through reading it).
+            return ticks
+        try:
+            phase = phase_provider() if callable(phase_provider) else "running"
+        except Exception:  # noqa: BLE001
+            phase = "running"
+        try:
+            files = files_provider() if callable(files_provider) else []
+        except Exception:  # noqa: BLE001
+            files = []
+        try:
+            write_presence(
+                channel_dir,
+                session_id=session_id,
+                tool=tool,
+                model=model,
+                run_id=run_id,
+                app_slug=app_slug,
+                phase=phase,
+                files_in_flight=files,
+                cwd=cwd,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        ticks += 1
+        if max_iterations is not None and ticks >= max_iterations:
+            return ticks
+        try:
+            sleep_fn(interval)
+        except (KeyboardInterrupt, SystemExit):
+            return ticks
+
+
 def set_cursor(
     channel_dir: Path, session_id: str, *, revision: int, changes_offset: int
 ) -> None:

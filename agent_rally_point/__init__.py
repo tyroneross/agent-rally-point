@@ -21,7 +21,7 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 # Map: public attribute name -> (submodule, source attribute name)
 # Source attribute = the name in the submodule that the public attribute resolves to.
@@ -36,6 +36,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str | None]] = {
     # presence (heartbeat)
     "write_presence": ("presence", "write_presence"),
     "read_active_presence": ("presence", "read_active_presence"),
+    "run_refresh_loop": ("presence", "run_refresh_loop"),
     # append-only event log
     "append_change": ("changes", "append_change"),
     "make_record": ("changes", "make_record"),
@@ -49,6 +50,10 @@ _LAZY_ATTRS: dict[str, tuple[str, str | None]] = {
     "lifecycle": ("lifecycle", None),
     # discovery (v0.2: manifest + resolver)
     "discover": ("discover", "discover"),
+    # repo identity (v0.3: worktree-stable, clone-stable repo_id)
+    "repo_id": ("repo_id", "repo_id"),
+    # migration tool (v0.3: legacy -> canonical, cutover verifier)
+    "migrate": ("migrate", None),
 }
 
 __all__ = [
