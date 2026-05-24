@@ -49,6 +49,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str | None]] = {
     "lifecycle": ("lifecycle", None),
     # discovery (v0.2: manifest + resolver)
     "discover": ("discover", "discover"),
+    # repo identity (v0.3: worktree-stable, clone-stable repo_id)
+    "repo_id": ("repo_id", "repo_id"),
 }
 
 __all__ = [
