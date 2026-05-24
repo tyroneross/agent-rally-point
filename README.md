@@ -8,7 +8,9 @@ Two or more AI agent CLIs (Claude Code, Codex, peer Claude sessions, CI verifier
 
 ## Status
 
-**v0.3.0 — canonical substrate** (2026-05-24). Adds: canonical channel layout at `~/.agent-rally-point/apps/<repo_id>/`, three-mode policy (canonical/migration/legacy-only), versioned discover envelope (`protocol_version: "1.0"`), repo_id normalization (worktree-stable + clone-stable), legacy → canonical migration tool with 4-condition cutover verifier, long-running presence-watcher with parent-liveness check. 104/104 tests pass.
+**v0.3.1 — preflight CLI** (2026-05-24). Adds `agent-rally-preflight`: a host-neutral session-start coordination check-in. Every AI coding agent (Claude Code, Codex, Cursor, Gemini, CI verifiers) runs the same single-line invocation at session start to resolve the canonical channel, surface pending ACKs and active peers, load shared north-star context, and decide `join_active` vs `proceed_solo`. Stdlib-only operational paths so the CLI works in degraded environments. 143/143 tests pass.
+
+**v0.3.0 — canonical substrate** (2026-05-24). Adds: canonical channel layout at `~/.agent-rally-point/apps/<repo_id>/`, three-mode policy (canonical/migration/legacy-only), versioned discover envelope (`protocol_version: "1.0"`), repo_id normalization (worktree-stable + clone-stable), legacy → canonical migration tool with 4-condition cutover verifier, long-running presence-watcher with parent-liveness check.
 
 Earlier: v0.2.x added the discovery layer + manifest. v0.1.0 (2026-05-20) extracted channel primitives from [build-loop](https://github.com/tyroneross/build-loop) v0.12.8.
 
@@ -45,6 +47,66 @@ uv pip install -e ./agent-rally-point
 ```
 
 If `which agent-rally-discover` does NOT resolve from a fresh shell, the consuming build-loop session will fail its protocol-version handshake and proceed in degraded coordination_unavailable mode. The shell-level resolution is part of the integration contract, not optional.
+
+## Session-start integration
+
+Every AI coding agent should run **one line** at session start. The preflight reads the canonical channel, surfaces pending ACKs + live peers, loads north-star intent/goal, and returns a routing decision (`join_active` vs `proceed_solo`).
+
+```bash
+agent-rally-preflight --tool <host> --start-ping --human
+```
+
+Replace `<host>` with one of `claude_code`, `codex`, `cursor`, `gemini`, `ci`. Output is human-readable; drop `--human` for JSON. `--start-ping` writes a presence record so peers see this session immediately.
+
+### Claude Code (plugin / `.claude-plugin/hooks/session-start.sh`)
+
+```bash
+#!/usr/bin/env bash
+# .claude-plugin/hooks/session-start.sh
+agent-rally-preflight --tool claude_code --start-ping --human
+```
+
+The hook runs once per session; the JSON or human-readable summary becomes context the model reads immediately.
+
+### Codex (project `AGENTS.md`)
+
+Add a single line near the top of `AGENTS.md`:
+
+```markdown
+## Session start
+Run `agent-rally-preflight --tool codex --start-ping --human` and read the output before any tool call.
+```
+
+### Cursor / Gemini
+
+Same shape — run the executable at session start with the appropriate `--tool` value. Any host that loads a session-bootstrap file (custom-instructions / system-prompt / pre-session script) can call the CLI directly.
+
+### Sample output (human mode)
+
+```
+======================================================================
+ AGENT-RALLY-PREFLIGHT v0.1.0  2026-05-24T22:14:52.448683Z
+======================================================================
+ tool:       codex
+ session_id: codex-7d289263137a4a38-1779660892
+ workdir:    /Users/me/dev/git-folder/myproj
+ repo_id:    myproj-2b14b480
+ channel:    /Users/me/.agent-rally-point/apps/myproj-2b14b480  [via agent-rally-point.discover]
+
+ coordination_status: IDLE
+ routing:    proceed_solo - No active peers and no pending ACKs - proceed with assigned task, log ping check-ins to substrate
+
+ GUARDRAILS:
+   - Global rules: /Users/me/.claude/CLAUDE.md
+```
+
+The JSON envelope (default; drop `--human`) carries the same data structured for programmatic consumption — `pending_acks_for_me`, `active_peers`, `routing.action`, `north_star`, `memory_locations`, `recent_changes`, `all_repos_active`.
+
+### Behavior
+
+- **Idle**: no peers, no pending ACKs → `routing.action: proceed_solo`. The session can run normally; the preflight writes its own presence so peers will see it on their next check.
+- **Coordinated**: pending ACK or live peer detected → `routing.action: join_active`. The session should handle the inbox or coordinate with peers before parallel work.
+- **Degraded**: substrate unreachable → exit code 1 with JSON envelope still emitted (just with `channel_dir: null`). Host LLM proceeds without coordination but isn't misled.
 
 ### Migrating from v0.2.x
 
