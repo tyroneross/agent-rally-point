@@ -60,7 +60,23 @@ The `post()` helper (`agent_rally_point.post`) is the canonical writer: it bumps
 
 ## Channel layout
 
-One channel per canonical repo, rooted at `~/.agent-rally-point/apps/<slug>/`. Slug is derived from `git rev-parse --git-common-dir` so a clone, the main checkout, and every `git worktree` of the same repo all resolve to the same channel (see `agent_rally_point/channel_paths.py`).
+One channel per canonical repo, rooted at `~/.agent-rally-point/apps/<repo_id>/` under canonical or migration policy. Under legacy-only policy, the channel root stays at the v0.1-era `~/.build-loop/apps/<slug>/`.
+
+`repo_id` (v0.3.0+) is `<slug>-<8hex>` where `slug` is the repo name from the normalized git remote URL and `8hex` is sha256 of that normalized URL truncated. Two clones of the same upstream converge to the same `repo_id` even when checked out at different local paths; two repos with the same basename but different remotes get different `repo_id`s. When no remote is configured, the fallback is a path-derived id (`<basename>-<8hex>` where 8hex hashes the resolved repo root path). See `agent_rally_point/repo_id.py`.
+
+The basename slug (`channel_paths.app_slug`) is still derived from `git rev-parse --git-common-dir` and stays worktree-aware. It's the right identifier for the legacy `~/.build-loop/apps/` tree (which only ever knew about slugs) and for the v0.3 `discover().app_slug` field.
+
+### Policy axis
+
+| Policy        | `channel_dir`                                  | Reads                              | Writes                                  |
+|---------------|------------------------------------------------|------------------------------------|-----------------------------------------|
+| `canonical`   | `~/.agent-rally-point/apps/<repo_id>/`         | canonical only                     | canonical only                          |
+| `migration`   | canonical (primary write target)               | merged union of canonical + legacy | canonical + mirror-write to legacy      |
+| `legacy-only` | `~/.build-loop/apps/<slug>/`                   | legacy only                        | legacy only                             |
+
+Default policy is `migration`. Promote to `canonical` only after `agent-rally-migrate verify-cutover` confirms the four conditions (legacy_fully_copied + integrity_verified + no_fresh_writes_within_ttl + downstream_ready). See `docs/DISCOVERY.md`.
+
+Under `canonical` policy, if the canonical channel becomes unreadable, `discover()` returns `coordination_unavailable: true` LOUDLY — it does **not** silently fall back to legacy. Rally Point is awareness, not enforcement; the build proceeds in degraded mode without coordination. This is the hard rule that exists to prevent the v0.12.16 silent-second-universe defect class.
 
 | Path                            | Purpose                                      | Writer            | Reader               |
 |---------------------------------|----------------------------------------------|-------------------|----------------------|
@@ -74,7 +90,7 @@ One channel per canonical repo, rooted at `~/.agent-rally-point/apps/<slug>/`. S
 | `watchers/<pid>.json`           | Daemon registration (one per watcher)        | watcher           | watcher              |
 | `arch/digest.json`              | Optional architecture digest (opt-in)        | architecture-scout| checkpoint reactions |
 
-Legacy path: channels also live at `~/.build-loop/apps/<slug>/` for sessions that predate the standalone package. The discovery layer transparently falls back to the legacy location when the canonical path is absent. See [`docs/DISCOVERY.md`](docs/DISCOVERY.md).
+Legacy path: under `migration` policy, channels are *also* read from `~/.build-loop/apps/<slug>/` and writes mirror there. The migration tool (`agent-rally-migrate apply`) copies legacy state into the canonical location keyed by `repo_id`. Once `verify-cutover` returns `can_promote: true` and the operator promotes `[policy] mode = "canonical"` in the manifest, the legacy path is no longer read or written. See [`docs/DISCOVERY.md`](docs/DISCOVERY.md) and the migration section in the README.
 
 ## Record schema
 
