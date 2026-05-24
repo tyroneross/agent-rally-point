@@ -253,3 +253,80 @@ def test_cli_field_unknown_exits_one(fresh_discover, isolated_home, tmp_path):
         text=True,
     )
     assert out.returncode == 1
+
+
+# -- v0.3.0 (alpha-2): policy + protocol_version + last_resolved_at + compat table --
+
+
+def test_manifest_includes_policy_section_with_migration_default(
+    fresh_discover, isolated_home, tmp_path
+):
+    repo = tmp_path / "p"; repo.mkdir(); _init_git_repo(repo)
+    fresh_discover.discover(cwd=repo)
+    manifest = (isolated_home / ".agent-rally-point" / "manifest.toml").read_text()
+    assert "[policy]" in manifest
+    assert 'mode = "migration"' in manifest
+    assert 'protocol_version = "1.0"' in manifest
+
+
+def test_discover_envelope_has_new_v030_fields(fresh_discover, isolated_home, tmp_path):
+    repo = tmp_path / "p"; repo.mkdir(); _init_git_repo(repo)
+    info = fresh_discover.discover(cwd=repo)
+    # v0.3.0 envelope additions
+    assert info["protocol_version"] == "1.0"
+    assert info["policy"] == "migration"  # default
+    assert "last_resolved_at" in info
+    # ISO8601 UTC shape: YYYY-MM-DDTHH:MM:SSZ
+    import re
+    assert re.match(
+        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", info["last_resolved_at"]
+    )
+    # Manifest auto-creates with [policy] mode="migration" → resolves via global.
+    assert info["sources"]["policy"] == "global"
+
+
+def test_policy_env_override(fresh_discover, isolated_home, tmp_path, monkeypatch):
+    repo = tmp_path / "p"; repo.mkdir(); _init_git_repo(repo)
+    monkeypatch.setenv("AGENT_RALLY_POLICY", "canonical")
+    info = fresh_discover.discover(cwd=repo)
+    assert info["policy"] == "canonical"
+    assert info["sources"]["policy"] == "env"
+
+
+def test_policy_invalid_env_falls_through_to_default(
+    fresh_discover, isolated_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "p"; repo.mkdir(); _init_git_repo(repo)
+    monkeypatch.setenv("AGENT_RALLY_POLICY", "garbage-mode")
+    info = fresh_discover.discover(cwd=repo)
+    # Invalid env value silently falls through; manifest [policy] mode wins.
+    assert info["policy"] == "migration"
+    assert info["sources"]["policy"] == "global"
+
+
+def test_policy_repo_overlay_overrides_global(
+    fresh_discover, isolated_home, tmp_path
+):
+    repo = tmp_path / "p"; repo.mkdir(); _init_git_repo(repo)
+    (repo / ".agent-rally.toml").write_text(
+        'schema_version = "1.0"\n[policy]\nmode = "legacy-only"\n'
+    )
+    info = fresh_discover.discover(cwd=repo)
+    assert info["policy"] == "legacy-only"
+    assert info["sources"]["policy"] == "repo"
+
+
+def test_compatibility_table_auto_materializes(
+    fresh_discover, isolated_home, tmp_path
+):
+    repo = tmp_path / "p"; repo.mkdir(); _init_git_repo(repo)
+    compat = isolated_home / ".agent-rally-point" / "compatibility.json"
+    assert not compat.exists()
+    fresh_discover.discover(cwd=repo)
+    assert compat.exists()
+    data = json.loads(compat.read_text())
+    # Documented shape from coordination-version-control.md
+    assert data["protocol_version"] == "1.0"
+    assert data["supported_build_loop_range"].startswith(">=0.12.")
+    assert isinstance(data["deprecation_notices"], list)
+    assert data["agent_rally_point"]  # filled at write time

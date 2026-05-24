@@ -50,16 +50,44 @@ def _get_version() -> str:
         return "unknown"
 
 _GLOBAL_MANIFEST_REL = ".agent-rally-point/manifest.toml"
+_COMPAT_REL = ".agent-rally-point/compatibility.json"
 _REPO_OVERLAY_NAME = ".agent-rally.toml"
 _LEGACY_APPS_ROOT = "~/.build-loop/apps"
+_CANONICAL_APPS_ROOT = "~/.agent-rally-point/apps"
 _SCHEMA_DOC_URL = (
     "https://github.com/tyroneross/agent-rally-point/blob/main/docs/SCHEMA.md"
 )
 _SCHEMA_VERSION = "1.0"
 
+# Protocol version — discovery-envelope contract version. Bumps when fields
+# are added/renamed/removed in the discover() return shape. Frozen at "1.0"
+# along with repo_id normalization and channel_layout policy semantics.
+# See coordination-version-control.md for the three-version-field design.
+_PROTOCOL_VERSION = "1.0"
+
+# Default policy when the manifest has no [policy] section. "migration" is
+# dual-aware: discover returns BOTH canonical and legacy paths, writes mirror
+# to both, no silent fallback. Only after the cutover verifier passes do we
+# promote to "canonical".
+_DEFAULT_POLICY = "migration"
+_VALID_POLICIES = ("canonical", "migration", "legacy-only")
+
+# Compatibility-table content. Materialized at ~/.agent-rally-point/compatibility.json
+# on first discover. Build-loop's bridge reads this to gate the protocol handshake.
+_COMPAT_TABLE = {
+    "agent_rally_point": None,  # filled in at write time from __version__
+    "protocol_version": _PROTOCOL_VERSION,
+    "supported_build_loop_range": ">=0.12.17,<0.14.0",
+    "deprecation_notices": [],
+}
+
 
 def _global_manifest_path() -> Path:
     return Path(os.path.expanduser(f"~/{_GLOBAL_MANIFEST_REL}"))
+
+
+def _compat_table_path() -> Path:
+    return Path(os.path.expanduser(f"~/{_COMPAT_REL}"))
 
 
 def _ensure_global_manifest() -> Path:
@@ -72,6 +100,7 @@ def _ensure_global_manifest() -> Path:
         now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         content = (
             f'schema_version = "{_SCHEMA_VERSION}"\n'
+            f'protocol_version = "{_PROTOCOL_VERSION}"\n'
             "\n"
             "[package]\n"
             'name = "agent-rally-point"\n'
@@ -79,8 +108,18 @@ def _ensure_global_manifest() -> Path:
             f'installed_at = "{now}"\n'
             "\n"
             "[paths]\n"
-            f'apps_root = "{DEFAULT_APPS_ROOT}"\n'
+            f'apps_root = "{_CANONICAL_APPS_ROOT}"\n'
             f'legacy_apps_root = "{_LEGACY_APPS_ROOT}"\n'
+            "\n"
+            "[policy]\n"
+            "# Coordination substrate policy. Values:\n"
+            "#   canonical    — write only to ~/.agent-rally-point/apps/<repo_id>/\n"
+            "#   migration    — DUAL-AWARE: write to both canonical and legacy,\n"
+            "#                  discover returns both paths + merged_view.\n"
+            "#   legacy-only  — write only to ~/.build-loop/apps/<slug>/\n"
+            "# Default: migration. Promote to canonical only after\n"
+            "# `agent-rally-point migrate verify-cutover` returns can_promote=true.\n"
+            f'mode = "{_DEFAULT_POLICY}"\n'
             "\n"
             "[api]\n"
             'discover_module = "agent_rally_point.discover"\n'
@@ -95,6 +134,45 @@ def _ensure_global_manifest() -> Path:
     except OSError:
         return p
     return p
+
+
+def _ensure_compatibility_table() -> Path:
+    """Materialize ``~/.agent-rally-point/compatibility.json`` if absent.
+
+    The table documents which build-loop versions this agent-rally-point
+    expects to handshake with. Build-loop's discovery bridge reads this
+    file at session start to gate the protocol version check. Fire-and-
+    forget — never raises if the home dir is read-only.
+    """
+    p = _compat_table_path()
+    if p.exists():
+        return p
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        table = dict(_COMPAT_TABLE)
+        table["agent_rally_point"] = _get_version()
+        p.write_text(json.dumps(table, indent=2, sort_keys=True) + "\n")
+    except OSError:
+        return p
+    return p
+
+
+def _resolve_policy(global_manifest: dict, repo_overlay: dict) -> tuple[str, str]:
+    """Return (policy_mode, source). Source ∈ {env, repo, global, default}.
+
+    Env override: ``$AGENT_RALLY_POLICY`` ∈ {canonical, migration, legacy-only}.
+    Invalid values silently fall through to the next layer.
+    """
+    env_override = os.environ.get("AGENT_RALLY_POLICY")
+    if env_override in _VALID_POLICIES:
+        return env_override, "env"
+    repo_policy = repo_overlay.get("policy", {}).get("mode")
+    if repo_policy in _VALID_POLICIES:
+        return str(repo_policy), "repo"
+    global_policy = global_manifest.get("policy", {}).get("mode")
+    if global_policy in _VALID_POLICIES:
+        return str(global_policy), "global"
+    return _DEFAULT_POLICY, "default"
 
 
 def _load_toml(path: Path) -> dict:
@@ -154,6 +232,10 @@ def discover(cwd: Path | str | None = None) -> dict[str, Any]:
     manifest_path = _ensure_global_manifest()
     global_manifest = _load_toml(manifest_path)
 
+    # Materialize the build-loop ↔ agent-rally-point compatibility table (idempotent).
+    # Build-loop's discovery bridge reads this file to gate the protocol handshake.
+    _ensure_compatibility_table()
+
     # Layer 2: read repo overlay (if present at canonical repo root).
     repo_root = _repo_root(cwd_path)
     repo_overlay: dict = {}
@@ -164,9 +246,10 @@ def discover(cwd: Path | str | None = None) -> dict[str, Any]:
             overlay_path = candidate
             repo_overlay = _load_toml(candidate)
 
-    # Resolve apps_root + slug with overlay precedence.
+    # Resolve apps_root + slug + policy with overlay precedence.
     apps_root_path, apps_root_source = _resolve_apps_root(repo_overlay, global_manifest)
     slug, slug_source = _resolve_slug(cwd_path, repo_overlay)
+    policy_mode, policy_source = _resolve_policy(global_manifest, repo_overlay)
 
     # Canonical channel dir under the resolved apps_root.
     canonical_channel = apps_root_path / slug
@@ -201,10 +284,15 @@ def discover(cwd: Path | str | None = None) -> dict[str, Any]:
         or legacy_channel.exists()
     )
 
+    now_iso = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     return {
         "installed": bool(installed),
         "version": _get_version(),
         "schema_version": _SCHEMA_VERSION,
+        "protocol_version": _PROTOCOL_VERSION,
+        "policy": policy_mode,
+        "last_resolved_at": now_iso,
         "channel_dir": str(channel_dir),
         "channel_layout": channel_layout,
         "app_slug": slug,
@@ -219,6 +307,7 @@ def discover(cwd: Path | str | None = None) -> dict[str, Any]:
         },
         "sources": {
             "channel_dir": channel_source,
+            "policy": policy_source,
             "apps_root": apps_root_source,
             "app_slug": slug_source,
             "manifest_global": str(manifest_path) if manifest_path.exists() else None,
