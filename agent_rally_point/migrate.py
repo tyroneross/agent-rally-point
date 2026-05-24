@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 # SPDX-License-Identifier: Apache-2.0
-"""Legacy → canonical channel migration tool (alpha-4 + alpha-5).
+"""Legacy → canonical channel migration tool (alpha-4 + alpha-5 + repo-id-split repair).
 
 Walks ``~/.build-loop/apps/*`` and copies each per-repo channel into
-``~/.agent-rally-point/apps/<repo_id>/`` keyed by the new ``repo_id``
-identifier. Writes an append-only audit log at
-``~/.agent-rally-point/migration.log`` (JSONL) and places an advisory
-read-only marker file at the legacy channel root so future writers can
-notice (best-effort; the marker is *advisory* per hard-rule #3 in
-``coordination-substrate-canonical.md`` — old build-loop scripts won't
-honor it, which is why ``verify-cutover`` independently scans legacy
-mtimes for fresh writes).
+``~/.agent-rally-point/apps/<repo_id>/`` keyed by the runtime ``repo_id()``
+function — the SAME function discover() uses. Single ID-derivation rule.
+
+For each legacy slug, the migration searches ``--repo-search-paths``
+(default ``~/dev/git-folder/``) for a git repo whose ``app_slug()`` matches.
+When found, the destination name is ``repo_id(repo_path)``. When no repo
+matches (or multiple match), the destination falls back to
+``<slug>-unmatched-<8hex>/`` with a ``MIGRATION_NEEDS_RELINK`` marker; the
+operator then runs ``agent-rally-migrate relink --slug <slug> --repo-path
+<path>`` to rename the dir to its canonical ``repo_id``.
 
 Subcommands:
 
   ``scan``           — dry-run; list discoverable legacy channels and
                        the canonical destination each would map to.
-  ``apply``          — copy + log + marker. Idempotent: re-running over
-                       an already-migrated channel writes an
-                       ``already-migrated`` log entry and no-ops the copy.
-  ``verify-cutover`` — return the 4-condition can-promote verdict
-                       (alpha-5 cutover gate).
+  ``apply``          — copy + log + marker. Idempotent.
+  ``relink``         — rename an existing ``<slug>-{legacy,unmatched}-<hex>/``
+                       dir to its canonical ``repo_id(<repo-path>)`` name.
+                       Idempotent (no-op when target already exists).
+  ``verify-cutover`` — 4-condition can-promote verdict (alpha-5).
+
+Writes an append-only audit log at ``~/.agent-rally-point/migration.log``
+(JSONL) and places an advisory marker file at the legacy channel root.
 
 All operations are fire-and-forget at the per-channel level — a single
 channel that fails to copy logs the error and continues. The overall
@@ -53,6 +58,12 @@ _LEGACY_APPS_ROOT = "~/.build-loop/apps"
 _CANONICAL_APPS_ROOT = "~/.agent-rally-point/apps"
 _MIGRATION_LOG_REL = ".agent-rally-point/migration.log"
 _READONLY_MARKER = ".RALLY_LEGACY_READONLY"
+_NEEDS_RELINK_MARKER = "MIGRATION_NEEDS_RELINK"
+
+# Default repo-search paths. The migration walks these looking for git repos
+# whose app_slug() matches a legacy slug. Override via --repo-search-paths
+# (CSV) or $AGENT_RALLY_REPO_SEARCH_PATHS.
+_DEFAULT_REPO_SEARCH_PATHS = "~/dev/git-folder/"
 
 # Default cutover TTL: matches presence heartbeat (15 min). After the marker
 # is placed, no legacy write within this window means the cutover is safe.
@@ -98,10 +109,10 @@ def _sha256_manifest_of_dir(root: Path) -> str:
     and survives filesystem reordering. Symlinks are followed; binary files
     are hashed verbatim. Returns "" for an empty/missing directory.
 
-    The advisory ``.RALLY_LEGACY_READONLY`` marker is **excluded** from the
-    manifest — it's metadata about the migration itself, not channel state,
-    and would otherwise make every post-apply legacy manifest diverge from
-    its pre-apply canonical counterpart.
+    The advisory ``.RALLY_LEGACY_READONLY`` marker and the
+    ``MIGRATION_NEEDS_RELINK`` marker are **excluded** from the manifest —
+    they're metadata about the migration itself, not channel state, and
+    would otherwise make every post-apply manifest diverge.
     """
     if not root.exists() or not root.is_dir():
         return ""
@@ -109,8 +120,8 @@ def _sha256_manifest_of_dir(root: Path) -> str:
     for p in sorted(root.rglob("*")):
         if not p.is_file():
             continue
-        if p.name == _READONLY_MARKER:
-            continue  # marker file is metadata; not part of channel state
+        if p.name in (_READONLY_MARKER, _NEEDS_RELINK_MARKER):
+            continue  # markers are metadata; not part of channel state
         try:
             rel = p.relative_to(root)
         except ValueError:
@@ -139,21 +150,146 @@ def _append_migration_log(record: dict) -> None:
         return
 
 
-def _repo_id_for_legacy_slug(slug: str, *, legacy_root: Path | None = None) -> str:
-    """Compute the canonical repo_id for a legacy slug.
+def _resolve_repo_search_paths(
+    repo_search_paths: list[str] | None = None,
+) -> list[Path]:
+    """Return absolute, expanded, existing dirs from the repo-search-paths spec.
 
-    Legacy channel paths are keyed by basename slug (no remote info), so we
-    cannot recover the normalized-remote-URL form. Fall back to a
-    path-derived id of the form ``<slug>-legacy-<8hex>`` where 8hex hashes
-    the legacy channel path. This guarantees:
-      - Idempotent: same slug always maps to same canonical dir.
-      - Disjoint from remote-derived repo_ids (different suffix).
-      - Stable across machines for the same slug + legacy root.
+    Resolution order: explicit argument → env var → default. Non-existent
+    paths are silently dropped (operator may pass a path that doesn't exist
+    on this machine — fine, just no matches from there).
     """
+    if repo_search_paths is None:
+        env = os.environ.get("AGENT_RALLY_REPO_SEARCH_PATHS")
+        if env:
+            repo_search_paths = [s.strip() for s in env.split(",") if s.strip()]
+        else:
+            repo_search_paths = [_DEFAULT_REPO_SEARCH_PATHS]
+    out: list[Path] = []
+    seen: set[str] = set()
+    for raw in repo_search_paths:
+        try:
+            p = Path(os.path.expanduser(raw)).resolve()
+        except (OSError, RuntimeError):
+            continue
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        if p.exists() and p.is_dir():
+            out.append(p)
+    return out
+
+
+def _find_repos_matching_slug(
+    slug: str, repo_search_paths: list[Path]
+) -> list[Path]:
+    """Find git-repo directories under repo_search_paths whose app_slug == slug.
+
+    Searches one directory level deep per search path. A "git repo" is any
+    directory containing a ``.git`` entry (file for worktrees, dir for main
+    checkouts). Worktrees of the same repo all resolve to the same
+    canonical repo root via ``app_slug()`` — but the *paths* themselves are
+    distinct, so we dedup by the value of ``app_slug()`` (which is the
+    canonical-repo-basename). This means the same repo appearing as a main
+    checkout AND a worktree gets counted as ONE match, not two.
+    """
+    out: list[Path] = []
+    seen_canonical_slugs: dict[str, Path] = {}
+    for base in repo_search_paths:
+        try:
+            children = sorted(base.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            # A directory is a git repo if it contains a .git entry. Don't
+            # descend further — slug-match operates one level deep.
+            git_marker = child / ".git"
+            if not git_marker.exists():
+                continue
+            try:
+                child_slug = _legacy_slug_from_cwd(child)
+            except Exception:  # noqa: BLE001
+                continue
+            if child_slug == slug:
+                # Dedup worktree of same canonical repo: keep the first hit
+                # that produces a unique canonical-repo path.
+                try:
+                    out_already_canonical_paths = {
+                        _resolve_canonical_repo_root(p) for p in out
+                    }
+                    this_canonical = _resolve_canonical_repo_root(child)
+                except Exception:  # noqa: BLE001
+                    out.append(child)
+                    continue
+                if this_canonical not in out_already_canonical_paths:
+                    out.append(child)
+    return out
+
+
+def _resolve_canonical_repo_root(p: Path) -> Path:
+    """Return the canonical repo root for ``p`` — same root for every worktree.
+
+    Uses ``git rev-parse --git-common-dir`` (parent of common-dir is the
+    canonical repo). Falls back to the path itself when not a git repo.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(p), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, timeout=1.0,
+        )
+        if out.returncode != 0:
+            return p.resolve()
+        common = Path(out.stdout.strip())
+        if not common.is_absolute():
+            common = p / common
+        return common.resolve().parent
+    except Exception:  # noqa: BLE001
+        return p.resolve()
+
+
+def _migration_destination_name(
+    slug: str,
+    *,
+    repo_search_paths: list[Path] | None = None,
+    legacy_root: Path | None = None,
+) -> tuple[str, str, Path | None]:
+    """Resolve the canonical destination name for a legacy slug.
+
+    Single ID-derivation rule: when a repo is found, the destination name is
+    EXACTLY ``repo_id(repo_path)`` — the same function discover() uses.
+
+    Returns ``(dest_name, match_status, repo_path)`` where:
+      - ``dest_name`` ∈ {``repo_id(repo_path)``, ``<slug>-unmatched-<8hex>``}
+      - ``match_status`` ∈ {``matched``, ``unmatched``, ``ambiguous``}
+      - ``repo_path`` is the matched git repo (or None on unmatched/ambiguous)
+
+    Ambiguous (multiple repos with the same slug) falls back to unmatched
+    naming — operator must run ``relink`` per-app with the correct
+    ``--repo-path``.
+    """
+    paths = (
+        repo_search_paths
+        if repo_search_paths is not None
+        else _resolve_repo_search_paths()
+    )
+    matches = _find_repos_matching_slug(slug, paths)
+    if len(matches) == 1:
+        repo_path = matches[0]
+        try:
+            dest = compute_repo_id(repo_path)
+            return dest, "matched", repo_path
+        except Exception:  # noqa: BLE001
+            pass  # fall through to unmatched
+    # Unmatched (0 hits) or ambiguous (>1) — same fallback shape.
     base = legacy_root if legacy_root is not None else _legacy_root()
     legacy_path = (base / slug).resolve()
-    h = hashlib.sha256(("legacy:" + str(legacy_path)).encode("utf-8")).hexdigest()[:8]
-    return f"{slug}-legacy-{h}"
+    h = hashlib.sha256(("unmatched:" + str(legacy_path)).encode("utf-8")).hexdigest()[:8]
+    status = "ambiguous" if len(matches) > 1 else "unmatched"
+    return f"{slug}-unmatched-{h}", status, None
 
 
 def _copy_tree_idempotent(src: Path, dest: Path) -> tuple[int, list[str]]:
@@ -224,21 +360,66 @@ def _place_readonly_marker(legacy_channel: Path, info: dict) -> None:
         return
 
 
+def _place_needs_relink_marker(dest: Path, info: dict) -> None:
+    """Drop a MIGRATION_NEEDS_RELINK marker inside an unmatched destination dir.
+
+    Indicates to the operator (and to discover() readers) that this channel
+    is at an unmatched name and should be relinked via
+    ``agent-rally-migrate relink --slug <slug> --repo-path <path>``.
+    """
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        marker = dest / _NEEDS_RELINK_MARKER
+        marker.write_text(json.dumps({
+            "ts": _iso_now(),
+            "status": "needs_relink",
+            "details": info,
+            "doc": (
+                "This channel was migrated to an unmatched destination name "
+                "because no unique git repo could be found for the legacy "
+                "slug. Run `agent-rally-migrate relink --slug <slug> "
+                "--repo-path <path>` to rename this dir to its canonical "
+                "repo_id."
+            ),
+        }, indent=2, sort_keys=True) + "\n")
+    except OSError:
+        return
+
+
 # ---------------------------------------------------------------------------
 # Subcommand implementations
 # ---------------------------------------------------------------------------
 
 
-def discover_legacy_channels(legacy_root: Path | None = None) -> list[dict]:
+def discover_legacy_channels(
+    legacy_root: Path | None = None,
+    *,
+    repo_search_paths: list[str] | list[Path] | None = None,
+) -> list[dict]:
     """Return a list of legacy channel descriptors.
 
-    Each descriptor: {slug, legacy_path, canonical_repo_id, canonical_path}.
+    Each descriptor: {slug, legacy_path, canonical_repo_id, canonical_path,
+    match_status, repo_path}.
+
+    ``canonical_repo_id`` is the runtime ``repo_id(repo_path)`` when a repo
+    is found, else the ``<slug>-unmatched-<8hex>`` fallback.
+    ``match_status`` ∈ {matched, unmatched, ambiguous}.
+    ``repo_path`` is the matched git repo (string) or None.
+
     Channels named ``_unscoped`` are included (they're real cleanup targets).
     Hidden dirs (start with ``.``) and non-directories are skipped.
     """
     base = legacy_root if legacy_root is not None else _legacy_root()
     if not base.exists():
         return []
+    # Normalize repo_search_paths to list[Path] once.
+    if repo_search_paths is None:
+        paths = _resolve_repo_search_paths()
+    else:
+        # Accept either list[str] or list[Path].
+        paths = _resolve_repo_search_paths(
+            [str(p) for p in repo_search_paths]
+        )
     out = []
     for entry in sorted(base.iterdir()):
         if not entry.is_dir():
@@ -246,12 +427,16 @@ def discover_legacy_channels(legacy_root: Path | None = None) -> list[dict]:
         if entry.name.startswith("."):
             continue
         slug = entry.name
-        rid = _repo_id_for_legacy_slug(slug, legacy_root=base)
+        dest_name, match_status, repo_path = _migration_destination_name(
+            slug, repo_search_paths=paths, legacy_root=base
+        )
         out.append({
             "slug": slug,
             "legacy_path": str(entry),
-            "canonical_repo_id": rid,
-            "canonical_path": str(_canonical_root() / rid),
+            "canonical_repo_id": dest_name,
+            "canonical_path": str(_canonical_root() / dest_name),
+            "match_status": match_status,
+            "repo_path": str(repo_path) if repo_path else None,
         })
     return out
 
@@ -260,6 +445,7 @@ def apply_migration(
     *,
     legacy_root: Path | None = None,
     canonical_root: Path | None = None,
+    repo_search_paths: list[str] | list[Path] | None = None,
     place_marker: bool = True,
     dry_run: bool = False,
 ) -> dict:
@@ -267,12 +453,19 @@ def apply_migration(
 
     Idempotent. Re-running over an already-migrated channel writes an
     ``already-migrated`` log entry (when the dest sha256 already matches
-    the source) and no-ops the copy. Returns a summary dict with
-    per-channel outcomes.
+    the source) and no-ops the copy.
+
+    When a legacy slug can be matched 1:1 to a git repo under
+    ``repo_search_paths`` (default ``~/dev/git-folder/``), the destination
+    is the runtime ``repo_id(repo_path)`` — same function discover() uses.
+    Otherwise it falls back to ``<slug>-unmatched-<8hex>`` and writes a
+    ``MIGRATION_NEEDS_RELINK`` marker; operator runs ``relink`` to fix.
     """
     base_l = legacy_root if legacy_root is not None else _legacy_root()
     base_c = canonical_root if canonical_root is not None else _canonical_root()
-    channels = discover_legacy_channels(legacy_root=base_l)
+    channels = discover_legacy_channels(
+        legacy_root=base_l, repo_search_paths=repo_search_paths
+    )
     outcomes = []
     failures = 0
     for ch in channels:
@@ -315,8 +508,16 @@ def apply_migration(
                     {
                         "canonical_repo_id": ch["canonical_repo_id"],
                         "canonical_path": str(dest_path),
+                        "match_status": ch["match_status"],
                     },
                 )
+                # Loud needs-relink signal for unmatched/ambiguous dests.
+                if ch["match_status"] in ("unmatched", "ambiguous"):
+                    _place_needs_relink_marker(dest_path, {
+                        "slug": ch["slug"],
+                        "match_status": ch["match_status"],
+                        "legacy_path": ch["legacy_path"],
+                    })
 
             log_rec = {
                 "ts": _iso_now(),
@@ -327,6 +528,8 @@ def apply_migration(
                 "sha256_manifest": src_manifest,
                 "canonical_repo_id": ch["canonical_repo_id"],
                 "slug": ch["slug"],
+                "match_status": ch["match_status"],
+                "repo_path": ch["repo_path"],
             }
             if not dry_run:
                 _append_migration_log(log_rec)
@@ -358,10 +561,162 @@ def apply_migration(
     }
 
 
+def relink(
+    *,
+    slug: str,
+    repo_path: Path | str,
+    canonical_root: Path | None = None,
+    force: bool = False,
+) -> dict:
+    """Rename an existing ``<slug>-{legacy,unmatched}-<hex>/`` dir to ``repo_id(repo_path)``.
+
+    Idempotent: when the canonical target already exists (matching repo_id),
+    refuse with a clear error unless ``force=True`` (force will rename to a
+    backup and proceed; reserved for operator-level recovery).
+
+    The function searches the canonical root for an existing dir matching
+    ``<slug>-legacy-*`` or ``<slug>-unmatched-*`` and renames it (single
+    ``Path.rename`` — atomic on POSIX when src and dest share a filesystem,
+    which is always the case here). Appends a ``relink`` record to the
+    migration log with ``from_path``, ``to_path``, ``repo_path``.
+
+    Never raises on the no-op (idempotent) case — returns
+    ``{operation: "already-canonical"}`` when the canonical dir already
+    exists and the legacy/unmatched source dir does not.
+    """
+    base_c = canonical_root if canonical_root is not None else _canonical_root()
+    repo_path_resolved = Path(os.path.expanduser(str(repo_path))).resolve()
+    try:
+        target_name = compute_repo_id(repo_path_resolved)
+    except Exception as e:  # noqa: BLE001
+        return {
+            "operation": "error",
+            "error": f"repo_id() failed for {repo_path_resolved}: {e}",
+            "slug": slug,
+        }
+
+    target_dir = base_c / target_name
+
+    # Find source candidates: <slug>-legacy-* OR <slug>-unmatched-*.
+    if not base_c.exists():
+        return {
+            "operation": "error",
+            "error": f"canonical root does not exist: {base_c}",
+            "slug": slug,
+        }
+    candidates: list[Path] = []
+    try:
+        for entry in base_c.iterdir():
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            if name == target_name:
+                continue  # the target itself — handled below
+            if name.startswith(f"{slug}-legacy-") or name.startswith(f"{slug}-unmatched-"):
+                candidates.append(entry)
+    except OSError as e:
+        return {
+            "operation": "error",
+            "error": f"failed to scan {base_c}: {e}",
+            "slug": slug,
+        }
+
+    target_exists = target_dir.exists()
+
+    # Idempotency: if target exists and no candidates remain, this is a no-op.
+    if target_exists and not candidates:
+        return {
+            "operation": "already-canonical",
+            "slug": slug,
+            "to_path": str(target_dir),
+            "repo_path": str(repo_path_resolved),
+        }
+
+    # Conflict: target exists AND a candidate exists → refuse unless force.
+    if target_exists and candidates and not force:
+        return {
+            "operation": "error",
+            "error": (
+                f"target {target_dir} already exists; refusing to overwrite. "
+                f"Candidates: {[str(c) for c in candidates]}. Use --force to "
+                f"backup the existing target and rename the candidate over it."
+            ),
+            "slug": slug,
+            "to_path": str(target_dir),
+            "candidates": [str(c) for c in candidates],
+        }
+
+    # Force path: move existing target aside.
+    if target_exists and force:
+        backup = base_c / f"{target_name}.backup-{int(time.time())}"
+        try:
+            target_dir.rename(backup)
+        except OSError as e:
+            return {
+                "operation": "error",
+                "error": f"failed to backup {target_dir} → {backup}: {e}",
+                "slug": slug,
+            }
+        _append_migration_log({
+            "ts": _iso_now(),
+            "operation": "relink-backup",
+            "from_path": str(target_dir),
+            "to_path": str(backup),
+            "slug": slug,
+        })
+
+    # Multi-candidate path: pick the most-recently-modified candidate (the
+    # one most likely to hold current state). Log the discard list.
+    if len(candidates) > 1:
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        chosen = candidates[0]
+        discarded = candidates[1:]
+        _append_migration_log({
+            "ts": _iso_now(),
+            "operation": "relink-multi-candidate",
+            "chosen": str(chosen),
+            "discarded": [str(d) for d in discarded],
+            "slug": slug,
+        })
+    else:
+        chosen = candidates[0]
+
+    # Atomic rename.
+    try:
+        chosen.rename(target_dir)
+    except OSError as e:
+        return {
+            "operation": "error",
+            "error": f"failed to rename {chosen} → {target_dir}: {e}",
+            "slug": slug,
+        }
+
+    # Remove the needs-relink marker if present (the relink resolved it).
+    marker = target_dir / _NEEDS_RELINK_MARKER
+    if marker.exists():
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+
+    log_rec = {
+        "ts": _iso_now(),
+        "operation": "relink",
+        "from_path": str(chosen),
+        "to_path": str(target_dir),
+        "repo_path": str(repo_path_resolved),
+        "canonical_repo_id": target_name,
+        "slug": slug,
+    }
+    _append_migration_log(log_rec)
+    return log_rec
+
+
 def verify_cutover(
     *,
     legacy_root: Path | None = None,
     canonical_root: Path | None = None,
+    repo_search_paths: list[str] | list[Path] | None = None,
     ttl_minutes: int = _DEFAULT_CUTOVER_TTL_MIN,
     require_downstream: bool = True,
 ) -> dict:
@@ -376,17 +731,16 @@ def verify_cutover(
          itself.
       4. downstream_ready — when require_downstream is True, check that
          ~/.agent-rally-point/compatibility.json exists and lists a
-         supported_build_loop_range. The actual installed build-loop
-         version cannot be probed from inside this package — that's the
-         operator's responsibility — but the file's presence indicates
-         the contract was published.
+         supported_build_loop_range.
 
     Returns: {can_promote: bool, conditions: {...}, fresh_writes: [...]}.
     Never raises.
     """
     base_l = legacy_root if legacy_root is not None else _legacy_root()
     base_c = canonical_root if canonical_root is not None else _canonical_root()
-    channels = discover_legacy_channels(legacy_root=base_l)
+    channels = discover_legacy_channels(
+        legacy_root=base_l, repo_search_paths=repo_search_paths
+    )
 
     fully_copied = True
     integrity_ok = True
@@ -462,6 +816,13 @@ def _main(argv: list[str] | None = None) -> int:
 
     p_scan = sub.add_parser("scan", help="Dry-run: list discoverable legacy channels")
     p_scan.add_argument("--json", action="store_true", help="JSON output")
+    p_scan.add_argument(
+        "--repo-search-paths", default=None,
+        help=(
+            "CSV of paths to search for git repos matching legacy slugs. "
+            "Default: ~/dev/git-folder/ (or $AGENT_RALLY_REPO_SEARCH_PATHS)."
+        ),
+    )
 
     p_apply = sub.add_parser("apply", help="Copy + log + place advisory marker")
     p_apply.add_argument(
@@ -472,6 +833,37 @@ def _main(argv: list[str] | None = None) -> int:
         help="Skip placing the advisory read-only marker",
     )
     p_apply.add_argument("--json", action="store_true", help="JSON output")
+    p_apply.add_argument(
+        "--repo-search-paths", default=None,
+        help=(
+            "CSV of paths to search for git repos matching legacy slugs. "
+            "Default: ~/dev/git-folder/ (or $AGENT_RALLY_REPO_SEARCH_PATHS)."
+        ),
+    )
+
+    p_relink = sub.add_parser(
+        "relink",
+        help=(
+            "Rename an existing <slug>-{legacy,unmatched}-<hex>/ canonical "
+            "channel dir to its runtime repo_id(<repo-path>) name."
+        ),
+    )
+    p_relink.add_argument(
+        "--slug", required=True,
+        help="The legacy slug (basename of ~/.build-loop/apps/<slug>/).",
+    )
+    p_relink.add_argument(
+        "--repo-path", required=True,
+        help="Absolute path to the git repo (any worktree). repo_id() of this path becomes the canonical name.",
+    )
+    p_relink.add_argument(
+        "--force", action="store_true",
+        help=(
+            "When the canonical target already exists AND a legacy/unmatched "
+            "candidate also exists, back up the existing target and proceed."
+        ),
+    )
+    p_relink.add_argument("--json", action="store_true", help="JSON output")
 
     p_verify = sub.add_parser(
         "verify-cutover",
@@ -485,27 +877,48 @@ def _main(argv: list[str] | None = None) -> int:
         "--no-downstream-check", action="store_true",
         help="Skip the compatibility.json existence check",
     )
+    p_verify.add_argument(
+        "--repo-search-paths", default=None,
+        help="CSV of paths to search for git repos matching legacy slugs.",
+    )
     p_verify.add_argument("--json", action="store_true", help="JSON output")
 
     args = parser.parse_args(argv)
 
+    # Parse --repo-search-paths CSV for the subcommands that accept it.
+    rsp: list[str] | None = None
+    rsp_attr = getattr(args, "repo_search_paths", None)
+    if rsp_attr:
+        rsp = [s.strip() for s in rsp_attr.split(",") if s.strip()]
+
     if args.subcommand == "scan":
-        out = discover_legacy_channels()
+        out = discover_legacy_channels(repo_search_paths=rsp)
         if args.json:
             print(json.dumps(out, indent=2, sort_keys=True))
         else:
             if not out:
                 print("(no legacy channels found at ~/.build-loop/apps/)")
             for ch in out:
-                print(f"{ch['slug']:30s}  →  {ch['canonical_repo_id']}")
-                print(f"  {ch['legacy_path']}")
-                print(f"  {ch['canonical_path']}")
+                status_mark = {
+                    "matched": "✓",
+                    "unmatched": "?",
+                    "ambiguous": "!",
+                }.get(ch["match_status"], "?")
+                print(
+                    f"{status_mark} {ch['slug']:30s}  →  {ch['canonical_repo_id']}  "
+                    f"[{ch['match_status']}]"
+                )
+                print(f"  legacy:    {ch['legacy_path']}")
+                print(f"  canonical: {ch['canonical_path']}")
+                if ch["repo_path"]:
+                    print(f"  repo:      {ch['repo_path']}")
         return 0
 
     if args.subcommand == "apply":
         result = apply_migration(
             place_marker=not args.no_marker,
             dry_run=args.dry_run,
+            repo_search_paths=rsp,
         )
         if args.json:
             print(json.dumps(result, indent=2, sort_keys=True))
@@ -514,6 +927,7 @@ def _main(argv: list[str] | None = None) -> int:
                 print(
                     f"[{o.get('operation','?')}] "
                     f"{o.get('slug','?'):30s}  files={o.get('file_count',0)}  "
+                    f"match={o.get('match_status','?')}  "
                     f"sha256={(o.get('sha256_manifest') or '')[:12]}"
                 )
             print(
@@ -523,10 +937,32 @@ def _main(argv: list[str] | None = None) -> int:
             )
         return 0 if result["failures"] == 0 else 1
 
+    if args.subcommand == "relink":
+        result = relink(
+            slug=args.slug, repo_path=args.repo_path, force=args.force,
+        )
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            op = result.get("operation", "?")
+            if op == "relink":
+                print(
+                    f"[relink] {result['slug']}: {result['from_path']}  →  "
+                    f"{result['to_path']}"
+                )
+            elif op == "already-canonical":
+                print(
+                    f"[already-canonical] {result['slug']}: {result['to_path']}"
+                )
+            else:
+                print(f"[{op}] {result.get('error', '')}", file=sys.stderr)
+        return 0 if result.get("operation") in ("relink", "already-canonical") else 1
+
     if args.subcommand == "verify-cutover":
         verdict = verify_cutover(
             ttl_minutes=args.ttl_minutes,
             require_downstream=not args.no_downstream_check,
+            repo_search_paths=rsp,
         )
         if args.json:
             print(json.dumps(verdict, indent=2, sort_keys=True))

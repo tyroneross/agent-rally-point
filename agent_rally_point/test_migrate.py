@@ -28,6 +28,10 @@ def isolated_home(tmp_path, monkeypatch):
 
 @pytest.fixture
 def fresh_migrate(isolated_home, monkeypatch):
+    # Default tests run with no repo-search-paths matches — every channel
+    # falls into the "unmatched" path. Tests that exercise the matched
+    # path explicitly set AGENT_RALLY_REPO_SEARCH_PATHS.
+    monkeypatch.setenv("AGENT_RALLY_REPO_SEARCH_PATHS", str(isolated_home / "_no_such_dir"))
     for mod in (
         "agent_rally_point.migrate",
         "agent_rally_point.repo_id",
@@ -58,8 +62,11 @@ def test_scan_lists_legacy_channels(fresh_migrate, isolated_home):
     channels = fresh_migrate.discover_legacy_channels()
     slugs = {ch["slug"] for ch in channels}
     assert slugs == {"app-a", "app-b"}
+    # No repo-search-paths match these fake slugs → unmatched naming.
     for ch in channels:
-        assert ch["canonical_repo_id"].startswith(ch["slug"] + "-legacy-")
+        assert ch["canonical_repo_id"].startswith(ch["slug"] + "-unmatched-")
+        assert ch["match_status"] == "unmatched"
+        assert ch["repo_path"] is None
         assert "/.agent-rally-point/apps/" in ch["canonical_path"]
 
 
