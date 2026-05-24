@@ -36,6 +36,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str | None]] = {
     # presence (heartbeat)
     "write_presence": ("presence", "write_presence"),
     "read_active_presence": ("presence", "read_active_presence"),
+    "run_refresh_loop": ("presence", "run_refresh_loop"),
     # append-only event log
     "append_change": ("changes", "append_change"),
     "make_record": ("changes", "make_record"),

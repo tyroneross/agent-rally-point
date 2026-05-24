@@ -177,3 +177,89 @@ def test_branch_merge_status_unknown_non_git(chan: Path, tmp_path: Path):
     assert rec["branch_merge_status"] == "unknown"
     assert rec["branch_name"] == "unknown"
     assert rec["branch_head_sha"] == "unknown"
+
+
+# -- alpha-7: run_refresh_loop ---------------------------------------------
+
+
+def test_refresh_loop_full_envelope_per_tick(chan: Path):
+    """Every tick writes the FULL envelope, not just heartbeat_ts."""
+    phases = iter(["execute", "review", "iterate"])
+    files = iter([["a.py"], ["b.py"], ["c.py"]])
+
+    pr.run_refresh_loop(
+        chan,
+        session_id="loop-1",
+        tool="claude_code", model="opus", run_id="r", app_slug="myapp",
+        phase_provider=lambda: next(phases),
+        files_provider=lambda: next(files),
+        interval=0,  # no sleep
+        max_iterations=3,
+        sleep_fn=lambda _x: None,
+    )
+
+    # After 3 ticks, the LAST envelope wrote phase="iterate" + ["c.py"]
+    rec = json.loads((chan / "sessions" / "loop-1.json").read_text())
+    assert rec["phase"] == "iterate"
+    assert rec["files_in_flight"] == ["c.py"]
+    assert rec["session_id"] == "loop-1"
+    assert rec["tool"] == "claude_code"
+
+
+def test_refresh_loop_exits_when_parent_pid_is_dead(chan: Path):
+    """parent_pid pointing at a dead process stops the loop cleanly."""
+    # PID 99999 is overwhelmingly likely to be dead/non-existent.
+    DEAD_PID = 99999
+    ticks = pr.run_refresh_loop(
+        chan,
+        session_id="dead-parent", tool="t", model="m", run_id="r",
+        app_slug="a",
+        phase_provider=lambda: "x",
+        files_provider=lambda: [],
+        interval=0,
+        parent_pid=DEAD_PID,
+        max_iterations=10,
+        sleep_fn=lambda _x: None,
+    )
+    # Exits before any tick because parent is checked first.
+    assert ticks == 0
+    # No presence file written.
+    assert not (chan / "sessions" / "dead-parent.json").exists()
+
+
+def test_refresh_loop_continues_while_parent_alive(chan: Path):
+    """Real, alive parent (this test process) → loop ticks normally."""
+    import os as _os
+    own_pid = _os.getpid()
+    ticks = pr.run_refresh_loop(
+        chan,
+        session_id="alive-parent", tool="t", model="m", run_id="r",
+        app_slug="a",
+        phase_provider=lambda: "x",
+        files_provider=lambda: [],
+        interval=0,
+        parent_pid=own_pid,
+        max_iterations=3,
+        sleep_fn=lambda _x: None,
+    )
+    assert ticks == 3
+    assert (chan / "sessions" / "alive-parent.json").exists()
+
+
+def test_refresh_loop_swallows_provider_exceptions(chan: Path):
+    """A misbehaving provider doesn't crash the loop."""
+    def bad_phase():
+        raise RuntimeError("boom")
+    ticks = pr.run_refresh_loop(
+        chan,
+        session_id="bad-provider", tool="t", model="m", run_id="r",
+        app_slug="a",
+        phase_provider=bad_phase,  # raises every tick
+        files_provider=lambda: [],
+        interval=0,
+        max_iterations=2,
+        sleep_fn=lambda _x: None,
+    )
+    assert ticks == 2  # exception was swallowed, defaults used
+    rec = json.loads((chan / "sessions" / "bad-provider.json").read_text())
+    assert rec["phase"] == "running"  # the fallback default
