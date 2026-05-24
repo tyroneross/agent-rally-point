@@ -8,61 +8,82 @@ Public API surface. Most users should reach for the CLI (`agent-rally-point ...`
 shipped in v0.2; this Python API is for advanced adapter authors building
 integrations into in-process runtimes (LangGraph nodes, CrewAI tools,
 AutoGen tool-callable wrappers, etc.).
+
+Submodules are imported lazily via PEP 562 module-level ``__getattr__`` so that
+``python -m agent_rally_point.<submodule>`` does not race the package
+``__init__`` (which previously caused a ``RuntimeWarning`` from runpy because
+the submodule was already in ``sys.modules`` before runpy executed it as
+``__main__``). Consumer-facing imports (``from agent_rally_point import
+discover``) behave identically to the previous eager-import layout.
 """
 from __future__ import annotations
 
-__version__ = "0.2.0"
+import importlib
+from typing import TYPE_CHECKING
 
-# Channel identity
-from .channel_paths import (
-    app_slug,
-    app_channel_dir,
-    ensure_channel_dir,
-    apps_root,
-    DEFAULT_APPS_ROOT,
-)
+__version__ = "0.2.1"
 
-# Presence (heartbeat)
-from .presence import (
-    write_presence,
-    read_active_presence,
-)
-
-# Append-only event log
-from .changes import (
-    append_change,
-    make_record,
-)
-
-# Monotonic revision counter
-from .revision import bump_revision
-
-# Delta-computing reader
-from .checkpoint import checkpoint_read
-
-# Canonical write helper (bumps revision + appends record atomically — use this, not raw append_change)
-from .post import post
-
-# Lifecycle hygiene (closeout)
-from . import lifecycle
-
-# Discovery (v0.2: manifest + resolver)
-from .discover import discover
+# Map: public attribute name -> (submodule, source attribute name)
+# Source attribute = the name in the submodule that the public attribute resolves to.
+# When source attribute is None, the public attribute IS the submodule itself.
+_LAZY_ATTRS: dict[str, tuple[str, str | None]] = {
+    # channel identity
+    "app_slug": ("channel_paths", "app_slug"),
+    "app_channel_dir": ("channel_paths", "app_channel_dir"),
+    "ensure_channel_dir": ("channel_paths", "ensure_channel_dir"),
+    "apps_root": ("channel_paths", "apps_root"),
+    "DEFAULT_APPS_ROOT": ("channel_paths", "DEFAULT_APPS_ROOT"),
+    # presence (heartbeat)
+    "write_presence": ("presence", "write_presence"),
+    "read_active_presence": ("presence", "read_active_presence"),
+    # append-only event log
+    "append_change": ("changes", "append_change"),
+    "make_record": ("changes", "make_record"),
+    # monotonic revision counter
+    "bump_revision": ("revision", "bump_revision"),
+    # delta-computing reader
+    "checkpoint_read": ("checkpoint", "checkpoint_read"),
+    # canonical write helper
+    "post": ("post", "post"),
+    # lifecycle hygiene (re-exported as the submodule itself)
+    "lifecycle": ("lifecycle", None),
+    # discovery (v0.2: manifest + resolver)
+    "discover": ("discover", "discover"),
+}
 
 __all__ = [
     "__version__",
-    "app_slug",
-    "app_channel_dir",
-    "ensure_channel_dir",
-    "apps_root",
-    "DEFAULT_APPS_ROOT",
-    "write_presence",
-    "read_active_presence",
-    "append_change",
-    "make_record",
-    "bump_revision",
-    "checkpoint_read",
-    "post",
-    "lifecycle",
-    "discover",
+    *_LAZY_ATTRS.keys(),
 ]
+
+
+def __getattr__(name: str):  # PEP 562
+    if name in _LAZY_ATTRS:
+        submodule_name, source_attr = _LAZY_ATTRS[name]
+        module = importlib.import_module(f".{submodule_name}", __name__)
+        value = module if source_attr is None else getattr(module, source_attr)
+        globals()[name] = value  # cache so subsequent lookups skip __getattr__
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(list(globals().keys()) + __all__))
+
+
+if TYPE_CHECKING:
+    # Re-state for type checkers (which don't execute __getattr__).
+    from .channel_paths import (  # noqa: F401
+        app_slug,
+        app_channel_dir,
+        ensure_channel_dir,
+        apps_root,
+        DEFAULT_APPS_ROOT,
+    )
+    from .presence import write_presence, read_active_presence  # noqa: F401
+    from .changes import append_change, make_record  # noqa: F401
+    from .revision import bump_revision  # noqa: F401
+    from .checkpoint import checkpoint_read  # noqa: F401
+    from .post import post  # noqa: F401
+    from . import lifecycle  # noqa: F401
+    from .discover import discover  # noqa: F401
