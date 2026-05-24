@@ -32,6 +32,7 @@ test = [
 [project.scripts]
 agent-rally-point = "agent_rally_point.cli:main"
 agent-rally-discover = "agent_rally_point.discover:_main"
+agent-rally-migrate = "agent_rally_point.migrate:_main"
 
 [project.urls]
 Homepage = "https://github.com/tyroneross/agent-rally-point"

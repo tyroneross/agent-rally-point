@@ -1,0 +1,272 @@
+# SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for migrate.py — legacy→canonical channel migration + cutover verifier."""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+
+@pytest.fixture
+def isolated_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("BUILD_LOOP_APPS_ROOT", raising=False)
+    yield home
+
+
+@pytest.fixture
+def fresh_migrate(isolated_home, monkeypatch):
+    for mod in (
+        "agent_rally_point.migrate",
+        "agent_rally_point.repo_id",
+        "agent_rally_point.channel_paths",
+    ):
+        if mod in sys.modules:
+            del sys.modules[mod]
+    import agent_rally_point.migrate as m
+    return m
+
+
+def _make_legacy_channel(home: Path, slug: str, files: dict[str, str]) -> Path:
+    """Materialize a fake legacy channel under home/.build-loop/apps/<slug>/."""
+    ch = home / ".build-loop" / "apps" / slug
+    ch.mkdir(parents=True)
+    for rel, content in files.items():
+        p = ch / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+    return ch
+
+
+def test_scan_lists_legacy_channels(fresh_migrate, isolated_home):
+    _make_legacy_channel(isolated_home, "app-a", {"revision": "5\n"})
+    _make_legacy_channel(isolated_home, "app-b", {
+        "revision": "7\n", "changes.jsonl": '{"kind":"phase"}\n',
+    })
+    channels = fresh_migrate.discover_legacy_channels()
+    slugs = {ch["slug"] for ch in channels}
+    assert slugs == {"app-a", "app-b"}
+    for ch in channels:
+        assert ch["canonical_repo_id"].startswith(ch["slug"] + "-legacy-")
+        assert "/.agent-rally-point/apps/" in ch["canonical_path"]
+
+
+def test_apply_migrates_files_and_writes_log(fresh_migrate, isolated_home):
+    _make_legacy_channel(isolated_home, "app-a", {
+        "revision": "5\n",
+        "changes.jsonl": '{"kind":"phase","payload":{}}\n',
+        "sessions/sess-1.json": '{"session_id":"sess-1"}',
+    })
+    result = fresh_migrate.apply_migration()
+    assert result["failures"] == 0
+    assert result["channels_total"] == 1
+    outcome = result["outcomes"][0]
+    assert outcome["operation"] == "migrate"
+    assert outcome["file_count"] == 3
+
+    # Files actually copied.
+    canonical = Path(outcome["dest_path"])
+    assert (canonical / "revision").read_text() == "5\n"
+    assert (canonical / "changes.jsonl").exists()
+    assert (canonical / "sessions/sess-1.json").exists()
+
+    # Migration log materialized.
+    log = isolated_home / ".agent-rally-point" / "migration.log"
+    assert log.exists()
+    entries = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+    assert any(e.get("operation") == "migrate" for e in entries)
+    assert any(e.get("sha256_manifest") for e in entries)
+
+
+def test_apply_is_idempotent(fresh_migrate, isolated_home):
+    _make_legacy_channel(isolated_home, "app-x", {"revision": "1\n"})
+    r1 = fresh_migrate.apply_migration()
+    r2 = fresh_migrate.apply_migration()
+    # Second run: every channel logs "already-migrated".
+    assert r1["outcomes"][0]["operation"] == "migrate"
+    assert r2["outcomes"][0]["operation"] == "already-migrated"
+    assert r2["failures"] == 0
+
+
+def test_apply_places_advisory_marker(fresh_migrate, isolated_home):
+    ch = _make_legacy_channel(isolated_home, "app-m", {"revision": "1\n"})
+    fresh_migrate.apply_migration()
+    marker = ch / ".RALLY_LEGACY_READONLY"
+    assert marker.exists()
+    data = json.loads(marker.read_text())
+    assert data["advisory"] is True
+    assert data["policy_after_cutover"] == "canonical"
+
+
+def test_apply_dry_run_writes_nothing(fresh_migrate, isolated_home):
+    _make_legacy_channel(isolated_home, "app-d", {"revision": "1\n"})
+    result = fresh_migrate.apply_migration(dry_run=True)
+    canonical_root = isolated_home / ".agent-rally-point" / "apps"
+    # No canonical channel materialized.
+    assert not canonical_root.exists() or not any(canonical_root.iterdir())
+    # No migration log written either.
+    log = isolated_home / ".agent-rally-point" / "migration.log"
+    assert not log.exists()
+    assert result["dry_run"] is True
+
+
+def test_verify_cutover_refuses_when_canonical_empty(fresh_migrate, isolated_home):
+    _make_legacy_channel(isolated_home, "app-1", {"revision": "1\n"})
+    v = fresh_migrate.verify_cutover(require_downstream=False)
+    # Nothing copied → fully_copied=False, integrity=False.
+    assert v["can_promote"] is False
+    assert v["conditions"]["legacy_fully_copied"] is False
+
+
+def test_verify_cutover_accepts_after_clean_migration(fresh_migrate, isolated_home):
+    _make_legacy_channel(isolated_home, "app-a", {"revision": "1\n"})
+    _make_legacy_channel(isolated_home, "app-b", {"revision": "2\n"})
+    fresh_migrate.apply_migration()
+
+    # Pretend we waited for the no-fresh-writes TTL by using a 0-minute TTL
+    # (which makes "fresh" = "modified in the last 0 seconds", impossible to
+    # satisfy with regular wall-clock — so we actually need to backdate the
+    # legacy file mtimes OR use a negative TTL... actually, simplest:
+    # use a -1-minute TTL so cutoff is in the FUTURE and nothing is "fresh").
+    # The simpler approach is to set mtimes to long-ago.
+    legacy_root = isolated_home / ".build-loop" / "apps"
+    long_ago = time.time() - 3600
+    for p in legacy_root.rglob("*"):
+        if p.is_file():
+            os.utime(p, (long_ago, long_ago))
+
+    v = fresh_migrate.verify_cutover(
+        ttl_minutes=15, require_downstream=False
+    )
+    assert v["can_promote"] is True, f"verdict: {v}"
+    assert v["conditions"]["legacy_fully_copied"] is True
+    assert v["conditions"]["integrity_verified"] is True
+    assert v["conditions"]["no_fresh_writes_within_ttl"] is True
+    assert v["fresh_writes"] == []
+
+
+def test_verify_cutover_refuses_on_fresh_legacy_write(fresh_migrate, isolated_home):
+    _make_legacy_channel(isolated_home, "app-a", {"revision": "1\n"})
+    fresh_migrate.apply_migration()
+    # Touch a legacy file NOW — this is a "fresh write" under any TTL > 0.
+    legacy_file = isolated_home / ".build-loop" / "apps" / "app-a" / "revision"
+    legacy_file.write_text("99\n")  # mtime is now()
+
+    v = fresh_migrate.verify_cutover(
+        ttl_minutes=15, require_downstream=False
+    )
+    # Even though everything else is fine, fresh-write detection refuses.
+    assert v["can_promote"] is False
+    assert v["conditions"]["no_fresh_writes_within_ttl"] is False
+    assert len(v["fresh_writes"]) >= 1
+
+
+def test_verify_cutover_refuses_on_integrity_mismatch(fresh_migrate, isolated_home):
+    _make_legacy_channel(isolated_home, "app-a", {"revision": "1\n"})
+    fresh_migrate.apply_migration()
+    # Mutate the canonical copy so manifests no longer match.
+    canonical = isolated_home / ".agent-rally-point" / "apps"
+    rid_dirs = list(canonical.iterdir())
+    assert rid_dirs
+    (rid_dirs[0] / "revision").write_text("999\n")
+    # Backdate legacy mtimes so fresh-write doesn't dominate the verdict.
+    legacy_root = isolated_home / ".build-loop" / "apps"
+    long_ago = time.time() - 3600
+    for p in legacy_root.rglob("*"):
+        if p.is_file():
+            os.utime(p, (long_ago, long_ago))
+
+    v = fresh_migrate.verify_cutover(
+        ttl_minutes=15, require_downstream=False
+    )
+    assert v["can_promote"] is False
+    assert v["conditions"]["integrity_verified"] is False
+
+
+def test_verify_cutover_requires_compatibility_table_by_default(
+    fresh_migrate, isolated_home
+):
+    _make_legacy_channel(isolated_home, "app-a", {"revision": "1\n"})
+    fresh_migrate.apply_migration()
+    legacy_root = isolated_home / ".build-loop" / "apps"
+    long_ago = time.time() - 3600
+    for p in legacy_root.rglob("*"):
+        if p.is_file():
+            os.utime(p, (long_ago, long_ago))
+
+    # require_downstream=True (default) and no compatibility.json present.
+    # apply_migration() did NOT materialize compatibility.json — that's
+    # discover()'s job. So downstream_ready should be False here.
+    compat = isolated_home / ".agent-rally-point" / "compatibility.json"
+    assert not compat.exists()
+    v = fresh_migrate.verify_cutover(ttl_minutes=15, require_downstream=True)
+    assert v["conditions"]["downstream_ready"] is False
+    assert v["can_promote"] is False
+
+    # Materialize the compat table → cutover now passes.
+    compat.write_text(json.dumps({
+        "agent_rally_point": "0.3.0", "protocol_version": "1.0",
+        "supported_build_loop_range": ">=0.12.17,<0.14.0",
+        "deprecation_notices": [],
+    }))
+    v2 = fresh_migrate.verify_cutover(ttl_minutes=15, require_downstream=True)
+    assert v2["conditions"]["downstream_ready"] is True
+    assert v2["can_promote"] is True
+
+
+def test_cli_scan_smoke(isolated_home):
+    _make_legacy_channel(isolated_home, "app-cli", {"revision": "1\n"})
+    out = subprocess.run(
+        [sys.executable, "-m", "agent_rally_point.migrate", "scan", "--json"],
+        env={**os.environ, "HOME": str(isolated_home)},
+        capture_output=True, text=True,
+    )
+    assert out.returncode == 0
+    data = json.loads(out.stdout)
+    assert any(ch["slug"] == "app-cli" for ch in data)
+
+
+def test_cli_apply_then_verify(isolated_home):
+    _make_legacy_channel(isolated_home, "app-cli2", {"revision": "1\n"})
+    # apply
+    r1 = subprocess.run(
+        [sys.executable, "-m", "agent_rally_point.migrate", "apply", "--json"],
+        env={**os.environ, "HOME": str(isolated_home)},
+        capture_output=True, text=True,
+    )
+    assert r1.returncode == 0, r1.stderr
+    # verify-cutover — write compat table so downstream_ready passes,
+    # backdate legacy mtimes so fresh-write check passes.
+    compat = isolated_home / ".agent-rally-point" / "compatibility.json"
+    compat.write_text(json.dumps({
+        "agent_rally_point": "0.3.0", "protocol_version": "1.0",
+        "supported_build_loop_range": ">=0.12.17,<0.14.0",
+        "deprecation_notices": [],
+    }))
+    long_ago = time.time() - 3600
+    for p in (isolated_home / ".build-loop" / "apps").rglob("*"):
+        if p.is_file():
+            os.utime(p, (long_ago, long_ago))
+    r2 = subprocess.run(
+        [
+            sys.executable, "-m", "agent_rally_point.migrate",
+            "verify-cutover", "--ttl-minutes", "15", "--json",
+        ],
+        env={**os.environ, "HOME": str(isolated_home)},
+        capture_output=True, text=True,
+    )
+    assert r2.returncode == 0
+    data = json.loads(r2.stdout)
+    assert data["can_promote"] is True

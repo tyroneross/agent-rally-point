@@ -51,6 +51,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str | None]] = {
     "discover": ("discover", "discover"),
     # repo identity (v0.3: worktree-stable, clone-stable repo_id)
     "repo_id": ("repo_id", "repo_id"),
+    # migration tool (v0.3: legacy -> canonical, cutover verifier)
+    "migrate": ("migrate", None),
 }
 
 __all__ = [

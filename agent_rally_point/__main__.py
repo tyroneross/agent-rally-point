@@ -5,6 +5,8 @@
 Dispatches to the discover CLI (same as the ``agent-rally-discover`` console
 script). Provided so users have one canonical ``-m`` form that avoids the
 runpy/submodule-in-sys.modules edge case.
+
+To run other subcommands as modules: ``python -m agent_rally_point.migrate ...``.
 """
 from __future__ import annotations
 
