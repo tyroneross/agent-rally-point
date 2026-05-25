@@ -424,13 +424,24 @@ def test_verify_cutover_catches_inbox_fresh_write(
 
 
 def test_verify_cutover_refuses_on_integrity_mismatch(fresh_migrate, isolated_home):
-    _make_legacy_channel(isolated_home, "app-a", {"revision": "1\n"})
+    """Provoke a true coverage failure: canonical revision REGRESSED below legacy.
+
+    Pre-record-superset-aware verifier rejected canonical_rev=999 vs
+    legacy_rev=1 as a "mismatch" because of byte-level inequality —
+    but that direction is actually a valid post-apply state. The
+    real mismatch is canonical_rev < legacy_rev (cursor regressed)
+    OR canonical missing a legacy record entirely. This test now
+    uses the regression case explicitly.
+    """
+    _make_legacy_channel(isolated_home, "app-a", {"revision": "5\n"})
     fresh_migrate.apply_migration()
-    # Mutate the canonical copy so manifests no longer match.
+    # Mutate canonical revision DOWNWARD (canonical < legacy). Under
+    # record-superset semantics this is a true coverage failure: dest
+    # no longer covers src's monotonic cursor.
     canonical = isolated_home / ".agent-rally-point" / "apps"
     rid_dirs = list(canonical.iterdir())
     assert rid_dirs
-    (rid_dirs[0] / "revision").write_text("999\n")
+    (rid_dirs[0] / "revision").write_text("1\n")
     # Backdate legacy mtimes so fresh-write doesn't dominate the verdict.
     legacy_root = isolated_home / ".build-loop" / "apps"
     long_ago = time.time() - 3600
@@ -443,6 +454,202 @@ def test_verify_cutover_refuses_on_integrity_mismatch(fresh_migrate, isolated_ho
     )
     assert v["can_promote"] is False
     assert v["conditions"]["integrity_verified"] is False
+
+
+# ---------------------------------------------------------------------------
+# Record-superset-aware integrity (PR #N): byte-equal-too-strict refinement.
+# ---------------------------------------------------------------------------
+
+
+def test_integrity_accepts_canonical_superset_of_changes_jsonl(
+    fresh_migrate, isolated_home
+):
+    """AC-2 — canonical has every legacy record + 20 extras → integrity OK.
+
+    Build legacy with 200 records (revisions 1..200). Pre-seed canonical
+    with the same 200 + 20 extras (revisions 201..220). After apply, the
+    canonical changes.jsonl is a record-superset of legacy by ``revision``.
+    Integrity check must pass.
+    """
+    base_rec = '{{"ts":{ts},"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{{}},"revision":{rev}}}'
+    legacy_lines = [base_rec.format(ts=i, rev=i) for i in range(1, 201)]
+    canonical_lines = list(legacy_lines) + [
+        base_rec.format(ts=i, rev=i) for i in range(201, 221)
+    ]
+
+    _make_legacy_channel(isolated_home, "app-superset", {
+        "revision": "200\n",
+        "changes.jsonl": "\n".join(legacy_lines) + "\n",
+    })
+    channels = fresh_migrate.discover_legacy_channels()
+    dest = Path(channels[0]["canonical_path"])
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "changes.jsonl").write_text("\n".join(canonical_lines) + "\n")
+    (dest / "revision").write_text("220\n")
+
+    fresh_migrate.apply_migration()
+    # Backdate legacy mtimes.
+    long_ago = time.time() - 3600
+    for p in (isolated_home / ".build-loop" / "apps").rglob("*"):
+        if p.is_file():
+            os.utime(p, (long_ago, long_ago))
+
+    v = fresh_migrate.verify_cutover(ttl_minutes=15, require_downstream=False)
+    assert v["conditions"]["integrity_verified"] is True, v
+
+
+def test_integrity_rejects_canonical_missing_legacy_records(
+    fresh_migrate, isolated_home
+):
+    """AC-3 — canonical missing 10 legacy records → integrity FAILS.
+
+    Build legacy with 200 records. Pre-seed canonical with only 190
+    (missing revs 191..200). Apply migration; record-superset check must
+    detect the coverage gap and return integrity_verified=False.
+
+    Edge case: ``_merge_changes_jsonl`` will RE-APPEND the missing
+    records during apply. To exercise the verifier's coverage check in
+    isolation we backdate legacy AFTER the seed so the cutover-gate
+    fresh-write check passes, then directly call _dest_covers_src on the
+    state we want to verify (with canonical hand-truncated post-apply).
+    """
+    base_rec = '{{"ts":{ts},"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{{}},"revision":{rev}}}'
+    legacy_lines = [base_rec.format(ts=i, rev=i) for i in range(1, 201)]
+    canonical_lines = legacy_lines[:190]
+
+    _make_legacy_channel(isolated_home, "app-gap", {
+        "revision": "200\n",
+        "changes.jsonl": "\n".join(legacy_lines) + "\n",
+    })
+    channels = fresh_migrate.discover_legacy_channels()
+    dest = Path(channels[0]["canonical_path"])
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "changes.jsonl").write_text("\n".join(canonical_lines) + "\n")
+    (dest / "revision").write_text("190\n")
+
+    # Direct _dest_covers_src call — bypasses apply()'s re-merge so the
+    # verifier sees the gap state we set up.
+    assert fresh_migrate._dest_covers_src(
+        Path(channels[0]["legacy_path"]), dest
+    ) is False
+
+
+def test_integrity_accepts_canonical_revision_greater_than_legacy(
+    fresh_migrate, isolated_home
+):
+    """AC-4 — canonical revision=300 vs legacy revision=270 → integrity OK.
+
+    Apply max-merges revisions: post-cutover canonical commonly has a
+    HIGHER revision integer than legacy (operator wrote more records
+    after the dual-write window closed). Verifier must accept this.
+    """
+    base_rec = '{{"ts":{ts},"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{{}},"revision":{rev}}}'
+    legacy_lines = [base_rec.format(ts=i, rev=i) for i in range(1, 271)]
+    canonical_lines = [base_rec.format(ts=i, rev=i) for i in range(1, 301)]
+
+    _make_legacy_channel(isolated_home, "app-revgt", {
+        "revision": "270\n",
+        "changes.jsonl": "\n".join(legacy_lines) + "\n",
+    })
+    channels = fresh_migrate.discover_legacy_channels()
+    dest = Path(channels[0]["canonical_path"])
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "changes.jsonl").write_text("\n".join(canonical_lines) + "\n")
+    (dest / "revision").write_text("300\n")
+
+    fresh_migrate.apply_migration()
+    long_ago = time.time() - 3600
+    for p in (isolated_home / ".build-loop" / "apps").rglob("*"):
+        if p.is_file():
+            os.utime(p, (long_ago, long_ago))
+
+    v = fresh_migrate.verify_cutover(ttl_minutes=15, require_downstream=False)
+    assert v["conditions"]["integrity_verified"] is True, v
+
+
+def test_integrity_rejects_canonical_revision_less_than_legacy(
+    fresh_migrate, isolated_home
+):
+    """AC-5 — legacy revision=300 vs canonical revision=270 → integrity FAILS.
+
+    Direct _dest_covers_src call so we verify the file-class branch in
+    isolation. Apply migration would auto-bump canonical's revision to
+    max(src,dest) via the monotonic-revision rule and mask the test.
+    """
+    _make_legacy_channel(isolated_home, "app-revlt", {"revision": "300\n"})
+    channels = fresh_migrate.discover_legacy_channels()
+    dest = Path(channels[0]["canonical_path"])
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "revision").write_text("270\n")
+
+    assert fresh_migrate._dest_covers_src(
+        Path(channels[0]["legacy_path"]), dest
+    ) is False
+
+
+def test_integrity_ignores_byte_drift_when_revision_field_covers(
+    fresh_migrate, isolated_home
+):
+    """Record-superset by ``revision`` ignores producer_metadata byte drift.
+
+    Mimics the β1.2 reality: legacy line lacks producer_metadata,
+    canonical line has the SAME ``revision`` value but extra
+    ``producer_name`` / ``producer_version`` fields. Raw-line check
+    would fail; record-superset by ``revision`` must pass.
+    """
+    legacy_line = '{"ts":1.0,"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{"x":1},"revision":42}'
+    canonical_line = '{"ts":1.0,"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{"x":1},"revision":42,"producer_name":"build-loop","producer_version":"0.12.16"}'
+
+    _make_legacy_channel(isolated_home, "app-drift", {
+        "revision": "42\n",
+        "changes.jsonl": legacy_line + "\n",
+    })
+    channels = fresh_migrate.discover_legacy_channels()
+    dest = Path(channels[0]["canonical_path"])
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "changes.jsonl").write_text(canonical_line + "\n")
+    (dest / "revision").write_text("42\n")
+
+    # Direct check: same revision (42) on both sides, different bytes.
+    assert fresh_migrate._dest_covers_src(
+        Path(channels[0]["legacy_path"]), dest
+    ) is True
+
+
+def test_integrity_inbox_rejections_record_superset_by_id(
+    fresh_migrate, isolated_home
+):
+    """Inbox + rejections jsonl: record-superset by ``id`` field.
+
+    Canonical may carry the same message id with extra metadata bytes.
+    Direct _dest_covers_src check.
+    """
+    msg = '{"schema_version":"1.0","id":"claude_code-1779735657868","kind":"handoff","ts":1.0,"from":"claude_code","to":"codex","payload":{}}'
+    msg_with_extras = '{"schema_version":"1.0","id":"claude_code-1779735657868","kind":"handoff","ts":1.0,"from":"claude_code","to":"codex","payload":{},"channel_revision_at_send":42}'
+    rej = '{"id":"rej-1","ts":1.0,"reason":"mece_gate","payload":{}}'
+
+    _make_legacy_channel(isolated_home, "app-inbox", {
+        "revision": "1\n",
+        "inbox/codex.jsonl": msg + "\n",
+        "rejections.jsonl": rej + "\n",
+    })
+    channels = fresh_migrate.discover_legacy_channels()
+    dest = Path(channels[0]["canonical_path"])
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "inbox").mkdir(parents=True, exist_ok=True)
+    (dest / "inbox" / "codex.jsonl").write_text(msg_with_extras + "\n")
+    (dest / "rejections.jsonl").write_text(rej + "\n")
+    (dest / "revision").write_text("1\n")
+
+    assert fresh_migrate._dest_covers_src(
+        Path(channels[0]["legacy_path"]), dest
+    ) is True
+
+    # And: canonical missing the message id → reject.
+    (dest / "inbox" / "codex.jsonl").write_text('{"id":"different","ts":2.0,"payload":{}}\n')
+    assert fresh_migrate._dest_covers_src(
+        Path(channels[0]["legacy_path"]), dest
+    ) is False
 
 
 def test_verify_cutover_requires_compatibility_table_by_default(

@@ -458,15 +458,80 @@ def _merge_changes_jsonl(src: Path, dest: Path) -> dict:
     }
 
 
+def _jsonl_record_keys(path: Path, prefer_keys: tuple[str, ...]) -> set:
+    """Return the set of "record identity keys" present in a JSONL file.
+
+    For each non-empty line, parse JSON and pick the first available key in
+    ``prefer_keys`` whose value is non-None. The returned set contains those
+    values (stringified for type-safety against int/str drift). Lines that
+    fail to parse OR have none of the preferred keys fall back to the raw
+    stripped line text as their identity — preserves coverage when records
+    don't carry the schema we expect.
+
+    Never raises. Returns an empty set on OSError.
+
+    Identity by ``revision`` (changes.jsonl) and ``id`` (inbox/rejections)
+    is correct because both are assigned monotonically by the producer and
+    are unique within the channel by construction. Byte content of the
+    record may legitimately differ (e.g., ``producer_metadata`` added
+    post-merge in β1.2 dual-write) — this function ignores that drift.
+    """
+    out: set = set()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.rstrip("\n")
+                if not stripped:
+                    continue
+                key: object | None = None
+                try:
+                    rec = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    rec = None
+                if isinstance(rec, dict):
+                    for k in prefer_keys:
+                        v = rec.get(k)
+                        if v is not None:
+                            key = v
+                            break
+                if key is None:
+                    # No preferred key parsed — fall back to raw line. This
+                    # preserves the historical line-superset behavior for
+                    # records lacking the schema fields we expect.
+                    key = stripped
+                out.add(repr(key) if not isinstance(key, (str, int, float, bool)) else str(key))
+    except OSError:
+        return set()
+    return out
+
+
 def _dest_covers_src(src_channel: Path, dest_channel: Path) -> bool:
     """Return True when dest "covers" src for migration-integrity purposes.
 
-    Coverage rules:
-      * For ``changes.jsonl``: dest is a line-superset of src (every
-        non-empty stripped src line also appears in dest). This matches
-        ``_merge_changes_jsonl``'s post-condition.
-      * For every other regular file under src: dest has a byte-equal
-        copy at the same relative path.
+    Coverage rules — semantic, not byte-identity, because β1.2 dual-write
+    can produce divergent serializations of the same record (e.g.,
+    ``producer_metadata`` added post-merge):
+
+      * ``changes.jsonl`` — record-superset by the ``revision`` field.
+        Every legacy record's ``revision`` MUST exist in canonical.
+        Records lacking ``revision`` fall back to raw-line identity.
+
+      * ``revision`` file (channel root) — parse both as integers; pass
+        iff ``dest_int >= src_int`` (canonical's cursor must cover legacy).
+        When EITHER side is non-integer, fall back to byte-equal so test
+        fixtures using sentinel content keep working.
+
+      * ``inbox/*.jsonl`` and ``rejections.jsonl`` — record-superset by
+        the ``id`` field (set at write time, unique within the file).
+        Falls back to ``ts`` and then raw line.
+
+      * All other regular files (``sessions/*.json``, ``rally/*.json``,
+        ``rally/current.json``, etc.) — byte-equal at the same relpath
+        when present in BOTH sides. Canonical-only files (e.g., a peer's
+        ``presence-*.json``) are not iterated by this walk — the loop
+        starts from ``src_channel`` — so canonical-superset is implicitly
+        allowed and is the desired post-cutover state.
+
       * Excluded from coverage entirely: markers + telemetry (see
         ``_is_telemetry_path``).
 
@@ -490,22 +555,44 @@ def _dest_covers_src(src_channel: Path, dest_channel: Path) -> bool:
         d = dest_channel / rel
         if not d.is_file():
             return False
-        # changes.jsonl: line-superset semantics.
-        if rel.as_posix() == _CHANGES_JSONL_NAME:
-            try:
-                with open(s, "r", encoding="utf-8") as fh:
-                    src_lines = {
-                        line.rstrip("\n") for line in fh if line.rstrip("\n")
-                    }
-                with open(d, "r", encoding="utf-8") as fh:
-                    dest_lines = {
-                        line.rstrip("\n") for line in fh if line.rstrip("\n")
-                    }
-            except OSError:
-                return False
-            if not src_lines.issubset(dest_lines):
+        rel_posix = rel.as_posix()
+
+        # changes.jsonl: record-superset by ``revision`` field.
+        if rel_posix == _CHANGES_JSONL_NAME:
+            src_keys = _jsonl_record_keys(s, prefer_keys=("revision",))
+            dest_keys = _jsonl_record_keys(d, prefer_keys=("revision",))
+            if not src_keys.issubset(dest_keys):
                 return False
             continue
+
+        # revision file: monotonic int-superset (dest_int >= src_int).
+        # Falls through to byte-equal when either side is non-integer.
+        if rel_posix == "revision":
+            try:
+                src_rev = int(s.read_text().strip())
+                dest_rev = int(d.read_text().strip())
+            except (OSError, ValueError):
+                src_rev = None
+                dest_rev = None
+            if src_rev is not None and dest_rev is not None:
+                if dest_rev < src_rev:
+                    return False
+                continue
+            # Fall through to byte-equal for non-integer content.
+
+        # Inbox jsonl + rejections.jsonl: record-superset by ``id`` field.
+        # Both files are append-only with monotonic per-record ids assigned
+        # at write time, so id-superset is the correct semantic-equivalent
+        # of line-superset across post-merge re-serializations.
+        if rel_posix == "rejections.jsonl" or (
+            rel.parts and rel.parts[0] == "inbox" and rel_posix.endswith(".jsonl")
+        ):
+            src_keys = _jsonl_record_keys(s, prefer_keys=("id", "ts"))
+            dest_keys = _jsonl_record_keys(d, prefer_keys=("id", "ts"))
+            if not src_keys.issubset(dest_keys):
+                return False
+            continue
+
         # All other files: byte-equal at the same relpath.
         try:
             if _sha256_file(s) != _sha256_file(d):
@@ -1073,7 +1160,15 @@ def verify_cutover(
         dst = _sha256_manifest_of_dir(dest_path)
         if not dst:
             fully_copied = False
-        if src and dst and src != dst:
+        # Integrity = coverage, not byte-identity. The β1.2 dual-write
+        # path can produce divergent serializations of the same record
+        # (e.g., ``producer_metadata`` added post-merge); a byte-equal
+        # manifest check would mark a legitimately-merged channel as a
+        # mismatch even when canonical proves a record-superset of legacy.
+        # _dest_covers_src applies semantic-aware rules per file class
+        # (revision int-superset, changes.jsonl record-superset by
+        # ``revision``, inbox/rejections by ``id``).
+        if src and not _dest_covers_src(legacy_path, dest_path):
             integrity_ok = False
         if src and not dst:
             integrity_ok = False
