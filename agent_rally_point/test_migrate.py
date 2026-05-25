@@ -180,6 +180,111 @@ def test_verify_cutover_refuses_on_fresh_legacy_write(fresh_migrate, isolated_ho
     assert len(v["fresh_writes"]) >= 1
 
 
+def test_verify_cutover_ignores_watcher_log_fresh_writes(
+    fresh_migrate, isolated_home
+):
+    """AC-9-1 — telemetry paths (watchers/*.log) MUST NOT gate cutover.
+
+    Codex Item 9 (rev 219): watcher daemons append to ``watchers/*.log``
+    every few seconds while any session is alive, so an
+    rglob("*")-then-exclude-marker fresh-write scan would effectively
+    never let the gate pass. The verifier now scans only the
+    coordination-state whitelist.
+    """
+    _make_legacy_channel(isolated_home, "app-a", {"revision": "1\n"})
+    fresh_migrate.apply_migration()
+    # Backdate everything to long-ago so the scan starts clean.
+    legacy_root = isolated_home / ".build-loop" / "apps"
+    long_ago = time.time() - 3600
+    for p in legacy_root.rglob("*"):
+        if p.is_file():
+            os.utime(p, (long_ago, long_ago))
+    # Materialize the compat table so downstream_ready passes.
+    compat = isolated_home / ".agent-rally-point" / "compatibility.json"
+    compat.write_text(json.dumps({
+        "agent_rally_point": "0.3.0", "protocol_version": "1.0",
+        "supported_build_loop_range": ">=0.12.17,<0.14.0",
+        "deprecation_notices": [],
+    }))
+
+    # NOW write a fresh watcher log file — this is the realistic case.
+    watchers_dir = legacy_root / "app-a" / "watchers"
+    watchers_dir.mkdir(parents=True, exist_ok=True)
+    (watchers_dir / "claude-code-abcd1234.log").write_text(
+        "watcher heartbeat\n"
+    )  # mtime is now()
+
+    v = fresh_migrate.verify_cutover(
+        ttl_minutes=15, require_downstream=True
+    )
+    # Telemetry doesn't gate; cutover passes.
+    assert v["conditions"]["no_fresh_writes_within_ttl"] is True, (
+        f"watcher log was treated as a fresh state write: {v['fresh_writes']}"
+    )
+    assert v["can_promote"] is True, f"verdict: {v}"
+
+
+def test_verify_cutover_catches_changes_jsonl_fresh_write(
+    fresh_migrate, isolated_home
+):
+    """AC-9-2 — the legitimate case: a fresh changes.jsonl write DOES gate.
+
+    Counterpart to AC-9-1; confirms the whitelist still catches the
+    state files cutover is supposed to gate on.
+    """
+    _make_legacy_channel(isolated_home, "app-a", {
+        "revision": "1\n",
+        "changes.jsonl": '{"kind":"phase","payload":{},"revision":1}\n',
+    })
+    fresh_migrate.apply_migration()
+    legacy_root = isolated_home / ".build-loop" / "apps"
+    long_ago = time.time() - 3600
+    for p in legacy_root.rglob("*"):
+        if p.is_file():
+            os.utime(p, (long_ago, long_ago))
+
+    # Touch changes.jsonl NOW.
+    changes = legacy_root / "app-a" / "changes.jsonl"
+    changes.write_text(changes.read_text() + '{"kind":"phase","payload":{},"revision":2}\n')
+
+    v = fresh_migrate.verify_cutover(
+        ttl_minutes=15, require_downstream=False
+    )
+    assert v["conditions"]["no_fresh_writes_within_ttl"] is False
+    assert any("changes.jsonl" in w["path"] for w in v["fresh_writes"]), (
+        f"changes.jsonl fresh write not surfaced: {v['fresh_writes']}"
+    )
+
+
+def test_verify_cutover_catches_inbox_fresh_write(
+    fresh_migrate, isolated_home
+):
+    """AC-9-bonus — positive coverage of the inbox/*.jsonl whitelist glob."""
+    _make_legacy_channel(isolated_home, "app-a", {
+        "revision": "1\n",
+        "inbox/msg-1.jsonl": '{"to":"peer","payload":{}}\n',
+    })
+    fresh_migrate.apply_migration()
+    legacy_root = isolated_home / ".build-loop" / "apps"
+    long_ago = time.time() - 3600
+    for p in legacy_root.rglob("*"):
+        if p.is_file():
+            os.utime(p, (long_ago, long_ago))
+
+    # Touch an inbox jsonl NOW.
+    (legacy_root / "app-a" / "inbox" / "msg-2.jsonl").write_text(
+        '{"to":"peer","payload":{}}\n'
+    )
+
+    v = fresh_migrate.verify_cutover(
+        ttl_minutes=15, require_downstream=False
+    )
+    assert v["conditions"]["no_fresh_writes_within_ttl"] is False
+    assert any("inbox/msg-2.jsonl" in w["path"] for w in v["fresh_writes"]), (
+        f"inbox fresh write not surfaced: {v['fresh_writes']}"
+    )
+
+
 def test_verify_cutover_refuses_on_integrity_mismatch(fresh_migrate, isolated_home):
     _make_legacy_channel(isolated_home, "app-a", {"revision": "1\n"})
     fresh_migrate.apply_migration()

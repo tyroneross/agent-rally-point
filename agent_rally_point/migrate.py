@@ -60,6 +60,53 @@ _MIGRATION_LOG_REL = ".agent-rally-point/migration.log"
 _READONLY_MARKER = ".RALLY_LEGACY_READONLY"
 _NEEDS_RELINK_MARKER = "MIGRATION_NEEDS_RELINK"
 
+# Cutover-gate whitelist — the EXACT set of files whose mtime can refuse
+# cutover under the fresh-writes-within-TTL condition. Codex flagged the
+# original rglob("*")-then-exclude-marker approach as hostile UX (Item 9,
+# rev 219): watchers append to ``watchers/*.log`` every few seconds while
+# any session is alive, so the gate would effectively never pass.
+#
+# Only ACTUAL coordination state files gate the verdict. Telemetry
+# (watcher logs, lock files), markers, and any future "operational" file
+# are silently ignored by the gate. The whitelist is intentionally
+# explicit rather than an exclude-list — adding a new state file
+# requires deliberately listing it here, which forces the contract to
+# stay clear.
+#
+# Shape entries:
+#   ("file", "<relpath>")         — exact file at channel root
+#   ("glob", "<pattern>")         — relative glob, evaluated via Path.glob()
+_CUTOVER_GATED_FILES: tuple[tuple[str, str], ...] = (
+    ("file", "changes.jsonl"),
+    ("file", "revision"),
+    ("file", "rejections.jsonl"),
+    ("glob", "inbox/*.jsonl"),
+    ("glob", "rally/*.json"),
+    ("glob", "sessions/*.json"),
+)
+
+
+def _iter_gated_paths(channel_dir: Path):
+    """Yield the subset of files under ``channel_dir`` that gate cutover.
+
+    Cutover whitelist (see ``_CUTOVER_GATED_FILES``). Telemetry — watcher
+    logs, lock files, the readonly/relink markers, anything else — is
+    skipped. The iterator never raises; missing dirs/files are silently
+    absent.
+    """
+    for kind, spec in _CUTOVER_GATED_FILES:
+        if kind == "file":
+            p = channel_dir / spec
+            if p.is_file():
+                yield p
+        elif kind == "glob":
+            try:
+                for p in channel_dir.glob(spec):
+                    if p.is_file():
+                        yield p
+            except OSError:
+                continue
+
 # Default repo-search paths. The migration walks these looking for git repos
 # whose app_slug() matches a legacy slug. Override via --repo-search-paths
 # (CSV) or $AGENT_RALLY_REPO_SEARCH_PATHS.
@@ -102,6 +149,23 @@ def _sha256_file(p: Path) -> str:
     return h.hexdigest()
 
 
+def _is_telemetry_path(rel: Path) -> bool:
+    """Return True for paths the cutover gate treats as telemetry, not state.
+
+    Mirrors the spirit of the ``_CUTOVER_GATED_FILES`` whitelist: watcher
+    logs, lock files, and similar operational bookkeeping are appended
+    every few seconds and aren't part of channel state. Excluding them
+    from BOTH the fresh-writes scan and the integrity manifest keeps
+    the gate's contract coherent (Codex Item 9, rev 219).
+    """
+    parts = rel.parts
+    if parts and parts[0] == "watchers":
+        return True
+    if rel.suffix == ".log" or rel.suffix == ".lock":
+        return True
+    return False
+
+
 def _sha256_manifest_of_dir(root: Path) -> str:
     """Compute a stable sha256-of-sha256s for every regular file under root.
 
@@ -109,10 +173,11 @@ def _sha256_manifest_of_dir(root: Path) -> str:
     and survives filesystem reordering. Symlinks are followed; binary files
     are hashed verbatim. Returns "" for an empty/missing directory.
 
-    The advisory ``.RALLY_LEGACY_READONLY`` marker and the
-    ``MIGRATION_NEEDS_RELINK`` marker are **excluded** from the manifest —
-    they're metadata about the migration itself, not channel state, and
-    would otherwise make every post-apply manifest diverge.
+    Excluded from the manifest:
+      * advisory markers (``.RALLY_LEGACY_READONLY``,
+        ``MIGRATION_NEEDS_RELINK``) — migration metadata, not channel state
+      * telemetry paths (``watchers/**``, ``*.log``, ``*.lock``) — appended
+        constantly by daemons, not state the cutover gate is about
     """
     if not root.exists() or not root.is_dir():
         return ""
@@ -126,6 +191,8 @@ def _sha256_manifest_of_dir(root: Path) -> str:
             rel = p.relative_to(root)
         except ValueError:
             continue
+        if _is_telemetry_path(rel):
+            continue  # telemetry; see _is_telemetry_path docstring
         try:
             digest = _sha256_file(p)
         except OSError:
@@ -756,17 +823,16 @@ def verify_cutover(
         if src and not dst:
             integrity_ok = False
 
-    # Fresh-writes scan: any file under any legacy channel with mtime newer
-    # than the cutoff is a fresh write.
+    # Fresh-writes scan: only files on the cutover-gated whitelist count.
+    # Telemetry (watchers/*.log, lock files), markers, and operational
+    # bookkeeping are excluded — they're appended every few seconds while
+    # any session is alive and would otherwise make the gate impossible
+    # to satisfy (Codex Item 9, rev 219).
     cutoff = time.time() - (ttl_minutes * 60)
     fresh_writes: list[dict] = []
     for ch in channels:
         legacy_path = Path(ch["legacy_path"])
-        for p in legacy_path.rglob("*"):
-            if not p.is_file():
-                continue
-            if p.name == _READONLY_MARKER:
-                continue  # the marker itself is allowed to be recent
+        for p in _iter_gated_paths(legacy_path):
             try:
                 mt = p.stat().st_mtime
             except OSError:
