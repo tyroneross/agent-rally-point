@@ -496,6 +496,173 @@ def test_human_output_renders(isolated_roots, repo, capsys):
 # Workdir validation
 # ───────────────────────────────────────────────────────────────────
 
+# ───────────────────────────────────────────────────────────────────
+# AC-G8..G11: build_loop_id / run_label rendering on peers + pending-ACKs
+# (the preflight-render-build-loop-id slice)
+# ───────────────────────────────────────────────────────────────────
+
+def _write_presence(channel_dir: Path, *, session_id: str, tool: str = "codex",
+                    phase: str = "phase-3-execute", build_loop_id: str | None = None,
+                    build_loop_run_label: str | None = None,
+                    ts: float | None = None) -> None:
+    rally = channel_dir / "rally"
+    rally.mkdir(exist_ok=True)
+    rec: dict = {
+        "session_id": session_id,
+        "tool": tool,
+        "phase": phase,
+        "files_in_flight": [],
+        "ts": ts if ts is not None else time.time(),
+    }
+    if build_loop_id is not None:
+        rec["build_loop_id"] = build_loop_id
+    if build_loop_run_label is not None:
+        rec["build_loop_run_label"] = build_loop_run_label
+    (rally / f"presence-{session_id}.json").write_text(json.dumps(rec))
+
+
+def test_ac_g8_human_render_shows_run_label_on_active_peer(isolated_roots, repo, capsys):
+    """AC-G1: presence with build_loop_run_label → 'run=codex#123456' in human output."""
+    canonical_root, _ = isolated_roots
+    rid = preflight.compute_repo_id(repo)
+    channel = canonical_root / rid
+    _make_channel(channel)
+    _write_presence(
+        channel,
+        session_id="codex-peer-G8",
+        tool="codex",
+        build_loop_id="bl-abc123",
+        build_loop_run_label="codex#482913",
+    )
+
+    rc = preflight.main([
+        "--workdir", str(repo),
+        "--tool", "claude_code",
+        "--session-id", "claude-G8",
+        "--human",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ACTIVE PEERS" in out
+    assert "run=codex#482913" in out
+
+
+def test_ac_g9_human_render_shows_run_label_on_pending_ack(isolated_roots, repo, capsys):
+    """AC-G2: handoff with build_loop_run_label → label rendered in pending-ACK line."""
+    canonical_root, _ = isolated_roots
+    rid = preflight.compute_repo_id(repo)
+    channel = canonical_root / rid
+    _make_channel(channel)
+    handoff = _handoff(id_="h-G9", from_="codex", to="claude_code", subject="please verify")
+    handoff["build_loop_id"] = "bl-xyz789"
+    handoff["build_loop_run_label"] = "codex#482913"
+    _write_inbox(channel / "inbox", "claude_code.jsonl", [handoff])
+
+    rc = preflight.main([
+        "--workdir", str(repo),
+        "--tool", "claude_code",
+        "--session-id", "claude-G9",
+        "--human",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "PENDING ACKs" in out
+    assert "run=codex#482913" in out
+
+
+def test_ac_g10_json_envelope_carries_build_loop_id_and_run_label(isolated_roots, repo):
+    """AC-G3: build_loop_id + run_label appear on active_peers[] + pending_acks_for_me[] entries."""
+    canonical_root, _ = isolated_roots
+    rid = preflight.compute_repo_id(repo)
+    channel = canonical_root / rid
+    _make_channel(channel)
+
+    _write_presence(
+        channel,
+        session_id="codex-peer-G10",
+        tool="codex",
+        build_loop_id="bl-peer-id",
+        build_loop_run_label="codex#100001",
+    )
+    handoff = _handoff(id_="h-G10", from_="codex", to="claude_code", subject="check")
+    handoff["build_loop_id"] = "bl-ack-id"
+    handoff["build_loop_run_label"] = "codex#200002"
+    _write_inbox(channel / "inbox", "claude_code.jsonl", [handoff])
+
+    env = preflight.build_envelope(repo, "claude_code", session_id="claude-G10")
+
+    assert len(env["active_peers"]) == 1
+    peer = env["active_peers"][0]
+    assert peer["build_loop_id"] == "bl-peer-id"
+    assert peer["run_label"] == "codex#100001"
+
+    assert len(env["pending_acks_for_me"]) == 1
+    ack = env["pending_acks_for_me"][0]
+    assert ack["build_loop_id"] == "bl-ack-id"
+    assert ack["run_label"] == "codex#200002"
+
+    # AC routing — pending_acks precede peers, so target_run_label points at the ACK.
+    assert env["routing"]["action"] == "join_active"
+    assert env["routing"].get("target_run_label") == "codex#200002"
+
+
+def test_ac_g11_backwards_compat_records_without_fields_still_render(isolated_roots, repo, capsys):
+    """AC-G4: records lacking build_loop_id/run_label render existing output, no error."""
+    canonical_root, _ = isolated_roots
+    rid = preflight.compute_repo_id(repo)
+    channel = canonical_root / rid
+    _make_channel(channel)
+    # Presence WITHOUT the new fields.
+    _write_presence(channel, session_id="codex-peer-G11", tool="codex")
+    # Handoff WITHOUT the new fields.
+    _write_inbox(
+        channel / "inbox", "claude_code.jsonl",
+        [_handoff(id_="h-G11", from_="codex", to="claude_code", subject="legacy")],
+    )
+
+    rc = preflight.main([
+        "--workdir", str(repo),
+        "--tool", "claude_code",
+        "--session-id", "claude-G11",
+        "--human",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ACTIVE PEERS" in out
+    assert "PENDING ACKs" in out
+    # No 'run=' tag should appear (no labels present anywhere).
+    assert "run=" not in out
+
+    # JSON path — entries carry None for the new keys.
+    env = preflight.build_envelope(repo, "claude_code", session_id="claude-G11b")
+    assert env["active_peers"][0]["build_loop_id"] is None
+    assert env["active_peers"][0]["run_label"] is None
+    assert env["pending_acks_for_me"][0]["build_loop_id"] is None
+    assert env["pending_acks_for_me"][0]["run_label"] is None
+    # Routing exists but has no target_run_label.
+    assert "target_run_label" not in env["routing"]
+
+
+def test_ac_g11_multiple_peers_with_distinct_labels_surface_as_list(isolated_roots, repo):
+    """Two peers with different run_labels → routing.target_run_labels is the sorted list."""
+    canonical_root, _ = isolated_roots
+    rid = preflight.compute_repo_id(repo)
+    channel = canonical_root / rid
+    _make_channel(channel)
+    _write_presence(channel, session_id="codex-A", tool="codex",
+                    build_loop_run_label="codex#A1")
+    _write_presence(channel, session_id="codex-B", tool="codex",
+                    build_loop_run_label="codex#B2")
+
+    env = preflight.build_envelope(repo, "claude_code", session_id="claude-multi")
+    assert env["routing"]["action"] == "join_active"
+    assert env["routing"].get("target_run_labels") == ["codex#A1", "codex#B2"]
+    assert "target_run_label" not in env["routing"]
+
+
+# ───────────────────────────────────────────────────────────────────
+
+
 def test_workdir_not_a_directory_returns_2(tmp_path, capsys):
     fake = tmp_path / "does_not_exist"
     rc = preflight.main([

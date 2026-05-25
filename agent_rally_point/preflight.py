@@ -251,6 +251,8 @@ def read_active_peers(
                 "phase": rec.get("phase"),
                 "files_in_flight": rec.get("files_in_flight", []),
                 "age_seconds": int(time.time() - rec.get("ts", 0)),
+                "build_loop_id": rec.get("build_loop_id"),
+                "run_label": rec.get("build_loop_run_label"),
             })
     except OSError:
         pass
@@ -385,6 +387,8 @@ def read_pending_acks(channel_dir: Path, tool: str) -> list[dict]:
                 "subject": subject[:80],
                 "checkpoint_id": payload.get("checkpoint_id"),
                 "age_seconds": int(time.time() - rec.get("ts", 0)),
+                "build_loop_id": rec.get("build_loop_id"),
+                "run_label": rec.get("build_loop_run_label"),
             })
     return pending
 
@@ -491,17 +495,26 @@ def routing_decision(
     (coordinate before parallel work) > proceed solo with periodic pings.
     """
     if pending_acks:
-        return {
+        out: dict[str, Any] = {
             "action": "join_active",
             "reason": f"{len(pending_acks)} pending ACK(s) addressed to this tool — handle before new work",
             "join_target": pending_acks[0],
         }
+        if pending_acks[0].get("run_label"):
+            out["target_run_label"] = pending_acks[0]["run_label"]
+        return out
     if active_peers:
-        return {
+        out = {
             "action": "join_active",
             "reason": f"{len(active_peers)} peer(s) actively working in this channel — coordinate before parallel work",
             "join_target": active_peers,
         }
+        labels = sorted({p["run_label"] for p in active_peers if p.get("run_label")})
+        if len(labels) == 1:
+            out["target_run_label"] = labels[0]
+        elif len(labels) > 1:
+            out["target_run_labels"] = labels
+        return out
     return {
         "action": "proceed_solo",
         "reason": "No active peers and no pending ACKs — proceed with assigned task, log ping check-ins to substrate",
@@ -644,13 +657,15 @@ def render_human(env: dict) -> str:
         for a in env['pending_acks_for_me']:
             cp = f"checkpoint_id={a.get('checkpoint_id')}" if a.get('checkpoint_id') else ""
             from_str = str(a.get('from') or '?')
-            L.append(f"   [{a['source']:9}] {a['kind']:9} from={from_str:8} age={a['age_seconds']:5}s  {a['subject']}  {cp}")
+            run_str = f" run={a['run_label']}" if a.get('run_label') else ""
+            L.append(f"   [{a['source']:9}] {a['kind']:9} from={from_str}{run_str} age={a['age_seconds']:5}s  {a['subject']}  {cp}")
         L.append("")
     if env['active_peers']:
         L.append(" ACTIVE PEERS:")
         for p in env['active_peers']:
             sid = (p.get('session_id') or '?')[:32]
-            L.append(f"   {sid} ({p.get('tool')}) phase={p.get('phase')}  age={p.get('age_seconds')}s")
+            run_str = f" run={p['run_label']}" if p.get('run_label') else ""
+            L.append(f"   {sid} ({p.get('tool')}){run_str} phase={p.get('phase')} age={p.get('age_seconds')}s")
         L.append("")
     if env['north_star']:
         L.append(" NORTH STAR:")
