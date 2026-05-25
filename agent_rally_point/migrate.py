@@ -359,18 +359,192 @@ def _migration_destination_name(
     return f"{slug}-unmatched-{h}", status, None
 
 
+_CHANGES_JSONL_NAME = "changes.jsonl"
+
+
+def _merge_changes_jsonl(src: Path, dest: Path) -> dict:
+    """Event-level merge of two ``changes.jsonl`` files. Idempotent + dedup.
+
+    Codex Item 10 (rev 219): in the dual-write (β1.2) handoff, legacy and
+    canonical can each hold records the other doesn't — and they share
+    records too. The original file-idempotent ``_copy_tree_idempotent``
+    can't represent that: it either overwrites destination, skips, or
+    would concatenate without dedup. The cutover apply step needs
+    event-level merge — append source records whose line-identity isn't
+    already present in dest, preserving append-only order semantics.
+
+    Dedup key is the canonicalized stripped line (records don't carry an
+    explicit ``id``; the schema is rich enough — ``ts`` float +
+    ``revision`` + ``run_id`` + payload — that line-identity is the
+    natural natural key). Empty lines are skipped.
+
+    Returns a stats dict for the migration log row:
+        {
+          "lines_in_src": int,
+          "lines_in_dest_before": int,
+          "lines_appended": int,
+          "lines_skipped_dup": int,
+          "lines_in_dest_after": int,
+        }
+    """
+    src_lines: list[str] = []
+    try:
+        with open(src, "r", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.rstrip("\n")
+                if stripped:
+                    src_lines.append(stripped)
+    except OSError:
+        return {
+            "lines_in_src": 0,
+            "lines_in_dest_before": 0,
+            "lines_appended": 0,
+            "lines_skipped_dup": 0,
+            "lines_in_dest_after": 0,
+        }
+
+    dest_lines: list[str] = []
+    if dest.exists():
+        try:
+            with open(dest, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    stripped = line.rstrip("\n")
+                    if stripped:
+                        dest_lines.append(stripped)
+        except OSError:
+            dest_lines = []
+
+    dest_seen = set(dest_lines)
+    appended = 0
+    skipped = 0
+    to_append: list[str] = []
+    for line in src_lines:
+        if line in dest_seen:
+            skipped += 1
+        else:
+            to_append.append(line)
+            dest_seen.add(line)
+            appended += 1
+
+    if appended:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic-ish append: open with O_APPEND so concurrent writers
+        # (unlikely during a migration but cheap insurance) interleave
+        # whole lines, not partial bytes — matches changes.py's own
+        # convention.
+        try:
+            fd = os.open(str(dest), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            try:
+                for line in to_append:
+                    os.write(fd, (line + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+        except OSError as e:
+            _append_migration_log({
+                "ts": _iso_now(),
+                "operation": "event-level-merge-error",
+                "source_path": str(src),
+                "dest_path": str(dest),
+                "error": str(e),
+            })
+            appended = 0  # nothing landed
+
+    return {
+        "lines_in_src": len(src_lines),
+        "lines_in_dest_before": len(dest_lines),
+        "lines_appended": appended,
+        "lines_skipped_dup": skipped,
+        "lines_in_dest_after": len(dest_lines) + appended,
+    }
+
+
+def _dest_covers_src(src_channel: Path, dest_channel: Path) -> bool:
+    """Return True when dest "covers" src for migration-integrity purposes.
+
+    Coverage rules:
+      * For ``changes.jsonl``: dest is a line-superset of src (every
+        non-empty stripped src line also appears in dest). This matches
+        ``_merge_changes_jsonl``'s post-condition.
+      * For every other regular file under src: dest has a byte-equal
+        copy at the same relative path.
+      * Excluded from coverage entirely: markers + telemetry (see
+        ``_is_telemetry_path``).
+
+    Returns False if either side is missing/empty. Never raises.
+    """
+    if not src_channel.exists() or not src_channel.is_dir():
+        return False
+    if not dest_channel.exists() or not dest_channel.is_dir():
+        return False
+    for s in sorted(src_channel.rglob("*")):
+        if not s.is_file():
+            continue
+        if s.name in (_READONLY_MARKER, _NEEDS_RELINK_MARKER):
+            continue
+        try:
+            rel = s.relative_to(src_channel)
+        except ValueError:
+            continue
+        if _is_telemetry_path(rel):
+            continue
+        d = dest_channel / rel
+        if not d.is_file():
+            return False
+        # changes.jsonl: line-superset semantics.
+        if rel.as_posix() == _CHANGES_JSONL_NAME:
+            try:
+                with open(s, "r", encoding="utf-8") as fh:
+                    src_lines = {
+                        line.rstrip("\n") for line in fh if line.rstrip("\n")
+                    }
+                with open(d, "r", encoding="utf-8") as fh:
+                    dest_lines = {
+                        line.rstrip("\n") for line in fh if line.rstrip("\n")
+                    }
+            except OSError:
+                return False
+            if not src_lines.issubset(dest_lines):
+                return False
+            continue
+        # All other files: byte-equal at the same relpath.
+        try:
+            if _sha256_file(s) != _sha256_file(d):
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def _copy_tree_idempotent(src: Path, dest: Path) -> tuple[int, list[str]]:
     """Copy src → dest. Skips files that already exist with identical content.
 
+    Special case: ``changes.jsonl`` gets event-level merge semantics —
+    dedup by line-identity and append-only into dest. See
+    ``_merge_changes_jsonl`` (Codex Item 10, rev 219). After the merge,
+    dest's ``revision`` file is bumped to ``max(src_rev, dest_rev)`` so
+    consumers see a cursor that covers every record.
+
     Returns (files_copied, file_paths_list). file_paths_list is every regular
     file under src (relative paths), regardless of whether it was copied or
-    skipped as already-identical.
+    skipped as already-identical. For the merged ``changes.jsonl`` case,
+    the file counts as "copied" when at least one line was appended.
     """
     if not src.exists():
         return 0, []
     dest.mkdir(parents=True, exist_ok=True)
     copied = 0
     relpaths = []
+    merge_stats: dict | None = None
+    # Capture dest_revision BEFORE the per-file walk — otherwise copying
+    # src's revision file overwrites dest's pre-merge value and the
+    # event-level-merge log row can't faithfully report
+    # ``dest_revision_before``.
+    def _read_rev(p: Path) -> int:
+        try:
+            return max(0, int((p / "revision").read_text().strip()))
+        except (OSError, ValueError):
+            return 0
+    dest_rev_before = _read_rev(dest)
     for s in sorted(src.rglob("*")):
         if not s.is_file():
             continue
@@ -380,6 +554,62 @@ def _copy_tree_idempotent(src: Path, dest: Path) -> tuple[int, list[str]]:
             continue
         d = dest / rel
         relpaths.append(rel.as_posix())
+
+        # Special case: changes.jsonl gets event-level merge, not
+        # whole-file replace. Only the top-level changes.jsonl (channel
+        # root) is treated this way — any deeper "changes.jsonl" (none
+        # exist in current protocol, but be explicit) falls through.
+        if rel.as_posix() == _CHANGES_JSONL_NAME:
+            stats = _merge_changes_jsonl(s, d)
+            merge_stats = stats
+            if stats["lines_appended"] > 0:
+                copied += 1
+            continue
+
+        # Special case: ``revision`` is monotonic — never overwrite a
+        # higher dest value with a lower src value (Codex Item 10
+        # corollary; without this guard the event-level-merge log row's
+        # ``dest_revision_before`` can't be observed and the cursor can
+        # regress on a re-run with a stale legacy side). Only kicks in
+        # when BOTH sides parse as integers (the protocol contract);
+        # otherwise falls through to the byte-copy path so existing
+        # callers using non-integer sentinel content keep working.
+        if rel.as_posix() == "revision":
+            try:
+                src_rev_int = int(s.read_text().strip())
+            except (OSError, ValueError):
+                src_rev_int = None
+            dest_rev_int: int | None
+            if d.exists():
+                try:
+                    dest_rev_int = int(d.read_text().strip())
+                except (OSError, ValueError):
+                    dest_rev_int = None
+            else:
+                dest_rev_int = None
+            if src_rev_int is not None and dest_rev_int is not None:
+                target = max(src_rev_int, dest_rev_int)
+                if dest_rev_int == target:
+                    continue  # dest already covers src; idempotent no-op
+                try:
+                    d.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = d.with_suffix(".tmp")
+                    tmp.write_text(f"{target}\n")
+                    tmp.replace(d)
+                    copied += 1
+                except OSError as e:
+                    _append_migration_log({
+                        "ts": _iso_now(),
+                        "operation": "copy-error",
+                        "source_path": str(s),
+                        "dest_path": str(d),
+                        "error": str(e),
+                    })
+                continue
+            # Fall through to default byte-copy when either side isn't
+            # integer-parseable (covers test fixtures + future protocol
+            # extensions without surprising existing callers).
+
         if d.exists():
             # Skip if content matches (idempotency on re-run).
             try:
@@ -399,6 +629,25 @@ def _copy_tree_idempotent(src: Path, dest: Path) -> tuple[int, list[str]]:
                 "dest_path": str(d),
                 "error": str(e),
             })
+
+    # If changes.jsonl was merged, log the merge stats. Revision is
+    # already at max(src,dest) thanks to the in-walk monotonic write
+    # above; re-read it for an accurate ``dest_revision_after`` value
+    # in the log row.
+    if merge_stats is not None:
+        src_rev = _read_rev(src)
+        dest_rev_after = _read_rev(dest)
+        _append_migration_log({
+            "ts": _iso_now(),
+            "operation": "event-level-merge",
+            "source_path": str(src / _CHANGES_JSONL_NAME),
+            "dest_path": str(dest / _CHANGES_JSONL_NAME),
+            "src_revision": src_rev,
+            "dest_revision_before": dest_rev_before,
+            "dest_revision_after": dest_rev_after,
+            **{f"changes_{k}": v for k, v in merge_stats.items()},
+        })
+
     return copied, relpaths
 
 
@@ -540,7 +789,12 @@ def apply_migration(
         dest_path = base_c / ch["canonical_repo_id"]
         operation = "migrate"
         try:
-            # Compute pre-copy manifests for the integrity record.
+            # Compute pre-copy manifest for the audit-log record only —
+            # the integrity DECISION uses _dest_covers_src so the
+            # changes.jsonl line-superset semantics from event-level
+            # merge (Codex Item 10, rev 219) are honored. A byte-equal
+            # manifest match still short-circuits to "already-migrated"
+            # for the common no-op case.
             src_manifest = _sha256_manifest_of_dir(legacy_path)
             existing_dest_manifest = _sha256_manifest_of_dir(dest_path) if dest_path.exists() else ""
 
@@ -564,8 +818,9 @@ def apply_migration(
                 else:
                     copied, relpaths = _copy_tree_idempotent(legacy_path, dest_path)
                     relpaths_count = len(relpaths)
-                    dest_manifest_after = _sha256_manifest_of_dir(dest_path)
-                    if src_manifest != dest_manifest_after:
+                    # Coverage-based integrity check: byte-equal for
+                    # ordinary files, line-superset for changes.jsonl.
+                    if not _dest_covers_src(legacy_path, dest_path):
                         operation = "integrity-mismatch"
                         failures += 1
 

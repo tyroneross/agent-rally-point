@@ -129,6 +129,144 @@ def test_apply_dry_run_writes_nothing(fresh_migrate, isolated_home):
     assert result["dry_run"] is True
 
 
+def _read_migration_log(home: Path) -> list[dict]:
+    log = home / ".agent-rally-point" / "migration.log"
+    if not log.exists():
+        return []
+    out = []
+    for line in log.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def test_apply_changes_jsonl_dedup_merge_overlapping(
+    fresh_migrate, isolated_home
+):
+    """AC-10-1 — overlapping source/dest changes.jsonl dedup-merge.
+
+    Pre-populate canonical with lines A, B; source has A, B, C. Result:
+    dest contains A, B, C — no duplicates of A/B.
+    """
+    line_a = '{"ts":1,"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{"n":"a"},"revision":1}'
+    line_b = '{"ts":2,"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{"n":"b"},"revision":2}'
+    line_c = '{"ts":3,"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{"n":"c"},"revision":3}'
+
+    _make_legacy_channel(isolated_home, "app-overlap", {
+        "revision": "3\n",
+        "changes.jsonl": f"{line_a}\n{line_b}\n{line_c}\n",
+    })
+    # Pre-seed canonical dest as if β1.2 dual-write had landed A and B.
+    channels = fresh_migrate.discover_legacy_channels()
+    dest = Path(channels[0]["canonical_path"])
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "changes.jsonl").write_text(f"{line_a}\n{line_b}\n")
+    (dest / "revision").write_text("2\n")
+
+    result = fresh_migrate.apply_migration()
+    assert result["failures"] == 0
+    assert result["outcomes"][0]["operation"] == "migrate"
+
+    merged = (dest / "changes.jsonl").read_text().splitlines()
+    # All three lines present, no duplicates.
+    assert merged.count(line_a) == 1
+    assert merged.count(line_b) == 1
+    assert merged.count(line_c) == 1
+    assert len(merged) == 3
+    # Revision bumped to max(src=3, dest_before=2) = 3.
+    assert (dest / "revision").read_text().strip() == "3"
+
+
+def test_apply_changes_jsonl_dedup_merge_non_overlapping(
+    fresh_migrate, isolated_home
+):
+    """AC-10-2 — non-overlapping source/dest concatenates correctly.
+
+    Pre-populate canonical with line A; source has B, C. Result:
+    dest contains A, B, C in append order.
+    """
+    line_a = '{"ts":1,"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{"n":"a"},"revision":1}'
+    line_b = '{"ts":2,"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{"n":"b"},"revision":2}'
+    line_c = '{"ts":3,"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{"n":"c"},"revision":3}'
+
+    _make_legacy_channel(isolated_home, "app-disjoint", {
+        "revision": "3\n",
+        "changes.jsonl": f"{line_b}\n{line_c}\n",
+    })
+    channels = fresh_migrate.discover_legacy_channels()
+    dest = Path(channels[0]["canonical_path"])
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "changes.jsonl").write_text(f"{line_a}\n")
+    (dest / "revision").write_text("1\n")
+
+    result = fresh_migrate.apply_migration()
+    assert result["failures"] == 0
+
+    merged = (dest / "changes.jsonl").read_text().splitlines()
+    assert merged == [line_a, line_b, line_c]
+    assert (dest / "revision").read_text().strip() == "3"
+
+
+def test_apply_changes_jsonl_merge_logs_event_level_merge(
+    fresh_migrate, isolated_home
+):
+    """AC-10-3 — the migration log carries an event-level-merge record."""
+    line_a = '{"ts":1,"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{"n":"a"},"revision":1}'
+    line_b = '{"ts":2,"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{"n":"b"},"revision":2}'
+
+    _make_legacy_channel(isolated_home, "app-log", {
+        "revision": "2\n",
+        "changes.jsonl": f"{line_a}\n{line_b}\n",
+    })
+    channels = fresh_migrate.discover_legacy_channels()
+    dest = Path(channels[0]["canonical_path"])
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "changes.jsonl").write_text(f"{line_a}\n")
+    (dest / "revision").write_text("1\n")
+
+    fresh_migrate.apply_migration()
+
+    records = _read_migration_log(isolated_home)
+    merge_records = [
+        r for r in records if r.get("operation") == "event-level-merge"
+    ]
+    assert len(merge_records) == 1, (
+        f"expected exactly one event-level-merge log row, got: {records}"
+    )
+    m = merge_records[0]
+    assert m["changes_lines_in_src"] == 2
+    assert m["changes_lines_in_dest_before"] == 1
+    assert m["changes_lines_appended"] == 1
+    assert m["changes_lines_skipped_dup"] == 1
+    assert m["changes_lines_in_dest_after"] == 2
+    assert m["src_revision"] == 2
+    assert m["dest_revision_before"] == 1
+    assert m["dest_revision_after"] == 2
+
+
+def test_apply_changes_jsonl_idempotent_no_op_on_rerun(
+    fresh_migrate, isolated_home
+):
+    """AC-10 follow-up — re-running apply after merge is a no-op."""
+    line_a = '{"ts":1,"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{"n":"a"},"revision":1}'
+    line_b = '{"ts":2,"kind":"phase","tool":"x","model":"x","run_id":"r","app_slug":"s","payload":{"n":"b"},"revision":2}'
+
+    _make_legacy_channel(isolated_home, "app-rerun", {
+        "revision": "2\n",
+        "changes.jsonl": f"{line_a}\n{line_b}\n",
+    })
+    r1 = fresh_migrate.apply_migration()
+    r2 = fresh_migrate.apply_migration()
+    assert r1["outcomes"][0]["operation"] == "migrate"
+    # Second pass: src and dest are byte-equal manifests → already-migrated.
+    assert r2["outcomes"][0]["operation"] == "already-migrated"
+
+
 def test_verify_cutover_refuses_when_canonical_empty(fresh_migrate, isolated_home):
     _make_legacy_channel(isolated_home, "app-1", {"revision": "1\n"})
     v = fresh_migrate.verify_cutover(require_downstream=False)
