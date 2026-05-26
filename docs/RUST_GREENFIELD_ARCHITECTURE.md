@@ -11,6 +11,11 @@ substrate while staying in Rally's lane: local-first, file-backed, agent-first
 coordination. Rally is not an agent runtime, scheduler, broker, chat service, or
 workflow engine.
 
+This proposal should be read alongside
+[`AGENT_COORDINATION_LANDSCAPE.md`](AGENT_COORDINATION_LANDSCAPE.md), which
+benchmarks Rally against A2A, MCP, ACP, OpenAI Agents SDK, LangGraph, CrewAI,
+AutoGen, Temporal, OpenTelemetry, CloudEvents, and local-first sync systems.
+
 ## Problem
 
 Independent coding agents need one durable coordination substrate that works
@@ -50,6 +55,14 @@ Rally should not become:
 
 The lane is narrower and stronger: Rally records coordination truth and derives
 agent-usable state from it.
+
+## Rally Owns, Bridges, Refuses
+
+| Category | Scope |
+|---|---|
+| Owns | Durable coordination facts, append-only event storage, derived inbox/claims/blockers/diagnosis state, local trust policy, signed event import/export. |
+| Bridges | A2A task/context IDs, MCP tools/resources, ACP-connected coding agents, AG-UI frontends, OpenTelemetry traces, CloudEvents event buses. |
+| Refuses | Agent runtime loops, model/tool orchestration, editor transport, hosted workflow execution, broker semantics, global federation service. |
 
 ## Load-Bearing Invariant
 
@@ -282,6 +295,23 @@ Minimum viable remote flow:
 Network transport is out of scope. Files, Git, rsync, a shared folder, A2A, or a
 future service can move the bytes. Rally defines what the bytes mean.
 
+## Protocol Interop
+
+Rally should be easy to bridge because its kernel is narrower than the
+surrounding protocols:
+
+| Protocol/runtime | Rally mapping |
+|---|---|
+| A2A | `handoff`/`ack`/`needs-info` map to task lifecycle state; `thread_id` maps to A2A context; attachments/results map to artifacts. |
+| MCP | Expose `inbox`, `diagnose`, `verify`, `thread`, and `trust` as tools/resources for any MCP-capable agent client. |
+| ACP | Treat editor-connected coding agents as producers/consumers; ACP sessions can post Rally presence, handoffs, claims, and verdicts. |
+| AG-UI | UI event streams can render Rally events and derived state without changing the core. |
+| OpenAI Agents SDK | SDK handoffs/sessions/traces can emit Rally events for cross-process coordination. Rally does not replace the SDK agent loop. |
+| LangGraph/CrewAI/AutoGen | Orchestrated workflows can publish Rally events at handoff, claim, blocker, and verdict boundaries. Rally stays below orchestration. |
+| Temporal | Temporal workflows can emit Rally events; Rally does not provide durable workflow execution. |
+| OpenTelemetry | Rally event IDs, thread IDs, and causation IDs can become trace links or span attributes. |
+| CloudEvents | Rally events stay CloudEvents-aligned for event bus export/import. |
+
 ## What Gets Deleted
 
 These are target deletions once Rust reaches parity:
@@ -382,4 +412,3 @@ Rally's Rust rewrite is successful when:
 - Python is no longer required for normal operation.
 - The codebase is smaller because old interpretations were deleted, not because
   behavior was hidden behind wrappers.
-
