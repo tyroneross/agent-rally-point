@@ -2,9 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
 use rally_core::event::{
     AckPayload, BlockerPayload, BlockerResolvedPayload, ClaimPayload, ClaimReleasePayload,
-    EventBuilder, EventPayload, HandoffPayload,
+    EventBuilder, EventKind, EventPayload, EventRecord, HandoffPayload,
+};
+use rally_core::query::{
+    active_blockers_at, active_claims_at, claim_conflicts, filter_since, now_epoch_seconds,
+    parse_since, pending_handoffs_at, record_id, related_records, score_records,
 };
 use rally_core::store::{ChannelStore, load_records};
 use rally_protocol::{event_id, event_value, sha256_hash};
@@ -77,6 +82,15 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Some("release") => run_write("release", args, parse_release, execute_release),
         Some("blocker") => run_write("blocker", args, parse_blocker, execute_blocker),
         Some("unblock") => run_write("unblock", args, parse_unblock, execute_unblock),
+        Some("inbox") => run_read("inbox", args, parse_read, execute_inbox),
+        Some("claims") => run_read("claims", args, parse_read, execute_claims),
+        Some("blockers") => run_read("blockers", args, parse_read, execute_blockers),
+        Some("conflicts") => run_read("conflicts", args, parse_read, execute_conflicts),
+        Some("diagnose") => run_read("diagnose", args, parse_read, execute_diagnose),
+        Some("score") => run_read("score", args, parse_read, execute_score),
+        Some("thread") => run_read("thread", args, parse_read, execute_thread),
+        Some("replay") => run_read("replay", args, parse_read, execute_replay),
+        Some("report") => run_read("report", args, parse_read, execute_report),
         _ => {
             usage();
             Ok(ExitCode::from(2))
@@ -114,6 +128,15 @@ fn run_write<T>(
     }
 }
 
+fn run_read<T>(
+    command: &'static str,
+    args: impl Iterator<Item = String>,
+    parse: fn(WriteArgs) -> Result<T, CliError>,
+    execute: fn(T) -> Result<WriteOutput, CliError>,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    run_write(command, args, parse, execute)
+}
+
 #[derive(Clone, Debug)]
 struct CommonOptions {
     channel_dir: Option<PathBuf>,
@@ -138,7 +161,7 @@ impl CommonOptions {
         self.channel_dir
             .clone()
             .map(ChannelStore::new)
-            .ok_or_else(|| CliError::usage(command, "--channel-dir is required for Rust writes"))
+            .ok_or_else(|| CliError::usage(command, "--channel-dir is required"))
     }
 
     fn tool(&self) -> String {
@@ -189,7 +212,7 @@ impl WriteArgs {
                 }
                 "--model" => common.model = Some(take_value(command, &arg, &mut args)?),
                 "--run-id" => common.run_id = Some(take_value(command, &arg, &mut args)?),
-                "--no-ack" | "--force" => bools.push(arg),
+                "--no-ack" | "--force" | "--ids" => bools.push(arg),
                 "--files" => {
                     let mut values = Vec::new();
                     while args.peek().is_some_and(|value| !value.starts_with('-')) {
@@ -197,8 +220,19 @@ impl WriteArgs {
                     }
                     flags.insert(arg, values);
                 }
-                "--to" | "--subject" | "--notes" | "--summary" | "--reason" | "--resource"
-                | "--path" | "--severity" | "--resolution" => {
+                "--to"
+                | "--subject"
+                | "--notes"
+                | "--summary"
+                | "--reason"
+                | "--resource"
+                | "--path"
+                | "--severity"
+                | "--resolution"
+                | "--since"
+                | "--thread"
+                | "--limit"
+                | "--stale-after-seconds" => {
                     let value = take_value(command, &arg, &mut args)?;
                     flags.entry(arg).or_default().push(value);
                 }
@@ -260,6 +294,18 @@ fn take_value(
 ) -> Result<String, CliError> {
     args.next()
         .ok_or_else(|| CliError::usage(command, format!("{flag} requires a value")))
+}
+
+fn parse_usize(command: &'static str, flag: &str, value: &str) -> Result<usize, CliError> {
+    value
+        .parse()
+        .map_err(|_| CliError::usage(command, format!("{flag} must be a positive integer")))
+}
+
+fn parse_i64(command: &'static str, flag: &str, value: &str) -> Result<i64, CliError> {
+    value
+        .parse()
+        .map_err(|_| CliError::usage(command, format!("{flag} must be an integer")))
 }
 
 #[derive(Debug)]
@@ -385,6 +431,53 @@ struct UnblockCommand {
     identifier: String,
     resolution: String,
     force: bool,
+}
+
+#[derive(Debug)]
+struct ReadCommand {
+    command: &'static str,
+    common: CommonOptions,
+    identifier: Option<String>,
+    since: Option<String>,
+    tool: Option<String>,
+    thread: Option<String>,
+    limit: usize,
+    ids: bool,
+    stale_after_seconds: i64,
+}
+
+fn parse_read(args: WriteArgs) -> Result<ReadCommand, CliError> {
+    let limit = args
+        .one("--limit")
+        .map(|value| parse_usize(args.command, "--limit", &value))
+        .transpose()?
+        .unwrap_or(200);
+    let stale_after_seconds = args
+        .one("--stale-after-seconds")
+        .map(|value| parse_i64(args.command, "--stale-after-seconds", &value))
+        .transpose()?
+        .unwrap_or(24 * 3600);
+    let identifier = match args.positional.as_slice() {
+        [] => None,
+        [value] => Some(value.clone()),
+        _ => {
+            return Err(CliError::usage(
+                args.command,
+                format!("{} accepts at most one identifier", args.command),
+            ));
+        }
+    };
+    Ok(ReadCommand {
+        command: args.command,
+        since: args.one("--since"),
+        tool: args.common.tool.clone(),
+        thread: args.one("--thread"),
+        limit,
+        ids: args.has("--ids"),
+        stale_after_seconds,
+        common: args.common,
+        identifier,
+    })
 }
 
 fn parse_handoff(args: WriteArgs) -> Result<HandoffCommand, CliError> {
@@ -781,6 +874,307 @@ fn execute_unblock(command: UnblockCommand) -> Result<WriteOutput, CliError> {
     ))
 }
 
+fn execute_inbox(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let (store, records, now) = query_records(&command)?;
+    let pending = pending_handoffs_at(&records, command.tool.as_deref(), now);
+    let text = if pending.is_empty() {
+        "No pending handoffs.".to_string()
+    } else {
+        pending
+            .iter()
+            .map(|item| {
+                let files = if item.files.is_empty() {
+                    String::new()
+                } else {
+                    format!(" files={}", item.files.join(","))
+                };
+                format!(
+                    "{} from={} to={}: {}{}",
+                    item.event_id,
+                    item.from_tool.as_deref().unwrap_or("unknown"),
+                    item.to_tool.as_deref().unwrap_or("all"),
+                    item.subject,
+                    files
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        json!({
+            "pending": pending,
+        }),
+    ))
+}
+
+fn execute_claims(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let (store, records, now) = query_records(&command)?;
+    let claims = active_claims_at(&records, command.tool.as_deref(), now);
+    let text = if claims.is_empty() {
+        "No active claims.".to_string()
+    } else {
+        claims
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} owner={} resource={}\n  {}",
+                    item.event_id,
+                    item.owner_tool.as_deref().unwrap_or("unknown"),
+                    item.resource,
+                    item.subject
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        json!({
+            "claims": claims,
+        }),
+    ))
+}
+
+fn execute_blockers(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let (store, records, now) = query_records(&command)?;
+    let blockers = active_blockers_at(&records, command.tool.as_deref(), now);
+    let text = if blockers.is_empty() {
+        "No blockers.".to_string()
+    } else {
+        blockers
+            .iter()
+            .map(|item| {
+                let resource = item
+                    .resource
+                    .as_ref()
+                    .map(|resource| format!(" resource={resource}"))
+                    .unwrap_or_default();
+                format!(
+                    "{} tool={} severity={}{}\n  {}",
+                    item.event_id,
+                    item.tool.as_deref().unwrap_or("unknown"),
+                    item.severity,
+                    resource,
+                    item.subject
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        json!({
+            "blockers": blockers,
+        }),
+    ))
+}
+
+fn execute_conflicts(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let (store, records, _now) = query_records(&command)?;
+    let conflicts = claim_conflicts(&records);
+    let text = if conflicts.is_empty() {
+        "No claim conflicts.".to_string()
+    } else {
+        conflicts
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} claimed by {} ({})",
+                    item.resource,
+                    item.owners.join(", "),
+                    item.claim_ids.join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        json!({
+            "conflicts": conflicts,
+        }),
+    ))
+}
+
+fn execute_diagnose(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let (store, records, now) = query_records(&command)?;
+    let diagnosis = diagnose_records(
+        &records,
+        DiagnoseOptions {
+            state_records: Some(&records),
+            tool: command.tool.as_deref(),
+            stale_after_seconds: command.stale_after_seconds,
+            since: command.since.as_deref(),
+            now_epoch_seconds: now,
+        },
+    );
+    let text = if diagnosis.findings.is_empty() {
+        format!("{} score={}", diagnosis.status, diagnosis.score)
+    } else {
+        let mut lines = vec![format!("{} score={}", diagnosis.status, diagnosis.score)];
+        lines.extend(diagnosis.findings.iter().map(|finding| {
+            let event = finding
+                .event_id
+                .as_ref()
+                .map(|event_id| format!(" [{event_id}]"))
+                .unwrap_or_default();
+            format!(
+                "{} {}{}: {}",
+                finding.severity, finding.code, event, finding.message
+            )
+        }));
+        lines.join("\n")
+    };
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        json!({
+            "diagnosis": diagnosis,
+        }),
+    ))
+}
+
+fn execute_score(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let (store, records, _now) = query_records(&command)?;
+    let (score, findings) = score_records(&records, command.tool.as_deref());
+    let text = if findings.is_empty() {
+        format!("score={score}")
+    } else {
+        let mut lines = vec![format!("score={score}")];
+        lines.extend(findings.iter().map(|finding| {
+            let event = finding
+                .event_id
+                .as_ref()
+                .map(|event_id| format!(" [{event_id}]"))
+                .unwrap_or_default();
+            format!(
+                "{} {}{}: {}",
+                finding.severity, finding.code, event, finding.message
+            )
+        }));
+        lines.join("\n")
+    };
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        json!({
+            "score": score,
+            "findings": findings,
+        }),
+    ))
+}
+
+fn execute_thread(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let identifier = command
+        .identifier
+        .clone()
+        .ok_or_else(|| CliError::usage(command.command, "thread requires an identifier"))?;
+    let (store, records, _now) = query_records(&command)?;
+    let events = related_records(&records, &identifier);
+    let events = limit_records(events, command.limit);
+    let text = if events.is_empty() {
+        format!("No related events for {identifier}.")
+    } else {
+        events
+            .iter()
+            .map(|record| format_record_line(record, command.ids))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        json!({
+            "identifier": identifier,
+            "events": events,
+        }),
+    ))
+}
+
+fn execute_replay(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let (store, records, _now) = query_records(&command)?;
+    let events = limit_records(
+        filter_thread(records, command.thread.as_deref()),
+        command.limit,
+    );
+    let text = if events.is_empty() {
+        "No events.".to_string()
+    } else {
+        events
+            .iter()
+            .map(|record| format_record_line(record, true))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        json!({
+            "events": events,
+        }),
+    ))
+}
+
+fn execute_report(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let (store, records, _now) = query_records(&command)?;
+    let events = limit_records(
+        filter_thread(records, command.thread.as_deref()),
+        command.limit,
+    );
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for record in &events {
+        *counts.entry(record_kind(record)).or_default() += 1;
+    }
+    let text = if events.is_empty() {
+        "No events.".to_string()
+    } else {
+        let counts_text = counts
+            .iter()
+            .map(|(kind, count)| format!("{kind}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut lines = vec![format!("summary records={} {}", events.len(), counts_text)];
+        lines.extend(
+            events
+                .iter()
+                .map(|record| format_record_line(record, command.ids)),
+        );
+        lines.join("\n")
+    };
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        json!({
+            "records": events.len(),
+            "counts": counts,
+            "events": events,
+        }),
+    ))
+}
+
 fn append(
     store: &ChannelStore,
     event: EventBuilder,
@@ -815,6 +1209,116 @@ fn write_output(
         json: options.json,
         text,
         body,
+    }
+}
+
+fn query_output(
+    command: &'static str,
+    options: &CommonOptions,
+    store: &ChannelStore,
+    text: String,
+    data: Value,
+) -> WriteOutput {
+    WriteOutput {
+        json: options.json,
+        text,
+        body: json!({
+            "ok": true,
+            "command": command,
+            "schema": format!("agent-rally.command.{command}.v1"),
+            "channel": store.channel_dir().display().to_string(),
+            "data": data,
+        }),
+    }
+}
+
+fn query_records(command: &ReadCommand) -> Result<(ChannelStore, Vec<Value>, f64), CliError> {
+    let store = command.common.channel_store(command.command)?;
+    let now = now_epoch_seconds();
+    let cutoff = parse_since(command.since.as_deref(), now)
+        .map_err(|err| CliError::usage(command.command, err.to_string()))?;
+    let records = store.load_records().map_err(|err| {
+        CliError::runtime(command.command, format!("failed to load channel: {err}"))
+    })?;
+    Ok((store, filter_since(&records, cutoff), now))
+}
+
+fn limit_records(records: Vec<Value>, limit: usize) -> Vec<Value> {
+    records.into_iter().take(limit).collect()
+}
+
+fn filter_thread(records: Vec<Value>, thread: Option<&str>) -> Vec<Value> {
+    let Some(thread) = thread else {
+        return records;
+    };
+    records
+        .into_iter()
+        .filter(|record| event_field(record, "thread_id").as_deref() == Some(thread))
+        .collect()
+}
+
+fn format_record_line(record: &Value, include_id: bool) -> String {
+    let id = if include_id {
+        format!("{} ", record_id(record))
+    } else {
+        String::new()
+    };
+    format!(
+        "{id}{} {}: {}",
+        record_kind(record),
+        record_tool(record),
+        record_subject(record)
+    )
+}
+
+fn record_kind(record: &Value) -> String {
+    EventRecord::parse(record)
+        .map(|record| kind_label(&record.kind).to_string())
+        .unwrap_or_else(|_| "event".to_string())
+}
+
+fn record_tool(record: &Value) -> String {
+    event_field(record, "tool").unwrap_or_else(|| "unknown".to_string())
+}
+
+fn record_subject(record: &Value) -> String {
+    let Ok(parsed) = EventRecord::parse(record) else {
+        return "(no subject)".to_string();
+    };
+    match parsed.payload {
+        Some(EventPayload::Handoff(payload)) => payload.subject,
+        Some(EventPayload::Claim(payload)) => payload.subject,
+        Some(EventPayload::Blocker(payload)) => payload.subject,
+        Some(EventPayload::Ack(payload)) | Some(EventPayload::Feedback(payload)) => payload
+            .summary
+            .or(payload.reason)
+            .unwrap_or(payload.ref_handoff_id),
+        Some(EventPayload::ClaimRelease(payload)) => payload
+            .reason
+            .unwrap_or_else(|| format!("release {}", payload.ref_claim_id)),
+        Some(EventPayload::BlockerResolved(payload)) => payload.resolution,
+        Some(EventPayload::Other { payload, .. }) => payload
+            .get("subject")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("summary").and_then(Value::as_str))
+            .or_else(|| payload.get("notes").and_then(Value::as_str))
+            .unwrap_or("(no subject)")
+            .to_string(),
+        None => event_field(record, "subject").unwrap_or_else(|| "(no subject)".to_string()),
+    }
+}
+
+fn kind_label(kind: &EventKind) -> &str {
+    match kind {
+        EventKind::Handoff => "handoff",
+        EventKind::Ack => "ack",
+        EventKind::Feedback => "feedback",
+        EventKind::Claim => "claim",
+        EventKind::ClaimRelease => "claim-release",
+        EventKind::Blocker => "blocker",
+        EventKind::BlockerResolved => "blocker-resolved",
+        EventKind::Other(value) if value.is_empty() => "event",
+        EventKind::Other(value) => value.as_str(),
     }
 }
 
@@ -944,6 +1448,10 @@ fn usage() {
     eprintln!(
         "       rally-rs release --channel-dir <dir> [--force] <claim-id> | blocker --channel-dir <dir> --subject <text> | unblock --channel-dir <dir> [--force] <blocker-id> --resolution <text>"
     );
+    eprintln!(
+        "       rally-rs inbox|claims|blockers|conflicts|diagnose|score|report|replay --channel-dir <dir> [--json] [--since <window>] [--tool <tool>]"
+    );
+    eprintln!("       rally-rs thread --channel-dir <dir> [--json] <event-id>");
 }
 
 fn verify(options: &VerifyOptions) -> Result<(), Box<dyn std::error::Error>> {

@@ -232,6 +232,165 @@ fn write_command_usage_errors_honor_json_mode() {
 }
 
 #[test]
+fn query_commands_project_typed_state() {
+    let channel = temp_channel("rally-cli-query-state");
+    let channel_arg = channel.to_str().unwrap();
+    let handoff = json_stdout(run_rally(&[
+        "handoff",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--to",
+        "codex",
+        "--from-tool",
+        "pi",
+        "--subject",
+        "review schema",
+    ]));
+    let handoff_id = handoff["event_id"].as_str().unwrap();
+    json_stdout(run_rally(&[
+        "claim",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--tool",
+        "codex",
+        "--resource",
+        "file:docs",
+        "--subject",
+        "docs edit",
+    ]));
+    json_stdout(run_rally(&[
+        "claim",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--tool",
+        "pi",
+        "--path",
+        "docs/SCHEMA.md",
+        "--subject",
+        "schema edit",
+    ]));
+    let blocker = json_stdout(run_rally(&[
+        "blocker",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--tool",
+        "codex",
+        "--subject",
+        "need branch",
+    ]));
+    let blocker_id = blocker["event_id"].as_str().unwrap();
+
+    let inbox = json_stdout(run_rally(&[
+        "inbox",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--tool",
+        "codex",
+    ]));
+    assert_eq!(inbox["data"]["pending"][0]["event_id"], handoff_id);
+
+    let claims = json_stdout(run_rally(&[
+        "claims",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--tool",
+        "codex",
+    ]));
+    assert_eq!(claims["data"]["claims"].as_array().unwrap().len(), 1);
+    assert_eq!(claims["data"]["claims"][0]["resource"], "file:docs");
+
+    let blockers = json_stdout(run_rally(&[
+        "blockers",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--tool",
+        "codex",
+    ]));
+    assert_eq!(blockers["data"]["blockers"][0]["event_id"], blocker_id);
+
+    let conflicts = json_stdout(run_rally(&[
+        "conflicts",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+    ]));
+    assert_eq!(conflicts["data"]["conflicts"][0]["resource"], "file:docs");
+    assert_eq!(
+        conflicts["data"]["conflicts"][0]["owners"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let diagnosis = json_stdout(run_rally(&[
+        "diagnose",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--tool",
+        "codex",
+    ]));
+    assert_eq!(diagnosis["data"]["diagnosis"]["status"], "stuck");
+    assert!(
+        diagnosis["data"]["diagnosis"]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["code"] == "active-blocker")
+    );
+
+    let score = json_stdout(run_rally(&[
+        "score",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--tool",
+        "codex",
+    ]));
+    assert!(score["data"]["score"].as_i64().unwrap() < 100);
+
+    let thread = json_stdout(run_rally(&[
+        "thread",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        handoff_id,
+    ]));
+    assert_eq!(thread["data"]["identifier"], handoff_id);
+    assert_eq!(thread["data"]["events"][0]["event"]["id"], handoff_id);
+
+    let replay = json_stdout(run_rally(&[
+        "replay",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--limit",
+        "2",
+    ]));
+    assert_eq!(replay["data"]["events"].as_array().unwrap().len(), 2);
+
+    let report = json_stdout(run_rally(&[
+        "report",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+    ]));
+    fs::remove_dir_all(channel).unwrap();
+
+    assert_eq!(report["data"]["records"], 4);
+    assert_eq!(report["data"]["counts"]["claim"], 2);
+    assert_eq!(report["data"]["counts"]["handoff"], 1);
+}
+
+#[test]
 fn usage_errors_exit_nonzero_for_agent_automation() {
     let output = Command::new(env!("CARGO_BIN_EXE_rally-rs"))
         .output()
