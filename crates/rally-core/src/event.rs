@@ -48,13 +48,26 @@ impl EventKind {
     pub fn event_type(&self) -> String {
         match self {
             Self::Handoff => "agent-rally.handoff.created.v1".to_string(),
-            Self::Ack => "agent-rally.ack.created.v1".to_string(),
-            Self::Feedback => "agent-rally.feedback.created.v1".to_string(),
+            Self::Ack => "agent-rally.handoff.acknowledged.v1".to_string(),
+            Self::Feedback => "agent-rally.feedback.posted.v1".to_string(),
             Self::Claim => "agent-rally.claim.created.v1".to_string(),
-            Self::ClaimRelease => "agent-rally.claim-release.created.v1".to_string(),
-            Self::Blocker => "agent-rally.blocker.created.v1".to_string(),
-            Self::BlockerResolved => "agent-rally.blocker-resolved.created.v1".to_string(),
+            Self::ClaimRelease => "agent-rally.claim.released.v1".to_string(),
+            Self::Blocker => "agent-rally.blocker.raised.v1".to_string(),
+            Self::BlockerResolved => "agent-rally.blocker.resolved.v1".to_string(),
             Self::Other(value) => format!("agent-rally.{value}.v1"),
+        }
+    }
+
+    pub fn schema_name(&self) -> String {
+        match self {
+            Self::Handoff => "handoff.created.v1".to_string(),
+            Self::Ack => "handoff.acknowledged.v1".to_string(),
+            Self::Feedback => "feedback.posted.v1".to_string(),
+            Self::Claim => "claim.created.v1".to_string(),
+            Self::ClaimRelease => "claim.released.v1".to_string(),
+            Self::Blocker => "blocker.raised.v1".to_string(),
+            Self::BlockerResolved => "blocker.resolved.v1".to_string(),
+            Self::Other(value) => format!("{value}.v1"),
         }
     }
 }
@@ -268,6 +281,21 @@ impl EventBuilder {
         self
     }
 
+    pub fn app_slug(mut self, app_slug: impl Into<String>) -> Self {
+        self.app_slug = app_slug.into();
+        self
+    }
+
+    pub fn subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
+    }
+
+    pub fn source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
     pub fn time(mut self, time: impl Into<String>) -> Self {
         self.time = Some(time.into());
         self
@@ -299,8 +327,8 @@ impl EventBuilder {
         event.insert(
             "dataschema".to_string(),
             json!(format!(
-                "urn:agent-rally-point:schema:{}.v1",
-                kind.as_kind_str()
+                "urn:agent-rally-point:schema:{}",
+                kind.schema_name()
             )),
         );
         if let Some(source) = self.source {
