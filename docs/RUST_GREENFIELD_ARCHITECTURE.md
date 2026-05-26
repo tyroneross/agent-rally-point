@@ -349,6 +349,10 @@ Initial implementation status:
   envelope shape for success and failure.
 - `rally-cli` is still a prototype verifier surface and should become a
   renderer over `rally-core` outputs rather than owning behavior.
+- `rally-core::preflight` now owns the Rust session-start projection:
+  pending handoffs for the current tool, active presence peers, claims,
+  blockers, claim conflicts, recent changes, and routing action. The CLI
+  renders that envelope through `rally-rs preflight`.
 
 ## Remote Agent Readiness
 
@@ -383,6 +387,27 @@ accepted entries, and report rejected entries by reason.
 
 Network transport is out of scope. Files, Git, rsync, a shared folder, A2A, or a
 future service can move the bytes. Rally defines what the bytes mean.
+
+## Agent-Start Flow
+
+The Rust preflight command is the agent-first entry point for a session:
+
+```bash
+rally-rs preflight --channel-dir <dir> --tool codex --session-id <id> --start-ping --json
+```
+
+It emits `agent-rally.command.preflight.v1` with a stable routing action:
+
+- `join_active` when the tool has pending required handoffs or when active
+  peers have recently pinged the same channel.
+- `proceed_solo` when no pending acknowledgements or active peers are present.
+
+`--start-ping` writes a disposable presence record under
+`rally/presence/<tool>-<session>.json`. Presence is intentionally not part of
+`changes.jsonl`: it is ephemeral liveness context, while the log remains the
+durable coordination truth. The preflight envelope also includes active claims,
+blockers, claim conflicts, and recent changes so agents can decide their next
+move without scraping human prose.
 
 ## Protocol Interop
 

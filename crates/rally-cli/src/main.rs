@@ -7,6 +7,7 @@ use rally_core::event::{
     AckPayload, BlockerPayload, BlockerResolvedPayload, ClaimPayload, ClaimReleasePayload,
     EventBuilder, EventKind, EventPayload, EventRecord, HandoffPayload,
 };
+use rally_core::preflight::{PreflightOptions, run_preflight};
 use rally_core::query::{
     active_blockers_at, active_claims_at, claim_conflicts, filter_since, now_epoch_seconds,
     parse_since, pending_handoffs_at, record_id, related_records, score_records,
@@ -67,6 +68,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
         }
         Some("handoff") => run_write("handoff", args, parse_handoff, execute_handoff),
+        Some("preflight") => run_write("preflight", args, parse_preflight, execute_preflight),
         Some("ack") => run_write("ack", args, |args| parse_ack(args, "done"), execute_ack),
         Some("reject") => run_write(
             "reject",
@@ -279,7 +281,13 @@ impl WriteArgs {
                         Some(PathBuf::from(take_value(command, &arg, &mut args)?));
                 }
                 "--key-id" => common.key_id = Some(take_value(command, &arg, &mut args)?),
-                "--no-ack" | "--force" | "--ids" | "--sign" | "--no-default-trust-policy" => {
+                "--no-ack"
+                | "--force"
+                | "--ids"
+                | "--sign"
+                | "--start-ping"
+                | "--human"
+                | "--no-default-trust-policy" => {
                     if arg == "--sign" {
                         common.sign = true;
                     }
@@ -305,6 +313,7 @@ impl WriteArgs {
                 | "--thread"
                 | "--limit"
                 | "--stale-after-seconds"
+                | "--session-id"
                 | "--origin"
                 | "--trust-policy" => {
                     let value = take_value(command, &arg, &mut args)?;
@@ -540,6 +549,14 @@ struct SyncImportCommand {
     no_default_trust_policy: bool,
 }
 
+#[derive(Debug)]
+struct PreflightCommand {
+    common: CommonOptions,
+    session_id: String,
+    start_ping: bool,
+    stale_after_seconds: i64,
+}
+
 fn parse_identity_init(args: WriteArgs) -> Result<IdentityInitCommand, CliError> {
     Ok(IdentityInitCommand {
         tool: args
@@ -548,6 +565,25 @@ fn parse_identity_init(args: WriteArgs) -> Result<IdentityInitCommand, CliError>
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
         common: args.common,
+    })
+}
+
+fn parse_preflight(args: WriteArgs) -> Result<PreflightCommand, CliError> {
+    let stale_after_seconds = args
+        .one("--stale-after-seconds")
+        .map(|value| parse_i64(args.command, "--stale-after-seconds", &value))
+        .transpose()?
+        .unwrap_or(300);
+    let session_id = args
+        .one("--session-id")
+        .or_else(|| args.common.run_id.clone())
+        .unwrap_or_else(|| new_id("session"));
+    let start_ping = args.has("--start-ping");
+    Ok(PreflightCommand {
+        common: args.common,
+        session_id,
+        start_ping,
+        stale_after_seconds,
     })
 }
 
@@ -1036,6 +1072,36 @@ fn execute_identity_init(command: IdentityInitCommand) -> Result<WriteOutput, Cl
             "public_key": identity.public_key,
             "tool": command.tool,
         }),
+    })
+}
+
+fn execute_preflight(command: PreflightCommand) -> Result<WriteOutput, CliError> {
+    let store = command.common.channel_store("preflight")?;
+    let envelope = run_preflight(
+        &store,
+        &PreflightOptions {
+            tool: command.common.tool(),
+            model: command.common.model.clone(),
+            session_id: command.session_id,
+            start_ping: command.start_ping,
+            stale_after_seconds: command.stale_after_seconds,
+            recent_limit: 5,
+        },
+    )
+    .map_err(|err| CliError::runtime("preflight", format!("failed to preflight: {err}")))?;
+    let text = format!(
+        "{} action={} pending_acks={} active_peers={}",
+        envelope.coordination_status,
+        envelope.routing.action,
+        envelope.pending_acks_for_me.len(),
+        envelope.active_peers.len()
+    );
+    let body = serde_json::to_value(&envelope)
+        .map_err(|err| CliError::runtime("preflight", err.to_string()))?;
+    Ok(WriteOutput {
+        json: command.common.json,
+        text,
+        body,
     })
 }
 
@@ -1791,6 +1857,9 @@ fn usage() {
     );
     eprintln!(
         "       rally-rs handoff --channel-dir <dir> --to <tool> --subject <text> [--from-tool <tool>] [--files <path>...] [--notes <text>] [--no-ack] [--sign] [--json]"
+    );
+    eprintln!(
+        "       rally-rs preflight --channel-dir <dir> --tool <tool> [--session-id <id>] [--start-ping] [--json]"
     );
     eprintln!(
         "       rally-rs ack|reject|needs-info --channel-dir <dir> [--tool <tool>] [--force] <handoff-id>"

@@ -403,6 +403,66 @@ fn query_commands_project_typed_state() {
 }
 
 #[test]
+fn preflight_routes_agents_and_writes_presence() {
+    let channel = temp_channel("rally-cli-preflight");
+    let channel_arg = channel.to_str().unwrap();
+    let handoff = json_stdout(run_rally(&[
+        "handoff",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--to",
+        "codex",
+        "--from-tool",
+        "pi",
+        "--subject",
+        "take the next PR",
+    ]));
+    let handoff_id = handoff["event_id"].as_str().unwrap();
+
+    let codex = json_stdout(run_rally(&[
+        "preflight",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--tool",
+        "codex",
+        "--session-id",
+        "codex-session",
+        "--start-ping",
+    ]));
+    assert_eq!(codex["ok"], true);
+    assert_eq!(codex["command"], "preflight");
+    assert_eq!(codex["schema"], "agent-rally.command.preflight.v1");
+    assert_eq!(codex["coordination_status"], "active");
+    assert_eq!(codex["routing"]["action"], "join_active");
+    assert_eq!(codex["pending_acks_for_me"][0]["event_id"], handoff_id);
+    assert!(
+        codex["presence_written"]
+            .as_str()
+            .unwrap()
+            .contains("codex-session")
+    );
+
+    let pi = json_stdout(run_rally(&[
+        "preflight",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--tool",
+        "pi",
+        "--session-id",
+        "pi-session",
+    ]));
+    fs::remove_dir_all(channel).unwrap();
+
+    assert_eq!(pi["pending_acks_for_me"].as_array().unwrap().len(), 0);
+    assert_eq!(pi["routing"]["action"], "join_active");
+    assert_eq!(pi["active_peers"][0]["tool"], "codex");
+    assert_eq!(pi["recent_changes"][0]["event_id"], handoff_id);
+}
+
+#[test]
 fn identity_init_and_signed_write_verify_as_trusted() {
     let channel = temp_channel("rally-cli-signed-channel");
     let identity_dir = temp_channel("rally-cli-identity");
