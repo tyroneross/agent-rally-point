@@ -271,13 +271,12 @@ def test_AC13_not_on_main_branch():
     ).stdout.strip()
     # Defensive: if test is run from main (e.g., after merge), this is
     # informational rather than a hard fail. We assert on the active dev
-    # workflow: in development the branch must be feat/canonical-substrate.
+    # workflow: in development the branch should be an explicit work branch.
     if branch == "main":
         pytest.skip("AC13 not meaningful when run from main (post-merge).")
-    # Accept the parent alpha branch OR any in-flight repair branch off it.
+    # Accept the parent alpha branch, repair branches, or Codex app branches.
     # The PR-level review enforces "no direct-to-main"; this defensive check
     # just confirms development isn't happening on main.
     assert branch != "main", f"unexpectedly on main: {branch}"
-    assert branch.startswith("feat/") or branch.startswith("fix/"), (
-        f"on unexpected branch: {branch}"
-    )
+    allowed_prefixes = ("feat/", "fix/", "codex/")
+    assert branch.startswith(allowed_prefixes), f"on unexpected branch: {branch}"

@@ -211,7 +211,39 @@ escalate event content into agent input, sync, or automation may require
 
 ## CLI surface
 
-Future commands:
+Current Rust prototype:
+
+```bash
+rally-rs verify [--json] [--trust-policy <trust.toml>] [--no-default-trust-policy] <changes.jsonl>
+```
+
+`rally-rs verify` reads a `changes.jsonl` trace and reports signature/trust
+classification without changing the trace. By default it loads
+`~/.agent-rally-point/identity/trust.toml` when that file exists. Pass
+`--trust-policy` to use an explicit policy file, or
+`--no-default-trust-policy` to verify signatures without local policy.
+
+JSON mode is the agent-facing contract:
+
+```json
+{
+  "records": 3,
+  "trust_policy": "/Users/me/.agent-rally-point/identity/trust.toml",
+  "counts": {
+    "trusted": 1,
+    "unsigned": 2
+  },
+  "events": [
+    {
+      "id": "evt_345ea9b74be3461b9473e0cf80a79d40",
+      "status": "trusted",
+      "key_id": "key_codex_local"
+    }
+  ]
+}
+```
+
+Future Python-facing commands:
 
 ```bash
 rally identity init --tool pi

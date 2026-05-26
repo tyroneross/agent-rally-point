@@ -15,4 +15,9 @@ path = "src/main.rs"
 [dependencies]
 rally-protocol = { path = "../rally-protocol" }
 rally-trust = { path = "../rally-trust" }
+serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true

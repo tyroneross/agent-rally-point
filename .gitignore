@@ -45,6 +45,7 @@ Thumbs.db
 
 # Build artifacts
 *.log
+target/
 
 # uv lockfile — library-style project; downstream pipx installs resolve own deps.
 uv.lock

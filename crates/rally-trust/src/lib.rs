@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs;
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -138,6 +140,8 @@ pub enum TrustError {
     Protocol(ProtocolError),
     InvalidKeyMaterial,
     MalformedSignature,
+    Io(std::io::Error),
+    Toml(toml::de::Error),
 }
 
 impl fmt::Display for TrustError {
@@ -146,6 +150,8 @@ impl fmt::Display for TrustError {
             Self::Protocol(err) => write!(f, "{err}"),
             Self::InvalidKeyMaterial => f.write_str("invalid public key material"),
             Self::MalformedSignature => f.write_str("malformed signature envelope"),
+            Self::Io(err) => write!(f, "I/O error: {err}"),
+            Self::Toml(err) => write!(f, "TOML error: {err}"),
         }
     }
 }
@@ -156,6 +162,56 @@ impl From<ProtocolError> for TrustError {
     fn from(value: ProtocolError) -> Self {
         Self::Protocol(value)
     }
+}
+
+impl From<std::io::Error> for TrustError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<toml::de::Error> for TrustError {
+    fn from(value: toml::de::Error) -> Self {
+        Self::Toml(value)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TrustContext {
+    pub keys: PublicKeyStore,
+    pub policy: TrustPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrustFile {
+    #[serde(default)]
+    keys: Vec<TrustFileKey>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrustFileKey {
+    key_id: String,
+    public_key: String,
+    #[serde(default)]
+    trusted_tools: Vec<String>,
+    #[serde(default)]
+    allowed_kinds: Vec<String>,
+}
+
+pub fn load_trust_file(path: impl AsRef<Path>) -> Result<TrustContext, TrustError> {
+    let text = fs::read_to_string(path)?;
+    let trust_file: TrustFile = toml::from_str(&text)?;
+    let mut context = TrustContext::default();
+    for key in trust_file.keys {
+        context
+            .keys
+            .insert_base64(key.key_id.clone(), &key.public_key)?;
+        context.policy =
+            context
+                .policy
+                .trust_key_for(key.key_id, key.trusted_tools, key.allowed_kinds);
+    }
+    Ok(context)
 }
 
 pub fn classify(record: &Value, keys: &PublicKeyStore) -> Result<Classification, TrustError> {
@@ -308,6 +364,62 @@ mod tests {
         assert_eq!(classify(&record, &keys).unwrap().status, TrustStatus::Valid);
         assert_eq!(
             classify_with_policy(&record, &keys, Some(&policy))
+                .unwrap()
+                .status,
+            TrustStatus::Trusted
+        );
+    }
+
+    #[test]
+    fn load_trust_file_builds_key_store_and_policy() {
+        let signing_key = SigningKey::from_bytes(&[9; 32]);
+        let path = std::env::temp_dir().join(format!(
+            "rally-trust-{}.toml",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[[keys]]
+key_id = "key_codex_test"
+public_key = "{}"
+trusted_tools = ["codex"]
+allowed_kinds = ["handoff"]
+"#,
+                STANDARD.encode(signing_key.verifying_key().to_bytes())
+            ),
+        )
+        .unwrap();
+
+        let context = load_trust_file(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        let mut record = json!({
+            "id": "evt_11111111111111111111111111111111",
+            "kind": "handoff",
+            "type": "agent-rally.handoff.created.v1",
+            "tool": "codex",
+            "payload": {"subject": "review"}
+        });
+        let signature = signing_key.sign(&canonical_event_bytes(&record).unwrap());
+        record.as_object_mut().unwrap().insert(
+            "signature".into(),
+            json!({
+                "version": "rally-signature-v1",
+                "algorithm": "ed25519",
+                "key_id": "key_codex_test",
+                "signed_at": "2026-05-26T18:00:00.000Z",
+                "signature": STANDARD.encode(signature.to_bytes()),
+                "canonicalization": CANONICALIZATION_VERSION
+            }),
+        );
+
+        assert_eq!(
+            classify_with_policy(&record, &context.keys, Some(&context.policy))
                 .unwrap()
                 .status,
             TrustStatus::Trusted

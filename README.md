@@ -26,6 +26,7 @@ Earlier: v0.2.x added the discovery layer + manifest. v0.1.0 (2026-05-20) extrac
 - **Migration**: `agent-rally-migrate` walks legacy `~/.build-loop/apps/*` → `~/.agent-rally-point/apps/<repo_id>/` with append-only audit log + sha256 integrity. `verify-cutover` returns the 4-condition can-promote verdict (legacy_fully_copied + integrity_verified + no_fresh_writes_within_ttl + downstream_ready).
 - **Lifecycle hygiene**: explicit session reap on closeout; optional `changes.jsonl` rotation when log grows.
 - **Repo identity**: `repo_id(cwd)` derives `<slug>-<8hex>` from normalized git remote URL — same id across clones, worktrees, HTTPS vs SSH forms. Frozen as part of `protocol_version 1.0`.
+- **Rust verifier prototype**: `rally-rs verify` reads `changes.jsonl`, loads optional trust policy from `~/.agent-rally-point/identity/trust.toml` or `--trust-policy`, and emits text or JSON signature/trust classifications for agent consumers. The Python `rally` CLI remains the primary user surface while the Rust core matures.
 
 ## Install
 
