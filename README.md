@@ -3,6 +3,10 @@
 > Local-first coordination for coding agents working in the same repo: durable
 > events, handoffs, claims, blockers, trust, and sync without a server.
 
+Rally's ambitious direction is attuned coordination: a repo-native intelligence
+layer that helps agents anticipate what each other need, using durable facts,
+trust, ownership, blockers, artifacts, decisions, and source-linked lessons.
+
 Agent Rally Point is now a Rust product. The user-facing command is `rally`.
 The older runtime package has been removed from the product architecture.
 
@@ -115,7 +119,8 @@ Do not use legacy compatibility gates for Rust-core work.
 ## Architecture
 
 Read [`docs/RUST_GREENFIELD_ARCHITECTURE.md`](docs/RUST_GREENFIELD_ARCHITECTURE.md)
-for the target architecture. The short version:
+and [`docs/ATTUNED_COORDINATION.md`](docs/ATTUNED_COORDINATION.md) for the
+target architecture. The short version:
 
 - One Rust binary named `rally`.
 - One durable source of truth: `changes.jsonl`.

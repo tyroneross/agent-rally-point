@@ -3,10 +3,7 @@
 
 use crate::CoreError;
 use crate::event::EventRecord;
-use crate::query::{
-    ActiveBlocker, ActiveClaim, ClaimConflict, active_blockers_at, active_claims_at,
-    claim_conflicts, pending_handoffs_at, record_id,
-};
+use crate::query::{ActiveBlocker, ActiveClaim, ClaimConflict, TraceProjection, record_id};
 use crate::store::ChannelStore;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -95,8 +92,8 @@ pub fn run_preflight(
 
     let now = DateTime::<Utc>::from(SystemTime::now());
     let records = store.load_records()?;
-    let pending_acks_for_me =
-        pending_handoffs_at(&records, Some(&options.tool), now.timestamp() as f64);
+    let projection = TraceProjection::from_records_at(&records, now.timestamp() as f64);
+    let pending_acks_for_me = projection.pending_handoffs(Some(&options.tool));
     let active_peers = active_peers(
         store.channel_dir(),
         &options.tool,
@@ -104,9 +101,9 @@ pub fn run_preflight(
         options.stale_after_seconds,
         now,
     )?;
-    let active_claims = active_claims_at(&records, None, now.timestamp() as f64);
-    let active_blockers = active_blockers_at(&records, None, now.timestamp() as f64);
-    let claim_conflicts = claim_conflicts(&records);
+    let active_claims = projection.active_claims(None);
+    let active_blockers = projection.active_blockers(None);
+    let claim_conflicts = projection.claim_conflicts();
     let recent_changes = recent_changes(&records, options.recent_limit);
 
     let routing = if !pending_acks_for_me.is_empty() {

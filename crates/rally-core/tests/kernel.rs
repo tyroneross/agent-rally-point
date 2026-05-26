@@ -4,8 +4,8 @@
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
 use rally_core::event::{EventBuilder, EventPayload, HandoffPayload};
 use rally_core::query::{
-    active_blockers_at, active_claims_at, claim_conflicts, pending_handoffs_at, related_records,
-    score_records,
+    TraceProjection, active_blockers_at, active_claims_at, claim_conflicts, pending_handoffs_at,
+    related_records, score_records,
 };
 use rally_core::store::{ChannelStore, store_entry_value};
 use rally_core::sync::{SyncError, SyncErrorKind, build_sync_packet, import_sync_packet};
@@ -132,6 +132,35 @@ fn claims_conflicts_and_releases_are_derived_from_log() {
     let records = vec![claim_a, claim_b, release];
     assert_eq!(active_claims_at(&records, None, 1_779_829_200.0).len(), 1);
     assert!(claim_conflicts(&records).is_empty());
+}
+
+#[test]
+fn trace_projection_derives_core_state_once() {
+    let handoff = record(
+        "handoff",
+        "evt_handoff",
+        "pi",
+        json!({"from_tool": "pi", "to_tool": "codex", "subject": "review", "requires_ack": true}),
+    );
+    let claim_a = record(
+        "claim",
+        "evt_claim_a",
+        "pi",
+        json!({"owner_tool": "pi", "resource": "file:docs", "subject": "edit docs"}),
+    );
+    let claim_b = record(
+        "claim",
+        "evt_claim_b",
+        "codex",
+        json!({"owner_tool": "codex", "resource": "file:docs/SCHEMA.md", "subject": "review schema"}),
+    );
+    let records = vec![handoff, claim_a, claim_b];
+    let projection = TraceProjection::from_records_at(&records, 1_779_829_200.0);
+
+    assert_eq!(projection.pending_handoffs(Some("codex")).len(), 1);
+    assert_eq!(projection.active_claims(None).len(), 2);
+    assert_eq!(projection.claim_conflicts().len(), 1);
+    assert!(projection.score(Some("codex")).0 < 100);
 }
 
 #[test]

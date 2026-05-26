@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::query::{
-    ActiveBlocker, ActiveClaim, ClaimConflict, ScoreFinding, active_blockers_at, active_claims_at,
-    claim_conflicts, score_records,
-};
+use crate::query::{ActiveBlocker, ActiveClaim, ClaimConflict, ScoreFinding, TraceProjection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -47,17 +44,19 @@ impl Default for DiagnoseOptions<'_> {
 
 pub fn diagnose_records(records: &[Value], options: DiagnoseOptions<'_>) -> Diagnosis {
     let state = options.state_records.unwrap_or(records);
-    let (score, score_findings) = score_records(records, options.tool);
+    let score_projection = TraceProjection::from_records(records);
+    let state_projection = TraceProjection::from_records_at(state, options.now_epoch_seconds);
+    let (score, score_findings) = score_projection.score(options.tool);
     let mut findings: Vec<DiagnoseFinding> =
         score_findings.into_iter().map(from_score_finding).collect();
 
-    for blocker in active_blockers_at(state, options.tool, options.now_epoch_seconds) {
+    for blocker in state_projection.active_blockers(options.tool) {
         findings.push(from_blocker(blocker));
     }
-    for conflict in claim_conflicts(state) {
+    for conflict in state_projection.claim_conflicts() {
         findings.push(from_conflict(conflict, options.since));
     }
-    for claim in active_claims_at(state, options.tool, options.now_epoch_seconds) {
+    for claim in state_projection.active_claims(options.tool) {
         if claim
             .age_seconds
             .is_some_and(|age| age >= options.stale_after_seconds)

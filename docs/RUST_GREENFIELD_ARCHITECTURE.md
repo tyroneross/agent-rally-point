@@ -15,12 +15,26 @@ This proposal should be read alongside
 [`AGENT_COORDINATION_LANDSCAPE.md`](AGENT_COORDINATION_LANDSCAPE.md), which
 benchmarks Rally against A2A, MCP, ACP, OpenAI Agents SDK, LangGraph, CrewAI,
 AutoGen, Temporal, OpenTelemetry, CloudEvents, and local-first sync systems.
+It should also be read with
+[`ATTUNED_COORDINATION.md`](ATTUNED_COORDINATION.md), which describes the
+ambitious product direction: Rally as a repo-native intelligence layer that
+anticipates what each agent needs next.
 
 ## Problem
 
 Independent coding agents need one durable coordination substrate that works
 locally, can sync safely across machines, and gives agents stable JSON state
 without requiring a daemon or central service.
+
+The higher-order problem is that agents should not merely discover stale
+coordination facts. They should receive the right compact context at the right
+time: pending obligations, likely collisions, relevant decisions, trusted
+remote updates, and prior lessons that improve the next move.
+
+That makes the central product question:
+
+> Given the trace, trust policy, repo state, and current agent identity, what
+> should this agent know now?
 
 ## Greenfield Sketch
 
@@ -34,6 +48,9 @@ If Rally started today, it would be:
 - Signed portable events as the unit of remote trust.
 - Local sequence/revision as replica metadata, never portable identity.
 - JSON output as the primary product surface; human text as a rendering layer.
+- `rally context` as the agent-facing attunement surface: a bounded, ranked,
+  source-linked briefing over the same projection used by preflight, query, and
+  diagnosis.
 - Adapters for Herdr, ACP, A2A, CI, and editor surfaces outside the core.
 
 Estimated target: roughly 5k-7k Rust LOC for the core product surface before
@@ -301,6 +318,7 @@ The first-class commands should be:
 | `rally claim` / `release` / `claims` | Ownership state. |
 | `rally blocker` / `unblock` / `blockers` | Blocker state. |
 | `rally inbox` | Agent-specific pending work. |
+| `rally context` | Agent-specific attunement brief: obligations, risks, relevant changes, trust labels, lessons, and recommended next action. |
 | `rally thread` | Related event expansion. |
 | `rally replay` / `report` | Timeline and summaries. |
 | `rally diagnose` | Deterministic coordination findings. |
@@ -350,6 +368,9 @@ Initial implementation status:
   `event_hash`, and `prev_entry_hash` validation for the greenfield log shape.
 - `rally-core` has the first typed `EventRecord`/`EventKind` boundary so query
   logic can stop growing around raw JSON kind strings.
+- `rally-core::query` owns a `TraceProjection` read model so pending handoffs,
+  claims, blockers, conflicts, score, preflight, and diagnosis can derive state
+  from one parsed view of the trace.
 - `rally-cli verify --json` now reads through `rally-core` and emits the command
   envelope shape for success and failure.
 - `rally-cli` is still a prototype verifier surface and should become a

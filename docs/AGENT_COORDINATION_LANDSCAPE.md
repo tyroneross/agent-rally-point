@@ -34,6 +34,16 @@ That gives Rally a sharper job than "multi-agent framework": it is the durable
 coordination truth for independent agents that may be running in different
 CLIs, worktrees, editors, shells, or machines.
 
+The ambitious version is one step stronger:
+
+> Rally should become a local intelligence layer that anticipates what each
+> coding agent needs next from durable coordination facts, trust, ownership,
+> task state, artifacts, and source-linked lessons.
+
+This is not generic memory or orchestration. It is attuned, repo-native
+situational awareness. See
+[`ATTUNED_COORDINATION.md`](ATTUNED_COORDINATION.md).
+
 ## Landscape
 
 | System | What it owns | What Rally should learn | What Rally should not copy |
@@ -241,13 +251,16 @@ The greenfield architecture should be revised around these ideas:
    but automation-authority depends on signature and policy.
 3. **Derived state, not mutable state.** Inbox, claims, blockers, diagnosis,
    and trust summaries are projections over the log.
-4. **JSON contracts over prose.** Every command that agents consume needs a
+4. **Attuned context over raw logs.** Agents should receive a bounded,
+   source-linked context brief that is ranked for their current tool, task,
+   files, trust policy, and unresolved obligations.
+5. **JSON contracts over prose.** Every command that agents consume needs a
    stable schema.
-5. **Adapters at the edge.** Herdr, ACP, MCP, A2A, AG-UI, and OTel are adapters,
+6. **Adapters at the edge.** Herdr, ACP, MCP, A2A, AG-UI, and OTel are adapters,
    not the kernel.
-6. **No daemon requirement.** Push/streaming can be added, but the core must
+7. **No daemon requirement.** Push/streaming can be added, but the core must
    work through file append and replay.
-7. **Local-first sync semantics.** Import/export packets should be transport
+8. **Local-first sync semantics.** Import/export packets should be transport
    neutral. Files, Git, shared folders, A2A, or a future service can carry them.
 
 ## Architecture Doc Changes Needed
@@ -263,4 +276,3 @@ The Rust greenfield architecture should add:
 - OTel mapping: Rally event IDs as trace links or span attributes.
 - Explicit statement that Rally is below orchestration frameworks, not a
   competitor to them.
-
