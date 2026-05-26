@@ -512,6 +512,17 @@ fn sync_export_import_round_trips_signed_events() {
 
     let inbox = json_stdout(dest.run(&["inbox", "--json", "--tool", "pi"]));
     assert_eq!(inbox["data"]["pending"][0]["event_id"], handoff_id);
+    assert_eq!(inbox["data"]["pending"][0]["origin"], "import:sync");
+    assert_eq!(inbox["data"]["pending"][0]["trust_status"], "trusted");
+
+    let preflight = json_stdout(dest.run(&["preflight", "--json", "--tool", "pi"]));
+    assert_eq!(preflight["pending_acks_for_me"][0]["origin"], "import:sync");
+    assert_eq!(
+        preflight["pending_acks_for_me"][0]["trust_status"],
+        "trusted"
+    );
+    assert_eq!(preflight["recent_changes"][0]["origin"], "import:sync");
+    assert_eq!(preflight["recent_changes"][0]["trust_status"], "trusted");
 
     let duplicate =
         json_stdout(dest.run(&["sync", "import", "--json", packet_path.to_str().unwrap()]));

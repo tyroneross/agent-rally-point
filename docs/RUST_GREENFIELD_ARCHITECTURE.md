@@ -383,8 +383,10 @@ rally sync import --trust-policy <trust.toml> packet.json --json
 
 `sync export` emits `agent-rally.sync.packet.v1` with portable events only.
 `sync import` appends accepted events with import origin metadata, preserves
-signatures, reports duplicates/conflicts, and includes trust counts in the
-command result.
+signatures, reports duplicates/conflicts, stores trust classification on
+accepted imports, and includes trust counts in the command result. Query and
+preflight projections expose imported record `origin` and `trust_status` so
+agents do not need to scrape raw store entries before deciding whether to act.
 
 Import must be idempotent and bounded-memory: validate packet structure, verify
 event hashes/signatures, sort only the packet being imported if needed, append

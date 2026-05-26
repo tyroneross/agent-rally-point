@@ -89,7 +89,10 @@ rally sync import --trust-policy <trust.toml> packet.json --json
 
 Import appends accepted events with local origin metadata, preserves signatures,
 deduplicates by event id and canonical bytes, reports same-id conflicts, and
-classifies trust using local policy.
+classifies trust using local policy. Imported store entries keep both `origin`
+and `trust_status`; query and preflight JSON include those fields where present
+so agents can apply different policy to local, imported trusted, and imported
+untrusted facts.
 
 ## Protocol Positioning
 

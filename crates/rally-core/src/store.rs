@@ -81,6 +81,15 @@ impl ChannelStore {
     }
 
     pub fn append_event_with_origin(&self, event: Value, origin: &str) -> Result<Value, CoreError> {
+        self.append_event_with_origin_and_trust(event, origin, None)
+    }
+
+    pub fn append_event_with_origin_and_trust(
+        &self,
+        event: Value,
+        origin: &str,
+        trust_status: Option<&str>,
+    ) -> Result<Value, CoreError> {
         fs::create_dir_all(&self.channel_dir)?;
         let lock = OpenOptions::new()
             .read(true)
@@ -90,14 +99,25 @@ impl ChannelStore {
             .open(self.lock_path())?;
         lock.lock_exclusive()?;
 
-        let result = self.append_event_locked(event, origin);
+        let result = self.append_event_locked(event, origin, trust_status);
         FileExt::unlock(&lock)?;
         result
     }
 
-    fn append_event_locked(&self, event: Value, origin: &str) -> Result<Value, CoreError> {
+    fn append_event_locked(
+        &self,
+        event: Value,
+        origin: &str,
+        trust_status: Option<&str>,
+    ) -> Result<Value, CoreError> {
         let tail = inspect_store_tail(self.changes_path(), self.tail_path())?;
-        let entry = store_entry_value(event, tail.next_seq, tail.prev_entry_hash, origin)?;
+        let entry = store_entry_value_with_trust(
+            event,
+            tail.next_seq,
+            tail.prev_entry_hash,
+            origin,
+            trust_status,
+        )?;
         let line = serde_json::to_string(&entry)?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -129,15 +149,29 @@ pub fn store_entry_value(
     prev_entry_hash: Option<String>,
     origin: &str,
 ) -> Result<Value, CoreError> {
+    store_entry_value_with_trust(event, local_seq, prev_entry_hash, origin, None)
+}
+
+pub fn store_entry_value_with_trust(
+    event: Value,
+    local_seq: u64,
+    prev_entry_hash: Option<String>,
+    origin: &str,
+    trust_status: Option<&str>,
+) -> Result<Value, CoreError> {
     event_value(&event)?;
-    Ok(serde_json::json!({
+    let mut entry = serde_json::json!({
         "local_seq": local_seq,
         "received_at": received_at_now(),
         "origin": origin,
         "event_hash": event_hash(&event)?,
         "prev_entry_hash": prev_entry_hash,
         "event": event
-    }))
+    });
+    if let Some(trust_status) = trust_status {
+        entry["trust_status"] = Value::String(trust_status.to_string());
+    }
+    Ok(entry)
 }
 
 fn received_at_now() -> String {

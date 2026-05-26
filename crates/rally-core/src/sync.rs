@@ -130,7 +130,7 @@ where
             }
         };
         let status = classify_trust(&event)?;
-        *trust_counts.entry(status).or_default() += 1;
+        *trust_counts.entry(status.clone()).or_default() += 1;
         if let Some(existing) = known.get(&id) {
             if existing == &canonical {
                 duplicates += 1;
@@ -142,7 +142,7 @@ where
             continue;
         }
         store
-            .append_event_with_origin(event, origin)
+            .append_event_with_origin_and_trust(event, origin, Some(&status))
             .map_err(|err| SyncError::new(format!("failed to append import: {err}")))?;
         known.insert(id, canonical);
         imported += 1;

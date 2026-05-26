@@ -14,6 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct PendingHandoff {
     pub event_id: String,
     pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_status: Option<String>,
     pub from_tool: Option<String>,
     pub to_tool: Option<String>,
     pub subject: String,
@@ -25,6 +29,10 @@ pub struct PendingHandoff {
 pub struct ActiveClaim {
     pub event_id: String,
     pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_status: Option<String>,
     pub owner_tool: Option<String>,
     pub resource: String,
     pub subject: String,
@@ -35,6 +43,10 @@ pub struct ActiveClaim {
 pub struct ActiveBlocker {
     pub event_id: String,
     pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_status: Option<String>,
     pub tool: Option<String>,
     pub subject: String,
     pub resource: Option<String>,
@@ -222,6 +234,8 @@ pub fn pending_handoffs_at(records: &[Value], tool: Option<&str>, now: f64) -> V
         out.push(PendingHandoff {
             event_id: record_id(record),
             thread_id: parsed.thread_id,
+            origin: record_origin(record),
+            trust_status: record_trust_status(record),
             from_tool,
             to_tool,
             subject: payload.subject,
@@ -256,6 +270,8 @@ pub fn active_claims_at(records: &[Value], tool: Option<&str>, now: f64) -> Vec<
         out.push(ActiveClaim {
             event_id: record_id(record),
             thread_id: parsed.thread_id,
+            origin: record_origin(record),
+            trust_status: record_trust_status(record),
             owner_tool: owner,
             resource: payload.resource,
             subject: payload.subject,
@@ -334,6 +350,8 @@ pub fn active_blockers_at(records: &[Value], tool: Option<&str>, now: f64) -> Ve
         out.push(ActiveBlocker {
             event_id: record_id(record),
             thread_id: parsed.thread_id,
+            origin: record_origin(record),
+            trust_status: record_trust_status(record),
             tool: producer,
             subject: payload.subject,
             resource: payload.resource,
@@ -485,6 +503,14 @@ fn relation_values(record: &Value) -> BTreeSet<String> {
     .into_iter()
     .flatten()
     .collect()
+}
+
+fn record_origin(record: &Value) -> Option<String> {
+    string_field(record, "origin")
+}
+
+fn record_trust_status(record: &Value) -> Option<String> {
+    string_field(record, "trust_status")
 }
 
 fn resources_overlap(left: &str, right: &str) -> bool {

@@ -68,6 +68,10 @@ pub struct RecentChange {
     pub kind: String,
     pub tool: Option<String>,
     pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -241,9 +245,25 @@ fn recent_changes(records: &[Value], limit: usize) -> Vec<RecentChange> {
                 kind: parsed.kind.label().to_string(),
                 tool: parsed.tool,
                 subject,
+                origin: record_origin(record),
+                trust_status: record_trust_status(record),
             })
         })
         .collect()
+}
+
+fn record_origin(record: &Value) -> Option<String> {
+    record
+        .get("origin")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn record_trust_status(record: &Value) -> Option<String> {
+    record
+        .get("trust_status")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn safe_component(value: &str) -> String {

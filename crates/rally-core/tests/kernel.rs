@@ -451,7 +451,12 @@ fn sync_packet_round_trips_through_core() {
     assert_eq!(summary.imported, 1);
     assert_eq!(summary.duplicates, 0);
     assert_eq!(summary.trust_counts.get("trusted"), Some(&1));
-    assert_eq!(target.load_records().unwrap()[0]["origin"], "remote:test");
+    let imported_records = target.load_records().unwrap();
+    assert_eq!(imported_records[0]["origin"], "remote:test");
+    assert_eq!(imported_records[0]["trust_status"], "trusted");
+    let pending = pending_handoffs_at(&imported_records, Some("codex"), 1_779_829_200.0);
+    assert_eq!(pending[0].origin.as_deref(), Some("remote:test"));
+    assert_eq!(pending[0].trust_status.as_deref(), Some("trusted"));
 
     let duplicate = import_sync_packet(&target, &packet, "remote:test", |_| {
         Ok::<_, SyncError>("trusted".to_string())

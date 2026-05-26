@@ -77,6 +77,12 @@ rally sync export --json > packet.json
 rally sync import --trust-policy <trust.toml> packet.json --json
 ```
 
+Imported events retain their import `origin` and trust classification in the
+local store. Agent-facing JSON projections such as `inbox`, `claims`,
+`blockers`, `preflight`, and recent changes expose `origin` and `trust_status`
+when present, so automation can distinguish local facts from imported or
+untrusted facts.
+
 ## Session Start
 
 Every coding agent should start with preflight:
