@@ -35,7 +35,7 @@ correlation. Domain-specific content stays inside `payload`.
 | `run_id`    | `string`   | Caller-chosen run identifier (the consuming tool's run/session id). Defaults to `"unknown"`. |
 | `app_slug`  | `string`   | Channel slug (the directory name under `apps/`). Worktree-independent — see `channel_paths.app_slug`. |
 | `payload`   | `object`   | Per-kind structured body. Schema varies by `kind`; see below. |
-| `revision`  | `integer`  | Channel revision counter snapshot AT THE TIME this record was posted. Set by `post()`; raw `append_change` callers MUST set this themselves. |
+| `revision`  | `integer`  | Channel revision counter snapshot AT THE TIME this record was posted. Set by `post()`; raw `append_change` callers MUST set this themselves. Local store metadata, not part of portable event identity or Rust-native signature bytes. |
 
 ### Canonical event metadata
 
@@ -102,8 +102,10 @@ kept for compatibility or for spec consumers.
 | Producer identity | `tool` / `model` / `run_id` | `source` (CloudEvents URI form of `tool`) | `source` is required by CloudEvents 1.0; ARP-native consumers prefer the structured `tool`/`model`/`run_id` triple. |
 
 Signed-event canonicalization (see [`SIGNED_EVENTS.md`](SIGNED_EVENTS.md))
-covers all envelope fields including derived aliases. A signer that emits
-`kind` and `type` is committing to both being consistent for that record.
+covers the portable envelope fields including derived aliases. It excludes local
+store metadata such as `revision`, `local_seq`, `received_at`, and `origin`. A
+signer that emits `kind` and `type` is committing to both being consistent for
+that record.
 
 ### NON-GOAL guard
 

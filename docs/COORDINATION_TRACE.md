@@ -179,11 +179,32 @@ consumer only needs the event payload.
 
 `revision` is a local monotonic channel counter. It is excellent for cheap
 checkpoint reads and local ordering. It is not a portable event identity.
+Because it is local store metadata, Rust-native canonical event bytes and
+future signatures exclude `revision`.
 
 `id` is stable identity. It survives export, replay, signing, and future
 sync/merge. Two records with the same `id` represent the same logical
 event; two records with different `id`s are different events even if they
 have similar payloads.
+
+Future remote-aware stores may separate the two concepts explicitly:
+
+```json
+{
+  "local_seq": 12,
+  "received_at": "2026-05-26T18:06:20.000Z",
+  "origin": "remote:peer-a",
+  "event": {
+    "id": "evt_345ea9b74be3461b9473e0cf80a79d40",
+    "type": "agent-rally.handoff.created.v1",
+    "payload": {}
+  }
+}
+```
+
+In that shape, `event` is the portable, signable unit. The wrapper fields are
+local append/import metadata and must not affect event identity or signature
+verification.
 
 Ordering rules:
 
@@ -412,9 +433,9 @@ Consequences worth naming up-front:
 The canonical envelope enables signing later because it separates identity,
 correlation, and payload. A signing extension should define:
 
-- canonical JSON bytes to sign (the full envelope, not just `payload`, so
-  forged `correlation_id` / `thread_id` cannot ride on a legitimate signature
-  — see "Trust model and known caveats" above)
+- canonical JSON bytes to sign (the full portable envelope, not just `payload`,
+  so forged `correlation_id` / `thread_id` cannot ride on a legitimate
+  signature while local store metadata such as `revision` remains excluded)
 - signer identity and key discovery
 - signature field location
 - unsigned-event compatibility behavior

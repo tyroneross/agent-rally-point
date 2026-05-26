@@ -54,8 +54,8 @@ signed the event bytes and whether local policy trusts that key for the action.
 
 ## Event canonicalization
 
-A signature covers the canonical event envelope, including `payload` and causal
-metadata.
+A signature covers the canonical portable event envelope, including `payload`
+and causal metadata. It does not cover local store metadata.
 
 The signed material MUST include:
 
@@ -76,9 +76,18 @@ The signed material MUST include:
 - `datacontenttype`
 - `dataschema`
 - `payload`
-- `revision`
 
-The signed material MUST NOT include the signature object itself.
+The signed material MUST NOT include:
+
+- the signature object itself
+- local append metadata such as `revision`, `local_seq`, `received_at`, or
+  `origin`
+- import/sync bookkeeping metadata
+
+This split is required for remote-safe identity. A Python flat record may carry
+`revision` beside the event fields, and a future Rust store entry may wrap the
+same event as `{ "event": { ... }, "local_seq": 12, ... }`. Both shapes must
+produce the same canonical event bytes for the same portable event.
 
 Canonical JSON rules for v1:
 
@@ -89,10 +98,9 @@ Canonical JSON rules for v1:
 - preserve JSON value types exactly
 - reject non-finite floats if they appear in payloads
 
-This is **Rally's Python-canonical JSON**, not RFC 8785/JCS. It is sufficient
-for a Python reference implementation and deliberately versioned so a future
-Rust core can introduce `rally-json-v2` if cross-language byte equivalence needs
-a stricter canonicalization profile.
+This is **Rally's canonical JSON v1**, not RFC 8785/JCS. It is deliberately
+versioned so a future profile can introduce `rally-json-v2` if cross-language
+byte equivalence needs a stricter canonicalization profile.
 
 Python reference shape:
 
@@ -102,17 +110,22 @@ import json
 
 def canonical_bytes(record: dict) -> bytes:
     unsigned = copy.deepcopy(record)
+    unsigned = unsigned.get("event", unsigned)
     unsigned.pop("signature", None)
+    for key in ("revision", "local_seq", "received_at", "origin", "imported_at", "store", "sync"):
+        unsigned.pop(key, None)
     return json.dumps(
         unsigned,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
+        ensure_ascii=False,
     ).encode("utf-8")
 ```
 
-This canonicalization is intentionally simple enough for Python now and Rust
-later. If cross-language edge cases appear, Rally can introduce
+This canonicalization is intentionally simple enough for Python and Rust now:
+strings are encoded as UTF-8 rather than ASCII escape sequences. If
+cross-language edge cases appear, Rally can introduce
 `signature.canonicalization = "rally-json-v2"` without changing older records.
 
 ## Signature envelope
