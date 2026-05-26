@@ -35,8 +35,10 @@ from .coordination_trace import (
     related_records,
 )
 from .discover import discover
+from .diagnose import diagnose_records
 from .herdr_bridge import inject_handoff, list_agents, report_pending_status
 from .post import post
+from .resources import resource_from_values
 from .score import score_records
 
 # Stable exit codes. Documented here once and surfaced in the capability map.
@@ -77,28 +79,12 @@ def _tool(args: argparse.Namespace) -> str | None:
 
 def _resource_arg(args: argparse.Namespace, *, required: bool = True) -> str | None:
     """Return canonical resource string from ``--resource`` or ``--path``."""
-    resource = getattr(args, "resource", None)
-    path = getattr(args, "path", None)
-    if resource and path:
-        raise ValueError("use either --resource or --path, not both")
-    if resource:
-        return resource
-    if path:
-        p = Path(path).expanduser()
-        if p.is_absolute():
-            resolved = p.resolve(strict=False)
-            try:
-                normalized = resolved.relative_to(_workdir(args)).as_posix()
-            except ValueError:
-                normalized = resolved.as_posix()
-        else:
-            normalized = os.path.normpath(path).replace(os.sep, "/")
-        if normalized == ".":
-            normalized = ""
-        return f"file:{normalized}"
-    if required:
-        raise ValueError("one of --resource or --path is required")
-    return None
+    return resource_from_values(
+        resource=getattr(args, "resource", None),
+        path=getattr(args, "path", None),
+        workdir=_workdir(args),
+        required=required,
+    )
 
 
 def _json_mode(args: argparse.Namespace) -> bool:
@@ -678,6 +664,7 @@ def cmd_conflicts(args: argparse.Namespace) -> int:
 def cmd_diagnose(args: argparse.Namespace) -> int:
     channel, _slug = _channel_dir(args)
     all_records = load_records(channel)
+    tool = _tool(args)
     if args.thread:
         records = related_records(all_records, args.thread)
         state_records = records
@@ -687,70 +674,38 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
         # older than the score/replay window. An unresolved blocker from last
         # week is still a blocker today.
         state_records = all_records
-    score, score_findings = score_records(records, tool=_tool(args))
-    findings: list[dict] = [
-        {
-            "severity": f.severity,
-            "code": f.code,
-            "event_id": f.event_id,
-            "message": f.message,
-            "recommendation": (
-                f"rally thread {f.event_id}" if f.event_id else "rally replay --since 2h"
-            ),
-        }
-        for f in score_findings
-    ]
-    for blocker in active_blockers(state_records, tool=_tool(args)):
-        findings.append({
-            "severity": "P1",
-            "code": "active-blocker",
-            "event_id": blocker.event_id,
-            "message": f"blocker from {blocker.tool or 'unknown'}: {blocker.subject}",
-            "recommendation": f"rally thread {blocker.event_id}",
-        })
-    for conflict in claim_conflicts(state_records):
-        findings.append({
-            "severity": "P1",
-            "code": "claim-conflict",
-            "event_id": conflict.claim_ids[0] if conflict.claim_ids else None,
-            "message": f"resource {conflict.resource} is claimed by {', '.join(conflict.owners)}",
-            "recommendation": f"rally conflicts --since {args.since}",
-        })
-    stale_after = args.stale_after_seconds
-    for claim in active_claims(state_records, tool=_tool(args)):
-        if claim.age_seconds is not None and claim.age_seconds >= stale_after:
-            findings.append({
-                "severity": "P2",
-                "code": "stale-claim",
-                "event_id": claim.event_id,
-                "message": f"claim on {claim.resource} by {claim.owner_tool or 'unknown'} is stale",
-                "recommendation": f"rally release {claim.event_id} --reason 'done or abandoned'",
-            })
-    status = "healthy" if not findings else "stuck"
+    diagnosis = diagnose_records(
+        records,
+        state_records=state_records,
+        tool=tool,
+        stale_after_seconds=args.stale_after_seconds,
+        since=args.since,
+    )
 
     def text():
-        print(f"Coordination diagnosis: {status} (score {score}/100)")
+        print(f"Coordination diagnosis: {diagnosis.status} (score {diagnosis.score}/100)")
         if args.thread:
             print(f"Thread: {args.thread}")
         elif args.since:
             print(f"Window: since {args.since}")
-        if not findings:
+        if not diagnosis.findings:
             print("No coordination blockers found.")
             return
         print("Coordination is stuck because:")
-        for idx, item in enumerate(findings, 1):
-            event = f" [{item['event_id']}]" if item.get("event_id") else ""
-            print(f"{idx}. [{item['severity']}] {item['code']}{event}: {item['message']}")
-            print(f"   next: {item['recommendation']}")
+        for idx, item in enumerate(diagnosis.findings, 1):
+            event = f" [{item.event_id}]" if item.event_id else ""
+            print(f"{idx}. [{item.severity}] {item.code}{event}: {item.message}")
+            if item.recommendation:
+                print(f"   next: {item.recommendation}")
 
     return _emit(args, {
         "command": "diagnose",
         "channel": str(channel),
-        "status": status,
-        "score": score,
+        "status": diagnosis.status,
+        "score": diagnosis.score,
         "thread": args.thread,
         "since": args.since,
-        "findings": findings,
+        "findings": [_to_jsonable(f) for f in diagnosis.findings],
     }, text_fn=text)
 
 
