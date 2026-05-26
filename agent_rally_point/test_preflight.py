@@ -505,3 +505,62 @@ def test_workdir_not_a_directory_returns_2(tmp_path, capsys):
     assert rc == 2
     err = capsys.readouterr().err
     assert "workdir not a directory" in err
+
+
+# ───────────────────────────────────────────────────────────────────
+# Pi guardrails / memory locations
+# ───────────────────────────────────────────────────────────────────
+
+def test_pi_global_agents_md_appears_in_guardrails(tmp_path, monkeypatch, repo):
+    # intent: Pi sessions need to see their global ~/.pi/agent/AGENTS.md
+    # in the preflight guardrails the same way Claude sessions see
+    # ~/.claude/CLAUDE.md. Without this, Pi runs through the preflight
+    # blind to its global rules.
+    fake_pi = tmp_path / "fake-pi" / "agent" / "AGENTS.md"
+    fake_pi.parent.mkdir(parents=True)
+    fake_pi.write_text("# Pi global rules\n")
+    monkeypatch.setattr(preflight, "PI_AGENTS_GLOBAL", fake_pi)
+    guards = preflight.load_guardrails(repo)
+    assert any(f"Pi global rules: {fake_pi}" == g for g in guards), guards
+
+
+def test_pi_project_agents_md_appears_in_guardrails(tmp_path, monkeypatch, repo):
+    # intent: per-project .pi/AGENTS.md overrides for a given repo must
+    # surface in guardrails so Pi sessions pick up project-scoped rules
+    # the same way Claude sessions pick up <repo>/CLAUDE.md.
+    pi_dir = repo / ".pi"
+    pi_dir.mkdir()
+    (pi_dir / "AGENTS.md").write_text("# Project Pi rules\n")
+    # Point PI_AGENTS_GLOBAL at a nonexistent path so only the project
+    # override should appear.
+    monkeypatch.setattr(preflight, "PI_AGENTS_GLOBAL",
+                        tmp_path / "no-such-pi-agents.md")
+    guards = preflight.load_guardrails(repo)
+    assert any("Pi project rules:" in g and ".pi/AGENTS.md" in g
+               for g in guards), guards
+
+
+def test_pi_paths_absent_when_not_installed(tmp_path, monkeypatch, repo):
+    # intent: contributors without Pi installed must not see Pi entries
+    # in their guardrails or memory_locations. A missing ~/.pi/ is the
+    # default, not an error.
+    monkeypatch.setattr(preflight, "PI_AGENTS_GLOBAL",
+                        tmp_path / "no-such-pi-agents.md")
+    monkeypatch.setattr(preflight, "PI_SESSIONS_DIR",
+                        tmp_path / "no-such-pi-sessions")
+    guards = preflight.load_guardrails(repo)
+    mem = preflight.memory_locations(repo)
+    assert not any("Pi " in g for g in guards), guards
+    assert "pi_sessions_dir" not in mem, mem
+
+
+def test_pi_sessions_dir_appears_in_memory_locations(tmp_path, monkeypatch, repo):
+    # intent: Pi keeps per-session history in ~/.pi/agent/sessions/;
+    # surfacing this as a memory location lets peer agents discover
+    # Pi's session-replay artifacts the same way they discover other
+    # tools' memory dirs.
+    fake_sessions = tmp_path / "fake-pi" / "agent" / "sessions"
+    fake_sessions.mkdir(parents=True)
+    monkeypatch.setattr(preflight, "PI_SESSIONS_DIR", fake_sessions)
+    mem = preflight.memory_locations(repo)
+    assert mem.get("pi_sessions_dir") == str(fake_sessions), mem

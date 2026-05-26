@@ -59,6 +59,8 @@ CANONICAL_APPS_ROOT = Path("~/.agent-rally-point/apps").expanduser()
 LEGACY_APPS_ROOT = Path("~/.build-loop/apps").expanduser()
 BUILDLOOP_MEMORY_GLOBAL = Path("~/.build-loop/memory").expanduser()
 CLAUDE_MEMORY_GLOBAL = Path("~/.claude/projects/-Users-tyroneross/memory/MEMORY.md").expanduser()
+PI_AGENTS_GLOBAL = Path("~/.pi/agent/AGENTS.md").expanduser()
+PI_SESSIONS_DIR = Path("~/.pi/agent/sessions").expanduser()
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -419,6 +421,9 @@ def memory_locations(workdir: Path) -> dict:
         "project_buildloop": str(BUILDLOOP_MEMORY_GLOBAL / "projects" / slug),
         "claude_global_index": str(CLAUDE_MEMORY_GLOBAL),
         "project_intent_dir": str(workdir / ".build-loop") if (workdir / ".build-loop").is_dir() else None,
+        # Pi keeps per-session history under ~/.pi/agent/sessions/, the
+        # closest analog to a "memory" location for Pi sessions.
+        "pi_sessions_dir": str(PI_SESSIONS_DIR) if PI_SESSIONS_DIR.is_dir() else None,
     }
     return {k: v for k, v in out.items() if v and Path(v).exists()}
 
@@ -436,6 +441,14 @@ def load_guardrails(workdir: Path) -> list[str]:
     global_claude_md = Path("~/.claude/CLAUDE.md").expanduser()
     if global_claude_md.is_file():
         guards.append(f"Global rules: {global_claude_md}")
+    # Pi's AGENTS.md is the equivalent of Claude's CLAUDE.md: global
+    # session-bootstrap rules at ~/.pi/agent/AGENTS.md, and an optional
+    # per-project override at <project>/.pi/AGENTS.md.
+    pi_project_agents = workdir / ".pi" / "AGENTS.md"
+    if pi_project_agents.is_file():
+        guards.append(f"Pi project rules: {pi_project_agents}")
+    if PI_AGENTS_GLOBAL.is_file():
+        guards.append(f"Pi global rules: {PI_AGENTS_GLOBAL}")
     return guards
 
 
