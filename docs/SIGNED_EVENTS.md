@@ -5,8 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Signed Rally Events
 
-This is a design spike for signing Agent Rally Point / Rally coordination events.
-It is intentionally not an implementation commitment yet.
+This documents the Rust signing path for Rally coordination events.
 
 ## Goal
 
@@ -211,10 +210,12 @@ escalate event content into agent input, sync, or automation may require
 
 ## CLI surface
 
-Current Rust prototype:
+Rust CLI:
 
 ```bash
 rally-rs verify [--json] [--trust-policy <trust.toml>] [--no-default-trust-policy] <changes.jsonl>
+rally-rs identity init --tool <tool> [--identity-dir <dir>] [--json]
+rally-rs handoff --sign --channel-dir <dir> --identity-dir <dir> ...
 ```
 
 `rally-rs verify` reads a `changes.jsonl` trace and reports signature/trust
@@ -243,24 +244,23 @@ JSON mode is the agent-facing contract:
 }
 ```
 
-Future Python-facing commands:
+Identity commands:
 
 ```bash
 rally identity init --tool pi
-rally sign <event-id>
 rally verify
 rally verify --json
-rally trust add <key-file> --tool codex --kinds ack,feedback,claim
 ```
 
-Write commands may later support:
+Rust write commands support sign-on-write:
 
 ```bash
-rally handoff --sign ...
-rally claim --sign ...
+rally-rs handoff --sign ...
+rally-rs claim --sign ...
 ```
 
-But signing should not become mandatory until downstream tools can tolerate it.
+Signing is optional for local-only coordination so downstream tools can continue
+to consume unsigned legacy events during the Rust cutover.
 
 ## Herdr policy
 

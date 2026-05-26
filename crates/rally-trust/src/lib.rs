@@ -11,16 +11,18 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rally_protocol::{
     CANONICALIZATION_VERSION, ProtocolError, SignatureEnvelope, canonical_event_bytes, event_value,
+    sha256_hash,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::fs;
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -140,8 +142,11 @@ pub enum TrustError {
     Protocol(ProtocolError),
     InvalidKeyMaterial,
     MalformedSignature,
+    MissingIdentity,
+    InvalidIdentity,
     Io(std::io::Error),
     Toml(toml::de::Error),
+    Json(serde_json::Error),
 }
 
 impl fmt::Display for TrustError {
@@ -150,8 +155,11 @@ impl fmt::Display for TrustError {
             Self::Protocol(err) => write!(f, "{err}"),
             Self::InvalidKeyMaterial => f.write_str("invalid public key material"),
             Self::MalformedSignature => f.write_str("malformed signature envelope"),
+            Self::MissingIdentity => f.write_str("missing signing identity"),
+            Self::InvalidIdentity => f.write_str("invalid signing identity"),
             Self::Io(err) => write!(f, "I/O error: {err}"),
             Self::Toml(err) => write!(f, "TOML error: {err}"),
+            Self::Json(err) => write!(f, "JSON error: {err}"),
         }
     }
 }
@@ -173,6 +181,12 @@ impl From<std::io::Error> for TrustError {
 impl From<toml::de::Error> for TrustError {
     fn from(value: toml::de::Error) -> Self {
         Self::Toml(value)
+    }
+}
+
+impl From<serde_json::Error> for TrustError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Json(value)
     }
 }
 
@@ -212,6 +226,172 @@ pub fn load_trust_file(path: impl AsRef<Path>) -> Result<TrustContext, TrustErro
                 .trust_key_for(key.key_id, key.trusted_tools, key.allowed_kinds);
     }
     Ok(context)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalIdentity {
+    pub key_id: String,
+    pub public_key: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SigningIdentity {
+    pub key_id: String,
+    signing_key: SigningKey,
+}
+
+impl SigningIdentity {
+    pub fn public_key_base64(&self) -> String {
+        STANDARD.encode(self.signing_key.verifying_key().to_bytes())
+    }
+}
+
+pub fn init_identity(
+    identity_dir: impl AsRef<Path>,
+    tool: &str,
+    allowed_kinds: &[&str],
+) -> Result<LocalIdentity, TrustError> {
+    let identity_dir = identity_dir.as_ref();
+    fs::create_dir_all(identity_dir.join("keys"))?;
+    fs::create_dir_all(identity_dir.join("private"))?;
+
+    let mut secret = [0_u8; 32];
+    File::open("/dev/urandom")?.read_exact(&mut secret)?;
+    let signing_key = SigningKey::from_bytes(&secret);
+    let public_key = signing_key.verifying_key().to_bytes();
+    let key_id = key_id_for_public_key(&public_key);
+
+    let public_key_base64 = STANDARD.encode(public_key);
+    let private_key_base64 = STANDARD.encode(secret);
+    fs::write(
+        identity_dir.join("keys").join(format!("{key_id}.pub")),
+        &public_key_base64,
+    )?;
+    write_private_key(
+        &identity_dir.join("private").join(format!("{key_id}.key")),
+        &private_key_base64,
+    )?;
+    fs::write(identity_dir.join("default_key"), &key_id)?;
+    upsert_trust_entry(
+        identity_dir.join("trust.toml"),
+        &key_id,
+        &public_key_base64,
+        tool,
+        allowed_kinds,
+    )?;
+
+    Ok(LocalIdentity {
+        key_id,
+        public_key: public_key_base64,
+    })
+}
+
+pub fn load_signing_identity(
+    identity_dir: impl AsRef<Path>,
+    key_id: Option<&str>,
+) -> Result<SigningIdentity, TrustError> {
+    let identity_dir = identity_dir.as_ref();
+    let key_id = match key_id {
+        Some(value) => value.to_string(),
+        None => fs::read_to_string(identity_dir.join("default_key"))
+            .map_err(|_| TrustError::MissingIdentity)?
+            .trim()
+            .to_string(),
+    };
+    if key_id.is_empty() {
+        return Err(TrustError::MissingIdentity);
+    }
+    let text = fs::read_to_string(identity_dir.join("private").join(format!("{key_id}.key")))?;
+    let secret = STANDARD
+        .decode(text.trim())
+        .map_err(|_| TrustError::InvalidIdentity)?;
+    let secret: [u8; 32] = secret.try_into().map_err(|_| TrustError::InvalidIdentity)?;
+    Ok(SigningIdentity {
+        key_id,
+        signing_key: SigningKey::from_bytes(&secret),
+    })
+}
+
+pub fn sign_event(
+    event: &mut Value,
+    identity: &SigningIdentity,
+    signed_at: &str,
+) -> Result<(), TrustError> {
+    let signature = identity.signing_key.sign(&canonical_event_bytes(event)?);
+    let object = event.as_object_mut().ok_or(ProtocolError::ExpectedObject)?;
+    object.insert(
+        "signature".to_string(),
+        json!({
+            "version": "rally-signature-v1",
+            "algorithm": "ed25519",
+            "key_id": identity.key_id,
+            "signed_at": signed_at,
+            "signature": STANDARD.encode(signature.to_bytes()),
+            "canonicalization": CANONICALIZATION_VERSION,
+        }),
+    );
+    Ok(())
+}
+
+fn key_id_for_public_key(public_key: &[u8; 32]) -> String {
+    let hash = sha256_hash(public_key);
+    format!("key_{}", &hash["sha256:".len().."sha256:".len() + 16])
+}
+
+fn write_private_key(path: &Path, private_key_base64: &str) -> Result<(), TrustError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(private_key_base64.as_bytes())?;
+        file.sync_data()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, private_key_base64)?;
+        Ok(())
+    }
+}
+
+fn upsert_trust_entry(
+    path: PathBuf,
+    key_id: &str,
+    public_key: &str,
+    tool: &str,
+    allowed_kinds: &[&str],
+) -> Result<(), TrustError> {
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    if existing.contains(&format!("key_id = \"{key_id}\"")) {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    if !existing.ends_with('\n') && !existing.is_empty() {
+        writeln!(file)?;
+    }
+    writeln!(file, "[[keys]]")?;
+    writeln!(file, "key_id = {}", toml_string(key_id)?)?;
+    writeln!(file, "public_key = {}", toml_string(public_key)?)?;
+    writeln!(file, "trusted_tools = [{}]", toml_string(tool)?)?;
+    writeln!(
+        file,
+        "allowed_kinds = [{}]",
+        allowed_kinds
+            .iter()
+            .map(|kind| toml_string(kind))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ")
+    )?;
+    Ok(())
+}
+
+fn toml_string(value: &str) -> Result<String, TrustError> {
+    Ok(serde_json::to_string(value)?)
 }
 
 pub fn classify(record: &Value, keys: &PublicKeyStore) -> Result<Classification, TrustError> {
@@ -423,6 +603,44 @@ allowed_kinds = ["handoff"]
                 .unwrap()
                 .status,
             TrustStatus::Trusted
+        );
+    }
+
+    #[test]
+    fn identity_init_stores_key_and_signs_events() {
+        let dir = std::env::temp_dir().join(format!(
+            "rally-identity-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let identity = init_identity(&dir, "codex", &["handoff"]).unwrap();
+        let signing = load_signing_identity(&dir, None).unwrap();
+        assert_eq!(identity.key_id, signing.key_id);
+        assert_eq!(identity.public_key, signing.public_key_base64());
+
+        let mut record = json!({
+            "id": "evt_11111111111111111111111111111111",
+            "kind": "handoff",
+            "type": "agent-rally.handoff.created.v1",
+            "tool": "codex",
+            "payload": {"subject": "review"}
+        });
+        sign_event(&mut record, &signing, "2026-05-26T18:00:00.000Z").unwrap();
+
+        let context = load_trust_file(dir.join("trust.toml")).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert_eq!(
+            classify_with_policy(&record, &context.keys, Some(&context.policy))
+                .unwrap()
+                .status,
+            TrustStatus::Trusted
+        );
+        assert_eq!(
+            record["signature"]["canonicalization"],
+            CANONICALIZATION_VERSION
         );
     }
 }

@@ -15,7 +15,7 @@ use rally_core::store::{ChannelStore, load_records};
 use rally_protocol::{event_id, event_value, sha256_hash};
 use rally_trust::{
     PublicKeyStore, TrustContext, TrustPolicy, TrustStatus, classify, classify_with_policy,
-    load_trust_file,
+    init_identity, load_signing_identity, load_trust_file, sign_event,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -91,11 +91,29 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Some("thread") => run_read("thread", args, parse_read, execute_thread),
         Some("replay") => run_read("replay", args, parse_read, execute_replay),
         Some("report") => run_read("report", args, parse_read, execute_report),
+        Some("identity") => run_identity(args),
         _ => {
             usage();
             Ok(ExitCode::from(2))
         }
     }
+}
+
+fn run_identity(
+    args: impl Iterator<Item = String>,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let mut args: Vec<String> = args.collect();
+    if args.first().is_some_and(|value| value == "init") {
+        args.remove(0);
+        return run_write(
+            "identity:init",
+            args.into_iter(),
+            parse_identity_init,
+            execute_identity_init,
+        );
+    }
+    usage();
+    Ok(ExitCode::from(2))
 }
 
 fn run_write<T>(
@@ -144,6 +162,9 @@ struct CommonOptions {
     tool: Option<String>,
     model: Option<String>,
     run_id: Option<String>,
+    identity_dir: Option<PathBuf>,
+    key_id: Option<String>,
+    sign: bool,
 }
 
 impl CommonOptions {
@@ -154,6 +175,9 @@ impl CommonOptions {
             tool: None,
             model: None,
             run_id: None,
+            identity_dir: None,
+            key_id: None,
+            sign: false,
         }
     }
 
@@ -176,6 +200,13 @@ impl CommonOptions {
         self.run_id
             .clone()
             .unwrap_or_else(|| "agent-rally-cli-rs".to_string())
+    }
+
+    fn identity_dir(&self) -> Result<PathBuf, CliError> {
+        self.identity_dir
+            .clone()
+            .or_else(default_identity_dir)
+            .ok_or_else(|| CliError::usage("identity", "HOME is required for default identity dir"))
     }
 }
 
@@ -212,7 +243,17 @@ impl WriteArgs {
                 }
                 "--model" => common.model = Some(take_value(command, &arg, &mut args)?),
                 "--run-id" => common.run_id = Some(take_value(command, &arg, &mut args)?),
-                "--no-ack" | "--force" | "--ids" => bools.push(arg),
+                "--identity-dir" => {
+                    common.identity_dir =
+                        Some(PathBuf::from(take_value(command, &arg, &mut args)?));
+                }
+                "--key-id" => common.key_id = Some(take_value(command, &arg, &mut args)?),
+                "--no-ack" | "--force" | "--ids" | "--sign" => {
+                    if arg == "--sign" {
+                        common.sign = true;
+                    }
+                    bools.push(arg)
+                }
                 "--files" => {
                     let mut values = Vec::new();
                     while args.peek().is_some_and(|value| !value.starts_with('-')) {
@@ -446,6 +487,23 @@ struct ReadCommand {
     stale_after_seconds: i64,
 }
 
+#[derive(Debug)]
+struct IdentityInitCommand {
+    common: CommonOptions,
+    tool: String,
+}
+
+fn parse_identity_init(args: WriteArgs) -> Result<IdentityInitCommand, CliError> {
+    Ok(IdentityInitCommand {
+        tool: args
+            .common
+            .tool
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        common: args.common,
+    })
+}
+
 fn parse_read(args: WriteArgs) -> Result<ReadCommand, CliError> {
     let limit = args
         .one("--limit")
@@ -595,6 +653,7 @@ fn execute_handoff(command: HandoffCommand) -> Result<WriteOutput, CliError> {
         .model(command.common.model())
         .subject(command.subject.clone())
         .time(now_rfc3339()),
+        &command.common,
         "handoff",
     )?;
     Ok(write_output(
@@ -660,7 +719,7 @@ fn execute_ack(command: AckCommand) -> Result<WriteOutput, CliError> {
     {
         builder = builder.correlation_id(correlation_id);
     }
-    let entry = append(&store, builder, command.command)?;
+    let entry = append(&store, builder, &command.common, command.command)?;
     Ok(write_output(
         command.command,
         &command.common,
@@ -701,6 +760,7 @@ fn execute_claim(command: ClaimCommand) -> Result<WriteOutput, CliError> {
         .model(command.common.model())
         .subject(command.subject.clone())
         .time(now_rfc3339()),
+        &command.common,
         "claim",
     )?;
     Ok(write_output(
@@ -758,6 +818,7 @@ fn execute_release(command: ReleaseCommand) -> Result<WriteOutput, CliError> {
         .subject(command.identifier.clone())
         .time(now_rfc3339())
         .causation_id(reference.clone()),
+        &command.common,
         "release",
     )?;
     Ok(write_output(
@@ -797,6 +858,7 @@ fn execute_blocker(command: BlockerCommand) -> Result<WriteOutput, CliError> {
         .model(command.common.model())
         .subject(command.subject.clone())
         .time(now_rfc3339()),
+        &command.common,
         "blocker",
     )?;
     Ok(write_output(
@@ -854,6 +916,7 @@ fn execute_unblock(command: UnblockCommand) -> Result<WriteOutput, CliError> {
         .subject(command.identifier.clone())
         .time(now_rfc3339())
         .causation_id(reference.clone()),
+        &command.common,
         "unblock",
     )?;
     Ok(write_output(
@@ -872,6 +935,39 @@ fn execute_unblock(command: UnblockCommand) -> Result<WriteOutput, CliError> {
             "resolved": target.is_some(),
         }),
     ))
+}
+
+fn execute_identity_init(command: IdentityInitCommand) -> Result<WriteOutput, CliError> {
+    let identity_dir = command.common.identity_dir()?;
+    let allowed_kinds = [
+        "handoff",
+        "ack",
+        "feedback",
+        "claim",
+        "claim-release",
+        "blocker",
+        "blocker-resolved",
+    ];
+    let identity = init_identity(&identity_dir, &command.tool, &allowed_kinds)
+        .map_err(|err| CliError::runtime("identity:init", err.to_string()))?;
+    Ok(WriteOutput {
+        json: command.common.json,
+        text: format!(
+            "initialized identity {} tool={} dir={}",
+            identity.key_id,
+            command.tool,
+            identity_dir.display()
+        ),
+        body: json!({
+            "ok": true,
+            "command": "identity:init",
+            "schema": "agent-rally.command.identity-init.v1",
+            "identity_dir": identity_dir.display().to_string(),
+            "key_id": identity.key_id,
+            "public_key": identity.public_key,
+            "tool": command.tool,
+        }),
+    })
 }
 
 fn execute_inbox(command: ReadCommand) -> Result<WriteOutput, CliError> {
@@ -1178,10 +1274,26 @@ fn execute_report(command: ReadCommand) -> Result<WriteOutput, CliError> {
 fn append(
     store: &ChannelStore,
     event: EventBuilder,
+    options: &CommonOptions,
     command: &'static str,
 ) -> Result<Value, CliError> {
+    if !options.sign {
+        return store
+            .append_typed(event)
+            .map_err(|err| CliError::runtime(command, format!("failed to append event: {err}")));
+    }
+    let identity_dir = options.identity_dir()?;
+    let identity =
+        load_signing_identity(&identity_dir, options.key_id.as_deref()).map_err(|err| {
+            CliError::runtime(command, format!("failed to load signing identity: {err}"))
+        })?;
+    let mut event = event
+        .build()
+        .map_err(|err| CliError::runtime(command, format!("failed to build event: {err}")))?;
+    sign_event(&mut event, &identity, &now_rfc3339())
+        .map_err(|err| CliError::runtime(command, format!("failed to sign event: {err}")))?;
     store
-        .append_typed(event)
+        .append_event(event)
         .map_err(|err| CliError::runtime(command, format!("failed to append event: {err}")))
 }
 
@@ -1437,7 +1549,7 @@ fn usage() {
         "usage: rally-rs verify [--json] [--trust-policy <trust.toml>] [--no-default-trust-policy] <changes.jsonl>"
     );
     eprintln!(
-        "       rally-rs handoff --channel-dir <dir> --to <tool> --subject <text> [--from-tool <tool>] [--files <path>...] [--notes <text>] [--no-ack] [--json]"
+        "       rally-rs handoff --channel-dir <dir> --to <tool> --subject <text> [--from-tool <tool>] [--files <path>...] [--notes <text>] [--no-ack] [--sign] [--json]"
     );
     eprintln!(
         "       rally-rs ack|reject|needs-info --channel-dir <dir> [--tool <tool>] [--force] <handoff-id>"
@@ -1452,6 +1564,7 @@ fn usage() {
         "       rally-rs inbox|claims|blockers|conflicts|diagnose|score|report|replay --channel-dir <dir> [--json] [--since <window>] [--tool <tool>]"
     );
     eprintln!("       rally-rs thread --channel-dir <dir> [--json] <event-id>");
+    eprintln!("       rally-rs identity init [--identity-dir <dir>] --tool <tool> [--json]");
 }
 
 fn verify(options: &VerifyOptions) -> Result<(), Box<dyn std::error::Error>> {
@@ -1543,4 +1656,10 @@ fn trust_policy_path(options: &VerifyOptions) -> Option<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".agent-rally-point/identity/trust.toml"))
+}
+
+fn default_identity_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".agent-rally-point/identity"))
 }

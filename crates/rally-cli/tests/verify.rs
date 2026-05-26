@@ -391,6 +391,61 @@ fn query_commands_project_typed_state() {
 }
 
 #[test]
+fn identity_init_and_signed_write_verify_as_trusted() {
+    let channel = temp_channel("rally-cli-signed-channel");
+    let identity_dir = temp_channel("rally-cli-identity");
+    let channel_arg = channel.to_str().unwrap();
+    let identity_arg = identity_dir.to_str().unwrap();
+
+    let identity = json_stdout(run_rally(&[
+        "identity",
+        "init",
+        "--json",
+        "--identity-dir",
+        identity_arg,
+        "--tool",
+        "codex",
+    ]));
+    assert_eq!(identity["ok"], true);
+    assert!(identity["key_id"].as_str().unwrap().starts_with("key_"));
+
+    let handoff = json_stdout(run_rally(&[
+        "handoff",
+        "--json",
+        "--channel-dir",
+        channel_arg,
+        "--identity-dir",
+        identity_arg,
+        "--sign",
+        "--to",
+        "pi",
+        "--from-tool",
+        "codex",
+        "--subject",
+        "signed review",
+    ]));
+    assert_eq!(handoff["event"]["signature"]["key_id"], identity["key_id"]);
+    assert_eq!(
+        handoff["event"]["signature"]["canonicalization"],
+        "rally-json-v1"
+    );
+
+    let verify = json_stdout(run_rally(&[
+        "verify",
+        "--json",
+        "--trust-policy",
+        identity_dir.join("trust.toml").to_str().unwrap(),
+        channel.join("changes.jsonl").to_str().unwrap(),
+    ]));
+    fs::remove_dir_all(channel).unwrap();
+    fs::remove_dir_all(identity_dir).unwrap();
+
+    assert_eq!(verify["data"]["counts"]["trusted"], 1);
+    assert_eq!(verify["data"]["events"][0]["status"], "trusted");
+    assert_eq!(verify["data"]["events"][0]["key_id"], identity["key_id"]);
+}
+
+#[test]
 fn usage_errors_exit_nonzero_for_agent_automation() {
     let output = Command::new(env!("CARGO_BIN_EXE_rally-rs"))
         .output()
