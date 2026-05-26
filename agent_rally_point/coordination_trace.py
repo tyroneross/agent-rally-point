@@ -10,7 +10,7 @@ never mutates a channel. CLI commands such as ``report``, ``replay``,
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 import re
 import time
@@ -106,7 +106,18 @@ def event_label(record: dict) -> str:
     payload = record.get("payload") or {}
     kind = record.get("kind", "unknown")
     tool = record.get("tool", "unknown")
-    subject = payload.get("subject") or payload.get("work_item") or payload.get("summary")
+    # Prefer payload-level subject (richer, set by producer convention); fall
+    # back to the top-level CloudEvents `subject` field, ignoring the
+    # placeholder where it merely echoes the channel app_slug.
+    top_subject = record.get("subject")
+    if top_subject == record.get("app_slug"):
+        top_subject = None
+    subject = (
+        payload.get("subject")
+        or payload.get("work_item")
+        or payload.get("summary")
+        or top_subject
+    )
     if kind == "handoff":
         to_tool = payload.get("to_tool") or payload.get("to")
         return f"{tool} handoff -> {to_tool or '?'}: {subject or '(no subject)'}"

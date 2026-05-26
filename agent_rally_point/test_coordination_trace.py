@@ -74,6 +74,39 @@ def test_filter_since_uses_ts_cutoff():
     assert filter_since([old, new], 15) == [new]
 
 
+def test_related_records_tolerates_dangling_causation():
+    # intent: replay/thread lookup must not break when a causation_id references
+    # an event that is not present in the channel (cross-channel or never-emitted parent).
+    orphan_ack = _record(
+        "ack", 5, {"ref_handoff_id": "evt_" + "9" * 32, "verdict": "done"},
+        event_id="evt_" + "5" * 32,
+        causation_id="evt_" + "9" * 32,  # parent not in this channel
+        tool="codex",
+    )
+    found = related_records([orphan_ack], orphan_ack["id"])
+    assert [r["id"] for r in found] == [orphan_ack["id"]]
+    # Looking up the missing parent also returns the orphan ack (not a crash).
+    found_parent = related_records([orphan_ack], "evt_" + "9" * 32)
+    assert [r["id"] for r in found_parent] == [orphan_ack["id"]]
+
+
+def test_event_label_falls_back_to_top_level_subject():
+    # intent: CloudEvents-shaped records that put subject top-level (not in payload)
+    # still render a meaningful summary.
+    from agent_rally_point.coordination_trace import event_label
+
+    rec = {
+        "kind": "phase", "tool": "claude", "app_slug": "app",
+        "subject": "verify build-loop integration",
+        "payload": {"phase": "verify"},
+    }
+    label = event_label(rec)
+    assert "verify build-loop integration" in label
+    # When top-level subject is the placeholder (== app_slug), it is ignored.
+    rec_placeholder = {**rec, "subject": "app", "payload": {"phase": "verify"}}
+    assert "app" not in event_label(rec_placeholder).split(":", 1)[1]
+
+
 def test_load_roundtrip_with_precanonical_record(tmp_path: Path):
     # intent: helpers tolerate historical records without canonical id/thread fields.
     from agent_rally_point.coordination_trace import load_records, record_id

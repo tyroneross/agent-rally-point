@@ -279,10 +279,18 @@ agent-rally handoff --to codex --subject "review schema" --files docs/SCHEMA.md
 agent-rally ack <handoff-id> --summary "reviewed"
 agent-rally reject <handoff-id> --reason "out of scope"
 agent-rally needs-info <handoff-id> --reason "which branch?"
+agent-rally score --since 2h
+agent-rally herdr status --report
+agent-rally herdr inject <handoff-id>
 ```
 
 These commands are deliberately text-first and operate on the trace itself; a
-future TUI can build on the same query helpers.
+future TUI can build on the same query helpers. `score` is deterministic: it
+checks coordination invariants such as open required handoffs, dangling causal
+references, dangling ack/feedback references, and unresolved `needs-info` states.
+The Herdr bridge is a dogfood adapter: it can report pending handoffs as Herdr
+custom status or inject a handoff prompt into the target pane, while ARP remains
+the trace source of truth.
 
 ## Replay and scoring
 

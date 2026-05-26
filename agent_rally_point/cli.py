@@ -22,7 +22,9 @@ from .coordination_trace import (
     related_records,
 )
 from .discover import discover
+from .herdr_bridge import inject_handoff, list_agents, report_pending_status
 from .post import post
+from .score import score_records
 
 
 def _channel_dir(args: argparse.Namespace) -> tuple[Path, str]:
@@ -67,6 +69,28 @@ def cmd_report(args: argparse.Namespace) -> int:
         age = f", age={item.age_seconds}s" if item.age_seconds is not None else ""
         files = f", files={','.join(item.files)}" if item.files else ""
         print(f"- {item.event_id} from={item.from_tool} to={item.to_tool}: {item.subject}{age}{files}")
+    return 0
+
+
+def cmd_score(args: argparse.Namespace) -> int:
+    channel, _slug = _channel_dir(args)
+    records = load_records(channel)
+    if args.thread:
+        records = related_records(records, args.thread)
+    else:
+        records = filter_since(records, parse_since(args.since))
+    score, findings = score_records(records, tool=_tool(args))
+    print(f"Coordination score: {score}/100")
+    if args.thread:
+        print(f"Thread: {args.thread}")
+    elif args.since:
+        print(f"Window: since {args.since}")
+    if not findings:
+        print("No coordination issues found.")
+        return 0
+    for finding in findings:
+        event = f" [{finding.event_id}]" if finding.event_id else ""
+        print(f"- [{finding.severity}] {finding.code}{event}: {finding.message}")
     return 0
 
 
@@ -149,6 +173,13 @@ def _ack(args: argparse.Namespace, verdict: str) -> int:
     channel, app_slug = _channel_dir(args)
     records = load_records(channel)
     target = find_record(records, args.identifier)
+    if target is None and not getattr(args, "force", False):
+        print(
+            f"agent-rally-point: no handoff found for {args.identifier!r} in {channel}; "
+            f"pass --force to ack anyway",
+            file=sys.stderr,
+        )
+        return 2
     tool = _tool(args) or args.tool or "unknown"
     payload = {"ref_handoff_id": args.identifier, "verdict": verdict}
     if getattr(args, "summary", None):
@@ -188,6 +219,38 @@ def cmd_needs_info(args: argparse.Namespace) -> int:
     return _ack(args, "needs-info")
 
 
+def cmd_herdr_status(args: argparse.Namespace) -> int:
+    channel, _slug = _channel_dir(args)
+    records = filter_since(load_records(channel), parse_since(args.since))
+    pending = pending_handoffs(records, tool=args.tool)
+    agents = list_agents()
+    print("Herdr agents:")
+    if not agents:
+        print("- none detected (is this running inside Herdr?)")
+    for agent in agents:
+        cwd = f" cwd={agent.cwd}" if agent.cwd else ""
+        print(f"- {agent.agent} pane={agent.pane_id} status={agent.status}{cwd}")
+    print()
+    print(f"Pending ARP handoffs: {len(pending)}")
+    for item in pending:
+        print(f"- {item.event_id} to={item.to_tool}: {item.subject}")
+    if args.report:
+        print()
+        for line in report_pending_status(pending):
+            print(line)
+    return 0
+
+
+def cmd_herdr_inject(args: argparse.Namespace) -> int:
+    channel, _slug = _channel_dir(args)
+    try:
+        print(inject_handoff(load_records(channel), args.identifier))
+    except (RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--channel-dir", help="read/write a specific channel directory")
     p.add_argument("--workdir", help="repo workdir for discovery; defaults to cwd")
@@ -204,6 +267,13 @@ def main(argv: list[str] | None = None) -> int:
     report.add_argument("--tool")
     report.add_argument("--ids", action="store_true")
     report.set_defaults(func=cmd_report)
+
+    score = sub.add_parser("score", help="score coordination trace invariants")
+    _add_common(score)
+    score.add_argument("--since", default="24h")
+    score.add_argument("--thread")
+    score.add_argument("--tool")
+    score.set_defaults(func=cmd_score)
 
     replay = sub.add_parser("replay", help="print an interleaved coordination timeline")
     _add_common(replay)
@@ -242,6 +312,10 @@ def main(argv: list[str] | None = None) -> int:
     ack.add_argument("--tool")
     ack.add_argument("--model")
     ack.add_argument("--run-id")
+    ack.add_argument(
+        "--force", action="store_true",
+        help="post the ack even when the referenced handoff is not found in this channel",
+    )
     ack.set_defaults(func=cmd_ack)
 
     reject = sub.add_parser("reject", help="reject a handoff")
@@ -251,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     reject.add_argument("--tool")
     reject.add_argument("--model")
     reject.add_argument("--run-id")
+    reject.add_argument("--force", action="store_true")
     reject.set_defaults(func=cmd_reject)
 
     needs = sub.add_parser("needs-info", help="mark a handoff as needing more information")
@@ -260,7 +335,23 @@ def main(argv: list[str] | None = None) -> int:
     needs.add_argument("--tool")
     needs.add_argument("--model")
     needs.add_argument("--run-id")
+    needs.add_argument("--force", action="store_true")
     needs.set_defaults(func=cmd_needs_info)
+
+    herdr = sub.add_parser("herdr", help="Herdr dogfood bridge")
+    herdr_sub = herdr.add_subparsers(dest="herdr_cmd", required=True)
+
+    herdr_status = herdr_sub.add_parser("status", help="show Herdr agents and ARP handoffs")
+    _add_common(herdr_status)
+    herdr_status.add_argument("--since", default="7d")
+    herdr_status.add_argument("--tool")
+    herdr_status.add_argument("--report", action="store_true", help="report pending handoffs as Herdr custom status")
+    herdr_status.set_defaults(func=cmd_herdr_status)
+
+    herdr_inject = herdr_sub.add_parser("inject", help="inject a handoff into its target Herdr pane")
+    _add_common(herdr_inject)
+    herdr_inject.add_argument("identifier")
+    herdr_inject.set_defaults(func=cmd_herdr_inject)
 
     args = parser.parse_args(argv)
     return args.func(args)

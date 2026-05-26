@@ -41,3 +41,54 @@ def test_handoff_inbox_ack_thread_report_smoke(tmp_path: Path, capsys):
 
     records = load_records(tmp_path)
     assert [r["kind"] for r in records] == ["handoff", "ack"]
+
+
+def test_score_command_reports_open_handoff(tmp_path: Path, capsys):
+    # intent: CLI scorer exposes trace coordination failures without model calls.
+    assert main([
+        "handoff", "--channel-dir", str(tmp_path), "--to", "codex",
+        "--from-tool", "pi", "--subject", "review schema",
+    ]) == 0
+    capsys.readouterr()
+    assert main(["score", "--channel-dir", str(tmp_path), "--tool", "codex"]) == 0
+    out = capsys.readouterr().out
+    assert "Coordination score: 75/100" in out
+    assert "open-required-handoff" in out
+
+
+def test_herdr_status_command_uses_bridge(tmp_path: Path, capsys, monkeypatch):
+    # intent: Herdr status command is a thin adapter over trace state + Herdr bridge helpers.
+    assert main([
+        "handoff", "--channel-dir", str(tmp_path), "--to", "codex",
+        "--from-tool", "pi", "--subject", "review schema",
+    ]) == 0
+    capsys.readouterr()
+
+    from agent_rally_point.herdr_bridge import HerdrAgent
+    monkeypatch.setattr("agent_rally_point.cli.list_agents", lambda: [HerdrAgent("codex", "1-2", "idle")])
+    monkeypatch.setattr("agent_rally_point.cli.report_pending_status", lambda pending: [f"reported {pending[0].event_id}"])
+
+    assert main(["herdr", "status", "--channel-dir", str(tmp_path), "--report"]) == 0
+    out = capsys.readouterr().out
+    assert "codex pane=1-2" in out
+    assert "Pending ARP handoffs: 1" in out
+    assert "reported evt_" in out
+
+
+def test_ack_unknown_identifier_refuses_without_force(tmp_path: Path, capsys):
+    # intent: typos must not silently create zombie ack records referencing missing handoffs.
+    rc = main([
+        "ack", "--channel-dir", str(tmp_path), "--tool", "codex",
+        "evt_deadbeef" + "0" * 24,
+    ])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "no handoff found" in err
+    # With --force, the ack is posted anyway.
+    rc2 = main([
+        "ack", "--channel-dir", str(tmp_path), "--tool", "codex", "--force",
+        "evt_deadbeef" + "0" * 24,
+    ])
+    assert rc2 == 0
+    records = load_records(tmp_path)
+    assert [r["kind"] for r in records] == ["ack"]
