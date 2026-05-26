@@ -34,7 +34,7 @@ fn record(kind: &str, id: &str, tool: &str, payload: Value) -> Value {
 }
 
 #[test]
-fn pending_handoff_matches_python_inbox_semantics() {
+fn pending_handoff_preserves_current_event_semantics() {
     let handoff = record(
         "handoff",
         "evt_handoff",
