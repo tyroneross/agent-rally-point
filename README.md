@@ -30,51 +30,51 @@ Install the Rust CLI from the checkout:
 git clone https://github.com/tyroneross/agent-rally-point.git
 cd agent-rally-point
 cargo install --path crates/rally-cli
-rally preflight --channel-dir /tmp/rally-smoke --tool codex --json
+rally preflight --tool codex --json
 ```
 
-During the current cutover, commands take an explicit `--channel-dir`:
+Run `rally` from inside a repo. The CLI derives the local coordination channel
+under `~/.agent-rally-point/apps/<repo_id>` from the Git origin when available,
+then the Git root, then the current directory as a final fallback.
 
 ```bash
-rally preflight --channel-dir ~/.agent-rally-point/apps/<repo_id> --tool codex --start-ping --json
+rally preflight --tool codex --start-ping --json
 ```
-
-Rust repo/channel discovery is the next product cutover target.
 
 ## Command Surface
 
 Core coordination commands:
 
 ```bash
-rally preflight --channel-dir <dir> --tool codex --start-ping --json
-rally handoff --channel-dir <dir> --to pi --from-tool codex --subject "review sync"
-rally ack --channel-dir <dir> --tool pi <handoff-id> --summary "done"
-rally claim --channel-dir <dir> --tool codex --path crates/rally-core/src/query.rs --subject "query cleanup"
-rally blocker --channel-dir <dir> --tool codex --subject "need decision"
+rally preflight --tool codex --start-ping --json
+rally handoff --to pi --from-tool codex --subject "review sync"
+rally ack --tool pi <handoff-id> --summary "done"
+rally claim --tool codex --path crates/rally-core/src/query.rs --subject "query cleanup"
+rally blocker --tool codex --subject "need decision"
 ```
 
 Read projections:
 
 ```bash
-rally inbox --channel-dir <dir> --tool codex --json
-rally claims --channel-dir <dir> --json
-rally blockers --channel-dir <dir> --json
-rally conflicts --channel-dir <dir> --json
-rally diagnose --channel-dir <dir> --json
-rally score --channel-dir <dir> --json
-rally thread --channel-dir <dir> <event-id> --json
-rally replay --channel-dir <dir> --json
-rally report --channel-dir <dir> --json
+rally inbox --tool codex --json
+rally claims --json
+rally blockers --json
+rally conflicts --json
+rally diagnose --json
+rally score --json
+rally thread <event-id> --json
+rally replay --json
+rally report --json
 ```
 
 Trust and sync:
 
 ```bash
 rally identity init --tool codex --json
-rally handoff --channel-dir <dir> --identity-dir <identity-dir> --sign --to pi --subject "signed handoff"
+rally handoff --identity-dir <identity-dir> --sign --to pi --subject "signed handoff"
 rally verify --json --trust-policy <trust.toml> <changes.jsonl>
-rally sync export --channel-dir <dir> --json > packet.json
-rally sync import --channel-dir <dir> --trust-policy <trust.toml> packet.json --json
+rally sync export --json > packet.json
+rally sync import --trust-policy <trust.toml> packet.json --json
 ```
 
 ## Session Start
@@ -82,7 +82,7 @@ rally sync import --channel-dir <dir> --trust-policy <trust.toml> packet.json --
 Every coding agent should start with preflight:
 
 ```bash
-rally preflight --channel-dir <dir> --tool <host> --start-ping --json
+rally preflight --tool <host> --start-ping --json
 ```
 
 Use stable tool IDs such as `codex`, `claude_code`, `pi`, `cursor`, `gemini`,

@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::CoreError;
-use crate::event::{EventPayload, EventRecord};
+use crate::event::EventRecord;
 use crate::query::{
     ActiveBlocker, ActiveClaim, ClaimConflict, active_blockers_at, active_claims_at,
     claim_conflicts, pending_handoffs_at, record_id,
 };
 use crate::store::ChannelStore;
 use chrono::{DateTime, SecondsFormat, Utc};
-use rally_protocol::event_value;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
@@ -236,63 +235,15 @@ fn recent_changes(records: &[Value], limit: usize) -> Vec<RecentChange> {
         .iter()
         .filter_map(|record| {
             let parsed = EventRecord::parse(record).ok()?;
+            let subject = parsed.subject_label();
             Some(RecentChange {
                 event_id: record_id(record),
-                kind: kind_label(&parsed),
+                kind: parsed.kind.label().to_string(),
                 tool: parsed.tool,
-                subject: subject_label(record),
+                subject,
             })
         })
         .collect()
-}
-
-fn kind_label(record: &EventRecord) -> String {
-    match &record.kind {
-        crate::event::EventKind::Handoff => "handoff".to_string(),
-        crate::event::EventKind::Ack => "ack".to_string(),
-        crate::event::EventKind::Feedback => "feedback".to_string(),
-        crate::event::EventKind::Claim => "claim".to_string(),
-        crate::event::EventKind::ClaimRelease => "claim-release".to_string(),
-        crate::event::EventKind::Blocker => "blocker".to_string(),
-        crate::event::EventKind::BlockerResolved => "blocker-resolved".to_string(),
-        crate::event::EventKind::Other(value) if value.is_empty() => "event".to_string(),
-        crate::event::EventKind::Other(value) => value.clone(),
-    }
-}
-
-fn subject_label(record: &Value) -> String {
-    let Ok(parsed) = EventRecord::parse(record) else {
-        return "(unparseable)".to_string();
-    };
-    match parsed.payload {
-        Some(EventPayload::Handoff(payload)) => payload.subject,
-        Some(EventPayload::Claim(payload)) => payload.subject,
-        Some(EventPayload::Blocker(payload)) => payload.subject,
-        Some(EventPayload::Ack(payload)) | Some(EventPayload::Feedback(payload)) => payload
-            .summary
-            .or(payload.reason)
-            .unwrap_or(payload.ref_handoff_id),
-        Some(EventPayload::ClaimRelease(payload)) => payload
-            .reason
-            .unwrap_or_else(|| format!("release {}", payload.ref_claim_id)),
-        Some(EventPayload::BlockerResolved(payload)) => payload.resolution,
-        Some(EventPayload::Other { payload, .. }) => payload
-            .get("subject")
-            .and_then(Value::as_str)
-            .or_else(|| payload.get("summary").and_then(Value::as_str))
-            .or_else(|| payload.get("notes").and_then(Value::as_str))
-            .unwrap_or("(no subject)")
-            .to_string(),
-        None => event_value(record)
-            .ok()
-            .and_then(|event| {
-                event
-                    .get("subject")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "(no subject)".to_string()),
-    }
 }
 
 fn safe_component(value: &str) -> String {

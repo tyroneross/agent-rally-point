@@ -196,7 +196,7 @@ Rust CLI:
 ```bash
 rally verify [--json] [--trust-policy <trust.toml>] [--no-default-trust-policy] <changes.jsonl>
 rally identity init --tool <tool> [--identity-dir <dir>] [--json]
-rally handoff --sign --channel-dir <dir> --identity-dir <dir> ...
+rally handoff --sign --identity-dir <dir> ...
 ```
 
 `rally verify` reads a `changes.jsonl` trace and reports signature/trust
@@ -268,8 +268,8 @@ Minimum sync behavior:
 Rust packet commands:
 
 ```bash
-rally sync export --channel-dir <dir> --json > packet.json
-rally sync import --channel-dir <dir> --trust-policy ~/.agent-rally-point/identity/trust.toml packet.json --json
+rally sync export --json > packet.json
+rally sync import --trust-policy ~/.agent-rally-point/identity/trust.toml packet.json --json
 ```
 
 ## Open questions

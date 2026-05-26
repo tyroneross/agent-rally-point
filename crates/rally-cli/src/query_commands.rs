@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::args::{CommonOptions, ReadCommand};
 use crate::output::{CliError, WriteOutput};
-use crate::{CommonOptions, ReadCommand};
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
-use rally_core::event::{EventKind, EventPayload, EventRecord};
+use rally_core::event::EventRecord;
 use rally_core::query::{
     active_blockers_at, active_claims_at, claim_conflicts, filter_since, now_epoch_seconds,
     parse_since, pending_handoffs_at, record_id, related_records, score_records,
@@ -378,7 +378,7 @@ fn format_record_line(record: &Value, include_id: bool) -> String {
 
 fn record_kind(record: &Value) -> String {
     EventRecord::parse(record)
-        .map(|record| kind_label(&record.kind).to_string())
+        .map(|record| record.kind.label().to_string())
         .unwrap_or_else(|_| "event".to_string())
 }
 
@@ -387,44 +387,9 @@ fn record_tool(record: &Value) -> String {
 }
 
 fn record_subject(record: &Value) -> String {
-    let Ok(parsed) = EventRecord::parse(record) else {
-        return "(no subject)".to_string();
-    };
-    match parsed.payload {
-        Some(EventPayload::Handoff(payload)) => payload.subject,
-        Some(EventPayload::Claim(payload)) => payload.subject,
-        Some(EventPayload::Blocker(payload)) => payload.subject,
-        Some(EventPayload::Ack(payload)) | Some(EventPayload::Feedback(payload)) => payload
-            .summary
-            .or(payload.reason)
-            .unwrap_or(payload.ref_handoff_id),
-        Some(EventPayload::ClaimRelease(payload)) => payload
-            .reason
-            .unwrap_or_else(|| format!("release {}", payload.ref_claim_id)),
-        Some(EventPayload::BlockerResolved(payload)) => payload.resolution,
-        Some(EventPayload::Other { payload, .. }) => payload
-            .get("subject")
-            .and_then(Value::as_str)
-            .or_else(|| payload.get("summary").and_then(Value::as_str))
-            .or_else(|| payload.get("notes").and_then(Value::as_str))
-            .unwrap_or("(no subject)")
-            .to_string(),
-        None => event_field(record, "subject").unwrap_or_else(|| "(no subject)".to_string()),
-    }
-}
-
-fn kind_label(kind: &EventKind) -> &str {
-    match kind {
-        EventKind::Handoff => "handoff",
-        EventKind::Ack => "ack",
-        EventKind::Feedback => "feedback",
-        EventKind::Claim => "claim",
-        EventKind::ClaimRelease => "claim-release",
-        EventKind::Blocker => "blocker",
-        EventKind::BlockerResolved => "blocker-resolved",
-        EventKind::Other(value) if value.is_empty() => "event",
-        EventKind::Other(value) => value.as_str(),
-    }
+    EventRecord::parse(record)
+        .map(|record| record.subject_label())
+        .unwrap_or_else(|_| "(no subject)".to_string())
 }
 
 fn event_field(record: &Value, key: &str) -> Option<String> {

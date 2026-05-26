@@ -83,8 +83,8 @@ Trust states are defined in `rally-trust`:
 Sync packets carry portable events only:
 
 ```bash
-rally sync export --channel-dir <dir> --json > packet.json
-rally sync import --channel-dir <dir> --trust-policy <trust.toml> packet.json --json
+rally sync export --json > packet.json
+rally sync import --trust-policy <trust.toml> packet.json --json
 ```
 
 Import appends accepted events with local origin metadata, preserves signatures,

@@ -152,6 +152,12 @@ checkpoints/        optional verified projection checkpoints
 quarantine/         rejected or corrupt input packets
 ```
 
+The channel directory is an implementation detail, not user workflow. The CLI
+resolves the channel from the current repo using Git origin, then Git root, then
+the working directory, and stores it under `~/.agent-rally-point/apps/<repo_id>`.
+Agents should start in the repo and ask Rally for JSON state; they should not
+coordinate by hand-assembling storage paths.
+
 Indexes and snapshots must be rebuildable from `changes.jsonl`. They are never
 authoritative.
 
@@ -371,8 +377,8 @@ Minimum viable remote flow:
 The Rust CLI implements the first transport-free packet flow:
 
 ```bash
-rally sync export --channel-dir <dir> --json > packet.json
-rally sync import --channel-dir <dir> --trust-policy <trust.toml> packet.json --json
+rally sync export --json > packet.json
+rally sync import --trust-policy <trust.toml> packet.json --json
 ```
 
 `sync export` emits `agent-rally.sync.packet.v1` with portable events only.
@@ -392,7 +398,7 @@ future service can move the bytes. Rally defines what the bytes mean.
 The Rust preflight command is the agent-first entry point for a session:
 
 ```bash
-rally preflight --channel-dir <dir> --tool codex --session-id <id> --start-ping --json
+rally preflight --tool codex --session-id <id> --start-ping --json
 ```
 
 It emits `agent-rally.command.preflight.v1` with a stable routing action:

@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::output::{CliError, WriteOutput};
-use crate::{
+use crate::args::{
     AckCommand, BlockerCommand, ClaimCommand, CommonOptions, HandoffCommand, IdentityInitCommand,
-    PreflightCommand, ReleaseCommand, UnblockCommand, new_id, now_rfc3339,
+    PreflightCommand, ReleaseCommand, UnblockCommand,
 };
+use crate::output::{CliError, WriteOutput};
+use crate::runtime::{new_id, now_rfc3339};
 use rally_core::event::{
     AckPayload, BlockerPayload, BlockerResolvedPayload, ClaimPayload, ClaimReleasePayload,
     EventBuilder, EventPayload, HandoffPayload,
@@ -17,7 +18,7 @@ use rally_trust::{init_identity, load_signing_identity, sign_event};
 use serde_json::{Value, json};
 
 pub(super) fn execute_handoff(command: HandoffCommand) -> Result<WriteOutput, CliError> {
-    let store = command.common.channel_store("handoff")?;
+    let context = CommandContext::new("handoff", &command.common)?;
     let payload = EventPayload::Handoff(HandoffPayload {
         subject: command.subject.clone(),
         to_tool: Some(command.to_tool.clone()),
@@ -26,25 +27,13 @@ pub(super) fn execute_handoff(command: HandoffCommand) -> Result<WriteOutput, Cl
         ref_files: command.files,
         notes: command.notes,
     });
-    let entry = append(
-        &store,
-        EventBuilder::new(
-            new_id("evt"),
-            payload,
-            &command.from_tool,
-            command.common.run_id(),
-            new_id("thr"),
-        )
-        .model(command.common.model())
-        .subject(command.subject.clone())
-        .time(now_rfc3339()),
-        &command.common,
-        "handoff",
-    )?;
-    Ok(write_output(
-        "handoff",
-        &command.common,
-        &store,
+    let entry = context.append(context.event(
+        payload,
+        &command.from_tool,
+        new_id("thr"),
+        command.subject.clone(),
+    ))?;
+    Ok(context.output(
         &entry,
         format!(
             "posted handoff {} local_seq={} to={}",
@@ -61,54 +50,29 @@ pub(super) fn execute_handoff(command: HandoffCommand) -> Result<WriteOutput, Cl
 }
 
 pub(super) fn execute_ack(command: AckCommand) -> Result<WriteOutput, CliError> {
-    let store = command.common.channel_store(command.command)?;
-    let records = store.load_records().map_err(|err| {
-        CliError::runtime(command.command, format!("failed to load channel: {err}"))
-    })?;
-    let target = find_record(&records, &command.identifier, Some("handoff"));
-    if target.is_none() && !command.force {
-        return Err(CliError::not_found(
-            command.command,
-            format!(
-                "no handoff found for {:?}; pass --force to ack anyway",
-                command.identifier
-            ),
-        ));
-    }
-    let reference = canonical_reference(target.as_ref(), &command.identifier);
-    let tool = command.common.tool();
+    let context = CommandContext::new(command.command, &command.common)?;
+    let target = context.resolve_target(&command.identifier, "handoff", command.force, "ack")?;
     let payload = EventPayload::Ack(AckPayload {
-        ref_handoff_id: reference.clone(),
+        ref_handoff_id: target.reference.clone(),
         verdict: command.verdict.clone(),
         summary: command.summary,
         reason: command.reason,
         notes: None,
     });
-    let mut builder = EventBuilder::new(
-        new_id("evt"),
-        payload,
-        &tool,
-        command.common.run_id(),
-        target
-            .as_ref()
-            .and_then(|record| event_field(record, "thread_id"))
-            .unwrap_or_else(|| new_id("thr")),
-    )
-    .model(command.common.model())
-    .subject(command.identifier.clone())
-    .time(now_rfc3339())
-    .causation_id(reference.clone());
-    if let Some(correlation_id) = target
-        .as_ref()
-        .and_then(|record| event_field(record, "correlation_id"))
-    {
+    let tool = context.tool();
+    let mut builder = context
+        .event(
+            payload,
+            &tool,
+            target.thread_id.clone(),
+            command.identifier.clone(),
+        )
+        .causation_id(target.reference.clone());
+    if let Some(correlation_id) = target.correlation_id.clone() {
         builder = builder.correlation_id(correlation_id);
     }
-    let entry = append(&store, builder, &command.common, command.command)?;
-    Ok(write_output(
-        command.command,
-        &command.common,
-        &store,
+    let entry = context.append(builder)?;
+    Ok(context.output(
         &entry,
         format!(
             "posted {} ack for {} local_seq={}",
@@ -118,40 +82,24 @@ pub(super) fn execute_ack(command: AckCommand) -> Result<WriteOutput, CliError> 
         ),
         json!({
             "verdict": command.verdict,
-            "ref_handoff_id": reference,
-            "resolved": target.is_some(),
+            "ref_handoff_id": target.reference,
+            "resolved": target.resolved,
         }),
     ))
 }
 
 pub(super) fn execute_claim(command: ClaimCommand) -> Result<WriteOutput, CliError> {
-    let store = command.common.channel_store("claim")?;
-    let tool = command.common.tool();
+    let context = CommandContext::new("claim", &command.common)?;
+    let tool = context.tool();
     let payload = EventPayload::Claim(ClaimPayload {
         owner_tool: tool.clone(),
         resource: command.resource.clone(),
         subject: command.subject.clone(),
         notes: command.notes,
     });
-    let entry = append(
-        &store,
-        EventBuilder::new(
-            new_id("evt"),
-            payload,
-            &tool,
-            command.common.run_id(),
-            new_id("thr"),
-        )
-        .model(command.common.model())
-        .subject(command.subject.clone())
-        .time(now_rfc3339()),
-        &command.common,
-        "claim",
-    )?;
-    Ok(write_output(
-        "claim",
-        &command.common,
-        &store,
+    let entry =
+        context.append(context.event(payload, &tool, new_id("thr"), command.subject.clone()))?;
+    Ok(context.output(
         &entry,
         format!(
             "posted claim {} local_seq={} resource={}",
@@ -168,48 +116,23 @@ pub(super) fn execute_claim(command: ClaimCommand) -> Result<WriteOutput, CliErr
 }
 
 pub(super) fn execute_release(command: ReleaseCommand) -> Result<WriteOutput, CliError> {
-    let store = command.common.channel_store("release")?;
-    let records = store
-        .load_records()
-        .map_err(|err| CliError::runtime("release", format!("failed to load channel: {err}")))?;
-    let target = find_record(&records, &command.identifier, Some("claim"));
-    if target.is_none() && !command.force {
-        return Err(CliError::not_found(
-            "release",
-            format!(
-                "no claim found for {:?}; pass --force to release anyway",
-                command.identifier
-            ),
-        ));
-    }
-    let reference = canonical_reference(target.as_ref(), &command.identifier);
-    let tool = command.common.tool();
-    let entry = append(
-        &store,
-        EventBuilder::new(
-            new_id("evt"),
-            EventPayload::ClaimRelease(ClaimReleasePayload {
-                ref_claim_id: reference.clone(),
-                reason: command.reason,
-            }),
-            &tool,
-            command.common.run_id(),
-            target
-                .as_ref()
-                .and_then(|record| event_field(record, "thread_id"))
-                .unwrap_or_else(|| new_id("thr")),
-        )
-        .model(command.common.model())
-        .subject(command.identifier.clone())
-        .time(now_rfc3339())
-        .causation_id(reference.clone()),
-        &command.common,
-        "release",
+    let context = CommandContext::new("release", &command.common)?;
+    let target = context.resolve_target(&command.identifier, "claim", command.force, "release")?;
+    let tool = context.tool();
+    let entry = context.append(
+        context
+            .event(
+                EventPayload::ClaimRelease(ClaimReleasePayload {
+                    ref_claim_id: target.reference.clone(),
+                    reason: command.reason,
+                }),
+                &tool,
+                target.thread_id,
+                command.identifier.clone(),
+            )
+            .causation_id(target.reference.clone()),
     )?;
-    Ok(write_output(
-        "release",
-        &command.common,
-        &store,
+    Ok(context.output(
         &entry,
         format!(
             "released claim {} local_seq={}",
@@ -217,39 +140,27 @@ pub(super) fn execute_release(command: ReleaseCommand) -> Result<WriteOutput, Cl
             local_seq(&entry).unwrap_or_default()
         ),
         json!({
-            "ref_claim_id": reference,
-            "resolved": target.is_some(),
+            "ref_claim_id": target.reference,
+            "resolved": target.resolved,
         }),
     ))
 }
 
 pub(super) fn execute_blocker(command: BlockerCommand) -> Result<WriteOutput, CliError> {
-    let store = command.common.channel_store("blocker")?;
-    let tool = command.common.tool();
-    let entry = append(
-        &store,
-        EventBuilder::new(
-            new_id("evt"),
-            EventPayload::Blocker(BlockerPayload {
-                subject: command.subject.clone(),
-                reason: command.reason,
-                severity: command.severity.clone(),
-                resource: command.resource.clone(),
-            }),
-            &tool,
-            command.common.run_id(),
-            new_id("thr"),
-        )
-        .model(command.common.model())
-        .subject(command.subject.clone())
-        .time(now_rfc3339()),
-        &command.common,
-        "blocker",
-    )?;
-    Ok(write_output(
-        "blocker",
-        &command.common,
-        &store,
+    let context = CommandContext::new("blocker", &command.common)?;
+    let tool = context.tool();
+    let entry = context.append(context.event(
+        EventPayload::Blocker(BlockerPayload {
+            subject: command.subject.clone(),
+            reason: command.reason,
+            severity: command.severity.clone(),
+            resource: command.resource.clone(),
+        }),
+        &tool,
+        new_id("thr"),
+        command.subject.clone(),
+    ))?;
+    Ok(context.output(
         &entry,
         format!(
             "posted blocker {} local_seq={}",
@@ -266,48 +177,24 @@ pub(super) fn execute_blocker(command: BlockerCommand) -> Result<WriteOutput, Cl
 }
 
 pub(super) fn execute_unblock(command: UnblockCommand) -> Result<WriteOutput, CliError> {
-    let store = command.common.channel_store("unblock")?;
-    let records = store
-        .load_records()
-        .map_err(|err| CliError::runtime("unblock", format!("failed to load channel: {err}")))?;
-    let target = find_record(&records, &command.identifier, Some("blocker"));
-    if target.is_none() && !command.force {
-        return Err(CliError::not_found(
-            "unblock",
-            format!(
-                "no blocker found for {:?}; pass --force to resolve anyway",
-                command.identifier
-            ),
-        ));
-    }
-    let reference = canonical_reference(target.as_ref(), &command.identifier);
-    let tool = command.common.tool();
-    let entry = append(
-        &store,
-        EventBuilder::new(
-            new_id("evt"),
-            EventPayload::BlockerResolved(BlockerResolvedPayload {
-                ref_blocker_id: reference.clone(),
-                resolution: command.resolution.clone(),
-            }),
-            &tool,
-            command.common.run_id(),
-            target
-                .as_ref()
-                .and_then(|record| event_field(record, "thread_id"))
-                .unwrap_or_else(|| new_id("thr")),
-        )
-        .model(command.common.model())
-        .subject(command.identifier.clone())
-        .time(now_rfc3339())
-        .causation_id(reference.clone()),
-        &command.common,
-        "unblock",
+    let context = CommandContext::new("unblock", &command.common)?;
+    let target =
+        context.resolve_target(&command.identifier, "blocker", command.force, "resolve")?;
+    let tool = context.tool();
+    let entry = context.append(
+        context
+            .event(
+                EventPayload::BlockerResolved(BlockerResolvedPayload {
+                    ref_blocker_id: target.reference.clone(),
+                    resolution: command.resolution.clone(),
+                }),
+                &tool,
+                target.thread_id,
+                command.identifier.clone(),
+            )
+            .causation_id(target.reference.clone()),
     )?;
-    Ok(write_output(
-        "unblock",
-        &command.common,
-        &store,
+    Ok(context.output(
         &entry,
         format!(
             "resolved blocker {} local_seq={}",
@@ -315,9 +202,9 @@ pub(super) fn execute_unblock(command: UnblockCommand) -> Result<WriteOutput, Cl
             local_seq(&entry).unwrap_or_default()
         ),
         json!({
-            "ref_blocker_id": reference,
+            "ref_blocker_id": target.reference,
             "resolution": command.resolution,
-            "resolved": target.is_some(),
+            "resolved": target.resolved,
         }),
     ))
 }
@@ -385,57 +272,133 @@ pub(super) fn execute_preflight(command: PreflightCommand) -> Result<WriteOutput
     })
 }
 
-fn append(
-    store: &ChannelStore,
-    event: EventBuilder,
-    options: &CommonOptions,
+struct CommandContext<'a> {
     command: &'static str,
-) -> Result<Value, CliError> {
-    if !options.sign {
-        return store
-            .append_typed(event)
-            .map_err(|err| CliError::runtime(command, format!("failed to append event: {err}")));
-    }
-    let identity_dir = options.identity_dir()?;
-    let identity =
-        load_signing_identity(&identity_dir, options.key_id.as_deref()).map_err(|err| {
-            CliError::runtime(command, format!("failed to load signing identity: {err}"))
-        })?;
-    let mut event = event
-        .build()
-        .map_err(|err| CliError::runtime(command, format!("failed to build event: {err}")))?;
-    sign_event(&mut event, &identity, &now_rfc3339())
-        .map_err(|err| CliError::runtime(command, format!("failed to sign event: {err}")))?;
-    store
-        .append_event(event)
-        .map_err(|err| CliError::runtime(command, format!("failed to append event: {err}")))
+    common: &'a CommonOptions,
+    store: ChannelStore,
 }
 
-fn write_output(
-    command: &'static str,
-    options: &CommonOptions,
-    store: &ChannelStore,
-    entry: &Value,
-    text: String,
-    extra: Value,
-) -> WriteOutput {
-    let mut body = json!({
-        "ok": true,
-        "command": command,
-        "schema": format!("agent-rally.command.{command}.v1"),
-        "channel": store.channel_dir().display().to_string(),
-        "event_id": event_field(entry, "id"),
-        "local_seq": local_seq(entry),
-        "event": entry.get("event").cloned().unwrap_or(Value::Null),
-    });
-    if let (Some(object), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
-        object.extend(extra.clone());
+impl<'a> CommandContext<'a> {
+    fn new(command: &'static str, common: &'a CommonOptions) -> Result<Self, CliError> {
+        Ok(Self {
+            command,
+            common,
+            store: common.channel_store(command)?,
+        })
     }
-    WriteOutput {
-        json: options.json,
-        text,
-        body,
+
+    fn tool(&self) -> String {
+        self.common.tool()
     }
+
+    fn event(
+        &self,
+        payload: EventPayload,
+        tool: &str,
+        thread_id: String,
+        subject: String,
+    ) -> EventBuilder {
+        EventBuilder::new(
+            new_id("evt"),
+            payload,
+            tool,
+            self.common.run_id(),
+            thread_id,
+        )
+        .model(self.common.model())
+        .subject(subject)
+        .time(now_rfc3339())
+    }
+
+    fn append(&self, event: EventBuilder) -> Result<Value, CliError> {
+        if !self.common.sign {
+            return self.store.append_typed(event).map_err(|err| {
+                CliError::runtime(self.command, format!("failed to append event: {err}"))
+            });
+        }
+        let identity_dir = self.common.identity_dir()?;
+        let identity = load_signing_identity(&identity_dir, self.common.key_id.as_deref())
+            .map_err(|err| {
+                CliError::runtime(
+                    self.command,
+                    format!("failed to load signing identity: {err}"),
+                )
+            })?;
+        let mut event = event.build().map_err(|err| {
+            CliError::runtime(self.command, format!("failed to build event: {err}"))
+        })?;
+        sign_event(&mut event, &identity, &now_rfc3339()).map_err(|err| {
+            CliError::runtime(self.command, format!("failed to sign event: {err}"))
+        })?;
+        self.store.append_event(event).map_err(|err| {
+            CliError::runtime(self.command, format!("failed to append event: {err}"))
+        })
+    }
+
+    fn output(&self, entry: &Value, text: String, extra: Value) -> WriteOutput {
+        let mut body = json!({
+            "ok": true,
+            "command": self.command,
+            "schema": format!("agent-rally.command.{}.v1", self.command),
+            "channel": self.store.channel_dir().display().to_string(),
+            "event_id": event_field(entry, "id"),
+            "local_seq": local_seq(entry),
+            "event": entry.get("event").cloned().unwrap_or(Value::Null),
+        });
+        if let (Some(object), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+            object.extend(extra.clone());
+        }
+        WriteOutput {
+            json: self.common.json,
+            text,
+            body,
+        }
+    }
+
+    fn resolve_target(
+        &self,
+        identifier: &str,
+        kind: &'static str,
+        force: bool,
+        force_action: &'static str,
+    ) -> Result<ResolvedTarget, CliError> {
+        let records = self.store.load_records().map_err(|err| {
+            CliError::runtime(self.command, format!("failed to load channel: {err}"))
+        })?;
+        let record = find_record(&records, identifier, Some(kind));
+        if record.is_none() && !force {
+            return Err(CliError::not_found(
+                self.command,
+                format!(
+                    "no {kind} found for {identifier:?}; pass --force to {force_action} anyway"
+                ),
+            ));
+        }
+        let reference = record
+            .as_ref()
+            .and_then(|value| event_field(value, "id"))
+            .unwrap_or_else(|| identifier.to_string());
+        let thread_id = record
+            .as_ref()
+            .and_then(|value| event_field(value, "thread_id"))
+            .unwrap_or_else(|| new_id("thr"));
+        let correlation_id = record
+            .as_ref()
+            .and_then(|value| event_field(value, "correlation_id"));
+        Ok(ResolvedTarget {
+            reference,
+            thread_id,
+            correlation_id,
+            resolved: record.is_some(),
+        })
+    }
+}
+
+struct ResolvedTarget {
+    reference: String,
+    thread_id: String,
+    correlation_id: Option<String>,
+    resolved: bool,
 }
 
 fn find_record(records: &[Value], identifier: &str, kind: Option<&str>) -> Option<Value> {
@@ -454,12 +417,6 @@ fn find_record(records: &[Value], identifier: &str, kind: Option<&str>) -> Optio
                     .is_some_and(|seq| seq.to_string() == identifier)
         })
         .cloned()
-}
-
-fn canonical_reference(record: Option<&Value>, fallback: &str) -> String {
-    record
-        .and_then(|value| event_field(value, "id"))
-        .unwrap_or_else(|| fallback.to_string())
 }
 
 fn event_field(record: &Value, key: &str) -> Option<String> {

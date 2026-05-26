@@ -12,6 +12,7 @@ pub mod diagnose;
 pub mod event;
 pub mod preflight;
 pub mod query;
+pub mod repo;
 pub mod store;
 pub mod sync;
 

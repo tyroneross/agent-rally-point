@@ -45,6 +45,13 @@ impl EventKind {
         }
     }
 
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Other(value) if value.is_empty() => "event",
+            value => value.as_kind_str(),
+        }
+    }
+
     pub fn event_type(&self) -> String {
         match self {
             Self::Handoff => "agent-rally.handoff.created.v1".to_string(),
@@ -232,6 +239,37 @@ impl EventRecord {
             correlation_id: string_field(&event, "correlation_id"),
             event,
         })
+    }
+
+    pub fn subject_label(&self) -> String {
+        match self.payload.as_ref() {
+            Some(EventPayload::Handoff(payload)) => payload.subject.clone(),
+            Some(EventPayload::Claim(payload)) => payload.subject.clone(),
+            Some(EventPayload::Blocker(payload)) => payload.subject.clone(),
+            Some(EventPayload::Ack(payload)) | Some(EventPayload::Feedback(payload)) => payload
+                .summary
+                .clone()
+                .or_else(|| payload.reason.clone())
+                .unwrap_or_else(|| payload.ref_handoff_id.clone()),
+            Some(EventPayload::ClaimRelease(payload)) => payload
+                .reason
+                .clone()
+                .unwrap_or_else(|| format!("release {}", payload.ref_claim_id)),
+            Some(EventPayload::BlockerResolved(payload)) => payload.resolution.clone(),
+            Some(EventPayload::Other { payload, .. }) => payload
+                .get("subject")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("summary").and_then(Value::as_str))
+                .or_else(|| payload.get("notes").and_then(Value::as_str))
+                .unwrap_or("(no subject)")
+                .to_string(),
+            None => self
+                .event
+                .get("subject")
+                .and_then(Value::as_str)
+                .unwrap_or("(no subject)")
+                .to_string(),
+        }
     }
 }
 

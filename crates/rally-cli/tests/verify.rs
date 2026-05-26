@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,8 +47,41 @@ fn temp_channel(name: &str) -> std::path::PathBuf {
     ))
 }
 
+struct RallyWorkspace {
+    cwd: PathBuf,
+    home: PathBuf,
+}
+
+impl RallyWorkspace {
+    fn new(name: &str) -> Self {
+        let cwd = temp_channel(&format!("{name}-cwd"));
+        let home = temp_channel(&format!("{name}-home"));
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        Self { cwd, home }
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        run_rally_in(&self.cwd, &self.home, args)
+    }
+
+    fn cleanup(self) {
+        fs::remove_dir_all(self.cwd).ok();
+        fs::remove_dir_all(self.home).ok();
+    }
+}
+
 fn run_rally(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_rally"))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn run_rally_in(cwd: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(cwd)
+        .env("HOME", home)
         .args(args)
         .output()
         .unwrap()
@@ -97,13 +131,10 @@ fn verify_reports_unsigned_store_entry() {
 
 #[test]
 fn write_commands_append_typed_handoff_and_ack_events() {
-    let channel = temp_channel("rally-cli-typed-handoff");
-    let channel_arg = channel.to_str().unwrap();
-    let handoff = json_stdout(run_rally(&[
+    let workspace = RallyWorkspace::new("rally-cli-typed-handoff");
+    let handoff = json_stdout(workspace.run(&[
         "handoff",
         "--json",
-        "--channel-dir",
-        channel_arg,
         "--to",
         "codex",
         "--from-tool",
@@ -130,18 +161,16 @@ fn write_commands_append_typed_handoff_and_ack_events() {
         "docs/SCHEMA.md"
     );
 
-    let ack = json_stdout(run_rally(&[
+    let ack = json_stdout(workspace.run(&[
         "ack",
         "--json",
-        "--channel-dir",
-        channel_arg,
         "--tool",
         "codex",
         "--summary",
         "done",
         handoff_id,
     ]));
-    fs::remove_dir_all(channel).unwrap();
+    workspace.cleanup();
 
     assert_eq!(ack["ok"], true);
     assert_eq!(ack["command"], "ack");
@@ -159,13 +188,10 @@ fn write_commands_append_typed_handoff_and_ack_events() {
 
 #[test]
 fn write_commands_cover_claim_and_blocker_lifecycles() {
-    let channel = temp_channel("rally-cli-typed-lifecycles");
-    let channel_arg = channel.to_str().unwrap();
-    let claim = json_stdout(run_rally(&[
+    let workspace = RallyWorkspace::new("rally-cli-typed-lifecycles");
+    let claim = json_stdout(workspace.run(&[
         "claim",
         "--json",
-        "--channel-dir",
-        channel_arg,
         "--tool",
         "codex",
         "--path",
@@ -180,26 +206,16 @@ fn write_commands_cover_claim_and_blocker_lifecycles() {
         "file:crates/rally-cli/src/main.rs"
     );
 
-    let release = json_stdout(run_rally(&[
-        "release",
-        "--json",
-        "--channel-dir",
-        channel_arg,
-        "--tool",
-        "codex",
-        "--reason",
-        "done",
-        claim_id,
+    let release = json_stdout(workspace.run(&[
+        "release", "--json", "--tool", "codex", "--reason", "done", claim_id,
     ]));
     assert_eq!(release["event"]["type"], "agent-rally.claim.released.v1");
     assert_eq!(release["event"]["causation_id"], claim_id);
     assert_eq!(release["event"]["thread_id"], claim["event"]["thread_id"]);
 
-    let blocker = json_stdout(run_rally(&[
+    let blocker = json_stdout(workspace.run(&[
         "blocker",
         "--json",
-        "--channel-dir",
-        channel_arg,
         "--tool",
         "codex",
         "--subject",
@@ -213,18 +229,16 @@ fn write_commands_cover_claim_and_blocker_lifecycles() {
     assert_eq!(blocker["event"]["type"], "agent-rally.blocker.raised.v1");
     assert_eq!(blocker["event"]["payload"]["reason"], "which branch?");
 
-    let unblock = json_stdout(run_rally(&[
+    let unblock = json_stdout(workspace.run(&[
         "unblock",
         "--json",
-        "--channel-dir",
-        channel_arg,
         "--tool",
         "codex",
         blocker_id,
         "--resolution",
         "branch supplied",
     ]));
-    fs::remove_dir_all(channel).unwrap();
+    workspace.cleanup();
 
     assert_eq!(unblock["event"]["type"], "agent-rally.blocker.resolved.v1");
     assert_eq!(unblock["event"]["causation_id"], blocker_id);
@@ -245,13 +259,10 @@ fn write_command_usage_errors_honor_json_mode() {
 
 #[test]
 fn query_commands_project_typed_state() {
-    let channel = temp_channel("rally-cli-query-state");
-    let channel_arg = channel.to_str().unwrap();
-    let handoff = json_stdout(run_rally(&[
+    let workspace = RallyWorkspace::new("rally-cli-query-state");
+    let handoff = json_stdout(workspace.run(&[
         "handoff",
         "--json",
-        "--channel-dir",
-        channel_arg,
         "--to",
         "codex",
         "--from-tool",
@@ -260,11 +271,9 @@ fn query_commands_project_typed_state() {
         "review schema",
     ]));
     let handoff_id = handoff["event_id"].as_str().unwrap();
-    json_stdout(run_rally(&[
+    json_stdout(workspace.run(&[
         "claim",
         "--json",
-        "--channel-dir",
-        channel_arg,
         "--tool",
         "codex",
         "--resource",
@@ -272,11 +281,9 @@ fn query_commands_project_typed_state() {
         "--subject",
         "docs edit",
     ]));
-    json_stdout(run_rally(&[
+    json_stdout(workspace.run(&[
         "claim",
         "--json",
-        "--channel-dir",
-        channel_arg,
         "--tool",
         "pi",
         "--path",
@@ -284,11 +291,9 @@ fn query_commands_project_typed_state() {
         "--subject",
         "schema edit",
     ]));
-    let blocker = json_stdout(run_rally(&[
+    let blocker = json_stdout(workspace.run(&[
         "blocker",
         "--json",
-        "--channel-dir",
-        channel_arg,
         "--tool",
         "codex",
         "--subject",
@@ -296,43 +301,17 @@ fn query_commands_project_typed_state() {
     ]));
     let blocker_id = blocker["event_id"].as_str().unwrap();
 
-    let inbox = json_stdout(run_rally(&[
-        "inbox",
-        "--json",
-        "--channel-dir",
-        channel_arg,
-        "--tool",
-        "codex",
-    ]));
+    let inbox = json_stdout(workspace.run(&["inbox", "--json", "--tool", "codex"]));
     assert_eq!(inbox["data"]["pending"][0]["event_id"], handoff_id);
 
-    let claims = json_stdout(run_rally(&[
-        "claims",
-        "--json",
-        "--channel-dir",
-        channel_arg,
-        "--tool",
-        "codex",
-    ]));
+    let claims = json_stdout(workspace.run(&["claims", "--json", "--tool", "codex"]));
     assert_eq!(claims["data"]["claims"].as_array().unwrap().len(), 1);
     assert_eq!(claims["data"]["claims"][0]["resource"], "file:docs");
 
-    let blockers = json_stdout(run_rally(&[
-        "blockers",
-        "--json",
-        "--channel-dir",
-        channel_arg,
-        "--tool",
-        "codex",
-    ]));
+    let blockers = json_stdout(workspace.run(&["blockers", "--json", "--tool", "codex"]));
     assert_eq!(blockers["data"]["blockers"][0]["event_id"], blocker_id);
 
-    let conflicts = json_stdout(run_rally(&[
-        "conflicts",
-        "--json",
-        "--channel-dir",
-        channel_arg,
-    ]));
+    let conflicts = json_stdout(workspace.run(&["conflicts", "--json"]));
     assert_eq!(conflicts["data"]["conflicts"][0]["resource"], "file:docs");
     assert_eq!(
         conflicts["data"]["conflicts"][0]["owners"]
@@ -342,14 +321,7 @@ fn query_commands_project_typed_state() {
         2
     );
 
-    let diagnosis = json_stdout(run_rally(&[
-        "diagnose",
-        "--json",
-        "--channel-dir",
-        channel_arg,
-        "--tool",
-        "codex",
-    ]));
+    let diagnosis = json_stdout(workspace.run(&["diagnose", "--json", "--tool", "codex"]));
     assert_eq!(diagnosis["data"]["diagnosis"]["status"], "stuck");
     assert!(
         diagnosis["data"]["diagnosis"]["findings"]
@@ -359,43 +331,18 @@ fn query_commands_project_typed_state() {
             .any(|finding| finding["code"] == "active-blocker")
     );
 
-    let score = json_stdout(run_rally(&[
-        "score",
-        "--json",
-        "--channel-dir",
-        channel_arg,
-        "--tool",
-        "codex",
-    ]));
+    let score = json_stdout(workspace.run(&["score", "--json", "--tool", "codex"]));
     assert!(score["data"]["score"].as_i64().unwrap() < 100);
 
-    let thread = json_stdout(run_rally(&[
-        "thread",
-        "--json",
-        "--channel-dir",
-        channel_arg,
-        handoff_id,
-    ]));
+    let thread = json_stdout(workspace.run(&["thread", "--json", handoff_id]));
     assert_eq!(thread["data"]["identifier"], handoff_id);
     assert_eq!(thread["data"]["events"][0]["event"]["id"], handoff_id);
 
-    let replay = json_stdout(run_rally(&[
-        "replay",
-        "--json",
-        "--channel-dir",
-        channel_arg,
-        "--limit",
-        "2",
-    ]));
+    let replay = json_stdout(workspace.run(&["replay", "--json", "--limit", "2"]));
     assert_eq!(replay["data"]["events"].as_array().unwrap().len(), 2);
 
-    let report = json_stdout(run_rally(&[
-        "report",
-        "--json",
-        "--channel-dir",
-        channel_arg,
-    ]));
-    fs::remove_dir_all(channel).unwrap();
+    let report = json_stdout(workspace.run(&["report", "--json"]));
+    workspace.cleanup();
 
     assert_eq!(report["data"]["records"], 4);
     assert_eq!(report["data"]["counts"]["claim"], 2);
@@ -404,13 +351,10 @@ fn query_commands_project_typed_state() {
 
 #[test]
 fn preflight_routes_agents_and_writes_presence() {
-    let channel = temp_channel("rally-cli-preflight");
-    let channel_arg = channel.to_str().unwrap();
-    let handoff = json_stdout(run_rally(&[
+    let workspace = RallyWorkspace::new("rally-cli-preflight");
+    let handoff = json_stdout(workspace.run(&[
         "handoff",
         "--json",
-        "--channel-dir",
-        channel_arg,
         "--to",
         "codex",
         "--from-tool",
@@ -420,11 +364,9 @@ fn preflight_routes_agents_and_writes_presence() {
     ]));
     let handoff_id = handoff["event_id"].as_str().unwrap();
 
-    let codex = json_stdout(run_rally(&[
+    let codex = json_stdout(workspace.run(&[
         "preflight",
         "--json",
-        "--channel-dir",
-        channel_arg,
         "--tool",
         "codex",
         "--session-id",
@@ -444,17 +386,15 @@ fn preflight_routes_agents_and_writes_presence() {
             .contains("codex-session")
     );
 
-    let pi = json_stdout(run_rally(&[
+    let pi = json_stdout(workspace.run(&[
         "preflight",
         "--json",
-        "--channel-dir",
-        channel_arg,
         "--tool",
         "pi",
         "--session-id",
         "pi-session",
     ]));
-    fs::remove_dir_all(channel).unwrap();
+    workspace.cleanup();
 
     assert_eq!(pi["pending_acks_for_me"].as_array().unwrap().len(), 0);
     assert_eq!(pi["routing"]["action"], "join_active");
@@ -464,12 +404,11 @@ fn preflight_routes_agents_and_writes_presence() {
 
 #[test]
 fn identity_init_and_signed_write_verify_as_trusted() {
-    let channel = temp_channel("rally-cli-signed-channel");
+    let workspace = RallyWorkspace::new("rally-cli-signed-channel");
     let identity_dir = temp_channel("rally-cli-identity");
-    let channel_arg = channel.to_str().unwrap();
     let identity_arg = identity_dir.to_str().unwrap();
 
-    let identity = json_stdout(run_rally(&[
+    let identity = json_stdout(workspace.run(&[
         "identity",
         "init",
         "--json",
@@ -481,11 +420,9 @@ fn identity_init_and_signed_write_verify_as_trusted() {
     assert_eq!(identity["ok"], true);
     assert!(identity["key_id"].as_str().unwrap().starts_with("key_"));
 
-    let handoff = json_stdout(run_rally(&[
+    let handoff = json_stdout(workspace.run(&[
         "handoff",
         "--json",
-        "--channel-dir",
-        channel_arg,
         "--identity-dir",
         identity_arg,
         "--sign",
@@ -502,14 +439,16 @@ fn identity_init_and_signed_write_verify_as_trusted() {
         "rally-json-v1"
     );
 
-    let verify = json_stdout(run_rally(&[
+    let trust_path = identity_dir.join("trust.toml");
+    let signed_changes = Path::new(handoff["channel"].as_str().unwrap()).join("changes.jsonl");
+    let verify = json_stdout(workspace.run(&[
         "verify",
         "--json",
         "--trust-policy",
-        identity_dir.join("trust.toml").to_str().unwrap(),
-        channel.join("changes.jsonl").to_str().unwrap(),
+        trust_path.to_str().unwrap(),
+        signed_changes.to_str().unwrap(),
     ]));
-    fs::remove_dir_all(channel).unwrap();
+    workspace.cleanup();
     fs::remove_dir_all(identity_dir).unwrap();
 
     assert_eq!(verify["data"]["counts"]["trusted"], 1);
@@ -519,14 +458,12 @@ fn identity_init_and_signed_write_verify_as_trusted() {
 
 #[test]
 fn sync_export_import_round_trips_signed_events() {
-    let source = temp_channel("rally-cli-sync-source");
-    let dest = temp_channel("rally-cli-sync-dest");
+    let source = RallyWorkspace::new("rally-cli-sync-source");
+    let dest = RallyWorkspace::new("rally-cli-sync-dest");
     let identity_dir = temp_channel("rally-cli-sync-identity");
-    let source_arg = source.to_str().unwrap();
-    let dest_arg = dest.to_str().unwrap();
     let identity_arg = identity_dir.to_str().unwrap();
 
-    let identity = json_stdout(run_rally(&[
+    let identity = json_stdout(source.run(&[
         "identity",
         "init",
         "--json",
@@ -536,11 +473,9 @@ fn sync_export_import_round_trips_signed_events() {
         "codex",
     ]));
     let key_id = identity["key_id"].as_str().unwrap();
-    let handoff = json_stdout(run_rally(&[
+    let handoff = json_stdout(source.run(&[
         "handoff",
         "--json",
-        "--channel-dir",
-        source_arg,
         "--identity-dir",
         identity_arg,
         "--key-id",
@@ -555,69 +490,43 @@ fn sync_export_import_round_trips_signed_events() {
     ]));
     let handoff_id = handoff["event_id"].as_str().unwrap();
 
-    let packet = json_stdout(run_rally(&[
-        "sync",
-        "export",
-        "--json",
-        "--channel-dir",
-        source_arg,
-    ]));
+    let packet = json_stdout(source.run(&["sync", "export", "--json"]));
     assert_eq!(packet["schema"], "agent-rally.sync.packet.v1");
     assert_eq!(packet["count"], 1);
     assert_eq!(packet["events"][0]["id"], handoff_id);
     assert!(packet["events"][0].get("local_seq").is_none());
     let packet_path = write_json("rally-cli-sync-packet", &packet);
 
-    let imported = json_stdout(run_rally(&[
+    let trust_path = identity_dir.join("trust.toml");
+    let imported = json_stdout(dest.run(&[
         "sync",
         "import",
         "--json",
-        "--channel-dir",
-        dest_arg,
         "--trust-policy",
-        identity_dir.join("trust.toml").to_str().unwrap(),
+        trust_path.to_str().unwrap(),
         packet_path.to_str().unwrap(),
     ]));
     assert_eq!(imported["data"]["imported"], 1);
     assert_eq!(imported["data"]["duplicates"], 0);
     assert_eq!(imported["data"]["trust_counts"]["trusted"], 1);
 
-    let inbox = json_stdout(run_rally(&[
-        "inbox",
-        "--json",
-        "--channel-dir",
-        dest_arg,
-        "--tool",
-        "pi",
-    ]));
+    let inbox = json_stdout(dest.run(&["inbox", "--json", "--tool", "pi"]));
     assert_eq!(inbox["data"]["pending"][0]["event_id"], handoff_id);
 
-    let duplicate = json_stdout(run_rally(&[
-        "sync",
-        "import",
-        "--json",
-        "--channel-dir",
-        dest_arg,
-        packet_path.to_str().unwrap(),
-    ]));
+    let duplicate =
+        json_stdout(dest.run(&["sync", "import", "--json", packet_path.to_str().unwrap()]));
     assert_eq!(duplicate["data"]["imported"], 0);
     assert_eq!(duplicate["data"]["duplicates"], 1);
 
     let mut conflict_packet = packet.clone();
     conflict_packet["events"][0]["payload"]["subject"] = serde_json::json!("different");
     let conflict_path = write_json("rally-cli-sync-conflict", &conflict_packet);
-    let conflict = json_stdout(run_rally(&[
-        "sync",
-        "import",
-        "--json",
-        "--channel-dir",
-        dest_arg,
-        conflict_path.to_str().unwrap(),
-    ]));
+    let conflict =
+        json_stdout(dest.run(&["sync", "import", "--json", conflict_path.to_str().unwrap()]));
     fs::remove_file(packet_path).unwrap();
     fs::remove_file(conflict_path).unwrap();
-    fs::remove_dir_all(source).unwrap();
-    fs::remove_dir_all(dest).unwrap();
+    source.cleanup();
+    dest.cleanup();
     fs::remove_dir_all(identity_dir).unwrap();
 
     assert_eq!(conflict["data"]["imported"], 0);
