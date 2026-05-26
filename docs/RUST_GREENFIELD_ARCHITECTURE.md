@@ -35,12 +35,11 @@ If Rally started today, it would be:
 - Local sequence/revision as replica metadata, never portable identity.
 - JSON output as the primary product surface; human text as a rendering layer.
 - Adapters for Herdr, ACP, A2A, CI, and editor surfaces outside the core.
-- Python retained only as a temporary compatibility and migration surface.
 
 Estimated target: roughly 5k-7k Rust LOC for the core product surface before
 adapters, plus tests and docs. The current repository is roughly 14k LOC across
-Python, Rust, and docs. The target is smaller because it removes duplicate
-interpretations of the trace rather than translating them file by file.
+Python, Rust, and docs. The target is smaller because the rewrite does not carry
+forward duplicate interpretations of the trace.
 
 ## Non-Goals
 
@@ -66,7 +65,7 @@ agent-usable state from it.
 
 ## Load-Bearing Invariant
 
-Today:
+Rejected:
 
 > Python owns the product surface; Rust is an emerging protocol/trust helper.
 
@@ -80,8 +79,8 @@ Proposed:
 > over that kernel.
 
 This collapses the architecture. Instead of porting Python modules to Rust, we
-build the kernel Rally should always have had and retire compatibility layers as
-the kernel reaches parity.
+build the kernel Rally should always have had and delete the older surfaces that
+do not fit it.
 
 ## Core Model
 
@@ -174,8 +173,10 @@ The target event line separates portable truth from local replica metadata:
 }
 ```
 
-Compatibility readers continue to accept today's flat Python records. New Rust
-writes should prefer the wrapper shape once the migration path is explicit.
+Rust writes this wrapper shape. Protocol helpers may also operate on bare
+portable event objects for signing, verification, and import/export packet
+construction, but `changes.jsonl` is not required to preserve any older flat
+record shape.
 
 ## Trust Model
 
@@ -314,31 +315,26 @@ surrounding protocols:
 
 ## What Gets Deleted
 
-These are target deletions once Rust reaches parity:
+These are target deletions during the Rust cutover:
 
 | Current surface | Why it goes | Replacement |
 |---|---|---|
-| Python dict-based event construction | Duplicates typed Rust event model. | `rally-core::EventBuilder` or typed payload constructors. |
-| Python trace query helpers | Duplicate Rust query engine. | `rally-core::Query`. |
+| Python dict-based event construction | Not part of the target architecture. | `rally-core::EventBuilder` or typed payload constructors. |
+| Python trace query helpers | Duplicate the Rust query engine. | `rally-core::Query`. |
 | Python scorer/diagnose logic | Duplicate deterministic findings. | `rally-core::diagnose`. |
 | Python preflight logic | Duplicates store/query/presence interpretation. | `rally preflight`. |
 | Python CLI command implementations | Text/JSON rendering should use Rust structs. | `rally-cli`. |
 | Rust `rally-rs` prototype name | Transitional name leaks implementation status. | Binary named `rally`. |
 | Docs that say signing/sync are future-only | Trust becomes active architecture. | Signed/trusted event docs tied to code. |
 
-## Compatibility Paths
+## No Migration Contract
 
-Compatibility should be explicit and temporary.
+The greenfield target has no old-log carry-forward requirement and no Python
+behavior gate. Existing code can inform vocabulary and product lessons, but it
+is not the oracle for command behavior or storage shape.
 
-| Path | Keep until | Deletion condition |
-|---|---|---|
-| Flat Python records in `changes.jsonl` | Rust readers and migration tests prove parity. | All Rust commands accept old records and new writes use wrapper shape. |
-| Python package entry points | Rust binary is packaged and CI exercises it. | `rally`, `agent-rally-preflight`, and `agent-rally-discover` have Rust equivalents. |
-| Legacy `~/.build-loop/apps` migration mode | Existing migration cutover remains supported. | Manifest default is canonical and downstream consumers no longer require dual-write. |
-| Human text exact wording | Never as a contract. | Agent contracts use JSON schemas only. |
-
-No compatibility path should survive without a named caller or a dated migration
-step.
+The durable contract is at the agent boundary: commands expose stable JSON
+schemas and clear exit codes. Human text exact wording is never a contract.
 
 ## What Survives
 
@@ -347,30 +343,27 @@ step.
 | `changes.jsonl` | Correct public protocol primitive for inspectable event sourcing. |
 | Coordination trace docs | Strong product semantics and event vocabulary. |
 | Rust canonicalization and trust spike | Seed for the actual kernel. |
-| Python tests | Useful parity specs while Rust replaces behavior. |
-| Migration/discovery experience | Encodes real downstream compatibility lessons. |
 | Herdr bridge concept | Valuable adapter, but not core architecture. |
 
-## Migration Strategy
+## Build Strategy
 
 1. **Land the Rust event/trust seed.** PRs for protocol, merge, verification,
    trust policy, and JSON verifier establish the kernel direction.
 2. **Create `rally-core`.** Move protocol/store/query primitives into the crate
    that will own product behavior. Keep `rally-cli` thin.
-3. **Implement read-only parity first.** `report`, `replay`, `thread`, `inbox`,
-   `claims`, `blockers`, `conflicts`, `diagnose`, and `verify` should run over
-   the same query engine.
-4. **Implement write parity second.** `handoff`, `ack`, `claim`, `blocker`, and
-   low-level `post` should write the target event shape while tests prove old
-   readers tolerate it or migration is explicit.
+3. **Implement read projections.** `report`, `replay`, `thread`, `inbox`,
+   `claims`, `blockers`, `conflicts`, `diagnose`, and `verify` run over the
+   same query engine and target store shape.
+4. **Implement writes.** `handoff`, `ack`, `claim`, `blocker`, and low-level
+   `post` write the target store-entry event shape.
 5. **Add identity and sign-on-write.** Local key generation, `trust add`, and
    signing policies make remote events authoritative.
 6. **Add sync import/export.** Keep transport out of scope; focus on event
    packets, merge, origin, conflict, and trust reporting.
-7. **Flip packaging.** The installed `rally` command becomes Rust. Python entry
-   points delegate or emit a deprecation warning during one release window.
-8. **Delete Python command implementations.** Keep only any packaging shim that
-   still has a named downstream caller.
+7. **Make Rust the installed surface.** The installed `rally` command is the
+   Rust binary.
+8. **Delete older command implementations.** Keep only adapters that match the
+   new architecture.
 
 ## Verification Strategy
 
@@ -379,21 +372,15 @@ The greenfield rewrite must be proven by behavior, not by preserving structure.
 - Rust unit tests for event canonicalization, read/write, query, diagnosis,
   signing, trust, and merge conflict behavior.
 - Golden JSON command tests for every agent-facing command.
-- Compatibility fixtures containing old flat Python records and new wrapper
-  records in the same log.
 - Property-style tests for append/read round trips and duplicate event merges.
-- Python parity tests only while Python remains a compatibility layer.
 - A small set of end-to-end shell tests using the installed `rally` binary.
 
 ## Risks
 
-- **Packaging risk.** Python packaging currently owns the installed CLI. Rust
-  binary distribution must be solved before flipping `rally`.
-- **Downstream caller risk.** Build-loop or local skills may still invoke Python
-  entry points. Caller search must happen before deletion.
-- **Schema churn risk.** Moving to wrapper-shaped store entries changes what new
-  lines look like. Readers must accept both shapes before Rust writes wrappers
-  by default.
+- **Cutover risk.** Some local scripts may still invoke older entry points.
+  Caller search must happen before deletion.
+- **Schema churn risk.** Store-entry lines are the target shape. Tests must make
+  the new JSON contract explicit so agents know what to emit and consume.
 - **Ambition creep.** Sync can pull Rally toward being a service. The boundary
   stays at import/export packets and local merge semantics.
 - **Trust UX risk.** If trust is too strict too early, local coordination gets
@@ -409,6 +396,6 @@ Rally's Rust rewrite is successful when:
   Rust query engine.
 - A signed event exported from one channel can be imported into another,
   deduplicated, classified, and shown in inbox/thread/replay output.
-- Python is no longer required for normal operation.
+- No normal command path calls Python.
 - The codebase is smaller because old interpretations were deleted, not because
   behavior was hidden behind wrappers.
