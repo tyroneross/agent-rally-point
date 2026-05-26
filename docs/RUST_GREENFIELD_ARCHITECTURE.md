@@ -1,0 +1,385 @@
+<!--
+SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Rust Greenfield Architecture
+
+This is the target architecture for Rally if Rust is the product, not a port of
+the current Python CLI. The goal is to be ambitious about the coordination
+substrate while staying in Rally's lane: local-first, file-backed, agent-first
+coordination. Rally is not an agent runtime, scheduler, broker, chat service, or
+workflow engine.
+
+## Problem
+
+Independent coding agents need one durable coordination substrate that works
+locally, can sync safely across machines, and gives agents stable JSON state
+without requiring a daemon or central service.
+
+## Greenfield Sketch
+
+If Rally started today, it would be:
+
+- A single Rust binary named `rally`.
+- A small Rust library stack with one event model, one store, one query engine,
+  one diagnosis engine, one trust layer, and one sync/import boundary.
+- `changes.jsonl` as the public, durable, append-only protocol.
+- Optional local projections for speed, treated as disposable caches.
+- Signed portable events as the unit of remote trust.
+- Local sequence/revision as replica metadata, never portable identity.
+- JSON output as the primary product surface; human text as a rendering layer.
+- Adapters for Herdr, ACP, A2A, CI, and editor surfaces outside the core.
+- Python retained only as a temporary compatibility and migration surface.
+
+Estimated target: roughly 5k-7k Rust LOC for the core product surface before
+adapters, plus tests and docs. The current repository is roughly 14k LOC across
+Python, Rust, and docs. The target is smaller because it removes duplicate
+interpretations of the trace rather than translating them file by file.
+
+## Non-Goals
+
+Rally should not become:
+
+- A long-running orchestrator that owns agent lifecycles.
+- A remote procedure call protocol between agents.
+- A general workflow engine with retries, scheduling, and task queues.
+- A database server.
+- A replacement for Git, A2A, ACP, MCP, Herdr, LangGraph, CrewAI, or Temporal.
+- A product that requires network access to coordinate agents on one machine.
+
+The lane is narrower and stronger: Rally records coordination truth and derives
+agent-usable state from it.
+
+## Load-Bearing Invariant
+
+Today:
+
+> Python owns the product surface; Rust is an emerging protocol/trust helper.
+
+That forces each new remote-ready capability to cross language and ownership
+boundaries. Signing, trust, diagnosis, preflight, and eventual sync risk being
+implemented as related but separate interpretations of the same JSONL trace.
+
+Proposed:
+
+> Rust owns the coordination kernel; every product surface is a view or adapter
+> over that kernel.
+
+This collapses the architecture. Instead of porting Python modules to Rust, we
+build the kernel Rally should always have had and retire compatibility layers as
+the kernel reaches parity.
+
+## Core Model
+
+Rally is an event-sourced coordination kernel.
+
+```text
+agent action
+  -> Event
+  -> Store append
+  -> Query projection
+  -> Diagnosis / inbox / replay / sync / trust output
+```
+
+The core types should stay few and boring:
+
+| Type | Role |
+|---|---|
+| `Event` | Portable, signable coordination fact. |
+| `StoreEntry` | Local wrapper around an event: local sequence, origin, received time. |
+| `Store` | Append/read/stream/merge over JSONL. |
+| `Query` | Pure derived state: inbox, thread, claims, blockers, timeline. |
+| `Diagnosis` | Deterministic findings over derived state. |
+| `Identity` | Local key material and signer identity. |
+| `TrustPolicy` | Local rules mapping keys to tools, event kinds, and capabilities. |
+| `SyncEnvelope` | Import/export packet for remote replicas. |
+
+Everything else is either an adapter or a rendering concern.
+
+## Storage Primitive
+
+`changes.jsonl` remains the canonical public primitive.
+
+It is the right durable protocol because it is append-only, inspectable, easy to
+copy, easy for agents to reason about, friendly to Git and shell tools, and
+usable without a daemon. Greenfield Rust should not replace this with SQLite as
+truth.
+
+The stronger storage split is:
+
+```text
+changes.jsonl       canonical source of truth
+rally.index.sqlite  optional local projection cache
+snapshots/          optional rebuildable checkpoints
+```
+
+Indexes and snapshots must be rebuildable from `changes.jsonl`. They are never
+authoritative.
+
+## Event Shape
+
+The target event line separates portable truth from local replica metadata:
+
+```json
+{
+  "local_seq": 12,
+  "received_at": "2026-05-26T18:06:20.000Z",
+  "origin": "local",
+  "event": {
+    "specversion": "1.0",
+    "id": "evt_345ea9b74be3461b9473e0cf80a79d40",
+    "source": "urn:agent-rally-point:tool:codex",
+    "subject": "agent-rally-point",
+    "time": "2026-05-26T18:06:19.660Z",
+    "kind": "handoff",
+    "type": "agent-rally.handoff.created.v1",
+    "tool": "codex",
+    "model": "gpt-5",
+    "run_id": "codex-123",
+    "app_slug": "agent-rally-point",
+    "thread_id": "thr_6d9d66a7e94844faacaa41f2fc1bafa5",
+    "causation_id": null,
+    "correlation_id": "thr_6d9d66a7e94844faacaa41f2fc1bafa5",
+    "datacontenttype": "application/json",
+    "dataschema": "urn:agent-rally-point:schema:handoff.created.v1",
+    "payload": {
+      "from_tool": "codex",
+      "to_tool": "pi",
+      "subject": "review trust policy verifier",
+      "requires_ack": true
+    },
+    "signature": {
+      "version": "rally-signature-v1",
+      "algorithm": "ed25519",
+      "key_id": "key_codex_local",
+      "signed_at": "2026-05-26T18:06:19.700Z",
+      "canonicalization": "rally-json-v1",
+      "signature": "base64..."
+    }
+  }
+}
+```
+
+Compatibility readers continue to accept today's flat Python records. New Rust
+writes should prefer the wrapper shape once the migration path is explicit.
+
+## Trust Model
+
+Trust is not a later feature. It is part of whether an event may influence
+automation.
+
+| State | Automation meaning |
+|---|---|
+| `trusted` | Eligible for normal agent automation. |
+| `valid-untrusted` | Authenticated but not authorized for this tool/kind. |
+| `unsigned` | Visible legacy/local information; not remote-authoritative. |
+| `unknown-key` | Visible but requires operator or policy update. |
+| `invalid` | Diagnostic finding; never automation-authoritative. |
+| `unsupported` | Visible but not trusted by this verifier. |
+
+Rally does not delete or hide untrusted events. It classifies them and lets
+commands decide what authority is required.
+
+Examples:
+
+- `rally replay` can show all events with trust badges.
+- `rally inbox` can include untrusted handoffs but mark them.
+- `rally herdr inject` should require trusted input or an explicit override.
+- `rally sync import` should preserve every event but report trust counts.
+
+## Command Contract
+
+JSON is primary. Text is a renderer over the same structs.
+
+Every command should support `--json` with a stable envelope:
+
+```json
+{
+  "ok": true,
+  "command": "diagnose",
+  "schema": "agent-rally.command.diagnose.v1",
+  "channel": "/Users/me/.agent-rally-point/apps/repo-12345678",
+  "data": {}
+}
+```
+
+Errors use the same shape on stderr:
+
+```json
+{
+  "ok": false,
+  "command": "diagnose",
+  "error": "invalid --since value",
+  "exit_code": 2
+}
+```
+
+The first-class commands should be:
+
+| Command | Purpose |
+|---|---|
+| `rally preflight` | Session-start routing, peers, pending ACKs, context locations. |
+| `rally post` | Low-level event append for automation. |
+| `rally handoff` / `ack` / `reject` / `needs-info` | Handoff lifecycle. |
+| `rally claim` / `release` / `claims` | Ownership state. |
+| `rally blocker` / `unblock` / `blockers` | Blocker state. |
+| `rally inbox` | Agent-specific pending work. |
+| `rally thread` | Related event expansion. |
+| `rally replay` / `report` | Timeline and summaries. |
+| `rally diagnose` | Deterministic coordination findings. |
+| `rally verify` | Signature/trust verification. |
+| `rally identity` / `trust` | Local keys and trust policy. |
+| `rally sync export` / `sync import` | Remote-safe event movement. |
+
+Adapter commands, such as Herdr injection, should live behind feature gates or
+adapter crates once the core is stable.
+
+## Crate Layout
+
+Target workspace:
+
+```text
+crates/
+  rally-core/
+    event.rs       typed event model and payload enums
+    store.rs       JSONL append/read/stream/merge
+    query.rs       inbox, threads, claims, blockers, report/replay
+    diagnose.rs    deterministic findings and score
+    preflight.rs   session-start projection over store + presence
+    presence.rs    ephemeral TTL state
+    repo.rs        repo identity and channel resolution
+  rally-trust/
+    identity.rs    key generation and local key storage
+    policy.rs      trust.toml loading and policy evaluation
+    verify.rs      canonicalization and signature verification
+    sign.rs        sign-on-write support
+  rally-sync/
+    export.rs      signed event packets
+    import.rs      merge, origin, duplicate/conflict reporting
+  rally-cli/
+    main.rs        argument parsing and rendering only
+```
+
+`rally-cli` should stay thin. If command behavior is hard to test without
+shelling out to the binary, it belongs in `rally-core`.
+
+## Remote Agent Readiness
+
+Remote support means import/export of coordination facts, not a Rally-hosted
+network.
+
+Minimum viable remote flow:
+
+1. Agent A exports a set of signed events.
+2. Agent B imports them into a local channel.
+3. The store deduplicates by event id.
+4. Conflicting same-id/different-bytes records are preserved as conflicts.
+5. Trust is evaluated against local policy.
+6. Derived state includes origin and trust classification.
+7. Automation only acts on events whose trust state meets the command's policy.
+
+Network transport is out of scope. Files, Git, rsync, a shared folder, A2A, or a
+future service can move the bytes. Rally defines what the bytes mean.
+
+## What Gets Deleted
+
+These are target deletions once Rust reaches parity:
+
+| Current surface | Why it goes | Replacement |
+|---|---|---|
+| Python dict-based event construction | Duplicates typed Rust event model. | `rally-core::EventBuilder` or typed payload constructors. |
+| Python trace query helpers | Duplicate Rust query engine. | `rally-core::Query`. |
+| Python scorer/diagnose logic | Duplicate deterministic findings. | `rally-core::diagnose`. |
+| Python preflight logic | Duplicates store/query/presence interpretation. | `rally preflight`. |
+| Python CLI command implementations | Text/JSON rendering should use Rust structs. | `rally-cli`. |
+| Rust `rally-rs` prototype name | Transitional name leaks implementation status. | Binary named `rally`. |
+| Docs that say signing/sync are future-only | Trust becomes active architecture. | Signed/trusted event docs tied to code. |
+
+## Compatibility Paths
+
+Compatibility should be explicit and temporary.
+
+| Path | Keep until | Deletion condition |
+|---|---|---|
+| Flat Python records in `changes.jsonl` | Rust readers and migration tests prove parity. | All Rust commands accept old records and new writes use wrapper shape. |
+| Python package entry points | Rust binary is packaged and CI exercises it. | `rally`, `agent-rally-preflight`, and `agent-rally-discover` have Rust equivalents. |
+| Legacy `~/.build-loop/apps` migration mode | Existing migration cutover remains supported. | Manifest default is canonical and downstream consumers no longer require dual-write. |
+| Human text exact wording | Never as a contract. | Agent contracts use JSON schemas only. |
+
+No compatibility path should survive without a named caller or a dated migration
+step.
+
+## What Survives
+
+| Existing asset | Why it earns its weight |
+|---|---|
+| `changes.jsonl` | Correct public protocol primitive for inspectable event sourcing. |
+| Coordination trace docs | Strong product semantics and event vocabulary. |
+| Rust canonicalization and trust spike | Seed for the actual kernel. |
+| Python tests | Useful parity specs while Rust replaces behavior. |
+| Migration/discovery experience | Encodes real downstream compatibility lessons. |
+| Herdr bridge concept | Valuable adapter, but not core architecture. |
+
+## Migration Strategy
+
+1. **Land the Rust event/trust seed.** PRs for protocol, merge, verification,
+   trust policy, and JSON verifier establish the kernel direction.
+2. **Create `rally-core`.** Move protocol/store/query primitives into the crate
+   that will own product behavior. Keep `rally-cli` thin.
+3. **Implement read-only parity first.** `report`, `replay`, `thread`, `inbox`,
+   `claims`, `blockers`, `conflicts`, `diagnose`, and `verify` should run over
+   the same query engine.
+4. **Implement write parity second.** `handoff`, `ack`, `claim`, `blocker`, and
+   low-level `post` should write the target event shape while tests prove old
+   readers tolerate it or migration is explicit.
+5. **Add identity and sign-on-write.** Local key generation, `trust add`, and
+   signing policies make remote events authoritative.
+6. **Add sync import/export.** Keep transport out of scope; focus on event
+   packets, merge, origin, conflict, and trust reporting.
+7. **Flip packaging.** The installed `rally` command becomes Rust. Python entry
+   points delegate or emit a deprecation warning during one release window.
+8. **Delete Python command implementations.** Keep only any packaging shim that
+   still has a named downstream caller.
+
+## Verification Strategy
+
+The greenfield rewrite must be proven by behavior, not by preserving structure.
+
+- Rust unit tests for event canonicalization, read/write, query, diagnosis,
+  signing, trust, and merge conflict behavior.
+- Golden JSON command tests for every agent-facing command.
+- Compatibility fixtures containing old flat Python records and new wrapper
+  records in the same log.
+- Property-style tests for append/read round trips and duplicate event merges.
+- Python parity tests only while Python remains a compatibility layer.
+- A small set of end-to-end shell tests using the installed `rally` binary.
+
+## Risks
+
+- **Packaging risk.** Python packaging currently owns the installed CLI. Rust
+  binary distribution must be solved before flipping `rally`.
+- **Downstream caller risk.** Build-loop or local skills may still invoke Python
+  entry points. Caller search must happen before deletion.
+- **Schema churn risk.** Moving to wrapper-shaped store entries changes what new
+  lines look like. Readers must accept both shapes before Rust writes wrappers
+  by default.
+- **Ambition creep.** Sync can pull Rally toward being a service. The boundary
+  stays at import/export packets and local merge semantics.
+- **Trust UX risk.** If trust is too strict too early, local coordination gets
+  noisy. Commands should classify first, then tighten authority by command.
+
+## Success Criteria
+
+Rally's Rust rewrite is successful when:
+
+- `rally --json` is the stable agent discovery surface.
+- `rally preflight --json` works without Python.
+- `rally diagnose --json` includes coordination and trust findings from one
+  Rust query engine.
+- A signed event exported from one channel can be imported into another,
+  deduplicated, classified, and shown in inbox/thread/replay output.
+- Python is no longer required for normal operation.
+- The codebase is smaller because old interpretations were deleted, not because
+  behavior was hidden behind wrappers.
+

@@ -8,6 +8,9 @@ SPDX-License-Identifier: Apache-2.0
 > **Role: protocol-of-record for agent-to-agent coordination via append-only JSONL stream.**
 > Substrate only. Daemons live in [`agent-rally-watcher`](https://github.com/tyroneross/agent-rally-watcher). Consumers (build-loop, codex, claude_code, custom tools) post events into and read events out of channels owned by this package.
 
+For the proposed Rust-native target architecture, see
+[`docs/RUST_GREENFIELD_ARCHITECTURE.md`](docs/RUST_GREENFIELD_ARCHITECTURE.md).
+
 ## Three-layer model
 
 ```
