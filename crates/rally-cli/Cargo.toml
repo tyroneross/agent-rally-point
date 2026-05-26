@@ -9,7 +9,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "rally-rs"
+name = "rally"
 path = "src/main.rs"
 
 [dependencies]

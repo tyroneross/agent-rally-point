@@ -36,7 +36,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("rally-rs: {err}");
+            eprintln!("rally: {err}");
             ExitCode::FAILURE
         }
     }
@@ -232,7 +232,7 @@ impl CommonOptions {
     fn run_id(&self) -> String {
         self.run_id
             .clone()
-            .unwrap_or_else(|| "agent-rally-cli-rs".to_string())
+            .unwrap_or_else(|| "rally-cli".to_string())
     }
 
     fn identity_dir(&self) -> Result<PathBuf, CliError> {
@@ -439,7 +439,7 @@ impl CliError {
                 })
             );
         } else {
-            eprintln!("rally-rs {}: {}", self.command, self.message);
+            eprintln!("rally {}: {}", self.command, self.message);
         }
     }
 }
@@ -1853,33 +1853,33 @@ impl VerifyOptions {
 
 fn usage() {
     eprintln!(
-        "usage: rally-rs verify [--json] [--trust-policy <trust.toml>] [--no-default-trust-policy] <changes.jsonl>"
+        "usage: rally verify [--json] [--trust-policy <trust.toml>] [--no-default-trust-policy] <changes.jsonl>"
     );
     eprintln!(
-        "       rally-rs handoff --channel-dir <dir> --to <tool> --subject <text> [--from-tool <tool>] [--files <path>...] [--notes <text>] [--no-ack] [--sign] [--json]"
+        "       rally handoff --channel-dir <dir> --to <tool> --subject <text> [--from-tool <tool>] [--files <path>...] [--notes <text>] [--no-ack] [--sign] [--json]"
     );
     eprintln!(
-        "       rally-rs preflight --channel-dir <dir> --tool <tool> [--session-id <id>] [--start-ping] [--json]"
+        "       rally preflight --channel-dir <dir> --tool <tool> [--session-id <id>] [--start-ping] [--json]"
     );
     eprintln!(
-        "       rally-rs ack|reject|needs-info --channel-dir <dir> [--tool <tool>] [--force] <handoff-id>"
+        "       rally ack|reject|needs-info --channel-dir <dir> [--tool <tool>] [--force] <handoff-id>"
     );
     eprintln!(
-        "       rally-rs claim --channel-dir <dir> --path <path>|--resource <id> --subject <text>"
+        "       rally claim --channel-dir <dir> --path <path>|--resource <id> --subject <text>"
     );
     eprintln!(
-        "       rally-rs release --channel-dir <dir> [--force] <claim-id> | blocker --channel-dir <dir> --subject <text> | unblock --channel-dir <dir> [--force] <blocker-id> --resolution <text>"
+        "       rally release --channel-dir <dir> [--force] <claim-id> | blocker --channel-dir <dir> --subject <text> | unblock --channel-dir <dir> [--force] <blocker-id> --resolution <text>"
     );
     eprintln!(
-        "       rally-rs inbox|claims|blockers|conflicts|diagnose|score|report|replay --channel-dir <dir> [--json] [--since <window>] [--tool <tool>]"
+        "       rally inbox|claims|blockers|conflicts|diagnose|score|report|replay --channel-dir <dir> [--json] [--since <window>] [--tool <tool>]"
     );
-    eprintln!("       rally-rs thread --channel-dir <dir> [--json] <event-id>");
-    eprintln!("       rally-rs identity init [--identity-dir <dir>] --tool <tool> [--json]");
+    eprintln!("       rally thread --channel-dir <dir> [--json] <event-id>");
+    eprintln!("       rally identity init [--identity-dir <dir>] --tool <tool> [--json]");
     eprintln!(
-        "       rally-rs sync export --channel-dir <dir> [--json] [--since <window>] > packet.json"
+        "       rally sync export --channel-dir <dir> [--json] [--since <window>] > packet.json"
     );
     eprintln!(
-        "       rally-rs sync import --channel-dir <dir> [--json] [--trust-policy <trust.toml>] <packet.json>"
+        "       rally sync import --channel-dir <dir> [--json] [--trust-policy <trust.toml>] <packet.json>"
     );
 }
 

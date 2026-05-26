@@ -101,30 +101,19 @@ This is **Rally's canonical JSON v1**, not RFC 8785/JCS. It is deliberately
 versioned so a future profile can introduce `rally-json-v2` if cross-language
 byte equivalence needs a stricter canonicalization profile.
 
-Python reference shape:
+Reference shape:
 
-```python
-import copy
-import json
-
-def canonical_bytes(record: dict) -> bytes:
-    unsigned = copy.deepcopy(record)
-    unsigned = unsigned.get("event", unsigned)
-    unsigned.pop("signature", None)
-    for key in ("revision", "local_seq", "received_at", "origin", "imported_at", "store", "sync"):
-        unsigned.pop(key, None)
-    return json.dumps(
-        unsigned,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-        ensure_ascii=False,
-    ).encode("utf-8")
+```text
+canonical_event = unwrap_store_entry(record)
+remove canonical_event.signature
+remove local metadata fields from the portable event:
+  revision, local_seq, received_at, origin, imported_at, store, sync
+serialize JSON with sorted object keys, UTF-8 strings, and compact separators
 ```
 
-This canonicalization is intentionally simple enough for Python and Rust now:
-strings are encoded as UTF-8 rather than ASCII escape sequences. If
-cross-language edge cases appear, Rally can introduce
+This canonicalization is intentionally small: strings are encoded as UTF-8
+rather than ASCII escape sequences. If cross-language edge cases appear, Rally
+can introduce
 `signature.canonicalization = "rally-json-v2"` without changing older records.
 
 ## Signature envelope
@@ -162,16 +151,8 @@ Initial implementation should use local key material only:
 A later implementation may use platform keychains. The file layout keeps the
 first version inspectable and portable.
 
-Recommended algorithm: Ed25519.
-
-Python stdlib does not include Ed25519. The implementation decision should be
-explicit:
-
-- use a small audited dependency such as `cryptography`; or
-- implement signing in a Rust core binary; or
-- defer signing until Rally has a native core.
-
-Do not invent custom crypto.
+Recommended algorithm: Ed25519, implemented by the Rust trust layer. Do not
+invent custom crypto.
 
 ## Trust policy
 
@@ -213,12 +194,12 @@ escalate event content into agent input, sync, or automation may require
 Rust CLI:
 
 ```bash
-rally-rs verify [--json] [--trust-policy <trust.toml>] [--no-default-trust-policy] <changes.jsonl>
-rally-rs identity init --tool <tool> [--identity-dir <dir>] [--json]
-rally-rs handoff --sign --channel-dir <dir> --identity-dir <dir> ...
+rally verify [--json] [--trust-policy <trust.toml>] [--no-default-trust-policy] <changes.jsonl>
+rally identity init --tool <tool> [--identity-dir <dir>] [--json]
+rally handoff --sign --channel-dir <dir> --identity-dir <dir> ...
 ```
 
-`rally-rs verify` reads a `changes.jsonl` trace and reports signature/trust
+`rally verify` reads a `changes.jsonl` trace and reports signature/trust
 classification without changing the trace. By default it loads
 `~/.agent-rally-point/identity/trust.toml` when that file exists. Pass
 `--trust-policy` to use an explicit policy file, or
@@ -255,8 +236,8 @@ rally verify --json
 Rust write commands support sign-on-write:
 
 ```bash
-rally-rs handoff --sign ...
-rally-rs claim --sign ...
+rally handoff --sign ...
+rally claim --sign ...
 ```
 
 Signing is optional for local-only coordination so downstream tools can continue
@@ -287,8 +268,8 @@ Minimum sync behavior:
 Rust packet commands:
 
 ```bash
-rally-rs sync export --channel-dir <dir> --json > packet.json
-rally-rs sync import --channel-dir <dir> --trust-policy ~/.agent-rally-point/identity/trust.toml packet.json --json
+rally sync export --channel-dir <dir> --json > packet.json
+rally sync import --channel-dir <dir> --trust-policy ~/.agent-rally-point/identity/trust.toml packet.json --json
 ```
 
 ## Open questions
@@ -299,5 +280,3 @@ rally-rs sync import --channel-dir <dir> --trust-policy ~/.agent-rally-point/ide
 - Should a human identity be distinct from tool identities?
 - Should Rally sign individual records only, or also periodic checkpoints / log
   segments for faster tamper detection?
-- Should the first implementation wait for a Rust core to avoid adding Python
-  crypto dependencies?

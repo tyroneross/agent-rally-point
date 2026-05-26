@@ -14,7 +14,7 @@ Two or more AI agent CLIs (Claude Code, Codex, peer Claude sessions, CI verifier
 
 **Greenfield Rust rewrite in progress** (2026-05-26). Rust owns the target
 coordination kernel, command envelopes, trust model, sync packet flow, and
-agent-start preflight UX. Python behavior is not the acceptance oracle for new
+agent-start preflight UX. Legacy behavior is not the acceptance oracle for new
 work.
 
 **v0.3.0 — canonical substrate** (2026-05-24). Adds: canonical channel layout at `~/.agent-rally-point/apps/<repo_id>/`, three-mode policy (canonical/migration/legacy-only), versioned discover envelope (`protocol_version: "1.0"`), repo_id normalization (worktree-stable + clone-stable), legacy → canonical migration tool with 4-condition cutover verifier, long-running presence-watcher with parent-liveness check.
@@ -23,39 +23,40 @@ Earlier: v0.2.x added the discovery layer + manifest. v0.1.0 (2026-05-20) extrac
 
 ## What it does
 
-- **Presence**: agents heartbeat into `~/.agent-rally-point/apps/<repo_id>/sessions/`; peers see each other via `read_active_presence()`. Long-running sessions use `run_refresh_loop()` (60s default cadence, exits when parent process dies).
-- **Channel**: append-only event log (`changes.jsonl`) with monotonic revision counter; readers compute deltas via `checkpoint_read()`.
-- **Canonical post**: single `post()` helper that bumps revision + appends record atomically (prevents the silent-no-op bug).
-- **Discovery**: `agent-rally-discover` resolves channel layout + active state via manifest with three-mode policy. Build-loop's discovery bridge reads `~/.agent-rally-point/compatibility.json` for the protocol handshake.
-- **Migration**: `agent-rally-migrate` walks legacy `~/.build-loop/apps/*` → `~/.agent-rally-point/apps/<repo_id>/` with append-only audit log + sha256 integrity. `verify-cutover` returns the 4-condition can-promote verdict (legacy_fully_copied + integrity_verified + no_fresh_writes_within_ttl + downstream_ready).
-- **Lifecycle hygiene**: explicit session reap on closeout; optional `changes.jsonl` rotation when log grows.
-- **Repo identity**: `repo_id(cwd)` derives `<slug>-<8hex>` from normalized git remote URL — same id across clones, worktrees, HTTPS vs SSH forms. Frozen as part of `protocol_version 1.0`.
-- **Rust command surface**: `rally-rs` owns the target command contracts for
+- **Presence**: `rally preflight --start-ping` writes ephemeral liveness under
+  `rally/presence/`; peers see each other without making liveness part of the
+  durable event log.
+- **Channel**: append-only event log (`changes.jsonl`) with strict store-entry
+  validation, local sequence numbers, event hashes, and previous-entry hashes.
+- **Typed writes**: `handoff`, `ack`, `claim`, `blocker`, and lifecycle commands
+  write through Rust event builders.
+- **Read projections**: `inbox`, `claims`, `blockers`, `conflicts`, `diagnose`,
+  `score`, `thread`, `replay`, and `report` derive state from one Rust query
+  engine.
+- **Trust and sync**: `identity`, signed writes, `verify`, and `sync
+  export/import` move portable signed events between local channels.
+- **Rust command surface**: `rally` owns the target command contracts for
   verify, typed writes, read projections, signed import/export, and preflight.
 
 ## Install
 
-The standalone CLIs (`agent-rally-discover`, `agent-rally-migrate`) are best installed via [pipx](https://pipx.pypa.io) so they live on your `$PATH` regardless of which virtualenv you happen to be in:
-
-```bash
-# Recommended — pipx puts the CLIs on PATH globally:
-pipx install agent-rally-point
-
-# Verify (this MUST resolve from a fresh shell, not just inside .venv):
-which agent-rally-discover
-which agent-rally-migrate
-```
-
-PyPI publication is pending; until then, install from the local checkout:
+Install the Rust CLI from the checkout:
 
 ```bash
 git clone https://github.com/tyroneross/agent-rally-point.git
-pipx install ./agent-rally-point      # global CLIs
-# OR, for library use only (no global CLI):
-uv pip install -e ./agent-rally-point
+cd agent-rally-point
+cargo install --path crates/rally-cli
+rally preflight --channel-dir /tmp/rally-smoke --tool codex --json
 ```
 
-If `which agent-rally-discover` does NOT resolve from a fresh shell, the consuming build-loop session will fail its protocol-version handshake and proceed in degraded coordination_unavailable mode. The shell-level resolution is part of the integration contract, not optional.
+During the greenfield rewrite, commands take an explicit `--channel-dir`:
+
+```bash
+rally preflight --channel-dir ~/.agent-rally-point/apps/<repo_id> --tool codex --start-ping --json
+```
+
+Repo/channel discovery is the next Rust cutover target; until that lands,
+callers pass the channel directory directly.
 
 ## Greenfield Verification
 
@@ -72,20 +73,23 @@ surface is cutover material and should not define greenfield behavior.
 
 ## Session-start integration
 
-Every AI coding agent should run **one line** at session start. The preflight reads the canonical channel, surfaces pending ACKs + live peers, loads north-star intent/goal, and returns a routing decision (`join_active` vs `proceed_solo`).
+Every AI coding agent should run **one line** at session start. The preflight
+reads the channel, surfaces pending ACKs + live peers, and returns a routing
+decision (`join_active` vs `proceed_solo`).
 
 ```bash
-agent-rally-preflight --tool <host> --start-ping --human
+rally preflight --channel-dir <dir> --tool <host> --start-ping --json
 ```
 
-Replace `<host>` with one of `claude_code`, `codex`, `cursor`, `gemini`, `ci`. Output is human-readable; drop `--human` for JSON. `--start-ping` writes a presence record so peers see this session immediately.
+Replace `<host>` with one of `claude_code`, `codex`, `cursor`, `gemini`, `ci`.
+`--start-ping` writes a presence record so peers see this session immediately.
 
 ### Claude Code (plugin / `.claude-plugin/hooks/session-start.sh`)
 
 ```bash
 #!/usr/bin/env bash
 # .claude-plugin/hooks/session-start.sh
-agent-rally-preflight --tool claude_code --start-ping --human
+rally preflight --channel-dir "$AGENT_RALLY_CHANNEL_DIR" --tool claude_code --start-ping --json
 ```
 
 The hook runs once per session; the JSON or human-readable summary becomes context the model reads immediately.
@@ -96,7 +100,7 @@ Add a single line near the top of `AGENTS.md`:
 
 ```markdown
 ## Session start
-Run `agent-rally-preflight --tool codex --start-ping --human` and read the output before any tool call.
+Run `rally preflight --channel-dir <dir> --tool codex --start-ping --json` and read the output before any tool call.
 ```
 
 ### Cursor / Gemini
@@ -105,95 +109,26 @@ Same shape — run the executable at session start with the appropriate `--tool`
 
 ### Sample output (human mode)
 
+```json
+{
+  "ok": true,
+  "command": "preflight",
+  "schema": "agent-rally.command.preflight.v1",
+  "coordination_status": "idle",
+  "routing": {
+    "action": "proceed_solo",
+    "reason": "no pending acknowledgements or active peers"
+  },
+  "pending_acks_for_me": [],
+  "active_peers": []
+}
 ```
-======================================================================
- AGENT-RALLY-PREFLIGHT v0.1.0  2026-05-24T22:14:52.448683Z
-======================================================================
- tool:       codex
- session_id: codex-7d289263137a4a38-1779660892
- workdir:    /Users/me/dev/git-folder/myproj
- repo_id:    myproj-2b14b480
- channel:    /Users/me/.agent-rally-point/apps/myproj-2b14b480  [via agent-rally-point.discover]
-
- coordination_status: IDLE
- routing:    proceed_solo - No active peers and no pending ACKs - proceed with assigned task, log ping check-ins to substrate
-
- GUARDRAILS:
-   - Global rules: /Users/me/.claude/CLAUDE.md
-```
-
-The JSON envelope (default; drop `--human`) carries the same data structured for programmatic consumption — `pending_acks_for_me`, `active_peers`, `routing.action`, `north_star`, `memory_locations`, `recent_changes`, `all_repos_active`.
 
 ### Behavior
 
 - **Idle**: no peers, no pending ACKs → `routing.action: proceed_solo`. The session can run normally; the preflight writes its own presence so peers will see it on their next check.
 - **Coordinated**: pending ACK or live peer detected → `routing.action: join_active`. The session should handle the inbox or coordinate with peers before parallel work.
 - **Degraded**: substrate unreachable → exit code 1 with JSON envelope still emitted (just with `channel_dir: null`). Host LLM proceeds without coordination but isn't misled.
-
-### Migrating from v0.2.x
-
-```bash
-# 1. Dry-run scan of legacy channels:
-agent-rally-migrate scan
-
-# 2. Apply the migration (writes audit log + advisory marker):
-agent-rally-migrate apply
-
-# 3. Verify the 4 cutover conditions:
-agent-rally-migrate verify-cutover
-
-# 4. Once verify-cutover returns can_promote: true, edit
-#    ~/.agent-rally-point/manifest.toml: change [policy] mode = "canonical".
-```
-
-The default policy stays at `migration` (dual-aware: reads merge both paths, writes mirror to both) until the manual cutover edit lands.
-
-## Quickstart (Python API)
-
-```python
-from pathlib import Path
-from agent_rally_point import (
-    app_slug, app_channel_dir, write_presence, post, checkpoint_read,
-)
-
-cwd = Path.cwd()
-slug = app_slug(cwd)                            # worktree-independent repo identity
-channel = app_channel_dir(slug)                 # ~/.agent-rally-point/apps/<slug>/
-
-# Write own presence (heartbeat)
-write_presence(
-    channel_dir=channel,
-    session_id="claude-feature-x-001",
-    tool="claude_code",
-    model="claude-opus-4-7",
-    run_id="feature-x-001",
-    app_slug=slug,
-    phase="phase-1-assess",
-    files_in_flight=["src/feature_x.py"],
-    cwd=cwd,
-)
-
-# Post a verdict (uses the canonical helper — bumps revision + appends atomically)
-new_rev = post(
-    channel_dir=channel,
-    kind="feedback",
-    tool="claude_code",
-    model="claude-opus-4-7",
-    run_id="feature-x-001",
-    app_slug=slug,
-    payload={"step": "1", "verdict": "PASS", "evidence": {"commit": "abc1234"}},
-)
-
-# Peer reads what's new
-envelope = checkpoint_read(
-    channel_dir=channel,
-    session_id="codex-verifier-001",
-    my_files=["src/feature_x.py"],
-)
-print(envelope)
-```
-
-CLI surface (`agent-rally-point status`, `watch`, `post`, etc.) ships in v0.2.
 
 ## How this differs from A2A / MCP / LangGraph / CrewAI / Temporal
 

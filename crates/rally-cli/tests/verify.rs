@@ -47,7 +47,7 @@ fn temp_channel(name: &str) -> std::path::PathBuf {
 }
 
 fn run_rally(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rally-rs"))
+    Command::new(env!("CARGO_BIN_EXE_rally"))
         .args(args)
         .output()
         .unwrap()
@@ -82,7 +82,7 @@ fn verify_reports_unsigned_store_entry() {
         &format!("{}\n", serde_json::to_string(&entry).unwrap()),
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rally-rs"))
+    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
         .arg("verify")
         .arg(&path)
         .output()
@@ -627,13 +627,13 @@ fn sync_export_import_round_trips_signed_events() {
 
 #[test]
 fn usage_errors_exit_nonzero_for_agent_automation() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rally-rs"))
+    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
         .output()
         .unwrap();
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("usage: rally-rs verify"));
+    assert!(stderr.contains("usage: rally verify"));
 }
 
 #[test]
@@ -687,7 +687,7 @@ allowed_kinds = ["handoff"]
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rally-rs"))
+    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
         .arg("verify")
         .arg("--json")
         .arg("--trust-policy")
@@ -713,7 +713,7 @@ allowed_kinds = ["handoff"]
 fn verify_json_errors_use_command_envelope() {
     let path = temp_jsonl("rally-cli-bad-store", "{\n");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rally-rs"))
+    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
         .arg("verify")
         .arg("--json")
         .arg(&path)

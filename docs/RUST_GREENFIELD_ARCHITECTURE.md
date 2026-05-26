@@ -352,7 +352,7 @@ Initial implementation status:
 - `rally-core::preflight` now owns the Rust session-start projection:
   pending handoffs for the current tool, active presence peers, claims,
   blockers, claim conflicts, recent changes, and routing action. The CLI
-  renders that envelope through `rally-rs preflight`.
+  renders that envelope through `rally preflight`.
 
 ## Remote Agent Readiness
 
@@ -372,8 +372,8 @@ Minimum viable remote flow:
 The Rust CLI implements the first transport-free packet flow:
 
 ```bash
-rally-rs sync export --channel-dir <dir> --json > packet.json
-rally-rs sync import --channel-dir <dir> --trust-policy <trust.toml> packet.json --json
+rally sync export --channel-dir <dir> --json > packet.json
+rally sync import --channel-dir <dir> --trust-policy <trust.toml> packet.json --json
 ```
 
 `sync export` emits `agent-rally.sync.packet.v1` with portable events only.
@@ -393,7 +393,7 @@ future service can move the bytes. Rally defines what the bytes mean.
 The Rust preflight command is the agent-first entry point for a session:
 
 ```bash
-rally-rs preflight --channel-dir <dir> --tool codex --session-id <id> --start-ping --json
+rally preflight --channel-dir <dir> --tool codex --session-id <id> --start-ping --json
 ```
 
 It emits `agent-rally.command.preflight.v1` with a stable routing action:
@@ -437,7 +437,7 @@ These are target deletions during the Rust cutover:
 | Python scorer/diagnose logic | Duplicate deterministic findings. | `rally-core::diagnose`. |
 | Python preflight logic | Duplicates store/query/presence interpretation. | `rally preflight`. |
 | Python CLI command implementations | Text/JSON rendering should use Rust structs. | `rally-cli`. |
-| Rust `rally-rs` prototype name | Transitional name leaks implementation status. | Binary named `rally`. |
+| Rust `rally` prototype name | Transitional name leaks implementation status. | Binary named `rally`. |
 | Docs that say signing/sync are future-only | Trust becomes active architecture. | Signed/trusted event docs tied to code. |
 
 ## No Migration Contract

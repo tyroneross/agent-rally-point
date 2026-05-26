@@ -367,15 +367,14 @@ can be released and diagnosed.
 Trust verification is exposed first through the Rust prototype:
 
 ```bash
-rally-rs verify --json --trust-policy ~/.agent-rally-point/identity/trust.toml ~/.agent-rally-point/apps/<repo_id>/changes.jsonl
+rally verify --json --trust-policy ~/.agent-rally-point/identity/trust.toml ~/.agent-rally-point/apps/<repo_id>/changes.jsonl
 ```
 
 The verifier emits stable per-event trust states (`trusted`,
 `valid-untrusted`, `unsigned`, `invalid`, `unknown-key`, `unsupported`) plus
 summary counts. Agent workflows should combine this with `rally diagnose
---json` until the Python CLI can call the Rust core directly. Verification is
-warn-not-drop: it surfaces remote/signed-event risk without deleting legacy or
-untrusted records from the append-only trace.
+--json`. Verification is warn-not-drop: it surfaces remote/signed-event risk
+without deleting legacy or untrusted records from the append-only trace.
 
 This is distinct from LLM observability products that track prompts, tokens,
 latency, or tool calls. ARP's trace is about coordination correctness across
