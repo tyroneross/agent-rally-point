@@ -46,6 +46,11 @@ def app_repo(tmp_path: Path, monkeypatch):
     _git(["init", "-q"], repo)
     _git(["config", "user.email", "t@e.com"], repo)
     _git(["config", "user.name", "t"], repo)
+    # Override any contributor-global core.hooksPath so the test's installed
+    # .git/hooks/post-commit is the one git actually runs. See same comment
+    # in test_post_commit.py.
+    _git(["config", "core.hooksPath",
+          str((repo / ".git" / "hooks").resolve())], repo)
     assert igh.install(repo) is True
     return repo
 

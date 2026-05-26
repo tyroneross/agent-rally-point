@@ -45,6 +45,12 @@ def repo(tmp_path: Path, monkeypatch) -> Path:
     _git(["init", "-q"], r)
     _git(["config", "user.email", "t@e.com"], r)
     _git(["config", "user.name", "t"], r)
+    # Override any contributor-global core.hooksPath so the test's installed
+    # .git/hooks/post-commit is the one git actually runs. Local config wins
+    # over global; without this, contributors who set a centralized
+    # core.hooksPath in ~/.gitconfig see the post-commit hook never fire and
+    # this whole test family fails with "no records written".
+    _git(["config", "core.hooksPath", str((r / ".git" / "hooks").resolve())], r)
     igh.install(r)
     return r
 
