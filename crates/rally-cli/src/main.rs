@@ -13,9 +13,8 @@ use rally_core::query::{
     parse_since, pending_handoffs_at, record_id, related_records, score_records,
 };
 use rally_core::store::{ChannelStore, load_records};
-use rally_protocol::{
-    canonical_event_bytes, event_id, event_value, portable_event_value, sha256_hash,
-};
+use rally_core::sync::{SyncError, SyncErrorKind, build_sync_packet, import_sync_packet};
+use rally_protocol::{event_id, event_value, sha256_hash};
 use rally_trust::{
     PublicKeyStore, TrustContext, TrustPolicy, TrustStatus, classify, classify_with_policy,
     init_identity, load_signing_identity, load_trust_file, sign_event,
@@ -29,6 +28,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod output;
+
+use output::{CliError, WriteOutput};
 
 static FALLBACK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -389,76 +392,6 @@ fn parse_i64(command: &'static str, flag: &str, value: &str) -> Result<i64, CliE
     value
         .parse()
         .map_err(|_| CliError::usage(command, format!("{flag} must be an integer")))
-}
-
-#[derive(Debug)]
-struct CliError {
-    command: &'static str,
-    message: String,
-    exit_code: u8,
-    json: bool,
-}
-
-impl CliError {
-    fn usage(command: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            command,
-            message: message.into(),
-            exit_code: 2,
-            json: false,
-        }
-    }
-
-    fn runtime(command: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            command,
-            message: message.into(),
-            exit_code: 1,
-            json: false,
-        }
-    }
-
-    fn not_found(command: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            command,
-            message: message.into(),
-            exit_code: 3,
-            json: false,
-        }
-    }
-
-    fn emit(&self) {
-        if self.json {
-            eprintln!(
-                "{}",
-                json!({
-                    "ok": false,
-                    "command": self.command,
-                    "error": self.message,
-                    "exit_code": self.exit_code,
-                })
-            );
-        } else {
-            eprintln!("rally {}: {}", self.command, self.message);
-        }
-    }
-}
-
-#[derive(Debug)]
-struct WriteOutput {
-    json: bool,
-    text: String,
-    body: Value,
-}
-
-impl WriteOutput {
-    fn emit(&self) {
-        if self.json {
-            println!("{}", self.body);
-        } else {
-            println!("{}", self.text);
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -1107,18 +1040,12 @@ fn execute_preflight(command: PreflightCommand) -> Result<WriteOutput, CliError>
 
 fn execute_sync_export(command: SyncExportCommand) -> Result<WriteOutput, CliError> {
     let (store, records, _now) = query_records(&command.read)?;
-    let events = records
-        .iter()
-        .map(portable_event_value)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| CliError::runtime("sync:export", err.to_string()))?;
-    let packet = json!({
-        "schema": "agent-rally.sync.packet.v1",
-        "exported_at": now_rfc3339(),
-        "source_channel": store.channel_dir().display().to_string(),
-        "count": events.len(),
-        "events": events,
-    });
+    let packet = build_sync_packet(
+        store.channel_dir().display().to_string(),
+        now_rfc3339(),
+        &records,
+    )
+    .map_err(|err| sync_error("sync:export", err))?;
     let text = serde_json::to_string_pretty(&packet)
         .map_err(|err| CliError::runtime("sync:export", err.to_string()))?;
     Ok(WriteOutput {
@@ -1131,73 +1058,17 @@ fn execute_sync_export(command: SyncExportCommand) -> Result<WriteOutput, CliErr
 fn execute_sync_import(command: SyncImportCommand) -> Result<WriteOutput, CliError> {
     let store = command.common.channel_store("sync:import")?;
     let packet = read_sync_packet(&command.packet_path)?;
-    let packet_events = packet_events(&packet)?;
     let trust = load_trust_for_sync(
         command.trust_policy.as_ref(),
         command.no_default_trust_policy,
     )
     .map_err(|err| CliError::runtime("sync:import", err))?;
-    let existing = store.load_records().map_err(|err| {
-        CliError::runtime("sync:import", format!("failed to load channel: {err}"))
-    })?;
-    let mut known: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for record in &existing {
-        let id =
-            event_id(record).map_err(|err| CliError::runtime("sync:import", err.to_string()))?;
-        let canonical = canonical_event_bytes(record)
-            .map_err(|err| CliError::runtime("sync:import", err.to_string()))?;
-        known.insert(id, canonical);
-    }
-
-    let mut imported = 0_usize;
-    let mut duplicate = 0_usize;
-    let mut invalid = 0_usize;
-    let mut conflicts = Vec::new();
-    let mut trust_counts: BTreeMap<TrustStatus, usize> = BTreeMap::new();
-
-    for raw in packet_events {
-        let event = match portable_event_value(raw) {
-            Ok(event) => event,
-            Err(_) => {
-                invalid += 1;
-                continue;
-            }
-        };
-        let id = match event_id(&event) {
-            Ok(id) => id,
-            Err(_) => {
-                invalid += 1;
-                continue;
-            }
-        };
-        let canonical = match canonical_event_bytes(&event) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                invalid += 1;
-                continue;
-            }
-        };
-        let status = classify_status_for_import(&event, trust.as_ref())
-            .map_err(|err| CliError::runtime("sync:import", err.to_string()))?;
-        *trust_counts.entry(status).or_default() += 1;
-        if let Some(existing) = known.get(&id) {
-            if existing == &canonical {
-                duplicate += 1;
-            } else {
-                conflicts.push(
-                    json!({"event_id": id, "reason": "same id with different canonical bytes"}),
-                );
-            }
-            continue;
-        }
-        store
-            .append_event_with_origin(event, &command.origin)
-            .map_err(|err| {
-                CliError::runtime("sync:import", format!("failed to append import: {err}"))
-            })?;
-        known.insert(id, canonical);
-        imported += 1;
-    }
+    let summary = import_sync_packet(&store, &packet, &command.origin, |event| {
+        classify_status_for_import(event, trust.as_ref())
+            .map(|status| status.to_string())
+            .map_err(|err| SyncError::new(err.to_string()))
+    })
+    .map_err(|err| sync_error("sync:import", err))?;
 
     let body = json!({
         "ok": true,
@@ -1206,21 +1077,24 @@ fn execute_sync_import(command: SyncImportCommand) -> Result<WriteOutput, CliErr
         "channel": store.channel_dir().display().to_string(),
         "origin": command.origin,
         "data": {
-            "imported": imported,
-            "duplicates": duplicate,
-            "conflicts": conflicts,
-            "invalid": invalid,
-            "trust_counts": trust_counts,
+            "imported": summary.imported,
+            "duplicates": summary.duplicates,
+            "conflicts": summary.conflicts,
+            "invalid": summary.invalid,
+            "trust_counts": summary.trust_counts,
         }
     });
     Ok(WriteOutput {
         json: command.common.json,
         text: format!(
-            "imported={imported} duplicates={duplicate} conflicts={} invalid={invalid}",
+            "imported={} duplicates={} conflicts={} invalid={}",
+            summary.imported,
+            summary.duplicates,
             body["data"]["conflicts"]
                 .as_array()
                 .map(Vec::len)
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            summary.invalid
         ),
         body,
     })
@@ -1618,13 +1492,11 @@ fn read_sync_packet(path: &PathBuf) -> Result<Value, CliError> {
         .map_err(|err| CliError::runtime("sync:import", format!("invalid packet JSON: {err}")))
 }
 
-fn packet_events(packet: &Value) -> Result<&[Value], CliError> {
-    let events = packet
-        .get("events")
-        .or_else(|| packet.get("packet").and_then(|packet| packet.get("events")))
-        .and_then(Value::as_array)
-        .ok_or_else(|| CliError::usage("sync:import", "packet must contain an events array"))?;
-    Ok(events)
+fn sync_error(command: &'static str, err: SyncError) -> CliError {
+    match err.kind() {
+        SyncErrorKind::Usage => CliError::usage(command, err.to_string()),
+        SyncErrorKind::Runtime => CliError::runtime(command, err.to_string()),
+    }
 }
 
 fn classify_status_for_import(

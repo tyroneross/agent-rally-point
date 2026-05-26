@@ -13,6 +13,7 @@ pub mod event;
 pub mod preflight;
 pub mod query;
 pub mod store;
+pub mod sync;
 
 use rally_protocol::ProtocolError;
 use std::fmt;

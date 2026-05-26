@@ -627,9 +627,7 @@ fn sync_export_import_round_trips_signed_events() {
 
 #[test]
 fn usage_errors_exit_nonzero_for_agent_automation() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
-        .output()
-        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rally")).output().unwrap();
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();

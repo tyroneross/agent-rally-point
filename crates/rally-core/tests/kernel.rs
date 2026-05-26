@@ -8,6 +8,7 @@ use rally_core::query::{
     score_records,
 };
 use rally_core::store::{ChannelStore, store_entry_value};
+use rally_core::sync::{SyncError, SyncErrorKind, build_sync_packet, import_sync_packet};
 use rally_protocol::{event_hash, store_entry_hash};
 use serde_json::{Value, json};
 use std::fs;
@@ -415,4 +416,68 @@ fn channel_store_serializes_concurrent_appenders() {
     fs::remove_dir_all(channel).unwrap();
 
     assert_eq!(records.len(), 8);
+}
+
+#[test]
+fn sync_packet_round_trips_through_core() {
+    let source_channel = temp_channel("rally-core-sync-source");
+    let source = ChannelStore::new(&source_channel);
+    source
+        .append_event(record(
+            "handoff",
+            "evt_sync_handoff",
+            "pi",
+            json!({"to_tool": "codex", "subject": "sync review"}),
+        ))
+        .unwrap();
+    let records = source.load_records().unwrap();
+    let packet = build_sync_packet("source", "2026-05-26T18:00:00.000Z", &records).unwrap();
+    assert_eq!(packet["schema"], "agent-rally.sync.packet.v1");
+    assert_eq!(packet["count"], 1);
+    assert!(
+        packet["events"][0]
+            .as_object()
+            .unwrap()
+            .get("local_seq")
+            .is_none()
+    );
+
+    let target_channel = temp_channel("rally-core-sync-target");
+    let target = ChannelStore::new(&target_channel);
+    let summary = import_sync_packet(&target, &packet, "remote:test", |_| {
+        Ok::<_, SyncError>("trusted".to_string())
+    })
+    .unwrap();
+    assert_eq!(summary.imported, 1);
+    assert_eq!(summary.duplicates, 0);
+    assert_eq!(summary.trust_counts.get("trusted"), Some(&1));
+    assert_eq!(target.load_records().unwrap()[0]["origin"], "remote:test");
+
+    let duplicate = import_sync_packet(&target, &packet, "remote:test", |_| {
+        Ok::<_, SyncError>("trusted".to_string())
+    })
+    .unwrap();
+    fs::remove_dir_all(source_channel).unwrap();
+    fs::remove_dir_all(target_channel).unwrap();
+
+    assert_eq!(duplicate.imported, 0);
+    assert_eq!(duplicate.duplicates, 1);
+    assert!(duplicate.conflicts.is_empty());
+}
+
+#[test]
+fn sync_import_rejects_packets_without_events_as_usage() {
+    let target_channel = temp_channel("rally-core-sync-invalid");
+    let target = ChannelStore::new(&target_channel);
+    let err = import_sync_packet(
+        &target,
+        &json!({"schema": "agent-rally.sync.packet.v1"}),
+        "remote:test",
+        |_| Ok::<_, SyncError>("trusted".to_string()),
+    )
+    .unwrap_err();
+    fs::remove_dir_all(target_channel).ok();
+
+    assert_eq!(err.kind(), SyncErrorKind::Usage);
+    assert_eq!(err.to_string(), "packet must contain an events array");
 }
