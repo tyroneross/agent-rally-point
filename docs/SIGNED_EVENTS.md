@@ -25,7 +25,7 @@ Signing is for integrity, provenance, and trust policy.
 
 - No daemon or server requirement.
 - No global identity provider requirement.
-- No mandatory signing for legacy records.
+- No mandatory signing for local-only records.
 - No encryption in the first signing layer.
 - No attempt to prove that the human approved the event unless a separate
   human-approval event is signed by a trusted human identity.
@@ -83,10 +83,10 @@ The signed material MUST NOT include:
   `origin`
 - import/sync bookkeeping metadata
 
-This split is required for remote-safe identity. A Python flat record may carry
-`revision` beside the event fields, and a future Rust store entry may wrap the
-same event as `{ "event": { ... }, "local_seq": 12, ... }`. Both shapes must
-produce the same canonical event bytes for the same portable event.
+This split is required for remote-safe identity. A Rust store entry wraps the
+event as `{ "event": { ... }, "local_seq": 12, ... }`, while sync packets carry
+the portable event directly. Both shapes must produce the same canonical event
+bytes for the same portable event.
 
 Canonical JSON rules for v1:
 
@@ -180,7 +180,7 @@ A verifier combines signature validity plus policy:
 |---|---|
 | `trusted` | signature valid; key known; policy permits `tool` + `kind` |
 | `valid-untrusted` | signature valid, but key/policy is not trusted for this event |
-| `unsigned` | no signature object; accepted for legacy compatibility |
+| `unsigned` | no signature object; visible but not remote-authoritative |
 | `invalid` | signature object exists but verification fails |
 | `unknown-key` | key id is not present in local trust policy |
 | `unsupported` | algorithm or canonicalization is unsupported |

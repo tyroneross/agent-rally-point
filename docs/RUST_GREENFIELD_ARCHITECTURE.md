@@ -5,8 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # Rust Greenfield Architecture
 
-This is the target architecture for Rally if Rust is the product, not a port of
-the current Python CLI. The goal is to be ambitious about the coordination
+This is the target architecture for Rally as a Rust product. The goal is to be
+ambitious about the coordination
 substrate while staying in Rally's lane: local-first, file-backed, agent-first
 coordination. Rally is not an agent runtime, scheduler, broker, chat service, or
 workflow engine.
@@ -37,9 +37,8 @@ If Rally started today, it would be:
 - Adapters for Herdr, ACP, A2A, CI, and editor surfaces outside the core.
 
 Estimated target: roughly 5k-7k Rust LOC for the core product surface before
-adapters, plus tests and docs. The current repository is roughly 14k LOC across
-Python, Rust, and docs. The target is smaller because the rewrite does not carry
-forward duplicate interpretations of the trace.
+adapters, plus tests and docs. The target stays small because the product has
+one interpretation of the trace.
 
 ## Quality Bar
 
@@ -437,14 +436,14 @@ These are target deletions during the Rust cutover:
 | Python scorer/diagnose logic | Duplicate deterministic findings. | `rally-core::diagnose`. |
 | Python preflight logic | Duplicates store/query/presence interpretation. | `rally preflight`. |
 | Python CLI command implementations | Text/JSON rendering should use Rust structs. | `rally-cli`. |
-| Rust `rally` prototype name | Transitional name leaks implementation status. | Binary named `rally`. |
+| Transitional Rust prototype names | Prototype names leak implementation status. | Binary named `rally`. |
 | Docs that say signing/sync are future-only | Trust becomes active architecture. | Signed/trusted event docs tied to code. |
 
 ## No Migration Contract
 
-The greenfield target has no old-log carry-forward requirement and no Python
-behavior gate. Existing code can inform vocabulary and product lessons, but it
-is not the oracle for command behavior or storage shape.
+The greenfield target has no old-log carry-forward requirement and no legacy
+behavior gate. Existing history can inform vocabulary and product lessons, but
+it is not the oracle for command behavior or storage shape.
 
 The durable contract is at the agent boundary: commands expose stable JSON
 schemas and clear exit codes. Human text exact wording is never a contract.
