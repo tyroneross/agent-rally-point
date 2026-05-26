@@ -42,3 +42,17 @@ Signed commits (`git commit -S` for GPG, or SSH-signed via `git config gpg.forma
 ## Commit message style
 
 Conventional Commits (https://www.conventionalcommits.org/) — `type(scope): subject`. Common types in this repo: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `perf`.
+
+## Verification
+
+Rust is the greenfield acceptance path:
+
+```bash
+cargo test
+cargo clippy --all-targets -- -D warnings
+git diff --check
+```
+
+Do not run legacy compatibility gates as the default proof for Rust-core
+changes. The older package is cutover material and no longer defines the
+product contract.

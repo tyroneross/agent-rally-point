@@ -4,14 +4,18 @@
 
 > **Local-first coordination point for coding agents working in the same repo: presence, handoffs, verifier gates, conflicts, and closeout without a server.**
 
-The user-facing CLI is **`rally`**. The package keeps the longer
-`agent-rally-point` / `agent-rally` names as compatibility aliases.
+The target user-facing CLI is **`rally`**, implemented by the Rust core. The
+older Python package remains in the tree only as legacy cutover material while
+the greenfield Rust surface takes over.
 
 Two or more AI agent CLIs (Claude Code, Codex, peer Claude sessions, CI verifiers) coordinating on a shared git repo with a human in the loop. No HTTP service. No broker. Just files + git for repo identity.
 
 ## Status
 
-**v0.3.1 — preflight CLI** (2026-05-24). Adds `agent-rally-preflight`: a host-neutral session-start coordination check-in. Every AI coding agent (Claude Code, Codex, Cursor, Gemini, CI verifiers) runs the same single-line invocation at session start to resolve the canonical channel, surface pending ACKs and active peers, load shared north-star context, and decide `join_active` vs `proceed_solo`. Stdlib-only operational paths so the CLI works in degraded environments. 143/143 tests pass.
+**Greenfield Rust rewrite in progress** (2026-05-26). Rust owns the target
+coordination kernel, command envelopes, trust model, sync packet flow, and
+agent-start preflight UX. Python behavior is not the acceptance oracle for new
+work.
 
 **v0.3.0 — canonical substrate** (2026-05-24). Adds: canonical channel layout at `~/.agent-rally-point/apps/<repo_id>/`, three-mode policy (canonical/migration/legacy-only), versioned discover envelope (`protocol_version: "1.0"`), repo_id normalization (worktree-stable + clone-stable), legacy → canonical migration tool with 4-condition cutover verifier, long-running presence-watcher with parent-liveness check.
 
@@ -26,7 +30,8 @@ Earlier: v0.2.x added the discovery layer + manifest. v0.1.0 (2026-05-20) extrac
 - **Migration**: `agent-rally-migrate` walks legacy `~/.build-loop/apps/*` → `~/.agent-rally-point/apps/<repo_id>/` with append-only audit log + sha256 integrity. `verify-cutover` returns the 4-condition can-promote verdict (legacy_fully_copied + integrity_verified + no_fresh_writes_within_ttl + downstream_ready).
 - **Lifecycle hygiene**: explicit session reap on closeout; optional `changes.jsonl` rotation when log grows.
 - **Repo identity**: `repo_id(cwd)` derives `<slug>-<8hex>` from normalized git remote URL — same id across clones, worktrees, HTTPS vs SSH forms. Frozen as part of `protocol_version 1.0`.
-- **Rust verifier prototype**: `rally-rs verify` reads `changes.jsonl`, loads optional trust policy from `~/.agent-rally-point/identity/trust.toml` or `--trust-policy`, and emits text or JSON signature/trust classifications for agent consumers. The Python `rally` CLI remains the primary user surface while the Rust core matures.
+- **Rust command surface**: `rally-rs` owns the target command contracts for
+  verify, typed writes, read projections, signed import/export, and preflight.
 
 ## Install
 
@@ -51,6 +56,19 @@ uv pip install -e ./agent-rally-point
 ```
 
 If `which agent-rally-discover` does NOT resolve from a fresh shell, the consuming build-loop session will fail its protocol-version handshake and proceed in degraded coordination_unavailable mode. The shell-level resolution is part of the integration contract, not optional.
+
+## Greenfield Verification
+
+Rust is the acceptance path:
+
+```bash
+cargo test
+cargo clippy --all-targets -- -D warnings
+git diff --check
+```
+
+Do not use legacy compatibility gates for Rust-core work. The older package
+surface is cutover material and should not define greenfield behavior.
 
 ## Session-start integration
 

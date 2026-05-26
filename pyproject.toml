@@ -24,11 +24,6 @@ classifiers = [
 ]
 dependencies = []
 
-[project.optional-dependencies]
-test = [
-    "pytest>=8",
-]
-
 [project.scripts]
 agent-rally-point = "agent_rally_point.cli:main"
 agent-rally = "agent_rally_point.cli:main"
@@ -48,8 +43,3 @@ exclude = ["agent_rally_point.test_*", "tests*", "docs*"]
 
 [tool.setuptools.package-data]
 "agent_rally_point.schemas" = ["*.json"]
-
-[tool.pytest.ini_options]
-# Restrict default pytest collection to the package's own tests; docs tests
-# and ad-hoc scripts are deferred and excluded from baseline runs.
-testpaths = ["agent_rally_point"]

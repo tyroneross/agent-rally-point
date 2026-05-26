@@ -1,18 +1,18 @@
-# Deferred build-loop integration tests
+# Retired build-loop integration fixtures
 
-These two test files were copied verbatim from `build-loop/scripts/app_pulse/`
-during the v0.0.1 extraction (sprint 1). They are NOT general-purpose
-tests for `agent-rally-point` — they validate build-loop's specific
-integration with the channel:
+The deferred Python integration tests that used to live here were copied from
+`build-loop/scripts/app_pulse/` during the v0.0.1 extraction. They were not
+general-purpose tests for `agent-rally-point`; they validated build-loop's
+specific integration with the old channel.
 
-- `test_orchestrator_contract.py` — verifies `agents/build-orchestrator.md`
-  in build-loop's repo documents the App Pulse surfacing block.
-- `test_cross_tool.py` — Stage 3 cross-tool validation that loads the
-  channel modules from build-loop's canonical install vs a hermetic copy.
+Those files have been removed from this repository. Greenfield Rally work is
+verified through the Rust suite, and any build-loop-specific Python integration
+coverage belongs back in build-loop itself.
 
-Both belong in build-loop's own test suite, not in the standalone
-package. They are kept here for reference until build-loop's cutover
-(sprint 3) at which point they should move back into build-loop's
-integration tests.
+Current acceptance path:
 
-For now: not collected by pytest.
+```bash
+cargo test
+cargo clippy --all-targets -- -D warnings
+git diff --check
+```

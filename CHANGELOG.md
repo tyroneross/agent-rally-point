@@ -41,13 +41,15 @@ All notable changes to this project are documented in this file. The format foll
   - `--start-ping` writes a presence record under `<channel>/rally/` so peers see the new session immediately.
   - `--human` renders a readable summary; default output is the structured JSON envelope.
 - **README session-start integration section**. Copy-paste snippets for Claude Code (`session-start.sh`), Codex (`AGENTS.md`), Cursor, and Gemini; sample human-mode output; behavior matrix (idle / coordinated / degraded).
-- **`agent_rally_point/test_preflight.py`** — 20 tests covering AC-G1 through AC-G7 (pending ACK detection, broadcasts, self-filter, dual-inbox dedupe, routing, `--start-ping` presence, graceful fallback).
+- **Preflight coverage.** The original AC-G1 through AC-G7 acceptance cases
+  covered pending ACK detection, broadcasts, self-filter, dual-inbox dedupe,
+  routing, `--start-ping` presence, and graceful fallback. Greenfield
+  acceptance has since moved to the Rust suite.
 
 ### Notes
 
 - The standalone v0.1.0 preflight at `~/.local/bin/agent-rally-preflight` is the design source; this release promotes it to a proper packaged console script that pipx installs alongside `agent-rally-discover` and `agent-rally-migrate`.
 - No breaking changes to `discover`, `migrate`, or any other v0.3.0 surface.
-- 143/143 tests pass (was 104 in v0.3.0).
 
 ## [0.3.0] — 2026-05-24
 

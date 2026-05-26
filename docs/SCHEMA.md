@@ -109,7 +109,8 @@ that record.
 
 ### NON-GOAL guard
 
-Records carry **structure and data-flow only** — never call-frequency, invocation-count, or hit-count fields. Forbidden keys (case-insensitive, asserted by `test_changes.py::_assert_no_freq`):
+Records carry **structure and data-flow only** — never call-frequency,
+invocation-count, or hit-count fields. Forbidden keys are case-insensitive:
 
 ```
 count, counts, frequency, freq, invocations, invocation_count,
@@ -135,7 +136,7 @@ A commit landed on a branch the channel cares about.
     "branch": "feat/foo",
     "commit_sha": "abc1234",
     "subject": "feat(x): bar",
-    "files_changed": ["src/x.py", "tests/test_x.py"]
+    "files_changed": ["src/x.rs", "crates/rally-core/src/query.rs"]
   }
 }
 ```
