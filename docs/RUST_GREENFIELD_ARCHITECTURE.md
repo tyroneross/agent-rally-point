@@ -335,6 +335,15 @@ crates/
 `rally-cli` should stay thin. If command behavior is hard to test without
 shelling out to the binary, it belongs in `rally-core`.
 
+Initial implementation status:
+
+- `rally-protocol` owns portable event canonicalization and merge by event id.
+- `rally-trust` owns signature verification and trust policy loading.
+- `rally-core` now owns channel loading and deterministic query/diagnose
+  projections over flat and wrapped records.
+- `rally-cli` is still a prototype verifier surface and should migrate toward
+  rendering `rally-core` outputs rather than owning behavior.
+
 ## Remote Agent Readiness
 
 Remote support means import/export of coordination facts, not a Rally-hosted
