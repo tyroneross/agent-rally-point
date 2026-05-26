@@ -213,12 +213,17 @@ fn channel_store_loads_changes_jsonl() {
         channel.join("changes.jsonl"),
         format!(
             "{}\n",
-            serde_json::to_string(&record(
-                "handoff",
-                "evt_handoff",
-                "pi",
-                json!({"to_tool": "codex", "subject": "review"})
-            ))
+            serde_json::to_string(&json!({
+                "local_seq": 1,
+                "received_at": "2026-05-26T18:00:00.000Z",
+                "origin": "local",
+                "event": record(
+                    "handoff",
+                    "evt_handoff",
+                    "pi",
+                    json!({"to_tool": "codex", "subject": "review"})
+                )
+            }))
             .unwrap()
         ),
     )

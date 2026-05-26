@@ -31,9 +31,9 @@ pub const LOCAL_METADATA_FIELDS: &[&str] = &[
 
 /// A portable Rally event envelope.
 ///
-/// This struct documents the Rust-native shape. The lower-level helpers in this
-/// crate also accept today's Python-written flat JSONL records and future
-/// store-entry records shaped as `{ local_seq, received_at, event: { ... } }`.
+/// This struct documents the Rust-native portable shape. `changes.jsonl` stores
+/// these events inside `StoreEntry`; sync/export code can also handle portable
+/// events directly before local replica metadata is attached.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RallyEvent {
     pub id: String,
@@ -202,7 +202,7 @@ impl From<std::io::Error> for ProtocolError {
     }
 }
 
-/// Extract the portable event object from a flat legacy record or a store entry.
+/// Extract the portable event object from a portable event or store entry.
 pub fn event_value(record: &Value) -> Result<Value, ProtocolError> {
     let object = record.as_object().ok_or(ProtocolError::ExpectedObject)?;
     if let Some(event) = object.get("event") {
@@ -216,7 +216,7 @@ pub fn event_value(record: &Value) -> Result<Value, ProtocolError> {
     }
 }
 
-/// Return the portable event id from a flat record or store entry.
+/// Return the portable event id from a portable event or store entry.
 pub fn event_id(record: &Value) -> Result<String, ProtocolError> {
     let event = event_value(record)?;
     event
@@ -241,9 +241,9 @@ pub fn portable_event_value(record: &Value) -> Result<Value, ProtocolError> {
 
 /// Normalize a record to the object whose bytes are signed/verified.
 ///
-/// The signature envelope and local store metadata are removed. This deliberately
-/// excludes Python's legacy `revision` field so events can be imported into a
-/// remote/local log with a different local sequence without invalidating trust.
+/// The signature envelope and local store metadata are removed so events can be
+/// imported into a remote/local log with different replica metadata without
+/// invalidating trust.
 pub fn canonical_event_value(record: &Value) -> Result<Value, ProtocolError> {
     let portable = portable_event_value(record)?;
     let mut object = portable
@@ -389,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_bytes_exclude_flat_local_revision() {
+    fn canonical_bytes_exclude_local_revision_metadata() {
         let mut left = event();
         let mut right = event();
         left.as_object_mut()
@@ -439,21 +439,17 @@ mod tests {
     }
 
     #[test]
-    fn reads_existing_flat_python_style_records() {
+    fn reads_portable_event_jsonl_records() {
         let path = std::env::temp_dir().join(format!(
-            "rally-flat-{}.jsonl",
+            "rally-event-{}.jsonl",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let mut line = event();
-        line.as_object_mut()
-            .unwrap()
-            .insert("revision".into(), json!(7));
         fs::write(
             &path,
-            format!("\n{}\n{{", serde_json::to_string(&line).unwrap()),
+            format!("\n{}\n{{", serde_json::to_string(&event()).unwrap()),
         )
         .unwrap();
 
@@ -520,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_future_store_entry_records() {
+    fn reads_store_entry_records() {
         let wrapped = json!({
             "local_seq": 12,
             "received_at": "2026-05-26T18:00:02.000Z",

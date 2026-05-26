@@ -24,10 +24,10 @@ fn temp_jsonl(name: &str, contents: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn verify_reports_unsigned_python_style_record() {
+fn verify_reports_unsigned_store_entry() {
     let path = temp_jsonl(
         "rally-cli-unsigned",
-        r#"{"id":"evt_11111111111111111111111111111111","kind":"handoff","type":"agent-rally.handoff.created.v1","tool":"codex","payload":{"subject":"smoke"},"revision":3}"#,
+        r#"{"local_seq":1,"received_at":"2026-05-26T18:00:00.000Z","origin":"local","event":{"id":"evt_11111111111111111111111111111111","kind":"handoff","type":"agent-rally.handoff.created.v1","tool":"codex","payload":{"subject":"smoke"}}}"#,
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_rally-rs"))
@@ -78,7 +78,13 @@ fn verify_json_uses_explicit_trust_policy() {
     );
     let changes = temp_jsonl(
         "rally-cli-trusted",
-        &serde_json::to_string(&record).unwrap(),
+        &serde_json::to_string(&json!({
+            "local_seq": 1,
+            "received_at": "2026-05-26T18:00:01.000Z",
+            "origin": "local",
+            "event": record
+        }))
+        .unwrap(),
     );
     let trust = std::env::temp_dir().join(format!(
         "rally-cli-trust-{}.toml",
