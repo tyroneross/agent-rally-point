@@ -41,6 +41,31 @@ adapters, plus tests and docs. The current repository is roughly 14k LOC across
 Python, Rust, and docs. The target is smaller because the rewrite does not carry
 forward duplicate interpretations of the trace.
 
+## Quality Bar
+
+Greenfield means Rally optimizes for the best architecture, not the safest path
+from the current one. The bar is:
+
+- **Clean:** one typed event model, one append path, one query engine, one
+  command envelope. `serde_json::Value` belongs at I/O boundaries and tests, not
+  in core domain logic.
+- **Secure:** unsigned or untrusted remote events are visible facts, never
+  automation authority. Trust checks happen before any bridge can affect an
+  agent, editor, shell, or file.
+- **Resilient:** append is crash-safe, concurrent writers coordinate through a
+  lock, corrupt records are isolated with diagnostics, and all derived state is
+  rebuildable from the log.
+- **Efficient:** reads stream by default, projections allocate only their output,
+  indexes are optional caches, and hot commands avoid reparsing unrelated
+  history once a verified checkpoint exists.
+- **Agent-first:** every command has stable JSON output, predictable exit codes,
+  and enough machine-readable context for another agent to decide what to do
+  next without scraping prose.
+
+The implementation should choose simple data structures until measurement says
+otherwise, but it should not choose ambiguous ownership, permissive trust, or
+duplicate interpretation paths for convenience.
+
 ## Non-Goals
 
 Rally should not become:
@@ -98,11 +123,11 @@ The core types should stay few and boring:
 
 | Type | Role |
 |---|---|
-| `Event` | Portable, signable coordination fact. |
-| `StoreEntry` | Local wrapper around an event: local sequence, origin, received time. |
-| `Store` | Append/read/stream/merge over JSONL. |
+| `Event` | Portable, typed, signable coordination fact. |
+| `StoreEntry` | Local wrapper around an event: local sequence, origin, received time, hashes. |
+| `Store` | Locked append, streaming read, checkpoint, and merge over JSONL. |
 | `Query` | Pure derived state: inbox, thread, claims, blockers, timeline. |
-| `Diagnosis` | Deterministic findings over derived state. |
+| `Diagnosis` | Deterministic findings over derived state and trust classification. |
 | `Identity` | Local key material and signer identity. |
 | `TrustPolicy` | Local rules mapping keys to tools, event kinds, and capabilities. |
 | `SyncEnvelope` | Import/export packet for remote replicas. |
@@ -122,12 +147,27 @@ The stronger storage split is:
 
 ```text
 changes.jsonl       canonical source of truth
+rally.lock          advisory writer lock
 rally.index.sqlite  optional local projection cache
-snapshots/          optional rebuildable checkpoints
+checkpoints/        optional verified projection checkpoints
+quarantine/         rejected or corrupt input packets
 ```
 
 Indexes and snapshots must be rebuildable from `changes.jsonl`. They are never
 authoritative.
+
+Append rules:
+
+- A writer takes `rally.lock`, reads the current tail metadata, assigns the next
+  `local_seq`, writes exactly one newline-delimited `StoreEntry`, flushes, and
+  releases the lock.
+- Each `StoreEntry` carries `event_hash` and `prev_entry_hash` so corruption,
+  accidental rewrites, and forked local histories are diagnosable.
+- Readers stream records through a validating iterator. A corrupt line stops
+  authoritative projection at that point and emits a diagnostic instead of
+  silently skipping history.
+- Optional indexes store offsets and projection checkpoints only after the log
+  prefix has been hash-verified.
 
 ## Event Shape
 
@@ -138,6 +178,8 @@ The target event line separates portable truth from local replica metadata:
   "local_seq": 12,
   "received_at": "2026-05-26T18:06:20.000Z",
   "origin": "local",
+  "event_hash": "sha256:...",
+  "prev_entry_hash": "sha256:...",
   "event": {
     "specversion": "1.0",
     "id": "evt_345ea9b74be3461b9473e0cf80a79d40",
@@ -178,6 +220,10 @@ portable event objects for signing, verification, and import/export packet
 construction, but `changes.jsonl` is not required to preserve any older flat
 record shape.
 
+`event_hash` is computed from canonical event bytes without the signature
+envelope. `prev_entry_hash` is computed over the previous complete store-entry
+line. Signatures prove event authorship; hashes prove local log integrity.
+
 ## Trust Model
 
 Trust is not a later feature. It is part of whether an event may influence
@@ -201,6 +247,17 @@ Examples:
 - `rally inbox` can include untrusted handoffs but mark them.
 - `rally herdr inject` should require trusted input or an explicit override.
 - `rally sync import` should preserve every event but report trust counts.
+
+Security invariants:
+
+- Canonicalization is versioned and deterministic.
+- Signing keys are local secrets; public trust policy is explicit and auditable.
+- Remote import never overwrites local log history. It appends classified facts
+  or quarantines malformed packets.
+- Bridge adapters must declare the minimum trust state they require before they
+  can act on an event.
+- File paths in payloads are data until a command validates them against the
+  active repository root and command authority.
 
 ## Command Contract
 
@@ -257,7 +314,7 @@ Target workspace:
 crates/
   rally-core/
     event.rs       typed event model and payload enums
-    store.rs       JSONL append/read/stream/merge
+    store.rs       locked JSONL append, streaming read, checkpoints
     query.rs       inbox, threads, claims, blockers, report/replay
     diagnose.rs    deterministic findings and score
     preflight.rs   session-start projection over store + presence
@@ -292,6 +349,10 @@ Minimum viable remote flow:
 5. Trust is evaluated against local policy.
 6. Derived state includes origin and trust classification.
 7. Automation only acts on events whose trust state meets the command's policy.
+
+Import must be idempotent and bounded-memory: validate packet structure, verify
+event hashes/signatures, sort only the packet being imported if needed, append
+accepted entries, and report rejected entries by reason.
 
 Network transport is out of scope. Files, Git, rsync, a shared folder, A2A, or a
 future service can move the bytes. Rally defines what the bytes mean.
@@ -349,20 +410,23 @@ schemas and clear exit codes. Human text exact wording is never a contract.
 
 1. **Land the Rust event/trust seed.** PRs for protocol, merge, verification,
    trust policy, and JSON verifier establish the kernel direction.
-2. **Create `rally-core`.** Move protocol/store/query primitives into the crate
-   that will own product behavior. Keep `rally-cli` thin.
-3. **Implement read projections.** `report`, `replay`, `thread`, `inbox`,
+2. **Create the typed kernel.** `rally-core` owns event builders, store-entry
+   validation, query structs, diagnosis structs, and command data models.
+3. **Implement the safe store.** Locked append, streaming read, hash-chain
+   validation, quarantine, and rebuildable checkpoints come before broad CLI
+   coverage.
+4. **Implement read projections.** `report`, `replay`, `thread`, `inbox`,
    `claims`, `blockers`, `conflicts`, `diagnose`, and `verify` run over the
    same query engine and target store shape.
-4. **Implement writes.** `handoff`, `ack`, `claim`, `blocker`, and low-level
+5. **Implement writes.** `handoff`, `ack`, `claim`, `blocker`, and low-level
    `post` write the target store-entry event shape.
-5. **Add identity and sign-on-write.** Local key generation, `trust add`, and
+6. **Add identity and sign-on-write.** Local key generation, `trust add`, and
    signing policies make remote events authoritative.
-6. **Add sync import/export.** Keep transport out of scope; focus on event
+7. **Add sync import/export.** Keep transport out of scope; focus on event
    packets, merge, origin, conflict, and trust reporting.
-7. **Make Rust the installed surface.** The installed `rally` command is the
+8. **Make Rust the installed surface.** The installed `rally` command is the
    Rust binary.
-8. **Delete older command implementations.** Keep only adapters that match the
+9. **Delete older command implementations.** Keep only adapters that match the
    new architecture.
 
 ## Verification Strategy
@@ -373,6 +437,10 @@ The greenfield rewrite must be proven by behavior, not by preserving structure.
   signing, trust, and merge conflict behavior.
 - Golden JSON command tests for every agent-facing command.
 - Property-style tests for append/read round trips and duplicate event merges.
+- Crash tests for interrupted writes, corrupt tails, and concurrent appenders.
+- Snapshot/index rebuild tests that prove cached state is disposable.
+- Security tests for trust policy denial, path normalization, malformed packet
+  quarantine, and untrusted bridge refusal.
 - A small set of end-to-end shell tests using the installed `rally` binary.
 
 ## Risks
@@ -381,6 +449,8 @@ The greenfield rewrite must be proven by behavior, not by preserving structure.
   Caller search must happen before deletion.
 - **Schema churn risk.** Store-entry lines are the target shape. Tests must make
   the new JSON contract explicit so agents know what to emit and consume.
+- **Hash-chain complexity.** Integrity metadata must stay simple enough that
+  agents can still inspect the log and operators can repair local corruption.
 - **Ambition creep.** Sync can pull Rally toward being a service. The boundary
   stays at import/export packets and local merge semantics.
 - **Trust UX risk.** If trust is too strict too early, local coordination gets
@@ -396,6 +466,9 @@ Rally's Rust rewrite is successful when:
   Rust query engine.
 - A signed event exported from one channel can be imported into another,
   deduplicated, classified, and shown in inbox/thread/replay output.
+- A corrupt or partially written log produces a precise diagnostic without
+  corrupting derived state.
+- Hot read commands can use verified checkpoints and avoid full-log reparsing.
 - No normal command path calls Python.
 - The codebase is smaller because old interpretations were deleted, not because
   behavior was hidden behind wrappers.
