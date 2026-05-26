@@ -276,8 +276,14 @@ def test_AC13_not_on_main_branch():
         pytest.skip("AC13 not meaningful when run from main (post-merge).")
     # Accept the parent alpha branch OR any in-flight repair branch off it.
     # The PR-level review enforces "no direct-to-main"; this defensive check
-    # just confirms development isn't happening on main.
+    # just confirms development isn't happening on main. Conventional Commits
+    # type prefixes are all acceptable for a development branch — feat/, fix/,
+    # docs/, chore/, refactor/, test/, perf/, build/, ci/, style/, revert/.
     assert branch != "main", f"unexpectedly on main: {branch}"
-    assert branch.startswith("feat/") or branch.startswith("fix/"), (
+    _CC_PREFIXES = (
+        "feat/", "fix/", "docs/", "chore/", "refactor/", "test/", "perf/",
+        "build/", "ci/", "style/", "revert/",
+    )
+    assert branch.startswith(_CC_PREFIXES), (
         f"on unexpected branch: {branch}"
     )

@@ -56,7 +56,7 @@ Every AI coding agent should run **one line** at session start. The preflight re
 agent-rally-preflight --tool <host> --start-ping --human
 ```
 
-Replace `<host>` with one of `claude_code`, `codex`, `cursor`, `gemini`, `ci`. Output is human-readable; drop `--human` for JSON. `--start-ping` writes a presence record so peers see this session immediately.
+Replace `<host>` with one of `claude_code`, `codex`, `cursor`, `gemini`, `pi`, `ci`. Output is human-readable; drop `--human` for JSON. `--start-ping` writes a presence record so peers see this session immediately.
 
 ### Claude Code (plugin / `.claude-plugin/hooks/session-start.sh`)
 
@@ -76,6 +76,17 @@ Add a single line near the top of `AGENTS.md`:
 ## Session start
 Run `agent-rally-preflight --tool codex --start-ping --human` and read the output before any tool call.
 ```
+
+### Pi (`~/.pi/agent/AGENTS.md`)
+
+Pi loads `~/.pi/agent/AGENTS.md` at session start (same convention as Codex). Add a single line near the top:
+
+```markdown
+## Session start
+Run `agent-rally-preflight --tool pi --start-ping --human` and read the output before any tool call.
+```
+
+Per-project `.pi/AGENTS.md` works the same way when present.
 
 ### Cursor / Gemini
 

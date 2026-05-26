@@ -27,7 +27,7 @@ Usage
     agent-rally-preflight                       # JSON envelope on stdout
     agent-rally-preflight --human               # human-readable summary
     agent-rally-preflight --workdir PATH        # override cwd
-    agent-rally-preflight --tool TOOL           # claude_code | codex | cursor | ci
+    agent-rally-preflight --tool TOOL           # claude_code | codex | cursor | gemini | pi | ci
     agent-rally-preflight --session-id ID       # explicit (else random)
     agent-rally-preflight --start-ping          # write a presence record
 

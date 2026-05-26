@@ -17,7 +17,7 @@ Each line in `changes.jsonl` is one self-contained JSON object terminated by `\n
 |-------------|------------|-------------|
 | `ts`        | `float`    | Wall-clock seconds since epoch (`time.time()`). Used for human display and stale-record reaping. |
 | `kind`      | `string`   | Record discriminator. See [Record kinds](#record-kinds). |
-| `tool`      | `string`   | Stable tool id (`claude_code`, `codex`, `cursor`, `build-loop`, etc.). Defaults to `"unknown"`. |
+| `tool`      | `string`   | Stable tool id (`claude_code`, `codex`, `cursor`, `gemini`, `pi`, `build-loop`, etc.). Defaults to `"unknown"`. |
 | `model`     | `string`   | Stable model id (`claude-opus-4-7`, `gpt-5`, etc.). Defaults to `"unknown"`. |
 | `run_id`    | `string`   | Caller-chosen run identifier (the consuming tool's run/session id). Defaults to `"unknown"`. |
 | `app_slug`  | `string`   | Channel slug (the directory name under `apps/`). Worktree-independent — see `channel_paths.app_slug`. |
