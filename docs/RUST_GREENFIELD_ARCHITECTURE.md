@@ -343,6 +343,10 @@ Initial implementation status:
   projections over portable events and store entries.
 - `rally-core::store` now has locked append, strict store-entry reads,
   `event_hash`, and `prev_entry_hash` validation for the greenfield log shape.
+- `rally-core` has the first typed `EventRecord`/`EventKind` boundary so query
+  logic can stop growing around raw JSON kind strings.
+- `rally-cli verify --json` now reads through `rally-core` and emits the command
+  envelope shape for success and failure.
 - `rally-cli` is still a prototype verifier surface and should become a
   renderer over `rally-core` outputs rather than owning behavior.
 

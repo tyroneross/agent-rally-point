@@ -9,6 +9,7 @@
 //! instead of reinterpreting `changes.jsonl` independently.
 
 pub mod diagnose;
+pub mod event;
 pub mod query;
 pub mod store;
 

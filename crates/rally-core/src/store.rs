@@ -5,14 +5,16 @@ use crate::CoreError;
 use chrono::{DateTime, SecondsFormat, Utc};
 use fs2::FileExt;
 use rally_protocol::{event_hash, event_value, store_entry_hash};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 pub const CHANGES_JSONL: &str = "changes.jsonl";
 pub const RALLY_LOCK: &str = "rally.lock";
+pub const RALLY_TAIL: &str = "rally.tail.json";
 pub const ORIGIN_LOCAL: &str = "local";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,6 +26,14 @@ pub struct ChannelStore {
 struct StoreTail {
     next_seq: u64,
     prev_entry_hash: Option<String>,
+    log_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct TailCache {
+    next_seq: u64,
+    prev_entry_hash: Option<String>,
+    log_bytes: u64,
 }
 
 impl ChannelStore {
@@ -43,6 +53,10 @@ impl ChannelStore {
 
     pub fn lock_path(&self) -> PathBuf {
         self.channel_dir.join(RALLY_LOCK)
+    }
+
+    pub fn tail_path(&self) -> PathBuf {
+        self.channel_dir.join(RALLY_TAIL)
     }
 
     pub fn load_records(&self) -> Result<Vec<Value>, CoreError> {
@@ -69,7 +83,7 @@ impl ChannelStore {
     }
 
     fn append_event_locked(&self, event: Value, origin: &str) -> Result<Value, CoreError> {
-        let tail = inspect_store_tail(self.changes_path())?;
+        let tail = inspect_store_tail(self.changes_path(), self.tail_path())?;
         let entry = store_entry_value(event, tail.next_seq, tail.prev_entry_hash, origin)?;
         let line = serde_json::to_string(&entry)?;
         let mut file = OpenOptions::new()
@@ -79,6 +93,14 @@ impl ChannelStore {
         file.write_all(line.as_bytes())?;
         file.write_all(b"\n")?;
         file.sync_data()?;
+        write_tail_cache(
+            self.tail_path(),
+            TailCache {
+                next_seq: tail.next_seq + 1,
+                prev_entry_hash: Some(store_entry_hash(&line)),
+                log_bytes: tail.log_bytes + line.len() as u64 + 1,
+            },
+        )?;
         Ok(entry)
     }
 }
@@ -115,11 +137,27 @@ struct StrictStoreRecord {
     line_hash: String,
 }
 
-fn inspect_store_tail(path: impl AsRef<Path>) -> Result<StoreTail, CoreError> {
-    let records = read_strict_store(path.as_ref())?;
+fn inspect_store_tail(
+    changes_path: impl AsRef<Path>,
+    tail_path: impl AsRef<Path>,
+) -> Result<StoreTail, CoreError> {
+    let changes_path = changes_path.as_ref();
+    let tail_path = tail_path.as_ref();
+    if let Some(tail) = read_tail_cache(changes_path, tail_path)? {
+        return Ok(tail);
+    }
+    let records = read_strict_store(changes_path)?;
+    let log_bytes = fs::metadata(changes_path)
+        .map(|metadata| metadata.len())
+        .or_else(|err| {
+            (err.kind() == std::io::ErrorKind::NotFound)
+                .then_some(0)
+                .ok_or(err)
+        })?;
     Ok(StoreTail {
         next_seq: records.len() as u64 + 1,
         prev_entry_hash: records.last().map(|record| record.line_hash.clone()),
+        log_bytes,
     })
 }
 
@@ -132,15 +170,43 @@ fn read_strict_store(path: &Path) -> Result<Vec<StrictStoreRecord>, CoreError> {
 
     let mut records = Vec::new();
     let mut prev_hash = None;
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let line_number = index + 1;
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    let mut reader = BufReader::new(file);
+    let mut line_bytes = Vec::new();
+    let mut line_number = 0;
+    loop {
+        line_bytes.clear();
+        let read = reader.read_until(b'\n', &mut line_bytes)?;
+        if read == 0 {
+            break;
+        }
+        line_number += 1;
+        if line_bytes.last() != Some(&b'\n') {
+            return Err(invalid_entry(
+                path,
+                line_number,
+                "store entry line is missing trailing newline",
+            ));
+        }
+        line_bytes.pop();
+        if line_bytes.is_empty() {
+            return Err(invalid_entry(path, line_number, "blank store entry line"));
+        }
+        let line = std::str::from_utf8(&line_bytes).map_err(|err| {
+            invalid_entry(
+                path,
+                line_number,
+                format!("store entry is not UTF-8: {err}"),
+            )
+        })?;
+        if line.trim() != line {
+            return Err(invalid_entry(
+                path,
+                line_number,
+                "store entry line has leading or trailing whitespace",
+            ));
         }
         let value: Value =
-            serde_json::from_str(trimmed).map_err(|source| CoreError::InvalidStoreLine {
+            serde_json::from_str(line).map_err(|source| CoreError::InvalidStoreLine {
                 path: path.to_path_buf(),
                 line: line_number,
                 source,
@@ -152,7 +218,7 @@ fn read_strict_store(path: &Path) -> Result<Vec<StrictStoreRecord>, CoreError> {
             &prev_hash,
             &value,
         )?;
-        let line_hash = store_entry_hash(trimmed);
+        let line_hash = store_entry_hash(line);
         prev_hash = Some(line_hash.clone());
         records.push(StrictStoreRecord { value, line_hash });
     }
@@ -220,4 +286,45 @@ fn invalid_entry(path: &Path, line: usize, message: impl Into<String>) -> CoreEr
         line,
         message: message.into(),
     }
+}
+
+fn read_tail_cache(changes_path: &Path, tail_path: &Path) -> Result<Option<StoreTail>, CoreError> {
+    let mut file = match File::open(tail_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    let cache: TailCache = serde_json::from_str(&text)?;
+    let log_bytes = fs::metadata(changes_path)
+        .map(|metadata| metadata.len())
+        .or_else(|err| {
+            (err.kind() == std::io::ErrorKind::NotFound)
+                .then_some(0)
+                .ok_or(err)
+        })?;
+    if cache.log_bytes != log_bytes {
+        return Ok(None);
+    }
+    Ok(Some(StoreTail {
+        next_seq: cache.next_seq,
+        prev_entry_hash: cache.prev_entry_hash,
+        log_bytes: cache.log_bytes,
+    }))
+}
+
+fn write_tail_cache(path: impl AsRef<Path>, cache: TailCache) -> Result<(), CoreError> {
+    let path = path.as_ref();
+    let tmp_path = path.with_extension("json.tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    serde_json::to_writer(&mut file, &cache)?;
+    file.write_all(b"\n")?;
+    file.sync_data()?;
+    fs::rename(tmp_path, path)?;
+    Ok(())
 }

@@ -10,6 +10,8 @@ use rally_core::store::{ChannelStore, store_entry_value};
 use rally_protocol::{event_hash, store_entry_hash};
 use serde_json::{Value, json};
 use std::fs;
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_channel(name: &str) -> std::path::PathBuf {
@@ -306,4 +308,72 @@ fn channel_store_rejects_corrupt_and_tampered_logs() {
     .unwrap();
     assert!(ChannelStore::new(&tampered).load_records().is_err());
     fs::remove_dir_all(tampered).unwrap();
+}
+
+#[test]
+fn channel_store_rejects_blank_whitespace_and_partial_lines() {
+    let entry = store_entry_value(
+        record(
+            "handoff",
+            "evt_handoff",
+            "pi",
+            json!({"to_tool": "codex", "subject": "review"}),
+        ),
+        1,
+        None,
+        "local",
+    )
+    .unwrap();
+    let line = serde_json::to_string(&entry).unwrap();
+
+    for (name, contents) in [
+        ("blank", format!("{line}\n\n")),
+        ("whitespace", format!(" {line}\n")),
+        ("partial", line),
+    ] {
+        let channel = temp_channel(&format!("rally-core-{name}"));
+        fs::create_dir_all(&channel).unwrap();
+        fs::write(channel.join("changes.jsonl"), contents).unwrap();
+        assert!(
+            ChannelStore::new(&channel).load_records().is_err(),
+            "{name} log should be rejected"
+        );
+        fs::remove_dir_all(channel).unwrap();
+    }
+}
+
+#[test]
+fn channel_store_serializes_concurrent_appenders() {
+    let channel = temp_channel("rally-core-concurrent");
+    let store = ChannelStore::new(&channel);
+    let barrier = Arc::new(Barrier::new(8));
+    let mut handles = Vec::new();
+
+    for index in 0..8 {
+        let store = store.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            store
+                .append_event(record(
+                    "handoff",
+                    &format!("evt_handoff_{index}"),
+                    "pi",
+                    json!({"to_tool": "codex", "subject": format!("review {index}")}),
+                ))
+                .unwrap()
+        }));
+    }
+
+    let mut seqs = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap()["local_seq"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    seqs.sort_unstable();
+    assert_eq!(seqs, (1..=8).collect::<Vec<_>>());
+
+    let records = store.load_records().unwrap();
+    fs::remove_dir_all(channel).unwrap();
+
+    assert_eq!(records.len(), 8);
 }

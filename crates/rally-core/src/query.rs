@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::CoreError;
+use crate::event::{EventKind, EventRecord};
 use chrono::{DateTime, Utc};
 use rally_protocol::event_value;
 use serde::{Deserialize, Serialize};
@@ -91,13 +92,14 @@ pub fn parse_since(value: Option<&str>, now: f64) -> Result<Option<f64>, CoreErr
 }
 
 pub fn record_epoch(record: &Value) -> f64 {
-    let Ok(event) = event_value(record) else {
+    let Ok(record) = EventRecord::parse(record) else {
         return 0.0;
     };
-    if let Some(ts) = event.get("ts").and_then(Value::as_f64) {
+    if let Some(ts) = record.event.get("ts").and_then(Value::as_f64) {
         return ts;
     }
-    event
+    record
+        .event
         .get("time")
         .and_then(Value::as_str)
         .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
@@ -196,22 +198,23 @@ pub fn pending_handoffs_at(records: &[Value], tool: Option<&str>, now: f64) -> V
     let acked = referenced_ids(records, "ack", &["ref_handoff_id", "ref_event_id"]);
     let mut out = Vec::new();
     for record in records {
-        let Ok(event) = event_value(record) else {
+        let Ok(parsed) = EventRecord::parse(record) else {
             continue;
         };
-        if string_field(&event, "kind").as_deref() != Some("handoff") {
+        if parsed.kind != EventKind::Handoff {
             continue;
         }
-        let requires_ack = payload_value(&event, "requires_ack")
+        let event = &parsed.event;
+        let requires_ack = payload_value(event, "requires_ack")
             .and_then(Value::as_bool)
             .unwrap_or(true);
         if !requires_ack || !record_aliases(record).is_disjoint(&acked) {
             continue;
         }
-        let to_tool = payload_string(&event, "to_tool").or_else(|| payload_string(&event, "to"));
-        let from_tool = payload_string(&event, "from_tool")
-            .or_else(|| payload_string(&event, "from"))
-            .or_else(|| string_field(&event, "tool"));
+        let to_tool = payload_string(event, "to_tool").or_else(|| payload_string(event, "to"));
+        let from_tool = payload_string(event, "from_tool")
+            .or_else(|| payload_string(event, "from"))
+            .or_else(|| string_field(event, "tool"));
         if let Some(tool) = tool {
             if !matches!(to_tool.as_deref(), Some(value) if value == tool || value == "all")
                 && to_tool.is_some()
@@ -224,13 +227,13 @@ pub fn pending_handoffs_at(records: &[Value], tool: Option<&str>, now: f64) -> V
         }
         out.push(PendingHandoff {
             event_id: record_id(record),
-            thread_id: string_field(&event, "thread_id"),
+            thread_id: parsed.thread_id,
             from_tool,
             to_tool,
-            subject: subject(&event),
+            subject: subject(event),
             age_seconds: age_seconds(record, now),
-            files: payload_array_strings(&event, "ref_files")
-                .or_else(|| payload_array_strings(&event, "files"))
+            files: payload_array_strings(event, "ref_files")
+                .or_else(|| payload_array_strings(event, "files"))
                 .unwrap_or_default(),
         });
     }
@@ -245,30 +248,31 @@ pub fn active_claims_at(records: &[Value], tool: Option<&str>, now: f64) -> Vec<
     let released = referenced_ids(records, "claim-release", &["ref_claim_id", "ref_event_id"]);
     let mut out = Vec::new();
     for record in records {
-        let Ok(event) = event_value(record) else {
+        let Ok(parsed) = EventRecord::parse(record) else {
             continue;
         };
-        if string_field(&event, "kind").as_deref() != Some("claim") {
+        if parsed.kind != EventKind::Claim {
             continue;
         }
+        let event = &parsed.event;
         if !record_aliases(record).is_disjoint(&released) {
             continue;
         }
-        let owner = payload_string(&event, "owner_tool")
-            .or_else(|| payload_string(&event, "tool"))
-            .or_else(|| string_field(&event, "tool"));
+        let owner = payload_string(event, "owner_tool")
+            .or_else(|| payload_string(event, "tool"))
+            .or_else(|| string_field(event, "tool"));
         if tool.is_some() && owner.as_deref() != tool {
             continue;
         }
         out.push(ActiveClaim {
             event_id: record_id(record),
-            thread_id: string_field(&event, "thread_id"),
+            thread_id: parsed.thread_id,
             owner_tool: owner,
-            resource: payload_string(&event, "resource")
-                .or_else(|| payload_string(&event, "path"))
+            resource: payload_string(event, "resource")
+                .or_else(|| payload_string(event, "path"))
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "unknown".to_string()),
-            subject: subject(&event),
+            subject: subject(event),
             age_seconds: age_seconds(record, now),
         });
     }
@@ -332,26 +336,27 @@ pub fn active_blockers_at(records: &[Value], tool: Option<&str>, now: f64) -> Ve
     );
     let mut out = Vec::new();
     for record in records {
-        let Ok(event) = event_value(record) else {
+        let Ok(parsed) = EventRecord::parse(record) else {
             continue;
         };
-        if string_field(&event, "kind").as_deref() != Some("blocker") {
+        if parsed.kind != EventKind::Blocker {
             continue;
         }
+        let event = &parsed.event;
         if !record_aliases(record).is_disjoint(&resolved) {
             continue;
         }
-        let producer = string_field(&event, "tool");
+        let producer = parsed.tool;
         if tool.is_some() && producer.as_deref() != tool {
             continue;
         }
         out.push(ActiveBlocker {
             event_id: record_id(record),
-            thread_id: string_field(&event, "thread_id"),
+            thread_id: parsed.thread_id,
             tool: producer,
-            subject: subject(&event),
-            resource: payload_string(&event, "resource").or_else(|| payload_string(&event, "path")),
-            severity: payload_string(&event, "severity").unwrap_or_else(|| "blocked".to_string()),
+            subject: subject(event),
+            resource: payload_string(event, "resource").or_else(|| payload_string(event, "path")),
+            severity: payload_string(event, "severity").unwrap_or_else(|| "blocked".to_string()),
             age_seconds: age_seconds(record, now),
         });
     }
@@ -375,12 +380,11 @@ pub fn score_records(records: &[Value], tool: Option<&str>) -> (i64, Vec<ScoreFi
     }
 
     for record in records {
-        let Ok(event) = event_value(record) else {
+        let Ok(parsed) = EventRecord::parse(record) else {
             continue;
         };
-        if let Some(causation) =
-            string_field(&event, "causation_id").filter(|value| !value.is_empty())
-        {
+        let event = &parsed.event;
+        if let Some(causation) = parsed.causation_id.filter(|value| !value.is_empty()) {
             if !ids.contains(&causation) {
                 findings.push(ScoreFinding {
                     severity: "P2".to_string(),
@@ -392,12 +396,9 @@ pub fn score_records(records: &[Value], tool: Option<&str>) -> (i64, Vec<ScoreFi
                 });
             }
         }
-        if matches!(
-            string_field(&event, "kind").as_deref(),
-            Some("ack" | "feedback")
-        ) {
-            let reference = payload_string(&event, "ref_handoff_id")
-                .or_else(|| payload_string(&event, "ref_event_id"));
+        if matches!(parsed.kind, EventKind::Ack | EventKind::Feedback) {
+            let reference = payload_string(event, "ref_handoff_id")
+                .or_else(|| payload_string(event, "ref_event_id"));
             if let Some(reference) = reference.filter(|value| !value.is_empty()) {
                 if !ids.contains(&reference) {
                     findings.push(ScoreFinding {
@@ -406,7 +407,7 @@ pub fn score_records(records: &[Value], tool: Option<&str>) -> (i64, Vec<ScoreFi
                         event_id: Some(record_id(record)),
                         message: format!(
                             "{} references missing handoff/event {reference}",
-                            string_field(&event, "kind").unwrap_or_else(|| "event".to_string())
+                            kind_label(&parsed.kind)
                         ),
                     });
                 }
@@ -439,13 +440,14 @@ pub fn score_records(records: &[Value], tool: Option<&str>) -> (i64, Vec<ScoreFi
 }
 
 fn referenced_ids(records: &[Value], kind: &str, keys: &[&str]) -> BTreeSet<String> {
+    let kind = EventKind::parse(Some(kind));
     records
         .iter()
-        .filter_map(|record| event_value(record).ok())
-        .filter(|event| string_field(event, "kind").as_deref() == Some(kind))
-        .flat_map(|event| {
+        .filter_map(|record| EventRecord::parse(record).ok())
+        .filter(|record| record.kind == kind)
+        .flat_map(|record| {
             keys.iter()
-                .filter_map(move |key| payload_string(&event, key))
+                .filter_map(move |key| payload_string(&record.event, key))
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -458,20 +460,35 @@ fn known_ids(records: &[Value]) -> BTreeSet<String> {
 fn final_ack_by_handoff(records: &[Value]) -> BTreeMap<String, String> {
     let mut latest = BTreeMap::new();
     for record in records {
-        let Ok(event) = event_value(record) else {
+        let Ok(parsed) = EventRecord::parse(record) else {
             continue;
         };
-        if string_field(&event, "kind").as_deref() != Some("ack") {
+        if parsed.kind != EventKind::Ack {
             continue;
         }
-        let reference = payload_string(&event, "ref_handoff_id")
-            .or_else(|| payload_string(&event, "ref_event_id"));
-        let verdict = payload_string(&event, "verdict");
+        let event = &parsed.event;
+        let reference = payload_string(event, "ref_handoff_id")
+            .or_else(|| payload_string(event, "ref_event_id"));
+        let verdict = payload_string(event, "verdict");
         if let (Some(reference), Some(verdict)) = (reference, verdict) {
             latest.insert(reference, verdict);
         }
     }
     latest
+}
+
+fn kind_label(kind: &EventKind) -> &str {
+    match kind {
+        EventKind::Handoff => "handoff",
+        EventKind::Ack => "ack",
+        EventKind::Feedback => "feedback",
+        EventKind::Claim => "claim",
+        EventKind::ClaimRelease => "claim-release",
+        EventKind::Blocker => "blocker",
+        EventKind::BlockerResolved => "blocker-resolved",
+        EventKind::Other(value) if value.is_empty() => "event",
+        EventKind::Other(value) => value.as_str(),
+    }
 }
 
 fn relation_values(record: &Value) -> BTreeSet<String> {

@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signer, SigningKey};
+use rally_core::store::store_entry_value;
 use rally_protocol::{CANONICALIZATION_VERSION, canonical_event_bytes};
 use serde_json::json;
 
@@ -25,9 +26,22 @@ fn temp_jsonl(name: &str, contents: &str) -> std::path::PathBuf {
 
 #[test]
 fn verify_reports_unsigned_store_entry() {
+    let entry = store_entry_value(
+        json!({
+            "id": "evt_11111111111111111111111111111111",
+            "kind": "handoff",
+            "type": "agent-rally.handoff.created.v1",
+            "tool": "codex",
+            "payload": {"subject": "smoke"}
+        }),
+        1,
+        None,
+        "local",
+    )
+    .unwrap();
     let path = temp_jsonl(
         "rally-cli-unsigned",
-        r#"{"local_seq":1,"received_at":"2026-05-26T18:00:00.000Z","origin":"local","event":{"id":"evt_11111111111111111111111111111111","kind":"handoff","type":"agent-rally.handoff.created.v1","tool":"codex","payload":{"subject":"smoke"}}}"#,
+        &format!("{}\n", serde_json::to_string(&entry).unwrap()),
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_rally-rs"))
@@ -78,13 +92,10 @@ fn verify_json_uses_explicit_trust_policy() {
     );
     let changes = temp_jsonl(
         "rally-cli-trusted",
-        &serde_json::to_string(&json!({
-            "local_seq": 1,
-            "received_at": "2026-05-26T18:00:01.000Z",
-            "origin": "local",
-            "event": record
-        }))
-        .unwrap(),
+        &format!(
+            "{}\n",
+            serde_json::to_string(&store_entry_value(record, 1, None, "local").unwrap()).unwrap()
+        ),
     );
     let trust = std::env::temp_dir().join(format!(
         "rally-cli-trust-{}.toml",
@@ -121,8 +132,31 @@ allowed_kinds = ["handoff"]
 
     assert!(output.status.success());
     let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(body["records"], 1);
-    assert_eq!(body["counts"]["trusted"], 1);
-    assert_eq!(body["events"][0]["status"], "trusted");
-    assert_eq!(body["events"][0]["key_id"], "key_codex_test");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["command"], "verify");
+    assert_eq!(body["schema"], "agent-rally.command.verify.v1");
+    assert_eq!(body["data"]["records"], 1);
+    assert_eq!(body["data"]["counts"]["trusted"], 1);
+    assert_eq!(body["data"]["events"][0]["status"], "trusted");
+    assert_eq!(body["data"]["events"][0]["key_id"], "key_codex_test");
+}
+
+#[test]
+fn verify_json_errors_use_command_envelope() {
+    let path = temp_jsonl("rally-cli-bad-store", "{\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rally-rs"))
+        .arg("verify")
+        .arg("--json")
+        .arg(&path)
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert!(!output.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["command"], "verify");
+    assert_eq!(body["exit_code"], 1);
+    assert!(body["error"].as_str().unwrap().contains("invalid"));
 }

@@ -13,6 +13,7 @@ name = "rally-rs"
 path = "src/main.rs"
 
 [dependencies]
+rally-core = { path = "../rally-core" }
 rally-protocol = { path = "../rally-protocol" }
 rally-trust = { path = "../rally-trust" }
 serde.workspace = true

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use rally_protocol::{event_id, read_jsonl};
+use rally_core::store::load_records;
+use rally_protocol::event_id;
 use rally_trust::{
     PublicKeyStore, TrustContext, TrustPolicy, TrustStatus, classify, classify_with_policy,
     load_trust_file,
@@ -29,8 +30,22 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 usage();
                 return Ok(ExitCode::from(2));
             };
-            verify(options)?;
-            Ok(ExitCode::SUCCESS)
+            match verify(&options) {
+                Ok(()) => Ok(ExitCode::SUCCESS),
+                Err(err) if options.json => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "ok": false,
+                            "command": "verify",
+                            "error": err.to_string(),
+                            "exit_code": 1,
+                        })
+                    );
+                    Ok(ExitCode::FAILURE)
+                }
+                Err(err) => Err(err),
+            }
         }
         _ => {
             usage();
@@ -89,9 +104,9 @@ fn usage() {
     );
 }
 
-fn verify(options: VerifyOptions) -> Result<(), Box<dyn std::error::Error>> {
-    let records = read_jsonl(&options.path)?;
-    let trust = load_trust_context(&options)?;
+fn verify(options: &VerifyOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let records = load_records(&options.path)?;
+    let trust = load_trust_context(options)?;
     let mut counts: BTreeMap<TrustStatus, usize> = BTreeMap::new();
     let mut json_events = Vec::new();
 
@@ -124,10 +139,15 @@ fn verify(options: VerifyOptions) -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "{}",
             serde_json::json!({
-                "records": records.len(),
-                "trust_policy": trust_policy,
-                "counts": counts,
-                "events": json_events,
+                "ok": true,
+                "command": "verify",
+                "schema": "agent-rally.command.verify.v1",
+                "data": {
+                    "records": records.len(),
+                    "trust_policy": trust_policy,
+                    "counts": counts,
+                    "events": json_events,
+                }
             })
         );
     } else {
