@@ -78,6 +78,7 @@ the canonical fields.
 | `arch-scan-complete` | `agent-rally.arch-scan.completed.v1` | `urn:agent-rally-point:schema:arch-scan.completed.v1` |
 | `feedback` | `agent-rally.feedback.posted.v1` | `urn:agent-rally-point:schema:feedback.posted.v1` |
 | `handoff` | `agent-rally.handoff.created.v1` | `urn:agent-rally-point:schema:handoff.created.v1` |
+| `ack` | `agent-rally.handoff.acknowledged.v1` | `urn:agent-rally-point:schema:handoff.acknowledged.v1` |
 
 Packaged JSON Schemas live under `agent_rally_point/schemas/`. They are
 diagnostic contracts for tooling and future bridges; validation remains
@@ -202,6 +203,22 @@ Plan owner → verifier work-item transfer (added 2026-05-20).
     "to_tool": "codex",
     "work_item": "verify Step 4 archive",
     "deadline_ts": 1779400000.0
+  }
+}
+```
+
+### `ack`
+
+Receiver response to a handoff. New CLI lifecycle commands use `verdict` values
+`done`, `rejected`, and `needs-info`.
+
+```json
+{
+  "kind": "ack",
+  "payload": {
+    "ref_handoff_id": "evt_...",
+    "verdict": "done",
+    "summary": "reviewed; no blockers"
   }
 }
 ```

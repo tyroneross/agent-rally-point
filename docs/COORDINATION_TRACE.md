@@ -225,6 +225,7 @@ Known `kind` values map to canonical event `type`s:
 | `arch-scan-complete` | `agent-rally.arch-scan.completed.v1` |
 | `feedback` | `agent-rally.feedback.posted.v1` |
 | `handoff` | `agent-rally.handoff.created.v1` |
+| `ack` | `agent-rally.handoff.acknowledged.v1` |
 
 Future event types should prefer the form:
 
@@ -251,6 +252,7 @@ Current schemas:
 
 - `envelope.v1.schema.json`
 - `handoff.created.v1.schema.json`
+- `handoff.acknowledged.v1.schema.json`
 - `feedback.posted.v1.schema.json`
 - `phase.recorded.v1.schema.json`
 - `commit.created.v1.schema.json`
@@ -263,6 +265,24 @@ are stable identifiers, not network locations.
 Schemas are tooling contracts. They support replay/report/scorer/bridge tooling,
 but the substrate keeps the existing warns-not-drops behavior: malformed or
 unknown events are kept, and consumers decide whether to act.
+
+## CLI surfaces
+
+The package includes initial plain-text trace commands:
+
+```bash
+agent-rally report --since 2h
+agent-rally replay --since 2h
+agent-rally thread <id-or-thread-id>
+agent-rally inbox --tool codex
+agent-rally handoff --to codex --subject "review schema" --files docs/SCHEMA.md
+agent-rally ack <handoff-id> --summary "reviewed"
+agent-rally reject <handoff-id> --reason "out of scope"
+agent-rally needs-info <handoff-id> --reason "which branch?"
+```
+
+These commands are deliberately text-first and operate on the trace itself; a
+future TUI can build on the same query helpers.
 
 ## Replay and scoring
 

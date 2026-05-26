@@ -116,6 +116,7 @@ def test_packaged_schemas_are_valid_json():
     names = {p.name for p in schema_dir.glob("*.json")}
     assert "envelope.v1.schema.json" in names
     assert "handoff.created.v1.schema.json" in names
+    assert "handoff.acknowledged.v1.schema.json" in names
     for path in schema_dir.glob("*.json"):
         schema = json.loads(path.read_text(encoding="utf-8"))
         assert schema["$schema"].startswith("https://json-schema.org/")

@@ -46,6 +46,7 @@ KNOWN_KINDS = (
     "arch-scan-complete",
     "feedback",
     "handoff",
+    "ack",
 )
 
 DEFAULT_DATA_CONTENT_TYPE = "application/json"
@@ -58,6 +59,7 @@ _KIND_TYPES = {
     "arch-scan-complete": "agent-rally.arch-scan.completed.v1",
     "feedback": "agent-rally.feedback.posted.v1",
     "handoff": "agent-rally.handoff.created.v1",
+    "ack": "agent-rally.handoff.acknowledged.v1",
 }
 
 _RECORD_KEYS = (
