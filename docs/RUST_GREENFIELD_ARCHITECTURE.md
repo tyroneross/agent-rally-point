@@ -341,6 +341,8 @@ Initial implementation status:
 - `rally-trust` owns signature verification and trust policy loading.
 - `rally-core` now owns channel loading and deterministic query/diagnose
   projections over portable events and store entries.
+- `rally-core::store` now has locked append, strict store-entry reads,
+  `event_hash`, and `prev_entry_hash` validation for the greenfield log shape.
 - `rally-cli` is still a prototype verifier surface and should become a
   renderer over `rally-core` outputs rather than owning behavior.
 

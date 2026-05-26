@@ -6,10 +6,21 @@ use rally_core::query::{
     active_blockers_at, active_claims_at, claim_conflicts, pending_handoffs_at, related_records,
     score_records,
 };
-use rally_core::store::ChannelStore;
+use rally_core::store::{ChannelStore, store_entry_value};
+use rally_protocol::{event_hash, store_entry_hash};
 use serde_json::{Value, json};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+fn temp_channel(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "{name}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
 
 fn record(kind: &str, id: &str, tool: &str, payload: Value) -> Value {
     json!({
@@ -201,31 +212,23 @@ fn score_reports_dangling_references() {
 
 #[test]
 fn channel_store_loads_changes_jsonl() {
-    let channel = std::env::temp_dir().join(format!(
-        "rally-core-store-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let channel = temp_channel("rally-core-store");
     fs::create_dir_all(&channel).unwrap();
+    let entry = store_entry_value(
+        record(
+            "handoff",
+            "evt_handoff",
+            "pi",
+            json!({"to_tool": "codex", "subject": "review"}),
+        ),
+        1,
+        None,
+        "local",
+    )
+    .unwrap();
     fs::write(
         channel.join("changes.jsonl"),
-        format!(
-            "{}\n",
-            serde_json::to_string(&json!({
-                "local_seq": 1,
-                "received_at": "2026-05-26T18:00:00.000Z",
-                "origin": "local",
-                "event": record(
-                    "handoff",
-                    "evt_handoff",
-                    "pi",
-                    json!({"to_tool": "codex", "subject": "review"})
-                )
-            }))
-            .unwrap()
-        ),
+        format!("{}\n", serde_json::to_string(&entry).unwrap()),
     )
     .unwrap();
 
@@ -237,4 +240,70 @@ fn channel_store_loads_changes_jsonl() {
         pending_handoffs_at(&records, Some("codex"), 1_779_829_200.0).len(),
         1
     );
+}
+
+#[test]
+fn channel_store_appends_hash_chained_entries() {
+    let channel = temp_channel("rally-core-append");
+    let store = ChannelStore::new(&channel);
+
+    let first = store
+        .append_event(record(
+            "handoff",
+            "evt_handoff",
+            "pi",
+            json!({"to_tool": "codex", "subject": "review"}),
+        ))
+        .unwrap();
+    let second = store
+        .append_event(record(
+            "ack",
+            "evt_ack",
+            "codex",
+            json!({"ref_handoff_id": "evt_handoff", "verdict": "done"}),
+        ))
+        .unwrap();
+
+    let text = fs::read_to_string(channel.join("changes.jsonl")).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    fs::remove_dir_all(channel).unwrap();
+
+    assert_eq!(first["local_seq"], 1);
+    assert_eq!(second["local_seq"], 2);
+    assert_eq!(first["origin"], "local");
+    assert_eq!(first["event_hash"], event_hash(&first).unwrap());
+    assert_eq!(second["prev_entry_hash"], store_entry_hash(lines[0]));
+    assert_eq!(lines.len(), 2);
+}
+
+#[test]
+fn channel_store_rejects_corrupt_and_tampered_logs() {
+    let corrupt = temp_channel("rally-core-corrupt");
+    fs::create_dir_all(&corrupt).unwrap();
+    fs::write(corrupt.join("changes.jsonl"), "{\n").unwrap();
+    assert!(ChannelStore::new(&corrupt).load_records().is_err());
+    fs::remove_dir_all(corrupt).unwrap();
+
+    let tampered = temp_channel("rally-core-tampered");
+    fs::create_dir_all(&tampered).unwrap();
+    let mut entry = store_entry_value(
+        record(
+            "handoff",
+            "evt_handoff",
+            "pi",
+            json!({"to_tool": "codex", "subject": "review"}),
+        ),
+        1,
+        None,
+        "local",
+    )
+    .unwrap();
+    entry["event_hash"] = json!("sha256:bad");
+    fs::write(
+        tampered.join("changes.jsonl"),
+        format!("{}\n", serde_json::to_string(&entry).unwrap()),
+    )
+    .unwrap();
+    assert!(ChannelStore::new(&tampered).load_records().is_err());
+    fs::remove_dir_all(tampered).unwrap();
 }

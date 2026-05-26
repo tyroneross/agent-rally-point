@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -17,6 +18,7 @@ use std::path::Path;
 
 /// Current canonicalization profile for Rust-native Rally event bytes.
 pub const CANONICALIZATION_VERSION: &str = "rally-json-v1";
+pub const HASH_PREFIX_SHA256: &str = "sha256:";
 
 /// Local metadata fields that are never part of signed/canonical event bytes.
 pub const LOCAL_METADATA_FIELDS: &[&str] = &[
@@ -25,6 +27,8 @@ pub const LOCAL_METADATA_FIELDS: &[&str] = &[
     "received_at",
     "origin",
     "imported_at",
+    "event_hash",
+    "prev_entry_hash",
     "store",
     "sync",
 ];
@@ -84,6 +88,10 @@ pub struct StoreEntry {
     pub received_at: Option<String>,
     #[serde(default)]
     pub origin: Option<String>,
+    #[serde(default)]
+    pub event_hash: Option<String>,
+    #[serde(default)]
+    pub prev_entry_hash: Option<String>,
     pub event: RallyEvent,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -263,6 +271,25 @@ pub fn canonical_event_bytes(record: &Value) -> Result<Vec<u8>, ProtocolError> {
     Ok(serde_json::to_vec(&canonical_event_value(record)?)?)
 }
 
+pub fn sha256_hash(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(HASH_PREFIX_SHA256.len() + digest.len() * 2);
+    out.push_str(HASH_PREFIX_SHA256);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    out
+}
+
+pub fn event_hash(record: &Value) -> Result<String, ProtocolError> {
+    Ok(sha256_hash(&canonical_event_bytes(record)?))
+}
+
+pub fn store_entry_hash(line: &str) -> String {
+    sha256_hash(line.as_bytes())
+}
+
 /// Read newline-delimited JSON records, skipping blank and malformed trailing lines.
 pub fn read_jsonl(path: impl AsRef<Path>) -> Result<Vec<Value>, ProtocolError> {
     let text = fs::read_to_string(path)?;
@@ -412,12 +439,16 @@ mod tests {
             "local_seq": 1,
             "received_at": "2026-05-26T18:00:02.000Z",
             "origin": "local",
+            "event_hash": "sha256:aaa",
+            "prev_entry_hash": "sha256:bbb",
             "event": event()
         });
         let wrapped_b = json!({
             "local_seq": 44,
             "received_at": "2027-01-01T00:00:00.000Z",
             "origin": "remote:peer-a",
+            "event_hash": "sha256:ccc",
+            "prev_entry_hash": "sha256:ddd",
             "event": event()
         });
 
@@ -436,6 +467,33 @@ mod tests {
         let rendered = String::from_utf8(bytes).unwrap();
         assert!(rendered.contains("cafe \u{e9}"));
         assert!(!rendered.contains("\\u00e9"));
+    }
+
+    #[test]
+    fn event_hash_uses_canonical_event_bytes() {
+        let unsigned = event();
+        let mut signed_entry = json!({
+            "local_seq": 12,
+            "received_at": "2026-05-26T18:00:02.000Z",
+            "origin": "local",
+            "event_hash": "sha256:ignored",
+            "prev_entry_hash": "sha256:ignored",
+            "event": event()
+        });
+        signed_entry["event"]
+            .as_object_mut()
+            .unwrap()
+            .insert("signature".into(), json!({"signature": "ignored"}));
+
+        assert_eq!(
+            event_hash(&unsigned).unwrap(),
+            event_hash(&signed_entry).unwrap()
+        );
+        assert!(
+            event_hash(&unsigned)
+                .unwrap()
+                .starts_with(HASH_PREFIX_SHA256)
+        );
     }
 
     #[test]

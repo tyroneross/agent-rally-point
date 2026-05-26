@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 chrono.workspace = true
+fs2.workspace = true
 rally-protocol = { path = "../rally-protocol" }
 serde.workspace = true
 serde_json.workspace = true
