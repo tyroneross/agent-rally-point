@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
+use rally_core::event::{EventBuilder, EventPayload, HandoffPayload};
 use rally_core::query::{
     active_blockers_at, active_claims_at, claim_conflicts, pending_handoffs_at, related_records,
     score_records,
@@ -44,6 +45,25 @@ fn record(kind: &str, id: &str, tool: &str, payload: Value) -> Value {
         "payload": payload,
         "revision": 1
     })
+}
+
+fn typed_handoff(id: &str, subject: &str) -> EventBuilder {
+    EventBuilder::new(
+        id,
+        EventPayload::Handoff(HandoffPayload {
+            subject: subject.to_string(),
+            to_tool: Some("codex".to_string()),
+            from_tool: Some("pi".to_string()),
+            requires_ack: true,
+            ref_files: vec!["docs/SCHEMA.md".to_string()],
+            notes: None,
+        }),
+        "pi",
+        "test-run",
+        "thr_11111111111111111111111111111111",
+    )
+    .model("test")
+    .time("2026-05-26T18:00:00.000Z")
 }
 
 #[test]
@@ -276,6 +296,25 @@ fn channel_store_appends_hash_chained_entries() {
     assert_eq!(first["event_hash"], event_hash(&first).unwrap());
     assert_eq!(second["prev_entry_hash"], store_entry_hash(lines[0]));
     assert_eq!(lines.len(), 2);
+}
+
+#[test]
+fn channel_store_appends_typed_events() {
+    let channel = temp_channel("rally-core-typed-append");
+    let store = ChannelStore::new(&channel);
+
+    let entry = store
+        .append_typed(typed_handoff("evt_typed_handoff", "typed review"))
+        .unwrap();
+    let records = store.load_records().unwrap();
+    fs::remove_dir_all(channel).unwrap();
+
+    assert_eq!(entry["event"]["kind"], "handoff");
+    assert_eq!(entry["event"]["payload"]["subject"], "typed review");
+    assert_eq!(
+        pending_handoffs_at(&records, Some("codex"), 1_779_829_200.0)[0].files,
+        vec!["docs/SCHEMA.md".to_string()]
+    );
 }
 
 #[test]

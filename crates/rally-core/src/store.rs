@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::CoreError;
+use crate::event::EventBuilder;
 use chrono::{DateTime, SecondsFormat, Utc};
 use fs2::FileExt;
 use rally_protocol::{event_hash, event_value, store_entry_hash};
@@ -65,6 +66,18 @@ impl ChannelStore {
 
     pub fn append_event(&self, event: Value) -> Result<Value, CoreError> {
         self.append_event_with_origin(event, ORIGIN_LOCAL)
+    }
+
+    pub fn append_typed(&self, event: EventBuilder) -> Result<Value, CoreError> {
+        self.append_typed_with_origin(event, ORIGIN_LOCAL)
+    }
+
+    pub fn append_typed_with_origin(
+        &self,
+        event: EventBuilder,
+        origin: &str,
+    ) -> Result<Value, CoreError> {
+        self.append_event_with_origin(event.build()?, origin)
     }
 
     pub fn append_event_with_origin(&self, event: Value, origin: &str) -> Result<Value, CoreError> {

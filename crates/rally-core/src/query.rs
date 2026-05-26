@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::CoreError;
-use crate::event::{EventKind, EventRecord};
+use crate::event::{EventKind, EventPayload, EventRecord};
 use chrono::{DateTime, Utc};
 use rally_protocol::event_value;
 use serde::{Deserialize, Serialize};
@@ -195,26 +195,20 @@ pub fn pending_handoffs(records: &[Value], tool: Option<&str>) -> Vec<PendingHan
 }
 
 pub fn pending_handoffs_at(records: &[Value], tool: Option<&str>, now: f64) -> Vec<PendingHandoff> {
-    let acked = referenced_ids(records, "ack", &["ref_handoff_id", "ref_event_id"]);
+    let acked = referenced_ids(records, EventKind::Ack);
     let mut out = Vec::new();
     for record in records {
         let Ok(parsed) = EventRecord::parse(record) else {
             continue;
         };
-        if parsed.kind != EventKind::Handoff {
+        let Some(EventPayload::Handoff(payload)) = parsed.payload else {
+            continue;
+        };
+        if !payload.requires_ack || !record_aliases(record).is_disjoint(&acked) {
             continue;
         }
-        let event = &parsed.event;
-        let requires_ack = payload_value(event, "requires_ack")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        if !requires_ack || !record_aliases(record).is_disjoint(&acked) {
-            continue;
-        }
-        let to_tool = payload_string(event, "to_tool").or_else(|| payload_string(event, "to"));
-        let from_tool = payload_string(event, "from_tool")
-            .or_else(|| payload_string(event, "from"))
-            .or_else(|| string_field(event, "tool"));
+        let to_tool = payload.to_tool;
+        let from_tool = payload.from_tool.or(parsed.tool);
         if let Some(tool) = tool {
             if !matches!(to_tool.as_deref(), Some(value) if value == tool || value == "all")
                 && to_tool.is_some()
@@ -230,11 +224,9 @@ pub fn pending_handoffs_at(records: &[Value], tool: Option<&str>, now: f64) -> V
             thread_id: parsed.thread_id,
             from_tool,
             to_tool,
-            subject: subject(event),
+            subject: payload.subject,
             age_seconds: age_seconds(record, now),
-            files: payload_array_strings(event, "ref_files")
-                .or_else(|| payload_array_strings(event, "files"))
-                .unwrap_or_default(),
+            files: payload.ref_files,
         });
     }
     out
@@ -245,22 +237,19 @@ pub fn active_claims(records: &[Value], tool: Option<&str>) -> Vec<ActiveClaim> 
 }
 
 pub fn active_claims_at(records: &[Value], tool: Option<&str>, now: f64) -> Vec<ActiveClaim> {
-    let released = referenced_ids(records, "claim-release", &["ref_claim_id", "ref_event_id"]);
+    let released = referenced_ids(records, EventKind::ClaimRelease);
     let mut out = Vec::new();
     for record in records {
         let Ok(parsed) = EventRecord::parse(record) else {
             continue;
         };
-        if parsed.kind != EventKind::Claim {
+        let Some(EventPayload::Claim(payload)) = parsed.payload else {
             continue;
-        }
-        let event = &parsed.event;
+        };
         if !record_aliases(record).is_disjoint(&released) {
             continue;
         }
-        let owner = payload_string(event, "owner_tool")
-            .or_else(|| payload_string(event, "tool"))
-            .or_else(|| string_field(event, "tool"));
+        let owner = Some(payload.owner_tool);
         if tool.is_some() && owner.as_deref() != tool {
             continue;
         }
@@ -268,11 +257,8 @@ pub fn active_claims_at(records: &[Value], tool: Option<&str>, now: f64) -> Vec<
             event_id: record_id(record),
             thread_id: parsed.thread_id,
             owner_tool: owner,
-            resource: payload_string(event, "resource")
-                .or_else(|| payload_string(event, "path"))
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "unknown".to_string()),
-            subject: subject(event),
+            resource: payload.resource,
+            subject: payload.subject,
             age_seconds: age_seconds(record, now),
         });
     }
@@ -329,20 +315,15 @@ pub fn active_blockers(records: &[Value], tool: Option<&str>) -> Vec<ActiveBlock
 }
 
 pub fn active_blockers_at(records: &[Value], tool: Option<&str>, now: f64) -> Vec<ActiveBlocker> {
-    let resolved = referenced_ids(
-        records,
-        "blocker-resolved",
-        &["ref_blocker_id", "ref_event_id"],
-    );
+    let resolved = referenced_ids(records, EventKind::BlockerResolved);
     let mut out = Vec::new();
     for record in records {
         let Ok(parsed) = EventRecord::parse(record) else {
             continue;
         };
-        if parsed.kind != EventKind::Blocker {
+        let Some(EventPayload::Blocker(payload)) = parsed.payload else {
             continue;
-        }
-        let event = &parsed.event;
+        };
         if !record_aliases(record).is_disjoint(&resolved) {
             continue;
         }
@@ -354,9 +335,9 @@ pub fn active_blockers_at(records: &[Value], tool: Option<&str>, now: f64) -> Ve
             event_id: record_id(record),
             thread_id: parsed.thread_id,
             tool: producer,
-            subject: subject(event),
-            resource: payload_string(event, "resource").or_else(|| payload_string(event, "path")),
-            severity: payload_string(event, "severity").unwrap_or_else(|| "blocked".to_string()),
+            subject: payload.subject,
+            resource: payload.resource,
+            severity: payload.severity.unwrap_or_else(|| "blocked".to_string()),
             age_seconds: age_seconds(record, now),
         });
     }
@@ -383,7 +364,6 @@ pub fn score_records(records: &[Value], tool: Option<&str>) -> (i64, Vec<ScoreFi
         let Ok(parsed) = EventRecord::parse(record) else {
             continue;
         };
-        let event = &parsed.event;
         if let Some(causation) = parsed.causation_id.filter(|value| !value.is_empty()) {
             if !ids.contains(&causation) {
                 findings.push(ScoreFinding {
@@ -396,10 +376,9 @@ pub fn score_records(records: &[Value], tool: Option<&str>) -> (i64, Vec<ScoreFi
                 });
             }
         }
-        if matches!(parsed.kind, EventKind::Ack | EventKind::Feedback) {
-            let reference = payload_string(event, "ref_handoff_id")
-                .or_else(|| payload_string(event, "ref_event_id"));
-            if let Some(reference) = reference.filter(|value| !value.is_empty()) {
+        if let Some(EventPayload::Ack(payload) | EventPayload::Feedback(payload)) = parsed.payload {
+            if !payload.ref_handoff_id.is_empty() {
+                let reference = payload.ref_handoff_id;
                 if !ids.contains(&reference) {
                     findings.push(ScoreFinding {
                         severity: "P2".to_string(),
@@ -439,16 +418,18 @@ pub fn score_records(records: &[Value], tool: Option<&str>) -> (i64, Vec<ScoreFi
     (score.max(0), findings)
 }
 
-fn referenced_ids(records: &[Value], kind: &str, keys: &[&str]) -> BTreeSet<String> {
-    let kind = EventKind::parse(Some(kind));
+fn referenced_ids(records: &[Value], kind: EventKind) -> BTreeSet<String> {
     records
         .iter()
         .filter_map(|record| EventRecord::parse(record).ok())
         .filter(|record| record.kind == kind)
-        .flat_map(|record| {
-            keys.iter()
-                .filter_map(move |key| payload_string(&record.event, key))
-                .collect::<Vec<_>>()
+        .filter_map(|record| match record.payload? {
+            EventPayload::Ack(payload) | EventPayload::Feedback(payload) => {
+                Some(payload.ref_handoff_id)
+            }
+            EventPayload::ClaimRelease(payload) => Some(payload.ref_claim_id),
+            EventPayload::BlockerResolved(payload) => Some(payload.ref_blocker_id),
+            _ => None,
         })
         .collect()
 }
@@ -466,12 +447,8 @@ fn final_ack_by_handoff(records: &[Value]) -> BTreeMap<String, String> {
         if parsed.kind != EventKind::Ack {
             continue;
         }
-        let event = &parsed.event;
-        let reference = payload_string(event, "ref_handoff_id")
-            .or_else(|| payload_string(event, "ref_event_id"));
-        let verdict = payload_string(event, "verdict");
-        if let (Some(reference), Some(verdict)) = (reference, verdict) {
-            latest.insert(reference, verdict);
+        if let Some(EventPayload::Ack(payload)) = parsed.payload {
+            latest.insert(payload.ref_handoff_id, payload.verdict);
         }
     }
     latest
@@ -535,22 +512,6 @@ fn age_seconds(record: &Value, now: f64) -> Option<i64> {
     (epoch > 0.0).then_some((now - epoch).max(0.0) as i64)
 }
 
-fn subject(event: &Value) -> String {
-    payload_string(event, "subject")
-        .or_else(|| payload_string(event, "work_item"))
-        .or_else(|| payload_string(event, "summary"))
-        .or_else(|| payload_string(event, "notes"))
-        .or_else(|| {
-            let subject = string_field(event, "subject")?;
-            (Some(subject.as_str()) != string_field(event, "app_slug").as_deref())
-                .then_some(subject)
-        })
-        .unwrap_or_else(|| "(no subject)".to_string())
-        .chars()
-        .take(120)
-        .collect()
-}
-
 fn string_field(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_string)
 }
@@ -563,17 +524,6 @@ fn payload_string(event: &Value, key: &str) -> Option<String> {
     payload_value(event, key)
         .and_then(Value::as_str)
         .map(str::to_string)
-}
-
-fn payload_array_strings(event: &Value, key: &str) -> Option<Vec<String>> {
-    Some(
-        payload_value(event, key)?
-            .as_array()?
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect(),
-    )
 }
 
 fn value_to_display_string(value: &Value) -> Option<String> {
