@@ -365,6 +365,18 @@ Minimum viable remote flow:
 6. Derived state includes origin and trust classification.
 7. Automation only acts on events whose trust state meets the command's policy.
 
+The Rust CLI implements the first transport-free packet flow:
+
+```bash
+rally-rs sync export --channel-dir <dir> --json > packet.json
+rally-rs sync import --channel-dir <dir> --trust-policy <trust.toml> packet.json --json
+```
+
+`sync export` emits `agent-rally.sync.packet.v1` with portable events only.
+`sync import` appends accepted events with import origin metadata, preserves
+signatures, reports duplicates/conflicts, and includes trust counts in the
+command result.
+
 Import must be idempotent and bounded-memory: validate packet structure, verify
 event hashes/signatures, sort only the packet being imported if needed, append
 accepted entries, and report rejected entries by reason.

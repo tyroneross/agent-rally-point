@@ -284,6 +284,13 @@ Minimum sync behavior:
 - display untrusted remote events separately or with warnings;
 - include signature status in `rally diagnose` when trust affects next actions.
 
+Rust packet commands:
+
+```bash
+rally-rs sync export --channel-dir <dir> --json > packet.json
+rally-rs sync import --channel-dir <dir> --trust-policy ~/.agent-rally-point/identity/trust.toml packet.json --json
+```
+
 ## Open questions
 
 - Should trust policy live only in `~/.agent-rally-point`, or can repos commit a

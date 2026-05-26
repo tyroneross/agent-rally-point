@@ -24,6 +24,18 @@ fn temp_jsonl(name: &str, contents: &str) -> std::path::PathBuf {
     path
 }
 
+fn write_json(name: &str, value: &serde_json::Value) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "{name}-{}.json",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&path, serde_json::to_string(value).unwrap()).unwrap();
+    path
+}
+
 fn temp_channel(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "{name}-{}",
@@ -443,6 +455,114 @@ fn identity_init_and_signed_write_verify_as_trusted() {
     assert_eq!(verify["data"]["counts"]["trusted"], 1);
     assert_eq!(verify["data"]["events"][0]["status"], "trusted");
     assert_eq!(verify["data"]["events"][0]["key_id"], identity["key_id"]);
+}
+
+#[test]
+fn sync_export_import_round_trips_signed_events() {
+    let source = temp_channel("rally-cli-sync-source");
+    let dest = temp_channel("rally-cli-sync-dest");
+    let identity_dir = temp_channel("rally-cli-sync-identity");
+    let source_arg = source.to_str().unwrap();
+    let dest_arg = dest.to_str().unwrap();
+    let identity_arg = identity_dir.to_str().unwrap();
+
+    let identity = json_stdout(run_rally(&[
+        "identity",
+        "init",
+        "--json",
+        "--identity-dir",
+        identity_arg,
+        "--tool",
+        "codex",
+    ]));
+    let key_id = identity["key_id"].as_str().unwrap();
+    let handoff = json_stdout(run_rally(&[
+        "handoff",
+        "--json",
+        "--channel-dir",
+        source_arg,
+        "--identity-dir",
+        identity_arg,
+        "--key-id",
+        key_id,
+        "--sign",
+        "--to",
+        "pi",
+        "--from-tool",
+        "codex",
+        "--subject",
+        "sync me",
+    ]));
+    let handoff_id = handoff["event_id"].as_str().unwrap();
+
+    let packet = json_stdout(run_rally(&[
+        "sync",
+        "export",
+        "--json",
+        "--channel-dir",
+        source_arg,
+    ]));
+    assert_eq!(packet["schema"], "agent-rally.sync.packet.v1");
+    assert_eq!(packet["count"], 1);
+    assert_eq!(packet["events"][0]["id"], handoff_id);
+    assert!(packet["events"][0].get("local_seq").is_none());
+    let packet_path = write_json("rally-cli-sync-packet", &packet);
+
+    let imported = json_stdout(run_rally(&[
+        "sync",
+        "import",
+        "--json",
+        "--channel-dir",
+        dest_arg,
+        "--trust-policy",
+        identity_dir.join("trust.toml").to_str().unwrap(),
+        packet_path.to_str().unwrap(),
+    ]));
+    assert_eq!(imported["data"]["imported"], 1);
+    assert_eq!(imported["data"]["duplicates"], 0);
+    assert_eq!(imported["data"]["trust_counts"]["trusted"], 1);
+
+    let inbox = json_stdout(run_rally(&[
+        "inbox",
+        "--json",
+        "--channel-dir",
+        dest_arg,
+        "--tool",
+        "pi",
+    ]));
+    assert_eq!(inbox["data"]["pending"][0]["event_id"], handoff_id);
+
+    let duplicate = json_stdout(run_rally(&[
+        "sync",
+        "import",
+        "--json",
+        "--channel-dir",
+        dest_arg,
+        packet_path.to_str().unwrap(),
+    ]));
+    assert_eq!(duplicate["data"]["imported"], 0);
+    assert_eq!(duplicate["data"]["duplicates"], 1);
+
+    let mut conflict_packet = packet.clone();
+    conflict_packet["events"][0]["payload"]["subject"] = serde_json::json!("different");
+    let conflict_path = write_json("rally-cli-sync-conflict", &conflict_packet);
+    let conflict = json_stdout(run_rally(&[
+        "sync",
+        "import",
+        "--json",
+        "--channel-dir",
+        dest_arg,
+        conflict_path.to_str().unwrap(),
+    ]));
+    fs::remove_file(packet_path).unwrap();
+    fs::remove_file(conflict_path).unwrap();
+    fs::remove_dir_all(source).unwrap();
+    fs::remove_dir_all(dest).unwrap();
+    fs::remove_dir_all(identity_dir).unwrap();
+
+    assert_eq!(conflict["data"]["imported"], 0);
+    assert_eq!(conflict["data"]["conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(conflict["data"]["conflicts"][0]["event_id"], handoff_id);
 }
 
 #[test]
