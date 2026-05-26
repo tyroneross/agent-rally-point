@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally-point:schema:dependency.changed.v1",
+  "title": "Agent Rally Point dependency.changed payload v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["manifest"],
+  "properties": {
+    "manifest": { "type": "string" },
+    "added": { "type": "array", "items": { "type": "string" } },
+    "removed": { "type": "array", "items": { "type": "string" } },
+    "session_id": { "type": "string" }
+  }
+}

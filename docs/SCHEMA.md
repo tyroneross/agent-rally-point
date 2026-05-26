@@ -7,11 +7,25 @@ SPDX-License-Identifier: Apache-2.0
 
 The canonical wire format for `changes.jsonl`. Single source of truth: `agent_rally_point/changes.py::make_record`. This document mirrors that implementation; if they disagree, the implementation wins and this doc is the bug.
 
+For product-level framing, design goals, and future replay/scoring/signing/sync
+implications, see [`COORDINATION_TRACE.md`](COORDINATION_TRACE.md). This file is
+the field-level schema reference.
+
 ## Format
 
 Each line in `changes.jsonl` is one self-contained JSON object terminated by `\n`. No multi-line records, no leading/trailing whitespace, no comments. Lines are written via `O_APPEND` single-write so concurrent writers from different processes never interleave.
 
-## Required top-level fields
+## Top-level fields
+
+The original v0 core fields remain the compatibility baseline. New records
+emitted by `make_record()` also carry canonical event identity and correlation
+fields so future consumers can build inboxes, replay views, signatures, sync,
+and protocol bridges without parsing per-kind payloads.
+
+Top-level fields are for routing, ordering, identity, versioning, and
+correlation. Domain-specific content stays inside `payload`.
+
+### Compatibility core
 
 | Field       | Type       | Description |
 |-------------|------------|-------------|
@@ -23,6 +37,51 @@ Each line in `changes.jsonl` is one self-contained JSON object terminated by `\n
 | `app_slug`  | `string`   | Channel slug (the directory name under `apps/`). Worktree-independent — see `channel_paths.app_slug`. |
 | `payload`   | `object`   | Per-kind structured body. Schema varies by `kind`; see below. |
 | `revision`  | `integer`  | Channel revision counter snapshot AT THE TIME this record was posted. Set by `post()`; raw `append_change` callers MUST set this themselves. |
+
+### Canonical event metadata
+
+| Field              | Type              | Description |
+|--------------------|-------------------|-------------|
+| `specversion`      | `string`          | CloudEvents spec version marker. Currently `1.0`. |
+| `id`               | `string`          | Opaque stable event id (`evt_<32 hex>`). Unlike `revision`, this survives export/sync/merge. |
+| `source`           | `string`          | Producer URI, e.g. `urn:agent-rally-point:tool:pi`. |
+| `subject`          | `string`          | Producer-scoped subject. Defaults to `app_slug`. |
+| `time`             | `string`          | RFC3339 UTC timestamp for protocol consumers. `ts` remains for compatibility and stale-record logic. |
+| `type`             | `string`          | Versioned semantic event type, e.g. `agent-rally.handoff.created.v1`. `kind` remains the coarse discriminator. |
+| `thread_id`        | `string`          | Opaque thread id (`thr_<32 hex>`) grouping related events such as handoff → ack → feedback. |
+| `causation_id`     | `string | null`   | Direct parent event `id`, when this event was caused by a prior event. |
+| `correlation_id`   | `string`          | Broader workflow/session correlation id. Defaults to `thread_id`. |
+| `datacontenttype`  | `string`          | Payload media type. Currently always `application/json`. |
+| `dataschema`       | `string`          | URI for the schema that describes `payload`, e.g. `urn:agent-rally-point:schema:handoff.created.v1`. |
+
+Canonical metadata is CloudEvents-aligned. Native ARP records retain the legacy
+`payload` field for existing consumers, so strict CloudEvents JSON-format output
+should be produced as a projection that maps `payload` to `data` and omits
+ARP-only compatibility fields. The field split mirrors the same design rule:
+metadata that routers, replay tools, and bridges need goes top-level; event data
+stays in `payload` for the native trace.
+
+For the projection table and native record example, see
+[`COORDINATION_TRACE.md#cloudevents-projection`](COORDINATION_TRACE.md#cloudevents-projection).
+
+Pre-canonical records without these fields remain valid historical records.
+Readers must tolerate their absence. New records built with `make_record()` emit
+the canonical fields.
+
+### Canonical known event types
+
+| `kind` | `type` | `dataschema` |
+|--------|--------|--------------|
+| `commit` | `agent-rally.commit.created.v1` | `urn:agent-rally-point:schema:commit.created.v1` |
+| `dep-change` | `agent-rally.dependency.changed.v1` | `urn:agent-rally-point:schema:dependency.changed.v1` |
+| `phase` | `agent-rally.phase.recorded.v1` | `urn:agent-rally-point:schema:phase.recorded.v1` |
+| `arch-scan-complete` | `agent-rally.arch-scan.completed.v1` | `urn:agent-rally-point:schema:arch-scan.completed.v1` |
+| `feedback` | `agent-rally.feedback.posted.v1` | `urn:agent-rally-point:schema:feedback.posted.v1` |
+| `handoff` | `agent-rally.handoff.created.v1` | `urn:agent-rally-point:schema:handoff.created.v1` |
+
+Packaged JSON Schemas live under `agent_rally_point/schemas/`. They are
+diagnostic contracts for tooling and future bridges; validation remains
+warns-not-drops at the substrate layer.
 
 ### NON-GOAL guard
 

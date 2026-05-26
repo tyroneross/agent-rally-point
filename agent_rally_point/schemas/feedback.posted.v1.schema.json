@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally-point:schema:feedback.posted.v1",
+  "title": "Agent Rally Point feedback.posted payload v1",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "step": { "type": ["integer", "string"] },
+    "verdict": { "type": "string", "enum": ["PASS", "VARIANCE", "BLOCKED", "done", "rejected", "needs-info"] },
+    "rationale": { "type": "string" },
+    "summary": { "type": "string" },
+    "evidence_paths": { "type": "array", "items": { "type": "string" } },
+    "ref_event_id": { "type": "string" },
+    "ref_handoff_id": { "type": "string" }
+  }
+}

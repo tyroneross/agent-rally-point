@@ -47,16 +47,57 @@ def chan(tmp_path: Path) -> Path:
 
 
 def test_make_record_schema():
+    # intent: new records emit canonical identity fields while preserving legacy core fields.
     r = ch.make_record(
         kind="commit", tool="claude", model="opus", run_id="r1",
         app_slug="app", payload={"sha": "abc"}, revision=3,
     )
-    assert set(r) == {
+    assert set(r) >= {
         "ts", "kind", "tool", "model", "run_id", "app_slug", "payload",
         "revision",
     }
+    assert set(r) >= {
+        "specversion", "id", "source", "subject", "time", "type",
+        "thread_id", "causation_id", "correlation_id",
+        "datacontenttype", "dataschema",
+    }
     assert r["kind"] == "commit" and r["revision"] == 3
+    assert r["specversion"] == "1.0"
+    assert r["id"].startswith("evt_")
+    assert r["source"] == "urn:agent-rally-point:tool:claude"
+    assert r["subject"] == "app"
+    assert r["thread_id"].startswith("thr_")
+    assert r["correlation_id"] == r["thread_id"]
+    assert r["type"] == "agent-rally.commit.created.v1"
+    assert r["datacontenttype"] == "application/json"
     _assert_no_freq(r)
+
+
+def test_make_record_accepts_correlation_overrides():
+    # intent: consumers can link later records to an existing thread and parent event.
+    r = ch.make_record(
+        kind="feedback", tool="codex", model="gpt", run_id="r2",
+        app_slug="app", payload={}, revision=4,
+        event_id="evt_" + "1" * 32,
+        thread_id="thr_" + "2" * 32,
+        causation_id="evt_" + "3" * 32,
+    )
+    assert r["id"] == "evt_" + "1" * 32
+    assert r["thread_id"] == "thr_" + "2" * 32
+    assert r["correlation_id"] == "thr_" + "2" * 32
+    assert r["causation_id"] == "evt_" + "3" * 32
+    assert r["type"] == "agent-rally.feedback.posted.v1"
+    assert r["dataschema"] == "urn:agent-rally-point:schema:feedback.posted.v1"
+
+
+def test_canonical_source_and_unknown_type_are_sanitized():
+    # intent: producer-controlled strings still produce conservative URI-ish metadata.
+    r = ch.make_record(
+        kind="custom kind/β", tool="Claude Code/β", model="m", run_id="r",
+        app_slug="app", payload={}, revision=1,
+    )
+    assert r["source"] == "urn:agent-rally-point:tool:Claude-Code"
+    assert r["type"] == "agent-rally.custom-kind.v1"
 
 
 def test_validate_warns_not_drops_unknown_kind(capsys):
@@ -67,6 +108,52 @@ def test_validate_warns_not_drops_unknown_kind(capsys):
     out = ch.validate_record(r)  # must RETURN the record, not drop it
     assert out == r
     assert "totally-new-kind" in capsys.readouterr().err
+
+
+def test_packaged_schemas_are_valid_json():
+    # intent: canonical schema files stay machine-readable for downstream tooling.
+    schema_dir = Path(__file__).resolve().parent / "schemas"
+    names = {p.name for p in schema_dir.glob("*.json")}
+    assert "envelope.v1.schema.json" in names
+    assert "handoff.created.v1.schema.json" in names
+    for path in schema_dir.glob("*.json"):
+        schema = json.loads(path.read_text(encoding="utf-8"))
+        assert schema["$schema"].startswith("https://json-schema.org/")
+        assert schema["$id"].startswith("urn:agent-rally-point:schema:")
+
+
+def test_make_record_matches_envelope_schema():
+    # intent: envelope.v1.schema.json and make_record() must not drift apart;
+    # adding a field to one without the other silently breaks downstream tooling.
+    import re
+
+    schema_path = (
+        Path(__file__).resolve().parent / "schemas" / "envelope.v1.schema.json"
+    )
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    r = ch.make_record(
+        kind="handoff", tool="claude_code", model="opus", run_id="r1",
+        app_slug="app", payload={"from_tool": "claude_code", "to_tool": "codex"},
+        revision=7, causation_id="evt_" + "a" * 32,
+    )
+    # All required fields present.
+    missing = set(schema["required"]) - set(r)
+    assert not missing, f"record missing required schema fields: {missing}"
+    # No unexpected top-level keys (additive evolution must update the schema).
+    extra = set(r) - set(schema["properties"])
+    assert not extra, f"record has fields not in envelope schema: {extra}"
+    # Pattern fields validate.
+    for field, prop in schema["properties"].items():
+        if "pattern" in prop and r.get(field) is not None:
+            assert re.match(prop["pattern"], r[field]), (
+                f"{field}={r[field]!r} fails schema pattern {prop['pattern']!r}"
+            )
+    # const fields match.
+    for field, prop in schema["properties"].items():
+        if "const" in prop:
+            assert r[field] == prop["const"], (
+                f"{field}={r[field]!r} != const {prop['const']!r}"
+            )
 
 
 def test_append_and_read_since(chan: Path):

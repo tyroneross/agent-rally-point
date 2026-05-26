@@ -40,6 +40,11 @@ _LAZY_ATTRS: dict[str, tuple[str, str | None]] = {
     # append-only event log
     "append_change": ("changes", "append_change"),
     "make_record": ("changes", "make_record"),
+    "new_event_id": ("changes", "new_event_id"),
+    "new_thread_id": ("changes", "new_thread_id"),
+    "source_for_tool": ("changes", "source_for_tool"),
+    "event_type_for_kind": ("changes", "event_type_for_kind"),
+    "dataschema_for_type": ("changes", "dataschema_for_type"),
     # monotonic revision counter
     "bump_revision": ("revision", "bump_revision"),
     # delta-computing reader
@@ -86,7 +91,15 @@ if TYPE_CHECKING:
         DEFAULT_APPS_ROOT,
     )
     from .presence import write_presence, read_active_presence  # noqa: F401
-    from .changes import append_change, make_record  # noqa: F401
+    from .changes import (  # noqa: F401
+        append_change,
+        make_record,
+        new_event_id,
+        new_thread_id,
+        source_for_tool,
+        event_type_for_kind,
+        dataschema_for_type,
+    )
     from .revision import bump_revision  # noqa: F401
     from .checkpoint import checkpoint_read  # noqa: F401
     from .post import post  # noqa: F401

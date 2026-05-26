@@ -58,6 +58,14 @@ def post(
     run_id: str,
     app_slug: str,
     payload: dict,
+    event_id: str | None = None,
+    source: str | None = None,
+    subject: str | None = None,
+    event_type: str | None = None,
+    thread_id: str | None = None,
+    causation_id: str | None = None,
+    correlation_id: str | None = None,
+    dataschema: str | None = None,
 ) -> int | None:
     """Bump revision + append a change record. Returns new revision on success, None on error.
 
@@ -81,6 +89,14 @@ def post(
             app_slug=app_slug,
             payload=payload,
             revision=new_rev,
+            event_id=event_id,
+            source=source,
+            subject=subject,
+            event_type=event_type,
+            thread_id=thread_id,
+            causation_id=causation_id,
+            correlation_id=correlation_id,
+            dataschema=dataschema,
         )
         append_change(d, record)
         return new_rev

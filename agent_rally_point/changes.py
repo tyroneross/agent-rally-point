@@ -12,9 +12,13 @@ only ``append_change`` and ``read_changes_since`` — no rewrite, delete,
 or truncate entry point exists (by design, see ``test_no_mutation_api``).
 
 Record schema (defined here once; D7 — unknown ``kind`` warns, never
-drops):
+drops). The v0 core fields remain stable for compatibility, while new
+records also carry canonical event identity/correlation metadata inspired by
+CloudEvents/OpenTelemetry/A2A:
 
-    {ts, kind, tool, model, run_id, app_slug, payload{...}, revision}
+    {ts, specversion, id, source, subject, time, kind, type, tool, model,
+     run_id, app_slug, thread_id, causation_id, correlation_id,
+     datacontenttype, dataschema, payload{...}, revision}
 
 NON-GOAL guard: records carry structure/data-flow only — never any
 call-frequency / invocation-count field.
@@ -25,6 +29,8 @@ import json
 import os
 import sys
 import time
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 _LOG_NAME = "changes.jsonl"
@@ -42,14 +48,74 @@ KNOWN_KINDS = (
     "handoff",
 )
 
+DEFAULT_DATA_CONTENT_TYPE = "application/json"
+CLOUDEVENTS_SPECVERSION = "1.0"
+
+_KIND_TYPES = {
+    "commit": "agent-rally.commit.created.v1",
+    "dep-change": "agent-rally.dependency.changed.v1",
+    "phase": "agent-rally.phase.recorded.v1",
+    "arch-scan-complete": "agent-rally.arch-scan.completed.v1",
+    "feedback": "agent-rally.feedback.posted.v1",
+    "handoff": "agent-rally.handoff.created.v1",
+}
+
 _RECORD_KEYS = (
     "ts", "kind", "tool", "model", "run_id", "app_slug", "payload",
     "revision",
 )
 
-
 def _log_path(channel_dir: Path) -> Path:
     return Path(channel_dir) / _LOG_NAME
+
+
+def _new_id(prefix: str) -> str:
+    """Return a stable opaque id without adding runtime dependencies."""
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def new_event_id() -> str:
+    """Return a new canonical event id."""
+    return _new_id("evt")
+
+
+def new_thread_id() -> str:
+    """Return a new canonical thread/correlation id."""
+    return _new_id("thr")
+
+
+def _format_time(ts: float) -> str:
+    """Return RFC3339 UTC time with millisecond precision."""
+    return (
+        datetime.fromtimestamp(ts, tz=UTC)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _safe_urn_component(value: str) -> str:
+    """Return a conservative URN component for producer-controlled strings."""
+    safe = "".join(
+        ch if ch.isascii() and (ch.isalnum() or ch in "._-") else "-"
+        for ch in value
+    )
+    return safe.strip("-") or "unknown"
+
+
+def source_for_tool(tool: str) -> str:
+    """Return the canonical event source URI for a producer tool."""
+    return f"urn:agent-rally-point:tool:{_safe_urn_component(tool or 'unknown')}"
+
+
+def event_type_for_kind(kind: str) -> str:
+    """Return the canonical event type for a record kind."""
+    return _KIND_TYPES.get(kind, f"agent-rally.{_safe_urn_component(kind)}.v1")
+
+
+def dataschema_for_type(event_type: str) -> str:
+    """Return the canonical payload schema URI for ``event_type``."""
+    suffix = event_type.removeprefix("agent-rally.")
+    return f"urn:agent-rally-point:schema:{suffix}"
 
 
 def make_record(
@@ -61,15 +127,39 @@ def make_record(
     app_slug: str,
     payload: dict,
     revision: int,
+    event_id: str | None = None,
+    source: str | None = None,
+    subject: str | None = None,
+    event_type: str | None = None,
+    thread_id: str | None = None,
+    causation_id: str | None = None,
+    correlation_id: str | None = None,
+    dataschema: str | None = None,
+    time_rfc3339: str | None = None,
 ) -> dict:
     """Build a well-formed change record (schema single source of truth)."""
+    ts = time.time()
+    canonical_type = event_type or event_type_for_kind(kind)
+    canonical_thread = thread_id or new_thread_id()
+    producer_tool = tool or "unknown"
     return {
-        "ts": time.time(),
+        "ts": ts,
+        "specversion": CLOUDEVENTS_SPECVERSION,
+        "id": event_id or new_event_id(),
+        "source": source or source_for_tool(producer_tool),
+        "subject": subject or app_slug,
+        "time": time_rfc3339 or _format_time(ts),
         "kind": kind,
-        "tool": tool or "unknown",
+        "type": canonical_type,
+        "tool": producer_tool,
         "model": model or "unknown",
         "run_id": run_id or "unknown",
         "app_slug": app_slug,
+        "thread_id": canonical_thread,
+        "causation_id": causation_id,
+        "correlation_id": correlation_id or canonical_thread,
+        "datacontenttype": DEFAULT_DATA_CONTENT_TYPE,
+        "dataschema": dataschema or dataschema_for_type(canonical_type),
         "payload": payload or {},
         "revision": int(revision),
     }
