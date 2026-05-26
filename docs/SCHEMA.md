@@ -29,7 +29,6 @@ correlation. Domain-specific content stays inside `payload`.
 
 | Field       | Type       | Description |
 |-------------|------------|-------------|
-| `ts`        | `float`    | Wall-clock seconds since epoch (`time.time()`). Used for human display and stale-record reaping. |
 | `kind`      | `string`   | Record discriminator. See [Record kinds](#record-kinds). |
 | `tool`      | `string`   | Stable tool id (`claude_code`, `codex`, `cursor`, `build-loop`, etc.). Defaults to `"unknown"`. |
 | `model`     | `string`   | Stable model id (`claude-opus-4-7`, `gpt-5`, etc.). Defaults to `"unknown"`. |
@@ -46,7 +45,7 @@ correlation. Domain-specific content stays inside `payload`.
 | `id`               | `string`          | Opaque stable event id (`evt_<32 hex>`). Unlike `revision`, this survives export/sync/merge. |
 | `source`           | `string`          | Producer URI, e.g. `urn:agent-rally-point:tool:pi`. |
 | `subject`          | `string`          | Producer-scoped subject. Defaults to `app_slug`. |
-| `time`             | `string`          | RFC3339 UTC timestamp for protocol consumers. `ts` remains for compatibility and stale-record logic. |
+| `time`             | `string`          | RFC3339 UTC timestamp. Sole event-time field as of 0.4 (legacy epoch-seconds `ts` is tolerated on read but no longer emitted). |
 | `type`             | `string`          | Versioned semantic event type, e.g. `agent-rally.handoff.created.v1`. `kind` remains the coarse discriminator. |
 | `thread_id`        | `string`          | Opaque thread id (`thr_<32 hex>`) grouping related events such as handoff → ack → feedback. |
 | `causation_id`     | `string | null`   | Direct parent event `id`, when this event was caused by a prior event. |
@@ -105,7 +104,7 @@ A commit landed on a branch the channel cares about.
 
 ```json
 {
-  "ts": 1779308543.92, "kind": "commit", "tool": "claude_code",
+  "time": "2026-05-16T18:22:23.920Z", "kind": "commit", "tool": "claude_code",
   "model": "claude-opus-4-7", "run_id": "build-2026-05-23-...",
   "app_slug": "build-loop", "revision": 18,
   "payload": {

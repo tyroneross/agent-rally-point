@@ -12,11 +12,12 @@ only ``append_change`` and ``read_changes_since`` — no rewrite, delete,
 or truncate entry point exists (by design, see ``test_no_mutation_api``).
 
 Record schema (defined here once; D7 — unknown ``kind`` warns, never
-drops). The v0 core fields remain stable for compatibility, while new
-records also carry canonical event identity/correlation metadata inspired by
-CloudEvents/OpenTelemetry/A2A:
+drops). Records carry canonical event identity/correlation metadata
+aligned with CloudEvents 1.0 plus ARP-specific causal fields. Pre-0.4
+records that still carry the legacy epoch-seconds ``ts`` field are
+tolerated on read; new records emit only the RFC3339 ``time`` field:
 
-    {ts, specversion, id, source, subject, time, kind, type, tool, model,
+    {specversion, id, source, subject, time, kind, type, tool, model,
      run_id, app_slug, thread_id, causation_id, correlation_id,
      datacontenttype, dataschema, payload{...}, revision}
 
@@ -63,7 +64,7 @@ _KIND_TYPES = {
 }
 
 _RECORD_KEYS = (
-    "ts", "kind", "tool", "model", "run_id", "app_slug", "payload",
+    "kind", "tool", "model", "run_id", "app_slug", "payload",
     "revision",
 )
 
@@ -145,7 +146,6 @@ def make_record(
     canonical_thread = thread_id or new_thread_id()
     producer_tool = tool or "unknown"
     return {
-        "ts": ts,
         "specversion": CLOUDEVENTS_SPECVERSION,
         "id": event_id or new_event_id(),
         "source": source or source_for_tool(producer_tool),

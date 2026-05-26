@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from typing import Callable
@@ -30,7 +31,10 @@ def _run(args: list[str]) -> subprocess.CompletedProcess:
 
 def list_agents(*, runner: Runner = _run) -> list[HerdrAgent]:
     """Return Herdr agents, or an empty list when Herdr is unavailable."""
-    result = runner(["herdr", "agent", "list"])
+    try:
+        result = runner(["herdr", "agent", "list"])
+    except OSError:
+        return []
     if result.returncode != 0:
         return []
     try:
@@ -51,8 +55,40 @@ def list_agents(*, runner: Runner = _run) -> list[HerdrAgent]:
     return out
 
 
-def match_agent(agents: list[HerdrAgent], target_tool: str | None) -> HerdrAgent | None:
-    """Find the Herdr pane most likely to own ``target_tool``."""
+def _normalize_cwd(value: str | None) -> str | None:
+    """Resolve a cwd string for stable comparison across symlinks/trailing slashes."""
+    if not value:
+        return None
+    try:
+        return os.path.realpath(value)
+    except OSError:
+        return value
+
+
+def _cwd_matches(agent: HerdrAgent, cwd: str | None) -> bool:
+    if cwd is None:
+        return True
+    return _normalize_cwd(agent.cwd) == _normalize_cwd(cwd)
+
+
+def match_agent(
+    agents: list[HerdrAgent],
+    target_tool: str | None,
+    *,
+    cwd: str | None = None,
+    allow_other_workspace: bool = False,
+) -> HerdrAgent | None:
+    """Find the Herdr pane most likely to own ``target_tool``.
+
+    Selection order when more than one pane matches:
+      1. Prefer panes whose ``cwd`` matches the supplied ``cwd`` (after
+         ``realpath`` normalization on both sides so symlinks and trailing
+         slashes don't mask a real match).
+      2. Within either tier, panes are sorted by ``pane_id`` so the choice is
+         deterministic when Herdr returns multiple matching agents.
+      3. If no cwd-matching pane is found and ``allow_other_workspace`` is
+         False, return None rather than falling back to a different workspace.
+    """
     if not target_tool:
         return None
     aliases = {
@@ -63,15 +99,23 @@ def match_agent(agents: list[HerdrAgent], target_tool: str | None) -> HerdrAgent
         "gemini": {"gemini"},
     }
     wanted = aliases.get(target_tool, {target_tool})
-    for agent in agents:
-        if agent.agent in wanted:
+    matching_tool = sorted(
+        (agent for agent in agents if agent.agent in wanted),
+        key=lambda a: a.pane_id,
+    )
+    for agent in matching_tool:
+        if _cwd_matches(agent, cwd):
             return agent
-    return None
+    if cwd is not None and not allow_other_workspace:
+        return None
+    return matching_tool[0] if matching_tool else None
 
 
 def report_pending_status(
     handoffs: list[PendingHandoff],
     *,
+    cwd: str | None = None,
+    allow_other_workspace: bool = False,
     runner: Runner = _run,
 ) -> list[str]:
     """Report pending handoffs into matching Herdr panes as custom status.
@@ -81,9 +125,13 @@ def report_pending_status(
     agents = list_agents(runner=runner)
     lines: list[str] = []
     for item in handoffs:
-        agent = match_agent(agents, item.to_tool)
+        agent = match_agent(
+            agents, item.to_tool,
+            cwd=cwd, allow_other_workspace=allow_other_workspace,
+        )
         if agent is None:
-            lines.append(f"no Herdr pane for {item.to_tool}: {item.event_id}")
+            where = f" in cwd {cwd}" if cwd and not allow_other_workspace else ""
+            lines.append(f"no Herdr pane for {item.to_tool}{where}: {item.event_id}")
             continue
         result = runner([
             "herdr", "pane", "report-agent", agent.pane_id,
@@ -119,6 +167,8 @@ def inject_handoff(
     records: list[dict],
     identifier: str,
     *,
+    cwd: str | None = None,
+    allow_other_workspace: bool = False,
     runner: Runner = _run,
 ) -> str:
     """Inject a handoff prompt into the target Herdr agent pane."""
@@ -127,9 +177,13 @@ def inject_handoff(
         raise ValueError(f"handoff {identifier!r} not found")
     payload = record.get("payload") or {}
     target = payload.get("to_tool") or payload.get("to")
-    agent = match_agent(list_agents(runner=runner), target if isinstance(target, str) else None)
+    agent = match_agent(
+        list_agents(runner=runner), target if isinstance(target, str) else None,
+        cwd=cwd, allow_other_workspace=allow_other_workspace,
+    )
     if agent is None:
-        raise RuntimeError(f"no Herdr pane found for target {target!r}")
+        where = f" in cwd {cwd}" if cwd and not allow_other_workspace else ""
+        raise RuntimeError(f"no Herdr pane found for target {target!r}{where}")
     result = runner(["herdr", "pane", "run", agent.pane_id, handoff_prompt(record)])
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "herdr pane run failed")

@@ -77,11 +77,10 @@ by mapping `payload` to `data` and omitting ARP-only compatibility fields.
 
 Each line in `changes.jsonl` is one complete JSON object.
 
-Legacy compatibility fields:
+Compatibility-core fields:
 
 | Field | Purpose |
 |---|---|
-| `ts` | Legacy wall-clock seconds since epoch. |
 | `kind` | Coarse record discriminator. Unknown kinds warn, never drop. |
 | `tool` | Tool id such as `claude_code`, `codex`, `pi`, `cursor`, `ci`. |
 | `model` | Model id supplied by the producer. |
@@ -128,7 +127,6 @@ Example native ARP record:
 
 ```json
 {
-  "ts": 1779818779.660,
   "specversion": "1.0",
   "id": "evt_345ea9b74be3461b9473e0cf80a79d40",
   "source": "urn:agent-rally-point:tool:pi",
@@ -190,7 +188,7 @@ have similar payloads.
 Ordering rules:
 
 1. Within one channel, sort primarily by `revision`.
-2. For human display, use `time` / `ts` as supporting context.
+2. For human display, use `time` (RFC3339) as supporting context.
 3. Across future synchronized channels, use event identity plus causation/sync
    metadata rather than assuming revisions are globally comparable.
 
@@ -290,7 +288,10 @@ checks coordination invariants such as open required handoffs, dangling causal
 references, dangling ack/feedback references, and unresolved `needs-info` states.
 The Herdr bridge is a dogfood adapter: it can report pending handoffs as Herdr
 custom status or inject a handoff prompt into the target pane, while ARP remains
-the trace source of truth.
+the trace source of truth. Injection and status reporting default to panes whose
+Herdr `cwd` matches the command `--workdir`/current directory; pass
+`--allow-other-workspace` only when intentionally targeting a matching agent in
+another workspace.
 
 ## Replay and scoring
 
@@ -341,6 +342,23 @@ Consequences worth naming up-front:
   URN that points at no packaged schema. The URN is well-formed but
   unresolvable; consumers should treat unknown `dataschema` URNs as "best-
   effort `payload`."
+- **Legacy `ts` field on read.** Records emitted before 0.4 carry a
+  floating-point `ts` (epoch seconds) instead of a string `time` (RFC3339).
+  `record_epoch()` reads either and prefers `ts` when present for backward
+  compatibility. `make_record()` no longer emits `ts`; new records use
+  `time` exclusively.
+- **Herdr injection escalates a recorded event into agent input.** The
+  `agent-rally herdr inject` command invokes `herdr pane run` with text
+  derived from a handoff payload (subject, notes, `ref_files`). Any tool
+  with ARP write access can therefore plant prompt-injection text inside
+  another agent's prompt context once an operator runs injection.
+  Operationally, treat ARP write access as equivalent to *terminal write*
+  access on the receiving agent — and require an explicit operator action
+  (the `herdr inject` invocation itself) before that escalation happens.
+  Future signing should cover the full envelope so an injected prompt can
+  be traced back to the producer who signed it.
+  Cross-workspace injection requires the explicit `--allow-other-workspace`
+  flag; by default a `cwd` mismatch blocks the send (see Herdr bridge).
 
 ## Implementation notes
 

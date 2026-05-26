@@ -153,6 +153,13 @@ def related_records(records: Iterable[dict], identifier: str) -> list[dict]:
     The expansion is transitive: once a matching record reveals a thread id,
     correlation id, or record id, records referencing that value are included.
     Legacy payload ids and ack reference fields are included for compatibility.
+
+    Complexity: O(n²) worst case in the number of records, because the
+    transitive-closure loop rescans the full record list per id discovered.
+    Acceptable for the channel sizes seen in practice (~10³ records); revisit
+    with an index if channels grow into the 10⁵+ range. Dangling causation
+    ids (parent event not present in this channel) are tolerated — the
+    lookup returns whatever IS present without raising.
     """
     all_records = list(records)
     ids = {identifier}
@@ -211,7 +218,19 @@ def acked_handoff_ids(records: Iterable[dict]) -> set[str]:
 
 
 def pending_handoffs(records: Iterable[dict], *, tool: str | None = None) -> list[PendingHandoff]:
-    """Return open handoffs, optionally filtered to ``tool``."""
+    """Return open handoffs, optionally filtered to ``tool``.
+
+    Filtering semantics when ``tool`` is set:
+      * include handoffs addressed ``to`` ``tool`` or to ``"all"``/unaddressed
+        (broadcast), AND
+      * EXCLUDE handoffs where ``from_tool == tool`` — i.e. your own outbox
+        is intentionally not in your inbox. To see what you've sent, use
+        ``report --tool <you>`` or omit ``--tool``.
+
+    Handoffs are considered closed once any ``ack``-kind record references
+    them via ``ref_handoff_id`` or ``ref_event_id``; ``requires_ack=False``
+    on the original handoff also marks it as not needing acknowledgement.
+    """
     recs = list(records)
     acked = acked_handoff_ids(recs)
     pending: list[PendingHandoff] = []

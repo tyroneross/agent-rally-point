@@ -47,20 +47,20 @@ def chan(tmp_path: Path) -> Path:
 
 
 def test_make_record_schema():
-    # intent: new records emit canonical identity fields while preserving legacy core fields.
+    # intent: new records emit canonical identity fields; legacy epoch `ts` is no longer emitted.
     r = ch.make_record(
         kind="commit", tool="claude", model="opus", run_id="r1",
         app_slug="app", payload={"sha": "abc"}, revision=3,
     )
     assert set(r) >= {
-        "ts", "kind", "tool", "model", "run_id", "app_slug", "payload",
-        "revision",
+        "kind", "tool", "model", "run_id", "app_slug", "payload", "revision",
     }
     assert set(r) >= {
         "specversion", "id", "source", "subject", "time", "type",
         "thread_id", "causation_id", "correlation_id",
         "datacontenttype", "dataschema",
     }
+    assert "ts" not in r  # legacy epoch-seconds field dropped in 0.4
     assert r["kind"] == "commit" and r["revision"] == 3
     assert r["specversion"] == "1.0"
     assert r["id"].startswith("evt_")
