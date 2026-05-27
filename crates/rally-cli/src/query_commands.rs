@@ -470,6 +470,8 @@ pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliErr
     let store = command.common.channel_store("setup")?;
     let mut status = setup_status(&store)?;
     let mut installed_path = None;
+    let mut installed_files = Vec::<String>::new();
+    let mut modified_external_config = None;
     match command.action.as_str() {
         "status" => {}
         "enforcement" => {
@@ -496,7 +498,10 @@ pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliErr
                     "unknown adapter; expected cmux or herdr",
                 ));
             }
-            installed_path = Some(write_adapter_install(&store, adapter)?);
+            let install = write_adapter_install(&store, adapter)?;
+            installed_path = install.primary_path;
+            installed_files = install.files;
+            modified_external_config = install.modified_config;
         }
         value => {
             return Err(CliError::usage(
@@ -521,6 +526,8 @@ pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliErr
                 "tools": status.tools,
                 "startup": status.startup,
                 "installed_path": installed_path,
+                "installed_files": installed_files,
+                "modified_external_config": modified_external_config,
             }
         }),
     ))
@@ -622,7 +629,13 @@ fn setup_config_path(store: &ChannelStore) -> PathBuf {
     store.channel_dir().join("rally/config.json")
 }
 
-fn write_adapter_install(store: &ChannelStore, adapter: &str) -> Result<String, CliError> {
+struct AdapterInstall {
+    primary_path: Option<String>,
+    files: Vec<String>,
+    modified_config: Option<String>,
+}
+
+fn write_adapter_install(store: &ChannelStore, adapter: &str) -> Result<AdapterInstall, CliError> {
     let dir = store.channel_dir().join("rally/adapters");
     fs::create_dir_all(&dir).map_err(|err| {
         CliError::runtime("setup", format!("failed to create adapter dir: {err}"))
@@ -640,7 +653,180 @@ fn write_adapter_install(store: &ChannelStore, adapter: &str) -> Result<String, 
     fs::write(&path, body).map_err(|err| {
         CliError::runtime("setup", format!("failed to write adapter file: {err}"))
     })?;
-    Ok(path.display().to_string())
+    let mut files = vec![path.display().to_string()];
+    let modified_config = match adapter {
+        "cmux" => install_cmux_adapter(&mut files)?,
+        "herdr" => install_herdr_adapter(&mut files)?,
+        _ => unreachable!(),
+    };
+    Ok(AdapterInstall {
+        primary_path: Some(path.display().to_string()),
+        files,
+        modified_config,
+    })
+}
+
+fn install_cmux_adapter(files: &mut Vec<String>) -> Result<Option<String>, CliError> {
+    let dir = adapter_config_dir("RALLY_CMUX_CONFIG_DIR", "cmux")?;
+    fs::create_dir_all(&dir)
+        .map_err(|err| CliError::runtime("setup", format!("failed to create cmux dir: {err}")))?;
+    let wrapper = dir.join("rally-agent-wrapper.sh");
+    write_executable(
+        &wrapper,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+tool="${1:-claude}"
+if [ "$#" -gt 0 ]; then shift; fi
+session="${RALLY_SESSION_ID:-${tool}-$(date +%s)}"
+rally "$tool" --session-id "$session" --json > "${TMPDIR:-/tmp}/rally-${tool}-${session}.json" || true
+exec "$tool" "$@"
+"#,
+    )?;
+    files.push(wrapper.display().to_string());
+
+    let config = dir.join("cmux.json");
+    let mut value = if config.exists() {
+        let text = fs::read_to_string(&config).map_err(|err| {
+            CliError::runtime("setup", format!("failed to read cmux config: {err}"))
+        })?;
+        serde_json::from_str::<Value>(&text).map_err(|err| {
+            CliError::runtime("setup", format!("failed to parse cmux config: {err}"))
+        })?
+    } else {
+        json!({ "commands": [] })
+    };
+    let commands = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("commands"))
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| CliError::runtime("setup", "cmux config must contain commands array"))?;
+    if !commands
+        .iter()
+        .any(|command| command.get("name").and_then(Value::as_str) == Some("rally-agent"))
+    {
+        commands.push(json!({
+            "name": "rally-agent",
+            "workspace": {
+                "cwd": env::current_dir()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| ".".to_string()),
+                "layout": {
+                    "pane": {
+                        "surfaces": [
+                            {
+                                "type": "terminal",
+                                "name": "agent",
+                                "command": format!("{} claude", shell_quote(&wrapper.display().to_string()))
+                            }
+                        ]
+                    }
+                }
+            }
+        }));
+        fs::write(&config, serde_json::to_vec_pretty(&value).unwrap()).map_err(|err| {
+            CliError::runtime("setup", format!("failed to write cmux config: {err}"))
+        })?;
+    }
+    files.push(config.display().to_string());
+    Ok(Some(config.display().to_string()))
+}
+
+fn install_herdr_adapter(files: &mut Vec<String>) -> Result<Option<String>, CliError> {
+    let dir = adapter_config_dir("RALLY_HERDR_CONFIG_DIR", "herdr")?;
+    let integration_dir = dir.join("integrations");
+    fs::create_dir_all(&integration_dir).map_err(|err| {
+        CliError::runtime(
+            "setup",
+            format!("failed to create herdr integration dir: {err}"),
+        )
+    })?;
+    let wrapper = integration_dir.join("rally-agent-start.sh");
+    write_executable(
+        &wrapper,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+tool="${1:-claude}"
+if [ "$#" -gt 0 ]; then shift; fi
+session="${RALLY_SESSION_ID:-${tool}-$(date +%s)}"
+rally "$tool" --session-id "$session" --json > "${TMPDIR:-/tmp}/rally-${tool}-${session}.json" || true
+exec "$tool" "$@"
+"#,
+    )?;
+    files.push(wrapper.display().to_string());
+
+    let config = dir.join("config.toml");
+    let marker_begin = "# BEGIN rally integration";
+    let marker_end = "# END rally integration";
+    let block = format!(
+        "{marker_begin}\n[integrations.rally]\nstartup_wrapper = \"{}\"\npacket_command = \"rally herdr packet --tool <tool> --json\"\ninject_command = \"rally herdr inject <event-id> --json\"\n{marker_end}\n",
+        toml_escape(&wrapper.display().to_string())
+    );
+    let existing = fs::read_to_string(&config).unwrap_or_default();
+    let next = replace_marked_block(&existing, marker_begin, marker_end, &block);
+    fs::write(&config, next).map_err(|err| {
+        CliError::runtime("setup", format!("failed to write herdr config: {err}"))
+    })?;
+    files.push(config.display().to_string());
+    Ok(Some(config.display().to_string()))
+}
+
+fn adapter_config_dir(env_key: &str, app: &str) -> Result<PathBuf, CliError> {
+    if let Ok(value) = env::var(env_key) {
+        return Ok(PathBuf::from(value));
+    }
+    if let Ok(value) = env::var("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(value).join(app));
+    }
+    let home = env::var("HOME").map_err(|_| {
+        CliError::runtime(
+            "setup",
+            format!("HOME is required to install {app} integration"),
+        )
+    })?;
+    Ok(PathBuf::from(home).join(".config").join(app))
+}
+
+fn write_executable(path: &Path, body: &str) -> Result<(), CliError> {
+    fs::write(path, body)
+        .map_err(|err| CliError::runtime("setup", format!("failed to write script: {err}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)
+            .map_err(|err| CliError::runtime("setup", format!("failed to stat script: {err}")))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)
+            .map_err(|err| CliError::runtime("setup", format!("failed to chmod script: {err}")))?;
+    }
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn toml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn replace_marked_block(existing: &str, begin: &str, end: &str, block: &str) -> String {
+    let Some(start) = existing.find(begin) else {
+        let separator = if existing.is_empty() || existing.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        return format!("{existing}{separator}{block}");
+    };
+    let Some(relative_end) = existing[start..].find(end) else {
+        return format!("{existing}\n{block}");
+    };
+    let end_index = start + relative_end + end.len();
+    let trailing_newline = existing[end_index..]
+        .strip_prefix('\n')
+        .unwrap_or(&existing[end_index..]);
+    format!("{}{}{}", &existing[..start], block, trailing_newline)
 }
 
 fn enforcement_severity(enforcement: &str) -> &'static str {

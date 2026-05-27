@@ -10,6 +10,12 @@ trust, ownership, blockers, artifacts, decisions, and source-linked lessons.
 Agent Rally Point is now a Rust product. The user-facing command is `rally`.
 The older runtime package has been removed from the product architecture.
 
+## Start here
+
+New agent or human dropping in? Read [`RALLY.md`](RALLY.md) — the four
+commands and the handoff loop in 60 seconds. The rest of this file is
+the full command surface for when you need it.
+
 ## Status
 
 The greenfield Rust rewrite owns the product surface:
@@ -103,8 +109,10 @@ the next watch command. `rally start <tool>` is the generic equivalent.
 `rally doctor` checks whether the current channel is safe for agents: anonymous
 claims/tasks/handoffs, stale checkpoints, missing profiles, open handoffs,
 conflicts, and trust/diagnosis findings. `rally setup` discovers local harnesses,
-records enforcement mode (`off`, `warn`, or `strict`), and writes cmux/Herdr
-adapter install notes.
+records enforcement mode (`off`, `warn`, or `strict`), installs cmux/Herdr
+startup wrappers, and records adapter config changes. In `strict` mode, write
+commands reject anonymous `tool`, `from_tool`, or `owner_tool` values instead of
+only reporting them in doctor output.
 
 `rally packet` is the bounded work-brief surface for specialized agents. It is
 read-only, derived from the same context projection, and shapes the JSON for the

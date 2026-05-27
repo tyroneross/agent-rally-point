@@ -18,9 +18,11 @@ use rally_core::store::ChannelStore;
 use rally_protocol::event_value;
 use rally_trust::{init_identity, load_signing_identity, sign_event};
 use serde_json::{Value, json};
+use std::fs;
 
 pub(super) fn execute_handoff(command: HandoffCommand) -> Result<WriteOutput, CliError> {
     let context = CommandContext::new("handoff", &command.common)?;
+    context.ensure_named_tool(&command.from_tool, "from_tool")?;
     let payload = EventPayload::Handoff(HandoffPayload {
         subject: command.subject.clone(),
         to_tool: Some(command.to_tool.clone()),
@@ -62,6 +64,7 @@ pub(super) fn execute_ack(command: AckCommand) -> Result<WriteOutput, CliError> 
         notes: None,
     });
     let tool = context.tool();
+    context.ensure_named_tool(&tool, "tool")?;
     let mut builder = context
         .event(
             payload,
@@ -93,6 +96,7 @@ pub(super) fn execute_ack(command: AckCommand) -> Result<WriteOutput, CliError> 
 pub(super) fn execute_claim(command: ClaimCommand) -> Result<WriteOutput, CliError> {
     let context = CommandContext::new("claim", &command.common)?;
     let tool = context.tool();
+    context.ensure_named_tool(&tool, "tool")?;
     let payload = EventPayload::Claim(ClaimPayload {
         owner_tool: tool.clone(),
         resource: command.resource.clone(),
@@ -121,6 +125,7 @@ pub(super) fn execute_release(command: ReleaseCommand) -> Result<WriteOutput, Cl
     let context = CommandContext::new("release", &command.common)?;
     let target = context.resolve_target(&command.identifier, "claim", command.force, "release")?;
     let tool = context.tool();
+    context.ensure_named_tool(&tool, "tool")?;
     let entry = context.append(
         context
             .event(
@@ -151,6 +156,7 @@ pub(super) fn execute_release(command: ReleaseCommand) -> Result<WriteOutput, Cl
 pub(super) fn execute_blocker(command: BlockerCommand) -> Result<WriteOutput, CliError> {
     let context = CommandContext::new("blocker", &command.common)?;
     let tool = context.tool();
+    context.ensure_named_tool(&tool, "tool")?;
     let entry = context.append(context.event(
         EventPayload::Blocker(BlockerPayload {
             subject: command.subject.clone(),
@@ -183,6 +189,7 @@ pub(super) fn execute_unblock(command: UnblockCommand) -> Result<WriteOutput, Cl
     let target =
         context.resolve_target(&command.identifier, "blocker", command.force, "resolve")?;
     let tool = context.tool();
+    context.ensure_named_tool(&tool, "tool")?;
     let entry = context.append(
         context
             .event(
@@ -214,6 +221,7 @@ pub(super) fn execute_unblock(command: UnblockCommand) -> Result<WriteOutput, Cl
 pub(super) fn execute_profile(command: ProfileCommand) -> Result<WriteOutput, CliError> {
     let context = CommandContext::new("profile", &command.common)?;
     let tool = context.tool();
+    context.ensure_named_tool(&tool, "tool")?;
     let payload = EventPayload::Profile(ProfilePayload {
         tool: tool.clone(),
         capabilities: command.capabilities.clone(),
@@ -245,6 +253,10 @@ pub(super) fn execute_profile(command: ProfileCommand) -> Result<WriteOutput, Cl
 pub(super) fn execute_task(command: TaskCommand) -> Result<WriteOutput, CliError> {
     let context = CommandContext::new("task", &command.common)?;
     let tool = context.tool();
+    context.ensure_named_tool(&tool, "tool")?;
+    if let Some(owner_tool) = &command.owner_tool {
+        context.ensure_named_tool(owner_tool, "owner_tool")?;
+    }
     let payload = EventPayload::Task(TaskPayload {
         subject: command.subject.clone(),
         status: command.status.clone(),
@@ -274,6 +286,7 @@ pub(super) fn execute_task(command: TaskCommand) -> Result<WriteOutput, CliError
 pub(super) fn execute_artifact(command: ArtifactCommand) -> Result<WriteOutput, CliError> {
     let context = CommandContext::new("artifact", &command.common)?;
     let tool = context.tool();
+    context.ensure_named_tool(&tool, "tool")?;
     let payload = EventPayload::Artifact(ArtifactPayload {
         subject: command.subject.clone(),
         artifact_kind: command.artifact_kind.clone(),
@@ -302,6 +315,7 @@ pub(super) fn execute_artifact(command: ArtifactCommand) -> Result<WriteOutput, 
 pub(super) fn execute_decision(command: DecisionCommand) -> Result<WriteOutput, CliError> {
     let context = CommandContext::new("decision", &command.common)?;
     let tool = context.tool();
+    context.ensure_named_tool(&tool, "tool")?;
     let payload = EventPayload::Decision(DecisionPayload {
         subject: command.subject.clone(),
         status: command.status.clone(),
@@ -329,6 +343,7 @@ pub(super) fn execute_decision(command: DecisionCommand) -> Result<WriteOutput, 
 pub(super) fn execute_lesson(command: LessonCommand) -> Result<WriteOutput, CliError> {
     let context = CommandContext::new("lesson", &command.common)?;
     let tool = context.tool();
+    context.ensure_named_tool(&tool, "tool")?;
     let payload = EventPayload::Lesson(LessonPayload {
         subject: command.subject.clone(),
         lesson_kind: command.lesson_kind.clone(),
@@ -356,6 +371,7 @@ pub(super) fn execute_lesson(command: LessonCommand) -> Result<WriteOutput, CliE
 pub(super) fn execute_subscribe(command: SubscribeCommand) -> Result<WriteOutput, CliError> {
     let context = CommandContext::new("subscribe", &command.common)?;
     let tool = context.tool();
+    context.ensure_named_tool(&tool, "tool")?;
     let payload = EventPayload::Subscription(SubscriptionPayload {
         tool: tool.clone(),
         paths: command.paths.clone(),
@@ -389,6 +405,7 @@ pub(super) fn execute_subscribe(command: SubscribeCommand) -> Result<WriteOutput
 pub(super) fn execute_post(command: PostCommand) -> Result<WriteOutput, CliError> {
     let context = CommandContext::new("post", &command.common)?;
     let tool = context.tool();
+    context.ensure_named_tool(&tool, "tool")?;
     let subject = command
         .subject
         .clone()
@@ -506,6 +523,34 @@ impl<'a> CommandContext<'a> {
 
     fn tool(&self) -> String {
         self.common.tool()
+    }
+
+    fn enforcement(&self) -> String {
+        let path = self.store.channel_dir().join("rally/config.json");
+        let Ok(text) = fs::read_to_string(path) else {
+            return "warn".to_string();
+        };
+        serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("enforcement")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "warn".to_string())
+    }
+
+    fn ensure_named_tool(&self, value: &str, field: &str) -> Result<(), CliError> {
+        if self.enforcement() == "strict" && value == "unknown" {
+            return Err(CliError::usage(
+                self.command,
+                format!(
+                    "strict enforcement rejects anonymous writes: {field}=unknown; pass --tool or a stable owner"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn event(

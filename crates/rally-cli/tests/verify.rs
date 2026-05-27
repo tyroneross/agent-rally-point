@@ -258,6 +258,98 @@ fn write_command_usage_errors_honor_json_mode() {
 }
 
 #[test]
+fn strict_enforcement_rejects_anonymous_writes() {
+    let workspace = RallyWorkspace::new("rally-cli-strict-enforcement");
+    json_stdout(workspace.run(&["setup", "enforcement", "strict", "--json"]));
+
+    let anonymous_claim = workspace.run(&[
+        "claim",
+        "--json",
+        "--path",
+        "crates/rally-cli/src/main.rs",
+        "--subject",
+        "anonymous edit",
+    ]);
+    assert_eq!(anonymous_claim.status.code(), Some(2));
+    let body: serde_json::Value = serde_json::from_slice(&anonymous_claim.stderr).unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("strict enforcement")
+    );
+
+    let anonymous_owner = workspace.run(&[
+        "task",
+        "--json",
+        "--tool",
+        "pi",
+        "--owner",
+        "unknown",
+        "--subject",
+        "anonymous owner",
+    ]);
+    assert_eq!(anonymous_owner.status.code(), Some(2));
+    let body: serde_json::Value = serde_json::from_slice(&anonymous_owner.stderr).unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("owner_tool=unknown")
+    );
+
+    let named_claim = json_stdout(workspace.run(&[
+        "claim",
+        "--json",
+        "--tool",
+        "pi",
+        "--path",
+        "crates/rally-cli/src/main.rs",
+        "--subject",
+        "named edit",
+    ]));
+    assert_eq!(named_claim["tool"], "pi");
+    workspace.cleanup();
+}
+
+#[test]
+fn setup_install_writes_adapter_hooks() {
+    let workspace = RallyWorkspace::new("rally-cli-adapter-install");
+    let cmux = json_stdout(workspace.run(&["setup", "install", "cmux", "--json"]));
+    let cmux_config = workspace.home.join(".config/cmux/cmux.json");
+    let cmux_wrapper = workspace.home.join(".config/cmux/rally-agent-wrapper.sh");
+    assert_eq!(
+        cmux["data"]["setup"]["modified_external_config"],
+        cmux_config.display().to_string()
+    );
+    assert!(cmux_wrapper.exists());
+    let cmux_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(cmux_config).unwrap()).unwrap();
+    assert!(
+        cmux_json["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["name"] == "rally-agent")
+    );
+
+    let herdr = json_stdout(workspace.run(&["setup", "install", "herdr", "--json"]));
+    let herdr_config = workspace.home.join(".config/herdr/config.toml");
+    let herdr_wrapper = workspace
+        .home
+        .join(".config/herdr/integrations/rally-agent-start.sh");
+    assert_eq!(
+        herdr["data"]["setup"]["modified_external_config"],
+        herdr_config.display().to_string()
+    );
+    assert!(herdr_wrapper.exists());
+    let config_text = fs::read_to_string(herdr_config).unwrap();
+    assert!(config_text.contains("[integrations.rally]"));
+    assert!(config_text.contains("packet_command"));
+    workspace.cleanup();
+}
+
+#[test]
 fn query_commands_project_typed_state() {
     let workspace = RallyWorkspace::new("rally-cli-query-state");
     let handoff = json_stdout(workspace.run(&[

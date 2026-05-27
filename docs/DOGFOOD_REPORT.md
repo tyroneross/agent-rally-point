@@ -34,9 +34,11 @@ PR: https://github.com/tyroneross/agent-rally-point/pull/40
 
 ## Product Gaps Found
 
-- Anonymous writes are still possible unless setup/doctor enforcement is used.
-- Harness install is still file/snippet based; cmux/Herdr do not yet mutate their
-  native config automatically.
+- Anonymous writes are rejected after `rally setup enforcement strict`; existing
+  anonymous events still surface in `rally doctor`.
+- Harness install now writes cmux/Herdr wrapper hooks and updates their local
+  config files, but this still needs real multi-harness dogfood before calling
+  it fully polished.
 - JSON schemas are intentionally minimal and should be expanded as contracts
   stabilize.
 

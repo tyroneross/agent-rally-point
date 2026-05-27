@@ -36,6 +36,11 @@ before making broad edits. Run `rally setup --json` when onboarding a new repo o
 checking whether cmux/Herdr/agent harnesses are visible. If anonymous claims or
 handoffs appear, treat that as a harness setup problem.
 
+`rally setup enforcement strict` makes new anonymous writes fail. Use it once all
+harnesses pass a stable `--tool`. `rally setup install cmux` and `rally setup
+install herdr` install edge wrappers/config hooks; they do not move coordination
+state out of Rally.
+
 If `rally start` is unavailable, fall back to:
 
 ```bash

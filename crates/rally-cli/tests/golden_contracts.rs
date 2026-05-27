@@ -155,6 +155,73 @@ fn assert_golden(name: &str, actual: Value) {
     assert_eq!(expected, actual_text, "golden mismatch for {name}");
 }
 
+fn assert_matches_schema(schema_name: &str, value: &Value) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/schemas")
+        .join(schema_name);
+    let schema: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    validate_schema(&schema, value, "$");
+}
+
+fn validate_schema(schema: &Value, value: &Value, path: &str) {
+    if let Some(expected) = schema.get("const") {
+        assert_eq!(expected, value, "schema const mismatch at {path}");
+    }
+    if let Some(options) = schema.get("enum").and_then(Value::as_array) {
+        assert!(
+            options.contains(value),
+            "schema enum mismatch at {path}: {value}"
+        );
+    }
+    if let Some(type_schema) = schema.get("type") {
+        assert!(
+            type_matches(type_schema, value),
+            "schema type mismatch at {path}: {value}"
+        );
+    }
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        let object = value
+            .as_object()
+            .unwrap_or_else(|| panic!("schema required used on non-object at {path}"));
+        for key in required.iter().filter_map(Value::as_str) {
+            assert!(
+                object.contains_key(key),
+                "schema missing required key {path}.{key}"
+            );
+        }
+    }
+    if let (Some(properties), Some(object)) = (
+        schema.get("properties").and_then(Value::as_object),
+        value.as_object(),
+    ) {
+        for (key, property_schema) in properties {
+            if let Some(child) = object.get(key) {
+                validate_schema(property_schema, child, &format!("{path}.{key}"));
+            }
+        }
+    }
+    if let (Some(item_schema), Some(array)) = (schema.get("items"), value.as_array()) {
+        for (index, child) in array.iter().enumerate() {
+            validate_schema(item_schema, child, &format!("{path}[{index}]"));
+        }
+    }
+}
+
+fn type_matches(type_schema: &Value, value: &Value) -> bool {
+    if let Some(types) = type_schema.as_array() {
+        return types.iter().any(|schema| type_matches(schema, value));
+    }
+    match type_schema.as_str().unwrap() {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        other => panic!("unsupported schema type {other}"),
+    }
+}
+
 fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "rally-golden-{name}-{}",
@@ -318,6 +385,32 @@ fn adapter_contract_and_checkpoint_json_contracts_match_goldens() {
         workspace.json(&["doctor", "--json", "--tool", "claude"]),
     );
 
+    workspace.cleanup();
+}
+
+#[test]
+fn golden_outputs_match_formal_json_schemas() {
+    let workspace = RallyWorkspace::new("schema-validation");
+    workspace.json(&[
+        "artifact",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "schema validation",
+        "--artifact-kind",
+        "test-contract",
+        "--uri",
+        "docs/schemas",
+    ]);
+    let start = workspace.json(&["pi", "--session-id", "schema-session"]);
+    assert_matches_schema("agent-rally.command.start.v1.json", &start);
+    let packet = workspace.json(&["packet", "--json", "--tool", "pi"]);
+    assert_matches_schema("agent-rally.command.packet.v1.json", &packet);
+    let doctor = workspace.json(&["doctor", "--json", "--tool", "pi"]);
+    assert_matches_schema("agent-rally.command.doctor.v1.json", &doctor);
+    let setup = workspace.json(&["setup", "--json"]);
+    assert_matches_schema("agent-rally.command.setup.v1.json", &setup);
     workspace.cleanup();
 }
 

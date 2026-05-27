@@ -4,7 +4,13 @@
   "data": {
     "setup": {
       "enforcement": "strict",
+      "installed_files": [
+        "<temp-path>",
+        "<temp-path>",
+        "<temp-path>"
+      ],
       "installed_path": "<installed_path>",
+      "modified_external_config": "<temp-path>",
       "schema": "agent-rally.command.setup.v1",
       "startup": [
         "rally pi",

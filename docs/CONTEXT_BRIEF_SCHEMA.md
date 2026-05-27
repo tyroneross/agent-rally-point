@@ -290,13 +290,22 @@ Adapter rules:
 `rally setup --json` discovers known harnesses and returns their availability
 plus canonical startup commands. `rally setup enforcement <off|warn|strict>`
 records how strongly anonymous coordination should be treated. `rally setup
-install <cmux|herdr>` writes adapter notes under the channel directory; it does
-not mutate external app config yet.
+install <cmux|herdr>` writes adapter notes under the channel directory and
+installs edge hooks in the harness config directory:
+
+- cmux: `~/.config/cmux/rally-agent-wrapper.sh` plus a `rally-agent` command in
+  `~/.config/cmux/cmux.json`.
+- Herdr: `~/.config/herdr/integrations/rally-agent-start.sh` plus a marked
+  `[integrations.rally]` block in `~/.config/herdr/config.toml`.
+
+Tests may override those locations with `RALLY_CMUX_CONFIG_DIR` and
+`RALLY_HERDR_CONFIG_DIR`.
 
 `rally doctor --tool <tool> --json` combines deterministic diagnosis,
 checkpoint status, setup enforcement, active anonymous claims/tasks/handoffs,
 and profile checks. Its status is `pass`, `warn`, or `fail`. Under `strict`,
-anonymous active coordination findings are P1.
+anonymous active coordination findings are P1, and write commands reject new
+anonymous `tool`, `from_tool`, or `owner_tool` values.
 
 Formal schema files for agent-facing contracts live in `docs/schemas/`:
 

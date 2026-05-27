@@ -51,6 +51,10 @@ SPDX-License-Identifier: Apache-2.0
 - Adds `rally doctor` and `rally setup` for agent-product readiness: harness
   discovery, enforcement mode, adapter install notes, anonymous coordination
   detection, and startup health findings.
+- Extends `rally setup install <cmux|herdr>` to install wrapper scripts and patch
+  harness-local config files, while keeping all Rally state in the channel.
+- Enforces `setup enforcement strict` on write commands by rejecting new
+  anonymous tool/from_tool/owner_tool writes.
 - Adds initial formal JSON schema files in `docs/schemas/` and a dogfood report
   in `docs/DOGFOOD_REPORT.md`.
 - Keeps urgent coordination obligations ahead of specialization:

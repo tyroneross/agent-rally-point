@@ -21,7 +21,9 @@
             "enforcement": { "enum": ["off", "warn", "strict"] },
             "tools": { "type": "array", "items": { "type": "object" } },
             "startup": { "type": "array", "items": { "type": "string" } },
-            "installed_path": { "type": ["string", "null"] }
+            "installed_path": { "type": ["string", "null"] },
+            "installed_files": { "type": "array", "items": { "type": "string" } },
+            "modified_external_config": { "type": ["string", "null"] }
           }
         }
       }
