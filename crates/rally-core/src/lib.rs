@@ -8,6 +8,7 @@
 //! MCP tools, ACP/A2A bridges, and future sync code should call this crate
 //! instead of reinterpreting `changes.jsonl` independently.
 
+pub mod context;
 pub mod diagnose;
 pub mod event;
 pub mod preflight;

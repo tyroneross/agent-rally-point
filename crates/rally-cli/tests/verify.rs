@@ -321,6 +321,18 @@ fn query_commands_project_typed_state() {
         2
     );
 
+    let context = json_stdout(workspace.run(&["context", "--json", "--tool", "codex"]));
+    assert_eq!(context["data"]["brief"]["routing"]["action"], "join_active");
+    assert_eq!(
+        context["data"]["brief"]["recommended_next_action"]["action"],
+        "ack_handoff"
+    );
+    assert_eq!(
+        context["data"]["brief"]["recommended_next_action"]["target"],
+        handoff_id
+    );
+    assert_eq!(context["data"]["brief"]["top_priority"]["kind"], "handoff");
+
     let diagnosis = json_stdout(workspace.run(&["diagnose", "--json", "--tool", "codex"]));
     assert_eq!(diagnosis["data"]["diagnosis"]["status"], "stuck");
     assert!(

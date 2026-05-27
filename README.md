@@ -61,6 +61,7 @@ Read projections:
 
 ```bash
 rally inbox --tool codex --json
+rally context --tool codex --json
 rally claims --json
 rally blockers --json
 rally conflicts --json

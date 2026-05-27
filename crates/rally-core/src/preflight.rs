@@ -2,12 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::CoreError;
-use crate::event::EventRecord;
-use crate::query::{ActiveBlocker, ActiveClaim, ClaimConflict, TraceProjection, record_id};
+use crate::query::{ActiveBlocker, ActiveClaim, ClaimConflict, RecentChange, TraceProjection};
 use crate::store::ChannelStore;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -60,18 +58,6 @@ pub struct ActivePeer {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RecentChange {
-    pub event_id: String,
-    pub kind: String,
-    pub tool: Option<String>,
-    pub subject: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trust_status: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct PresenceRecord {
     schema: String,
     tool: String,
@@ -104,7 +90,7 @@ pub fn run_preflight(
     let active_claims = projection.active_claims(None);
     let active_blockers = projection.active_blockers(None);
     let claim_conflicts = projection.claim_conflicts();
-    let recent_changes = recent_changes(&records, options.recent_limit);
+    let recent_changes = projection.recent_changes(options.recent_limit);
 
     let routing = if !pending_acks_for_me.is_empty() {
         PreflightRouting {
@@ -228,39 +214,6 @@ fn active_peers(
             .then(left.session_id.cmp(&right.session_id))
     });
     Ok(out)
-}
-
-fn recent_changes(records: &[Value], limit: usize) -> Vec<RecentChange> {
-    let start = records.len().saturating_sub(limit);
-    records[start..]
-        .iter()
-        .filter_map(|record| {
-            let parsed = EventRecord::parse(record).ok()?;
-            let subject = parsed.subject_label();
-            Some(RecentChange {
-                event_id: record_id(record),
-                kind: parsed.kind.label().to_string(),
-                tool: parsed.tool,
-                subject,
-                origin: record_origin(record),
-                trust_status: record_trust_status(record),
-            })
-        })
-        .collect()
-}
-
-fn record_origin(record: &Value) -> Option<String> {
-    record
-        .get("origin")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-fn record_trust_status(record: &Value) -> Option<String> {
-    record
-        .get("trust_status")
-        .and_then(Value::as_str)
-        .map(str::to_string)
 }
 
 fn safe_component(value: &str) -> String {

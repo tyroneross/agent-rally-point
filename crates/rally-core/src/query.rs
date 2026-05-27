@@ -62,6 +62,18 @@ pub struct ClaimConflict {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecentChange {
+    pub event_id: String,
+    pub kind: String,
+    pub tool: Option<String>,
+    pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_status: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScoreFinding {
     pub severity: String,
     pub code: String,
@@ -230,6 +242,21 @@ impl TraceProjection {
 
     pub fn claim_conflicts(&self) -> Vec<ClaimConflict> {
         claim_conflicts_for(self.active_claims(None))
+    }
+
+    pub fn recent_changes(&self, limit: usize) -> Vec<RecentChange> {
+        let start = self.records.len().saturating_sub(limit);
+        self.records[start..]
+            .iter()
+            .map(|record| RecentChange {
+                event_id: record.id.clone(),
+                kind: record.parsed.kind.label().to_string(),
+                tool: record.parsed.tool.clone(),
+                subject: record.parsed.subject_label(),
+                origin: record.origin.clone(),
+                trust_status: record.trust_status.clone(),
+            })
+            .collect()
     }
 
     pub fn score(&self, tool: Option<&str>) -> (i64, Vec<ScoreFinding>) {

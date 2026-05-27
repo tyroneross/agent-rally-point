@@ -3,11 +3,12 @@
 
 use crate::args::{CommonOptions, ReadCommand};
 use crate::output::{CliError, WriteOutput};
+use rally_core::context::build_context_brief;
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
 use rally_core::event::EventRecord;
 use rally_core::query::{
-    active_blockers_at, active_claims_at, claim_conflicts, filter_since, now_epoch_seconds,
-    parse_since, pending_handoffs_at, record_id, related_records, score_records,
+    TraceProjection, active_blockers_at, active_claims_at, claim_conflicts, filter_since,
+    now_epoch_seconds, parse_since, pending_handoffs_at, record_id, related_records, score_records,
 };
 use rally_core::store::ChannelStore;
 use rally_protocol::event_value;
@@ -145,6 +146,30 @@ pub(super) fn execute_conflicts(command: ReadCommand) -> Result<WriteOutput, Cli
         text,
         json!({
             "conflicts": conflicts,
+        }),
+    ))
+}
+
+pub(super) fn execute_context(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let tool = command.common.tool();
+    let (store, records, now) = query_records(&command)?;
+    let projection = TraceProjection::from_records_at(&records, now);
+    let brief = build_context_brief(&projection, &tool, command.limit);
+    let text = if let Some(priority) = &brief.top_priority {
+        format!(
+            "{}: {} ({})",
+            brief.recommended_next_action.action, priority.subject, priority.event_id
+        )
+    } else {
+        brief.recommended_next_action.reason.clone()
+    };
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        json!({
+            "brief": brief,
         }),
     ))
 }

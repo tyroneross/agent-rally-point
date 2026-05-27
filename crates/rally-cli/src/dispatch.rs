@@ -8,8 +8,8 @@ use crate::args::{
 };
 use crate::output::{CliError, WriteOutput};
 use crate::query_commands::{
-    execute_blockers, execute_claims, execute_conflicts, execute_diagnose, execute_inbox,
-    execute_replay, execute_report, execute_score, execute_thread,
+    execute_blockers, execute_claims, execute_conflicts, execute_context, execute_diagnose,
+    execute_inbox, execute_replay, execute_report, execute_score, execute_thread,
 };
 use crate::sync_commands::{execute_sync_export, execute_sync_import};
 use crate::verify_commands::{VerifyOptions, verify};
@@ -48,6 +48,7 @@ pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Some("claims") => run_read("claims", args, parse_read, execute_claims),
         Some("blockers") => run_read("blockers", args, parse_read, execute_blockers),
         Some("conflicts") => run_read("conflicts", args, parse_read, execute_conflicts),
+        Some("context") => run_read("context", args, parse_read, execute_context),
         Some("diagnose") => run_read("diagnose", args, parse_read, execute_diagnose),
         Some("score") => run_read("score", args, parse_read, execute_score),
         Some("thread") => run_read("thread", args, parse_read, execute_thread),
@@ -183,7 +184,7 @@ fn usage() {
         "       rally release [--force] <claim-id> | blocker --subject <text> | unblock [--force] <blocker-id> --resolution <text>"
     );
     eprintln!(
-        "       rally inbox|claims|blockers|conflicts|diagnose|score|report|replay [--json] [--since <window>] [--tool <tool>]"
+        "       rally context|inbox|claims|blockers|conflicts|diagnose|score|report|replay [--json] [--since <window>] [--tool <tool>]"
     );
     eprintln!("       rally thread [--json] <event-id>");
     eprintln!("       rally identity init [--identity-dir <dir>] --tool <tool> [--json]");

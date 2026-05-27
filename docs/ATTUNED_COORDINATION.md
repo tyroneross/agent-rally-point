@@ -164,3 +164,10 @@ The core rule:
 PR #34 starts at step 1. It makes one projection the core query substrate so
 future intelligence can compound instead of becoming another parallel
 interpretation of the trace.
+
+The first `rally context` slice starts step 2. It turns the projection into a
+bounded `ContextBrief` with routing, a top priority, a recommended next action,
+attention items, collision risk, active claims/blockers, and relevant recent
+changes. Later slices should add richer agent profiles, task/artifact facts,
+decisions, lessons, subscriptions, and ranking signals without changing the
+core rule: docs teach Rally; Rally briefs agents.

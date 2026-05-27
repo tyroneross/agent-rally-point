@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use rally_core::context::build_context_brief;
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
 use rally_core::event::{EventBuilder, EventPayload, HandoffPayload};
 use rally_core::query::{
@@ -161,6 +162,34 @@ fn trace_projection_derives_core_state_once() {
     assert_eq!(projection.active_claims(None).len(), 2);
     assert_eq!(projection.claim_conflicts().len(), 1);
     assert!(projection.score(Some("codex")).0 < 100);
+}
+
+#[test]
+fn context_brief_recommends_the_highest_priority_agent_action() {
+    let handoff = record(
+        "handoff",
+        "evt_handoff",
+        "pi",
+        json!({"from_tool": "pi", "to_tool": "codex", "subject": "review", "requires_ack": true}),
+    );
+    let claim = record(
+        "claim",
+        "evt_claim",
+        "codex",
+        json!({"owner_tool": "codex", "resource": "file:docs", "subject": "edit docs"}),
+    );
+    let records = vec![claim, handoff];
+    let projection = TraceProjection::from_records_at(&records, 1_779_829_200.0);
+    let brief = build_context_brief(&projection, "codex", 5);
+
+    assert_eq!(brief.routing.action, "join_active");
+    assert_eq!(brief.recommended_next_action.action, "ack_handoff");
+    assert_eq!(
+        brief.recommended_next_action.target.as_deref(),
+        Some("evt_handoff")
+    );
+    assert_eq!(brief.top_priority.unwrap().kind, "handoff");
+    assert_eq!(brief.relevant_changes.len(), 2);
 }
 
 #[test]

@@ -371,6 +371,8 @@ Initial implementation status:
 - `rally-core::query` owns a `TraceProjection` read model so pending handoffs,
   claims, blockers, conflicts, score, preflight, and diagnosis can derive state
   from one parsed view of the trace.
+- `rally-core::context` now exposes the first `ContextBrief` projection and the
+  CLI renders it through `rally context --tool <agent> --json`.
 - `rally-cli verify --json` now reads through `rally-core` and emits the command
   envelope shape for success and failure.
 - `rally-cli` is still a prototype verifier surface and should become a
