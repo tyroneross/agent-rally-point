@@ -64,6 +64,10 @@ SPDX-License-Identifier: Apache-2.0
   config.
 - Adds setup safety controls: `--dry-run`, `<file>.rally.bak` backups before
   config mutation/removal, `rally setup verify [tool]`, and idempotency tests.
+- Adds adapter visibility research in `docs/ADAPTER_VISIBILITY_RESEARCH.md`.
+  Finding: Rally can stay pull-based, but every adapter needs a native
+  model-visible obligation path; cursor-scoped inbox is not enough for pending
+  handoffs/blockers/conflicts.
 - Adds `rally repair`, `rally setup uninstall <tool>`, and `rally ci gate` plus a
   GitHub Actions merge gate workflow.
 - Adds initial formal JSON schema files in `docs/schemas/` and a dogfood report
