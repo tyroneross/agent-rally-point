@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally2:command:next:v1",
+  "title": "Rally 2 Next Command",
+  "type": "object",
+  "required": ["ok", "product", "command", "schema", "data"],
+  "properties": {
+    "ok": {
+      "const": true
+    },
+    "product": {
+      "const": "rally2"
+    },
+    "command": {
+      "const": "next"
+    },
+    "schema": {
+      "const": "agent-rally2.command.next.v1"
+    },
+    "data": {
+      "type": "object",
+      "required": ["tool", "next", "room"],
+      "properties": {
+        "tool": {
+          "type": "string"
+        },
+        "role": {
+          "type": ["string", "null"]
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "next": {
+          "type": "object",
+          "required": [
+            "mode",
+            "action",
+            "reason",
+            "score",
+            "confidence",
+            "target_event_id",
+            "source_event_ids",
+            "waiting_on",
+            "alternatives"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string"
+            },
+            "action": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "score": {
+              "type": "integer"
+            },
+            "confidence": {
+              "type": "number"
+            },
+            "target_event_id": {
+              "type": ["string", "null"]
+            },
+            "source_event_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "fact": {
+              "type": ["object", "null"]
+            },
+            "waiting_on": {
+              "type": "array"
+            },
+            "alternatives": {
+              "type": "array"
+            }
+          }
+        },
+        "room": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}

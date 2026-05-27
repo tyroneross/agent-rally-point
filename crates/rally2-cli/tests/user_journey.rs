@@ -279,6 +279,7 @@ fn rally2_is_not_a_legacy_command_fallback() {
     let help = workspace.output(&["--help"]);
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("rally2 enter --tool <tool>"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("rally2 next --tool <tool>"));
 
     let output = workspace.output(&["context", "--json", "--tool", "codex"]);
     assert!(!output.status.success());
@@ -292,6 +293,101 @@ fn rally2_is_not_a_legacy_command_fallback() {
             .unwrap()
             .contains("unknown Rally 2 command context")
     );
+    workspace.cleanup();
+}
+
+#[test]
+fn rally2_next_finds_useful_work_while_waiting() {
+    let workspace = Workspace::new("rally2-next-useful");
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "codex",
+        "--target",
+        "claude_code",
+        "--subject",
+        "need review",
+    ]);
+    let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
+    let artifact = workspace.json(&[
+        "say",
+        "artifact",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--subject",
+        "adapter notes ready",
+        "--uri",
+        "docs/notes.md",
+        "--evidence",
+        "notes captured",
+    ]);
+    let artifact_id = artifact["data"]["fact"]["event_id"].as_str().unwrap();
+
+    let next = workspace.json(&["next", "--json", "--tool", "codex", "--limit", "4"]);
+    assert_eq!(next["schema"], "agent-rally2.command.next.v1");
+    assert_matches_schema("agent-rally2.command.next.v1.json", &next);
+    assert_eq!(next["data"]["next"]["mode"], "useful_while_waiting");
+    assert_eq!(next["data"]["next"]["action"], "review_artifact");
+    assert_eq!(next["data"]["next"]["target_event_id"], artifact_id);
+    assert!(
+        next["data"]["next"]["waiting_on"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["event_id"] == handoff_id)
+    );
+    assert!(
+        next["data"]["next"]["alternatives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["action"] == "clarify_handoff")
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally2_next_waits_only_when_no_useful_work_exists() {
+    let workspace = Workspace::new("rally2-next-wait");
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "codex",
+        "--target",
+        "claude_code",
+        "--subject",
+        "review requested",
+        "--summary",
+        "Claude has enough context to review the clean rewrite.",
+        "--evidence",
+        "cargo test -p rally2-cli",
+    ]);
+    let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
+
+    let next = workspace.json(&["next", "--json", "--tool", "codex"]);
+    assert_matches_schema("agent-rally2.command.next.v1.json", &next);
+    assert_eq!(next["data"]["next"]["mode"], "waiting");
+    assert_eq!(next["data"]["next"]["action"], "wait");
+    assert!(
+        next["data"]["next"]["source_event_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some(handoff_id))
+    );
+    assert!(
+        next["data"]["next"]["alternatives"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
     workspace.cleanup();
 }
 

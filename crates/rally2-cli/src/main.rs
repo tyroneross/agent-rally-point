@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const SCHEMA_ENTER: &str = "agent-rally2.command.enter.v1";
 const SCHEMA_SAY: &str = "agent-rally2.command.say.v1";
 const SCHEMA_ROOM: &str = "agent-rally2.command.room.v1";
+const SCHEMA_NEXT: &str = "agent-rally2.command.next.v1";
 const SCHEMA_CHECK: &str = "agent-rally2.command.check.v1";
 const SCHEMA_INSTALL: &str = "agent-rally2.command.install.v1";
 const FACT_SCHEMA: &str = "agent-rally2.fact.v1";
@@ -51,6 +52,7 @@ fn run_inner() -> Result<Output, String> {
         "enter" => command_enter(ArgBag::new("enter", args)),
         "say" => command_say(ArgBag::new("say", args)),
         "room" => command_room(ArgBag::new("room", args)),
+        "next" => command_next(ArgBag::new("next", args)),
         "check" => command_check(ArgBag::new("check", args)),
         "install" => command_install(ArgBag::new("install", args)),
         _ => Err(format!("unknown Rally 2 command {command}")),
@@ -205,6 +207,38 @@ fn command_room(args: ArgBag) -> Result<Output, String> {
         snapshot.current_decisions.len(),
         snapshot.current_risks.len(),
         snapshot.recent_artifacts.len()
+    );
+    Ok(Output::new(json_output, text, body))
+}
+
+fn command_next(args: ArgBag) -> Result<Output, String> {
+    let json_output = args.flag("--json");
+    let tool = args.required("--tool")?;
+    let role = args.one("--role");
+    let paths: Vec<String> = args.all("--path").into_iter().map(normalize_path).collect();
+    let limit = parse_i64_option(&args, "--limit")?
+        .unwrap_or(5)
+        .clamp(1, 20) as usize;
+    let mut room = RoomStore::open()?;
+    let snapshot = room.snapshot()?;
+    let next = build_next(&snapshot, &tool, role.as_deref(), &paths, limit);
+    let body = envelope(
+        "next",
+        SCHEMA_NEXT,
+        json!({
+            "tool": tool,
+            "role": role,
+            "paths": paths,
+            "next": next,
+            "room": snapshot.summary_json()
+        }),
+    );
+    let text = format!(
+        "next action={} target={}",
+        body["data"]["next"]["action"].as_str().unwrap_or("unknown"),
+        body["data"]["next"]["target_event_id"]
+            .as_str()
+            .unwrap_or("none")
     );
     Ok(Output::new(json_output, text, body))
 }
@@ -1648,6 +1682,239 @@ fn build_entry(
     })
 }
 
+#[derive(Clone, Debug)]
+struct NextCandidate {
+    action: &'static str,
+    reason: &'static str,
+    score: i64,
+    fact: Option<Fact>,
+    source_event_ids: Vec<String>,
+}
+
+impl NextCandidate {
+    fn from_fact(action: &'static str, reason: &'static str, score: i64, fact: &Fact) -> Self {
+        Self {
+            action,
+            reason,
+            score,
+            fact: Some(fact.clone()),
+            source_event_ids: vec![fact.event_id.clone()],
+        }
+    }
+
+    fn synthetic(
+        action: &'static str,
+        reason: &'static str,
+        score: i64,
+        source_event_ids: Vec<String>,
+        fact: Option<Fact>,
+    ) -> Self {
+        Self {
+            action,
+            reason,
+            score,
+            fact,
+            source_event_ids,
+        }
+    }
+
+    fn seq(&self) -> i64 {
+        self.fact.as_ref().map(|fact| fact.seq).unwrap_or_default()
+    }
+
+    fn to_json(&self) -> Value {
+        let target_event_id = self.fact.as_ref().map(|fact| fact.event_id.clone());
+        let confidence = (self.score.clamp(5, 95) as f64) / 100.0;
+        json!({
+            "action": self.action,
+            "reason": self.reason,
+            "score": self.score,
+            "confidence": confidence,
+            "target_event_id": target_event_id,
+            "source_event_ids": self.source_event_ids,
+            "fact": self.fact.as_ref().map(Fact::to_json)
+        })
+    }
+}
+
+fn build_next(
+    snapshot: &RoomSnapshot,
+    tool: &str,
+    role: Option<&str>,
+    paths: &[String],
+    limit: usize,
+) -> Value {
+    let waiting_on = snapshot
+        .open_handoffs
+        .iter()
+        .chain(snapshot.active_blockers.iter())
+        .filter(|fact| waiting_on_peer(fact, tool))
+        .cloned()
+        .collect::<Vec<_>>();
+    let waiting = !waiting_on.is_empty();
+    let mut candidates = Vec::new();
+
+    for handoff in &snapshot.open_handoffs {
+        if assigned_to_tool(handoff, tool) {
+            candidates.push(NextCandidate::from_fact(
+                "respond_to_handoff",
+                "open_handoff_targeted_to_this_tool",
+                boost_score(100, handoff, role, paths),
+                handoff,
+            ));
+        }
+    }
+    for blocker in &snapshot.active_blockers {
+        if blocker.tool.as_deref() == Some(tool) {
+            candidates.push(NextCandidate::from_fact(
+                "resolve_owned_blocker",
+                "owned_blocker_is_still_open",
+                boost_score(90, blocker, role, paths),
+                blocker,
+            ));
+        }
+    }
+    for claim in &snapshot.active_claims {
+        if claim.tool.as_deref() == Some(tool) {
+            candidates.push(NextCandidate::from_fact(
+                "continue_or_release_claim",
+                "owned_claim_is_still_active",
+                boost_score(75, claim, role, paths),
+                claim,
+            ));
+        }
+    }
+    for artifact in &snapshot.unconsumed_artifacts {
+        let authored_by_self = artifact.tool.as_deref() == Some(tool);
+        let routed_elsewhere = artifact
+            .target
+            .as_deref()
+            .is_some_and(|target| target != tool && target != "all");
+        if !authored_by_self && !routed_elsewhere {
+            candidates.push(NextCandidate::from_fact(
+                "review_artifact",
+                "unconsumed_peer_artifact_can_be_checked_while_waiting",
+                boost_score(if waiting { 80 } else { 65 }, artifact, role, paths),
+                artifact,
+            ));
+        }
+    }
+    for handoff in waiting_on.iter().filter(|fact| fact.kind == "handoff") {
+        if fact_is_weak(handoff) {
+            candidates.push(NextCandidate::from_fact(
+                "clarify_handoff",
+                "outgoing_handoff_needs_more_context_for_the_target_agent",
+                boost_score(55, handoff, role, paths),
+                handoff,
+            ));
+        }
+    }
+
+    if candidates.is_empty() {
+        if waiting {
+            candidates.push(NextCandidate::synthetic(
+                "wait",
+                "waiting_on_peer_with_no_useful_alternate_work",
+                10,
+                waiting_on
+                    .iter()
+                    .map(|fact| fact.event_id.clone())
+                    .collect(),
+                waiting_on.first().cloned(),
+            ));
+        } else {
+            candidates.push(NextCandidate::synthetic(
+                "proceed_solo",
+                "no_room_items_require_action",
+                5,
+                Vec::new(),
+                None,
+            ));
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| right.seq().cmp(&left.seq()))
+            .then_with(|| left.action.cmp(right.action))
+    });
+
+    let top = candidates.first().cloned().unwrap_or_else(|| {
+        NextCandidate::synthetic("proceed_solo", "empty_room", 5, Vec::new(), None)
+    });
+    let alternatives = candidates
+        .iter()
+        .skip(1)
+        .take(limit.saturating_sub(1))
+        .map(NextCandidate::to_json)
+        .collect::<Vec<_>>();
+    let mode = if waiting && top.action != "wait" {
+        "useful_while_waiting"
+    } else if waiting {
+        "waiting"
+    } else if top.action == "proceed_solo" {
+        "idle"
+    } else {
+        "direct"
+    };
+    let waiting_json = facts_json(&waiting_on);
+    let top_json = top.to_json();
+
+    json!({
+        "mode": mode,
+        "action": top_json["action"].clone(),
+        "reason": top_json["reason"].clone(),
+        "score": top_json["score"].clone(),
+        "confidence": top_json["confidence"].clone(),
+        "target_event_id": top_json["target_event_id"].clone(),
+        "source_event_ids": top_json["source_event_ids"].clone(),
+        "fact": top_json["fact"].clone(),
+        "waiting_on": waiting_json,
+        "alternatives": alternatives
+    })
+}
+
+fn assigned_to_tool(fact: &Fact, tool: &str) -> bool {
+    fact.target
+        .as_deref()
+        .is_none_or(|target| target == tool || target == "all")
+}
+
+fn waiting_on_peer(fact: &Fact, tool: &str) -> bool {
+    fact.tool.as_deref() == Some(tool)
+        && fact
+            .target
+            .as_deref()
+            .is_some_and(|target| target != tool && target != "all")
+}
+
+fn fact_is_weak(fact: &Fact) -> bool {
+    fact.summary
+        .as_deref()
+        .is_none_or(|summary| summary.trim().is_empty())
+        && fact.evidence.is_empty()
+}
+
+fn boost_score(base: i64, fact: &Fact, role: Option<&str>, paths: &[String]) -> i64 {
+    let role_boost = match (role, fact.kind.as_str()) {
+        (Some("reviewer" | "qa"), "artifact") => 10,
+        (Some("builder"), "claim") => 5,
+        _ => 0,
+    };
+    let path_boost = if !paths.is_empty()
+        && paths
+            .iter()
+            .any(|path| fact.scope.iter().any(|scope| scope == path))
+    {
+        5
+    } else {
+        0
+    };
+    (base + role_boost + path_boost).min(100)
+}
+
 fn build_attention(
     snapshot: &RoomSnapshot,
     tool: &str,
@@ -2079,6 +2346,7 @@ fn help_text() -> String {
         "  rally2 enter --tool <tool> [--path <path>] [--role <role>] [--json]",
         "  rally2 say <kind> --tool <tool> --subject <subject> [--path <path>] [--json]",
         "  rally2 room [--tool <tool>] [--role <role>] [--path <path>] [--since <seq>] [--json]",
+        "  rally2 next --tool <tool> [--path <path>] [--role <role>] [--limit <n>] [--json]",
         "  rally2 check before-write --tool <tool> --path <path> [--strict] [--json]",
         "  rally2 check after-artifact --tool <tool> [--evidence <text>] [--target <tool>] [--json]",
         "  rally2 check before-complete --tool <tool> [--strict] [--json]",
