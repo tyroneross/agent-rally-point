@@ -180,11 +180,7 @@ pub struct ContextInputs {
 impl ContextInputs {
     /// Gather inputs from a TraceProjection — the legacy in-memory path.
     /// Identical to what `build_context_brief` previously did inline.
-    pub fn from_projection(
-        projection: &TraceProjection,
-        tool: &str,
-        recent_limit: usize,
-    ) -> Self {
+    pub fn from_projection(projection: &TraceProjection, tool: &str, recent_limit: usize) -> Self {
         Self {
             tool: tool.to_string(),
             recent_limit,

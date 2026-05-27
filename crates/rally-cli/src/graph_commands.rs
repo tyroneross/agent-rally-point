@@ -32,7 +32,10 @@ pub(crate) fn run(
     let sub = match args.first().cloned() {
         Some(value) => value,
         None => {
-            emit_usage_error(wants_json, "graph requires a subcommand: init|build|rebuild|status|subgraph|causal|deps|unconsumed");
+            emit_usage_error(
+                wants_json,
+                "graph requires a subcommand: init|build|rebuild|status|subgraph|causal|deps|unconsumed",
+            );
             return Ok(ExitCode::from(2));
         }
     };
@@ -250,7 +253,9 @@ fn cmd_causal(args: &WriteArgs, id: String) -> Result<WriteOutput, CliError> {
 
 fn cmd_deps(args: &WriteArgs, id: String) -> Result<WriteOutput, CliError> {
     let store = args.common.channel_store(args.command)?;
-    let depth = parse_uint(args.one("--limit").as_deref(), 10).max(1).min(20);
+    let depth = parse_uint(args.one("--limit").as_deref(), 10)
+        .max(1)
+        .min(20);
     catch_up_before_read(args.command, &store)?;
     let conn = open_graph(args.command, store.channel_dir())?;
     let deps = graph::transitive_deps(&conn, &id, depth)
@@ -273,7 +278,9 @@ fn cmd_deps(args: &WriteArgs, id: String) -> Result<WriteOutput, CliError> {
 
 fn cmd_unconsumed(args: &WriteArgs) -> Result<WriteOutput, CliError> {
     let store = args.common.channel_store(args.command)?;
-    let limit = parse_uint(args.one("--limit").as_deref(), 20).max(1).min(200);
+    let limit = parse_uint(args.one("--limit").as_deref(), 20)
+        .max(1)
+        .min(200);
     catch_up_before_read(args.command, &store)?;
     let conn = open_graph(args.command, store.channel_dir())?;
     let rows = graph::unconsumed_artifacts(&conn, limit)
@@ -304,10 +311,7 @@ fn load_records(command: &'static str, store: &ChannelStore) -> Result<Vec<Value
         .map_err(|err| CliError::runtime(command, format!("load records: {err}")))
 }
 
-fn open_graph(
-    command: &'static str,
-    channel: &Path,
-) -> Result<graph::GraphConnection, CliError> {
+fn open_graph(command: &'static str, channel: &Path) -> Result<graph::GraphConnection, CliError> {
     graph::init(channel, &now_rfc3339())
         .map_err(|err| CliError::runtime(command, format!("open graph: {err}")))
 }

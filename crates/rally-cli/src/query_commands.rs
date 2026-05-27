@@ -256,17 +256,19 @@ pub(super) fn execute_context(command: ReadCommand) -> Result<WriteOutput, CliEr
             data["graph"] = payload;
         }
     }
-    Ok(query_output(command.command, &command.common, &store, text, data))
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        data,
+    ))
 }
 
 /// Best-effort: open the graph projection, catch up to the latest log
 /// position, and return `{subgraph, chain, status}` rooted at `focus`.
 /// Returns None on any graph error — caller treats this as a silent omit.
-fn focus_graph_view(
-    store: &ChannelStore,
-    records: &[Value],
-    focus: &str,
-) -> Option<Value> {
+fn focus_graph_view(store: &ChannelStore, records: &[Value], focus: &str) -> Option<Value> {
     let mut conn = graph::init(store.channel_dir(), &now_rfc3339()).ok()?;
     graph::catch_up(&mut conn, records, &now_rfc3339()).ok()?;
     let meta = graph::read_meta(&conn).ok()?;
@@ -516,7 +518,8 @@ pub(super) fn execute_next(command: ReadCommand) -> Result<WriteOutput, CliError
     // legacy behavior so `rally next` never goes dark on a corrupt cache.
     let graph_view = open_graph_view(&store, &records).ok();
 
-    let recommendation = next_recommendation(&projection, &tool, command.limit, graph_view.as_ref());
+    let recommendation =
+        next_recommendation(&projection, &tool, command.limit, graph_view.as_ref());
     let text = recommendation
         .get("subject")
         .and_then(Value::as_str)
@@ -567,10 +570,9 @@ fn open_graph_view(store: &ChannelStore, records: &[Value]) -> Result<GraphView,
         .collect();
     // Split tasks into owned/unowned. The split was previously two separate
     // TraceProjection queries; doing it once at the graph layer is cheaper.
-    let (owned_active_tasks, unowned_active_tasks) =
-        owned_active_tasks
-            .into_iter()
-            .partition::<Vec<_>, _>(|t| t["owner_tool"].as_str().is_some());
+    let (owned_active_tasks, unowned_active_tasks) = owned_active_tasks
+        .into_iter()
+        .partition::<Vec<_>, _>(|t| t["owner_tool"].as_str().is_some());
     Ok(GraphView {
         pending_handoffs,
         active_blockers,
@@ -1236,7 +1238,11 @@ fn next_recommendation(
     // ── Active blockers ───────────────────────────────────────────────
     if let Some(view) = graph_view {
         for blocker in view.active_blockers.iter() {
-            let score = if blocker["tool"].as_str() == Some(tool) { 90.0 } else { 70.0 };
+            let score = if blocker["tool"].as_str() == Some(tool) {
+                90.0
+            } else {
+                70.0
+            };
             let event_id = blocker["event_id"].as_str().unwrap_or("").to_string();
             let subject = blocker["subject"].as_str().unwrap_or("").to_string();
             candidates.push(candidate(
@@ -1251,7 +1257,11 @@ fn next_recommendation(
         }
     } else {
         for blocker in projection.active_blockers(None) {
-            let score = if blocker.tool.as_deref() == Some(tool) { 90.0 } else { 70.0 };
+            let score = if blocker.tool.as_deref() == Some(tool) {
+                90.0
+            } else {
+                70.0
+            };
             candidates.push(candidate(
                 "unblock_peer",
                 &blocker.event_id,
@@ -1338,7 +1348,11 @@ fn next_recommendation(
             let subject = artifact["subject"].as_str().unwrap_or("").to_string();
             let bonus = role_match_bonus(role, &capabilities, "artifact");
             candidates.push(candidate(
-                if bonus > 0.0 { "review_artifact" } else { "consume_artifact" },
+                if bonus > 0.0 {
+                    "review_artifact"
+                } else {
+                    "consume_artifact"
+                },
                 &event_id,
                 &subject,
                 35.0 + bonus,
@@ -1351,7 +1365,11 @@ fn next_recommendation(
         for artifact in projection.artifacts(limit.max(3)) {
             let bonus = role_match_bonus(role, &capabilities, "artifact");
             candidates.push(candidate(
-                if bonus > 0.0 { "review_artifact" } else { "consume_artifact" },
+                if bonus > 0.0 {
+                    "review_artifact"
+                } else {
+                    "consume_artifact"
+                },
                 &artifact.event_id,
                 &artifact.subject,
                 35.0 + bonus,
@@ -1362,13 +1380,7 @@ fn next_recommendation(
         }
     }
 
-    candidates.sort_by(|left, right| {
-        right["score"]
-            .as_f64()
-            .unwrap_or(0.0)
-            .partial_cmp(&left["score"].as_f64().unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    candidates = normalize_candidates(candidates);
     if candidates.is_empty() {
         return json!({
             "action_kind": "idle",
@@ -1396,6 +1408,153 @@ fn next_recommendation(
         "agent_visible": agent_visible,
         "alternatives": alternatives,
     })
+}
+
+fn normalize_candidates(candidates: Vec<Value>) -> Vec<Value> {
+    let mut by_target = BTreeMap::<String, Value>::new();
+    for candidate in candidates {
+        let key = candidate_key(&candidate);
+        match by_target.remove(&key) {
+            Some(existing) => {
+                let merged = merge_duplicate_candidate(existing, candidate);
+                by_target.insert(key, merged);
+            }
+            None => {
+                by_target.insert(key, candidate);
+            }
+        }
+    }
+
+    let mut normalized = by_target.into_values().collect::<Vec<_>>();
+    normalized.sort_by(|left, right| {
+        candidate_score(right)
+            .partial_cmp(&candidate_score(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    normalized
+}
+
+fn candidate_key(candidate: &Value) -> String {
+    candidate
+        .get("target_event_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                candidate
+                    .get("action_kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                candidate
+                    .get("subject")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            )
+        })
+}
+
+fn merge_duplicate_candidate(left: Value, right: Value) -> Value {
+    let (mut kept, duplicate) = if candidate_score(&right) > candidate_score(&left) {
+        (right, left)
+    } else {
+        (left, right)
+    };
+    append_unique_strings(&mut kept, &duplicate, "source_event_ids");
+    append_unique_strings(&mut kept, &duplicate, "reasoning");
+    kept
+}
+
+fn candidate_score(candidate: &Value) -> f64 {
+    candidate
+        .get("score")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+}
+
+fn append_unique_strings(target: &mut Value, source: &Value, field: &str) {
+    let existing = target
+        .get(field)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut values = existing
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    for value in source
+        .get(field)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if !values.iter().any(|existing| existing == value) {
+            values.push(value.to_string());
+        }
+    }
+
+    target[field] = json!(values);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_candidates_keeps_highest_score_per_target() {
+        let candidates = vec![
+            candidate(
+                "consume_artifact",
+                "evt_same",
+                "same work",
+                35.0,
+                json!({ "artifact": 35.0 }),
+                vec!["evt_same".to_string()],
+                vec!["recent artifact may need follow-up".to_string()],
+            ),
+            candidate(
+                "progress_owned_task",
+                "evt_same",
+                "same work",
+                80.0,
+                json!({ "owned_task": 80.0 }),
+                vec!["evt_same".to_string(), "evt_task".to_string()],
+                vec!["open task is already owned by this tool".to_string()],
+            ),
+            candidate(
+                "claim_task",
+                "evt_other",
+                "other work",
+                55.0,
+                json!({ "unowned_task": 55.0 }),
+                vec!["evt_other".to_string()],
+                vec!["open task has no owner".to_string()],
+            ),
+        ];
+
+        let normalized = normalize_candidates(candidates);
+
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0]["target_event_id"], "evt_same");
+        assert_eq!(normalized[0]["action_kind"], "progress_owned_task");
+        assert_eq!(normalized[0]["score"], 80.0);
+        assert_eq!(
+            normalized[0]["source_event_ids"],
+            json!(["evt_same", "evt_task"])
+        );
+        assert_eq!(
+            normalized[0]["reasoning"],
+            json!([
+                "open task is already owned by this tool",
+                "recent artifact may need follow-up"
+            ])
+        );
+        assert_eq!(normalized[1]["target_event_id"], "evt_other");
+    }
 }
 
 fn inactive_agent_visible() -> Value {

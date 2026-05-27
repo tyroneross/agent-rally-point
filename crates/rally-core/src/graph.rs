@@ -38,7 +38,13 @@ pub use rusqlite::Connection as GraphConnection;
 ///       events as nodes/edges so `pending_handoffs`, `active_blockers`,
 ///       `active_claims`, and `active_tasks` queries can run against the
 ///       graph directly (replacing in-memory TraceProjection scans).
-pub const SCHEMA_VERSION: i64 = 3;
+///   v4: thread_id / origin / trust_status columns on nodes so typed
+///       graph queries return the same field set as TraceProjection's
+///       PendingHandoff / ActiveClaim / ActiveBlocker structs. Project
+///       profile + subscription events as their own node kinds so the
+///       latest is queryable by tool. Enables full migration of
+///       build_context_brief to the graph.
+pub const SCHEMA_VERSION: i64 = 4;
 
 const GRAPH_FILENAME: &str = "rally.graph.db";
 
@@ -146,11 +152,15 @@ fn apply_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             created_at      TEXT NOT NULL,
             source_event_id TEXT,
             source_seq      INTEGER,
-            producer_tool   TEXT
+            producer_tool   TEXT,
+            thread_id       TEXT,
+            origin          TEXT,
+            trust_status    TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_nodes_kind     ON nodes(kind);
         CREATE INDEX IF NOT EXISTS idx_nodes_subject  ON nodes(subject);
         CREATE INDEX IF NOT EXISTS idx_nodes_producer ON nodes(producer_tool);
+        CREATE INDEX IF NOT EXISTS idx_nodes_thread   ON nodes(thread_id);
 
         CREATE TABLE IF NOT EXISTS edges (
             source_id       TEXT NOT NULL,
@@ -253,10 +263,7 @@ pub fn rebuild(
     {
         let tx = conn.transaction()?;
         for record in records {
-            let seq = record
-                .get("local_seq")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
+            let seq = record.get("local_seq").and_then(Value::as_i64).unwrap_or(0);
             if seq > high {
                 high = seq;
             }
@@ -286,10 +293,7 @@ pub fn catch_up(
     let mut high = cursor;
     let tx = conn.transaction()?;
     for record in records {
-        let seq = record
-            .get("local_seq")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
+        let seq = record.get("local_seq").and_then(Value::as_i64).unwrap_or(0);
         if seq <= cursor {
             continue;
         }
@@ -322,16 +326,55 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
     }
     let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
     let payload = event.get("payload").cloned().unwrap_or(Value::Null);
-    let tool = event.get("tool").and_then(Value::as_str).unwrap_or("unknown");
+    let tool = event
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     let time = event
         .get("time")
         .and_then(Value::as_str)
         .unwrap_or("1970-01-01T00:00:00Z");
-    let subject_field = event.get("subject").and_then(Value::as_str).map(str::to_string);
+    let subject_field = event
+        .get("subject")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    // Envelope-level metadata that callers (PendingHandoff, ActiveClaim, etc.)
+    // expect on every projected event. thread_id lives on the event itself;
+    // origin and trust_status come from the store_entry wrapper (set on
+    // sync import for non-local events).
+    let thread_id = event
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let origin = record
+        .get("origin")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let trust_status = record
+        .get("trust_status")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let meta = NodeMeta {
+        producer_tool: Some(tool),
+        thread_id: thread_id.as_deref(),
+        origin: origin.as_deref(),
+        trust_status: trust_status.as_deref(),
+    };
 
     match kind {
         "task" => {
-            upsert_node(tx, &event_id, "task", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_node(
+                tx,
+                &event_id,
+                "task",
+                subject_field.as_deref(),
+                &payload,
+                time,
+                &event_id,
+                seq,
+                meta,
+            )?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             if let Some(owner) = payload.get("owner_tool").and_then(Value::as_str) {
                 upsert_peer(tx, owner, time, &event_id, seq)?;
@@ -361,7 +404,17 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
             }
         }
         "artifact" => {
-            upsert_node(tx, &event_id, "artifact", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_node(
+                tx,
+                &event_id,
+                "artifact",
+                subject_field.as_deref(),
+                &payload,
+                time,
+                &event_id,
+                seq,
+                meta,
+            )?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             upsert_edge(tx, &event_id, tool, "produced_by", None, &event_id, seq)?;
             if let Some(task_id) = payload.get("ref_task_id").and_then(Value::as_str) {
@@ -369,7 +422,17 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
             }
         }
         "decision" => {
-            upsert_node(tx, &event_id, "decision", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_node(
+                tx,
+                &event_id,
+                "decision",
+                subject_field.as_deref(),
+                &payload,
+                time,
+                &event_id,
+                seq,
+                meta,
+            )?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             upsert_edge(tx, &event_id, tool, "produced_by", None, &event_id, seq)?;
             for sup in payload
@@ -384,7 +447,17 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
             }
         }
         "lesson" => {
-            upsert_node(tx, &event_id, "lesson", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_node(
+                tx,
+                &event_id,
+                "lesson",
+                subject_field.as_deref(),
+                &payload,
+                time,
+                &event_id,
+                seq,
+                meta,
+            )?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             upsert_edge(tx, &event_id, tool, "produced_by", None, &event_id, seq)?;
             for src in payload
@@ -401,17 +474,24 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
         "profile" => {
             // Profile events refresh the Peer node's metadata. The node id is the tool name,
             // not the event id — peer identity is stable across many profile events.
-            let profile_tool = payload
-                .get("tool")
-                .and_then(Value::as_str)
-                .unwrap_or(tool);
+            let profile_tool = payload.get("tool").and_then(Value::as_str).unwrap_or(tool);
             upsert_peer(tx, profile_tool, time, &event_id, seq)?;
         }
         "handoff" => {
             // Project handoffs as nodes so "any later non-producer activity"
             // can see them. The producer is the from_tool (the sender), which
             // is the same as the event's `tool` envelope field.
-            upsert_node(tx, &event_id, "handoff", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_node(
+                tx,
+                &event_id,
+                "handoff",
+                subject_field.as_deref(),
+                &payload,
+                time,
+                &event_id,
+                seq,
+                meta,
+            )?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             if let Some(to) = payload.get("to_tool").and_then(Value::as_str) {
                 upsert_peer(tx, to, time, &event_id, seq)?;
@@ -421,7 +501,17 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
         "ack" => {
             // Project the ack as a node so it counts as later non-producer
             // activity on prior artifacts/handoffs from the original sender.
-            upsert_node(tx, &event_id, "ack", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_node(
+                tx,
+                &event_id,
+                "ack",
+                subject_field.as_deref(),
+                &payload,
+                time,
+                &event_id,
+                seq,
+                meta,
+            )?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             let verdict = payload.get("verdict").and_then(Value::as_str).unwrap_or("");
             if matches!(verdict, "done" | "passed" | "approved") {
@@ -430,7 +520,15 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
                     // Mark the handoff as resolved via a status-bearing edge from
                     // the handoff node to a synthetic "done" terminator. Allows
                     // "pending handoffs" queries to filter via NOT EXISTS.
-                    upsert_edge(tx, handoff_id, "__resolved__", "resolved_by_ack", Some(&json!({"verdict": verdict})), &event_id, seq)?;
+                    upsert_edge(
+                        tx,
+                        handoff_id,
+                        "__resolved__",
+                        "resolved_by_ack",
+                        Some(&json!({"verdict": verdict})),
+                        &event_id,
+                        seq,
+                    )?;
                 }
             }
         }
@@ -439,7 +537,17 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
             // would require resource to be a node too — defer that. For now,
             // the claim node carries the resource in its payload, and an
             // owned_by edge records the owner.
-            upsert_node(tx, &event_id, "claim", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_node(
+                tx,
+                &event_id,
+                "claim",
+                subject_field.as_deref(),
+                &payload,
+                time,
+                &event_id,
+                seq,
+                meta,
+            )?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             let owner = payload
                 .get("owner_tool")
@@ -453,27 +561,84 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
         "claim-release" | "claim_release" => {
             // Mark the referenced claim resolved via an edge to the synthetic
             // __resolved__ marker. Active-claim queries filter on NOT EXISTS.
-            upsert_node(tx, &event_id, "claim-release", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_node(
+                tx,
+                &event_id,
+                "claim-release",
+                subject_field.as_deref(),
+                &payload,
+                time,
+                &event_id,
+                seq,
+                meta,
+            )?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             if let Some(claim_id) = payload.get("ref_claim_id").and_then(Value::as_str) {
-                upsert_edge(tx, claim_id, "__resolved__", "resolved_by_release", None, &event_id, seq)?;
+                upsert_edge(
+                    tx,
+                    claim_id,
+                    "__resolved__",
+                    "resolved_by_release",
+                    None,
+                    &event_id,
+                    seq,
+                )?;
             }
         }
         "blocker" => {
-            upsert_node(tx, &event_id, "blocker", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_node(
+                tx,
+                &event_id,
+                "blocker",
+                subject_field.as_deref(),
+                &payload,
+                time,
+                &event_id,
+                seq,
+                meta,
+            )?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             upsert_edge(tx, &event_id, tool, "raised_by", None, &event_id, seq)?;
         }
         "blocker-resolved" | "blocker_resolved" => {
-            upsert_node(tx, &event_id, "blocker-resolved", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_node(
+                tx,
+                &event_id,
+                "blocker-resolved",
+                subject_field.as_deref(),
+                &payload,
+                time,
+                &event_id,
+                seq,
+                meta,
+            )?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             if let Some(blocker_id) = payload.get("ref_blocker_id").and_then(Value::as_str) {
-                upsert_edge(tx, blocker_id, "__resolved__", "resolved_by_unblock", None, &event_id, seq)?;
+                upsert_edge(
+                    tx,
+                    blocker_id,
+                    "__resolved__",
+                    "resolved_by_unblock",
+                    None,
+                    &event_id,
+                    seq,
+                )?;
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Bundle of envelope-level metadata that every typed node needs.
+/// Lifted from `apply_record` once so it doesn't need to be re-extracted
+/// at every upsert site.
+#[derive(Clone, Copy, Default)]
+struct NodeMeta<'a> {
+    producer_tool: Option<&'a str>,
+    thread_id: Option<&'a str>,
+    origin: Option<&'a str>,
+    trust_status: Option<&'a str>,
 }
 
 fn upsert_node(
@@ -485,21 +650,27 @@ fn upsert_node(
     time: &str,
     source_event_id: &str,
     seq: i64,
-    producer_tool: Option<&str>,
+    meta: NodeMeta<'_>,
 ) -> Result<(), rusqlite::Error> {
     let payload_str = serde_json::to_string(payload).unwrap_or_else(|_| "null".to_string());
     tx.execute(
-        "INSERT INTO nodes(id, kind, subject, payload_json, created_at, source_event_id, source_seq, producer_tool)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO nodes(id, kind, subject, payload_json, created_at, source_event_id, source_seq, producer_tool, thread_id, origin, trust_status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(id) DO UPDATE SET
             kind            = excluded.kind,
             subject         = COALESCE(excluded.subject, nodes.subject),
             payload_json    = excluded.payload_json,
             source_event_id = excluded.source_event_id,
             source_seq      = excluded.source_seq,
-            producer_tool   = COALESCE(excluded.producer_tool, nodes.producer_tool)
+            producer_tool   = COALESCE(excluded.producer_tool, nodes.producer_tool),
+            thread_id       = COALESCE(excluded.thread_id, nodes.thread_id),
+            origin          = COALESCE(excluded.origin, nodes.origin),
+            trust_status    = COALESCE(excluded.trust_status, nodes.trust_status)
          WHERE excluded.source_seq >= nodes.source_seq",
-        params![id, kind, subject, payload_str, time, source_event_id, seq, producer_tool],
+        params![
+            id, kind, subject, payload_str, time, source_event_id, seq,
+            meta.producer_tool, meta.thread_id, meta.origin, meta.trust_status
+        ],
     )?;
     Ok(())
 }
@@ -537,7 +708,8 @@ fn upsert_edge(
     source_event_id: &str,
     seq: i64,
 ) -> Result<(), rusqlite::Error> {
-    let payload_str = payload.map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()));
+    let payload_str =
+        payload.map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()));
     tx.execute(
         "INSERT OR IGNORE INTO edges(source_id, target_id, kind, payload_json, source_event_id, source_seq)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -850,9 +1022,7 @@ pub fn pending_handoffs(
         .filter_map(Result::ok)
         // requires_ack=false handoffs are not "pending" — they're FYI.
         .filter(|row| row["requires_ack"].as_bool().unwrap_or(true))
-        .filter(|row| {
-            tool.is_none_or(|target| row["to_tool"].as_str() == Some(target))
-        })
+        .filter(|row| tool.is_none_or(|target| row["to_tool"].as_str() == Some(target)))
         .collect();
     Ok(rows)
 }
@@ -888,9 +1058,7 @@ pub fn active_blockers(
             }))
         })?
         .filter_map(Result::ok)
-        .filter(|row| {
-            tool.is_none_or(|target| row["tool"].as_str() == Some(target))
-        })
+        .filter(|row| tool.is_none_or(|target| row["tool"].as_str() == Some(target)))
         .collect();
     Ok(rows)
 }
@@ -898,10 +1066,7 @@ pub fn active_blockers(
 /// Active tasks: task nodes whose payload.status is not in
 /// {done, closed, cancelled}. When `tool` is Some, restrict to tasks
 /// owned_by that tool.
-pub fn active_tasks(
-    conn: &Connection,
-    tool: Option<&str>,
-) -> Result<Vec<Value>, rusqlite::Error> {
+pub fn active_tasks(conn: &Connection, tool: Option<&str>) -> Result<Vec<Value>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         r#"
         SELECT n.id, n.subject, n.created_at, n.producer_tool, n.payload_json,
@@ -939,9 +1104,7 @@ pub fn active_tasks(
                 "done" | "closed" | "cancelled"
             )
         })
-        .filter(|row| {
-            tool.is_none_or(|target| row["owner_tool"].as_str() == Some(target))
-        })
+        .filter(|row| tool.is_none_or(|target| row["owner_tool"].as_str() == Some(target)))
         .collect();
     Ok(rows)
 }

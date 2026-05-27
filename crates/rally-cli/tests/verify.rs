@@ -476,24 +476,24 @@ fn context_focus_attaches_graph_neighborhood() {
 
     // Without --focus, brief is present but graph is omitted.
     let plain = json_stdout(workspace.run(&["context", "--json", "--tool", "pi"]));
-    assert!(plain["data"]["brief"].is_object(), "plain context must include brief");
+    assert!(
+        plain["data"]["brief"].is_object(),
+        "plain context must include brief"
+    );
     assert!(
         plain["data"].get("graph").is_none(),
         "plain context must not include graph field"
     );
 
     // With --focus, both brief and graph appear.
-    let focused = json_stdout(workspace.run(&[
-        "context",
-        "--json",
-        "--tool",
-        "pi",
-        "--focus",
-        &t1_id,
-    ]));
+    let focused =
+        json_stdout(workspace.run(&["context", "--json", "--tool", "pi", "--focus", &t1_id]));
     assert!(focused["data"]["brief"].is_object());
     let graph = &focused["data"]["graph"];
-    assert!(graph.is_object(), "focused context must include graph field");
+    assert!(
+        graph.is_object(),
+        "focused context must include graph field"
+    );
     assert_eq!(graph["focus"], t1_id);
     let node_count = graph["subgraph"]["nodes"]
         .as_array()
