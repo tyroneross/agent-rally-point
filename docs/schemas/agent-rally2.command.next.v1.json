@@ -38,11 +38,17 @@
           "required": [
             "mode",
             "action",
+            "actionable",
             "reason",
             "score",
             "confidence",
+            "requires_human",
+            "stop_reason",
             "target_event_id",
             "source_event_ids",
+            "suggested_claims",
+            "suggested_commands",
+            "completion",
             "waiting_on",
             "alternatives"
           ],
@@ -53,6 +59,9 @@
             "action": {
               "type": "string"
             },
+            "actionable": {
+              "type": "boolean"
+            },
             "reason": {
               "type": "string"
             },
@@ -61,6 +70,12 @@
             },
             "confidence": {
               "type": "number"
+            },
+            "requires_human": {
+              "type": "boolean"
+            },
+            "stop_reason": {
+              "type": ["string", "null"]
             },
             "target_event_id": {
               "type": ["string", "null"]
@@ -73,6 +88,18 @@
             },
             "fact": {
               "type": ["object", "null"]
+            },
+            "suggested_claims": {
+              "type": "array"
+            },
+            "suggested_commands": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "completion": {
+              "type": "object"
             },
             "waiting_on": {
               "type": "array"

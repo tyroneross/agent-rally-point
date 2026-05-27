@@ -102,6 +102,36 @@ The product succeeds when agents know Rally through repeated interaction:
 Manual CLI use should be possible, but the primary product path is adapter-led.
 If agents must remember to run Rally by habit, the product is not finished.
 
+## Act-On-Next Contract
+
+`rally2 next` is an execution contract for an agent build loop, not a daemon.
+Rally recommends and constrains work; the agent or harness still executes,
+verifies, and decides when to continue.
+
+The `next` payload must make the loop explicit:
+
+- `actionable`: whether the agent may treat the recommendation as a task
+  candidate.
+- `requires_human`: whether the agent should stop and ask before acting.
+- `stop_reason`: why there is no autonomous action, such as waiting on a peer.
+- `suggested_claims`: scoped claim commands for work the agent should reserve
+  before editing or reviewing files.
+- `suggested_commands`: command templates for checks and completion facts.
+- `completion`: the durable fact kind expected after work, whether evidence is
+  required, whether claims should be released, and whether the agent should run
+  `rally2 next` again.
+
+The intended autonomous build loop is:
+
+```text
+enter -> next -> if actionable, claim/check -> execute -> verify
+      -> say artifact/handoff/resolve/release -> next
+```
+
+The loop stops when `actionable` is false, `requires_human` is true, the agent
+hits a blocker, or the harness/user budget expires. This keeps autonomy in the
+agent harness while Rally remains the room and coordination substrate.
+
 ## Typed Facts
 
 Rally facts are speech acts that affect future work. They should remain small

@@ -331,7 +331,32 @@ fn rally2_next_finds_useful_work_while_waiting() {
     assert_matches_schema("agent-rally2.command.next.v1.json", &next);
     assert_eq!(next["data"]["next"]["mode"], "useful_while_waiting");
     assert_eq!(next["data"]["next"]["action"], "review_artifact");
+    assert_eq!(next["data"]["next"]["actionable"], true);
+    assert_eq!(next["data"]["next"]["requires_human"], false);
+    assert_eq!(next["data"]["next"]["stop_reason"], Value::Null);
     assert_eq!(next["data"]["next"]["target_event_id"], artifact_id);
+    assert!(
+        next["data"]["next"]["suggested_claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["scope"] == "file:docs/notes.md")
+    );
+    assert!(
+        next["data"]["next"]["suggested_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item
+                .as_str()
+                .unwrap()
+                .contains("rally2 say artifact --tool codex --ref"))
+    );
+    assert_eq!(
+        next["data"]["next"]["completion"]["record_kind"],
+        "artifact"
+    );
+    assert_eq!(next["data"]["next"]["completion"]["rerun_next"], true);
     assert!(
         next["data"]["next"]["waiting_on"]
             .as_array()
@@ -374,6 +399,25 @@ fn rally2_next_waits_only_when_no_useful_work_exists() {
     assert_matches_schema("agent-rally2.command.next.v1.json", &next);
     assert_eq!(next["data"]["next"]["mode"], "waiting");
     assert_eq!(next["data"]["next"]["action"], "wait");
+    assert_eq!(next["data"]["next"]["actionable"], false);
+    assert_eq!(
+        next["data"]["next"]["stop_reason"],
+        "waiting_on_peer_with_no_useful_alternate_work"
+    );
+    assert!(
+        next["data"]["next"]["suggested_claims"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        next["data"]["next"]["suggested_commands"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(next["data"]["next"]["completion"]["record_kind"], "none");
+    assert_eq!(next["data"]["next"]["completion"]["rerun_next"], false);
     assert!(
         next["data"]["next"]["source_event_ids"]
             .as_array()

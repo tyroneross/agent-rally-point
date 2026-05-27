@@ -1900,19 +1900,143 @@ fn build_next(
     };
     let waiting_json = facts_json(&waiting_on);
     let top_json = top.to_json();
+    let contract = action_contract(&top, tool);
 
     json!({
         "mode": mode,
         "action": top_json["action"].clone(),
+        "actionable": contract["actionable"].clone(),
         "reason": top_json["reason"].clone(),
         "score": top_json["score"].clone(),
         "confidence": top_json["confidence"].clone(),
+        "requires_human": contract["requires_human"].clone(),
+        "stop_reason": contract["stop_reason"].clone(),
         "target_event_id": top_json["target_event_id"].clone(),
         "source_event_ids": top_json["source_event_ids"].clone(),
         "fact": top_json["fact"].clone(),
+        "suggested_claims": contract["suggested_claims"].clone(),
+        "suggested_commands": contract["suggested_commands"].clone(),
+        "completion": contract["completion"].clone(),
         "waiting_on": waiting_json,
         "alternatives": alternatives
     })
+}
+
+fn action_contract(candidate: &NextCandidate, tool: &str) -> Value {
+    let actionable = !matches!(candidate.action, "wait" | "proceed_solo");
+    let stop_reason = match candidate.action {
+        "wait" => Some("waiting_on_peer_with_no_useful_alternate_work"),
+        "proceed_solo" => Some("no_actionable_room_item"),
+        _ => None,
+    };
+    let suggested_claims = candidate
+        .fact
+        .as_ref()
+        .filter(|_| actionable && candidate.action != "continue_or_release_claim")
+        .map(|fact| suggested_claims(tool, fact))
+        .unwrap_or_default();
+    let suggested_commands = if actionable {
+        suggested_commands(tool, candidate)
+    } else {
+        Vec::new()
+    };
+    json!({
+        "actionable": actionable,
+        "requires_human": false,
+        "stop_reason": stop_reason,
+        "suggested_claims": suggested_claims,
+        "suggested_commands": suggested_commands,
+        "completion": completion_contract(candidate.action, actionable)
+    })
+}
+
+fn suggested_claims(tool: &str, fact: &Fact) -> Vec<Value> {
+    let scopes = executable_scopes(fact);
+    scopes
+        .into_iter()
+        .map(|scope| {
+            let path = command_path(&scope);
+            json!({
+                "scope": scope,
+                "command": format!("rally2 say claim --tool {tool} --subject \"act on next\" --path {path} --json")
+            })
+        })
+        .collect()
+}
+
+fn suggested_commands(tool: &str, candidate: &NextCandidate) -> Vec<String> {
+    let Some(fact) = candidate.fact.as_ref() else {
+        return Vec::new();
+    };
+    let mut commands = executable_scopes(fact)
+        .into_iter()
+        .map(|scope| {
+            let path = command_path(&scope);
+            format!("rally2 check before-write --tool {tool} --path {path} --strict --json")
+        })
+        .collect::<Vec<_>>();
+    match candidate.action {
+        "respond_to_handoff" => commands.push(format!(
+            "rally2 say resolve --tool {tool} --ref {} --subject \"responded to handoff\" --json",
+            fact.event_id
+        )),
+        "resolve_owned_blocker" => commands.push(format!(
+            "rally2 say resolve --tool {tool} --ref {} --subject \"resolved blocker\" --json",
+            fact.event_id
+        )),
+        "continue_or_release_claim" => commands.push(format!(
+            "rally2 say release --tool {tool} --ref {} --subject \"done\" --json",
+            fact.event_id
+        )),
+        "review_artifact" => commands.push(format!(
+            "rally2 say artifact --tool {tool} --ref {} --subject \"reviewed artifact\" --uri {} --evidence \"<verification>\" --json",
+            fact.event_id,
+            fact.uri.as_deref().unwrap_or("<path>")
+        )),
+        "clarify_handoff" => commands.push(format!(
+            "rally2 say handoff --tool {tool} --target {} --ref {} --subject \"clarify handoff\" --summary \"<needed context>\" --json",
+            fact.target.as_deref().unwrap_or("<target-tool>"),
+            fact.event_id
+        )),
+        _ => {}
+    }
+    commands
+}
+
+fn completion_contract(action: &str, actionable: bool) -> Value {
+    let record_kind = match action {
+        "respond_to_handoff" | "resolve_owned_blocker" => "resolve",
+        "continue_or_release_claim" => "artifact_or_release",
+        "review_artifact" => "artifact",
+        "clarify_handoff" => "handoff",
+        _ => "none",
+    };
+    json!({
+        "record_kind": record_kind,
+        "evidence_required": actionable,
+        "release_claims": actionable,
+        "rerun_next": actionable
+    })
+}
+
+fn executable_scopes(fact: &Fact) -> Vec<String> {
+    let mut scopes = fact.scope.clone();
+    if scopes.is_empty()
+        && let Some(uri) = &fact.uri
+    {
+        if uri.starts_with("file:") {
+            scopes.push(uri.clone());
+        } else if !uri.contains("://") {
+            scopes.push(normalize_path(uri.clone()));
+        }
+    }
+    scopes.sort();
+    scopes.dedup();
+    scopes
+}
+
+fn command_path(scope: &str) -> String {
+    scope.strip_prefix("file:").unwrap_or(scope).to_string()
 }
 
 fn assigned_to_tool(fact: &Fact, tool: &str) -> bool {
