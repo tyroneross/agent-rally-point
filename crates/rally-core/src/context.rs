@@ -153,21 +153,87 @@ pub struct PacketTrustSummary {
     pub unknown: usize,
 }
 
+/// All inputs `build_context_brief` needs, decoupled from how they were
+/// gathered. The legacy gather path (records → TraceProjection → method
+/// calls) lives in `ContextInputs::from_projection`. A graph-backed path
+/// will be added in a follow-up commit as `ContextInputs::from_graph`.
+///
+/// This struct exists so the brief assembly logic stays in one place and
+/// callers pick the source: in-memory records or persisted graph.
+#[derive(Clone, Debug)]
+pub struct ContextInputs {
+    pub tool: String,
+    pub recent_limit: usize,
+    pub profile: Option<AgentProfile>,
+    pub subscription: Option<AgentSubscription>,
+    pub pending_handoffs: Vec<PendingHandoff>,
+    pub own_blockers: Vec<ActiveBlocker>,
+    pub active_tasks: Vec<ActiveTask>,
+    pub active_claims: Vec<ActiveClaim>,
+    pub claim_conflicts: Vec<ClaimConflict>,
+    pub artifacts: Vec<CoordinationArtifact>,
+    pub decisions: Vec<CoordinationDecision>,
+    pub lessons: Vec<CoordinationLesson>,
+    pub recent_changes: Vec<RecentChange>,
+}
+
+impl ContextInputs {
+    /// Gather inputs from a TraceProjection — the legacy in-memory path.
+    /// Identical to what `build_context_brief` previously did inline.
+    pub fn from_projection(
+        projection: &TraceProjection,
+        tool: &str,
+        recent_limit: usize,
+    ) -> Self {
+        Self {
+            tool: tool.to_string(),
+            recent_limit,
+            profile: projection.profile(tool),
+            subscription: projection.subscription(tool),
+            pending_handoffs: projection.pending_handoffs(Some(tool)),
+            own_blockers: projection.active_blockers(Some(tool)),
+            active_tasks: projection.active_tasks(Some(tool)),
+            active_claims: projection.active_claims(Some(tool)),
+            claim_conflicts: projection.claim_conflicts(),
+            artifacts: projection.artifacts(10),
+            decisions: projection.decisions(10),
+            lessons: projection.lessons(10),
+            recent_changes: projection.recent_changes(recent_limit),
+        }
+    }
+}
+
+/// Legacy entrypoint preserved for callers passing `&TraceProjection`.
+/// Internally just constructs `ContextInputs::from_projection` and calls
+/// `build_context_brief_from_inputs`. New callers should prefer
+/// `ContextInputs::from_graph` (added in a follow-up) and pass the
+/// inputs directly.
 pub fn build_context_brief(
     projection: &TraceProjection,
     tool: &str,
     recent_limit: usize,
 ) -> ContextBrief {
-    let profile = projection.profile(tool);
-    let subscription = projection.subscription(tool);
-    let pending_handoffs = projection.pending_handoffs(Some(tool));
-    let own_blockers = projection.active_blockers(Some(tool));
-    let active_tasks = projection.active_tasks(Some(tool));
-    let active_claims = projection.active_claims(Some(tool));
-    let collision_risk = projection
-        .claim_conflicts()
-        .into_iter()
+    let inputs = ContextInputs::from_projection(projection, tool, recent_limit);
+    build_context_brief_from_inputs(&inputs)
+}
+
+/// Assemble a ContextBrief from already-gathered inputs. Pure transformer
+/// — no I/O, no projection construction. The data-source split lives in
+/// `ContextInputs::from_*` constructors.
+pub fn build_context_brief_from_inputs(inputs: &ContextInputs) -> ContextBrief {
+    let tool = inputs.tool.as_str();
+    let recent_limit = inputs.recent_limit;
+    let profile = inputs.profile.clone();
+    let subscription = inputs.subscription.clone();
+    let pending_handoffs = inputs.pending_handoffs.clone();
+    let own_blockers = inputs.own_blockers.clone();
+    let active_tasks = inputs.active_tasks.clone();
+    let active_claims = inputs.active_claims.clone();
+    let collision_risk = inputs
+        .claim_conflicts
+        .iter()
         .filter(|conflict| conflict.owners.iter().any(|owner| owner == tool))
+        .cloned()
         .collect::<Vec<_>>();
 
     let mut needs_attention = Vec::new();
@@ -184,10 +250,10 @@ pub fn build_context_brief(
     });
 
     let top_priority = needs_attention.first().cloned();
-    let artifacts = projection.artifacts(10);
-    let decisions = projection.decisions(10);
-    let lessons = projection.lessons(10);
-    let relevant_changes = projection.recent_changes(recent_limit);
+    let artifacts = inputs.artifacts.clone();
+    let decisions = inputs.decisions.clone();
+    let lessons = inputs.lessons.clone();
+    let relevant_changes = inputs.recent_changes.clone();
     let attuned_items = build_attuned_items(AttunementInput {
         profile: profile.as_ref(),
         subscription: subscription.as_ref(),
