@@ -105,6 +105,15 @@ rally preflight --tool <host> --start-ping --json
 Use stable tool IDs such as `codex`, `claude_code`, `pi`, `cursor`, `gemini`,
 or `ci`.
 
+Agents that support skills should also install/use the bundled Rally skill at
+[`skills/agent-rally-point/SKILL.md`](skills/agent-rally-point/SKILL.md). The
+canonical cross-agent copy lives at `~/.agent-skills/agent-rally-point/SKILL.md`
+and can be linked into Claude, Codex, Pi, and other agent clients with:
+
+```bash
+~/.agents/bin/sync-agent-skills
+```
+
 Preflight returns `routing.action`:
 
 - `proceed_solo` when no active peers or pending handoffs need attention.
