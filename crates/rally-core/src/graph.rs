@@ -1407,10 +1407,15 @@ pub fn active_tasks_typed(
     conn: &Connection,
     tool: Option<&str>,
 ) -> Result<Vec<ActiveTask>, rusqlite::Error> {
+    // Match TraceProjection::active_tasks behavior: collapse by
+    // (owner_tool, subject) keeping the latest event, then filter by
+    // status and (optionally) owner. Without the collapse, a task with
+    // a done-status follow-up event still appears alongside the active
+    // version, which is wrong for "what's open" queries.
     let mut stmt = conn.prepare(
         r#"
         SELECT n.id, n.subject, n.thread_id, n.origin, n.trust_status,
-               n.payload_json,
+               n.payload_json, n.source_seq,
                (SELECT e.target_id FROM edges e
                  WHERE e.source_id = n.id AND e.kind = 'owned_by'
                  ORDER BY e.source_seq DESC LIMIT 1) AS owner
@@ -1419,7 +1424,7 @@ pub fn active_tasks_typed(
          ORDER BY n.source_seq ASC
         "#,
     )?;
-    let rows: Vec<ActiveTask> = stmt
+    let all_rows: Vec<(i64, ActiveTask)> = stmt
         .query_map([], |row| {
             let payload_json: String = row.get(5)?;
             let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
@@ -1428,21 +1433,41 @@ pub fn active_tasks_typed(
                 .and_then(Value::as_str)
                 .unwrap_or("active")
                 .to_string();
-            Ok(ActiveTask {
-                event_id: row.get::<_, String>(0)?,
-                thread_id: row.get::<_, Option<String>>(2)?,
-                subject: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                status,
-                owner_tool: row.get::<_, Option<String>>(6)?,
-                depends_on: json_string_array(&payload, "depends_on"),
-                artifacts: json_string_array(&payload, "artifacts"),
-                verification: payload.get("verification").and_then(Value::as_str).map(str::to_string),
-                origin: row.get::<_, Option<String>>(3)?,
-                trust_status: row.get::<_, Option<String>>(4)?,
-            })
+            let seq: i64 = row.get(6)?;
+            Ok((
+                seq,
+                ActiveTask {
+                    event_id: row.get::<_, String>(0)?,
+                    thread_id: row.get::<_, Option<String>>(2)?,
+                    subject: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    status,
+                    owner_tool: row.get::<_, Option<String>>(7)?,
+                    depends_on: json_string_array(&payload, "depends_on"),
+                    artifacts: json_string_array(&payload, "artifacts"),
+                    verification: payload.get("verification").and_then(Value::as_str).map(str::to_string),
+                    origin: row.get::<_, Option<String>>(3)?,
+                    trust_status: row.get::<_, Option<String>>(4)?,
+                },
+            ))
         })?
         .filter_map(Result::ok)
-        .filter(|t| !matches!(t.status.as_str(), "done" | "closed" | "cancelled"))
+        .collect();
+    // Collapse by (owner_tool, subject) keeping the latest seq.
+    use std::collections::BTreeMap;
+    let mut latest: BTreeMap<(Option<String>, String), (i64, ActiveTask)> = BTreeMap::new();
+    for (seq, task) in all_rows {
+        let key = (task.owner_tool.clone(), task.subject.clone());
+        match latest.get(&key) {
+            Some((prev_seq, _)) if *prev_seq > seq => {}
+            _ => {
+                latest.insert(key, (seq, task));
+            }
+        }
+    }
+    let rows: Vec<ActiveTask> = latest
+        .into_values()
+        .map(|(_seq, task)| task)
+        .filter(|t| !matches!(t.status.as_str(), "done" | "completed" | "closed" | "cancelled"))
         .filter(|t| tool.is_none_or(|target| t.owner_tool.as_deref() == Some(target)))
         .collect();
     Ok(rows)

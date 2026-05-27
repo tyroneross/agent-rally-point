@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use rally_core::context::{build_context_brief, build_work_packet};
+use rally_core::context::{
+    ContextBrief, ContextInputs, build_context_brief_from_inputs, build_work_packet,
+};
+use rally_core::graph;
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
 use rally_core::event::{EventBuilder, EventPayload, HandoffPayload};
 use rally_core::query::{
@@ -25,6 +28,47 @@ fn temp_channel(name: &str) -> std::path::PathBuf {
             .unwrap()
             .as_nanos()
     ))
+}
+
+/// Build a `ContextBrief` from records via the graph projection.
+/// Records that are already store-entry-shaped (have a top-level
+/// `event` field) are passed through with their existing origin /
+/// trust_status. Raw events get wrapped with default `local` origin.
+fn brief_from_records(records: &[Value], tool: &str, limit: usize, now: f64) -> ContextBrief {
+    let dir = temp_channel("kernel-brief");
+    std::fs::create_dir_all(&dir).unwrap();
+    let now_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp(now as i64, 0)
+        .unwrap()
+        .to_rfc3339();
+    let mut conn = graph::init(&dir, &now_rfc).unwrap();
+    let wrapped: Vec<Value> = records
+        .iter()
+        .enumerate()
+        .map(|(i, record)| {
+            let seq = (i + 1) as i64;
+            if record.get("event").is_some() {
+                let mut wrapped = record.clone();
+                if let Some(map) = wrapped.as_object_mut() {
+                    map.entry("local_seq".to_string()).or_insert(json!(seq));
+                    map.entry("origin".to_string()).or_insert(json!("local"));
+                    map.entry("trust_status".to_string()).or_insert(json!("local"));
+                }
+                wrapped
+            } else {
+                json!({
+                    "local_seq": seq,
+                    "origin": "local",
+                    "trust_status": "local",
+                    "event": record
+                })
+            }
+        })
+        .collect();
+    graph::catch_up(&mut conn, &wrapped, &now_rfc).unwrap();
+    let inputs = ContextInputs::from_graph(&conn, tool, limit, now).unwrap();
+    let brief = build_context_brief_from_inputs(&inputs);
+    std::fs::remove_dir_all(&dir).ok();
+    brief
 }
 
 fn record(kind: &str, id: &str, tool: &str, payload: Value) -> Value {
@@ -179,8 +223,7 @@ fn context_brief_recommends_the_highest_priority_agent_action() {
         json!({"owner_tool": "codex", "resource": "file:docs", "subject": "edit docs"}),
     );
     let records = vec![claim, handoff];
-    let projection = TraceProjection::from_records_at(&records, 1_779_829_200.0);
-    let brief = build_context_brief(&projection, "codex", 5);
+    let brief = brief_from_records(&records, "codex", 5, 1_779_829_200.0);
 
     assert_eq!(brief.routing.action, "join_active");
     assert_eq!(brief.recommended_next_action.action, "ack_handoff");
@@ -266,8 +309,7 @@ fn context_brief_includes_attuned_agent_facts() {
         }),
     );
     let records = vec![profile, subscription, task, artifact, decision, lesson];
-    let projection = TraceProjection::from_records_at(&records, 1_779_829_200.0);
-    let brief = build_context_brief(&projection, "codex", 10);
+    let brief = brief_from_records(&records, "codex", 10, 1_779_829_200.0);
 
     assert_eq!(
         brief.profile.unwrap().capabilities,
@@ -383,8 +425,7 @@ fn context_brief_ranks_attuned_items_by_profile_subscription_path_and_trust() {
         related_artifact,
         related_decision,
     ];
-    let projection = TraceProjection::from_records_at(&records, 1_779_829_200.0);
-    let brief = build_context_brief(&projection, "codex", 10);
+    let brief = brief_from_records(&records, "codex", 10, 1_779_829_200.0);
 
     let related = brief
         .attuned_items
@@ -460,11 +501,12 @@ fn reviewer_profile_shapes_attunement_and_recommendations() {
             "scope": "crates/rally-core/src/context.rs"
         }),
     );
-    let projection = TraceProjection::from_records_at(
+    let brief = brief_from_records(
         &[profile, subscription, decision, artifact],
+        "codex-reviewer",
+        10,
         1_779_829_200.0,
     );
-    let brief = build_context_brief(&projection, "codex-reviewer", 10);
 
     assert_eq!(
         brief.profile.as_ref().unwrap().role.as_deref(),
@@ -521,9 +563,12 @@ fn work_packet_shapes_role_specific_briefs_and_trust_contract() {
             "scope": "crates/rally-core/src/context.rs"
         }),
     );
-    let projection =
-        TraceProjection::from_records_at(&[profile, artifact, decision], 1_779_829_200.0);
-    let brief = build_context_brief(&projection, "codex-reviewer", 10);
+    let brief = brief_from_records(
+        &[profile, artifact, decision],
+        "codex-reviewer",
+        10,
+        1_779_829_200.0,
+    );
     let packet = build_work_packet(&brief, 10);
 
     assert_eq!(packet.role, "reviewer");
@@ -580,9 +625,33 @@ fn active_tasks_use_latest_task_state_by_owner_and_subject() {
         }),
     );
 
-    let projection = TraceProjection::from_records_at(&[active, done], 1_779_829_200.0);
+    // Build the graph from the two records and assert that the collapse
+    // semantic (latest by (owner_tool, subject)) filters out the
+    // closed-then-reopened task. This used to test TraceProjection
+    // directly; the graph queries replicate the same collapse.
+    let dir = temp_channel("active-tasks-collapse");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut conn = graph::init(&dir, "2026-05-27T00:00:00Z").unwrap();
+    let wrapped: Vec<Value> = [active, done]
+        .iter()
+        .enumerate()
+        .map(|(i, event)| {
+            json!({
+                "local_seq": (i + 1) as i64,
+                "origin": "local",
+                "trust_status": "local",
+                "event": event
+            })
+        })
+        .collect();
+    graph::catch_up(&mut conn, &wrapped, "2026-05-27T00:00:00Z").unwrap();
+    let active_tasks = graph::active_tasks_typed(&conn, Some("codex")).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
 
-    assert!(projection.active_tasks(Some("codex")).is_empty());
+    assert!(
+        active_tasks.is_empty(),
+        "done-status follow-up event must collapse with the active one and filter out"
+    );
 }
 
 #[test]

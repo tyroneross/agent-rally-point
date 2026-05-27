@@ -4,7 +4,6 @@
 use crate::query::{
     ActiveBlocker, ActiveClaim, ActiveTask, AgentProfile, AgentSubscription, ClaimConflict,
     CoordinationArtifact, CoordinationDecision, CoordinationLesson, PendingHandoff, RecentChange,
-    TraceProjection,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -153,13 +152,9 @@ pub struct PacketTrustSummary {
     pub unknown: usize,
 }
 
-/// All inputs `build_context_brief` needs, decoupled from how they were
-/// gathered. The legacy gather path (records → TraceProjection → method
-/// calls) lives in `ContextInputs::from_projection`. A graph-backed path
-/// will be added in a follow-up commit as `ContextInputs::from_graph`.
-///
-/// This struct exists so the brief assembly logic stays in one place and
-/// callers pick the source: in-memory records or persisted graph.
+/// All inputs `build_context_brief_from_inputs` needs. Sourced from the
+/// SQLite graph projection via `from_graph`. The legacy TraceProjection
+/// gather path was retired with the graph-primary migration.
 #[derive(Clone, Debug)]
 pub struct ContextInputs {
     pub tool: String,
@@ -178,32 +173,9 @@ pub struct ContextInputs {
 }
 
 impl ContextInputs {
-    /// Gather inputs from a TraceProjection — the legacy in-memory path.
-    /// Identical to what `build_context_brief` previously did inline.
-    pub fn from_projection(projection: &TraceProjection, tool: &str, recent_limit: usize) -> Self {
-        Self {
-            tool: tool.to_string(),
-            recent_limit,
-            profile: projection.profile(tool),
-            subscription: projection.subscription(tool),
-            pending_handoffs: projection.pending_handoffs(Some(tool)),
-            own_blockers: projection.active_blockers(Some(tool)),
-            active_tasks: projection.active_tasks(Some(tool)),
-            active_claims: projection.active_claims(Some(tool)),
-            claim_conflicts: projection.claim_conflicts(),
-            artifacts: projection.artifacts(10),
-            decisions: projection.decisions(10),
-            lessons: projection.lessons(10),
-            recent_changes: projection.recent_changes(recent_limit),
-        }
-    }
-
-    /// Gather inputs from the SQLite graph projection — the migration
-    /// target. Same field shapes as `from_projection`, sourced from the
-    /// persistent index instead of an in-memory record scan.
-    ///
-    /// Caller must ensure the graph is caught up before calling (e.g.,
-    /// via `graph::catch_up`). This function performs no mutation.
+    /// Gather inputs from the SQLite graph projection. Caller must
+    /// ensure the graph is caught up first (`graph::catch_up`); this
+    /// function performs no mutation.
     pub fn from_graph(
         conn: &crate::graph::GraphConnection,
         tool: &str,
@@ -226,20 +198,6 @@ impl ContextInputs {
             recent_changes: crate::graph::recent_changes_typed(conn, recent_limit as u32, now_epoch)?,
         })
     }
-}
-
-/// Legacy entrypoint preserved for callers passing `&TraceProjection`.
-/// Internally just constructs `ContextInputs::from_projection` and calls
-/// `build_context_brief_from_inputs`. New callers should prefer
-/// `ContextInputs::from_graph` (added in a follow-up) and pass the
-/// inputs directly.
-pub fn build_context_brief(
-    projection: &TraceProjection,
-    tool: &str,
-    recent_limit: usize,
-) -> ContextBrief {
-    let inputs = ContextInputs::from_projection(projection, tool, recent_limit);
-    build_context_brief_from_inputs(&inputs)
 }
 
 /// Assemble a ContextBrief from already-gathered inputs. Pure transformer
