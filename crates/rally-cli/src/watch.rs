@@ -4,7 +4,7 @@
 //! `rally watch` — block on changes.jsonl, emit new matching events as JSON lines.
 //!
 //! Uses the `notify` crate for kqueue/inotify/ReadDirectoryChangesW wakeups so
-//! idle = zero CPU and latency is ~ms. A slow safety-net poll catches any
+//! idle = near-zero CPU and latency is ~ms. A safety-net poll catches any
 //! coalesced/missed events.
 //!
 //! Production fan-out (multi-consumer, sinks, configured filter rules) lives
@@ -22,11 +22,14 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Maximum interval between forced re-reads even when no FS event arrived.
-/// Belt-and-suspenders for cases where notify coalesces or drops an event.
-const SAFETY_POLL: Duration = Duration::from_secs(5);
+/// Keeps the CLI tailer responsive when notify coalesces or drops an event.
+const SAFETY_POLL: Duration = Duration::from_millis(500);
+const SETTLE_POLL: Duration = Duration::from_millis(20);
+const SETTLE_WINDOW: Duration = Duration::from_millis(300);
 
 pub(crate) fn execute_watch(command: WatchCommand) -> Result<(), CliError> {
     let store = command.common.channel_store("watch")?;
@@ -82,11 +85,26 @@ pub(crate) fn execute_watch(command: WatchCommand) -> Result<(), CliError> {
                 break;
             }
             let wait = (deadline - now).min(SAFETY_POLL);
-            let _ = recv_relevant_event(&rx, wait, &changes_path);
+            let woke = recv_relevant_event(&rx, wait, &changes_path);
+            drain_after_wake(
+                woke,
+                &changes_path,
+                &mut offset,
+                &mut max_seq,
+                &command,
+                &mut out,
+            );
         } else {
-            let _ = recv_relevant_event(&rx, SAFETY_POLL, &changes_path);
+            let woke = recv_relevant_event(&rx, SAFETY_POLL, &changes_path);
+            drain_after_wake(
+                woke,
+                &changes_path,
+                &mut offset,
+                &mut max_seq,
+                &command,
+                &mut out,
+            );
         }
-        drain(&changes_path, &mut offset, &mut max_seq, &command, &mut out);
         if command.since_cursor && !command.peek {
             advance_cursor(&store, &command, max_seq);
         }
@@ -94,6 +112,25 @@ pub(crate) fn execute_watch(command: WatchCommand) -> Result<(), CliError> {
 
     drop(watcher);
     Ok(())
+}
+
+fn drain_after_wake(
+    woke: bool,
+    changes_path: &Path,
+    offset: &mut u64,
+    max_seq: &mut u64,
+    command: &WatchCommand,
+    out: &mut impl Write,
+) {
+    let mut drained = drain(changes_path, offset, max_seq, command, out);
+    if !woke || drained > 0 {
+        return;
+    }
+    let deadline = Instant::now() + SETTLE_WINDOW;
+    while drained == 0 && Instant::now() < deadline {
+        thread::sleep(SETTLE_POLL);
+        drained = drain(changes_path, offset, max_seq, command, out);
+    }
 }
 
 /// Block up to `timeout` for an FS event affecting `changes_path` (or any
@@ -104,10 +141,17 @@ fn recv_relevant_event(
     timeout: Duration,
     changes_path: &Path,
 ) -> bool {
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(event)) => event_touches_log(&event, changes_path),
-        Ok(Err(_)) => false,
-        Err(_) => false,
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok(Ok(event)) if event_touches_log(&event, changes_path) => return true,
+            Ok(_) => continue,
+            Err(_) => return false,
+        }
     }
 }
 
@@ -121,11 +165,12 @@ fn event_touches_log(event: &notify::Event, changes_path: &Path) -> bool {
     if !kind_ok {
         return false;
     }
-    event
-        .paths
-        .iter()
-        .any(|p| p == changes_path || p.ends_with("changes.jsonl"))
-        || matches!(event.kind, EventKind::Modify(ModifyKind::Any))
+    let watch_dir = changes_path.parent();
+    event.paths.iter().any(|p| {
+        p == changes_path
+            || p.ends_with("changes.jsonl")
+            || watch_dir.is_some_and(|dir| p == dir || p.parent() == Some(dir))
+    }) || matches!(event.kind, EventKind::Modify(ModifyKind::Any))
 }
 
 fn drain(
@@ -134,8 +179,9 @@ fn drain(
     max_seq: &mut u64,
     command: &WatchCommand,
     out: &mut impl Write,
-) {
+) -> usize {
     let (records, new_offset) = read_new(changes_path, *offset);
+    let read_count = records.len();
     *offset = new_offset;
     for record in records {
         let seq = record.get("local_seq").and_then(Value::as_u64).unwrap_or(0);
@@ -147,6 +193,7 @@ fn drain(
             out.flush().ok();
         }
     }
+    read_count
 }
 
 fn matches(record: &Value, command: &WatchCommand) -> bool {

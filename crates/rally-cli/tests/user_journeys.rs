@@ -593,3 +593,199 @@ fn rally_post_rejects_non_object_payload() {
 
     workspace.cleanup();
 }
+
+// -----------------------------------------------------------------------------
+// Codex installer: TOML-safe `[features]` handling
+//
+// Regression coverage for the duplicate-`[features]` parse error reported on
+// real Codex configs that already carry `[features]\nmemories = true`. The
+// installer must mutate the existing `[features]` table instead of emitting a
+// second header.
+// -----------------------------------------------------------------------------
+
+fn parse_codex_config(path: &std::path::Path) -> toml::Value {
+    let text = fs::read_to_string(path).expect("config.toml must be readable");
+    toml::from_str(&text).unwrap_or_else(|err| {
+        panic!("Codex config must parse as valid TOML, got error: {err}\nfile:\n{text}")
+    })
+}
+
+fn count_features_headers(path: &std::path::Path) -> usize {
+    let text = fs::read_to_string(path).expect("config.toml must be readable");
+    text.lines()
+        .filter(|line| line.trim() == "[features]")
+        .count()
+}
+
+fn assert_run_ok(output: std::process::Output) {
+    assert!(
+        output.status.success(),
+        "command failed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn codex_install_preserves_existing_features_table() {
+    let workspace = RallyWorkspace::new("codex-install-existing-features");
+    let codex_dir = workspace.home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let config_path = codex_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        "model = \"gpt-5\"\n\n[features]\nmemories = true\n\n[tools]\nweb_search = true\n",
+    )
+    .unwrap();
+
+    assert_run_ok(workspace.run(&["setup", "install", "codex", "--json"]));
+
+    let doc = parse_codex_config(&config_path);
+    assert_eq!(
+        count_features_headers(&config_path),
+        1,
+        "exactly one [features] header"
+    );
+    let features = doc["features"]
+        .as_table()
+        .expect("features must be a table");
+    assert_eq!(features["memories"].as_bool(), Some(true));
+    assert_eq!(features["hooks"].as_bool(), Some(true));
+    // Sibling top-level tables must survive untouched.
+    assert_eq!(doc["tools"]["web_search"].as_bool(), Some(true));
+    assert_eq!(doc["model"].as_str(), Some("gpt-5"));
+
+    workspace.cleanup();
+}
+
+#[test]
+fn codex_install_creates_features_when_absent() {
+    let workspace = RallyWorkspace::new("codex-install-empty-config");
+    let codex_dir = workspace.home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let config_path = codex_dir.join("config.toml");
+    // Not creating the file at all — installer must handle the missing-file
+    // case identically to an empty file.
+
+    assert_run_ok(workspace.run(&["setup", "install", "codex", "--json"]));
+
+    let doc = parse_codex_config(&config_path);
+    assert_eq!(count_features_headers(&config_path), 1);
+    assert_eq!(doc["features"]["hooks"].as_bool(), Some(true));
+
+    workspace.cleanup();
+}
+
+#[test]
+fn codex_install_uninstall_round_trip_preserves_siblings() {
+    let workspace = RallyWorkspace::new("codex-install-uninstall-roundtrip");
+    let codex_dir = workspace.home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let config_path = codex_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        "[features]\nmemories = true\n\n[mcp_servers.example]\ncommand = \"echo\"\n",
+    )
+    .unwrap();
+
+    assert_run_ok(workspace.run(&["setup", "install", "codex", "--json"]));
+    let after_install = parse_codex_config(&config_path);
+    assert_eq!(after_install["features"]["memories"].as_bool(), Some(true));
+    assert_eq!(after_install["features"]["hooks"].as_bool(), Some(true));
+
+    assert_run_ok(workspace.run(&["setup", "uninstall", "codex", "--json"]));
+    let after_uninstall = parse_codex_config(&config_path);
+    let features = after_uninstall["features"]
+        .as_table()
+        .expect("features table survives uninstall");
+    assert_eq!(features.get("hooks"), None, "features.hooks removed");
+    assert_eq!(
+        features["memories"].as_bool(),
+        Some(true),
+        "sibling features.memories preserved"
+    );
+    assert!(
+        after_uninstall["mcp_servers"]["example"]["command"]
+            .as_str()
+            .is_some(),
+        "unrelated table preserved"
+    );
+    // No orphan rally markers.
+    let text = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !text.contains("BEGIN rally codex hooks") && !text.contains("END rally codex hooks"),
+        "no orphan rally marker block"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn codex_uninstall_drops_empty_features_table() {
+    let workspace = RallyWorkspace::new("codex-uninstall-empty-features");
+    let codex_dir = workspace.home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let config_path = codex_dir.join("config.toml");
+    // No pre-existing [features] table at all.
+    fs::write(&config_path, "model = \"gpt-5\"\n").unwrap();
+
+    assert_run_ok(workspace.run(&["setup", "install", "codex", "--json"]));
+    assert_eq!(count_features_headers(&config_path), 1);
+
+    assert_run_ok(workspace.run(&["setup", "uninstall", "codex", "--json"]));
+    let after = parse_codex_config(&config_path);
+    assert!(
+        after.get("features").is_none(),
+        "empty [features] table removed: {after:?}"
+    );
+    assert_eq!(after["model"].as_str(), Some("gpt-5"));
+
+    workspace.cleanup();
+}
+
+#[test]
+fn codex_install_heals_pre_fix_duplicate_features_state() {
+    // Reproduces the corrupted on-disk state the pre-fix installer left when
+    // it ran against a config that already had `[features]`. Until the heal
+    // path runs, this file fails `toml::from_str` with a duplicate-key error.
+    let workspace = RallyWorkspace::new("codex-install-heal-duplicate");
+    let codex_dir = workspace.home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let config_path = codex_dir.join("config.toml");
+    let corrupted = concat!(
+        "model = \"gpt-5\"\n",
+        "\n",
+        "[features]\n",
+        "memories = true\n",
+        "\n",
+        "# BEGIN rally codex hooks\n",
+        "[features]\n",
+        "hooks = true\n",
+        "# END rally codex hooks\n",
+    );
+    fs::write(&config_path, corrupted).unwrap();
+    // Sanity-check the precondition — corrupted file must NOT parse.
+    assert!(
+        toml::from_str::<toml::Value>(&fs::read_to_string(&config_path).unwrap()).is_err(),
+        "precondition: corrupted config must fail to parse"
+    );
+
+    assert_run_ok(workspace.run(&["setup", "install", "codex", "--json"]));
+
+    let doc = parse_codex_config(&config_path);
+    assert_eq!(
+        count_features_headers(&config_path),
+        1,
+        "duplicate [features] headers collapsed"
+    );
+    let features = doc["features"].as_table().unwrap();
+    assert_eq!(features["memories"].as_bool(), Some(true));
+    assert_eq!(features["hooks"].as_bool(), Some(true));
+    assert_eq!(doc["model"].as_str(), Some("gpt-5"));
+    let text = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !text.contains("BEGIN rally codex hooks") && !text.contains("END rally codex hooks"),
+        "rally marker block stripped during heal"
+    );
+
+    workspace.cleanup();
+}

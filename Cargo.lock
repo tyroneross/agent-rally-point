@@ -560,6 +560,7 @@ dependencies = [
  "rally-trust",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
