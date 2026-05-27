@@ -12,6 +12,7 @@ use rally_core::context::{ContextRecommendation, build_context_brief, build_work
 use rally_core::cursors;
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
 use rally_core::event::{ClaimPayload, EventBuilder, EventPayload, EventRecord, ProfilePayload};
+use rally_core::graph;
 use rally_core::preflight::{PreflightOptions, run_preflight};
 use rally_core::query::{
     TraceProjection, active_blockers_at, active_claims_at, claim_conflicts, filter_since,
@@ -20,7 +21,7 @@ use rally_core::query::{
 use rally_core::store::ChannelStore;
 use rally_protocol::event_value;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -476,7 +477,14 @@ pub(super) fn execute_next(command: ReadCommand) -> Result<WriteOutput, CliError
     let tool = command.common.tool();
     let (store, records, now) = query_records(&command)?;
     let projection = TraceProjection::from_records_at(&records, now);
-    let recommendation = next_recommendation(&projection, &tool, command.limit);
+
+    // Graph-backed filter: only consider artifacts with no incoming
+    // `reviewed_by` edge. Falls back to None on graph error so a corrupt
+    // projection doesn't take `rally next` down — the worst case is the
+    // old behavior (every recent artifact scores).
+    let unconsumed = unconsumed_filter(&store, &records).ok();
+
+    let recommendation = next_recommendation(&projection, &tool, command.limit, unconsumed.as_ref());
     let text = recommendation
         .get("subject")
         .and_then(Value::as_str)
@@ -489,6 +497,25 @@ pub(super) fn execute_next(command: ReadCommand) -> Result<WriteOutput, CliError
         text,
         json!({ "next": recommendation }),
     ))
+}
+
+/// Build a set of artifact event_ids with no `reviewed_by` edge, using the
+/// derived graph projection. Returns Err if the graph cannot be opened or
+/// caught up — caller decides whether to fall back.
+fn unconsumed_filter(
+    store: &ChannelStore,
+    records: &[Value],
+) -> Result<HashSet<String>, CliError> {
+    let mut conn = graph::init(store.channel_dir(), &now_rfc3339())
+        .map_err(|err| CliError::runtime("next", format!("open graph: {err}")))?;
+    graph::catch_up(&mut conn, records, &now_rfc3339())
+        .map_err(|err| CliError::runtime("next", format!("graph catch_up: {err}")))?;
+    let rows = graph::unconsumed_artifacts(&conn, 200)
+        .map_err(|err| CliError::runtime("next", format!("unconsumed query: {err}")))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|n| n.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect())
 }
 
 pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliError> {
@@ -1094,7 +1121,12 @@ fn build_judgment(
     })
 }
 
-fn next_recommendation(projection: &TraceProjection, tool: &str, limit: usize) -> Value {
+fn next_recommendation(
+    projection: &TraceProjection,
+    tool: &str,
+    limit: usize,
+    unconsumed_artifacts: Option<&HashSet<String>>,
+) -> Value {
     let profile = projection.profile(tool);
     let role = profile
         .as_ref()
@@ -1163,8 +1195,23 @@ fn next_recommendation(projection: &TraceProjection, tool: &str, limit: usize) -
         ));
     }
 
+    // When the graph projection is available, restrict artifact candidates
+    // to those with no incoming `reviewed_by` edge — addresses the
+    // stale-recommendation issue where reviewed artifacts kept resurfacing.
+    // When the filter is None (graph unavailable), fall back to all recent
+    // artifacts to preserve prior behavior.
     for artifact in projection.artifacts(limit.max(3)) {
+        if let Some(filter) = unconsumed_artifacts {
+            if !filter.contains(&artifact.event_id) {
+                continue;
+            }
+        }
         let bonus = role_match_bonus(role, &capabilities, "artifact");
+        let reasoning = if unconsumed_artifacts.is_some() {
+            "no follow-up activity from another peer — needs review".to_string()
+        } else {
+            "recent artifact may need follow-up".to_string()
+        };
         candidates.push(candidate(
             if bonus > 0.0 {
                 "review_artifact"
@@ -1176,7 +1223,7 @@ fn next_recommendation(projection: &TraceProjection, tool: &str, limit: usize) -
             35.0 + bonus,
             json!({ "artifact": 35.0, "role_match": bonus }),
             vec![artifact.event_id.clone()],
-            vec!["recent artifact may need follow-up".to_string()],
+            vec![reasoning],
         ));
     }
 

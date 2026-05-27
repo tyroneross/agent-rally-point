@@ -32,8 +32,11 @@ use std::path::{Path, PathBuf};
 pub use rusqlite::Connection as GraphConnection;
 
 /// Bumped when the projection schema or builder semantics change. Triggers
-/// a full rebuild on next `catch_up`.
-pub const SCHEMA_VERSION: i64 = 1;
+/// a full rebuild on next `catch_up`. v2 added the `producer_tool` column
+/// on `nodes` and changed `unconsumed_artifacts` to "no later non-producer
+/// activity" (vs the v1 "no reviewed_by edge", which missed the real
+/// review flow where acks live on handoffs not artifacts).
+pub const SCHEMA_VERSION: i64 = 2;
 
 const GRAPH_FILENAME: &str = "rally.graph.db";
 
@@ -87,9 +90,44 @@ pub fn init(channel_dir: &Path, now_rfc3339: &str) -> Result<Connection, rusqlit
         })?;
     }
     let conn = Connection::open(&path)?;
+    // If a prior schema version's tables exist, drop them before applying
+    // the current schema. CREATE TABLE IF NOT EXISTS won't add new columns
+    // to an existing table, so a version bump that adds columns requires
+    // a clean recreate. Catch_up will replay events into the fresh tables.
+    drop_stale_tables_if_schema_changed(&conn)?;
     apply_schema(&conn)?;
     seed_meta(&conn, now_rfc3339)?;
     Ok(conn)
+}
+
+fn drop_stale_tables_if_schema_changed(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // graph_meta may not exist yet on a fresh DB; query defensively.
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='graph_meta'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(());
+    }
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM graph_meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let stored_version: i64 = stored.and_then(|v| v.parse().ok()).unwrap_or(0);
+    if stored_version != SCHEMA_VERSION {
+        // Newer version exists in code → wipe and rebuild. Same version → leave alone.
+        conn.execute("DROP TABLE IF EXISTS edges", [])?;
+        conn.execute("DROP TABLE IF EXISTS nodes", [])?;
+        conn.execute("DROP TABLE IF EXISTS graph_meta", [])?;
+    }
+    Ok(())
 }
 
 fn apply_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -105,10 +143,12 @@ fn apply_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             payload_json    TEXT NOT NULL,
             created_at      TEXT NOT NULL,
             source_event_id TEXT,
-            source_seq      INTEGER
+            source_seq      INTEGER,
+            producer_tool   TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_nodes_kind    ON nodes(kind);
-        CREATE INDEX IF NOT EXISTS idx_nodes_subject ON nodes(subject);
+        CREATE INDEX IF NOT EXISTS idx_nodes_kind     ON nodes(kind);
+        CREATE INDEX IF NOT EXISTS idx_nodes_subject  ON nodes(subject);
+        CREATE INDEX IF NOT EXISTS idx_nodes_producer ON nodes(producer_tool);
 
         CREATE TABLE IF NOT EXISTS edges (
             source_id       TEXT NOT NULL,
@@ -289,7 +329,7 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
 
     match kind {
         "task" => {
-            upsert_node(tx, &event_id, "task", subject_field.as_deref(), &payload, time, &event_id, seq)?;
+            upsert_node(tx, &event_id, "task", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             if let Some(owner) = payload.get("owner_tool").and_then(Value::as_str) {
                 upsert_peer(tx, owner, time, &event_id, seq)?;
@@ -319,7 +359,7 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
             }
         }
         "artifact" => {
-            upsert_node(tx, &event_id, "artifact", subject_field.as_deref(), &payload, time, &event_id, seq)?;
+            upsert_node(tx, &event_id, "artifact", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             upsert_edge(tx, &event_id, tool, "produced_by", None, &event_id, seq)?;
             if let Some(task_id) = payload.get("ref_task_id").and_then(Value::as_str) {
@@ -327,7 +367,7 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
             }
         }
         "decision" => {
-            upsert_node(tx, &event_id, "decision", subject_field.as_deref(), &payload, time, &event_id, seq)?;
+            upsert_node(tx, &event_id, "decision", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             upsert_edge(tx, &event_id, tool, "produced_by", None, &event_id, seq)?;
             for sup in payload
@@ -342,7 +382,7 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
             }
         }
         "lesson" => {
-            upsert_node(tx, &event_id, "lesson", subject_field.as_deref(), &payload, time, &event_id, seq)?;
+            upsert_node(tx, &event_id, "lesson", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
             upsert_peer(tx, tool, time, &event_id, seq)?;
             upsert_edge(tx, &event_id, tool, "produced_by", None, &event_id, seq)?;
             for src in payload
@@ -365,13 +405,25 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
                 .unwrap_or(tool);
             upsert_peer(tx, profile_tool, time, &event_id, seq)?;
         }
+        "handoff" => {
+            // Project handoffs as nodes so "any later non-producer activity"
+            // can see them. The producer is the from_tool (the sender), which
+            // is the same as the event's `tool` envelope field.
+            upsert_node(tx, &event_id, "handoff", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_peer(tx, tool, time, &event_id, seq)?;
+            if let Some(to) = payload.get("to_tool").and_then(Value::as_str) {
+                upsert_peer(tx, to, time, &event_id, seq)?;
+                upsert_edge(tx, &event_id, to, "addressed_to", None, &event_id, seq)?;
+            }
+        }
         "ack" => {
-            // An ack with verdict=done/passed/approved closes the loop. Record a
-            // reviewed_by edge so unconsumed_artifacts can detect follow-up.
+            // Project the ack as a node so it counts as later non-producer
+            // activity on prior artifacts/handoffs from the original sender.
+            upsert_node(tx, &event_id, "ack", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_peer(tx, tool, time, &event_id, seq)?;
             let verdict = payload.get("verdict").and_then(Value::as_str).unwrap_or("");
             if matches!(verdict, "done" | "passed" | "approved") {
                 if let Some(handoff_id) = payload.get("ref_handoff_id").and_then(Value::as_str) {
-                    upsert_peer(tx, tool, time, &event_id, seq)?;
                     upsert_edge(tx, handoff_id, tool, "reviewed_by", None, &event_id, seq)?;
                 }
             }
@@ -390,19 +442,21 @@ fn upsert_node(
     time: &str,
     source_event_id: &str,
     seq: i64,
+    producer_tool: Option<&str>,
 ) -> Result<(), rusqlite::Error> {
     let payload_str = serde_json::to_string(payload).unwrap_or_else(|_| "null".to_string());
     tx.execute(
-        "INSERT INTO nodes(id, kind, subject, payload_json, created_at, source_event_id, source_seq)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO nodes(id, kind, subject, payload_json, created_at, source_event_id, source_seq, producer_tool)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(id) DO UPDATE SET
             kind            = excluded.kind,
             subject         = COALESCE(excluded.subject, nodes.subject),
             payload_json    = excluded.payload_json,
             source_event_id = excluded.source_event_id,
-            source_seq      = excluded.source_seq
+            source_seq      = excluded.source_seq,
+            producer_tool   = COALESCE(excluded.producer_tool, nodes.producer_tool)
          WHERE excluded.source_seq >= nodes.source_seq",
-        params![id, kind, subject, payload_str, time, source_event_id, seq],
+        params![id, kind, subject, payload_str, time, source_event_id, seq, producer_tool],
     )?;
     Ok(())
 }
@@ -417,9 +471,11 @@ fn upsert_peer(
     if tool.is_empty() || tool == "unknown" {
         return Ok(());
     }
+    // A peer "produces" itself; setting producer_tool=tool keeps the column
+    // non-null and makes "later activity by different peer" queries simpler.
     tx.execute(
-        "INSERT INTO nodes(id, kind, subject, payload_json, created_at, source_event_id, source_seq)
-         VALUES (?1, 'peer', ?1, '{}', ?2, ?3, ?4)
+        "INSERT INTO nodes(id, kind, subject, payload_json, created_at, source_event_id, source_seq, producer_tool)
+         VALUES (?1, 'peer', ?1, '{}', ?2, ?3, ?4, ?1)
          ON CONFLICT(id) DO UPDATE SET
             source_event_id = excluded.source_event_id,
             source_seq      = excluded.source_seq
@@ -663,18 +719,34 @@ pub fn transitive_deps(
     Ok(deps)
 }
 
-/// Artifacts that have no incoming `reviewed_by` edge — i.e., produced but
-/// never consumed. The shape the v1 `rally next` candidate-filter wanted.
+/// Artifacts with no later activity by a different peer — the practical
+/// "this still needs follow-up" filter.
+///
+/// An artifact A is consumed iff there exists any node N where:
+///   * N.source_seq > A.source_seq, AND
+///   * N.producer_tool != A.producer_tool AND N.producer_tool IS NOT NULL,
+///     AND
+///   * N is not itself a peer (peer upserts run on every event and would
+///     mark every artifact consumed instantly otherwise).
+///
+/// This is broader than "ack with verdict=done" but matches real-team
+/// behavior: when a different peer has acted after an artifact, that peer
+/// has effectively engaged with the work; recommendations should move on.
 pub fn unconsumed_artifacts(conn: &Connection, limit: u32) -> Result<Vec<Value>, rusqlite::Error> {
     let lim = limit.max(1).min(200) as i64;
     let mut stmt = conn.prepare(
         r#"
-        SELECT n.id, n.subject, n.created_at, n.source_event_id
+        SELECT n.id, n.subject, n.created_at, n.source_event_id, n.producer_tool
           FROM nodes n
          WHERE n.kind = 'artifact'
+           AND n.producer_tool IS NOT NULL
            AND NOT EXISTS (
-             SELECT 1 FROM edges e
-              WHERE e.source_id = n.id AND e.kind = 'reviewed_by'
+             SELECT 1
+               FROM nodes other
+              WHERE other.kind != 'peer'
+                AND other.source_seq > n.source_seq
+                AND other.producer_tool IS NOT NULL
+                AND other.producer_tool != n.producer_tool
            )
          ORDER BY n.source_seq DESC
          LIMIT ?1
@@ -687,6 +759,7 @@ pub fn unconsumed_artifacts(conn: &Connection, limit: u32) -> Result<Vec<Value>,
                 "subject":         row.get::<_, Option<String>>(1)?,
                 "created_at":      row.get::<_, String>(2)?,
                 "source_event_id": row.get::<_, Option<String>>(3)?,
+                "producer_tool":   row.get::<_, Option<String>>(4)?,
             }))
         })?
         .filter_map(Result::ok)
@@ -829,35 +902,61 @@ mod tests {
     }
 
     #[test]
-    fn unconsumed_artifacts_filters_out_acked_handoffs() {
-        // intent: an artifact with no reviewed_by edge must be flagged unconsumed; one with reviewed_by must not.
+    fn unconsumed_artifacts_drops_after_later_non_producer_activity() {
+        // intent: once a peer other than the producer has posted any event
+        // with a greater source_seq, the producer's earlier artifacts must
+        // stop surfacing as unconsumed. This is the bug behind stale
+        // "rally next" recommendations that kept resurfacing reviewed work.
         let dir = temp_dir("unconsumed");
         let mut conn = init(&dir, "now").unwrap();
-        let records = vec![
-            artifact_event("art_unreviewed", "first cut", None),
-            artifact_event("art_reviewed", "second cut", None),
-            json!({
-                "local_seq": 5,
-                "event": {
-                    "id": "evt_ack",
-                    "kind": "ack",
-                    "tool": "claude_code",
-                    "time": "2026-05-27T00:05:00.000Z",
-                    "payload": {
-                        "ref_handoff_id": "art_reviewed",
-                        "verdict": "done"
-                    }
-                }
-            }),
+
+        // pi posts two artifacts. With no other peer activity, both are unconsumed.
+        let mut records = vec![
+            artifact_event("art_one", "first cut", None),
+            artifact_event("art_two", "second cut", None),
         ];
+        // Bump the seqs so they're distinct.
+        records[0]["local_seq"] = json!(1);
+        records[1]["local_seq"] = json!(2);
         catch_up(&mut conn, &records, "now").unwrap();
-        let unconsumed = unconsumed_artifacts(&conn, 10).unwrap();
-        let ids: Vec<&str> = unconsumed
-            .iter()
-            .filter_map(|n| n["id"].as_str())
+        let baseline: Vec<String> = unconsumed_artifacts(&conn, 10)
+            .unwrap()
+            .into_iter()
+            .filter_map(|n| n["id"].as_str().map(str::to_string))
             .collect();
-        assert!(ids.contains(&"art_unreviewed"));
-        assert!(!ids.contains(&"art_reviewed"));
+        assert!(baseline.contains(&"art_one".to_string()));
+        assert!(baseline.contains(&"art_two".to_string()));
+
+        // claude_code posts a follow-up handoff. Both prior artifacts (by pi)
+        // are now consumed — a different peer has engaged.
+        let followup = json!({
+            "local_seq": 3,
+            "event": {
+                "id": "evt_followup",
+                "kind": "handoff",
+                "tool": "claude_code",
+                "time": "2026-05-27T00:03:00.000Z",
+                "subject": "follow-up review",
+                "payload": {
+                    "subject": "follow-up review",
+                    "to_tool": "pi"
+                }
+            }
+        });
+        catch_up(&mut conn, &[followup], "now").unwrap();
+        let after: Vec<String> = unconsumed_artifacts(&conn, 10)
+            .unwrap()
+            .into_iter()
+            .filter_map(|n| n["id"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            !after.contains(&"art_one".to_string()),
+            "art_one should have dropped from unconsumed after claude_code activity"
+        );
+        assert!(
+            !after.contains(&"art_two".to_string()),
+            "art_two should have dropped from unconsumed after claude_code activity"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -945,6 +1044,37 @@ mod tests {
         // The old node must be gone — rebuild from new_records only.
         assert!(get_node(&conn, "evt_q").unwrap().is_none());
         assert!(get_node(&conn, "evt_r").unwrap().is_some());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn init_drops_stale_tables_when_schema_version_changed_on_disk() {
+        // intent: opening a DB whose schema_version differs from the
+        // compiled SCHEMA_VERSION must wipe the prior tables so columns
+        // added in the new version don't fail at apply_schema time. The
+        // alternative is silent SQL errors like "no such column".
+        let dir = temp_dir("schema-drift");
+        {
+            let conn = init(&dir, "now").unwrap();
+            // Force an old schema version onto the existing DB. The next
+            // open() must notice and rebuild.
+            conn.execute(
+                "UPDATE graph_meta SET value = '0' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+        // Open again — must succeed even though the underlying nodes table
+        // was created without the new columns. The drop+recreate path is
+        // what makes this work.
+        let conn = init(&dir, "now").unwrap();
+        let meta = read_meta(&conn).unwrap();
+        assert_eq!(meta.schema_version, SCHEMA_VERSION);
+        // Inserting a task event into the fresh schema must succeed.
+        let records = vec![task_event("evt_after_migration", "fresh", &[])];
+        let mut conn = conn;
+        catch_up(&mut conn, &records, "now").unwrap();
+        assert!(get_node(&conn, "evt_after_migration").unwrap().is_some());
         std::fs::remove_dir_all(dir).ok();
     }
 }

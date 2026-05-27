@@ -430,6 +430,73 @@ fn next_recommends_highest_scoring_action() {
 }
 
 #[test]
+fn next_drops_artifacts_after_non_producer_activity() {
+    // intent: once a peer other than the artifact's producer posts a
+    // follow-up event, that artifact must stop surfacing in `rally next`
+    // recommendations. This was the stale-recommendation bug — reviewed
+    // work kept resurfacing because the projection had no way to mark it
+    // consumed.
+    let workspace = RallyWorkspace::new("rally-cli-next-unconsumed");
+
+    // pi ships an artifact. Until anyone else posts, it's a valid candidate.
+    let art = json_stdout(workspace.run(&[
+        "artifact",
+        "--json",
+        "--tool",
+        "pi",
+        "--subject",
+        "fresh artifact awaiting review",
+        "--artifact-kind",
+        "code",
+    ]));
+    let art_id = art["event_id"].as_str().unwrap().to_string();
+
+    let before = json_stdout(workspace.run(&["next", "--json", "--tool", "pi"]));
+    assert_eq!(
+        before["data"]["next"]["target_event_id"], art_id,
+        "while no other peer has acted, pi's own artifact must be the top candidate"
+    );
+
+    // claude_code posts any event — a handoff is the cheapest realistic one.
+    // The artifact above is now "consumed" (someone else engaged with the work).
+    json_stdout(workspace.run(&[
+        "handoff",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--from-tool",
+        "claude_code",
+        "--to",
+        "pi",
+        "--subject",
+        "looked at it",
+    ]));
+
+    let after = json_stdout(workspace.run(&["next", "--json", "--tool", "pi"]));
+    let target = after["data"]["next"]["target_event_id"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let alts: Vec<String> = after["data"]["next"]["alternatives"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|alt| alt["target_event_id"].as_str().map(str::to_string))
+        .collect();
+
+    assert_ne!(
+        target, art_id,
+        "artifact must drop from top candidate after non-producer activity"
+    );
+    assert!(
+        !alts.contains(&art_id),
+        "artifact must not appear in alternatives either"
+    );
+    workspace.cleanup();
+}
+
+#[test]
 fn setup_install_and_uninstall_agent_wrapper() {
     let workspace = RallyWorkspace::new("rally-cli-agent-wrapper");
     let install = json_stdout(workspace.run(&["setup", "install", "pi", "--json"]));
