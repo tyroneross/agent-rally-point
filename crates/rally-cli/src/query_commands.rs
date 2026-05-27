@@ -18,8 +18,7 @@ use rally_core::event::{ClaimPayload, EventBuilder, EventPayload, EventRecord, P
 use rally_core::graph;
 use rally_core::preflight::{PreflightOptions, run_preflight};
 use rally_core::query::{
-    active_blockers_at, active_claims_at, claim_conflicts, filter_since, now_epoch_seconds,
-    parse_since, pending_handoffs_at, record_id, related_records, score_records,
+    filter_since, now_epoch_seconds, parse_since, record_id, related_records,
 };
 use rally_core::store::ChannelStore;
 use rally_protocol::event_value;
@@ -135,10 +134,29 @@ fn maybe_advance_cursor(store: &ChannelStore, scope: Option<&CursorScope>, comma
     );
 }
 
+/// Open the graph projection, catch it up against the provided records,
+/// and return the connection. Errors propagate as CliError so callers
+/// surface graph failures rather than silently degrading.
+fn graph_caught_up(
+    command: &'static str,
+    store: &ChannelStore,
+    records: &[Value],
+) -> Result<graph::GraphConnection, CliError> {
+    let mut conn = graph::init(store.channel_dir(), &now_rfc3339())
+        .map_err(|err| CliError::runtime(command, format!("open graph: {err}")))?;
+    graph::catch_up(&mut conn, records, &now_rfc3339())
+        .map_err(|err| CliError::runtime(command, format!("graph catch_up: {err}")))?;
+    Ok(conn)
+}
+
 pub(super) fn execute_inbox(command: ReadCommand) -> Result<WriteOutput, CliError> {
     let (store, records, now) = query_records(&command)?;
     let (records, cursor_scope) = apply_cursor(&store, records, &command);
-    let pending = pending_handoffs_at(&records, command.tool.as_deref(), now);
+    // Inbox uses cursor-scoped record filtering — only events past the
+    // per-session cursor count as "new." A persistent graph projection
+    // can't model that (it reflects the full log), so this surface
+    // stays on the in-memory record scan from rally-core::query.
+    let pending = rally_core::query::pending_handoffs_at(&records, command.tool.as_deref(), now);
     let text = if pending.is_empty() {
         "No pending handoffs.".to_string()
     } else {
@@ -179,7 +197,9 @@ pub(super) fn execute_inbox(command: ReadCommand) -> Result<WriteOutput, CliErro
 
 pub(super) fn execute_claims(command: ReadCommand) -> Result<WriteOutput, CliError> {
     let (store, records, now) = query_records(&command)?;
-    let claims = active_claims_at(&records, command.tool.as_deref(), now);
+    let conn = graph_caught_up("claims", &store, &records)?;
+    let claims = graph::active_claims_typed(&conn, command.tool.as_deref(), now)
+        .map_err(|err| CliError::runtime("claims", format!("active_claims: {err}")))?;
     let text = if claims.is_empty() {
         "No active claims.".to_string()
     } else {
@@ -210,7 +230,9 @@ pub(super) fn execute_claims(command: ReadCommand) -> Result<WriteOutput, CliErr
 
 pub(super) fn execute_blockers(command: ReadCommand) -> Result<WriteOutput, CliError> {
     let (store, records, now) = query_records(&command)?;
-    let blockers = active_blockers_at(&records, command.tool.as_deref(), now);
+    let conn = graph_caught_up("blockers", &store, &records)?;
+    let blockers = graph::active_blockers_typed(&conn, command.tool.as_deref(), now)
+        .map_err(|err| CliError::runtime("blockers", format!("active_blockers: {err}")))?;
     let text = if blockers.is_empty() {
         "No blockers.".to_string()
     } else {
@@ -247,7 +269,9 @@ pub(super) fn execute_blockers(command: ReadCommand) -> Result<WriteOutput, CliE
 
 pub(super) fn execute_conflicts(command: ReadCommand) -> Result<WriteOutput, CliError> {
     let (store, records, _now) = query_records(&command)?;
-    let conflicts = claim_conflicts(&records);
+    let conn = graph_caught_up("conflicts", &store, &records)?;
+    let conflicts = graph::claim_conflicts_typed(&conn)
+        .map_err(|err| CliError::runtime("conflicts", format!("claim_conflicts: {err}")))?;
     let text = if conflicts.is_empty() {
         "No claim conflicts.".to_string()
     } else {
@@ -3136,8 +3160,10 @@ pub(super) fn execute_diagnose(command: ReadCommand) -> Result<WriteOutput, CliE
 }
 
 pub(super) fn execute_score(command: ReadCommand) -> Result<WriteOutput, CliError> {
-    let (store, records, _now) = query_records(&command)?;
-    let (score, findings) = score_records(&records, command.tool.as_deref());
+    let (store, records, now) = query_records(&command)?;
+    let conn = graph_caught_up("score", &store, &records)?;
+    let (score, findings) = graph::score(&conn, &records, command.tool.as_deref(), now)
+        .map_err(|err| CliError::runtime("score", format!("score: {err}")))?;
     let text = if findings.is_empty() {
         format!("score={score}")
     } else {

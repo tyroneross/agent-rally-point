@@ -1361,46 +1361,12 @@ pub fn active_claims_typed(
 }
 
 pub fn claim_conflicts_typed(conn: &Connection) -> Result<Vec<ClaimConflict>, rusqlite::Error> {
-    // Group active claims by resource; emit conflicts where ≥2 distinct
-    // owners hold the same resource. SQLite handles json_extract for the
-    // resource lookup.
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT json_extract(n.payload_json, '$.resource')    AS resource,
-               GROUP_CONCAT(n.id, ',')                       AS claim_ids,
-               GROUP_CONCAT(COALESCE(json_extract(n.payload_json, '$.owner_tool'), n.producer_tool), ',') AS owners
-          FROM nodes n
-         WHERE n.kind = 'claim'
-           AND resource IS NOT NULL
-           AND NOT EXISTS (
-             SELECT 1 FROM edges e
-              WHERE e.source_id = n.id AND e.kind = 'resolved_by_release'
-           )
-         GROUP BY resource
-        HAVING COUNT(DISTINCT COALESCE(json_extract(n.payload_json, '$.owner_tool'), n.producer_tool)) > 1
-        "#,
-    )?;
-    let rows: Vec<ClaimConflict> = stmt
-        .query_map([], |row| {
-            let resource: String = row.get(0)?;
-            let claim_ids: String = row.get(1)?;
-            let owners: String = row.get(2)?;
-            let mut owner_list: Vec<String> = owners
-                .split(',')
-                .map(str::to_string)
-                .filter(|s| !s.is_empty())
-                .collect();
-            owner_list.sort();
-            owner_list.dedup();
-            Ok(ClaimConflict {
-                resource,
-                claim_ids: claim_ids.split(',').map(str::to_string).collect(),
-                owners: owner_list,
-            })
-        })?
-        .filter_map(Result::ok)
-        .collect();
-    Ok(rows)
+    // Pull active claims via the typed query, then defer to the shared
+    // overlap-grouping logic in `crate::query::claim_conflicts_for`.
+    // That function handles path containment (file:docs vs
+    // file:docs/foo.md), which a flat GROUP BY can't model.
+    let claims = active_claims_typed(conn, None, 0.0)?;
+    Ok(crate::query::claim_conflicts_for(claims))
 }
 
 pub fn active_tasks_typed(
@@ -1699,6 +1665,123 @@ pub fn latest_subscription_typed(
         })
         .optional()?;
     Ok(row)
+}
+
+/// Score the channel state, returning `(score, findings)` matching the
+/// shape of `TraceProjection::score`. Uses the graph for pending-handoff
+/// detection and walks `records` directly for causation / reference /
+/// needs-info checks (these are envelope-level fields the graph doesn't
+/// store as columns).
+pub fn score(
+    conn: &Connection,
+    records: &[Value],
+    tool: Option<&str>,
+    now_epoch: f64,
+) -> Result<(i64, Vec<crate::query::ScoreFinding>), rusqlite::Error> {
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
+
+    let mut findings = Vec::new();
+
+    // P1: open required handoffs.
+    for handoff in pending_handoffs_typed(conn, tool, now_epoch)? {
+        findings.push(crate::query::ScoreFinding {
+            severity: crate::severity::P1.to_string(),
+            code: "open-required-handoff".to_string(),
+            event_id: Some(handoff.event_id),
+            message: format!(
+                "required handoff to {} is still open: {}",
+                handoff.to_tool.unwrap_or_else(|| "unknown".to_string()),
+                handoff.subject
+            ),
+        });
+    }
+
+    // Build the set of known event identifiers from the records so the
+    // dangling-causation and dangling-reference checks can resolve.
+    let mut known_ids: BTreeSet<String> = BTreeSet::new();
+    let mut final_ack_by_handoff: BTreeMap<String, String> = BTreeMap::new();
+    for record in records {
+        let event = record.get("event").unwrap_or(record);
+        if let Some(id) = event.get("id").and_then(Value::as_str) {
+            known_ids.insert(id.to_string());
+        }
+        // Track final ack verdict per handoff (later acks win).
+        let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
+        if matches!(kind, "ack" | "feedback") {
+            let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+            if let (Some(handoff_id), Some(verdict)) = (
+                payload.get("ref_handoff_id").and_then(Value::as_str),
+                payload.get("verdict").and_then(Value::as_str),
+            ) {
+                final_ack_by_handoff
+                    .insert(handoff_id.to_string(), verdict.to_string());
+            }
+        }
+    }
+
+    // P2: dangling causation_id + dangling ref_handoff_id.
+    for record in records {
+        let event = record.get("event").unwrap_or(record);
+        let event_id = event
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if event_id.is_empty() {
+            continue;
+        }
+        if let Some(causation) = event.get("causation_id").and_then(Value::as_str) {
+            if !causation.is_empty() && !known_ids.contains(causation) {
+                findings.push(crate::query::ScoreFinding {
+                    severity: crate::severity::P2.to_string(),
+                    code: "dangling-causation".to_string(),
+                    event_id: Some(event_id.clone()),
+                    message: format!(
+                        "causation_id {causation} does not resolve in this trace window"
+                    ),
+                });
+            }
+        }
+        let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
+        if matches!(kind, "ack" | "feedback") {
+            let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+            if let Some(handoff_id) = payload.get("ref_handoff_id").and_then(Value::as_str) {
+                if !handoff_id.is_empty() && !known_ids.contains(handoff_id) {
+                    findings.push(crate::query::ScoreFinding {
+                        severity: crate::severity::P2.to_string(),
+                        code: "dangling-reference".to_string(),
+                        event_id: Some(event_id),
+                        message: format!("{kind} references missing handoff/event {handoff_id}"),
+                    });
+                }
+            }
+        }
+    }
+
+    // P2: handoffs whose final ack is needs-info.
+    for (handoff_id, verdict) in final_ack_by_handoff {
+        if verdict == "needs-info" {
+            findings.push(crate::query::ScoreFinding {
+                severity: crate::severity::P2.to_string(),
+                code: "unresolved-needs-info".to_string(),
+                event_id: Some(handoff_id),
+                message: "handoff is still waiting on more information".to_string(),
+            });
+        }
+    }
+
+    let score = 100
+        - findings
+            .iter()
+            .map(|finding| match finding.severity.as_str() {
+                "P1" => 25,
+                "P2" => 10,
+                "P3" => 3,
+                _ => 0,
+            })
+            .sum::<i64>();
+    Ok((score.max(0), findings))
 }
 
 /// Helper exposed for CLI surfaces — returns counts by node kind + edge kind.

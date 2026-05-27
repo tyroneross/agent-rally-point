@@ -556,16 +556,8 @@ pub fn related_records(records: &[Value], identifier: &str) -> Vec<Value> {
         .collect()
 }
 
-pub fn pending_handoffs(records: &[Value], tool: Option<&str>) -> Vec<PendingHandoff> {
-    TraceProjection::from_records(records).pending_handoffs(tool)
-}
-
 pub fn pending_handoffs_at(records: &[Value], tool: Option<&str>, now: f64) -> Vec<PendingHandoff> {
     TraceProjection::from_records_at(records, now).pending_handoffs(tool)
-}
-
-pub fn active_claims(records: &[Value], tool: Option<&str>) -> Vec<ActiveClaim> {
-    TraceProjection::from_records(records).active_claims(tool)
 }
 
 pub fn active_claims_at(records: &[Value], tool: Option<&str>, now: f64) -> Vec<ActiveClaim> {
@@ -576,7 +568,7 @@ pub fn claim_conflicts(records: &[Value]) -> Vec<ClaimConflict> {
     TraceProjection::from_records(records).claim_conflicts()
 }
 
-fn claim_conflicts_for(claims: Vec<ActiveClaim>) -> Vec<ClaimConflict> {
+pub fn claim_conflicts_for(claims: Vec<ActiveClaim>) -> Vec<ClaimConflict> {
     let mut by_resource: BTreeMap<String, Vec<ActiveClaim>> = BTreeMap::new();
     for left_index in 0..claims.len() {
         for right in claims.iter().skip(left_index + 1) {
@@ -618,10 +610,6 @@ fn claim_conflicts_for(claims: Vec<ActiveClaim>) -> Vec<ClaimConflict> {
             })
         })
         .collect()
-}
-
-pub fn active_blockers(records: &[Value], tool: Option<&str>) -> Vec<ActiveBlocker> {
-    TraceProjection::from_records(records).active_blockers(tool)
 }
 
 pub fn active_blockers_at(records: &[Value], tool: Option<&str>, now: f64) -> Vec<ActiveBlocker> {

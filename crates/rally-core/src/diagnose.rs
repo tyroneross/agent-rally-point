@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::query::{ActiveBlocker, ActiveClaim, ClaimConflict, ScoreFinding, TraceProjection};
+use crate::query::{ActiveBlocker, ActiveClaim, ClaimConflict, ScoreFinding};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::Path;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiagnoseFinding {
@@ -44,24 +45,111 @@ impl Default for DiagnoseOptions<'_> {
 
 pub fn diagnose_records(records: &[Value], options: DiagnoseOptions<'_>) -> Diagnosis {
     let state = options.state_records.unwrap_or(records);
-    let score_projection = TraceProjection::from_records(records);
-    let state_projection = TraceProjection::from_records_at(state, options.now_epoch_seconds);
-    let (score, score_findings) = score_projection.score(options.tool);
+    // Build a throwaway graph in a temp dir to source the same queries
+    // production callers use. diagnose_records doesn't have a channel
+    // store available — it's called by `rally diagnose` with raw records
+    // — so we materialize a per-call projection here.
+    let temp_dir = std::env::temp_dir().join(format!(
+        "rally-diagnose-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let result = diagnose_via_graph(&temp_dir, records, state, &options);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    result
+}
+
+fn diagnose_via_graph(
+    channel_dir: &Path,
+    records: &[Value],
+    state: &[Value],
+    options: &DiagnoseOptions<'_>,
+) -> Diagnosis {
+    let now_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp(
+        options.now_epoch_seconds as i64,
+        0,
+    )
+    .map(|dt| dt.to_rfc3339())
+    .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+
+    let Ok(mut conn) = crate::graph::init(channel_dir, &now_rfc) else {
+        return Diagnosis {
+            status: "stuck".to_string(),
+            score: 0,
+            findings: vec![DiagnoseFinding {
+                severity: crate::severity::P1.to_string(),
+                code: "graph-unavailable".to_string(),
+                message: "could not open the graph projection".to_string(),
+                event_id: None,
+                recommendation: Some("rally graph rebuild --tool ci --json".to_string()),
+            }],
+        };
+    };
+    // Wrap raw events with synthetic local_seq so catch_up's gate doesn't
+    // skip them. The test fixtures used by diagnose pass bare events;
+    // production callers pass store entries that already have local_seq.
+    let wrapped: Vec<Value> = state
+        .iter()
+        .enumerate()
+        .map(|(i, record)| {
+            if record.get("local_seq").is_some() {
+                record.clone()
+            } else if record.get("event").is_some() {
+                let mut out = record.clone();
+                if let Some(map) = out.as_object_mut() {
+                    map.insert("local_seq".into(), serde_json::json!((i + 1) as i64));
+                }
+                out
+            } else {
+                serde_json::json!({
+                    "local_seq": (i + 1) as i64,
+                    "origin": "local",
+                    "trust_status": "local",
+                    "event": record
+                })
+            }
+        })
+        .collect();
+    if crate::graph::catch_up(&mut conn, &wrapped, &now_rfc).is_err() {
+        return Diagnosis {
+            status: "stuck".to_string(),
+            score: 0,
+            findings: vec![DiagnoseFinding {
+                severity: crate::severity::P1.to_string(),
+                code: "graph-catch-up-failed".to_string(),
+                message: "failed to apply records to graph projection".to_string(),
+                event_id: None,
+                recommendation: Some("rally graph rebuild --tool ci --json".to_string()),
+            }],
+        };
+    }
+
+    let (score, score_findings) = crate::graph::score(&conn, records, options.tool, options.now_epoch_seconds)
+        .unwrap_or((0, Vec::new()));
     let mut findings: Vec<DiagnoseFinding> =
         score_findings.into_iter().map(from_score_finding).collect();
 
-    for blocker in state_projection.active_blockers(options.tool) {
-        findings.push(from_blocker(blocker));
+    if let Ok(blockers) = crate::graph::active_blockers_typed(&conn, options.tool, options.now_epoch_seconds) {
+        for blocker in blockers {
+            findings.push(from_blocker(blocker));
+        }
     }
-    for conflict in state_projection.claim_conflicts() {
-        findings.push(from_conflict(conflict, options.since));
+    if let Ok(conflicts) = crate::graph::claim_conflicts_typed(&conn) {
+        for conflict in conflicts {
+            findings.push(from_conflict(conflict, options.since));
+        }
     }
-    for claim in state_projection.active_claims(options.tool) {
-        if claim
-            .age_seconds
-            .is_some_and(|age| age >= options.stale_after_seconds)
-        {
-            findings.push(from_stale_claim(claim));
+    if let Ok(claims) = crate::graph::active_claims_typed(&conn, options.tool, options.now_epoch_seconds) {
+        for claim in claims {
+            if claim
+                .age_seconds
+                .is_some_and(|age| age >= options.stale_after_seconds)
+            {
+                findings.push(from_stale_claim(claim));
+            }
         }
     }
 
