@@ -29,6 +29,33 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Gather the four inputs `execute_doctor` needs from the graph in one
+/// shot. Returns Err on any graph error so the caller can decide to
+/// fall back to TraceProjection.
+fn doctor_inputs_from_graph(
+    store: &ChannelStore,
+    records: &[Value],
+    tool: &str,
+    now: f64,
+) -> Result<
+    (
+        Vec<rally_core::query::ActiveClaim>,
+        Vec<rally_core::query::ActiveTask>,
+        Vec<rally_core::query::PendingHandoff>,
+        bool,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let mut conn = graph::init(store.channel_dir(), &now_rfc3339())?;
+    graph::catch_up(&mut conn, records, &now_rfc3339())?;
+    Ok((
+        graph::active_claims_typed(&conn, None, now)?,
+        graph::active_tasks_typed(&conn, None)?,
+        graph::pending_handoffs_typed(&conn, None, now)?,
+        graph::latest_profile_typed(&conn, tool)?.is_some(),
+    ))
+}
+
 /// Build a ContextBrief preferring the SQLite graph projection, falling
 /// back to TraceProjection on any graph error. The graph path matches
 /// TraceProjection's typed fields (thread_id, origin, trust_status,
@@ -464,9 +491,17 @@ pub(super) fn execute_doctor(command: ReadCommand) -> Result<WriteOutput, CliErr
         CliError::runtime(command.command, format!("failed to read checkpoint: {err}"))
     })?;
     let setup = setup_status(&store)?;
-    let active_claims = projection.active_claims(None);
-    let active_tasks = projection.active_tasks(None);
-    let pending_handoffs = projection.pending_handoffs(None);
+    // Prefer graph queries; fall back to TraceProjection on graph error.
+    let (active_claims, active_tasks, pending_handoffs, profile_present) =
+        match doctor_inputs_from_graph(&store, &records, &tool, now) {
+            Ok(t) => t,
+            Err(_) => (
+                projection.active_claims(None),
+                projection.active_tasks(None),
+                projection.pending_handoffs(None),
+                projection.profile(&tool).is_some(),
+            ),
+        };
     let mut findings = Vec::new();
     for finding in diagnosis.findings {
         findings.push(json!({
@@ -514,7 +549,7 @@ pub(super) fn execute_doctor(command: ReadCommand) -> Result<WriteOutput, CliErr
             "message": checkpoint.reason.as_deref().unwrap_or("checkpoint is invalid"),
         }));
     }
-    if command.tool.is_some() && projection.profile(&tool).is_none() {
+    if command.tool.is_some() && !profile_present {
         findings.push(json!({
             "severity": "P3",
             "code": "missing-profile",
@@ -884,10 +919,32 @@ pub(super) fn execute_repair(command: RepairCommand) -> Result<WriteOutput, CliE
 pub(super) fn execute_ci_gate(command: ReadCommand) -> Result<WriteOutput, CliError> {
     let store = command.common.channel_store("ci:gate")?;
     let records = load_records_cached_or_empty(&store, "ci:gate")?;
-    let projection = TraceProjection::from_records_at(&records, now_epoch_seconds());
-    let conflicts = projection.claim_conflicts();
-    let blockers = projection.active_blockers(None);
-    let handoffs = projection.pending_handoffs(None);
+    let now = now_epoch_seconds();
+    let projection = TraceProjection::from_records_at(&records, now);
+    // Prefer graph queries; fall back to TraceProjection on graph error.
+    let (conflicts, blockers, handoffs) = match (|| -> Result<
+        (
+            Vec<rally_core::query::ClaimConflict>,
+            Vec<rally_core::query::ActiveBlocker>,
+            Vec<rally_core::query::PendingHandoff>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let mut conn = graph::init(store.channel_dir(), &now_rfc3339())?;
+        graph::catch_up(&mut conn, &records, &now_rfc3339())?;
+        Ok((
+            graph::claim_conflicts_typed(&conn)?,
+            graph::active_blockers_typed(&conn, None, now)?,
+            graph::pending_handoffs_typed(&conn, None, now)?,
+        ))
+    })() {
+        Ok(t) => t,
+        Err(_) => (
+            projection.claim_conflicts(),
+            projection.active_blockers(None),
+            projection.pending_handoffs(None),
+        ),
+    };
     let checkpoint = store
         .checkpoint_status()
         .map_err(|err| CliError::runtime("ci:gate", format!("failed to read checkpoint: {err}")))?;
@@ -1035,7 +1092,8 @@ fn build_judgment(
 ) -> Result<JudgmentResult, CliError> {
     let tool = common.tool();
     let records = load_records_cached_or_empty(store, input.command)?;
-    let projection = TraceProjection::from_records_at(&records, now_epoch_seconds());
+    let now = now_epoch_seconds();
+    let projection = TraceProjection::from_records_at(&records, now);
     let setup = setup_status(store)?;
     let mut reasons = Vec::new();
     let mut required_actions = Vec::new();
@@ -1062,7 +1120,30 @@ fn build_judgment(
         required_actions.push("rally repair checkpoint --json".to_string());
     }
 
-    let pending = projection.pending_handoffs(Some(&tool));
+    // Prefer graph queries; fall back to TraceProjection on graph error.
+    let (pending, blockers, all_claims) = match (|| -> Result<
+        (
+            Vec<rally_core::query::PendingHandoff>,
+            Vec<rally_core::query::ActiveBlocker>,
+            Vec<rally_core::query::ActiveClaim>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let mut conn = graph::init(store.channel_dir(), &now_rfc3339())?;
+        graph::catch_up(&mut conn, &records, &now_rfc3339())?;
+        Ok((
+            graph::pending_handoffs_typed(&conn, Some(&tool), now)?,
+            graph::active_blockers_typed(&conn, None, now)?,
+            graph::active_claims_typed(&conn, None, now)?,
+        ))
+    })() {
+        Ok(t) => t,
+        Err(_) => (
+            projection.pending_handoffs(Some(&tool)),
+            projection.active_blockers(None),
+            projection.active_claims(None),
+        ),
+    };
     if !pending.is_empty() {
         reasons.push(json!({
             "code": "pending-handoff",
@@ -1074,7 +1155,6 @@ fn build_judgment(
         ));
     }
 
-    let blockers = projection.active_blockers(None);
     for blocker in &blockers {
         if path_resource
             .as_ref()
@@ -1088,14 +1168,11 @@ fn build_judgment(
             }));
         }
     }
-    if blockers.is_empty() {
-        // no-op; keeps the path-specific blocker loop above precise.
-    } else {
+    if !blockers.is_empty() {
         required_actions
             .push("resolve or acknowledge active blockers before continuing".to_string());
     }
 
-    let all_claims = projection.active_claims(None);
     let mut path_conflicts = Vec::new();
     let mut has_own_claim = false;
     if let Some(resource) = &path_resource {
