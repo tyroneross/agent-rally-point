@@ -68,6 +68,9 @@ SPDX-License-Identifier: Apache-2.0
   Finding: Rally can stay pull-based, but every adapter needs a native
   model-visible obligation path; cursor-scoped inbox is not enough for pending
   handoffs/blockers/conflicts.
+- Implements the first visibility slice: `agent_visible` on start/next/hook,
+  Pi message injection, Claude/Codex/Gemini native context/deny translations,
+  and cmux/Herdr operator-vs-agent-injection metadata.
 - Adds `rally repair`, `rally setup uninstall <tool>`, and `rally ci gate` plus a
   GitHub Actions merge gate workflow.
 - Adds initial formal JSON schema files in `docs/schemas/` and a dogfood report

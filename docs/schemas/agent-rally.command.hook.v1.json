@@ -15,10 +15,11 @@
       "properties": {
         "hook": {
           "type": "object",
-          "required": ["phase", "allow", "judgment"],
+          "required": ["phase", "allow", "agent_visible", "judgment"],
           "properties": {
             "phase": { "type": "string" },
             "allow": { "type": "boolean" },
+            "agent_visible": { "type": "object" },
             "judgment": { "type": "object" }
           }
         }

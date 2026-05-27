@@ -3,7 +3,7 @@
   "$id": "https://agent-rally-point.local/schemas/agent-rally.command.start.v1.json",
   "title": "Rally start command",
   "type": "object",
-  "required": ["ok", "command", "schema", "tool", "session_id", "started_process", "preflight", "context", "packet", "checkpoint", "cursor", "warnings", "next_commands"],
+  "required": ["ok", "command", "schema", "tool", "session_id", "started_process", "preflight", "context", "packet", "agent_visible", "checkpoint", "cursor", "warnings", "next_commands"],
   "properties": {
     "ok": { "const": true },
     "command": { "const": "start" },
@@ -15,6 +15,7 @@
     "preflight": { "type": "object" },
     "context": { "type": "object", "required": ["brief"] },
     "packet": { "type": "object" },
+    "agent_visible": { "type": "object" },
     "checkpoint": { "type": "object" },
     "cursor": {
       "type": "object",

@@ -4,7 +4,28 @@
   "data": {
     "adapter": {
       "adapter": "cmux",
+      "agent_input_injection": {
+        "default_enabled": false,
+        "message": {
+          "automation_allowed": true,
+          "message": "Rally recommendation: review_artifact. reviewer profile is best matched to artifact",
+          "present": true,
+          "required_action": "review_artifact",
+          "severity": "info",
+          "source_event_ids": [
+            "evt_1"
+          ]
+        },
+        "requires_explicit_operator_action": true
+      },
       "available_on_path": false,
+      "operator_visibility": {
+        "default": "notify/sidebar",
+        "suggested_commands": [
+          "cmux notify --title Rally --body <agent_visible.message>",
+          "cmux set-status rally <status>"
+        ]
+      },
       "packet": {
         "artifacts": [
           {

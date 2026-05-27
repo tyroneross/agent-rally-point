@@ -219,15 +219,23 @@ Rules:
 5. Blocking hooks should be used only for stop-worthy obligations; otherwise
    inject context and let the model continue.
 
-## Next implementation slice
+## Implementation slice landed
 
-1. Implement the Rally `agent_visible` helper and add fields to `next`, `hook`,
-   and `start` JSON schemas/goldens.
-2. Update Pi extension to return a `before_agent_start` message when
-   `agent_visible.present` and keep `tool_call` blocking for writes.
-3. Update Claude/Codex/Gemini hook scripts to translate `agent_visible` into
-   each native `additionalContext` / continuation / deny shape.
-4. Update cmux/Herdr adapters to distinguish operator visibility from explicit
-   agent input injection.
-5. Add a small fixture test per script shape: given a synthetic Rally obligation,
+The first adapter-visibility slice landed after this spike:
+
+- `rally start`, `rally next`, and `rally hook` now include an
+  `agent_visible` object.
+- The Pi extension injects visible Rally messages through
+  `before_agent_start` and can wake an idle session with `pi.sendMessage`.
+- Claude/Codex/Gemini generated hooks translate Rally obligations into native
+  model-visible `additionalContext`, retry, or deny shapes.
+- cmux/Herdr adapter packets distinguish operator visibility from explicit
+  agent input injection.
+
+## Next implementation slice after visibility
+
+1. Add a small fixture test per script shape: given a synthetic Rally obligation,
    the adapter emits the expected native hook JSON.
+2. Add configurable cmux/Herdr watch daemons for explicit input injection.
+3. Dogfood real installed hooks in live Pi/Claude/Codex/Gemini sessions and
+   capture actual payload drift.

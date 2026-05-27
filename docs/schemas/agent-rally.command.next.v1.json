@@ -15,7 +15,7 @@
       "properties": {
         "next": {
           "type": "object",
-          "required": ["action_kind", "target_event_id", "subject", "reasoning", "source_event_ids", "score", "factors", "alternatives"],
+          "required": ["action_kind", "target_event_id", "subject", "reasoning", "source_event_ids", "score", "factors", "agent_visible", "alternatives"],
           "properties": {
             "action_kind": { "type": "string" },
             "target_event_id": { "type": ["string", "null"] },
@@ -24,6 +24,7 @@
             "source_event_ids": { "type": "array", "items": { "type": "string" } },
             "score": { "type": "number" },
             "factors": { "type": "object" },
+            "agent_visible": { "type": "object" },
             "alternatives": { "type": "array", "items": { "type": "object" } }
           }
         }

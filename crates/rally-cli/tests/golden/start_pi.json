@@ -1,4 +1,12 @@
 {
+  "agent_visible": {
+    "automation_allowed": true,
+    "message": "",
+    "present": false,
+    "required_action": null,
+    "severity": "info",
+    "source_event_ids": []
+  },
   "channel": "<channel>",
   "checkpoint": {
     "exists": true,

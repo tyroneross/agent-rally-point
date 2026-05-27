@@ -4,6 +4,26 @@
   "data": {
     "adapter": {
       "adapter": "herdr",
+      "agent_input_injection": {
+        "default_enabled": false,
+        "message": {
+          "automation_allowed": true,
+          "message": "Rally recommendation: review_artifact. reviewer profile is best matched to artifact",
+          "present": true,
+          "required_action": "review_artifact",
+          "severity": "info",
+          "source_event_ids": [
+            "evt_1"
+          ]
+        },
+        "requires_explicit_operator_action": true
+      },
+      "operator_visibility": {
+        "default": "pane.report_agent",
+        "suggested_commands": [
+          "herdr pane report-agent <pane> --source rally --state blocked --message <agent_visible.message>"
+        ]
+      },
       "packet": {
         "artifacts": [
           {

@@ -382,6 +382,7 @@ fn hook_before_write_auto_claims_and_blocks_conflicts() {
     assert_eq!(judgment["allow"], false);
     assert_eq!(judgment["decision"], "pause");
     assert_eq!(judgment["claim_conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(judgment["agent_visible"]["present"], true);
     workspace.cleanup();
 }
 
@@ -416,6 +417,8 @@ fn next_recommends_highest_scoring_action() {
     let handoff = json_stdout(workspace.run(&["next", "--json", "--tool", "pi"]));
     assert_eq!(handoff["data"]["next"]["action_kind"], "pick_up_handoff");
     assert_eq!(handoff["data"]["next"]["subject"], "review this first");
+    assert_eq!(handoff["data"]["next"]["agent_visible"]["present"], true);
+    assert_eq!(handoff["data"]["next"]["agent_visible"]["severity"], "stop");
     assert_eq!(
         handoff["data"]["next"]["alternatives"]
             .as_array()
@@ -441,7 +444,7 @@ fn setup_install_and_uninstall_agent_wrapper() {
     assert!(
         fs::read_to_string(&extension)
             .unwrap()
-            .contains("tool_call")
+            .contains("before_agent_start")
     );
 
     let uninstall = json_stdout(workspace.run(&["setup", "uninstall", "pi", "--json"]));
@@ -466,6 +469,11 @@ fn setup_install_and_uninstall_agent_wrapper() {
         fs::read_to_string(&claude_settings)
             .unwrap()
             .contains("PreToolUse")
+    );
+    assert!(
+        fs::read_to_string(&claude_hook)
+            .unwrap()
+            .contains("additionalContext")
     );
 
     let codex = json_stdout(workspace.run(&["setup", "install", "codex", "--json"]));
@@ -495,7 +503,7 @@ fn setup_install_and_uninstall_agent_wrapper() {
     assert!(
         fs::read_to_string(&gemini_settings)
             .unwrap()
-            .contains("PreToolUse")
+            .contains("BeforeTool")
     );
 
     let dry_workspace = RallyWorkspace::new("rally-cli-setup-dry-run");

@@ -5,12 +5,16 @@
     "contract": {
       "adapters": {
         "cmux": {
+          "agent_input_injection": "explicit opt-in only",
           "command": "rally cmux packet --tool <tool> --json",
+          "operator_visibility_default": "cmux notify/sidebar status",
           "purpose": "workspace/feed-friendly packet export",
           "side_effects": false
         },
         "herdr": {
+          "agent_input_injection": "explicit opt-in only",
           "command": "rally herdr packet --tool <tool> --json",
+          "operator_visibility_default": "pane.report_agent / sidebar state",
           "purpose": "prompt payload export; actual injection remains adapter-owned",
           "side_effects": false
         }
@@ -24,6 +28,7 @@
       "stable_fields": [
         "command",
         "schema",
+        "agent_visible",
         "data.packet.tool",
         "data.packet.role",
         "data.packet.packet_kind",

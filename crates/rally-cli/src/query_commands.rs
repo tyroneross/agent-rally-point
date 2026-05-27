@@ -8,7 +8,7 @@ use crate::args::{
 use crate::output::{CliError, WriteOutput};
 use crate::resources::normalize_file_resource;
 use crate::runtime::{new_id, now_rfc3339};
-use rally_core::context::{build_context_brief, build_work_packet};
+use rally_core::context::{ContextRecommendation, build_context_brief, build_work_packet};
 use rally_core::cursors;
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
 use rally_core::event::{ClaimPayload, EventBuilder, EventPayload, EventRecord, ProfilePayload};
@@ -321,6 +321,7 @@ pub(super) fn execute_start(command: StartCommand) -> Result<WriteOutput, CliErr
     let projection = TraceProjection::from_records_at(&records, now_epoch_seconds());
     let brief = build_context_brief(&projection, &command.tool, command.limit);
     let packet = build_work_packet(&brief, command.limit);
+    let agent_visible = agent_visible_from_context(&brief.recommended_next_action);
     let checkpoint = store
         .checkpoint_status()
         .map_err(|err| CliError::runtime("start", format!("failed to read checkpoint: {err}")))?;
@@ -350,6 +351,7 @@ pub(super) fn execute_start(command: StartCommand) -> Result<WriteOutput, CliErr
             "preflight": preflight,
             "context": { "brief": brief },
             "packet": packet,
+            "agent_visible": agent_visible,
             "checkpoint": checkpoint,
             "cursor": {
                 "before": cursor_before,
@@ -653,6 +655,7 @@ pub(super) fn execute_hook(command: HookCommand) -> Result<WriteOutput, CliError
                 "hook": {
                     "phase": phase,
                     "allow": judgment.allow,
+                    "agent_visible": judgment.agent_visible(),
                     "judgment": judgment.to_json()
                 }
             }
@@ -832,9 +835,64 @@ impl JudgmentResult {
             "auto_claimed": self.auto_claimed,
             "reasons": self.reasons,
             "required_actions": self.required_actions,
+            "agent_visible": self.agent_visible(),
             "pending_handoffs": self.pending_handoffs,
             "claim_conflicts": self.claim_conflicts,
         })
+    }
+
+    fn agent_visible(&self) -> Value {
+        let source_event_ids = self
+            .pending_handoffs
+            .iter()
+            .filter_map(|item| item.get("event_id").and_then(Value::as_str))
+            .chain(
+                self.reasons
+                    .iter()
+                    .filter_map(|item| item.get("event_id").and_then(Value::as_str)),
+            )
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if let Some(handoff) = self.pending_handoffs.first() {
+            let subject = handoff
+                .get("subject")
+                .and_then(Value::as_str)
+                .unwrap_or("pending handoff");
+            let from = handoff
+                .get("from_tool")
+                .and_then(Value::as_str)
+                .unwrap_or("another agent");
+            return agent_visible(
+                true,
+                &self.severity,
+                format!(
+                    "Rally obligation: pending handoff from {from}. Subject: {subject}. Required action: inspect the source_event_ids and respond with ack, needs-info, or reject."
+                ),
+                Some(self.decision.as_str()),
+                source_event_ids,
+                false,
+            );
+        }
+        if !self.reasons.is_empty() || self.context_stale {
+            let message = self
+                .reasons
+                .first()
+                .and_then(|reason| reason.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("new coordination events exist since this session cursor");
+            return agent_visible(
+                true,
+                &self.severity,
+                format!(
+                    "Rally coordination notice: {message}. Decision: {}.",
+                    self.decision
+                ),
+                Some(self.decision.as_str()),
+                source_event_ids,
+                self.allow,
+            );
+        }
+        inactive_agent_visible()
     }
 }
 
@@ -1138,11 +1196,13 @@ fn next_recommendation(projection: &TraceProjection, tool: &str, limit: usize) -
             "source_event_ids": [],
             "score": 0.0,
             "factors": {},
+            "agent_visible": inactive_agent_visible(),
             "alternatives": []
         });
     }
     let top = candidates.remove(0);
     let alternatives = candidates.into_iter().take(3).collect::<Vec<_>>();
+    let agent_visible = agent_visible_from_next(&top);
     json!({
         "action_kind": top["action_kind"],
         "target_event_id": top["target_event_id"],
@@ -1151,8 +1211,91 @@ fn next_recommendation(projection: &TraceProjection, tool: &str, limit: usize) -
         "source_event_ids": top["source_event_ids"],
         "score": top["score"],
         "factors": top["factors"],
+        "agent_visible": agent_visible,
         "alternatives": alternatives,
     })
+}
+
+fn inactive_agent_visible() -> Value {
+    agent_visible(false, "info", "", None, Vec::new(), true)
+}
+
+fn agent_visible(
+    present: bool,
+    severity: &str,
+    message: impl Into<String>,
+    required_action: Option<&str>,
+    source_event_ids: Vec<String>,
+    automation_allowed: bool,
+) -> Value {
+    json!({
+        "present": present,
+        "severity": severity,
+        "message": message.into(),
+        "required_action": required_action,
+        "source_event_ids": source_event_ids,
+        "automation_allowed": automation_allowed,
+    })
+}
+
+fn agent_visible_from_next(next: &Value) -> Value {
+    let action = next
+        .get("action_kind")
+        .and_then(Value::as_str)
+        .unwrap_or("idle");
+    if action == "idle" {
+        return inactive_agent_visible();
+    }
+    let subject = next
+        .get("subject")
+        .and_then(Value::as_str)
+        .unwrap_or("recommended work");
+    let source_event_ids = next
+        .get("source_event_ids")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let severity = match action {
+        "pick_up_handoff" | "unblock_peer" => "stop",
+        "progress_owned_task" | "claim_task" => "warn",
+        _ => "info",
+    };
+    agent_visible(
+        true,
+        severity,
+        format!(
+            "Rally recommendation: {action}. Subject: {subject}. Treat pending handoffs, blockers, and conflicts as obligations before unrelated work."
+        ),
+        Some(action),
+        source_event_ids,
+        !matches!(severity, "stop"),
+    )
+}
+
+fn agent_visible_from_context(recommendation: &ContextRecommendation) -> Value {
+    let action = recommendation.action.as_str();
+    if action == "proceed_solo" {
+        return inactive_agent_visible();
+    }
+    let severity = match action {
+        "ack_handoff" | "resolve_blocker" | "resolve_claim_conflict" => "stop",
+        "continue_claim" | "work_task" | "refresh_context" => "warn",
+        _ => "info",
+    };
+    agent_visible(
+        true,
+        severity,
+        format!("Rally recommendation: {action}. {}", recommendation.reason),
+        Some(action),
+        recommendation.source_event_ids.clone(),
+        recommendation.trust.automation_allowed && !matches!(severity, "stop"),
+    )
 }
 
 fn candidate(
@@ -1643,7 +1786,7 @@ fn install_gemini_hooks() -> Result<AdapterInstall, CliError> {
     );
     add_native_hook(
         &mut value,
-        "PreToolUse",
+        "BeforeTool",
         None,
         &format!(
             "bash {} before-write gemini",
@@ -1972,22 +2115,73 @@ set -euo pipefail
 phase="${1:-idle}"
 tool="${2:-DEFAULT_TOOL}"
 input="$(cat || true)"
-path="$({ printf '%s' "$input" | node -e '
+meta="$({ printf '%s' "$input" | node -e '
 let data=""; process.stdin.on("data", c => data += c); process.stdin.on("end", () => {
   try {
     const value = JSON.parse(data || "{}");
-    const input = value.tool_input || value.toolInput || value.input || value;
-    const path = input.file_path || input.filePath || input.path || input.notebook_path || "";
-    if (path) process.stdout.write(String(path));
-  } catch (_) {}
+    const toolInput = value.tool_input || value.toolInput || value.input || value;
+    const path = toolInput.file_path || toolInput.filePath || toolInput.path || toolInput.notebook_path || "";
+    const session = value.session_id || value.sessionId || "";
+    process.stdout.write(JSON.stringify({path, session}));
+  } catch (_) { process.stdout.write("{}"); }
 });
 ' ; } 2>/dev/null)"
-args=(hook "$phase" --tool "$tool" --json --fail-open)
-if [ -n "$path" ]; then
-  args+=(--path "$path")
-  if [ "$phase" = "before-write" ]; then args+=(--auto-claim); fi
+path="$({ printf '%s' "$meta" | node -e 'const fs=require("fs"); try { const v=JSON.parse(fs.readFileSync(0,"utf8")||"{}"); process.stdout.write(v.path||""); } catch (_) {}' ; } 2>/dev/null)"
+session="$({ printf '%s' "$meta" | node -e 'const fs=require("fs"); try { const v=JSON.parse(fs.readFileSync(0,"utf8")||"{}"); process.stdout.write(v.session||""); } catch (_) {}' ; } 2>/dev/null)"
+if [ -z "$session" ]; then session="${RALLY_SESSION_ID:-${tool}-$(date +%s)}"; fi
+if [ "$phase" = "start" ]; then
+  args=(start "$tool" --session-id "$session" --json)
+else
+  args=(hook "$phase" --tool "$tool" --session-id "$session" --json --fail-open)
+  if [ -n "$path" ]; then
+    args+=(--path "$path")
+    if [ "$phase" = "before-write" ]; then args+=(--auto-claim); fi
+  fi
 fi
-rally "${args[@]}" 2>/dev/null || echo '{"allow":true,"rally_error":"hook failed open"}'
+rally_output="$(rally "${args[@]}" 2>/dev/null || true)"
+printf '%s' "$rally_output" | node -e '
+const fs = require("fs");
+const raw = fs.readFileSync(0, "utf8");
+const phase = process.argv[1] || "idle";
+const tool = process.argv[2] || "DEFAULT_TOOL";
+function nativeEvent(tool, phase) {
+  if (tool === "gemini") return {start:"SessionStart", idle:"BeforeAgent", "before-write":"BeforeTool", "after-write":"AfterAgent"}[phase] || "BeforeAgent";
+  return {start:"SessionStart", idle:"UserPromptSubmit", "before-write":"PreToolUse", "after-write":"Stop"}[phase] || "UserPromptSubmit";
+}
+function output(value) { process.stdout.write(JSON.stringify(value)); }
+let parsed = {};
+try { parsed = JSON.parse(raw || "{}"); } catch (_) { output({}); process.exit(0); }
+const hook = parsed?.data?.hook || {};
+const judgment = hook?.judgment || parsed?.data?.judgment || {};
+const visible = hook?.agent_visible || judgment?.agent_visible || parsed?.agent_visible || parsed?.data?.next?.agent_visible || {};
+if (!visible.present) { output({}); process.exit(0); }
+const event = nativeEvent(tool, phase);
+const message = visible.message || "Rally has a pending coordination obligation.";
+const severity = visible.severity || "warn";
+const allow = hook.allow ?? judgment.allow ?? true;
+const stop = severity === "stop" || allow === false;
+if (tool === "gemini") {
+  if (event === "SessionStart" || event === "BeforeAgent") {
+    output({hookSpecificOutput: {hookEventName: event, additionalContext: message}});
+  } else if (event === "BeforeTool") {
+    output(stop ? {decision: "deny", reason: message} : {hookSpecificOutput: {hookEventName: event, additionalContext: message}});
+  } else if (event === "AfterAgent") {
+    output(stop ? {decision: "deny", reason: message} : {systemMessage: message});
+  } else {
+    output({systemMessage: message});
+  }
+} else {
+  if (event === "SessionStart" || event === "UserPromptSubmit") {
+    output({hookSpecificOutput: {hookEventName: event, additionalContext: message}});
+  } else if (event === "PreToolUse") {
+    output(stop ? {hookSpecificOutput: {hookEventName: event, permissionDecision: "deny", permissionDecisionReason: message}} : {hookSpecificOutput: {hookEventName: event, additionalContext: message}});
+  } else if (event === "Stop") {
+    output(stop ? {decision: "block", reason: message} : {systemMessage: message});
+  } else {
+    output({systemMessage: message});
+  }
+}
+' "$phase" "$tool"
 "#
     .replace("DEFAULT_TOOL", default_tool)
 }
@@ -2013,14 +2207,46 @@ function pathFromTool(event: any): string | undefined {
   return input.path || input.file_path || input.filePath || input.notebook_path;
 }
 
+function agentVisible(output: string): { key: string; message: string } | undefined {
+  try {
+    const parsed = JSON.parse(output || "{}");
+    const visible = parsed?.agent_visible || parsed?.data?.hook?.agent_visible || parsed?.data?.hook?.judgment?.agent_visible || parsed?.data?.next?.agent_visible;
+    if (!visible?.present || !visible?.message) return undefined;
+    const ids = Array.isArray(visible.source_event_ids) ? visible.source_event_ids.join(",") : "";
+    return { key: `${visible.required_action || "notice"}:${ids}:${visible.message}`, message: visible.message };
+  } catch (_) {
+    return undefined;
+  }
+}
+
 export default function rallyJudgment(pi: ExtensionAPI) {
+  let lastDelivered = "";
+
+  function deliver(output: string, triggerTurn: boolean) {
+    const visible = agentVisible(output);
+    if (!visible || visible.key === lastDelivered) return undefined;
+    lastDelivered = visible.key;
+    const message = {
+      customType: "rally",
+      content: visible.message,
+      display: true,
+    };
+    if (triggerTurn) {
+      try { pi.sendMessage(message, { triggerTurn: true, deliverAs: "followUp" }); } catch (_) {}
+    }
+    return message;
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     const session = ctx.sessionManager.getSessionId?.() || `${Date.now()}`;
-    runRally(["hook", "start", "--tool", "pi", "--session-id", session, "--json", "--fail-open"]);
+    const output = runRally(["start", "pi", "--session-id", session, "--json"]);
+    deliver(output, true);
   });
 
   pi.on("before_agent_start", async (_event, _ctx) => {
-    runRally(["hook", "idle", "--tool", "pi", "--json", "--fail-open"]);
+    const output = runRally(["hook", "idle", "--tool", "pi", "--json", "--fail-open"]);
+    const message = deliver(output, false);
+    if (message) return { message };
   });
 
   pi.on("tool_call", async (event) => {
@@ -2034,7 +2260,8 @@ export default function rallyJudgment(pi: ExtensionAPI) {
       const parsed = JSON.parse(output);
       const hook = parsed?.data?.hook || parsed?.data?.judgment || parsed;
       if (hook?.allow === false || hook?.judgment?.allow === false) {
-        return { block: true, reason: `Rally blocked write: ${output}` };
+        const visible = agentVisible(output);
+        return { block: true, reason: visible?.message || `Rally blocked write: ${output}` };
       }
     } catch (_) {}
   });
@@ -2050,10 +2277,10 @@ fn write_adapter_install(store: &ChannelStore, adapter: &str) -> Result<AdapterI
     let path = dir.join(format!("{adapter}-rally-start.md"));
     let body = match adapter {
         "cmux" => {
-            "# cmux Rally integration\n\nRun `rally <tool>` when an agent pane starts. Use `rally cmux packet --tool <tool>` for feed/workspace payloads.\n"
+            "# cmux Rally integration\n\nRun `rally <tool>` when an agent pane starts. Use `rally cmux packet --tool <tool>` for feed/workspace payloads. cmux should surface Rally obligations through operator-visible notifications/sidebar by default. Sending text into an agent pane is explicit opt-in only.\n"
         }
         "herdr" => {
-            "# Herdr Rally integration\n\nRun `rally <tool>` when an agent pane starts. Use `rally herdr packet --tool <tool>` and honor `rally herdr inject` gates.\n"
+            "# Herdr Rally integration\n\nRun `rally <tool>` when an agent pane starts. Use `rally herdr packet --tool <tool>` and honor `rally herdr inject` gates. Herdr should report Rally obligations as pane/agent state by default. Sending text into an agent terminal is explicit opt-in only.\n"
         }
         _ => unreachable!(),
     };
@@ -2091,7 +2318,16 @@ set -euo pipefail
 tool="${1:-claude}"
 if [ "$#" -gt 0 ]; then shift; fi
 session="${RALLY_SESSION_ID:-${tool}-$(date +%s)}"
-rally hook start --tool "$tool" --session-id "$session" --json > "${TMPDIR:-/tmp}/rally-${tool}-${session}.json" || true
+packet="${TMPDIR:-/tmp}/rally-${tool}-${session}.json"
+rally start "$tool" --session-id "$session" --json > "$packet" || true
+message="$(node -e 'const fs=require("fs"); try { const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const m=v.agent_visible?.present ? v.agent_visible.message : ""; process.stdout.write(m || ""); } catch (_) {}' "$packet")"
+if [ -n "$message" ] && command -v cmux >/dev/null 2>&1; then
+  cmux notify --title "Rally" --subtitle "$tool" --body "$message" >/dev/null 2>&1 || true
+  cmux set-status rally "blocked" --icon flag --color "ff9500" --priority 90 >/dev/null 2>&1 || true
+fi
+if [ "${RALLY_INJECT_AGENT_INPUT:-0}" = "1" ] && [ -n "$message" ]; then
+  printf '%s\n' "$message" > "${TMPDIR:-/tmp}/rally-${tool}-${session}.agent-message.txt"
+fi
 exec "$tool" "$@"
 "#,
     )?;
@@ -2166,7 +2402,15 @@ set -euo pipefail
 tool="${1:-claude}"
 if [ "$#" -gt 0 ]; then shift; fi
 session="${RALLY_SESSION_ID:-${tool}-$(date +%s)}"
-rally hook start --tool "$tool" --session-id "$session" --json > "${TMPDIR:-/tmp}/rally-${tool}-${session}.json" || true
+packet="${TMPDIR:-/tmp}/rally-${tool}-${session}.json"
+rally start "$tool" --session-id "$session" --json > "$packet" || true
+message="$(node -e 'const fs=require("fs"); try { const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const m=v.agent_visible?.present ? v.agent_visible.message : ""; process.stdout.write(m || ""); } catch (_) {}' "$packet")"
+if [ -n "$message" ] && command -v herdr >/dev/null 2>&1 && [ -n "${HERDR_PANE_ID:-}" ]; then
+  herdr pane report-agent "$HERDR_PANE_ID" --source rally --agent "$tool" --state blocked --message "$message" >/dev/null 2>&1 || true
+fi
+if [ "${RALLY_INJECT_AGENT_INPUT:-0}" = "1" ] && [ -n "$message" ]; then
+  printf '%s\n' "$message" > "${TMPDIR:-/tmp}/rally-${tool}-${session}.agent-message.txt"
+fi
 exec "$tool" "$@"
 "#,
     )?;
@@ -2336,6 +2580,7 @@ pub(super) fn execute_adapter_contract(command: ReadCommand) -> Result<WriteOutp
                 "stable_fields": [
                     "command",
                     "schema",
+                    "agent_visible",
                     "data.packet.tool",
                     "data.packet.role",
                     "data.packet.packet_kind",
@@ -2350,12 +2595,16 @@ pub(super) fn execute_adapter_contract(command: ReadCommand) -> Result<WriteOutp
                     "cmux": {
                         "command": "rally cmux packet --tool <tool> --json",
                         "side_effects": false,
-                        "purpose": "workspace/feed-friendly packet export"
+                        "purpose": "workspace/feed-friendly packet export",
+                        "operator_visibility_default": "cmux notify/sidebar status",
+                        "agent_input_injection": "explicit opt-in only"
                     },
                     "herdr": {
                         "command": "rally herdr packet --tool <tool> --json",
                         "side_effects": false,
-                        "purpose": "prompt payload export; actual injection remains adapter-owned"
+                        "purpose": "prompt payload export; actual injection remains adapter-owned",
+                        "operator_visibility_default": "pane.report_agent / sidebar state",
+                        "agent_input_injection": "explicit opt-in only"
                     }
                 }
             }
@@ -2380,6 +2629,7 @@ fn execute_adapter_packet(
     let projection = TraceProjection::from_records_at(&records, now);
     let brief = build_context_brief(&projection, &tool, command.limit);
     let packet = build_work_packet(&brief, command.limit);
+    let agent_visible = agent_visible_from_context(&packet.recommended_next_action);
     let ready_to_act = packet.recommended_next_action.trust.automation_allowed;
     let title = format!("Rally {} packet for {}", packet.packet_kind, packet.tool);
     let body = adapter_body(
@@ -2395,6 +2645,15 @@ fn execute_adapter_packet(
             "available_on_path": executable_on_path("cmux"),
             "side_effects": false,
             "suggested_commands": ["cmux feed tui", "cmux open ."],
+            "operator_visibility": {
+                "default": "notify/sidebar",
+                "suggested_commands": ["cmux notify --title Rally --body <agent_visible.message>", "cmux set-status rally <status>"]
+            },
+            "agent_input_injection": {
+                "default_enabled": false,
+                "requires_explicit_operator_action": true,
+                "message": agent_visible
+            },
             "work_item": {
                 "title": title,
                 "body": body,
@@ -2410,6 +2669,15 @@ fn execute_adapter_packet(
             "schema": "agent-rally.adapter.herdr-packet.v1",
             "side_effects": false,
             "ready_to_inject": ready_to_act,
+            "operator_visibility": {
+                "default": "pane.report_agent",
+                "suggested_commands": ["herdr pane report-agent <pane> --source rally --state blocked --message <agent_visible.message>"]
+            },
+            "agent_input_injection": {
+                "default_enabled": false,
+                "requires_explicit_operator_action": true,
+                "message": agent_visible
+            },
             "prompt": body,
             "trust": packet.recommended_next_action.trust,
             "packet": packet,
