@@ -94,6 +94,15 @@ editing, `inbox --since-cursor` at boundaries, `handoff` to delegate,
 If you use herdr, `rally setup install herdr` chains these together
 automatically — open a `rally pi` pane and you're done.
 
+Before mutating real agent config, inspect the plan:
+
+```bash
+rally setup install pi --dry-run --json
+rally setup verify pi --json
+```
+
+Setup writes `<file>.rally.bak` backups before changing existing files.
+
 The bundled skill at `skills/agent-rally-point/SKILL.md` (linked
 into Claude/Codex/Pi via `~/.agents/bin/sync-agent-skills`) is what
 teaches each agent the loop above.

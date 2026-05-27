@@ -117,6 +117,7 @@ impl WriteArgs {
                 | "--from-start"
                 | "--auto-claim"
                 | "--fail-open"
+                | "--dry-run"
                 | "--no-default-trust-policy" => {
                     if arg == "--sign" {
                         common.sign = true;

@@ -41,6 +41,10 @@ harnesses pass a stable `--tool`. `rally setup install cmux` and `rally setup
 install herdr` install edge wrappers/config hooks; they do not move coordination
 state out of Rally.
 
+Before installing hooks on a real machine, use `rally setup install <tool>
+--dry-run --json` and then `rally setup verify <tool> --json`. Setup creates
+`<file>.rally.bak` backups before changing existing config files.
+
 At work boundaries, call the judgment layer:
 
 - To decide what to do next: `rally next --tool <tool> --json`

@@ -213,6 +213,7 @@ pub(crate) struct SetupCommand {
     pub(crate) common: CommonOptions,
     pub(crate) action: String,
     pub(crate) target: Option<String>,
+    pub(crate) dry_run: bool,
 }
 
 #[derive(Debug)]
@@ -336,10 +337,12 @@ pub(crate) fn parse_setup(args: WriteArgs) -> Result<SetupCommand, CliError> {
             ));
         }
     };
+    let dry_run = args.has("--dry-run");
     Ok(SetupCommand {
         common: args.common,
         action,
         target,
+        dry_run,
     })
 }
 

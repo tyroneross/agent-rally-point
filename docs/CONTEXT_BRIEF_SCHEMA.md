@@ -314,6 +314,14 @@ surface rather than PATH shadowing:
 `rally setup uninstall <tool>` removes generated Rally hooks or marked adapter
 config blocks.
 
+Safety rules for setup mutation:
+
+- `--dry-run` returns planned files/config without writing.
+- Existing files are copied to `<file>.rally.bak` before mutation/removal.
+- `rally setup verify [tool] --json` checks expected files and markers.
+- Install/uninstall are intended to be idempotent: generated hook entries are not
+  duplicated on repeat installs.
+
 `rally doctor --tool <tool> --json` combines deterministic diagnosis,
 checkpoint status, setup enforcement, active anonymous claims/tasks/handoffs,
 and profile checks. Its status is `pass`, `warn`, or `fail`. Under `strict`,

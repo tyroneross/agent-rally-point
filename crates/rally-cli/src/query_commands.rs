@@ -495,8 +495,13 @@ pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliErr
     let mut installed_path = None;
     let mut installed_files = Vec::<String>::new();
     let mut modified_external_config = None;
+    let mut backup_paths = Vec::<String>::new();
+    let mut verification = Vec::<Value>::new();
     match command.action.as_str() {
         "status" => {}
+        "verify" => {
+            verification = verify_setup(command.target.as_deref())?;
+        }
         "enforcement" => {
             let mode = command.target.as_deref().ok_or_else(|| {
                 CliError::usage("setup", "setup enforcement requires off, warn, or strict")
@@ -507,7 +512,12 @@ pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliErr
                     "enforcement must be off, warn, or strict",
                 ));
             }
-            write_setup_config(&store, mode)?;
+            if command.dry_run {
+                installed_files.push(setup_config_path(&store).display().to_string());
+            } else {
+                backup_paths.extend(backup_file(&setup_config_path(&store))?);
+                write_setup_config(&store, mode)?;
+            }
             status = setup_status(&store)?;
         }
         "install" => {
@@ -524,7 +534,9 @@ pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliErr
                     "unknown adapter; expected pi, claude, codex, gemini, cmux, or herdr",
                 ));
             }
-            let install = if matches!(adapter, "cmux" | "herdr") {
+            let install = if command.dry_run {
+                plan_install(&store, adapter)?
+            } else if matches!(adapter, "cmux" | "herdr") {
                 write_adapter_install(&store, adapter)?
             } else {
                 write_tool_install(adapter)?
@@ -532,15 +544,21 @@ pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliErr
             installed_path = install.primary_path;
             installed_files = install.files;
             modified_external_config = install.modified_config;
+            backup_paths = install.backup_paths;
         }
         "uninstall" => {
             let adapter = command
                 .target
                 .as_deref()
                 .ok_or_else(|| CliError::usage("setup", "setup uninstall requires a tool id"))?;
-            let uninstall = uninstall_tool_or_adapter(adapter)?;
+            let uninstall = if command.dry_run {
+                plan_uninstall(adapter)?
+            } else {
+                uninstall_tool_or_adapter(adapter)?
+            };
             installed_files = uninstall.files;
             modified_external_config = uninstall.modified_config;
+            backup_paths = uninstall.backup_paths;
         }
         value => {
             return Err(CliError::usage(
@@ -567,6 +585,9 @@ pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliErr
                 "installed_path": installed_path,
                 "installed_files": installed_files,
                 "modified_external_config": modified_external_config,
+                "backup_paths": backup_paths,
+                "dry_run": command.dry_run,
+                "verification": verification,
             }
         }),
     ))
@@ -1276,6 +1297,158 @@ struct AdapterInstall {
     primary_path: Option<String>,
     files: Vec<String>,
     modified_config: Option<String>,
+    backup_paths: Vec<String>,
+}
+
+fn plan_install(store: &ChannelStore, tool: &str) -> Result<AdapterInstall, CliError> {
+    let files = install_paths(store, tool)?;
+    Ok(AdapterInstall {
+        primary_path: files.first().cloned(),
+        modified_config: modified_config_for(tool, &files),
+        files,
+        backup_paths: Vec::new(),
+    })
+}
+
+fn plan_uninstall(tool: &str) -> Result<AdapterInstall, CliError> {
+    let files = install_paths(&ChannelStore::new("."), tool)?
+        .into_iter()
+        .filter(|path| Path::new(path).exists())
+        .collect::<Vec<_>>();
+    Ok(AdapterInstall {
+        primary_path: None,
+        modified_config: modified_config_for(tool, &files),
+        files,
+        backup_paths: Vec::new(),
+    })
+}
+
+fn install_paths(store: &ChannelStore, tool: &str) -> Result<Vec<String>, CliError> {
+    Ok(match tool {
+        "pi" => vec![
+            pi_extensions_dir()?
+                .join("rally-judgment.ts")
+                .display()
+                .to_string(),
+        ],
+        "claude" => {
+            let dir = home_dot(".claude")?;
+            vec![
+                dir.join("hooks/rally-hook.sh").display().to_string(),
+                dir.join("settings.json").display().to_string(),
+            ]
+        }
+        "codex" => {
+            let dir = codex_home()?;
+            vec![
+                dir.join("rally-hook.sh").display().to_string(),
+                dir.join("hooks.json").display().to_string(),
+                dir.join("config.toml").display().to_string(),
+            ]
+        }
+        "gemini" => {
+            let dir = home_dot(".gemini")?;
+            vec![
+                dir.join("rally-hook.sh").display().to_string(),
+                dir.join("settings.json").display().to_string(),
+            ]
+        }
+        "cmux" => {
+            let dir = adapter_config_dir("RALLY_CMUX_CONFIG_DIR", "cmux")?;
+            vec![
+                store
+                    .channel_dir()
+                    .join("rally/adapters/cmux-rally-start.md")
+                    .display()
+                    .to_string(),
+                dir.join("rally-agent-wrapper.sh").display().to_string(),
+                dir.join("cmux.json").display().to_string(),
+            ]
+        }
+        "herdr" => {
+            let dir = adapter_config_dir("RALLY_HERDR_CONFIG_DIR", "herdr")?;
+            vec![
+                store
+                    .channel_dir()
+                    .join("rally/adapters/herdr-rally-start.md")
+                    .display()
+                    .to_string(),
+                dir.join("integrations/rally-agent-start.sh")
+                    .display()
+                    .to_string(),
+                dir.join("config.toml").display().to_string(),
+            ]
+        }
+        _ => return Err(CliError::usage("setup", "unknown tool")),
+    })
+}
+
+fn modified_config_for(tool: &str, files: &[String]) -> Option<String> {
+    match tool {
+        "claude" | "gemini" => files
+            .iter()
+            .find(|path| path.ends_with("settings.json"))
+            .cloned(),
+        "codex" => files
+            .iter()
+            .find(|path| path.ends_with("hooks.json"))
+            .cloned(),
+        "cmux" => files
+            .iter()
+            .find(|path| path.ends_with("cmux.json"))
+            .cloned(),
+        "herdr" => files
+            .iter()
+            .find(|path| path.ends_with("config.toml"))
+            .cloned(),
+        _ => None,
+    }
+}
+
+fn verify_setup(target: Option<&str>) -> Result<Vec<Value>, CliError> {
+    let tools = match target {
+        Some(tool) => vec![tool],
+        None => vec!["pi", "claude", "codex", "gemini", "cmux", "herdr"],
+    };
+    tools
+        .into_iter()
+        .map(verify_setup_tool)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn verify_setup_tool(tool: &str) -> Result<Value, CliError> {
+    let files = install_paths(&ChannelStore::new("."), tool)?;
+    let marker_ok = match tool {
+        "pi" => file_contains(files.first(), "rally-pi-judgment-extension-marker"),
+        "claude" | "codex" | "gemini" => {
+            files
+                .iter()
+                .any(|path| path.ends_with("rally-hook.sh") && Path::new(path).exists())
+                && files
+                    .iter()
+                    .any(|path| file_contains(Some(path), "rally-hook.sh"))
+        }
+        "cmux" => files
+            .iter()
+            .any(|path| file_contains(Some(path), "rally-agent")),
+        "herdr" => files
+            .iter()
+            .any(|path| file_contains(Some(path), "integrations.rally")),
+        _ => return Err(CliError::usage("setup", "unknown tool")),
+    };
+    Ok(json!({
+        "tool": tool,
+        "installed": marker_ok,
+        "files": files.iter().map(|path| json!({
+            "path": path,
+            "exists": Path::new(path).exists()
+        })).collect::<Vec<_>>()
+    }))
+}
+
+fn file_contains(path: Option<&String>, needle: &str) -> bool {
+    path.and_then(|path| fs::read_to_string(path).ok())
+        .is_some_and(|text| text.contains(needle))
 }
 
 fn write_tool_install(tool: &str) -> Result<AdapterInstall, CliError> {
@@ -1294,6 +1467,7 @@ fn install_pi_extension() -> Result<AdapterInstall, CliError> {
         CliError::runtime("setup", format!("failed to create Pi extension dir: {err}"))
     })?;
     let path = dir.join("rally-judgment.ts");
+    let backup_paths = backup_file(&path)?.into_iter().collect::<Vec<_>>();
     fs::write(&path, pi_rally_extension()).map_err(|err| {
         CliError::runtime("setup", format!("failed to write Pi extension: {err}"))
     })?;
@@ -1301,6 +1475,7 @@ fn install_pi_extension() -> Result<AdapterInstall, CliError> {
         primary_path: Some(path.display().to_string()),
         files: vec![path.display().to_string()],
         modified_config: None,
+        backup_paths,
     })
 }
 
@@ -1311,8 +1486,10 @@ fn install_claude_hooks() -> Result<AdapterInstall, CliError> {
         CliError::runtime("setup", format!("failed to create Claude hooks dir: {err}"))
     })?;
     let script = hooks_dir.join("rally-hook.sh");
+    let mut backup_paths = backup_file(&script)?.into_iter().collect::<Vec<_>>();
     write_executable(&script, &native_hook_script("claude"))?;
     let settings = dir.join("settings.json");
+    backup_paths.extend(backup_file(&settings)?);
     let mut value = read_json_object_or_default(&settings)?;
     add_native_hook(
         &mut value,
@@ -1359,6 +1536,7 @@ fn install_claude_hooks() -> Result<AdapterInstall, CliError> {
         primary_path: Some(script.display().to_string()),
         files: vec![script.display().to_string(), settings.display().to_string()],
         modified_config: Some(settings.display().to_string()),
+        backup_paths,
     })
 }
 
@@ -1367,8 +1545,10 @@ fn install_codex_hooks() -> Result<AdapterInstall, CliError> {
     fs::create_dir_all(&dir)
         .map_err(|err| CliError::runtime("setup", format!("failed to create Codex home: {err}")))?;
     let script = dir.join("rally-hook.sh");
+    let mut backup_paths = backup_file(&script)?.into_iter().collect::<Vec<_>>();
     write_executable(&script, &native_hook_script("codex"))?;
     let hooks = dir.join("hooks.json");
+    backup_paths.extend(backup_file(&hooks)?);
     let mut value = read_json_object_or_default(&hooks)?;
     add_native_hook(
         &mut value,
@@ -1412,6 +1592,7 @@ fn install_codex_hooks() -> Result<AdapterInstall, CliError> {
     );
     write_json_pretty(&hooks, &value)?;
     let config = dir.join("config.toml");
+    backup_paths.extend(backup_file(&config)?);
     upsert_marked_block(
         &config,
         "# BEGIN rally codex hooks",
@@ -1426,6 +1607,7 @@ fn install_codex_hooks() -> Result<AdapterInstall, CliError> {
             config.display().to_string(),
         ],
         modified_config: Some(hooks.display().to_string()),
+        backup_paths,
     })
 }
 
@@ -1434,8 +1616,10 @@ fn install_gemini_hooks() -> Result<AdapterInstall, CliError> {
     fs::create_dir_all(&dir)
         .map_err(|err| CliError::runtime("setup", format!("failed to create Gemini dir: {err}")))?;
     let script = dir.join("rally-hook.sh");
+    let mut backup_paths = backup_file(&script)?.into_iter().collect::<Vec<_>>();
     write_executable(&script, &native_hook_script("gemini"))?;
     let settings = dir.join("settings.json");
+    backup_paths.extend(backup_file(&settings)?);
     let mut value = read_json_object_or_default(&settings)?;
     add_native_hook(
         &mut value,
@@ -1482,15 +1666,18 @@ fn install_gemini_hooks() -> Result<AdapterInstall, CliError> {
         primary_path: Some(settings.display().to_string()),
         files: vec![script.display().to_string(), settings.display().to_string()],
         modified_config: Some(settings.display().to_string()),
+        backup_paths,
     })
 }
 
 fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
     let mut files = Vec::new();
     let mut modified_config = None;
+    let mut backup_paths = Vec::new();
     if tool == "pi" {
         let path = pi_extensions_dir()?.join("rally-judgment.ts");
         if path.exists() {
+            backup_paths.extend(backup_file(&path)?);
             fs::remove_file(&path).map_err(|err| {
                 CliError::runtime("setup", format!("failed to remove Pi extension: {err}"))
             })?;
@@ -1500,6 +1687,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
         let dir = home_dot(".claude")?;
         let script = dir.join("hooks/rally-hook.sh");
         if script.exists() {
+            backup_paths.extend(backup_file(&script)?);
             fs::remove_file(&script).map_err(|err| {
                 CliError::runtime("setup", format!("failed to remove Claude hook: {err}"))
             })?;
@@ -1507,6 +1695,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
         files.push(script.display().to_string());
         let settings = dir.join("settings.json");
         if settings.exists() {
+            backup_paths.extend(backup_file(&settings)?);
             let mut value = read_json_object_or_default(&settings)?;
             remove_rally_native_hooks(&mut value);
             write_json_pretty(&settings, &value)?;
@@ -1516,6 +1705,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
         let dir = codex_home()?;
         let script = dir.join("rally-hook.sh");
         if script.exists() {
+            backup_paths.extend(backup_file(&script)?);
             fs::remove_file(&script).map_err(|err| {
                 CliError::runtime("setup", format!("failed to remove Codex hook: {err}"))
             })?;
@@ -1523,6 +1713,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
         files.push(script.display().to_string());
         let hooks = dir.join("hooks.json");
         if hooks.exists() {
+            backup_paths.extend(backup_file(&hooks)?);
             let mut value = read_json_object_or_default(&hooks)?;
             remove_rally_native_hooks(&mut value);
             write_json_pretty(&hooks, &value)?;
@@ -1530,6 +1721,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
         }
         let config = dir.join("config.toml");
         if config.exists() {
+            backup_paths.extend(backup_file(&config)?);
             let existing = fs::read_to_string(&config).map_err(|err| {
                 CliError::runtime("setup", format!("failed to read Codex config: {err}"))
             })?;
@@ -1546,6 +1738,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
         let dir = home_dot(".gemini")?;
         let script = dir.join("rally-hook.sh");
         if script.exists() {
+            backup_paths.extend(backup_file(&script)?);
             fs::remove_file(&script).map_err(|err| {
                 CliError::runtime("setup", format!("failed to remove Gemini hook: {err}"))
             })?;
@@ -1553,6 +1746,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
         files.push(script.display().to_string());
         let settings = dir.join("settings.json");
         if settings.exists() {
+            backup_paths.extend(backup_file(&settings)?);
             let mut value = read_json_object_or_default(&settings)?;
             remove_rally_native_hooks(&mut value);
             write_json_pretty(&settings, &value)?;
@@ -1562,6 +1756,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
         let dir = adapter_config_dir("RALLY_CMUX_CONFIG_DIR", "cmux")?;
         let wrapper = dir.join("rally-agent-wrapper.sh");
         if wrapper.exists() {
+            backup_paths.extend(backup_file(&wrapper)?);
             fs::remove_file(&wrapper).map_err(|err| {
                 CliError::runtime("setup", format!("failed to remove cmux wrapper: {err}"))
             })?;
@@ -1569,6 +1764,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
         files.push(wrapper.display().to_string());
         let config = dir.join("cmux.json");
         if config.exists() {
+            backup_paths.extend(backup_file(&config)?);
             let text = fs::read_to_string(&config).map_err(|err| {
                 CliError::runtime("setup", format!("failed to read cmux config: {err}"))
             })?;
@@ -1593,6 +1789,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
         let dir = adapter_config_dir("RALLY_HERDR_CONFIG_DIR", "herdr")?;
         let wrapper = dir.join("integrations/rally-agent-start.sh");
         if wrapper.exists() {
+            backup_paths.extend(backup_file(&wrapper)?);
             fs::remove_file(&wrapper).map_err(|err| {
                 CliError::runtime("setup", format!("failed to remove herdr wrapper: {err}"))
             })?;
@@ -1600,6 +1797,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
         files.push(wrapper.display().to_string());
         let config = dir.join("config.toml");
         if config.exists() {
+            backup_paths.extend(backup_file(&config)?);
             let existing = fs::read_to_string(&config).map_err(|err| {
                 CliError::runtime("setup", format!("failed to read herdr config: {err}"))
             })?;
@@ -1620,6 +1818,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
         primary_path: None,
         files,
         modified_config,
+        backup_paths,
     })
 }
 
@@ -1673,6 +1872,24 @@ fn write_json_pretty(path: &Path, value: &Value) -> Result<(), CliError> {
             format!("failed to write {}: {err}", path.display()),
         )
     })
+}
+
+fn backup_file(path: &Path) -> Result<Option<String>, CliError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let backup = path.with_file_name(format!("{file_name}.rally.bak"));
+    fs::copy(path, &backup).map_err(|err| {
+        CliError::runtime(
+            "setup",
+            format!("failed to back up {}: {err}", path.display()),
+        )
+    })?;
+    Ok(Some(backup.display().to_string()))
 }
 
 fn add_native_hook(
@@ -1840,27 +2057,33 @@ fn write_adapter_install(store: &ChannelStore, adapter: &str) -> Result<AdapterI
         }
         _ => unreachable!(),
     };
+    let mut backup_paths = backup_file(&path)?.into_iter().collect::<Vec<_>>();
     fs::write(&path, body).map_err(|err| {
         CliError::runtime("setup", format!("failed to write adapter file: {err}"))
     })?;
     let mut files = vec![path.display().to_string()];
     let modified_config = match adapter {
-        "cmux" => install_cmux_adapter(&mut files)?,
-        "herdr" => install_herdr_adapter(&mut files)?,
+        "cmux" => install_cmux_adapter(&mut files, &mut backup_paths)?,
+        "herdr" => install_herdr_adapter(&mut files, &mut backup_paths)?,
         _ => unreachable!(),
     };
     Ok(AdapterInstall {
         primary_path: Some(path.display().to_string()),
         files,
         modified_config,
+        backup_paths,
     })
 }
 
-fn install_cmux_adapter(files: &mut Vec<String>) -> Result<Option<String>, CliError> {
+fn install_cmux_adapter(
+    files: &mut Vec<String>,
+    backup_paths: &mut Vec<String>,
+) -> Result<Option<String>, CliError> {
     let dir = adapter_config_dir("RALLY_CMUX_CONFIG_DIR", "cmux")?;
     fs::create_dir_all(&dir)
         .map_err(|err| CliError::runtime("setup", format!("failed to create cmux dir: {err}")))?;
     let wrapper = dir.join("rally-agent-wrapper.sh");
+    backup_paths.extend(backup_file(&wrapper)?);
     write_executable(
         &wrapper,
         r#"#!/usr/bin/env bash
@@ -1875,6 +2098,7 @@ exec "$tool" "$@"
     files.push(wrapper.display().to_string());
 
     let config = dir.join("cmux.json");
+    backup_paths.extend(backup_file(&config)?);
     let mut value = if config.exists() {
         let text = fs::read_to_string(&config).map_err(|err| {
             CliError::runtime("setup", format!("failed to read cmux config: {err}"))
@@ -1921,7 +2145,10 @@ exec "$tool" "$@"
     Ok(Some(config.display().to_string()))
 }
 
-fn install_herdr_adapter(files: &mut Vec<String>) -> Result<Option<String>, CliError> {
+fn install_herdr_adapter(
+    files: &mut Vec<String>,
+    backup_paths: &mut Vec<String>,
+) -> Result<Option<String>, CliError> {
     let dir = adapter_config_dir("RALLY_HERDR_CONFIG_DIR", "herdr")?;
     let integration_dir = dir.join("integrations");
     fs::create_dir_all(&integration_dir).map_err(|err| {
@@ -1931,6 +2158,7 @@ fn install_herdr_adapter(files: &mut Vec<String>) -> Result<Option<String>, CliE
         )
     })?;
     let wrapper = integration_dir.join("rally-agent-start.sh");
+    backup_paths.extend(backup_file(&wrapper)?);
     write_executable(
         &wrapper,
         r#"#!/usr/bin/env bash
@@ -1945,6 +2173,7 @@ exec "$tool" "$@"
     files.push(wrapper.display().to_string());
 
     let config = dir.join("config.toml");
+    backup_paths.extend(backup_file(&config)?);
     let marker_begin = "# BEGIN rally integration";
     let marker_end = "# END rally integration";
     let block = format!(

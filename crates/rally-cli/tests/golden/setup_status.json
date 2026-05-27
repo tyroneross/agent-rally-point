@@ -3,6 +3,8 @@
   "command": "setup",
   "data": {
     "setup": {
+      "backup_paths": [],
+      "dry_run": false,
       "enforcement": "warn",
       "installed_files": [],
       "installed_path": "<installed_path>",
@@ -50,7 +52,8 @@
           "startup_command": "rally herdr packet --tool <agent>",
           "tool": "herdr"
         }
-      ]
+      ],
+      "verification": []
     }
   },
   "ok": true,

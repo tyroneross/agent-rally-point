@@ -497,6 +497,36 @@ fn setup_install_and_uninstall_agent_wrapper() {
             .unwrap()
             .contains("PreToolUse")
     );
+
+    let dry_workspace = RallyWorkspace::new("rally-cli-setup-dry-run");
+    let dry = json_stdout(dry_workspace.run(&["setup", "install", "codex", "--dry-run", "--json"]));
+    let dry_codex_hooks = dry_workspace.home.join(".codex/hooks.json");
+    assert_eq!(dry["data"]["setup"]["dry_run"], true);
+    assert_eq!(
+        dry["data"]["setup"]["modified_external_config"],
+        dry_codex_hooks.display().to_string()
+    );
+    assert!(!dry_codex_hooks.exists());
+
+    let verify_before = json_stdout(dry_workspace.run(&["setup", "verify", "codex", "--json"]));
+    assert_eq!(
+        verify_before["data"]["setup"]["verification"][0]["installed"],
+        false
+    );
+    json_stdout(dry_workspace.run(&["setup", "install", "codex", "--json"]));
+    let second_install = json_stdout(dry_workspace.run(&["setup", "install", "codex", "--json"]));
+    assert!(
+        !second_install["data"]["setup"]["backup_paths"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let verify_after = json_stdout(dry_workspace.run(&["setup", "verify", "codex", "--json"]));
+    assert_eq!(
+        verify_after["data"]["setup"]["verification"][0]["installed"],
+        true
+    );
+    dry_workspace.cleanup();
     workspace.cleanup();
 }
 

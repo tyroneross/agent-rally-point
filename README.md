@@ -63,6 +63,8 @@ rally next --tool codex --json
 rally judge --tool codex --phase idle --json
 rally hook before-write --tool codex --path crates/foo.rs --auto-claim --json
 rally setup --json
+rally setup install codex --dry-run --json
+rally setup verify codex --json
 rally setup enforcement strict --json
 rally setup install cmux --json
 rally preflight --tool codex --start-ping --json
@@ -112,10 +114,12 @@ the next watch command. `rally start <tool>` is the generic equivalent.
 `rally doctor` checks whether the current channel is safe for agents: anonymous
 claims/tasks/handoffs, stale checkpoints, missing profiles, open handoffs,
 conflicts, and trust/diagnosis findings. `rally setup` discovers local harnesses,
-records enforcement mode (`off`, `warn`, or `strict`), installs cmux/Herdr
-startup wrappers, and records adapter config changes. In `strict` mode, write
-commands reject anonymous `tool`, `from_tool`, or `owner_tool` values instead of
-only reporting them in doctor output.
+records enforcement mode (`off`, `warn`, or `strict`), installs native hooks,
+and records adapter config changes. Install/uninstall support `--dry-run`, write
+`.rally.bak` backups before mutating existing config files, and can be checked
+with `rally setup verify [tool] --json`. In `strict` mode, write commands reject
+anonymous `tool`, `from_tool`, or `owner_tool` values instead of only reporting
+them in doctor output.
 
 `rally next`, `rally judge`, and `rally hook` close the loop during work. `next`
 returns the highest-scoring next action for this agent with alternatives and
