@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 mod args;
 mod dispatch;
+mod graph_commands;
 mod output;
 mod query_commands;
 mod resources;

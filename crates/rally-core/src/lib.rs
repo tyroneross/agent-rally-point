@@ -12,6 +12,7 @@ pub mod context;
 pub mod cursors;
 pub mod diagnose;
 pub mod event;
+pub mod graph;
 pub mod preflight;
 pub mod query;
 pub mod repo;

@@ -88,6 +88,7 @@ pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Some("adapter") => run_adapter(args),
         Some("checkpoint") => run_checkpoint(args),
         Some("setup") => run_write("setup", args, parse_setup, execute_setup),
+        Some("graph") => crate::graph_commands::run(args),
         Some("ci") => run_ci(args),
         _ => {
             usage();

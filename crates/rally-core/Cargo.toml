@@ -12,6 +12,7 @@ rust-version.workspace = true
 chrono.workspace = true
 fs2.workspace = true
 rally-protocol = { path = "../rally-protocol" }
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
