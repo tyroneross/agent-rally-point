@@ -167,6 +167,10 @@ pub(crate) struct ReadCommand {
     pub(crate) peek: bool,
     /// Session id used to scope read cursors and presence.
     pub(crate) session_id: Option<String>,
+    /// Optional focus event id. When set, `rally context` attaches the
+    /// graph subgraph + causal chain rooted at this node, giving the
+    /// agent a neighborhood-bounded view instead of the full brief alone.
+    pub(crate) focus: Option<String>,
 }
 
 #[derive(Debug)]
@@ -585,6 +589,7 @@ pub(crate) fn parse_read(args: WriteArgs) -> Result<ReadCommand, CliError> {
     let since_cursor = args.has("--since-cursor");
     let peek = args.has("--peek");
     let session_id = args.one("--session-id");
+    let focus = args.one("--focus");
     Ok(ReadCommand {
         command: args.command,
         since: args.one("--since"),
@@ -596,6 +601,7 @@ pub(crate) fn parse_read(args: WriteArgs) -> Result<ReadCommand, CliError> {
         since_cursor,
         peek,
         session_id,
+        focus,
         common: args.common,
         identifier,
     })

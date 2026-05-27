@@ -167,6 +167,7 @@ impl WriteArgs {
                 | "--since"
                 | "--thread"
                 | "--limit"
+                | "--focus"
                 | "--stale-after-seconds"
                 | "--session-id"
                 | "--origin"

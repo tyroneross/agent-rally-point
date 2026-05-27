@@ -430,6 +430,83 @@ fn next_recommends_highest_scoring_action() {
 }
 
 #[test]
+fn context_focus_attaches_graph_neighborhood() {
+    // intent: `rally context --focus <event-id>` must return both the
+    // legacy brief AND a graph-backed neighborhood + causal chain rooted
+    // at the focus node. Without focus, the response omits the graph
+    // field. This is the additive migration path — old callers
+    // unchanged, new callers get bounded context.
+    let workspace = RallyWorkspace::new("rally-cli-context-focus");
+
+    // Build a small causal chain: task T1, derived task T2 depends on T1,
+    // artifact A1 produced by T1.
+    let t1 = json_stdout(workspace.run(&[
+        "task",
+        "--json",
+        "--tool",
+        "pi",
+        "--subject",
+        "foundation task",
+    ]));
+    let t1_id = t1["event_id"].as_str().unwrap().to_string();
+
+    json_stdout(workspace.run(&[
+        "task",
+        "--json",
+        "--tool",
+        "pi",
+        "--subject",
+        "follow-up task",
+        "--depends-on",
+        &t1_id,
+    ]));
+
+    json_stdout(workspace.run(&[
+        "artifact",
+        "--json",
+        "--tool",
+        "pi",
+        "--subject",
+        "deliverable for foundation",
+        "--artifact-kind",
+        "code",
+        "--ref-task",
+        &t1_id,
+    ]));
+
+    // Without --focus, brief is present but graph is omitted.
+    let plain = json_stdout(workspace.run(&["context", "--json", "--tool", "pi"]));
+    assert!(plain["data"]["brief"].is_object(), "plain context must include brief");
+    assert!(
+        plain["data"].get("graph").is_none(),
+        "plain context must not include graph field"
+    );
+
+    // With --focus, both brief and graph appear.
+    let focused = json_stdout(workspace.run(&[
+        "context",
+        "--json",
+        "--tool",
+        "pi",
+        "--focus",
+        &t1_id,
+    ]));
+    assert!(focused["data"]["brief"].is_object());
+    let graph = &focused["data"]["graph"];
+    assert!(graph.is_object(), "focused context must include graph field");
+    assert_eq!(graph["focus"], t1_id);
+    let node_count = graph["subgraph"]["nodes"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0);
+    assert!(
+        node_count >= 2,
+        "subgraph around the foundation task must include at least itself plus a neighbor"
+    );
+    workspace.cleanup();
+}
+
+#[test]
 fn next_drops_artifacts_after_non_producer_activity() {
     // intent: once a peer other than the artifact's producer posts a
     // follow-up event, that artifact must stop surfacing in `rally next`

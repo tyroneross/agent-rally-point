@@ -239,15 +239,48 @@ pub(super) fn execute_context(command: ReadCommand) -> Result<WriteOutput, CliEr
     } else {
         brief.recommended_next_action.reason.clone()
     };
-    Ok(query_output(
-        command.command,
-        &command.common,
-        &store,
-        text,
-        json!({
-            "brief": brief,
-        }),
-    ))
+
+    // When `--focus <event-id>` is set, attach a graph-backed neighborhood
+    // + causal chain so the agent gets bounded context instead of the
+    // firehose. Failure to open/catch-up the graph silently omits the
+    // graph field rather than failing the whole command — the legacy
+    // brief is still useful on its own.
+    let graph_view = command
+        .focus
+        .as_deref()
+        .map(|focus| focus_graph_view(&store, &records, focus));
+
+    let mut data = json!({ "brief": brief });
+    if let Some(view) = graph_view {
+        if let Some(payload) = view {
+            data["graph"] = payload;
+        }
+    }
+    Ok(query_output(command.command, &command.common, &store, text, data))
+}
+
+/// Best-effort: open the graph projection, catch up to the latest log
+/// position, and return `{subgraph, chain, status}` rooted at `focus`.
+/// Returns None on any graph error — caller treats this as a silent omit.
+fn focus_graph_view(
+    store: &ChannelStore,
+    records: &[Value],
+    focus: &str,
+) -> Option<Value> {
+    let mut conn = graph::init(store.channel_dir(), &now_rfc3339()).ok()?;
+    graph::catch_up(&mut conn, records, &now_rfc3339()).ok()?;
+    let meta = graph::read_meta(&conn).ok()?;
+    let subgraph = graph::subgraph_around(&conn, focus, 1).ok()?;
+    let chain = graph::causal_chain(&conn, focus, 5).ok()?;
+    let target = graph::get_node(&conn, focus).ok()?;
+    Some(json!({
+        "focus": focus,
+        "status": meta.status.as_str(),
+        "last_applied_seq": meta.last_applied_seq,
+        "target": target,
+        "subgraph": subgraph,
+        "chain": chain,
+    }))
 }
 
 pub(super) fn execute_packet(command: ReadCommand) -> Result<WriteOutput, CliError> {
