@@ -470,6 +470,25 @@ pub(super) fn execute_doctor(command: ReadCommand) -> Result<WriteOutput, CliErr
     ))
 }
 
+pub(super) fn execute_next(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let tool = command.common.tool();
+    let (store, records, now) = query_records(&command)?;
+    let projection = TraceProjection::from_records_at(&records, now);
+    let recommendation = next_recommendation(&projection, &tool, command.limit);
+    let text = recommendation
+        .get("subject")
+        .and_then(Value::as_str)
+        .unwrap_or("idle")
+        .to_string();
+    Ok(query_output(
+        "next",
+        &command.common,
+        &store,
+        text,
+        json!({ "next": recommendation }),
+    ))
+}
+
 pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliError> {
     let store = command.common.channel_store("setup")?;
     let mut status = setup_status(&store)?;
@@ -496,10 +515,13 @@ pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliErr
                 .target
                 .as_deref()
                 .ok_or_else(|| CliError::usage("setup", "setup install requires a tool id"))?;
-            if !matches!(adapter, "pi" | "claude" | "codex" | "cmux" | "herdr") {
+            if !matches!(
+                adapter,
+                "pi" | "claude" | "codex" | "gemini" | "cmux" | "herdr"
+            ) {
                 return Err(CliError::usage(
                     "setup",
-                    "unknown adapter; expected pi, claude, codex, cmux, or herdr",
+                    "unknown adapter; expected pi, claude, codex, gemini, cmux, or herdr",
                 ));
             }
             let install = if matches!(adapter, "cmux" | "herdr") {
@@ -562,7 +584,6 @@ pub(super) fn execute_judge(command: JudgeCommand) -> Result<WriteOutput, CliErr
             session_id: command.session_id,
             auto_claim: command.auto_claim,
             fail_open: command.fail_open,
-            _stale_after_seconds: command.stale_after_seconds,
         },
     )?;
     Ok(WriteOutput {
@@ -594,7 +615,6 @@ pub(super) fn execute_hook(command: HookCommand) -> Result<WriteOutput, CliError
             session_id: command.session_id,
             auto_claim: command.auto_claim,
             fail_open: command.fail_open,
-            _stale_after_seconds: command.stale_after_seconds,
         },
     )?;
     Ok(WriteOutput {
@@ -759,11 +779,11 @@ struct JudgmentInput {
     session_id: Option<String>,
     auto_claim: bool,
     fail_open: bool,
-    _stale_after_seconds: i64,
 }
 
 struct JudgmentResult {
     allow: bool,
+    fail_open_requested: bool,
     decision: String,
     severity: String,
     safe_to_write: bool,
@@ -781,6 +801,7 @@ impl JudgmentResult {
     fn to_json(&self) -> Value {
         json!({
             "allow": self.allow,
+            "fail_open_requested": self.fail_open_requested,
             "decision": self.decision,
             "severity": self.severity,
             "safe_to_write": self.safe_to_write,
@@ -960,10 +981,7 @@ fn build_judgment(
             .is_some_and(|code| stop_codes.contains(&code))
     });
     let pending_handoff = !pending.is_empty();
-    let mut allow = !has_stop_reason && !pending_handoff;
-    if input.fail_open && setup.enforcement != "strict" {
-        allow = true;
-    }
+    let allow = !has_stop_reason && !pending_handoff;
     let decision = if has_stop_reason {
         "pause"
     } else if pending_handoff {
@@ -982,6 +1000,7 @@ fn build_judgment(
     };
     Ok(JudgmentResult {
         allow,
+        fail_open_requested: input.fail_open,
         decision: decision.to_string(),
         severity: severity.to_string(),
         safe_to_write: allow && matches!(input.phase.as_str(), "before-write" | "write"),
@@ -994,6 +1013,155 @@ fn build_judgment(
         pending_handoffs: pending.into_iter().map(|item| json!(item)).collect(),
         claim_conflicts: path_conflicts,
     })
+}
+
+fn next_recommendation(projection: &TraceProjection, tool: &str, limit: usize) -> Value {
+    let profile = projection.profile(tool);
+    let role = profile
+        .as_ref()
+        .and_then(|profile| profile.role.as_deref())
+        .unwrap_or("general");
+    let capabilities = profile
+        .as_ref()
+        .map(|profile| profile.capabilities.clone())
+        .unwrap_or_default();
+    let mut candidates = Vec::<Value>::new();
+
+    for handoff in projection.pending_handoffs(Some(tool)) {
+        candidates.push(candidate(
+            "pick_up_handoff",
+            &handoff.event_id,
+            &handoff.subject,
+            100.0,
+            json!({ "handoff": 100.0 }),
+            vec![handoff.event_id.clone()],
+            vec!["required handoff is addressed to this tool".to_string()],
+        ));
+    }
+
+    for blocker in projection.active_blockers(None) {
+        let score = if blocker.tool.as_deref() == Some(tool) {
+            90.0
+        } else {
+            70.0
+        };
+        candidates.push(candidate(
+            "unblock_peer",
+            &blocker.event_id,
+            &blocker.subject,
+            score,
+            json!({ "blocker": score }),
+            vec![blocker.event_id.clone()],
+            vec!["active blocker is preventing progress".to_string()],
+        ));
+    }
+
+    for task in projection.active_tasks(Some(tool)) {
+        candidates.push(candidate(
+            "progress_owned_task",
+            &task.event_id,
+            &task.subject,
+            80.0,
+            json!({ "owned_task": 80.0, "role_match": role_match_bonus(role, &capabilities, "task") }),
+            vec![task.event_id.clone()],
+            vec!["open task is already owned by this tool".to_string()],
+        ));
+    }
+
+    for task in projection.active_tasks(None) {
+        if task.owner_tool.is_some() {
+            continue;
+        }
+        let bonus = role_match_bonus(role, &capabilities, "task");
+        candidates.push(candidate(
+            "claim_task",
+            &task.event_id,
+            &task.subject,
+            55.0 + bonus,
+            json!({ "unowned_task": 55.0, "role_match": bonus }),
+            vec![task.event_id.clone()],
+            vec!["open task has no owner".to_string()],
+        ));
+    }
+
+    for artifact in projection.artifacts(limit.max(3)) {
+        let bonus = role_match_bonus(role, &capabilities, "artifact");
+        candidates.push(candidate(
+            if bonus > 0.0 {
+                "review_artifact"
+            } else {
+                "consume_artifact"
+            },
+            &artifact.event_id,
+            &artifact.subject,
+            35.0 + bonus,
+            json!({ "artifact": 35.0, "role_match": bonus }),
+            vec![artifact.event_id.clone()],
+            vec!["recent artifact may need follow-up".to_string()],
+        ));
+    }
+
+    candidates.sort_by(|left, right| {
+        right["score"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .partial_cmp(&left["score"].as_f64().unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if candidates.is_empty() {
+        return json!({
+            "action_kind": "idle",
+            "target_event_id": null,
+            "subject": "no actionable work",
+            "reasoning": ["no pending handoffs, blockers, tasks, or artifacts scored above threshold"],
+            "source_event_ids": [],
+            "score": 0.0,
+            "factors": {},
+            "alternatives": []
+        });
+    }
+    let top = candidates.remove(0);
+    let alternatives = candidates.into_iter().take(3).collect::<Vec<_>>();
+    json!({
+        "action_kind": top["action_kind"],
+        "target_event_id": top["target_event_id"],
+        "subject": top["subject"],
+        "reasoning": top["reasoning"],
+        "source_event_ids": top["source_event_ids"],
+        "score": top["score"],
+        "factors": top["factors"],
+        "alternatives": alternatives,
+    })
+}
+
+fn candidate(
+    action_kind: &str,
+    target_event_id: &str,
+    subject: &str,
+    score: f64,
+    factors: Value,
+    source_event_ids: Vec<String>,
+    reasoning: Vec<String>,
+) -> Value {
+    json!({
+        "action_kind": action_kind,
+        "target_event_id": target_event_id,
+        "subject": subject,
+        "reasoning": reasoning,
+        "source_event_ids": source_event_ids,
+        "score": score,
+        "factors": factors,
+    })
+}
+
+fn role_match_bonus(role: &str, capabilities: &[String], kind: &str) -> f64 {
+    let has_capability = |needle: &str| capabilities.iter().any(|value| value.contains(needle));
+    match kind {
+        "artifact" if role.contains("review") || has_capability("review") => 25.0,
+        "task" if role.contains("builder") || has_capability("build") => 15.0,
+        "task" if role.contains("architect") || has_capability("design") => 10.0,
+        _ => 0.0,
+    }
 }
 
 fn load_records_cached_or_empty(
@@ -1111,12 +1279,24 @@ struct AdapterInstall {
 }
 
 fn write_tool_install(tool: &str) -> Result<AdapterInstall, CliError> {
-    let dir = rally_hooks_dir()?;
+    match tool {
+        "pi" => install_pi_extension(),
+        "claude" => install_claude_hooks(),
+        "codex" => install_codex_hooks(),
+        "gemini" => install_gemini_hooks(),
+        _ => Err(CliError::usage("setup", "unknown tool for install")),
+    }
+}
+
+fn install_pi_extension() -> Result<AdapterInstall, CliError> {
+    let dir = pi_extensions_dir()?;
     fs::create_dir_all(&dir).map_err(|err| {
-        CliError::runtime("setup", format!("failed to create rally hooks dir: {err}"))
+        CliError::runtime("setup", format!("failed to create Pi extension dir: {err}"))
     })?;
-    let path = dir.join(format!("{tool}-rally-wrapper.sh"));
-    write_executable(&path, &agent_wrapper_script(tool))?;
+    let path = dir.join("rally-judgment.ts");
+    fs::write(&path, pi_rally_extension()).map_err(|err| {
+        CliError::runtime("setup", format!("failed to write Pi extension: {err}"))
+    })?;
     Ok(AdapterInstall {
         primary_path: Some(path.display().to_string()),
         files: vec![path.display().to_string()],
@@ -1124,17 +1304,260 @@ fn write_tool_install(tool: &str) -> Result<AdapterInstall, CliError> {
     })
 }
 
+fn install_claude_hooks() -> Result<AdapterInstall, CliError> {
+    let dir = home_dot(".claude")?;
+    let hooks_dir = dir.join("hooks");
+    fs::create_dir_all(&hooks_dir).map_err(|err| {
+        CliError::runtime("setup", format!("failed to create Claude hooks dir: {err}"))
+    })?;
+    let script = hooks_dir.join("rally-hook.sh");
+    write_executable(&script, &native_hook_script("claude"))?;
+    let settings = dir.join("settings.json");
+    let mut value = read_json_object_or_default(&settings)?;
+    add_native_hook(
+        &mut value,
+        "SessionStart",
+        Some("startup|clear"),
+        &format!(
+            "bash {} start claude",
+            shell_quote(&script.display().to_string())
+        ),
+        5000,
+    );
+    add_native_hook(
+        &mut value,
+        "UserPromptSubmit",
+        None,
+        &format!(
+            "bash {} idle claude",
+            shell_quote(&script.display().to_string())
+        ),
+        5000,
+    );
+    add_native_hook(
+        &mut value,
+        "PreToolUse",
+        Some("Write|Edit|NotebookEdit"),
+        &format!(
+            "bash {} before-write claude",
+            shell_quote(&script.display().to_string())
+        ),
+        10000,
+    );
+    add_native_hook(
+        &mut value,
+        "Stop",
+        None,
+        &format!(
+            "bash {} after-write claude",
+            shell_quote(&script.display().to_string())
+        ),
+        5000,
+    );
+    write_json_pretty(&settings, &value)?;
+    Ok(AdapterInstall {
+        primary_path: Some(script.display().to_string()),
+        files: vec![script.display().to_string(), settings.display().to_string()],
+        modified_config: Some(settings.display().to_string()),
+    })
+}
+
+fn install_codex_hooks() -> Result<AdapterInstall, CliError> {
+    let dir = codex_home()?;
+    fs::create_dir_all(&dir)
+        .map_err(|err| CliError::runtime("setup", format!("failed to create Codex home: {err}")))?;
+    let script = dir.join("rally-hook.sh");
+    write_executable(&script, &native_hook_script("codex"))?;
+    let hooks = dir.join("hooks.json");
+    let mut value = read_json_object_or_default(&hooks)?;
+    add_native_hook(
+        &mut value,
+        "SessionStart",
+        None,
+        &format!(
+            "bash {} start codex",
+            shell_quote(&script.display().to_string())
+        ),
+        5000,
+    );
+    add_native_hook(
+        &mut value,
+        "UserPromptSubmit",
+        None,
+        &format!(
+            "bash {} idle codex",
+            shell_quote(&script.display().to_string())
+        ),
+        5000,
+    );
+    add_native_hook(
+        &mut value,
+        "PreToolUse",
+        None,
+        &format!(
+            "bash {} before-write codex",
+            shell_quote(&script.display().to_string())
+        ),
+        10000,
+    );
+    add_native_hook(
+        &mut value,
+        "Stop",
+        None,
+        &format!(
+            "bash {} after-write codex",
+            shell_quote(&script.display().to_string())
+        ),
+        5000,
+    );
+    write_json_pretty(&hooks, &value)?;
+    let config = dir.join("config.toml");
+    upsert_marked_block(
+        &config,
+        "# BEGIN rally codex hooks",
+        "# END rally codex hooks",
+        "# BEGIN rally codex hooks\n[features]\nhooks = true\n# END rally codex hooks\n",
+    )?;
+    Ok(AdapterInstall {
+        primary_path: Some(hooks.display().to_string()),
+        files: vec![
+            script.display().to_string(),
+            hooks.display().to_string(),
+            config.display().to_string(),
+        ],
+        modified_config: Some(hooks.display().to_string()),
+    })
+}
+
+fn install_gemini_hooks() -> Result<AdapterInstall, CliError> {
+    let dir = home_dot(".gemini")?;
+    fs::create_dir_all(&dir)
+        .map_err(|err| CliError::runtime("setup", format!("failed to create Gemini dir: {err}")))?;
+    let script = dir.join("rally-hook.sh");
+    write_executable(&script, &native_hook_script("gemini"))?;
+    let settings = dir.join("settings.json");
+    let mut value = read_json_object_or_default(&settings)?;
+    add_native_hook(
+        &mut value,
+        "SessionStart",
+        None,
+        &format!(
+            "bash {} start gemini",
+            shell_quote(&script.display().to_string())
+        ),
+        10000,
+    );
+    add_native_hook(
+        &mut value,
+        "BeforeAgent",
+        None,
+        &format!(
+            "bash {} idle gemini",
+            shell_quote(&script.display().to_string())
+        ),
+        10000,
+    );
+    add_native_hook(
+        &mut value,
+        "PreToolUse",
+        None,
+        &format!(
+            "bash {} before-write gemini",
+            shell_quote(&script.display().to_string())
+        ),
+        10000,
+    );
+    add_native_hook(
+        &mut value,
+        "AfterAgent",
+        None,
+        &format!(
+            "bash {} after-write gemini",
+            shell_quote(&script.display().to_string())
+        ),
+        10000,
+    );
+    write_json_pretty(&settings, &value)?;
+    Ok(AdapterInstall {
+        primary_path: Some(settings.display().to_string()),
+        files: vec![script.display().to_string(), settings.display().to_string()],
+        modified_config: Some(settings.display().to_string()),
+    })
+}
+
 fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
     let mut files = Vec::new();
     let mut modified_config = None;
-    if matches!(tool, "pi" | "claude" | "codex") {
-        let path = rally_hooks_dir()?.join(format!("{tool}-rally-wrapper.sh"));
+    if tool == "pi" {
+        let path = pi_extensions_dir()?.join("rally-judgment.ts");
         if path.exists() {
             fs::remove_file(&path).map_err(|err| {
-                CliError::runtime("setup", format!("failed to remove wrapper: {err}"))
+                CliError::runtime("setup", format!("failed to remove Pi extension: {err}"))
             })?;
         }
         files.push(path.display().to_string());
+    } else if tool == "claude" {
+        let dir = home_dot(".claude")?;
+        let script = dir.join("hooks/rally-hook.sh");
+        if script.exists() {
+            fs::remove_file(&script).map_err(|err| {
+                CliError::runtime("setup", format!("failed to remove Claude hook: {err}"))
+            })?;
+        }
+        files.push(script.display().to_string());
+        let settings = dir.join("settings.json");
+        if settings.exists() {
+            let mut value = read_json_object_or_default(&settings)?;
+            remove_rally_native_hooks(&mut value);
+            write_json_pretty(&settings, &value)?;
+            modified_config = Some(settings.display().to_string());
+        }
+    } else if tool == "codex" {
+        let dir = codex_home()?;
+        let script = dir.join("rally-hook.sh");
+        if script.exists() {
+            fs::remove_file(&script).map_err(|err| {
+                CliError::runtime("setup", format!("failed to remove Codex hook: {err}"))
+            })?;
+        }
+        files.push(script.display().to_string());
+        let hooks = dir.join("hooks.json");
+        if hooks.exists() {
+            let mut value = read_json_object_or_default(&hooks)?;
+            remove_rally_native_hooks(&mut value);
+            write_json_pretty(&hooks, &value)?;
+            modified_config = Some(hooks.display().to_string());
+        }
+        let config = dir.join("config.toml");
+        if config.exists() {
+            let existing = fs::read_to_string(&config).map_err(|err| {
+                CliError::runtime("setup", format!("failed to read Codex config: {err}"))
+            })?;
+            let next = remove_marked_block(
+                &existing,
+                "# BEGIN rally codex hooks",
+                "# END rally codex hooks",
+            );
+            fs::write(&config, next).map_err(|err| {
+                CliError::runtime("setup", format!("failed to write Codex config: {err}"))
+            })?;
+        }
+    } else if tool == "gemini" {
+        let dir = home_dot(".gemini")?;
+        let script = dir.join("rally-hook.sh");
+        if script.exists() {
+            fs::remove_file(&script).map_err(|err| {
+                CliError::runtime("setup", format!("failed to remove Gemini hook: {err}"))
+            })?;
+        }
+        files.push(script.display().to_string());
+        let settings = dir.join("settings.json");
+        if settings.exists() {
+            let mut value = read_json_object_or_default(&settings)?;
+            remove_rally_native_hooks(&mut value);
+            write_json_pretty(&settings, &value)?;
+            modified_config = Some(settings.display().to_string());
+        }
     } else if tool == "cmux" {
         let dir = adapter_config_dir("RALLY_CMUX_CONFIG_DIR", "cmux")?;
         let wrapper = dir.join("rally-agent-wrapper.sh");
@@ -1200,25 +1623,206 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
     })
 }
 
-fn rally_hooks_dir() -> Result<PathBuf, CliError> {
-    if let Ok(value) = env::var("RALLY_HOOKS_DIR") {
-        return Ok(PathBuf::from(value));
-    }
+fn home_dot(name: &str) -> Result<PathBuf, CliError> {
     let home = env::var("HOME")
-        .map_err(|_| CliError::runtime("setup", "HOME is required to install hooks"))?;
-    Ok(PathBuf::from(home).join(".agent-rally-point/hooks"))
+        .map_err(|_| CliError::runtime("setup", format!("HOME is required for {name}")))?;
+    Ok(PathBuf::from(home).join(name))
 }
 
-fn agent_wrapper_script(tool: &str) -> String {
-    format!(
-        r#"#!/usr/bin/env bash
+fn pi_extensions_dir() -> Result<PathBuf, CliError> {
+    if let Ok(value) = env::var("PI_CODING_AGENT_DIR") {
+        return Ok(PathBuf::from(value).join("extensions"));
+    }
+    Ok(home_dot(".pi")?.join("agent/extensions"))
+}
+
+fn codex_home() -> Result<PathBuf, CliError> {
+    if let Ok(value) = env::var("CODEX_HOME") {
+        return Ok(PathBuf::from(value));
+    }
+    home_dot(".codex")
+}
+
+fn read_json_object_or_default(path: &Path) -> Result<Value, CliError> {
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let text = fs::read_to_string(path).map_err(|err| {
+        CliError::runtime("setup", format!("failed to read {}: {err}", path.display()))
+    })?;
+    serde_json::from_str::<Value>(&text).map_err(|err| {
+        CliError::runtime(
+            "setup",
+            format!("failed to parse {}: {err}", path.display()),
+        )
+    })
+}
+
+fn write_json_pretty(path: &Path, value: &Value) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::runtime(
+                "setup",
+                format!("failed to create {}: {err}", parent.display()),
+            )
+        })?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(value).unwrap()).map_err(|err| {
+        CliError::runtime(
+            "setup",
+            format!("failed to write {}: {err}", path.display()),
+        )
+    })
+}
+
+fn add_native_hook(
+    value: &mut Value,
+    event: &str,
+    matcher: Option<&str>,
+    command: &str,
+    timeout: u64,
+) {
+    if !value.is_object() {
+        *value = json!({});
+    }
+    let object = value.as_object_mut().unwrap();
+    let hooks = object.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        *hooks = json!({});
+    }
+    let event_hooks = hooks
+        .as_object_mut()
+        .unwrap()
+        .entry(event)
+        .or_insert_with(|| json!([]));
+    if !event_hooks.is_array() {
+        *event_hooks = json!([]);
+    }
+    let entries = event_hooks.as_array_mut().unwrap();
+    if entries
+        .iter()
+        .any(|entry| entry.to_string().contains(command))
+    {
+        return;
+    }
+    let mut entry = json!({
+        "hooks": [{
+            "type": "command",
+            "command": command,
+            "timeout": timeout
+        }]
+    });
+    if let Some(matcher) = matcher {
+        entry["matcher"] = Value::String(matcher.to_string());
+    }
+    entries.push(entry);
+}
+
+fn remove_rally_native_hooks(value: &mut Value) {
+    let Some(hooks) = value.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for entries in hooks.values_mut() {
+        let Some(array) = entries.as_array_mut() else {
+            continue;
+        };
+        array.retain(|entry| !entry.to_string().contains("rally-hook.sh"));
+    }
+}
+
+fn upsert_marked_block(path: &Path, begin: &str, end: &str, block: &str) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::runtime(
+                "setup",
+                format!("failed to create {}: {err}", parent.display()),
+            )
+        })?;
+    }
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let next = replace_marked_block(&existing, begin, end, block);
+    fs::write(path, next).map_err(|err| {
+        CliError::runtime(
+            "setup",
+            format!("failed to write {}: {err}", path.display()),
+        )
+    })
+}
+
+fn native_hook_script(default_tool: &str) -> String {
+    r#"#!/usr/bin/env bash
 set -euo pipefail
-tool="{tool}"
-session="${{RALLY_SESSION_ID:-${{tool}}-$(date +%s)}}"
-rally hook start --tool "$tool" --session-id "$session" --json > "${{TMPDIR:-/tmp}}/rally-${{tool}}-${{session}}.json"
-exec "$tool" "$@"
+phase="${1:-idle}"
+tool="${2:-DEFAULT_TOOL}"
+input="$(cat || true)"
+path="$({ printf '%s' "$input" | node -e '
+let data=""; process.stdin.on("data", c => data += c); process.stdin.on("end", () => {
+  try {
+    const value = JSON.parse(data || "{}");
+    const input = value.tool_input || value.toolInput || value.input || value;
+    const path = input.file_path || input.filePath || input.path || input.notebook_path || "";
+    if (path) process.stdout.write(String(path));
+  } catch (_) {}
+});
+' ; } 2>/dev/null)"
+args=(hook "$phase" --tool "$tool" --json --fail-open)
+if [ -n "$path" ]; then
+  args+=(--path "$path")
+  if [ "$phase" = "before-write" ]; then args+=(--auto-claim); fi
+fi
+rally "${args[@]}" 2>/dev/null || echo '{"allow":true,"rally_error":"hook failed open"}'
 "#
-    )
+    .replace("DEFAULT_TOOL", default_tool)
+}
+
+fn pi_rally_extension() -> &'static str {
+    r#"// rally-pi-judgment-extension-marker v1
+// Installed by `rally setup install pi`. DO NOT EDIT MANUALLY.
+import { spawnSync } from "node:child_process";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+function runRally(args: string[], input?: unknown): string {
+  const result = spawnSync("rally", args, {
+    input: input === undefined ? undefined : JSON.stringify(input),
+    encoding: "utf8",
+    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    timeout: 10000,
+  });
+  return result.stdout || result.stderr || "";
+}
+
+function pathFromTool(event: any): string | undefined {
+  const input = event?.input || {};
+  return input.path || input.file_path || input.filePath || input.notebook_path;
+}
+
+export default function rallyJudgment(pi: ExtensionAPI) {
+  pi.on("session_start", async (_event, ctx) => {
+    const session = ctx.sessionManager.getSessionId?.() || `${Date.now()}`;
+    runRally(["hook", "start", "--tool", "pi", "--session-id", session, "--json", "--fail-open"]);
+  });
+
+  pi.on("before_agent_start", async (_event, _ctx) => {
+    runRally(["hook", "idle", "--tool", "pi", "--json", "--fail-open"]);
+  });
+
+  pi.on("tool_call", async (event) => {
+    const name = event.toolName;
+    if (!["write", "edit", "serena_replace_content", "serena_replace_symbol_body"].includes(name)) return;
+    const path = pathFromTool(event);
+    const args = ["hook", "before-write", "--tool", "pi", "--json"];
+    if (path) args.push("--path", path, "--auto-claim");
+    const output = runRally(args, event);
+    try {
+      const parsed = JSON.parse(output);
+      const hook = parsed?.data?.hook || parsed?.data?.judgment || parsed;
+      if (hook?.allow === false || hook?.judgment?.allow === false) {
+        return { block: true, reason: `Rally blocked write: ${output}` };
+      }
+    } catch (_) {}
+  });
+}
+"#
 }
 
 fn write_adapter_install(store: &ChannelStore, adapter: &str) -> Result<AdapterInstall, CliError> {

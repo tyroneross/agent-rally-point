@@ -13,7 +13,7 @@ use crate::query_commands::{
     execute_adapter_contract, execute_blockers, execute_checkpoint_rebuild,
     execute_checkpoint_status, execute_ci_gate, execute_claims, execute_cmux_packet,
     execute_conflicts, execute_context, execute_diagnose, execute_doctor, execute_herdr_inject,
-    execute_herdr_packet, execute_hook, execute_inbox, execute_judge, execute_packet,
+    execute_herdr_packet, execute_hook, execute_inbox, execute_judge, execute_next, execute_packet,
     execute_repair, execute_replay, execute_report, execute_score, execute_setup, execute_start,
     execute_thread,
 };
@@ -73,6 +73,7 @@ pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Some("packet") => run_read("packet", args, parse_read, execute_packet),
         Some("diagnose") => run_read("diagnose", args, parse_read, execute_diagnose),
         Some("doctor") => run_read("doctor", args, parse_read, execute_doctor),
+        Some("next") => run_read("next", args, parse_read, execute_next),
         Some("judge") => run_write("judge", args, parse_judge, execute_judge),
         Some("hook") => run_write("hook", args, parse_hook, execute_hook),
         Some("repair") => run_write("repair", args, parse_repair, execute_repair),
@@ -389,6 +390,7 @@ fn usage() {
     eprintln!("       rally sync export [--json] [--since <window>] > packet.json");
     eprintln!("       rally sync import [--json] [--trust-policy <trust.toml>] <packet.json>");
     eprintln!("       rally doctor [--tool <tool>] [--json]");
+    eprintln!("       rally next --tool <tool> --json");
     eprintln!("       rally judge --tool <tool> [--phase <phase>] [--path <path>] [--json]");
     eprintln!("       rally hook <phase> --tool <tool> [--path <path>] [--auto-claim] [--json]");
     eprintln!("       rally repair [checkpoint|profile] [--json]");

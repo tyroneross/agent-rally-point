@@ -43,6 +43,7 @@ state out of Rally.
 
 At work boundaries, call the judgment layer:
 
+- To decide what to do next: `rally next --tool <tool> --json`
 - Before editing: `rally hook before-write --tool <tool> --path <path> --auto-claim --json`
 - After a batch: `rally hook after-write --tool <tool> --json`
 - Before commit/push: `rally hook before-commit --tool <tool> --json`

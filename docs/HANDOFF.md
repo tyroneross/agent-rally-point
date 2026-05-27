@@ -57,6 +57,11 @@ SPDX-License-Identifier: Apache-2.0
   anonymous tool/from_tool/owner_tool writes.
 - Adds `rally judge` and `rally hook <phase>` as the continuous judgment layer;
   `hook before-write --auto-claim` claims safe paths and stops on conflicts.
+- Adds `rally next` as the ranked recommendation surface over handoffs,
+  blockers, owned/unowned tasks, and recent artifacts.
+- Reworks setup installs to use actual native surfaces: Pi extensions, Claude
+  hooks, Codex hooks/config, Gemini hooks, cmux hooks, and Herdr integration
+  config.
 - Adds `rally repair`, `rally setup uninstall <tool>`, and `rally ci gate` plus a
   GitHub Actions merge gate workflow.
 - Adds initial formal JSON schema files in `docs/schemas/` and a dogfood report

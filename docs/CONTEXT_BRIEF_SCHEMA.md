@@ -301,10 +301,18 @@ installs edge hooks in the harness config directory:
 Tests may override those locations with `RALLY_CMUX_CONFIG_DIR` and
 `RALLY_HERDR_CONFIG_DIR`.
 
-`rally setup install <pi|claude|codex>` writes a small wrapper under
-`~/.agent-rally-point/hooks/` that calls `rally hook start` before execing the
-agent binary. `rally setup uninstall <tool>` removes the wrapper or marked
-adapter config block.
+`rally setup install <pi|claude|codex|gemini>` uses each tool's native hook
+surface rather than PATH shadowing:
+
+- Pi: `~/.pi/agent/extensions/rally-judgment.ts` via Pi's extension API.
+- Claude: `~/.claude/settings.json` hook entries plus
+  `~/.claude/hooks/rally-hook.sh`.
+- Codex: `~/.codex/hooks.json`, `~/.codex/config.toml` hook enablement, and
+  `~/.codex/rally-hook.sh`.
+- Gemini: `~/.gemini/settings.json` hook entries plus `~/.gemini/rally-hook.sh`.
+
+`rally setup uninstall <tool>` removes generated Rally hooks or marked adapter
+config blocks.
 
 `rally doctor --tool <tool> --json` combines deterministic diagnosis,
 checkpoint status, setup enforcement, active anonymous claims/tasks/handoffs,
@@ -316,12 +324,18 @@ Formal schema files for agent-facing contracts live in `docs/schemas/`:
 
 - `agent-rally.command.start.v1.json`
 - `agent-rally.command.packet.v1.json`
+- `agent-rally.command.next.v1.json`
 - `agent-rally.command.doctor.v1.json`
 - `agent-rally.command.setup.v1.json`
 - `agent-rally.command.judge.v1.json`
 - `agent-rally.command.hook.v1.json`
 
 ## Judgment and Hook Contracts
+
+`rally next --tool <tool> --json` is the ranked next-action surface. It returns
+one top recommendation plus alternatives, source events, score, and factor
+breakdown. It is deterministic derived state over the log: pending handoffs,
+blockers, owned tasks, unowned tasks, and recent artifacts are candidate sources.
 
 `rally judge --tool <tool> --phase <phase> --json` is the pure judgment surface.
 It answers whether the agent should continue, pause, acknowledge a handoff, or

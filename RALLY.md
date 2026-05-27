@@ -8,6 +8,7 @@ surface you need; everything else in `docs/` is reference.
 
 ```bash
 rally <you>                                                       # session start
+rally next --tool <you> --json                                    # best next action
 rally judge --tool <you> --phase idle --json                      # decide what now
 rally hook before-write --tool <you> --path <path> --auto-claim   # write gate
 rally inbox --tool <you> --since-cursor --session-id <id> --json  # mid-session check
@@ -15,9 +16,9 @@ rally handoff --to <peer> --subject "<what you're handing off>"   # give work aw
 rally ack --tool <you> <handoff-id> --summary "<what you did>"    # close work
 ```
 
-That's the load-bearing surface. Startup gives context, judgment tells
-you whether to continue, hooks protect boundaries, and handoff/ack close
-obligations.
+That's the load-bearing surface. Startup gives context, `next` chooses the most
+useful action, judgment tells you whether to continue, hooks protect boundaries,
+and handoff/ack close obligations.
 
 ## Identify yourself
 

@@ -15,9 +15,10 @@
       "properties": {
         "judgment": {
           "type": "object",
-          "required": ["allow", "decision", "severity", "safe_to_write", "context_stale", "new_events_since_cursor", "reasons", "required_actions"],
+          "required": ["allow", "fail_open_requested", "decision", "severity", "safe_to_write", "context_stale", "new_events_since_cursor", "reasons", "required_actions"],
           "properties": {
             "allow": { "type": "boolean" },
+            "fail_open_requested": { "type": "boolean" },
             "decision": { "enum": ["continue", "pause", "ack_handoff", "refresh_context"] },
             "severity": { "enum": ["ok", "warn", "stop"] },
             "safe_to_write": { "type": "boolean" },

@@ -223,7 +223,6 @@ pub(crate) struct JudgeCommand {
     pub(crate) session_id: Option<String>,
     pub(crate) auto_claim: bool,
     pub(crate) fail_open: bool,
-    pub(crate) stale_after_seconds: i64,
 }
 
 #[derive(Debug)]
@@ -234,7 +233,6 @@ pub(crate) struct HookCommand {
     pub(crate) session_id: Option<String>,
     pub(crate) auto_claim: bool,
     pub(crate) fail_open: bool,
-    pub(crate) stale_after_seconds: i64,
 }
 
 #[derive(Debug)]
@@ -334,7 +332,7 @@ pub(crate) fn parse_setup(args: WriteArgs) -> Result<SetupCommand, CliError> {
         _ => {
             return Err(CliError::usage(
                 args.command,
-                "setup accepts: setup | setup install <pi|claude|codex|cmux|herdr> | setup uninstall <pi|claude|codex|cmux|herdr> | setup enforcement <off|warn|strict>",
+                "setup accepts: setup | setup install <pi|claude|codex|gemini|cmux|herdr> | setup uninstall <pi|claude|codex|gemini|cmux|herdr> | setup enforcement <off|warn|strict>",
             ));
         }
     };
@@ -347,11 +345,6 @@ pub(crate) fn parse_setup(args: WriteArgs) -> Result<SetupCommand, CliError> {
 
 pub(crate) fn parse_judge(args: WriteArgs) -> Result<JudgeCommand, CliError> {
     let phase = args.one("--phase").unwrap_or_else(|| "idle".to_string());
-    let stale_after_seconds = args
-        .one("--stale-after-seconds")
-        .map(|value| parse_i64(args.command, "--stale-after-seconds", &value))
-        .transpose()?
-        .unwrap_or(300);
     if !args.positional.is_empty() {
         return Err(CliError::usage(
             args.command,
@@ -369,7 +362,6 @@ pub(crate) fn parse_judge(args: WriteArgs) -> Result<JudgeCommand, CliError> {
         session_id,
         auto_claim,
         fail_open,
-        stale_after_seconds,
     })
 }
 
@@ -384,11 +376,6 @@ pub(crate) fn parse_hook(args: WriteArgs) -> Result<HookCommand, CliError> {
             ));
         }
     };
-    let stale_after_seconds = args
-        .one("--stale-after-seconds")
-        .map(|value| parse_i64(args.command, "--stale-after-seconds", &value))
-        .transpose()?
-        .unwrap_or(300);
     let path = args.one("--path");
     let session_id = args.one("--session-id");
     let auto_claim = args.has("--auto-claim");
@@ -400,7 +387,6 @@ pub(crate) fn parse_hook(args: WriteArgs) -> Result<HookCommand, CliError> {
         session_id,
         auto_claim,
         fail_open,
-        stale_after_seconds,
     })
 }
 

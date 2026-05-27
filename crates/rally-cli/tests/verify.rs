@@ -386,21 +386,62 @@ fn hook_before_write_auto_claims_and_blocks_conflicts() {
 }
 
 #[test]
+fn next_recommends_highest_scoring_action() {
+    let workspace = RallyWorkspace::new("rally-cli-next");
+    json_stdout(workspace.run(&[
+        "task",
+        "--json",
+        "--tool",
+        "pi",
+        "--owner",
+        "pi",
+        "--subject",
+        "owned task",
+    ]));
+    let owned = json_stdout(workspace.run(&["next", "--json", "--tool", "pi"]));
+    assert_eq!(owned["data"]["next"]["action_kind"], "progress_owned_task");
+
+    json_stdout(workspace.run(&[
+        "handoff",
+        "--json",
+        "--tool",
+        "codex",
+        "--from-tool",
+        "codex",
+        "--to",
+        "pi",
+        "--subject",
+        "review this first",
+    ]));
+    let handoff = json_stdout(workspace.run(&["next", "--json", "--tool", "pi"]));
+    assert_eq!(handoff["data"]["next"]["action_kind"], "pick_up_handoff");
+    assert_eq!(handoff["data"]["next"]["subject"], "review this first");
+    assert_eq!(
+        handoff["data"]["next"]["alternatives"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    workspace.cleanup();
+}
+
+#[test]
 fn setup_install_and_uninstall_agent_wrapper() {
     let workspace = RallyWorkspace::new("rally-cli-agent-wrapper");
     let install = json_stdout(workspace.run(&["setup", "install", "pi", "--json"]));
-    let wrapper = workspace
+    let extension = workspace
         .home
-        .join(".agent-rally-point/hooks/pi-rally-wrapper.sh");
+        .join(".pi/agent/extensions/rally-judgment.ts");
     assert_eq!(
         install["data"]["setup"]["installed_path"],
-        wrapper.display().to_string()
+        extension.display().to_string()
     );
-    assert!(wrapper.exists());
+    assert!(extension.exists());
     assert!(
-        fs::read_to_string(&wrapper)
+        fs::read_to_string(&extension)
             .unwrap()
-            .contains("rally hook start")
+            .contains("tool_call")
     );
 
     let uninstall = json_stdout(workspace.run(&["setup", "uninstall", "pi", "--json"]));
@@ -411,7 +452,51 @@ fn setup_install_and_uninstall_agent_wrapper() {
             .len()
             == 1
     );
-    assert!(!wrapper.exists());
+    assert!(!extension.exists());
+
+    let claude = json_stdout(workspace.run(&["setup", "install", "claude", "--json"]));
+    let claude_settings = workspace.home.join(".claude/settings.json");
+    let claude_hook = workspace.home.join(".claude/hooks/rally-hook.sh");
+    assert_eq!(
+        claude["data"]["setup"]["modified_external_config"],
+        claude_settings.display().to_string()
+    );
+    assert!(claude_hook.exists());
+    assert!(
+        fs::read_to_string(&claude_settings)
+            .unwrap()
+            .contains("PreToolUse")
+    );
+
+    let codex = json_stdout(workspace.run(&["setup", "install", "codex", "--json"]));
+    let codex_hooks = workspace.home.join(".codex/hooks.json");
+    let codex_config = workspace.home.join(".codex/config.toml");
+    assert_eq!(
+        codex["data"]["setup"]["modified_external_config"],
+        codex_hooks.display().to_string()
+    );
+    assert!(
+        fs::read_to_string(&codex_hooks)
+            .unwrap()
+            .contains("PreToolUse")
+    );
+    assert!(
+        fs::read_to_string(&codex_config)
+            .unwrap()
+            .contains("hooks = true")
+    );
+
+    let gemini = json_stdout(workspace.run(&["setup", "install", "gemini", "--json"]));
+    let gemini_settings = workspace.home.join(".gemini/settings.json");
+    assert_eq!(
+        gemini["data"]["setup"]["modified_external_config"],
+        gemini_settings.display().to_string()
+    );
+    assert!(
+        fs::read_to_string(&gemini_settings)
+            .unwrap()
+            .contains("PreToolUse")
+    );
     workspace.cleanup();
 }
 

@@ -1,8 +1,8 @@
 # Judgment Layer — Design Memo
 
-Status: implemented as the v1 boundary judgment layer. `rally judge` and
-`rally hook <phase>` provide the closed loop; deeper ranked candidate scoring
-remains future work.
+Status: implemented as the v1 boundary judgment + recommendation layer.
+`rally next` ranks candidate work; `rally judge` and `rally hook <phase>` provide
+the closed loop. Deeper weight tuning remains future work.
 
 ## Problem
 
@@ -134,6 +134,16 @@ Each candidate gets scored. Top one wins. Ties broken by recency.
 5. **What about the receiver-pull problem** — does the judgment layer make `rally claim` from receiver-side first-class? An agent picks up via `rally next` → top recommendation is `claim_task` → agent fires `rally claim`. The pull *is* the routing.
 
 6. **Versioning and stability** — `rally next` output schema needs to be stable for agents. Version it from day one (`schema: agent-rally.next.v1`).
+
+## Implemented v1
+
+- Candidate sources: pending handoffs, active blockers, owned tasks, unowned
+  tasks, and recent artifacts.
+- Scoring: deterministic fixed weights with role/capability bonuses.
+- Output: one top recommendation plus top alternatives, source event ids,
+  factors, score, and reasoning.
+- Boundary enforcement: `rally judge` and `rally hook` stop unsafe work and can
+  auto-claim before writes.
 
 ## Concrete next steps (suggested)
 

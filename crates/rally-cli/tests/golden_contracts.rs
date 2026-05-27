@@ -216,6 +216,9 @@ fn type_matches(type_schema: &Value, value: &Value) -> bool {
         "array" => value.is_array(),
         "string" => value.is_string(),
         "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => {
+            value.as_f64().is_some() || value.as_i64().is_some() || value.as_u64().is_some()
+        }
         "boolean" => value.is_boolean(),
         "null" => value.is_null(),
         other => panic!("unsupported schema type {other}"),
@@ -411,6 +414,8 @@ fn golden_outputs_match_formal_json_schemas() {
     assert_matches_schema("agent-rally.command.doctor.v1.json", &doctor);
     let setup = workspace.json(&["setup", "--json"]);
     assert_matches_schema("agent-rally.command.setup.v1.json", &setup);
+    let next = workspace.json(&["next", "--json", "--tool", "pi"]);
+    assert_matches_schema("agent-rally.command.next.v1.json", &next);
     let judge = workspace.json(&["judge", "--json", "--tool", "pi"]);
     assert_matches_schema("agent-rally.command.judge.v1.json", &judge);
     let hook = workspace.json(&["hook", "idle", "--json", "--tool", "pi"]);
