@@ -32,11 +32,13 @@ use std::path::{Path, PathBuf};
 pub use rusqlite::Connection as GraphConnection;
 
 /// Bumped when the projection schema or builder semantics change. Triggers
-/// a full rebuild on next `catch_up`. v2 added the `producer_tool` column
-/// on `nodes` and changed `unconsumed_artifacts` to "no later non-producer
-/// activity" (vs the v1 "no reviewed_by edge", which missed the real
-/// review flow where acks live on handoffs not artifacts).
-pub const SCHEMA_VERSION: i64 = 2;
+/// a full rebuild on next `catch_up`.
+///   v2: producer_tool column + non-producer-activity unconsumed semantic
+///   v3: project blocker / claim / claim_release / blocker_resolved
+///       events as nodes/edges so `pending_handoffs`, `active_blockers`,
+///       `active_claims`, and `active_tasks` queries can run against the
+///       graph directly (replacing in-memory TraceProjection scans).
+pub const SCHEMA_VERSION: i64 = 3;
 
 const GRAPH_FILENAME: &str = "rally.graph.db";
 
@@ -425,7 +427,48 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
             if matches!(verdict, "done" | "passed" | "approved") {
                 if let Some(handoff_id) = payload.get("ref_handoff_id").and_then(Value::as_str) {
                     upsert_edge(tx, handoff_id, tool, "reviewed_by", None, &event_id, seq)?;
+                    // Mark the handoff as resolved via a status-bearing edge from
+                    // the handoff node to a synthetic "done" terminator. Allows
+                    // "pending handoffs" queries to filter via NOT EXISTS.
+                    upsert_edge(tx, handoff_id, "__resolved__", "resolved_by_ack", Some(&json!({"verdict": verdict})), &event_id, seq)?;
                 }
+            }
+        }
+        "claim" => {
+            // Project the claim as a node. Edge `claims(claim_node → resource_string)`
+            // would require resource to be a node too — defer that. For now,
+            // the claim node carries the resource in its payload, and an
+            // owned_by edge records the owner.
+            upsert_node(tx, &event_id, "claim", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_peer(tx, tool, time, &event_id, seq)?;
+            let owner = payload
+                .get("owner_tool")
+                .and_then(Value::as_str)
+                .unwrap_or(tool);
+            if !owner.is_empty() && owner != "unknown" {
+                upsert_peer(tx, owner, time, &event_id, seq)?;
+                upsert_edge(tx, &event_id, owner, "owned_by", None, &event_id, seq)?;
+            }
+        }
+        "claim-release" | "claim_release" => {
+            // Mark the referenced claim resolved via an edge to the synthetic
+            // __resolved__ marker. Active-claim queries filter on NOT EXISTS.
+            upsert_node(tx, &event_id, "claim-release", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_peer(tx, tool, time, &event_id, seq)?;
+            if let Some(claim_id) = payload.get("ref_claim_id").and_then(Value::as_str) {
+                upsert_edge(tx, claim_id, "__resolved__", "resolved_by_release", None, &event_id, seq)?;
+            }
+        }
+        "blocker" => {
+            upsert_node(tx, &event_id, "blocker", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_peer(tx, tool, time, &event_id, seq)?;
+            upsert_edge(tx, &event_id, tool, "raised_by", None, &event_id, seq)?;
+        }
+        "blocker-resolved" | "blocker_resolved" => {
+            upsert_node(tx, &event_id, "blocker-resolved", subject_field.as_deref(), &payload, time, &event_id, seq, Some(tool))?;
+            upsert_peer(tx, tool, time, &event_id, seq)?;
+            if let Some(blocker_id) = payload.get("ref_blocker_id").and_then(Value::as_str) {
+                upsert_edge(tx, blocker_id, "__resolved__", "resolved_by_unblock", None, &event_id, seq)?;
             }
         }
         _ => {}
@@ -760,6 +803,171 @@ pub fn unconsumed_artifacts(conn: &Connection, limit: u32) -> Result<Vec<Value>,
                 "created_at":      row.get::<_, String>(2)?,
                 "source_event_id": row.get::<_, Option<String>>(3)?,
                 "producer_tool":   row.get::<_, Option<String>>(4)?,
+            }))
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(rows)
+}
+
+/// A minimal "pending handoff" projection over the graph: handoff nodes
+/// whose payload has `requires_ack=true` (or default true) and which have
+/// no `resolved_by_ack` edge yet. When `tool` is Some, restrict to
+/// handoffs addressed to that tool. Returns rows shaped for callers that
+/// previously used `TraceProjection::pending_handoffs`.
+pub fn pending_handoffs(
+    conn: &Connection,
+    tool: Option<&str>,
+) -> Result<Vec<Value>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT n.id, n.subject, n.created_at, n.source_event_id, n.producer_tool, n.payload_json
+          FROM nodes n
+         WHERE n.kind = 'handoff'
+           AND NOT EXISTS (
+             SELECT 1 FROM edges e
+              WHERE e.source_id = n.id AND e.kind = 'resolved_by_ack'
+           )
+         ORDER BY n.source_seq ASC
+        "#,
+    )?;
+    let rows: Vec<Value> = stmt
+        .query_map([], |row| {
+            let payload_json: String = row.get(5)?;
+            let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            Ok(json!({
+                "event_id":     row.get::<_, String>(0)?,
+                "subject":      row.get::<_, Option<String>>(1)?,
+                "created_at":   row.get::<_, String>(2)?,
+                "from_tool":    row.get::<_, Option<String>>(4)?,
+                "to_tool":      payload.get("to_tool").and_then(Value::as_str),
+                "requires_ack": payload.get("requires_ack")
+                                       .and_then(Value::as_bool)
+                                       .unwrap_or(true),
+                "payload":      payload,
+            }))
+        })?
+        .filter_map(Result::ok)
+        // requires_ack=false handoffs are not "pending" — they're FYI.
+        .filter(|row| row["requires_ack"].as_bool().unwrap_or(true))
+        .filter(|row| {
+            tool.is_none_or(|target| row["to_tool"].as_str() == Some(target))
+        })
+        .collect();
+    Ok(rows)
+}
+
+/// Active blockers: blocker nodes without a `resolved_by_unblock` edge.
+/// When `tool` is Some, restrict to blockers raised by that tool.
+pub fn active_blockers(
+    conn: &Connection,
+    tool: Option<&str>,
+) -> Result<Vec<Value>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT n.id, n.subject, n.created_at, n.producer_tool, n.payload_json
+          FROM nodes n
+         WHERE n.kind = 'blocker'
+           AND NOT EXISTS (
+             SELECT 1 FROM edges e
+              WHERE e.source_id = n.id AND e.kind = 'resolved_by_unblock'
+           )
+         ORDER BY n.source_seq ASC
+        "#,
+    )?;
+    let rows: Vec<Value> = stmt
+        .query_map([], |row| {
+            let payload_json: String = row.get(4)?;
+            let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            Ok(json!({
+                "event_id":   row.get::<_, String>(0)?,
+                "subject":    row.get::<_, Option<String>>(1)?,
+                "created_at": row.get::<_, String>(2)?,
+                "tool":       row.get::<_, Option<String>>(3)?,
+                "payload":    payload,
+            }))
+        })?
+        .filter_map(Result::ok)
+        .filter(|row| {
+            tool.is_none_or(|target| row["tool"].as_str() == Some(target))
+        })
+        .collect();
+    Ok(rows)
+}
+
+/// Active tasks: task nodes whose payload.status is not in
+/// {done, closed, cancelled}. When `tool` is Some, restrict to tasks
+/// owned_by that tool.
+pub fn active_tasks(
+    conn: &Connection,
+    tool: Option<&str>,
+) -> Result<Vec<Value>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT n.id, n.subject, n.created_at, n.producer_tool, n.payload_json,
+               (SELECT e.target_id FROM edges e
+                 WHERE e.source_id = n.id AND e.kind = 'owned_by'
+                 ORDER BY e.source_seq DESC LIMIT 1) AS owner
+          FROM nodes n
+         WHERE n.kind = 'task'
+         ORDER BY n.source_seq ASC
+        "#,
+    )?;
+    let rows: Vec<Value> = stmt
+        .query_map([], |row| {
+            let payload_json: String = row.get(4)?;
+            let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("active")
+                .to_string();
+            Ok(json!({
+                "event_id":   row.get::<_, String>(0)?,
+                "subject":    row.get::<_, Option<String>>(1)?,
+                "created_at": row.get::<_, String>(2)?,
+                "tool":       row.get::<_, Option<String>>(3)?,
+                "owner_tool": row.get::<_, Option<String>>(5)?,
+                "status":     status,
+                "payload":    payload,
+            }))
+        })?
+        .filter_map(Result::ok)
+        .filter(|row| {
+            !matches!(
+                row["status"].as_str().unwrap_or("active"),
+                "done" | "closed" | "cancelled"
+            )
+        })
+        .filter(|row| {
+            tool.is_none_or(|target| row["owner_tool"].as_str() == Some(target))
+        })
+        .collect();
+    Ok(rows)
+}
+
+/// Recent artifact nodes (any producer), newest first, bounded by `limit`.
+pub fn recent_artifacts(conn: &Connection, limit: u32) -> Result<Vec<Value>, rusqlite::Error> {
+    let lim = limit.max(1).min(500) as i64;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT n.id, n.subject, n.created_at, n.producer_tool, n.payload_json
+          FROM nodes n
+         WHERE n.kind = 'artifact'
+         ORDER BY n.source_seq DESC
+         LIMIT ?1
+        "#,
+    )?;
+    let rows: Vec<Value> = stmt
+        .query_map(params![lim], |row| {
+            let payload_json: String = row.get(4)?;
+            let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            Ok(json!({
+                "event_id":   row.get::<_, String>(0)?,
+                "subject":    row.get::<_, Option<String>>(1)?,
+                "created_at": row.get::<_, String>(2)?,
+                "tool":       row.get::<_, Option<String>>(3)?,
+                "payload":    payload,
             }))
         })?
         .filter_map(Result::ok)

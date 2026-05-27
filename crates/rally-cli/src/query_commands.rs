@@ -511,13 +511,12 @@ pub(super) fn execute_next(command: ReadCommand) -> Result<WriteOutput, CliError
     let (store, records, now) = query_records(&command)?;
     let projection = TraceProjection::from_records_at(&records, now);
 
-    // Graph-backed filter: only consider artifacts with no incoming
-    // `reviewed_by` edge. Falls back to None on graph error so a corrupt
-    // projection doesn't take `rally next` down — the worst case is the
-    // old behavior (every recent artifact scores).
-    let unconsumed = unconsumed_filter(&store, &records).ok();
+    // Graph-backed sources for next_recommendation. If the graph fails to
+    // open or catch up, fall back to TraceProjection — preserving the
+    // legacy behavior so `rally next` never goes dark on a corrupt cache.
+    let graph_view = open_graph_view(&store, &records).ok();
 
-    let recommendation = next_recommendation(&projection, &tool, command.limit, unconsumed.as_ref());
+    let recommendation = next_recommendation(&projection, &tool, command.limit, graph_view.as_ref());
     let text = recommendation
         .get("subject")
         .and_then(Value::as_str)
@@ -532,23 +531,54 @@ pub(super) fn execute_next(command: ReadCommand) -> Result<WriteOutput, CliError
     ))
 }
 
-/// Build a set of artifact event_ids with no `reviewed_by` edge, using the
-/// derived graph projection. Returns Err if the graph cannot be opened or
-/// caught up — caller decides whether to fall back.
-fn unconsumed_filter(
-    store: &ChannelStore,
-    records: &[Value],
-) -> Result<HashSet<String>, CliError> {
+/// Bundle of graph-derived inputs to `next_recommendation`. When this
+/// is None, callers fall back to TraceProjection-derived sources.
+pub(crate) struct GraphView {
+    pub pending_handoffs: Vec<Value>,
+    pub active_blockers: Vec<Value>,
+    pub owned_active_tasks: Vec<Value>,
+    pub unowned_active_tasks: Vec<Value>,
+    pub recent_artifacts: Vec<Value>,
+    pub unconsumed_ids: HashSet<String>,
+}
+
+/// Open + catch up the graph, then load all the projections
+/// `next_recommendation` needs in one place. Returns Err if any step
+/// fails so the caller can decide to fall back rather than partially
+/// migrate.
+fn open_graph_view(store: &ChannelStore, records: &[Value]) -> Result<GraphView, CliError> {
     let mut conn = graph::init(store.channel_dir(), &now_rfc3339())
         .map_err(|err| CliError::runtime("next", format!("open graph: {err}")))?;
     graph::catch_up(&mut conn, records, &now_rfc3339())
         .map_err(|err| CliError::runtime("next", format!("graph catch_up: {err}")))?;
-    let rows = graph::unconsumed_artifacts(&conn, 200)
-        .map_err(|err| CliError::runtime("next", format!("unconsumed query: {err}")))?;
-    Ok(rows
-        .into_iter()
+    let pending_handoffs = graph::pending_handoffs(&conn, None)
+        .map_err(|err| CliError::runtime("next", format!("pending_handoffs: {err}")))?;
+    let active_blockers = graph::active_blockers(&conn, None)
+        .map_err(|err| CliError::runtime("next", format!("active_blockers: {err}")))?;
+    let owned_active_tasks = graph::active_tasks(&conn, None)
+        .map_err(|err| CliError::runtime("next", format!("active_tasks: {err}")))?;
+    let recent_artifacts = graph::recent_artifacts(&conn, 200)
+        .map_err(|err| CliError::runtime("next", format!("recent_artifacts: {err}")))?;
+    let unconsumed_rows = graph::unconsumed_artifacts(&conn, 200)
+        .map_err(|err| CliError::runtime("next", format!("unconsumed: {err}")))?;
+    let unconsumed_ids: HashSet<String> = unconsumed_rows
+        .iter()
         .filter_map(|n| n.get("id").and_then(Value::as_str).map(str::to_string))
-        .collect())
+        .collect();
+    // Split tasks into owned/unowned. The split was previously two separate
+    // TraceProjection queries; doing it once at the graph layer is cheaper.
+    let (owned_active_tasks, unowned_active_tasks) =
+        owned_active_tasks
+            .into_iter()
+            .partition::<Vec<_>, _>(|t| t["owner_tool"].as_str().is_some());
+    Ok(GraphView {
+        pending_handoffs,
+        active_blockers,
+        owned_active_tasks,
+        unowned_active_tasks,
+        recent_artifacts,
+        unconsumed_ids,
+    })
 }
 
 pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliError> {
@@ -1158,7 +1188,7 @@ fn next_recommendation(
     projection: &TraceProjection,
     tool: &str,
     limit: usize,
-    unconsumed_artifacts: Option<&HashSet<String>>,
+    graph_view: Option<&GraphView>,
 ) -> Value {
     let profile = projection.profile(tool);
     let role = profile
@@ -1171,93 +1201,165 @@ fn next_recommendation(
         .unwrap_or_default();
     let mut candidates = Vec::<Value>::new();
 
-    for handoff in projection.pending_handoffs(Some(tool)) {
-        candidates.push(candidate(
-            "pick_up_handoff",
-            &handoff.event_id,
-            &handoff.subject,
-            100.0,
-            json!({ "handoff": 100.0 }),
-            vec![handoff.event_id.clone()],
-            vec!["required handoff is addressed to this tool".to_string()],
-        ));
-    }
-
-    for blocker in projection.active_blockers(None) {
-        let score = if blocker.tool.as_deref() == Some(tool) {
-            90.0
-        } else {
-            70.0
-        };
-        candidates.push(candidate(
-            "unblock_peer",
-            &blocker.event_id,
-            &blocker.subject,
-            score,
-            json!({ "blocker": score }),
-            vec![blocker.event_id.clone()],
-            vec!["active blocker is preventing progress".to_string()],
-        ));
-    }
-
-    for task in projection.active_tasks(Some(tool)) {
-        candidates.push(candidate(
-            "progress_owned_task",
-            &task.event_id,
-            &task.subject,
-            80.0,
-            json!({ "owned_task": 80.0, "role_match": role_match_bonus(role, &capabilities, "task") }),
-            vec![task.event_id.clone()],
-            vec!["open task is already owned by this tool".to_string()],
-        ));
-    }
-
-    for task in projection.active_tasks(None) {
-        if task.owner_tool.is_some() {
-            continue;
-        }
-        let bonus = role_match_bonus(role, &capabilities, "task");
-        candidates.push(candidate(
-            "claim_task",
-            &task.event_id,
-            &task.subject,
-            55.0 + bonus,
-            json!({ "unowned_task": 55.0, "role_match": bonus }),
-            vec![task.event_id.clone()],
-            vec!["open task has no owner".to_string()],
-        ));
-    }
-
-    // When the graph projection is available, restrict artifact candidates
-    // to those with no incoming `reviewed_by` edge — addresses the
-    // stale-recommendation issue where reviewed artifacts kept resurfacing.
-    // When the filter is None (graph unavailable), fall back to all recent
-    // artifacts to preserve prior behavior.
-    for artifact in projection.artifacts(limit.max(3)) {
-        if let Some(filter) = unconsumed_artifacts {
-            if !filter.contains(&artifact.event_id) {
+    // ── Pending handoffs ──────────────────────────────────────────────
+    if let Some(view) = graph_view {
+        for handoff in view.pending_handoffs.iter() {
+            if handoff["to_tool"].as_str() != Some(tool) {
                 continue;
             }
+            let event_id = handoff["event_id"].as_str().unwrap_or("").to_string();
+            let subject = handoff["subject"].as_str().unwrap_or("").to_string();
+            candidates.push(candidate(
+                "pick_up_handoff",
+                &event_id,
+                &subject,
+                100.0,
+                json!({ "handoff": 100.0 }),
+                vec![event_id.clone()],
+                vec!["required handoff is addressed to this tool".to_string()],
+            ));
         }
-        let bonus = role_match_bonus(role, &capabilities, "artifact");
-        let reasoning = if unconsumed_artifacts.is_some() {
-            "no follow-up activity from another peer — needs review".to_string()
-        } else {
-            "recent artifact may need follow-up".to_string()
-        };
-        candidates.push(candidate(
-            if bonus > 0.0 {
-                "review_artifact"
-            } else {
-                "consume_artifact"
-            },
-            &artifact.event_id,
-            &artifact.subject,
-            35.0 + bonus,
-            json!({ "artifact": 35.0, "role_match": bonus }),
-            vec![artifact.event_id.clone()],
-            vec![reasoning],
-        ));
+    } else {
+        for handoff in projection.pending_handoffs(Some(tool)) {
+            candidates.push(candidate(
+                "pick_up_handoff",
+                &handoff.event_id,
+                &handoff.subject,
+                100.0,
+                json!({ "handoff": 100.0 }),
+                vec![handoff.event_id.clone()],
+                vec!["required handoff is addressed to this tool".to_string()],
+            ));
+        }
+    }
+
+    // ── Active blockers ───────────────────────────────────────────────
+    if let Some(view) = graph_view {
+        for blocker in view.active_blockers.iter() {
+            let score = if blocker["tool"].as_str() == Some(tool) { 90.0 } else { 70.0 };
+            let event_id = blocker["event_id"].as_str().unwrap_or("").to_string();
+            let subject = blocker["subject"].as_str().unwrap_or("").to_string();
+            candidates.push(candidate(
+                "unblock_peer",
+                &event_id,
+                &subject,
+                score,
+                json!({ "blocker": score }),
+                vec![event_id.clone()],
+                vec!["active blocker is preventing progress".to_string()],
+            ));
+        }
+    } else {
+        for blocker in projection.active_blockers(None) {
+            let score = if blocker.tool.as_deref() == Some(tool) { 90.0 } else { 70.0 };
+            candidates.push(candidate(
+                "unblock_peer",
+                &blocker.event_id,
+                &blocker.subject,
+                score,
+                json!({ "blocker": score }),
+                vec![blocker.event_id.clone()],
+                vec!["active blocker is preventing progress".to_string()],
+            ));
+        }
+    }
+
+    // ── Active tasks (owned + unowned) ────────────────────────────────
+    if let Some(view) = graph_view {
+        for task in view.owned_active_tasks.iter() {
+            if task["owner_tool"].as_str() != Some(tool) {
+                continue;
+            }
+            let event_id = task["event_id"].as_str().unwrap_or("").to_string();
+            let subject = task["subject"].as_str().unwrap_or("").to_string();
+            candidates.push(candidate(
+                "progress_owned_task",
+                &event_id,
+                &subject,
+                80.0,
+                json!({ "owned_task": 80.0, "role_match": role_match_bonus(role, &capabilities, "task") }),
+                vec![event_id.clone()],
+                vec!["open task is already owned by this tool".to_string()],
+            ));
+        }
+        for task in view.unowned_active_tasks.iter() {
+            let bonus = role_match_bonus(role, &capabilities, "task");
+            let event_id = task["event_id"].as_str().unwrap_or("").to_string();
+            let subject = task["subject"].as_str().unwrap_or("").to_string();
+            candidates.push(candidate(
+                "claim_task",
+                &event_id,
+                &subject,
+                55.0 + bonus,
+                json!({ "unowned_task": 55.0, "role_match": bonus }),
+                vec![event_id.clone()],
+                vec!["open task has no owner".to_string()],
+            ));
+        }
+    } else {
+        for task in projection.active_tasks(Some(tool)) {
+            candidates.push(candidate(
+                "progress_owned_task",
+                &task.event_id,
+                &task.subject,
+                80.0,
+                json!({ "owned_task": 80.0, "role_match": role_match_bonus(role, &capabilities, "task") }),
+                vec![task.event_id.clone()],
+                vec!["open task is already owned by this tool".to_string()],
+            ));
+        }
+        for task in projection.active_tasks(None) {
+            if task.owner_tool.is_some() {
+                continue;
+            }
+            let bonus = role_match_bonus(role, &capabilities, "task");
+            candidates.push(candidate(
+                "claim_task",
+                &task.event_id,
+                &task.subject,
+                55.0 + bonus,
+                json!({ "unowned_task": 55.0, "role_match": bonus }),
+                vec![task.event_id.clone()],
+                vec!["open task has no owner".to_string()],
+            ));
+        }
+    }
+
+    // ── Recent / unconsumed artifacts ─────────────────────────────────
+    if let Some(view) = graph_view {
+        // Source from the graph directly; only artifacts with no later
+        // non-producer activity show up. No more "every recent artifact
+        // scores" stale-recommendation bug.
+        for artifact in view.recent_artifacts.iter().take(limit.max(3)) {
+            let event_id = artifact["event_id"].as_str().unwrap_or("").to_string();
+            if !view.unconsumed_ids.contains(&event_id) {
+                continue;
+            }
+            let subject = artifact["subject"].as_str().unwrap_or("").to_string();
+            let bonus = role_match_bonus(role, &capabilities, "artifact");
+            candidates.push(candidate(
+                if bonus > 0.0 { "review_artifact" } else { "consume_artifact" },
+                &event_id,
+                &subject,
+                35.0 + bonus,
+                json!({ "artifact": 35.0, "role_match": bonus }),
+                vec![event_id.clone()],
+                vec!["no follow-up activity from another peer — needs review".to_string()],
+            ));
+        }
+    } else {
+        for artifact in projection.artifacts(limit.max(3)) {
+            let bonus = role_match_bonus(role, &capabilities, "artifact");
+            candidates.push(candidate(
+                if bonus > 0.0 { "review_artifact" } else { "consume_artifact" },
+                &artifact.event_id,
+                &artifact.subject,
+                35.0 + bonus,
+                json!({ "artifact": 35.0, "role_match": bonus }),
+                vec![artifact.event_id.clone()],
+                vec!["recent artifact may need follow-up".to_string()],
+            ));
+        }
     }
 
     candidates.sort_by(|left, right| {
