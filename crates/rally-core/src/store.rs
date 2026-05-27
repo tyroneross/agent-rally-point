@@ -16,6 +16,7 @@ use std::time::SystemTime;
 pub const CHANGES_JSONL: &str = "changes.jsonl";
 pub const RALLY_LOCK: &str = "rally.lock";
 pub const RALLY_TAIL: &str = "rally.tail.json";
+pub const RALLY_CHECKPOINT: &str = "rally.checkpoint.json";
 pub const ORIGIN_LOCAL: &str = "local";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +36,25 @@ struct TailCache {
     next_seq: u64,
     prev_entry_hash: Option<String>,
     log_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointStatus {
+    pub exists: bool,
+    pub valid: bool,
+    pub records: usize,
+    pub log_bytes: u64,
+    pub last_entry_hash: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct CheckpointCache {
+    schema: String,
+    records: Vec<Value>,
+    record_count: usize,
+    log_bytes: u64,
+    last_entry_hash: Option<String>,
 }
 
 impl ChannelStore {
@@ -60,8 +80,93 @@ impl ChannelStore {
         self.channel_dir.join(RALLY_TAIL)
     }
 
+    pub fn checkpoint_path(&self) -> PathBuf {
+        self.channel_dir.join(RALLY_CHECKPOINT)
+    }
+
     pub fn load_records(&self) -> Result<Vec<Value>, CoreError> {
         load_records(self.changes_path())
+    }
+
+    pub fn load_records_cached(&self) -> Result<Vec<Value>, CoreError> {
+        if let Some(records) = read_valid_checkpoint(
+            self.changes_path(),
+            self.tail_path(),
+            self.checkpoint_path(),
+        )? {
+            return Ok(records);
+        }
+        let records = read_strict_store(&self.changes_path())?;
+        let log_bytes = log_bytes(&self.changes_path())?;
+        let last_entry_hash = records.last().map(|record| record.line_hash.clone());
+        let records = records
+            .into_iter()
+            .map(|record| record.value)
+            .collect::<Vec<_>>();
+        write_tail_cache(
+            self.tail_path(),
+            TailCache {
+                next_seq: records.len() as u64 + 1,
+                prev_entry_hash: last_entry_hash.clone(),
+                log_bytes,
+            },
+        )?;
+        write_checkpoint_cache(
+            self.checkpoint_path(),
+            CheckpointCache {
+                schema: "agent-rally.checkpoint.v1".to_string(),
+                record_count: records.len(),
+                records: records.clone(),
+                log_bytes,
+                last_entry_hash,
+            },
+        )?;
+        Ok(records)
+    }
+
+    pub fn rebuild_checkpoint(&self) -> Result<CheckpointStatus, CoreError> {
+        fs::create_dir_all(&self.channel_dir)?;
+        let records = read_strict_store(&self.changes_path())?;
+        let log_bytes = log_bytes(&self.changes_path())?;
+        let last_entry_hash = records.last().map(|record| record.line_hash.clone());
+        let records = records
+            .into_iter()
+            .map(|record| record.value)
+            .collect::<Vec<_>>();
+        write_tail_cache(
+            self.tail_path(),
+            TailCache {
+                next_seq: records.len() as u64 + 1,
+                prev_entry_hash: last_entry_hash.clone(),
+                log_bytes,
+            },
+        )?;
+        write_checkpoint_cache(
+            self.checkpoint_path(),
+            CheckpointCache {
+                schema: "agent-rally.checkpoint.v1".to_string(),
+                record_count: records.len(),
+                records,
+                log_bytes,
+                last_entry_hash: last_entry_hash.clone(),
+            },
+        )?;
+        Ok(CheckpointStatus {
+            exists: true,
+            valid: true,
+            records: checkpoint_record_count(&self.checkpoint_path())?,
+            log_bytes,
+            last_entry_hash,
+            reason: None,
+        })
+    }
+
+    pub fn checkpoint_status(&self) -> Result<CheckpointStatus, CoreError> {
+        checkpoint_status(
+            self.changes_path(),
+            self.tail_path(),
+            self.checkpoint_path(),
+        )
     }
 
     pub fn append_event(&self, event: Value) -> Result<Value, CoreError> {
@@ -359,6 +464,113 @@ fn read_tail_cache(changes_path: &Path, tail_path: &Path) -> Result<Option<Store
         prev_entry_hash: cache.prev_entry_hash,
         log_bytes: cache.log_bytes,
     }))
+}
+
+fn read_valid_checkpoint(
+    changes_path: impl AsRef<Path>,
+    tail_path: impl AsRef<Path>,
+    checkpoint_path: impl AsRef<Path>,
+) -> Result<Option<Vec<Value>>, CoreError> {
+    let changes_path = changes_path.as_ref();
+    let tail_path = tail_path.as_ref();
+    let checkpoint_path = checkpoint_path.as_ref();
+    let Some(tail) = read_tail_cache(changes_path, tail_path)? else {
+        return Ok(None);
+    };
+    let Some(checkpoint) = read_checkpoint_cache(checkpoint_path)? else {
+        return Ok(None);
+    };
+    if checkpoint.schema != "agent-rally.checkpoint.v1"
+        || checkpoint.log_bytes != tail.log_bytes
+        || checkpoint.last_entry_hash != tail.prev_entry_hash
+        || checkpoint.record_count != checkpoint.records.len()
+    {
+        return Ok(None);
+    }
+    Ok(Some(checkpoint.records))
+}
+
+fn checkpoint_status(
+    changes_path: impl AsRef<Path>,
+    tail_path: impl AsRef<Path>,
+    checkpoint_path: impl AsRef<Path>,
+) -> Result<CheckpointStatus, CoreError> {
+    let changes_path = changes_path.as_ref();
+    let tail_path = tail_path.as_ref();
+    let checkpoint_path = checkpoint_path.as_ref();
+    let Some(checkpoint) = read_checkpoint_cache(checkpoint_path)? else {
+        return Ok(CheckpointStatus {
+            exists: false,
+            valid: false,
+            records: 0,
+            log_bytes: log_bytes(changes_path)?,
+            last_entry_hash: None,
+            reason: Some("checkpoint is missing".to_string()),
+        });
+    };
+    let Some(tail) = read_tail_cache(changes_path, tail_path)? else {
+        return Ok(CheckpointStatus {
+            exists: true,
+            valid: false,
+            records: checkpoint.record_count,
+            log_bytes: checkpoint.log_bytes,
+            last_entry_hash: checkpoint.last_entry_hash,
+            reason: Some("tail cache is missing or stale".to_string()),
+        });
+    };
+    let valid = checkpoint.schema == "agent-rally.checkpoint.v1"
+        && checkpoint.log_bytes == tail.log_bytes
+        && checkpoint.last_entry_hash == tail.prev_entry_hash
+        && checkpoint.record_count == checkpoint.records.len();
+    Ok(CheckpointStatus {
+        exists: true,
+        valid,
+        records: checkpoint.record_count,
+        log_bytes: checkpoint.log_bytes,
+        last_entry_hash: checkpoint.last_entry_hash,
+        reason: (!valid).then(|| "checkpoint does not match the current log tail".to_string()),
+    })
+}
+
+fn read_checkpoint_cache(path: &Path) -> Result<Option<CheckpointCache>, CoreError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(Some(serde_json::from_str(&text)?))
+}
+
+fn write_checkpoint_cache(path: impl AsRef<Path>, cache: CheckpointCache) -> Result<(), CoreError> {
+    let path = path.as_ref();
+    let tmp_path = path.with_extension("json.tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    serde_json::to_writer(&mut file, &cache)?;
+    file.write_all(b"\n")?;
+    file.sync_data()?;
+    fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+fn checkpoint_record_count(path: &Path) -> Result<usize, CoreError> {
+    Ok(read_checkpoint_cache(path)?.map_or(0, |checkpoint| checkpoint.record_count))
+}
+
+fn log_bytes(path: &Path) -> Result<u64, CoreError> {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .or_else(|err| {
+            (err.kind() == std::io::ErrorKind::NotFound)
+                .then_some(0)
+                .ok_or(err)
+        })
+        .map_err(CoreError::from)
 }
 
 fn write_tail_cache(path: impl AsRef<Path>, cache: TailCache) -> Result<(), CoreError> {

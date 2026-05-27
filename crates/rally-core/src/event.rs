@@ -44,22 +44,37 @@ impl EventKind {
         }
     }
 
+    /// Single source of truth for `(kind_str, schema_name)` per known variant.
+    ///
+    /// Returns `None` for `Self::Other(_)` so `Other` handling stays local
+    /// to the public methods. New event kinds should add one arm here;
+    /// `event_type`, `schema_name`, and `as_kind_str` derive from this.
+    fn meta(&self) -> Option<(&'static str, &'static str)> {
+        Some(match self {
+            Self::Handoff => ("handoff", "handoff.created.v1"),
+            Self::Ack => ("ack", "handoff.acknowledged.v1"),
+            Self::Feedback => ("feedback", "feedback.posted.v1"),
+            Self::Claim => ("claim", "claim.created.v1"),
+            Self::ClaimRelease => ("claim-release", "claim.released.v1"),
+            Self::Blocker => ("blocker", "blocker.raised.v1"),
+            Self::BlockerResolved => ("blocker-resolved", "blocker.resolved.v1"),
+            Self::Profile => ("profile", "profile.updated.v1"),
+            Self::Task => ("task", "task.updated.v1"),
+            Self::Artifact => ("artifact", "artifact.recorded.v1"),
+            Self::Decision => ("decision", "decision.recorded.v1"),
+            Self::Lesson => ("lesson", "lesson.recorded.v1"),
+            Self::Subscription => ("subscription", "subscription.updated.v1"),
+            Self::Other(_) => return None,
+        })
+    }
+
     pub fn as_kind_str(&self) -> &str {
-        match self {
-            Self::Handoff => "handoff",
-            Self::Ack => "ack",
-            Self::Feedback => "feedback",
-            Self::Claim => "claim",
-            Self::ClaimRelease => "claim-release",
-            Self::Blocker => "blocker",
-            Self::BlockerResolved => "blocker-resolved",
-            Self::Profile => "profile",
-            Self::Task => "task",
-            Self::Artifact => "artifact",
-            Self::Decision => "decision",
-            Self::Lesson => "lesson",
-            Self::Subscription => "subscription",
-            Self::Other(value) => value.as_str(),
+        match self.meta() {
+            Some((k, _)) => k,
+            None => match self {
+                Self::Other(value) => value.as_str(),
+                _ => unreachable!("meta() returned None only for Other"),
+            },
         }
     }
 
@@ -70,42 +85,18 @@ impl EventKind {
         }
     }
 
-    pub fn event_type(&self) -> String {
-        match self {
-            Self::Handoff => "agent-rally.handoff.created.v1".to_string(),
-            Self::Ack => "agent-rally.handoff.acknowledged.v1".to_string(),
-            Self::Feedback => "agent-rally.feedback.posted.v1".to_string(),
-            Self::Claim => "agent-rally.claim.created.v1".to_string(),
-            Self::ClaimRelease => "agent-rally.claim.released.v1".to_string(),
-            Self::Blocker => "agent-rally.blocker.raised.v1".to_string(),
-            Self::BlockerResolved => "agent-rally.blocker.resolved.v1".to_string(),
-            Self::Profile => "agent-rally.profile.updated.v1".to_string(),
-            Self::Task => "agent-rally.task.updated.v1".to_string(),
-            Self::Artifact => "agent-rally.artifact.recorded.v1".to_string(),
-            Self::Decision => "agent-rally.decision.recorded.v1".to_string(),
-            Self::Lesson => "agent-rally.lesson.recorded.v1".to_string(),
-            Self::Subscription => "agent-rally.subscription.updated.v1".to_string(),
-            Self::Other(value) => format!("agent-rally.{value}.v1"),
+    pub fn schema_name(&self) -> String {
+        match self.meta() {
+            Some((_, s)) => s.to_string(),
+            None => match self {
+                Self::Other(value) => format!("{value}.v1"),
+                _ => unreachable!("meta() returned None only for Other"),
+            },
         }
     }
 
-    pub fn schema_name(&self) -> String {
-        match self {
-            Self::Handoff => "handoff.created.v1".to_string(),
-            Self::Ack => "handoff.acknowledged.v1".to_string(),
-            Self::Feedback => "feedback.posted.v1".to_string(),
-            Self::Claim => "claim.created.v1".to_string(),
-            Self::ClaimRelease => "claim.released.v1".to_string(),
-            Self::Blocker => "blocker.raised.v1".to_string(),
-            Self::BlockerResolved => "blocker.resolved.v1".to_string(),
-            Self::Profile => "profile.updated.v1".to_string(),
-            Self::Task => "task.updated.v1".to_string(),
-            Self::Artifact => "artifact.recorded.v1".to_string(),
-            Self::Decision => "decision.recorded.v1".to_string(),
-            Self::Lesson => "lesson.recorded.v1".to_string(),
-            Self::Subscription => "subscription.updated.v1".to_string(),
-            Self::Other(value) => format!("{value}.v1"),
-        }
+    pub fn event_type(&self) -> String {
+        format!("agent-rally.{}", self.schema_name())
     }
 }
 

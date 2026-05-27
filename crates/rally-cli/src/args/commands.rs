@@ -165,6 +165,14 @@ pub(crate) struct PreflightCommand {
     pub(crate) stale_after_seconds: i64,
 }
 
+#[derive(Debug)]
+pub(crate) struct HerdrInjectCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) identifier: String,
+    pub(crate) strict: bool,
+    pub(crate) force: bool,
+}
+
 pub(crate) fn parse_identity_init(args: WriteArgs) -> Result<IdentityInitCommand, CliError> {
     Ok(IdentityInitCommand {
         tool: args
@@ -192,6 +200,15 @@ pub(crate) fn parse_preflight(args: WriteArgs) -> Result<PreflightCommand, CliEr
         session_id,
         start_ping,
         stale_after_seconds,
+    })
+}
+
+pub(crate) fn parse_herdr_inject(args: WriteArgs) -> Result<HerdrInjectCommand, CliError> {
+    Ok(HerdrInjectCommand {
+        identifier: args.identifier()?,
+        strict: true,
+        force: args.has("--force"),
+        common: args.common,
     })
 }
 
@@ -416,7 +433,8 @@ fn optional_resource_arg(args: &WriteArgs) -> Option<String> {
         return Some(resource);
     }
     if let Some(path) = args.one("--path") {
-        return Some(format!("file:{}", path.replace('\\', "/")));
+        let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        return Some(crate::resources::normalize_file_resource(&path, &workdir));
     }
     None
 }

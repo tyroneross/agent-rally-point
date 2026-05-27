@@ -120,6 +120,149 @@ Recommendations also carry `minimum_trust_for_automation`. Agents may display
 lower-trust facts, but bridge adapters must satisfy that threshold before they
 act on the recommendation automatically.
 
+Recommendations also include a `trust` object so agents do not have to infer
+automation safety from prose:
+
+```json
+{
+  "action": "ack_handoff",
+  "target": "evt_...",
+  "minimum_trust_for_automation": "trusted",
+  "trust": {
+    "required": "trusted",
+    "automation_allowed": false,
+    "source_statuses": [
+      {
+        "event_id": "evt_...",
+        "origin": "local",
+        "trust_status": "local"
+      }
+    ]
+  }
+}
+```
+
+## Work Packet Contract
+
+`rally packet --tool <agent> --json` returns a bounded, role-shaped work brief
+derived from the same `ContextBrief`. It is read-only and does not assign work.
+
+Envelope:
+
+```json
+{
+  "ok": true,
+  "command": "packet",
+  "schema": "agent-rally.command.packet.v1",
+  "channel": "/Users/me/.agent-rally-point/apps/repo",
+  "data": {
+    "packet": {}
+  }
+}
+```
+
+Common packet fields:
+
+| Field | Meaning |
+|---|---|
+| `tool` | Agent/tool id the packet is shaped for. |
+| `role` | Canonical role: `reviewer`, `builder`, `architect`, `qa`, or `general`. |
+| `packet_kind` | Role-oriented kind: `review`, `build`, `architecture`, `verification`, or `general`. |
+| `recommended_next_action` | Same action contract as `context`, including trust assessment. |
+| `trust_summary` | Counts for trusted/local/unsigned/untrusted/invalid/unknown focus items plus recommendation automation safety. |
+| `source_event_ids` | Source ids used to assemble the packet. |
+| `focus` | Top bounded `attuned_items`. |
+| `files` | Deduplicated file/path hints from focus, attention items, and active claims. |
+| `test_commands` | Verification commands from active tasks. |
+| `trust_risks` | Focus items with unsigned, untrusted, invalid, conflict, or unknown trust. |
+
+Role-specific fields are omitted when empty:
+
+| Role | Fields |
+|---|---|
+| reviewer | `review_targets`, `artifacts`, `decisions`, `lessons`, `risk_areas` |
+| builder | `build_targets`, `active_tasks`, `active_claims`, `active_blockers`, `collision_risk`, `decisions` |
+| architect | `architecture_targets`, `decisions`, `lessons`, `artifacts`, `open_tradeoffs` |
+| qa | `verification_targets`, `artifacts`, `lessons`, `test_commands`, `risk_areas`, `collision_risk` |
+| general | `focus`, `recommended_next_action`, `trust_summary`, `source_event_ids` |
+
+The packet exists so specialized agents can start from one compact JSON object
+instead of re-filtering the full context brief. It is still derived state over
+the trace, not a scheduler or workflow framework.
+
+Packets are intentionally smaller than full context. They preserve full
+`AttunedItem` metadata for the bounded `focus` set and role-specific target
+lists, but they are a curated projection. Agents that need every recent fact or
+all attention categories should read `rally context` first.
+
+## Herdr Injection Gate
+
+`rally herdr inject --json <handoff-id>` is a safety gate for future Herdr
+adapters. It surfaces the handoff trust state and refuses unsigned/untrusted
+input unless explicitly overridden with `--force`. The command emits gate data;
+actual editor/terminal injection remains an adapter concern.
+
+Adapters that consume this output must honor `ready_to_inject: false` unless the
+operator supplies an explicit override equivalent to `--force`.
+
+## Adapter Packet Contract
+
+Adapters consume Rally JSON; they do not reinterpret `changes.jsonl` directly.
+The shared contract is available through:
+
+```bash
+rally adapter contract --json
+```
+
+Current side-effect-free adapter packet exports:
+
+```bash
+rally cmux packet --tool codex-reviewer --json
+rally herdr packet --tool codex-reviewer --json
+```
+
+Both commands wrap `rally packet` output with adapter-specific metadata. The
+cmux envelope includes a `work_item` suitable for workspace/feed surfaces plus
+suggested cmux commands. The Herdr envelope includes a prompt payload and
+`ready_to_inject` derived from `recommended_next_action.trust.automation_allowed`.
+
+Adapter rules:
+
+- Read `data.packet.recommended_next_action.trust` before acting.
+- Treat `ready_to_inject: false` as a hard stop unless the operator explicitly
+  overrides.
+- Preserve `source_event_ids` when displaying or forwarding packet contents.
+- Keep adapter side effects outside Rally core; these commands are JSON exports.
+
+## Checkpoint Contract
+
+Hot query commands use a disposable checkpoint at `rally.checkpoint.json` when
+it matches the current `changes.jsonl` tail metadata. The checkpoint is a cache,
+not source of truth. It can be rebuilt or inspected with:
+
+```bash
+rally checkpoint rebuild --json
+rally checkpoint status --json
+```
+
+If the checkpoint or tail cache is missing, stale, or mismatched, Rally falls
+back to strict log replay and rebuilds the checkpoint. Cached and uncached reads
+must produce the same command JSON except for expected timing fields.
+
+## Golden Contract Tests
+
+Agent-facing JSON contracts are covered by CLI golden tests under
+`crates/rally-cli/tests/golden/`. The test harness normalizes dynamic ids,
+timestamps, hashes, signatures, channel paths, and age counters before comparing
+fixtures. Update fixtures deliberately with:
+
+```bash
+RALLY_UPDATE_GOLDENS=1 cargo test -p rally-cli --test golden_contracts
+```
+
+Then run the same test without `RALLY_UPDATE_GOLDENS` to prove the checked-in
+fixtures are stable.
+
 ## Write Commands
 
 The context brief improves when agents write structured coordination facts:

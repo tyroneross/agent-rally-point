@@ -245,9 +245,10 @@ to consume unsigned legacy events during the Rust cutover.
 
 ## Herdr policy
 
-`rally herdr inject <handoff-id>` should eventually print trust state before
-injection. In strict mode it should refuse to inject unsigned/invalid/unknown-key
-handoffs unless explicitly overridden.
+`rally herdr inject <handoff-id>` prints trust state before any future adapter
+injection. The current command is a strict gate: unsigned, invalid, untrusted,
+or unknown-key handoffs report `ready_to_inject: false` unless explicitly
+overridden with `--force`.
 
 Prompt injection is a semantic risk even for trusted events. Signing tells the
 operator who produced the payload; it does not make the payload safe.

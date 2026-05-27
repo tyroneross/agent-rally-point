@@ -510,7 +510,7 @@ impl TraceProjection {
         let mut findings = Vec::new();
         for item in self.pending_handoffs(tool) {
             findings.push(ScoreFinding {
-                severity: "P1".to_string(),
+                severity: crate::severity::P1.to_string(),
                 code: "open-required-handoff".to_string(),
                 event_id: Some(item.event_id),
                 message: format!(
@@ -530,7 +530,7 @@ impl TraceProjection {
             {
                 if !self.known_ids.contains(causation) {
                     findings.push(ScoreFinding {
-                        severity: "P2".to_string(),
+                        severity: crate::severity::P2.to_string(),
                         code: "dangling-causation".to_string(),
                         event_id: Some(record.id.clone()),
                         message: format!(
@@ -546,7 +546,7 @@ impl TraceProjection {
                     && !self.known_ids.contains(&payload.ref_handoff_id)
                 {
                     findings.push(ScoreFinding {
-                        severity: "P2".to_string(),
+                        severity: crate::severity::P2.to_string(),
                         code: "dangling-reference".to_string(),
                         event_id: Some(record.id.clone()),
                         message: format!(
@@ -562,7 +562,7 @@ impl TraceProjection {
         for (reference, verdict) in &self.final_ack_by_handoff {
             if verdict == "needs-info" {
                 findings.push(ScoreFinding {
-                    severity: "P2".to_string(),
+                    severity: crate::severity::P2.to_string(),
                     code: "unresolved-needs-info".to_string(),
                     event_id: Some(reference.clone()),
                     message: "handoff is still waiting on more information".to_string(),

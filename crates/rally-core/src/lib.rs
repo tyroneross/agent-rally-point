@@ -17,6 +17,14 @@ pub mod repo;
 pub mod store;
 pub mod sync;
 
+/// Severity tags for diagnose/score findings. `severity` stays a `String`
+/// on the wire (forward-compat with external input), but emit sites should
+/// reference these constants so typo-class bugs (`"P!"`, `"p1"`) can't ship.
+pub mod severity {
+    pub const P1: &str = "P1";
+    pub const P2: &str = "P2";
+}
+
 use rally_protocol::ProtocolError;
 use std::fmt;
 use std::path::PathBuf;

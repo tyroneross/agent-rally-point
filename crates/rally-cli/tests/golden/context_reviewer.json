@@ -1,0 +1,200 @@
+{
+  "channel": "<channel>",
+  "command": "context",
+  "data": {
+    "brief": {
+      "active_blockers": [],
+      "active_claims": [],
+      "active_tasks": [],
+      "artifacts": [
+        {
+          "artifact_kind": "review-notes",
+          "event_id": "evt_1",
+          "origin": "local",
+          "ref_task_id": null,
+          "subject": "packet implementation notes",
+          "summary": null,
+          "uri": "crates/rally-core/src/context.rs"
+        }
+      ],
+      "attuned_items": [
+        {
+          "event_id": "evt_1",
+          "factors": [
+            "artifact:review-notes",
+            "profile_watch:crates/rally-core",
+            "role:reviewer",
+            "local"
+          ],
+          "kind": "artifact",
+          "origin": "local",
+          "paths": [
+            "crates/rally-core/src/context.rs"
+          ],
+          "score": 108,
+          "source_event_ids": [
+            "evt_1"
+          ],
+          "subject": "packet implementation notes"
+        },
+        {
+          "event_id": "evt_2",
+          "factors": [
+            "decision:binding",
+            "profile_watch:crates/rally-core",
+            "role:reviewer",
+            "local"
+          ],
+          "kind": "decision",
+          "origin": "local",
+          "paths": [
+            "crates/rally-core/src/context.rs"
+          ],
+          "score": 93,
+          "source_event_ids": [
+            "evt_2"
+          ],
+          "subject": "packets are read-only derived state"
+        },
+        {
+          "event_id": "evt_3",
+          "factors": [
+            "lesson:coordination",
+            "role:reviewer",
+            "local"
+          ],
+          "kind": "lesson",
+          "origin": "local",
+          "score": 61,
+          "source_event_ids": [
+            "evt_3"
+          ],
+          "subject": "packets preserve source-linked context"
+        },
+        {
+          "event_id": "evt_4",
+          "factors": [
+            "recent_change",
+            "local",
+            "fresh"
+          ],
+          "kind": "recent_profile",
+          "origin": "local",
+          "score": 31,
+          "source_event_ids": [
+            "evt_4"
+          ],
+          "subject": "profile codex-reviewer"
+        }
+      ],
+      "collision_risk": [],
+      "decisions": [
+        {
+          "event_id": "evt_2",
+          "origin": "local",
+          "rationale": null,
+          "scope": "crates/rally-core/src/context.rs",
+          "status": "binding",
+          "subject": "packets are read-only derived state",
+          "supersedes": []
+        }
+      ],
+      "lessons": [
+        {
+          "confidence": 0.8,
+          "event_id": "evt_3",
+          "lesson_kind": "coordination",
+          "origin": "local",
+          "scope": null,
+          "source_event_ids": [],
+          "subject": "packets preserve source-linked context"
+        }
+      ],
+      "needs_attention": [],
+      "profile": {
+        "availability": null,
+        "branch": null,
+        "capabilities": [
+          "review"
+        ],
+        "current_task": null,
+        "event_id": "evt_4",
+        "notes": null,
+        "origin": "local",
+        "role": "reviewer",
+        "tool": "codex-reviewer",
+        "watch": [
+          "crates/rally-core"
+        ]
+      },
+      "recommended_next_action": {
+        "action": "review_artifact",
+        "confidence": 0.72,
+        "minimum_trust_for_automation": "local-or-trusted",
+        "reason": "reviewer profile is best matched to artifact",
+        "source_event_ids": [
+          "evt_1"
+        ],
+        "target": "evt_1",
+        "trust": {
+          "automation_allowed": true,
+          "required": "local-or-trusted",
+          "source_statuses": [
+            {
+              "event_id": "evt_1",
+              "origin": "local",
+              "trust_status": "local"
+            }
+          ]
+        }
+      },
+      "relevant_changes": [
+        {
+          "age_seconds": 0,
+          "event_id": "evt_4",
+          "kind": "profile",
+          "origin": "local",
+          "subject": "profile codex-reviewer",
+          "thread_id": "thr_1",
+          "tool": "codex-reviewer"
+        },
+        {
+          "age_seconds": 0,
+          "event_id": "evt_1",
+          "kind": "artifact",
+          "origin": "local",
+          "subject": "packet implementation notes",
+          "thread_id": "thr_2",
+          "tool": "codex"
+        },
+        {
+          "age_seconds": 0,
+          "event_id": "evt_2",
+          "kind": "decision",
+          "origin": "local",
+          "subject": "packets are read-only derived state",
+          "thread_id": "thr_3",
+          "tool": "codex"
+        },
+        {
+          "age_seconds": 0,
+          "event_id": "evt_3",
+          "kind": "lesson",
+          "origin": "local",
+          "subject": "packets preserve source-linked context",
+          "thread_id": "thr_4",
+          "tool": "codex"
+        }
+      ],
+      "routing": {
+        "action": "join_active",
+        "reason": "reviewer profile is best matched to artifact"
+      },
+      "subscription": null,
+      "tool": "codex-reviewer",
+      "top_priority": null
+    }
+  },
+  "ok": true,
+  "schema": "agent-rally.command.context.v1"
+}

@@ -22,7 +22,7 @@ SPDX-License-Identifier: Apache-2.0
 - #39 `feat(rust): rank attuned context for agents`
 - #40 `feat(rust): specialize context by agent role`
 
-## What #40 Adds
+## What The Current Branch Adds
 
 - Adds optional `role` to agent profiles.
 - Wires `rally profile --role <name>` through the CLI.
@@ -35,6 +35,16 @@ SPDX-License-Identifier: Apache-2.0
   declared, for example `review`, `architecture`, `qa`, or `implementation`.
 - Uses specialization to shape `attuned_items` scoring.
 - Adds advisory role-specific recommendations such as `review_artifact`.
+- Adds `rally packet --tool <agent> --json`: a read-only, role-shaped work
+  brief derived from `ContextBrief.attuned_items`.
+- Adds machine-readable recommendation trust assessment so agents can see
+  whether a recommended action satisfies its automation threshold.
+- Adds a strict `rally herdr inject` trust gate that surfaces handoff trust and
+  requires `--force` for unsigned/untrusted input.
+- Adds `rally adapter contract`, `rally cmux packet`, and `rally herdr packet`
+  as side-effect-free adapter JSON surfaces over work packets.
+- Adds rebuildable `rally.checkpoint.json` hot-read cache support plus
+  `rally checkpoint status|rebuild`.
 - Keeps urgent coordination obligations ahead of specialization:
   - required handoffs
   - active tasks
@@ -43,14 +53,18 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Important Files
 
-- `crates/rally-core/src/context.rs`: role-aware ranking and recommendations.
+- `crates/rally-core/src/context.rs`: role-aware ranking, recommendations, and
+  work packet shaping.
 - `crates/rally-core/src/event.rs`: profile payload includes `role`.
 - `crates/rally-core/src/query.rs`: projected agent profile includes `role`.
 - `crates/rally-cli/src/args.rs`: accepts `--role`.
 - `crates/rally-cli/src/args/commands.rs`: parses profile role.
 - `crates/rally-cli/src/write_commands.rs`: writes profile role.
-- `crates/rally-core/tests/kernel.rs`: reviewer specialization test.
-- `crates/rally-cli/tests/verify.rs`: CLI profile role coverage.
+- `crates/rally-core/src/store.rs`: checkpoint cache read/rebuild/status.
+- `crates/rally-cli/src/query_commands.rs`: renders context, packet,
+  checkpoint, adapter, cmux, and Herdr outputs.
+- `crates/rally-core/tests/kernel.rs`: reviewer specialization and packet tests.
+- `crates/rally-cli/tests/verify.rs`: CLI profile, packet, and Herdr gate coverage.
 - `docs/CONTEXT_BRIEF_SCHEMA.md`: context contract updates.
 - `skills/agent-rally-point/SKILL.md`: agent skill guidance for roles.
 
@@ -84,12 +98,8 @@ The desired behavior is:
 
 ## Next Good PR
 
-The next clean slice is a compact "review packet" output or command surface:
+The next clean slice is hardening and documentation around packet consumption:
 
-- produce a bounded review-oriented context packet from `attuned_items`;
-- include changed files, artifacts, decisions, test evidence, and trust labels;
-- keep it read-only and source-linked;
-- avoid adding orchestration or scheduler behavior.
-
-That would make role-aware specialization more directly usable by reviewer
-agents without bloating #40.
+- add more fixture-style JSON contract coverage as packet fields stabilize;
+- dogfood packet output from the Rally skill before installing `rally` globally;
+- keep packet shaping read-only and derived from context, not scheduler-y.

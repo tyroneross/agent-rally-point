@@ -16,6 +16,7 @@ From inside the repo, identify your stable tool id (`codex`, `claude_code`,
 
 ```bash
 rally context --tool <tool> --json
+rally packet --tool <tool> --json
 ```
 
 Use the returned `data.brief` to decide what to do next:
@@ -27,6 +28,15 @@ Use the returned `data.brief` to decide what to do next:
 - `active_tasks`, `active_claims`, `active_blockers`: current work state.
 - `decisions`, `lessons`: durable project knowledge.
 - `minimum_trust_for_automation`: trust threshold before acting automatically.
+
+Use `rally packet --tool <tool> --json` when you need a compact work brief for a
+specialized agent. It is derived from context, read-only, and role-shaped by the
+tool profile: reviewer, builder, architect, QA, or general.
+
+Use `rally adapter contract --json` before wiring a new client integration.
+Use `rally cmux packet --tool <tool> --json` or `rally herdr packet --tool
+<tool> --json` for side-effect-free adapter payloads. Adapters must honor trust
+fields and `ready_to_inject: false` unless the operator explicitly overrides.
 
 If `rally context` is unavailable, fall back to:
 
@@ -118,6 +128,16 @@ Treat `rally context` as the live brief:
 - If it is `continue_claim`, continue the claimed work and release it when done.
 - If it is `proceed_solo`, proceed, but still claim files before editing.
 
+For role-specific startup, prefer the packet after reading context:
+
+- Reviewer packets emphasize review targets, artifacts, decisions, test
+  evidence, and trust risks.
+- Builder packets emphasize active tasks, claims, blockers, decisions, and
+  files to touch.
+- Architect packets emphasize decisions, lessons, artifacts, and open tradeoffs.
+- QA packets emphasize verification artifacts, test commands, failure lessons,
+  and risk areas.
+
 Never treat recommendations as magic. They are derived from source events.
 Check `source_event_ids`, `origin`, and `trust_status` when the action affects
 files, tools, shells, editors, or another agent.
@@ -137,6 +157,7 @@ Before ending a session:
 
 ```bash
 rally context --tool <tool> --json
+rally checkpoint status --json
 rally release --tool <tool> <claim-id> --reason "done" --json
 rally task --tool <tool> --subject "<task>" --status done --json
 ```

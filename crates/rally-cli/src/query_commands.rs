@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::args::{CommonOptions, ReadCommand};
+use crate::args::{CommonOptions, HerdrInjectCommand, ReadCommand};
 use crate::output::{CliError, WriteOutput};
-use rally_core::context::build_context_brief;
+use rally_core::context::{build_context_brief, build_work_packet};
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
-use rally_core::event::EventRecord;
+use rally_core::event::{EventPayload, EventRecord};
 use rally_core::query::{
     TraceProjection, active_blockers_at, active_claims_at, claim_conflicts, filter_since,
     now_epoch_seconds, parse_since, pending_handoffs_at, record_id, related_records, score_records,
@@ -14,6 +14,8 @@ use rally_core::store::ChannelStore;
 use rally_protocol::event_value;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::env;
+use std::path::Path;
 
 pub(super) fn execute_inbox(command: ReadCommand) -> Result<WriteOutput, CliError> {
     let (store, records, now) = query_records(&command)?;
@@ -170,6 +172,280 @@ pub(super) fn execute_context(command: ReadCommand) -> Result<WriteOutput, CliEr
         text,
         json!({
             "brief": brief,
+        }),
+    ))
+}
+
+pub(super) fn execute_packet(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let tool = command.common.tool();
+    let (store, records, now) = query_records(&command)?;
+    let projection = TraceProjection::from_records_at(&records, now);
+    let brief = build_context_brief(&projection, &tool, command.limit);
+    let packet = build_work_packet(&brief, command.limit);
+    let text = format!(
+        "{} packet for {}: {}",
+        packet.packet_kind, packet.tool, packet.recommended_next_action.reason
+    );
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        json!({
+            "packet": packet,
+        }),
+    ))
+}
+
+pub(super) fn execute_checkpoint_status(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let store = command.common.channel_store(command.command)?;
+    let status = store.checkpoint_status().map_err(|err| {
+        CliError::runtime(
+            command.command,
+            format!("failed to read checkpoint status: {err}"),
+        )
+    })?;
+    let text = if status.valid {
+        format!("checkpoint valid records={}", status.records)
+    } else {
+        format!(
+            "checkpoint invalid: {}",
+            status.reason.as_deref().unwrap_or("unknown reason")
+        )
+    };
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        json!({ "checkpoint": status }),
+    ))
+}
+
+pub(super) fn execute_checkpoint_rebuild(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let store = command.common.channel_store(command.command)?;
+    let status = store.rebuild_checkpoint().map_err(|err| {
+        CliError::runtime(
+            command.command,
+            format!("failed to rebuild checkpoint: {err}"),
+        )
+    })?;
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        format!("checkpoint rebuilt records={}", status.records),
+        json!({ "checkpoint": status }),
+    ))
+}
+
+pub(super) fn execute_adapter_contract(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let store = command.common.channel_store(command.command)?;
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        "adapter contract v1".to_string(),
+        json!({
+            "contract": {
+                "schema": "agent-rally.adapter.contract.v1",
+                "consumes": [
+                    "agent-rally.command.context.v1",
+                    "agent-rally.command.packet.v1",
+                    "agent-rally.command.herdr-inject.v1"
+                ],
+                "trust_rules": {
+                    "must_honor_ready_to_inject_false": true,
+                    "override_requires_explicit_operator_action": true,
+                    "automation_field": "recommended_next_action.trust.automation_allowed",
+                    "minimum_trust_field": "recommended_next_action.trust.required"
+                },
+                "stable_fields": [
+                    "command",
+                    "schema",
+                    "data.packet.tool",
+                    "data.packet.role",
+                    "data.packet.packet_kind",
+                    "data.packet.recommended_next_action",
+                    "data.packet.trust_summary",
+                    "data.packet.source_event_ids",
+                    "data.packet.focus",
+                    "data.gate.ready_to_inject",
+                    "data.gate.trust"
+                ],
+                "adapters": {
+                    "cmux": {
+                        "command": "rally cmux packet --tool <tool> --json",
+                        "side_effects": false,
+                        "purpose": "workspace/feed-friendly packet export"
+                    },
+                    "herdr": {
+                        "command": "rally herdr packet --tool <tool> --json",
+                        "side_effects": false,
+                        "purpose": "prompt payload export; actual injection remains adapter-owned"
+                    }
+                }
+            }
+        }),
+    ))
+}
+
+pub(super) fn execute_cmux_packet(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    execute_adapter_packet(command, "cmux")
+}
+
+pub(super) fn execute_herdr_packet(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    execute_adapter_packet(command, "herdr")
+}
+
+fn execute_adapter_packet(
+    command: ReadCommand,
+    adapter: &'static str,
+) -> Result<WriteOutput, CliError> {
+    let tool = command.common.tool();
+    let (store, records, now) = query_records(&command)?;
+    let projection = TraceProjection::from_records_at(&records, now);
+    let brief = build_context_brief(&projection, &tool, command.limit);
+    let packet = build_work_packet(&brief, command.limit);
+    let ready_to_act = packet.recommended_next_action.trust.automation_allowed;
+    let title = format!("Rally {} packet for {}", packet.packet_kind, packet.tool);
+    let body = adapter_body(
+        &packet.packet_kind,
+        &packet.role,
+        &packet.recommended_next_action.reason,
+        &packet.files,
+    );
+    let adapter_data = match adapter {
+        "cmux" => json!({
+            "adapter": "cmux",
+            "schema": "agent-rally.adapter.cmux-packet.v1",
+            "available_on_path": executable_on_path("cmux"),
+            "side_effects": false,
+            "suggested_commands": ["cmux feed tui", "cmux open ."],
+            "work_item": {
+                "title": title,
+                "body": body,
+                "files": packet.files,
+                "source_event_ids": packet.source_event_ids,
+                "ready_to_act": ready_to_act,
+                "trust": packet.recommended_next_action.trust,
+            },
+            "packet": packet,
+        }),
+        "herdr" => json!({
+            "adapter": "herdr",
+            "schema": "agent-rally.adapter.herdr-packet.v1",
+            "side_effects": false,
+            "ready_to_inject": ready_to_act,
+            "prompt": body,
+            "trust": packet.recommended_next_action.trust,
+            "packet": packet,
+        }),
+        _ => unreachable!(),
+    };
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        format!("{adapter} packet for {tool}"),
+        json!({ "adapter": adapter_data }),
+    ))
+}
+
+fn adapter_body(kind: &str, role: &str, reason: &str, files: &[String]) -> String {
+    let files = if files.is_empty() {
+        "none".to_string()
+    } else {
+        files.join(", ")
+    };
+    format!("Rally {kind} packet ({role}). Next action: {reason}. Files: {files}.")
+}
+
+fn executable_on_path(name: &str) -> bool {
+    env::var_os("PATH").is_some_and(|paths| {
+        env::split_paths(&paths).any(|path| Path::new(&path).join(name).is_file())
+    })
+}
+
+pub(super) fn execute_herdr_inject(command: HerdrInjectCommand) -> Result<WriteOutput, CliError> {
+    let store = command.common.channel_store("herdr:inject")?;
+    let records = store.load_records().map_err(|err| {
+        CliError::runtime("herdr:inject", format!("failed to load channel: {err}"))
+    })?;
+    let record = records
+        .iter()
+        .find(|record| record_id(record) == command.identifier)
+        .ok_or_else(|| {
+            CliError::not_found(
+                "herdr:inject",
+                format!("handoff {} was not found", command.identifier),
+            )
+        })?;
+    let parsed = EventRecord::parse(record).map_err(|err| {
+        CliError::runtime("herdr:inject", format!("failed to parse event: {err}"))
+    })?;
+    let Some(EventPayload::Handoff(payload)) = parsed.payload.as_ref() else {
+        return Err(CliError::usage(
+            "herdr:inject",
+            format!("{} is not a handoff event", command.identifier),
+        ));
+    };
+    let origin = record
+        .get("origin")
+        .and_then(Value::as_str)
+        .unwrap_or("local");
+    let trust_status = record
+        .get("trust_status")
+        .and_then(Value::as_str)
+        .unwrap_or("unsigned");
+    let trusted = trust_status == "trusted";
+    let ready_to_inject = trusted || command.force || !command.strict;
+    let action = if ready_to_inject {
+        if command.force && !trusted {
+            "override"
+        } else {
+            "ready"
+        }
+    } else {
+        "refuse"
+    };
+    let text = if ready_to_inject {
+        format!(
+            "herdr inject {action}: {} trust_status={trust_status} origin={origin}",
+            command.identifier
+        )
+    } else {
+        format!(
+            "herdr inject refused: {} trust_status={trust_status} origin={origin}; use --force to override",
+            command.identifier
+        )
+    };
+    Ok(query_output(
+        "herdr:inject",
+        &command.common,
+        &store,
+        text,
+        json!({
+            "gate": {
+                "action": action,
+                "ready_to_inject": ready_to_inject,
+                "strict": command.strict,
+                "override_used": command.force,
+                "override_flag": "--force",
+                "trust": {
+                    "origin": origin,
+                    "trust_status": trust_status,
+                    "required": "trusted"
+                },
+                "handoff": {
+                    "event_id": command.identifier,
+                    "subject": payload.subject,
+                    "from_tool": payload.from_tool,
+                    "to_tool": payload.to_tool,
+                    "files": payload.ref_files,
+                    "notes": payload.notes
+                }
+            }
         }),
     ))
 }
@@ -353,7 +629,7 @@ fn query_output(
         body: json!({
             "ok": true,
             "command": command,
-            "schema": format!("agent-rally.command.{command}.v1"),
+            "schema": format!("agent-rally.command.{}.v1", command.replace(':', "-")),
             "channel": store.channel_dir().display().to_string(),
             "data": data,
         }),
@@ -367,7 +643,7 @@ pub(super) fn query_records(
     let now = now_epoch_seconds();
     let cutoff = parse_since(command.since.as_deref(), now)
         .map_err(|err| CliError::usage(command.command, err.to_string()))?;
-    let records = store.load_records().map_err(|err| {
+    let records = store.load_records_cached().map_err(|err| {
         CliError::runtime(command.command, format!("failed to load channel: {err}"))
     })?;
     Ok((store, filter_since(&records, cutoff), now))

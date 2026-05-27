@@ -558,6 +558,99 @@ fn attuned_fact_commands_feed_context_brief() {
 }
 
 #[test]
+fn packet_command_emits_role_shaped_contract() {
+    let workspace = RallyWorkspace::new("rally-cli-packet-contract");
+
+    json_stdout(workspace.run(&[
+        "profile",
+        "--json",
+        "--tool",
+        "codex-reviewer",
+        "--role",
+        "reviewer",
+        "--capability",
+        "review",
+        "--watch",
+        "crates/rally-core",
+    ]));
+    json_stdout(workspace.run(&[
+        "artifact",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "packet implementation notes",
+        "--artifact-kind",
+        "review-notes",
+        "--uri",
+        "crates/rally-core/src/context.rs",
+    ]));
+    json_stdout(workspace.run(&[
+        "decision",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "packets are read-only derived state",
+        "--status",
+        "binding",
+        "--scope",
+        "crates/rally-core/src/context.rs",
+    ]));
+
+    let packet = json_stdout(workspace.run(&["packet", "--json", "--tool", "codex-reviewer"]));
+    workspace.cleanup();
+
+    assert_eq!(packet["command"], "packet");
+    assert_eq!(packet["schema"], "agent-rally.command.packet.v1");
+    assert_eq!(packet["data"]["packet"]["role"], "reviewer");
+    assert_eq!(packet["data"]["packet"]["packet_kind"], "review");
+    assert!(
+        packet["data"]["packet"]["review_targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["kind"] == "artifact")
+    );
+    assert_eq!(
+        packet["data"]["packet"]["trust_summary"]["minimum_trust_for_automation"],
+        "local-or-trusted"
+    );
+    assert!(packet["data"]["packet"]["build_targets"].is_null());
+}
+
+#[test]
+fn herdr_inject_gate_surfaces_trust_and_requires_override_for_unsigned_handoffs() {
+    let workspace = RallyWorkspace::new("rally-cli-herdr-gate");
+    let handoff = json_stdout(workspace.run(&[
+        "handoff",
+        "--json",
+        "--to",
+        "pi",
+        "--from-tool",
+        "codex",
+        "--subject",
+        "inject this into herdr",
+    ]));
+    let handoff_id = handoff["event_id"].as_str().unwrap();
+
+    let gate = json_stdout(workspace.run(&["herdr", "inject", "--json", handoff_id]));
+    assert_eq!(gate["command"], "herdr:inject");
+    assert_eq!(gate["schema"], "agent-rally.command.herdr-inject.v1");
+    assert_eq!(gate["data"]["gate"]["action"], "refuse");
+    assert_eq!(gate["data"]["gate"]["ready_to_inject"], false);
+    assert_eq!(gate["data"]["gate"]["trust"]["trust_status"], "unsigned");
+
+    let override_gate =
+        json_stdout(workspace.run(&["herdr", "inject", "--json", "--force", handoff_id]));
+    workspace.cleanup();
+
+    assert_eq!(override_gate["data"]["gate"]["action"], "override");
+    assert_eq!(override_gate["data"]["gate"]["ready_to_inject"], true);
+    assert_eq!(override_gate["data"]["gate"]["override_used"], true);
+}
+
+#[test]
 fn identity_init_and_signed_write_verify_as_trusted() {
     let workspace = RallyWorkspace::new("rally-cli-signed-channel");
     let identity_dir = temp_channel("rally-cli-identity");

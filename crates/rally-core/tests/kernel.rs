@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use rally_core::context::build_context_brief;
+use rally_core::context::{build_context_brief, build_work_packet};
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
 use rally_core::event::{EventBuilder, EventPayload, HandoffPayload};
 use rally_core::query::{
@@ -484,6 +484,80 @@ fn reviewer_profile_shapes_attunement_and_recommendations() {
 }
 
 #[test]
+fn work_packet_shapes_role_specific_briefs_and_trust_contract() {
+    let profile = record(
+        "profile",
+        "evt_profile",
+        "codex-reviewer",
+        json!({
+            "tool": "codex-reviewer",
+            "role": "reviewer",
+            "capabilities": ["review"],
+            "watch": ["crates/rally-core"]
+        }),
+    );
+    let artifact = json!({
+        "local_seq": 1,
+        "origin": "import:sync",
+        "trust_status": "untrusted",
+        "event": record(
+            "artifact",
+            "evt_review_target",
+            "codex",
+            json!({
+                "subject": "packet implementation notes",
+                "artifact_kind": "review-notes",
+                "uri": "crates/rally-core/src/context.rs"
+            }),
+        )
+    });
+    let decision = record(
+        "decision",
+        "evt_decision",
+        "codex",
+        json!({
+            "subject": "packets are read-only derived state",
+            "status": "binding",
+            "scope": "crates/rally-core/src/context.rs"
+        }),
+    );
+    let projection =
+        TraceProjection::from_records_at(&[profile, artifact, decision], 1_779_829_200.0);
+    let brief = build_context_brief(&projection, "codex-reviewer", 10);
+    let packet = build_work_packet(&brief, 10);
+
+    assert_eq!(packet.role, "reviewer");
+    assert_eq!(packet.packet_kind, "review");
+    assert!(packet.build_targets.is_empty());
+    assert!(
+        packet
+            .review_targets
+            .iter()
+            .any(|item| item.event_id == "evt_review_target")
+    );
+    assert!(
+        packet
+            .files
+            .contains(&"crates/rally-core/src/context.rs".to_string())
+    );
+    assert_eq!(
+        packet.trust_summary.minimum_trust_for_automation,
+        packet.recommended_next_action.minimum_trust_for_automation
+    );
+    assert_eq!(
+        packet.trust_summary.recommendation_automation_allowed,
+        packet.recommended_next_action.trust.automation_allowed
+    );
+    assert_eq!(packet.trust_summary.untrusted, 1);
+    assert!(
+        packet
+            .trust_risks
+            .iter()
+            .any(|item| item.event_id == "evt_review_target")
+    );
+}
+
+#[test]
 fn active_tasks_use_latest_task_state_by_owner_and_subject() {
     let active = record(
         "task",
@@ -793,6 +867,30 @@ fn channel_store_serializes_concurrent_appenders() {
     fs::remove_dir_all(channel).unwrap();
 
     assert_eq!(records.len(), 8);
+}
+
+#[test]
+fn channel_store_checkpoint_is_rebuildable_cache() {
+    let channel = temp_channel("rally-core-checkpoint");
+    let store = ChannelStore::new(&channel);
+    store
+        .append_event(record(
+            "handoff",
+            "evt_checkpoint_handoff",
+            "pi",
+            json!({"to_tool": "codex", "subject": "checkpoint review"}),
+        ))
+        .unwrap();
+
+    let strict = store.load_records().unwrap();
+    let rebuilt = store.rebuild_checkpoint().unwrap();
+    let cached = store.load_records_cached().unwrap();
+    let status = store.checkpoint_status().unwrap();
+    fs::remove_dir_all(channel).unwrap();
+
+    assert_eq!(rebuilt.records, 1);
+    assert!(status.valid);
+    assert_eq!(strict, cached);
 }
 
 #[test]

@@ -7,6 +7,7 @@ mod args;
 mod dispatch;
 mod output;
 mod query_commands;
+mod resources;
 mod runtime;
 mod sync_commands;
 mod trust_policy;

@@ -3,14 +3,16 @@
 
 use crate::args::{
     WriteArgs, parse_ack, parse_artifact, parse_blocker, parse_claim, parse_decision,
-    parse_handoff, parse_identity_init, parse_lesson, parse_preflight, parse_profile, parse_read,
-    parse_release, parse_subscribe, parse_sync_export, parse_sync_import, parse_task,
-    parse_unblock,
+    parse_handoff, parse_herdr_inject, parse_identity_init, parse_lesson, parse_preflight,
+    parse_profile, parse_read, parse_release, parse_subscribe, parse_sync_export,
+    parse_sync_import, parse_task, parse_unblock,
 };
 use crate::output::{CliError, WriteOutput};
 use crate::query_commands::{
-    execute_blockers, execute_claims, execute_conflicts, execute_context, execute_diagnose,
-    execute_inbox, execute_replay, execute_report, execute_score, execute_thread,
+    execute_adapter_contract, execute_blockers, execute_checkpoint_rebuild,
+    execute_checkpoint_status, execute_claims, execute_cmux_packet, execute_conflicts,
+    execute_context, execute_diagnose, execute_herdr_inject, execute_herdr_packet, execute_inbox,
+    execute_packet, execute_replay, execute_report, execute_score, execute_thread,
 };
 use crate::sync_commands::{execute_sync_export, execute_sync_import};
 use crate::verify_commands::{VerifyOptions, verify};
@@ -57,6 +59,7 @@ pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Some("blockers") => run_read("blockers", args, parse_read, execute_blockers),
         Some("conflicts") => run_read("conflicts", args, parse_read, execute_conflicts),
         Some("context") => run_read("context", args, parse_read, execute_context),
+        Some("packet") => run_read("packet", args, parse_read, execute_packet),
         Some("diagnose") => run_read("diagnose", args, parse_read, execute_diagnose),
         Some("score") => run_read("score", args, parse_read, execute_score),
         Some("thread") => run_read("thread", args, parse_read, execute_thread),
@@ -64,6 +67,106 @@ pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Some("report") => run_read("report", args, parse_read, execute_report),
         Some("identity") => run_identity(args),
         Some("sync") => run_sync(args),
+        Some("herdr") => run_herdr(args),
+        Some("cmux") => run_cmux(args),
+        Some("adapter") => run_adapter(args),
+        Some("checkpoint") => run_checkpoint(args),
+        _ => {
+            usage();
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+fn run_herdr(args: impl Iterator<Item = String>) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let mut args: Vec<String> = args.collect();
+    match args.first().map(String::as_str) {
+        Some("inject") => {
+            args.remove(0);
+            run_write(
+                "herdr:inject",
+                args.into_iter(),
+                parse_herdr_inject,
+                execute_herdr_inject,
+            )
+        }
+        Some("packet") => {
+            args.remove(0);
+            run_read(
+                "herdr:packet",
+                args.into_iter(),
+                parse_read,
+                execute_herdr_packet,
+            )
+        }
+        _ => {
+            usage();
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+fn run_cmux(args: impl Iterator<Item = String>) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let mut args: Vec<String> = args.collect();
+    match args.first().map(String::as_str) {
+        Some("packet") => {
+            args.remove(0);
+            run_read(
+                "cmux:packet",
+                args.into_iter(),
+                parse_read,
+                execute_cmux_packet,
+            )
+        }
+        _ => {
+            usage();
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+fn run_adapter(args: impl Iterator<Item = String>) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let mut args: Vec<String> = args.collect();
+    match args.first().map(String::as_str) {
+        Some("contract") => {
+            args.remove(0);
+            run_read(
+                "adapter:contract",
+                args.into_iter(),
+                parse_read,
+                execute_adapter_contract,
+            )
+        }
+        _ => {
+            usage();
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+fn run_checkpoint(
+    args: impl Iterator<Item = String>,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let mut args: Vec<String> = args.collect();
+    match args.first().map(String::as_str) {
+        Some("status") => {
+            args.remove(0);
+            run_read(
+                "checkpoint:status",
+                args.into_iter(),
+                parse_read,
+                execute_checkpoint_status,
+            )
+        }
+        Some("rebuild") => {
+            args.remove(0);
+            run_read(
+                "checkpoint:rebuild",
+                args.into_iter(),
+                parse_read,
+                execute_checkpoint_rebuild,
+            )
+        }
         _ => {
             usage();
             Ok(ExitCode::from(2))
@@ -210,10 +313,15 @@ fn usage() {
         "       rally subscribe [--tool <tool>] [--path <path>]... [--event-kind <kind>]... [--thread <id>]... [--task <id>]... [--json]"
     );
     eprintln!(
-        "       rally context|inbox|claims|blockers|conflicts|diagnose|score|report|replay [--json] [--since <window>] [--tool <tool>]"
+        "       rally context|packet|inbox|claims|blockers|conflicts|diagnose|score|report|replay [--json] [--since <window>] [--tool <tool>]"
     );
     eprintln!("       rally thread [--json] <event-id>");
     eprintln!("       rally identity init [--identity-dir <dir>] --tool <tool> [--json]");
     eprintln!("       rally sync export [--json] [--since <window>] > packet.json");
     eprintln!("       rally sync import [--json] [--trust-policy <trust.toml>] <packet.json>");
+    eprintln!("       rally herdr inject [--json] [--force] <handoff-id>");
+    eprintln!("       rally adapter contract [--json]");
+    eprintln!("       rally cmux packet [--tool <tool>] [--json]");
+    eprintln!("       rally herdr packet [--tool <tool>] [--json]");
+    eprintln!("       rally checkpoint status|rebuild [--json]");
 }

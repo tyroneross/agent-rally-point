@@ -78,8 +78,79 @@ pub struct ContextRecommendation {
     pub target: Option<String>,
     pub confidence: f64,
     pub minimum_trust_for_automation: String,
+    pub trust: RecommendationTrust,
     pub reason: String,
     pub source_event_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecommendationTrust {
+    pub required: String,
+    pub automation_allowed: bool,
+    pub source_statuses: Vec<TrustSourceStatus>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrustSourceStatus {
+    pub event_id: String,
+    pub origin: String,
+    pub trust_status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkPacket {
+    pub tool: String,
+    pub role: String,
+    pub packet_kind: String,
+    pub profile: Option<AgentProfile>,
+    pub recommended_next_action: ContextRecommendation,
+    pub trust_summary: PacketTrustSummary,
+    pub source_event_ids: Vec<String>,
+    pub focus: Vec<AttunedItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub review_targets: Vec<AttunedItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub build_targets: Vec<AttunedItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub architecture_targets: Vec<AttunedItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub verification_targets: Vec<AttunedItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub active_tasks: Vec<ActiveTask>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub active_claims: Vec<ActiveClaim>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub active_blockers: Vec<ActiveBlocker>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub collision_risk: Vec<ClaimConflict>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub artifacts: Vec<CoordinationArtifact>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub decisions: Vec<CoordinationDecision>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub lessons: Vec<CoordinationLesson>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub files: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub test_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub trust_risks: Vec<AttunedItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub risk_areas: Vec<AttunedItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub open_tradeoffs: Vec<ContextItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PacketTrustSummary {
+    pub minimum_trust_for_automation: String,
+    pub recommendation_automation_allowed: bool,
+    pub trusted: usize,
+    pub local: usize,
+    pub unsigned: usize,
+    pub untrusted: usize,
+    pub invalid: usize,
+    pub unknown: usize,
 }
 
 pub fn build_context_brief(
@@ -157,6 +228,215 @@ pub fn build_context_brief(
         lessons,
         relevant_changes,
     }
+}
+
+pub fn build_work_packet(brief: &ContextBrief, limit: usize) -> WorkPacket {
+    let limit = limit.max(1);
+    let role = role_for_brief(brief).unwrap_or("general");
+    let packet_kind = match role {
+        "reviewer" => "review",
+        "builder" => "build",
+        "architect" => "architecture",
+        "qa" => "verification",
+        _ => "general",
+    };
+    let focus = brief
+        .attuned_items
+        .iter()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let trust_risks = focus
+        .iter()
+        .filter(|item| item_has_trust_risk(item))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut packet = WorkPacket {
+        tool: brief.tool.clone(),
+        role: role.to_string(),
+        packet_kind: packet_kind.to_string(),
+        profile: brief.profile.clone(),
+        recommended_next_action: brief.recommended_next_action.clone(),
+        trust_summary: packet_trust_summary(brief, &focus),
+        source_event_ids: packet_source_event_ids(brief, &focus),
+        focus: focus.clone(),
+        review_targets: Vec::new(),
+        build_targets: Vec::new(),
+        architecture_targets: Vec::new(),
+        verification_targets: Vec::new(),
+        active_tasks: Vec::new(),
+        active_claims: Vec::new(),
+        active_blockers: Vec::new(),
+        collision_risk: Vec::new(),
+        artifacts: Vec::new(),
+        decisions: Vec::new(),
+        lessons: Vec::new(),
+        files: packet_files(brief, &focus),
+        test_commands: packet_test_commands(brief),
+        trust_risks,
+        risk_areas: Vec::new(),
+        open_tradeoffs: Vec::new(),
+    };
+
+    match role {
+        "reviewer" => {
+            packet.review_targets = filter_focus(&focus, review_target_kind);
+            packet.artifacts = brief.artifacts.clone();
+            packet.decisions = brief.decisions.clone();
+            packet.lessons = brief.lessons.clone();
+            packet.risk_areas = packet.trust_risks.clone();
+        }
+        "builder" => {
+            packet.build_targets = filter_focus(&focus, build_target_kind);
+            packet.active_tasks = brief.active_tasks.clone();
+            packet.active_claims = brief.active_claims.clone();
+            packet.active_blockers = brief.active_blockers.clone();
+            packet.collision_risk = brief.collision_risk.clone();
+            packet.decisions = brief.decisions.clone();
+        }
+        "architect" => {
+            packet.architecture_targets = filter_focus(&focus, architecture_target_kind);
+            packet.decisions = brief.decisions.clone();
+            packet.lessons = brief.lessons.clone();
+            packet.artifacts = brief.artifacts.clone();
+            packet.open_tradeoffs = brief
+                .needs_attention
+                .iter()
+                .filter(|item| matches!(item.kind.as_str(), "blocker" | "claim_conflict"))
+                .cloned()
+                .collect();
+        }
+        "qa" => {
+            packet.verification_targets = filter_focus(&focus, verification_target_kind);
+            packet.artifacts = brief.artifacts.clone();
+            packet.lessons = brief.lessons.clone();
+            packet.active_blockers = brief.active_blockers.clone();
+            packet.collision_risk = brief.collision_risk.clone();
+            packet.risk_areas = focus
+                .iter()
+                .filter(|item| item_has_trust_risk(item) || item.kind.contains("blocker"))
+                .cloned()
+                .collect();
+        }
+        _ => {}
+    }
+
+    packet
+}
+
+fn role_for_brief(brief: &ContextBrief) -> Option<&'static str> {
+    brief.profile.as_ref().and_then(profile_specialization)
+}
+
+fn filter_focus(items: &[AttunedItem], predicate: fn(&str) -> bool) -> Vec<AttunedItem> {
+    items
+        .iter()
+        .filter(|item| predicate(item.kind.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn review_target_kind(kind: &str) -> bool {
+    matches!(kind, "artifact" | "decision" | "lesson" | "handoff")
+        || kind.starts_with("recent_artifact")
+        || kind.starts_with("recent_decision")
+}
+
+fn build_target_kind(kind: &str) -> bool {
+    matches!(kind, "task" | "claim" | "blocker" | "claim_conflict")
+        || kind.starts_with("recent_task")
+        || kind.starts_with("recent_claim")
+}
+
+fn architecture_target_kind(kind: &str) -> bool {
+    matches!(kind, "decision" | "lesson" | "artifact") || kind.starts_with("recent_decision")
+}
+
+fn verification_target_kind(kind: &str) -> bool {
+    matches!(kind, "artifact" | "lesson") || kind.starts_with("recent_artifact")
+}
+
+fn packet_files(brief: &ContextBrief, focus: &[AttunedItem]) -> Vec<String> {
+    let mut files = BTreeSet::new();
+    for path in focus.iter().flat_map(|item| item.paths.iter()) {
+        files.insert(path.clone());
+    }
+    for path in brief
+        .needs_attention
+        .iter()
+        .flat_map(|item| item.paths.iter())
+    {
+        files.insert(path.clone());
+    }
+    for path in brief
+        .active_claims
+        .iter()
+        .filter_map(|claim| normalize_path(&claim.resource).map(str::to_string))
+    {
+        files.insert(path);
+    }
+    files.into_iter().collect()
+}
+
+fn packet_test_commands(brief: &ContextBrief) -> Vec<String> {
+    let mut commands = BTreeSet::new();
+    for command in brief
+        .active_tasks
+        .iter()
+        .filter_map(|task| task.verification.as_ref())
+    {
+        commands.insert(command.clone());
+    }
+    commands.into_iter().collect()
+}
+
+fn packet_source_event_ids(brief: &ContextBrief, focus: &[AttunedItem]) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    ids.extend(
+        brief
+            .recommended_next_action
+            .source_event_ids
+            .iter()
+            .cloned(),
+    );
+    for item in focus {
+        ids.extend(item.source_event_ids.iter().cloned());
+    }
+    ids.into_iter().collect()
+}
+
+fn packet_trust_summary(brief: &ContextBrief, focus: &[AttunedItem]) -> PacketTrustSummary {
+    let mut summary = PacketTrustSummary {
+        minimum_trust_for_automation: brief
+            .recommended_next_action
+            .minimum_trust_for_automation
+            .clone(),
+        recommendation_automation_allowed: brief.recommended_next_action.trust.automation_allowed,
+        trusted: 0,
+        local: 0,
+        unsigned: 0,
+        untrusted: 0,
+        invalid: 0,
+        unknown: 0,
+    };
+    for item in focus {
+        match classified_trust(item.origin.as_deref(), item.trust_status.as_deref()).as_str() {
+            "trusted" => summary.trusted += 1,
+            "local" => summary.local += 1,
+            "unsigned" => summary.unsigned += 1,
+            "untrusted" => summary.untrusted += 1,
+            "invalid" | "conflict" => summary.invalid += 1,
+            _ => summary.unknown += 1,
+        }
+    }
+    summary
+}
+
+fn item_has_trust_risk(item: &AttunedItem) -> bool {
+    matches!(
+        classified_trust(item.origin.as_deref(), item.trust_status.as_deref()).as_str(),
+        "unsigned" | "untrusted" | "invalid" | "conflict" | "unknown"
+    )
 }
 
 fn handoff_item(item: &PendingHandoff) -> ContextItem {
@@ -667,67 +947,86 @@ fn recommend_next_action(
     attuned_items: &[AttunedItem],
 ) -> ContextRecommendation {
     if let Some(item) = pending_handoffs.first() {
-        return ContextRecommendation {
-            action: "ack_handoff".to_string(),
-            target: Some(item.event_id.clone()),
-            confidence: 0.95,
-            minimum_trust_for_automation: "trusted".to_string(),
-            reason: "a required handoff is assigned to this tool".to_string(),
-            source_event_ids: vec![item.event_id.clone()],
-        };
+        return context_recommendation(
+            "ack_handoff",
+            Some(item.event_id.clone()),
+            0.95,
+            "trusted",
+            "a required handoff is assigned to this tool".to_string(),
+            vec![trust_ref(
+                &item.event_id,
+                item.origin.as_deref(),
+                item.trust_status.as_deref(),
+            )],
+        );
     }
     if let Some(item) = active_tasks.first() {
-        return ContextRecommendation {
-            action: "work_task".to_string(),
-            target: Some(item.event_id.clone()),
-            confidence: 0.88,
-            minimum_trust_for_automation: "trusted".to_string(),
-            reason: "an active task is assigned to this tool".to_string(),
-            source_event_ids: vec![item.event_id.clone()],
-        };
+        return context_recommendation(
+            "work_task",
+            Some(item.event_id.clone()),
+            0.88,
+            "trusted",
+            "an active task is assigned to this tool".to_string(),
+            vec![trust_ref(
+                &item.event_id,
+                item.origin.as_deref(),
+                item.trust_status.as_deref(),
+            )],
+        );
     }
     if let Some(item) = own_blockers.first() {
-        return ContextRecommendation {
-            action: "resolve_blocker".to_string(),
-            target: Some(item.event_id.clone()),
-            confidence: 0.85,
-            minimum_trust_for_automation: "local-or-trusted".to_string(),
-            reason: "this tool is blocked until the blocker is resolved or updated".to_string(),
-            source_event_ids: vec![item.event_id.clone()],
-        };
+        return context_recommendation(
+            "resolve_blocker",
+            Some(item.event_id.clone()),
+            0.85,
+            "local-or-trusted",
+            "this tool is blocked until the blocker is resolved or updated".to_string(),
+            vec![trust_ref(
+                &item.event_id,
+                item.origin.as_deref(),
+                item.trust_status.as_deref(),
+            )],
+        );
     }
     if let Some(item) = collision_risk.first() {
-        return ContextRecommendation {
-            action: "resolve_claim_conflict".to_string(),
-            target: Some(item.resource.clone()),
-            confidence: 0.8,
-            minimum_trust_for_automation: "local-or-trusted".to_string(),
-            reason: "this tool has an active claim that overlaps another owner".to_string(),
-            source_event_ids: item.claim_ids.clone(),
-        };
+        return context_recommendation(
+            "resolve_claim_conflict",
+            Some(item.resource.clone()),
+            0.8,
+            "local-or-trusted",
+            "this tool has an active claim that overlaps another owner".to_string(),
+            item.claim_ids
+                .iter()
+                .map(|event_id| trust_ref(event_id, None, None))
+                .collect(),
+        );
     }
     if let Some(item) = active_claims.first() {
-        return ContextRecommendation {
-            action: "continue_claim".to_string(),
-            target: Some(item.event_id.clone()),
-            confidence: 0.65,
-            minimum_trust_for_automation: "local-or-trusted".to_string(),
-            reason: "this tool has active claimed work and no higher-priority coordination risk"
+        return context_recommendation(
+            "continue_claim",
+            Some(item.event_id.clone()),
+            0.65,
+            "local-or-trusted",
+            "this tool has active claimed work and no higher-priority coordination risk"
                 .to_string(),
-            source_event_ids: vec![item.event_id.clone()],
-        };
+            vec![trust_ref(
+                &item.event_id,
+                item.origin.as_deref(),
+                item.trust_status.as_deref(),
+            )],
+        );
     }
     if let Some(recommendation) = recommend_specialized_action(profile, attuned_items) {
         return recommendation;
     }
-    ContextRecommendation {
-        action: "proceed_solo".to_string(),
-        target: None,
-        confidence: 0.55,
-        minimum_trust_for_automation: "none".to_string(),
-        reason: "no pending handoffs, blockers, or claim conflicts for this tool".to_string(),
-        source_event_ids: Vec::new(),
-    }
+    context_recommendation(
+        "proceed_solo",
+        None,
+        0.55,
+        "none",
+        "no pending handoffs, blockers, or claim conflicts for this tool".to_string(),
+        Vec::new(),
+    )
 }
 
 fn recommend_specialized_action(
@@ -745,14 +1044,106 @@ fn recommend_specialized_action(
         ("qa", "artifact") => "verify_artifact",
         _ => return None,
     };
-    Some(ContextRecommendation {
+    Some(context_recommendation(
+        action,
+        Some(item.event_id.clone()),
+        0.72,
+        "local-or-trusted",
+        format!("{role} profile is best matched to {}", item.kind),
+        item.source_event_ids
+            .iter()
+            .map(|event_id| {
+                trust_ref(
+                    event_id,
+                    item.origin.as_deref(),
+                    item.trust_status.as_deref(),
+                )
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Clone, Debug)]
+struct RecommendationTrustRef {
+    event_id: String,
+    origin: Option<String>,
+    trust_status: Option<String>,
+}
+
+fn trust_ref(
+    event_id: &str,
+    origin: Option<&str>,
+    trust_status: Option<&str>,
+) -> RecommendationTrustRef {
+    RecommendationTrustRef {
+        event_id: event_id.to_string(),
+        origin: origin.map(str::to_string),
+        trust_status: trust_status.map(str::to_string),
+    }
+}
+
+fn context_recommendation(
+    action: &str,
+    target: Option<String>,
+    confidence: f64,
+    minimum_trust_for_automation: &str,
+    reason: String,
+    trust_refs: Vec<RecommendationTrustRef>,
+) -> ContextRecommendation {
+    let source_event_ids = trust_refs
+        .iter()
+        .map(|item| item.event_id.clone())
+        .collect::<Vec<_>>();
+    let source_statuses = trust_refs
+        .iter()
+        .map(|item| TrustSourceStatus {
+            event_id: item.event_id.clone(),
+            origin: item.origin.clone().unwrap_or_else(|| "local".to_string()),
+            trust_status: classified_trust(item.origin.as_deref(), item.trust_status.as_deref()),
+        })
+        .collect::<Vec<_>>();
+    let trust = RecommendationTrust {
+        required: minimum_trust_for_automation.to_string(),
+        automation_allowed: automation_allowed(minimum_trust_for_automation, &source_statuses),
+        source_statuses,
+    };
+    ContextRecommendation {
         action: action.to_string(),
-        target: Some(item.event_id.clone()),
-        confidence: 0.72,
-        minimum_trust_for_automation: "local-or-trusted".to_string(),
-        reason: format!("{role} profile is best matched to {}", item.kind),
-        source_event_ids: item.source_event_ids.clone(),
-    })
+        target,
+        confidence,
+        minimum_trust_for_automation: minimum_trust_for_automation.to_string(),
+        trust,
+        reason,
+        source_event_ids,
+    }
+}
+
+fn automation_allowed(required: &str, statuses: &[TrustSourceStatus]) -> bool {
+    match required {
+        "none" => true,
+        "trusted" => {
+            !statuses.is_empty()
+                && statuses
+                    .iter()
+                    .all(|status| status.trust_status == "trusted")
+        }
+        "local-or-trusted" => statuses.iter().all(|status| {
+            status.trust_status == "trusted"
+                || (status.trust_status == "local" && status.origin == "local")
+        }),
+        _ => false,
+    }
+}
+
+fn classified_trust(origin: Option<&str>, trust_status: Option<&str>) -> String {
+    if let Some(status) = trust_status {
+        return status.to_string();
+    }
+    if origin.is_none_or(|origin| origin == "local") {
+        "local".to_string()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 fn profile_specialization(profile: &AgentProfile) -> Option<&'static str> {

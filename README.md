@@ -68,6 +68,12 @@ Read projections:
 ```bash
 rally inbox --tool codex --json
 rally context --tool codex --json
+rally packet --tool codex-reviewer --json
+rally adapter contract --json
+rally cmux packet --tool codex-reviewer --json
+rally herdr packet --tool codex-reviewer --json
+rally checkpoint rebuild --json
+rally checkpoint status --json
 rally claims --json
 rally blockers --json
 rally conflicts --json
@@ -83,6 +89,16 @@ recommended next action plus `attuned_items`: scored, source-linked facts ranked
 for that specific tool from active work, declared role, watched paths,
 subscriptions, task links, trust labels, and recent changes.
 
+`rally packet` is the bounded work-brief surface for specialized agents. It is
+read-only, derived from the same context projection, and shapes the JSON for the
+requesting profile role: reviewer, builder, architect, QA, or general.
+
+Adapter commands are edge exports over the same packet contract. `rally cmux
+packet` and `rally herdr packet` emit side-effect-free adapter envelopes;
+`rally adapter contract` documents the trust fields adapters must honor.
+`rally checkpoint rebuild/status` manages the disposable hot-read checkpoint
+used by query commands.
+
 Trust and sync:
 
 ```bash
@@ -91,6 +107,7 @@ rally handoff --identity-dir <identity-dir> --sign --to pi --subject "signed han
 rally verify --json --trust-policy <trust.toml> <changes.jsonl>
 rally sync export --json > packet.json
 rally sync import --trust-policy <trust.toml> packet.json --json
+rally herdr inject --json <handoff-id>
 ```
 
 Imported events retain their import `origin` and trust classification in the
@@ -148,8 +165,10 @@ target architecture. The short version:
 - Store metadata is local replica state.
 - Portable events are the sync/signature unit.
 - CLI output is machine-readable JSON first.
-- Bridges to ACP, A2A, MCP, Herdr, and UI surfaces live outside the core.
+- Agent integration is through the shared Rally skill and CLI JSON first;
+  bridges to ACP, A2A, MCP, Herdr, and UI surfaces stay at the edge.
 - `rally context --tool <agent> --json` is the first attuned briefing surface.
+- `rally packet --tool <agent> --json` is the role-shaped work brief.
 
 ## License
 

@@ -319,15 +319,21 @@ The first-class commands should be:
 | `rally blocker` / `unblock` / `blockers` | Blocker state. |
 | `rally inbox` | Agent-specific pending work. |
 | `rally context` | Agent-specific attunement brief: obligations, risks, relevant changes, trust labels, lessons, and recommended next action. |
+| `rally packet` | Bounded role-shaped work brief derived from context for reviewer, builder, architect, QA, or general agents. |
+| `rally adapter contract` | Machine-readable adapter rules for packet consumers and trust gates. |
+| `rally cmux packet` / `herdr packet` | Side-effect-free adapter envelopes over `rally packet`. |
+| `rally checkpoint status` / `rebuild` | Inspect or rebuild the disposable hot-read checkpoint cache. |
 | `rally thread` | Related event expansion. |
 | `rally replay` / `report` | Timeline and summaries. |
 | `rally diagnose` | Deterministic coordination findings. |
 | `rally verify` | Signature/trust verification. |
 | `rally identity` / `trust` | Local keys and trust policy. |
 | `rally sync export` / `sync import` | Remote-safe event movement. |
+| `rally herdr inject` | Trust gate for future Herdr injection adapters; refuses untrusted input unless overridden. |
 
-Adapter commands, such as Herdr injection, should live behind feature gates or
-adapter crates once the core is stable.
+Adapter commands should keep kernel boundaries explicit. `rally herdr inject`
+currently acts as a trust gate and structured handoff export for a future Herdr
+adapter; editor or terminal mutation remains outside the core.
 
 ## Crate Layout
 
@@ -382,6 +388,19 @@ Initial implementation status:
 - Profiles may declare an optional `role`; reviewer, architect, builder, and QA
   specialization changes ranking and advisory recommendations without taking
   precedence over urgent coordination obligations.
+- `rally-core::context` also exposes `WorkPacket`, a role-shaped packet derived
+  from `ContextBrief`; the CLI renders it through `rally packet --tool <agent>
+  --json`.
+- `ContextRecommendation` now carries a machine-readable trust assessment so
+  agents can see whether the recommendation satisfies its automation threshold.
+- `rally herdr inject` is implemented as a strict trust gate that surfaces
+  handoff trust and requires `--force` for unsigned/untrusted input; actual
+  Herdr injection remains adapter work.
+- Query commands use a rebuildable `rally.checkpoint.json` cache when it matches
+  verified tail metadata; stale or missing checkpoints fall back to strict log
+  replay and can be rebuilt with `rally checkpoint rebuild`.
+- `rally adapter contract`, `rally cmux packet`, and `rally herdr packet` expose
+  stable adapter envelopes without moving cmux/Herdr behavior into the kernel.
 - `rally-cli verify --json` now reads through `rally-core` and emits the command
   envelope shape for success and failure.
 - `rally-cli` is still a prototype verifier surface and should become a
@@ -456,7 +475,7 @@ surrounding protocols:
 | Protocol/runtime | Rally mapping |
 |---|---|
 | A2A | `handoff`/`ack`/`needs-info` map to task lifecycle state; `thread_id` maps to A2A context; attachments/results map to artifacts. |
-| MCP | Expose `inbox`, `diagnose`, `verify`, `thread`, and `trust` as tools/resources for any MCP-capable agent client. |
+| MCP | Optional edge adapter only. The current first-class agent integration is the Rally skill plus CLI JSON; if MCP is added later, expose `context`, `packet`, `inbox`, `diagnose`, `verify`, and `trust` without moving logic out of the kernel. |
 | ACP | Treat editor-connected coding agents as producers/consumers; ACP sessions can post Rally presence, handoffs, claims, and verdicts. |
 | AG-UI | UI event streams can render Rally events and derived state without changing the core. |
 | OpenAI Agents SDK | SDK handoffs/sessions/traces can emit Rally events for cross-process coordination. Rally does not replace the SDK agent loop. |
@@ -464,6 +483,11 @@ surrounding protocols:
 | Temporal | Temporal workflows can emit Rally events; Rally does not provide durable workflow execution. |
 | OpenTelemetry | Rally event IDs, thread IDs, and causation IDs can become trace links or span attributes. |
 | CloudEvents | Rally events stay CloudEvents-aligned for event bus export/import. |
+
+Interop mappings are directional until an adapter explicitly says otherwise.
+The kernel can export Rally facts in protocol-shaped terms and ingest trusted
+portable Rally events; it does not imply full bidirectional A2A, ACP, MCP, OTel,
+or CloudEvents protocol participation.
 
 ## What Gets Deleted
 
@@ -487,6 +511,9 @@ it is not the oracle for command behavior or storage shape.
 
 The durable contract is at the agent boundary: commands expose stable JSON
 schemas and clear exit codes. Human text exact wording is never a contract.
+The CLI JSON contracts remain first-class even if optional adapters such as MCP,
+ACP, A2A, or Herdr are added later; adapters should wrap these semantics, not
+replace them.
 
 ## What Survives
 

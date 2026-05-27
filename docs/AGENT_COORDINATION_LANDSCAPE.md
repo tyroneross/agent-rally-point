@@ -87,9 +87,11 @@ data sources, tools, and workflows. Its own docs frame it as a standardized
 connection layer for clients and servers, with broad ecosystem support across
 AI assistants and developer tools.
 
-Rally implication: Rally should expose coordination state through MCP; it should
-not become MCP. "List pending handoffs" and "read diagnosis" are good MCP
-tools/resources. "Run arbitrary tool against user data" is not Rally's lane.
+Rally implication: Rally can expose coordination state through MCP later, but
+MCP is not the primary near-term integration. The shared Rally skill plus stable
+CLI JSON is enough for agent clients now. If an MCP adapter is built, "read
+context/packet/inbox/diagnosis/trust" are good tools/resources; "run arbitrary
+tool against user data" is not Rally's lane.
 
 Source: https://modelcontextprotocol.io/docs/getting-started/intro
 
@@ -263,16 +265,20 @@ The greenfield architecture should be revised around these ideas:
 8. **Local-first sync semantics.** Import/export packets should be transport
    neutral. Files, Git, shared folders, A2A, or a future service can carry them.
 
-## Architecture Doc Changes Needed
+## Architecture Interop Boundary
 
-The Rust greenfield architecture should add:
+The Rust greenfield architecture now carries the interop boundary explicitly:
 
-- A dedicated "Protocol Interop" section.
-- A "Rally owns / Rally bridges / Rally refuses" boundary table.
-- A2A mapping: Rally `handoff` and `ack` to A2A `Task`, `TaskStatus`, and
-  artifacts.
-- MCP mapping: Rally inbox/diagnose/trust as tools/resources.
-- ACP mapping: editor-connected coding agents as Rally producers/consumers.
-- OTel mapping: Rally event IDs as trace links or span attributes.
-- Explicit statement that Rally is below orchestration frameworks, not a
-  competitor to them.
+- Rally owns durable coordination facts and derived JSON projections.
+- Rally bridges A2A task/context IDs, ACP sessions, optional MCP resources,
+  OpenTelemetry trace links/span attributes, and CloudEvents-shaped event
+  movement.
+- Rally refuses to become an orchestrator, RPC broker, scheduler, editor
+  transport, or hosted workflow runtime.
+
+That boundary keeps `rally context` and `rally packet` as attuned local briefs,
+not a control plane for remote automation.
+
+Protocol mappings are not full bridge commitments by default. Directionality,
+trust requirements, and override behavior belong in the adapter that implements
+each bridge; the stable CLI JSON remains the source contract for agents.

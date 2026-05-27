@@ -1,0 +1,30 @@
+{
+  "channel": "<channel>",
+  "command": "herdr:inject",
+  "data": {
+    "gate": {
+      "action": "refuse",
+      "handoff": {
+        "event_id": "evt_1",
+        "files": [
+          "crates/rally-core/src/context.rs"
+        ],
+        "from_tool": "codex",
+        "notes": null,
+        "subject": "inject this into herdr",
+        "to_tool": "pi"
+      },
+      "override_flag": "--force",
+      "override_used": false,
+      "ready_to_inject": false,
+      "strict": true,
+      "trust": {
+        "origin": "local",
+        "required": "trusted",
+        "trust_status": "unsigned"
+      }
+    }
+  },
+  "ok": true,
+  "schema": "agent-rally.command.herdr-inject.v1"
+}

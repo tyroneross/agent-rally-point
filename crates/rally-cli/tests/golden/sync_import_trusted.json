@@ -1,0 +1,16 @@
+{
+  "channel": "<channel>",
+  "command": "sync:import",
+  "data": {
+    "conflicts": [],
+    "duplicates": 0,
+    "imported": 1,
+    "invalid": 0,
+    "trust_counts": {
+      "trusted": 1
+    }
+  },
+  "ok": true,
+  "origin": "import:sync",
+  "schema": "agent-rally.command.sync-import.v1"
+}

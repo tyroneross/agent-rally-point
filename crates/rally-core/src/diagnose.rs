@@ -93,7 +93,7 @@ fn from_score_finding(finding: ScoreFinding) -> DiagnoseFinding {
 
 fn from_blocker(blocker: ActiveBlocker) -> DiagnoseFinding {
     DiagnoseFinding {
-        severity: "P1".to_string(),
+        severity: crate::severity::P1.to_string(),
         code: "active-blocker".to_string(),
         event_id: Some(blocker.event_id.clone()),
         message: format!(
@@ -107,7 +107,7 @@ fn from_blocker(blocker: ActiveBlocker) -> DiagnoseFinding {
 
 fn from_conflict(conflict: ClaimConflict, since: Option<&str>) -> DiagnoseFinding {
     DiagnoseFinding {
-        severity: "P1".to_string(),
+        severity: crate::severity::P1.to_string(),
         code: "claim-conflict".to_string(),
         event_id: conflict.claim_ids.first().cloned(),
         message: format!(
@@ -125,7 +125,7 @@ fn from_conflict(conflict: ClaimConflict, since: Option<&str>) -> DiagnoseFindin
 
 fn from_stale_claim(claim: ActiveClaim) -> DiagnoseFinding {
     DiagnoseFinding {
-        severity: "P2".to_string(),
+        severity: crate::severity::P2.to_string(),
         code: "stale-claim".to_string(),
         event_id: Some(claim.event_id.clone()),
         message: format!(

@@ -188,3 +188,18 @@ may declare `profile.role` values such as `reviewer`, `architect`, `builder`,
 or `qa`; when omitted, role-like capabilities can imply the same specialization.
 The role shapes `attuned_items` and low-risk recommendations, while urgent
 handoffs, tasks, blockers, and claim conflicts still take precedence.
+
+`rally packet` is the next layer over that context: one read-only command that
+turns the same attuned projection into a bounded work brief shaped by the
+requesting role. Reviewer packets emphasize review targets, artifacts,
+decisions, test evidence, and trust risks; builder packets emphasize tasks,
+claims, blockers, decisions, and files; architect packets emphasize decisions,
+lessons, artifacts, and tradeoffs; QA packets emphasize verification artifacts,
+test commands, lessons, and risk areas. Unknown roles get a general packet with
+top `attuned_items` and the recommended next action.
+
+Adapters consume packets rather than raw logs. `rally adapter contract` exposes
+the trust rules, while `rally cmux packet` and `rally herdr packet` wrap the work
+packet for those surfaces without side effects. Hot packet/context reads may use
+a disposable checkpoint cache, but the cache is always derived from
+`changes.jsonl` and can be rebuilt.

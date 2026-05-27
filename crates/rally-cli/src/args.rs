@@ -107,6 +107,7 @@ impl WriteArgs {
                 "--key-id" => common.key_id = Some(take_value(command, &arg, &mut args)?),
                 "--no-ack"
                 | "--force"
+                | "--strict"
                 | "--ids"
                 | "--sign"
                 | "--start-ping"
