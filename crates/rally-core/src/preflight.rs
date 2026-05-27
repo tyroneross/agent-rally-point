@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::CoreError;
-use crate::query::{ActiveBlocker, ActiveClaim, ClaimConflict, RecentChange, TraceProjection};
+use crate::query::{ActiveBlocker, ActiveClaim, ClaimConflict, RecentChange};
 use crate::store::ChannelStore;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -79,7 +79,6 @@ pub fn run_preflight(
     let now = DateTime::<Utc>::from(SystemTime::now());
     let now_epoch = now.timestamp() as f64;
     let records = store.load_records()?;
-    let projection = TraceProjection::from_records_at(&records, now_epoch);
     let active_peers = active_peers(
         store.channel_dir(),
         &options.tool,
@@ -88,40 +87,25 @@ pub fn run_preflight(
         now,
     )?;
 
-    // Prefer graph projection; fall back to TraceProjection on any graph
-    // error so a corrupt cache doesn't take preflight down.
-    let graph_result = (|| -> Result<
-        (
-            Vec<crate::query::PendingHandoff>,
-            Vec<crate::query::ActiveClaim>,
-            Vec<crate::query::ActiveBlocker>,
-            Vec<crate::query::ClaimConflict>,
-            Vec<crate::query::RecentChange>,
-        ),
-        Box<dyn std::error::Error>,
-    > {
-        let now_rfc = now.to_rfc3339();
-        let mut conn = crate::graph::init(store.channel_dir(), &now_rfc)?;
-        crate::graph::catch_up(&mut conn, &records, &now_rfc)?;
-        Ok((
-            crate::graph::pending_handoffs_typed(&conn, Some(&options.tool), now_epoch)?,
-            crate::graph::active_claims_typed(&conn, None, now_epoch)?,
-            crate::graph::active_blockers_typed(&conn, None, now_epoch)?,
-            crate::graph::claim_conflicts_typed(&conn)?,
-            crate::graph::recent_changes_typed(&conn, options.recent_limit as u32, now_epoch)?,
-        ))
-    })();
-    let (pending_acks_for_me, active_claims, active_blockers, claim_conflicts, recent_changes) =
-        match graph_result {
-            Ok(tuple) => tuple,
-            Err(_) => (
-                projection.pending_handoffs(Some(&options.tool)),
-                projection.active_claims(None),
-                projection.active_blockers(None),
-                projection.claim_conflicts(),
-                projection.recent_changes(options.recent_limit),
-            ),
-        };
+    // Graph is the source of truth. Surfacing graph errors here lets
+    // callers detect a corrupt projection rather than serve stale data.
+    let now_rfc = now.to_rfc3339();
+    let mut conn = crate::graph::init(store.channel_dir(), &now_rfc).map_err(|err| {
+        crate::CoreError::Io(std::io::Error::other(format!("open graph: {err}")))
+    })?;
+    crate::graph::catch_up(&mut conn, &records, &now_rfc).map_err(|err| {
+        crate::CoreError::Io(std::io::Error::other(format!("graph catch_up: {err}")))
+    })?;
+    let pending_acks_for_me = crate::graph::pending_handoffs_typed(&conn, Some(&options.tool), now_epoch)
+        .map_err(|err| crate::CoreError::Io(std::io::Error::other(format!("handoffs: {err}"))))?;
+    let active_claims = crate::graph::active_claims_typed(&conn, None, now_epoch)
+        .map_err(|err| crate::CoreError::Io(std::io::Error::other(format!("claims: {err}"))))?;
+    let active_blockers = crate::graph::active_blockers_typed(&conn, None, now_epoch)
+        .map_err(|err| crate::CoreError::Io(std::io::Error::other(format!("blockers: {err}"))))?;
+    let claim_conflicts = crate::graph::claim_conflicts_typed(&conn)
+        .map_err(|err| crate::CoreError::Io(std::io::Error::other(format!("conflicts: {err}"))))?;
+    let recent_changes = crate::graph::recent_changes_typed(&conn, options.recent_limit as u32, now_epoch)
+        .map_err(|err| crate::CoreError::Io(std::io::Error::other(format!("recent: {err}"))))?;
 
     let routing = if !pending_acks_for_me.is_empty() {
         PreflightRouting {

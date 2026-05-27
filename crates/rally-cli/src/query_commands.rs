@@ -18,8 +18,8 @@ use rally_core::event::{ClaimPayload, EventBuilder, EventPayload, EventRecord, P
 use rally_core::graph;
 use rally_core::preflight::{PreflightOptions, run_preflight};
 use rally_core::query::{
-    TraceProjection, active_blockers_at, active_claims_at, claim_conflicts, filter_since,
-    now_epoch_seconds, parse_since, pending_handoffs_at, record_id, related_records, score_records,
+    active_blockers_at, active_claims_at, claim_conflicts, filter_since, now_epoch_seconds,
+    parse_since, pending_handoffs_at, record_id, related_records, score_records,
 };
 use rally_core::store::ChannelStore;
 use rally_protocol::event_value;
@@ -56,31 +56,23 @@ fn doctor_inputs_from_graph(
     ))
 }
 
-/// Build a ContextBrief preferring the SQLite graph projection, falling
-/// back to TraceProjection on any graph error. The graph path matches
-/// TraceProjection's typed fields (thread_id, origin, trust_status,
-/// age_seconds) via the schema-v4 node columns, so the brief shape is
-/// identical from both sources.
-fn brief_via_graph_or_projection(
+/// Build a ContextBrief from the SQLite graph projection. The graph is
+/// the source of truth for this surface — propagate errors up rather
+/// than silently masking them with a stale in-memory projection.
+fn brief_from_graph(
     store: &ChannelStore,
     records: &[Value],
-    projection: &TraceProjection,
     tool: &str,
     recent_limit: usize,
     now: f64,
-) -> ContextBrief {
-    let from_graph = (|| -> Result<ContextInputs, Box<dyn std::error::Error>> {
-        let mut conn = graph::init(store.channel_dir(), &now_rfc3339())?;
-        graph::catch_up(&mut conn, records, &now_rfc3339())?;
-        Ok(ContextInputs::from_graph(&conn, tool, recent_limit, now)?)
-    })();
-    match from_graph {
-        Ok(inputs) => build_context_brief_from_inputs(&inputs),
-        Err(_) => {
-            let inputs = ContextInputs::from_projection(projection, tool, recent_limit);
-            build_context_brief_from_inputs(&inputs)
-        }
-    }
+) -> Result<ContextBrief, CliError> {
+    let mut conn = graph::init(store.channel_dir(), &now_rfc3339())
+        .map_err(|err| CliError::runtime("context", format!("open graph: {err}")))?;
+    graph::catch_up(&mut conn, records, &now_rfc3339())
+        .map_err(|err| CliError::runtime("context", format!("graph catch_up: {err}")))?;
+    let inputs = ContextInputs::from_graph(&conn, tool, recent_limit, now)
+        .map_err(|err| CliError::runtime("context", format!("graph inputs: {err}")))?;
+    Ok(build_context_brief_from_inputs(&inputs))
 }
 
 /// Filter `records` to those with `local_seq` strictly greater than the cursor
@@ -286,9 +278,7 @@ pub(super) fn execute_conflicts(command: ReadCommand) -> Result<WriteOutput, Cli
 pub(super) fn execute_context(command: ReadCommand) -> Result<WriteOutput, CliError> {
     let tool = command.common.tool();
     let (store, records, now) = query_records(&command)?;
-    let projection = TraceProjection::from_records_at(&records, now);
-    let brief =
-        brief_via_graph_or_projection(&store, &records, &projection, &tool, command.limit, now);
+    let brief = brief_from_graph(&store, &records, &tool, command.limit, now)?;
     let text = if let Some(priority) = &brief.top_priority {
         format!(
             "{}: {} ({})",
@@ -346,9 +336,7 @@ fn focus_graph_view(store: &ChannelStore, records: &[Value], focus: &str) -> Opt
 pub(super) fn execute_packet(command: ReadCommand) -> Result<WriteOutput, CliError> {
     let tool = command.common.tool();
     let (store, records, now) = query_records(&command)?;
-    let projection = TraceProjection::from_records_at(&records, now);
-    let brief =
-        brief_via_graph_or_projection(&store, &records, &projection, &tool, command.limit, now);
+    let brief = brief_from_graph(&store, &records, &tool, command.limit, now)?;
     let packet = build_work_packet(&brief, command.limit);
     let text = format!(
         "{} packet for {}: {}",
@@ -414,15 +402,7 @@ pub(super) fn execute_start(command: StartCommand) -> Result<WriteOutput, CliErr
     }
 
     let now = now_epoch_seconds();
-    let projection = TraceProjection::from_records_at(&records, now);
-    let brief = brief_via_graph_or_projection(
-        &store,
-        &records,
-        &projection,
-        &command.tool,
-        command.limit,
-        now,
-    );
+    let brief = brief_from_graph(&store, &records, &command.tool, command.limit, now)?;
     let packet = build_work_packet(&brief, command.limit);
     let agent_visible = agent_visible_from_context(&brief.recommended_next_action);
     let checkpoint = store
@@ -476,7 +456,6 @@ pub(super) fn execute_start(command: StartCommand) -> Result<WriteOutput, CliErr
 pub(super) fn execute_doctor(command: ReadCommand) -> Result<WriteOutput, CliError> {
     let tool = command.common.tool();
     let (store, records, now) = query_records(&command)?;
-    let projection = TraceProjection::from_records_at(&records, now);
     let diagnosis = diagnose_records(
         &records,
         DiagnoseOptions {
@@ -491,17 +470,9 @@ pub(super) fn execute_doctor(command: ReadCommand) -> Result<WriteOutput, CliErr
         CliError::runtime(command.command, format!("failed to read checkpoint: {err}"))
     })?;
     let setup = setup_status(&store)?;
-    // Prefer graph queries; fall back to TraceProjection on graph error.
     let (active_claims, active_tasks, pending_handoffs, profile_present) =
-        match doctor_inputs_from_graph(&store, &records, &tool, now) {
-            Ok(t) => t,
-            Err(_) => (
-                projection.active_claims(None),
-                projection.active_tasks(None),
-                projection.pending_handoffs(None),
-                projection.profile(&tool).is_some(),
-            ),
-        };
+        doctor_inputs_from_graph(&store, &records, &tool, now)
+            .map_err(|err| CliError::runtime("doctor", format!("graph: {err}")))?;
     let mut findings = Vec::new();
     for finding in diagnosis.findings {
         findings.push(json!({
@@ -586,15 +557,11 @@ pub(super) fn execute_doctor(command: ReadCommand) -> Result<WriteOutput, CliErr
 pub(super) fn execute_next(command: ReadCommand) -> Result<WriteOutput, CliError> {
     let tool = command.common.tool();
     let (store, records, now) = query_records(&command)?;
-    let projection = TraceProjection::from_records_at(&records, now);
-
-    // Graph-backed sources for next_recommendation. If the graph fails to
-    // open or catch up, fall back to TraceProjection — preserving the
-    // legacy behavior so `rally next` never goes dark on a corrupt cache.
-    let graph_view = open_graph_view(&store, &records).ok();
-
-    let recommendation =
-        next_recommendation(&projection, &tool, command.limit, graph_view.as_ref());
+    // Graph is the source of truth for `rally next`. Propagate errors
+    // rather than masking with TraceProjection — agents need to know
+    // when the projection cache is broken.
+    let graph_view = open_graph_view(&store, &records, &tool, now)?;
+    let recommendation = next_recommendation(&tool, command.limit, &graph_view);
     let text = recommendation
         .get("subject")
         .and_then(Value::as_str)
@@ -609,9 +576,10 @@ pub(super) fn execute_next(command: ReadCommand) -> Result<WriteOutput, CliError
     ))
 }
 
-/// Bundle of graph-derived inputs to `next_recommendation`. When this
-/// is None, callers fall back to TraceProjection-derived sources.
+/// Bundle of graph-derived inputs to `next_recommendation`. Graph is
+/// the source of truth — there is no fallback path.
 pub(crate) struct GraphView {
+    pub profile: Option<rally_core::query::AgentProfile>,
     pub pending_handoffs: Vec<Value>,
     pub active_blockers: Vec<Value>,
     pub owned_active_tasks: Vec<Value>,
@@ -621,14 +589,20 @@ pub(crate) struct GraphView {
 }
 
 /// Open + catch up the graph, then load all the projections
-/// `next_recommendation` needs in one place. Returns Err if any step
-/// fails so the caller can decide to fall back rather than partially
-/// migrate.
-fn open_graph_view(store: &ChannelStore, records: &[Value]) -> Result<GraphView, CliError> {
+/// `next_recommendation` needs in one place. Errors propagate — agents
+/// need to know when the projection cache is unreadable.
+fn open_graph_view(
+    store: &ChannelStore,
+    records: &[Value],
+    tool: &str,
+    _now: f64,
+) -> Result<GraphView, CliError> {
     let mut conn = graph::init(store.channel_dir(), &now_rfc3339())
         .map_err(|err| CliError::runtime("next", format!("open graph: {err}")))?;
     graph::catch_up(&mut conn, records, &now_rfc3339())
         .map_err(|err| CliError::runtime("next", format!("graph catch_up: {err}")))?;
+    let profile = graph::latest_profile_typed(&conn, tool)
+        .map_err(|err| CliError::runtime("next", format!("profile: {err}")))?;
     let pending_handoffs = graph::pending_handoffs(&conn, None)
         .map_err(|err| CliError::runtime("next", format!("pending_handoffs: {err}")))?;
     let active_blockers = graph::active_blockers(&conn, None)
@@ -643,12 +617,11 @@ fn open_graph_view(store: &ChannelStore, records: &[Value]) -> Result<GraphView,
         .iter()
         .filter_map(|n| n.get("id").and_then(Value::as_str).map(str::to_string))
         .collect();
-    // Split tasks into owned/unowned. The split was previously two separate
-    // TraceProjection queries; doing it once at the graph layer is cheaper.
     let (owned_active_tasks, unowned_active_tasks) = owned_active_tasks
         .into_iter()
         .partition::<Vec<_>, _>(|t| t["owner_tool"].as_str().is_some());
     Ok(GraphView {
+        profile,
         pending_handoffs,
         active_blockers,
         owned_active_tasks,
@@ -920,31 +893,16 @@ pub(super) fn execute_ci_gate(command: ReadCommand) -> Result<WriteOutput, CliEr
     let store = command.common.channel_store("ci:gate")?;
     let records = load_records_cached_or_empty(&store, "ci:gate")?;
     let now = now_epoch_seconds();
-    let projection = TraceProjection::from_records_at(&records, now);
-    // Prefer graph queries; fall back to TraceProjection on graph error.
-    let (conflicts, blockers, handoffs) = match (|| -> Result<
-        (
-            Vec<rally_core::query::ClaimConflict>,
-            Vec<rally_core::query::ActiveBlocker>,
-            Vec<rally_core::query::PendingHandoff>,
-        ),
-        Box<dyn std::error::Error>,
-    > {
-        let mut conn = graph::init(store.channel_dir(), &now_rfc3339())?;
-        graph::catch_up(&mut conn, &records, &now_rfc3339())?;
-        Ok((
-            graph::claim_conflicts_typed(&conn)?,
-            graph::active_blockers_typed(&conn, None, now)?,
-            graph::pending_handoffs_typed(&conn, None, now)?,
-        ))
-    })() {
-        Ok(t) => t,
-        Err(_) => (
-            projection.claim_conflicts(),
-            projection.active_blockers(None),
-            projection.pending_handoffs(None),
-        ),
-    };
+    let mut conn = graph::init(store.channel_dir(), &now_rfc3339())
+        .map_err(|err| CliError::runtime("ci:gate", format!("open graph: {err}")))?;
+    graph::catch_up(&mut conn, &records, &now_rfc3339())
+        .map_err(|err| CliError::runtime("ci:gate", format!("graph catch_up: {err}")))?;
+    let conflicts = graph::claim_conflicts_typed(&conn)
+        .map_err(|err| CliError::runtime("ci:gate", format!("conflicts: {err}")))?;
+    let blockers = graph::active_blockers_typed(&conn, None, now)
+        .map_err(|err| CliError::runtime("ci:gate", format!("blockers: {err}")))?;
+    let handoffs = graph::pending_handoffs_typed(&conn, None, now)
+        .map_err(|err| CliError::runtime("ci:gate", format!("handoffs: {err}")))?;
     let checkpoint = store
         .checkpoint_status()
         .map_err(|err| CliError::runtime("ci:gate", format!("failed to read checkpoint: {err}")))?;
@@ -1093,7 +1051,6 @@ fn build_judgment(
     let tool = common.tool();
     let records = load_records_cached_or_empty(store, input.command)?;
     let now = now_epoch_seconds();
-    let projection = TraceProjection::from_records_at(&records, now);
     let setup = setup_status(store)?;
     let mut reasons = Vec::new();
     let mut required_actions = Vec::new();
@@ -1120,30 +1077,16 @@ fn build_judgment(
         required_actions.push("rally repair checkpoint --json".to_string());
     }
 
-    // Prefer graph queries; fall back to TraceProjection on graph error.
-    let (pending, blockers, all_claims) = match (|| -> Result<
-        (
-            Vec<rally_core::query::PendingHandoff>,
-            Vec<rally_core::query::ActiveBlocker>,
-            Vec<rally_core::query::ActiveClaim>,
-        ),
-        Box<dyn std::error::Error>,
-    > {
-        let mut conn = graph::init(store.channel_dir(), &now_rfc3339())?;
-        graph::catch_up(&mut conn, &records, &now_rfc3339())?;
-        Ok((
-            graph::pending_handoffs_typed(&conn, Some(&tool), now)?,
-            graph::active_blockers_typed(&conn, None, now)?,
-            graph::active_claims_typed(&conn, None, now)?,
-        ))
-    })() {
-        Ok(t) => t,
-        Err(_) => (
-            projection.pending_handoffs(Some(&tool)),
-            projection.active_blockers(None),
-            projection.active_claims(None),
-        ),
-    };
+    let mut conn = graph::init(store.channel_dir(), &now_rfc3339())
+        .map_err(|err| CliError::runtime(input.command, format!("open graph: {err}")))?;
+    graph::catch_up(&mut conn, &records, &now_rfc3339())
+        .map_err(|err| CliError::runtime(input.command, format!("graph catch_up: {err}")))?;
+    let pending = graph::pending_handoffs_typed(&conn, Some(&tool), now)
+        .map_err(|err| CliError::runtime(input.command, format!("handoffs: {err}")))?;
+    let blockers = graph::active_blockers_typed(&conn, None, now)
+        .map_err(|err| CliError::runtime(input.command, format!("blockers: {err}")))?;
+    let all_claims = graph::active_claims_typed(&conn, None, now)
+        .map_err(|err| CliError::runtime(input.command, format!("claims: {err}")))?;
     if !pending.is_empty() {
         reasons.push(json!({
             "code": "pending-handoff",
@@ -1303,200 +1246,104 @@ fn build_judgment(
     })
 }
 
-fn next_recommendation(
-    projection: &TraceProjection,
-    tool: &str,
-    limit: usize,
-    graph_view: Option<&GraphView>,
-) -> Value {
-    let profile = projection.profile(tool);
-    let role = profile
+fn next_recommendation(tool: &str, limit: usize, view: &GraphView) -> Value {
+    let role = view
+        .profile
         .as_ref()
-        .and_then(|profile| profile.role.as_deref())
+        .and_then(|p| p.role.as_deref())
         .unwrap_or("general");
-    let capabilities = profile
+    let capabilities = view
+        .profile
         .as_ref()
-        .map(|profile| profile.capabilities.clone())
+        .map(|p| p.capabilities.clone())
         .unwrap_or_default();
     let mut candidates = Vec::<Value>::new();
 
     // ── Pending handoffs ──────────────────────────────────────────────
-    if let Some(view) = graph_view {
-        for handoff in view.pending_handoffs.iter() {
-            if handoff["to_tool"].as_str() != Some(tool) {
-                continue;
-            }
-            let event_id = handoff["event_id"].as_str().unwrap_or("").to_string();
-            let subject = handoff["subject"].as_str().unwrap_or("").to_string();
-            candidates.push(candidate(
-                "pick_up_handoff",
-                &event_id,
-                &subject,
-                100.0,
-                json!({ "handoff": 100.0 }),
-                vec![event_id.clone()],
-                vec!["required handoff is addressed to this tool".to_string()],
-            ));
+    for handoff in view.pending_handoffs.iter() {
+        if handoff["to_tool"].as_str() != Some(tool) {
+            continue;
         }
-    } else {
-        for handoff in projection.pending_handoffs(Some(tool)) {
-            candidates.push(candidate(
-                "pick_up_handoff",
-                &handoff.event_id,
-                &handoff.subject,
-                100.0,
-                json!({ "handoff": 100.0 }),
-                vec![handoff.event_id.clone()],
-                vec!["required handoff is addressed to this tool".to_string()],
-            ));
-        }
+        let event_id = handoff["event_id"].as_str().unwrap_or("").to_string();
+        let subject = handoff["subject"].as_str().unwrap_or("").to_string();
+        candidates.push(candidate(
+            "pick_up_handoff",
+            &event_id,
+            &subject,
+            100.0,
+            json!({ "handoff": 100.0 }),
+            vec![event_id.clone()],
+            vec!["required handoff is addressed to this tool".to_string()],
+        ));
     }
 
     // ── Active blockers ───────────────────────────────────────────────
-    if let Some(view) = graph_view {
-        for blocker in view.active_blockers.iter() {
-            let score = if blocker["tool"].as_str() == Some(tool) {
-                90.0
-            } else {
-                70.0
-            };
-            let event_id = blocker["event_id"].as_str().unwrap_or("").to_string();
-            let subject = blocker["subject"].as_str().unwrap_or("").to_string();
-            candidates.push(candidate(
-                "unblock_peer",
-                &event_id,
-                &subject,
-                score,
-                json!({ "blocker": score }),
-                vec![event_id.clone()],
-                vec!["active blocker is preventing progress".to_string()],
-            ));
-        }
-    } else {
-        for blocker in projection.active_blockers(None) {
-            let score = if blocker.tool.as_deref() == Some(tool) {
-                90.0
-            } else {
-                70.0
-            };
-            candidates.push(candidate(
-                "unblock_peer",
-                &blocker.event_id,
-                &blocker.subject,
-                score,
-                json!({ "blocker": score }),
-                vec![blocker.event_id.clone()],
-                vec!["active blocker is preventing progress".to_string()],
-            ));
-        }
+    for blocker in view.active_blockers.iter() {
+        let score = if blocker["tool"].as_str() == Some(tool) { 90.0 } else { 70.0 };
+        let event_id = blocker["event_id"].as_str().unwrap_or("").to_string();
+        let subject = blocker["subject"].as_str().unwrap_or("").to_string();
+        candidates.push(candidate(
+            "unblock_peer",
+            &event_id,
+            &subject,
+            score,
+            json!({ "blocker": score }),
+            vec![event_id.clone()],
+            vec!["active blocker is preventing progress".to_string()],
+        ));
     }
 
     // ── Active tasks (owned + unowned) ────────────────────────────────
-    if let Some(view) = graph_view {
-        for task in view.owned_active_tasks.iter() {
-            if task["owner_tool"].as_str() != Some(tool) {
-                continue;
-            }
-            let event_id = task["event_id"].as_str().unwrap_or("").to_string();
-            let subject = task["subject"].as_str().unwrap_or("").to_string();
-            candidates.push(candidate(
-                "progress_owned_task",
-                &event_id,
-                &subject,
-                80.0,
-                json!({ "owned_task": 80.0, "role_match": role_match_bonus(role, &capabilities, "task") }),
-                vec![event_id.clone()],
-                vec!["open task is already owned by this tool".to_string()],
-            ));
+    for task in view.owned_active_tasks.iter() {
+        if task["owner_tool"].as_str() != Some(tool) {
+            continue;
         }
-        for task in view.unowned_active_tasks.iter() {
-            let bonus = role_match_bonus(role, &capabilities, "task");
-            let event_id = task["event_id"].as_str().unwrap_or("").to_string();
-            let subject = task["subject"].as_str().unwrap_or("").to_string();
-            candidates.push(candidate(
-                "claim_task",
-                &event_id,
-                &subject,
-                55.0 + bonus,
-                json!({ "unowned_task": 55.0, "role_match": bonus }),
-                vec![event_id.clone()],
-                vec!["open task has no owner".to_string()],
-            ));
-        }
-    } else {
-        for task in projection.active_tasks(Some(tool)) {
-            candidates.push(candidate(
-                "progress_owned_task",
-                &task.event_id,
-                &task.subject,
-                80.0,
-                json!({ "owned_task": 80.0, "role_match": role_match_bonus(role, &capabilities, "task") }),
-                vec![task.event_id.clone()],
-                vec!["open task is already owned by this tool".to_string()],
-            ));
-        }
-        for task in projection.active_tasks(None) {
-            if task.owner_tool.is_some() {
-                continue;
-            }
-            let bonus = role_match_bonus(role, &capabilities, "task");
-            candidates.push(candidate(
-                "claim_task",
-                &task.event_id,
-                &task.subject,
-                55.0 + bonus,
-                json!({ "unowned_task": 55.0, "role_match": bonus }),
-                vec![task.event_id.clone()],
-                vec!["open task has no owner".to_string()],
-            ));
-        }
+        let event_id = task["event_id"].as_str().unwrap_or("").to_string();
+        let subject = task["subject"].as_str().unwrap_or("").to_string();
+        candidates.push(candidate(
+            "progress_owned_task",
+            &event_id,
+            &subject,
+            80.0,
+            json!({ "owned_task": 80.0, "role_match": role_match_bonus(role, &capabilities, "task") }),
+            vec![event_id.clone()],
+            vec!["open task is already owned by this tool".to_string()],
+        ));
+    }
+    for task in view.unowned_active_tasks.iter() {
+        let bonus = role_match_bonus(role, &capabilities, "task");
+        let event_id = task["event_id"].as_str().unwrap_or("").to_string();
+        let subject = task["subject"].as_str().unwrap_or("").to_string();
+        candidates.push(candidate(
+            "claim_task",
+            &event_id,
+            &subject,
+            55.0 + bonus,
+            json!({ "unowned_task": 55.0, "role_match": bonus }),
+            vec![event_id.clone()],
+            vec!["open task has no owner".to_string()],
+        ));
     }
 
-    // ── Recent / unconsumed artifacts ─────────────────────────────────
-    if let Some(view) = graph_view {
-        // Source from the graph directly; only artifacts with no later
-        // non-producer activity show up. No more "every recent artifact
-        // scores" stale-recommendation bug.
-        for artifact in view.recent_artifacts.iter().take(limit.max(3)) {
-            let event_id = artifact["event_id"].as_str().unwrap_or("").to_string();
-            if !view.unconsumed_ids.contains(&event_id) {
-                continue;
-            }
-            let subject = artifact["subject"].as_str().unwrap_or("").to_string();
-            let bonus = role_match_bonus(role, &capabilities, "artifact");
-            candidates.push(candidate(
-                if bonus > 0.0 {
-                    "review_artifact"
-                } else {
-                    "consume_artifact"
-                },
-                &event_id,
-                &subject,
-                35.0 + bonus,
-                json!({ "artifact": 35.0, "role_match": bonus }),
-                vec![event_id.clone()],
-                vec!["no follow-up activity from another peer — needs review".to_string()],
-            ));
+    // ── Unconsumed artifacts ──────────────────────────────────────────
+    // Only artifacts with no later non-producer activity surface.
+    for artifact in view.recent_artifacts.iter().take(limit.max(3)) {
+        let event_id = artifact["event_id"].as_str().unwrap_or("").to_string();
+        if !view.unconsumed_ids.contains(&event_id) {
+            continue;
         }
-    } else {
-        for artifact in projection.artifacts(limit.max(3)) {
-            let bonus = role_match_bonus(role, &capabilities, "artifact");
-            candidates.push(candidate(
-                if bonus > 0.0 {
-                    "review_artifact"
-                } else {
-                    "consume_artifact"
-                },
-                &artifact.event_id,
-                &artifact.subject,
-                35.0 + bonus,
-                json!({ "artifact": 35.0, "role_match": bonus }),
-                vec![artifact.event_id.clone()],
-                vec!["recent artifact may need follow-up".to_string()],
-            ));
-        }
+        let subject = artifact["subject"].as_str().unwrap_or("").to_string();
+        let bonus = role_match_bonus(role, &capabilities, "artifact");
+        candidates.push(candidate(
+            if bonus > 0.0 { "review_artifact" } else { "consume_artifact" },
+            &event_id,
+            &subject,
+            35.0 + bonus,
+            json!({ "artifact": 35.0, "role_match": bonus }),
+            vec![event_id.clone()],
+            vec!["no follow-up activity from another peer — needs review".to_string()],
+        ));
     }
-
     candidates = normalize_candidates(candidates);
     if candidates.is_empty() {
         return json!({
@@ -3084,9 +2931,7 @@ fn execute_adapter_packet(
 ) -> Result<WriteOutput, CliError> {
     let tool = command.common.tool();
     let (store, records, now) = query_records(&command)?;
-    let projection = TraceProjection::from_records_at(&records, now);
-    let brief =
-        brief_via_graph_or_projection(&store, &records, &projection, &tool, command.limit, now);
+    let brief = brief_from_graph(&store, &records, &tool, command.limit, now)?;
     let packet = build_work_packet(&brief, command.limit);
     let agent_visible = agent_visible_from_context(&packet.recommended_next_action);
     let ready_to_act = packet.recommended_next_action.trust.automation_allowed;
