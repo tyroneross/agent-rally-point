@@ -415,6 +415,135 @@ fn preflight_routes_agents_and_writes_presence() {
 }
 
 #[test]
+fn attuned_fact_commands_feed_context_brief() {
+    let workspace = RallyWorkspace::new("rally-cli-attuned-context");
+
+    json_stdout(workspace.run(&[
+        "profile",
+        "--json",
+        "--tool",
+        "codex",
+        "--capability",
+        "rust",
+        "--capability",
+        "review",
+        "--watch",
+        "crates/rally-core",
+        "--current-task",
+        "task-local",
+        "--branch",
+        "codex/rally-attuned-events",
+        "--availability",
+        "active",
+    ]));
+    json_stdout(workspace.run(&[
+        "subscribe",
+        "--json",
+        "--tool",
+        "codex",
+        "--path",
+        "crates/rally-core",
+        "--event-kind",
+        "task",
+        "--event-kind",
+        "decision",
+        "--task",
+        "task-local",
+    ]));
+    let task = json_stdout(workspace.run(&[
+        "task",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "finish context ranking",
+        "--status",
+        "active",
+        "--verification",
+        "cargo test",
+    ]));
+    let task_id = task["event_id"].as_str().unwrap();
+    json_stdout(workspace.run(&[
+        "artifact",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "context contract",
+        "--artifact-kind",
+        "schema",
+        "--uri",
+        "docs/context.schema.json",
+        "--ref-task",
+        task_id,
+    ]));
+    json_stdout(workspace.run(&[
+        "decision",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "agents use rally context for next action",
+        "--status",
+        "binding",
+        "--scope",
+        "agent-start",
+    ]));
+    json_stdout(workspace.run(&[
+        "lesson",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "avoid giant planning docs as control surfaces",
+        "--lesson-kind",
+        "coordination",
+        "--source-event",
+        task_id,
+        "--confidence",
+        "0.9",
+    ]));
+
+    let context = json_stdout(workspace.run(&["context", "--json", "--tool", "codex"]));
+    workspace.cleanup();
+
+    assert_eq!(context["data"]["brief"]["profile"]["tool"], "codex");
+    assert_eq!(
+        context["data"]["brief"]["profile"]["capabilities"][0],
+        "rust"
+    );
+    assert_eq!(
+        context["data"]["brief"]["subscription"]["event_kinds"][1],
+        "decision"
+    );
+    assert_eq!(
+        context["data"]["brief"]["recommended_next_action"]["action"],
+        "work_task"
+    );
+    assert_eq!(
+        context["data"]["brief"]["recommended_next_action"]["target"],
+        task_id
+    );
+    assert_eq!(
+        context["data"]["brief"]["recommended_next_action"]["minimum_trust_for_automation"],
+        "trusted"
+    );
+    assert_eq!(
+        context["data"]["brief"]["active_tasks"][0]["event_id"],
+        task_id
+    );
+    assert_eq!(
+        context["data"]["brief"]["artifacts"][0]["ref_task_id"],
+        task_id
+    );
+    assert_eq!(
+        context["data"]["brief"]["decisions"][0]["status"],
+        "binding"
+    );
+    assert_eq!(context["data"]["brief"]["lessons"][0]["confidence"], 0.9);
+}
+
+#[test]
 fn identity_init_and_signed_write_verify_as_trusted() {
     let workspace = RallyWorkspace::new("rally-cli-signed-channel");
     let identity_dir = temp_channel("rally-cli-identity");

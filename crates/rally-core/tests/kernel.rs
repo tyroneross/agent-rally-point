@@ -185,11 +185,107 @@ fn context_brief_recommends_the_highest_priority_agent_action() {
     assert_eq!(brief.routing.action, "join_active");
     assert_eq!(brief.recommended_next_action.action, "ack_handoff");
     assert_eq!(
+        brief.recommended_next_action.minimum_trust_for_automation,
+        "trusted"
+    );
+    assert_eq!(
         brief.recommended_next_action.target.as_deref(),
         Some("evt_handoff")
     );
     assert_eq!(brief.top_priority.unwrap().kind, "handoff");
     assert_eq!(brief.relevant_changes.len(), 2);
+}
+
+#[test]
+fn context_brief_includes_attuned_agent_facts() {
+    let profile = record(
+        "profile",
+        "evt_profile",
+        "codex",
+        json!({
+            "tool": "codex",
+            "capabilities": ["rust", "review"],
+            "watch": ["crates/rally-core"],
+            "current_task": "evt_task",
+            "branch": "codex/rally-attuned-events",
+            "availability": "active"
+        }),
+    );
+    let subscription = record(
+        "subscription",
+        "evt_subscription",
+        "codex",
+        json!({
+            "tool": "codex",
+            "paths": ["crates/rally-core"],
+            "event_kinds": ["task", "decision"],
+            "tasks": ["evt_task"]
+        }),
+    );
+    let task = record(
+        "task",
+        "evt_task",
+        "codex",
+        json!({
+            "subject": "finish context ranking",
+            "status": "active",
+            "owner_tool": "codex",
+            "verification": "cargo test"
+        }),
+    );
+    let artifact = record(
+        "artifact",
+        "evt_artifact",
+        "codex",
+        json!({
+            "subject": "context schema",
+            "artifact_kind": "json-schema",
+            "uri": "docs/context.schema.json",
+            "ref_task_id": "evt_task"
+        }),
+    );
+    let decision = record(
+        "decision",
+        "evt_decision",
+        "codex",
+        json!({
+            "subject": "agents use rally context for next action",
+            "status": "binding",
+            "scope": "agent-start"
+        }),
+    );
+    let lesson = record(
+        "lesson",
+        "evt_lesson",
+        "codex",
+        json!({
+            "subject": "avoid giant planning docs as control surfaces",
+            "lesson_kind": "coordination",
+            "source_event_ids": ["evt_decision"],
+            "confidence": 0.9
+        }),
+    );
+    let records = vec![profile, subscription, task, artifact, decision, lesson];
+    let projection = TraceProjection::from_records_at(&records, 1_779_829_200.0);
+    let brief = build_context_brief(&projection, "codex", 10);
+
+    assert_eq!(
+        brief.profile.unwrap().capabilities,
+        vec!["rust".to_string(), "review".to_string()]
+    );
+    assert_eq!(
+        brief.subscription.unwrap().event_kinds,
+        vec!["task".to_string(), "decision".to_string()]
+    );
+    assert_eq!(brief.recommended_next_action.action, "work_task");
+    assert_eq!(
+        brief.recommended_next_action.minimum_trust_for_automation,
+        "trusted"
+    );
+    assert_eq!(brief.active_tasks[0].event_id, "evt_task");
+    assert_eq!(brief.artifacts[0].ref_task_id.as_deref(), Some("evt_task"));
+    assert_eq!(brief.decisions[0].status, "binding");
+    assert_eq!(brief.lessons[0].confidence, Some(0.9));
 }
 
 #[test]

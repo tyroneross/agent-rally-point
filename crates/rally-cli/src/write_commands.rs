@@ -2,14 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::args::{
-    AckCommand, BlockerCommand, ClaimCommand, CommonOptions, HandoffCommand, IdentityInitCommand,
-    PreflightCommand, ReleaseCommand, UnblockCommand,
+    AckCommand, ArtifactCommand, BlockerCommand, ClaimCommand, CommonOptions, DecisionCommand,
+    HandoffCommand, IdentityInitCommand, LessonCommand, PreflightCommand, ProfileCommand,
+    ReleaseCommand, SubscribeCommand, TaskCommand, UnblockCommand,
 };
 use crate::output::{CliError, WriteOutput};
 use crate::runtime::{new_id, now_rfc3339};
 use rally_core::event::{
-    AckPayload, BlockerPayload, BlockerResolvedPayload, ClaimPayload, ClaimReleasePayload,
-    EventBuilder, EventPayload, HandoffPayload,
+    AckPayload, ArtifactPayload, BlockerPayload, BlockerResolvedPayload, ClaimPayload,
+    ClaimReleasePayload, DecisionPayload, EventBuilder, EventPayload, HandoffPayload,
+    LessonPayload, ProfilePayload, SubscriptionPayload, TaskPayload,
 };
 use rally_core::preflight::{PreflightOptions, run_preflight};
 use rally_core::store::ChannelStore;
@@ -209,6 +211,179 @@ pub(super) fn execute_unblock(command: UnblockCommand) -> Result<WriteOutput, Cl
     ))
 }
 
+pub(super) fn execute_profile(command: ProfileCommand) -> Result<WriteOutput, CliError> {
+    let context = CommandContext::new("profile", &command.common)?;
+    let tool = context.tool();
+    let payload = EventPayload::Profile(ProfilePayload {
+        tool: tool.clone(),
+        capabilities: command.capabilities.clone(),
+        watch: command.watch.clone(),
+        current_task: command.current_task.clone(),
+        branch: command.branch.clone(),
+        availability: command.availability.clone(),
+        notes: command.notes.clone(),
+    });
+    let entry =
+        context.append(context.event(payload, &tool, new_id("thr"), format!("profile {tool}")))?;
+    Ok(context.output(
+        &entry,
+        format!(
+            "updated profile {} local_seq={}",
+            tool,
+            local_seq(&entry).unwrap_or_default()
+        ),
+        json!({
+            "tool": tool,
+            "capabilities": command.capabilities,
+            "watch": command.watch,
+        }),
+    ))
+}
+
+pub(super) fn execute_task(command: TaskCommand) -> Result<WriteOutput, CliError> {
+    let context = CommandContext::new("task", &command.common)?;
+    let tool = context.tool();
+    let payload = EventPayload::Task(TaskPayload {
+        subject: command.subject.clone(),
+        status: command.status.clone(),
+        owner_tool: command.owner_tool.clone(),
+        depends_on: command.depends_on.clone(),
+        artifacts: command.artifacts.clone(),
+        verification: command.verification.clone(),
+        notes: command.notes.clone(),
+    });
+    let entry =
+        context.append(context.event(payload, &tool, new_id("thr"), command.subject.clone()))?;
+    Ok(context.output(
+        &entry,
+        format!(
+            "posted task {} local_seq={}",
+            event_field(&entry, "id").unwrap_or_default(),
+            local_seq(&entry).unwrap_or_default()
+        ),
+        json!({
+            "subject": command.subject,
+            "status": command.status,
+            "owner_tool": command.owner_tool,
+        }),
+    ))
+}
+
+pub(super) fn execute_artifact(command: ArtifactCommand) -> Result<WriteOutput, CliError> {
+    let context = CommandContext::new("artifact", &command.common)?;
+    let tool = context.tool();
+    let payload = EventPayload::Artifact(ArtifactPayload {
+        subject: command.subject.clone(),
+        artifact_kind: command.artifact_kind.clone(),
+        uri: command.uri.clone(),
+        ref_task_id: command.ref_task_id.clone(),
+        summary: command.summary.clone(),
+    });
+    let entry =
+        context.append(context.event(payload, &tool, new_id("thr"), command.subject.clone()))?;
+    Ok(context.output(
+        &entry,
+        format!(
+            "recorded artifact {} local_seq={}",
+            event_field(&entry, "id").unwrap_or_default(),
+            local_seq(&entry).unwrap_or_default()
+        ),
+        json!({
+            "subject": command.subject,
+            "artifact_kind": command.artifact_kind,
+            "uri": command.uri,
+            "ref_task_id": command.ref_task_id,
+        }),
+    ))
+}
+
+pub(super) fn execute_decision(command: DecisionCommand) -> Result<WriteOutput, CliError> {
+    let context = CommandContext::new("decision", &command.common)?;
+    let tool = context.tool();
+    let payload = EventPayload::Decision(DecisionPayload {
+        subject: command.subject.clone(),
+        status: command.status.clone(),
+        scope: command.scope.clone(),
+        supersedes: command.supersedes.clone(),
+        rationale: command.rationale.clone(),
+    });
+    let entry =
+        context.append(context.event(payload, &tool, new_id("thr"), command.subject.clone()))?;
+    Ok(context.output(
+        &entry,
+        format!(
+            "recorded decision {} local_seq={}",
+            event_field(&entry, "id").unwrap_or_default(),
+            local_seq(&entry).unwrap_or_default()
+        ),
+        json!({
+            "subject": command.subject,
+            "status": command.status,
+            "scope": command.scope,
+        }),
+    ))
+}
+
+pub(super) fn execute_lesson(command: LessonCommand) -> Result<WriteOutput, CliError> {
+    let context = CommandContext::new("lesson", &command.common)?;
+    let tool = context.tool();
+    let payload = EventPayload::Lesson(LessonPayload {
+        subject: command.subject.clone(),
+        lesson_kind: command.lesson_kind.clone(),
+        scope: command.scope.clone(),
+        source_event_ids: command.source_event_ids.clone(),
+        confidence: command.confidence,
+    });
+    let entry =
+        context.append(context.event(payload, &tool, new_id("thr"), command.subject.clone()))?;
+    Ok(context.output(
+        &entry,
+        format!(
+            "recorded lesson {} local_seq={}",
+            event_field(&entry, "id").unwrap_or_default(),
+            local_seq(&entry).unwrap_or_default()
+        ),
+        json!({
+            "subject": command.subject,
+            "lesson_kind": command.lesson_kind,
+            "confidence": command.confidence,
+        }),
+    ))
+}
+
+pub(super) fn execute_subscribe(command: SubscribeCommand) -> Result<WriteOutput, CliError> {
+    let context = CommandContext::new("subscribe", &command.common)?;
+    let tool = context.tool();
+    let payload = EventPayload::Subscription(SubscriptionPayload {
+        tool: tool.clone(),
+        paths: command.paths.clone(),
+        event_kinds: command.event_kinds.clone(),
+        threads: command.threads.clone(),
+        tasks: command.tasks.clone(),
+    });
+    let entry = context.append(context.event(
+        payload,
+        &tool,
+        new_id("thr"),
+        format!("subscription {tool}"),
+    ))?;
+    Ok(context.output(
+        &entry,
+        format!(
+            "updated subscription {} local_seq={}",
+            tool,
+            local_seq(&entry).unwrap_or_default()
+        ),
+        json!({
+            "tool": tool,
+            "paths": command.paths,
+            "event_kinds": command.event_kinds,
+            "threads": command.threads,
+            "tasks": command.tasks,
+        }),
+    ))
+}
+
 pub(super) fn execute_identity_init(command: IdentityInitCommand) -> Result<WriteOutput, CliError> {
     let identity_dir = command.common.identity_dir()?;
     let allowed_kinds = [
@@ -219,6 +394,12 @@ pub(super) fn execute_identity_init(command: IdentityInitCommand) -> Result<Writ
         "claim-release",
         "blocker",
         "blocker-resolved",
+        "profile",
+        "task",
+        "artifact",
+        "decision",
+        "lesson",
+        "subscription",
     ];
     let identity = init_identity(&identity_dir, &command.tool, &allowed_kinds)
         .map_err(|err| CliError::runtime("identity:init", err.to_string()))?;

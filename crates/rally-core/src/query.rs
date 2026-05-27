@@ -73,6 +73,94 @@ pub struct RecentChange {
     pub trust_status: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentProfile {
+    pub event_id: String,
+    pub tool: String,
+    pub capabilities: Vec<String>,
+    pub watch: Vec<String>,
+    pub current_task: Option<String>,
+    pub branch: Option<String>,
+    pub availability: Option<String>,
+    pub notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_status: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActiveTask {
+    pub event_id: String,
+    pub thread_id: Option<String>,
+    pub subject: String,
+    pub status: String,
+    pub owner_tool: Option<String>,
+    pub depends_on: Vec<String>,
+    pub artifacts: Vec<String>,
+    pub verification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_status: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CoordinationArtifact {
+    pub event_id: String,
+    pub subject: String,
+    pub artifact_kind: String,
+    pub uri: Option<String>,
+    pub ref_task_id: Option<String>,
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_status: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CoordinationDecision {
+    pub event_id: String,
+    pub subject: String,
+    pub status: String,
+    pub scope: Option<String>,
+    pub supersedes: Vec<String>,
+    pub rationale: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_status: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CoordinationLesson {
+    pub event_id: String,
+    pub subject: String,
+    pub lesson_kind: Option<String>,
+    pub scope: Option<String>,
+    pub source_event_ids: Vec<String>,
+    pub confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_status: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentSubscription {
+    pub event_id: String,
+    pub tool: String,
+    pub paths: Vec<String>,
+    pub event_kinds: Vec<String>,
+    pub threads: Vec<String>,
+    pub tasks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_status: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScoreFinding {
     pub severity: String,
@@ -257,6 +345,146 @@ impl TraceProjection {
                 trust_status: record.trust_status.clone(),
             })
             .collect()
+    }
+
+    pub fn profile(&self, tool: &str) -> Option<AgentProfile> {
+        self.records.iter().rev().find_map(|record| {
+            let Some(EventPayload::Profile(payload)) = record.parsed.payload.as_ref() else {
+                return None;
+            };
+            (payload.tool == tool).then(|| AgentProfile {
+                event_id: record.id.clone(),
+                tool: payload.tool.clone(),
+                capabilities: payload.capabilities.clone(),
+                watch: payload.watch.clone(),
+                current_task: payload.current_task.clone(),
+                branch: payload.branch.clone(),
+                availability: payload.availability.clone(),
+                notes: payload.notes.clone(),
+                origin: record.origin.clone(),
+                trust_status: record.trust_status.clone(),
+            })
+        })
+    }
+
+    pub fn active_tasks(&self, tool: Option<&str>) -> Vec<ActiveTask> {
+        self.records
+            .iter()
+            .filter_map(|record| {
+                let Some(EventPayload::Task(payload)) = record.parsed.payload.as_ref() else {
+                    return None;
+                };
+                let status = payload.status.as_deref().unwrap_or("open");
+                if matches!(status, "done" | "completed" | "cancelled") {
+                    return None;
+                }
+                if tool.is_some() && payload.owner_tool.as_deref() != tool {
+                    return None;
+                }
+                Some(ActiveTask {
+                    event_id: record.id.clone(),
+                    thread_id: record.parsed.thread_id.clone(),
+                    subject: payload.subject.clone(),
+                    status: status.to_string(),
+                    owner_tool: payload.owner_tool.clone(),
+                    depends_on: payload.depends_on.clone(),
+                    artifacts: payload.artifacts.clone(),
+                    verification: payload.verification.clone(),
+                    origin: record.origin.clone(),
+                    trust_status: record.trust_status.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn artifacts(&self, limit: usize) -> Vec<CoordinationArtifact> {
+        self.records
+            .iter()
+            .rev()
+            .filter_map(|record| {
+                let Some(EventPayload::Artifact(payload)) = record.parsed.payload.as_ref() else {
+                    return None;
+                };
+                Some(CoordinationArtifact {
+                    event_id: record.id.clone(),
+                    subject: payload.subject.clone(),
+                    artifact_kind: payload.artifact_kind.clone(),
+                    uri: payload.uri.clone(),
+                    ref_task_id: payload.ref_task_id.clone(),
+                    summary: payload.summary.clone(),
+                    origin: record.origin.clone(),
+                    trust_status: record.trust_status.clone(),
+                })
+            })
+            .take(limit)
+            .collect()
+    }
+
+    pub fn decisions(&self, limit: usize) -> Vec<CoordinationDecision> {
+        self.records
+            .iter()
+            .rev()
+            .filter_map(|record| {
+                let Some(EventPayload::Decision(payload)) = record.parsed.payload.as_ref() else {
+                    return None;
+                };
+                Some(CoordinationDecision {
+                    event_id: record.id.clone(),
+                    subject: payload.subject.clone(),
+                    status: payload
+                        .status
+                        .clone()
+                        .unwrap_or_else(|| "binding".to_string()),
+                    scope: payload.scope.clone(),
+                    supersedes: payload.supersedes.clone(),
+                    rationale: payload.rationale.clone(),
+                    origin: record.origin.clone(),
+                    trust_status: record.trust_status.clone(),
+                })
+            })
+            .take(limit)
+            .collect()
+    }
+
+    pub fn lessons(&self, limit: usize) -> Vec<CoordinationLesson> {
+        self.records
+            .iter()
+            .rev()
+            .filter_map(|record| {
+                let Some(EventPayload::Lesson(payload)) = record.parsed.payload.as_ref() else {
+                    return None;
+                };
+                Some(CoordinationLesson {
+                    event_id: record.id.clone(),
+                    subject: payload.subject.clone(),
+                    lesson_kind: payload.lesson_kind.clone(),
+                    scope: payload.scope.clone(),
+                    source_event_ids: payload.source_event_ids.clone(),
+                    confidence: payload.confidence,
+                    origin: record.origin.clone(),
+                    trust_status: record.trust_status.clone(),
+                })
+            })
+            .take(limit)
+            .collect()
+    }
+
+    pub fn subscription(&self, tool: &str) -> Option<AgentSubscription> {
+        self.records.iter().rev().find_map(|record| {
+            let Some(EventPayload::Subscription(payload)) = record.parsed.payload.as_ref() else {
+                return None;
+            };
+            (payload.tool == tool).then(|| AgentSubscription {
+                event_id: record.id.clone(),
+                tool: payload.tool.clone(),
+                paths: payload.paths.clone(),
+                event_kinds: payload.event_kinds.clone(),
+                threads: payload.threads.clone(),
+                tasks: payload.tasks.clone(),
+                origin: record.origin.clone(),
+                trust_status: record.trust_status.clone(),
+            })
+        })
     }
 
     pub fn score(&self, tool: Option<&str>) -> (i64, Vec<ScoreFinding>) {
@@ -590,10 +818,18 @@ fn relation_values(record: &Value) -> BTreeSet<String> {
         payload_string(&event, "ref_event_id"),
         payload_string(&event, "ref_claim_id"),
         payload_string(&event, "ref_blocker_id"),
+        payload_string(&event, "current_task"),
+        payload_string(&event, "ref_task_id"),
         payload_string(&event, "checkpoint_id"),
     ]
     .into_iter()
     .flatten()
+    .chain(payload_string_array(&event, "depends_on"))
+    .chain(payload_string_array(&event, "artifacts"))
+    .chain(payload_string_array(&event, "supersedes"))
+    .chain(payload_string_array(&event, "source_event_ids"))
+    .chain(payload_string_array(&event, "threads"))
+    .chain(payload_string_array(&event, "tasks"))
     .collect()
 }
 
@@ -642,6 +878,19 @@ fn payload_string(event: &Value, key: &str) -> Option<String> {
     payload_value(event, key)
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn payload_string_array(event: &Value, key: &str) -> Vec<String> {
+    payload_value(event, key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn value_to_display_string(value: &Value) -> Option<String> {

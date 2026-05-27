@@ -90,9 +90,26 @@ Required identity fields:
 | `claim-release` | `agent-rally.claim.released.v1` |
 | `blocker` | `agent-rally.blocker.raised.v1` |
 | `blocker-resolved` | `agent-rally.blocker.resolved.v1` |
+| `profile` | `agent-rally.profile.updated.v1` |
+| `subscription` | `agent-rally.subscription.updated.v1` |
+| `task` | `agent-rally.task.updated.v1` |
+| `artifact` | `agent-rally.artifact.recorded.v1` |
+| `decision` | `agent-rally.decision.recorded.v1` |
+| `lesson` | `agent-rally.lesson.recorded.v1` |
 
 Unknown kinds may be displayed, but core automation should only rely on kinds
 with typed Rust payload support.
+
+Attuned context commands use the newer kinds as structured source facts:
+
+- `profile`: capabilities, watched paths, current task, branch, availability.
+- `subscription`: paths, event kinds, threads, and tasks an agent wants surfaced.
+- `task`: objective, owner, lifecycle status, dependencies, artifacts,
+  verification.
+- `artifact`: structured output or reference attached to a task or trace.
+- `decision`: source-linked project truth with status, scope, and supersession.
+- `lesson`: reusable failure/success reflection with source event ids and
+  confidence.
 
 ## Signatures
 

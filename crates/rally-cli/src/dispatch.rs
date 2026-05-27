@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::args::{
-    WriteArgs, parse_ack, parse_blocker, parse_claim, parse_handoff, parse_identity_init,
-    parse_preflight, parse_read, parse_release, parse_sync_export, parse_sync_import,
+    WriteArgs, parse_ack, parse_artifact, parse_blocker, parse_claim, parse_decision,
+    parse_handoff, parse_identity_init, parse_lesson, parse_preflight, parse_profile, parse_read,
+    parse_release, parse_subscribe, parse_sync_export, parse_sync_import, parse_task,
     parse_unblock,
 };
 use crate::output::{CliError, WriteOutput};
@@ -14,8 +15,9 @@ use crate::query_commands::{
 use crate::sync_commands::{execute_sync_export, execute_sync_import};
 use crate::verify_commands::{VerifyOptions, verify};
 use crate::write_commands::{
-    execute_ack, execute_blocker, execute_claim, execute_handoff, execute_identity_init,
-    execute_preflight, execute_release, execute_unblock,
+    execute_ack, execute_artifact, execute_blocker, execute_claim, execute_decision,
+    execute_handoff, execute_identity_init, execute_lesson, execute_preflight, execute_profile,
+    execute_release, execute_subscribe, execute_task, execute_unblock,
 };
 use serde_json::json;
 use std::env;
@@ -44,6 +46,12 @@ pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Some("release") => run_write("release", args, parse_release, execute_release),
         Some("blocker") => run_write("blocker", args, parse_blocker, execute_blocker),
         Some("unblock") => run_write("unblock", args, parse_unblock, execute_unblock),
+        Some("profile") => run_write("profile", args, parse_profile, execute_profile),
+        Some("task") => run_write("task", args, parse_task, execute_task),
+        Some("artifact") => run_write("artifact", args, parse_artifact, execute_artifact),
+        Some("decision") => run_write("decision", args, parse_decision, execute_decision),
+        Some("lesson") => run_write("lesson", args, parse_lesson, execute_lesson),
+        Some("subscribe") => run_write("subscribe", args, parse_subscribe, execute_subscribe),
         Some("inbox") => run_read("inbox", args, parse_read, execute_inbox),
         Some("claims") => run_read("claims", args, parse_read, execute_claims),
         Some("blockers") => run_read("blockers", args, parse_read, execute_blockers),
@@ -182,6 +190,24 @@ fn usage() {
     eprintln!("       rally claim --path <path>|--resource <id> --subject <text>");
     eprintln!(
         "       rally release [--force] <claim-id> | blocker --subject <text> | unblock [--force] <blocker-id> --resolution <text>"
+    );
+    eprintln!(
+        "       rally profile [--tool <tool>] [--capability <name>]... [--watch <path>]... [--current-task <id>] [--branch <name>] [--availability <state>] [--json]"
+    );
+    eprintln!(
+        "       rally task --subject <text> [--owner <tool>] [--status <state>] [--depends-on <id>]... [--artifact <id>]... [--verification <text>] [--json]"
+    );
+    eprintln!(
+        "       rally artifact --subject <text> [--artifact-kind <kind>] [--uri <uri>] [--ref-task <id>] [--summary <text>] [--json]"
+    );
+    eprintln!(
+        "       rally decision --subject <text> [--status <state>] [--scope <scope>] [--supersedes <id>]... [--rationale <text>] [--json]"
+    );
+    eprintln!(
+        "       rally lesson --subject <text> [--lesson-kind <kind>] [--source-event <id>]... [--confidence <0-1>] [--json]"
+    );
+    eprintln!(
+        "       rally subscribe [--tool <tool>] [--path <path>]... [--event-kind <kind>]... [--thread <id>]... [--task <id>]... [--json]"
     );
     eprintln!(
         "       rally context|inbox|claims|blockers|conflicts|diagnose|score|report|replay [--json] [--since <window>] [--tool <tool>]"

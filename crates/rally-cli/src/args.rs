@@ -127,6 +127,27 @@ impl WriteArgs {
                     flags.insert(arg, values);
                 }
                 "--to"
+                | "--availability"
+                | "--branch"
+                | "--capability"
+                | "--current-task"
+                | "--depends-on"
+                | "--artifact"
+                | "--artifact-kind"
+                | "--uri"
+                | "--ref-task"
+                | "--owner"
+                | "--status"
+                | "--verification"
+                | "--scope"
+                | "--supersedes"
+                | "--rationale"
+                | "--lesson-kind"
+                | "--source-event"
+                | "--confidence"
+                | "--watch"
+                | "--event-kind"
+                | "--task"
                 | "--subject"
                 | "--notes"
                 | "--summary"
@@ -166,6 +187,10 @@ impl WriteArgs {
             .get(flag)
             .and_then(|values| values.last())
             .cloned()
+    }
+
+    pub(crate) fn all(&self, flag: &str) -> Vec<String> {
+        self.flags.get(flag).cloned().unwrap_or_default()
     }
 
     pub(crate) fn required(&self, flag: &str) -> Result<String, CliError> {

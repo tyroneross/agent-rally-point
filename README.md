@@ -51,6 +51,12 @@ Core coordination commands:
 
 ```bash
 rally preflight --tool codex --start-ping --json
+rally profile --tool codex --capability rust --capability review --watch crates/rally-core --json
+rally task --tool codex --subject "finish context ranking" --status active --verification "cargo test" --json
+rally artifact --tool codex --subject "context schema" --artifact-kind schema --uri docs/context.schema.json --json
+rally decision --tool codex --subject "agents use rally context for next action" --status binding --json
+rally lesson --tool codex --subject "avoid giant planning docs as control surfaces" --lesson-kind coordination --json
+rally subscribe --tool codex --path crates/rally-core --event-kind task --event-kind decision --json
 rally handoff --to pi --from-tool codex --subject "review sync"
 rally ack --tool pi <handoff-id> --summary "done"
 rally claim --tool codex --path crates/rally-core/src/query.rs --subject "query cleanup"
@@ -129,6 +135,7 @@ target architecture. The short version:
 - Portable events are the sync/signature unit.
 - CLI output is machine-readable JSON first.
 - Bridges to ACP, A2A, MCP, Herdr, and UI surfaces live outside the core.
+- `rally context --tool <agent> --json` is the first attuned briefing surface.
 
 ## License
 

@@ -168,6 +168,10 @@ interpretation of the trace.
 The first `rally context` slice starts step 2. It turns the projection into a
 bounded `ContextBrief` with routing, a top priority, a recommended next action,
 attention items, collision risk, active claims/blockers, and relevant recent
-changes. Later slices should add richer agent profiles, task/artifact facts,
-decisions, lessons, subscriptions, and ranking signals without changing the
-core rule: docs teach Rally; Rally briefs agents.
+changes.
+
+The next attuned-events slice adds the first structured facts for profiles,
+subscriptions, tasks, artifacts, decisions, and lessons. It also gives attention
+items deterministic priority bands, so `rally context` begins acting like a
+small ranking engine rather than a status dump. See
+[`CONTEXT_BRIEF_SCHEMA.md`](CONTEXT_BRIEF_SCHEMA.md).

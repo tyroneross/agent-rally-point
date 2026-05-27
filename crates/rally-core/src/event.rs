@@ -14,6 +14,12 @@ pub enum EventKind {
     ClaimRelease,
     Blocker,
     BlockerResolved,
+    Profile,
+    Task,
+    Artifact,
+    Decision,
+    Lesson,
+    Subscription,
     Other(String),
 }
 
@@ -27,6 +33,12 @@ impl EventKind {
             Some("claim-release") => Self::ClaimRelease,
             Some("blocker") => Self::Blocker,
             Some("blocker-resolved") => Self::BlockerResolved,
+            Some("profile") => Self::Profile,
+            Some("task") => Self::Task,
+            Some("artifact") => Self::Artifact,
+            Some("decision") => Self::Decision,
+            Some("lesson") => Self::Lesson,
+            Some("subscription") => Self::Subscription,
             Some(value) => Self::Other(value.to_string()),
             None => Self::Other(String::new()),
         }
@@ -41,6 +53,12 @@ impl EventKind {
             Self::ClaimRelease => "claim-release",
             Self::Blocker => "blocker",
             Self::BlockerResolved => "blocker-resolved",
+            Self::Profile => "profile",
+            Self::Task => "task",
+            Self::Artifact => "artifact",
+            Self::Decision => "decision",
+            Self::Lesson => "lesson",
+            Self::Subscription => "subscription",
             Self::Other(value) => value.as_str(),
         }
     }
@@ -61,6 +79,12 @@ impl EventKind {
             Self::ClaimRelease => "agent-rally.claim.released.v1".to_string(),
             Self::Blocker => "agent-rally.blocker.raised.v1".to_string(),
             Self::BlockerResolved => "agent-rally.blocker.resolved.v1".to_string(),
+            Self::Profile => "agent-rally.profile.updated.v1".to_string(),
+            Self::Task => "agent-rally.task.updated.v1".to_string(),
+            Self::Artifact => "agent-rally.artifact.recorded.v1".to_string(),
+            Self::Decision => "agent-rally.decision.recorded.v1".to_string(),
+            Self::Lesson => "agent-rally.lesson.recorded.v1".to_string(),
+            Self::Subscription => "agent-rally.subscription.updated.v1".to_string(),
             Self::Other(value) => format!("agent-rally.{value}.v1"),
         }
     }
@@ -74,12 +98,18 @@ impl EventKind {
             Self::ClaimRelease => "claim.released.v1".to_string(),
             Self::Blocker => "blocker.raised.v1".to_string(),
             Self::BlockerResolved => "blocker.resolved.v1".to_string(),
+            Self::Profile => "profile.updated.v1".to_string(),
+            Self::Task => "task.updated.v1".to_string(),
+            Self::Artifact => "artifact.recorded.v1".to_string(),
+            Self::Decision => "decision.recorded.v1".to_string(),
+            Self::Lesson => "lesson.recorded.v1".to_string(),
+            Self::Subscription => "subscription.updated.v1".to_string(),
             Self::Other(value) => format!("{value}.v1"),
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload")]
 pub enum EventPayload {
     Handoff(HandoffPayload),
@@ -89,6 +119,12 @@ pub enum EventPayload {
     ClaimRelease(ClaimReleasePayload),
     Blocker(BlockerPayload),
     BlockerResolved(BlockerResolvedPayload),
+    Profile(ProfilePayload),
+    Task(TaskPayload),
+    Artifact(ArtifactPayload),
+    Decision(DecisionPayload),
+    Lesson(LessonPayload),
+    Subscription(SubscriptionPayload),
     Other { kind: String, payload: Value },
 }
 
@@ -102,6 +138,12 @@ impl EventPayload {
             Self::ClaimRelease(_) => EventKind::ClaimRelease,
             Self::Blocker(_) => EventKind::Blocker,
             Self::BlockerResolved(_) => EventKind::BlockerResolved,
+            Self::Profile(_) => EventKind::Profile,
+            Self::Task(_) => EventKind::Task,
+            Self::Artifact(_) => EventKind::Artifact,
+            Self::Decision(_) => EventKind::Decision,
+            Self::Lesson(_) => EventKind::Lesson,
+            Self::Subscription(_) => EventKind::Subscription,
             Self::Other { kind, .. } => EventKind::Other(kind.clone()),
         }
     }
@@ -127,6 +169,22 @@ impl EventPayload {
             EventKind::BlockerResolved => serde_json::from_value(payload.clone())
                 .ok()
                 .map(Self::BlockerResolved),
+            EventKind::Profile => serde_json::from_value(payload.clone())
+                .ok()
+                .map(Self::Profile),
+            EventKind::Task => serde_json::from_value(payload.clone()).ok().map(Self::Task),
+            EventKind::Artifact => serde_json::from_value(payload.clone())
+                .ok()
+                .map(Self::Artifact),
+            EventKind::Decision => serde_json::from_value(payload.clone())
+                .ok()
+                .map(Self::Decision),
+            EventKind::Lesson => serde_json::from_value(payload.clone())
+                .ok()
+                .map(Self::Lesson),
+            EventKind::Subscription => serde_json::from_value(payload.clone())
+                .ok()
+                .map(Self::Subscription),
             EventKind::Other(value) => Some(Self::Other {
                 kind: value.clone(),
                 payload: payload.clone(),
@@ -142,6 +200,12 @@ impl EventPayload {
             Self::ClaimRelease(payload) => serde_json::to_value(payload),
             Self::Blocker(payload) => serde_json::to_value(payload),
             Self::BlockerResolved(payload) => serde_json::to_value(payload),
+            Self::Profile(payload) => serde_json::to_value(payload),
+            Self::Task(payload) => serde_json::to_value(payload),
+            Self::Artifact(payload) => serde_json::to_value(payload),
+            Self::Decision(payload) => serde_json::to_value(payload),
+            Self::Lesson(payload) => serde_json::to_value(payload),
+            Self::Subscription(payload) => serde_json::to_value(payload),
             Self::Other { payload, .. } => Ok(payload.clone()),
         }
     }
@@ -206,6 +270,91 @@ pub struct BlockerResolvedPayload {
     pub resolution: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProfilePayload {
+    pub tool: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub watch: Vec<String>,
+    #[serde(default)]
+    pub current_task: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub availability: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskPayload {
+    pub subject: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub owner_tool: Option<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    #[serde(default)]
+    pub verification: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactPayload {
+    pub subject: String,
+    pub artifact_kind: String,
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub ref_task_id: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DecisionPayload {
+    pub subject: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub supersedes: Vec<String>,
+    #[serde(default)]
+    pub rationale: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LessonPayload {
+    pub subject: String,
+    #[serde(default)]
+    pub lesson_kind: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub source_event_ids: Vec<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SubscriptionPayload {
+    pub tool: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub event_kinds: Vec<String>,
+    #[serde(default)]
+    pub threads: Vec<String>,
+    #[serde(default)]
+    pub tasks: Vec<String>,
+}
+
 fn default_requires_ack() -> bool {
     true
 }
@@ -246,6 +395,14 @@ impl EventRecord {
             Some(EventPayload::Handoff(payload)) => payload.subject.clone(),
             Some(EventPayload::Claim(payload)) => payload.subject.clone(),
             Some(EventPayload::Blocker(payload)) => payload.subject.clone(),
+            Some(EventPayload::Profile(payload)) => format!("profile {}", payload.tool),
+            Some(EventPayload::Task(payload)) => payload.subject.clone(),
+            Some(EventPayload::Artifact(payload)) => payload.subject.clone(),
+            Some(EventPayload::Decision(payload)) => payload.subject.clone(),
+            Some(EventPayload::Lesson(payload)) => payload.subject.clone(),
+            Some(EventPayload::Subscription(payload)) => {
+                format!("subscription {}", payload.tool)
+            }
             Some(EventPayload::Ack(payload)) | Some(EventPayload::Feedback(payload)) => payload
                 .summary
                 .clone()
@@ -273,7 +430,7 @@ impl EventRecord {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EventBuilder {
     id: String,
     payload: EventPayload,

@@ -373,6 +373,9 @@ Initial implementation status:
   from one parsed view of the trace.
 - `rally-core::context` now exposes the first `ContextBrief` projection and the
   CLI renders it through `rally context --tool <agent> --json`.
+- Attuned event families now cover agent profiles, subscriptions, tasks,
+  artifacts, decisions, and lessons. `ContextBrief` consumes those facts with
+  deterministic attention priorities and source-linked recommendations.
 - `rally-cli verify --json` now reads through `rally-core` and emits the command
   envelope shape for success and failure.
 - `rally-cli` is still a prototype verifier surface and should become a

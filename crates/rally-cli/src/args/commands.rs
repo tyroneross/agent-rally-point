@@ -62,6 +62,68 @@ pub(crate) struct UnblockCommand {
 }
 
 #[derive(Debug)]
+pub(crate) struct ProfileCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) capabilities: Vec<String>,
+    pub(crate) watch: Vec<String>,
+    pub(crate) current_task: Option<String>,
+    pub(crate) branch: Option<String>,
+    pub(crate) availability: Option<String>,
+    pub(crate) notes: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TaskCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) subject: String,
+    pub(crate) status: Option<String>,
+    pub(crate) owner_tool: Option<String>,
+    pub(crate) depends_on: Vec<String>,
+    pub(crate) artifacts: Vec<String>,
+    pub(crate) verification: Option<String>,
+    pub(crate) notes: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ArtifactCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) subject: String,
+    pub(crate) artifact_kind: String,
+    pub(crate) uri: Option<String>,
+    pub(crate) ref_task_id: Option<String>,
+    pub(crate) summary: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DecisionCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) subject: String,
+    pub(crate) status: Option<String>,
+    pub(crate) scope: Option<String>,
+    pub(crate) supersedes: Vec<String>,
+    pub(crate) rationale: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LessonCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) subject: String,
+    pub(crate) lesson_kind: Option<String>,
+    pub(crate) scope: Option<String>,
+    pub(crate) source_event_ids: Vec<String>,
+    pub(crate) confidence: Option<f64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SubscribeCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) paths: Vec<String>,
+    pub(crate) event_kinds: Vec<String>,
+    pub(crate) threads: Vec<String>,
+    pub(crate) tasks: Vec<String>,
+}
+
+#[derive(Debug)]
 pub(crate) struct ReadCommand {
     pub(crate) command: &'static str,
     pub(crate) common: CommonOptions,
@@ -150,6 +212,84 @@ pub(crate) fn parse_sync_import(args: WriteArgs) -> Result<SyncImportCommand, Cl
         origin,
         trust_policy,
         no_default_trust_policy,
+        common: args.common,
+    })
+}
+
+pub(crate) fn parse_profile(args: WriteArgs) -> Result<ProfileCommand, CliError> {
+    Ok(ProfileCommand {
+        capabilities: args.all("--capability"),
+        watch: args.all("--watch"),
+        current_task: args.one("--current-task"),
+        branch: args.one("--branch"),
+        availability: args.one("--availability"),
+        notes: args.one("--notes"),
+        common: args.common,
+    })
+}
+
+pub(crate) fn parse_task(args: WriteArgs) -> Result<TaskCommand, CliError> {
+    Ok(TaskCommand {
+        subject: args.required("--subject")?,
+        status: args.one("--status"),
+        owner_tool: args.one("--owner").or_else(|| args.common.tool.clone()),
+        depends_on: args.all("--depends-on"),
+        artifacts: args.all("--artifact"),
+        verification: args.one("--verification"),
+        notes: args.one("--notes"),
+        common: args.common,
+    })
+}
+
+pub(crate) fn parse_artifact(args: WriteArgs) -> Result<ArtifactCommand, CliError> {
+    Ok(ArtifactCommand {
+        subject: args.required("--subject")?,
+        artifact_kind: args
+            .one("--artifact-kind")
+            .unwrap_or_else(|| "note".to_string()),
+        uri: args.one("--uri"),
+        ref_task_id: args.one("--ref-task"),
+        summary: args.one("--summary"),
+        common: args.common,
+    })
+}
+
+pub(crate) fn parse_decision(args: WriteArgs) -> Result<DecisionCommand, CliError> {
+    Ok(DecisionCommand {
+        subject: args.required("--subject")?,
+        status: args.one("--status"),
+        scope: args.one("--scope"),
+        supersedes: args.all("--supersedes"),
+        rationale: args.one("--rationale"),
+        common: args.common,
+    })
+}
+
+pub(crate) fn parse_lesson(args: WriteArgs) -> Result<LessonCommand, CliError> {
+    let confidence = args
+        .one("--confidence")
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .map_err(|_| CliError::usage(args.command, "--confidence must be a decimal number"))
+        })
+        .transpose()?;
+    Ok(LessonCommand {
+        subject: args.required("--subject")?,
+        lesson_kind: args.one("--lesson-kind"),
+        scope: args.one("--scope"),
+        source_event_ids: args.all("--source-event"),
+        confidence,
+        common: args.common,
+    })
+}
+
+pub(crate) fn parse_subscribe(args: WriteArgs) -> Result<SubscribeCommand, CliError> {
+    Ok(SubscribeCommand {
+        paths: args.all("--path"),
+        event_kinds: args.all("--event-kind"),
+        threads: args.all("--thread"),
+        tasks: args.all("--task"),
         common: args.common,
     })
 }
