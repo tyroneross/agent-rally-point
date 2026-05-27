@@ -313,6 +313,8 @@ The first-class commands should be:
 | Command | Purpose |
 |---|---|
 | `rally <tool>` / `rally start <tool>` | Canonical agent startup: writes presence and returns preflight, context, packet, checkpoint, cursor, warnings, and next watch command. |
+| `rally doctor` | Agent-readiness checks: anonymous owners, stale checkpoints, missing profile, diagnosis findings, open handoffs, and conflicts. |
+| `rally setup` | Harness discovery, enforcement mode, and adapter install notes. |
 | `rally preflight` | Session-start routing, peers, pending ACKs, context locations. |
 | `rally post` | Low-level event append for automation. |
 | `rally handoff` / `ack` / `reject` / `needs-info` | Handoff lifecycle. |
@@ -414,6 +416,9 @@ Initial implementation status:
   surface. They default to JSON, do not launch the harness process, write
   presence, return preflight/context/packet/checkpoint/cursor state, and advance
   the per-session cursor unless `--peek` is supplied.
+- `rally doctor` and `rally setup` provide the first agent-product readiness
+  layer: harness discovery, enforcement mode, anonymous coordination detection,
+  and adapter install notes.
 
 ## Remote Agent Readiness
 

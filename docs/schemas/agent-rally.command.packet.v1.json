@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-rally-point.local/schemas/agent-rally.command.packet.v1.json",
+  "title": "Rally packet command",
+  "type": "object",
+  "required": ["ok", "command", "schema", "channel", "data"],
+  "properties": {
+    "ok": { "const": true },
+    "command": { "const": "packet" },
+    "schema": { "const": "agent-rally.command.packet.v1" },
+    "channel": { "type": "string" },
+    "data": {
+      "type": "object",
+      "required": ["packet"],
+      "properties": {
+        "packet": {
+          "type": "object",
+          "required": ["tool", "role", "packet_kind", "recommended_next_action", "trust_summary", "source_event_ids", "focus"],
+          "properties": {
+            "tool": { "type": "string" },
+            "role": { "enum": ["reviewer", "builder", "architect", "qa", "general"] },
+            "packet_kind": { "enum": ["review", "build", "architecture", "verification", "general"] },
+            "recommended_next_action": { "type": "object" },
+            "trust_summary": { "type": "object" },
+            "source_event_ids": { "type": "array", "items": { "type": "string" } },
+            "focus": { "type": "array", "items": { "type": "object" } }
+          }
+        }
+      }
+    }
+  }
+}

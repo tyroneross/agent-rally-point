@@ -31,6 +31,11 @@ rally start <tool>
 returns preflight, context, packet, checkpoint, cursor state, warnings, and the
 next watch command. It does not launch the tool process.
 
+Run `rally doctor --tool <tool> --json` when startup warnings are present or
+before making broad edits. Run `rally setup --json` when onboarding a new repo or
+checking whether cmux/Herdr/agent harnesses are visible. If anonymous claims or
+handoffs appear, treat that as a harness setup problem.
+
 If `rally start` is unavailable, fall back to:
 
 ```bash

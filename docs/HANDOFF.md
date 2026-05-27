@@ -48,6 +48,11 @@ SPDX-License-Identifier: Apache-2.0
 - Adds `rally <tool>` and `rally start <tool>` as the canonical agent startup
   surface, returning preflight/context/packet/checkpoint/cursor state and next
   watch command as JSON by default.
+- Adds `rally doctor` and `rally setup` for agent-product readiness: harness
+  discovery, enforcement mode, adapter install notes, anonymous coordination
+  detection, and startup health findings.
+- Adds initial formal JSON schema files in `docs/schemas/` and a dogfood report
+  in `docs/DOGFOOD_REPORT.md`.
 - Keeps urgent coordination obligations ahead of specialization:
   - required handoffs
   - active tasks

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::args::{CommonOptions, HerdrInjectCommand, ReadCommand, StartCommand};
+use crate::args::{CommonOptions, HerdrInjectCommand, ReadCommand, SetupCommand, StartCommand};
 use crate::output::{CliError, WriteOutput};
 use crate::runtime::now_rfc3339;
 use rally_core::context::{build_context_brief, build_work_packet};
@@ -18,7 +18,8 @@ use rally_protocol::event_value;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::env;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Filter `records` to those with `local_seq` strictly greater than the cursor
 /// for `(tool, session_id)` under `store.channel_dir()`. Returns the filtered
@@ -363,6 +364,168 @@ pub(super) fn execute_start(command: StartCommand) -> Result<WriteOutput, CliErr
     })
 }
 
+pub(super) fn execute_doctor(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let tool = command.common.tool();
+    let (store, records, now) = query_records(&command)?;
+    let projection = TraceProjection::from_records_at(&records, now);
+    let diagnosis = diagnose_records(
+        &records,
+        DiagnoseOptions {
+            state_records: Some(&records),
+            tool: command.tool.as_deref(),
+            stale_after_seconds: command.stale_after_seconds,
+            since: command.since.as_deref(),
+            now_epoch_seconds: now,
+        },
+    );
+    let checkpoint = store.checkpoint_status().map_err(|err| {
+        CliError::runtime(command.command, format!("failed to read checkpoint: {err}"))
+    })?;
+    let setup = setup_status(&store)?;
+    let active_claims = projection.active_claims(None);
+    let active_tasks = projection.active_tasks(None);
+    let pending_handoffs = projection.pending_handoffs(None);
+    let mut findings = Vec::new();
+    for finding in diagnosis.findings {
+        findings.push(json!({
+            "severity": finding.severity,
+            "code": finding.code,
+            "message": finding.message,
+            "event_id": finding.event_id,
+        }));
+    }
+    for claim in &active_claims {
+        if claim.owner_tool.as_deref() == Some("unknown") {
+            findings.push(json!({
+                "severity": enforcement_severity(&setup.enforcement),
+                "code": "anonymous-claim",
+                "message": "active claim has owner_tool=unknown",
+                "event_id": claim.event_id,
+                "resource": claim.resource,
+            }));
+        }
+    }
+    for task in &active_tasks {
+        if task.owner_tool.as_deref() == Some("unknown") {
+            findings.push(json!({
+                "severity": enforcement_severity(&setup.enforcement),
+                "code": "anonymous-task",
+                "message": "active task has owner_tool=unknown",
+                "event_id": task.event_id,
+            }));
+        }
+    }
+    for handoff in &pending_handoffs {
+        if handoff.from_tool.as_deref() == Some("unknown") {
+            findings.push(json!({
+                "severity": enforcement_severity(&setup.enforcement),
+                "code": "anonymous-handoff",
+                "message": "pending handoff has from_tool=unknown",
+                "event_id": handoff.event_id,
+            }));
+        }
+    }
+    if !checkpoint.valid {
+        findings.push(json!({
+            "severity": "P2",
+            "code": "checkpoint-invalid",
+            "message": checkpoint.reason.as_deref().unwrap_or("checkpoint is invalid"),
+        }));
+    }
+    if command.tool.is_some() && projection.profile(&tool).is_none() {
+        findings.push(json!({
+            "severity": "P3",
+            "code": "missing-profile",
+            "message": format!("tool {tool} has not written a profile"),
+        }));
+    }
+    let p1 = findings.iter().any(|finding| finding["severity"] == "P1");
+    let status = if p1 {
+        "fail"
+    } else if findings.is_empty() {
+        "pass"
+    } else {
+        "warn"
+    };
+    let text = format!("doctor {status} findings={}", findings.len());
+    Ok(query_output(
+        command.command,
+        &command.common,
+        &store,
+        text,
+        json!({
+            "doctor": {
+                "status": status,
+                "tool": command.tool,
+                "enforcement": setup.enforcement,
+                "findings": findings,
+                "checkpoint": checkpoint,
+                "installed_tools": setup.tools,
+            }
+        }),
+    ))
+}
+
+pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliError> {
+    let store = command.common.channel_store("setup")?;
+    let mut status = setup_status(&store)?;
+    let mut installed_path = None;
+    match command.action.as_str() {
+        "status" => {}
+        "enforcement" => {
+            let mode = command.target.as_deref().ok_or_else(|| {
+                CliError::usage("setup", "setup enforcement requires off, warn, or strict")
+            })?;
+            if !matches!(mode, "off" | "warn" | "strict") {
+                return Err(CliError::usage(
+                    "setup",
+                    "enforcement must be off, warn, or strict",
+                ));
+            }
+            write_setup_config(&store, mode)?;
+            status = setup_status(&store)?;
+        }
+        "install" => {
+            let adapter = command
+                .target
+                .as_deref()
+                .ok_or_else(|| CliError::usage("setup", "setup install requires cmux or herdr"))?;
+            if !matches!(adapter, "cmux" | "herdr") {
+                return Err(CliError::usage(
+                    "setup",
+                    "unknown adapter; expected cmux or herdr",
+                ));
+            }
+            installed_path = Some(write_adapter_install(&store, adapter)?);
+        }
+        value => {
+            return Err(CliError::usage(
+                "setup",
+                format!("unknown setup action {value}"),
+            ));
+        }
+    }
+    Ok(query_output(
+        "setup",
+        &command.common,
+        &store,
+        format!(
+            "setup enforcement={} tools={}",
+            status.enforcement,
+            status.tools.len()
+        ),
+        json!({
+            "setup": {
+                "schema": "agent-rally.command.setup.v1",
+                "enforcement": status.enforcement,
+                "tools": status.tools,
+                "startup": status.startup,
+                "installed_path": installed_path,
+            }
+        }),
+    ))
+}
+
 fn start_warnings(
     tool: &str,
     preflight: &rally_core::preflight::PreflightEnvelope,
@@ -392,6 +555,100 @@ fn start_warnings(
         }));
     }
     warnings
+}
+
+#[derive(Clone, Debug)]
+struct SetupStatus {
+    enforcement: String,
+    tools: Vec<Value>,
+    startup: Vec<String>,
+}
+
+fn setup_status(store: &ChannelStore) -> Result<SetupStatus, CliError> {
+    let enforcement = read_setup_config(store).unwrap_or_else(|| "warn".to_string());
+    let known = ["pi", "claude", "codex", "gemini", "cursor", "cmux", "herdr"];
+    let tools = known
+        .iter()
+        .map(|tool| {
+            json!({
+                "tool": tool,
+                "available_on_path": executable_on_path(tool),
+                "startup_command": if matches!(*tool, "cmux" | "herdr") {
+                    format!("rally {tool} packet --tool <agent>")
+                } else {
+                    format!("rally {tool}")
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(SetupStatus {
+        enforcement,
+        tools,
+        startup: vec![
+            "rally pi".to_string(),
+            "rally claude".to_string(),
+            "rally codex".to_string(),
+            "rally start <custom-tool>".to_string(),
+        ],
+    })
+}
+
+fn read_setup_config(store: &ChannelStore) -> Option<String> {
+    let path = setup_config_path(store);
+    let text = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    value
+        .get("enforcement")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn write_setup_config(store: &ChannelStore, enforcement: &str) -> Result<(), CliError> {
+    let path = setup_config_path(store);
+    fs::create_dir_all(path.parent().unwrap())
+        .map_err(|err| CliError::runtime("setup", format!("failed to create config dir: {err}")))?;
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": "agent-rally.setup.v1",
+            "enforcement": enforcement,
+        }))
+        .unwrap(),
+    )
+    .map_err(|err| CliError::runtime("setup", format!("failed to write config: {err}")))
+}
+
+fn setup_config_path(store: &ChannelStore) -> PathBuf {
+    store.channel_dir().join("rally/config.json")
+}
+
+fn write_adapter_install(store: &ChannelStore, adapter: &str) -> Result<String, CliError> {
+    let dir = store.channel_dir().join("rally/adapters");
+    fs::create_dir_all(&dir).map_err(|err| {
+        CliError::runtime("setup", format!("failed to create adapter dir: {err}"))
+    })?;
+    let path = dir.join(format!("{adapter}-rally-start.md"));
+    let body = match adapter {
+        "cmux" => {
+            "# cmux Rally integration\n\nRun `rally <tool>` when an agent pane starts. Use `rally cmux packet --tool <tool>` for feed/workspace payloads.\n"
+        }
+        "herdr" => {
+            "# Herdr Rally integration\n\nRun `rally <tool>` when an agent pane starts. Use `rally herdr packet --tool <tool>` and honor `rally herdr inject` gates.\n"
+        }
+        _ => unreachable!(),
+    };
+    fs::write(&path, body).map_err(|err| {
+        CliError::runtime("setup", format!("failed to write adapter file: {err}"))
+    })?;
+    Ok(path.display().to_string())
+}
+
+fn enforcement_severity(enforcement: &str) -> &'static str {
+    match enforcement {
+        "strict" => "P1",
+        "warn" => "P2",
+        _ => "P3",
+    }
 }
 
 pub(super) fn execute_checkpoint_status(command: ReadCommand) -> Result<WriteOutput, CliError> {

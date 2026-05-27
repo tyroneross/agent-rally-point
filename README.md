@@ -52,6 +52,10 @@ Core coordination commands:
 ```bash
 rally pi
 rally start codex
+rally doctor --tool codex --json
+rally setup --json
+rally setup enforcement strict --json
+rally setup install cmux --json
 rally preflight --tool codex --start-ping --json
 rally profile --tool codex --role builder --capability rust --capability implementation --watch crates/rally-core --json
 rally task --tool codex --subject "finish context ranking" --status active --verification "cargo test" --json
@@ -95,6 +99,12 @@ subscriptions, task links, trust labels, and recent changes.
 as `pi`, `claude`, `codex`, `gemini`, and `cursor`. It defaults to JSON, writes
 presence, returns preflight/context/packet/checkpoint/cursor state, and gives
 the next watch command. `rally start <tool>` is the generic equivalent.
+
+`rally doctor` checks whether the current channel is safe for agents: anonymous
+claims/tasks/handoffs, stale checkpoints, missing profiles, open handoffs,
+conflicts, and trust/diagnosis findings. `rally setup` discovers local harnesses,
+records enforcement mode (`off`, `warn`, or `strict`), and writes cmux/Herdr
+adapter install notes.
 
 `rally packet` is the bounded work-brief surface for specialized agents. It is
 read-only, derived from the same context projection, and shapes the JSON for the

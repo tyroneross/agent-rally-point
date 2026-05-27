@@ -285,6 +285,26 @@ Adapter rules:
 - Preserve `source_event_ids` when displaying or forwarding packet contents.
 - Keep adapter side effects outside Rally core; these commands are JSON exports.
 
+## Setup and Doctor Contracts
+
+`rally setup --json` discovers known harnesses and returns their availability
+plus canonical startup commands. `rally setup enforcement <off|warn|strict>`
+records how strongly anonymous coordination should be treated. `rally setup
+install <cmux|herdr>` writes adapter notes under the channel directory; it does
+not mutate external app config yet.
+
+`rally doctor --tool <tool> --json` combines deterministic diagnosis,
+checkpoint status, setup enforcement, active anonymous claims/tasks/handoffs,
+and profile checks. Its status is `pass`, `warn`, or `fail`. Under `strict`,
+anonymous active coordination findings are P1.
+
+Formal schema files for agent-facing contracts live in `docs/schemas/`:
+
+- `agent-rally.command.start.v1.json`
+- `agent-rally.command.packet.v1.json`
+- `agent-rally.command.doctor.v1.json`
+- `agent-rally.command.setup.v1.json`
+
 ## Checkpoint Contract
 
 Hot query commands use a disposable checkpoint at `rally.checkpoint.json` when

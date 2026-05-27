@@ -1,0 +1,65 @@
+{
+  "channel": "<channel>",
+  "command": "doctor",
+  "data": {
+    "doctor": {
+      "checkpoint": {
+        "exists": true,
+        "last_entry_hash": "sha256:<hash>",
+        "log_bytes": 0,
+        "reason": null,
+        "records": 1,
+        "valid": true
+      },
+      "enforcement": "strict",
+      "findings": [
+        {
+          "code": "missing-profile",
+          "message": "tool claude has not written a profile",
+          "severity": "P3"
+        }
+      ],
+      "installed_tools": [
+        {
+          "available_on_path": false,
+          "startup_command": "rally pi",
+          "tool": "pi"
+        },
+        {
+          "available_on_path": false,
+          "startup_command": "rally claude",
+          "tool": "claude"
+        },
+        {
+          "available_on_path": false,
+          "startup_command": "rally codex",
+          "tool": "codex"
+        },
+        {
+          "available_on_path": false,
+          "startup_command": "rally gemini",
+          "tool": "gemini"
+        },
+        {
+          "available_on_path": false,
+          "startup_command": "rally cursor",
+          "tool": "cursor"
+        },
+        {
+          "available_on_path": false,
+          "startup_command": "rally cmux packet --tool <agent>",
+          "tool": "cmux"
+        },
+        {
+          "available_on_path": false,
+          "startup_command": "rally herdr packet --tool <agent>",
+          "tool": "herdr"
+        }
+      ],
+      "status": "warn",
+      "tool": "claude"
+    }
+  },
+  "ok": true,
+  "schema": "agent-rally.command.doctor.v1"
+}

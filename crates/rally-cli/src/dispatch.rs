@@ -4,15 +4,16 @@
 use crate::args::{
     WriteArgs, parse_ack, parse_artifact, parse_blocker, parse_claim, parse_decision,
     parse_handoff, parse_herdr_inject, parse_identity_init, parse_lesson, parse_post,
-    parse_preflight, parse_profile, parse_read, parse_release, parse_start, parse_subscribe,
-    parse_sync_export, parse_sync_import, parse_task, parse_unblock, parse_watch,
+    parse_preflight, parse_profile, parse_read, parse_release, parse_setup, parse_start,
+    parse_subscribe, parse_sync_export, parse_sync_import, parse_task, parse_unblock, parse_watch,
 };
 use crate::output::{CliError, WriteOutput};
 use crate::query_commands::{
     execute_adapter_contract, execute_blockers, execute_checkpoint_rebuild,
     execute_checkpoint_status, execute_claims, execute_cmux_packet, execute_conflicts,
-    execute_context, execute_diagnose, execute_herdr_inject, execute_herdr_packet, execute_inbox,
-    execute_packet, execute_replay, execute_report, execute_score, execute_start, execute_thread,
+    execute_context, execute_diagnose, execute_doctor, execute_herdr_inject, execute_herdr_packet,
+    execute_inbox, execute_packet, execute_replay, execute_report, execute_score, execute_setup,
+    execute_start, execute_thread,
 };
 use crate::sync_commands::{execute_sync_export, execute_sync_import};
 use crate::verify_commands::{VerifyOptions, verify};
@@ -69,6 +70,7 @@ pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Some("context") => run_read("context", args, parse_read, execute_context),
         Some("packet") => run_read("packet", args, parse_read, execute_packet),
         Some("diagnose") => run_read("diagnose", args, parse_read, execute_diagnose),
+        Some("doctor") => run_read("doctor", args, parse_read, execute_doctor),
         Some("score") => run_read("score", args, parse_read, execute_score),
         Some("thread") => run_read("thread", args, parse_read, execute_thread),
         Some("replay") => run_read("replay", args, parse_read, execute_replay),
@@ -79,6 +81,7 @@ pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Some("cmux") => run_cmux(args),
         Some("adapter") => run_adapter(args),
         Some("checkpoint") => run_checkpoint(args),
+        Some("setup") => run_write("setup", args, parse_setup, execute_setup),
         _ => {
             usage();
             Ok(ExitCode::from(2))
@@ -365,6 +368,8 @@ fn usage() {
     eprintln!("       rally identity init [--identity-dir <dir>] --tool <tool> [--json]");
     eprintln!("       rally sync export [--json] [--since <window>] > packet.json");
     eprintln!("       rally sync import [--json] [--trust-policy <trust.toml>] <packet.json>");
+    eprintln!("       rally doctor [--tool <tool>] [--json]");
+    eprintln!("       rally setup [install <cmux|herdr>|enforcement <off|warn|strict>] [--json]");
     eprintln!("       rally herdr inject [--json] [--force] <handoff-id>");
     eprintln!("       rally adapter contract [--json]");
     eprintln!("       rally cmux packet [--tool <tool>] [--json]");

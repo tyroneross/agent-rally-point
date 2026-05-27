@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-rally-point.local/schemas/agent-rally.command.start.v1.json",
+  "title": "Rally start command",
+  "type": "object",
+  "required": ["ok", "command", "schema", "tool", "session_id", "started_process", "preflight", "context", "packet", "checkpoint", "cursor", "warnings", "next_commands"],
+  "properties": {
+    "ok": { "const": true },
+    "command": { "const": "start" },
+    "schema": { "const": "agent-rally.command.start.v1" },
+    "channel": { "type": "string" },
+    "tool": { "type": "string", "minLength": 1 },
+    "session_id": { "type": "string", "minLength": 1 },
+    "started_process": { "const": false },
+    "preflight": { "type": "object" },
+    "context": { "type": "object", "required": ["brief"] },
+    "packet": { "type": "object" },
+    "checkpoint": { "type": "object" },
+    "cursor": {
+      "type": "object",
+      "required": ["before", "after", "max_seq", "unseen_count", "advanced"],
+      "properties": {
+        "before": { "type": "integer", "minimum": 0 },
+        "after": { "type": "integer", "minimum": 0 },
+        "max_seq": { "type": "integer", "minimum": 0 },
+        "unseen_count": { "type": "integer", "minimum": 0 },
+        "advanced": { "type": "boolean" }
+      }
+    },
+    "warnings": { "type": "array", "items": { "type": "object" } },
+    "next_commands": { "type": "object" }
+  }
+}

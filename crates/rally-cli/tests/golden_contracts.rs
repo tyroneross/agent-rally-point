@@ -62,7 +62,7 @@ impl Normalizer {
                     .map(|(key, value)| {
                         let value = if matches!(
                             key.as_str(),
-                            "channel" | "identity_dir" | "presence_written"
+                            "channel" | "identity_dir" | "presence_written" | "installed_path"
                         ) {
                             Value::String(format!("<{key}>"))
                         } else if matches!(
@@ -303,6 +303,19 @@ fn adapter_contract_and_checkpoint_json_contracts_match_goldens() {
     assert_golden(
         "checkpoint_status_valid.json",
         workspace.json(&["checkpoint", "status", "--json"]),
+    );
+    assert_golden("setup_status.json", workspace.json(&["setup", "--json"]));
+    assert_golden(
+        "setup_enforcement_strict.json",
+        workspace.json(&["setup", "enforcement", "strict", "--json"]),
+    );
+    assert_golden(
+        "setup_install_cmux.json",
+        workspace.json(&["setup", "install", "cmux", "--json"]),
+    );
+    assert_golden(
+        "doctor_claude.json",
+        workspace.json(&["doctor", "--json", "--tool", "claude"]),
     );
 
     workspace.cleanup();

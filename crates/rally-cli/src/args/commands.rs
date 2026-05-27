@@ -209,6 +209,13 @@ pub(crate) struct StartCommand {
 }
 
 #[derive(Debug)]
+pub(crate) struct SetupCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) action: String,
+    pub(crate) target: Option<String>,
+}
+
+#[derive(Debug)]
 pub(crate) struct HerdrInjectCommand {
     pub(crate) common: CommonOptions,
     pub(crate) identifier: String,
@@ -288,6 +295,25 @@ pub(crate) fn parse_start(args: WriteArgs) -> Result<StartCommand, CliError> {
         limit,
         peek,
         human,
+    })
+}
+
+pub(crate) fn parse_setup(args: WriteArgs) -> Result<SetupCommand, CliError> {
+    let (action, target) = match args.positional.as_slice() {
+        [] => ("status".to_string(), None),
+        [action] => (action.clone(), None),
+        [action, target] => (action.clone(), Some(target.clone())),
+        _ => {
+            return Err(CliError::usage(
+                args.command,
+                "setup accepts: setup | setup install <cmux|herdr> | setup enforcement <off|warn|strict>",
+            ));
+        }
+    };
+    Ok(SetupCommand {
+        common: args.common,
+        action,
+        target,
     })
 }
 
