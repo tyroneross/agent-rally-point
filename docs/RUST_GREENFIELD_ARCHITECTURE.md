@@ -315,6 +315,10 @@ The first-class commands should be:
 | `rally <tool>` / `rally start <tool>` | Canonical agent startup: writes presence and returns preflight, context, packet, checkpoint, cursor, warnings, and next watch command. |
 | `rally doctor` | Agent-readiness checks: anonymous owners, stale checkpoints, missing profile, diagnosis findings, open handoffs, and conflicts. |
 | `rally setup` | Harness discovery, enforcement mode, adapter wrapper install, and harness-local config patching. |
+| `rally judge` | Boundary judgment: continue, pause, acknowledge handoff, or refresh context. |
+| `rally hook` | Integration hook contract for start/before-write/after-write/before-commit/idle; can auto-claim before writes. |
+| `rally repair` | Fix known repairable state such as checkpoint cache and missing profile. |
+| `rally ci gate` | Non-zero merge gate for unresolved coordination failures. |
 | `rally preflight` | Session-start routing, peers, pending ACKs, context locations. |
 | `rally post` | Low-level event append for automation. |
 | `rally handoff` / `ack` / `reject` / `needs-info` | Handoff lifecycle. |
@@ -420,6 +424,9 @@ Initial implementation status:
   layer: harness discovery, enforcement mode, anonymous coordination detection,
   adapter wrapper installation, and harness-local config patching. Strict
   enforcement rejects new anonymous writes at append time.
+- `rally judge` and `rally hook` make coordination continuous at integration
+  boundaries. Every harness should call the same hook contract rather than
+  inventing local judgment.
 
 ## Remote Agent Readiness
 

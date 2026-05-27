@@ -59,6 +59,8 @@ Core coordination commands:
 rally pi
 rally start codex
 rally doctor --tool codex --json
+rally judge --tool codex --phase idle --json
+rally hook before-write --tool codex --path crates/foo.rs --auto-claim --json
 rally setup --json
 rally setup enforcement strict --json
 rally setup install cmux --json
@@ -113,6 +115,11 @@ records enforcement mode (`off`, `warn`, or `strict`), installs cmux/Herdr
 startup wrappers, and records adapter config changes. In `strict` mode, write
 commands reject anonymous `tool`, `from_tool`, or `owner_tool` values instead of
 only reporting them in doctor output.
+
+`rally judge` and `rally hook` close the loop during work. `judge` returns the
+current allow/stop decision for a phase. `hook before-write --auto-claim` can
+claim a path when safe or stop on handoffs, blockers, stale checkpoints, or claim
+conflicts. `rally ci gate` gives CI a merge-time coordination check.
 
 `rally packet` is the bounded work-brief surface for specialized agents. It is
 read-only, derived from the same context projection, and shapes the JSON for the

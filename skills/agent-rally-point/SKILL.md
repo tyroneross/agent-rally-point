@@ -41,6 +41,16 @@ harnesses pass a stable `--tool`. `rally setup install cmux` and `rally setup
 install herdr` install edge wrappers/config hooks; they do not move coordination
 state out of Rally.
 
+At work boundaries, call the judgment layer:
+
+- Before editing: `rally hook before-write --tool <tool> --path <path> --auto-claim --json`
+- After a batch: `rally hook after-write --tool <tool> --json`
+- Before commit/push: `rally hook before-commit --tool <tool> --json`
+- When unsure: `rally judge --tool <tool> --phase idle --json`
+
+If a hook returns `allow: false`, stop and perform its `required_actions` before
+continuing.
+
 If `rally start` is unavailable, fall back to:
 
 ```bash

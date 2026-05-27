@@ -216,6 +216,34 @@ pub(crate) struct SetupCommand {
 }
 
 #[derive(Debug)]
+pub(crate) struct JudgeCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) phase: String,
+    pub(crate) path: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) auto_claim: bool,
+    pub(crate) fail_open: bool,
+    pub(crate) stale_after_seconds: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct HookCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) phase: String,
+    pub(crate) path: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) auto_claim: bool,
+    pub(crate) fail_open: bool,
+    pub(crate) stale_after_seconds: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct RepairCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) action: String,
+}
+
+#[derive(Debug)]
 pub(crate) struct HerdrInjectCommand {
     pub(crate) common: CommonOptions,
     pub(crate) identifier: String,
@@ -306,7 +334,7 @@ pub(crate) fn parse_setup(args: WriteArgs) -> Result<SetupCommand, CliError> {
         _ => {
             return Err(CliError::usage(
                 args.command,
-                "setup accepts: setup | setup install <cmux|herdr> | setup enforcement <off|warn|strict>",
+                "setup accepts: setup | setup install <pi|claude|codex|cmux|herdr> | setup uninstall <pi|claude|codex|cmux|herdr> | setup enforcement <off|warn|strict>",
             ));
         }
     };
@@ -314,6 +342,82 @@ pub(crate) fn parse_setup(args: WriteArgs) -> Result<SetupCommand, CliError> {
         common: args.common,
         action,
         target,
+    })
+}
+
+pub(crate) fn parse_judge(args: WriteArgs) -> Result<JudgeCommand, CliError> {
+    let phase = args.one("--phase").unwrap_or_else(|| "idle".to_string());
+    let stale_after_seconds = args
+        .one("--stale-after-seconds")
+        .map(|value| parse_i64(args.command, "--stale-after-seconds", &value))
+        .transpose()?
+        .unwrap_or(300);
+    if !args.positional.is_empty() {
+        return Err(CliError::usage(
+            args.command,
+            "judge does not accept positional args",
+        ));
+    }
+    let path = args.one("--path");
+    let session_id = args.one("--session-id");
+    let auto_claim = args.has("--auto-claim");
+    let fail_open = args.has("--fail-open");
+    Ok(JudgeCommand {
+        common: args.common,
+        phase,
+        path,
+        session_id,
+        auto_claim,
+        fail_open,
+        stale_after_seconds,
+    })
+}
+
+pub(crate) fn parse_hook(args: WriteArgs) -> Result<HookCommand, CliError> {
+    let phase = match args.positional.as_slice() {
+        [phase] => phase.clone(),
+        [] => args.one("--phase").unwrap_or_else(|| "idle".to_string()),
+        _ => {
+            return Err(CliError::usage(
+                args.command,
+                "hook accepts at most one phase",
+            ));
+        }
+    };
+    let stale_after_seconds = args
+        .one("--stale-after-seconds")
+        .map(|value| parse_i64(args.command, "--stale-after-seconds", &value))
+        .transpose()?
+        .unwrap_or(300);
+    let path = args.one("--path");
+    let session_id = args.one("--session-id");
+    let auto_claim = args.has("--auto-claim");
+    let fail_open = args.has("--fail-open");
+    Ok(HookCommand {
+        common: args.common,
+        phase,
+        path,
+        session_id,
+        auto_claim,
+        fail_open,
+        stale_after_seconds,
+    })
+}
+
+pub(crate) fn parse_repair(args: WriteArgs) -> Result<RepairCommand, CliError> {
+    let action = match args.positional.as_slice() {
+        [] => "doctor".to_string(),
+        [action] => action.clone(),
+        _ => {
+            return Err(CliError::usage(
+                args.command,
+                "repair accepts at most one action",
+            ));
+        }
+    };
+    Ok(RepairCommand {
+        common: args.common,
+        action,
     })
 }
 

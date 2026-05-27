@@ -115,6 +115,8 @@ impl WriteArgs {
                 | "--since-cursor"
                 | "--peek"
                 | "--from-start"
+                | "--auto-claim"
+                | "--fail-open"
                 | "--no-default-trust-policy" => {
                     if arg == "--sign" {
                         common.sign = true;
@@ -169,6 +171,7 @@ impl WriteArgs {
                 | "--origin"
                 | "--trust-policy"
                 | "--kind"
+                | "--phase"
                 | "--payload"
                 | "--thread-id"
                 | "--causation-id"

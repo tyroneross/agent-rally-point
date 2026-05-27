@@ -3,17 +3,19 @@
 
 use crate::args::{
     WriteArgs, parse_ack, parse_artifact, parse_blocker, parse_claim, parse_decision,
-    parse_handoff, parse_herdr_inject, parse_identity_init, parse_lesson, parse_post,
-    parse_preflight, parse_profile, parse_read, parse_release, parse_setup, parse_start,
-    parse_subscribe, parse_sync_export, parse_sync_import, parse_task, parse_unblock, parse_watch,
+    parse_handoff, parse_herdr_inject, parse_hook, parse_identity_init, parse_judge, parse_lesson,
+    parse_post, parse_preflight, parse_profile, parse_read, parse_release, parse_repair,
+    parse_setup, parse_start, parse_subscribe, parse_sync_export, parse_sync_import, parse_task,
+    parse_unblock, parse_watch,
 };
 use crate::output::{CliError, WriteOutput};
 use crate::query_commands::{
     execute_adapter_contract, execute_blockers, execute_checkpoint_rebuild,
-    execute_checkpoint_status, execute_claims, execute_cmux_packet, execute_conflicts,
-    execute_context, execute_diagnose, execute_doctor, execute_herdr_inject, execute_herdr_packet,
-    execute_inbox, execute_packet, execute_replay, execute_report, execute_score, execute_setup,
-    execute_start, execute_thread,
+    execute_checkpoint_status, execute_ci_gate, execute_claims, execute_cmux_packet,
+    execute_conflicts, execute_context, execute_diagnose, execute_doctor, execute_herdr_inject,
+    execute_herdr_packet, execute_hook, execute_inbox, execute_judge, execute_packet,
+    execute_repair, execute_replay, execute_report, execute_score, execute_setup, execute_start,
+    execute_thread,
 };
 use crate::sync_commands::{execute_sync_export, execute_sync_import};
 use crate::verify_commands::{VerifyOptions, verify};
@@ -71,6 +73,9 @@ pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Some("packet") => run_read("packet", args, parse_read, execute_packet),
         Some("diagnose") => run_read("diagnose", args, parse_read, execute_diagnose),
         Some("doctor") => run_read("doctor", args, parse_read, execute_doctor),
+        Some("judge") => run_write("judge", args, parse_judge, execute_judge),
+        Some("hook") => run_write("hook", args, parse_hook, execute_hook),
+        Some("repair") => run_write("repair", args, parse_repair, execute_repair),
         Some("score") => run_read("score", args, parse_read, execute_score),
         Some("thread") => run_read("thread", args, parse_read, execute_thread),
         Some("replay") => run_read("replay", args, parse_read, execute_replay),
@@ -82,6 +87,21 @@ pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Some("adapter") => run_adapter(args),
         Some("checkpoint") => run_checkpoint(args),
         Some("setup") => run_write("setup", args, parse_setup, execute_setup),
+        Some("ci") => run_ci(args),
+        _ => {
+            usage();
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+fn run_ci(args: impl Iterator<Item = String>) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let mut args: Vec<String> = args.collect();
+    match args.first().map(String::as_str) {
+        Some("gate") => {
+            args.remove(0);
+            run_read("ci:gate", args.into_iter(), parse_read, execute_ci_gate)
+        }
         _ => {
             usage();
             Ok(ExitCode::from(2))
@@ -369,7 +389,13 @@ fn usage() {
     eprintln!("       rally sync export [--json] [--since <window>] > packet.json");
     eprintln!("       rally sync import [--json] [--trust-policy <trust.toml>] <packet.json>");
     eprintln!("       rally doctor [--tool <tool>] [--json]");
-    eprintln!("       rally setup [install <cmux|herdr>|enforcement <off|warn|strict>] [--json]");
+    eprintln!("       rally judge --tool <tool> [--phase <phase>] [--path <path>] [--json]");
+    eprintln!("       rally hook <phase> --tool <tool> [--path <path>] [--auto-claim] [--json]");
+    eprintln!("       rally repair [checkpoint|profile] [--json]");
+    eprintln!("       rally ci gate --tool ci --json");
+    eprintln!(
+        "       rally setup [install|uninstall <tool>|enforcement <off|warn|strict>] [--json]"
+    );
     eprintln!("       rally herdr inject [--json] [--force] <handoff-id>");
     eprintln!("       rally adapter contract [--json]");
     eprintln!("       rally cmux packet [--tool <tool>] [--json]");

@@ -49,7 +49,13 @@ rally pi
 rally watch --tool pi --session-id <session> --since-cursor
 rally doctor --tool pi --json
 rally setup --json
+rally judge --tool pi --phase idle --json
+rally hook before-write --tool pi --path <path> --auto-claim --json
 ```
+
+`rally judge` correctly stopped Pi while a required handoff from `claude_code`
+was pending. `rally hook before-write --auto-claim` was then adjusted so it does
+not create claims when a stop reason already exists.
 
 ## Verification
 

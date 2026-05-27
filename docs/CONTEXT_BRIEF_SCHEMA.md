@@ -301,6 +301,11 @@ installs edge hooks in the harness config directory:
 Tests may override those locations with `RALLY_CMUX_CONFIG_DIR` and
 `RALLY_HERDR_CONFIG_DIR`.
 
+`rally setup install <pi|claude|codex>` writes a small wrapper under
+`~/.agent-rally-point/hooks/` that calls `rally hook start` before execing the
+agent binary. `rally setup uninstall <tool>` removes the wrapper or marked
+adapter config block.
+
 `rally doctor --tool <tool> --json` combines deterministic diagnosis,
 checkpoint status, setup enforcement, active anonymous claims/tasks/handoffs,
 and profile checks. Its status is `pass`, `warn`, or `fail`. Under `strict`,
@@ -313,6 +318,25 @@ Formal schema files for agent-facing contracts live in `docs/schemas/`:
 - `agent-rally.command.packet.v1.json`
 - `agent-rally.command.doctor.v1.json`
 - `agent-rally.command.setup.v1.json`
+- `agent-rally.command.judge.v1.json`
+- `agent-rally.command.hook.v1.json`
+
+## Judgment and Hook Contracts
+
+`rally judge --tool <tool> --phase <phase> --json` is the pure judgment surface.
+It answers whether the agent should continue, pause, acknowledge a handoff, or
+refresh context. Phases are conventions (`start`, `before-write`, `after-write`,
+`before-commit`, `idle`) and are intentionally shared across all integrations.
+
+`rally hook <phase> --tool <tool> --json` is the adapter-facing boundary hook.
+It wraps the same judgment envelope and may perform safe boundary side effects.
+The first side effect is `hook before-write --path <path> --auto-claim`, which
+creates a claim only when no stop reasons and no competing claim exist. Hooks are
+boundary-based, not token-by-token.
+
+`rally ci gate --tool ci --json` is the merge gate. It fails non-zero when active
+blockers, pending required handoffs, claim conflicts, or invalid checkpoints are
+present.
 
 ## Checkpoint Contract
 

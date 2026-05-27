@@ -350,6 +350,107 @@ fn setup_install_writes_adapter_hooks() {
 }
 
 #[test]
+fn hook_before_write_auto_claims_and_blocks_conflicts() {
+    let workspace = RallyWorkspace::new("rally-cli-hook-judge");
+    let hook = json_stdout(workspace.run(&[
+        "hook",
+        "before-write",
+        "--json",
+        "--tool",
+        "pi",
+        "--path",
+        "src/lib.rs",
+        "--auto-claim",
+    ]));
+    let judgment = &hook["data"]["hook"]["judgment"];
+    assert_eq!(judgment["allow"], true);
+    assert_eq!(judgment["decision"], "continue");
+    assert_eq!(judgment["resource"], "file:src/lib.rs");
+    assert!(judgment["auto_claimed"].as_str().is_some());
+
+    let conflict = json_stdout(workspace.run(&[
+        "judge",
+        "--json",
+        "--tool",
+        "codex",
+        "--phase",
+        "before-write",
+        "--path",
+        "src/lib.rs",
+    ]));
+    let judgment = &conflict["data"]["judgment"];
+    assert_eq!(judgment["allow"], false);
+    assert_eq!(judgment["decision"], "pause");
+    assert_eq!(judgment["claim_conflicts"].as_array().unwrap().len(), 1);
+    workspace.cleanup();
+}
+
+#[test]
+fn setup_install_and_uninstall_agent_wrapper() {
+    let workspace = RallyWorkspace::new("rally-cli-agent-wrapper");
+    let install = json_stdout(workspace.run(&["setup", "install", "pi", "--json"]));
+    let wrapper = workspace
+        .home
+        .join(".agent-rally-point/hooks/pi-rally-wrapper.sh");
+    assert_eq!(
+        install["data"]["setup"]["installed_path"],
+        wrapper.display().to_string()
+    );
+    assert!(wrapper.exists());
+    assert!(
+        fs::read_to_string(&wrapper)
+            .unwrap()
+            .contains("rally hook start")
+    );
+
+    let uninstall = json_stdout(workspace.run(&["setup", "uninstall", "pi", "--json"]));
+    assert!(
+        uninstall["data"]["setup"]["installed_files"]
+            .as_array()
+            .unwrap()
+            .len()
+            == 1
+    );
+    assert!(!wrapper.exists());
+    workspace.cleanup();
+}
+
+#[test]
+fn repair_profile_and_ci_gate() {
+    let workspace = RallyWorkspace::new("rally-cli-repair-ci");
+    let repair = json_stdout(workspace.run(&["repair", "profile", "--json", "--tool", "pi"]));
+    assert_eq!(repair["data"]["repair"]["repaired"], true);
+    assert!(repair["data"]["repair"]["event_id"].as_str().is_some());
+
+    let pass = json_stdout(workspace.run(&["ci", "gate", "--json", "--tool", "ci"]));
+    assert_eq!(pass["data"]["gate"]["status"], "pass");
+
+    json_stdout(workspace.run(&[
+        "handoff",
+        "--json",
+        "--tool",
+        "pi",
+        "--from-tool",
+        "pi",
+        "--to",
+        "codex",
+        "--subject",
+        "required review",
+    ]));
+    let fail = workspace.run(&["ci", "gate", "--json", "--tool", "ci"]);
+    assert!(!fail.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&fail.stderr).unwrap();
+    assert_eq!(body["ok"], false);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("coordination gate failed")
+    );
+    workspace.cleanup();
+}
+
+#[test]
 fn query_commands_project_typed_state() {
     let workspace = RallyWorkspace::new("rally-cli-query-state");
     let handoff = json_stdout(workspace.run(&[

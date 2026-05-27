@@ -55,6 +55,10 @@ SPDX-License-Identifier: Apache-2.0
   harness-local config files, while keeping all Rally state in the channel.
 - Enforces `setup enforcement strict` on write commands by rejecting new
   anonymous tool/from_tool/owner_tool writes.
+- Adds `rally judge` and `rally hook <phase>` as the continuous judgment layer;
+  `hook before-write --auto-claim` claims safe paths and stops on conflicts.
+- Adds `rally repair`, `rally setup uninstall <tool>`, and `rally ci gate` plus a
+  GitHub Actions merge gate workflow.
 - Adds initial formal JSON schema files in `docs/schemas/` and a dogfood report
   in `docs/DOGFOOD_REPORT.md`.
 - Keeps urgent coordination obligations ahead of specialization:

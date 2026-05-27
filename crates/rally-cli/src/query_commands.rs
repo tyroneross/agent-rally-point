@@ -1,13 +1,17 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::args::{CommonOptions, HerdrInjectCommand, ReadCommand, SetupCommand, StartCommand};
+use crate::args::{
+    CommonOptions, HerdrInjectCommand, HookCommand, JudgeCommand, ReadCommand, RepairCommand,
+    SetupCommand, StartCommand,
+};
 use crate::output::{CliError, WriteOutput};
-use crate::runtime::now_rfc3339;
+use crate::resources::normalize_file_resource;
+use crate::runtime::{new_id, now_rfc3339};
 use rally_core::context::{build_context_brief, build_work_packet};
 use rally_core::cursors;
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
-use rally_core::event::{EventPayload, EventRecord};
+use rally_core::event::{ClaimPayload, EventBuilder, EventPayload, EventRecord, ProfilePayload};
 use rally_core::preflight::{PreflightOptions, run_preflight};
 use rally_core::query::{
     TraceProjection, active_blockers_at, active_claims_at, claim_conflicts, filter_since,
@@ -491,17 +495,30 @@ pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliErr
             let adapter = command
                 .target
                 .as_deref()
-                .ok_or_else(|| CliError::usage("setup", "setup install requires cmux or herdr"))?;
-            if !matches!(adapter, "cmux" | "herdr") {
+                .ok_or_else(|| CliError::usage("setup", "setup install requires a tool id"))?;
+            if !matches!(adapter, "pi" | "claude" | "codex" | "cmux" | "herdr") {
                 return Err(CliError::usage(
                     "setup",
-                    "unknown adapter; expected cmux or herdr",
+                    "unknown adapter; expected pi, claude, codex, cmux, or herdr",
                 ));
             }
-            let install = write_adapter_install(&store, adapter)?;
+            let install = if matches!(adapter, "cmux" | "herdr") {
+                write_adapter_install(&store, adapter)?
+            } else {
+                write_tool_install(adapter)?
+            };
             installed_path = install.primary_path;
             installed_files = install.files;
             modified_external_config = install.modified_config;
+        }
+        "uninstall" => {
+            let adapter = command
+                .target
+                .as_deref()
+                .ok_or_else(|| CliError::usage("setup", "setup uninstall requires a tool id"))?;
+            let uninstall = uninstall_tool_or_adapter(adapter)?;
+            installed_files = uninstall.files;
+            modified_external_config = uninstall.modified_config;
         }
         value => {
             return Err(CliError::usage(
@@ -531,6 +548,464 @@ pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliErr
             }
         }),
     ))
+}
+
+pub(super) fn execute_judge(command: JudgeCommand) -> Result<WriteOutput, CliError> {
+    let store = command.common.channel_store("judge")?;
+    let judgment = build_judgment(
+        &store,
+        &command.common,
+        JudgmentInput {
+            command: "judge",
+            phase: command.phase,
+            path: command.path,
+            session_id: command.session_id,
+            auto_claim: command.auto_claim,
+            fail_open: command.fail_open,
+            _stale_after_seconds: command.stale_after_seconds,
+        },
+    )?;
+    Ok(WriteOutput {
+        json: true,
+        text: format!(
+            "{} allow={} decision={}",
+            judgment.severity, judgment.allow, judgment.decision
+        ),
+        body: json!({
+            "ok": true,
+            "command": "judge",
+            "schema": "agent-rally.command.judge.v1",
+            "channel": store.channel_dir().display().to_string(),
+            "data": { "judgment": judgment.to_json() }
+        }),
+    })
+}
+
+pub(super) fn execute_hook(command: HookCommand) -> Result<WriteOutput, CliError> {
+    let store = command.common.channel_store("hook")?;
+    let phase = command.phase.clone();
+    let judgment = build_judgment(
+        &store,
+        &command.common,
+        JudgmentInput {
+            command: "hook",
+            phase: command.phase,
+            path: command.path,
+            session_id: command.session_id,
+            auto_claim: command.auto_claim,
+            fail_open: command.fail_open,
+            _stale_after_seconds: command.stale_after_seconds,
+        },
+    )?;
+    Ok(WriteOutput {
+        json: true,
+        text: format!(
+            "hook {phase} allow={} decision={}",
+            judgment.allow, judgment.decision
+        ),
+        body: json!({
+            "ok": true,
+            "command": "hook",
+            "schema": "agent-rally.command.hook.v1",
+            "channel": store.channel_dir().display().to_string(),
+            "data": {
+                "hook": {
+                    "phase": phase,
+                    "allow": judgment.allow,
+                    "judgment": judgment.to_json()
+                }
+            }
+        }),
+    })
+}
+
+pub(super) fn execute_repair(command: RepairCommand) -> Result<WriteOutput, CliError> {
+    let store = command.common.channel_store("repair")?;
+    match command.action.as_str() {
+        "checkpoint" | "checkpoint-invalid" => {
+            let status = store.rebuild_checkpoint().map_err(|err| {
+                CliError::runtime("repair", format!("failed to rebuild checkpoint: {err}"))
+            })?;
+            Ok(query_output(
+                "repair",
+                &command.common,
+                &store,
+                format!("checkpoint rebuilt records={}", status.records),
+                json!({
+                    "repair": {
+                        "action": command.action,
+                        "repaired": true,
+                        "checkpoint": status
+                    }
+                }),
+            ))
+        }
+        "profile" => {
+            let tool = command.common.tool();
+            if tool == "unknown" {
+                return Err(CliError::usage("repair", "profile repair requires --tool"));
+            }
+            let event = EventBuilder::new(
+                new_id("evt"),
+                EventPayload::Profile(ProfilePayload {
+                    tool: tool.clone(),
+                    capabilities: Vec::new(),
+                    role: None,
+                    watch: Vec::new(),
+                    current_task: None,
+                    branch: None,
+                    availability: Some("available".to_string()),
+                    notes: Some("created by rally repair profile".to_string()),
+                }),
+                &tool,
+                command.common.run_id(),
+                new_id("thr"),
+            )
+            .model(command.common.model())
+            .subject(format!("profile {tool}"))
+            .time(now_rfc3339());
+            let entry = store.append_typed(event).map_err(|err| {
+                CliError::runtime("repair", format!("failed to append profile: {err}"))
+            })?;
+            Ok(query_output(
+                "repair",
+                &command.common,
+                &store,
+                format!("profile repaired tool={tool}"),
+                json!({
+                    "repair": {
+                        "action": "profile",
+                        "repaired": true,
+                        "event_id": event_field(&entry, "id")
+                    }
+                }),
+            ))
+        }
+        "doctor" => Ok(query_output(
+            "repair",
+            &command.common,
+            &store,
+            "run rally doctor to inspect repairable issues".to_string(),
+            json!({
+                "repair": {
+                    "action": "doctor",
+                    "repaired": false,
+                    "next_commands": [
+                        "rally doctor --tool <tool> --json",
+                        "rally repair checkpoint --json",
+                        "rally repair profile --tool <tool> --json"
+                    ]
+                }
+            }),
+        )),
+        other => Err(CliError::usage(
+            "repair",
+            format!("unknown repair action {other}; expected checkpoint or profile"),
+        )),
+    }
+}
+
+pub(super) fn execute_ci_gate(command: ReadCommand) -> Result<WriteOutput, CliError> {
+    let store = command.common.channel_store("ci:gate")?;
+    let records = load_records_cached_or_empty(&store, "ci:gate")?;
+    let projection = TraceProjection::from_records_at(&records, now_epoch_seconds());
+    let conflicts = projection.claim_conflicts();
+    let blockers = projection.active_blockers(None);
+    let handoffs = projection.pending_handoffs(None);
+    let checkpoint = store
+        .checkpoint_status()
+        .map_err(|err| CliError::runtime("ci:gate", format!("failed to read checkpoint: {err}")))?;
+    let checkpoint_ok = !checkpoint.exists || checkpoint.valid;
+    let failures = json!({
+        "claim_conflicts": conflicts,
+        "active_blockers": blockers,
+        "pending_handoffs": handoffs,
+        "checkpoint_valid": checkpoint_ok,
+    });
+    let pass = failures["claim_conflicts"]
+        .as_array()
+        .is_none_or(Vec::is_empty)
+        && failures["active_blockers"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        && failures["pending_handoffs"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        && checkpoint_ok;
+    if !pass {
+        return Err(CliError::runtime(
+            "ci:gate",
+            format!("rally coordination gate failed: {failures}"),
+        ));
+    }
+    Ok(query_output(
+        "ci:gate",
+        &command.common,
+        &store,
+        "rally ci gate passed".to_string(),
+        json!({
+            "gate": {
+                "status": "pass",
+                "checkpoint": checkpoint,
+            }
+        }),
+    ))
+}
+
+struct JudgmentInput {
+    command: &'static str,
+    phase: String,
+    path: Option<String>,
+    session_id: Option<String>,
+    auto_claim: bool,
+    fail_open: bool,
+    _stale_after_seconds: i64,
+}
+
+struct JudgmentResult {
+    allow: bool,
+    decision: String,
+    severity: String,
+    safe_to_write: bool,
+    context_stale: bool,
+    reasons: Vec<Value>,
+    required_actions: Vec<String>,
+    auto_claimed: Option<String>,
+    resource: Option<String>,
+    new_events_since_cursor: u64,
+    pending_handoffs: Vec<Value>,
+    claim_conflicts: Vec<Value>,
+}
+
+impl JudgmentResult {
+    fn to_json(&self) -> Value {
+        json!({
+            "allow": self.allow,
+            "decision": self.decision,
+            "severity": self.severity,
+            "safe_to_write": self.safe_to_write,
+            "context_stale": self.context_stale,
+            "new_events_since_cursor": self.new_events_since_cursor,
+            "resource": self.resource,
+            "auto_claimed": self.auto_claimed,
+            "reasons": self.reasons,
+            "required_actions": self.required_actions,
+            "pending_handoffs": self.pending_handoffs,
+            "claim_conflicts": self.claim_conflicts,
+        })
+    }
+}
+
+fn build_judgment(
+    store: &ChannelStore,
+    common: &CommonOptions,
+    input: JudgmentInput,
+) -> Result<JudgmentResult, CliError> {
+    let tool = common.tool();
+    let records = load_records_cached_or_empty(store, input.command)?;
+    let projection = TraceProjection::from_records_at(&records, now_epoch_seconds());
+    let setup = setup_status(store)?;
+    let mut reasons = Vec::new();
+    let mut required_actions = Vec::new();
+    let path_resource = input.path.as_ref().map(|path| {
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        normalize_file_resource(path, &cwd)
+    });
+
+    if setup.enforcement == "strict" && tool == "unknown" {
+        reasons.push(
+            json!({"code": "anonymous-tool", "message": "strict mode requires a stable --tool"}),
+        );
+        required_actions.push("rerun with --tool <stable-id>".to_string());
+    }
+
+    let checkpoint = store.checkpoint_status().map_err(|err| {
+        CliError::runtime(input.command, format!("failed to read checkpoint: {err}"))
+    })?;
+    if checkpoint.exists && !checkpoint.valid {
+        reasons.push(json!({
+            "code": "checkpoint-invalid",
+            "message": checkpoint.reason.as_deref().unwrap_or("checkpoint invalid")
+        }));
+        required_actions.push("rally repair checkpoint --json".to_string());
+    }
+
+    let pending = projection.pending_handoffs(Some(&tool));
+    if !pending.is_empty() {
+        reasons.push(json!({
+            "code": "pending-handoff",
+            "message": "required handoff is assigned to this tool",
+            "event_id": pending[0].event_id
+        }));
+        required_actions.push(format!(
+            "rally ack --tool {tool} <handoff-id> --summary <summary>"
+        ));
+    }
+
+    let blockers = projection.active_blockers(None);
+    for blocker in &blockers {
+        if path_resource
+            .as_ref()
+            .is_none_or(|resource| blocker.resource.as_ref() == Some(resource))
+        {
+            reasons.push(json!({
+                "code": "active-blocker",
+                "message": blocker.subject,
+                "event_id": blocker.event_id,
+                "resource": blocker.resource
+            }));
+        }
+    }
+    if blockers.is_empty() {
+        // no-op; keeps the path-specific blocker loop above precise.
+    } else {
+        required_actions
+            .push("resolve or acknowledge active blockers before continuing".to_string());
+    }
+
+    let all_claims = projection.active_claims(None);
+    let mut path_conflicts = Vec::new();
+    let mut has_own_claim = false;
+    if let Some(resource) = &path_resource {
+        for claim in &all_claims {
+            if &claim.resource != resource {
+                continue;
+            }
+            if claim.owner_tool.as_deref() == Some(&tool) {
+                has_own_claim = true;
+            } else {
+                path_conflicts.push(json!({
+                    "event_id": claim.event_id,
+                    "owner_tool": claim.owner_tool,
+                    "resource": claim.resource,
+                    "subject": claim.subject
+                }));
+            }
+        }
+        if !path_conflicts.is_empty() {
+            reasons.push(json!({
+                "code": "claim-conflict",
+                "message": "another active claim owns this path",
+                "resource": resource,
+                "conflicts": path_conflicts
+            }));
+            required_actions.push("pause or coordinate with the claim owner".to_string());
+        }
+    }
+
+    let mut auto_claimed = None;
+    if matches!(input.phase.as_str(), "before-write" | "write")
+        && input.auto_claim
+        && path_resource.is_some()
+        && path_conflicts.is_empty()
+        && reasons.is_empty()
+        && !has_own_claim
+        && tool != "unknown"
+    {
+        let resource = path_resource.clone().unwrap();
+        let event = EventBuilder::new(
+            new_id("evt"),
+            EventPayload::Claim(ClaimPayload {
+                owner_tool: tool.clone(),
+                resource: resource.clone(),
+                subject: format!("auto-claim {resource}"),
+                notes: Some("created by rally hook before-write --auto-claim".to_string()),
+            }),
+            &tool,
+            common.run_id(),
+            new_id("thr"),
+        )
+        .model(common.model())
+        .subject(format!("auto-claim {resource}"))
+        .time(now_rfc3339());
+        let entry = store.append_typed(event).map_err(|err| {
+            CliError::runtime(input.command, format!("failed to auto-claim path: {err}"))
+        })?;
+        auto_claimed = event_field(&entry, "id");
+    }
+
+    let max_seq = records
+        .iter()
+        .filter_map(|record| record.get("local_seq").and_then(Value::as_u64))
+        .max()
+        .unwrap_or(0);
+    let cursor = input
+        .session_id
+        .as_ref()
+        .map(|session_id| cursors::read_cursor(store.channel_dir(), &tool, session_id))
+        .unwrap_or(max_seq);
+    let new_events_since_cursor = max_seq.saturating_sub(cursor);
+    let context_stale = input.session_id.is_some() && new_events_since_cursor > 0;
+    if context_stale {
+        reasons.push(json!({
+            "code": "context-stale",
+            "message": "new coordination events exist since this session cursor",
+            "new_events_since_cursor": new_events_since_cursor
+        }));
+        required_actions.push(format!(
+            "rally watch --tool {tool} --session-id <session> --since-cursor"
+        ));
+    }
+
+    let stop_codes = [
+        "anonymous-tool",
+        "checkpoint-invalid",
+        "active-blocker",
+        "claim-conflict",
+    ];
+    let has_stop_reason = reasons.iter().any(|reason| {
+        reason
+            .get("code")
+            .and_then(Value::as_str)
+            .is_some_and(|code| stop_codes.contains(&code))
+    });
+    let pending_handoff = !pending.is_empty();
+    let mut allow = !has_stop_reason && !pending_handoff;
+    if input.fail_open && setup.enforcement != "strict" {
+        allow = true;
+    }
+    let decision = if has_stop_reason {
+        "pause"
+    } else if pending_handoff {
+        "ack_handoff"
+    } else if context_stale {
+        "refresh_context"
+    } else {
+        "continue"
+    };
+    let severity = if !allow {
+        "stop"
+    } else if context_stale || !reasons.is_empty() {
+        "warn"
+    } else {
+        "ok"
+    };
+    Ok(JudgmentResult {
+        allow,
+        decision: decision.to_string(),
+        severity: severity.to_string(),
+        safe_to_write: allow && matches!(input.phase.as_str(), "before-write" | "write"),
+        context_stale,
+        reasons,
+        required_actions,
+        auto_claimed,
+        resource: path_resource,
+        new_events_since_cursor,
+        pending_handoffs: pending.into_iter().map(|item| json!(item)).collect(),
+        claim_conflicts: path_conflicts,
+    })
+}
+
+fn load_records_cached_or_empty(
+    store: &ChannelStore,
+    command: &'static str,
+) -> Result<Vec<Value>, CliError> {
+    if !store.changes_path().exists() {
+        return Ok(Vec::new());
+    }
+    store
+        .load_records_cached()
+        .map_err(|err| CliError::runtime(command, format!("failed to load channel: {err}")))
 }
 
 fn start_warnings(
@@ -635,6 +1110,117 @@ struct AdapterInstall {
     modified_config: Option<String>,
 }
 
+fn write_tool_install(tool: &str) -> Result<AdapterInstall, CliError> {
+    let dir = rally_hooks_dir()?;
+    fs::create_dir_all(&dir).map_err(|err| {
+        CliError::runtime("setup", format!("failed to create rally hooks dir: {err}"))
+    })?;
+    let path = dir.join(format!("{tool}-rally-wrapper.sh"));
+    write_executable(&path, &agent_wrapper_script(tool))?;
+    Ok(AdapterInstall {
+        primary_path: Some(path.display().to_string()),
+        files: vec![path.display().to_string()],
+        modified_config: None,
+    })
+}
+
+fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
+    let mut files = Vec::new();
+    let mut modified_config = None;
+    if matches!(tool, "pi" | "claude" | "codex") {
+        let path = rally_hooks_dir()?.join(format!("{tool}-rally-wrapper.sh"));
+        if path.exists() {
+            fs::remove_file(&path).map_err(|err| {
+                CliError::runtime("setup", format!("failed to remove wrapper: {err}"))
+            })?;
+        }
+        files.push(path.display().to_string());
+    } else if tool == "cmux" {
+        let dir = adapter_config_dir("RALLY_CMUX_CONFIG_DIR", "cmux")?;
+        let wrapper = dir.join("rally-agent-wrapper.sh");
+        if wrapper.exists() {
+            fs::remove_file(&wrapper).map_err(|err| {
+                CliError::runtime("setup", format!("failed to remove cmux wrapper: {err}"))
+            })?;
+        }
+        files.push(wrapper.display().to_string());
+        let config = dir.join("cmux.json");
+        if config.exists() {
+            let text = fs::read_to_string(&config).map_err(|err| {
+                CliError::runtime("setup", format!("failed to read cmux config: {err}"))
+            })?;
+            let mut value: Value = serde_json::from_str(&text).map_err(|err| {
+                CliError::runtime("setup", format!("failed to parse cmux config: {err}"))
+            })?;
+            if let Some(commands) = value
+                .as_object_mut()
+                .and_then(|object| object.get_mut("commands"))
+                .and_then(Value::as_array_mut)
+            {
+                commands.retain(|command| {
+                    command.get("name").and_then(Value::as_str) != Some("rally-agent")
+                });
+                fs::write(&config, serde_json::to_vec_pretty(&value).unwrap()).map_err(|err| {
+                    CliError::runtime("setup", format!("failed to write cmux config: {err}"))
+                })?;
+                modified_config = Some(config.display().to_string());
+            }
+        }
+    } else if tool == "herdr" {
+        let dir = adapter_config_dir("RALLY_HERDR_CONFIG_DIR", "herdr")?;
+        let wrapper = dir.join("integrations/rally-agent-start.sh");
+        if wrapper.exists() {
+            fs::remove_file(&wrapper).map_err(|err| {
+                CliError::runtime("setup", format!("failed to remove herdr wrapper: {err}"))
+            })?;
+        }
+        files.push(wrapper.display().to_string());
+        let config = dir.join("config.toml");
+        if config.exists() {
+            let existing = fs::read_to_string(&config).map_err(|err| {
+                CliError::runtime("setup", format!("failed to read herdr config: {err}"))
+            })?;
+            let next = remove_marked_block(
+                &existing,
+                "# BEGIN rally integration",
+                "# END rally integration",
+            );
+            fs::write(&config, next).map_err(|err| {
+                CliError::runtime("setup", format!("failed to write herdr config: {err}"))
+            })?;
+            modified_config = Some(config.display().to_string());
+        }
+    } else {
+        return Err(CliError::usage("setup", "unknown tool for uninstall"));
+    }
+    Ok(AdapterInstall {
+        primary_path: None,
+        files,
+        modified_config,
+    })
+}
+
+fn rally_hooks_dir() -> Result<PathBuf, CliError> {
+    if let Ok(value) = env::var("RALLY_HOOKS_DIR") {
+        return Ok(PathBuf::from(value));
+    }
+    let home = env::var("HOME")
+        .map_err(|_| CliError::runtime("setup", "HOME is required to install hooks"))?;
+    Ok(PathBuf::from(home).join(".agent-rally-point/hooks"))
+}
+
+fn agent_wrapper_script(tool: &str) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+tool="{tool}"
+session="${{RALLY_SESSION_ID:-${{tool}}-$(date +%s)}}"
+rally hook start --tool "$tool" --session-id "$session" --json > "${{TMPDIR:-/tmp}}/rally-${{tool}}-${{session}}.json"
+exec "$tool" "$@"
+"#
+    )
+}
+
 fn write_adapter_install(store: &ChannelStore, adapter: &str) -> Result<AdapterInstall, CliError> {
     let dir = store.channel_dir().join("rally/adapters");
     fs::create_dir_all(&dir).map_err(|err| {
@@ -678,7 +1264,7 @@ set -euo pipefail
 tool="${1:-claude}"
 if [ "$#" -gt 0 ]; then shift; fi
 session="${RALLY_SESSION_ID:-${tool}-$(date +%s)}"
-rally "$tool" --session-id "$session" --json > "${TMPDIR:-/tmp}/rally-${tool}-${session}.json" || true
+rally hook start --tool "$tool" --session-id "$session" --json > "${TMPDIR:-/tmp}/rally-${tool}-${session}.json" || true
 exec "$tool" "$@"
 "#,
     )?;
@@ -748,7 +1334,7 @@ set -euo pipefail
 tool="${1:-claude}"
 if [ "$#" -gt 0 ]; then shift; fi
 session="${RALLY_SESSION_ID:-${tool}-$(date +%s)}"
-rally "$tool" --session-id "$session" --json > "${TMPDIR:-/tmp}/rally-${tool}-${session}.json" || true
+rally hook start --tool "$tool" --session-id "$session" --json > "${TMPDIR:-/tmp}/rally-${tool}-${session}.json" || true
 exec "$tool" "$@"
 "#,
     )?;
@@ -827,6 +1413,20 @@ fn replace_marked_block(existing: &str, begin: &str, end: &str, block: &str) -> 
         .strip_prefix('\n')
         .unwrap_or(&existing[end_index..]);
     format!("{}{}{}", &existing[..start], block, trailing_newline)
+}
+
+fn remove_marked_block(existing: &str, begin: &str, end: &str) -> String {
+    let Some(start) = existing.find(begin) else {
+        return existing.to_string();
+    };
+    let Some(relative_end) = existing[start..].find(end) else {
+        return existing.to_string();
+    };
+    let end_index = start + relative_end + end.len();
+    let trailing = existing[end_index..]
+        .strip_prefix('\n')
+        .unwrap_or(&existing[end_index..]);
+    format!("{}{}", &existing[..start], trailing)
 }
 
 fn enforcement_severity(enforcement: &str) -> &'static str {

@@ -1,0 +1,17 @@
+name: Rally coordination gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  rally-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test
+      - name: Rally coordination gate
+        run: cargo run -p rally-cli -- ci gate --tool ci --json

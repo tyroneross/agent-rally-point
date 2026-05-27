@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-rally-point.local/schemas/agent-rally.command.hook.v1.json",
+  "title": "Rally hook command",
+  "type": "object",
+  "required": ["ok", "command", "schema", "channel", "data"],
+  "properties": {
+    "ok": { "const": true },
+    "command": { "const": "hook" },
+    "schema": { "const": "agent-rally.command.hook.v1" },
+    "channel": { "type": "string" },
+    "data": {
+      "type": "object",
+      "required": ["hook"],
+      "properties": {
+        "hook": {
+          "type": "object",
+          "required": ["phase", "allow", "judgment"],
+          "properties": {
+            "phase": { "type": "string" },
+            "allow": { "type": "boolean" },
+            "judgment": { "type": "object" }
+          }
+        }
+      }
+    }
+  }
+}

@@ -411,6 +411,10 @@ fn golden_outputs_match_formal_json_schemas() {
     assert_matches_schema("agent-rally.command.doctor.v1.json", &doctor);
     let setup = workspace.json(&["setup", "--json"]);
     assert_matches_schema("agent-rally.command.setup.v1.json", &setup);
+    let judge = workspace.json(&["judge", "--json", "--tool", "pi"]);
+    assert_matches_schema("agent-rally.command.judge.v1.json", &judge);
+    let hook = workspace.json(&["hook", "idle", "--json", "--tool", "pi"]);
+    assert_matches_schema("agent-rally.command.hook.v1.json", &hook);
     workspace.cleanup();
 }
 
