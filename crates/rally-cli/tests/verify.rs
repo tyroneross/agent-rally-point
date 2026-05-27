@@ -533,6 +533,17 @@ fn attuned_fact_commands_feed_context_brief() {
         task_id
     );
     assert_eq!(
+        context["data"]["brief"]["attuned_items"][0]["event_id"],
+        task_id
+    );
+    assert!(
+        context["data"]["brief"]["attuned_items"][0]["factors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|factor| factor == "unresolved:task")
+    );
+    assert_eq!(
         context["data"]["brief"]["artifacts"][0]["ref_task_id"],
         task_id
     );

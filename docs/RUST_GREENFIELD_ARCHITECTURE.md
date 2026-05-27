@@ -376,6 +376,9 @@ Initial implementation status:
 - Attuned event families now cover agent profiles, subscriptions, tasks,
   artifacts, decisions, and lessons. `ContextBrief` consumes those facts with
   deterministic attention priorities and source-linked recommendations.
+- `ContextBrief.attuned_items` now ranks attention items, claims, artifacts,
+  decisions, lessons, and recent changes for the specific tool using profile
+  watch paths, subscriptions, current task, task links, trust, and freshness.
 - `rally-cli verify --json` now reads through `rally-core` and emits the command
   envelope shape for success and failure.
 - `rally-cli` is still a prototype verifier surface and should become a

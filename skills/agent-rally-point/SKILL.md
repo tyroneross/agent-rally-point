@@ -21,6 +21,7 @@ rally context --tool <tool> --json
 Use the returned `data.brief` to decide what to do next:
 
 - `recommended_next_action`: the preferred next action.
+- `attuned_items`: scored, source-linked facts ranked for your tool.
 - `top_priority`: the highest-priority source item.
 - `needs_attention`: ranked handoffs, tasks, blockers, and conflicts.
 - `active_tasks`, `active_claims`, `active_blockers`: current work state.
@@ -100,6 +101,9 @@ rally unblock --tool <tool> <blocker-id> --resolution "decision recorded" --json
 
 Treat `rally context` as the live brief:
 
+- Read `attuned_items` before broad repo exploration. Prefer items with factors
+  matching your current task, watched paths, subscriptions, trusted origin, or
+  active claims.
 - If `recommended_next_action.action` is `ack_handoff`, inspect the source
   event and respond with `ack`, `needs-info`, or `reject`.
 - If it is `work_task`, work the referenced task and record artifacts.

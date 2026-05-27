@@ -175,3 +175,10 @@ subscriptions, tasks, artifacts, decisions, and lessons. It also gives attention
 items deterministic priority bands, so `rally context` begins acting like a
 small ranking engine rather than a status dump. See
 [`CONTEXT_BRIEF_SCHEMA.md`](CONTEXT_BRIEF_SCHEMA.md).
+
+The attunement ranking slice turns those facts into a tool-specific intelligence
+layer. `ContextBrief.attuned_items` now scores attention items, active claims,
+artifacts, decisions, lessons, and recent changes using profile watch paths,
+current task, subscriptions, active ownership, trust labels, and freshness. Each
+ranked item carries factors and source ids so agents can explain why it matters
+before acting.

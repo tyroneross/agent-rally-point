@@ -78,6 +78,11 @@ rally replay --json
 rally report --json
 ```
 
+`rally context` is the agent-facing intelligence layer. It returns the
+recommended next action plus `attuned_items`: scored, source-linked facts ranked
+for that specific tool from active work, watched paths, subscriptions, task
+links, trust labels, and recent changes.
+
 Trust and sync:
 
 ```bash

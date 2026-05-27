@@ -64,9 +64,11 @@ pub struct ClaimConflict {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RecentChange {
     pub event_id: String,
+    pub thread_id: Option<String>,
     pub kind: String,
     pub tool: Option<String>,
     pub subject: String,
+    pub age_seconds: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -338,9 +340,11 @@ impl TraceProjection {
             .iter()
             .map(|record| RecentChange {
                 event_id: record.id.clone(),
+                thread_id: record.parsed.thread_id.clone(),
                 kind: record.parsed.kind.label().to_string(),
                 tool: record.parsed.tool.clone(),
                 subject: record.parsed.subject_label(),
+                age_seconds: record.age_seconds,
                 origin: record.origin.clone(),
                 trust_status: record.trust_status.clone(),
             })
@@ -368,9 +372,22 @@ impl TraceProjection {
     }
 
     pub fn active_tasks(&self, tool: Option<&str>) -> Vec<ActiveTask> {
-        self.records
-            .iter()
-            .filter_map(|record| {
+        let mut latest_tasks = Vec::new();
+        for record in &self.records {
+            let Some(EventPayload::Task(payload)) = record.parsed.payload.as_ref() else {
+                continue;
+            };
+            let key = task_key(payload);
+            if let Some(index) = latest_tasks.iter().position(|(known, _)| known == &key) {
+                latest_tasks[index] = (key, record);
+            } else {
+                latest_tasks.push((key, record));
+            }
+        }
+
+        latest_tasks
+            .into_iter()
+            .filter_map(|(_key, record)| {
                 let Some(EventPayload::Task(payload)) = record.parsed.payload.as_ref() else {
                     return None;
                 };
@@ -804,6 +821,14 @@ fn final_ack_by_handoff_for(records: &[ProjectedRecord]) -> BTreeMap<String, Str
         }
     }
     latest
+}
+
+fn task_key(payload: &crate::event::TaskPayload) -> String {
+    format!(
+        "{}\n{}",
+        payload.owner_tool.as_deref().unwrap_or(""),
+        payload.subject
+    )
 }
 
 fn relation_values(record: &Value) -> BTreeSet<String> {

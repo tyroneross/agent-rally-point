@@ -32,6 +32,7 @@ Current fields:
 | `subscription` | Latest `subscription` event for the tool, when present. |
 | `routing` | Agent-start action and reason. |
 | `top_priority` | Highest-priority attention item, if any. |
+| `attuned_items` | Scored, explainable relevance ranking for this tool across attention items, claims, artifacts, decisions, lessons, and recent changes. |
 | `recommended_next_action` | Machine-readable action, target, confidence, minimum automation trust, reason, and source ids. |
 | `needs_attention` | Ranked attention items such as handoffs, tasks, blockers, and claim conflicts. |
 | `collision_risk` | Claim conflicts involving this tool. |
@@ -53,6 +54,7 @@ Current fields:
   "subject": "review sync",
   "reason": "assigned to this tool and requires acknowledgement",
   "source_event_ids": ["evt_..."],
+  "paths": ["crates/rally-core/src/sync.rs"],
   "origin": "import:sync",
   "trust_status": "trusted"
 }
@@ -67,9 +69,49 @@ Current priority bands:
 | 80 | unresolved blocker raised by this tool |
 | 70 | claim conflict involving this tool |
 
-The ranking is intentionally simple and deterministic. Later versions can add
-profile-fit scoring, path subscriptions, dependency links, task/artifact
-relationships, and trust weighting without changing the core principle:
+`attuned_items` explain why each item is relevant:
+
+```json
+{
+  "kind": "artifact",
+  "event_id": "evt_...",
+  "subject": "context ranking notes",
+  "score": 125,
+  "factors": [
+    "artifact:notes",
+    "current_task:evt_task",
+    "subscribed_task:evt_task",
+    "profile_watch:crates/rally-core",
+    "subscribed_path:crates/rally-core/src/context.rs",
+    "subscribed_kind:artifact",
+    "trusted"
+  ],
+  "source_event_ids": ["evt_..."],
+  "paths": ["crates/rally-core/src/context.rs"],
+  "linked_task_ids": ["evt_task"],
+  "origin": "remote:peer-a",
+  "trust_status": "trusted"
+}
+```
+
+Attunement scoring is deterministic and source-linked. It combines:
+
+| Signal | Examples |
+|---|---|
+| Unresolved state | Required handoffs, active tasks, blockers, claim conflicts. |
+| Agent profile | `current_task` and watched paths. |
+| Subscriptions | Event kinds, paths, threads, and task ids. |
+| Active ownership | Paths already claimed by this tool. |
+| Trust | Trusted imports rank up; untrusted/invalid facts rank down. |
+| Recency | Fresh recent changes get a small boost. |
+
+Task lifecycle is projected from the latest task event for the same
+`owner_tool` and `subject`. A later `status: done`, `completed`, or `cancelled`
+event removes that task from `active_tasks` and from unresolved attention.
+
+The ranking is intentionally bounded rather than a scheduler. It does not
+execute work or hide lower-scoring facts; it gives agents a compact, explainable
+brief they can act on:
 
 > Every recommendation must cite source events.
 

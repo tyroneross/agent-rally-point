@@ -286,6 +286,163 @@ fn context_brief_includes_attuned_agent_facts() {
     assert_eq!(brief.artifacts[0].ref_task_id.as_deref(), Some("evt_task"));
     assert_eq!(brief.decisions[0].status, "binding");
     assert_eq!(brief.lessons[0].confidence, Some(0.9));
+    assert_eq!(brief.attuned_items[0].event_id, "evt_task");
+    assert!(
+        brief.attuned_items[0]
+            .factors
+            .contains(&"current_task:evt_task".to_string())
+    );
+    assert!(brief.attuned_items.iter().any(|item| {
+        item.event_id == "evt_artifact"
+            && item
+                .factors
+                .contains(&"subscribed_task:evt_task".to_string())
+    }));
+}
+
+#[test]
+fn context_brief_ranks_attuned_items_by_profile_subscription_path_and_trust() {
+    let profile = record(
+        "profile",
+        "evt_profile",
+        "codex",
+        json!({
+            "tool": "codex",
+            "watch": ["crates/rally-core"],
+            "current_task": "evt_task"
+        }),
+    );
+    let subscription = record(
+        "subscription",
+        "evt_subscription",
+        "codex",
+        json!({
+            "tool": "codex",
+            "paths": ["crates/rally-core/src/context.rs"],
+            "event_kinds": ["artifact", "decision"],
+            "tasks": ["evt_task"]
+        }),
+    );
+    let task = record(
+        "task",
+        "evt_task",
+        "codex",
+        json!({
+            "subject": "finish intelligence ranking",
+            "status": "active",
+            "owner_tool": "codex"
+        }),
+    );
+    let related_artifact = json!({
+        "local_seq": 1,
+        "origin": "remote:peer-a",
+        "trust_status": "trusted",
+        "event": record(
+            "artifact",
+            "evt_related_artifact",
+            "pi",
+            json!({
+                "subject": "context ranking notes",
+                "artifact_kind": "notes",
+                "uri": "crates/rally-core/src/context.rs",
+                "ref_task_id": "evt_task"
+            }),
+        )
+    });
+    let unrelated_artifact = json!({
+        "local_seq": 2,
+        "origin": "remote:peer-b",
+        "trust_status": "untrusted",
+        "event": record(
+            "artifact",
+            "evt_unrelated_artifact",
+            "pi",
+            json!({
+                "subject": "website screenshot",
+                "artifact_kind": "screenshot",
+                "uri": "docs/marketing.png"
+            }),
+        )
+    });
+    let related_decision = record(
+        "decision",
+        "evt_context_decision",
+        "pi",
+        json!({
+            "subject": "rank context by source-linked relevance",
+            "status": "binding",
+            "scope": "crates/rally-core/src/context.rs"
+        }),
+    );
+
+    let records = vec![
+        profile,
+        subscription,
+        task,
+        unrelated_artifact,
+        related_artifact,
+        related_decision,
+    ];
+    let projection = TraceProjection::from_records_at(&records, 1_779_829_200.0);
+    let brief = build_context_brief(&projection, "codex", 10);
+
+    let related = brief
+        .attuned_items
+        .iter()
+        .find(|item| item.event_id == "evt_related_artifact")
+        .unwrap();
+    let unrelated = brief
+        .attuned_items
+        .iter()
+        .find(|item| item.event_id == "evt_unrelated_artifact")
+        .unwrap();
+
+    assert!(related.score > unrelated.score);
+    assert!(
+        related
+            .factors
+            .contains(&"profile_watch:crates/rally-core".to_string())
+    );
+    assert!(
+        related
+            .factors
+            .contains(&"subscribed_path:crates/rally-core/src/context.rs".to_string())
+    );
+    assert!(
+        related
+            .factors
+            .contains(&"subscribed_kind:artifact".to_string())
+    );
+    assert!(related.factors.contains(&"trusted".to_string()));
+    assert!(unrelated.factors.contains(&"untrusted".to_string()));
+}
+
+#[test]
+fn active_tasks_use_latest_task_state_by_owner_and_subject() {
+    let active = record(
+        "task",
+        "evt_task_active",
+        "codex",
+        json!({
+            "subject": "finish intelligence ranking",
+            "status": "active",
+            "owner_tool": "codex"
+        }),
+    );
+    let done = record(
+        "task",
+        "evt_task_done",
+        "codex",
+        json!({
+            "subject": "finish intelligence ranking",
+            "status": "done",
+            "owner_tool": "codex"
+        }),
+    );
+
+    let projection = TraceProjection::from_records_at(&[active, done], 1_779_829_200.0);
+
+    assert!(projection.active_tasks(Some("codex")).is_empty());
 }
 
 #[test]
