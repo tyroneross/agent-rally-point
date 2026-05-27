@@ -2388,13 +2388,14 @@ impl ArgBag {
                 continue;
             }
 
-            if option_takes_value(&arg)
-                && let Some(value) = iter.peek()
-                && !value.starts_with("--")
-            {
-                let value = iter.next().unwrap_or_default();
-                options.entry(arg).or_default().push(value);
-                continue;
+            if option_takes_value(&arg) {
+                if let Some(value) = iter.peek() {
+                    if !value.starts_with("--") {
+                        let value = iter.next().unwrap_or_default();
+                        options.entry(arg).or_default().push(value);
+                        continue;
+                    }
+                }
             }
             flags.insert(arg);
         }
