@@ -2068,12 +2068,7 @@ fn install_codex_hooks() -> Result<AdapterInstall, CliError> {
     write_json_pretty(&hooks, &value)?;
     let config = dir.join("config.toml");
     backup_paths.extend(backup_file(&config)?);
-    upsert_marked_block(
-        &config,
-        "# BEGIN rally codex hooks",
-        "# END rally codex hooks",
-        "# BEGIN rally codex hooks\n[features]\nhooks = true\n# END rally codex hooks\n",
-    )?;
+    set_codex_features_hooks(&config, true)?;
     Ok(AdapterInstall {
         primary_path: Some(hooks.display().to_string()),
         files: vec![
@@ -2084,6 +2079,95 @@ fn install_codex_hooks() -> Result<AdapterInstall, CliError> {
         modified_config: Some(hooks.display().to_string()),
         backup_paths,
     })
+}
+
+/// Set `features.hooks = true` (or remove it, when `enabled` is false) in a
+/// Codex `config.toml`, preserving sibling keys inside `[features]` and any
+/// other top-level tables.
+///
+/// Heals two legacy states left behind by the older marker-block installer:
+///   * a `# BEGIN rally codex hooks` / `# END rally codex hooks` block that
+///     emitted a literal `[features]` header (root cause of the duplicate-key
+///     parse error this routine replaces);
+///   * any resulting duplicate `[features]` headers that snuck into the file.
+///
+/// When the file already parses as valid TOML, mutates the parsed document
+/// directly. When it doesn't, strips the rally marker block (if any) and
+/// retries the parse; on a second failure, returns a CliError that names the
+/// underlying TOML error so the operator can resolve it manually.
+fn set_codex_features_hooks(path: &Path, enabled: bool) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::runtime(
+                "setup",
+                format!("failed to create {}: {err}", parent.display()),
+            )
+        })?;
+    }
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let cleaned = remove_marked_block(
+        &existing,
+        "# BEGIN rally codex hooks",
+        "# END rally codex hooks",
+    );
+    let parse_source = if existing == cleaned {
+        existing.clone()
+    } else {
+        cleaned.clone()
+    };
+    let mut doc: toml::Value = match toml::from_str(&parse_source) {
+        Ok(value) => value,
+        Err(_) => {
+            // Second-chance parse from the cleaned source: removing the rally
+            // marker block is enough to repair files written by the buggy
+            // pre-fix installer (where the block injected a duplicate
+            // `[features]` table header).
+            toml::from_str(&cleaned).map_err(|err| {
+                CliError::runtime(
+                    "setup",
+                    format!("failed to parse Codex config {}: {err}", path.display()),
+                )
+            })?
+        }
+    };
+    if !doc.is_table() {
+        doc = toml::Value::Table(toml::value::Table::new());
+    }
+    let table = doc.as_table_mut().expect("doc is guaranteed to be a table");
+    if enabled {
+        let features_entry = table
+            .entry("features".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+        if !features_entry.is_table() {
+            *features_entry = toml::Value::Table(toml::value::Table::new());
+        }
+        let features = features_entry
+            .as_table_mut()
+            .expect("features entry was just normalized to a table");
+        features.insert("hooks".to_string(), toml::Value::Boolean(true));
+    } else if let Some(features_entry) = table.get_mut("features") {
+        if let Some(features) = features_entry.as_table_mut() {
+            features.remove("hooks");
+        }
+        if table
+            .get("features")
+            .and_then(|value| value.as_table())
+            .map(|features| features.is_empty())
+            .unwrap_or(false)
+        {
+            table.remove("features");
+        }
+    }
+    let serialized = toml::to_string(&doc).map_err(|err| {
+        CliError::runtime("setup", format!("failed to serialize Codex config: {err}"))
+    })?;
+    fs::write(path, serialized).map_err(|err| {
+        CliError::runtime(
+            "setup",
+            format!("failed to write {}: {err}", path.display()),
+        )
+    })?;
+    Ok(())
 }
 
 fn install_gemini_hooks() -> Result<AdapterInstall, CliError> {
@@ -2197,17 +2281,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
         let config = dir.join("config.toml");
         if config.exists() {
             backup_paths.extend(backup_file(&config)?);
-            let existing = fs::read_to_string(&config).map_err(|err| {
-                CliError::runtime("setup", format!("failed to read Codex config: {err}"))
-            })?;
-            let next = remove_marked_block(
-                &existing,
-                "# BEGIN rally codex hooks",
-                "# END rally codex hooks",
-            );
-            fs::write(&config, next).map_err(|err| {
-                CliError::runtime("setup", format!("failed to write Codex config: {err}"))
-            })?;
+            set_codex_features_hooks(&config, false)?;
         }
     } else if tool == "gemini" {
         let dir = home_dot(".gemini")?;
@@ -2420,25 +2494,6 @@ fn remove_rally_native_hooks(value: &mut Value) {
         };
         array.retain(|entry| !entry.to_string().contains("rally-hook.sh"));
     }
-}
-
-fn upsert_marked_block(path: &Path, begin: &str, end: &str, block: &str) -> Result<(), CliError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            CliError::runtime(
-                "setup",
-                format!("failed to create {}: {err}", parent.display()),
-            )
-        })?;
-    }
-    let existing = fs::read_to_string(path).unwrap_or_default();
-    let next = replace_marked_block(&existing, begin, end, block);
-    fs::write(path, next).map_err(|err| {
-        CliError::runtime(
-            "setup",
-            format!("failed to write {}: {err}", path.display()),
-        )
-    })
 }
 
 fn native_hook_script(default_tool: &str) -> String {

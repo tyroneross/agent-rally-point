@@ -20,6 +20,7 @@ rally-protocol = { path = "../rally-protocol" }
 rally-trust = { path = "../rally-trust" }
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
