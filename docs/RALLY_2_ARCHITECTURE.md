@@ -4,6 +4,16 @@ Rally 2.0 is a repo-local coordination layer for parallel goal-driven agents.
 It is not a conductor, task runner, dashboard, or coding agent. Its job is to
 keep shared room state correct, fresh, and visible before agents act.
 
+Rally 2.0 is the primary Agent Rally Point product path. The legacy `rally`
+CLI remains available as a deprecated compatibility layer for existing
+`changes.jsonl` channels, sync/trust workflows, and older adapters, but future
+agent-loop design should land in Rally 2 unless it is explicitly migration
+work.
+
+This direction builds on Jason's Rally 2 rewrite and act-on-next contract work
+in PRs #42/#43. The changes here promote that work as the default path while
+keeping the legacy CLI as deprecated compatibility.
+
 Product sentence:
 
 ```text
@@ -67,6 +77,11 @@ rally2 check before-write    # boundary check before shared work changes
 
 Everything else is debug, admin, or adapter plumbing. `HANDOFF.md` export and
 adapter setup matter, but they should not be part of the core product loop.
+
+Legacy commands such as `rally preflight`, `rally context`, `rally packet`,
+`rally doctor`, and `rally sync` are compatibility surfaces. They can remain
+tested and installable, but they should not define the primary agent experience
+after Rally 2 is available.
 
 ## Agent Product Loop
 

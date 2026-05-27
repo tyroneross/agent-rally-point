@@ -1,153 +1,133 @@
-# RALLY — the 60-second guide
+# RALLY 2 - the 60-second guide
 
-Rally is a local-first message bus so coding agents working in the same
-repo can see each other and hand off work. This file is the minimum
-surface you need; everything else in `docs/` is reference.
+Rally 2 is the primary Agent Rally Point path. It gives coding agents a shared
+repo-local room: what is owned, blocked, handed off, decided, produced, and what
+to do next.
 
-## The load-bearing commands
+Legacy `rally` still exists for old channels and adapters, but the operating
+loop below uses `rally2`.
+
+## The Load-Bearing Commands
 
 ```bash
-rally <you>                                                       # session start
-rally next --tool <you> --json                                    # best next action
-rally judge --tool <you> --phase idle --json                      # decide what now
-rally hook before-write --tool <you> --path <path> --auto-claim   # write gate
-rally inbox --tool <you> --since-cursor --session-id <id> --json  # mid-session check
-rally handoff --to <peer> --subject "<what you're handing off>"   # give work away
-rally ack --tool <you> <handoff-id> --summary "<what you did>"    # close work
+rally2 enter --tool <you> --json
+rally2 next --tool <you> --json
+rally2 check before-write --tool <you> --path <path> --strict --json
+rally2 say artifact --tool <you> --subject "<what changed>" --uri <path> --evidence "<verification>" --json
+rally2 room --json
 ```
 
-That's the load-bearing surface. Startup gives context, `next` chooses the most
-useful action, judgment tells you whether to continue, hooks protect boundaries,
-and handoff/ack close obligations.
+That is the core loop. `enter` shows the room, `next` gives a concrete action
+contract, `check` protects shared boundaries, `say` records durable facts, and
+`room` inspects the current projection.
 
-## Identify yourself
+## Identify Yourself
 
-Pick a stable `tool` id and use it across sessions. Peers address you
-by this id.
+Pick a stable `tool` id and use it across sessions. Peers address you by this
+id.
 
-| Host          | tool id      |
-|---------------|--------------|
-| Claude Code   | `claude_code`|
-| Codex CLI     | `codex`      |
-| Pi            | `pi`         |
-| Cursor        | `cursor`     |
-| Gemini CLI    | `gemini`     |
-| CI/automation | `ci`         |
+| Host          | tool id       |
+|---------------|---------------|
+| Claude Code   | `claude_code` |
+| Codex CLI     | `codex`       |
+| Pi            | `pi`          |
+| Cursor        | `cursor`      |
+| Gemini CLI    | `gemini`      |
+| CI/automation | `ci`          |
 
-## The loop
+## The Agent Loop
 
-```
-session start
-  └─ rally preflight                  → peers? pending handoffs?
-       ├─ action: proceed_solo         → do your work
-       └─ action: join_active          → handle pending ACKs first
-
-mid-session, at meaningful boundaries
-  └─ rally inbox --since-cursor       → what's new since last check?
-
-when you're done with a slice another agent should pick up
-  └─ rally handoff --to <peer> ...    → posts a handoff event
-
-when preflight/inbox shows a handoff addressed to you
-  └─ do the work, then
-     rally ack <handoff-id> ...       → closes the obligation
+```text
+enter repo/session
+  -> run next
+     -> if actionable, claim/check
+        -> execute and verify
+           -> say artifact/handoff/resolve/release
+              -> run next again
 ```
 
-Start with `rally <tool>`, judge at boundaries, use hooks before writes
-and commits, handoff to delegate, ack to close. That's the whole protocol.
+Stop and ask when `next.requires_human` is true, when `next.actionable` is
+false, when a boundary check blocks, or when the work hits a real blocker.
 
-## Concrete example
+## Concrete Example
 
 Claude has finished planning a refactor and wants Codex to implement:
 
 ```bash
 # Claude:
-rally handoff --to codex \
+rally2 say handoff --tool claude_code \
+  --target codex \
   --subject "implement the auth refactor from docs/plans/auth-v2.md" \
-  --notes "tests in tests/auth_test.rs should still pass"
+  --summary "tests in tests/auth_test.rs should still pass" \
+  --json
 
-# Codex (next session):
-rally preflight --tool codex --start-ping --json
-# → sees pending_acks_for_me: [{id: evt_..., subject: "implement the auth refactor..."}]
-# ... does the work ...
-rally ack --tool codex evt_... --summary "done, all auth tests green at abc1234"
+# Codex:
+rally2 enter --tool codex --json
+rally2 next --tool codex --json
+# ... claims/checks, does the work, verifies ...
+rally2 say artifact --tool codex \
+  --subject "auth refactor implemented" \
+  --uri docs/plans/auth-v2.md \
+  --evidence "cargo test" \
+  --json
+rally2 next --tool codex --json
 ```
 
-## How agents wire this in
+## How Agents Wire This In
 
-One command per host. Run it, then launch the agent:
+Install Rally 2 adapter glue for the host:
 
 ```bash
-rally pi      && pi          # Pi
-rally claude  && claude      # Claude Code
-rally codex   && codex       # Codex CLI
-rally start <tool>           # Cursor, Gemini, anything else
+rally2 install codex --dry-run --json
+rally2 install codex --json
+rally2 install claude_code --json
+rally2 install pi --json
+rally2 install all --json
 ```
 
-`rally <tool>` writes presence, runs preflight, and emits the JSON
-brief (peers, pending handoffs, recent changes, recommended next
-action) the agent reads on its first turn. The agent picks up the
-loop from there: `judge` when deciding, `hook before-write` before
-editing, `inbox --since-cursor` at boundaries, `handoff` to delegate,
-`ack` to close.
+Adapters should inject both `rally2 enter` and `rally2 next` at startup,
+resume, prompt, or idle boundaries. Before shared writes, adapters should call
+`rally2 check before-write`.
 
-If you use herdr, `rally setup install herdr` chains these together
-automatically — open a `rally pi` pane and you're done.
+Rally 2 installers write Rally 2-owned hooks and snippets. They do not silently
+delete legacy `rally` hooks; remove those manually after confirming the new
+adapter path is working.
 
-Before mutating real agent config, inspect the plan:
+## Useful Fact Writes
 
 ```bash
-rally setup install pi --dry-run --json
-rally setup verify pi --json
+rally2 say claim --tool <you> --subject "edit parser" --path crates/rally2-cli/src/main.rs --json
+rally2 say release --tool <you> --ref <claim-id> --subject "done" --json
+rally2 say blocker --tool <you> --subject "need decision" --severity high --json
+rally2 say resolve --tool <you> --ref <blocker-id> --subject "resolved" --json
+rally2 say decision --tool <you> --subject "Rally 2 is primary" --status binding --json
+rally2 say risk --tool <you> --subject "adapter not installed everywhere" --severity medium --json
 ```
 
-Setup writes `<file>.rally.bak` backups before changing existing files.
+## What To Ignore Unless You Have A Reason
 
-The bundled skill at `skills/agent-rally-point/SKILL.md` (linked
-into Claude/Codex/Pi via `~/.agents/bin/sync-agent-skills`) is what
-teaches each agent the loop above.
+Legacy `rally` commands such as `preflight`, `context`, `packet`, `doctor`,
+`verify`, and `sync export/import` are still available for older workflows.
+They are compatibility surfaces, not the primary Rally 2 loop.
 
-## What to ignore unless you have a reason
+Use legacy `rally` when you need to read an existing `changes.jsonl` channel,
+support an old hook, or move sync packets before Rally 2 has equivalent
+migration support.
 
-The `rally` CLI has ~25 other commands (`claim`, `blocker`, `task`,
-`artifact`, `decision`, `lesson`, `subscribe`, `profile`, `diagnose`,
-`score`, `report`, `replay`, `verify`, `sync export/import`,
-adapter packets, etc.). They're real, but they're not the loop.
-Reach for them when you have a specific need:
+## Where State Lives
 
-- **`claim` / `release`** — when two agents might touch the same file
-  concurrently and you want a soft lock visible in `rally conflicts`.
-- **`blocker` / `unblock`** — when you're stuck on something only
-  another agent can resolve.
-- **`watch`** — when a daemon needs to block on new events
-  (notify/inotify-driven; not for interactive agents).
-- **`post`** — escape hatch for event kinds we haven't typed yet.
-- **`sync export` / `sync import`** — cross-machine via files / git /
-  rsync / shared folder. No network transport built in by design.
-- **`identity init` / `--sign` / `verify`** — only if you actually need
-  cross-machine trust. Single-machine multi-agent doesn't.
-
-Everything else is reference; reach for `docs/SCHEMA.md` and
-`docs/RUST_GREENFIELD_ARCHITECTURE.md` when you need them.
-
-## Where state lives
-
-```
-~/.agent-rally-point/apps/<repo_id>/
-├── changes.jsonl         ← source of truth, append-only
-├── rally/cursors/        ← per-(tool, session) read cursors
-└── rally/...             ← derived projections, checkpoints
+```text
+.rally2/facts.jsonl  canonical append-only fact log
+.rally2/room.db      derived SQLite room projection
 ```
 
-`<repo_id>` is derived from `git remote get-url origin` when present,
-else the git root, else `cwd`. Worktrees and clones of the same repo
-share the channel.
+The database is disposable derived state. The fact log is the source of truth.
 
 ## Install
 
 ```bash
 git clone https://github.com/tyroneross/agent-rally-point.git
 cd agent-rally-point
-cargo install --path crates/rally-cli
-rally preflight --tool <you> --json
+cargo install --path crates/rally2-cli
+rally2 enter --tool <you> --json
 ```

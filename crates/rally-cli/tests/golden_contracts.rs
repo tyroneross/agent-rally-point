@@ -26,6 +26,9 @@ impl RallyWorkspace {
         let output = Command::new(env!("CARGO_BIN_EXE_rally"))
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("RALLY_CMUX_CONFIG_DIR")
+            .env_remove("RALLY_HERDR_CONFIG_DIR")
             .args(args)
             .output()
             .unwrap();

@@ -2021,13 +2021,13 @@ fn completion_contract(action: &str, actionable: bool) -> Value {
 
 fn executable_scopes(fact: &Fact) -> Vec<String> {
     let mut scopes = fact.scope.clone();
-    if scopes.is_empty()
-        && let Some(uri) = &fact.uri
-    {
-        if uri.starts_with("file:") {
-            scopes.push(uri.clone());
-        } else if !uri.contains("://") {
-            scopes.push(normalize_path(uri.clone()));
+    if scopes.is_empty() {
+        if let Some(uri) = &fact.uri {
+            if uri.starts_with("file:") {
+                scopes.push(uri.clone());
+            } else if !uri.contains("://") {
+                scopes.push(normalize_path(uri.clone()));
+            }
         }
     }
     scopes.sort();
