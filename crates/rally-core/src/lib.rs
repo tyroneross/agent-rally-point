@@ -9,6 +9,7 @@
 //! instead of reinterpreting `changes.jsonl` independently.
 
 pub mod context;
+pub mod cursors;
 pub mod diagnose;
 pub mod event;
 pub mod preflight;

@@ -50,6 +50,8 @@ rally preflight --tool codex --start-ping --json
 Core coordination commands:
 
 ```bash
+rally pi
+rally start codex
 rally preflight --tool codex --start-ping --json
 rally profile --tool codex --role builder --capability rust --capability implementation --watch crates/rally-core --json
 rally task --tool codex --subject "finish context ranking" --status active --verification "cargo test" --json
@@ -88,6 +90,11 @@ rally report --json
 recommended next action plus `attuned_items`: scored, source-linked facts ranked
 for that specific tool from active work, declared role, watched paths,
 subscriptions, task links, trust labels, and recent changes.
+
+`rally <tool>` is the canonical session-start surface for known harnesses such
+as `pi`, `claude`, `codex`, `gemini`, and `cursor`. It defaults to JSON, writes
+presence, returns preflight/context/packet/checkpoint/cursor state, and gives
+the next watch command. `rally start <tool>` is the generic equivalent.
 
 `rally packet` is the bounded work-brief surface for specialized agents. It is
 read-only, derived from the same context projection, and shapes the JSON for the

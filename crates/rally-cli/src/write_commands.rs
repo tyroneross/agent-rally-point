@@ -3,8 +3,8 @@
 
 use crate::args::{
     AckCommand, ArtifactCommand, BlockerCommand, ClaimCommand, CommonOptions, DecisionCommand,
-    HandoffCommand, IdentityInitCommand, LessonCommand, PreflightCommand, ProfileCommand,
-    ReleaseCommand, SubscribeCommand, TaskCommand, UnblockCommand,
+    HandoffCommand, IdentityInitCommand, LessonCommand, PostCommand, PreflightCommand,
+    ProfileCommand, ReleaseCommand, SubscribeCommand, TaskCommand, UnblockCommand,
 };
 use crate::output::{CliError, WriteOutput};
 use crate::runtime::{new_id, now_rfc3339};
@@ -382,6 +382,40 @@ pub(super) fn execute_subscribe(command: SubscribeCommand) -> Result<WriteOutput
             "event_kinds": command.event_kinds,
             "threads": command.threads,
             "tasks": command.tasks,
+        }),
+    ))
+}
+
+pub(super) fn execute_post(command: PostCommand) -> Result<WriteOutput, CliError> {
+    let context = CommandContext::new("post", &command.common)?;
+    let tool = context.tool();
+    let subject = command
+        .subject
+        .clone()
+        .unwrap_or_else(|| command.kind.clone());
+    let thread_id = command.thread_id.clone().unwrap_or_else(|| new_id("thr"));
+    let payload = EventPayload::Other {
+        kind: command.kind.clone(),
+        payload: command.payload.clone(),
+    };
+    let mut builder = context.event(payload, &tool, thread_id.clone(), subject.clone());
+    if let Some(causation) = &command.causation_id {
+        builder = builder.causation_id(causation);
+    }
+    let entry = context.append(builder)?;
+    Ok(context.output(
+        &entry,
+        format!(
+            "posted {} {} local_seq={}",
+            command.kind,
+            event_field(&entry, "id").unwrap_or_default(),
+            local_seq(&entry).unwrap_or_default()
+        ),
+        json!({
+            "kind": command.kind,
+            "thread_id": thread_id,
+            "causation_id": command.causation_id,
+            "subject": subject,
         }),
     ))
 }

@@ -3,23 +3,24 @@
 
 use crate::args::{
     WriteArgs, parse_ack, parse_artifact, parse_blocker, parse_claim, parse_decision,
-    parse_handoff, parse_herdr_inject, parse_identity_init, parse_lesson, parse_preflight,
-    parse_profile, parse_read, parse_release, parse_subscribe, parse_sync_export,
-    parse_sync_import, parse_task, parse_unblock,
+    parse_handoff, parse_herdr_inject, parse_identity_init, parse_lesson, parse_post,
+    parse_preflight, parse_profile, parse_read, parse_release, parse_start, parse_subscribe,
+    parse_sync_export, parse_sync_import, parse_task, parse_unblock, parse_watch,
 };
 use crate::output::{CliError, WriteOutput};
 use crate::query_commands::{
     execute_adapter_contract, execute_blockers, execute_checkpoint_rebuild,
     execute_checkpoint_status, execute_claims, execute_cmux_packet, execute_conflicts,
     execute_context, execute_diagnose, execute_herdr_inject, execute_herdr_packet, execute_inbox,
-    execute_packet, execute_replay, execute_report, execute_score, execute_thread,
+    execute_packet, execute_replay, execute_report, execute_score, execute_start, execute_thread,
 };
 use crate::sync_commands::{execute_sync_export, execute_sync_import};
 use crate::verify_commands::{VerifyOptions, verify};
+use crate::watch::execute_watch;
 use crate::write_commands::{
     execute_ack, execute_artifact, execute_blocker, execute_claim, execute_decision,
-    execute_handoff, execute_identity_init, execute_lesson, execute_preflight, execute_profile,
-    execute_release, execute_subscribe, execute_task, execute_unblock,
+    execute_handoff, execute_identity_init, execute_lesson, execute_post, execute_preflight,
+    execute_profile, execute_release, execute_subscribe, execute_task, execute_unblock,
 };
 use serde_json::json;
 use std::env;
@@ -27,10 +28,15 @@ use std::process::ExitCode;
 
 pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
-    match args.next().as_deref() {
+    let first = args.next();
+    match first.as_deref() {
         Some("verify") => run_verify(args),
         Some("handoff") => run_write("handoff", args, parse_handoff, execute_handoff),
         Some("preflight") => run_write("preflight", args, parse_preflight, execute_preflight),
+        Some("start") => run_write("start", args, parse_start, execute_start),
+        Some(tool @ ("pi" | "claude" | "codex" | "gemini" | "cursor")) => {
+            run_tool_start(tool, args)
+        }
         Some("ack") => run_write("ack", args, |args| parse_ack(args, "done"), execute_ack),
         Some("reject") => run_write(
             "reject",
@@ -54,6 +60,8 @@ pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Some("decision") => run_write("decision", args, parse_decision, execute_decision),
         Some("lesson") => run_write("lesson", args, parse_lesson, execute_lesson),
         Some("subscribe") => run_write("subscribe", args, parse_subscribe, execute_subscribe),
+        Some("post") => run_write("post", args, parse_post, execute_post),
+        Some("watch") => run_watch(args),
         Some("inbox") => run_read("inbox", args, parse_read, execute_inbox),
         Some("claims") => run_read("claims", args, parse_read, execute_claims),
         Some("blockers") => run_read("blockers", args, parse_read, execute_blockers),
@@ -76,6 +84,14 @@ pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             Ok(ExitCode::from(2))
         }
     }
+}
+
+fn run_tool_start(
+    tool: &str,
+    args: impl Iterator<Item = String>,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let args = std::iter::once(tool.to_string()).chain(args);
+    run_write("start", args, parse_start, execute_start)
 }
 
 fn run_herdr(args: impl Iterator<Item = String>) -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -272,6 +288,28 @@ fn run_write<T>(
     }
 }
 
+fn run_watch(args: impl Iterator<Item = String>) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let args: Vec<String> = args.collect();
+    let wants_json = args.iter().any(|arg| arg == "--json");
+    let args = match WriteArgs::parse("watch", args.into_iter()) {
+        Ok(args) => args,
+        Err(mut err) => {
+            err.json = wants_json;
+            err.emit();
+            return Ok(ExitCode::from(err.exit_code));
+        }
+    };
+    let json = args.common.json;
+    match parse_watch(args).and_then(execute_watch) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(mut err) => {
+            err.json |= json;
+            err.emit();
+            Ok(ExitCode::from(err.exit_code))
+        }
+    }
+}
+
 fn run_read<T>(
     command: &'static str,
     args: impl Iterator<Item = String>,
@@ -289,6 +327,8 @@ fn usage() {
         "       rally handoff --to <tool> --subject <text> [--from-tool <tool>] [--files <path>...] [--notes <text>] [--no-ack] [--sign] [--json]"
     );
     eprintln!("       rally preflight --tool <tool> [--session-id <id>] [--start-ping] [--json]");
+    eprintln!("       rally <pi|claude|codex|gemini|cursor> [--session-id <id>] [--human]");
+    eprintln!("       rally start <tool> [--session-id <id>] [--human]");
     eprintln!("       rally ack|reject|needs-info [--tool <tool>] [--force] <handoff-id>");
     eprintln!("       rally claim --path <path>|--resource <id> --subject <text>");
     eprintln!(
@@ -315,6 +355,12 @@ fn usage() {
     eprintln!(
         "       rally context|packet|inbox|claims|blockers|conflicts|diagnose|score|report|replay [--json] [--since <window>] [--tool <tool>]"
     );
+    eprintln!(
+        "       rally inbox [--since-cursor --session-id <id> --tool <tool>] [--peek] [--json]   # incremental per-session read"
+    );
+    eprintln!(
+        "       rally watch [--tool <t>] [--kind <k>] [--thread <id>] [--since-cursor --session-id <id>] [--from-start] [--max-seconds <n>]   # block + emit new events via kqueue/inotify"
+    );
     eprintln!("       rally thread [--json] <event-id>");
     eprintln!("       rally identity init [--identity-dir <dir>] --tool <tool> [--json]");
     eprintln!("       rally sync export [--json] [--since <window>] > packet.json");
@@ -324,4 +370,7 @@ fn usage() {
     eprintln!("       rally cmux packet [--tool <tool>] [--json]");
     eprintln!("       rally herdr packet [--tool <tool>] [--json]");
     eprintln!("       rally checkpoint status|rebuild [--json]");
+    eprintln!(
+        "       rally post --kind <kind> [--payload <json>] [--subject <text>] [--thread-id <id>] [--causation-id <id>] [--sign] [--json]"
+    );
 }

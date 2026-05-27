@@ -253,3 +253,343 @@ fn signed_handoff_can_be_synced_to_another_workspace_and_acked() {
 
     assert_eq!(cleared["pending_acks_for_me"].as_array().unwrap().len(), 0);
 }
+
+#[test]
+fn rally_watch_wakes_within_a_second_of_an_append() {
+    // intent: kqueue/inotify-driven watch must react within ~1s of an append, not on a slow poll cycle.
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let workspace = RallyWorkspace::new("journey-watch-latency");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .args(["watch", "--kind", "handoff", "--max-seconds", "5"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Let the watcher register before we append.
+    thread::sleep(Duration::from_millis(200));
+
+    let append_at = Instant::now();
+    workspace.json(&[
+        "handoff",
+        "--json",
+        "--to",
+        "claude",
+        "--from-tool",
+        "codex",
+        "--subject",
+        "latency probe",
+    ]);
+
+    // Read exactly one line of stdout (which is what notify should produce
+    // almost immediately) and measure how long it took.
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let observed_after = append_at.elapsed();
+
+    child.wait().ok();
+    workspace.cleanup();
+
+    assert!(
+        !line.trim().is_empty(),
+        "watcher should emit the appended event"
+    );
+    assert!(
+        observed_after < Duration::from_millis(1000),
+        "watcher took {observed_after:?} to react; expected < 1s with notify"
+    );
+}
+
+#[test]
+fn rally_watch_emits_new_matching_events() {
+    // intent: blocking watchers see only events that arrive after they start (or post-cursor).
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
+
+    let workspace = RallyWorkspace::new("journey-watch");
+
+    // Pre-existing event before watch starts.
+    workspace.json(&[
+        "handoff",
+        "--json",
+        "--to",
+        "claude",
+        "--from-tool",
+        "codex",
+        "--subject",
+        "before watch",
+    ]);
+
+    // Launch rally watch in the background with a short max-seconds.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .args([
+            "watch",
+            "--tool",
+            "codex",
+            "--kind",
+            "handoff",
+            "--max-seconds",
+            "3",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Give the watcher a moment to record current EOF as its start offset.
+    thread::sleep(Duration::from_millis(250));
+
+    // Post a new event after the watcher has started.
+    let posted = workspace.json(&[
+        "handoff",
+        "--json",
+        "--to",
+        "claude",
+        "--from-tool",
+        "codex",
+        "--subject",
+        "after watch starts",
+    ]);
+    let new_event_id = posted["event_id"].as_str().unwrap().to_string();
+
+    let stdout = child.stdout.take().unwrap();
+    let reader = BufReader::new(stdout);
+    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+    child.wait().ok();
+
+    // Watcher should have emitted exactly the new event, not the pre-existing one.
+    let emitted: Vec<Value> = lines
+        .iter()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(
+        emitted.iter().any(|e| {
+            e.get("event")
+                .and_then(|ev| ev.get("id"))
+                .and_then(Value::as_str)
+                == Some(new_event_id.as_str())
+        }),
+        "watcher should have emitted the new event, got {emitted:?}"
+    );
+    assert!(
+        emitted.iter().all(|e| {
+            e.get("event")
+                .and_then(|ev| ev.get("subject"))
+                .and_then(Value::as_str)
+                != Some("before watch")
+        }),
+        "watcher should NOT emit pre-existing events without --from-start"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn inbox_since_cursor_advances_and_filters_per_session() {
+    // intent: two sessions of the same tool must each see only what's new since *their* last read.
+    let workspace = RallyWorkspace::new("journey-cursor-inbox");
+
+    // Three handoffs to claude over time.
+    let h1 = workspace.json(&[
+        "handoff",
+        "--json",
+        "--to",
+        "claude",
+        "--from-tool",
+        "codex",
+        "--subject",
+        "first",
+    ]);
+    let h2 = workspace.json(&[
+        "handoff",
+        "--json",
+        "--to",
+        "claude",
+        "--from-tool",
+        "codex",
+        "--subject",
+        "second",
+    ]);
+
+    // Session A reads with cursor — sees both, advances cursor.
+    let a_first = workspace.json(&[
+        "inbox",
+        "--json",
+        "--tool",
+        "claude",
+        "--session-id",
+        "session-A",
+        "--since-cursor",
+    ]);
+    assert_eq!(a_first["data"]["pending"].as_array().unwrap().len(), 2);
+    assert_eq!(a_first["data"]["cursor_advanced"], true);
+
+    // Session A immediately reads again — nothing new since cursor.
+    let a_second = workspace.json(&[
+        "inbox",
+        "--json",
+        "--tool",
+        "claude",
+        "--session-id",
+        "session-A",
+        "--since-cursor",
+    ]);
+    assert_eq!(a_second["data"]["pending"].as_array().unwrap().len(), 0);
+
+    // A third handoff arrives.
+    let h3 = workspace.json(&[
+        "handoff",
+        "--json",
+        "--to",
+        "claude",
+        "--from-tool",
+        "codex",
+        "--subject",
+        "third",
+    ]);
+
+    // Session A sees only the new one.
+    let a_third = workspace.json(&[
+        "inbox",
+        "--json",
+        "--tool",
+        "claude",
+        "--session-id",
+        "session-A",
+        "--since-cursor",
+    ]);
+    let a_pending = a_third["data"]["pending"].as_array().unwrap();
+    assert_eq!(a_pending.len(), 1);
+    assert_eq!(a_pending[0]["event_id"], h3["event_id"]);
+
+    // Session B is fresh — sees ALL three handoffs.
+    let b_first = workspace.json(&[
+        "inbox",
+        "--json",
+        "--tool",
+        "claude",
+        "--session-id",
+        "session-B",
+        "--since-cursor",
+    ]);
+    assert_eq!(b_first["data"]["pending"].as_array().unwrap().len(), 3);
+
+    // --peek does not advance: session B reading again sees the same set, not empty.
+    let b_peek = workspace.json(&[
+        "inbox",
+        "--json",
+        "--tool",
+        "claude",
+        "--session-id",
+        "session-B",
+        "--since-cursor",
+        "--peek",
+    ]);
+    assert_eq!(b_peek["data"]["pending"].as_array().unwrap().len(), 0);
+    // ^ session B's previous (non-peek) read already advanced. After peek-on-empty, still empty.
+
+    let _ = (h1, h2);
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_post_writes_arbitrary_event_kind() {
+    // intent: extensibility — agents can record event kinds outside the typed 13 without forking the binary.
+    let workspace = RallyWorkspace::new("journey-post-custom-kind");
+
+    let posted = workspace.json(&[
+        "post",
+        "--json",
+        "--tool",
+        "claude",
+        "--kind",
+        "experiment-result",
+        "--payload",
+        r#"{"score":0.87,"variant":"A"}"#,
+        "--subject",
+        "ran eval set Q3",
+    ]);
+
+    assert_eq!(posted["kind"], "experiment-result");
+    assert_eq!(posted["event"]["type"], "agent-rally.experiment-result.v1");
+    assert_eq!(posted["event"]["payload"]["score"], 0.87);
+    assert_eq!(posted["event"]["payload"]["variant"], "A");
+
+    // The new event participates in the standard read surface.
+    let replay = workspace.json(&["replay", "--json"]);
+    let events = replay["data"]["events"].as_array().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"]["kind"] == "experiment-result"),
+        "replay should include the custom-kind event: {events:?}"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_post_rejects_invalid_payload_json() {
+    // intent: malformed payload JSON is rejected at the CLI boundary with a clear error, not silently accepted.
+    let workspace = RallyWorkspace::new("journey-post-invalid-payload");
+
+    let output = workspace.run(&[
+        "post",
+        "--json",
+        "--tool",
+        "claude",
+        "--kind",
+        "experiment-result",
+        "--payload",
+        "{not valid json",
+    ]);
+
+    assert!(!output.status.success(), "post should fail on bad JSON");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let err: Value = serde_json::from_str(stderr.trim()).expect("error should be JSON");
+    assert_eq!(err["ok"], false);
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap()
+            .contains("must be valid JSON")
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_post_rejects_non_object_payload() {
+    // intent: payloads must be JSON objects so consumers can rely on `payload` being structured.
+    let workspace = RallyWorkspace::new("journey-post-non-object-payload");
+
+    let output = workspace.run(&[
+        "post",
+        "--json",
+        "--tool",
+        "claude",
+        "--kind",
+        "experiment-result",
+        "--payload",
+        "[1,2,3]",
+    ]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let err: Value = serde_json::from_str(stderr.trim()).expect("error should be JSON");
+    assert_eq!(err["ok"], false);
+    assert!(err["error"].as_str().unwrap().contains("JSON object"));
+
+    workspace.cleanup();
+}

@@ -312,6 +312,7 @@ The first-class commands should be:
 
 | Command | Purpose |
 |---|---|
+| `rally <tool>` / `rally start <tool>` | Canonical agent startup: writes presence and returns preflight, context, packet, checkpoint, cursor, warnings, and next watch command. |
 | `rally preflight` | Session-start routing, peers, pending ACKs, context locations. |
 | `rally post` | Low-level event append for automation. |
 | `rally handoff` / `ack` / `reject` / `needs-info` | Handoff lifecycle. |
@@ -409,6 +410,10 @@ Initial implementation status:
   pending handoffs for the current tool, active presence peers, claims,
   blockers, claim conflicts, recent changes, and routing action. The CLI
   renders that envelope through `rally preflight`.
+- `rally <tool>` and `rally start <tool>` are the canonical agent startup
+  surface. They default to JSON, do not launch the harness process, write
+  presence, return preflight/context/packet/checkpoint/cursor state, and advance
+  the per-session cursor unless `--peek` is supplied.
 
 ## Remote Agent Readiness
 

@@ -270,6 +270,10 @@ fn context_and_packet_json_contracts_match_goldens() {
             "4",
         ]),
     );
+    assert_golden(
+        "start_pi.json",
+        workspace.json(&["pi", "--session-id", "pi-golden", "--limit", "4"]),
+    );
 
     workspace.cleanup();
 }

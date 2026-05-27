@@ -45,6 +45,9 @@ SPDX-License-Identifier: Apache-2.0
   as side-effect-free adapter JSON surfaces over work packets.
 - Adds rebuildable `rally.checkpoint.json` hot-read cache support plus
   `rally checkpoint status|rebuild`.
+- Adds `rally <tool>` and `rally start <tool>` as the canonical agent startup
+  surface, returning preflight/context/packet/checkpoint/cursor state and next
+  watch command as JSON by default.
 - Keeps urgent coordination obligations ahead of specialization:
   - required handoffs
   - active tasks

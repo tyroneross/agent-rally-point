@@ -125,6 +125,30 @@ pub(crate) struct SubscribeCommand {
 }
 
 #[derive(Debug)]
+pub(crate) struct WatchCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) tool: Option<String>,
+    pub(crate) kind: Option<String>,
+    pub(crate) thread: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) since_cursor: bool,
+    pub(crate) peek: bool,
+    pub(crate) from_start: bool,
+    /// Optional safety cap used primarily by tests; `None` runs forever.
+    pub(crate) max_seconds: Option<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PostCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) kind: String,
+    pub(crate) payload: serde_json::Value,
+    pub(crate) subject: Option<String>,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) causation_id: Option<String>,
+}
+
+#[derive(Debug)]
 pub(crate) struct ReadCommand {
     pub(crate) command: &'static str,
     pub(crate) common: CommonOptions,
@@ -135,6 +159,14 @@ pub(crate) struct ReadCommand {
     pub(crate) limit: usize,
     pub(crate) ids: bool,
     pub(crate) stale_after_seconds: i64,
+    /// When true, scope reads to events with `local_seq` greater than the
+    /// per-(tool, session_id) cursor, advancing the cursor on success unless
+    /// `peek` is also set.
+    pub(crate) since_cursor: bool,
+    /// When true with `since_cursor`, do not advance the cursor after read.
+    pub(crate) peek: bool,
+    /// Session id used to scope read cursors and presence.
+    pub(crate) session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -163,6 +195,17 @@ pub(crate) struct PreflightCommand {
     pub(crate) session_id: String,
     pub(crate) start_ping: bool,
     pub(crate) stale_after_seconds: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct StartCommand {
+    pub(crate) common: CommonOptions,
+    pub(crate) tool: String,
+    pub(crate) session_id: String,
+    pub(crate) stale_after_seconds: i64,
+    pub(crate) limit: usize,
+    pub(crate) peek: bool,
+    pub(crate) human: bool,
 }
 
 #[derive(Debug)]
@@ -200,6 +243,51 @@ pub(crate) fn parse_preflight(args: WriteArgs) -> Result<PreflightCommand, CliEr
         session_id,
         start_ping,
         stale_after_seconds,
+    })
+}
+
+pub(crate) fn parse_start(args: WriteArgs) -> Result<StartCommand, CliError> {
+    let tool = match (args.common.tool.clone(), args.positional.as_slice()) {
+        (Some(tool), []) => tool,
+        (None, [tool]) => tool.clone(),
+        (Some(_), [..]) => {
+            return Err(CliError::usage(
+                args.command,
+                "use either positional tool or --tool, not both",
+            ));
+        }
+        (None, []) => return Err(CliError::usage(args.command, "start requires a tool id")),
+        (None, [..]) => {
+            return Err(CliError::usage(
+                args.command,
+                "start accepts at most one positional tool id",
+            ));
+        }
+    };
+    let stale_after_seconds = args
+        .one("--stale-after-seconds")
+        .map(|value| parse_i64(args.command, "--stale-after-seconds", &value))
+        .transpose()?
+        .unwrap_or(300);
+    let limit = args
+        .one("--limit")
+        .map(|value| parse_usize(args.command, "--limit", &value))
+        .transpose()?
+        .unwrap_or(20);
+    let session_id = args
+        .one("--session-id")
+        .or_else(|| args.common.run_id.clone())
+        .unwrap_or_else(|| new_id("session"));
+    let peek = args.has("--peek");
+    let human = args.has("--human");
+    Ok(StartCommand {
+        common: args.common,
+        tool,
+        session_id,
+        stale_after_seconds,
+        limit,
+        peek,
+        human,
     })
 }
 
@@ -313,6 +401,47 @@ pub(crate) fn parse_subscribe(args: WriteArgs) -> Result<SubscribeCommand, CliEr
     })
 }
 
+pub(crate) fn parse_watch(args: WriteArgs) -> Result<WatchCommand, CliError> {
+    let max_seconds = args
+        .one("--max-seconds")
+        .map(|v| parse_usize(args.command, "--max-seconds", &v))
+        .transpose()?
+        .map(|v| v as u64);
+    Ok(WatchCommand {
+        tool: args.common.tool.clone(),
+        kind: args.one("--kind"),
+        thread: args.one("--thread"),
+        session_id: args.one("--session-id"),
+        since_cursor: args.has("--since-cursor"),
+        peek: args.has("--peek"),
+        from_start: args.has("--from-start"),
+        max_seconds,
+        common: args.common,
+    })
+}
+
+pub(crate) fn parse_post(args: WriteArgs) -> Result<PostCommand, CliError> {
+    let kind = args.required("--kind")?;
+    let payload_str = args.one("--payload").unwrap_or_else(|| "{}".to_string());
+    let payload: serde_json::Value = serde_json::from_str(&payload_str).map_err(|err| {
+        CliError::usage(args.command, format!("--payload must be valid JSON: {err}"))
+    })?;
+    if !payload.is_object() {
+        return Err(CliError::usage(
+            args.command,
+            "--payload must be a JSON object",
+        ));
+    }
+    Ok(PostCommand {
+        kind,
+        payload,
+        subject: args.one("--subject"),
+        thread_id: args.one("--thread-id"),
+        causation_id: args.one("--causation-id"),
+        common: args.common,
+    })
+}
+
 pub(crate) fn parse_read(args: WriteArgs) -> Result<ReadCommand, CliError> {
     let limit = args
         .one("--limit")
@@ -334,6 +463,9 @@ pub(crate) fn parse_read(args: WriteArgs) -> Result<ReadCommand, CliError> {
             ));
         }
     };
+    let since_cursor = args.has("--since-cursor");
+    let peek = args.has("--peek");
+    let session_id = args.one("--session-id");
     Ok(ReadCommand {
         command: args.command,
         since: args.one("--since"),
@@ -342,6 +474,9 @@ pub(crate) fn parse_read(args: WriteArgs) -> Result<ReadCommand, CliError> {
         limit,
         ids: args.has("--ids"),
         stale_after_seconds,
+        since_cursor,
+        peek,
+        session_id,
         common: args.common,
         identifier,
     })

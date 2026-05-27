@@ -12,6 +12,7 @@ mod runtime;
 mod sync_commands;
 mod trust_policy;
 mod verify_commands;
+mod watch;
 mod write_commands;
 
 fn main() -> ExitCode {

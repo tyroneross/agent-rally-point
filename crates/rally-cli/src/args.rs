@@ -112,6 +112,9 @@ impl WriteArgs {
                 | "--sign"
                 | "--start-ping"
                 | "--human"
+                | "--since-cursor"
+                | "--peek"
+                | "--from-start"
                 | "--no-default-trust-policy" => {
                     if arg == "--sign" {
                         common.sign = true;
@@ -164,7 +167,12 @@ impl WriteArgs {
                 | "--stale-after-seconds"
                 | "--session-id"
                 | "--origin"
-                | "--trust-policy" => {
+                | "--trust-policy"
+                | "--kind"
+                | "--payload"
+                | "--thread-id"
+                | "--causation-id"
+                | "--max-seconds" => {
                     let value = take_value(command, &arg, &mut args)?;
                     flags.entry(arg).or_default().push(value);
                 }

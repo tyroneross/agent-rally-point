@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::args::{CommonOptions, HerdrInjectCommand, ReadCommand};
+use crate::args::{CommonOptions, HerdrInjectCommand, ReadCommand, StartCommand};
 use crate::output::{CliError, WriteOutput};
+use crate::runtime::now_rfc3339;
 use rally_core::context::{build_context_brief, build_work_packet};
+use rally_core::cursors;
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
 use rally_core::event::{EventPayload, EventRecord};
+use rally_core::preflight::{PreflightOptions, run_preflight};
 use rally_core::query::{
     TraceProjection, active_blockers_at, active_claims_at, claim_conflicts, filter_since,
     now_epoch_seconds, parse_since, pending_handoffs_at, record_id, related_records, score_records,
@@ -17,8 +20,69 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::Path;
 
+/// Filter `records` to those with `local_seq` strictly greater than the cursor
+/// for `(tool, session_id)` under `store.channel_dir()`. Returns the filtered
+/// records and the largest `local_seq` observed across the full input — the
+/// caller advances the cursor to that value on successful read (unless --peek).
+struct CursorScope {
+    tool: String,
+    session_id: String,
+    max_seq: u64,
+}
+
+fn apply_cursor(
+    store: &ChannelStore,
+    records: Vec<Value>,
+    command: &ReadCommand,
+) -> (Vec<Value>, Option<CursorScope>) {
+    if !command.since_cursor {
+        return (records, None);
+    }
+    let (Some(tool), Some(session_id)) = (command.tool.as_deref(), command.session_id.as_deref())
+    else {
+        // --since-cursor without tool+session is a no-op; the cursor key would be ambiguous.
+        return (records, None);
+    };
+    let cursor = cursors::read_cursor(store.channel_dir(), tool, session_id);
+    let mut max_seq = cursor;
+    let filtered: Vec<Value> = records
+        .into_iter()
+        .filter_map(|record| {
+            let seq = record.get("local_seq").and_then(Value::as_u64).unwrap_or(0);
+            if seq > max_seq {
+                max_seq = seq;
+            }
+            if seq > cursor { Some(record) } else { None }
+        })
+        .collect();
+    (
+        filtered,
+        Some(CursorScope {
+            tool: tool.to_string(),
+            session_id: session_id.to_string(),
+            max_seq,
+        }),
+    )
+}
+
+fn maybe_advance_cursor(store: &ChannelStore, scope: Option<&CursorScope>, command: &ReadCommand) {
+    let Some(scope) = scope else { return };
+    if command.peek {
+        return;
+    }
+    // Cursor advance is best-effort: a write failure must not poison the read.
+    let _ = cursors::write_cursor(
+        store.channel_dir(),
+        &scope.tool,
+        &scope.session_id,
+        scope.max_seq,
+        &now_rfc3339(),
+    );
+}
+
 pub(super) fn execute_inbox(command: ReadCommand) -> Result<WriteOutput, CliError> {
     let (store, records, now) = query_records(&command)?;
+    let (records, cursor_scope) = apply_cursor(&store, records, &command);
     let pending = pending_handoffs_at(&records, command.tool.as_deref(), now);
     let text = if pending.is_empty() {
         "No pending handoffs.".to_string()
@@ -43,15 +107,19 @@ pub(super) fn execute_inbox(command: ReadCommand) -> Result<WriteOutput, CliErro
             .collect::<Vec<_>>()
             .join("\n")
     };
-    Ok(query_output(
+    let output = query_output(
         command.command,
         &command.common,
         &store,
         text,
         json!({
             "pending": pending,
+            "cursor_advanced": cursor_scope.is_some() && !command.peek,
+            "cursor_last_seq": cursor_scope.as_ref().map(|s| s.max_seq),
         }),
-    ))
+    );
+    maybe_advance_cursor(&store, cursor_scope.as_ref(), &command);
+    Ok(output)
 }
 
 pub(super) fn execute_claims(command: ReadCommand) -> Result<WriteOutput, CliError> {
@@ -195,6 +263,135 @@ pub(super) fn execute_packet(command: ReadCommand) -> Result<WriteOutput, CliErr
             "packet": packet,
         }),
     ))
+}
+
+pub(super) fn execute_start(command: StartCommand) -> Result<WriteOutput, CliError> {
+    let mut common = command.common.clone();
+    common.tool = Some(command.tool.clone());
+    let store = common.channel_store("start")?;
+    let preflight = run_preflight(
+        &store,
+        &PreflightOptions {
+            tool: command.tool.clone(),
+            model: common.model.clone(),
+            session_id: command.session_id.clone(),
+            start_ping: true,
+            stale_after_seconds: command.stale_after_seconds,
+            recent_limit: 5,
+        },
+    )
+    .map_err(|err| CliError::runtime("start", format!("failed to start session: {err}")))?;
+
+    let records = store
+        .load_records_cached()
+        .map_err(|err| CliError::runtime("start", format!("failed to load channel: {err}")))?;
+    let max_seq = records
+        .iter()
+        .filter_map(|record| record.get("local_seq").and_then(Value::as_u64))
+        .max()
+        .unwrap_or(0);
+    let cursor_before =
+        cursors::read_cursor(store.channel_dir(), &command.tool, &command.session_id);
+    let unseen_count = records
+        .iter()
+        .filter(|record| {
+            record
+                .get("local_seq")
+                .and_then(Value::as_u64)
+                .is_some_and(|seq| seq > cursor_before)
+        })
+        .count();
+    let cursor_advanced = !command.peek;
+    if cursor_advanced {
+        cursors::write_cursor(
+            store.channel_dir(),
+            &command.tool,
+            &command.session_id,
+            max_seq,
+            &now_rfc3339(),
+        )
+        .map_err(|err| CliError::runtime("start", format!("failed to write cursor: {err}")))?;
+    }
+
+    let projection = TraceProjection::from_records_at(&records, now_epoch_seconds());
+    let brief = build_context_brief(&projection, &command.tool, command.limit);
+    let packet = build_work_packet(&brief, command.limit);
+    let checkpoint = store
+        .checkpoint_status()
+        .map_err(|err| CliError::runtime("start", format!("failed to read checkpoint: {err}")))?;
+    let warnings = start_warnings(&command.tool, &preflight, &checkpoint);
+    let watch_command = format!(
+        "rally watch --tool {} --session-id {} --since-cursor",
+        command.tool, command.session_id
+    );
+    let text = format!(
+        "started rally session tool={} session={} action={} warnings={}",
+        command.tool,
+        command.session_id,
+        brief.recommended_next_action.action,
+        warnings.len()
+    );
+    Ok(WriteOutput {
+        json: common.json || !command.human,
+        text,
+        body: json!({
+            "ok": true,
+            "command": "start",
+            "schema": "agent-rally.command.start.v1",
+            "channel": store.channel_dir().display().to_string(),
+            "tool": command.tool,
+            "session_id": command.session_id,
+            "started_process": false,
+            "preflight": preflight,
+            "context": { "brief": brief },
+            "packet": packet,
+            "checkpoint": checkpoint,
+            "cursor": {
+                "before": cursor_before,
+                "after": if cursor_advanced { max_seq } else { cursor_before },
+                "max_seq": max_seq,
+                "unseen_count": unseen_count,
+                "advanced": cursor_advanced
+            },
+            "warnings": warnings,
+            "next_commands": {
+                "watch": watch_command,
+                "packet": format!("rally packet --tool {} --json", command.tool),
+                "context": format!("rally context --tool {} --json", command.tool)
+            }
+        }),
+    })
+}
+
+fn start_warnings(
+    tool: &str,
+    preflight: &rally_core::preflight::PreflightEnvelope,
+    checkpoint: &rally_core::store::CheckpointStatus,
+) -> Vec<Value> {
+    let mut warnings = Vec::new();
+    if tool == "unknown" {
+        warnings.push(json!({
+            "code": "unknown-tool",
+            "message": "tool id is unknown; use a stable harness id"
+        }));
+    }
+    for claim in &preflight.active_claims {
+        if claim.owner_tool.as_deref() == Some("unknown") {
+            warnings.push(json!({
+                "code": "anonymous-claim",
+                "event_id": claim.event_id,
+                "resource": claim.resource,
+                "message": "active claim has owner_tool=unknown"
+            }));
+        }
+    }
+    if !checkpoint.valid {
+        warnings.push(json!({
+            "code": "stale-checkpoint",
+            "message": checkpoint.reason.as_deref().unwrap_or("checkpoint is not valid")
+        }));
+    }
+    warnings
 }
 
 pub(super) fn execute_checkpoint_status(command: ReadCommand) -> Result<WriteOutput, CliError> {

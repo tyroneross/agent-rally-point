@@ -5,6 +5,57 @@ SPDX-License-Identifier: Apache-2.0
 
 # Context Brief Contract
 
+## Session Start Contract
+
+Known agent harnesses start from a tool-named command:
+
+```bash
+rally pi
+rally claude
+rally codex
+```
+
+Custom tools use the generic form:
+
+```bash
+rally start <tool>
+```
+
+`start` defaults to JSON because it is agent-facing. Use `--human` for text.
+It does not launch the harness process; it starts/refreshes Rally coordination
+for that tool in the current repo. The envelope is:
+
+```json
+{
+  "ok": true,
+  "command": "start",
+  "schema": "agent-rally.command.start.v1",
+  "tool": "pi",
+  "session_id": "...",
+  "started_process": false,
+  "preflight": {},
+  "context": { "brief": {} },
+  "packet": {},
+  "checkpoint": {},
+  "cursor": {
+    "before": 12,
+    "after": 42,
+    "max_seq": 42,
+    "unseen_count": 30,
+    "advanced": true
+  },
+  "warnings": [],
+  "next_commands": {
+    "watch": "rally watch --tool pi --session-id ... --since-cursor"
+  }
+}
+```
+
+By default `start` advances the per-session cursor to the current tail after
+returning the full context and packet. This makes the returned `watch` command
+stream future changes instead of replaying everything the startup brief already
+summarized. Pass `--peek` to inspect startup state without advancing the cursor.
+
 `rally context --tool <agent> --json` is the first attuned coordination surface.
 It is designed for agents, not prose readers.
 

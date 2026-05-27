@@ -11,15 +11,35 @@ planning doc as the day-to-day control surface.
 
 ## Session Start
 
-From inside the repo, identify your stable tool id (`codex`, `claude_code`,
-`pi`, `cursor`, `gemini`, `ci`, etc.) and run:
+From inside the repo, identify your stable tool id (`codex`, `claude`, `pi`,
+`cursor`, `gemini`, `ci`, etc.) and run the tool-named startup command when
+available:
+
+```bash
+rally pi
+rally claude
+rally codex
+```
+
+For custom tools, use:
+
+```bash
+rally start <tool>
+```
+
+`rally <tool>` / `rally start <tool>` defaults to JSON. It writes presence,
+returns preflight, context, packet, checkpoint, cursor state, warnings, and the
+next watch command. It does not launch the tool process.
+
+If `rally start` is unavailable, fall back to:
 
 ```bash
 rally context --tool <tool> --json
 rally packet --tool <tool> --json
 ```
 
-Use the returned `data.brief` to decide what to do next:
+Use the returned start `context.brief` or context `data.brief` to decide what to
+do next:
 
 - `recommended_next_action`: the preferred next action.
 - `attuned_items`: scored, source-linked facts ranked for your tool.

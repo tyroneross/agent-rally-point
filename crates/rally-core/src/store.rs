@@ -68,6 +68,13 @@ impl ChannelStore {
         &self.channel_dir
     }
 
+    /// Ensure the channel directory exists on disk. Cheap, idempotent. Useful
+    /// for callers that observe the directory (e.g. `rally watch`) before the
+    /// first append has lazily created it.
+    pub fn ensure_dir(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.channel_dir)
+    }
+
     pub fn changes_path(&self) -> PathBuf {
         self.channel_dir.join(CHANGES_JSONL)
     }
