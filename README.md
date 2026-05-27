@@ -51,7 +51,7 @@ Core coordination commands:
 
 ```bash
 rally preflight --tool codex --start-ping --json
-rally profile --tool codex --capability rust --capability review --watch crates/rally-core --json
+rally profile --tool codex --role builder --capability rust --capability implementation --watch crates/rally-core --json
 rally task --tool codex --subject "finish context ranking" --status active --verification "cargo test" --json
 rally artifact --tool codex --subject "context schema" --artifact-kind schema --uri docs/context.schema.json --json
 rally decision --tool codex --subject "agents use rally context for next action" --status binding --json
@@ -80,8 +80,8 @@ rally report --json
 
 `rally context` is the agent-facing intelligence layer. It returns the
 recommended next action plus `attuned_items`: scored, source-linked facts ranked
-for that specific tool from active work, watched paths, subscriptions, task
-links, trust labels, and recent changes.
+for that specific tool from active work, declared role, watched paths,
+subscriptions, task links, trust labels, and recent changes.
 
 Trust and sync:
 

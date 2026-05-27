@@ -379,6 +379,9 @@ Initial implementation status:
 - `ContextBrief.attuned_items` now ranks attention items, claims, artifacts,
   decisions, lessons, and recent changes for the specific tool using profile
   watch paths, subscriptions, current task, task links, trust, and freshness.
+- Profiles may declare an optional `role`; reviewer, architect, builder, and QA
+  specialization changes ranking and advisory recommendations without taking
+  precedence over urgent coordination obligations.
 - `rally-cli verify --json` now reads through `rally-core` and emits the command
   envelope shape for success and failure.
 - `rally-cli` is still a prototype verifier surface and should become a

@@ -276,6 +276,8 @@ pub struct ProfilePayload {
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
     pub watch: Vec<String>,
     #[serde(default)]
     pub current_task: Option<String>,

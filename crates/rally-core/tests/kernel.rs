@@ -418,6 +418,72 @@ fn context_brief_ranks_attuned_items_by_profile_subscription_path_and_trust() {
 }
 
 #[test]
+fn reviewer_profile_shapes_attunement_and_recommendations() {
+    let profile = record(
+        "profile",
+        "evt_profile",
+        "codex-reviewer",
+        json!({
+            "tool": "codex-reviewer",
+            "role": "reviewer",
+            "capabilities": ["rust", "review"],
+            "watch": ["crates/rally-core"]
+        }),
+    );
+    let subscription = record(
+        "subscription",
+        "evt_subscription",
+        "codex-reviewer",
+        json!({
+            "tool": "codex-reviewer",
+            "paths": ["crates/rally-core/src/context.rs"],
+            "event_kinds": ["artifact", "decision"]
+        }),
+    );
+    let artifact = record(
+        "artifact",
+        "evt_review_packet",
+        "codex",
+        json!({
+            "subject": "attunement ranking review packet",
+            "artifact_kind": "review-packet",
+            "uri": "crates/rally-core/src/context.rs"
+        }),
+    );
+    let decision = record(
+        "decision",
+        "evt_arch_decision",
+        "codex",
+        json!({
+            "subject": "context recommendations are advisory",
+            "status": "binding",
+            "scope": "crates/rally-core/src/context.rs"
+        }),
+    );
+    let projection = TraceProjection::from_records_at(
+        &[profile, subscription, decision, artifact],
+        1_779_829_200.0,
+    );
+    let brief = build_context_brief(&projection, "codex-reviewer", 10);
+
+    assert_eq!(
+        brief.profile.as_ref().unwrap().role.as_deref(),
+        Some("reviewer")
+    );
+    assert_eq!(brief.attuned_items[0].event_id, "evt_review_packet");
+    assert!(
+        brief.attuned_items[0]
+            .factors
+            .contains(&"role:reviewer".to_string())
+    );
+    assert_eq!(brief.recommended_next_action.action, "review_artifact");
+    assert_eq!(
+        brief.recommended_next_action.target.as_deref(),
+        Some("evt_review_packet")
+    );
+}
+
+#[test]
 fn active_tasks_use_latest_task_state_by_owner_and_subject() {
     let active = record(
         "task",

@@ -192,7 +192,7 @@ fn usage() {
         "       rally release [--force] <claim-id> | blocker --subject <text> | unblock [--force] <blocker-id> --resolution <text>"
     );
     eprintln!(
-        "       rally profile [--tool <tool>] [--capability <name>]... [--watch <path>]... [--current-task <id>] [--branch <name>] [--availability <state>] [--json]"
+        "       rally profile [--tool <tool>] [--role <name>] [--capability <name>]... [--watch <path>]... [--current-task <id>] [--branch <name>] [--availability <state>] [--json]"
     );
     eprintln!(
         "       rally task --subject <text> [--owner <tool>] [--status <state>] [--depends-on <id>]... [--artifact <id>]... [--verification <text>] [--json]"

@@ -182,3 +182,9 @@ artifacts, decisions, lessons, and recent changes using profile watch paths,
 current task, subscriptions, active ownership, trust labels, and freshness. Each
 ranked item carries factors and source ids so agents can explain why it matters
 before acting.
+
+Role-aware specialization keeps that ranking narrow instead of generic. Agents
+may declare `profile.role` values such as `reviewer`, `architect`, `builder`,
+or `qa`; when omitted, role-like capabilities can imply the same specialization.
+The role shapes `attuned_items` and low-risk recommendations, while urgent
+handoffs, tasks, blockers, and claim conflicts still take precedence.

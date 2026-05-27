@@ -427,6 +427,8 @@ fn attuned_fact_commands_feed_context_brief() {
         "rust",
         "--capability",
         "review",
+        "--role",
+        "reviewer",
         "--watch",
         "crates/rally-core",
         "--current-task",
@@ -512,6 +514,7 @@ fn attuned_fact_commands_feed_context_brief() {
         context["data"]["brief"]["profile"]["capabilities"][0],
         "rust"
     );
+    assert_eq!(context["data"]["brief"]["profile"]["role"], "reviewer");
     assert_eq!(
         context["data"]["brief"]["subscription"]["event_kinds"][1],
         "decision"

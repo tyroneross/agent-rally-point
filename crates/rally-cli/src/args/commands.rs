@@ -65,6 +65,7 @@ pub(crate) struct UnblockCommand {
 pub(crate) struct ProfileCommand {
     pub(crate) common: CommonOptions,
     pub(crate) capabilities: Vec<String>,
+    pub(crate) role: Option<String>,
     pub(crate) watch: Vec<String>,
     pub(crate) current_task: Option<String>,
     pub(crate) branch: Option<String>,
@@ -219,6 +220,7 @@ pub(crate) fn parse_sync_import(args: WriteArgs) -> Result<SyncImportCommand, Cl
 pub(crate) fn parse_profile(args: WriteArgs) -> Result<ProfileCommand, CliError> {
     Ok(ProfileCommand {
         capabilities: args.all("--capability"),
+        role: args.one("--role"),
         watch: args.all("--watch"),
         current_task: args.one("--current-task"),
         branch: args.one("--branch"),

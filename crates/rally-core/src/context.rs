@@ -129,11 +129,13 @@ pub fn build_context_brief(
         limit: recent_limit,
     });
     let recommended_next_action = recommend_next_action(
+        profile.as_ref(),
         &pending_handoffs,
         &active_tasks,
         &own_blockers,
         &collision_risk,
         &active_claims,
+        &attuned_items,
     );
     let routing = routing_for(&recommended_next_action);
 
@@ -238,6 +240,8 @@ struct AttunementInput<'a> {
 
 #[derive(Clone, Debug)]
 struct AttunementPolicy<'a> {
+    role: Option<&'a str>,
+    capabilities: Vec<&'a str>,
     current_task: Option<&'a str>,
     profile_watch: Vec<&'a str>,
     subscribed_paths: Vec<&'a str>,
@@ -308,6 +312,10 @@ impl<'a> AttunementPolicy<'a> {
         active_claims: &'a [ActiveClaim],
     ) -> Self {
         Self {
+            role: profile.and_then(|profile| profile.role.as_deref()),
+            capabilities: profile
+                .map(|profile| profile.capabilities.iter().map(String::as_str).collect())
+                .unwrap_or_default(),
             current_task: profile.and_then(|profile| profile.current_task.as_deref()),
             profile_watch: profile
                 .map(|profile| profile.watch.iter().map(String::as_str).collect())
@@ -529,7 +537,56 @@ fn apply_policy(
         .map(String::as_str)
         .collect::<Vec<_>>();
     apply_path_matches(candidate, &claim_paths, "active_claim_path", 15);
+    apply_specialization(candidate, policy);
     apply_trust(candidate);
+}
+
+fn apply_specialization(candidate: &mut AttunedItem, policy: &AttunementPolicy<'_>) {
+    match specialization(policy) {
+        Some("reviewer") => match candidate.kind.as_str() {
+            "artifact" => add_factor(candidate, 40, "role:reviewer"),
+            "decision" => add_factor(candidate, 30, "role:reviewer"),
+            "lesson" => add_factor(candidate, 20, "role:reviewer"),
+            "handoff" => add_factor(candidate, 15, "role:reviewer"),
+            value
+                if value.starts_with("recent_artifact") || value.starts_with("recent_decision") =>
+            {
+                add_factor(candidate, 20, "role:reviewer");
+            }
+            _ => {}
+        },
+        Some("architect") => match candidate.kind.as_str() {
+            "decision" => add_factor(candidate, 45, "role:architect"),
+            "lesson" => add_factor(candidate, 25, "role:architect"),
+            "artifact" => add_factor(candidate, 15, "role:architect"),
+            value if value.starts_with("recent_decision") => {
+                add_factor(candidate, 25, "role:architect");
+            }
+            _ => {}
+        },
+        Some("builder") => match candidate.kind.as_str() {
+            "task" | "claim" => add_factor(candidate, 25, "role:builder"),
+            value if value.starts_with("recent_task") || value.starts_with("recent_claim") => {
+                add_factor(candidate, 15, "role:builder");
+            }
+            _ => {}
+        },
+        Some("qa") => match candidate.kind.as_str() {
+            "artifact" | "lesson" => add_factor(candidate, 30, "role:qa"),
+            value if value.starts_with("recent_artifact") => {
+                add_factor(candidate, 20, "role:qa");
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+fn specialization(policy: &AttunementPolicy<'_>) -> Option<&'static str> {
+    if let Some(role) = policy.role {
+        return canonical_role(role);
+    }
+    capability_specialization(policy.capabilities.iter().copied())
 }
 
 fn apply_path_matches(candidate: &mut AttunedItem, watched: &[&str], label: &str, score: i64) {
@@ -601,11 +658,13 @@ fn paths_overlap(left: &str, right: &str) -> bool {
 }
 
 fn recommend_next_action(
+    profile: Option<&AgentProfile>,
     pending_handoffs: &[PendingHandoff],
     active_tasks: &[ActiveTask],
     own_blockers: &[ActiveBlocker],
     collision_risk: &[ClaimConflict],
     active_claims: &[ActiveClaim],
+    attuned_items: &[AttunedItem],
 ) -> ContextRecommendation {
     if let Some(item) = pending_handoffs.first() {
         return ContextRecommendation {
@@ -658,6 +717,9 @@ fn recommend_next_action(
             source_event_ids: vec![item.event_id.clone()],
         };
     }
+    if let Some(recommendation) = recommend_specialized_action(profile, attuned_items) {
+        return recommendation;
+    }
     ContextRecommendation {
         action: "proceed_solo".to_string(),
         target: None,
@@ -668,9 +730,78 @@ fn recommend_next_action(
     }
 }
 
+fn recommend_specialized_action(
+    profile: Option<&AgentProfile>,
+    attuned_items: &[AttunedItem],
+) -> Option<ContextRecommendation> {
+    let role = profile.and_then(profile_specialization)?;
+    let item = attuned_items.first()?;
+    let action = match (role, item.kind.as_str()) {
+        ("reviewer", "artifact") => "review_artifact",
+        ("reviewer", "decision") => "review_decision",
+        ("reviewer", "lesson") => "review_lesson",
+        ("architect", "decision") => "review_decision",
+        ("architect", "lesson") => "review_lesson",
+        ("qa", "artifact") => "verify_artifact",
+        _ => return None,
+    };
+    Some(ContextRecommendation {
+        action: action.to_string(),
+        target: Some(item.event_id.clone()),
+        confidence: 0.72,
+        minimum_trust_for_automation: "local-or-trusted".to_string(),
+        reason: format!("{role} profile is best matched to {}", item.kind),
+        source_event_ids: item.source_event_ids.clone(),
+    })
+}
+
+fn profile_specialization(profile: &AgentProfile) -> Option<&'static str> {
+    if let Some(role) = profile.role.as_deref() {
+        return canonical_role(role);
+    }
+    capability_specialization(profile.capabilities.iter().map(String::as_str))
+}
+
+fn canonical_role(role: &str) -> Option<&'static str> {
+    match role {
+        "review" | "reviewer" => Some("reviewer"),
+        "architecture" | "architect" => Some("architect"),
+        "qa" | "test" | "testing" => Some("qa"),
+        "build" | "builder" | "implementation" => Some("builder"),
+        _ => None,
+    }
+}
+
+fn capability_specialization<'a>(
+    capabilities: impl IntoIterator<Item = &'a str>,
+) -> Option<&'static str> {
+    for capability in capabilities {
+        if matches!(capability, "review" | "reviewer" | "security") {
+            return Some("reviewer");
+        }
+        if matches!(capability, "architecture" | "architect" | "design") {
+            return Some("architect");
+        }
+        if matches!(capability, "qa" | "test" | "testing") {
+            return Some("qa");
+        }
+        if matches!(capability, "build" | "builder" | "implementation") {
+            return Some("builder");
+        }
+    }
+    None
+}
+
 fn routing_for(recommendation: &ContextRecommendation) -> ContextRouting {
     let action = match recommendation.action.as_str() {
-        "ack_handoff" | "work_task" | "resolve_blocker" | "resolve_claim_conflict" => "join_active",
+        "ack_handoff"
+        | "work_task"
+        | "resolve_blocker"
+        | "resolve_claim_conflict"
+        | "review_artifact"
+        | "review_decision"
+        | "review_lesson"
+        | "verify_artifact" => "join_active",
         "continue_claim" => "continue_active",
         _ => "proceed_solo",
     };

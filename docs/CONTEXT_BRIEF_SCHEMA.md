@@ -28,7 +28,7 @@ Current fields:
 | Field | Meaning |
 |---|---|
 | `tool` | Agent/tool id the brief is ranked for. |
-| `profile` | Latest `profile` event for the tool, when present. |
+| `profile` | Latest `profile` event for the tool, when present, including optional `role`. |
 | `subscription` | Latest `subscription` event for the tool, when present. |
 | `routing` | Agent-start action and reason. |
 | `top_priority` | Highest-priority attention item, if any. |
@@ -100,6 +100,7 @@ Attunement scoring is deterministic and source-linked. It combines:
 |---|---|
 | Unresolved state | Required handoffs, active tasks, blockers, claim conflicts. |
 | Agent profile | `current_task` and watched paths. |
+| Specialization | Profile `role` or role-like capabilities such as `review`, `architecture`, `qa`, or `implementation`. |
 | Subscriptions | Event kinds, paths, threads, and task ids. |
 | Active ownership | Paths already claimed by this tool. |
 | Trust | Trusted imports rank up; untrusted/invalid facts rank down. |
@@ -125,6 +126,7 @@ The context brief improves when agents write structured coordination facts:
 
 ```bash
 rally profile --tool codex --capability rust --capability review --watch crates/rally-core --json
+rally profile --tool codex-reviewer --role reviewer --capability rust --capability review --json
 rally subscribe --tool codex --path crates/rally-core --event-kind task --json
 rally task --tool codex --subject "finish context ranking" --status active --verification "cargo test" --json
 rally artifact --tool codex --subject "context schema" --artifact-kind schema --uri docs/context.schema.json --json

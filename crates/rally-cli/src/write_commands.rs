@@ -217,6 +217,7 @@ pub(super) fn execute_profile(command: ProfileCommand) -> Result<WriteOutput, Cl
     let payload = EventPayload::Profile(ProfilePayload {
         tool: tool.clone(),
         capabilities: command.capabilities.clone(),
+        role: command.role.clone(),
         watch: command.watch.clone(),
         current_task: command.current_task.clone(),
         branch: command.branch.clone(),
@@ -234,6 +235,7 @@ pub(super) fn execute_profile(command: ProfileCommand) -> Result<WriteOutput, Cl
         ),
         json!({
             "tool": tool,
+            "role": command.role,
             "capabilities": command.capabilities,
             "watch": command.watch,
         }),

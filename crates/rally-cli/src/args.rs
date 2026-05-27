@@ -130,6 +130,7 @@ impl WriteArgs {
                 | "--availability"
                 | "--branch"
                 | "--capability"
+                | "--role"
                 | "--current-task"
                 | "--depends-on"
                 | "--artifact"

@@ -41,8 +41,13 @@ rally diagnose --tool <tool> --json
 1. **Create or refresh your profile** when missing, stale, or your task changed:
 
 ```bash
-rally profile --tool <tool> --capability rust --capability review --watch crates/rally-core --json
+rally profile --tool <tool> --role builder --capability rust --capability implementation --watch crates/rally-core --json
 ```
+
+Use `--role reviewer`, `--role architect`, `--role builder`, or `--role qa`
+when the agent is intentionally specialized. If no role is declared, Rally can
+still infer lightweight specialization from capabilities such as `review`,
+`architecture`, `qa`, or `implementation`.
 
 2. **Declare subscriptions** for paths or event kinds you want surfaced:
 
@@ -102,8 +107,8 @@ rally unblock --tool <tool> <blocker-id> --resolution "decision recorded" --json
 Treat `rally context` as the live brief:
 
 - Read `attuned_items` before broad repo exploration. Prefer items with factors
-  matching your current task, watched paths, subscriptions, trusted origin, or
-  active claims.
+  matching your role, current task, watched paths, subscriptions, trusted
+  origin, or active claims.
 - If `recommended_next_action.action` is `ack_handoff`, inspect the source
   event and respond with `ack`, `needs-info`, or `reject`.
 - If it is `work_task`, work the referenced task and record artifacts.
