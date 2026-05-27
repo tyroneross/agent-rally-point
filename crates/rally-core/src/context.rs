@@ -197,6 +197,35 @@ impl ContextInputs {
             recent_changes: projection.recent_changes(recent_limit),
         }
     }
+
+    /// Gather inputs from the SQLite graph projection — the migration
+    /// target. Same field shapes as `from_projection`, sourced from the
+    /// persistent index instead of an in-memory record scan.
+    ///
+    /// Caller must ensure the graph is caught up before calling (e.g.,
+    /// via `graph::catch_up`). This function performs no mutation.
+    pub fn from_graph(
+        conn: &crate::graph::GraphConnection,
+        tool: &str,
+        recent_limit: usize,
+        now_epoch: f64,
+    ) -> Result<Self, rusqlite::Error> {
+        Ok(Self {
+            tool: tool.to_string(),
+            recent_limit,
+            profile: crate::graph::latest_profile_typed(conn, tool)?,
+            subscription: crate::graph::latest_subscription_typed(conn, tool)?,
+            pending_handoffs: crate::graph::pending_handoffs_typed(conn, Some(tool), now_epoch)?,
+            own_blockers: crate::graph::active_blockers_typed(conn, Some(tool), now_epoch)?,
+            active_tasks: crate::graph::active_tasks_typed(conn, Some(tool))?,
+            active_claims: crate::graph::active_claims_typed(conn, Some(tool), now_epoch)?,
+            claim_conflicts: crate::graph::claim_conflicts_typed(conn)?,
+            artifacts: crate::graph::recent_artifacts_typed(conn, 10)?,
+            decisions: crate::graph::recent_decisions_typed(conn, 10)?,
+            lessons: crate::graph::recent_lessons_typed(conn, 10)?,
+            recent_changes: crate::graph::recent_changes_typed(conn, recent_limit as u32, now_epoch)?,
+        })
+    }
 }
 
 /// Legacy entrypoint preserved for callers passing `&TraceProjection`.

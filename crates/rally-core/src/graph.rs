@@ -472,10 +472,50 @@ fn apply_record(tx: &Transaction, record: &Value, seq: i64) -> Result<(), rusqli
             }
         }
         "profile" => {
-            // Profile events refresh the Peer node's metadata. The node id is the tool name,
-            // not the event id — peer identity is stable across many profile events.
+            // Two projections: refresh the lightweight Peer identity node
+            // AND store the full profile event as its own node so the
+            // *latest* profile per tool is queryable via `latest_profile_typed`.
             let profile_tool = payload.get("tool").and_then(Value::as_str).unwrap_or(tool);
             upsert_peer(tx, profile_tool, time, &event_id, seq)?;
+            // Profile node id is the event id; multiple profiles per tool
+            // are distinct rows. producer_tool tags the declared tool so
+            // queries can find the latest profile for X without joining
+            // on the payload JSON.
+            let profile_meta = NodeMeta {
+                producer_tool: Some(profile_tool),
+                ..meta
+            };
+            upsert_node(
+                tx,
+                &event_id,
+                "profile",
+                subject_field.as_deref(),
+                &payload,
+                time,
+                &event_id,
+                seq,
+                profile_meta,
+            )?;
+        }
+        "subscribe" | "subscription" => {
+            // Same shape as profile: keep latest per tool queryable.
+            let sub_tool = payload.get("tool").and_then(Value::as_str).unwrap_or(tool);
+            upsert_peer(tx, sub_tool, time, &event_id, seq)?;
+            let sub_meta = NodeMeta {
+                producer_tool: Some(sub_tool),
+                ..meta
+            };
+            upsert_node(
+                tx,
+                &event_id,
+                "subscription",
+                subject_field.as_deref(),
+                &payload,
+                time,
+                &event_id,
+                seq,
+                sub_meta,
+            )?;
         }
         "handoff" => {
             // Project handoffs as nodes so "any later non-producer activity"
@@ -1136,6 +1176,504 @@ pub fn recent_artifacts(conn: &Connection, limit: u32) -> Result<Vec<Value>, rus
         .filter_map(Result::ok)
         .collect();
     Ok(rows)
+}
+
+// ───────────────────────── Typed queries (rich structs) ──────────────
+//
+// These return the same struct types as `TraceProjection` methods so
+// `ContextInputs::from_graph` can swap data sources without changing the
+// downstream `build_context_brief_from_inputs` assembly logic.
+//
+// Where TraceProjection had access to wall-clock age via parsed records,
+// these compute `age_seconds` from the stored `created_at` (RFC3339)
+// against `now_epoch_seconds`. Origin / trust_status / thread_id are
+// read directly from the v4 node columns.
+
+use crate::query::{
+    ActiveBlocker, ActiveClaim, ActiveTask, AgentProfile, AgentSubscription, ClaimConflict,
+    CoordinationArtifact, CoordinationDecision, CoordinationLesson, PendingHandoff, RecentChange,
+};
+
+fn age_from_iso(created_at: &str, now_epoch: f64) -> Option<i64> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(created_at).ok()?;
+    let secs = parsed.timestamp() as f64;
+    Some((now_epoch - secs) as i64)
+}
+
+fn json_string_array(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn pending_handoffs_typed(
+    conn: &Connection,
+    tool: Option<&str>,
+    now_epoch: f64,
+) -> Result<Vec<PendingHandoff>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT n.id, n.subject, n.created_at, n.thread_id, n.origin,
+               n.trust_status, n.producer_tool, n.payload_json
+          FROM nodes n
+         WHERE n.kind = 'handoff'
+           AND NOT EXISTS (
+             SELECT 1 FROM edges e
+              WHERE e.source_id = n.id AND e.kind = 'resolved_by_ack'
+           )
+         ORDER BY n.source_seq ASC
+        "#,
+    )?;
+    let rows: Vec<PendingHandoff> = stmt
+        .query_map([], |row| {
+            let created_at: String = row.get(2)?;
+            let payload_json: String = row.get(7)?;
+            let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            let to_tool: Option<String> = payload.get("to_tool").and_then(Value::as_str).map(str::to_string);
+            let requires_ack: bool = payload
+                .get("requires_ack")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            Ok((
+                requires_ack,
+                PendingHandoff {
+                    event_id: row.get::<_, String>(0)?,
+                    thread_id: row.get::<_, Option<String>>(3)?,
+                    origin: row.get::<_, Option<String>>(4)?,
+                    trust_status: row.get::<_, Option<String>>(5)?,
+                    from_tool: row.get::<_, Option<String>>(6)?,
+                    to_tool,
+                    subject: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    age_seconds: age_from_iso(&created_at, now_epoch),
+                    files: json_string_array(&payload, "ref_files"),
+                },
+            ))
+        })?
+        .filter_map(Result::ok)
+        .filter(|(requires_ack, _)| *requires_ack)
+        .map(|(_, handoff)| handoff)
+        .filter(|h| tool.is_none_or(|t| h.to_tool.as_deref() == Some(t)))
+        .collect();
+    Ok(rows)
+}
+
+pub fn active_blockers_typed(
+    conn: &Connection,
+    tool: Option<&str>,
+    now_epoch: f64,
+) -> Result<Vec<ActiveBlocker>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT n.id, n.subject, n.created_at, n.thread_id, n.origin,
+               n.trust_status, n.producer_tool, n.payload_json
+          FROM nodes n
+         WHERE n.kind = 'blocker'
+           AND NOT EXISTS (
+             SELECT 1 FROM edges e
+              WHERE e.source_id = n.id AND e.kind = 'resolved_by_unblock'
+           )
+         ORDER BY n.source_seq ASC
+        "#,
+    )?;
+    let rows: Vec<ActiveBlocker> = stmt
+        .query_map([], |row| {
+            let created_at: String = row.get(2)?;
+            let payload_json: String = row.get(7)?;
+            let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            let resource: Option<String> = payload.get("resource").and_then(Value::as_str).map(str::to_string);
+            let severity: String = payload
+                .get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("blocked")
+                .to_string();
+            Ok(ActiveBlocker {
+                event_id: row.get::<_, String>(0)?,
+                thread_id: row.get::<_, Option<String>>(3)?,
+                origin: row.get::<_, Option<String>>(4)?,
+                trust_status: row.get::<_, Option<String>>(5)?,
+                tool: row.get::<_, Option<String>>(6)?,
+                subject: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                resource,
+                severity,
+                age_seconds: age_from_iso(&created_at, now_epoch),
+            })
+        })?
+        .filter_map(Result::ok)
+        .filter(|b| tool.is_none_or(|t| b.tool.as_deref() == Some(t)))
+        .collect();
+    Ok(rows)
+}
+
+pub fn active_claims_typed(
+    conn: &Connection,
+    tool: Option<&str>,
+    now_epoch: f64,
+) -> Result<Vec<ActiveClaim>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT n.id, n.subject, n.created_at, n.thread_id, n.origin,
+               n.trust_status, n.producer_tool, n.payload_json
+          FROM nodes n
+         WHERE n.kind = 'claim'
+           AND NOT EXISTS (
+             SELECT 1 FROM edges e
+              WHERE e.source_id = n.id AND e.kind = 'resolved_by_release'
+           )
+         ORDER BY n.source_seq ASC
+        "#,
+    )?;
+    let rows: Vec<ActiveClaim> = stmt
+        .query_map([], |row| {
+            let created_at: String = row.get(2)?;
+            let payload_json: String = row.get(7)?;
+            let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            let resource: String = payload
+                .get("resource")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let owner_tool: Option<String> = payload
+                .get("owner_tool")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| row.get::<_, Option<String>>(6).ok().flatten());
+            Ok(ActiveClaim {
+                event_id: row.get::<_, String>(0)?,
+                thread_id: row.get::<_, Option<String>>(3)?,
+                origin: row.get::<_, Option<String>>(4)?,
+                trust_status: row.get::<_, Option<String>>(5)?,
+                owner_tool,
+                resource,
+                subject: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                age_seconds: age_from_iso(&created_at, now_epoch),
+            })
+        })?
+        .filter_map(Result::ok)
+        .filter(|c| tool.is_none_or(|t| c.owner_tool.as_deref() == Some(t)))
+        .collect();
+    Ok(rows)
+}
+
+pub fn claim_conflicts_typed(conn: &Connection) -> Result<Vec<ClaimConflict>, rusqlite::Error> {
+    // Group active claims by resource; emit conflicts where ≥2 distinct
+    // owners hold the same resource. SQLite handles json_extract for the
+    // resource lookup.
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT json_extract(n.payload_json, '$.resource')    AS resource,
+               GROUP_CONCAT(n.id, ',')                       AS claim_ids,
+               GROUP_CONCAT(COALESCE(json_extract(n.payload_json, '$.owner_tool'), n.producer_tool), ',') AS owners
+          FROM nodes n
+         WHERE n.kind = 'claim'
+           AND resource IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM edges e
+              WHERE e.source_id = n.id AND e.kind = 'resolved_by_release'
+           )
+         GROUP BY resource
+        HAVING COUNT(DISTINCT COALESCE(json_extract(n.payload_json, '$.owner_tool'), n.producer_tool)) > 1
+        "#,
+    )?;
+    let rows: Vec<ClaimConflict> = stmt
+        .query_map([], |row| {
+            let resource: String = row.get(0)?;
+            let claim_ids: String = row.get(1)?;
+            let owners: String = row.get(2)?;
+            let mut owner_list: Vec<String> = owners
+                .split(',')
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+                .collect();
+            owner_list.sort();
+            owner_list.dedup();
+            Ok(ClaimConflict {
+                resource,
+                claim_ids: claim_ids.split(',').map(str::to_string).collect(),
+                owners: owner_list,
+            })
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(rows)
+}
+
+pub fn active_tasks_typed(
+    conn: &Connection,
+    tool: Option<&str>,
+) -> Result<Vec<ActiveTask>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT n.id, n.subject, n.thread_id, n.origin, n.trust_status,
+               n.payload_json,
+               (SELECT e.target_id FROM edges e
+                 WHERE e.source_id = n.id AND e.kind = 'owned_by'
+                 ORDER BY e.source_seq DESC LIMIT 1) AS owner
+          FROM nodes n
+         WHERE n.kind = 'task'
+         ORDER BY n.source_seq ASC
+        "#,
+    )?;
+    let rows: Vec<ActiveTask> = stmt
+        .query_map([], |row| {
+            let payload_json: String = row.get(5)?;
+            let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("active")
+                .to_string();
+            Ok(ActiveTask {
+                event_id: row.get::<_, String>(0)?,
+                thread_id: row.get::<_, Option<String>>(2)?,
+                subject: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                status,
+                owner_tool: row.get::<_, Option<String>>(6)?,
+                depends_on: json_string_array(&payload, "depends_on"),
+                artifacts: json_string_array(&payload, "artifacts"),
+                verification: payload.get("verification").and_then(Value::as_str).map(str::to_string),
+                origin: row.get::<_, Option<String>>(3)?,
+                trust_status: row.get::<_, Option<String>>(4)?,
+            })
+        })?
+        .filter_map(Result::ok)
+        .filter(|t| !matches!(t.status.as_str(), "done" | "closed" | "cancelled"))
+        .filter(|t| tool.is_none_or(|target| t.owner_tool.as_deref() == Some(target)))
+        .collect();
+    Ok(rows)
+}
+
+pub fn recent_artifacts_typed(
+    conn: &Connection,
+    limit: u32,
+) -> Result<Vec<CoordinationArtifact>, rusqlite::Error> {
+    let lim = limit.max(1).min(500) as i64;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT n.id, n.subject, n.origin, n.trust_status, n.payload_json
+          FROM nodes n
+         WHERE n.kind = 'artifact'
+         ORDER BY n.source_seq DESC
+         LIMIT ?1
+        "#,
+    )?;
+    let rows: Vec<CoordinationArtifact> = stmt
+        .query_map(params![lim], |row| {
+            let payload_json: String = row.get(4)?;
+            let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            Ok(CoordinationArtifact {
+                event_id: row.get::<_, String>(0)?,
+                subject: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                artifact_kind: payload
+                    .get("artifact_kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                uri: payload.get("uri").and_then(Value::as_str).map(str::to_string),
+                ref_task_id: payload.get("ref_task_id").and_then(Value::as_str).map(str::to_string),
+                summary: payload.get("summary").and_then(Value::as_str).map(str::to_string),
+                origin: row.get::<_, Option<String>>(2)?,
+                trust_status: row.get::<_, Option<String>>(3)?,
+            })
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(rows)
+}
+
+pub fn recent_decisions_typed(
+    conn: &Connection,
+    limit: u32,
+) -> Result<Vec<CoordinationDecision>, rusqlite::Error> {
+    let lim = limit.max(1).min(500) as i64;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT n.id, n.subject, n.origin, n.trust_status, n.payload_json
+          FROM nodes n
+         WHERE n.kind = 'decision'
+         ORDER BY n.source_seq DESC
+         LIMIT ?1
+        "#,
+    )?;
+    let rows: Vec<CoordinationDecision> = stmt
+        .query_map(params![lim], |row| {
+            let payload_json: String = row.get(4)?;
+            let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            Ok(CoordinationDecision {
+                event_id: row.get::<_, String>(0)?,
+                subject: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                status: payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("proposed")
+                    .to_string(),
+                scope: payload.get("scope").and_then(Value::as_str).map(str::to_string),
+                supersedes: json_string_array(&payload, "supersedes"),
+                rationale: payload.get("rationale").and_then(Value::as_str).map(str::to_string),
+                origin: row.get::<_, Option<String>>(2)?,
+                trust_status: row.get::<_, Option<String>>(3)?,
+            })
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(rows)
+}
+
+pub fn recent_lessons_typed(
+    conn: &Connection,
+    limit: u32,
+) -> Result<Vec<CoordinationLesson>, rusqlite::Error> {
+    let lim = limit.max(1).min(500) as i64;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT n.id, n.subject, n.origin, n.trust_status, n.payload_json
+          FROM nodes n
+         WHERE n.kind = 'lesson'
+         ORDER BY n.source_seq DESC
+         LIMIT ?1
+        "#,
+    )?;
+    let rows: Vec<CoordinationLesson> = stmt
+        .query_map(params![lim], |row| {
+            let payload_json: String = row.get(4)?;
+            let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            Ok(CoordinationLesson {
+                event_id: row.get::<_, String>(0)?,
+                subject: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                lesson_kind: payload.get("lesson_kind").and_then(Value::as_str).map(str::to_string),
+                scope: payload.get("scope").and_then(Value::as_str).map(str::to_string),
+                source_event_ids: json_string_array(&payload, "source_event_ids"),
+                confidence: payload.get("confidence").and_then(Value::as_f64),
+                origin: row.get::<_, Option<String>>(2)?,
+                trust_status: row.get::<_, Option<String>>(3)?,
+            })
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(rows)
+}
+
+pub fn recent_changes_typed(
+    conn: &Connection,
+    limit: u32,
+    now_epoch: f64,
+) -> Result<Vec<RecentChange>, rusqlite::Error> {
+    let lim = limit.max(1).min(500) as i64;
+    // Match TraceProjection::recent_changes: take the newest N events,
+    // then return them in chronological (insertion) order — oldest of
+    // the window first, newest last.
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, kind, subject, thread_id, origin, trust_status,
+               producer_tool, created_at
+          FROM (
+            SELECT n.id, n.kind, n.subject, n.thread_id, n.origin,
+                   n.trust_status, n.producer_tool, n.created_at, n.source_seq
+              FROM nodes n
+             WHERE n.kind != 'peer'
+             ORDER BY n.source_seq DESC
+             LIMIT ?1
+          )
+          ORDER BY source_seq ASC
+        "#,
+    )?;
+    let rows: Vec<RecentChange> = stmt
+        .query_map(params![lim], |row| {
+            let created_at: String = row.get(7)?;
+            Ok(RecentChange {
+                event_id: row.get::<_, String>(0)?,
+                thread_id: row.get::<_, Option<String>>(3)?,
+                kind: row.get::<_, String>(1)?,
+                tool: row.get::<_, Option<String>>(6)?,
+                subject: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                age_seconds: age_from_iso(&created_at, now_epoch),
+                origin: row.get::<_, Option<String>>(4)?,
+                trust_status: row.get::<_, Option<String>>(5)?,
+            })
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(rows)
+}
+
+pub fn latest_profile_typed(
+    conn: &Connection,
+    tool: &str,
+) -> Result<Option<AgentProfile>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT n.id, n.origin, n.trust_status, n.payload_json
+          FROM nodes n
+         WHERE n.kind = 'profile' AND n.producer_tool = ?1
+         ORDER BY n.source_seq DESC
+         LIMIT 1
+        "#,
+    )?;
+    let row: Option<AgentProfile> = stmt
+        .query_row(params![tool], |row| {
+            let payload_json: String = row.get(3)?;
+            let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            Ok(AgentProfile {
+                event_id: row.get::<_, String>(0)?,
+                tool: payload
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or(tool)
+                    .to_string(),
+                capabilities: json_string_array(&payload, "capabilities"),
+                role: payload.get("role").and_then(Value::as_str).map(str::to_string),
+                watch: json_string_array(&payload, "watch"),
+                current_task: payload.get("current_task").and_then(Value::as_str).map(str::to_string),
+                branch: payload.get("branch").and_then(Value::as_str).map(str::to_string),
+                availability: payload.get("availability").and_then(Value::as_str).map(str::to_string),
+                notes: payload.get("notes").and_then(Value::as_str).map(str::to_string),
+                origin: row.get::<_, Option<String>>(1)?,
+                trust_status: row.get::<_, Option<String>>(2)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+pub fn latest_subscription_typed(
+    conn: &Connection,
+    tool: &str,
+) -> Result<Option<AgentSubscription>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT n.id, n.origin, n.trust_status, n.payload_json
+          FROM nodes n
+         WHERE n.kind = 'subscription' AND n.producer_tool = ?1
+         ORDER BY n.source_seq DESC
+         LIMIT 1
+        "#,
+    )?;
+    let row: Option<AgentSubscription> = stmt
+        .query_row(params![tool], |row| {
+            let payload_json: String = row.get(3)?;
+            let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            Ok(AgentSubscription {
+                event_id: row.get::<_, String>(0)?,
+                tool: payload
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or(tool)
+                    .to_string(),
+                paths: json_string_array(&payload, "paths"),
+                event_kinds: json_string_array(&payload, "event_kinds"),
+                threads: json_string_array(&payload, "threads"),
+                tasks: json_string_array(&payload, "tasks"),
+                origin: row.get::<_, Option<String>>(1)?,
+                trust_status: row.get::<_, Option<String>>(2)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
 }
 
 /// Helper exposed for CLI surfaces — returns counts by node kind + edge kind.

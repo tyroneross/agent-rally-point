@@ -8,7 +8,10 @@ use crate::args::{
 use crate::output::{CliError, WriteOutput};
 use crate::resources::normalize_file_resource;
 use crate::runtime::{new_id, now_rfc3339};
-use rally_core::context::{ContextRecommendation, build_context_brief, build_work_packet};
+use rally_core::context::{
+    ContextBrief, ContextInputs, ContextRecommendation, build_context_brief_from_inputs,
+    build_work_packet,
+};
 use rally_core::cursors;
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
 use rally_core::event::{ClaimPayload, EventBuilder, EventPayload, EventRecord, ProfilePayload};
@@ -25,6 +28,33 @@ use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Build a ContextBrief preferring the SQLite graph projection, falling
+/// back to TraceProjection on any graph error. The graph path matches
+/// TraceProjection's typed fields (thread_id, origin, trust_status,
+/// age_seconds) via the schema-v4 node columns, so the brief shape is
+/// identical from both sources.
+fn brief_via_graph_or_projection(
+    store: &ChannelStore,
+    records: &[Value],
+    projection: &TraceProjection,
+    tool: &str,
+    recent_limit: usize,
+    now: f64,
+) -> ContextBrief {
+    let from_graph = (|| -> Result<ContextInputs, Box<dyn std::error::Error>> {
+        let mut conn = graph::init(store.channel_dir(), &now_rfc3339())?;
+        graph::catch_up(&mut conn, records, &now_rfc3339())?;
+        Ok(ContextInputs::from_graph(&conn, tool, recent_limit, now)?)
+    })();
+    match from_graph {
+        Ok(inputs) => build_context_brief_from_inputs(&inputs),
+        Err(_) => {
+            let inputs = ContextInputs::from_projection(projection, tool, recent_limit);
+            build_context_brief_from_inputs(&inputs)
+        }
+    }
+}
 
 /// Filter `records` to those with `local_seq` strictly greater than the cursor
 /// for `(tool, session_id)` under `store.channel_dir()`. Returns the filtered
@@ -230,7 +260,8 @@ pub(super) fn execute_context(command: ReadCommand) -> Result<WriteOutput, CliEr
     let tool = command.common.tool();
     let (store, records, now) = query_records(&command)?;
     let projection = TraceProjection::from_records_at(&records, now);
-    let brief = build_context_brief(&projection, &tool, command.limit);
+    let brief =
+        brief_via_graph_or_projection(&store, &records, &projection, &tool, command.limit, now);
     let text = if let Some(priority) = &brief.top_priority {
         format!(
             "{}: {} ({})",
@@ -289,7 +320,8 @@ pub(super) fn execute_packet(command: ReadCommand) -> Result<WriteOutput, CliErr
     let tool = command.common.tool();
     let (store, records, now) = query_records(&command)?;
     let projection = TraceProjection::from_records_at(&records, now);
-    let brief = build_context_brief(&projection, &tool, command.limit);
+    let brief =
+        brief_via_graph_or_projection(&store, &records, &projection, &tool, command.limit, now);
     let packet = build_work_packet(&brief, command.limit);
     let text = format!(
         "{} packet for {}: {}",
@@ -354,8 +386,16 @@ pub(super) fn execute_start(command: StartCommand) -> Result<WriteOutput, CliErr
         .map_err(|err| CliError::runtime("start", format!("failed to write cursor: {err}")))?;
     }
 
-    let projection = TraceProjection::from_records_at(&records, now_epoch_seconds());
-    let brief = build_context_brief(&projection, &command.tool, command.limit);
+    let now = now_epoch_seconds();
+    let projection = TraceProjection::from_records_at(&records, now);
+    let brief = brief_via_graph_or_projection(
+        &store,
+        &records,
+        &projection,
+        &command.tool,
+        command.limit,
+        now,
+    );
     let packet = build_work_packet(&brief, command.limit);
     let agent_visible = agent_visible_from_context(&brief.recommended_next_action);
     let checkpoint = store
@@ -2968,7 +3008,8 @@ fn execute_adapter_packet(
     let tool = command.common.tool();
     let (store, records, now) = query_records(&command)?;
     let projection = TraceProjection::from_records_at(&records, now);
-    let brief = build_context_brief(&projection, &tool, command.limit);
+    let brief =
+        brief_via_graph_or_projection(&store, &records, &projection, &tool, command.limit, now);
     let packet = build_work_packet(&brief, command.limit);
     let agent_visible = agent_visible_from_context(&packet.recommended_next_action);
     let ready_to_act = packet.recommended_next_action.trust.automation_allowed;
