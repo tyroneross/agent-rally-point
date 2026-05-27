@@ -681,6 +681,7 @@ struct NodeMeta<'a> {
     trust_status: Option<&'a str>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upsert_node(
     tx: &Transaction,
     id: &str,
@@ -791,7 +792,7 @@ pub fn subgraph_around(
     root_id: &str,
     depth: u32,
 ) -> Result<Value, rusqlite::Error> {
-    let depth = depth.max(1).min(10) as i64;
+    let depth = depth.clamp(1, 10) as i64;
     let mut stmt = conn.prepare(
         r#"
         WITH RECURSIVE walk(node_id, distance) AS (
@@ -856,8 +857,7 @@ fn edges_among(conn: &Connection, node_ids: &[String]) -> Result<Vec<Value>, rus
     // Anonymous `?` placeholders bind positionally — 2N placeholders, 2N
     // values via params_from_iter. Reusing `?1..?N` here would conflate
     // the two IN clauses.
-    let placeholders = std::iter::repeat("?")
-        .take(node_ids.len())
+    let placeholders = std::iter::repeat_n("?", node_ids.len())
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
@@ -900,7 +900,7 @@ pub fn causal_chain(
     target_id: &str,
     max_depth: u32,
 ) -> Result<Vec<Value>, rusqlite::Error> {
-    let depth = max_depth.max(1).min(20) as i64;
+    let depth = max_depth.clamp(1, 20) as i64;
     let mut stmt = conn.prepare(
         r#"
         WITH RECURSIVE chain(node_id, distance) AS (
@@ -941,7 +941,7 @@ pub fn transitive_deps(
     task_id: &str,
     max_depth: u32,
 ) -> Result<Vec<Value>, rusqlite::Error> {
-    let depth = max_depth.max(1).min(20) as i64;
+    let depth = max_depth.clamp(1, 20) as i64;
     let mut stmt = conn.prepare(
         r#"
         WITH RECURSIVE deps(node_id, distance) AS (
@@ -988,7 +988,7 @@ pub fn transitive_deps(
 /// behavior: when a different peer has acted after an artifact, that peer
 /// has effectively engaged with the work; recommendations should move on.
 pub fn unconsumed_artifacts(conn: &Connection, limit: u32) -> Result<Vec<Value>, rusqlite::Error> {
-    let lim = limit.max(1).min(200) as i64;
+    let lim = limit.clamp(1, 200) as i64;
     let mut stmt = conn.prepare(
         r#"
         SELECT n.id, n.subject, n.created_at, n.source_event_id, n.producer_tool
@@ -1151,7 +1151,7 @@ pub fn active_tasks(conn: &Connection, tool: Option<&str>) -> Result<Vec<Value>,
 
 /// Recent artifact nodes (any producer), newest first, bounded by `limit`.
 pub fn recent_artifacts(conn: &Connection, limit: u32) -> Result<Vec<Value>, rusqlite::Error> {
-    let lim = limit.max(1).min(500) as i64;
+    let lim = limit.clamp(1, 500) as i64;
     let mut stmt = conn.prepare(
         r#"
         SELECT n.id, n.subject, n.created_at, n.producer_tool, n.payload_json
@@ -1235,7 +1235,10 @@ pub fn pending_handoffs_typed(
             let created_at: String = row.get(2)?;
             let payload_json: String = row.get(7)?;
             let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
-            let to_tool: Option<String> = payload.get("to_tool").and_then(Value::as_str).map(str::to_string);
+            let to_tool: Option<String> = payload
+                .get("to_tool")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let requires_ack: bool = payload
                 .get("requires_ack")
                 .and_then(Value::as_bool)
@@ -1286,7 +1289,10 @@ pub fn active_blockers_typed(
             let created_at: String = row.get(2)?;
             let payload_json: String = row.get(7)?;
             let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
-            let resource: Option<String> = payload.get("resource").and_then(Value::as_str).map(str::to_string);
+            let resource: Option<String> = payload
+                .get("resource")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let severity: String = payload
                 .get("severity")
                 .and_then(Value::as_str)
@@ -1410,7 +1416,10 @@ pub fn active_tasks_typed(
                     owner_tool: row.get::<_, Option<String>>(7)?,
                     depends_on: json_string_array(&payload, "depends_on"),
                     artifacts: json_string_array(&payload, "artifacts"),
-                    verification: payload.get("verification").and_then(Value::as_str).map(str::to_string),
+                    verification: payload
+                        .get("verification")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     origin: row.get::<_, Option<String>>(3)?,
                     trust_status: row.get::<_, Option<String>>(4)?,
                 },
@@ -1433,7 +1442,12 @@ pub fn active_tasks_typed(
     let rows: Vec<ActiveTask> = latest
         .into_values()
         .map(|(_seq, task)| task)
-        .filter(|t| !matches!(t.status.as_str(), "done" | "completed" | "closed" | "cancelled"))
+        .filter(|t| {
+            !matches!(
+                t.status.as_str(),
+                "done" | "completed" | "closed" | "cancelled"
+            )
+        })
         .filter(|t| tool.is_none_or(|target| t.owner_tool.as_deref() == Some(target)))
         .collect();
     Ok(rows)
@@ -1443,7 +1457,7 @@ pub fn recent_artifacts_typed(
     conn: &Connection,
     limit: u32,
 ) -> Result<Vec<CoordinationArtifact>, rusqlite::Error> {
-    let lim = limit.max(1).min(500) as i64;
+    let lim = limit.clamp(1, 500) as i64;
     let mut stmt = conn.prepare(
         r#"
         SELECT n.id, n.subject, n.origin, n.trust_status, n.payload_json
@@ -1465,9 +1479,18 @@ pub fn recent_artifacts_typed(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
-                uri: payload.get("uri").and_then(Value::as_str).map(str::to_string),
-                ref_task_id: payload.get("ref_task_id").and_then(Value::as_str).map(str::to_string),
-                summary: payload.get("summary").and_then(Value::as_str).map(str::to_string),
+                uri: payload
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                ref_task_id: payload
+                    .get("ref_task_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                summary: payload
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 origin: row.get::<_, Option<String>>(2)?,
                 trust_status: row.get::<_, Option<String>>(3)?,
             })
@@ -1481,7 +1504,7 @@ pub fn recent_decisions_typed(
     conn: &Connection,
     limit: u32,
 ) -> Result<Vec<CoordinationDecision>, rusqlite::Error> {
-    let lim = limit.max(1).min(500) as i64;
+    let lim = limit.clamp(1, 500) as i64;
     let mut stmt = conn.prepare(
         r#"
         SELECT n.id, n.subject, n.origin, n.trust_status, n.payload_json
@@ -1503,9 +1526,15 @@ pub fn recent_decisions_typed(
                     .and_then(Value::as_str)
                     .unwrap_or("proposed")
                     .to_string(),
-                scope: payload.get("scope").and_then(Value::as_str).map(str::to_string),
+                scope: payload
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 supersedes: json_string_array(&payload, "supersedes"),
-                rationale: payload.get("rationale").and_then(Value::as_str).map(str::to_string),
+                rationale: payload
+                    .get("rationale")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 origin: row.get::<_, Option<String>>(2)?,
                 trust_status: row.get::<_, Option<String>>(3)?,
             })
@@ -1519,7 +1548,7 @@ pub fn recent_lessons_typed(
     conn: &Connection,
     limit: u32,
 ) -> Result<Vec<CoordinationLesson>, rusqlite::Error> {
-    let lim = limit.max(1).min(500) as i64;
+    let lim = limit.clamp(1, 500) as i64;
     let mut stmt = conn.prepare(
         r#"
         SELECT n.id, n.subject, n.origin, n.trust_status, n.payload_json
@@ -1536,8 +1565,14 @@ pub fn recent_lessons_typed(
             Ok(CoordinationLesson {
                 event_id: row.get::<_, String>(0)?,
                 subject: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                lesson_kind: payload.get("lesson_kind").and_then(Value::as_str).map(str::to_string),
-                scope: payload.get("scope").and_then(Value::as_str).map(str::to_string),
+                lesson_kind: payload
+                    .get("lesson_kind")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                scope: payload
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 source_event_ids: json_string_array(&payload, "source_event_ids"),
                 confidence: payload.get("confidence").and_then(Value::as_f64),
                 origin: row.get::<_, Option<String>>(2)?,
@@ -1554,7 +1589,7 @@ pub fn recent_changes_typed(
     limit: u32,
     now_epoch: f64,
 ) -> Result<Vec<RecentChange>, rusqlite::Error> {
-    let lim = limit.max(1).min(500) as i64;
+    let lim = limit.clamp(1, 500) as i64;
     // Match TraceProjection::recent_changes: take the newest N events,
     // then return them in chronological (insertion) order — oldest of
     // the window first, newest last.
@@ -1617,12 +1652,27 @@ pub fn latest_profile_typed(
                     .unwrap_or(tool)
                     .to_string(),
                 capabilities: json_string_array(&payload, "capabilities"),
-                role: payload.get("role").and_then(Value::as_str).map(str::to_string),
+                role: payload
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 watch: json_string_array(&payload, "watch"),
-                current_task: payload.get("current_task").and_then(Value::as_str).map(str::to_string),
-                branch: payload.get("branch").and_then(Value::as_str).map(str::to_string),
-                availability: payload.get("availability").and_then(Value::as_str).map(str::to_string),
-                notes: payload.get("notes").and_then(Value::as_str).map(str::to_string),
+                current_task: payload
+                    .get("current_task")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                branch: payload
+                    .get("branch")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                availability: payload
+                    .get("availability")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                notes: payload
+                    .get("notes")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 origin: row.get::<_, Option<String>>(1)?,
                 trust_status: row.get::<_, Option<String>>(2)?,
             })
@@ -1714,8 +1764,7 @@ pub fn score(
                 payload.get("ref_handoff_id").and_then(Value::as_str),
                 payload.get("verdict").and_then(Value::as_str),
             ) {
-                final_ack_by_handoff
-                    .insert(handoff_id.to_string(), verdict.to_string());
+                final_ack_by_handoff.insert(handoff_id.to_string(), verdict.to_string());
             }
         }
     }

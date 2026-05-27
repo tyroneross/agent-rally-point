@@ -195,7 +195,11 @@ impl ContextInputs {
             artifacts: crate::graph::recent_artifacts_typed(conn, 10)?,
             decisions: crate::graph::recent_decisions_typed(conn, 10)?,
             lessons: crate::graph::recent_lessons_typed(conn, 10)?,
-            recent_changes: crate::graph::recent_changes_typed(conn, recent_limit as u32, now_epoch)?,
+            recent_changes: crate::graph::recent_changes_typed(
+                conn,
+                recent_limit as u32,
+                now_epoch,
+            )?,
         })
     }
 }

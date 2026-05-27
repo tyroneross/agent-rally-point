@@ -4,9 +4,9 @@
 use rally_core::context::{
     ContextBrief, ContextInputs, build_context_brief_from_inputs, build_work_packet,
 };
-use rally_core::graph;
 use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
 use rally_core::event::{EventBuilder, EventPayload, HandoffPayload};
+use rally_core::graph;
 use rally_core::query::{
     TraceProjection, active_blockers_at, active_claims_at, claim_conflicts, pending_handoffs_at,
     related_records, score_records,
@@ -51,7 +51,8 @@ fn brief_from_records(records: &[Value], tool: &str, limit: usize, now: f64) -> 
                 if let Some(map) = wrapped.as_object_mut() {
                     map.entry("local_seq".to_string()).or_insert(json!(seq));
                     map.entry("origin".to_string()).or_insert(json!("local"));
-                    map.entry("trust_status".to_string()).or_insert(json!("local"));
+                    map.entry("trust_status".to_string())
+                        .or_insert(json!("local"));
                 }
                 wrapped
             } else {

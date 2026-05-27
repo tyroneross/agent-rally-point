@@ -90,22 +90,24 @@ pub fn run_preflight(
     // Graph is the source of truth. Surfacing graph errors here lets
     // callers detect a corrupt projection rather than serve stale data.
     let now_rfc = now.to_rfc3339();
-    let mut conn = crate::graph::init(store.channel_dir(), &now_rfc).map_err(|err| {
-        crate::CoreError::Io(std::io::Error::other(format!("open graph: {err}")))
-    })?;
+    let mut conn = crate::graph::init(store.channel_dir(), &now_rfc)
+        .map_err(|err| crate::CoreError::Io(std::io::Error::other(format!("open graph: {err}"))))?;
     crate::graph::catch_up(&mut conn, &records, &now_rfc).map_err(|err| {
         crate::CoreError::Io(std::io::Error::other(format!("graph catch_up: {err}")))
     })?;
-    let pending_acks_for_me = crate::graph::pending_handoffs_typed(&conn, Some(&options.tool), now_epoch)
-        .map_err(|err| crate::CoreError::Io(std::io::Error::other(format!("handoffs: {err}"))))?;
+    let pending_acks_for_me =
+        crate::graph::pending_handoffs_typed(&conn, Some(&options.tool), now_epoch).map_err(
+            |err| crate::CoreError::Io(std::io::Error::other(format!("handoffs: {err}"))),
+        )?;
     let active_claims = crate::graph::active_claims_typed(&conn, None, now_epoch)
         .map_err(|err| crate::CoreError::Io(std::io::Error::other(format!("claims: {err}"))))?;
     let active_blockers = crate::graph::active_blockers_typed(&conn, None, now_epoch)
         .map_err(|err| crate::CoreError::Io(std::io::Error::other(format!("blockers: {err}"))))?;
     let claim_conflicts = crate::graph::claim_conflicts_typed(&conn)
         .map_err(|err| crate::CoreError::Io(std::io::Error::other(format!("conflicts: {err}"))))?;
-    let recent_changes = crate::graph::recent_changes_typed(&conn, options.recent_limit as u32, now_epoch)
-        .map_err(|err| crate::CoreError::Io(std::io::Error::other(format!("recent: {err}"))))?;
+    let recent_changes =
+        crate::graph::recent_changes_typed(&conn, options.recent_limit as u32, now_epoch)
+            .map_err(|err| crate::CoreError::Io(std::io::Error::other(format!("recent: {err}"))))?;
 
     let routing = if !pending_acks_for_me.is_empty() {
         PreflightRouting {

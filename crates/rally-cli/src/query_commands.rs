@@ -17,9 +17,7 @@ use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
 use rally_core::event::{ClaimPayload, EventBuilder, EventPayload, EventRecord, ProfilePayload};
 use rally_core::graph;
 use rally_core::preflight::{PreflightOptions, run_preflight};
-use rally_core::query::{
-    filter_since, now_epoch_seconds, parse_since, record_id, related_records,
-};
+use rally_core::query::{filter_since, now_epoch_seconds, parse_since, record_id, related_records};
 use rally_core::store::ChannelStore;
 use rally_protocol::event_value;
 use serde_json::{Value, json};
@@ -27,6 +25,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+type DoctorGraphInputs = (
+    Vec<rally_core::query::ActiveClaim>,
+    Vec<rally_core::query::ActiveTask>,
+    Vec<rally_core::query::PendingHandoff>,
+    bool,
+);
 
 /// Gather the four inputs `execute_doctor` needs from the graph in one
 /// shot. Returns Err on any graph error so the caller can decide to
@@ -36,15 +41,7 @@ fn doctor_inputs_from_graph(
     records: &[Value],
     tool: &str,
     now: f64,
-) -> Result<
-    (
-        Vec<rally_core::query::ActiveClaim>,
-        Vec<rally_core::query::ActiveTask>,
-        Vec<rally_core::query::PendingHandoff>,
-        bool,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<DoctorGraphInputs, Box<dyn std::error::Error>> {
     let mut conn = graph::init(store.channel_dir(), &now_rfc3339())?;
     graph::catch_up(&mut conn, records, &now_rfc3339())?;
     Ok((
@@ -323,10 +320,8 @@ pub(super) fn execute_context(command: ReadCommand) -> Result<WriteOutput, CliEr
         .map(|focus| focus_graph_view(&store, &records, focus));
 
     let mut data = json!({ "brief": brief });
-    if let Some(view) = graph_view {
-        if let Some(payload) = view {
-            data["graph"] = payload;
-        }
+    if let Some(Some(payload)) = graph_view {
+        data["graph"] = payload;
     }
     Ok(query_output(
         command.command,
@@ -1303,7 +1298,11 @@ fn next_recommendation(tool: &str, limit: usize, view: &GraphView) -> Value {
 
     // ── Active blockers ───────────────────────────────────────────────
     for blocker in view.active_blockers.iter() {
-        let score = if blocker["tool"].as_str() == Some(tool) { 90.0 } else { 70.0 };
+        let score = if blocker["tool"].as_str() == Some(tool) {
+            90.0
+        } else {
+            70.0
+        };
         let event_id = blocker["event_id"].as_str().unwrap_or("").to_string();
         let subject = blocker["subject"].as_str().unwrap_or("").to_string();
         candidates.push(candidate(
@@ -1359,7 +1358,11 @@ fn next_recommendation(tool: &str, limit: usize, view: &GraphView) -> Value {
         let subject = artifact["subject"].as_str().unwrap_or("").to_string();
         let bonus = role_match_bonus(role, &capabilities, "artifact");
         candidates.push(candidate(
-            if bonus > 0.0 { "review_artifact" } else { "consume_artifact" },
+            if bonus > 0.0 {
+                "review_artifact"
+            } else {
+                "consume_artifact"
+            },
             &event_id,
             &subject,
             35.0 + bonus,

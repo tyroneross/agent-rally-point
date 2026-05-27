@@ -68,12 +68,10 @@ fn diagnose_via_graph(
     state: &[Value],
     options: &DiagnoseOptions<'_>,
 ) -> Diagnosis {
-    let now_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp(
-        options.now_epoch_seconds as i64,
-        0,
-    )
-    .map(|dt| dt.to_rfc3339())
-    .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+    let now_rfc =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(options.now_epoch_seconds as i64, 0)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
     let Ok(mut conn) = crate::graph::init(channel_dir, &now_rfc) else {
         return Diagnosis {
@@ -127,12 +125,15 @@ fn diagnose_via_graph(
         };
     }
 
-    let (score, score_findings) = crate::graph::score(&conn, records, options.tool, options.now_epoch_seconds)
-        .unwrap_or((0, Vec::new()));
+    let (score, score_findings) =
+        crate::graph::score(&conn, records, options.tool, options.now_epoch_seconds)
+            .unwrap_or((0, Vec::new()));
     let mut findings: Vec<DiagnoseFinding> =
         score_findings.into_iter().map(from_score_finding).collect();
 
-    if let Ok(blockers) = crate::graph::active_blockers_typed(&conn, options.tool, options.now_epoch_seconds) {
+    if let Ok(blockers) =
+        crate::graph::active_blockers_typed(&conn, options.tool, options.now_epoch_seconds)
+    {
         for blocker in blockers {
             findings.push(from_blocker(blocker));
         }
@@ -142,7 +143,9 @@ fn diagnose_via_graph(
             findings.push(from_conflict(conflict, options.since));
         }
     }
-    if let Ok(claims) = crate::graph::active_claims_typed(&conn, options.tool, options.now_epoch_seconds) {
+    if let Ok(claims) =
+        crate::graph::active_claims_typed(&conn, options.tool, options.now_epoch_seconds)
+    {
         for claim in claims {
             if claim
                 .age_seconds

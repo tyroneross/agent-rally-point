@@ -201,7 +201,7 @@ fn cmd_status(args: &WriteArgs) -> Result<WriteOutput, CliError> {
 
 fn cmd_subgraph(args: &WriteArgs, id: String) -> Result<WriteOutput, CliError> {
     let store = args.common.channel_store(args.command)?;
-    let depth = parse_uint(args.one("--limit").as_deref(), 1).max(1).min(10);
+    let depth = parse_uint(args.one("--limit").as_deref(), 1).clamp(1, 10);
     catch_up_before_read(args.command, &store)?;
     let conn = open_graph(args.command, store.channel_dir())?;
     let subgraph = graph::subgraph_around(&conn, &id, depth)
@@ -228,7 +228,7 @@ fn cmd_subgraph(args: &WriteArgs, id: String) -> Result<WriteOutput, CliError> {
 
 fn cmd_causal(args: &WriteArgs, id: String) -> Result<WriteOutput, CliError> {
     let store = args.common.channel_store(args.command)?;
-    let depth = parse_uint(args.one("--limit").as_deref(), 5).max(1).min(20);
+    let depth = parse_uint(args.one("--limit").as_deref(), 5).clamp(1, 20);
     catch_up_before_read(args.command, &store)?;
     let conn = open_graph(args.command, store.channel_dir())?;
     let chain = graph::causal_chain(&conn, &id, depth)
@@ -253,9 +253,7 @@ fn cmd_causal(args: &WriteArgs, id: String) -> Result<WriteOutput, CliError> {
 
 fn cmd_deps(args: &WriteArgs, id: String) -> Result<WriteOutput, CliError> {
     let store = args.common.channel_store(args.command)?;
-    let depth = parse_uint(args.one("--limit").as_deref(), 10)
-        .max(1)
-        .min(20);
+    let depth = parse_uint(args.one("--limit").as_deref(), 10).clamp(1, 20);
     catch_up_before_read(args.command, &store)?;
     let conn = open_graph(args.command, store.channel_dir())?;
     let deps = graph::transitive_deps(&conn, &id, depth)
@@ -278,9 +276,7 @@ fn cmd_deps(args: &WriteArgs, id: String) -> Result<WriteOutput, CliError> {
 
 fn cmd_unconsumed(args: &WriteArgs) -> Result<WriteOutput, CliError> {
     let store = args.common.channel_store(args.command)?;
-    let limit = parse_uint(args.one("--limit").as_deref(), 20)
-        .max(1)
-        .min(200);
+    let limit = parse_uint(args.one("--limit").as_deref(), 20).clamp(1, 200);
     catch_up_before_read(args.command, &store)?;
     let conn = open_graph(args.command, store.channel_dir())?;
     let rows = graph::unconsumed_artifacts(&conn, limit)
