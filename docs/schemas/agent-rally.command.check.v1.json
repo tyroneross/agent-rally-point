@@ -18,7 +18,7 @@
           "required": ["phase", "tool", "allow", "mode", "findings", "agent_visible"],
           "properties": {
             "phase": {
-              "enum": ["before-write", "after-artifact", "before-complete"]
+              "enum": ["before-write", "before-complete"]
             },
             "tool": { "type": "string" },
             "allow": { "type": "boolean" },

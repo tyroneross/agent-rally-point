@@ -21,7 +21,7 @@ what it must not collide with.
 ## Core Thesis
 
 Agents can already write clean code and run long goals. The missing layer is
-shared situational awareness across tabs, tools, sessions, remotes, and time.
+shared situational awareness across tabs, tools, sessions, and time.
 
 Rally should own:
 
@@ -29,7 +29,7 @@ Rally should own:
 - Current room state projected from those facts.
 - Agent entry state.
 - Boundary checks before shared work collides.
-- Adapter installation that makes agents remember to consult Rally.
+- Managed-session delivery into addressable tmux, Herdr, and cmux panes.
 
 Rally should not own:
 
@@ -44,18 +44,15 @@ Rally should not own:
 
 ```text
 .rally/facts.db     canonical append-only typed fact store (factstr-sqlite)
-.rally/room.db      live SQLite room projection/index derived from facts.db
-enter/next/room/check product APIs backed by the projection
-HANDOFF.md           optional plain-text snapshot export
-adapters             Codex, Claude, Pi, Herdr, cmux, CI integration
+.rally/cursors.json per-tool read cursors
+enter/next/room/check product APIs derived from facts.db
+managed sessions     tmux, Herdr, and cmux launch/inject/capture/stop
 ```
 
 `facts.db` is the source of truth. It is backed by `factstr-sqlite`, which owns
-ordered append, sequence numbers, and durable fact storage. `room.db` is a
-derived cache and never writes back to the fact store. The live surface is a
-SQLite room projection with relationship indexes, not a graph product.
-`HANDOFF.md` is an optional export for humans, agents without Rally access, and
-end-of-session snapshots.
+ordered append, sequence numbers, and durable fact storage. Room snapshots and
+managed session lists are derived from that event log on demand, not stored in
+a second projection DB.
 
 ## Command Surface
 
@@ -69,13 +66,12 @@ rally room --json           # inspect current projected room state
 rally check before-write    # boundary check before shared work changes
 ```
 
-Everything else is debug, admin, or adapter plumbing. `HANDOFF.md` export and
-adapter setup matter, but they should not be part of the core product loop.
+Everything else is debug or admin plumbing.
 
 ## Agent Product Loop
 
-An agent should not need to remember Rally from documentation. The integration
-must put Rally into the agent's normal operating loop.
+An agent should not need to remember Rally from documentation. The managed
+session path must put Rally into the agent's normal operating loop.
 
 Required loop:
 
@@ -92,9 +88,7 @@ The product succeeds when agents know Rally through repeated interaction:
 
 - At startup, `rally run` starts the agent in a managed mux session.
 - During work, write boundaries call `rally check` before changes land.
-- For unmanaged sessions, native adapters may block unsafe writes with
-  `rally check before-write`.
-- On prompt, idle, resume, or loop boundaries, adapters stay silent. Rally must
+- On prompt, idle, resume, or loop boundaries, Rally stays silent. It must
   not inject full room or `next` state into ordinary prompts just to keep Rally
   in context.
 - If an explicit `rally next` call shows the agent is waiting on a peer, the
@@ -171,8 +165,6 @@ Each fact should carry:
 - `status` for lifecycle-bearing facts such as claims, blockers, and handoffs
 - `severity` for risks, blockers, warnings, and check findings
 - `uri` for produced artifacts or external evidence
-- `origin`
-- `trust_status`
 
 ## Room Projection
 
@@ -187,7 +179,6 @@ The room projection answers:
 - What artifacts are unreviewed or unconsumed?
 - Which blockers are active?
 - What is related to this event/thread/task?
-- Which remote/imported facts are trusted enough to automate against?
 
 The product should expose `enter`, `room`, and `check`, not require users or
 agents to think in storage or query-planning terms. A richer graph should not be
@@ -209,35 +200,17 @@ Required room sections:
 - recent artifacts
 - unconsumed artifacts
 - stale facts
-- trusted/imported fact summary
 
 The room must be queryable by tool, role, path, event, thread, and since cursor.
 Agents should normally consume `enter` and `room`, not a rendered markdown file.
 
-## HANDOFF.md Export
+## Portable State
 
-`HANDOFF.md` is a portable snapshot. It should be generated on demand from the
-room state and safe to overwrite.
-
-Recommended sections:
-
-```md
-# Rally Handoff
-
-## Do Not Touch
-## Active Work
-## Open Handoffs
-## Blockers
-## Decisions
-## Risks
-## Recent Artifacts
-## Evidence
-## Next Attention Points
-```
+Portable state lives in Rally facts and typed command output. Agents should use
+`enter`, `next`, and `room --json` instead of a generated markdown snapshot.
 
 The file should be concise enough to paste into an agent prompt. It is useful
-for humans, tools without adapter support, end-of-session summaries, and remote
-handoff bundles.
+for humans and end-of-session summaries.
 
 ## Enter
 
@@ -291,7 +264,6 @@ Bad attention candidates:
 Required checks:
 
 - `before-write`: warn/block if a path is claimed or constrained.
-- `after-artifact`: encourage evidence and handoff routing.
 - `before-complete`: ensure active claims are released or explained.
 
 Strict blocking should only apply to local or trusted facts unless configured
@@ -334,101 +306,70 @@ Hard-coded backends, in order:
 - cmux: visible surface/workspace backend with native `new-workspace`, `send`,
   `read-screen`, `select-workspace`, and `close-workspace` commands.
 
-No dynamic adapter/plugin system is needed until this contract stabilizes and a
+No dynamic backend/plugin system is needed until this contract stabilizes and a
 third-party runtime needs to implement it. Unmanaged existing panes remain
 best-effort; managed sessions are the reliable path.
 
-## Adapters
+## Managed Sessions
 
-Setup is the infrastructure that teaches each agent surface how to use Rally.
-It is not a separate product surface.
+Managed sessions are the delivery infrastructure. Rally starts or addresses a
+visible agent pane/workspace, injects a focused handoff prompt, captures output,
+and records completion through Rally facts.
 
-Adapters are now secondary to managed sessions. They make native agent products
-call Rally at safety and context boundaries when an agent was not launched by
-`rally run`:
+Required managed backends:
 
-- startup/resume/prompt/idle/loop boundary: stay silent
-- before write: call `check before-write`
-
-Completion should not run on every finished model turn by default. It is too
-noisy. Agents can still run `rally check before-complete` explicitly, and a
-surface may add a completion prompt later only when there is an actionable
-condition such as an active owned claim or blocker.
-
-The setup command is intentionally narrow:
-
-```bash
-rally install codex --dry-run --json
-rally install all --json
-rally install codex --uninstall --json
-```
-
-It writes only Rally-owned hook scripts, extensions, snippets, and hook config
-entries. It does not inspect or manage older Rally wiring from other products.
-
-Required first-class adapters:
-
-- Codex
-- Claude Code
-- Pi
+- tmux
 - Herdr
 - cmux
 - CI
 
-Adapter status should report surfaces, not abstract health:
+Backend status should report addressability, not abstract health:
 
 ```json
 {
-  "adapter": "codex",
-  "installed": true,
+  "backend": "tmux",
+  "available": true,
   "surfaces": {
-    "startup_enter": false,
-    "loop_enter": false,
-    "before_write_check": true,
-    "completion_prompt": false
+    "run": true,
+    "inject": true,
+    "capture": true,
+    "stop": true
   }
 }
 ```
 
-Each adapter must define:
+Each backend must define:
 
-- Whether Rally room state becomes model-visible at all. For Codex, Claude
-  Code, and Pi guard adapters, it should not.
-- How managed sessions deliver actionable work when the backend owns the
-  session.
-- Which boundary events can call `check`.
-- How an agent is prompted to publish facts.
+- How managed sessions deliver actionable work.
+- How an agent prompt is cleared before injection.
+- How Rally captures recent output.
 - Where tool identity, role, watched paths, and cursors are stored.
-- Which failures are blocking, warning-only, or invisible to the agent.
+- Which failures are blocking, warning-only, or invisible to the operator.
 
-The adapter layer is no longer the primary delivery mechanism. Reliable
-delivery belongs to managed mux sessions; adapters cover native hook safety.
+Backend expectations by surface:
 
-Adapter expectations by surface:
-
-- Codex: guard write tools with `check before-write`; no startup, prompt, or
-  completion context injection.
-- Claude Code: guard write tools with `check before-write`; no startup, prompt,
-  or completion context injection.
-- Pi: guard write tool calls with `check before-write`; no session-start
-  message injection.
 - Herdr: implement the managed-session backend, track pane/tool identity, and
   make it easy for an operator agent to read panes and route work.
 - cmux: implement the managed-session backend without pretending cmux owns the
   coordination state.
-- CI: read room/check state, fail or warn on unresolved trusted blockers and
-  unsafe claims according to policy, and publish evidence facts when useful.
+- tmux: provide the default local backend with no setup step.
+- CI: read room/check state, fail or warn on unresolved blockers and unsafe
+  claims according to policy, and publish evidence facts when useful.
 
 ## Remote Model
 
-Remote support is event exchange, not live shared state.
+Remote support is operational, not a Rally-level import/export protocol. SSH to
+the machine that owns the repo, then run Rally there:
 
 ```text
-local facts -> export -> import elsewhere -> project room locally
+ssh machine
+cd repo
+rally run claude --backend tmux
 ```
 
-Imported facts retain `origin` and `trust_status`. Checks only automate against
-facts whose trust status satisfies local policy.
+The room remains repo-local. If Rally later grows federation or A2A remote-room
+support, provenance/trust should return as an explicit module rather than
+speculative fields on every fact.
 
 ## Product Constraints
 
@@ -439,11 +380,11 @@ Required product qualities:
 
 - Few nouns: room, fact, enter, next, say, check.
 - Commands that are obvious without reading old project history.
-- SQLite room projection with relationship indexes as the default live surface.
-- `HANDOFF.md` as an explicit export, not constantly updated state.
-- JSON contracts designed for agents first.
+- Factstr-backed SQLite event storage as the default live surface.
+- JSON contracts designed for agents first, backed by typed Rust structs and
+  schemars generation checks.
 - Internal projection/indexing hidden behind product commands.
-- Adapter setup tied to concrete surfaces, not broad health checks.
+- Managed-session backends tied to concrete surfaces, not broad health checks.
 - Tests written around user journeys and stable command contracts.
 
 Forbidden product drift:
@@ -454,16 +395,15 @@ Forbidden product drift:
 - visual graph product
 - proof/run-validity framing
 - task recommendation as a substitute for agent reasoning
-- broad setup/doctor surfaces not tied to adapter installation
+- broad setup surfaces that write host config
 
 ## Build Plan
 
 Phase 1: Product contract.
 
 - Freeze this document as the Rally product boundary.
-- Define the command contracts and event schemas.
+- Define typed command contracts and event schemas.
 - Define JSON output for `enter`, `room`, and `check`.
-- Define optional `HANDOFF.md` export sections and ordering.
 
 Phase 2: Product build.
 
@@ -472,9 +412,8 @@ Phase 2: Product build.
 - Use an internal SQLite projection for queries.
 - Add journey tests for stable command contracts.
 
-Phase 3: Adapter loop.
+Phase 3: Managed-session loop.
 
-- Install Codex, Claude Code, and Pi write-guard adapters.
 - Implement tmux-backed `run`, `sessions`, and `inject`.
 - Add Herdr and cmux managed-session backends.
 - Add CI read-only room checks and optional handoff export checks.

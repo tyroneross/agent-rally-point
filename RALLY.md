@@ -72,19 +72,16 @@ rally next --tool codex --json
 
 ## How Agents Wire This In
 
-Install Rally adapter glue for the host:
+Managed sessions are the reliable delivery path:
 
 ```bash
-rally install codex --dry-run --json
-rally install codex --json
-rally install claude_code --json
-rally install pi --json
-rally install all --json
+rally run claude --backend tmux --json
+rally inject <session|name|tool> --handoff <event-id> --json
+rally capture <session|name|tool> --json
 ```
 
-Write-boundary adapters should call `rally check before-write` before shared
-edits. Managed sessions should use `rally run` and `rally inject` to deliver
-work into tmux, Herdr, or cmux panes.
+Agents can still call `rally check before-write` explicitly before shared
+edits. Rally no longer installs host hooks or prompt injection glue.
 
 ## Useful Fact Writes
 
@@ -94,18 +91,18 @@ rally say release --tool <you> --ref <claim-id> --subject "done" --json
 rally say blocker --tool <you> --subject "need decision" --severity high --json
 rally say resolve --tool <you> --ref <blocker-id> --subject "resolved" --json
 rally say decision --tool <you> --subject "Rally is primary" --status binding --json
-rally say risk --tool <you> --subject "adapter not installed everywhere" --severity medium --json
+rally say risk --tool <you> --subject "managed session unavailable" --severity medium --json
 ```
 
 ## Where State Lives
 
 ```text
 .rally/facts.db  canonical fact store
-.rally/room.db   derived SQLite room projection
+.rally/cursors.json per-tool read cursors
 ```
 
-The room database is disposable derived state. The fact store is the source of
-truth.
+Room state is derived from the fact store on demand. The fact store is the
+source of truth, including managed session lifecycle facts.
 
 ## Install
 

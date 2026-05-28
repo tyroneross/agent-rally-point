@@ -18,12 +18,11 @@ The full product boundary is [`docs/RALLY_ARCHITECTURE.md`](docs/RALLY_ARCHITECT
 Rally owns the primary product path:
 
 - `rally` is the primary CLI.
-- `.rally/facts.db` is the durable fact store.
-- `.rally/room.db` is the rebuildable SQLite room projection.
-- `enter`, `next`, `say`, `room`, `check`, `install`, `run`, `sessions`,
-  `inject`, `attach`, `capture`, and `stop` are the load-bearing commands.
-- Adapter setup installs write-boundary guards where available; managed
-  sessions own live delivery into tmux, Herdr, and cmux panes.
+- `.rally/facts.db` is the durable fact store, including managed sessions.
+- Room state is derived from the fact store on demand.
+- `enter`, `next`, `say`, `room`, `check`, `run`, `sessions`, `inject`,
+  `attach`, `capture`, and `stop` are the load-bearing commands.
+- Managed sessions own live delivery into tmux, Herdr, and cmux panes.
 
 Network transport remains out of scope. Files, Git, rsync, shared folders, A2A,
 or a future service can move facts; Rally defines what the bytes mean.
@@ -74,17 +73,8 @@ rally say decision --tool codex --subject "Rally is primary" --status binding --
 rally say handoff --tool codex --target claude_code --subject "review docs" --summary "Rally is now primary" --json
 ```
 
-Adapter setup:
-
-```bash
-rally install codex --dry-run --json
-rally install codex --json
-rally install all --json
-rally install codex --uninstall --json
-```
-
-Rally installers write only Rally-owned hook scripts, snippets, extensions,
-and config entries.
+Managed sessions need no setup step. `rally run --backend <tmux|herdr|cmux>`
+starts the addressable pane/workspace, and `rally inject` delivers work to it.
 
 ## Verification
 
@@ -108,7 +98,7 @@ The short version:
 - The product model is room, fact, enter, next, say, check.
 - The room projection is SQLite-backed derived state.
 - JSON contracts are designed for agents first.
-- Adapter integration is how Rally becomes part of normal agent behavior.
+- Managed session delivery is how Rally becomes part of normal agent behavior.
 
 ## License
 
