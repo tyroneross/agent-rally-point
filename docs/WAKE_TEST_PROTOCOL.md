@@ -55,10 +55,14 @@ python3 scripts/rally_wake.py --pane w652e4f81649201-3 "[codex reverse-wake WAKE
 # (rally_wake.py does: agent send -> send-keys Enter -> send-keys Enter, then waits for 'working')
 ```
 
-**Success signals (you can observe all of these):**
-- `rally_wake.py` prints `{"woke": true, ... "status_after": "working"}`, OR
-- `herdr wait agent-status w652e4f81649201-3 --status working --timeout 12000` resolves to `working` within ~10s, AND
-- after claude responds, `herdr agent read w652e4f81649201-3 --source recent` shows claude's reply **containing `WAKE-7F3A`**.
+**Success signal — CHANNEL POST is AUTHORITATIVE** (doorbell + mailbox design):
+- The doorbell only nudges; the woken agent acts by **posting back to the Rally channel**. Confirm by a new line in `changes.jsonl`: `rally_wake.py --confirm-channel <changes.jsonl>` prints `{"woke": true, "confirm": "confirmed:channel-post"}`.
+- **Do NOT confirm by TUI scraping.** Two scrape methods were tried and both failed:
+  - status-flip (`herdr wait agent-status --status working`) → **false negative** (a succeeded wake never surfaced `working` within 12s).
+  - token-echo (count token in pane buffer) → **false positive** (counted the *un-submitted input echo* as a reply; 2026-05-28).
+- The channel is the only machine-verifiable proof the agent actually acted.
+
+**Keep the doorbell SHORT.** A short nudge stays inline → a single `C-m` submits reliably on tmux or herdr. A long payload collapses to `[Pasted Content]` and the submit becomes intermittent (paste-collapse + Enter-encoding; see anthropics/claude-code#43169). Put the payload in the mailbox (channel / `rally next` / a file), not the doorbell.
 
 **Failure signals (and what each means):**
 - Status never leaves `idle` → the submit (Enter) did not fire. Try a different submit approach (§6).
