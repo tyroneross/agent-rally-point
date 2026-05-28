@@ -29,6 +29,12 @@ const FACT_SCHEMA: &str = "agent-rally2.fact.v1";
 const DB_SCHEMA_VERSION: i64 = 2;
 const INSTALL_MARKER: &str = "agent-rally2-install-v1";
 
+macro_rules! cmd {
+    ($($arg:expr),+ $(,)?) => {
+        vec![$($arg.to_string()),+]
+    };
+}
+
 fn main() -> ExitCode {
     let wants_json = env::args().any(|arg| arg == "--json");
     match run_inner() {
@@ -439,7 +445,7 @@ fn command_run(args: ArgBag) -> Result<Output, String> {
                 "target": actual_target
             },
             "commands": {
-                "start": start_commands
+                "start": command_plan_json(&start_commands)
             }
         }),
     );
@@ -480,14 +486,7 @@ fn command_inject(args: ArgBag) -> Result<Output, String> {
         .first()
         .cloned()
         .ok_or_else(|| "inject requires a session id, name, or tool".to_string())?;
-    let sessions = read_session_records()?;
-    let session = sessions
-        .iter()
-        .find(|session| {
-            session.session_id == target || session.name == target || session.tool == target
-        })
-        .cloned()
-        .ok_or_else(|| format!("unknown managed session {target}"))?;
+    let session = find_session(&target)?;
     let handoff = args.one("--handoff").or_else(|| args.one("--ref"));
     let text = match (args.one("--text"), handoff.as_deref()) {
         (Some(text), _) => text,
@@ -526,7 +525,7 @@ fn command_inject(args: ArgBag) -> Result<Output, String> {
             "handoff": handoff,
             "require_ack": require_ack,
             "ack": ack,
-            "commands": commands
+            "commands": command_plan_json(&commands)
         }),
     );
     let text = format!(
@@ -592,17 +591,13 @@ fn command_session_action(args: ArgBag, action: SessionAction) -> Result<Output,
     let command_name = args.command;
     let body = envelope(
         command_name,
-        match action {
-            SessionAction::Attach => SCHEMA_SESSION_ACTION,
-            SessionAction::Capture => SCHEMA_SESSION_ACTION,
-            SessionAction::Stop => SCHEMA_SESSION_ACTION,
-        },
+        SCHEMA_SESSION_ACTION,
         json!({
             "mode": if dry_run { "dry-run" } else { command_name },
             "action": command_name,
             "session": session.to_json(),
             "output": output,
-            "commands": commands
+            "commands": command_plan_json(&commands)
         }),
     );
     let text =
@@ -646,12 +641,8 @@ impl AgentSpec {
 
     fn command_line(&self, name: &str) -> Vec<String> {
         match self.agent {
-            "claude" => vec![
-                self.command.to_string(),
-                "--name".to_string(),
-                name.to_string(),
-            ],
-            _ => vec![self.command.to_string()],
+            "claude" => cmd![self.command, "--name", name],
+            _ => cmd![self.command],
         }
     }
 }
@@ -696,75 +687,6 @@ impl ManagedSession {
     }
 }
 
-struct TmuxBackend {
-    bin: String,
-}
-
-impl TmuxBackend {
-    fn new(bin: Option<String>) -> Self {
-        Self {
-            bin: bin.unwrap_or_else(|| "tmux".to_string()),
-        }
-    }
-
-    fn start_args(&self, session: &str, cwd: &Path, command: &[String]) -> Vec<String> {
-        let shell_command = format!(
-            "cd {} && exec {}",
-            shell_quote(&cwd.display().to_string()),
-            shell_words(command)
-        );
-        vec![
-            "new-session".to_string(),
-            "-d".to_string(),
-            "-s".to_string(),
-            session.to_string(),
-            "-x".to_string(),
-            "140".to_string(),
-            "-y".to_string(),
-            "50".to_string(),
-            shell_command,
-        ]
-    }
-
-    fn inject_args(&self, session: &str, text: &str) -> Vec<Value> {
-        let buffer = format!("rally-inject-{session}");
-        vec![
-            json!([self.bin.clone(), "send-keys", "-t", session, "C-u"]),
-            json!([self.bin.clone(), "set-buffer", "-b", buffer, text]),
-            json!([
-                self.bin.clone(),
-                "paste-buffer",
-                "-b",
-                buffer,
-                "-t",
-                session
-            ]),
-            json!([self.bin.clone(), "send-keys", "-t", session, "Enter"]),
-        ]
-    }
-
-    fn run(&self, args: &[String]) -> Result<(), String> {
-        let status = Command::new(&self.bin)
-            .args(args)
-            .status()
-            .map_err(|err| format!("run tmux: {err}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("tmux exited with {status}"))
-        }
-    }
-
-    fn inject(&self, session: &str, text: &str) -> Result<(), String> {
-        let buffer = format!("rally-inject-{session}");
-        run_command(&self.bin, &["send-keys", "-t", session, "C-u"])?;
-        run_command(&self.bin, &["set-buffer", "-b", &buffer, text])?;
-        run_command(&self.bin, &["paste-buffer", "-b", &buffer, "-t", session])?;
-        run_command(&self.bin, &["send-keys", "-t", session, "Enter"])?;
-        Ok(())
-    }
-}
-
 struct BackendRunner {
     backend: String,
     tmux_bin: String,
@@ -790,27 +712,17 @@ impl BackendRunner {
         cwd: &Path,
         command: &[String],
         name: &str,
-    ) -> Vec<Value> {
+    ) -> Vec<Vec<String>> {
         match self.backend.as_str() {
-            "tmux" => {
-                let tmux = TmuxBackend::new(Some(self.tmux_bin.clone()));
-                let mut args = vec![self.tmux_bin.clone()];
-                args.extend(tmux.start_args(target, cwd, command));
-                vec![json!(args)]
-            }
-            "herdr" => vec![json!(herdr_start_command(
-                &self.herdr_bin,
-                target,
-                cwd,
-                command
-            ))],
-            "cmux" => vec![json!(cmux_start_command(
+            "tmux" => vec![tmux_start_command(&self.tmux_bin, target, cwd, command)],
+            "herdr" => vec![herdr_start_command(&self.herdr_bin, target, cwd, command)],
+            "cmux" => vec![cmux_start_command(
                 &self.cmux_bin,
                 target,
                 cwd,
                 command,
-                name
-            ))],
+                name,
+            )],
             _ => Vec::new(),
         }
     }
@@ -822,24 +734,11 @@ impl BackendRunner {
         command: &[String],
         name: &str,
     ) -> Result<String, String> {
+        let commands = self.start_commands(target, cwd, command, name);
         match self.backend.as_str() {
-            "tmux" => {
-                let tmux = TmuxBackend::new(Some(self.tmux_bin.clone()));
-                tmux.run(&tmux.start_args(target, cwd, command))?;
-                Ok(target.to_string())
-            }
-            "herdr" => {
-                run_command_output(&herdr_start_command(&self.herdr_bin, target, cwd, command))?;
-                Ok(target.to_string())
-            }
+            "tmux" | "herdr" => run_commands(&commands).map(|()| target.to_string()),
             "cmux" => {
-                let output = run_command_output(&cmux_start_command(
-                    &self.cmux_bin,
-                    target,
-                    cwd,
-                    command,
-                    name,
-                ))?;
+                let output = run_command_output(first_command(&commands)?)?;
                 Ok(parse_cmux_start_target(&output, target))
             }
             other => Err(format!("unsupported backend {other}")),
@@ -854,36 +753,18 @@ impl BackendRunner {
         }
     }
 
-    fn inject_commands(&self, target: &str, text: &str) -> Vec<Value> {
+    fn inject_commands(&self, target: &str, text: &str) -> Vec<Vec<String>> {
         match self.backend.as_str() {
-            "tmux" => TmuxBackend::new(Some(self.tmux_bin.clone())).inject_args(target, text),
+            "tmux" => tmux_inject_commands(&self.tmux_bin, target, text),
             "herdr" => vec![
-                json!([
-                    self.herdr_bin.clone(),
-                    "pane",
-                    "send-text",
-                    target,
-                    "\u{15}"
-                ]),
-                json!([self.herdr_bin.clone(), "pane", "send-text", target, text]),
-                json!([self.herdr_bin.clone(), "pane", "send-keys", target, "enter"]),
+                cmd![&self.herdr_bin, "pane", "send-text", target, "\u{15}"],
+                cmd![&self.herdr_bin, "pane", "send-text", target, text],
+                cmd![&self.herdr_bin, "pane", "send-keys", target, "enter"],
             ],
             "cmux" => vec![
-                json!([
-                    self.cmux_bin.clone(),
-                    "send-key",
-                    "--workspace",
-                    target,
-                    "ctrl+u"
-                ]),
-                json!([self.cmux_bin.clone(), "send", "--workspace", target, text]),
-                json!([
-                    self.cmux_bin.clone(),
-                    "send-key",
-                    "--workspace",
-                    target,
-                    "enter"
-                ]),
+                cmd![&self.cmux_bin, "send-key", "--workspace", target, "ctrl+u"],
+                cmd![&self.cmux_bin, "send", "--workspace", target, text],
+                cmd![&self.cmux_bin, "send-key", "--workspace", target, "enter"],
             ],
             _ => Vec::new(),
         }
@@ -891,210 +772,136 @@ impl BackendRunner {
 
     fn inject(&self, target: &str, text: &str) -> Result<(), String> {
         match self.backend.as_str() {
-            "tmux" => TmuxBackend::new(Some(self.tmux_bin.clone())).inject(target, text),
-            "herdr" => {
-                run_command_owned(&[
-                    self.herdr_bin.clone(),
-                    "pane".to_string(),
-                    "send-text".to_string(),
-                    target.to_string(),
-                    "\u{15}".to_string(),
-                ])?;
-                run_command_owned(&[
-                    self.herdr_bin.clone(),
-                    "pane".to_string(),
-                    "send-text".to_string(),
-                    target.to_string(),
-                    text.to_string(),
-                ])?;
-                run_command_owned(&[
-                    self.herdr_bin.clone(),
-                    "pane".to_string(),
-                    "send-keys".to_string(),
-                    target.to_string(),
-                    "enter".to_string(),
-                ])
-            }
-            "cmux" => {
-                run_command_owned(&[
-                    self.cmux_bin.clone(),
-                    "send-key".to_string(),
-                    "--workspace".to_string(),
-                    target.to_string(),
-                    "ctrl+u".to_string(),
-                ])?;
-                run_command_owned(&[
-                    self.cmux_bin.clone(),
-                    "send".to_string(),
-                    "--workspace".to_string(),
-                    target.to_string(),
-                    text.to_string(),
-                ])?;
-                run_command_owned(&[
-                    self.cmux_bin.clone(),
-                    "send-key".to_string(),
-                    "--workspace".to_string(),
-                    target.to_string(),
-                    "enter".to_string(),
-                ])
-            }
+            "tmux" | "herdr" | "cmux" => run_commands(&self.inject_commands(target, text)),
             other => Err(format!("unsupported backend {other}")),
         }
     }
 
-    fn attach_commands(&self, target: &str) -> Vec<Value> {
+    fn attach_commands(&self, target: &str) -> Vec<Vec<String>> {
         match self.backend.as_str() {
-            "tmux" => vec![json!([self.tmux_bin.clone(), "attach", "-t", target])],
-            "herdr" => vec![json!([self.herdr_bin.clone(), "agent", "attach", target])],
-            "cmux" => vec![json!([
-                self.cmux_bin.clone(),
+            "tmux" => vec![cmd![&self.tmux_bin, "attach", "-t", target]],
+            "herdr" => vec![cmd![&self.herdr_bin, "agent", "attach", target]],
+            "cmux" => vec![cmd![
+                &self.cmux_bin,
                 "select-workspace",
                 "--workspace",
-                target
-            ])],
+                target,
+            ]],
             _ => Vec::new(),
         }
     }
 
     fn attach(&self, target: &str) -> Result<(), String> {
         match self.backend.as_str() {
-            "tmux" => run_command_owned(&[
-                self.tmux_bin.clone(),
-                "attach".to_string(),
-                "-t".to_string(),
-                target.to_string(),
-            ]),
-            "herdr" => run_command_owned(&[
-                self.herdr_bin.clone(),
-                "agent".to_string(),
-                "attach".to_string(),
-                target.to_string(),
-            ]),
-            "cmux" => run_command_owned(&[
-                self.cmux_bin.clone(),
-                "select-workspace".to_string(),
-                "--workspace".to_string(),
-                target.to_string(),
-            ]),
+            "tmux" | "herdr" | "cmux" => run_commands(&self.attach_commands(target)),
             other => Err(format!("unsupported backend {other}")),
         }
     }
 
-    fn capture_commands(&self, target: &str, lines: usize) -> Vec<Value> {
+    fn capture_commands(&self, target: &str, lines: usize) -> Vec<Vec<String>> {
         match self.backend.as_str() {
-            "tmux" => vec![json!([
-                self.tmux_bin.clone(),
+            "tmux" => vec![cmd![
+                &self.tmux_bin,
                 "capture-pane",
                 "-pt",
                 target,
                 "-S",
-                format!("-{lines}")
-            ])],
-            "herdr" => vec![json!([
-                self.herdr_bin.clone(),
+                format!("-{lines}"),
+            ]],
+            "herdr" => vec![cmd![
+                &self.herdr_bin,
                 "agent",
                 "read",
                 target,
                 "--source",
                 "recent-unwrapped",
                 "--lines",
-                lines.to_string()
-            ])],
-            "cmux" => vec![json!([
-                self.cmux_bin.clone(),
+                lines,
+            ]],
+            "cmux" => vec![cmd![
+                &self.cmux_bin,
                 "read-screen",
                 "--workspace",
                 target,
                 "--scrollback",
                 "--lines",
-                lines.to_string()
-            ])],
+                lines,
+            ]],
             _ => Vec::new(),
         }
     }
 
     fn capture(&self, target: &str, lines: usize) -> Result<String, String> {
         match self.backend.as_str() {
-            "tmux" => run_command_output(&[
-                self.tmux_bin.clone(),
-                "capture-pane".to_string(),
-                "-pt".to_string(),
-                target.to_string(),
-                "-S".to_string(),
-                format!("-{lines}"),
-            ]),
-            "herdr" => run_command_output(&[
-                self.herdr_bin.clone(),
-                "agent".to_string(),
-                "read".to_string(),
-                target.to_string(),
-                "--source".to_string(),
-                "recent-unwrapped".to_string(),
-                "--lines".to_string(),
-                lines.to_string(),
-            ]),
-            "cmux" => run_command_output(&[
-                self.cmux_bin.clone(),
-                "read-screen".to_string(),
-                "--workspace".to_string(),
-                target.to_string(),
-                "--scrollback".to_string(),
-                "--lines".to_string(),
-                lines.to_string(),
-            ]),
+            "tmux" | "herdr" | "cmux" => {
+                run_command_output(first_command(&self.capture_commands(target, lines))?)
+            }
             other => Err(format!("unsupported backend {other}")),
         }
     }
 
-    fn stop_commands(&self, target: &str) -> Vec<Value> {
+    fn stop_commands(&self, target: &str) -> Vec<Vec<String>> {
         match self.backend.as_str() {
-            "tmux" => vec![json!([self.tmux_bin.clone(), "kill-session", "-t", target])],
-            "herdr" => vec![json!([self.herdr_bin.clone(), "pane", "close", target])],
-            "cmux" => vec![json!([
-                self.cmux_bin.clone(),
+            "tmux" => vec![cmd![&self.tmux_bin, "kill-session", "-t", target]],
+            "herdr" => vec![cmd![&self.herdr_bin, "pane", "close", target]],
+            "cmux" => vec![cmd![
+                &self.cmux_bin,
                 "close-workspace",
                 "--workspace",
                 target
-            ])],
+            ]],
             _ => Vec::new(),
         }
     }
 
     fn stop(&self, target: &str) -> Result<(), String> {
         match self.backend.as_str() {
-            "tmux" => run_command_owned(&[
-                self.tmux_bin.clone(),
-                "kill-session".to_string(),
-                "-t".to_string(),
-                target.to_string(),
-            ]),
-            "herdr" => run_command_owned(&[
-                self.herdr_bin.clone(),
-                "pane".to_string(),
-                "close".to_string(),
-                target.to_string(),
-            ]),
-            "cmux" => run_command_owned(&[
-                self.cmux_bin.clone(),
-                "close-workspace".to_string(),
-                "--workspace".to_string(),
-                target.to_string(),
-            ]),
+            "tmux" | "herdr" | "cmux" => run_commands(&self.stop_commands(target)),
             other => Err(format!("unsupported backend {other}")),
         }
     }
 }
 
+fn tmux_start_command(bin: &str, session: &str, cwd: &Path, command: &[String]) -> Vec<String> {
+    let shell_command = format!(
+        "cd {} && exec {}",
+        shell_quote(&cwd.display().to_string()),
+        shell_words(command)
+    );
+    cmd![
+        bin,
+        "new-session",
+        "-d",
+        "-s",
+        session,
+        "-x",
+        "140",
+        "-y",
+        "50",
+        shell_command,
+    ]
+}
+
+fn tmux_inject_commands(bin: &str, session: &str, text: &str) -> Vec<Vec<String>> {
+    let buffer = format!("rally-inject-{session}");
+    vec![
+        cmd![bin, "send-keys", "-t", session, "C-u"],
+        cmd![bin, "set-buffer", "-b", &buffer, text],
+        cmd![bin, "paste-buffer", "-b", buffer, "-t", session],
+        cmd![bin, "send-keys", "-t", session, "Enter"],
+    ]
+}
+
 fn herdr_start_command(bin: &str, target: &str, cwd: &Path, command: &[String]) -> Vec<String> {
-    let mut args = vec![
-        bin.to_string(),
-        "agent".to_string(),
-        "start".to_string(),
-        target.to_string(),
-        "--cwd".to_string(),
-        cwd.display().to_string(),
-        "--no-focus".to_string(),
-        "--".to_string(),
+    let mut args = cmd![
+        bin,
+        "agent",
+        "start",
+        target,
+        "--cwd",
+        cwd.display(),
+        "--no-focus",
+        "--",
     ];
     args.extend(command.iter().cloned());
     args
@@ -1118,19 +925,19 @@ fn cmux_start_command(
         }
     })
     .to_string();
-    vec![
-        bin.to_string(),
-        "new-workspace".to_string(),
-        "--name".to_string(),
-        name.to_string(),
-        "--description".to_string(),
-        target.to_string(),
-        "--cwd".to_string(),
-        cwd.display().to_string(),
-        "--layout".to_string(),
+    cmd![
+        bin,
+        "new-workspace",
+        "--name",
+        name,
+        "--description",
+        target,
+        "--cwd",
+        cwd.display(),
+        "--layout",
         layout,
-        "--focus".to_string(),
-        "false".to_string(),
+        "--focus",
+        "false",
     ]
 }
 
@@ -1170,7 +977,8 @@ mod tests {
 }
 
 fn herdr_live_pane(bin: &str, session: &ManagedSession) -> Result<String, String> {
-    let output = run_command_output(&[bin.to_string(), "agent".to_string(), "list".to_string()])?;
+    let command = cmd![bin, "agent", "list"];
+    let output = run_command_output(&command)?;
     if output.trim().is_empty() {
         return Ok(session.target.clone());
     }
@@ -1202,16 +1010,22 @@ fn herdr_live_pane(bin: &str, session: &ManagedSession) -> Result<String, String
     ))
 }
 
-fn run_command(bin: &str, args: &[&str]) -> Result<(), String> {
-    let status = Command::new(bin)
-        .args(args)
-        .status()
-        .map_err(|err| format!("run {bin}: {err}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{bin} exited with {status}"))
+fn command_plan_json(commands: &[Vec<String>]) -> Vec<Value> {
+    commands.iter().map(|command| json!(command)).collect()
+}
+
+fn first_command(commands: &[Vec<String>]) -> Result<&[String], String> {
+    commands
+        .first()
+        .map(Vec::as_slice)
+        .ok_or_else(|| "empty command plan".to_string())
+}
+
+fn run_commands(commands: &[Vec<String>]) -> Result<(), String> {
+    for command in commands {
+        run_command_owned(command)?;
     }
+    Ok(())
 }
 
 fn run_command_owned(args: &[String]) -> Result<(), String> {
@@ -1273,27 +1087,20 @@ fn read_session_records() -> Result<Vec<ManagedSession>, String> {
 }
 
 fn write_session_record(session: &ManagedSession) -> Result<(), String> {
-    let path = sessions_path()?;
     let mut sessions = read_session_records()?;
     sessions.retain(|existing| existing.session_id != session.session_id);
     sessions.push(session.clone());
-    let value = json!(
-        sessions
-            .iter()
-            .map(ManagedSession::to_json)
-            .collect::<Vec<_>>()
-    );
-    fs::write(
-        &path,
-        serde_json::to_string_pretty(&value).unwrap_or_default(),
-    )
-    .map_err(|err| format!("write {}: {err}", path.display()))
+    write_session_records(&sessions)
 }
 
 fn remove_session_record(session_id: &str) -> Result<(), String> {
-    let path = sessions_path()?;
     let mut sessions = read_session_records()?;
     sessions.retain(|existing| existing.session_id != session_id);
+    write_session_records(&sessions)
+}
+
+fn write_session_records(sessions: &[ManagedSession]) -> Result<(), String> {
+    let path = sessions_path()?;
     let value = json!(
         sessions
             .iter()
