@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:agent-rally2:command:say:v1",
-  "title": "Rally 2 Say Command",
+  "$id": "urn:agent-rally:command:say:v1",
+  "title": "Rally Say Command",
   "type": "object",
   "required": ["ok", "product", "command", "schema", "data"],
   "properties": {
     "ok": { "const": true },
-    "product": { "const": "rally2" },
+    "product": { "const": "rally" },
     "command": { "const": "say" },
-    "schema": { "const": "agent-rally2.command.say.v1" },
+    "schema": { "const": "agent-rally.command.say.v1" },
     "data": {
       "type": "object",
       "required": ["fact", "room"],

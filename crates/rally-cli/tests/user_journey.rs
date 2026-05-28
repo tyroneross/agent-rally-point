@@ -42,7 +42,7 @@ impl Workspace {
     }
 
     fn output(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_rally2"))
+        Command::new(env!("CARGO_BIN_EXE_rally"))
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
             .args(args)
@@ -131,8 +131,8 @@ fn type_matches(type_schema: &Value, value: &Value) -> bool {
 }
 
 #[test]
-fn rally2_uses_factstr_sqlite_as_the_fact_store() {
-    let workspace = Workspace::new("rally2-factstr-store");
+fn rally_uses_factstr_sqlite_as_the_fact_store() {
+    let workspace = Workspace::new("rally-factstr-store");
 
     workspace.json(&[
         "say",
@@ -143,10 +143,10 @@ fn rally2_uses_factstr_sqlite_as_the_fact_store() {
         "--subject",
         "complete fact",
     ]);
-    assert!(workspace.cwd.join(".rally2/facts.db").exists());
-    assert!(!workspace.cwd.join(".rally2/facts.jsonl").exists());
+    assert!(workspace.cwd.join(".rally/facts.db").exists());
+    assert!(!workspace.cwd.join(".rally/facts.jsonl").exists());
 
-    fs::remove_file(workspace.cwd.join(".rally2/room.db")).unwrap();
+    fs::remove_file(workspace.cwd.join(".rally/room.db")).unwrap();
 
     let room = workspace.json(&["room", "--json"]);
     assert_eq!(room["ok"], true);
@@ -156,8 +156,8 @@ fn rally2_uses_factstr_sqlite_as_the_fact_store() {
 }
 
 #[test]
-fn rally2_agent_enters_room_checks_work_and_says_artifact() {
-    let workspace = Workspace::new("rally2-room");
+fn rally_agent_enters_room_checks_work_and_says_artifact() {
+    let workspace = Workspace::new("rally-room");
 
     let claim = workspace.json(&[
         "say",
@@ -170,9 +170,9 @@ fn rally2_agent_enters_room_checks_work_and_says_artifact() {
         "--subject",
         "shape room projection",
     ]);
-    assert_eq!(claim["schema"], "agent-rally2.command.say.v1");
-    assert_matches_schema("agent-rally2.command.say.v1.json", &claim);
-    assert_matches_schema("agent-rally2.fact.v1.json", &claim["data"]["fact"]);
+    assert_eq!(claim["schema"], "agent-rally.command.say.v1");
+    assert_matches_schema("agent-rally.command.say.v1.json", &claim);
+    assert_matches_schema("agent-rally.fact.v1.json", &claim["data"]["fact"]);
     let claim_id = claim["data"]["fact"]["event_id"].as_str().unwrap();
 
     workspace.json(&[
@@ -182,7 +182,7 @@ fn rally2_agent_enters_room_checks_work_and_says_artifact() {
         "--tool",
         "pi",
         "--subject",
-        "Rally 2 uses enter/say/room/check",
+        "Rally uses enter/say/room/check",
         "--path",
         "src/room.rs",
     ]);
@@ -197,8 +197,8 @@ fn rally2_agent_enters_room_checks_work_and_says_artifact() {
         "--path",
         "src/room.rs",
     ]);
-    assert_eq!(enter["schema"], "agent-rally2.command.enter.v1");
-    assert_matches_schema("agent-rally2.command.enter.v1.json", &enter);
+    assert_eq!(enter["schema"], "agent-rally.command.enter.v1");
+    assert_matches_schema("agent-rally.command.enter.v1.json", &enter);
     assert_eq!(enter["data"]["adapter"]["adapter"], "codex");
     assert_eq!(enter["data"]["adapter"]["first_class"], true);
     assert!(
@@ -213,7 +213,7 @@ fn rally2_agent_enters_room_checks_work_and_says_artifact() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item["subject"] == "Rally 2 uses enter/say/room/check")
+            .any(|item| item["subject"] == "Rally uses enter/say/room/check")
     );
 
     let (check, check_output) = workspace.json_with_status(&[
@@ -227,8 +227,8 @@ fn rally2_agent_enters_room_checks_work_and_says_artifact() {
         "--strict",
     ]);
     assert_eq!(check_output.status.code(), Some(4));
-    assert_eq!(check["schema"], "agent-rally2.command.check.v1");
-    assert_matches_schema("agent-rally2.command.check.v1.json", &check);
+    assert_eq!(check["schema"], "agent-rally.command.check.v1");
+    assert_matches_schema("agent-rally.command.check.v1.json", &check);
     assert_eq!(check["data"]["check"]["allow"], false);
     assert!(
         check["data"]["check"]["findings"]
@@ -249,15 +249,15 @@ fn rally2_agent_enters_room_checks_work_and_says_artifact() {
         "--uri",
         "src/room.rs",
         "--evidence",
-        "cargo test -p rally2-cli rally2_agent_enters_room_checks_work_and_says_artifact",
+        "cargo test -p rally-cli rally_agent_enters_room_checks_work_and_says_artifact",
     ]);
     let room_without_export = workspace.json(&["room", "--json"]);
     assert!(!workspace.cwd.join("HANDOFF.md").exists());
     assert_eq!(room_without_export["data"]["exported_handoff"], Value::Null);
 
     let room = workspace.json(&["room", "--json", "--export-handoff"]);
-    assert_eq!(room["schema"], "agent-rally2.command.room.v1");
-    assert_matches_schema("agent-rally2.command.room.v1.json", &room);
+    assert_eq!(room["schema"], "agent-rally.command.room.v1");
+    assert_matches_schema("agent-rally.command.room.v1.json", &room);
     assert_eq!(
         room["data"]["room"]["active_claims"]
             .as_array()
@@ -287,9 +287,9 @@ fn rally2_agent_enters_room_checks_work_and_says_artifact() {
     assert!(handoff.contains("## Do Not Touch"));
     assert!(handoff.contains("## Active Work"));
     assert!(handoff.contains("room projection implemented"));
-    assert!(workspace.cwd.join(".rally2/facts.db").exists());
-    assert!(workspace.cwd.join(".rally2/room.db").exists());
-    let conn = Connection::open(workspace.cwd.join(".rally2/room.db")).unwrap();
+    assert!(workspace.cwd.join(".rally/facts.db").exists());
+    assert!(workspace.cwd.join(".rally/room.db").exists());
+    let conn = Connection::open(workspace.cwd.join(".rally/room.db")).unwrap();
     let graph_edges: i64 = conn
         .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
         .unwrap();
@@ -299,31 +299,31 @@ fn rally2_agent_enters_room_checks_work_and_says_artifact() {
 }
 
 #[test]
-fn rally2_is_not_a_command_fallback() {
-    let workspace = Workspace::new("rally2-no-fallback");
+fn rally_is_not_a_command_fallback() {
+    let workspace = Workspace::new("rally-no-fallback");
     let help = workspace.output(&["--help"]);
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("rally2 enter --tool <tool>"));
-    assert!(String::from_utf8_lossy(&help.stdout).contains("rally2 next --tool <tool>"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("rally enter --tool <tool>"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("rally next --tool <tool>"));
 
     let output = workspace.output(&["context", "--json", "--tool", "codex"]);
     assert!(!output.status.success());
     let error: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(error["ok"], false);
-    assert_eq!(error["product"], "rally2");
+    assert_eq!(error["product"], "rally");
     assert_eq!(error["exit_code"], 2);
     assert!(
         error["error"]
             .as_str()
             .unwrap()
-            .contains("unknown Rally 2 command context")
+            .contains("unknown Rally command context")
     );
     workspace.cleanup();
 }
 
 #[test]
-fn rally2_next_finds_useful_work_while_waiting() {
-    let workspace = Workspace::new("rally2-next-useful");
+fn rally_next_finds_useful_work_while_waiting() {
+    let workspace = Workspace::new("rally-next-useful");
     let handoff = workspace.json(&[
         "say",
         "handoff",
@@ -352,8 +352,8 @@ fn rally2_next_finds_useful_work_while_waiting() {
     let artifact_id = artifact["data"]["fact"]["event_id"].as_str().unwrap();
 
     let next = workspace.json(&["next", "--json", "--tool", "codex", "--limit", "4"]);
-    assert_eq!(next["schema"], "agent-rally2.command.next.v1");
-    assert_matches_schema("agent-rally2.command.next.v1.json", &next);
+    assert_eq!(next["schema"], "agent-rally.command.next.v1");
+    assert_matches_schema("agent-rally.command.next.v1.json", &next);
     assert_eq!(next["data"]["next"]["mode"], "useful_while_waiting");
     assert_eq!(next["data"]["next"]["action"], "review_artifact");
     assert_eq!(next["data"]["next"]["actionable"], true);
@@ -375,7 +375,7 @@ fn rally2_next_finds_useful_work_while_waiting() {
             .any(|item| item
                 .as_str()
                 .unwrap()
-                .contains("rally2 say artifact --tool codex --ref"))
+                .contains("rally say artifact --tool codex --ref"))
     );
     assert_eq!(
         next["data"]["next"]["completion"]["record_kind"],
@@ -401,8 +401,8 @@ fn rally2_next_finds_useful_work_while_waiting() {
 }
 
 #[test]
-fn rally2_next_waits_only_when_no_useful_work_exists() {
-    let workspace = Workspace::new("rally2-next-wait");
+fn rally_next_waits_only_when_no_useful_work_exists() {
+    let workspace = Workspace::new("rally-next-wait");
     let handoff = workspace.json(&[
         "say",
         "handoff",
@@ -416,12 +416,12 @@ fn rally2_next_waits_only_when_no_useful_work_exists() {
         "--summary",
         "Claude has enough context to review the clean rewrite.",
         "--evidence",
-        "cargo test -p rally2-cli",
+        "cargo test -p rally-cli",
     ]);
     let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
 
     let next = workspace.json(&["next", "--json", "--tool", "codex"]);
-    assert_matches_schema("agent-rally2.command.next.v1.json", &next);
+    assert_matches_schema("agent-rally.command.next.v1.json", &next);
     assert_eq!(next["data"]["next"]["mode"], "waiting");
     assert_eq!(next["data"]["next"]["action"], "wait");
     assert_eq!(next["data"]["next"]["actionable"], false);
@@ -461,8 +461,8 @@ fn rally2_next_waits_only_when_no_useful_work_exists() {
 }
 
 #[test]
-fn rally2_exposes_required_first_class_adapters() {
-    let workspace = Workspace::new("rally2-adapters");
+fn rally_exposes_required_first_class_adapters() {
+    let workspace = Workspace::new("rally-adapters");
     let expected = ["codex", "claude_code", "pi", "herdr", "cmux", "ci"];
 
     for tool in expected {
@@ -471,7 +471,7 @@ fn rally2_exposes_required_first_class_adapters() {
         assert_eq!(entered["data"]["adapter"]["first_class"], true);
         assert_eq!(
             entered["data"]["adapter"]["commands"]["enter"],
-            format!("rally2 enter --tool {tool} --json")
+            format!("rally enter --tool {tool} --json")
         );
         assert!(entered["data"]["adapter"]["commands"]["next"].is_null());
         if matches!(tool, "codex" | "claude_code" | "pi") {
@@ -509,7 +509,7 @@ fn rally2_exposes_required_first_class_adapters() {
             .unwrap();
         assert_eq!(
             adapter["commands"]["check_before_write"],
-            format!("rally2 check before-write --tool {tool} --path <path> --json")
+            format!("rally check before-write --tool {tool} --path <path> --json")
         );
         assert!(adapter["commands"]["next_for_path"].is_null());
     }
@@ -518,8 +518,8 @@ fn rally2_exposes_required_first_class_adapters() {
 }
 
 #[test]
-fn rally2_entry_and_handoff_split_response_and_work_buckets() {
-    let workspace = Workspace::new("rally2-entry-buckets");
+fn rally_entry_and_handoff_split_response_and_work_buckets() {
+    let workspace = Workspace::new("rally-entry-buckets");
     workspace.json(&[
         "say",
         "claim",
@@ -586,41 +586,40 @@ fn rally2_entry_and_handoff_split_response_and_work_buckets() {
 }
 
 #[test]
-fn rally2_installs_guard_adapter_glue() {
-    let workspace = Workspace::new("rally2-install");
+fn rally_installs_guard_adapter_glue() {
+    let workspace = Workspace::new("rally-install");
 
     let dry_run = workspace.json(&[
         "install",
         "codex",
         "--json",
         "--dry-run",
-        "--rally2-bin",
-        "/tmp/rally2",
+        "--rally-bin",
+        "/tmp/rally",
     ]);
-    assert_eq!(dry_run["schema"], "agent-rally2.command.install.v1");
-    assert_matches_schema("agent-rally2.command.install.v1.json", &dry_run);
+    assert_eq!(dry_run["schema"], "agent-rally.command.install.v1");
+    assert_matches_schema("agent-rally.command.install.v1.json", &dry_run);
     assert_eq!(dry_run["data"]["mode"], "dry-run");
-    assert!(!workspace.home.join(".codex/hooks/rally2-hook.sh").exists());
+    assert!(!workspace.home.join(".codex/hooks/rally-hook.sh").exists());
 
-    let installed = workspace.json(&["install", "codex", "--json", "--rally2-bin", "/tmp/rally2"]);
+    let installed = workspace.json(&["install", "codex", "--json", "--rally-bin", "/tmp/rally"]);
     assert_eq!(installed["data"]["adapters"][0]["adapter"], "codex");
-    let script = fs::read_to_string(workspace.home.join(".codex/hooks/rally2-hook.sh")).unwrap();
-    assert!(script.contains("agent-rally2-install-v1"));
-    assert!(script.contains("/tmp/rally2"));
+    let script = fs::read_to_string(workspace.home.join(".codex/hooks/rally-hook.sh")).unwrap();
+    assert!(script.contains("agent-rally-install-v1"));
+    assert!(script.contains("/tmp/rally"));
     assert!(!script.contains("next --tool"));
-    assert!(!script.contains("Rally 2 next"));
-    assert!(!script.contains("Rally 2 room"));
+    assert!(!script.contains("Rally next"));
+    assert!(!script.contains("Rally room"));
     assert!(!script.contains("user-prompt"));
     assert!(!script.contains("before-complete"));
     let hooks = fs::read_to_string(workspace.home.join(".codex/hooks.json")).unwrap();
-    assert!(hooks.contains("rally2-hook.sh"));
+    assert!(hooks.contains("rally-hook.sh"));
     assert!(!hooks.contains("session-start codex"));
     assert!(!hooks.contains("\"UserPromptSubmit\""));
     assert!(!hooks.contains("\"Stop\""));
     assert!(!hooks.contains("before-complete codex"));
 
-    let reinstalled =
-        workspace.json(&["install", "codex", "--json", "--rally2-bin", "/tmp/rally2"]);
+    let reinstalled = workspace.json(&["install", "codex", "--json", "--rally-bin", "/tmp/rally"]);
     let config_actions = reinstalled["data"]["adapters"][0]["actions"]
         .as_array()
         .unwrap()
@@ -631,78 +630,68 @@ fn rally2_installs_guard_adapter_glue() {
 
     let uninstalled = workspace.json(&["install", "codex", "--json", "--uninstall"]);
     assert_eq!(uninstalled["data"]["mode"], "uninstall");
-    assert!(!workspace.home.join(".codex/hooks/rally2-hook.sh").exists());
+    assert!(!workspace.home.join(".codex/hooks/rally-hook.sh").exists());
     let hooks = fs::read_to_string(workspace.home.join(".codex/hooks.json")).unwrap();
-    assert!(!hooks.contains("rally2-hook.sh"));
+    assert!(!hooks.contains("rally-hook.sh"));
 
     workspace.cleanup();
 }
 
 #[test]
-fn rally2_installs_every_required_adapter_surface() {
-    let workspace = Workspace::new("rally2-install-all");
-    let installed = workspace.json(&[
-        "install",
-        "all",
-        "--json",
-        "--rally2-bin",
-        "/opt/bin/rally2",
-    ]);
-    assert_matches_schema("agent-rally2.command.install.v1.json", &installed);
+fn rally_installs_every_required_adapter_surface() {
+    let workspace = Workspace::new("rally-install-all");
+    let installed = workspace.json(&["install", "all", "--json", "--rally-bin", "/opt/bin/rally"]);
+    assert_matches_schema("agent-rally.command.install.v1.json", &installed);
     assert_eq!(installed["data"]["adapters"].as_array().unwrap().len(), 6);
-    assert!(workspace.home.join(".codex/hooks/rally2-hook.sh").exists());
-    assert!(workspace.home.join(".claude/hooks/rally2-hook.sh").exists());
+    assert!(workspace.home.join(".codex/hooks/rally-hook.sh").exists());
+    assert!(workspace.home.join(".claude/hooks/rally-hook.sh").exists());
     assert!(
         workspace
             .home
-            .join(".pi/agent/extensions/rally2-guard.ts")
+            .join(".pi/agent/extensions/rally-guard.ts")
             .exists()
     );
     assert!(
         workspace
             .home
-            .join(".config/herdr/integrations/rally2.json")
+            .join(".config/herdr/integrations/rally.json")
             .exists()
     );
     assert!(
         workspace
             .home
-            .join(".config/cmux/rally2-integration.json")
+            .join(".config/cmux/rally-integration.json")
             .exists()
     );
     assert!(
         workspace
             .home
-            .join(".config/rally2/ci/github-actions-rally2.yml")
+            .join(".config/rally/ci/github-actions-rally.yml")
             .exists()
     );
 
     let pi_extension =
-        fs::read_to_string(workspace.home.join(".pi/agent/extensions/rally2-guard.ts")).unwrap();
-    assert!(pi_extension.contains("rally2Guard"));
-    assert!(pi_extension.contains("/opt/bin/rally2"));
+        fs::read_to_string(workspace.home.join(".pi/agent/extensions/rally-guard.ts")).unwrap();
+    assert!(pi_extension.contains("rallyGuard"));
+    assert!(pi_extension.contains("/opt/bin/rally"));
     assert!(!pi_extension.contains("\"next\", \"--tool\", \"pi\""));
     assert!(!pi_extension.contains("sendMessage"));
     assert!(!pi_extension.contains("session_start"));
     assert!(!pi_extension.contains("before_agent_start"));
 
-    let herdr_integration = fs::read_to_string(
-        workspace
-            .home
-            .join(".config/herdr/integrations/rally2.json"),
-    )
-    .unwrap();
+    let herdr_integration =
+        fs::read_to_string(workspace.home.join(".config/herdr/integrations/rally.json")).unwrap();
     assert!(!herdr_integration.contains("\"next\""));
-    assert!(herdr_integration.contains("rally2 run --backend herdr"));
+    assert!(herdr_integration.contains("rally run --backend herdr"));
 
     let cmux_integration =
-        fs::read_to_string(workspace.home.join(".config/cmux/rally2-integration.json")).unwrap();
+        fs::read_to_string(workspace.home.join(".config/cmux/rally-integration.json")).unwrap();
     assert!(!cmux_integration.contains("\"next\""));
 
     let ci_workflow = fs::read_to_string(
         workspace
             .home
-            .join(".config/rally2/ci/github-actions-rally2.yml"),
+            .join(".config/rally/ci/github-actions-rally.yml"),
     )
     .unwrap();
     assert!(!ci_workflow.contains("next --tool ci --json"));
@@ -711,8 +700,8 @@ fn rally2_installs_every_required_adapter_surface() {
 }
 
 #[test]
-fn rally2_runs_and_injects_managed_tmux_sessions() {
-    let workspace = Workspace::new("rally2-run-tmux");
+fn rally_runs_and_injects_managed_tmux_sessions() {
+    let workspace = Workspace::new("rally-run-tmux");
 
     let run = workspace.json(&[
         "run",
@@ -725,8 +714,8 @@ fn rally2_runs_and_injects_managed_tmux_sessions() {
         "--tmux-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(run["schema"], "agent-rally2.command.run.v1");
-    assert_matches_schema("agent-rally2.command.run.v1.json", &run);
+    assert_eq!(run["schema"], "agent-rally.command.run.v1");
+    assert_matches_schema("agent-rally.command.run.v1.json", &run);
     assert_eq!(run["data"]["session"]["name"], "reviewer");
     assert_eq!(run["data"]["session"]["agent"], "claude");
     assert_eq!(run["data"]["session"]["tool"], "claude_code:reviewer");
@@ -742,8 +731,8 @@ fn rally2_runs_and_injects_managed_tmux_sessions() {
     );
 
     let sessions = workspace.json(&["sessions", "--json"]);
-    assert_eq!(sessions["schema"], "agent-rally2.command.sessions.v1");
-    assert_matches_schema("agent-rally2.command.sessions.v1.json", &sessions);
+    assert_eq!(sessions["schema"], "agent-rally.command.sessions.v1");
+    assert_matches_schema("agent-rally.command.sessions.v1.json", &sessions);
     assert_eq!(sessions["data"]["sessions"].as_array().unwrap().len(), 1);
     assert_eq!(sessions["data"]["sessions"][0]["name"], "reviewer");
 
@@ -756,8 +745,8 @@ fn rally2_runs_and_injects_managed_tmux_sessions() {
         "--tmux-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(inject["schema"], "agent-rally2.command.inject.v1");
-    assert_matches_schema("agent-rally2.command.inject.v1.json", &inject);
+    assert_eq!(inject["schema"], "agent-rally.command.inject.v1");
+    assert_matches_schema("agent-rally.command.inject.v1.json", &inject);
     assert_eq!(inject["data"]["session"]["name"], "reviewer");
     assert_eq!(inject["data"]["commands"].as_array().unwrap().len(), 4);
 
@@ -808,8 +797,8 @@ fn rally2_runs_and_injects_managed_tmux_sessions() {
         "--tmux-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(capture["schema"], "agent-rally2.command.session-action.v1");
-    assert_matches_schema("agent-rally2.command.session-action.v1.json", &capture);
+    assert_eq!(capture["schema"], "agent-rally.command.session-action.v1");
+    assert_matches_schema("agent-rally.command.session-action.v1.json", &capture);
     assert_eq!(capture["data"]["action"], "capture");
     assert_eq!(capture["data"]["output"], "");
 
@@ -821,8 +810,8 @@ fn rally2_runs_and_injects_managed_tmux_sessions() {
         "--tmux-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(attach["schema"], "agent-rally2.command.session-action.v1");
-    assert_matches_schema("agent-rally2.command.session-action.v1.json", &attach);
+    assert_eq!(attach["schema"], "agent-rally.command.session-action.v1");
+    assert_matches_schema("agent-rally.command.session-action.v1.json", &attach);
     assert_eq!(attach["data"]["commands"][0][1], "attach");
 
     let dry_run = workspace.json(&[
@@ -840,8 +829,8 @@ fn rally2_runs_and_injects_managed_tmux_sessions() {
     assert_eq!(sessions["data"]["sessions"].as_array().unwrap().len(), 1);
 
     let stop = workspace.json(&["stop", "reviewer", "--json", "--tmux-bin", "/usr/bin/true"]);
-    assert_eq!(stop["schema"], "agent-rally2.command.session-action.v1");
-    assert_matches_schema("agent-rally2.command.session-action.v1.json", &stop);
+    assert_eq!(stop["schema"], "agent-rally.command.session-action.v1");
+    assert_matches_schema("agent-rally.command.session-action.v1.json", &stop);
     assert_eq!(stop["data"]["action"], "stop");
     let sessions = workspace.json(&["sessions", "--json"]);
     assert_eq!(sessions["data"]["sessions"].as_array().unwrap().len(), 0);
@@ -850,8 +839,8 @@ fn rally2_runs_and_injects_managed_tmux_sessions() {
 }
 
 #[test]
-fn rally2_uses_native_herdr_and_cmux_managed_session_commands() {
-    let workspace = Workspace::new("rally2-native-session-backends");
+fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
+    let workspace = Workspace::new("rally-native-session-backends");
 
     let herdr = workspace.json(&[
         "run",
@@ -864,8 +853,8 @@ fn rally2_uses_native_herdr_and_cmux_managed_session_commands() {
         "--herdr-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(herdr["schema"], "agent-rally2.command.run.v1");
-    assert_matches_schema("agent-rally2.command.run.v1.json", &herdr);
+    assert_eq!(herdr["schema"], "agent-rally.command.run.v1");
+    assert_matches_schema("agent-rally.command.run.v1.json", &herdr);
     assert_eq!(herdr["data"]["session"]["backend"], "herdr");
     assert_eq!(herdr["data"]["session"]["target"], "claude-herdr-reviewer");
     assert_eq!(herdr["data"]["commands"]["start"][0][1], "agent");
@@ -898,10 +887,7 @@ fn rally2_uses_native_herdr_and_cmux_managed_session_commands() {
         "--lines",
         "30",
     ]);
-    assert_matches_schema(
-        "agent-rally2.command.session-action.v1.json",
-        &herdr_capture,
-    );
+    assert_matches_schema("agent-rally.command.session-action.v1.json", &herdr_capture);
     assert_eq!(herdr_capture["data"]["commands"][0][1], "agent");
     assert_eq!(herdr_capture["data"]["commands"][0][2], "read");
 
@@ -916,8 +902,8 @@ fn rally2_uses_native_herdr_and_cmux_managed_session_commands() {
         "--cmux-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(cmux["schema"], "agent-rally2.command.run.v1");
-    assert_matches_schema("agent-rally2.command.run.v1.json", &cmux);
+    assert_eq!(cmux["schema"], "agent-rally.command.run.v1");
+    assert_matches_schema("agent-rally.command.run.v1.json", &cmux);
     assert_eq!(cmux["data"]["session"]["backend"], "cmux");
     assert_eq!(cmux["data"]["session"]["target"], "codex-cmux-builder");
     assert_eq!(cmux["data"]["commands"]["start"][0][1], "new-workspace");
@@ -985,8 +971,8 @@ fn rally2_uses_native_herdr_and_cmux_managed_session_commands() {
 }
 
 #[test]
-fn rally2_room_is_queryable_by_tool_role_path_event_thread_and_since() {
-    let workspace = Workspace::new("rally2-query");
+fn rally_room_is_queryable_by_tool_role_path_event_thread_and_since() {
+    let workspace = Workspace::new("rally-query");
     let claim = workspace.json(&[
         "say",
         "claim",
@@ -1081,13 +1067,13 @@ fn rally2_room_is_queryable_by_tool_role_path_event_thread_and_since() {
 }
 
 #[test]
-fn rally2_json_errors_use_agent_cli_exit_codes() {
-    let workspace = Workspace::new("rally2-json-errors");
+fn rally_json_errors_use_agent_cli_exit_codes() {
+    let workspace = Workspace::new("rally-json-errors");
     let unknown = workspace.output(&["nope", "--json"]);
     assert_eq!(unknown.status.code(), Some(2));
     let body: Value = serde_json::from_slice(&unknown.stderr).unwrap();
     assert_eq!(body["ok"], false);
-    assert_eq!(body["product"], "rally2");
+    assert_eq!(body["product"], "rally");
     assert_eq!(body["exit_code"], 2);
 
     let invalid = workspace.output(&["room", "--json", "--since", "later"]);
@@ -1100,8 +1086,8 @@ fn rally2_json_errors_use_agent_cli_exit_codes() {
 }
 
 #[test]
-fn rally2_flags_do_not_silently_consume_positionals() {
-    let workspace = Workspace::new("rally2-argbag-flags");
+fn rally_flags_do_not_silently_consume_positionals() {
+    let workspace = Workspace::new("rally-argbag-flags");
 
     let fact = workspace.json(&[
         "say",
@@ -1123,8 +1109,8 @@ fn rally2_flags_do_not_silently_consume_positionals() {
 }
 
 #[test]
-fn rally2_check_covers_artifacts_and_completion_boundaries() {
-    let workspace = Workspace::new("rally2-check-phases");
+fn rally_check_covers_artifacts_and_completion_boundaries() {
+    let workspace = Workspace::new("rally-check-phases");
     workspace.json(&[
         "say",
         "claim",
@@ -1176,8 +1162,8 @@ fn rally2_check_covers_artifacts_and_completion_boundaries() {
 }
 
 #[test]
-fn rally2_supports_all_required_fact_kinds() {
-    let workspace = Workspace::new("rally2-facts");
+fn rally_supports_all_required_fact_kinds() {
+    let workspace = Workspace::new("rally-facts");
     let kinds = [
         "claim", "release", "blocker", "resolve", "decision", "artifact", "handoff", "risk",
         "lesson",
@@ -1198,9 +1184,9 @@ fn rally2_supports_all_required_fact_kinds() {
             "observed",
         ]);
         assert_eq!(fact["data"]["fact"]["kind"], kind);
-        assert_eq!(fact["data"]["fact"]["schema"], "agent-rally2.fact.v1");
+        assert_eq!(fact["data"]["fact"]["schema"], "agent-rally.fact.v1");
         DateTime::parse_from_rfc3339(fact["data"]["fact"]["created_at"].as_str().unwrap()).unwrap();
-        assert_matches_schema("agent-rally2.fact.v1.json", &fact["data"]["fact"]);
+        assert_matches_schema("agent-rally.fact.v1.json", &fact["data"]["fact"]);
     }
 
     let room = workspace.json(&["room", "--json"]);

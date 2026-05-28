@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:agent-rally2:command:session-action:v1",
-  "title": "Rally 2 Session Action Command",
+  "$id": "urn:agent-rally:command:session-action:v1",
+  "title": "Rally Session Action Command",
   "type": "object",
   "required": ["ok", "product", "command", "schema", "data"],
   "properties": {
     "ok": { "const": true },
-    "product": { "const": "rally2" },
+    "product": { "const": "rally" },
     "command": { "type": "string" },
-    "schema": { "const": "agent-rally2.command.session-action.v1" },
+    "schema": { "const": "agent-rally.command.session-action.v1" },
     "data": {
       "type": "object",
       "required": ["mode", "action", "session", "output", "commands"],

@@ -1,25 +1,25 @@
 # Agent Rally Point
 
-> Rally 2 is a repo-local coordination room for coding agents working in the
+> Rally is a repo-local coordination room for coding agents working in the
 > same checkout: durable facts, current room state, next-action guidance, and
 > write-boundary checks without a server.
 
-The only shipped coordination command is `rally2`.
+The only shipped coordination command is `rally`.
 
 ## Start Here
 
 New agent or human dropping in? Read [`RALLY.md`](RALLY.md). It is the short
-operating guide for the Rally 2 loop.
+operating guide for the Rally loop.
 
-The full product boundary is [`docs/RALLY_2_ARCHITECTURE.md`](docs/RALLY_2_ARCHITECTURE.md).
+The full product boundary is [`docs/RALLY_ARCHITECTURE.md`](docs/RALLY_ARCHITECTURE.md).
 
 ## Status
 
-Rally 2 owns the primary product path:
+Rally owns the primary product path:
 
-- `rally2` is the primary CLI.
-- `.rally2/facts.db` is the durable fact store.
-- `.rally2/room.db` is the rebuildable SQLite room projection.
+- `rally` is the primary CLI.
+- `.rally/facts.db` is the durable fact store.
+- `.rally/room.db` is the rebuildable SQLite room projection.
 - `enter`, `next`, `say`, `room`, `check`, `install`, `run`, `sessions`,
   `inject`, `attach`, `capture`, and `stop` are the load-bearing commands.
 - Adapter setup installs write-boundary guards where available; managed
@@ -30,26 +30,26 @@ or a future service can move facts; Rally defines what the bytes mean.
 
 ## Install
 
-Install the primary Rally 2 CLI from the checkout:
+Install the primary Rally CLI from the checkout:
 
 ```bash
 git clone https://github.com/tyroneross/agent-rally-point.git
 cd agent-rally-point
-cargo install --path crates/rally2-cli
-rally2 enter --tool codex --json
-rally2 next --tool codex --json
+cargo install --path crates/rally-cli
+rally enter --tool codex --json
+rally next --tool codex --json
 ```
 
-## Rally 2 Command Surface
+## Rally Command Surface
 
 The primary loop is intentionally small:
 
 ```bash
-rally2 enter --tool codex --json
-rally2 next --tool codex --json
-rally2 check before-write --tool codex --path crates/foo.rs --strict --json
-rally2 say artifact --tool codex --subject "implementation complete" --uri crates/foo.rs --evidence "cargo test" --json
-rally2 room --json
+rally enter --tool codex --json
+rally next --tool codex --json
+rally check before-write --tool codex --path crates/foo.rs --strict --json
+rally say artifact --tool codex --subject "implementation complete" --uri crates/foo.rs --evidence "cargo test" --json
+rally room --json
 ```
 
 The autonomous act-on-next contract is:
@@ -59,31 +59,31 @@ enter -> next -> if actionable, claim/check -> execute -> verify
       -> say artifact/handoff/resolve/release -> next
 ```
 
-`rally2 next` returns `actionable`, `requires_human`, `stop_reason`,
+`rally next` returns `actionable`, `requires_human`, `stop_reason`,
 `suggested_claims`, `suggested_commands`, and `completion` so an agent harness
 can act without turning Rally into a scheduler or coding agent.
 
 Useful fact writes:
 
 ```bash
-rally2 say claim --tool codex --subject "edit parser" --path crates/rally2-cli/src/main.rs --json
-rally2 say release --tool codex --ref <claim-id> --subject "done" --json
-rally2 say blocker --tool codex --subject "need merge decision" --severity high --json
-rally2 say resolve --tool codex --ref <blocker-id> --subject "resolved" --json
-rally2 say decision --tool codex --subject "Rally 2 is primary" --status binding --json
-rally2 say handoff --tool codex --target claude_code --subject "review docs" --summary "Rally 2 is now primary" --json
+rally say claim --tool codex --subject "edit parser" --path crates/rally-cli/src/main.rs --json
+rally say release --tool codex --ref <claim-id> --subject "done" --json
+rally say blocker --tool codex --subject "need merge decision" --severity high --json
+rally say resolve --tool codex --ref <blocker-id> --subject "resolved" --json
+rally say decision --tool codex --subject "Rally is primary" --status binding --json
+rally say handoff --tool codex --target claude_code --subject "review docs" --summary "Rally is now primary" --json
 ```
 
 Adapter setup:
 
 ```bash
-rally2 install codex --dry-run --json
-rally2 install codex --json
-rally2 install all --json
-rally2 install codex --uninstall --json
+rally install codex --dry-run --json
+rally install codex --json
+rally install all --json
+rally install codex --uninstall --json
 ```
 
-Rally 2 installers write only Rally 2-owned hook scripts, snippets, extensions,
+Rally installers write only Rally-owned hook scripts, snippets, extensions,
 and config entries.
 
 ## Verification
@@ -104,7 +104,7 @@ Rust 1.85 even when newer stable compilers accept newer syntax.
 
 The short version:
 
-- Rally 2 is the primary product.
+- Rally is the primary product.
 - The product model is room, fact, enter, next, say, check.
 - The room projection is SQLite-backed derived state.
 - JSON contracts are designed for agents first.

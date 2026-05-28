@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "rally2-cli"
+name = "rally-cli"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "rally2"
+name = "rally"
 path = "src/main.rs"
 
 [dependencies]

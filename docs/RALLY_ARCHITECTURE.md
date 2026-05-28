@@ -1,11 +1,11 @@
-# Rally 2.0 Architecture
+# Rally Architecture
 
-Rally 2.0 is a repo-local coordination layer for parallel goal-driven agents.
+Rally is a repo-local coordination layer for parallel goal-driven agents.
 It is not a conductor, task runner, dashboard, or coding agent. Its job is to
 keep shared room state correct, fresh, and visible before agents act.
 
-Rally 2.0 is the Agent Rally Point product path. The repository ships one
-coordination CLI: `rally2`.
+Rally is the Agent Rally Point product path. The repository ships one
+coordination CLI: `rally`.
 
 Product sentence:
 
@@ -43,8 +43,8 @@ Rally should not own:
 ## Architecture
 
 ```text
-.rally2/facts.db     canonical append-only typed fact store (factstr-sqlite)
-.rally2/room.db      live SQLite room projection/index derived from facts.db
+.rally/facts.db     canonical append-only typed fact store (factstr-sqlite)
+.rally/room.db      live SQLite room projection/index derived from facts.db
 enter/next/room/check product APIs backed by the projection
 HANDOFF.md           optional plain-text snapshot export
 adapters             Codex, Claude, Pi, Herdr, cmux, CI integration
@@ -62,11 +62,11 @@ end-of-session snapshots.
 The greenfield surface should be small:
 
 ```bash
-rally2 enter --tool codex    # agent entry state + changed attention
-rally2 next --tool codex     # ranked next action when idle or waiting
-rally2 say <kind> ...        # append a typed coordination fact
-rally2 room --json           # inspect current projected room state
-rally2 check before-write    # boundary check before shared work changes
+rally enter --tool codex    # agent entry state + changed attention
+rally next --tool codex     # ranked next action when idle or waiting
+rally say <kind> ...        # append a typed coordination fact
+rally room --json           # inspect current projected room state
+rally check before-write    # boundary check before shared work changes
 ```
 
 Everything else is debug, admin, or adapter plumbing. `HANDOFF.md` export and
@@ -90,17 +90,17 @@ when another agent acts -> rally inject routes the obligation to a managed sessi
 
 The product succeeds when agents know Rally through repeated interaction:
 
-- At startup, `rally2 run` starts the agent in a managed mux session.
-- During work, write boundaries call `rally2 check` before changes land.
+- At startup, `rally run` starts the agent in a managed mux session.
+- During work, write boundaries call `rally check` before changes land.
 - For unmanaged sessions, native adapters may block unsafe writes with
-  `rally2 check before-write`.
+  `rally check before-write`.
 - On prompt, idle, resume, or loop boundaries, adapters stay silent. Rally must
   not inject full room or `next` state into ordinary prompts just to keep Rally
   in context.
-- If an explicit `rally2 next` call shows the agent is waiting on a peer, the
+- If an explicit `rally next` call shows the agent is waiting on a peer, the
   agent can still use alternate work such as reviewing unconsumed artifacts
   before settling for a wait state.
-- When the agent asks for the broader picture, `rally2 room` is the source of
+- When the agent asks for the broader picture, `rally room` is the source of
   truth.
 
 Manual CLI use should be possible, but the primary product path is managed
@@ -109,7 +109,7 @@ not finished.
 
 ## Act-On-Next Contract
 
-`rally2 next` is an execution contract for an agent build loop, not a daemon.
+`rally next` is an execution contract for an agent build loop, not a daemon.
 Rally recommends and constrains work; the agent or harness still executes,
 verifies, and decides when to continue.
 
@@ -124,7 +124,7 @@ The `next` payload must make the loop explicit:
 - `suggested_commands`: command templates for checks and completion facts.
 - `completion`: the durable fact kind expected after work, whether evidence is
   required, whether claims should be released, and whether the agent should run
-  `rally2 next` again.
+  `rally next` again.
 
 The intended autonomous build loop is:
 
@@ -308,11 +308,11 @@ debug evidence.
 First-class commands:
 
 ```bash
-rally2 run claude --name reviewer --backend tmux --json
-rally2 sessions --json
-rally2 inject reviewer --handoff <event-id> --require-ack --json
-rally2 capture reviewer --lines 120 --json
-rally2 stop reviewer --json
+rally run claude --name reviewer --backend tmux --json
+rally sessions --json
+rally inject reviewer --handoff <event-id> --require-ack --json
+rally capture reviewer --lines 120 --json
+rally stop reviewer --json
 ```
 
 Backend contract:
@@ -345,25 +345,25 @@ It is not a separate product surface.
 
 Adapters are now secondary to managed sessions. They make native agent products
 call Rally at safety and context boundaries when an agent was not launched by
-`rally2 run`:
+`rally run`:
 
 - startup/resume/prompt/idle/loop boundary: stay silent
 - before write: call `check before-write`
 
 Completion should not run on every finished model turn by default. It is too
-noisy. Agents can still run `rally2 check before-complete` explicitly, and a
+noisy. Agents can still run `rally check before-complete` explicitly, and a
 surface may add a completion prompt later only when there is an actionable
 condition such as an active owned claim or blocker.
 
 The setup command is intentionally narrow:
 
 ```bash
-rally2 install codex --dry-run --json
-rally2 install all --json
-rally2 install codex --uninstall --json
+rally install codex --dry-run --json
+rally install all --json
+rally install codex --uninstall --json
 ```
 
-It writes only Rally 2-owned hook scripts, extensions, snippets, and hook config
+It writes only Rally-owned hook scripts, extensions, snippets, and hook config
 entries. It does not inspect or manage older Rally wiring from other products.
 
 Required first-class adapters:
@@ -432,7 +432,7 @@ facts whose trust status satisfies local policy.
 
 ## Product Constraints
 
-Build Rally 2.0 as a clean product. The implementation may use proven local
+Build Rally as a clean product. The implementation may use proven local
 techniques, but the user-facing model should stand on its own.
 
 Required product qualities:
@@ -460,7 +460,7 @@ Forbidden product drift:
 
 Phase 1: Product contract.
 
-- Freeze this document as the Rally 2.0 product boundary.
+- Freeze this document as the Rally product boundary.
 - Define the command contracts and event schemas.
 - Define JSON output for `enter`, `room`, and `check`.
 - Define optional `HANDOFF.md` export sections and ordering.
@@ -488,7 +488,7 @@ Phase 4: Dogfood.
 
 ## Acceptance Test
 
-Rally 2.0 is working when:
+Rally is working when:
 
 ```text
 A fresh agent enters a busy repo, receives room state, avoids claimed work,

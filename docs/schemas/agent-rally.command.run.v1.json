@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:agent-rally2:command:run:v1",
-  "title": "Rally 2 Run Command",
+  "$id": "urn:agent-rally:command:run:v1",
+  "title": "Rally Run Command",
   "type": "object",
   "required": ["ok", "product", "command", "schema", "data"],
   "properties": {
     "ok": { "const": true },
-    "product": { "const": "rally2" },
+    "product": { "const": "rally" },
     "command": { "const": "run" },
-    "schema": { "const": "agent-rally2.command.run.v1" },
+    "schema": { "const": "agent-rally.command.run.v1" },
     "data": {
       "type": "object",
       "required": ["mode", "session", "commands"],

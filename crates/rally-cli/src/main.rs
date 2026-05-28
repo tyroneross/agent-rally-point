@@ -15,19 +15,19 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SCHEMA_ENTER: &str = "agent-rally2.command.enter.v1";
-const SCHEMA_SAY: &str = "agent-rally2.command.say.v1";
-const SCHEMA_ROOM: &str = "agent-rally2.command.room.v1";
-const SCHEMA_NEXT: &str = "agent-rally2.command.next.v1";
-const SCHEMA_CHECK: &str = "agent-rally2.command.check.v1";
-const SCHEMA_INSTALL: &str = "agent-rally2.command.install.v1";
-const SCHEMA_RUN: &str = "agent-rally2.command.run.v1";
-const SCHEMA_SESSIONS: &str = "agent-rally2.command.sessions.v1";
-const SCHEMA_INJECT: &str = "agent-rally2.command.inject.v1";
-const SCHEMA_SESSION_ACTION: &str = "agent-rally2.command.session-action.v1";
-const FACT_SCHEMA: &str = "agent-rally2.fact.v1";
+const SCHEMA_ENTER: &str = "agent-rally.command.enter.v1";
+const SCHEMA_SAY: &str = "agent-rally.command.say.v1";
+const SCHEMA_ROOM: &str = "agent-rally.command.room.v1";
+const SCHEMA_NEXT: &str = "agent-rally.command.next.v1";
+const SCHEMA_CHECK: &str = "agent-rally.command.check.v1";
+const SCHEMA_INSTALL: &str = "agent-rally.command.install.v1";
+const SCHEMA_RUN: &str = "agent-rally.command.run.v1";
+const SCHEMA_SESSIONS: &str = "agent-rally.command.sessions.v1";
+const SCHEMA_INJECT: &str = "agent-rally.command.inject.v1";
+const SCHEMA_SESSION_ACTION: &str = "agent-rally.command.session-action.v1";
+const FACT_SCHEMA: &str = "agent-rally.fact.v1";
 const DB_SCHEMA_VERSION: i64 = 2;
-const INSTALL_MARKER: &str = "agent-rally2-install-v1";
+const INSTALL_MARKER: &str = "agent-rally-install-v1";
 
 macro_rules! cmd {
     ($($arg:expr),+ $(,)?) => {
@@ -74,7 +74,7 @@ fn run_inner() -> Result<Output, String> {
         "attach" => command_session_action(ArgBag::new("attach", args), SessionAction::Attach),
         "capture" => command_session_action(ArgBag::new("capture", args), SessionAction::Capture),
         "stop" => command_session_action(ArgBag::new("stop", args), SessionAction::Stop),
-        _ => Err(format!("unknown Rally 2 command {command}")),
+        _ => Err(format!("unknown Rally command {command}")),
     }
 }
 
@@ -336,14 +336,14 @@ fn command_install(args: ArgBag) -> Result<Output, String> {
         .one("--home")
         .map(PathBuf::from)
         .unwrap_or_else(home_dir);
-    let rally2_bin = args
-        .one("--rally2-bin")
-        .unwrap_or_else(|| "rally2".to_string());
+    let rally_bin = args
+        .one("--rally-bin")
+        .unwrap_or_else(|| "rally".to_string());
     let adapters = install_targets(&target)?;
     let mut installed = Vec::new();
 
     for adapter in adapters {
-        let mut plan = install_plan(adapter, &home, &rally2_bin)?;
+        let mut plan = install_plan(adapter, &home, &rally_bin)?;
         let actions = if uninstall {
             apply_uninstall_plan(&plan, dry_run)?
         } else {
@@ -376,7 +376,7 @@ fn command_install(args: ArgBag) -> Result<Output, String> {
             "target": normalize_install_target(&target),
             "mode": mode,
             "home": home.display().to_string(),
-            "rally2_bin": rally2_bin,
+            "rally_bin": rally_bin,
             "adapters": installed
         }),
     );
@@ -1068,8 +1068,8 @@ fn shell_words(words: &[String]) -> String {
 
 fn sessions_path() -> Result<PathBuf, String> {
     let root = repo_root()?;
-    let dir = root.join(".rally2");
-    fs::create_dir_all(&dir).map_err(|err| format!("create .rally2: {err}"))?;
+    let dir = root.join(".rally");
+    fs::create_dir_all(&dir).map_err(|err| format!("create .rally: {err}"))?;
     Ok(dir.join("sessions.json"))
 }
 
@@ -1134,7 +1134,7 @@ fn backend_target(backend: &str, session_id: &str) -> String {
 
 fn handoff_prompt(session: &ManagedSession, handoff: &str) -> String {
     format!(
-        "Rally managed-session injection for {}. Run: rally2 next --tool {} --json. If it is actionable for handoff {}, execute the suggested Rally completion command or run: rally2 say resolve --tool {} --ref {} --subject 'resolved via Rally managed session' --json. Do not edit files unless the Rally action explicitly requires it. Do not ask for confirmation after the Rally command succeeds.",
+        "Rally managed-session injection for {}. Run: rally next --tool {} --json. If it is actionable for handoff {}, execute the suggested Rally completion command or run: rally say resolve --tool {} --ref {} --subject 'resolved via Rally managed session' --json. Do not edit files unless the Rally action explicitly requires it. Do not ask for confirmation after the Rally command succeeds.",
         session.name, session.tool, handoff, session.tool, handoff
     )
 }
@@ -1252,17 +1252,17 @@ fn normalize_install_target(target: &str) -> String {
 fn install_plan(
     adapter: &'static str,
     home: &Path,
-    rally2_bin: &str,
+    rally_bin: &str,
 ) -> Result<InstallPlan, String> {
     let mut files = Vec::new();
     let mut hook_configs = Vec::new();
 
     match adapter {
         "codex" => {
-            let hook = home.join(".codex/hooks/rally2-hook.sh");
+            let hook = home.join(".codex/hooks/rally-hook.sh");
             files.push(InstallFile {
                 path: hook.clone(),
-                content: guard_hook("codex", rally2_bin),
+                content: guard_hook("codex", rally_bin),
                 executable: true,
                 kind: "hook-script",
             });
@@ -1272,10 +1272,10 @@ fn install_plan(
             });
         }
         "claude_code" => {
-            let hook = home.join(".claude/hooks/rally2-hook.sh");
+            let hook = home.join(".claude/hooks/rally-hook.sh");
             files.push(InstallFile {
                 path: hook.clone(),
-                content: guard_hook("claude_code", rally2_bin),
+                content: guard_hook("claude_code", rally_bin),
                 executable: true,
                 kind: "hook-script",
             });
@@ -1285,34 +1285,34 @@ fn install_plan(
             });
         }
         "pi" => {
-            let extension = home.join(".pi/agent/extensions/rally2-guard.ts");
+            let extension = home.join(".pi/agent/extensions/rally-guard.ts");
             files.push(InstallFile {
                 path: extension,
-                content: pi_guard_extension(rally2_bin),
+                content: pi_guard_extension(rally_bin),
                 executable: false,
                 kind: "pi-extension",
             });
         }
         "herdr" => {
             files.push(InstallFile {
-                path: home.join(".config/herdr/integrations/rally2.json"),
-                content: herdr_integration(rally2_bin),
+                path: home.join(".config/herdr/integrations/rally.json"),
+                content: herdr_integration(rally_bin),
                 executable: false,
                 kind: "herdr-integration",
             });
         }
         "cmux" => {
             files.push(InstallFile {
-                path: home.join(".config/cmux/rally2-integration.json"),
-                content: cmux_integration(rally2_bin),
+                path: home.join(".config/cmux/rally-integration.json"),
+                content: cmux_integration(rally_bin),
                 executable: false,
                 kind: "cmux-integration",
             });
         }
         "ci" => {
             files.push(InstallFile {
-                path: home.join(".config/rally2/ci/github-actions-rally2.yml"),
-                content: ci_workflow(rally2_bin),
+                path: home.join(".config/rally/ci/github-actions-rally.yml"),
+                content: ci_workflow(rally_bin),
                 executable: false,
                 kind: "ci-workflow",
             });
@@ -1454,7 +1454,7 @@ fn merge_hook_config(config: &HookConfig, install: bool) -> Result<String, Strin
             *event_hooks = json!([]);
         }
         let event_hooks = event_hooks.as_array_mut().unwrap();
-        remove_rally2_hook_entries(event_hooks);
+        remove_rally_hook_entries(event_hooks);
         if install {
             event_hooks.push(json!({
                 "matcher": entry.matcher,
@@ -1468,7 +1468,7 @@ fn merge_hook_config(config: &HookConfig, install: bool) -> Result<String, Strin
     serde_json::to_string_pretty(&value).map_err(|err| format!("render hook config: {err}"))
 }
 
-fn remove_rally2_hook_entries(event_hooks: &mut Vec<Value>) {
+fn remove_rally_hook_entries(event_hooks: &mut Vec<Value>) {
     for entry in event_hooks.iter_mut() {
         if let Some(hooks) = entry.get_mut("hooks").and_then(Value::as_array_mut) {
             hooks.retain(|hook| {
@@ -1519,7 +1519,7 @@ fn hook_entry(
     HookEntry {
         event,
         matcher,
-        command: format!("RALLY2_INSTALL_MARKER={INSTALL_MARKER} /bin/sh {hook} {phase} {adapter}"),
+        command: format!("RALLY_INSTALL_MARKER={INSTALL_MARKER} /bin/sh {hook} {phase} {adapter}"),
     }
 }
 
@@ -1535,16 +1535,16 @@ fn shell_quote(value: &str) -> String {
         .into_owned()
 }
 
-fn guard_hook(adapter: &str, rally2_bin: &str) -> String {
+fn guard_hook(adapter: &str, rally_bin: &str) -> String {
     format!(
         r#"#!/bin/sh
 # {marker}
-# Installed by `rally2 install {adapter}`. DO NOT EDIT MANUALLY.
+# Installed by `rally install {adapter}`. DO NOT EDIT MANUALLY.
 set -u
 
 phase="${{1:-before-write}}"
 tool="${{2:-{adapter}}}"
-RALLY2_BIN="${{RALLY2_BIN:-{rally2_bin}}}"
+RALLY_BIN="${{RALLY_BIN:-{rally_bin}}}"
 payload="$(cat 2>/dev/null || true)"
 
 json_field() {{
@@ -1571,9 +1571,9 @@ session_id="$(json_field session_id)"
 
 run_check() {{
   if [ -n "$path" ]; then
-    "$RALLY2_BIN" check before-write --tool "$tool" --path "$path" --strict --json 2>/dev/null || true
+    "$RALLY_BIN" check before-write --tool "$tool" --path "$path" --strict --json 2>/dev/null || true
   else
-    "$RALLY2_BIN" check before-write --tool "$tool" --strict --json 2>/dev/null || true
+    "$RALLY_BIN" check before-write --tool "$tool" --strict --json 2>/dev/null || true
   fi
 }}
 
@@ -1585,7 +1585,7 @@ case "$phase" in
   before-write)
     output="$(run_check)"
     if printf '%s' "$output" | grep -q '"allow": false'; then
-      reason="$(printf 'Rally 2 blocked this write:\n%s' "$output" | json_escape)"
+      reason="$(printf 'Rally blocked this write:\n%s' "$output" | json_escape)"
       printf '{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":%s}}}}\n' "$reason"
     else
       printf '{{}}\n'
@@ -1598,21 +1598,21 @@ esac
 "#,
         marker = INSTALL_MARKER,
         adapter = adapter,
-        rally2_bin = rally2_bin.replace('"', "\\\"")
+        rally_bin = rally_bin.replace('"', "\\\"")
     )
 }
 
-fn pi_guard_extension(rally2_bin: &str) -> String {
+fn pi_guard_extension(rally_bin: &str) -> String {
     format!(
         r#"// {marker}
-// Installed by `rally2 install pi`. DO NOT EDIT MANUALLY.
+// Installed by `rally install pi`. DO NOT EDIT MANUALLY.
 import {{ spawnSync }} from "node:child_process";
 import type {{ ExtensionAPI }} from "@earendil-works/pi-coding-agent";
 
-const RALLY2_BIN = process.env.RALLY2_BIN || {bin};
+const RALLY_BIN = process.env.RALLY_BIN || {bin};
 
-function runRally2(args: string[], input?: unknown): string {{
-  const result = spawnSync(RALLY2_BIN, args, {{
+function runRally(args: string[], input?: unknown): string {{
+  const result = spawnSync(RALLY_BIN, args, {{
     input: input === undefined ? undefined : JSON.stringify(input),
     encoding: "utf8",
     stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
@@ -1626,85 +1626,85 @@ function pathFromTool(event: any): string | undefined {{
   return input.path || input.file_path || input.filePath || input.notebook_path;
 }}
 
-export default function rally2Guard(pi: ExtensionAPI) {{
+export default function rallyGuard(pi: ExtensionAPI) {{
   pi.on("tool_call", async (event) => {{
     const name = event.toolName;
     if (!["write", "edit", "serena_replace_content", "serena_replace_symbol_body"].includes(name)) return;
     const path = pathFromTool(event);
     const args = ["check", "before-write", "--tool", "pi", "--json", "--strict"];
     if (path) args.push("--path", path);
-    const output = runRally2(args, event);
+    const output = runRally(args, event);
     try {{
       const parsed = JSON.parse(output || "{{}}");
       if (parsed?.data?.check?.allow === false) {{
-        return {{ block: true, reason: `Rally 2 blocked write:\n${{output}}` }};
+        return {{ block: true, reason: `Rally blocked write:\n${{output}}` }};
       }}
     }} catch (_) {{}}
   }});
 }}
 "#,
         marker = INSTALL_MARKER,
-        bin = serde_json::to_string(rally2_bin).unwrap_or_else(|_| "\"rally2\"".to_string())
+        bin = serde_json::to_string(rally_bin).unwrap_or_else(|_| "\"rally\"".to_string())
     )
 }
 
-fn herdr_integration(rally2_bin: &str) -> String {
+fn herdr_integration(rally_bin: &str) -> String {
     json!({
         "marker": INSTALL_MARKER,
         "adapter": "herdr",
         "remote_safe": true,
         "commands": {
-            "enter": format!("{rally2_bin} enter --tool herdr --json"),
-            "room": format!("{rally2_bin} room --json"),
-            "before_write": format!("{rally2_bin} check before-write --tool herdr --path <path> --strict --json"),
-            "before_complete": format!("{rally2_bin} check before-complete --tool herdr --strict --json")
+            "enter": format!("{rally_bin} enter --tool herdr --json"),
+            "room": format!("{rally_bin} room --json"),
+            "before_write": format!("{rally_bin} check before-write --tool herdr --path <path> --strict --json"),
+            "before_complete": format!("{rally_bin} check before-complete --tool herdr --strict --json")
         },
         "notes": [
-            "Use rally2 run --backend herdr to start managed agent panes.",
-            "Use rally2 inject to route actionable work into managed Herdr panes.",
-            "Remote Herdr sessions can run the same commands on the remote checkout because Rally 2 state is repo-local."
+            "Use rally run --backend herdr to start managed agent panes.",
+            "Use rally inject to route actionable work into managed Herdr panes.",
+            "Remote Herdr sessions can run the same commands on the remote checkout because Rally state is repo-local."
         ]
     })
     .to_string()
 }
 
-fn cmux_integration(rally2_bin: &str) -> String {
+fn cmux_integration(rally_bin: &str) -> String {
     json!({
         "marker": INSTALL_MARKER,
         "adapter": "cmux",
         "commands": {
-            "enter": format!("{rally2_bin} enter --tool cmux --json"),
-            "room": format!("{rally2_bin} room --json"),
-            "before_write": format!("{rally2_bin} check before-write --tool cmux --path <path> --strict --json")
+            "enter": format!("{rally_bin} enter --tool cmux --json"),
+            "room": format!("{rally_bin} room --json"),
+            "before_write": format!("{rally_bin} check before-write --tool cmux --path <path> --strict --json")
         },
         "notes": [
-            "Use rally2 run --backend cmux to start managed workspaces.",
-            "Use rally2 inject to route actionable work into managed cmux workspaces."
+            "Use rally run --backend cmux to start managed workspaces.",
+            "Use rally inject to route actionable work into managed cmux workspaces."
         ]
     })
     .to_string()
 }
 
-fn ci_workflow(rally2_bin: &str) -> String {
+fn ci_workflow(rally_bin: &str) -> String {
     format!(
         r#"# {marker}
-# Copy into .github/workflows/rally2.yml when this repository has rally2 on PATH.
-name: Rally 2
+# Copy into .github/workflows/rally.yml when this repository has rally on PATH.
+name: Rally
 
 on:
   pull_request:
   push:
 
 jobs:
-  rally2:
+  rally:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check Rally 2 room before completion
-        run: {rally2_bin} check before-complete --tool ci --strict --json
+      - name: Check Rally room before completion
+        run: {rally_bin} check before-complete --tool ci --strict --json
 "#,
         marker = INSTALL_MARKER,
-        rally2_bin = rally2_bin
+        rally_bin = rally_bin
     )
 }
 
@@ -1950,8 +1950,8 @@ struct RoomStore {
 impl RoomStore {
     fn open() -> Result<Self, String> {
         let root = repo_root()?;
-        let dir = root.join(".rally2");
-        fs::create_dir_all(&dir).map_err(|err| format!("create .rally2: {err}"))?;
+        let dir = root.join(".rally");
+        fs::create_dir_all(&dir).map_err(|err| format!("create .rally: {err}"))?;
         let fact_store_path = dir.join("facts.db");
         let fact_store =
             SqliteStore::open(&fact_store_path).map_err(|err| format!("open fact store: {err}"))?;
@@ -2630,7 +2630,7 @@ fn suggested_claims(tool: &str, fact: &Fact) -> Vec<Value> {
             let path = command_path(&scope);
             json!({
                 "scope": scope,
-                "command": format!("rally2 say claim --tool {tool} --subject \"act on next\" --path {path} --json")
+                "command": format!("rally say claim --tool {tool} --subject \"act on next\" --path {path} --json")
             })
         })
         .collect()
@@ -2644,29 +2644,29 @@ fn suggested_commands(tool: &str, candidate: &NextCandidate) -> Vec<String> {
         .into_iter()
         .map(|scope| {
             let path = command_path(&scope);
-            format!("rally2 check before-write --tool {tool} --path {path} --strict --json")
+            format!("rally check before-write --tool {tool} --path {path} --strict --json")
         })
         .collect::<Vec<_>>();
     match candidate.action {
         "respond_to_handoff" => commands.push(format!(
-            "rally2 say resolve --tool {tool} --ref {} --subject \"responded to handoff\" --json",
+            "rally say resolve --tool {tool} --ref {} --subject \"responded to handoff\" --json",
             fact.event_id
         )),
         "resolve_owned_blocker" => commands.push(format!(
-            "rally2 say resolve --tool {tool} --ref {} --subject \"resolved blocker\" --json",
+            "rally say resolve --tool {tool} --ref {} --subject \"resolved blocker\" --json",
             fact.event_id
         )),
         "continue_or_release_claim" => commands.push(format!(
-            "rally2 say release --tool {tool} --ref {} --subject \"done\" --json",
+            "rally say release --tool {tool} --ref {} --subject \"done\" --json",
             fact.event_id
         )),
         "review_artifact" => commands.push(format!(
-            "rally2 say artifact --tool {tool} --ref {} --subject \"reviewed artifact\" --uri {} --evidence \"<verification>\" --json",
+            "rally say artifact --tool {tool} --ref {} --subject \"reviewed artifact\" --uri {} --evidence \"<verification>\" --json",
             fact.event_id,
             fact.uri.as_deref().unwrap_or("<path>")
         )),
         "clarify_handoff" => commands.push(format!(
-            "rally2 say handoff --tool {tool} --target {} --ref {} --subject \"clarify handoff\" --summary \"<needed context>\" --json",
+            "rally say handoff --tool {tool} --target {} --ref {} --subject \"clarify handoff\" --summary \"<needed context>\" --json",
             fact.target.as_deref().unwrap_or("<target-tool>"),
             fact.event_id
         )),
@@ -2843,7 +2843,7 @@ fn adapter_contracts() -> Vec<Value> {
             false,
             false,
             false,
-            "Managed-session backend metadata. Use rally2 run/inject/capture for live delivery.",
+            "Managed-session backend metadata. Use rally run/inject/capture for live delivery.",
         ),
         adapter_contract(
             "cmux",
@@ -2851,7 +2851,7 @@ fn adapter_contracts() -> Vec<Value> {
             false,
             false,
             false,
-            "Managed-session backend metadata. Use rally2 run/inject/capture for live delivery.",
+            "Managed-session backend metadata. Use rally run/inject/capture for live delivery.",
         ),
         adapter_contract(
             "ci",
@@ -2879,10 +2879,10 @@ fn adapter_contract(
         "first_class": true,
         "model_visible": model_visible,
         "commands": {
-            "enter": format!("rally2 enter --tool {adapter} --json"),
-            "check_before_write": format!("rally2 check before-write --tool {adapter} --path <path> --json"),
-            "say_artifact": format!("rally2 say artifact --tool {adapter} --subject <subject> --uri <path> --evidence <evidence> --json"),
-            "room": "rally2 room --json"
+            "enter": format!("rally enter --tool {adapter} --json"),
+            "check_before_write": format!("rally check before-write --tool {adapter} --path <path> --json"),
+            "say_artifact": format!("rally say artifact --tool {adapter} --subject <subject> --uri <path> --evidence <evidence> --json"),
+            "room": "rally room --json"
         },
         "surfaces": {
             "startup_enter": startup_enter,
@@ -3142,7 +3142,7 @@ fn default_subject(kind: &str) -> String {
 fn envelope(command: &str, schema: &str, data: Value) -> Value {
     json!({
         "ok": true,
-        "product": "rally2",
+        "product": "rally",
         "command": command,
         "schema": schema,
         "data": data
@@ -3175,23 +3175,23 @@ fn now_string() -> String {
 
 fn help_text() -> String {
     [
-        "rally2: repo-local coordination room for parallel agents",
+        "rally: repo-local coordination room for parallel agents",
         "",
         "Usage:",
-        "  rally2 enter --tool <tool> [--path <path>] [--role <role>] [--json]",
-        "  rally2 say <kind> --tool <tool> --subject <subject> [--path <path>] [--json]",
-        "  rally2 room [--tool <tool>] [--role <role>] [--path <path>] [--since <seq>] [--json]",
-        "  rally2 next --tool <tool> [--path <path>] [--role <role>] [--limit <n>] [--json]",
-        "  rally2 check before-write --tool <tool> --path <path> [--strict] [--json]",
-        "  rally2 check after-artifact --tool <tool> [--evidence <text>] [--target <tool>] [--json]",
-        "  rally2 check before-complete --tool <tool> [--strict] [--json]",
-        "  rally2 install <codex|claude_code|pi|herdr|cmux|ci|all> [--dry-run] [--uninstall] [--json]",
-        "  rally2 run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|herdr|cmux>] [--dry-run] [--json]",
-        "  rally2 sessions [--json]",
-        "  rally2 inject <session|name|tool> (--text <text>|--handoff <event-id>) [--require-ack] [--json]",
-        "  rally2 attach <session|name|tool> [--dry-run] [--json]",
-        "  rally2 capture <session|name|tool> [--lines <n>] [--dry-run] [--json]",
-        "  rally2 stop <session|name|tool> [--dry-run] [--json]",
+        "  rally enter --tool <tool> [--path <path>] [--role <role>] [--json]",
+        "  rally say <kind> --tool <tool> --subject <subject> [--path <path>] [--json]",
+        "  rally room [--tool <tool>] [--role <role>] [--path <path>] [--since <seq>] [--json]",
+        "  rally next --tool <tool> [--path <path>] [--role <role>] [--limit <n>] [--json]",
+        "  rally check before-write --tool <tool> --path <path> [--strict] [--json]",
+        "  rally check after-artifact --tool <tool> [--evidence <text>] [--target <tool>] [--json]",
+        "  rally check before-complete --tool <tool> [--strict] [--json]",
+        "  rally install <codex|claude_code|pi|herdr|cmux|ci|all> [--dry-run] [--uninstall] [--json]",
+        "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|herdr|cmux>] [--dry-run] [--json]",
+        "  rally sessions [--json]",
+        "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--require-ack] [--json]",
+        "  rally attach <session|name|tool> [--dry-run] [--json]",
+        "  rally capture <session|name|tool> [--lines <n>] [--dry-run] [--json]",
+        "  rally stop <session|name|tool> [--dry-run] [--json]",
         "",
         "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson",
     ]
@@ -3290,7 +3290,7 @@ fn option_takes_value(name: &str) -> bool {
             | "--event"
             | "--thread"
             | "--home"
-            | "--rally2-bin"
+            | "--rally-bin"
             | "--name"
             | "--backend"
             | "--tmux-bin"
@@ -3365,20 +3365,20 @@ impl CliError {
                 "{}",
                 json!({
                     "ok": false,
-                    "product": "rally2",
+                    "product": "rally",
                     "error": self.message,
                     "exit_code": self.exit_code
                 })
             );
         } else {
-            eprintln!("rally2: {}", self.message);
+            eprintln!("rally: {}", self.message);
         }
     }
 }
 
 fn is_usage_error(message: &str) -> bool {
     message.contains("requires")
-        || message.starts_with("unknown Rally 2 command")
+        || message.starts_with("unknown Rally command")
         || message.starts_with("unsupported")
         || message.starts_with("invalid")
 }

@@ -3,7 +3,7 @@
 
 [workspace]
 members = [
-    "crates/rally2-cli",
+    "crates/rally-cli",
 ]
 resolver = "2"
 

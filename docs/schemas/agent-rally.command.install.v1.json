@@ -1,21 +1,21 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Rally 2 Install Command",
+  "title": "Rally Install Command",
   "type": "object",
   "required": ["ok", "product", "command", "schema", "data"],
   "properties": {
     "ok": { "type": "boolean" },
-    "product": { "const": "rally2" },
+    "product": { "const": "rally" },
     "command": { "const": "install" },
-    "schema": { "const": "agent-rally2.command.install.v1" },
+    "schema": { "const": "agent-rally.command.install.v1" },
     "data": {
       "type": "object",
-      "required": ["target", "mode", "home", "rally2_bin", "adapters"],
+      "required": ["target", "mode", "home", "rally_bin", "adapters"],
       "properties": {
         "target": { "type": "string" },
         "mode": { "type": "string" },
         "home": { "type": "string" },
-        "rally2_bin": { "type": "string" },
+        "rally_bin": { "type": "string" },
         "adapters": {
           "type": "array",
           "items": {

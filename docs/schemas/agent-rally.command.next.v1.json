@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:agent-rally2:command:next:v1",
-  "title": "Rally 2 Next Command",
+  "$id": "urn:agent-rally:command:next:v1",
+  "title": "Rally Next Command",
   "type": "object",
   "required": ["ok", "product", "command", "schema", "data"],
   "properties": {
@@ -9,13 +9,13 @@
       "const": true
     },
     "product": {
-      "const": "rally2"
+      "const": "rally"
     },
     "command": {
       "const": "next"
     },
     "schema": {
-      "const": "agent-rally2.command.next.v1"
+      "const": "agent-rally.command.next.v1"
     },
     "data": {
       "type": "object",

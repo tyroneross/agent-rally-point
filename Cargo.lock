@@ -948,7 +948,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rally2-cli"
+name = "rally-cli"
 version = "0.1.0"
 dependencies = [
  "chrono",

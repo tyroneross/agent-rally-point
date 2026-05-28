@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:agent-rally2:fact:v1",
-  "title": "Rally 2 Fact",
+  "$id": "urn:agent-rally:fact:v1",
+  "title": "Rally Fact",
   "type": "object",
   "required": [
     "schema",
@@ -17,7 +17,7 @@
     "trust_status"
   ],
   "properties": {
-    "schema": { "const": "agent-rally2.fact.v1" },
+    "schema": { "const": "agent-rally.fact.v1" },
     "event_id": { "type": "string" },
     "thread_id": { "type": "string" },
     "created_at": { "type": "string", "format": "date-time" },
