@@ -25,6 +25,9 @@ impl RallyWorkspace {
         Command::new(env!("CARGO_BIN_EXE_rally"))
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("RALLY_CMUX_CONFIG_DIR")
+            .env_remove("RALLY_HERDR_CONFIG_DIR")
             .args(args)
             .output()
             .unwrap()
@@ -267,6 +270,9 @@ fn rally_watch_wakes_within_a_second_of_an_append() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rally"))
         .current_dir(&workspace.cwd)
         .env("HOME", &workspace.home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("RALLY_CMUX_CONFIG_DIR")
+        .env_remove("RALLY_HERDR_CONFIG_DIR")
         .args(["watch", "--kind", "handoff", "--max-seconds", "5"])
         .stdout(Stdio::piped())
         .spawn()
@@ -334,6 +340,9 @@ fn rally_watch_emits_new_matching_events() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rally"))
         .current_dir(&workspace.cwd)
         .env("HOME", &workspace.home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("RALLY_CMUX_CONFIG_DIR")
+        .env_remove("RALLY_HERDR_CONFIG_DIR")
         .args([
             "watch",
             "--tool",

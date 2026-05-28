@@ -811,6 +811,20 @@ run_enter() {{
   fi
 }}
 
+run_next() {{
+  if [ -n "$path" ]; then
+    "$RALLY2_BIN" next --tool "$tool" --path "$path" --json 2>/dev/null || true
+  else
+    "$RALLY2_BIN" next --tool "$tool" --json 2>/dev/null || true
+  fi
+}}
+
+run_visibility() {{
+  enter_output="$(run_enter)"
+  next_output="$(run_next)"
+  printf 'Rally 2 room:\n%s\n\nRally 2 next:\n%s' "$enter_output" "$next_output"
+}}
+
 run_check() {{
   if [ -n "$path" ]; then
     "$RALLY2_BIN" check before-write --tool "$tool" --path "$path" --strict --json 2>/dev/null || true
@@ -825,13 +839,13 @@ json_escape() {{
 
 case "$phase" in
   session-start|start|resume)
-    output="$(run_enter)"
-    context="$(printf 'Rally 2 room:\n%s' "$output" | json_escape)"
+    output="$(run_visibility)"
+    context="$(printf '%s' "$output" | json_escape)"
     printf '{{"hookSpecificOutput":{{"hookEventName":"SessionStart","additionalContext":%s}}}}\n' "$context"
     ;;
   user-prompt|idle|enter)
-    output="$(run_enter)"
-    context="$(printf 'Rally 2 room:\n%s' "$output" | json_escape)"
+    output="$(run_visibility)"
+    context="$(printf '%s' "$output" | json_escape)"
     printf '{{"hookSpecificOutput":{{"hookEventName":"UserPromptSubmit","additionalContext":%s}}}}\n' "$context"
     ;;
   before-write)
@@ -898,11 +912,22 @@ function entryMessage(output: string): string | undefined {{
   }}
 }}
 
+function nextMessage(output: string): string | undefined {{
+  try {{
+    const parsed = JSON.parse(output || "{{}}");
+    const next = parsed?.data?.next;
+    if (!next) return undefined;
+    return `Rally 2 next:\n${{JSON.stringify(next, null, 2)}}`;
+  }} catch (_) {{
+    return undefined;
+  }}
+}}
+
 export default function rally2Room(pi: ExtensionAPI) {{
   let lastDelivered = "";
 
-  function deliver(output: string, triggerTurn: boolean) {{
-    const content = entryMessage(output);
+  function deliver(entryOutput: string, nextOutput: string, triggerTurn: boolean) {{
+    const content = [entryMessage(entryOutput), nextMessage(nextOutput)].filter(Boolean).join("\n\n");
     if (!content || content === lastDelivered) return undefined;
     lastDelivered = content;
     const message = {{ customType: "rally2", content, display: true }};
@@ -914,11 +939,19 @@ export default function rally2Room(pi: ExtensionAPI) {{
 
   pi.on("session_start", async (_event, ctx) => {{
     const session = ctx.sessionManager.getSessionId?.() || `${{Date.now()}}`;
-    deliver(runRally2(["enter", "--tool", "pi", "--session-id", session, "--json"]), true);
+    deliver(
+      runRally2(["enter", "--tool", "pi", "--session-id", session, "--json"]),
+      runRally2(["next", "--tool", "pi", "--json"]),
+      true
+    );
   }});
 
   pi.on("before_agent_start", async () => {{
-    const message = deliver(runRally2(["enter", "--tool", "pi", "--json"]), false);
+    const message = deliver(
+      runRally2(["enter", "--tool", "pi", "--json"]),
+      runRally2(["next", "--tool", "pi", "--json"]),
+      false
+    );
     if (message) return {{ message }};
   }});
 
@@ -950,12 +983,15 @@ fn herdr_integration(rally2_bin: &str) -> String {
         "remote_safe": true,
         "commands": {
             "enter": format!("{rally2_bin} enter --tool herdr --json"),
+            "next": format!("{rally2_bin} next --tool herdr --json"),
+            "next_for_pane": format!("{rally2_bin} next --tool <pane-tool> --json"),
             "room": format!("{rally2_bin} room --json"),
             "before_write": format!("{rally2_bin} check before-write --tool herdr --path <path> --strict --json"),
             "before_complete": format!("{rally2_bin} check before-complete --tool herdr --strict --json")
         },
         "notes": [
-            "Herdr panes should inject enter output into the active agent pane at start/resume.",
+            "Herdr panes should inject enter and next output into the active agent pane at start/resume.",
+            "Pane status can summarize next.action and waiting_on from rally2 next for that pane's tool identity.",
             "Remote Herdr sessions can run the same commands on the remote checkout because Rally 2 state is repo-local."
         ]
     })
@@ -968,11 +1004,12 @@ fn cmux_integration(rally2_bin: &str) -> String {
         "adapter": "cmux",
         "commands": {
             "enter": format!("{rally2_bin} enter --tool cmux --json"),
+            "next": format!("{rally2_bin} next --tool cmux --json"),
             "room": format!("{rally2_bin} room --json"),
             "before_write": format!("{rally2_bin} check before-write --tool cmux --path <path> --strict --json")
         },
         "notes": [
-            "cmux should expose Rally 2 entry state to each managed session.",
+            "cmux should expose Rally 2 entry and next state to each managed session.",
             "Use alongside cmux native hooks; Rally 2 remains the coordination room, not the terminal multiplexer."
         ]
     })
@@ -994,6 +1031,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Report Rally 2 next action
+        run: {rally2_bin} next --tool ci --json
       - name: Check Rally 2 room before completion
         run: {rally2_bin} check before-complete --tool ci --strict --json
 "#,
@@ -1861,19 +1900,143 @@ fn build_next(
     };
     let waiting_json = facts_json(&waiting_on);
     let top_json = top.to_json();
+    let contract = action_contract(&top, tool);
 
     json!({
         "mode": mode,
         "action": top_json["action"].clone(),
+        "actionable": contract["actionable"].clone(),
         "reason": top_json["reason"].clone(),
         "score": top_json["score"].clone(),
         "confidence": top_json["confidence"].clone(),
+        "requires_human": contract["requires_human"].clone(),
+        "stop_reason": contract["stop_reason"].clone(),
         "target_event_id": top_json["target_event_id"].clone(),
         "source_event_ids": top_json["source_event_ids"].clone(),
         "fact": top_json["fact"].clone(),
+        "suggested_claims": contract["suggested_claims"].clone(),
+        "suggested_commands": contract["suggested_commands"].clone(),
+        "completion": contract["completion"].clone(),
         "waiting_on": waiting_json,
         "alternatives": alternatives
     })
+}
+
+fn action_contract(candidate: &NextCandidate, tool: &str) -> Value {
+    let actionable = !matches!(candidate.action, "wait" | "proceed_solo");
+    let stop_reason = match candidate.action {
+        "wait" => Some("waiting_on_peer_with_no_useful_alternate_work"),
+        "proceed_solo" => Some("no_actionable_room_item"),
+        _ => None,
+    };
+    let suggested_claims = candidate
+        .fact
+        .as_ref()
+        .filter(|_| actionable && candidate.action != "continue_or_release_claim")
+        .map(|fact| suggested_claims(tool, fact))
+        .unwrap_or_default();
+    let suggested_commands = if actionable {
+        suggested_commands(tool, candidate)
+    } else {
+        Vec::new()
+    };
+    json!({
+        "actionable": actionable,
+        "requires_human": false,
+        "stop_reason": stop_reason,
+        "suggested_claims": suggested_claims,
+        "suggested_commands": suggested_commands,
+        "completion": completion_contract(candidate.action, actionable)
+    })
+}
+
+fn suggested_claims(tool: &str, fact: &Fact) -> Vec<Value> {
+    let scopes = executable_scopes(fact);
+    scopes
+        .into_iter()
+        .map(|scope| {
+            let path = command_path(&scope);
+            json!({
+                "scope": scope,
+                "command": format!("rally2 say claim --tool {tool} --subject \"act on next\" --path {path} --json")
+            })
+        })
+        .collect()
+}
+
+fn suggested_commands(tool: &str, candidate: &NextCandidate) -> Vec<String> {
+    let Some(fact) = candidate.fact.as_ref() else {
+        return Vec::new();
+    };
+    let mut commands = executable_scopes(fact)
+        .into_iter()
+        .map(|scope| {
+            let path = command_path(&scope);
+            format!("rally2 check before-write --tool {tool} --path {path} --strict --json")
+        })
+        .collect::<Vec<_>>();
+    match candidate.action {
+        "respond_to_handoff" => commands.push(format!(
+            "rally2 say resolve --tool {tool} --ref {} --subject \"responded to handoff\" --json",
+            fact.event_id
+        )),
+        "resolve_owned_blocker" => commands.push(format!(
+            "rally2 say resolve --tool {tool} --ref {} --subject \"resolved blocker\" --json",
+            fact.event_id
+        )),
+        "continue_or_release_claim" => commands.push(format!(
+            "rally2 say release --tool {tool} --ref {} --subject \"done\" --json",
+            fact.event_id
+        )),
+        "review_artifact" => commands.push(format!(
+            "rally2 say artifact --tool {tool} --ref {} --subject \"reviewed artifact\" --uri {} --evidence \"<verification>\" --json",
+            fact.event_id,
+            fact.uri.as_deref().unwrap_or("<path>")
+        )),
+        "clarify_handoff" => commands.push(format!(
+            "rally2 say handoff --tool {tool} --target {} --ref {} --subject \"clarify handoff\" --summary \"<needed context>\" --json",
+            fact.target.as_deref().unwrap_or("<target-tool>"),
+            fact.event_id
+        )),
+        _ => {}
+    }
+    commands
+}
+
+fn completion_contract(action: &str, actionable: bool) -> Value {
+    let record_kind = match action {
+        "respond_to_handoff" | "resolve_owned_blocker" => "resolve",
+        "continue_or_release_claim" => "artifact_or_release",
+        "review_artifact" => "artifact",
+        "clarify_handoff" => "handoff",
+        _ => "none",
+    };
+    json!({
+        "record_kind": record_kind,
+        "evidence_required": actionable,
+        "release_claims": actionable,
+        "rerun_next": actionable
+    })
+}
+
+fn executable_scopes(fact: &Fact) -> Vec<String> {
+    let mut scopes = fact.scope.clone();
+    if scopes.is_empty() {
+        if let Some(uri) = &fact.uri {
+            if uri.starts_with("file:") {
+                scopes.push(uri.clone());
+            } else if !uri.contains("://") {
+                scopes.push(normalize_path(uri.clone()));
+            }
+        }
+    }
+    scopes.sort();
+    scopes.dedup();
+    scopes
+}
+
+fn command_path(scope: &str) -> String {
+    scope.strip_prefix("file:").unwrap_or(scope).to_string()
 }
 
 fn assigned_to_tool(fact: &Fact, tool: &str) -> bool {
@@ -1984,7 +2147,7 @@ fn adapter_contracts() -> Vec<Value> {
             true,
             true,
             true,
-            "Inject enter output at session start/resume and before continuing a /goal loop.",
+            "Inject enter and next output at session start/resume, user prompts, and before continuing a /goal loop.",
         ),
         adapter_contract(
             "claude_code",
@@ -1992,7 +2155,7 @@ fn adapter_contracts() -> Vec<Value> {
             true,
             true,
             true,
-            "Inject enter output through project/user instructions or hooks before Claude Code acts.",
+            "Inject enter and next output through project/user instructions or hooks before Claude Code acts.",
         ),
         adapter_contract(
             "pi",
@@ -2000,7 +2163,7 @@ fn adapter_contracts() -> Vec<Value> {
             true,
             true,
             true,
-            "Inject enter output into Pi's active message state and refresh at session boundaries.",
+            "Inject enter and next output into Pi's active message state and refresh at session boundaries.",
         ),
         adapter_contract(
             "herdr",
@@ -2008,7 +2171,7 @@ fn adapter_contracts() -> Vec<Value> {
             true,
             false,
             true,
-            "Expose enter output to panes and preserve pane/tool identity for operator routing.",
+            "Expose enter and next output to panes and preserve pane/tool identity for operator routing.",
         ),
         adapter_contract(
             "cmux",
@@ -2016,7 +2179,7 @@ fn adapter_contracts() -> Vec<Value> {
             true,
             false,
             true,
-            "Expose enter output to sessions while keeping Rally as the coordination source.",
+            "Expose enter and next output to sessions while keeping Rally as the coordination source.",
         ),
         adapter_contract(
             "ci",
@@ -2024,7 +2187,7 @@ fn adapter_contracts() -> Vec<Value> {
             false,
             true,
             true,
-            "Read room/check output in automation and publish evidence facts when useful.",
+            "Read next/room/check output in automation and publish evidence facts when useful.",
         ),
     ]
     .into_iter()
@@ -2045,6 +2208,8 @@ fn adapter_contract(
         "model_visible": model_visible,
         "commands": {
             "enter": format!("rally2 enter --tool {adapter} --json"),
+            "next": format!("rally2 next --tool {adapter} --json"),
+            "next_for_path": format!("rally2 next --tool {adapter} --path <path> --json"),
             "check_before_write": format!("rally2 check before-write --tool {adapter} --path <path> --json"),
             "say_artifact": format!("rally2 say artifact --tool {adapter} --subject <subject> --uri <path> --evidence <evidence> --json"),
             "room": "rally2 room --json"
@@ -2052,6 +2217,7 @@ fn adapter_contract(
         "surfaces": {
             "startup_enter": startup_enter,
             "loop_enter": loop_enter,
+            "idle_next": true,
             "before_write_check": before_write_check,
             "completion_prompt": completion_prompt
         }

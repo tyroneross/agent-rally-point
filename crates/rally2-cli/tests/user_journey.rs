@@ -331,7 +331,32 @@ fn rally2_next_finds_useful_work_while_waiting() {
     assert_matches_schema("agent-rally2.command.next.v1.json", &next);
     assert_eq!(next["data"]["next"]["mode"], "useful_while_waiting");
     assert_eq!(next["data"]["next"]["action"], "review_artifact");
+    assert_eq!(next["data"]["next"]["actionable"], true);
+    assert_eq!(next["data"]["next"]["requires_human"], false);
+    assert_eq!(next["data"]["next"]["stop_reason"], Value::Null);
     assert_eq!(next["data"]["next"]["target_event_id"], artifact_id);
+    assert!(
+        next["data"]["next"]["suggested_claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["scope"] == "file:docs/notes.md")
+    );
+    assert!(
+        next["data"]["next"]["suggested_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item
+                .as_str()
+                .unwrap()
+                .contains("rally2 say artifact --tool codex --ref"))
+    );
+    assert_eq!(
+        next["data"]["next"]["completion"]["record_kind"],
+        "artifact"
+    );
+    assert_eq!(next["data"]["next"]["completion"]["rerun_next"], true);
     assert!(
         next["data"]["next"]["waiting_on"]
             .as_array()
@@ -374,6 +399,25 @@ fn rally2_next_waits_only_when_no_useful_work_exists() {
     assert_matches_schema("agent-rally2.command.next.v1.json", &next);
     assert_eq!(next["data"]["next"]["mode"], "waiting");
     assert_eq!(next["data"]["next"]["action"], "wait");
+    assert_eq!(next["data"]["next"]["actionable"], false);
+    assert_eq!(
+        next["data"]["next"]["stop_reason"],
+        "waiting_on_peer_with_no_useful_alternate_work"
+    );
+    assert!(
+        next["data"]["next"]["suggested_claims"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        next["data"]["next"]["suggested_commands"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(next["data"]["next"]["completion"]["record_kind"], "none");
+    assert_eq!(next["data"]["next"]["completion"]["rerun_next"], false);
     assert!(
         next["data"]["next"]["source_event_ids"]
             .as_array()
@@ -404,12 +448,16 @@ fn rally2_exposes_required_first_class_adapters() {
             entered["data"]["adapter"]["commands"]["enter"],
             format!("rally2 enter --tool {tool} --json")
         );
+        assert_eq!(
+            entered["data"]["adapter"]["commands"]["next"],
+            format!("rally2 next --tool {tool} --json")
+        );
+        assert_eq!(entered["data"]["adapter"]["surfaces"]["idle_next"], true);
         assert!(
             entered["data"]["adapter"]["model_visible"]
                 .as_str()
                 .unwrap()
-                .len()
-                > 20
+                .contains("next")
         );
     }
 
@@ -423,6 +471,10 @@ fn rally2_exposes_required_first_class_adapters() {
         assert_eq!(
             adapter["commands"]["check_before_write"],
             format!("rally2 check before-write --tool {tool} --path <path> --json")
+        );
+        assert_eq!(
+            adapter["commands"]["next_for_path"],
+            format!("rally2 next --tool {tool} --path <path> --json")
         );
     }
 
@@ -537,6 +589,8 @@ fn rally2_installs_adapter_glue_without_touching_legacy_hooks() {
     let script = fs::read_to_string(workspace.home.join(".codex/hooks/rally2-hook.sh")).unwrap();
     assert!(script.contains("agent-rally2-install-v1"));
     assert!(script.contains("/tmp/rally2"));
+    assert!(script.contains("next --tool"));
+    assert!(script.contains("Rally 2 next"));
     let hooks = fs::read_to_string(workspace.home.join(".codex/hooks.json")).unwrap();
     assert!(hooks.contains("rally2-hook.sh"));
     assert!(!hooks.contains("\"Stop\""));
@@ -607,6 +661,28 @@ fn rally2_installs_every_required_adapter_surface() {
         fs::read_to_string(workspace.home.join(".pi/agent/extensions/rally2-room.ts")).unwrap();
     assert!(pi_extension.contains("rally2Room"));
     assert!(pi_extension.contains("/opt/bin/rally2"));
+    assert!(pi_extension.contains("\"next\", \"--tool\", \"pi\""));
+
+    let herdr_integration = fs::read_to_string(
+        workspace
+            .home
+            .join(".config/herdr/integrations/rally2.json"),
+    )
+    .unwrap();
+    assert!(herdr_integration.contains("\"next\""));
+    assert!(herdr_integration.contains("waiting_on"));
+
+    let cmux_integration =
+        fs::read_to_string(workspace.home.join(".config/cmux/rally2-integration.json")).unwrap();
+    assert!(cmux_integration.contains("\"next\""));
+
+    let ci_workflow = fs::read_to_string(
+        workspace
+            .home
+            .join(".config/rally2/ci/github-actions-rally2.yml"),
+    )
+    .unwrap();
+    assert!(ci_workflow.contains("next --tool ci --json"));
 
     workspace.cleanup();
 }

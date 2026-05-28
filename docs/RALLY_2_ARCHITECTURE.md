@@ -4,6 +4,16 @@ Rally 2.0 is a repo-local coordination layer for parallel goal-driven agents.
 It is not a conductor, task runner, dashboard, or coding agent. Its job is to
 keep shared room state correct, fresh, and visible before agents act.
 
+Rally 2.0 is the primary Agent Rally Point product path. The legacy `rally`
+CLI remains available as a deprecated compatibility layer for existing
+`changes.jsonl` channels, sync/trust workflows, and older adapters, but future
+agent-loop design should land in Rally 2 unless it is explicitly migration
+work.
+
+This direction builds on Jason's Rally 2 rewrite and act-on-next contract work
+in PRs #42/#43. The changes here promote that work as the default path while
+keeping the legacy CLI as deprecated compatibility.
+
 Product sentence:
 
 ```text
@@ -42,7 +52,7 @@ Rally should not own:
 ```text
 .rally2/facts.jsonl  canonical append-only typed fact log
 .rally2/room.db      live SQLite room projection/index
-enter/room/check     product APIs backed by the projection
+enter/next/room/check product APIs backed by the projection
 HANDOFF.md           optional plain-text snapshot export
 adapters             Codex, Claude, Pi, Herdr, cmux, CI integration
 ```
@@ -59,6 +69,7 @@ The greenfield surface should be small:
 
 ```bash
 rally2 enter --tool codex    # agent entry state + changed attention
+rally2 next --tool codex     # ranked next action when idle or waiting
 rally2 say <kind> ...        # append a typed coordination fact
 rally2 room --json           # inspect current projected room state
 rally2 check before-write    # boundary check before shared work changes
@@ -66,6 +77,11 @@ rally2 check before-write    # boundary check before shared work changes
 
 Everything else is debug, admin, or adapter plumbing. `HANDOFF.md` export and
 adapter setup matter, but they should not be part of the core product loop.
+
+Legacy commands such as `rally preflight`, `rally context`, `rally packet`,
+`rally doctor`, and `rally sync` are compatibility surfaces. They can remain
+tested and installable, but they should not define the primary agent experience
+after Rally 2 is available.
 
 ## Agent Product Loop
 
@@ -76,6 +92,7 @@ Required loop:
 
 ```text
 enter repo/session -> receive room state
+idle/wait boundary -> receive next useful action
 before shared change -> run boundary check
 after meaningful work -> say the durable fact
 when another agent acts -> it enters with those facts visible
@@ -83,17 +100,52 @@ when another agent acts -> it enters with those facts visible
 
 The product succeeds when agents know Rally through repeated interaction:
 
-- At startup, the adapter injects `rally2 enter` into visible model state.
+- At startup, the adapter injects `rally2 enter` and `rally2 next` into visible
+  model state.
 - During work, write boundaries call `rally2 check` before changes land.
 - At completion, the adapter prompts for `rally2 say artifact`, `handoff`,
   `decision`, `risk`, or `blocker` when appropriate.
-- On resume or loop boundary, the adapter calls `rally2 enter` again so the
-  agent sees what changed while it was focused elsewhere.
+- On resume, prompt, idle, or loop boundary, the adapter calls `rally2 enter`
+  and `rally2 next` again so the agent sees what changed and has a concrete
+  ranked action.
+- If `rally2 next` shows the agent is waiting on a peer, the adapter still
+  exposes useful alternate work such as reviewing unconsumed artifacts before
+  settling for a wait state.
 - When the agent asks for the broader picture, `rally2 room` is the source of
   truth.
 
 Manual CLI use should be possible, but the primary product path is adapter-led.
 If agents must remember to run Rally by habit, the product is not finished.
+
+## Act-On-Next Contract
+
+`rally2 next` is an execution contract for an agent build loop, not a daemon.
+Rally recommends and constrains work; the agent or harness still executes,
+verifies, and decides when to continue.
+
+The `next` payload must make the loop explicit:
+
+- `actionable`: whether the agent may treat the recommendation as a task
+  candidate.
+- `requires_human`: whether the agent should stop and ask before acting.
+- `stop_reason`: why there is no autonomous action, such as waiting on a peer.
+- `suggested_claims`: scoped claim commands for work the agent should reserve
+  before editing or reviewing files.
+- `suggested_commands`: command templates for checks and completion facts.
+- `completion`: the durable fact kind expected after work, whether evidence is
+  required, whether claims should be released, and whether the agent should run
+  `rally2 next` again.
+
+The intended autonomous build loop is:
+
+```text
+enter -> next -> if actionable, claim/check -> execute -> verify
+      -> say artifact/handoff/resolve/release -> next
+```
+
+The loop stops when `actionable` is false, `requires_human` is true, the agent
+hits a blocker, or the harness/user budget expires. This keeps autonomy in the
+agent harness while Rally remains the room and coordination substrate.
 
 ## Typed Facts
 
@@ -312,6 +364,7 @@ Adapter status should report surfaces, not abstract health:
 Each adapter must define:
 
 - How Rally room state becomes model-visible.
+- How `next.action` and `waiting_on` become visible at idle/wait boundaries.
 - Which boundary events can call `check`.
 - How an agent is prompted to publish facts.
 - Where tool identity, role, watched paths, and cursors are stored.
@@ -322,18 +375,21 @@ just another command an agent may forget.
 
 Adapter expectations by surface:
 
-- Codex: inject `enter` at startup/resume, refresh at goal loop boundaries when
-  possible, call `check before-write`, and prompt for `say` on completion.
-- Claude Code: inject `enter` through project/user instructions or hooks, call
-  `check before-write`, and prompt for durable facts when tasks complete.
-- Pi: inject `enter` into the active Pi message/context surface, refresh at
-  session boundaries, and support completion prompts for `say`.
-- Herdr: expose room context to panes, track pane/tool identity, and make it
-  easy for an operator agent to read panes, route work, and inject `enter`.
-- cmux: expose Rally entry state to sessions without pretending cmux
+- Codex: inject `enter` and `next` at startup/resume and prompt boundaries,
+  refresh at goal loop boundaries when possible, call `check before-write`, and
+  prompt for `say` on completion.
+- Claude Code: inject `enter` and `next` through project/user instructions or
+  hooks, call `check before-write`, and prompt for durable facts when tasks
+  complete.
+- Pi: inject `enter` and `next` into the active Pi message/context surface,
+  refresh at session boundaries, and support completion prompts for `say`.
+- Herdr: expose room context and next action to panes, track pane/tool identity,
+  and make it easy for an operator agent to read panes, route work, and inject
+  `enter`/`next`.
+- cmux: expose Rally entry and next state to sessions without pretending cmux
   owns the coordination state.
-- CI: read room/check state, fail or warn on unresolved trusted blockers and
-  unsafe claims according to policy, and publish evidence facts when useful.
+- CI: read next/room/check state, fail or warn on unresolved trusted blockers
+  and unsafe claims according to policy, and publish evidence facts when useful.
 
 ## Remote Model
 
@@ -353,7 +409,7 @@ techniques, but the user-facing model should stand on its own.
 
 Required product qualities:
 
-- Few nouns: room, fact, enter, say, check.
+- Few nouns: room, fact, enter, next, say, check.
 - Commands that are obvious without reading old project history.
 - SQLite room projection with relationship indexes as the default live surface.
 - `HANDOFF.md` as an explicit export, not constantly updated state.
