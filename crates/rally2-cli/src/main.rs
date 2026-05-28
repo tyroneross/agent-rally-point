@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use chrono::{SecondsFormat, Utc};
+use factstr::{EventQuery as FactQuery, EventStore, NewEvent};
+use factstr_sqlite::SqliteStore;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_ENTER: &str = "agent-rally2.command.enter.v1";
@@ -18,6 +21,10 @@ const SCHEMA_ROOM: &str = "agent-rally2.command.room.v1";
 const SCHEMA_NEXT: &str = "agent-rally2.command.next.v1";
 const SCHEMA_CHECK: &str = "agent-rally2.command.check.v1";
 const SCHEMA_INSTALL: &str = "agent-rally2.command.install.v1";
+const SCHEMA_RUN: &str = "agent-rally2.command.run.v1";
+const SCHEMA_SESSIONS: &str = "agent-rally2.command.sessions.v1";
+const SCHEMA_INJECT: &str = "agent-rally2.command.inject.v1";
+const SCHEMA_SESSION_ACTION: &str = "agent-rally2.command.session-action.v1";
 const FACT_SCHEMA: &str = "agent-rally2.fact.v1";
 const DB_SCHEMA_VERSION: i64 = 2;
 const INSTALL_MARKER: &str = "agent-rally2-install-v1";
@@ -55,6 +62,12 @@ fn run_inner() -> Result<Output, String> {
         "next" => command_next(ArgBag::new("next", args)),
         "check" => command_check(ArgBag::new("check", args)),
         "install" => command_install(ArgBag::new("install", args)),
+        "run" => command_run(ArgBag::new("run", args)),
+        "sessions" => command_sessions(ArgBag::new("sessions", args)),
+        "inject" => command_inject(ArgBag::new("inject", args)),
+        "attach" => command_session_action(ArgBag::new("attach", args), SessionAction::Attach),
+        "capture" => command_session_action(ArgBag::new("capture", args), SessionAction::Capture),
+        "stop" => command_session_action(ArgBag::new("stop", args), SessionAction::Stop),
         _ => Err(format!("unknown Rally 2 command {command}")),
     }
 }
@@ -161,7 +174,7 @@ fn command_say(args: ArgBag) -> Result<Output, String> {
         "trust_status": args.one("--trust-status").unwrap_or_else(|| "local".to_string())
     });
     let mut room = RoomStore::open()?;
-    room.append_fact(&fact)?;
+    let fact = room.append_fact(&fact)?;
     let snapshot = room.snapshot()?;
     let body = envelope(
         "say",
@@ -369,12 +382,1013 @@ fn command_install(args: ArgBag) -> Result<Output, String> {
     Ok(Output::new(json_output, text, body))
 }
 
+fn command_run(args: ArgBag) -> Result<Output, String> {
+    let json_output = args.flag("--json");
+    let dry_run = args.flag("--dry-run");
+    let agent = args
+        .positional
+        .first()
+        .cloned()
+        .ok_or_else(|| "run requires an agent name".to_string())?;
+    let backend = normalize_backend(args.one("--backend").as_deref().unwrap_or("tmux"))?;
+    let repo = repo_root()?;
+    let agent_spec = AgentSpec::from_name(&agent)?;
+    let name = args
+        .one("--name")
+        .unwrap_or_else(|| format!("{}-{}", agent_spec.agent, short_id()));
+    let session_id = args
+        .one("--session-id")
+        .unwrap_or_else(|| format!("{}-{}", agent_spec.agent, sanitize_id(&name)));
+    let tool = args
+        .one("--tool")
+        .unwrap_or_else(|| format!("{}:{}", agent_spec.tool, sanitize_id(&name)));
+    let backend_target = backend_target(&backend, &session_id);
+    let command = agent_spec.command_line(&name);
+    let backend_runner = BackendRunner::new(&backend, &args)?;
+    let start_commands = backend_runner.start_commands(&backend_target, &repo, &command, &name);
+
+    let actual_target = if dry_run {
+        backend_target.clone()
+    } else {
+        backend_runner.start(&backend_target, &repo, &command, &name)?
+    };
+    if !dry_run {
+        write_session_record(&ManagedSession {
+            session_id: session_id.clone(),
+            name: name.clone(),
+            agent: agent_spec.agent.to_string(),
+            tool: tool.clone(),
+            backend: backend.clone(),
+            cwd: repo.clone(),
+            target: actual_target.clone(),
+        })?;
+    }
+
+    let body = envelope(
+        "run",
+        SCHEMA_RUN,
+        json!({
+            "mode": if dry_run { "dry-run" } else { "run" },
+            "session": {
+                "session_id": session_id,
+                "name": name,
+                "agent": agent_spec.agent,
+                "tool": tool,
+                "backend": backend,
+                "cwd": repo.display().to_string(),
+                "target": actual_target
+            },
+            "commands": {
+                "start": start_commands
+            }
+        }),
+    );
+    let text = format!(
+        "run agent={} backend={} session={}",
+        body["data"]["session"]["agent"]
+            .as_str()
+            .unwrap_or("unknown"),
+        body["data"]["session"]["backend"]
+            .as_str()
+            .unwrap_or("unknown"),
+        body["data"]["session"]["session_id"]
+            .as_str()
+            .unwrap_or("unknown")
+    );
+    Ok(Output::new(json_output, text, body))
+}
+
+fn command_sessions(args: ArgBag) -> Result<Output, String> {
+    let json_output = args.flag("--json");
+    let sessions = read_session_records()?;
+    let body = envelope(
+        "sessions",
+        SCHEMA_SESSIONS,
+        json!({
+            "sessions": sessions.iter().map(ManagedSession::to_json).collect::<Vec<_>>()
+        }),
+    );
+    let text = format!("sessions {}", sessions.len());
+    Ok(Output::new(json_output, text, body))
+}
+
+fn command_inject(args: ArgBag) -> Result<Output, String> {
+    let json_output = args.flag("--json");
+    let dry_run = args.flag("--dry-run");
+    let target = args
+        .positional
+        .first()
+        .cloned()
+        .ok_or_else(|| "inject requires a session id, name, or tool".to_string())?;
+    let sessions = read_session_records()?;
+    let session = sessions
+        .iter()
+        .find(|session| {
+            session.session_id == target || session.name == target || session.tool == target
+        })
+        .cloned()
+        .ok_or_else(|| format!("unknown managed session {target}"))?;
+    let handoff = args.one("--handoff").or_else(|| args.one("--ref"));
+    let text = match (args.one("--text"), handoff.as_deref()) {
+        (Some(text), _) => text,
+        (None, Some(handoff)) => handoff_prompt(&session, handoff),
+        (None, None) => return Err("inject requires --text or --handoff".to_string()),
+    };
+    let require_ack = args.flag("--require-ack");
+    if require_ack && handoff.is_none() {
+        return Err("--require-ack requires --handoff or --ref".to_string());
+    }
+    let timeout = parse_i64_option(&args, "--timeout-seconds")?
+        .unwrap_or(60)
+        .clamp(1, 600) as u64;
+    let backend_runner = BackendRunner::new(&session.backend, &args)?;
+    let live_target = if dry_run {
+        session.target.clone()
+    } else {
+        backend_runner.live_target(&session)?
+    };
+    let commands = backend_runner.inject_commands(&live_target, &text);
+    if !dry_run {
+        backend_runner.inject(&live_target, &text)?;
+    }
+    let ack = if require_ack && !dry_run {
+        let handoff = handoff.as_deref().unwrap_or_default();
+        Some(wait_for_resolution(handoff, timeout)?)
+    } else {
+        None
+    };
+    let body = envelope(
+        "inject",
+        SCHEMA_INJECT,
+        json!({
+            "mode": if dry_run { "dry-run" } else { "inject" },
+            "session": session.to_json(),
+            "handoff": handoff,
+            "require_ack": require_ack,
+            "ack": ack,
+            "commands": commands
+        }),
+    );
+    let text = format!(
+        "inject session={} ack={}",
+        session.session_id,
+        body["data"]["ack"].is_object()
+    );
+    Ok(Output::new(json_output, text, body))
+}
+
+#[derive(Clone, Copy)]
+enum SessionAction {
+    Attach,
+    Capture,
+    Stop,
+}
+
+fn command_session_action(args: ArgBag, action: SessionAction) -> Result<Output, String> {
+    let json_output = args.flag("--json");
+    let dry_run = args.flag("--dry-run");
+    let target = args
+        .positional
+        .first()
+        .cloned()
+        .ok_or_else(|| format!("{} requires a session id, name, or tool", args.command))?;
+    let session = find_session(&target)?;
+    let backend_runner = BackendRunner::new(&session.backend, &args)?;
+    let live_target = if dry_run {
+        session.target.clone()
+    } else {
+        backend_runner.live_target(&session)?
+    };
+    let lines = parse_i64_option(&args, "--lines")?
+        .unwrap_or(120)
+        .clamp(1, 2000) as usize;
+    let (commands, output) = match action {
+        SessionAction::Attach => {
+            let commands = backend_runner.attach_commands(&live_target);
+            if !dry_run && !json_output {
+                backend_runner.attach(&live_target)?;
+            }
+            (commands, None)
+        }
+        SessionAction::Capture => {
+            let commands = backend_runner.capture_commands(&live_target, lines);
+            let output = if dry_run {
+                None
+            } else {
+                Some(backend_runner.capture(&live_target, lines)?)
+            };
+            (commands, output)
+        }
+        SessionAction::Stop => {
+            let commands = backend_runner.stop_commands(&live_target);
+            if !dry_run {
+                backend_runner.stop(&live_target)?;
+                remove_session_record(&session.session_id)?;
+            }
+            (commands, None)
+        }
+    };
+    let output_text = output.clone();
+    let command_name = args.command;
+    let body = envelope(
+        command_name,
+        match action {
+            SessionAction::Attach => SCHEMA_SESSION_ACTION,
+            SessionAction::Capture => SCHEMA_SESSION_ACTION,
+            SessionAction::Stop => SCHEMA_SESSION_ACTION,
+        },
+        json!({
+            "mode": if dry_run { "dry-run" } else { command_name },
+            "action": command_name,
+            "session": session.to_json(),
+            "output": output,
+            "commands": commands
+        }),
+    );
+    let text =
+        output_text.unwrap_or_else(|| format!("{command_name} session={}", session.session_id));
+    Ok(Output::new(json_output, text, body))
+}
+
+#[derive(Clone, Debug)]
+struct AgentSpec {
+    agent: &'static str,
+    tool: &'static str,
+    command: &'static str,
+}
+
+impl AgentSpec {
+    fn from_name(agent: &str) -> Result<Self, String> {
+        match agent {
+            "claude" | "claude_code" | "claude-code" => Ok(Self {
+                agent: "claude",
+                tool: "claude_code",
+                command: "claude",
+            }),
+            "codex" => Ok(Self {
+                agent: "codex",
+                tool: "codex",
+                command: "codex",
+            }),
+            "opencode" | "ocode" | "oc" => Ok(Self {
+                agent: "opencode",
+                tool: "opencode",
+                command: "opencode",
+            }),
+            "gemini" => Ok(Self {
+                agent: "gemini",
+                tool: "gemini",
+                command: "gemini",
+            }),
+            other => Err(format!("unsupported agent {other}")),
+        }
+    }
+
+    fn command_line(&self, name: &str) -> Vec<String> {
+        match self.agent {
+            "claude" => vec![
+                self.command.to_string(),
+                "--name".to_string(),
+                name.to_string(),
+            ],
+            _ => vec![self.command.to_string()],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ManagedSession {
+    session_id: String,
+    name: String,
+    agent: String,
+    tool: String,
+    backend: String,
+    cwd: PathBuf,
+    target: String,
+}
+
+impl ManagedSession {
+    fn from_value(value: &Value) -> Option<Self> {
+        Some(Self {
+            session_id: value.get("session_id")?.as_str()?.to_string(),
+            name: value.get("name")?.as_str()?.to_string(),
+            agent: value.get("agent")?.as_str()?.to_string(),
+            tool: value.get("tool")?.as_str()?.to_string(),
+            backend: value.get("backend")?.as_str()?.to_string(),
+            cwd: PathBuf::from(value.get("cwd")?.as_str()?),
+            target: value
+                .get("target")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)?,
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "session_id": self.session_id,
+            "name": self.name,
+            "agent": self.agent,
+            "tool": self.tool,
+            "backend": self.backend,
+            "cwd": self.cwd.display().to_string(),
+            "target": self.target
+        })
+    }
+}
+
+struct TmuxBackend {
+    bin: String,
+}
+
+impl TmuxBackend {
+    fn new(bin: Option<String>) -> Self {
+        Self {
+            bin: bin.unwrap_or_else(|| "tmux".to_string()),
+        }
+    }
+
+    fn start_args(&self, session: &str, cwd: &Path, command: &[String]) -> Vec<String> {
+        let shell_command = format!(
+            "cd {} && exec {}",
+            shell_quote(&cwd.display().to_string()),
+            shell_words(command)
+        );
+        vec![
+            "new-session".to_string(),
+            "-d".to_string(),
+            "-s".to_string(),
+            session.to_string(),
+            "-x".to_string(),
+            "140".to_string(),
+            "-y".to_string(),
+            "50".to_string(),
+            shell_command,
+        ]
+    }
+
+    fn inject_args(&self, session: &str, text: &str) -> Vec<Value> {
+        let buffer = format!("rally-inject-{session}");
+        vec![
+            json!([self.bin.clone(), "send-keys", "-t", session, "C-u"]),
+            json!([self.bin.clone(), "set-buffer", "-b", buffer, text]),
+            json!([
+                self.bin.clone(),
+                "paste-buffer",
+                "-b",
+                buffer,
+                "-t",
+                session
+            ]),
+            json!([self.bin.clone(), "send-keys", "-t", session, "Enter"]),
+        ]
+    }
+
+    fn run(&self, args: &[String]) -> Result<(), String> {
+        let status = Command::new(&self.bin)
+            .args(args)
+            .status()
+            .map_err(|err| format!("run tmux: {err}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("tmux exited with {status}"))
+        }
+    }
+
+    fn inject(&self, session: &str, text: &str) -> Result<(), String> {
+        let buffer = format!("rally-inject-{session}");
+        run_command(&self.bin, &["send-keys", "-t", session, "C-u"])?;
+        run_command(&self.bin, &["set-buffer", "-b", &buffer, text])?;
+        run_command(&self.bin, &["paste-buffer", "-b", &buffer, "-t", session])?;
+        run_command(&self.bin, &["send-keys", "-t", session, "Enter"])?;
+        Ok(())
+    }
+}
+
+struct BackendRunner {
+    backend: String,
+    tmux_bin: String,
+    herdr_bin: String,
+    cmux_bin: String,
+}
+
+impl BackendRunner {
+    fn new(backend: &str, args: &ArgBag) -> Result<Self, String> {
+        Ok(Self {
+            backend: normalize_backend(backend)?,
+            tmux_bin: args.one("--tmux-bin").unwrap_or_else(|| "tmux".to_string()),
+            herdr_bin: args
+                .one("--herdr-bin")
+                .unwrap_or_else(|| "herdr".to_string()),
+            cmux_bin: args.one("--cmux-bin").unwrap_or_else(|| "cmux".to_string()),
+        })
+    }
+
+    fn start_commands(
+        &self,
+        target: &str,
+        cwd: &Path,
+        command: &[String],
+        name: &str,
+    ) -> Vec<Value> {
+        match self.backend.as_str() {
+            "tmux" => {
+                let tmux = TmuxBackend::new(Some(self.tmux_bin.clone()));
+                let mut args = vec![self.tmux_bin.clone()];
+                args.extend(tmux.start_args(target, cwd, command));
+                vec![json!(args)]
+            }
+            "herdr" => vec![json!(herdr_start_command(
+                &self.herdr_bin,
+                target,
+                cwd,
+                command
+            ))],
+            "cmux" => vec![json!(cmux_start_command(
+                &self.cmux_bin,
+                target,
+                cwd,
+                command,
+                name
+            ))],
+            _ => Vec::new(),
+        }
+    }
+
+    fn start(
+        &self,
+        target: &str,
+        cwd: &Path,
+        command: &[String],
+        name: &str,
+    ) -> Result<String, String> {
+        match self.backend.as_str() {
+            "tmux" => {
+                let tmux = TmuxBackend::new(Some(self.tmux_bin.clone()));
+                tmux.run(&tmux.start_args(target, cwd, command))?;
+                Ok(target.to_string())
+            }
+            "herdr" => {
+                run_command_output(&herdr_start_command(&self.herdr_bin, target, cwd, command))?;
+                Ok(target.to_string())
+            }
+            "cmux" => {
+                let output = run_command_output(&cmux_start_command(
+                    &self.cmux_bin,
+                    target,
+                    cwd,
+                    command,
+                    name,
+                ))?;
+                Ok(parse_cmux_start_target(&output, target))
+            }
+            other => Err(format!("unsupported backend {other}")),
+        }
+    }
+
+    fn live_target(&self, session: &ManagedSession) -> Result<String, String> {
+        if self.backend == "herdr" {
+            herdr_live_pane(&self.herdr_bin, session)
+        } else {
+            Ok(session.target.clone())
+        }
+    }
+
+    fn inject_commands(&self, target: &str, text: &str) -> Vec<Value> {
+        match self.backend.as_str() {
+            "tmux" => TmuxBackend::new(Some(self.tmux_bin.clone())).inject_args(target, text),
+            "herdr" => vec![
+                json!([
+                    self.herdr_bin.clone(),
+                    "pane",
+                    "send-text",
+                    target,
+                    "\u{15}"
+                ]),
+                json!([self.herdr_bin.clone(), "pane", "send-text", target, text]),
+                json!([self.herdr_bin.clone(), "pane", "send-keys", target, "enter"]),
+            ],
+            "cmux" => vec![
+                json!([
+                    self.cmux_bin.clone(),
+                    "send-key",
+                    "--workspace",
+                    target,
+                    "ctrl+u"
+                ]),
+                json!([self.cmux_bin.clone(), "send", "--workspace", target, text]),
+                json!([
+                    self.cmux_bin.clone(),
+                    "send-key",
+                    "--workspace",
+                    target,
+                    "enter"
+                ]),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    fn inject(&self, target: &str, text: &str) -> Result<(), String> {
+        match self.backend.as_str() {
+            "tmux" => TmuxBackend::new(Some(self.tmux_bin.clone())).inject(target, text),
+            "herdr" => {
+                run_command_owned(&[
+                    self.herdr_bin.clone(),
+                    "pane".to_string(),
+                    "send-text".to_string(),
+                    target.to_string(),
+                    "\u{15}".to_string(),
+                ])?;
+                run_command_owned(&[
+                    self.herdr_bin.clone(),
+                    "pane".to_string(),
+                    "send-text".to_string(),
+                    target.to_string(),
+                    text.to_string(),
+                ])?;
+                run_command_owned(&[
+                    self.herdr_bin.clone(),
+                    "pane".to_string(),
+                    "send-keys".to_string(),
+                    target.to_string(),
+                    "enter".to_string(),
+                ])
+            }
+            "cmux" => {
+                run_command_owned(&[
+                    self.cmux_bin.clone(),
+                    "send-key".to_string(),
+                    "--workspace".to_string(),
+                    target.to_string(),
+                    "ctrl+u".to_string(),
+                ])?;
+                run_command_owned(&[
+                    self.cmux_bin.clone(),
+                    "send".to_string(),
+                    "--workspace".to_string(),
+                    target.to_string(),
+                    text.to_string(),
+                ])?;
+                run_command_owned(&[
+                    self.cmux_bin.clone(),
+                    "send-key".to_string(),
+                    "--workspace".to_string(),
+                    target.to_string(),
+                    "enter".to_string(),
+                ])
+            }
+            other => Err(format!("unsupported backend {other}")),
+        }
+    }
+
+    fn attach_commands(&self, target: &str) -> Vec<Value> {
+        match self.backend.as_str() {
+            "tmux" => vec![json!([self.tmux_bin.clone(), "attach", "-t", target])],
+            "herdr" => vec![json!([self.herdr_bin.clone(), "agent", "attach", target])],
+            "cmux" => vec![json!([
+                self.cmux_bin.clone(),
+                "select-workspace",
+                "--workspace",
+                target
+            ])],
+            _ => Vec::new(),
+        }
+    }
+
+    fn attach(&self, target: &str) -> Result<(), String> {
+        match self.backend.as_str() {
+            "tmux" => run_command_owned(&[
+                self.tmux_bin.clone(),
+                "attach".to_string(),
+                "-t".to_string(),
+                target.to_string(),
+            ]),
+            "herdr" => run_command_owned(&[
+                self.herdr_bin.clone(),
+                "agent".to_string(),
+                "attach".to_string(),
+                target.to_string(),
+            ]),
+            "cmux" => run_command_owned(&[
+                self.cmux_bin.clone(),
+                "select-workspace".to_string(),
+                "--workspace".to_string(),
+                target.to_string(),
+            ]),
+            other => Err(format!("unsupported backend {other}")),
+        }
+    }
+
+    fn capture_commands(&self, target: &str, lines: usize) -> Vec<Value> {
+        match self.backend.as_str() {
+            "tmux" => vec![json!([
+                self.tmux_bin.clone(),
+                "capture-pane",
+                "-pt",
+                target,
+                "-S",
+                format!("-{lines}")
+            ])],
+            "herdr" => vec![json!([
+                self.herdr_bin.clone(),
+                "agent",
+                "read",
+                target,
+                "--source",
+                "recent-unwrapped",
+                "--lines",
+                lines.to_string()
+            ])],
+            "cmux" => vec![json!([
+                self.cmux_bin.clone(),
+                "read-screen",
+                "--workspace",
+                target,
+                "--scrollback",
+                "--lines",
+                lines.to_string()
+            ])],
+            _ => Vec::new(),
+        }
+    }
+
+    fn capture(&self, target: &str, lines: usize) -> Result<String, String> {
+        match self.backend.as_str() {
+            "tmux" => run_command_output(&[
+                self.tmux_bin.clone(),
+                "capture-pane".to_string(),
+                "-pt".to_string(),
+                target.to_string(),
+                "-S".to_string(),
+                format!("-{lines}"),
+            ]),
+            "herdr" => run_command_output(&[
+                self.herdr_bin.clone(),
+                "agent".to_string(),
+                "read".to_string(),
+                target.to_string(),
+                "--source".to_string(),
+                "recent-unwrapped".to_string(),
+                "--lines".to_string(),
+                lines.to_string(),
+            ]),
+            "cmux" => run_command_output(&[
+                self.cmux_bin.clone(),
+                "read-screen".to_string(),
+                "--workspace".to_string(),
+                target.to_string(),
+                "--scrollback".to_string(),
+                "--lines".to_string(),
+                lines.to_string(),
+            ]),
+            other => Err(format!("unsupported backend {other}")),
+        }
+    }
+
+    fn stop_commands(&self, target: &str) -> Vec<Value> {
+        match self.backend.as_str() {
+            "tmux" => vec![json!([self.tmux_bin.clone(), "kill-session", "-t", target])],
+            "herdr" => vec![json!([self.herdr_bin.clone(), "pane", "close", target])],
+            "cmux" => vec![json!([
+                self.cmux_bin.clone(),
+                "close-workspace",
+                "--workspace",
+                target
+            ])],
+            _ => Vec::new(),
+        }
+    }
+
+    fn stop(&self, target: &str) -> Result<(), String> {
+        match self.backend.as_str() {
+            "tmux" => run_command_owned(&[
+                self.tmux_bin.clone(),
+                "kill-session".to_string(),
+                "-t".to_string(),
+                target.to_string(),
+            ]),
+            "herdr" => run_command_owned(&[
+                self.herdr_bin.clone(),
+                "pane".to_string(),
+                "close".to_string(),
+                target.to_string(),
+            ]),
+            "cmux" => run_command_owned(&[
+                self.cmux_bin.clone(),
+                "close-workspace".to_string(),
+                "--workspace".to_string(),
+                target.to_string(),
+            ]),
+            other => Err(format!("unsupported backend {other}")),
+        }
+    }
+}
+
+fn herdr_start_command(bin: &str, target: &str, cwd: &Path, command: &[String]) -> Vec<String> {
+    let mut args = vec![
+        bin.to_string(),
+        "agent".to_string(),
+        "start".to_string(),
+        target.to_string(),
+        "--cwd".to_string(),
+        cwd.display().to_string(),
+        "--no-focus".to_string(),
+        "--".to_string(),
+    ];
+    args.extend(command.iter().cloned());
+    args
+}
+
+fn cmux_start_command(
+    bin: &str,
+    target: &str,
+    cwd: &Path,
+    command: &[String],
+    name: &str,
+) -> Vec<String> {
+    let layout = json!({
+        "pane": {
+            "surfaces": [
+                {
+                    "type": "terminal",
+                    "command": shell_words(command)
+                }
+            ]
+        }
+    })
+    .to_string();
+    vec![
+        bin.to_string(),
+        "new-workspace".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+        "--description".to_string(),
+        target.to_string(),
+        "--cwd".to_string(),
+        cwd.display().to_string(),
+        "--layout".to_string(),
+        layout,
+        "--focus".to_string(),
+        "false".to_string(),
+    ]
+}
+
+fn parse_cmux_start_target(output: &str, fallback: &str) -> String {
+    output
+        .split_whitespace()
+        .find_map(|word| {
+            let value = word.trim_matches(|ch: char| {
+                ch == '"' || ch == '\'' || ch == ',' || ch == ';' || ch == '.'
+            });
+            if value.starts_with("workspace:") {
+                Some(value.to_string())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            output
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(|line| line.trim().to_string())
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cmux_start_target;
+
+    #[test]
+    fn cmux_start_target_uses_workspace_ref_from_status_output() {
+        assert_eq!(
+            parse_cmux_start_target("OK workspace:11\n", "claude-cmux-smoke"),
+            "workspace:11"
+        );
+    }
+}
+
+fn herdr_live_pane(bin: &str, session: &ManagedSession) -> Result<String, String> {
+    let output = run_command_output(&[bin.to_string(), "agent".to_string(), "list".to_string()])?;
+    if output.trim().is_empty() {
+        return Ok(session.target.clone());
+    }
+    let value: Value =
+        serde_json::from_str(&output).map_err(|err| format!("parse herdr agent list: {err}"))?;
+    let agents = value
+        .pointer("/result/agents")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "herdr agent list did not return agents".to_string())?;
+    for agent in agents {
+        let matches = ["name", "pane_id", "terminal_id", "label"]
+            .iter()
+            .filter_map(|key| agent.get(*key).and_then(Value::as_str))
+            .any(|value| {
+                value == session.target
+                    || value == session.session_id
+                    || value == session.name
+                    || value == session.tool
+            });
+        if matches {
+            if let Some(pane_id) = agent.get("pane_id").and_then(Value::as_str) {
+                return Ok(pane_id.to_string());
+            }
+        }
+    }
+    Err(format!(
+        "herdr managed session {} is not currently live",
+        session.session_id
+    ))
+}
+
+fn run_command(bin: &str, args: &[&str]) -> Result<(), String> {
+    let status = Command::new(bin)
+        .args(args)
+        .status()
+        .map_err(|err| format!("run {bin}: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{bin} exited with {status}"))
+    }
+}
+
+fn run_command_owned(args: &[String]) -> Result<(), String> {
+    let (bin, rest) = args
+        .split_first()
+        .ok_or_else(|| "empty command".to_string())?;
+    let status = Command::new(bin)
+        .args(rest)
+        .status()
+        .map_err(|err| format!("run {bin}: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{bin} exited with {status}"))
+    }
+}
+
+fn run_command_output(args: &[String]) -> Result<String, String> {
+    let (bin, rest) = args
+        .split_first()
+        .ok_or_else(|| "empty command".to_string())?;
+    let output = Command::new(bin)
+        .args(rest)
+        .output()
+        .map_err(|err| format!("run {bin}: {err}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(format!(
+            "{bin} exited with {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+fn shell_words(words: &[String]) -> String {
+    shlex::try_join(words.iter().map(String::as_str)).expect("agent command contains NUL byte")
+}
+
+fn sessions_path() -> Result<PathBuf, String> {
+    let root = repo_root()?;
+    let dir = root.join(".rally2");
+    fs::create_dir_all(&dir).map_err(|err| format!("create .rally2: {err}"))?;
+    Ok(dir.join("sessions.json"))
+}
+
+fn read_session_records() -> Result<Vec<ManagedSession>, String> {
+    let path = sessions_path()?;
+    let text = fs::read_to_string(path).unwrap_or_else(|_| "[]".to_string());
+    let value: Value =
+        serde_json::from_str(&text).map_err(|err| format!("parse sessions.json: {err}"))?;
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(ManagedSession::from_value)
+        .collect())
+}
+
+fn write_session_record(session: &ManagedSession) -> Result<(), String> {
+    let path = sessions_path()?;
+    let mut sessions = read_session_records()?;
+    sessions.retain(|existing| existing.session_id != session.session_id);
+    sessions.push(session.clone());
+    let value = json!(
+        sessions
+            .iter()
+            .map(ManagedSession::to_json)
+            .collect::<Vec<_>>()
+    );
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&value).unwrap_or_default(),
+    )
+    .map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+fn remove_session_record(session_id: &str) -> Result<(), String> {
+    let path = sessions_path()?;
+    let mut sessions = read_session_records()?;
+    sessions.retain(|existing| existing.session_id != session_id);
+    let value = json!(
+        sessions
+            .iter()
+            .map(ManagedSession::to_json)
+            .collect::<Vec<_>>()
+    );
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&value).unwrap_or_default(),
+    )
+    .map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+fn find_session(target: &str) -> Result<ManagedSession, String> {
+    read_session_records()?
+        .into_iter()
+        .find(|session| {
+            session.session_id == target || session.name == target || session.tool == target
+        })
+        .ok_or_else(|| format!("unknown managed session {target}"))
+}
+
+fn backend_target(backend: &str, session_id: &str) -> String {
+    match backend {
+        "tmux" => format!("rally-{}", sanitize_id(session_id)),
+        "herdr" => sanitize_id(session_id),
+        "cmux" => sanitize_id(session_id),
+        _ => sanitize_id(session_id),
+    }
+}
+
+fn handoff_prompt(session: &ManagedSession, handoff: &str) -> String {
+    format!(
+        "Rally managed-session injection for {}. Run: rally2 next --tool {} --json. If it is actionable for handoff {}, execute the suggested Rally completion command or run: rally2 say resolve --tool {} --ref {} --subject 'resolved via Rally managed session' --json. Do not edit files unless the Rally action explicitly requires it. Do not ask for confirmation after the Rally command succeeds.",
+        session.name, session.tool, handoff, session.tool, handoff
+    )
+}
+
+fn wait_for_resolution(handoff: &str, timeout_seconds: u64) -> Result<Value, String> {
+    for _ in 0..timeout_seconds {
+        let room = RoomStore::open()?;
+        for fact in room.facts()? {
+            if fact.kind == "resolve" && fact.ref_id.as_deref() == Some(handoff) {
+                return Ok(json!({
+                    "resolved": true,
+                    "event_id": fact.event_id,
+                    "tool": fact.tool,
+                    "subject": fact.subject
+                }));
+            }
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    Err(format!(
+        "timed out after {timeout_seconds}s waiting for resolve fact for {handoff}"
+    ))
+}
+
+fn normalize_backend(backend: &str) -> Result<String, String> {
+    match backend {
+        "auto" | "tmux" => Ok("tmux".to_string()),
+        "herdr" => Ok("herdr".to_string()),
+        "cmux" => Ok("cmux".to_string()),
+        other => Err(format!("unsupported backend {other}")),
+    }
+}
+
+fn sanitize_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn short_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{:x}", nanos & 0xfffff)
+}
+
 #[derive(Clone, Debug)]
 struct InstallPlan {
     adapter: &'static str,
     files: Vec<InstallFile>,
     hook_configs: Vec<HookConfig>,
-    warnings: Vec<String>,
     actions: Vec<Value>,
 }
 
@@ -382,7 +1396,6 @@ impl InstallPlan {
     fn to_json(&self) -> Value {
         json!({
             "adapter": self.adapter,
-            "warnings": self.warnings,
             "actions": self.actions
         })
     }
@@ -436,14 +1449,13 @@ fn install_plan(
 ) -> Result<InstallPlan, String> {
     let mut files = Vec::new();
     let mut hook_configs = Vec::new();
-    let mut warnings = Vec::new();
 
     match adapter {
         "codex" => {
             let hook = home.join(".codex/hooks/rally2-hook.sh");
             files.push(InstallFile {
                 path: hook.clone(),
-                content: shell_hook("codex", rally2_bin),
+                content: guard_hook("codex", rally2_bin),
                 executable: true,
                 kind: "hook-script",
             });
@@ -451,18 +1463,12 @@ fn install_plan(
                 path: home.join(".codex/hooks.json"),
                 entries: codex_hook_entries(&hook),
             });
-            detect_legacy_file(
-                &home.join(".codex/rally-hook.sh"),
-                "Codex has a Rally 1 hook script; Rally 2 will coexist, but both may run.",
-                &mut warnings,
-            );
-            detect_legacy_config(&home.join(".codex/hooks.json"), &mut warnings);
         }
         "claude_code" => {
             let hook = home.join(".claude/hooks/rally2-hook.sh");
             files.push(InstallFile {
                 path: hook.clone(),
-                content: shell_hook("claude_code", rally2_bin),
+                content: guard_hook("claude_code", rally2_bin),
                 executable: true,
                 kind: "hook-script",
             });
@@ -470,26 +1476,15 @@ fn install_plan(
                 path: home.join(".claude/settings.json"),
                 entries: claude_hook_entries(&hook),
             });
-            detect_legacy_file(
-                &home.join(".claude/hooks/rally-hook.sh"),
-                "Claude Code has a Rally 1 hook script; Rally 2 will coexist, but both may run.",
-                &mut warnings,
-            );
-            detect_legacy_config(&home.join(".claude/settings.json"), &mut warnings);
         }
         "pi" => {
-            let extension = home.join(".pi/agent/extensions/rally2-room.ts");
+            let extension = home.join(".pi/agent/extensions/rally2-guard.ts");
             files.push(InstallFile {
                 path: extension,
-                content: pi_extension(rally2_bin),
+                content: pi_guard_extension(rally2_bin),
                 executable: false,
                 kind: "pi-extension",
             });
-            detect_legacy_file(
-                &home.join(".pi/agent/extensions/rally-judgment.ts"),
-                "Pi has a Rally 1 extension; Rally 2 will coexist, but both may run.",
-                &mut warnings,
-            );
         }
         "herdr" => {
             files.push(InstallFile {
@@ -522,7 +1517,6 @@ fn install_plan(
         adapter,
         files,
         hook_configs,
-        warnings,
         actions: Vec::new(),
     })
 }
@@ -688,43 +1682,24 @@ fn remove_rally2_hook_entries(event_hooks: &mut Vec<Value>) {
 
 fn codex_hook_entries(hook: &Path) -> Vec<HookEntry> {
     let hook = shell_quote(&hook.display().to_string());
-    vec![
-        hook_entry(
-            "SessionStart",
-            "startup|resume|clear",
-            &hook,
-            "session-start",
-            "codex",
-        ),
-        hook_entry("UserPromptSubmit", "*", &hook, "user-prompt", "codex"),
-        hook_entry(
-            "PreToolUse",
-            "Write|Edit|MultiEdit|NotebookEdit",
-            &hook,
-            "before-write",
-            "codex",
-        ),
-    ]
+    vec![hook_entry(
+        "PreToolUse",
+        "Write|Edit|MultiEdit|NotebookEdit",
+        &hook,
+        "before-write",
+        "codex",
+    )]
 }
 
 fn claude_hook_entries(hook: &Path) -> Vec<HookEntry> {
     let hook = shell_quote(&hook.display().to_string());
-    vec![
-        hook_entry(
-            "SessionStart",
-            "startup|resume|clear",
-            &hook,
-            "session-start",
-            "claude_code",
-        ),
-        hook_entry(
-            "PreToolUse",
-            "Write|Edit|MultiEdit|NotebookEdit",
-            &hook,
-            "before-write",
-            "claude_code",
-        ),
-    ]
+    vec![hook_entry(
+        "PreToolUse",
+        "Write|Edit|MultiEdit|NotebookEdit",
+        &hook,
+        "before-write",
+        "claude_code",
+    )]
 }
 
 fn hook_entry(
@@ -741,24 +1716,6 @@ fn hook_entry(
     }
 }
 
-fn detect_legacy_file(path: &Path, message: &str, warnings: &mut Vec<String>) {
-    if path.exists() {
-        warnings.push(format!("{message} Path: {}", path.display()));
-    }
-}
-
-fn detect_legacy_config(path: &Path, warnings: &mut Vec<String>) {
-    if fs::read_to_string(path)
-        .map(|content| content.contains("rally-hook.sh") || content.contains("\"rally\""))
-        .unwrap_or(false)
-    {
-        warnings.push(format!(
-            "Existing config appears to reference Rally 1 hooks. Rally 2 did not remove them. Path: {}",
-            path.display()
-        ));
-    }
-}
-
 fn home_dir() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -766,17 +1723,19 @@ fn home_dir() -> PathBuf {
 }
 
 fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    shlex::try_quote(value)
+        .expect("shell argument contains NUL byte")
+        .into_owned()
 }
 
-fn shell_hook(adapter: &str, rally2_bin: &str) -> String {
+fn guard_hook(adapter: &str, rally2_bin: &str) -> String {
     format!(
         r#"#!/bin/sh
 # {marker}
 # Installed by `rally2 install {adapter}`. DO NOT EDIT MANUALLY.
 set -u
 
-phase="${{1:-enter}}"
+phase="${{1:-before-write}}"
 tool="${{2:-{adapter}}}"
 RALLY2_BIN="${{RALLY2_BIN:-{rally2_bin}}}"
 payload="$(cat 2>/dev/null || true)"
@@ -803,28 +1762,6 @@ session_id="$(json_field session_id)"
 [ -n "$session_id" ] || session_id="$(json_field sessionId)"
 [ -n "$session_id" ] || session_id="session-$tool"
 
-run_enter() {{
-  if [ -n "$path" ]; then
-    "$RALLY2_BIN" enter --tool "$tool" --session-id "$session_id" --path "$path" --json 2>/dev/null || true
-  else
-    "$RALLY2_BIN" enter --tool "$tool" --session-id "$session_id" --json 2>/dev/null || true
-  fi
-}}
-
-run_next() {{
-  if [ -n "$path" ]; then
-    "$RALLY2_BIN" next --tool "$tool" --path "$path" --json 2>/dev/null || true
-  else
-    "$RALLY2_BIN" next --tool "$tool" --json 2>/dev/null || true
-  fi
-}}
-
-run_visibility() {{
-  enter_output="$(run_enter)"
-  next_output="$(run_next)"
-  printf 'Rally 2 room:\n%s\n\nRally 2 next:\n%s' "$enter_output" "$next_output"
-}}
-
 run_check() {{
   if [ -n "$path" ]; then
     "$RALLY2_BIN" check before-write --tool "$tool" --path "$path" --strict --json 2>/dev/null || true
@@ -834,34 +1771,15 @@ run_check() {{
 }}
 
 json_escape() {{
-  python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
+  node -e 'let input = ""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => process.stdout.write(JSON.stringify(input)));'
 }}
 
 case "$phase" in
-  session-start|start|resume)
-    output="$(run_visibility)"
-    context="$(printf '%s' "$output" | json_escape)"
-    printf '{{"hookSpecificOutput":{{"hookEventName":"SessionStart","additionalContext":%s}}}}\n' "$context"
-    ;;
-  user-prompt|idle|enter)
-    output="$(run_visibility)"
-    context="$(printf '%s' "$output" | json_escape)"
-    printf '{{"hookSpecificOutput":{{"hookEventName":"UserPromptSubmit","additionalContext":%s}}}}\n' "$context"
-    ;;
   before-write)
     output="$(run_check)"
     if printf '%s' "$output" | grep -q '"allow": false'; then
       reason="$(printf 'Rally 2 blocked this write:\n%s' "$output" | json_escape)"
       printf '{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":%s}}}}\n' "$reason"
-    else
-      printf '{{}}\n'
-    fi
-    ;;
-  before-complete|stop)
-    output="$("$RALLY2_BIN" check before-complete --tool "$tool" --strict --json 2>/dev/null || true)"
-    if printf '%s' "$output" | grep -q '"allow": false'; then
-      reason="$(printf 'Rally 2 needs completion cleanup:\n%s' "$output" | json_escape)"
-      printf '{{"decision":"block","reason":%s}}\n' "$reason"
     else
       printf '{{}}\n'
     fi
@@ -877,7 +1795,7 @@ esac
     )
 }
 
-fn pi_extension(rally2_bin: &str) -> String {
+fn pi_guard_extension(rally2_bin: &str) -> String {
     format!(
         r#"// {marker}
 // Installed by `rally2 install pi`. DO NOT EDIT MANUALLY.
@@ -901,60 +1819,7 @@ function pathFromTool(event: any): string | undefined {{
   return input.path || input.file_path || input.filePath || input.notebook_path;
 }}
 
-function entryMessage(output: string): string | undefined {{
-  try {{
-    const parsed = JSON.parse(output || "{{}}");
-    const entry = parsed?.data?.entry;
-    if (!entry) return undefined;
-    return `Rally 2 room:\n${{JSON.stringify(entry, null, 2)}}`;
-  }} catch (_) {{
-    return undefined;
-  }}
-}}
-
-function nextMessage(output: string): string | undefined {{
-  try {{
-    const parsed = JSON.parse(output || "{{}}");
-    const next = parsed?.data?.next;
-    if (!next) return undefined;
-    return `Rally 2 next:\n${{JSON.stringify(next, null, 2)}}`;
-  }} catch (_) {{
-    return undefined;
-  }}
-}}
-
-export default function rally2Room(pi: ExtensionAPI) {{
-  let lastDelivered = "";
-
-  function deliver(entryOutput: string, nextOutput: string, triggerTurn: boolean) {{
-    const content = [entryMessage(entryOutput), nextMessage(nextOutput)].filter(Boolean).join("\n\n");
-    if (!content || content === lastDelivered) return undefined;
-    lastDelivered = content;
-    const message = {{ customType: "rally2", content, display: true }};
-    if (triggerTurn) {{
-      try {{ pi.sendMessage(message, {{ triggerTurn: true, deliverAs: "followUp" }}); }} catch (_) {{}}
-    }}
-    return message;
-  }}
-
-  pi.on("session_start", async (_event, ctx) => {{
-    const session = ctx.sessionManager.getSessionId?.() || `${{Date.now()}}`;
-    deliver(
-      runRally2(["enter", "--tool", "pi", "--session-id", session, "--json"]),
-      runRally2(["next", "--tool", "pi", "--json"]),
-      true
-    );
-  }});
-
-  pi.on("before_agent_start", async () => {{
-    const message = deliver(
-      runRally2(["enter", "--tool", "pi", "--json"]),
-      runRally2(["next", "--tool", "pi", "--json"]),
-      false
-    );
-    if (message) return {{ message }};
-  }});
-
+export default function rally2Guard(pi: ExtensionAPI) {{
   pi.on("tool_call", async (event) => {{
     const name = event.toolName;
     if (!["write", "edit", "serena_replace_content", "serena_replace_symbol_body"].includes(name)) return;
@@ -983,15 +1848,13 @@ fn herdr_integration(rally2_bin: &str) -> String {
         "remote_safe": true,
         "commands": {
             "enter": format!("{rally2_bin} enter --tool herdr --json"),
-            "next": format!("{rally2_bin} next --tool herdr --json"),
-            "next_for_pane": format!("{rally2_bin} next --tool <pane-tool> --json"),
             "room": format!("{rally2_bin} room --json"),
             "before_write": format!("{rally2_bin} check before-write --tool herdr --path <path> --strict --json"),
             "before_complete": format!("{rally2_bin} check before-complete --tool herdr --strict --json")
         },
         "notes": [
-            "Herdr panes should inject enter and next output into the active agent pane at start/resume.",
-            "Pane status can summarize next.action and waiting_on from rally2 next for that pane's tool identity.",
+            "Use rally2 run --backend herdr to start managed agent panes.",
+            "Use rally2 inject to route actionable work into managed Herdr panes.",
             "Remote Herdr sessions can run the same commands on the remote checkout because Rally 2 state is repo-local."
         ]
     })
@@ -1004,13 +1867,12 @@ fn cmux_integration(rally2_bin: &str) -> String {
         "adapter": "cmux",
         "commands": {
             "enter": format!("{rally2_bin} enter --tool cmux --json"),
-            "next": format!("{rally2_bin} next --tool cmux --json"),
             "room": format!("{rally2_bin} room --json"),
             "before_write": format!("{rally2_bin} check before-write --tool cmux --path <path> --strict --json")
         },
         "notes": [
-            "cmux should expose Rally 2 entry and next state to each managed session.",
-            "Use alongside cmux native hooks; Rally 2 remains the coordination room, not the terminal multiplexer."
+            "Use rally2 run --backend cmux to start managed workspaces.",
+            "Use rally2 inject to route actionable work into managed cmux workspaces."
         ]
     })
     .to_string()
@@ -1031,8 +1893,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Report Rally 2 next action
-        run: {rally2_bin} next --tool ci --json
       - name: Check Rally 2 room before completion
         run: {rally2_bin} check before-complete --tool ci --strict --json
 "#,
@@ -1067,7 +1927,7 @@ impl Fact {
     fn from_value(value: &Value, seq: i64) -> Self {
         Self {
             event_id: value["event_id"].as_str().unwrap_or("").to_string(),
-            seq,
+            seq: value["seq"].as_i64().unwrap_or(seq),
             thread_id: value["thread_id"].as_str().unwrap_or("").to_string(),
             kind: value["kind"].as_str().unwrap_or("unknown").to_string(),
             tool: value["tool"].as_str().map(str::to_string),
@@ -1276,7 +2136,7 @@ impl RoomQuery {
 
 struct RoomStore {
     root: PathBuf,
-    facts_path: PathBuf,
+    fact_store: SqliteStore,
     db_path: PathBuf,
 }
 
@@ -1285,35 +2145,40 @@ impl RoomStore {
         let root = repo_root()?;
         let dir = root.join(".rally2");
         fs::create_dir_all(&dir).map_err(|err| format!("create .rally2: {err}"))?;
+        let fact_store_path = dir.join("facts.db");
+        let fact_store =
+            SqliteStore::open(&fact_store_path).map_err(|err| format!("open fact store: {err}"))?;
         Ok(Self {
             root,
-            facts_path: dir.join("facts.jsonl"),
+            fact_store,
             db_path: dir.join("room.db"),
         })
     }
 
-    fn append_fact(&mut self, fact: &Value) -> Result<(), String> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.facts_path)
-            .map_err(|err| format!("open facts log: {err}"))?;
-        writeln!(file, "{fact}").map_err(|err| format!("append fact: {err}"))?;
-        self.rebuild_projection()
+    fn append_fact(&mut self, fact: &Value) -> Result<Value, String> {
+        let mut fact = fact.clone();
+        let event_type = fact["kind"].as_str().unwrap_or("fact").to_string();
+        let result = self
+            .fact_store
+            .append(vec![NewEvent::new(event_type, fact.clone())])
+            .map_err(|err| format!("append fact: {err}"))?;
+        if let Some(object) = fact.as_object_mut() {
+            object.insert("seq".to_string(), json!(result.last_sequence_number));
+        }
+        self.rebuild_projection()?;
+        Ok(fact)
     }
 
     fn facts(&self) -> Result<Vec<Fact>, String> {
-        let text = fs::read_to_string(&self.facts_path).unwrap_or_default();
-        let mut facts = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let value: Value = serde_json::from_str(line)
-                .map_err(|err| format!("parse facts line {}: {err}", index + 1))?;
-            facts.push(Fact::from_value(&value, (index + 1) as i64));
-        }
-        Ok(facts)
+        let query = self
+            .fact_store
+            .query(&FactQuery::all())
+            .map_err(|err| format!("query facts: {err}"))?;
+        Ok(query
+            .event_records
+            .into_iter()
+            .map(|record| Fact::from_value(&record.payload, record.sequence_number as i64))
+            .collect())
     }
 
     fn connection(&self) -> Result<Connection, String> {
@@ -2143,43 +3008,43 @@ fn adapter_contracts() -> Vec<Value> {
     [
         adapter_contract(
             "codex",
+            false,
+            false,
             true,
-            true,
-            true,
-            true,
-            "Inject enter and next output at session start/resume, user prompts, and before continuing a /goal loop.",
+            false,
+            "Write-boundary guard only. Managed sessions own live Rally delivery.",
         ),
         adapter_contract(
             "claude_code",
+            false,
+            false,
             true,
-            true,
-            true,
-            true,
-            "Inject enter and next output through project/user instructions or hooks before Claude Code acts.",
+            false,
+            "Write-boundary guard only. Managed sessions own live Rally delivery.",
         ),
         adapter_contract(
             "pi",
+            false,
+            false,
             true,
-            true,
-            true,
-            true,
-            "Inject enter and next output into Pi's active message state and refresh at session boundaries.",
+            false,
+            "Write-boundary guard only. Managed sessions own live Rally delivery.",
         ),
         adapter_contract(
             "herdr",
-            true,
-            true,
             false,
-            true,
-            "Expose enter and next output to panes and preserve pane/tool identity for operator routing.",
+            false,
+            false,
+            false,
+            "Managed-session backend metadata. Use rally2 run/inject/capture for live delivery.",
         ),
         adapter_contract(
             "cmux",
-            true,
-            true,
             false,
-            true,
-            "Expose enter and next output to sessions while keeping Rally as the coordination source.",
+            false,
+            false,
+            false,
+            "Managed-session backend metadata. Use rally2 run/inject/capture for live delivery.",
         ),
         adapter_contract(
             "ci",
@@ -2187,7 +3052,7 @@ fn adapter_contracts() -> Vec<Value> {
             false,
             true,
             true,
-            "Read next/room/check output in automation and publish evidence facts when useful.",
+            "Read room/check output in automation and publish evidence facts when useful.",
         ),
     ]
     .into_iter()
@@ -2208,8 +3073,6 @@ fn adapter_contract(
         "model_visible": model_visible,
         "commands": {
             "enter": format!("rally2 enter --tool {adapter} --json"),
-            "next": format!("rally2 next --tool {adapter} --json"),
-            "next_for_path": format!("rally2 next --tool {adapter} --path <path> --json"),
             "check_before_write": format!("rally2 check before-write --tool {adapter} --path <path> --json"),
             "say_artifact": format!("rally2 say artifact --tool {adapter} --subject <subject> --uri <path> --evidence <evidence> --json"),
             "room": "rally2 room --json"
@@ -2217,7 +3080,6 @@ fn adapter_contract(
         "surfaces": {
             "startup_enter": startup_enter,
             "loop_enter": loop_enter,
-            "idle_next": true,
             "before_write_check": before_write_check,
             "completion_prompt": completion_prompt
         }
@@ -2517,6 +3379,12 @@ fn help_text() -> String {
         "  rally2 check after-artifact --tool <tool> [--evidence <text>] [--target <tool>] [--json]",
         "  rally2 check before-complete --tool <tool> [--strict] [--json]",
         "  rally2 install <codex|claude_code|pi|herdr|cmux|ci|all> [--dry-run] [--uninstall] [--json]",
+        "  rally2 run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|herdr|cmux>] [--dry-run] [--json]",
+        "  rally2 sessions [--json]",
+        "  rally2 inject <session|name|tool> (--text <text>|--handoff <event-id>) [--require-ack] [--json]",
+        "  rally2 attach <session|name|tool> [--dry-run] [--json]",
+        "  rally2 capture <session|name|tool> [--lines <n>] [--dry-run] [--json]",
+        "  rally2 stop <session|name|tool> [--dry-run] [--json]",
         "",
         "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson",
     ]
@@ -2616,6 +3484,15 @@ fn option_takes_value(name: &str) -> bool {
             | "--thread"
             | "--home"
             | "--rally2-bin"
+            | "--name"
+            | "--backend"
+            | "--tmux-bin"
+            | "--herdr-bin"
+            | "--cmux-bin"
+            | "--text"
+            | "--handoff"
+            | "--timeout-seconds"
+            | "--lines"
     )
 }
 

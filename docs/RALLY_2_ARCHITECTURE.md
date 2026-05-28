@@ -50,16 +50,17 @@ Rally should not own:
 ## Architecture
 
 ```text
-.rally2/facts.jsonl  canonical append-only typed fact log
-.rally2/room.db      live SQLite room projection/index
+.rally2/facts.db     canonical append-only typed fact store (factstr-sqlite)
+.rally2/room.db      live SQLite room projection/index derived from facts.db
 enter/next/room/check product APIs backed by the projection
 HANDOFF.md           optional plain-text snapshot export
 adapters             Codex, Claude, Pi, Herdr, cmux, CI integration
 ```
 
-`facts.jsonl` is the source of truth. `room.db` is a derived cache and never
-writes back to the log. The live surface is a SQLite room projection with
-relationship indexes, not a graph product.
+`facts.db` is the source of truth. It is backed by `factstr-sqlite`, which owns
+ordered append, sequence numbers, and durable fact storage. `room.db` is a
+derived cache and never writes back to the fact store. The live surface is a
+SQLite room projection with relationship indexes, not a graph product.
 `HANDOFF.md` is an optional export for humans, agents without Rally access, and
 end-of-session snapshots.
 
@@ -91,31 +92,32 @@ must put Rally into the agent's normal operating loop.
 Required loop:
 
 ```text
+rally run -> managed mux session starts the agent
 enter repo/session -> receive room state
-idle/wait boundary -> receive next useful action
+explicit idle/wait command -> receive next useful action
 before shared change -> run boundary check
 after meaningful work -> say the durable fact
-when another agent acts -> it enters with those facts visible
+when another agent acts -> rally inject routes the obligation to a managed session
 ```
 
 The product succeeds when agents know Rally through repeated interaction:
 
-- At startup, the adapter injects `rally2 enter` and `rally2 next` into visible
-  model state.
+- At startup, `rally2 run` starts the agent in a managed mux session.
 - During work, write boundaries call `rally2 check` before changes land.
-- At completion, the adapter prompts for `rally2 say artifact`, `handoff`,
-  `decision`, `risk`, or `blocker` when appropriate.
-- On resume, prompt, idle, or loop boundary, the adapter calls `rally2 enter`
-  and `rally2 next` again so the agent sees what changed and has a concrete
-  ranked action.
-- If `rally2 next` shows the agent is waiting on a peer, the adapter still
-  exposes useful alternate work such as reviewing unconsumed artifacts before
-  settling for a wait state.
+- For unmanaged sessions, native adapters may block unsafe writes with
+  `rally2 check before-write`.
+- On prompt, idle, resume, or loop boundaries, adapters stay silent. Rally must
+  not inject full room or `next` state into ordinary prompts just to keep Rally
+  in context.
+- If an explicit `rally2 next` call shows the agent is waiting on a peer, the
+  agent can still use alternate work such as reviewing unconsumed artifacts
+  before settling for a wait state.
 - When the agent asks for the broader picture, `rally2 room` is the source of
   truth.
 
-Manual CLI use should be possible, but the primary product path is adapter-led.
-If agents must remember to run Rally by habit, the product is not finished.
+Manual CLI use should be possible, but the primary product path is managed
+session delivery. If agents must remember to run Rally by habit, the product is
+not finished.
 
 ## Act-On-Next Contract
 
@@ -307,15 +309,57 @@ Required checks:
 Strict blocking should only apply to local or trusted facts unless configured
 otherwise.
 
+## Managed Sessions
+
+Reliable live delivery is mux-backed, not daemon-backed and not raw terminal
+automation. Rally starts and records a normal visible agent session, then
+injects Rally obligations into that session through a small hard-coded backend.
+The agent confirms delivery by writing Rally facts; screen scraping is only
+debug evidence.
+
+First-class commands:
+
+```bash
+rally2 run claude --name reviewer --backend tmux --json
+rally2 sessions --json
+rally2 inject reviewer --handoff <event-id> --require-ack --json
+rally2 capture reviewer --lines 120 --json
+rally2 stop reviewer --json
+```
+
+Backend contract:
+
+```text
+start agent session
+record session id, name, tool id, cwd, backend target
+clear pending input
+paste prompt
+submit
+optionally wait for a resolve/ack fact
+```
+
+Hard-coded backends, in order:
+
+- tmux: first implementation and baseline for macOS/Linux/WSL.
+- Herdr: visible pane/workspace backend with native `agent start`,
+  `agent send`, `agent read`, `agent attach`, and pane lifecycle commands.
+- cmux: visible surface/workspace backend with native `new-workspace`, `send`,
+  `read-screen`, `select-workspace`, and `close-workspace` commands.
+
+No dynamic adapter/plugin system is needed until this contract stabilizes and a
+third-party runtime needs to implement it. Unmanaged existing panes remain
+best-effort; managed sessions are the reliable path.
+
 ## Adapters
 
 Setup is the infrastructure that teaches each agent surface how to use Rally.
 It is not a separate product surface.
 
-Adapters make each product call Rally at the right moments:
+Adapters are now secondary to managed sessions. They make native agent products
+call Rally at safety and context boundaries when an agent was not launched by
+`rally2 run`:
 
-- startup/resume: inject `enter`
-- idle/loop boundary: call `enter` again
+- startup/resume/prompt/idle/loop boundary: stay silent
 - before write: call `check before-write`
 
 Completion should not run on every finished model turn by default. It is too
@@ -332,10 +376,7 @@ rally2 install codex --uninstall --json
 ```
 
 It writes only Rally 2-owned hook scripts, extensions, snippets, and hook config
-entries. It does not silently delete older Rally wiring from other products;
-this project has one user right now, so legacy cleanup is a manual local
-operation instead of product behavior. The installer may report legacy hooks so
-the operator knows what to remove.
+entries. It does not inspect or manage older Rally wiring from other products.
 
 Required first-class adapters:
 
@@ -353,8 +394,8 @@ Adapter status should report surfaces, not abstract health:
   "adapter": "codex",
   "installed": true,
   "surfaces": {
-    "startup_enter": true,
-    "loop_enter": true,
+    "startup_enter": false,
+    "loop_enter": false,
     "before_write_check": true,
     "completion_prompt": false
   }
@@ -363,33 +404,32 @@ Adapter status should report surfaces, not abstract health:
 
 Each adapter must define:
 
-- How Rally room state becomes model-visible.
-- How `next.action` and `waiting_on` become visible at idle/wait boundaries.
+- Whether Rally room state becomes model-visible at all. For Codex, Claude
+  Code, and Pi guard adapters, it should not.
+- How managed sessions deliver actionable work when the backend owns the
+  session.
 - Which boundary events can call `check`.
 - How an agent is prompted to publish facts.
 - Where tool identity, role, watched paths, and cursors are stored.
 - Which failures are blocking, warning-only, or invisible to the agent.
 
-The adapter layer is the main reason Rally can be useful. Without it, Rally is
-just another command an agent may forget.
+The adapter layer is no longer the primary delivery mechanism. Reliable
+delivery belongs to managed mux sessions; adapters cover native hook safety.
 
 Adapter expectations by surface:
 
-- Codex: inject `enter` and `next` at startup/resume and prompt boundaries,
-  refresh at goal loop boundaries when possible, call `check before-write`, and
-  prompt for `say` on completion.
-- Claude Code: inject `enter` and `next` through project/user instructions or
-  hooks, call `check before-write`, and prompt for durable facts when tasks
-  complete.
-- Pi: inject `enter` and `next` into the active Pi message/context surface,
-  refresh at session boundaries, and support completion prompts for `say`.
-- Herdr: expose room context and next action to panes, track pane/tool identity,
-  and make it easy for an operator agent to read panes, route work, and inject
-  `enter`/`next`.
-- cmux: expose Rally entry and next state to sessions without pretending cmux
-  owns the coordination state.
-- CI: read next/room/check state, fail or warn on unresolved trusted blockers
-  and unsafe claims according to policy, and publish evidence facts when useful.
+- Codex: guard write tools with `check before-write`; no startup, prompt, or
+  completion context injection.
+- Claude Code: guard write tools with `check before-write`; no startup, prompt,
+  or completion context injection.
+- Pi: guard write tool calls with `check before-write`; no session-start
+  message injection.
+- Herdr: implement the managed-session backend, track pane/tool identity, and
+  make it easy for an operator agent to read panes and route work.
+- cmux: implement the managed-session backend without pretending cmux owns the
+  coordination state.
+- CI: read room/check state, fail or warn on unresolved trusted blockers and
+  unsafe claims according to policy, and publish evidence facts when useful.
 
 ## Remote Model
 
@@ -446,8 +486,9 @@ Phase 2: Product build.
 
 Phase 3: Adapter loop.
 
-- Install Codex, Claude Code, and Pi startup/refresh adapters.
-- Add Herdr and cmux workspace/session demos.
+- Install Codex, Claude Code, and Pi write-guard adapters.
+- Implement tmux-backed `run`, `sessions`, and `inject`.
+- Add Herdr and cmux managed-session backends.
 - Add CI read-only room checks and optional handoff export checks.
 
 Phase 4: Dogfood.
