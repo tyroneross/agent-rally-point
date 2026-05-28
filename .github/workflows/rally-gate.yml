@@ -14,4 +14,4 @@ jobs:
       - name: Test
         run: cargo test
       - name: Rally coordination gate
-        run: cargo run -p rally-cli -- ci gate --tool ci --json
+        run: cargo run -p rally2-cli -- check before-complete --tool ci --json

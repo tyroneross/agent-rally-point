@@ -299,8 +299,8 @@ fn rally2_agent_enters_room_checks_work_and_says_artifact() {
 }
 
 #[test]
-fn rally2_is_not_a_legacy_command_fallback() {
-    let workspace = Workspace::new("rally2-no-legacy");
+fn rally2_is_not_a_command_fallback() {
+    let workspace = Workspace::new("rally2-no-fallback");
     let help = workspace.output(&["--help"]);
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("rally2 enter --tool <tool>"));

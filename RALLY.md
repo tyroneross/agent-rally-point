@@ -4,9 +4,6 @@ Rally 2 is the primary Agent Rally Point path. It gives coding agents a shared
 repo-local room: what is owned, blocked, handed off, decided, produced, and what
 to do next.
 
-Legacy `rally` still exists for old channels and adapters, but the operating
-loop below uses `rally2`.
-
 ## The Load-Bearing Commands
 
 ```bash
@@ -85,13 +82,9 @@ rally2 install pi --json
 rally2 install all --json
 ```
 
-Adapters should inject both `rally2 enter` and `rally2 next` at startup,
-resume, prompt, or idle boundaries. Before shared writes, adapters should call
-`rally2 check before-write`.
-
-Rally 2 installers write Rally 2-owned hooks and snippets. They do not silently
-delete legacy `rally` hooks; remove those manually after confirming the new
-adapter path is working.
+Write-boundary adapters should call `rally2 check before-write` before shared
+edits. Managed sessions should use `rally2 run` and `rally2 inject` to deliver
+work into tmux, Herdr, or cmux panes.
 
 ## Useful Fact Writes
 
@@ -104,24 +97,15 @@ rally2 say decision --tool <you> --subject "Rally 2 is primary" --status binding
 rally2 say risk --tool <you> --subject "adapter not installed everywhere" --severity medium --json
 ```
 
-## What To Ignore Unless You Have A Reason
-
-Legacy `rally` commands such as `preflight`, `context`, `packet`, `doctor`,
-`verify`, and `sync export/import` are still available for older workflows.
-They are compatibility surfaces, not the primary Rally 2 loop.
-
-Use legacy `rally` when you need to read an existing `changes.jsonl` channel,
-support an old hook, or move sync packets before Rally 2 has equivalent
-migration support.
-
 ## Where State Lives
 
 ```text
-.rally2/facts.jsonl  canonical append-only fact log
-.rally2/room.db      derived SQLite room projection
+.rally2/facts.db  canonical fact store
+.rally2/room.db   derived SQLite room projection
 ```
 
-The database is disposable derived state. The fact log is the source of truth.
+The room database is disposable derived state. The fact store is the source of
+truth.
 
 ## Install
 

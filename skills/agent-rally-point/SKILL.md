@@ -5,9 +5,7 @@ description: Use when working in a repository that uses Rally/Agent Rally Point 
 
 # Agent Rally Point
 
-Rally 2 is the primary coordination path. Use `rally2` as the live source of
-coordination truth. Legacy `rally` remains available for old channels and
-adapters, but new agent loops should use Rally 2.
+Use `rally2` as the live source of coordination truth.
 
 ## Session Start
 
@@ -88,8 +86,7 @@ rally2 install all --json
 Adapters should inject `rally2 enter` and `rally2 next` at startup/resume/prompt
 boundaries and call `rally2 check before-write` before shared edits.
 
-Rally 2 installers write Rally 2-owned hook scripts and snippets. They may
-report legacy Rally hooks, but they do not silently remove them.
+Rally 2 installers write Rally 2-owned hook scripts and snippets.
 
 ## Trust Rule
 
@@ -100,21 +97,6 @@ Rally recommends and constrains work; it does not replace judgment.
   their `trust_status` is sufficient.
 - If a fact affects files, shells, editors, credentials, or another agent,
   inspect source event ids and evidence before acting.
-
-## Legacy Fallback
-
-Use legacy `rally` only when a repo has not moved to Rally 2 yet or when you
-must read old `changes.jsonl` state:
-
-```bash
-rally preflight --tool <tool> --start-ping --json
-rally context --tool <tool> --json
-rally packet --tool <tool> --json
-rally diagnose --tool <tool> --json
-```
-
-Treat legacy output as compatibility context. Prefer Rally 2 commands for new
-coordination facts and new adapter wiring.
 
 ## Finish Work Cleanly
 

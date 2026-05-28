@@ -4,14 +4,7 @@
 > same checkout: durable facts, current room state, next-action guidance, and
 > write-boundary checks without a server.
 
-Rally's product direction is Rally 2. The primary user-facing command is now
-`rally2`. The legacy `rally` CLI remains available for compatibility,
-migration, and older adapter workflows, but new product behavior should target
-Rally 2 unless it is explicitly a migration bridge.
-
-Rally 2 builds on Jason's rewrite and act-on-next contract work in PRs #42/#43.
-This follow-up promotes that work as the default path and hardens compatibility
-around it.
+The only shipped coordination command is `rally2`.
 
 ## Start Here
 
@@ -25,20 +18,12 @@ The full product boundary is [`docs/RALLY_2_ARCHITECTURE.md`](docs/RALLY_2_ARCHI
 Rally 2 owns the primary product path:
 
 - `rally2` is the primary CLI.
-- `.rally2/facts.jsonl` is the durable append-only coordination log.
-- `.rally2/room.db` is the derived SQLite room projection.
-- `enter`, `next`, `say`, `room`, `check`, and `install` are the load-bearing
-  commands.
-- Adapter setup injects `enter` and `next` into Codex, Claude Code, Pi, Herdr,
-  cmux, and CI surfaces where available.
-
-Legacy Rally remains in the workspace as a deprecated compatibility surface:
-
-- `rally` still supports the existing `changes.jsonl` channel, sync, trust,
-  diagnosis, packet, and older setup workflows.
-- Existing hooks and users do not need an immediate hard cutover.
-- Do not add new primary agent-loop behavior to `rally` unless it helps migrate
-  users or keep old channels readable.
+- `.rally2/facts.db` is the durable fact store.
+- `.rally2/room.db` is the rebuildable SQLite room projection.
+- `enter`, `next`, `say`, `room`, `check`, `install`, `run`, `sessions`,
+  `inject`, `attach`, `capture`, and `stop` are the load-bearing commands.
+- Adapter setup installs write-boundary guards where available; managed
+  sessions own live delivery into tmux, Herdr, and cmux panes.
 
 Network transport remains out of scope. Files, Git, rsync, shared folders, A2A,
 or a future service can move facts; Rally defines what the bytes mean.
@@ -53,13 +38,6 @@ cd agent-rally-point
 cargo install --path crates/rally2-cli
 rally2 enter --tool codex --json
 rally2 next --tool codex --json
-```
-
-Install the deprecated legacy CLI only when an older integration still needs it:
-
-```bash
-cargo install --path crates/rally-cli
-rally preflight --tool codex --json
 ```
 
 ## Rally 2 Command Surface
@@ -106,25 +84,7 @@ rally2 install codex --uninstall --json
 ```
 
 Rally 2 installers write only Rally 2-owned hook scripts, snippets, extensions,
-and config entries. They may report older Rally hooks but do not silently delete
-them.
-
-## Legacy Compatibility
-
-Use legacy `rally` only for existing channels or older adapter surfaces:
-
-```bash
-rally preflight --tool codex --start-ping --json
-rally context --tool codex --json
-rally packet --tool codex --json
-rally sync export --json > packet.json
-rally sync import --trust-policy <trust.toml> packet.json --json
-rally verify --json --trust-policy <trust.toml> <changes.jsonl>
-```
-
-The legacy CLI is still tested, but it is no longer the design center. Treat it
-as a compatibility layer while Rally 2 reaches parity on the workflows that
-matter.
+and config entries.
 
 ## Verification
 
@@ -149,7 +109,6 @@ The short version:
 - The room projection is SQLite-backed derived state.
 - JSON contracts are designed for agents first.
 - Adapter integration is how Rally becomes part of normal agent behavior.
-- Legacy `rally` remains available for compatibility, not future primary design.
 
 ## License
 
