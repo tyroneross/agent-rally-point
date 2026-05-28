@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally:command:session-action:v1",
+  "title": "Rally Session Action Command",
+  "type": "object",
+  "required": ["ok", "product", "command", "schema", "data"],
+  "properties": {
+    "ok": { "const": true },
+    "product": { "const": "rally" },
+    "command": { "type": "string" },
+    "schema": { "const": "agent-rally.command.session-action.v1" },
+    "data": {
+      "type": "object",
+      "required": ["mode", "action", "session", "output", "commands"],
+      "properties": {
+        "mode": { "type": "string" },
+        "action": { "type": "string" },
+        "session": { "type": "object" },
+        "output": { "type": ["string", "null"] },
+        "commands": { "type": "array" }
+      }
+    }
+  }
+}

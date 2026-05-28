@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally:command:enter:v1",
+  "title": "Rally Enter Command",
+  "type": "object",
+  "required": ["ok", "product", "command", "schema", "data"],
+  "properties": {
+    "ok": { "const": true },
+    "product": { "const": "rally" },
+    "command": { "const": "enter" },
+    "schema": { "const": "agent-rally.command.enter.v1" },
+    "data": {
+      "type": "object",
+      "required": ["tool", "adapter", "cursor", "entry", "attention", "room"],
+      "properties": {
+        "tool": { "type": "string" },
+        "session_id": { "type": "string" },
+        "adapter": { "type": "object" },
+        "cursor": { "type": "object" },
+        "entry": {
+          "type": "object",
+          "required": ["do", "do_not", "know", "verify", "respond_to", "ignore"]
+        },
+        "attention": { "type": "array" },
+        "room": { "type": "object" }
+      }
+    }
+  }
+}

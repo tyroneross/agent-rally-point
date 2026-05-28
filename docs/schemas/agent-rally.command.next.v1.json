@@ -1,32 +1,116 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://agent-rally-point.local/schemas/agent-rally.command.next.v1.json",
-  "title": "Rally next command",
+  "$id": "urn:agent-rally:command:next:v1",
+  "title": "Rally Next Command",
   "type": "object",
-  "required": ["ok", "command", "schema", "channel", "data"],
+  "required": ["ok", "product", "command", "schema", "data"],
   "properties": {
-    "ok": { "const": true },
-    "command": { "const": "next" },
-    "schema": { "const": "agent-rally.command.next.v1" },
-    "channel": { "type": "string" },
+    "ok": {
+      "const": true
+    },
+    "product": {
+      "const": "rally"
+    },
+    "command": {
+      "const": "next"
+    },
+    "schema": {
+      "const": "agent-rally.command.next.v1"
+    },
     "data": {
       "type": "object",
-      "required": ["next"],
+      "required": ["tool", "next", "room"],
       "properties": {
+        "tool": {
+          "type": "string"
+        },
+        "role": {
+          "type": ["string", "null"]
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "next": {
           "type": "object",
-          "required": ["action_kind", "target_event_id", "subject", "reasoning", "source_event_ids", "score", "factors", "agent_visible", "alternatives"],
+          "required": [
+            "mode",
+            "action",
+            "actionable",
+            "reason",
+            "score",
+            "confidence",
+            "requires_human",
+            "stop_reason",
+            "target_event_id",
+            "source_event_ids",
+            "suggested_claims",
+            "suggested_commands",
+            "completion",
+            "waiting_on",
+            "alternatives"
+          ],
           "properties": {
-            "action_kind": { "type": "string" },
-            "target_event_id": { "type": ["string", "null"] },
-            "subject": { "type": "string" },
-            "reasoning": { "type": "array", "items": { "type": "string" } },
-            "source_event_ids": { "type": "array", "items": { "type": "string" } },
-            "score": { "type": "number" },
-            "factors": { "type": "object" },
-            "agent_visible": { "type": "object" },
-            "alternatives": { "type": "array", "items": { "type": "object" } }
+            "mode": {
+              "type": "string"
+            },
+            "action": {
+              "type": "string"
+            },
+            "actionable": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "score": {
+              "type": "integer"
+            },
+            "confidence": {
+              "type": "number"
+            },
+            "requires_human": {
+              "type": "boolean"
+            },
+            "stop_reason": {
+              "type": ["string", "null"]
+            },
+            "target_event_id": {
+              "type": ["string", "null"]
+            },
+            "source_event_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "fact": {
+              "type": ["object", "null"]
+            },
+            "suggested_claims": {
+              "type": "array"
+            },
+            "suggested_commands": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "completion": {
+              "type": "object"
+            },
+            "waiting_on": {
+              "type": "array"
+            },
+            "alternatives": {
+              "type": "array"
+            }
           }
+        },
+        "room": {
+          "type": "object"
         }
       }
     }

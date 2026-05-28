@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally:command:check:v1",
+  "title": "Rally Check Command",
+  "type": "object",
+  "required": ["ok", "product", "command", "schema", "data"],
+  "properties": {
+    "ok": { "const": true },
+    "product": { "const": "rally" },
+    "command": { "const": "check" },
+    "schema": { "const": "agent-rally.command.check.v1" },
+    "data": {
+      "type": "object",
+      "required": ["check"],
+      "properties": {
+        "check": {
+          "type": "object",
+          "required": ["phase", "tool", "allow", "mode", "findings", "agent_visible"],
+          "properties": {
+            "phase": {
+              "enum": ["before-write", "after-artifact", "before-complete"]
+            },
+            "tool": { "type": "string" },
+            "allow": { "type": "boolean" },
+            "mode": { "enum": ["warn", "strict"] },
+            "findings": { "type": "array" },
+            "agent_visible": { "type": "object" }
+          }
+        }
+      }
+    }
+  }
+}

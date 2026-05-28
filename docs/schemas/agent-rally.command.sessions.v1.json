@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally:command:sessions:v1",
+  "title": "Rally Sessions Command",
+  "type": "object",
+  "required": ["ok", "product", "command", "schema", "data"],
+  "properties": {
+    "ok": { "const": true },
+    "product": { "const": "rally" },
+    "command": { "const": "sessions" },
+    "schema": { "const": "agent-rally.command.sessions.v1" },
+    "data": {
+      "type": "object",
+      "required": ["sessions"],
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "session_id",
+              "name",
+              "agent",
+              "tool",
+              "backend",
+              "cwd",
+              "target"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

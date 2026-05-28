@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally:command:room:v1",
+  "title": "Rally Room Command",
+  "type": "object",
+  "required": ["ok", "product", "command", "schema", "data"],
+  "properties": {
+    "ok": { "const": true },
+    "product": { "const": "rally" },
+    "command": { "const": "room" },
+    "schema": { "const": "agent-rally.command.room.v1" },
+    "data": {
+      "type": "object",
+      "required": ["query", "room"],
+      "properties": {
+        "query": {
+          "type": "object",
+          "required": ["paths"]
+        },
+        "room": {
+          "type": "object",
+          "required": ["active_claims", "active_blockers", "open_handoffs", "current_decisions", "current_risks", "recent_artifacts", "unconsumed_artifacts", "stale_facts", "trust_summary", "adapters"]
+        }
+      }
+    }
+  }
+}

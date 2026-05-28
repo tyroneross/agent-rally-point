@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally:command:inject:v1",
+  "title": "Rally Inject Command",
+  "type": "object",
+  "required": ["ok", "product", "command", "schema", "data"],
+  "properties": {
+    "ok": { "const": true },
+    "product": { "const": "rally" },
+    "command": { "const": "inject" },
+    "schema": { "const": "agent-rally.command.inject.v1" },
+    "data": {
+      "type": "object",
+      "required": ["mode", "session", "require_ack", "commands"],
+      "properties": {
+        "mode": { "type": "string" },
+        "session": { "type": "object" },
+        "handoff": { "type": ["string", "null"] },
+        "require_ack": { "type": "boolean" },
+        "ack": { "type": ["object", "null"] },
+        "commands": { "type": "array" }
+      }
+    }
+  }
+}
