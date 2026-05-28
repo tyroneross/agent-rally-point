@@ -143,6 +143,24 @@ rally room --json   # -> data.room.receipts[]
 it. The `evidence` is the producer's own claim, and `state` reflects which
 facts were written — not whether the work is actually correct.
 
+## CI gate
+
+`rally check ci --strict` reads the whole room and **fails the build**
+(exit 4) on unreconciled coordination state:
+
+- `confirmed-stale-base` — a peer changes a contract another agent pinned a
+  different version of (stop)
+- `active-blocker` — work is blocked (stop)
+- `open-handoff` — delegated work is still in flight (warn)
+
+```yaml
+- run: cargo run -p rally-cli -- check ci --tool ci --strict --json
+```
+
+Agents are nudged to declare contracts two ways, so coverage doesn't depend
+on memory: the injected handoff prompt tells them to, and every
+`rally check before-write` returns a `declare-contracts` reminder.
+
 ## Where State Lives
 
 ```text

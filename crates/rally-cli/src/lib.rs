@@ -557,8 +557,8 @@ fn backend_target(backend: Backend, session_id: &str) -> String {
 
 fn handoff_prompt(session: &ManagedSession, handoff: &str) -> String {
     format!(
-        "Rally managed-session injection for {}. Run: rally next --tool {} --json. If it is actionable for handoff {}, execute the suggested Rally completion command or run: rally say resolve --tool {} --ref {} --subject 'resolved via Rally managed session' --json. Do not edit files unless the Rally action explicitly requires it. Do not ask for confirmation after the Rally command succeeds.",
-        session.name, session.tool, handoff, session.tool, handoff
+        "Rally managed-session injection for {}. Run: rally next --tool {} --json. If it is actionable for handoff {}, execute the suggested Rally completion command or run: rally say resolve --tool {} --ref {} --subject 'resolved via Rally managed session' --json. Before editing shared code, declare what you change with: rally say claim --tool {} --produces <contract> --depends <contract>@<hash> --json, so peers get a stale-base warning. Do not edit files unless the Rally action explicitly requires it. Do not ask for confirmation after the Rally command succeeds.",
+        session.name, session.tool, handoff, session.tool, handoff, session.tool
     )
 }
 

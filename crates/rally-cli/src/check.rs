@@ -60,6 +60,7 @@ pub(crate) fn build_check(
     match phase.as_str() {
         "before-write" => check_before_write(snapshot, &tool, path.as_deref(), &mut findings),
         "before-complete" => check_before_complete(snapshot, &tool, &mut findings),
+        "ci" => check_ci(snapshot, &mut findings),
         other => {
             return Err(RallyError::Usage(format!(
                 "unsupported check phase {other}"
@@ -166,6 +167,66 @@ fn check_before_write(
                 scope: Vec::new(),
             });
         }
+    }
+    // Nudge the agent to declare what this change produces/depends on, so peers
+    // get a predictive stale-base warning. Informational — never blocks a write.
+    findings.push(CheckFinding {
+        code: "declare-contracts",
+        severity: "info",
+        message: "declare what this change produces/depends on: \
+            rally say claim --tool <you> --produces <contract> --depends <contract>@<hash>"
+            .to_string(),
+        fact_id: None,
+        owner: None,
+        path: Some(path.to_string()),
+        scope: Vec::new(),
+    });
+}
+
+/// CI gate: inspect the whole room and stop a merge on unreconciled coordination
+/// state. `confirmed` stale bases and active blockers are hard stops; in-flight
+/// (incomplete) handoffs are warnings. Run as `rally check ci --strict`.
+fn check_ci(snapshot: &RoomSnapshot, findings: &mut Vec<CheckFinding>) {
+    for stale in crate::next::stale_base_findings(&snapshot.active_claims) {
+        if !stale.confirmed {
+            continue;
+        }
+        findings.push(CheckFinding {
+            code: "confirmed-stale-base",
+            severity: "stop",
+            message: format!(
+                "{} changes contract {} that {} depends on (pins differ)",
+                stale.producer_tool.as_deref().unwrap_or("a peer"),
+                stale.contract,
+                stale.consumer_tool.as_deref().unwrap_or("another agent"),
+            ),
+            fact_id: Some(stale.consumer_event_id.clone()),
+            owner: stale.producer_tool.clone(),
+            path: None,
+            scope: vec![stale.contract.clone()],
+        });
+    }
+    for blocker in &snapshot.active_blockers {
+        findings.push(CheckFinding {
+            code: "active-blocker",
+            severity: "stop",
+            message: blocker.subject.clone(),
+            fact_id: Some(blocker.event_id.clone()),
+            owner: blocker.tool.clone(),
+            path: None,
+            scope: blocker.scope.clone(),
+        });
+    }
+    for handoff in &snapshot.open_handoffs {
+        findings.push(CheckFinding {
+            code: "open-handoff",
+            severity: "warn",
+            message: format!("delegated work is not complete: {}", handoff.subject),
+            fact_id: Some(handoff.event_id.clone()),
+            owner: handoff.target.clone(),
+            path: None,
+            scope: Vec::new(),
+        });
     }
 }
 

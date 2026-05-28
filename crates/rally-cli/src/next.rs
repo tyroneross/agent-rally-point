@@ -110,20 +110,20 @@ pub(crate) struct CompletionContract {
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub(crate) struct StaleBase {
     /// Bare contract name shared by the producer and consumer (pin stripped).
-    contract: String,
-    consumer_event_id: String,
-    consumer_tool: Option<String>,
-    consumer_subject: String,
-    consumer_pin: Option<String>,
-    producer_event_id: String,
-    producer_tool: Option<String>,
-    producer_pin: Option<String>,
+    pub(crate) contract: String,
+    pub(crate) consumer_event_id: String,
+    pub(crate) consumer_tool: Option<String>,
+    pub(crate) consumer_subject: String,
+    pub(crate) consumer_pin: Option<String>,
+    pub(crate) producer_event_id: String,
+    pub(crate) producer_tool: Option<String>,
+    pub(crate) producer_pin: Option<String>,
     /// True when both sides pinned a version (`name@hash`) and the hashes
     /// differ — a confirmed stale base, not just an overlapping contract.
-    confirmed: bool,
+    pub(crate) confirmed: bool,
     /// The cheap coordinating move: raise a blocker referencing the producer so
     /// the change is reconciled before the consumer builds further.
-    suggested_command: String,
+    pub(crate) suggested_command: String,
 }
 
 /// Split a contract token `name@hash` into its bare name and optional pin.

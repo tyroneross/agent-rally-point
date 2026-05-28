@@ -1534,6 +1534,113 @@ fn rally_rejects_unknown_flags() {
 }
 
 #[test]
+fn rally_ci_gate_blocks_on_confirmed_stale_base_and_active_blocker() {
+    // intent: a merge must not proceed while a peer's change provably invalidates
+    // another agent's pinned base, or while work is blocked — the gate fails CI.
+    let workspace = Workspace::new("rally-ci-gate");
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "change users",
+        "--produces",
+        "db.users@v2",
+    ]);
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--subject",
+        "read users",
+        "--depends",
+        "db.users@v1",
+    ]);
+    workspace.json(&[
+        "say",
+        "blocker",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "need decision",
+        "--severity",
+        "high",
+    ]);
+
+    let (ci, out) =
+        workspace.json_with_status(&["check", "ci", "--json", "--tool", "ci", "--strict"]);
+    assert_matches_schema("agent-rally.command.check.v1.json", &ci);
+    assert_eq!(out.status.code(), Some(4));
+    assert_eq!(ci["data"]["check"]["allow"], false);
+    let codes: Vec<&str> = ci["data"]["check"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"confirmed-stale-base"), "codes: {codes:?}");
+    assert!(codes.contains(&"active-blocker"), "codes: {codes:?}");
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_ci_gate_passes_a_clean_room() {
+    // intent: with no confirmed collisions or blockers the gate must not block a
+    // merge — a gate that fires on healthy state is noise and gets disabled.
+    let workspace = Workspace::new("rally-ci-clean");
+    workspace.json(&[
+        "say",
+        "artifact",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "done",
+        "--uri",
+        "x.rs",
+        "--evidence",
+        "cargo test",
+    ]);
+    let (ci, out) =
+        workspace.json_with_status(&["check", "ci", "--json", "--tool", "ci", "--strict"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(ci["data"]["check"]["allow"], true);
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_before_write_nudges_contract_declaration() {
+    // intent: every before-write check reminds the agent to declare what it
+    // changes, so predictive stale-base coverage does not depend on memory.
+    let workspace = Workspace::new("rally-declare-nudge");
+    let (check, _out) = workspace.json_with_status(&[
+        "check",
+        "before-write",
+        "--json",
+        "--tool",
+        "codex",
+        "--path",
+        "src/x.rs",
+    ]);
+    let codes: Vec<&str> = check["data"]["check"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"declare-contracts"), "codes: {codes:?}");
+
+    workspace.cleanup();
+}
+
+#[test]
 fn rally_check_covers_completion_boundaries() {
     let workspace = Workspace::new("rally-check-phases");
     workspace.json(&[
