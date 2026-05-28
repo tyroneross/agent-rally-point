@@ -19,7 +19,7 @@
         },
         "room": {
           "type": "object",
-          "required": ["active_claims", "active_blockers", "open_handoffs", "current_decisions", "current_risks", "recent_artifacts", "unconsumed_artifacts", "stale_facts"]
+          "required": ["active_claims", "active_blockers", "open_handoffs", "current_decisions", "current_risks", "recent_artifacts", "unconsumed_artifacts", "stale_facts", "receipts"]
         }
       }
     }

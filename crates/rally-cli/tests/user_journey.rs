@@ -65,6 +65,15 @@ fn temp_path(name: &str) -> PathBuf {
     ))
 }
 
+fn find_receipt<'a>(room: &'a Value, handoff_id: &str) -> &'a Value {
+    room["data"]["room"]["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|receipt| receipt["handoff_event_id"] == handoff_id)
+        .expect("receipt for handoff")
+}
+
 fn assert_matches_schema(schema_name: &str, value: &Value) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../docs/schemas")
@@ -586,6 +595,117 @@ fn rally_stale_base_is_unconfirmed_without_version_pins() {
     // unpinned overlap is informational only: it must not trip the soft gate,
     // because "might collide" is not "did collide".
     assert_eq!(next["data"]["next"]["coordination_required"], false);
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_room_renders_handoff_receipts_as_a_self_reported_lifecycle() {
+    // intent: a coordinator must see whether delegated work was delivered,
+    // picked up, or completed-with-evidence without reading transcripts — and a
+    // rendered "completed" must carry self_reported=true so it is never mistaken
+    // for independent verification (Rally renders the chain, it does not run it).
+    let workspace = Workspace::new("rally-receipts");
+
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "codex",
+        "--target",
+        "claude_code",
+        "--subject",
+        "implement auth refactor",
+    ]);
+    let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
+
+    // Before Claude acts, the receipt is "delivered" and labeled self-reported.
+    let room = workspace.json(&["room", "--json"]);
+    assert_matches_schema("agent-rally.command.room.v1.json", &room);
+    let receipt = find_receipt(&room, handoff_id);
+    assert_eq!(receipt["state"], "delivered");
+    assert_eq!(receipt["self_reported"], true);
+    assert_eq!(receipt["to_target"], "claude_code");
+
+    // Claude claims the work referencing the handoff -> "acted".
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--ref",
+        handoff_id,
+        "--subject",
+        "claim auth refactor",
+    ]);
+    let room = workspace.json(&["room", "--json"]);
+    assert_eq!(find_receipt(&room, handoff_id)["state"], "acted");
+
+    // Claude produces an artifact with evidence referencing the handoff -> "completed".
+    workspace.json(&[
+        "say",
+        "artifact",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--ref",
+        handoff_id,
+        "--subject",
+        "auth refactor done",
+        "--uri",
+        "docs/auth.md",
+        "--evidence",
+        "cargo test --all",
+    ]);
+    let room = workspace.json(&["room", "--json"]);
+    let receipt = find_receipt(&room, handoff_id);
+    assert_eq!(receipt["state"], "completed");
+    assert!(
+        receipt["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "cargo test --all"),
+        "expected the self-reported evidence on the completed receipt: {receipt}"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_receipt_reflects_a_blocker_raised_against_a_handoff() {
+    // intent: when delegated work is blocked, the receipt must read "blocked",
+    // not a stale "delivered" — otherwise the coordinator cannot see stuck work.
+    let workspace = Workspace::new("rally-receipt-blocked");
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "codex",
+        "--target",
+        "claude_code",
+        "--subject",
+        "ship feature",
+    ]);
+    let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
+    workspace.json(&[
+        "say",
+        "blocker",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--ref",
+        handoff_id,
+        "--subject",
+        "need API key",
+        "--severity",
+        "high",
+    ]);
+    let room = workspace.json(&["room", "--json"]);
+    assert_eq!(find_receipt(&room, handoff_id)["state"], "blocked");
 
     workspace.cleanup();
 }

@@ -194,13 +194,14 @@ fn command_room(args: RoomArgs) -> Result<Output> {
         },
     );
     let text = format!(
-        "room claims={} blockers={} handoffs={} decisions={} risks={} artifacts={}",
+        "room claims={} blockers={} handoffs={} decisions={} risks={} artifacts={} receipts={}",
         snapshot.active_claims.len(),
         snapshot.active_blockers.len(),
         snapshot.open_handoffs.len(),
         snapshot.current_decisions.len(),
         snapshot.current_risks.len(),
-        snapshot.recent_artifacts.len()
+        snapshot.recent_artifacts.len(),
+        snapshot.receipts.len()
     );
     Ok(Output::new(json_output, text, body))
 }

@@ -122,6 +122,27 @@ can reconcile before building further. This is advisory: it never forces
 `requires_human`. An unpinned overlap stays informational
 (`confirmed: false`, gate not tripped).
 
+## Receipts (handoff lifecycle)
+
+`rally room` derives a **receipt** for every handoff by walking its `ref`
+chain — no extra commands, no new facts. Each receipt reports a `state`:
+
+```text
+delivered -> acted -> completed     (claim refs it -> artifact refs it)
+              \-> blocked            (an open blocker refs it)
+              \-> acknowledged       (a resolve refs it, no artifact)
+```
+
+```bash
+rally room --json   # -> data.room.receipts[]
+# { "handoff_event_id": "...", "state": "completed",
+#   "evidence": ["cargo test --all"], "self_reported": true, "chain": [ ... ] }
+```
+
+`self_reported` is always `true`: Rally *renders* the chain, it does not run
+it. The `evidence` is the producer's own claim, and `state` reflects which
+facts were written — not whether the work is actually correct.
+
 ## Where State Lives
 
 ```text

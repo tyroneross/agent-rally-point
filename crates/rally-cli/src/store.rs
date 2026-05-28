@@ -130,6 +130,34 @@ fn fact_schema() -> String {
     FACT_SCHEMA.to_string()
 }
 
+/// One step in a handoff's life, kept for transparency in a receipt.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct ReceiptStep {
+    pub(crate) event_id: String,
+    pub(crate) kind: FactKind,
+    pub(crate) tool: Option<String>,
+    pub(crate) seq: i64,
+}
+
+/// The derived lifecycle of a delegated unit of work (a handoff), read straight
+/// from the ref chain. Rally *renders* the chain; it does not verify the work.
+/// `self_reported` is always true: `evidence` is the producer's own claim, and
+/// `state` reflects which facts were written, not whether they are accurate.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct Receipt {
+    pub(crate) handoff_event_id: String,
+    pub(crate) subject: String,
+    pub(crate) from_tool: Option<String>,
+    pub(crate) to_target: Option<String>,
+    pub(crate) created_at: String,
+    pub(crate) seq: i64,
+    /// delivered | acted | acknowledged | blocked | completed
+    pub(crate) state: &'static str,
+    pub(crate) evidence: Vec<String>,
+    pub(crate) self_reported: bool,
+    pub(crate) chain: Vec<ReceiptStep>,
+}
+
 #[derive(Clone, Debug, Default, JsonSchema, Serialize)]
 pub(crate) struct RoomSnapshot {
     pub(crate) max_seq: i64,
@@ -141,6 +169,7 @@ pub(crate) struct RoomSnapshot {
     pub(crate) recent_artifacts: Vec<Fact>,
     pub(crate) unconsumed_artifacts: Vec<Fact>,
     pub(crate) stale_facts: Vec<Fact>,
+    pub(crate) receipts: Vec<Receipt>,
 }
 
 impl RoomSnapshot {
@@ -158,6 +187,7 @@ impl RoomSnapshot {
             recent_artifacts: filter_facts(self.recent_artifacts, query),
             unconsumed_artifacts: filter_facts(self.unconsumed_artifacts, query),
             stale_facts: filter_facts(self.stale_facts, query),
+            receipts: filter_receipts(self.receipts, query),
         }
     }
 }
@@ -248,6 +278,7 @@ pub(crate) struct RoomSummary {
     pub(crate) recent_artifacts: usize,
     pub(crate) unconsumed_artifacts: usize,
     pub(crate) stale_facts: usize,
+    pub(crate) receipts: usize,
 }
 
 impl From<&RoomSnapshot> for RoomSummary {
@@ -262,6 +293,7 @@ impl From<&RoomSnapshot> for RoomSummary {
             recent_artifacts: snapshot.recent_artifacts.len(),
             unconsumed_artifacts: snapshot.unconsumed_artifacts.len(),
             stale_facts: snapshot.stale_facts.len(),
+            receipts: snapshot.receipts.len(),
         }
     }
 }
@@ -379,6 +411,7 @@ impl RoomStore {
             .filter(|f| !consumed_refs.contains(&f.event_id))
             .cloned()
             .collect::<Vec<_>>();
+        let receipts = build_receipts(&facts, &resolved);
         Ok(RoomSnapshot {
             max_seq,
             active_claims,
@@ -389,6 +422,7 @@ impl RoomStore {
             recent_artifacts,
             unconsumed_artifacts,
             stale_facts: Vec::new(),
+            receipts,
         })
     }
 
@@ -451,5 +485,77 @@ fn filter_facts(facts: Vec<Fact>, query: &RoomQuery) -> Vec<Fact> {
     facts
         .into_iter()
         .filter(|fact| query.matches(fact))
+        .collect()
+}
+
+/// Walk each handoff's ref chain into a lifecycle receipt. `resolved` is the set
+/// of event ids that a resolve/release fact points at (the acknowledged/closed
+/// set). State precedence: completed (an artifact landed) > blocked (an open
+/// blocker refs it) > acknowledged (a resolve refs it) > acted (a claim refs it)
+/// > delivered. This only reads what facts exist; it does not verify them.
+fn build_receipts(facts: &[Fact], resolved: &BTreeSet<String>) -> Vec<Receipt> {
+    facts
+        .iter()
+        .filter(|fact| fact.kind == "handoff")
+        .map(|handoff| {
+            let chain_facts = facts
+                .iter()
+                .filter(|fact| fact.ref_id.as_deref() == Some(handoff.event_id.as_str()))
+                .collect::<Vec<_>>();
+            let artifact = chain_facts.iter().find(|fact| fact.kind == "artifact");
+            let open_blocker = chain_facts
+                .iter()
+                .any(|fact| fact.kind == "blocker" && !resolved.contains(&fact.event_id));
+            let acted = chain_facts.iter().any(|fact| fact.kind == "claim");
+            let acknowledged = resolved.contains(&handoff.event_id);
+            let state = if artifact.is_some() {
+                "completed"
+            } else if open_blocker {
+                "blocked"
+            } else if acknowledged {
+                "acknowledged"
+            } else if acted {
+                "acted"
+            } else {
+                "delivered"
+            };
+            let evidence = artifact
+                .map(|fact| fact.evidence.clone())
+                .unwrap_or_default();
+            let mut chain = chain_facts
+                .iter()
+                .map(|fact| ReceiptStep {
+                    event_id: fact.event_id.clone(),
+                    kind: fact.kind.clone(),
+                    tool: fact.tool.clone(),
+                    seq: fact.seq,
+                })
+                .collect::<Vec<_>>();
+            chain.sort_by_key(|step| step.seq);
+            Receipt {
+                handoff_event_id: handoff.event_id.clone(),
+                subject: handoff.subject.clone(),
+                from_tool: handoff.tool.clone(),
+                to_target: handoff.target.clone(),
+                created_at: handoff.created_at.clone(),
+                seq: handoff.seq,
+                state,
+                evidence,
+                self_reported: true,
+                chain,
+            }
+        })
+        .collect()
+}
+
+fn filter_receipts(receipts: Vec<Receipt>, query: &RoomQuery) -> Vec<Receipt> {
+    receipts
+        .into_iter()
+        .filter(|receipt| {
+            query.tool.as_deref().is_none_or(|tool| {
+                receipt.from_tool.as_deref() == Some(tool)
+                    || receipt.to_target.as_deref() == Some(tool)
+            })
+        })
         .collect()
 }
