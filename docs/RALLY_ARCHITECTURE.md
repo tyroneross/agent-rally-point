@@ -91,6 +91,8 @@ The product succeeds when agents know Rally through repeated interaction:
 - On prompt, idle, resume, or loop boundaries, Rally stays silent. It must
   not inject full room or `next` state into ordinary prompts just to keep Rally
   in context.
+- Explicit wake or handoff delivery is different: a managed backend may inject a
+  focused Rally obligation when a peer addresses a live session.
 - If an explicit `rally next` call shows the agent is waiting on a peer, the
   agent can still use alternate work such as reviewing unconsumed artifacts
   before settling for a wait state.
@@ -130,6 +132,35 @@ enter -> next -> if actionable, claim/check -> execute -> verify
 The loop stops when `actionable` is false, `requires_human` is true, the agent
 hits a blocker, or the harness/user budget expires. This keeps autonomy in the
 agent harness while Rally remains the room and coordination substrate.
+
+## Standby And Wake Contract
+
+Rally does not keep model agents awake. Standby behavior belongs to the agent
+host, managed-session backend, connector, or external runner. Rally's job is to
+make wake intent cheap to detect and unambiguous to deliver.
+
+The contract:
+
+- Rally persists facts and projects room state.
+- `rally next --tool <tool> --json` is the canonical "should this agent act?"
+  check when no direct handoff id is already known.
+- `rally inject <session|name|tool> --handoff <event-id> --json` is the
+  canonical delivery path for a focused obligation into a managed session.
+- Lightweight watchers may poll `next`, query `room`, or watch fact-store
+  changes, but they must only emit transition signals. They must not edit code,
+  resolve blockers, publish facts on behalf of an agent, or act as hidden
+  schedulers.
+- Connectors decide how to deliver the signal: native wake, managed-session
+  injection, pane notification, resume-only context, or automation
+  failure/warning.
+- Durable always-on monitoring belongs in host-native packaging such as launchd,
+  systemd, CI, Herdr, or cmux. Ad hoc background shells are for short active
+  sessions only.
+
+This keeps Rally optimized for coordination instead of process supervision. If
+a connector can wake an idle agent safely, it should do so through the
+connector's native primitive. If it cannot, it should make the latest Rally
+state visible at the next prompt, resume, or loop boundary.
 
 ## Typed Facts
 
@@ -333,7 +364,14 @@ Backend status should report addressability, not abstract health:
     "run": true,
     "inject": true,
     "capture": true,
-    "stop": true
+    "stop": true,
+    "wake_signal": "inject"
+  },
+  "standby": {
+    "wake_intent": "rally next --tool <tool> --json",
+    "delivery": "managed_session_injection",
+    "watcher_role": "transition_signal_only",
+    "rally_owns_daemon": false
   }
 }
 ```
@@ -341,6 +379,8 @@ Backend status should report addressability, not abstract health:
 Each backend must define:
 
 - How managed sessions deliver actionable work.
+- How standby signals are handled: native wake, injected message, pane/status
+  notification, resume-only visibility, or automation policy.
 - How an agent prompt is cleared before injection.
 - How Rally captures recent output.
 - Where tool identity, role, watched paths, and cursors are stored.
@@ -349,12 +389,18 @@ Each backend must define:
 Backend expectations by surface:
 
 - Herdr: implement the managed-session backend, track pane/tool identity, and
-  make it easy for an operator agent to read panes and route work.
+  make it easy for an operator agent to read panes and route work. Herdr may
+  wake a standby pane with focused `agent send` or pane injection when the host
+  exposes that primitive.
 - cmux: implement the managed-session backend without pretending cmux owns the
-  coordination state.
+  coordination state. cmux may notify or inject into sessions, but the room
+  state remains Rally-owned.
 - tmux: provide the default local backend with no setup step.
 - CI: read room/check state, fail or warn on unresolved blockers and unsafe
   claims according to policy, and publish evidence facts when useful.
+
+The machine-readable backend contract is documented in
+`docs/schemas/agent-rally.session-backend.v1.json`.
 
 ## Remote Model
 

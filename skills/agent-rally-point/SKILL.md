@@ -81,6 +81,17 @@ rally inject <session|name|tool> --handoff <event-id> --json
 rally capture <session|name|tool> --json
 ```
 
+Rally does not keep agents awake by itself. Treat `rally next --tool <tool>
+--json` as the wake-intent check and `rally inject ... --handoff <event-id>` as
+the focused delivery path for managed sessions. Host adapters decide whether to
+use native wake, prompt injection, pane notification, resume-only context, or CI
+policy.
+
+Watchers must stay narrow: they may detect a transition and notify or inject
+through the host's native mechanism, but they must not edit files, resolve
+blockers, publish facts on behalf of an agent, or behave like hidden
+schedulers.
+
 When delegating work from inside herdr, keep the user's main tab clean. Start
 new helper agents in the workspace's `agents` tab whenever one exists. Discover
 the tab with `herdr tab list`, then start the agent with `herdr agent start
