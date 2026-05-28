@@ -142,6 +142,11 @@ pub(crate) fn stale_base_findings(active_claims: &[Fact]) -> Vec<StaleBase> {
     for consumer in active_claims {
         for dep in &consumer.depends {
             let (dep_name, dep_pin) = contract_parts(dep);
+            // Defense in depth: facts written before validation (or by another
+            // tool) could carry an empty contract name; never match on it.
+            if dep_name.is_empty() {
+                continue;
+            }
             for producer in active_claims {
                 if producer.event_id == consumer.event_id {
                     continue;
@@ -714,7 +719,19 @@ pub(crate) fn build_attention(
             .iter()
             .find(|claim| claim.event_id == finding.producer_event_id)
         {
-            push_fact("stale_base", producer);
+            // A live collision is surfaced every enter until resolved, even when
+            // the producer claim predates this tool's cursor — it is a derived
+            // finding, not a since-cursor "new fact".
+            items.push(AttentionItem {
+                reason: "stale_base",
+                event_id: producer.event_id.clone(),
+                seq: producer.seq,
+                kind: producer.kind.clone(),
+                subject: producer.subject.clone(),
+                scope: producer.scope.clone(),
+                tool: producer.tool.clone(),
+                target: producer.target.clone(),
+            });
         }
     }
     items

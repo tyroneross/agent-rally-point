@@ -137,8 +137,35 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     Ok(Output::new(args.json, text, body))
 }
 
+/// A contract token is `name` or `name@pin`: the name must be non-empty and
+/// there can be at most one `@`. Reject malformed tokens at the boundary so the
+/// stale-base matcher never produces phantom (or spuriously "confirmed") findings.
+fn validate_contracts(tokens: &[String]) -> Result<()> {
+    for token in tokens {
+        let name = match token.split_once('@') {
+            Some((name, pin)) => {
+                if pin.contains('@') {
+                    return Err(RallyError::Usage(format!(
+                        "contract token {token:?} has more than one '@'"
+                    )));
+                }
+                name
+            }
+            None => token.as_str(),
+        };
+        if name.is_empty() {
+            return Err(RallyError::Usage(format!(
+                "contract token {token:?} has an empty name"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn command_say(args: SayArgs) -> Result<Output> {
     let kind = args.kind;
+    validate_contracts(&args.produces)?;
+    validate_contracts(&args.depends)?;
     let subject = args
         .subject
         .unwrap_or_else(|| default_subject(kind.as_str()));
@@ -146,7 +173,6 @@ fn command_say(args: SayArgs) -> Result<Output> {
     let fact = Fact {
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
-        seq: 0,
         thread_id: args.thread_id.unwrap_or_else(|| new_id("room")),
         kind,
         tool: Some(args.tool),
@@ -163,7 +189,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
         status: args.status,
         severity: args.severity,
         uri: args.uri,
-        session: None,
+        ..Default::default()
     };
     let room = RoomStore::open()?;
     let fact = room.append_fact(&fact)?;
@@ -496,27 +522,20 @@ fn session_fact(session: &ManagedSession, status: &str, ref_id: Option<String>) 
     Fact {
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
-        seq: 0,
         thread_id: format!("session-{}", session.session_id),
         kind: FactKind::Session,
         tool: Some(session.tool.clone()),
-        role: None,
         subject: format!("managed session {} {status}", session.name),
-        scope: Vec::new(),
-        produces: Vec::new(),
-        depends: Vec::new(),
         created_at: now_string(),
         summary: Some(format!(
             "{} {} session via {}",
             status, session.agent, session.backend
         )),
-        evidence: Vec::new(),
         target: Some(session.tool.clone()),
         ref_id,
         status: Some(status.to_string()),
-        severity: None,
-        uri: None,
         session: Some(session.clone()),
+        ..Default::default()
     }
 }
 
@@ -587,9 +606,14 @@ fn short_id() -> String {
 }
 
 pub(crate) fn shell_quote(value: &str) -> String {
-    shlex::try_quote(value)
-        .expect("shell argument contains NUL byte")
-        .into_owned()
+    // shlex only rejects NUL bytes. A fact field is agent-controlled, so strip
+    // NULs and quote the remainder rather than panicking the coordination process.
+    match shlex::try_quote(value) {
+        Ok(quoted) => quoted.into_owned(),
+        Err(_) => shlex::try_quote(&value.replace('\0', ""))
+            .map(|quoted| quoted.into_owned())
+            .unwrap_or_else(|_| "''".to_string()),
+    }
 }
 
 #[derive(JsonSchema, Serialize)]

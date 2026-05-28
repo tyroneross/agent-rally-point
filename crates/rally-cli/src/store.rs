@@ -71,7 +71,7 @@ impl PartialEq<&str> for FactKind {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 pub(crate) struct Fact {
     #[serde(default = "fact_schema")]
     pub(crate) schema: String,
@@ -411,7 +411,14 @@ impl RoomStore {
             .filter(|f| !consumed_refs.contains(&f.event_id))
             .cloned()
             .collect::<Vec<_>>();
-        let receipts = build_receipts(&facts, &resolved);
+        // A handoff is acknowledged / a blocker cleared only by `resolve`, never
+        // by `release` (which retires a claim's scope). Receipts use this set.
+        let resolve_refs = facts
+            .iter()
+            .filter(|f| f.kind == "resolve")
+            .filter_map(|f| f.ref_id.clone())
+            .collect::<BTreeSet<_>>();
+        let receipts = build_receipts(&facts, &resolve_refs);
         Ok(RoomSnapshot {
             max_seq,
             active_claims,
@@ -488,12 +495,12 @@ fn filter_facts(facts: Vec<Fact>, query: &RoomQuery) -> Vec<Fact> {
         .collect()
 }
 
-/// Walk each handoff's ref chain into a lifecycle receipt. `resolved` is the set
-/// of event ids that a resolve/release fact points at (the acknowledged/closed
-/// set). State precedence: completed (an artifact landed) > blocked (an open
-/// blocker refs it) > acknowledged (a resolve refs it) > acted (a claim refs it)
-/// > delivered. This only reads what facts exist; it does not verify them.
-fn build_receipts(facts: &[Fact], resolved: &BTreeSet<String>) -> Vec<Receipt> {
+/// Walk each handoff's ref chain into a lifecycle receipt. `resolve_refs` is the
+/// set of event ids that a `resolve` fact points at (acknowledged/cleared).
+/// State precedence: completed (an artifact landed) > blocked (an open blocker
+/// refs it) > acknowledged (a resolve refs it) > acted (a claim refs it) >
+/// delivered. This only reads what facts exist; it does not verify them.
+fn build_receipts(facts: &[Fact], resolve_refs: &BTreeSet<String>) -> Vec<Receipt> {
     facts
         .iter()
         .filter(|fact| fact.kind == "handoff")
@@ -502,12 +509,17 @@ fn build_receipts(facts: &[Fact], resolved: &BTreeSet<String>) -> Vec<Receipt> {
                 .iter()
                 .filter(|fact| fact.ref_id.as_deref() == Some(handoff.event_id.as_str()))
                 .collect::<Vec<_>>();
-            let artifact = chain_facts.iter().find(|fact| fact.kind == "artifact");
+            // The latest artifact is the live one; an earlier draft's evidence
+            // must not shadow a corrected re-submission.
+            let artifact = chain_facts
+                .iter()
+                .filter(|fact| fact.kind == "artifact")
+                .max_by_key(|fact| fact.seq);
             let open_blocker = chain_facts
                 .iter()
-                .any(|fact| fact.kind == "blocker" && !resolved.contains(&fact.event_id));
+                .any(|fact| fact.kind == "blocker" && !resolve_refs.contains(&fact.event_id));
             let acted = chain_facts.iter().any(|fact| fact.kind == "claim");
-            let acknowledged = resolved.contains(&handoff.event_id);
+            let acknowledged = resolve_refs.contains(&handoff.event_id);
             let state = if artifact.is_some() {
                 "completed"
             } else if open_blocker {
@@ -552,10 +564,13 @@ fn filter_receipts(receipts: Vec<Receipt>, query: &RoomQuery) -> Vec<Receipt> {
     receipts
         .into_iter()
         .filter(|receipt| {
-            query.tool.as_deref().is_none_or(|tool| {
+            let tool_ok = query.tool.as_deref().is_none_or(|tool| {
                 receipt.from_tool.as_deref() == Some(tool)
                     || receipt.to_target.as_deref() == Some(tool)
-            })
+            });
+            // Stay windowed with the rest of the snapshot when `--since` is set.
+            let since_ok = query.since.is_none_or(|since| receipt.seq > since);
+            tool_ok && since_ok
         })
         .collect()
 }

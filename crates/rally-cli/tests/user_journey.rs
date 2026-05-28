@@ -711,6 +711,143 @@ fn rally_receipt_reflects_a_blocker_raised_against_a_handoff() {
 }
 
 #[test]
+fn rally_say_rejects_malformed_contract_tokens() {
+    // intent: a malformed contract declaration must fail loudly at the boundary,
+    // not silently create phantom (or spuriously "confirmed") stale-base findings.
+    let workspace = Workspace::new("rally-bad-contract");
+
+    // empty name (`@v1`)
+    let empty_out = workspace.output(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "x",
+        "--produces",
+        "@v1",
+    ]);
+    assert!(!empty_out.status.success());
+    let empty: Value = serde_json::from_slice(&empty_out.stderr).unwrap();
+    assert_eq!(empty["exit_code"], 2);
+
+    // more than one `@`
+    let multi_out = workspace.output(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "x",
+        "--depends",
+        "a@v1@v2",
+    ]);
+    assert!(!multi_out.status.success());
+    let multi: Value = serde_json::from_slice(&multi_out.stderr).unwrap();
+    assert_eq!(multi["exit_code"], 2);
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_receipt_release_does_not_acknowledge_a_handoff() {
+    // intent: a `release` (a claim's scope retired) must not be misread as
+    // acknowledgment of delegated work; only a `resolve` acknowledges a handoff.
+    let workspace = Workspace::new("rally-receipt-release");
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "codex",
+        "--target",
+        "claude_code",
+        "--subject",
+        "do x",
+    ]);
+    let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
+
+    workspace.json(&[
+        "say",
+        "release",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--ref",
+        handoff_id,
+        "--subject",
+        "released",
+    ]);
+    let room = workspace.json(&["room", "--json"]);
+    assert_eq!(find_receipt(&room, handoff_id)["state"], "delivered");
+
+    workspace.json(&[
+        "say",
+        "resolve",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--ref",
+        handoff_id,
+        "--subject",
+        "ack",
+    ]);
+    let room = workspace.json(&["room", "--json"]);
+    assert_eq!(find_receipt(&room, handoff_id)["state"], "acknowledged");
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_stale_base_attention_shows_a_producer_that_predates_the_cursor() {
+    // intent: a live collision must surface in enter attention even when the
+    // producer's claim is older than the consumer's read cursor — otherwise an
+    // agent joining an existing contract never learns its base is changing.
+    let workspace = Workspace::new("rally-stale-attention");
+
+    let producer = workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "change base",
+        "--produces",
+        "api.search@v2",
+    ]);
+    let producer_id = producer["data"]["fact"]["event_id"].as_str().unwrap();
+
+    // Consumer enters first (advancing its cursor past the producer), then claims.
+    workspace.json(&["enter", "--json", "--tool", "claude_code"]);
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--subject",
+        "callers",
+        "--depends",
+        "api.search@v1",
+    ]);
+
+    let enter = workspace.json(&["enter", "--json", "--tool", "claude_code"]);
+    assert!(
+        enter["data"]["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["reason"] == "stale_base" && item["event_id"] == producer_id),
+        "expected stale_base attention for the pre-cursor producer: {enter}"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
 fn rally_artifact_ref_consumes_handoff_but_not_blocker_or_claim() {
     // intent: an artifact fact that references a handoff via --ref should
     // close that handoff (drop it from room.open_handoffs and next).
