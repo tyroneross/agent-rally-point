@@ -1086,6 +1086,51 @@ fn rally_json_errors_use_agent_cli_exit_codes() {
 }
 
 #[test]
+fn rally_say_persists_summary_round_trip() {
+    let workspace = Workspace::new("rally-summary-roundtrip");
+
+    // space-separated form
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "codex",
+        "--target",
+        "claude_code",
+        "--subject",
+        "needs review",
+        "--summary",
+        "Reviewer has enough context to proceed.",
+    ]);
+    assert_eq!(
+        handoff["data"]["fact"]["summary"],
+        "Reviewer has enough context to proceed.",
+        "space-separated --summary must round-trip into fact.summary"
+    );
+    assert_eq!(handoff["data"]["fact"]["subject"], "needs review");
+
+    // equals form
+    let decision = workspace.json(&[
+        "say",
+        "decision",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "binding call",
+        "--summary=Adopt the finite pickup protocol.",
+    ]);
+    assert_eq!(
+        decision["data"]["fact"]["summary"],
+        "Adopt the finite pickup protocol.",
+        "--summary=value form must round-trip into fact.summary"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
 fn rally_flags_do_not_silently_consume_positionals() {
     let workspace = Workspace::new("rally-argbag-flags");
 

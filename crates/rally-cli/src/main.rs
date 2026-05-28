@@ -3277,6 +3277,7 @@ fn option_takes_value(name: &str) -> bool {
             | "--subject"
             | "--thread-id"
             | "--scope"
+            | "--summary"
             | "--resource"
             | "--evidence"
             | "--target"
