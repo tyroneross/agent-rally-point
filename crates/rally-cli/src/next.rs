@@ -59,6 +59,9 @@ pub(crate) struct NextResult {
     suggested_commands: Vec<String>,
     completion: CompletionContract,
     waiting_on: Vec<Fact>,
+    /// Active claims owned by this tool whose declared base is being changed by
+    /// another agent — surfaced before the conflict reaches a merge.
+    stale_bases: Vec<StaleBase>,
     alternatives: Vec<NextCandidateData>,
 }
 
@@ -95,6 +98,73 @@ pub(crate) struct CompletionContract {
     evidence_required: bool,
     release_claims: bool,
     rerun_next: bool,
+}
+
+/// A consumer claim whose declared `depends` contract is being changed by
+/// another active producer claim. This is the predictive collision signal:
+/// the consumer's base is shifting *before* a merge surfaces the conflict.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct StaleBase {
+    /// Bare contract name shared by the producer and consumer (pin stripped).
+    contract: String,
+    consumer_event_id: String,
+    consumer_tool: Option<String>,
+    consumer_subject: String,
+    consumer_pin: Option<String>,
+    producer_event_id: String,
+    producer_tool: Option<String>,
+    producer_pin: Option<String>,
+    /// True when both sides pinned a version (`name@hash`) and the hashes
+    /// differ — a confirmed stale base, not just an overlapping contract.
+    confirmed: bool,
+}
+
+/// Split a contract token `name@hash` into its bare name and optional pin.
+fn contract_parts(token: &str) -> (&str, Option<&str>) {
+    match token.split_once('@') {
+        Some((name, pin)) => (name, Some(pin)),
+        None => (token, None),
+    }
+}
+
+/// Cross-match active claims: any claim that `depends` on a contract another
+/// active claim (owned by a different tool) `produces` is flagged. Rally only
+/// matches declared strings — agents own the reasoning about what a contract is.
+pub(crate) fn stale_base_findings(active_claims: &[Fact]) -> Vec<StaleBase> {
+    let mut findings = Vec::new();
+    for consumer in active_claims {
+        for dep in &consumer.depends {
+            let (dep_name, dep_pin) = contract_parts(dep);
+            for producer in active_claims {
+                if producer.event_id == consumer.event_id {
+                    continue;
+                }
+                // Coordination is cross-agent: a tool changing its own base is not a collision.
+                if producer.tool.is_some() && producer.tool == consumer.tool {
+                    continue;
+                }
+                for prod in &producer.produces {
+                    let (prod_name, prod_pin) = contract_parts(prod);
+                    if prod_name != dep_name {
+                        continue;
+                    }
+                    let confirmed = matches!((dep_pin, prod_pin), (Some(d), Some(p)) if d != p);
+                    findings.push(StaleBase {
+                        contract: dep_name.to_string(),
+                        consumer_event_id: consumer.event_id.clone(),
+                        consumer_tool: consumer.tool.clone(),
+                        consumer_subject: consumer.subject.clone(),
+                        consumer_pin: dep_pin.map(str::to_string),
+                        producer_event_id: producer.event_id.clone(),
+                        producer_tool: producer.tool.clone(),
+                        producer_pin: prod_pin.map(str::to_string),
+                        confirmed,
+                    });
+                }
+            }
+        }
+    }
+    findings
 }
 
 pub(crate) fn build_entry(
@@ -248,6 +318,10 @@ pub(crate) fn build_next(
     let mode = next_mode(waiting, top.action);
     let contract = action_contract(&top, tool);
     let top_data = top.to_data();
+    let stale_bases = stale_base_findings(&snapshot.active_claims)
+        .into_iter()
+        .filter(|finding| finding.consumer_tool.as_deref() == Some(tool))
+        .collect::<Vec<_>>();
 
     NextResult {
         mode,
@@ -265,6 +339,7 @@ pub(crate) fn build_next(
         suggested_commands: contract.suggested_commands,
         completion: contract.completion,
         waiting_on,
+        stale_bases,
         alternatives,
     }
 }
@@ -612,6 +687,18 @@ pub(crate) fn build_attention(
         .chain(snapshot.unconsumed_artifacts.iter())
     {
         push_fact("new_room_fact", fact);
+    }
+    for finding in stale_base_findings(&snapshot.active_claims) {
+        if finding.consumer_tool.as_deref() != Some(tool) {
+            continue;
+        }
+        if let Some(producer) = snapshot
+            .active_claims
+            .iter()
+            .find(|claim| claim.event_id == finding.producer_event_id)
+        {
+            push_fact("stale_base", producer);
+        }
     }
     items
 }

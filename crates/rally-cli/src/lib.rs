@@ -77,7 +77,7 @@ fn run_inner() -> Result<Output> {
 
     match parse_cli(&args)? {
         CliCommand::Enter(args) => command_enter(args),
-        CliCommand::Say(args) => command_say(args),
+        CliCommand::Say(args) => command_say(*args),
         CliCommand::Room(args) => command_room(args),
         CliCommand::Next(args) => command_next(args),
         CliCommand::Check(args) => command_check(args),
@@ -153,6 +153,8 @@ fn command_say(args: SayArgs) -> Result<Output> {
         role: args.role,
         subject,
         scope,
+        produces: args.produces,
+        depends: args.depends,
         created_at: now_string(),
         summary: args.summary,
         evidence: args.evidence,
@@ -500,6 +502,8 @@ fn session_fact(session: &ManagedSession, status: &str, ref_id: Option<String>) 
         role: None,
         subject: format!("managed session {} {status}", session.name),
         scope: Vec::new(),
+        produces: Vec::new(),
+        depends: Vec::new(),
         created_at: now_string(),
         summary: Some(format!(
             "{} {} session via {}",

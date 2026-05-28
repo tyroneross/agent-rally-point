@@ -94,6 +94,27 @@ rally say decision --tool <you> --subject "Rally is primary" --status binding --
 rally say risk --tool <you> --subject "managed session unavailable" --severity medium --json
 ```
 
+## Contract-Aware Claims (predictive collisions)
+
+A claim can declare the contracts it `produces` (changes) and `depends`
+on, optionally pinned to a version with `@<hash>`. When one agent's active
+claim changes a contract another agent's active claim depends on, Rally
+surfaces it as a `stale_base` finding in `next` and in `enter` attention —
+*before* the change reaches a merge.
+
+```bash
+# Producer: declares the contract it changes
+rally say claim --tool codex --subject "soft-delete users" \
+  --produces scope.active_users@b1c2 --json
+
+# Consumer: pins the version it built against
+rally say claim --tool claude_code --subject "user search" \
+  --depends scope.active_users@a3f9 --json
+
+# Consumer is warned its base is shifting (confirmed: pins differ)
+rally next --tool claude_code --json   # -> data.next.stale_bases[]
+```
+
 ## Where State Lives
 
 ```text

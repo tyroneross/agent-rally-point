@@ -91,6 +91,10 @@ pub(crate) struct Fact {
     pub(crate) subject: String,
     #[serde(default)]
     pub(crate) scope: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) produces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) depends: Vec<String>,
     #[serde(default)]
     pub(crate) created_at: String,
     #[serde(default)]

@@ -7,7 +7,7 @@ use crate::store::FactKind;
 
 pub(crate) enum CliCommand {
     Enter(EnterArgs),
-    Say(SayArgs),
+    Say(Box<SayArgs>),
     Room(RoomArgs),
     Next(NextArgs),
     Check(CheckArgs),
@@ -39,6 +39,8 @@ pub(crate) struct SayArgs {
     pub(crate) scopes: Vec<String>,
     pub(crate) resources: Vec<String>,
     pub(crate) paths: Vec<String>,
+    pub(crate) produces: Vec<String>,
+    pub(crate) depends: Vec<String>,
     pub(crate) evidence: Vec<String>,
     pub(crate) target: Option<String>,
     pub(crate) ref_id: Option<String>,
@@ -173,7 +175,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
     let say = say_parser()
         .to_options()
         .command("say")
-        .map(CliCommand::Say);
+        .map(|args| CliCommand::Say(Box::new(args)));
     let room = room_parser()
         .to_options()
         .command("room")
@@ -245,6 +247,8 @@ fn say_parser() -> impl Parser<SayArgs> {
     let scopes = many_string_arg("scope", "SCOPE");
     let resources = many_string_arg("resource", "RESOURCE");
     let paths = many_string_arg("path", "PATH");
+    let produces = many_string_arg("produces", "CONTRACT");
+    let depends = many_string_arg("depends", "CONTRACT");
     let evidence = many_string_arg("evidence", "EVIDENCE");
     let target = target_arg();
     let ref_id = optional_string_arg("ref", "EVENT_ID");
@@ -262,6 +266,8 @@ fn say_parser() -> impl Parser<SayArgs> {
         scopes,
         resources,
         paths,
+        produces,
+        depends,
         evidence,
         target,
         ref_id,

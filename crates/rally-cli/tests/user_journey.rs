@@ -468,6 +468,115 @@ fn rally_next_finds_useful_work_while_waiting() {
 }
 
 #[test]
+fn rally_next_warns_when_a_peer_claim_changes_a_declared_base() {
+    // intent: when one agent's in-flight claim changes a contract another agent
+    // declared it depends on, the dependent agent must be warned before the
+    // change reaches a merge. This is the cascading-invalidation failure that
+    // eats 30-50% of parallel-agent time; without the warning the dependent
+    // agent keeps building on a base that is already shifting.
+    let workspace = Workspace::new("rally-stale-base");
+
+    // Claude reserves dependent work, pinning the contract version it built against.
+    let consumer = workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--subject",
+        "user search over active users",
+        "--depends",
+        "scope.active_users@a3f9",
+    ]);
+    let consumer_id = consumer["data"]["fact"]["event_id"].as_str().unwrap();
+
+    // Codex reserves work that changes that same contract to a new version.
+    let producer = workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "soft-delete users",
+        "--produces",
+        "scope.active_users@b1c2",
+    ]);
+    let producer_id = producer["data"]["fact"]["event_id"].as_str().unwrap();
+
+    // Claude asks what to do next and is told its base is stale.
+    let next = workspace.json(&["next", "--json", "--tool", "claude_code"]);
+    assert_matches_schema("agent-rally.command.next.v1.json", &next);
+    let stale = next["data"]["next"]["stale_bases"].as_array().unwrap();
+    assert_eq!(stale.len(), 1, "expected one stale-base finding: {next}");
+    let finding = &stale[0];
+    assert_eq!(finding["contract"], "scope.active_users");
+    assert_eq!(finding["consumer_event_id"], consumer_id);
+    assert_eq!(finding["producer_event_id"], producer_id);
+    assert_eq!(finding["producer_tool"], "codex");
+    // both sides pinned a version and the hashes differ -> confirmed, not a guess
+    assert_eq!(finding["confirmed"], true);
+
+    // The producer (codex) is not the one at risk: its own next carries no stale base.
+    let producer_next = workspace.json(&["next", "--json", "--tool", "codex"]);
+    assert!(
+        producer_next["data"]["next"]["stale_bases"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // The same warning surfaces in Claude's entry attention on the next enter.
+    let enter = workspace.json(&["enter", "--json", "--tool", "claude_code"]);
+    assert!(
+        enter["data"]["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["reason"] == "stale_base" && item["event_id"] == producer_id),
+        "expected stale_base attention referencing the producer claim: {enter}"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_stale_base_is_unconfirmed_without_version_pins() {
+    // intent: an overlapping contract with no version pins is a real but weaker
+    // signal (we cannot prove the base changed), so it must surface as a finding
+    // yet stay unconfirmed — agents should not treat "might collide" as "did".
+    let workspace = Workspace::new("rally-stale-base-unpinned");
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--subject",
+        "search",
+        "--depends",
+        "scope.active_users",
+    ]);
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "soft delete",
+        "--produces",
+        "scope.active_users",
+    ]);
+    let next = workspace.json(&["next", "--json", "--tool", "claude_code"]);
+    let stale = next["data"]["next"]["stale_bases"].as_array().unwrap();
+    assert_eq!(stale.len(), 1, "expected one finding: {next}");
+    assert_eq!(stale[0]["confirmed"], false);
+
+    workspace.cleanup();
+}
+
+#[test]
 fn rally_artifact_ref_consumes_handoff_but_not_blocker_or_claim() {
     // intent: an artifact fact that references a handoff via --ref should
     // close that handoff (drop it from room.open_handoffs and next).

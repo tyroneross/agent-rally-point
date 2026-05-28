@@ -104,6 +104,9 @@
             "waiting_on": {
               "type": "array"
             },
+            "stale_bases": {
+              "type": "array"
+            },
             "alternatives": {
               "type": "array"
             }
