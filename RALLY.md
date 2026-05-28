@@ -115,6 +115,13 @@ rally say claim --tool claude_code --subject "user search" \
 rally next --tool claude_code --json   # -> data.next.stale_bases[]
 ```
 
+A *confirmed* stale base (both sides pinned, hashes differ) sets
+`data.next.coordination_required = true` and each finding carries a
+`suggested_command` (raise a blocker referencing the producer) so the agent
+can reconcile before building further. This is advisory: it never forces
+`requires_human`. An unpinned overlap stays informational
+(`confirmed: false`, gate not tripped).
+
 ## Where State Lives
 
 ```text

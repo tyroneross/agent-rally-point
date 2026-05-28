@@ -107,6 +107,9 @@
             "stale_bases": {
               "type": "array"
             },
+            "coordination_required": {
+              "type": "boolean"
+            },
             "alternatives": {
               "type": "array"
             }

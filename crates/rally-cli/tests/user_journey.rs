@@ -516,6 +516,17 @@ fn rally_next_warns_when_a_peer_claim_changes_a_declared_base() {
     assert_eq!(finding["producer_tool"], "codex");
     // both sides pinned a version and the hashes differ -> confirmed, not a guess
     assert_eq!(finding["confirmed"], true);
+    // soft gate: a confirmed stale base raises coordination_required and offers
+    // the cheap reconciling move, without forcing requires_human.
+    assert_eq!(next["data"]["next"]["coordination_required"], true);
+    assert_eq!(next["data"]["next"]["requires_human"], false);
+    assert!(
+        finding["suggested_command"]
+            .as_str()
+            .unwrap()
+            .contains("rally say blocker --tool claude_code --ref"),
+        "expected a coordinating blocker command: {finding}"
+    );
 
     // The producer (codex) is not the one at risk: its own next carries no stale base.
     let producer_next = workspace.json(&["next", "--json", "--tool", "codex"]);
@@ -572,6 +583,9 @@ fn rally_stale_base_is_unconfirmed_without_version_pins() {
     let stale = next["data"]["next"]["stale_bases"].as_array().unwrap();
     assert_eq!(stale.len(), 1, "expected one finding: {next}");
     assert_eq!(stale[0]["confirmed"], false);
+    // unpinned overlap is informational only: it must not trip the soft gate,
+    // because "might collide" is not "did collide".
+    assert_eq!(next["data"]["next"]["coordination_required"], false);
 
     workspace.cleanup();
 }

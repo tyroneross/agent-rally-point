@@ -62,6 +62,10 @@ pub(crate) struct NextResult {
     /// Active claims owned by this tool whose declared base is being changed by
     /// another agent — surfaced before the conflict reaches a merge.
     stale_bases: Vec<StaleBase>,
+    /// Soft gate: true when at least one stale base is confirmed (pins differ).
+    /// The agent should reconcile via the finding's suggested_command before
+    /// building further. Advisory — it does not force `requires_human`.
+    coordination_required: bool,
     alternatives: Vec<NextCandidateData>,
 }
 
@@ -117,6 +121,9 @@ pub(crate) struct StaleBase {
     /// True when both sides pinned a version (`name@hash`) and the hashes
     /// differ — a confirmed stale base, not just an overlapping contract.
     confirmed: bool,
+    /// The cheap coordinating move: raise a blocker referencing the producer so
+    /// the change is reconciled before the consumer builds further.
+    suggested_command: String,
 }
 
 /// Split a contract token `name@hash` into its bare name and optional pin.
@@ -149,6 +156,13 @@ pub(crate) fn stale_base_findings(active_claims: &[Fact]) -> Vec<StaleBase> {
                         continue;
                     }
                     let confirmed = matches!((dep_pin, prod_pin), (Some(d), Some(p)) if d != p);
+                    let severity = if confirmed { "high" } else { "medium" };
+                    let consumer_tool_arg = shell_quote(consumer.tool.as_deref().unwrap_or("you"));
+                    let producer_arg = shell_quote(&producer.event_id);
+                    let subject_arg = shell_quote(&format!("stale base: {dep_name}"));
+                    let suggested_command = format!(
+                        "rally say blocker --tool {consumer_tool_arg} --ref {producer_arg} --subject {subject_arg} --severity {severity} --json"
+                    );
                     findings.push(StaleBase {
                         contract: dep_name.to_string(),
                         consumer_event_id: consumer.event_id.clone(),
@@ -159,6 +173,7 @@ pub(crate) fn stale_base_findings(active_claims: &[Fact]) -> Vec<StaleBase> {
                         producer_tool: producer.tool.clone(),
                         producer_pin: prod_pin.map(str::to_string),
                         confirmed,
+                        suggested_command,
                     });
                 }
             }
@@ -322,6 +337,7 @@ pub(crate) fn build_next(
         .into_iter()
         .filter(|finding| finding.consumer_tool.as_deref() == Some(tool))
         .collect::<Vec<_>>();
+    let coordination_required = stale_bases.iter().any(|finding| finding.confirmed);
 
     NextResult {
         mode,
@@ -340,6 +356,7 @@ pub(crate) fn build_next(
         completion: contract.completion,
         waiting_on,
         stale_bases,
+        coordination_required,
         alternatives,
     }
 }
