@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# PR45 dependencies (icu_*, time) require Rust >= 1.86/1.88; the machine default
+# toolchain may be older (e.g. 1.85). Pinning to stable makes `cargo build`
+# resolve a compatible compiler regardless of the global default, so local builds
+# and CI agree without relying on `rustc --version` of the host.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
