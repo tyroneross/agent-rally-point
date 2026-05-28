@@ -15,7 +15,7 @@
       "properties": {
         "fact": {
           "type": "object",
-          "required": ["schema", "event_id", "thread_id", "created_at", "tool", "kind", "subject", "scope", "evidence", "origin", "trust_status"]
+          "required": ["schema", "event_id", "thread_id", "created_at", "tool", "kind", "subject", "scope", "evidence"]
         },
         "room": { "type": "object" }
       }
