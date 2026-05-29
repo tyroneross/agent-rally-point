@@ -48,13 +48,25 @@ Thumbs.db
 target/
 
 # Local Rally room state.
-# `.rally/ledger.jsonl` IS committed — it is the canonical, append-only,
-# durable record of every fact in this repo's rally point. It survives
-# clone/machine with no external service. Everything else under .rally/
-# is a derived cache (facts.db, room.db, cursors.json, tmp files) that
-# `rally` rebuilds from the ledger on first open.
+# Three things in .rally/ are canonical (committed) and survive clone/machine
+# with no external service:
+#   - `.rally/ledger.jsonl` (R1) and/or `.rally/log/**` (R5): the append-only
+#     durable record of every fact. R5 supersedes the monolith with
+#     per-engagement segments; R1's `.rally/ledger.jsonl` remains a valid
+#     input path during migration.
+#   - `.rally/archive/**` (R7): rotated old segments, still replayable.
+#   - `.rally/manifest.json` (R4): self-describing pointers to docs + ledger
+#     so any agent landing in the repo finds the rally point.
+# Everything else under .rally/ is a derived cache (facts.db, room.db,
+# cursors.json, tmp files) that `rally` rebuilds from the ledger on first
+# open.
 .rally/*
 !.rally/ledger.jsonl
+!.rally/manifest.json
+!.rally/log/
+!.rally/archive/
+.rally/log/*.tmp-*
+.rally/archive/*.tmp-*
 .rally2/
 
 # build-loop's own runtime + planning artifacts. build-loop is one optional

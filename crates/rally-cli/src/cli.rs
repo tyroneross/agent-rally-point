@@ -6,6 +6,7 @@ use crate::error::{RallyError, Result};
 use crate::store::FactKind;
 
 pub(crate) enum CliCommand {
+    Init(InitArgs),
     Enter(EnterArgs),
     Say(SayArgs),
     Room(RoomArgs),
@@ -22,6 +23,11 @@ pub(crate) enum CliCommand {
 pub(crate) enum CliParse {
     Command(Box<CliCommand>),
     Help(String),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InitArgs {
+    pub(crate) json: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -155,8 +161,8 @@ impl Default for BackendBins {
 }
 
 const COMMANDS: &[&str] = &[
-    "enter", "say", "room", "next", "check", "run", "sessions", "inject", "attach", "capture",
-    "stop", "locate", "recent",
+    "init", "enter", "say", "room", "next", "check", "run", "sessions", "inject", "attach",
+    "capture", "stop", "locate", "recent",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -194,6 +200,10 @@ fn parse_failure_message(failure: ParseFailure) -> String {
 }
 
 fn cli_parser() -> OptionParser<CliCommand> {
+    let init = init_parser()
+        .to_options()
+        .command("init")
+        .map(CliCommand::Init);
     let enter = enter_parser()
         .to_options()
         .command("enter")
@@ -248,9 +258,15 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .map(CliCommand::Session);
 
     construct!([
-        enter, say, room, next, locate, recent, check, run, sessions, inject, attach, capture, stop
+        init, enter, say, room, next, locate, recent, check, run, sessions, inject, attach,
+        capture, stop
     ])
     .to_options()
+}
+
+fn init_parser() -> impl Parser<InitArgs> {
+    let json = json_flag();
+    construct!(InitArgs { json })
 }
 
 fn enter_parser() -> impl Parser<EnterArgs> {

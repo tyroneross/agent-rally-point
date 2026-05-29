@@ -4,6 +4,13 @@ Rally is the primary Agent Rally Point path. It gives coding agents a shared
 repo-local room: what is owned, blocked, handed off, decided, produced, and what
 to do next.
 
+> **First time in a repo?** Run `rally init` once. It writes
+> `.rally/manifest.json` (machine-readable self-description) and injects a
+> fenced rally pointer into the repo's `CLAUDE.md` and `AGENTS.md` so any
+> agent landing there sees how to enter and where the deeper docs live.
+> Idempotent — re-running `rally init` refreshes the pointer block between
+> stable markers without duplicating anything.
+
 ## The Load-Bearing Commands
 
 ```bash
@@ -120,14 +127,20 @@ rally say risk --tool <you> --subject "managed session unavailable" --severity m
 ## Where State Lives
 
 ```text
-.rally/facts.db  canonical fact store
-.rally/cursors.json per-tool read cursors
+.rally/log/<engagement>.jsonl   canonical, append-only per-engagement facts (R5; committed)
+.rally/ledger.jsonl             legacy monolith — migrated into log/ on first open (R1)
+.rally/archive/                 rotated old segments, still replayable (R7)
+.rally/manifest.json            self-describing pointers (R4; committed)
+.rally/facts.db                 derived sqlite cache — rebuilt by replay (gitignored)
+.rally/cursors.json             per-tool read cursors
 ```
 
 Linked git worktrees resolve this room from the shared git common dir, so the
-main checkout and its worktrees coordinate through one `.rally/` store. Room
-state is derived from the fact store on demand. The fact store is the source of
-truth, including managed session lifecycle facts.
+main checkout and its worktrees coordinate through one `.rally/` store. The
+**ledger files under `.rally/log/`** are the source of truth — append-only,
+committed, durable across clone/machine. `facts.db` is a pure cache that
+`rally` rebuilds from the ledger on first open. Managed session lifecycle
+facts ride the same ledger.
 
 ## Install
 

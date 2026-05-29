@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const SCHEMA_INIT: &str = "agent-rally.command.init.v1";
 const SCHEMA_ENTER: &str = "agent-rally.command.enter.v1";
 const SCHEMA_SAY: &str = "agent-rally.command.say.v1";
 const SCHEMA_ROOM: &str = "agent-rally.command.room.v1";
@@ -39,6 +40,7 @@ mod check;
 mod cli;
 mod discovery;
 mod error;
+mod init;
 mod next;
 mod output;
 mod store;
@@ -85,6 +87,7 @@ fn run_inner() -> Result<Output> {
     };
 
     match command {
+        CliCommand::Init(args) => command_init(args),
         CliCommand::Enter(args) => command_enter(args),
         CliCommand::Say(args) => command_say(args),
         CliCommand::Room(args) => command_room(args),
@@ -97,6 +100,29 @@ fn run_inner() -> Result<Output> {
         CliCommand::Inject(args) => command_inject(args),
         CliCommand::Session(args) => command_session_action(args),
     }
+}
+
+fn command_init(args: InitArgs) -> Result<Output> {
+    // Shared coordination dir (main checkout under git's commondir) vs.
+    // active worktree. Pointer docs land in the worktree (active branch);
+    // manifest lives under the shared `.rally/`. See `init::run_init`.
+    let repo = repo_root()?;
+    let worktree = worktree_root()?;
+    let outcome = init::run_init(repo, worktree)?;
+    let manifest_action = outcome.manifest.action;
+    let pointers_summary: Vec<String> = outcome
+        .pointers
+        .iter()
+        .map(|p| format!("{}={}", p.path, p.action))
+        .collect();
+    let text = format!(
+        "rally init: manifest={manifest_action} {pointers} (ledger_dir={ledger}; room_cmd={room})",
+        pointers = pointers_summary.join(" "),
+        ledger = outcome.ledger_dir,
+        room = outcome.room_cmd,
+    );
+    let body = envelope("init", SCHEMA_INIT, outcome)?;
+    Ok(Output::new(args.json, text, body))
 }
 
 fn command_enter(args: EnterArgs) -> Result<Output> {
@@ -1237,6 +1263,23 @@ pub(crate) fn repo_root() -> Result<PathBuf> {
     }
 }
 
+/// The current worktree root — the directory containing the `.git` file or
+/// dir reached by walking up from cwd. **Does not** follow `commondir` to the
+/// main checkout. Use this when an artifact must land in the active branch's
+/// checkout (e.g. files committed to git), as opposed to the shared `.rally/`
+/// coordination dir which lives under [`repo_root`].
+pub(crate) fn worktree_root() -> Result<PathBuf> {
+    let mut dir = env::current_dir().map_err(RallyError::io("current dir"))?;
+    loop {
+        if dir.join(".git").exists() {
+            return Ok(dir);
+        }
+        if !dir.pop() {
+            return env::current_dir().map_err(RallyError::io("current dir"));
+        }
+    }
+}
+
 fn git_common_repo_root(worktree_root: &Path) -> Option<PathBuf> {
     git_common_dir(worktree_root)?
         .parent()
@@ -1294,6 +1337,7 @@ fn help_text() -> String {
         "rally: repo-local coordination room for parallel agents",
         "",
         "Usage:",
+        "  rally init [--json]",
         "  rally enter --tool <tool> [--path <path>] [--role <role>] [--json]",
         "  rally say <kind> --tool <tool> --subject <subject> [--path <path>] [--json]",
         "  rally room [--tool <tool>] [--role <role>] [--path <path>] [--since <seq>] [--json]",
