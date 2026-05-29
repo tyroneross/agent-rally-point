@@ -5,6 +5,7 @@ use chrono::DateTime;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
@@ -1408,6 +1409,17 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
     assert_eq!(herdr_capture["data"]["commands"][0][1], "agent");
     assert_eq!(herdr_capture["data"]["commands"][0][2], "read");
 
+    let cmux_bin = workspace.cwd.join("fake-cmux");
+    fs::write(
+        &cmux_bin,
+        "#!/bin/sh\nif [ \"$1\" = \"new-workspace\" ]; then echo workspace:cmux-builder; fi\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&cmux_bin).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&cmux_bin, permissions).unwrap();
+    let cmux_bin = cmux_bin.to_str().unwrap();
+
     let cmux = workspace.json(&[
         "run",
         "codex",
@@ -1417,12 +1429,12 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
         "--backend",
         "cmux",
         "--cmux-bin",
-        "/usr/bin/true",
+        cmux_bin,
     ]);
     assert_eq!(cmux["schema"], "agent-rally.command.run.v1");
     assert_matches_schema("agent-rally.command.run.v1.json", &cmux);
     assert_eq!(cmux["data"]["session"]["backend"], "cmux");
-    assert_eq!(cmux["data"]["session"]["target"], "codex-cmux-builder-01");
+    assert_eq!(cmux["data"]["session"]["target"], "workspace:cmux-builder");
     assert_eq!(cmux["data"]["commands"]["start"][0][1], "new-workspace");
     assert!(
         !cmux["data"]["commands"]["start"][0]
@@ -1456,7 +1468,7 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
         "--text",
         "hello cmux",
         "--cmux-bin",
-        "/usr/bin/true",
+        cmux_bin,
     ]);
     assert_eq!(cmux_inject["data"]["commands"][0][1], "send-key");
     assert_eq!(cmux_inject["data"]["commands"][0][4], "ctrl+u");
@@ -1465,13 +1477,7 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
     assert_eq!(cmux_inject["data"]["commands"][2][1], "send-key");
     assert_eq!(cmux_inject["data"]["commands"][2][4], "enter");
 
-    let cmux_stop = workspace.json(&[
-        "stop",
-        "cmux-builder-01",
-        "--json",
-        "--cmux-bin",
-        "/usr/bin/true",
-    ]);
+    let cmux_stop = workspace.json(&["stop", "cmux-builder-01", "--json", "--cmux-bin", cmux_bin]);
     assert_eq!(cmux_stop["data"]["commands"][0][1], "close-workspace");
 
     let herdr_stop = workspace.json(&[

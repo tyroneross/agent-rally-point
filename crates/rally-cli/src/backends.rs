@@ -148,9 +148,9 @@ impl BackendRunner {
         cwd: &Path,
         command: &[String],
         name: &str,
-    ) -> Vec<Vec<String>> {
-        match self.backend {
-            Backend::Tmux => vec![tmux_start_command(&self.tmux_bin, target, cwd, command)],
+    ) -> Result<Vec<Vec<String>>> {
+        let commands = match self.backend {
+            Backend::Tmux => vec![tmux_start_command(&self.tmux_bin, target, cwd, command)?],
             Backend::Herdr => vec![herdr_start_command(
                 &self.herdr_bin,
                 target,
@@ -164,8 +164,9 @@ impl BackendRunner {
                 cwd,
                 command,
                 name,
-            )],
-        }
+            )?],
+        };
+        Ok(commands)
     }
 
     pub(crate) fn start(
@@ -175,12 +176,12 @@ impl BackendRunner {
         command: &[String],
         name: &str,
     ) -> Result<String> {
-        let commands = self.start_commands(target, cwd, command, name);
+        let commands = self.start_commands(target, cwd, command, name)?;
         match self.backend {
             Backend::Tmux | Backend::Herdr => run_commands(&commands).map(|()| target.to_string()),
             Backend::Cmux => {
                 let output = run_command_output(first_command(&commands)?)?;
-                Ok(parse_cmux_start_target(&output, target))
+                parse_cmux_start_target(&output, target)
             }
         }
     }
@@ -283,13 +284,18 @@ impl BackendRunner {
     }
 }
 
-fn tmux_start_command(bin: &str, session: &str, cwd: &Path, command: &[String]) -> Vec<String> {
+fn tmux_start_command(
+    bin: &str,
+    session: &str,
+    cwd: &Path,
+    command: &[String],
+) -> Result<Vec<String>> {
     let shell_command = format!(
         "cd {} && exec {}",
         shell_quote(&cwd.display().to_string()),
-        shell_words(command)
+        shell_words(command)?
     );
-    cmd![
+    Ok(cmd![
         bin,
         "new-session",
         "-d",
@@ -300,7 +306,7 @@ fn tmux_start_command(bin: &str, session: &str, cwd: &Path, command: &[String]) 
         "-y",
         "50",
         shell_command,
-    ]
+    ])
 }
 
 fn tmux_inject_commands(bin: &str, session: &str, text: &str) -> Vec<Vec<String>> {
@@ -346,6 +352,7 @@ fn parse_herdr_agents_tab(output: &str) -> Option<String> {
         .find(|tab| {
             tab.get("workspace_id").and_then(Value::as_str) == Some(workspace_id)
                 && tab.get("label").and_then(Value::as_str) == Some("agents")
+                && tab.get("focused").and_then(Value::as_bool) != Some(true)
         })
         .and_then(|tab| tab.get("tab_id").and_then(Value::as_str))
         .map(str::to_string)
@@ -357,19 +364,19 @@ fn cmux_start_command(
     cwd: &Path,
     command: &[String],
     name: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let layout = json!({
         "pane": {
             "surfaces": [
                 {
                     "type": "terminal",
-                    "command": shell_words(command)
+                    "command": shell_words(command)?
                 }
             ]
         }
     })
     .to_string();
-    cmd![
+    Ok(cmd![
         bin,
         "new-workspace",
         "--name",
@@ -382,10 +389,10 @@ fn cmux_start_command(
         layout,
         "--focus",
         "false",
-    ]
+    ])
 }
 
-pub(crate) fn parse_cmux_start_target(output: &str, fallback: &str) -> String {
+pub(crate) fn parse_cmux_start_target(output: &str, fallback: &str) -> Result<String> {
     output
         .split_whitespace()
         .find_map(|word| {
@@ -398,13 +405,12 @@ pub(crate) fn parse_cmux_start_target(output: &str, fallback: &str) -> String {
                 None
             }
         })
-        .or_else(|| {
-            output
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .map(|line| line.trim().to_string())
+        .ok_or_else(|| {
+            RallyError::Command(format!(
+                "cmux did not report a workspace ref for {fallback}; stdout: {}",
+                output.trim()
+            ))
         })
-        .unwrap_or_else(|| fallback.to_string())
 }
 
 fn herdr_live_pane(bin: &str, session: &ManagedSession) -> Result<String> {
@@ -493,13 +499,14 @@ fn run_command_output(args: &[String]) -> Result<String> {
     }
 }
 
-fn shell_words(words: &[String]) -> String {
-    shlex::try_join(words.iter().map(String::as_str)).expect("agent command contains NUL byte")
+fn shell_words(words: &[String]) -> Result<String> {
+    shlex::try_join(words.iter().map(String::as_str))
+        .map_err(|err| RallyError::Usage(format!("agent command cannot be shell-quoted: {err}")))
 }
 #[cfg(test)]
 mod tests {
     use super::{InjectData, RunData, SessionActionData, SessionsData};
-    use super::{parse_cmux_start_target, parse_herdr_agents_tab};
+    use super::{parse_cmux_start_target, parse_herdr_agents_tab, shell_words};
     use crate::check::CheckData;
     use crate::store::Fact;
     use crate::{EnterData, Envelope, NextData, RoomData, SayData};
@@ -509,9 +516,22 @@ mod tests {
     #[test]
     fn cmux_start_target_uses_workspace_ref_from_status_output() {
         assert_eq!(
-            parse_cmux_start_target("OK workspace:11\n", "claude-cmux-smoke"),
+            parse_cmux_start_target("OK workspace:11\n", "claude-cmux-smoke").unwrap(),
             "workspace:11"
         );
+    }
+
+    #[test]
+    fn cmux_start_target_rejects_output_without_workspace_ref() {
+        let err = parse_cmux_start_target("created workspace\n", "claude-cmux-smoke").unwrap_err();
+        assert!(err.to_string().contains("did not report a workspace ref"));
+    }
+
+    #[test]
+    fn shell_words_rejects_nul_bytes() {
+        let command = vec!["claude".to_string(), "bad\0arg".to_string()];
+        let err = shell_words(&command).unwrap_err();
+        assert!(err.to_string().contains("cannot be shell-quoted"));
     }
 
     #[test]
@@ -546,6 +566,25 @@ mod tests {
             parse_herdr_agents_tab(&output).as_deref(),
             Some("current:2")
         );
+    }
+
+    #[test]
+    fn herdr_agents_tab_does_not_return_focused_agents_tab() {
+        let output = json!({
+            "result": {
+                "tabs": [
+                    {
+                        "focused": true,
+                        "label": "agents",
+                        "tab_id": "current:1",
+                        "workspace_id": "current"
+                    }
+                ]
+            }
+        })
+        .to_string();
+
+        assert_eq!(parse_herdr_agents_tab(&output), None);
     }
 
     #[test]
