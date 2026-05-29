@@ -16,6 +16,11 @@ and host-facing skills that map the plan onto the rally primitives.
 > spawns, resumes, retries, or schedules work. If something would make Rally *execute*, it belongs
 > in the host or an external runner, not here.
 
+> **Two coordination modes.** This doc is **deterministic routing** — one driver decomposes a
+> short, defined task into scripted subagent roles. For **multiple autonomous frontier agents**
+> sharing a room (no single driver with full context), see **`COORDINATION.md`**: first-agent-is-lead,
+> proactive engagement (backlog → no-regrets → check-lead), and rally-as-facilitator-not-coordinator.
+
 ## 1. The workstream descriptor
 
 A JSON document. `core/workstream-lint.mjs` is the source of truth for what is valid; this section
