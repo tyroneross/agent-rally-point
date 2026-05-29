@@ -49,6 +49,10 @@ decision / blocker / claim / artifact is visible. **The lead (an agent) routes; 
 4. **Checkpoint to rally.** claim (start) → artifact (done), so progress is durable and any fresh
    agent can resume a long-running workstream (`core/workstream-status.mjs`). This is the long-running
    edge over pi, whose progress lives only in one parent's memory.
+5. **Model tiers are host-relative.** Never dictate another host's model tier — Sonnet/Opus are
+   Claude (Anthropic) tiers; Codex/GPT and other hosts have their own. The portable rule is *use the
+   cheapest tier sufficient for the task*, chosen by each agent **in its own model family**. (The lead
+   sets the principle — "defined task → economical tier" — not the specific model name across hosts.)
 
 ## Joining checklist (drop-in)
 
