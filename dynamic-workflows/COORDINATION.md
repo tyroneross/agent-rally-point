@@ -39,12 +39,19 @@ coordinates is the **squad**, not the individual sub-agent — a squad's interna
 Tier-1 business, **hidden behind the squad id** (per the in-memory-subagents-stay-host-side boundary
 above). So: 10 terminals → 10 squad ids in the room, regardless of how many agents run inside each.
 
-- **Distinct squad id, enforced at entry.** Every squad enters under **one** stable, distinct id
-  (`<host>:<squad>`, e.g. `claude_code:lead`, `codex:dynwf-coordinator`). Rally MUST reject/flag a
-  duplicate squad id so two squads never collide (the bare-`codex` / bare-`claude_code` collisions this
-  session are the failure mode). No squad uses a bare host id or two ids.
-- **Model tier per squad.** Each squad registers its tier (**frontier | executing | fast**, per
-  `MODEL-TIERS.md`) at enter, so the room knows each squad's capability/cost for routing.
+- **Distinct, self-declaring squad id, enforced at entry.** Every squad enters under **one** stable,
+  distinct id in the form **`host-llm-role-number`** (e.g. `codex-gpt-5.5-builder-01`,
+  `claude-opus-4.8-lead-01`). The **model lives in the id**, so the lead never *infers* a peer's model
+  — it reads it. Rally MUST reject/flag a duplicate id so two squads never collide (the bare-`codex` /
+  bare-`claude_code` collisions this session are the failure mode). No squad uses a bare host id or two
+  ids. *(Legacy `<host>:<squad>` ids — `claude_code:lead`, `codex:dynwf-coordinator` — migrate to the
+  new form **on next `enter`**, never by force-rename: renaming a live squad orphans its in-flight
+  claims/handoffs.)*
+- **Model tier per squad.** Each squad's **tier** (**frontier | executing | fast**, per `MODEL-TIERS.md`)
+  is the stable routing abstraction; the **specific model** is the mutable `llm` token *in the id*. A
+  model upgrade (`gpt-5.5`→`gpt-5.6`) = **re-enter under the new id + release old claims** (a different
+  model is a different capability). Because the model is in the id, B11 need only enforce id-uniqueness +
+  tier + lead-assert — not separate model-registration.
 - Rally-side enforcement (enter rejects duplicate squad id + records tier) is backlog **B11**; until it
   lands the **lead enforces the convention** and maintains the squad roster on the board.
 
