@@ -510,8 +510,16 @@ fn bounded_i64_arg(
 ) -> impl Parser<i64> {
     string_arg(name, metavar)
         .parse(move |value| parse_i64_arg(name, value))
+        .parse(move |value| {
+            if (min..=max).contains(&value) {
+                Ok(value)
+            } else {
+                Err(RallyError::Usage(format!(
+                    "--{name} must be between {min} and {max}, got {value}"
+                )))
+            }
+        })
         .fallback(default)
-        .map(move |value| value.clamp(min, max))
 }
 
 fn backend_arg() -> impl Parser<Backend> {
@@ -523,13 +531,23 @@ fn backend_arg() -> impl Parser<Backend> {
 fn target_arg() -> impl Parser<Option<String>> {
     let target = optional_string_arg("target", "TOOL");
     let to = optional_string_arg("to", "TOOL");
-    construct!(target, to).map(|(target, to)| target.or(to))
+    construct!(target, to).parse(|(target, to)| match (target, to) {
+        (Some(_), Some(_)) => Err(RallyError::Usage(
+            "cannot use --target and --to together".to_string(),
+        )),
+        (target, to) => Ok(target.or(to)),
+    })
 }
 
 fn handoff_arg() -> impl Parser<Option<String>> {
     let handoff = optional_string_arg("handoff", "EVENT_ID");
     let ref_id = optional_string_arg("ref", "EVENT_ID");
-    construct!(handoff, ref_id).map(|(handoff, ref_id)| handoff.or(ref_id))
+    construct!(handoff, ref_id).parse(|(handoff, ref_id)| match (handoff, ref_id) {
+        (Some(_), Some(_)) => Err(RallyError::Usage(
+            "cannot use --handoff and --ref together".to_string(),
+        )),
+        (handoff, ref_id) => Ok(handoff.or(ref_id)),
+    })
 }
 
 fn parse_fact_kind(value: String) -> Result<FactKind> {

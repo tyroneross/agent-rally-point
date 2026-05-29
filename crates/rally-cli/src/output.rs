@@ -26,14 +26,15 @@ impl Output {
 
     pub(crate) fn print(self) {
         if self.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&self.body).unwrap_or(self.body.to_string())
-            );
+            println!("{}", json_string(&self.body));
         } else {
             println!("{}", self.text);
         }
     }
+}
+
+fn json_string(value: &Value) -> String {
+    serde_json::to_string_pretty(value).expect("serde_json::Value serialization is infallible")
 }
 
 pub(crate) struct CliError {
@@ -65,5 +66,16 @@ impl CliError {
         } else {
             eprintln!("rally: {}", self.message);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::json_string;
+    use serde_json::json;
+
+    #[test]
+    fn json_output_uses_pretty_serialization() {
+        assert_eq!(json_string(&json!({"ok": true})), "{\n  \"ok\": true\n}");
     }
 }
