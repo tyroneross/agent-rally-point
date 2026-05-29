@@ -339,7 +339,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
     let command = agent_spec.command_line(&session.name);
     let backend_runner = BackendRunner::new(backend, bins);
     let start_commands =
-        backend_runner.start_commands(&session.target, &repo, &command, &session.name);
+        backend_runner.start_commands(&session.target, &repo, &command, &session.name)?;
 
     let actual_target = if dry_run {
         session.target.clone()
