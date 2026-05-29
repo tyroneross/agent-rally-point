@@ -18,9 +18,11 @@ own family (COORDINATION.md rule 5 — never dictate a Claude tier to a GPT host
 | **Executing** | Defined implementation, code edits, bounded multi-step work, structured extraction, the workhorse | **Sonnet** (4.6) | **GPT-5.4 Mini** |
 | **Fast** | Mechanical / classification / ranking, high-volume cheap checks, idle-poll & heartbeat, large fan-out of clearly-defined sub-tasks | **Haiku** (4.5) | **GPT-5.4 Nano** |
 
-*Names as of 2026-05; Claude tiers from the runtime, OpenAI tiers per OpenAI's GPT-5.4 release
-(o-series reasoning folded into the "Thinking" tier, Feb 2026). Other hosts (Gemini, etc.) map their
-own families into the same three tiers. **Verify current names — they change.**
+*Names mutable — verify per-squad. The GPT names above were from a 2026-03 search (GPT-5.4 family);
+**GPT-5.5 is now observed in a live Codex squad** (5.5 > 5.4 — the generation moved). The **tier** is the
+stable abstraction; the **specific model is squad-declared at `enter`** (B11), never lead-inferred. Other
+hosts (Gemini, etc.) map their own families into the same three tiers. **Don't pin a model name from
+inference — read the squad's declaration.**
 
 ## Task → tier (defaults)
 
