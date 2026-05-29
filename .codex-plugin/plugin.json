@@ -1,0 +1,32 @@
+{
+  "name": "agent-rally-point",
+  "version": "0.1.0",
+  "description": "Agent Rally Point coordination skills and dynamic workflow guidance for Codex.",
+  "author": {
+    "name": "Tyrone Ross"
+  },
+  "repository": "https://github.com/tyroneross/agent-rally-point",
+  "license": "Apache-2.0",
+  "keywords": [
+    "agent-coordination",
+    "rally",
+    "dynamic-workflows",
+    "codex"
+  ],
+  "skills": "./skills",
+  "interface": {
+    "displayName": "Agent Rally Point",
+    "shortDescription": "Coordinate Codex work through Rally and dynamic workflow task packets.",
+    "longDescription": "Agent Rally Point gives Codex a repo-local coordination surface for Rally claims, checks, artifacts, handoffs, and dynamic workflow task packets.",
+    "developerName": "Ross Labs",
+    "category": "Coding",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Coordinate this repo with Rally.",
+      "Run a dynamic workflow through Rally."
+    ]
+  }
+}
