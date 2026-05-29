@@ -348,11 +348,11 @@ fn command_run(args: RunArgs) -> Result<Output> {
             Ok(target) => target,
             Err(err) => {
                 if let Some(fact) = &reservation.fact {
-                    let _ = room.append_fact(&session_fact(
-                        &session,
-                        "stopped",
-                        Some(fact.event_id.clone()),
-                    ));
+                    if let Err(cleanup_err) = append_stopped_session_record(&room, &session, fact) {
+                        return Err(RallyError::Message(format!(
+                            "backend start failed: {err}; additionally failed to mark managed session stopped: {cleanup_err}"
+                        )));
+                    }
                 }
                 return Err(err);
             }
@@ -741,6 +741,19 @@ fn remove_session_record(session_id: &str) -> Result<()> {
         return Ok(());
     };
     room.append_fact(&session_fact(&session, "stopped", Some(fact.event_id)))?;
+    Ok(())
+}
+
+fn append_stopped_session_record(
+    room: &RoomStore,
+    session: &ManagedSession,
+    active_fact: &Fact,
+) -> Result<()> {
+    room.append_fact(&session_fact(
+        session,
+        "stopped",
+        Some(active_fact.event_id.clone()),
+    ))?;
     Ok(())
 }
 
