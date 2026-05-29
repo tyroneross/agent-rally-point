@@ -103,7 +103,8 @@ rally recent [--all] [--limit N] [--include-legacy] --json   # recent activity a
 `sessions`, `attach`, `capture`, and `stop` operate on managed sessions started
 by `rally run`. `locate` and `recent` answer "where is this?" / "what just
 happened?" across the channels Rally knows about; `--include-legacy` also scans
-the retiring `~/.build-loop/apps/` root.
+the retiring `~/.agent-rally-point/apps/` JSONL channels (the pre-`.rally/`
+per-repo store, kept readable during migration).
 
 ## Useful Fact Writes
 

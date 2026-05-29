@@ -33,8 +33,9 @@ decision / blocker / claim / artifact is visible. **The lead (an agent) routes; 
 ## Squads (agent teams = terminals)
 
 A **squad** is one terminal. **N terminals = N squads** (1:1). A squad may be a *single agent* (e.g. one
-GPT-5.5 or one Opus session) **or** a *multi-agent team* (e.g. a **build-loop squad** = orchestrator +
-its subagents, or a Rally Flow Tier-1 fan-out). Either way it is **one squad**. The unit rally
+GPT-5.5 or one Opus session) **or** a *multi-agent team* — for example a Rally Flow Tier-1 fan-out, a
+LangGraph DAG, or a plugin-orchestrated subagent group like build-loop. Either way it is **one squad**.
+The unit rally
 coordinates is the **squad**, not the individual sub-agent — a squad's internal agents are its own
 Tier-1 business, **hidden behind the squad id** (per the in-memory-subagents-stay-host-side boundary
 above). So: 10 terminals → 10 squad ids in the room, regardless of how many agents run inside each.
@@ -100,24 +101,27 @@ A receiver that has all 11 fields never needs to ask "what next?".
 | 5 | **base** | branch + worktree (default: your **own worktree off `main`**; canonical paths) |
 | 6 | **mode** | `fix` vs `review-only` (resolve the issue, or only report risks) |
 | 7 | **model/tier + fan-out** | host-relative tier (cheapest sufficient, your own family) + parallel cap |
-| 8 | **execution** | structured plan→execute→review→verify loop, not raw edits — **host-relative**: build-loop (`/build-loop:run`) on Claude; on Codex/other hosts the host-equivalent (rally `check before-write` + tests + `git diff --check` + commit) |
+| 8 | **execution** | structured plan→execute→review→verify loop, not raw edits — **host-relative**: use whichever loop your host provides. The portable, rally-required minimum is rally `check before-write` + tests + `git diff --check` + commit. Plugin orchestrators (build-loop on Claude, ChatGPT optimizers on Codex, host-native Workflow tools, LangGraph) are valid *richer* substitutes; none is required. |
 | 9 | **validation + evidence** | the verify command + the evidence to post |
 | 10 | **completion** | closing action: `rally say artifact --evidence …` → `resolve` / handoff-back |
 | 11 | **stop** | `blocker \| requires-human \| core-decision \| budget` |
 
 Example (`--summary`): `ref:B9 fix · P1 · owns:crates/rally-cli/src/lib.rs no-touch:next.rs,store.rs ·
 authority:edit+commit · base:own-worktree off main · mode:fix · tier:executing fan-out:≤4 ·
-exec:build-loop · validate:cargo test → evidence in artifact · done:rally say artifact then resolve ·
-stop:requires-human|core-decision`.
+exec:verify-loop · validate:cargo test → evidence in artifact · done:rally say artifact then resolve ·
+stop:requires-human|core-decision`. (The `exec:` token names *whichever* plan→execute→review→verify
+loop the squad uses — e.g. `exec:verify-loop` for the rally-minimum, `exec:build-loop` if that plugin
+is the chosen substrate. Rally does not care which.)
 
 **Execution substrate — route through a structured plan→execute→review→verify loop, not raw edits**
-(field 8). Build-loop is **install-dependent, not host-locked**: it ships as a plugin available wherever
-cached — Claude always; **Codex where installed** (build-loop@0.13.3 confirmed in one Codex runtime
-seq306; *absent* in another seq283). So: **use build-loop if present in YOUR runtime** (`/build-loop:run`);
-**else the host-equivalent verify-loop** (rally `check before-write` + tests + `git diff --check` + commit).
-The host-relative principle still holds (rule 5): never *assume* a peer has your tooling — check, then use
-the richest verify-loop available. Rally coordinates *across* agents; the verify-loop drives *within* each
-lane. (Lead board/doc syncs are coordination artifacts, not code changes.)
+(field 8). Rally's portable, required minimum *per lane* is: rally `check before-write` → run tests →
+`git diff --check` → commit → post evidence. Anything that does at least that satisfies the contract.
+Plugin orchestrators are richer substitutes — build-loop (`/build-loop:run`) on Claude, ChatGPT
+optimizers on Codex, host-native Workflow tools, LangGraph DAGs — and squads should use the richest
+loop their runtime offers, but none is required and none is privileged. The host-relative principle
+(rule 5) still holds: never *assume* a peer has your tooling; check, then use whatever satisfies the
+minimum. Rally coordinates *across* agents; the verify-loop drives *within* each lane. (Lead
+board/doc syncs are coordination artifacts, not code changes.)
 
 ## Joining checklist (drop-in)
 

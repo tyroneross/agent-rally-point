@@ -15,20 +15,33 @@ version = "0.3.0"
 installed_at = "2026-05-24T12:00:00Z"
 
 [paths]
-# Canonical channels root. Override per-process with $BUILD_LOOP_APPS_ROOT.
+# Per-repo canonical store lives at `<repo_root>/.rally/` (ledger.jsonl
+# canonical + facts.db derived cache). This is the source of truth and
+# survives clone with no external service. The home-dir paths below are
+# global *discovery hints* — pointers that let `rally locate` / `rally
+# recent --all` find rooms across the user's repos. They never hold
+# canonical data.
+
+# Global discovery hint: pointers-only index at
+# ~/.agent-rally-point/rooms/v1/index.json (see docs/RALLY_ARCHITECTURE.md
+# for the per-repo segmentation contract).
 apps_root = "~/.agent-rally-point/apps"
 
-# Legacy channels root (read-only during migration, retired at cutover).
-legacy_apps_root = "~/.build-loop/apps"
+# Legacy hint root scanned only when `rally locate --include-legacy` /
+# `rally recent --include-legacy` is set. Retained for one cutover cycle;
+# it is *not* a write path under any current policy.
+legacy_apps_root = "~/.agent-rally-point/apps"
 
 [policy]
 # Coordination substrate policy. Values:
-#   canonical    — write only to ~/.agent-rally-point/apps/<repo_id>/
-#   migration    — DUAL-AWARE: write to both canonical and legacy,
-#                  discover returns both paths + merged_view.
-#   legacy-only  — write only to ~/.build-loop/apps/<slug>/
-# Default: migration. Promote to canonical only after
-# `agent-rally-point migrate verify-cutover` returns can_promote=true.
+#   canonical    — write only to <repo_root>/.rally/ (no global writes)
+#   migration    — DUAL-AWARE: write to <repo_root>/.rally/ and keep a
+#                  discovery-hint entry in ~/.agent-rally-point/rooms/v1/.
+#   legacy-only  — read-only fallback that scans the legacy hint root
+#                  during `--include-legacy` discovery only.
+# Default: migration. Per-repo `.rally/ledger.jsonl` is canonical under
+# every policy; the modes differ only in which discovery hints are
+# written.
 mode = "migration"
 
 [api]

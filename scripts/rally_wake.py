@@ -33,8 +33,8 @@ restarted with the Herdr v4 integration loaded.
 
 Examples:
   rally_wake.py --tool codex      "Unread in Rally — run: rally next --tool codex --json"
-  rally_wake.py --tmux-target rev:0.0 "Read .build-loop/coordination/<file> then continue"
-  rally_wake.py --herdr-pane w652... "doorbell" --confirm-channel ~/.agent-rally-point/apps/<slug>/changes.jsonl
+  rally_wake.py --tmux-target rev:0.0 "Read <coordination-file> then continue"
+  rally_wake.py --herdr-pane w652... "doorbell" --confirm-channel <repo_root>/.rally/ledger.jsonl
 """
 import argparse, json, subprocess, sys, time
 

@@ -161,8 +161,13 @@ Two questions decide whether to build now:
   (not pi-specific): events `handoff`/`artifact`/`decision`/`standby`/`wake`, a derived fan-out
   DAG view, trust-gated triggers, **execution explicitly excluded**. pi-dynamic = reference client.
 
-Per user workflow rules, any code/spec work here **routes through build-loop** (`/build-loop:run`),
-not direct edits.
+Any subsequent code/spec work here should route through a structured
+plan→execute→review→verify loop, not raw direct edits. Build-loop
+(`/build-loop:run`) is one such loop on Claude hosts and is what the
+authoring sessions for this handoff happen to use; on Codex or other
+hosts the host-equivalent verify-loop (rally `check before-write` +
+tests + `git diff --check` + commit) is equally acceptable. Rally
+itself does not require either.
 
 ---
 

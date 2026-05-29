@@ -57,9 +57,10 @@ target/
 !.rally/ledger.jsonl
 .rally2/
 
-# Generated build-loop runtime state
-.build-loop/state.json
-.build-loop/worktree-gc-last.txt
+# build-loop's own runtime + planning artifacts. build-loop is one optional
+# tool that may be used to *build* agent-rally-point on Claude hosts; its
+# files belong to itself, not to this repo. Ignore the whole directory.
+.build-loop/
 
 # uv lockfile — library-style project; downstream pipx installs resolve own deps.
 uv.lock
