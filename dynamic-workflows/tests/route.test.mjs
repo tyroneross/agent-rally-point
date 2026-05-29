@@ -3,7 +3,9 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parallel, pipeline, budget, createLimiter } from "../core/route.mjs";
+import { parallel, pipeline, budget } from "../core/route.mjs";
+import * as routeModule from "../core/route.mjs";
+import { createLimiter } from "../core/limiter.mjs";
 
 // ---------------------------------------------------------------------------
 // parallel
@@ -176,9 +178,13 @@ describe("budget", () => {
 });
 
 // ---------------------------------------------------------------------------
-// createLimiter (re-export from limiter.mjs)
+// createLimiter (canonical home: ./limiter.mjs — NOT re-exported from ./route)
 // ---------------------------------------------------------------------------
 describe("createLimiter", () => {
+  it("is not re-exported from ./route (single canonical path is ./limiter)", () => {
+    assert.equal(routeModule.createLimiter, undefined, "createLimiter must not be re-exported from route.mjs");
+  });
+
   it("caps concurrency at the given limit", async () => {
     const limit = 2;
     const run = createLimiter(limit);

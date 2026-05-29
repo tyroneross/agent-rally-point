@@ -27,8 +27,14 @@
 
 import { readFileSync } from "node:fs";
 
-/** Pull the room object out of whatever shape `rally room --json` (or a raw room) gives. */
-function extractRoom(raw) {
+/**
+ * Pull the room object out of whatever shape `rally room --json` (or a raw room) gives.
+ * - `raw.data.room`: the live CLI envelope shape — `rally room --json` emits
+ *   `{ command, data: { query, room }, ok, ... }` (verified 2026-05-29).
+ * - `raw.room`: a thinner `{ room }` wrapper some callers pass.
+ * - else: `raw` is already a bare room object (tests + in-process callers).
+ */
+export function extractRoom(raw) {
   if (raw && raw.data && raw.data.room) return raw.data.room;
   if (raw && raw.room) return raw.room;
   return raw || {};
@@ -46,6 +52,10 @@ function mentions(subject, id) {
 
 function scopesOverlap(scope, owns) {
   if (!Array.isArray(scope) || owns === "read-only" || !Array.isArray(owns)) return false;
+  // norm() here strips a leading `file:` scheme (rally claims carry `file:`-prefixed scopes)
+  // and trailing slashes, for EXACT-MATCH comparison between a claim's scope and a task's owns.
+  // It deliberately does NOT strip trailing globs — this is exact-match claim detection, not the
+  // lint's prefix-overlap MECE check. The two norm() helpers are intentionally different; do not merge.
   const norm = (p) => String(p).replace(/^file:/, "").replace(/\/+$/, "");
   return scope.some((s) => owns.some((o) => norm(s) === norm(o)));
 }

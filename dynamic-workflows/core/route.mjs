@@ -9,8 +9,10 @@
 // HOST-NEUTRAL control-flow primitives. This module owns concurrency, ordering, and budget
 // accounting only. It does NOT import node:vm, typebox, WorkflowAgent, or any
 // @mariozechner/* package. The host supplies actual agent-spawn logic as thunk/stage bodies.
-
-export { createLimiter } from "./limiter.mjs";
+//
+// NOTE: createLimiter lives in ./limiter.mjs and is exported via the package's "./limiter"
+// entry. It is intentionally NOT re-exported here — one canonical public path avoids the
+// two-import-paths drift the assessment flagged. Import it as: import { createLimiter } from "./limiter.mjs".
 
 // ---------------------------------------------------------------------------
 // parallel(thunks, opts?)

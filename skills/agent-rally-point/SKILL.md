@@ -117,6 +117,17 @@ Rally recommends and constrains work; it does not replace judgment.
 - If a fact affects files, shells, editors, credentials, or another agent,
   inspect source event ids and evidence before acting.
 
+## Multi-Agent Fan-Out (Rally Flow)
+
+To coordinate *several* agents on one objective — fan out parallel subagents, run a dynamic
+workflow, or split a workstream across hosts — use **Rally Flow** (the `dynamic-workflows/` module).
+It adds a lint-checked workstream descriptor (MECE write boundaries + determinism) on top of the
+rally loop above. Host-specific entry points:
+
+- Claude: [`dynamic-workflows/skills/claude/SKILL.md`](../../dynamic-workflows/skills/claude/SKILL.md)
+- Codex: [`dynamic-workflows/skills/codex/SKILL.md`](../../dynamic-workflows/skills/codex/SKILL.md)
+- Shared protocol both reference: [`dynamic-workflows/skills/SHARED.md`](../../dynamic-workflows/skills/SHARED.md)
+
 ## Finish Work Cleanly
 
 Before ending a session:

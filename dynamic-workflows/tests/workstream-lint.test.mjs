@@ -7,7 +7,6 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { lintWorkstream } from "../core/workstream-lint.mjs";
-import { createLimiter } from "../core/limiter.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const load = (name) => JSON.parse(readFileSync(join(here, "..", "examples", name), "utf8"));
@@ -54,18 +53,4 @@ test("rejects unknown depends_on and dependency cycles", () => {
 test("rejects a non-object descriptor and empty tasks", () => {
   assert.ok(lintWorkstream(null).length > 0);
   assert.ok(lintWorkstream({ workstream: "w", description: "d", tasks: [] }).some((e) => /non-empty array/.test(e)));
-});
-
-test("createLimiter caps concurrency", async () => {
-  const run = createLimiter(2);
-  let active = 0;
-  let peak = 0;
-  const task = () => run(async () => {
-    active++;
-    peak = Math.max(peak, active);
-    await new Promise((r) => setTimeout(r, 5));
-    active--;
-  });
-  await Promise.all(Array.from({ length: 6 }, task));
-  assert.ok(peak <= 2, `peak concurrency ${peak} exceeded limit 2`);
 });

@@ -28,7 +28,7 @@ Drop this directory into any repo. No install required; no runtime dependencies.
 | `core/limiter.mjs` | Bounded-concurrency helper hosts can use to cap their own Tier-1 fan-out |
 | `skills/claude/SKILL.md` · `skills/codex/SKILL.md` | Skills mapping a workstream onto rally primitives, per host |
 | `examples/*.workstream.json` | One valid + two invalid descriptors (linter demos) |
-| `tests/*.test.mjs` | 35 tests across lint / status / route / limiter (Node built-in runner) |
+| `tests/*.test.mjs` | Tests across lint / status / route / limiter (Node built-in runner) — run `npm test` |
 | `package.json` | Module manifest; no runtime dependencies (exports: lint/status/route/limiter) |
 | `NOTICE` | MIT attribution for the portions lifted from pi-dynamic-workflows |
 
@@ -40,7 +40,7 @@ Drop this directory into any repo. No install required; no runtime dependencies.
 # Validate a descriptor (exit 0 = valid)
 node core/workstream-lint.mjs examples/audit-repo.workstream.json
 
-# Run the test suite (35 tests, no install needed)
+# Run the test suite (no install needed)
 npm test
 
 # Resume a long-running workstream — what's left to dispatch?

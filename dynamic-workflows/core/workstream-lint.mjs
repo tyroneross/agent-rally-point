@@ -45,6 +45,10 @@ function ownedPaths(owns) {
 /** Two path/glob tokens conflict if either is a prefix of the other (dir-segment aware). */
 function pathsOverlap(a, b) {
   if (a === b) return true;
+  // norm() here strips a trailing glob (`/*`, `/**`) and trailing slashes so that
+  // "src/" and "src/*" both reduce to "src" for PREFIX-OVERLAP detection. It deliberately
+  // does NOT strip a leading `file:` scheme — that is workstream-status's concern (exact-match),
+  // not the lint's (MECE boundary). The two norm() helpers are intentionally different; do not merge.
   const norm = (p) => p.replace(/\/+$/, "").replace(/\/?\*+$/, "");
   const na = norm(a);
   const nb = norm(b);
@@ -102,11 +106,9 @@ export function lintWorkstream(doc) {
       e(`task ${label}: \`tier\` must be one of ${[...TIERS].join(" | ")}`);
     }
 
-    // determinism: scan every declared command string for the blocklist
-    for (const field of ["validation"]) {
-      if (isNonEmptyString(task[field]) && DETERMINISM_BLOCKLIST.test(task[field])) {
-        e(`task ${label}: \`${field}\` is non-deterministic (Date.now()/Math.random()/new Date()) — declared commands must be reproducible`);
-      }
+    // determinism: scan the declared validation string + every command for the blocklist
+    if (isNonEmptyString(task.validation) && DETERMINISM_BLOCKLIST.test(task.validation)) {
+      e(`task ${label}: \`validation\` is non-deterministic (Date.now()/Math.random()/new Date()) — declared commands must be reproducible`);
     }
     if (Array.isArray(task.commands)) {
       task.commands.forEach((cmd, ci) => {

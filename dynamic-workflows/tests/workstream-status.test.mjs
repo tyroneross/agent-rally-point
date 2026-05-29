@@ -3,7 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { workstreamStatus } from "../core/workstream-status.mjs";
+import { workstreamStatus, extractRoom } from "../core/workstream-status.mjs";
 
 const descriptor = {
   workstream: "demo",
@@ -60,7 +60,21 @@ test("done-detection is whole-token (does not match a substring of another id)",
   assert.ok(s.pending.includes("build"));
 });
 
-test("accepts the nested `rally room --json` envelope shape via the CLI extractor is covered by core; here verify raw room object works", () => {
+test("extractRoom unwraps the live `rally room --json` envelope (raw.data.room)", () => {
+  // The actual CLI shape (verified 2026-05-29): { command, data: { query, room }, ok, ... }
+  const envelope = { command: "room", ok: true, data: { query: {}, room: { recent_artifacts: [{ subject: "x" }], active_claims: [] } } };
+  const r = extractRoom(envelope);
+  assert.deepEqual(r, { recent_artifacts: [{ subject: "x" }], active_claims: [] });
+});
+
+test("extractRoom unwraps a thin { room } wrapper and passes a bare room through", () => {
+  assert.deepEqual(extractRoom({ room: { active_claims: [] } }), { active_claims: [] });
+  const bare = { recent_artifacts: [{ subject: "a: done" }], active_claims: [] };
+  assert.deepEqual(extractRoom(bare), bare);
+  assert.deepEqual(extractRoom(null), {});
+});
+
+test("workstreamStatus accepts a bare room object", () => {
   const s = workstreamStatus(descriptor, { recent_artifacts: [{ subject: "a: done" }], active_claims: [] });
   assert.deepEqual(s.done, ["a"]);
 });
