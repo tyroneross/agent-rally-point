@@ -24,6 +24,12 @@ github.com/Michaelliv/pi-dynamic-workflows), used under the MIT License:
   core/limiter.mjs
     (c) createLimiter — the bounded-concurrency helper that lets a host cap its own fan-out.
 
+  core/route.mjs
+    (d) parallel() / pipeline() control-flow and the budget object — the deterministic-routing
+        primitives, ported host-neutral (decoupled from pi's node:vm executor, WorkflowAgent, and
+        agent() primitive) and extended for the durable model (onError/abort visibility; generic
+        budget units, not pi's token heuristic).
+
 The MIT License for those portions is reproduced here:
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
