@@ -1316,6 +1316,47 @@ fn rally_locate_and_recent_discover_rooms_and_legacy_channels() {
 }
 
 #[test]
+fn rally_refresh_does_not_clobber_corrupt_room_index() {
+    let home = temp_path("rally-corrupt-index-home");
+    let workspace = Workspace::new_with_home("rally-corrupt-index", &home);
+    let index_path = home.join(".agent-rally-point/rooms/v1/index.json");
+    fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+    fs::write(&index_path, "{not-json").unwrap();
+
+    let artifact = workspace.json(&[
+        "say",
+        "artifact",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "keeps corrupt index",
+    ]);
+    let artifact_id = artifact["data"]["fact"]["event_id"].as_str().unwrap();
+
+    assert_eq!(fs::read_to_string(&index_path).unwrap(), "{not-json");
+
+    let recent = workspace.json(&["recent", "--all", "--json", "--limit", "10"]);
+    assert!(
+        recent["data"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["code"] == "room_index_unreadable")
+    );
+    assert!(
+        recent["data"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["fact"]["event_id"].as_str() == Some(artifact_id))
+    );
+
+    workspace.cleanup();
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn linked_git_worktree_uses_common_room() {
     let home = temp_path("rally-common-room-home");
     let primary = Workspace::new_with_home("rally-common-room-main", &home);

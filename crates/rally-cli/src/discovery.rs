@@ -92,7 +92,7 @@ pub(crate) fn refresh_room_index(
     let Some(path) = room_index_path() else {
         return Ok(());
     };
-    let mut index = read_room_index_at(&path).unwrap_or_default();
+    let mut index = read_room_index_at(&path)?;
     let repo_root = absolute_path(repo_root);
     let facts_db = absolute_path(facts_db);
     let display_name = repo_root
