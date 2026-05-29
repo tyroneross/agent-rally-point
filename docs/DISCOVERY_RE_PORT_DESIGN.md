@@ -28,10 +28,10 @@ PR45 state lives here:
 <repo>/.rally/cursors.json  per-tool read cursors
 ```
 
-`RoomStore::open()` resolves the current repo root and opens `.rally/facts.db`.
-Room projections come from `RoomStore::facts()` and `RoomStore::snapshot()`.
-Discovery should call that boundary or a small sibling reader, not parse
-factstr internals ad hoc.
+`RoomStore::open()` resolves the repo through its git common dir before opening
+`.rally/facts.db`, so linked worktrees share one room. Room projections come
+from `RoomStore::facts()` and `RoomStore::snapshot()`. Discovery should call
+that boundary or a small sibling reader, not parse factstr internals ad hoc.
 
 ## Proposed Shape
 
@@ -161,11 +161,14 @@ separate reviewable path.
 3. Add `locate` and `recent` parser entries and JSON schemas.
 4. Add tests with two temporary repos plus one synthetic legacy channel.
 5. Add warning coverage for stale registry entries and malformed legacy rows.
+6. Add a linked-worktree regression so P3 cannot split rooms by checkout path.
 
 ## Acceptance Criteria
 
 - A fact written in repo A can be found from repo B after both repos have opened
   Rally once.
+- A fact written from a linked git worktree lands in the shared common-dir room,
+  not a worktree-local `.rally/` store.
 - A stale index entry reports a warning and does not fail the command.
 - A legacy `changes.jsonl` event can be located by id and is clearly marked as
   `legacy_channel`.

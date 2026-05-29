@@ -19,6 +19,7 @@ Rally owns the primary product path:
 
 - `rally` is the primary CLI.
 - `.rally/facts.db` is the durable fact store, including managed sessions.
+- Linked git worktrees share one room through the repo's git common dir.
 - Room state is derived from the fact store on demand.
 - `enter`, `next`, `say`, `room`, `check`, `run`, `sessions`, `inject`,
   `attach`, `capture`, and `stop` are the load-bearing commands.

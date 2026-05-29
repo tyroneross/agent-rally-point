@@ -101,8 +101,10 @@ rally say risk --tool <you> --subject "managed session unavailable" --severity m
 .rally/cursors.json per-tool read cursors
 ```
 
-Room state is derived from the fact store on demand. The fact store is the
-source of truth, including managed session lifecycle facts.
+Linked git worktrees resolve this room from the shared git common dir, so the
+main checkout and its worktrees coordinate through one `.rally/` store. Room
+state is derived from the fact store on demand. The fact store is the source of
+truth, including managed session lifecycle facts.
 
 ## Install
 

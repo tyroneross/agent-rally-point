@@ -1047,6 +1047,44 @@ fn rally_locate_and_recent_discover_rooms_and_legacy_channels() {
 }
 
 #[test]
+fn linked_git_worktree_uses_common_room() {
+    let home = temp_path("rally-common-room-home");
+    let primary = Workspace::new_with_home("rally-common-room-main", &home);
+    let linked = Workspace {
+        cwd: temp_path("rally-common-room-linked"),
+        home: home.clone(),
+    };
+    fs::create_dir_all(&linked.cwd).unwrap();
+    let linked_git_dir = primary.cwd.join(".git/worktrees/rally-common-room-linked");
+    fs::create_dir_all(&linked_git_dir).unwrap();
+    fs::write(linked_git_dir.join("commondir"), "../..\n").unwrap();
+    fs::write(
+        linked.cwd.join(".git"),
+        format!("gitdir: {}\n", linked_git_dir.display()),
+    )
+    .unwrap();
+
+    linked.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "shared room from linked worktree",
+    ]);
+
+    assert!(primary.cwd.join(".rally/facts.db").exists());
+    assert!(!linked.cwd.join(".rally/facts.db").exists());
+    let room = primary.json(&["room", "--json"]);
+    assert_eq!(room["data"]["room"]["max_seq"], 1);
+
+    linked.cleanup();
+    primary.cleanup();
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
     let workspace = Workspace::new("rally-native-session-backends");
 

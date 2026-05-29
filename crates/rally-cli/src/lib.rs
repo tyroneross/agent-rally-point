@@ -873,11 +873,51 @@ pub(crate) fn repo_root() -> Result<PathBuf> {
     let mut dir = env::current_dir().map_err(RallyError::io("current dir"))?;
     loop {
         if dir.join(".git").exists() {
-            return Ok(dir);
+            return Ok(git_common_repo_root(&dir).unwrap_or(dir));
         }
         if !dir.pop() {
             return env::current_dir().map_err(RallyError::io("current dir"));
         }
+    }
+}
+
+fn git_common_repo_root(worktree_root: &Path) -> Option<PathBuf> {
+    git_common_dir(worktree_root)?
+        .parent()
+        .map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+}
+
+fn git_common_dir(worktree_root: &Path) -> Option<PathBuf> {
+    let git = worktree_root.join(".git");
+    if git.is_dir() {
+        return Some(git.canonicalize().unwrap_or(git));
+    }
+    let git_dir = read_gitdir_file(&git, worktree_root)?;
+    let common_dir = fs::read_to_string(git_dir.join("commondir"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| resolve_git_path(&git_dir, &value))
+        .unwrap_or(git_dir);
+    Some(common_dir.canonicalize().unwrap_or(common_dir))
+}
+
+fn read_gitdir_file(git_file: &Path, worktree_root: &Path) -> Option<PathBuf> {
+    let value = fs::read_to_string(git_file).ok()?;
+    let git_dir = value.trim().strip_prefix("gitdir:")?.trim();
+    if git_dir.is_empty() {
+        return None;
+    }
+    let path = resolve_git_path(worktree_root, git_dir);
+    Some(path.canonicalize().unwrap_or(path))
+}
+
+fn resolve_git_path(base: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
     }
 }
 
