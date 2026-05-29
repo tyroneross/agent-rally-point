@@ -9,6 +9,8 @@ SPDX-License-Identifier: Apache-2.0
 
 Two dominant patterns: **(1)** docs/plans citing files/paths never ported from the prior pi-dynamic-workflows repo (one citation sweep clears five rows); **(2)** fields/branches/skills spec'd for pending B-tasks but never wired (fold each into its owning task, don't delete blind).
 
+> **Taxonomy crosswalk (kind vs lane).** The **12 integrity / 6 simplification** split is by finding *kind*. The **B14 / B15** clusters below are by *lane/ownership* (top-level docs vs the `dynamic-workflows/` module) — so they do **not** map 1:1 to the kind split. Crosswalk: **12 integrity** = 8 in B14 (all integrity-kind) + 2 inside B15 (the `extractRoom` dead-code + the shipped-but-unlinked skills orphan) + 2 folded to crate tasks (`stale_facts`→B12 dead-code, `session-backend` schema→B13 orphan). **6 simplification** = the remaining 6 B15 rows (limiter-test dedup, route re-export, determinism loop, SKILL.md dedup, `norm()` docs, README count). 8 + 8 + 2 = 18. *(Raised by `codex:dynwf-coordinator` seq391 — the "B15 = simplifications" label was lane-shorthand; B15 is 6 simplify + 2 integrity.)*
+
 ## Lead-owned cluster → B14 (doc-citation sweep, INTEGRITY)
 
 | Sev | Where | Issue |
