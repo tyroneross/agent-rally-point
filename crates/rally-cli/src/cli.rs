@@ -272,7 +272,6 @@ fn enter_parser() -> impl Parser<EnterArgs> {
 
 fn say_parser() -> impl Parser<SayArgs> {
     let json = json_flag();
-    let kind = positional::<String>("KIND").parse(parse_fact_kind);
     let tool = string_arg("tool", "TOOL");
     let subject = optional_string_arg("subject", "SUBJECT");
     let thread_id = optional_string_arg("thread-id", "THREAD_ID");
@@ -287,24 +286,48 @@ fn say_parser() -> impl Parser<SayArgs> {
     let status = optional_string_arg("status", "STATUS");
     let severity = optional_string_arg("severity", "SEVERITY");
     let uri = optional_string_arg("uri", "URI");
-    construct!(SayArgs {
-        json,
-        kind,
-        tool,
-        subject,
-        thread_id,
-        role,
-        summary,
-        scopes,
-        resources,
-        paths,
-        evidence,
-        target,
-        ref_id,
-        status,
-        severity,
-        uri
-    })
+    let kind = positional::<String>("KIND").parse(parse_fact_kind);
+    construct!(
+        json, tool, subject, thread_id, role, summary, scopes, resources, paths, evidence, target,
+        ref_id, status, severity, uri, kind
+    )
+    .map(
+        |(
+            json,
+            tool,
+            subject,
+            thread_id,
+            role,
+            summary,
+            scopes,
+            resources,
+            paths,
+            evidence,
+            target,
+            ref_id,
+            status,
+            severity,
+            uri,
+            kind,
+        )| SayArgs {
+            json,
+            kind,
+            tool,
+            subject,
+            thread_id,
+            role,
+            summary,
+            scopes,
+            resources,
+            paths,
+            evidence,
+            target,
+            ref_id,
+            status,
+            severity,
+            uri,
+        },
+    )
 }
 
 fn room_parser() -> impl Parser<RoomArgs> {
@@ -343,12 +366,12 @@ fn next_parser() -> impl Parser<NextArgs> {
 
 fn locate_parser() -> impl Parser<LocateArgs> {
     let json = json_flag();
-    let event_id = positional::<String>("EVENT_ID");
     let include_legacy = long("include-legacy").switch();
-    construct!(LocateArgs {
+    let event_id = positional::<String>("EVENT_ID");
+    construct!(json, include_legacy, event_id).map(|(json, include_legacy, event_id)| LocateArgs {
         json,
         event_id,
-        include_legacy
+        include_legacy,
     })
 }
 
@@ -367,18 +390,18 @@ fn recent_parser() -> impl Parser<RecentArgs> {
 
 fn check_parser() -> impl Parser<CheckArgs> {
     let json = json_flag();
-    let phase = positional::<String>("PHASE")
-        .optional()
-        .map(|phase| phase.unwrap_or_else(|| "before-write".to_string()));
     let tool = optional_string_arg("tool", "TOOL");
     let path = optional_string_arg("path", "PATH");
     let strict = long("strict").switch();
-    construct!(CheckArgs {
+    let phase = positional::<String>("PHASE")
+        .optional()
+        .map(|phase| phase.unwrap_or_else(|| "before-write".to_string()));
+    construct!(json, tool, path, strict, phase).map(|(json, tool, path, strict, phase)| CheckArgs {
         json,
         phase,
         tool,
         path,
-        strict
+        strict,
     })
 }
 

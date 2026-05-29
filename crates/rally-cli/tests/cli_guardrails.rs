@@ -53,6 +53,29 @@ fn json_error(output: &Output) -> Value {
 }
 
 #[test]
+fn subcommand_help_handles_positionals_without_panicking() {
+    let workspace = Workspace::new("rally-subcommand-help-positionals");
+
+    for command in [
+        "say", "check", "locate", "run", "inject", "attach", "capture", "stop",
+    ] {
+        let output = workspace.output(&[command, "--help"]);
+        assert!(
+            output.status.success(),
+            "{command} --help failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("Usage"),
+            "{command} --help did not print usage"
+        );
+    }
+
+    workspace.cleanup();
+}
+
+#[test]
 fn bounded_numeric_flags_reject_out_of_range_values() {
     let workspace = Workspace::new("rally-bounded-numeric-flags");
 
