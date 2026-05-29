@@ -51,5 +51,9 @@ target/
 .rally/
 .rally2/
 
+# Generated build-loop runtime state
+.build-loop/state.json
+.build-loop/worktree-gc-last.txt
+
 # uv lockfile — library-style project; downstream pipx installs resolve own deps.
 uv.lock
