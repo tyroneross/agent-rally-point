@@ -42,4 +42,17 @@ We A/B the tier boundary instead of guessing. Run `ab-sonnet-vs-opus-assessment`
 synthesis (`premium_justified: yes|no|marginal`). Result feeds whether "code assessment" sits at
 Executing (expected) or warrants Frontier. Re-run per task class; record the verdict here.
 
-> Status: A/B `wjh0kr38l` in flight — verdict + recommendation to be appended on completion.
+### A/B verdict — code assessment (`wjh0kr38l`, 2026-05-29)
+
+Same 3-file assessment, Executing (Sonnet) vs Frontier (Opus) arm. **`premium_justified: marginal`.**
+- **Sonnet (Executing): higher recall** — 14 findings, broader surface; caught 2 real items Opus missed.
+  But shipped **~1 false positive + 1 over-rated severity + 1 speculative** per batch.
+- **Opus (Frontier): higher precision** — 9–10 findings (9 raw per-file; synthesis counted 10),
+  **0 false positives**, calibrated severity, and caught the single highest-value correctness bug
+  Sonnet's coarser flag walked past.
+
+**Calibration (binding default):** routine bounded **code assessment runs at Executing (Sonnet/Mini),
+gated by a verification pass** — never act on raw Executing-tier findings (expect ~1 FP/batch). Reserve
+**Frontier for correctness-critical audits** where a missed truncation/semantic bug or a false-positive-
+driven *wrong fix* is expensive: the premium buys precision + severity calibration, **not** raw count.
+This is the empirical basis for the adversarial-verify step in the workflow patterns.

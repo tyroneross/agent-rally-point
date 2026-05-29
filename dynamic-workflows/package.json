@@ -5,10 +5,13 @@
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "workstream-lint": "./core/workstream-lint.mjs"
+    "workstream-lint": "./core/workstream-lint.mjs",
+    "workstream-status": "./core/workstream-status.mjs"
   },
   "exports": {
     "./lint": "./core/workstream-lint.mjs",
+    "./status": "./core/workstream-status.mjs",
+    "./route": "./core/route.mjs",
     "./limiter": "./core/limiter.mjs"
   },
   "scripts": {
@@ -20,6 +23,8 @@
     "skills/",
     "examples/",
     "PROTOCOL.md",
+    "COORDINATION.md",
+    "MODEL-TIERS.md",
     "NOTICE",
     "README.md"
   ],
