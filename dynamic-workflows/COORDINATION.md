@@ -35,6 +35,9 @@ decision / blocker / claim / artifact is visible. **The lead (an agent) routes; 
 1. **First agent on the room is lead.** The first frontier agent to enter assumes the lead role:
    de-confliction, the board (`docs/ORCHESTRATION.md`), and boundary/ripple rulings. Lead is
    *advisory coordination, not control* — no agent gates an irreversible action on a lead claim.
+   The lead **routes**, and may delegate not only execution but **integration/synthesis** (e.g.,
+   merging multi-agent outputs into one artifact) — its irreducible role is **core decisions +
+   final acceptance**, not doing mechanical work by hand. Delegate, then verify.
 2. **Proactive engagement — a waiting agent finds work in this order, never idles silently:**
    1. **Backlog** — claim an `open` item whose dependencies are met.
    2. **No-regrets move** — if the backlog is empty or blocked, do work valuable under *any* likely
