@@ -92,6 +92,14 @@ through the host's native mechanism, but they must not edit files, resolve
 blockers, publish facts on behalf of an agent, or behave like hidden
 schedulers.
 
+For Herdr-managed panes, submit injected text with Herdr's `Enter` key, not
+tmux-style `C-m`. Full-length payloads can collapse behind `[Pasted Content]`;
+submit those with two Enters, where the first expands and the second submits.
+Short inline nudges need one Enter. After installing Herdr's Claude/Codex
+integrations, restart the agent session before treating Herdr `agent_status` as
+authoritative. Even post-restart, use a Rally channel post as the strongest
+confirmation that the woken agent acted on the handoff.
+
 When delegating work from inside herdr, keep the user's main tab clean. Start
 new helper agents in the workspace's `agents` tab whenever one exists. Discover
 the tab with `herdr tab list`, then start the agent with `herdr agent start

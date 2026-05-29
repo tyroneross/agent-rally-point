@@ -6,19 +6,21 @@
 Design: doorbell + mailbox.
   The wake is a SHORT nudge, not a payload. A short message stays INLINE in the
   agent TUI — it never crosses the paste-collapse threshold that turns input into a
-  `[Pasted Content]` placeholder — so a single carriage return (`C-m`) submits
-  RELIABLY, on tmux or herdr, for Claude Code or Codex. The long content lives in
+  `[Pasted Content]` placeholder. Herdr submits inline text with `Enter`; tmux
+  submits inline text with `C-m`. The long content lives in
   the "mailbox" (the Rally channel, `rally next`, or a file) and the woken agent
   PULLS it.
 
 Why short matters (researched 2026-05-28): a pasted blob is wrapped in
 bracketed-paste; an Enter sent with it is treated as a literal newline, and under
 tmux `extended-keys-format csi-u` the CR is re-encoded and dropped entirely
-(anthropics/claude-code#43169). A short inline nudge avoids the paste path, which
-is why a fixed "2x Enter" was intermittent and a short doorbell + single C-m is not.
+(anthropics/claude-code#43169). A short inline nudge avoids the paste path. Herdr
+does not accept `C-m`; use `Enter`, and use 2x `Enter` for collapsed direct payloads.
 
 Confirmation is via the CHANNEL (a changes.jsonl line bump = the agent posted back),
-never TUI scraping — scraping false-positives on the injected text's own echo.
+not TUI scraping — scraping false-positives on the injected text's own echo.
+Herdr status confirmation is useful only after the target agent session has been
+restarted with the Herdr v4 integration loaded.
 
 Examples:
   rally_wake.py --tool codex      "Unread in Rally — run: rally next --tool codex --json"
@@ -53,15 +55,51 @@ def herdr_resolve(tool=None, pane=None, require_idle=False):
     return (idle or pool)[0]
 
 
-def herdr_send(target, text):
-    run(["herdr", "agent", "send", target, text])      # short inline nudge
-    run(["herdr", "pane", "send-keys", target, "C-m"])  # single CR submits
+def herdr_submit_keys(text, mode, max_inline_chars):
+    if mode == "inline":
+        return ["Enter"]
+    if mode == "collapsed":
+        return ["Enter", "Enter"]
+    if len(text) > max_inline_chars:
+        return ["Enter", "Enter"]
+    return ["Enter"]
+
+
+def herdr_send(target, text, mode, max_inline_chars):
+    run(["herdr", "agent", "send", target, text])
+    keys = herdr_submit_keys(text, mode, max_inline_chars)
+    for key in keys:
+        run(["herdr", "pane", "send-keys", target, key])
+    return keys
 
 
 # ---- tmux backend (no agent-status API; address pane explicitly, doorbell is low-harm) ----
 def tmux_send(target, text):
     run(["tmux", "send-keys", "-t", target, "-l", text])  # -l = literal, NO paste bracket
     run(["tmux", "send-keys", "-t", target, "C-m"])        # submit
+    return ["C-m"]
+
+
+def herdr_wait_status(target, status, timeout):
+    p = subprocess.run(
+        [
+            "herdr",
+            "wait",
+            "agent-status",
+            target,
+            "--status",
+            status,
+            "--timeout",
+            str(int(timeout * 1000)),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return {
+        "matched": p.returncode == 0,
+        "status": status,
+        "output": (p.stdout or p.stderr).strip(),
+    }
 
 
 def channel_lines(path):
@@ -83,6 +121,11 @@ def main():
     ap.add_argument("--confirm-channel", help="changes.jsonl path; success = a new line appears (agent posted back)")
     ap.add_argument("--confirm-timeout", type=float, default=45.0)
     ap.add_argument("--max-nudge-chars", type=int, default=300, help="warn above this — paste-collapse risk")
+    ap.add_argument("--herdr-submit", choices=["auto", "inline", "collapsed"], default="auto",
+                    help="herdr only: auto=1 Enter for inline, 2 Enters above max-nudge-chars")
+    ap.add_argument("--confirm-status", choices=["idle", "working", "blocked", "done", "unknown"],
+                    help="herdr only: optional post-restart liveness check via herdr wait agent-status")
+    ap.add_argument("--confirm-status-timeout", type=float, default=12.0)
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
@@ -102,14 +145,20 @@ def main():
         backend, target, agent, status = "herdr", t["pane_id"], t.get("agent"), t.get("agent_status")
 
     if a.dry_run:
-        print(json.dumps({"would_wake": target, "backend": backend, "agent": agent, "status": status}))
+        submit_keys = (["C-m"] if backend == "tmux"
+                       else herdr_submit_keys(a.message, a.herdr_submit, a.max_nudge_chars))
+        print(json.dumps({"would_wake": target, "backend": backend, "agent": agent,
+                          "status": status, "submit_keys": submit_keys}))
         return
 
     base = channel_lines(a.confirm_channel) if a.confirm_channel else None
-    (tmux_send if backend == "tmux" else herdr_send)(target, a.message)
+    if backend == "tmux":
+        submit_keys = tmux_send(target, a.message)
+    else:
+        submit_keys = herdr_send(target, a.message, a.herdr_submit, a.max_nudge_chars)
 
     # Honest confirmation: woke=true ONLY when the channel shows the agent posted back.
-    # Without --confirm-channel we report delivery only (woke=None) — never a TUI-scrape guess.
+    # Without --confirm-channel/--confirm-status we report delivery only (woke=None).
     woke, outcome = None, "delivered (unconfirmed — pass --confirm-channel to verify)"
     if a.confirm_channel:
         deadline = time.monotonic() + a.confirm_timeout
@@ -119,8 +168,19 @@ def main():
                 woke, outcome = True, "confirmed:channel-post"
                 break
             time.sleep(2)
+    status_confirm = None
+    if a.confirm_status:
+        if backend != "herdr":
+            status_confirm = {"matched": False, "status": a.confirm_status,
+                              "output": "--confirm-status is herdr-only"}
+        else:
+            status_confirm = herdr_wait_status(target, a.confirm_status, a.confirm_status_timeout)
+            if not a.confirm_channel:
+                woke = status_confirm["matched"]
+                outcome = "confirmed:herdr-status" if woke else "delivered:no-status-match-within-timeout"
     print(json.dumps({"woke": woke, "backend": backend, "target": target,
-                      "agent": agent, "confirm": outcome}))
+                      "agent": agent, "submit_keys": submit_keys, "confirm": outcome,
+                      "status_confirm": status_confirm}))
 
 
 if __name__ == "__main__":
