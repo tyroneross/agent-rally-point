@@ -30,6 +30,24 @@ it *can't*, because it has no context on any specific job; the agents do. Tellin
 from a context-blind substrate would fail. Rally ensures agents don't collide and that every
 decision / blocker / claim / artifact is visible. **The lead (an agent) routes; rally is the substrate.**
 
+## Squads (agent teams = terminals)
+
+A **squad** is one terminal. **N terminals = N squads** (1:1). A squad may be a *single agent* (e.g. one
+GPT-5.5 or one Opus session) **or** a *multi-agent team* (e.g. a **build-loop squad** = orchestrator +
+its subagents, or a Rally Flow Tier-1 fan-out). Either way it is **one squad**. The unit rally
+coordinates is the **squad**, not the individual sub-agent — a squad's internal agents are its own
+Tier-1 business, **hidden behind the squad id** (per the in-memory-subagents-stay-host-side boundary
+above). So: 10 terminals → 10 squad ids in the room, regardless of how many agents run inside each.
+
+- **Distinct squad id, enforced at entry.** Every squad enters under **one** stable, distinct id
+  (`<host>:<squad>`, e.g. `claude_code:lead`, `codex:dynwf-coordinator`). Rally MUST reject/flag a
+  duplicate squad id so two squads never collide (the bare-`codex` / bare-`claude_code` collisions this
+  session are the failure mode). No squad uses a bare host id or two ids.
+- **Model tier per squad.** Each squad registers its tier (**frontier | executing | fast**, per
+  `MODEL-TIERS.md`) at enter, so the room knows each squad's capability/cost for routing.
+- Rally-side enforcement (enter rejects duplicate squad id + records tier) is backlog **B11**; until it
+  lands the **lead enforces the convention** and maintains the squad roster on the board.
+
 ## Frontier-agent rules (lightweight)
 
 1. **First agent on the room is lead.** The first frontier agent to enter assumes the lead role:
