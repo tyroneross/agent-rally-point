@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_ENTER: &str = "agent-rally.command.enter.v1";
@@ -112,7 +112,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     let max_seq = snapshot.max_seq;
     let attention = build_attention(&snapshot, &tool, cursor_before, &paths);
     let entry = build_entry(&snapshot, &tool, role.as_deref(), &paths, &attention);
-    let _ = room.set_cursor(&tool, max_seq);
+    room.set_cursor(&tool, max_seq)?;
     let body = envelope(
         "enter",
         SCHEMA_ENTER,
@@ -122,13 +122,13 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
             cursor: CursorData {
                 before: cursor_before,
                 after: max_seq,
-                advanced: true,
+                advanced: max_seq > cursor_before,
             },
             entry,
             attention,
             room: RoomSummary::from(&snapshot),
         },
-    );
+    )?;
     let text = format!(
         "entered room tool={} do={} do_not={} attention={}",
         body["data"]["tool"].as_str().unwrap_or("unknown"),
@@ -184,7 +184,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
             fact: fact.clone(),
             room: RoomSummary::from(&snapshot),
         },
-    );
+    )?;
     let text = format!("said {} {}", fact.kind.as_str(), fact.event_id);
     Ok(Output::new(args.json, text, body))
 }
@@ -201,7 +201,7 @@ fn command_room(args: RoomArgs) -> Result<Output> {
             query,
             room: snapshot.clone(),
         },
-    );
+    )?;
     let text = format!(
         "room claims={} blockers={} handoffs={} decisions={} risks={} artifacts={}",
         snapshot.active_claims.len(),
@@ -244,7 +244,7 @@ fn command_next(args: NextArgs) -> Result<Output> {
             wake_intent,
             room: RoomSummary::from(&snapshot),
         },
-    );
+    )?;
     let text = format!("next action={action} target={target_event_id}");
     Ok(Output::new(args.json, text, body))
 }
@@ -252,7 +252,7 @@ fn command_next(args: NextArgs) -> Result<Output> {
 fn command_locate(args: LocateArgs) -> Result<Output> {
     let data = discovery::locate(&args.event_id, args.include_legacy)?;
     let found = data.located.is_some();
-    let body = envelope("locate", SCHEMA_LOCATE, data);
+    let body = envelope("locate", SCHEMA_LOCATE, data)?;
     let text = format!("locate event={} found={}", args.event_id, found);
     Ok(Output::new(args.json, text, body))
 }
@@ -260,7 +260,7 @@ fn command_locate(args: LocateArgs) -> Result<Output> {
 fn command_recent(args: RecentArgs) -> Result<Output> {
     let data = discovery::recent(args.all, args.include_legacy, args.limit)?;
     let count = data.rows.len();
-    let body = envelope("recent", SCHEMA_RECENT, data);
+    let body = envelope("recent", SCHEMA_RECENT, data)?;
     let text = format!("recent rows={count}");
     Ok(Output::new(args.json, text, body))
 }
@@ -285,7 +285,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
     let room = RoomStore::open()?;
     let snapshot = room.snapshot()?;
     let check = build_check(phase, tool, path, args.strict, &snapshot)?;
-    let body = envelope("check", SCHEMA_CHECK, check.data);
+    let body = envelope("check", SCHEMA_CHECK, check.data)?;
     let text = format!("check findings={}", check.finding_count);
     Ok(Output::new(args.json, text, body).with_exit_code(check.exit_code))
 }
@@ -379,7 +379,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 start: command_plan_json(&start_commands),
             },
         },
-    );
+    )?;
     let text = format!(
         "run agent={} backend={} session={}",
         session.agent, session.backend, session.session_id
@@ -590,7 +590,7 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
         SessionsData {
             sessions: sessions.clone(),
         },
-    );
+    )?;
     let text = format!("sessions {}", sessions.len());
     Ok(Output::new(args.json, text, body))
 }
@@ -616,6 +616,11 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
         ));
     }
     let timeout = args.timeout_seconds as u64;
+    let ack_after_seq = if require_ack && !dry_run {
+        Some(RoomStore::open()?.snapshot()?.max_seq)
+    } else {
+        None
+    };
     let backend_runner = BackendRunner::new(Backend::parse(&session.backend)?, args.bins);
     let live_target = if dry_run {
         session.target.clone()
@@ -629,7 +634,11 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     let wake_intent = inject_wake_intent(&session, handoff.as_deref(), &commands, dry_run)?;
     let ack = if require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
-        Some(wait_for_resolution(handoff, timeout)?)
+        Some(wait_for_resolution(
+            handoff,
+            timeout,
+            ack_after_seq.unwrap_or(0),
+        )?)
     } else {
         None
     };
@@ -645,7 +654,7 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
             wake_intent,
             commands: command_plan_json(&commands),
         },
-    );
+    )?;
     let text = format!(
         "inject session={} ack={}",
         session.session_id,
@@ -721,9 +730,12 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
             output,
             commands: command_plan_json(&commands),
         },
-    );
-    let text =
-        output_text.unwrap_or_else(|| format!("{command_name} session={}", session.session_id));
+    )?;
+    let text = output_text
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{command_name} session={}", session.session_id));
     Ok(Output::new(args.json, text, body))
 }
 
@@ -928,11 +940,17 @@ fn handoff_prompt(session: &ManagedSession, handoff: &str) -> String {
     )
 }
 
-fn wait_for_resolution(handoff: &str, timeout_seconds: u64) -> Result<Value> {
-    for _ in 0..timeout_seconds {
+fn wait_for_resolution(handoff: &str, timeout_seconds: u64, after_seq: i64) -> Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let mut last_seen_seq = after_seq;
+    loop {
         let room = RoomStore::open()?;
         for fact in room.facts()? {
-            if fact.kind == "resolve" && fact.ref_id.as_deref() == Some(handoff) {
+            last_seen_seq = last_seen_seq.max(fact.seq);
+            if fact.seq > after_seq
+                && fact.kind == "resolve"
+                && fact.ref_id.as_deref() == Some(handoff)
+            {
                 return Ok(json!({
                     "resolved": true,
                     "event_id": fact.event_id,
@@ -941,10 +959,14 @@ fn wait_for_resolution(handoff: &str, timeout_seconds: u64) -> Result<Value> {
                 }));
             }
         }
-        thread::sleep(Duration::from_secs(1));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(250)));
     }
     Err(RallyError::Message(format!(
-        "timed out after {timeout_seconds}s waiting for resolve fact for {handoff}"
+        "timed out after {timeout_seconds}s waiting for resolve fact for {handoff} after seq {after_seq} (last seen seq {last_seen_seq})"
     )))
 }
 
@@ -1192,7 +1214,7 @@ struct Envelope<T> {
     data: T,
 }
 
-fn envelope<T: Serialize>(command: &str, schema: &str, data: T) -> Value {
+fn envelope<T: Serialize>(command: &str, schema: &str, data: T) -> Result<Value> {
     serde_json::to_value(Envelope {
         ok: true,
         product: "rally",
@@ -1200,7 +1222,7 @@ fn envelope<T: Serialize>(command: &str, schema: &str, data: T) -> Value {
         schema: schema.to_string(),
         data,
     })
-    .unwrap_or_else(|_| json!({}))
+    .map_err(RallyError::json("render command envelope"))
 }
 
 pub(crate) fn repo_root() -> Result<PathBuf> {

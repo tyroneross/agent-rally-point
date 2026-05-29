@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct Workspace {
     cwd: PathBuf,
@@ -213,6 +213,9 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
     ]);
     assert_eq!(enter["schema"], "agent-rally.command.enter.v1");
     assert_matches_schema("agent-rally.command.enter.v1.json", &enter);
+    assert_eq!(enter["data"]["cursor"]["before"], 0);
+    assert_eq!(enter["data"]["cursor"]["after"], 2);
+    assert_eq!(enter["data"]["cursor"]["advanced"], true);
     assert!(
         enter["data"]["entry"]["do_not"]
             .as_array()
@@ -227,6 +230,19 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
             .iter()
             .any(|item| item["subject"] == "Rally uses enter/say/room/check")
     );
+    let enter_again = workspace.json(&[
+        "enter",
+        "--json",
+        "--tool",
+        "codex",
+        "--session-id",
+        "codex-main",
+        "--path",
+        "src/room.rs",
+    ]);
+    assert_eq!(enter_again["data"]["cursor"]["before"], 2);
+    assert_eq!(enter_again["data"]["cursor"]["after"], 2);
+    assert_eq!(enter_again["data"]["cursor"]["advanced"], false);
 
     let (check, check_output) = workspace.json_with_status(&[
         "check",
@@ -912,6 +928,34 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "--subject",
         "managed session handoff resolved",
     ]);
+    let resolver_cwd = workspace.cwd.clone();
+    let resolver_home = workspace.home.clone();
+    let resolver_handoff = handoff_id.to_string();
+    let resolver = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+            .current_dir(resolver_cwd)
+            .env("HOME", resolver_home)
+            .args([
+                "say",
+                "resolve",
+                "--json",
+                "--tool",
+                "claude_code:reviewer-01",
+                "--ref",
+                resolver_handoff.as_str(),
+                "--subject",
+                "managed session handoff resolved after inject",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    });
     let acked = workspace.json(&[
         "inject",
         "reviewer-01",
@@ -920,12 +964,17 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         handoff_id,
         "--require-ack",
         "--timeout-seconds",
-        "1",
+        "3",
         "--tmux-bin",
         "/usr/bin/true",
     ]);
+    resolver.join().unwrap();
     assert_eq!(acked["data"]["ack"]["resolved"], true);
     assert_eq!(acked["data"]["ack"]["tool"], "claude_code:reviewer-01");
+    assert_eq!(
+        acked["data"]["ack"]["subject"],
+        "managed session handoff resolved after inject"
+    );
 
     let capture = workspace.json(&[
         "capture",
@@ -940,6 +989,19 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     assert_matches_schema("agent-rally.command.session-action.v1.json", &capture);
     assert_eq!(capture["data"]["action"], "capture");
     assert_eq!(capture["data"]["output"], "");
+    let capture_text = workspace.output(&[
+        "capture",
+        "reviewer-01",
+        "--lines",
+        "20",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert!(capture_text.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&capture_text.stdout).trim(),
+        "capture session=claude-reviewer-01"
+    );
 
     let attach = workspace.json(&[
         "attach",
