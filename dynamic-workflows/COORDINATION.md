@@ -43,6 +43,9 @@ decision / blocker / claim / artifact is visible. **The lead (an agent) routes; 
 3. **De-conflict before writing.** `rally say claim` + `rally check before-write` on **canonical
    paths** (`crates/.../<file>`); one owner per file. A change whose signature ripples into another
    agent's file is a **cross-lane ripple → route it to the lead**, don't reach across.
+   **Shared checkout:** the primary checkout stays on `main`. Branch-isolated work (a PR branch)
+   MUST use a dedicated `git worktree` — never switch the shared checkout's branch under peers
+   (it lands their in-flight commits on your branch). The lead operates from its own worktree.
 4. **Checkpoint to rally.** claim (start) → artifact (done), so progress is durable and any fresh
    agent can resume a long-running workstream (`core/workstream-status.mjs`). This is the long-running
    edge over pi, whose progress lives only in one parent's memory.
