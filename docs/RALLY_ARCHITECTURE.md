@@ -43,16 +43,73 @@ Rally should not own:
 ## Architecture
 
 ```text
-.rally/facts.db     canonical append-only typed fact store (factstr-sqlite)
-.rally/cursors.json per-tool read cursors
+.rally/ledger.jsonl  canonical append-only event log (committed)
+.rally/facts.db      derived sqlite cache (gitignored; rebuildable)
+.rally/cursors.json  per-tool read cursors (gitignored; advisory)
 enter/next/room/check product APIs derived from facts.db
 managed sessions     tmux, Herdr, and cmux launch/inject/capture/stop
 ```
 
-`facts.db` is the source of truth. It is backed by `factstr-sqlite`, which owns
-ordered append, sequence numbers, and durable fact storage. Room snapshots and
-managed session lists are derived from that event log on demand, not stored in
-a second projection DB.
+`ledger.jsonl` is the source of truth. It is append-only, one event per line
+(`{seq, occurred_at, event_type, payload}`), and committed to the repository
+(see `.gitignore` and `.gitattributes`: `merge=union` for conflict-free
+concurrent appends from sibling worktrees). `facts.db` is a *derived* sqlite
+cache backed by `factstr-sqlite` that `RoomStore::open_at` rebuilds by
+replaying the ledger whenever the cache is missing or behind. A clone or a
+fresh machine reconstructs the room state from the ledger alone — no external
+service, no migration step.
+
+Room snapshots and managed session lists are derived from the event log on
+demand, not stored in a second projection DB.
+
+## Per-Repo Segmentation
+
+**One repo = one rally point.** Rally's coordination data lives at
+`<repo_root>/.rally/`, keyed by `repo_root` in `discovery.rs::repo_root()`.
+Data never co-mingles across repos: claims, blockers, decisions, artifacts,
+and managed sessions in repo A are invisible to a `rally` invocation in
+repo B.
+
+The home-dir directory `~/.agent-rally-point/rooms/v1/index.json` is a
+**pointers-only** discovery hint — it lists `(repo_root, facts_db_path,
+last_seen_seq)` so `rally locate --all` and `rally recent --all` can answer
+"what other rooms exist on this machine?" without a network call. It holds
+**zero canonical fact data**; the per-repo `ledger.jsonl` files do. Deleting
+the global index loses cross-repo visibility but not a single fact.
+
+```text
+~/.agent-rally-point/rooms/v1/index.json   global discovery hint (pointers)
+~/dev/repo-a/.rally/ledger.jsonl           repo A — canonical facts
+~/dev/repo-a/.rally/facts.db               repo A — derived cache
+~/dev/repo-b/.rally/ledger.jsonl           repo B — canonical facts (isolated)
+~/dev/repo-b/.rally/facts.db               repo B — derived cache (isolated)
+```
+
+### Disabling the global index (`RALLY_NO_GLOBAL_INDEX=1`)
+
+For privacy-isolated, multi-tenant, sandboxed, or CI scenarios where rally
+must not touch the user's home directory, set the environment variable
+`RALLY_NO_GLOBAL_INDEX=1` (any non-empty value) on the `rally` process.
+This:
+
+- Skips every write to `~/.agent-rally-point/rooms/v1/index.json`.
+- Skips every read of the same file.
+- Collapses `rally locate --all` / `rally recent --all` to "this repo only".
+
+Per-repo coordination is **unaffected** — `.rally/ledger.jsonl` and
+`.rally/facts.db` work exactly as before. Only the cross-repo "what other
+rooms exist?" surface goes silent.
+
+```bash
+RALLY_NO_GLOBAL_INDEX=1 rally enter --tool codex --json
+RALLY_NO_GLOBAL_INDEX=1 rally say claim --tool codex --subject "..." --json
+RALLY_NO_GLOBAL_INDEX=1 rally recent --all --json   # silent on other repos
+```
+
+There is no CLI flag — env-var-only is the minimum surface that does the
+job, and it composes cleanly with `direnv`, container env files, and CI
+secret panels. A future release may add `--no-global-index` if the env-var
+form proves insufficient.
 
 ## Command Surface
 

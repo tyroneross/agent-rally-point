@@ -1419,6 +1419,77 @@ fn rally_refresh_does_not_clobber_corrupt_room_index() {
 }
 
 #[test]
+fn rally_no_global_index_env_var_skips_home_index() {
+    // R3: per-repo segmentation — `RALLY_NO_GLOBAL_INDEX=1` opts every rally
+    // invocation out of writing to or reading from the home-dir index file.
+    // Per-repo facts (in <repo_root>/.rally/) keep working normally; only the
+    // cross-repo "what other rooms exist?" surface goes silent.
+    let home = temp_path("rally-no-global-index-home");
+    let workspace = Workspace::new_with_home("rally-no-global-index", &home);
+    let index_path = home.join(".agent-rally-point/rooms/v1/index.json");
+
+    // Sanity: at the moment, this directory shouldn't exist yet.
+    assert!(!index_path.exists());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .env("RALLY_NO_GLOBAL_INDEX", "1")
+        .args([
+            "say",
+            "artifact",
+            "--json",
+            "--tool",
+            "codex",
+            "--subject",
+            "no-global-index write",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The home-dir index file must not have been created.
+    assert!(
+        !index_path.exists(),
+        "RALLY_NO_GLOBAL_INDEX=1 must skip writes to {}",
+        index_path.display()
+    );
+
+    // The per-repo ledger + db, however, *must* exist — coordination within
+    // this repo is unaffected.
+    assert!(workspace.cwd.join(".rally/ledger.jsonl").exists());
+    assert!(workspace.cwd.join(".rally/facts.db").exists());
+
+    // `recent --all` still works; it just collapses to "this repo only" and
+    // emits no `room_index_unreadable` warning.
+    let recent_output = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .env("RALLY_NO_GLOBAL_INDEX", "1")
+        .args(["recent", "--all", "--json", "--limit", "10"])
+        .output()
+        .unwrap();
+    assert!(recent_output.status.success());
+    let recent: Value = serde_json::from_slice(&recent_output.stdout).unwrap();
+    assert!(
+        recent["data"]["warnings"]
+            .as_array()
+            .map(|w| w
+                .iter()
+                .all(|warning| warning["code"] != "room_index_unreadable"))
+            .unwrap_or(true),
+        "no room_index_unreadable warning expected in fully-isolated mode"
+    );
+
+    workspace.cleanup();
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn linked_git_worktree_uses_common_room() {
     let home = temp_path("rally-common-room-home");
     let primary = Workspace::new_with_home("rally-common-room-main", &home);

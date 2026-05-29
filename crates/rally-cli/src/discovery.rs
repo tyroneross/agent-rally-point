@@ -456,7 +456,29 @@ fn write_room_index_at(path: &Path, index: &RoomIndex) -> Result<()> {
     })
 }
 
+/// Resolve the path to the global discovery index, or `None` when global
+/// discovery is disabled.
+///
+/// The index at `~/.agent-rally-point/rooms/v1/index.json` is a
+/// **pointers-only** file — it tells `rally locate --all` and
+/// `rally recent --all` which `.rally/facts.db` files exist on this
+/// machine. It never holds canonical fact data; that lives per-repo under
+/// `<repo_root>/.rally/ledger.jsonl` and is rebuilt into the cache on
+/// demand. Disabling the index therefore *does not* affect coordination
+/// within any single repo — only the cross-repo "what other rooms do I
+/// know about?" surface.
+///
+/// Setting `RALLY_NO_GLOBAL_INDEX=1` (any non-empty value) returns `None`,
+/// which both `refresh_room_index` and `known_rooms_with_current` already
+/// treat as the fully-isolated mode: no writes to the index, no reads of
+/// the index, and `--all` collapses to "this repo only".
 fn room_index_path() -> Option<PathBuf> {
+    if env::var_os("RALLY_NO_GLOBAL_INDEX")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
     Some(home_dir()?.join(".agent-rally-point/rooms/v1/index.json"))
 }
 

@@ -101,9 +101,21 @@ The short version:
 
 - Rally is the primary product.
 - The product model is room, fact, enter, next, say, check.
-- The room projection is SQLite-backed derived state.
+- **One repo = one rally point.** Coordination lives at
+  `<repo_root>/.rally/`, segmented per-repo, never co-mingled.
+- **`.rally/ledger.jsonl` is canonical** — append-only, committed,
+  `merge=union`. Survives clone and machine with no external service.
+- `.rally/facts.db` is a derived sqlite cache rebuilt by replaying the
+  ledger when missing or behind.
+- `~/.agent-rally-point/rooms/v1/index.json` is a global discovery hint
+  (pointers-only, no canonical data). Disable with
+  `RALLY_NO_GLOBAL_INDEX=1`.
 - JSON contracts are designed for agents first.
-- Managed session delivery is how Rally becomes part of normal agent behavior.
+- Managed session delivery is how Rally becomes part of normal agent
+  behavior.
+
+See [docs/RALLY_ARCHITECTURE.md](docs/RALLY_ARCHITECTURE.md) for the full
+per-repo segmentation contract.
 
 ## License
 
