@@ -210,11 +210,12 @@ impl NextCandidate {
 
     fn to_data(&self) -> NextCandidateData {
         let target_event_id = self.fact.as_ref().map(|fact| fact.event_id.clone());
-        let confidence = (self.score.clamp(5, 95) as f64) / 100.0;
+        let score = self.score.clamp(5, 95);
+        let confidence = (score as f64) / 100.0;
         NextCandidateData {
             action: self.action,
             reason: self.reason,
-            score: self.score,
+            score,
             confidence,
             target_event_id,
             source_event_ids: self.source_event_ids.clone(),
@@ -599,7 +600,13 @@ pub(crate) fn build_attention(
     }
     for claim in &snapshot.active_claims {
         if claim.tool.as_deref() != Some(tool)
-            && (paths.is_empty() || paths.iter().any(|path| claim.scope.contains(path)))
+            && (paths.is_empty()
+                || paths.iter().any(|path| {
+                    claim
+                        .scope
+                        .iter()
+                        .any(|scope| path_matches_scope(scope, path))
+                }))
         {
             push_fact("claimed_scope", claim);
         }

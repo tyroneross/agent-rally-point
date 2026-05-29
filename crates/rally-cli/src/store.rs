@@ -319,7 +319,8 @@ impl RoomStore {
             .fact_store
             .append(vec![NewEvent::new(event_type, payload)])
             .map_err(|err| RallyError::Message(format!("append fact: {err}")))?;
-        fact.seq = result.last_sequence_number as i64;
+        fact.seq = i64::try_from(result.last_sequence_number)
+            .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
         let _ = self.refresh_index(fact.seq);
         Ok(fact)
     }
@@ -339,7 +340,9 @@ impl RoomStore {
         );
         match result {
             Ok(result) => {
-                fact.seq = result.last_sequence_number as i64;
+                fact.seq = i64::try_from(result.last_sequence_number).map_err(|err| {
+                    RallyError::Message(format!("sequence number overflow: {err}"))
+                })?;
                 let _ = self.refresh_index(fact.seq);
                 Ok(Some(fact))
             }
@@ -356,7 +359,12 @@ impl RoomStore {
         query
             .event_records
             .into_iter()
-            .map(|record| Fact::from_value(record.payload, record.sequence_number as i64))
+            .map(|record| {
+                let seq = i64::try_from(record.sequence_number).map_err(|err| {
+                    RallyError::Message(format!("sequence number overflow: {err}"))
+                })?;
+                Fact::from_value(record.payload, seq)
+            })
             .collect()
     }
 
@@ -372,7 +380,12 @@ impl RoomStore {
         let facts = query
             .event_records
             .into_iter()
-            .map(|record| Fact::from_value(record.payload, record.sequence_number as i64))
+            .map(|record| {
+                let seq = i64::try_from(record.sequence_number).map_err(|err| {
+                    RallyError::Message(format!("sequence number overflow: {err}"))
+                })?;
+                Fact::from_value(record.payload, seq)
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok((facts, context_version))
     }
