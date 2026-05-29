@@ -19,6 +19,11 @@ pub(crate) enum CliCommand {
     Recent(RecentArgs),
 }
 
+pub(crate) enum CliParse {
+    Command(Box<CliCommand>),
+    Help(String),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct EnterArgs {
     pub(crate) json: bool,
@@ -167,10 +172,16 @@ pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
     }
 }
 
-pub(crate) fn parse_cli(args: &[String]) -> Result<CliCommand> {
-    cli_parser()
-        .run_inner(Args::from(args).set_name("rally"))
-        .map_err(|failure| RallyError::Usage(parse_failure_message(failure)))
+pub(crate) fn parse_cli(args: &[String]) -> Result<CliParse> {
+    match cli_parser().run_inner(Args::from(args).set_name("rally")) {
+        Ok(command) => Ok(CliParse::Command(Box::new(command))),
+        Err(failure @ (ParseFailure::Stdout(..) | ParseFailure::Completion(_))) => {
+            Ok(CliParse::Help(failure.unwrap_stdout()))
+        }
+        Err(failure @ ParseFailure::Stderr(_)) => {
+            Err(RallyError::Usage(parse_failure_message(failure)))
+        }
+    }
 }
 
 fn parse_failure_message(failure: ParseFailure) -> String {
@@ -374,22 +385,24 @@ fn check_parser() -> impl Parser<CheckArgs> {
 fn run_parser() -> impl Parser<RunArgs> {
     let json = json_flag();
     let dry_run = dry_run_flag();
-    let agent = positional::<String>("AGENT");
     let name = optional_string_arg("name", "NAME");
     let backend = backend_arg();
     let session_id = optional_string_arg("session-id", "SESSION_ID");
     let tool = optional_string_arg("tool", "TOOL");
     let bins = backend_bins_parser();
-    construct!(RunArgs {
-        json,
-        dry_run,
-        agent,
-        name,
-        backend,
-        session_id,
-        tool,
-        bins
-    })
+    let agent = positional::<String>("AGENT");
+    construct!(json, dry_run, name, backend, session_id, tool, bins, agent).map(
+        |(json, dry_run, name, backend, session_id, tool, bins, agent)| RunArgs {
+            json,
+            dry_run,
+            agent,
+            name,
+            backend,
+            session_id,
+            tool,
+            bins,
+        },
+    )
 }
 
 fn sessions_parser() -> impl Parser<SessionsArgs> {
@@ -400,32 +413,44 @@ fn sessions_parser() -> impl Parser<SessionsArgs> {
 fn inject_parser() -> impl Parser<InjectArgs> {
     let json = json_flag();
     let dry_run = dry_run_flag();
-    let target = positional::<String>("TARGET");
     let text = optional_string_arg("text", "TEXT");
     let handoff = handoff_arg();
     let require_ack = long("require-ack").switch();
     let timeout_seconds = bounded_i64_arg("timeout-seconds", "SECONDS", 60, 1, 600);
     let bins = backend_bins_parser();
-    construct!(InjectArgs {
+    let target = positional::<String>("TARGET");
+    construct!(
         json,
         dry_run,
-        target,
         text,
         handoff,
         require_ack,
         timeout_seconds,
-        bins
-    })
+        bins,
+        target
+    )
+    .map(
+        |(json, dry_run, text, handoff, require_ack, timeout_seconds, bins, target)| InjectArgs {
+            json,
+            dry_run,
+            target,
+            text,
+            handoff,
+            require_ack,
+            timeout_seconds,
+            bins,
+        },
+    )
 }
 
 fn session_action_parser(action: SessionAction) -> impl Parser<SessionActionArgs> {
     let json = json_flag();
     let dry_run = dry_run_flag();
-    let target = positional::<String>("TARGET");
     let lines = bounded_i64_arg("lines", "N", 120, 1, 2000);
     let bins = backend_bins_parser();
-    construct!(json, dry_run, target, lines, bins).map(
-        move |(json, dry_run, target, lines, bins)| SessionActionArgs {
+    let target = positional::<String>("TARGET");
+    construct!(json, dry_run, lines, bins, target).map(
+        move |(json, dry_run, lines, bins, target)| SessionActionArgs {
             json,
             dry_run,
             action,

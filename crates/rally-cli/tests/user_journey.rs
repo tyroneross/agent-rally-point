@@ -301,6 +301,16 @@ fn rally_is_not_a_command_fallback() {
     assert!(String::from_utf8_lossy(&help.stdout).contains("rally enter --tool <tool>"));
     assert!(String::from_utf8_lossy(&help.stdout).contains("rally next --tool <tool>"));
 
+    for command in ["run", "inject", "attach", "capture", "stop"] {
+        let output = workspace.output(&[command, "--help"]);
+        assert!(
+            output.status.success(),
+            "{command} --help failed\nstderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
     let output = workspace.output(&["context", "--json", "--tool", "codex"]);
     assert!(!output.status.success());
     let error: Value = serde_json::from_slice(&output.stderr).unwrap();
