@@ -15,16 +15,17 @@ Drop this directory into any repo. No install required; no runtime dependencies.
 
 | Path | Purpose |
 |---|---|
-| `PROTOCOL.md` | Canonical spec: descriptor format, lint rules, spawn tiers, and agent loop |
+| `PROTOCOL.md` | Canonical spec: descriptor format, lint rules, spawn tiers, the agent loop, and **durable fan-out & resume** |
+| `COORDINATION.md` | Frontier-agent coordination doctrine — two modes, the rules (first-agent-is-lead, proactive engagement, instruction contract), rally-facilitates-not-coordinates |
+| `MODEL-TIERS.md` | Host-neutral model-tier taxonomy (frontier/executing/fast) + the empirical A/B verdict |
 | `core/workstream-lint.mjs` | Zero-dependency linter — validates a descriptor before fan-out (exits 0/1/2) |
+| `core/workstream-status.mjs` | **Resume helper** — derives done/claimed/pending + the `to_dispatch` set from a `rally room` snapshot (the durable counterpart to pi's in-memory progress) |
+| `core/route.mjs` | **Deterministic routing** (ported host-neutral from pi): `parallel`/`pipeline`/`budget` + onError/abort failure-visibility |
 | `core/limiter.mjs` | Bounded-concurrency helper hosts can use to cap their own Tier-1 fan-out |
-| `skills/claude/SKILL.md` | Skill that maps a workstream onto rally primitives for Claude Code |
-| `skills/codex/SKILL.md` | Same, for Codex |
-| `examples/audit-repo.workstream.json` | Valid example: repo-audit workstream with three tasks |
-| `examples/bad-missing-fields.workstream.json` | Invalid example: missing required fields (linter demo) |
-| `examples/bad-nondeterministic.workstream.json` | Invalid example: non-deterministic validation command |
-| `tests/workstream-lint.test.mjs` | 7 unit tests for the linter (Node built-in test runner) |
-| `package.json` | Module manifest; no runtime dependencies |
+| `skills/claude/SKILL.md` · `skills/codex/SKILL.md` | Skills mapping a workstream onto rally primitives, per host |
+| `examples/*.workstream.json` | One valid + two invalid descriptors (linter demos) |
+| `tests/*.test.mjs` | 35 tests across lint / status / route / limiter (Node built-in runner) |
+| `package.json` | Module manifest; no runtime dependencies (exports: lint/status/route/limiter) |
 | `NOTICE` | MIT attribution for the portions lifted from pi-dynamic-workflows |
 
 ---
@@ -35,8 +36,11 @@ Drop this directory into any repo. No install required; no runtime dependencies.
 # Validate a descriptor (exit 0 = valid)
 node core/workstream-lint.mjs examples/audit-repo.workstream.json
 
-# Run the test suite (7 tests, no install needed)
+# Run the test suite (35 tests, no install needed)
 npm test
+
+# Resume a long-running workstream — what's left to dispatch?
+rally room --json > room.json && node core/workstream-status.mjs my.workstream.json room.json
 ```
 
 No `npm install` required — `"dependencies": {}`.
