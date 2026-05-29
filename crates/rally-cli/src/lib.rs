@@ -79,7 +79,12 @@ fn run_inner() -> Result<Output> {
     }
     reject_unknown_command(&args)?;
 
-    match parse_cli(&args)? {
+    let command = match parse_cli(&args)? {
+        CliParse::Command(command) => *command,
+        CliParse::Help(text) => return Ok(Output::new(false, text, json!({}))),
+    };
+
+    match command {
         CliCommand::Enter(args) => command_enter(args),
         CliCommand::Say(args) => command_say(args),
         CliCommand::Room(args) => command_room(args),
