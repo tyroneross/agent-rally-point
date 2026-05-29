@@ -23,7 +23,7 @@ reads this + `rally room --json` and knows what is owned, in flight, landed, and
 - **Durable outputs this session:** **Rally Flow** (agent-rally-point's take on dynamic workflows — the dynamic-workflows module: L1+L6 — protocol, `workstream-lint`, `route.mjs`, `workstream-status` resume, host skills); doctrine `COORDINATION.md`; `MODEL-TIERS.md` (+ A/B verdict); `RALLY-AUTOMATION-PROPOSALS.md` (10 ranked, cross-host-corroborated).
 - **Next lead actions:** (1) on L4 merge → flip B2/B3/L5, delegate **B10** (canonical-path matching — rank-1 linchpin) to Codex; (2) keep contracts **host-relative** (model tier + execution substrate); (3) sync board as facts land. Coordination is host-relative + charter-safe (rally facilitates, never executes/decides).
 
-## Squad roster (2 Claude + 2 Codex squads)
+## Squad roster (2 Claude + 3 Codex squads)
 
 A **squad** = one terminal (an agent team: one agent or many inside it). **Distinct squad id + model tier**, enforced at `rally enter` — bare/shared ids retired. *(Rally-side enforcement = B11; lead enforces the convention until then.)*
 
@@ -32,9 +32,10 @@ A **squad** = one terminal (an agent team: one agent or many inside it). **Disti
 | **Claude-Lead** | `claude_code:lead` | Claude · **Frontier** (Opus 4.8) | lead orchestration, board, Rally Flow (L1/L6), audit. No `crates/**` writes. |
 | **Claude-L4** | `claude_code:l4` | Claude · **Frontier** (Opus) | L4/PR46 (next.rs, store.rs) — has merge authority |
 | **Codex-Coord** | `codex:dynwf-coordinator` | Codex · **Executing** (self-reported gpt-5.4-mini, seq283) | coordination, review, assessments |
-| **Codex-Build** | `codex:dynamic-scale-01` | Codex · **Executing** (model squad-declared — optimizer observed on **GPT-5.5**; confirm via B11) | `crates/**` fixes (B4–B9), managed-session (L2) |
+| **Codex-Build** | `codex:dynamic-scale-01` | Codex · **Executing** (model squad-declared — pending B11) | `crates/**` fixes (B4–B9), managed-session (L2) |
+| **Codex-Optimizer** | `codex:chatgpt-optimizer-01` | Codex · **Executing** (user-confirmed **GPT-5.5**) | optimization pass (the GPT-5.5 squad the user is driving) |
 
-*Model names are squad-declared, not lead-inferred (B11 registration) — tier is the stable abstraction; specific GPT-5.x version is mutable + per-squad.*
+*Model names are squad-declared, not lead-inferred (B11 registration) — tier is the stable abstraction; specific GPT-5.x version is mutable + per-squad. The "GPT-5.5" I'd briefly mis-attached to Codex-Build is in fact **this** distinct optimizer squad.*
 
 Retired: bare `codex`, bare `claude_code`, transient `codex:optimizer`. **One squad = one id.**
 
