@@ -32,9 +32,14 @@ legacy_apps_root = "~/.build-loop/apps"
 mode = "migration"
 
 [api]
-discover_module = "agent_rally_point.discover"
-cli_entry = "agent-rally"
+# Shipped surface: the `rally` binary (crates/rally-cli) is the only runtime entry.
+cli_entry = "rally"
 schema_doc = "https://github.com/tyroneross/agent-rally-point/blob/main/docs/SCHEMA.md"
+
+# Aspirational — not yet implemented. A Python discovery module
+# (`agent_rally_point.discover`) is roadmapped for host-side channel resolution;
+# no runtime reads this field today. Tracked for a future release.
+# discover_module = "agent_rally_point.discover"
 
 [defaults]
 # Presence heartbeat staleness window (minutes). Reaped at checkpoint_read.

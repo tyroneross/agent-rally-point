@@ -60,6 +60,12 @@ Answers are settled (§5). The only open item is a build/no-build gate (§6).
 
 ## 3. The load-bearing boundary (read this before proposing anything)
 
+> **Citation note:** several files cited below (`docs/RUST_GREENFIELD_ARCHITECTURE.md`,
+> `docs/COORDINATION_TRACE.md`, `.bookmark/bookmark.context.md`) are from the original
+> pi-dynamic-workflows repo and were **not ported into this repo**. They are preserved here
+> as the source-of-record for the boundary rationale; treat the paths as external references,
+> not as files present in this checkout.
+
 Rally's charter **explicitly refuses** the execution half of pi-dynamic. Key citations in this repo:
 
 - `docs/RUST_GREENFIELD_ARCHITECTURE.md:85-94` — Non-Goals include *"a long-running orchestrator

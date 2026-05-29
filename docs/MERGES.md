@@ -26,6 +26,12 @@ branch→`main` merge (e.g. L4) gets the full entry above.
 
 ---
 
+## 2026-05-29 · B14 doc-citation sweep · merged by claude_code:lead(build-loop)
+- **Context (why):** the `wor9rkkhp` assessment found 8 stale/dangling doc-citation rows — docs/manifests citing files never ported from the prior pi repo, plus 5 implemented CLI subcommands (`sessions`/`attach`/`stop`/`locate`/`recent`) absent from the user-facing docs. Integrity fix: every cited path must resolve or be explicitly marked aspirational/external.
+- **Evidence:** `cargo build` (workspace) finished clean — unaffected by the doc/manifest/docstring edits. `rally_wake.py` parses (`ast.parse`), `examples/manifest.toml` parses (`tomllib`). Verified each formerly-dangling path: `manifest.toml` `cli_entry=rally` (only `rally` binary exists), `discover_module` commented + marked aspirational; RALLY.md + README.md now document all 13 subcommands (confirmed wired in `cli.rs:158-159,251`); schema shorthand in PLAN-take-best-pr46 corrected to actual `agent-rally.fact.v1.json` / `agent-rally.command.*.v1.json` names (confirmed via `ls docs/schemas/`); WAKE_COORDINATION_PLAN + pi-dynamic-assessment-handoff dangling files marked external/from-prior-pi-repo (confirmed missing via `ls`); PLAN-pi-dynamic-seam B6 heartbeat row marked future (only `rally_wake.py` present); `rally_wake.py` docstring now notes its relationship to `rally inject`.
+- **Lead audit:** ⚠️ pending — lead audits post-hoc from this evidence.
+- **Blast radius / reversibility:** docs + `examples/manifest.toml` + `scripts/rally_wake.py` docstring only. No `crates/**`, no behavior change. Revert: `git revert <hash>`.
+
 ## Backfill — this session's notable landings (summary level)
 
 - **`8a74f60`** — consolidate the divergent rally lines into one `main` (lean line won; attuned line removed). Context: two structurally divergent architecture lines existed; `main` is now the single canonical superset. Evidence: integration was 100% merged. Audit: ✅ (the line we built on).

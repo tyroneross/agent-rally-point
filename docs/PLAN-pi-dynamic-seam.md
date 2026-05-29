@@ -66,7 +66,7 @@ heartbeat itself are the first clients; pi-dynamic is the reference). So we buil
 | **Claude** | B2 fan-out DAG view | `crates/rally-cli/src/{dag.rs(new),cli.rs(subcommand)}` | `feature.dag-view` |
 | **Claude** | B3 pi-dynamic reference emitter | `examples/pi-dynamic-emitter/*`, `docs/ORCHESTRATOR_SEAM.md` (client section) | `client.pi-dynamic-ref` |
 | **Claude** | B5 schema + tests | `docs/schemas/*.json`, `crates/rally-cli/tests/*` | `schema.seam`, `tests.seam` |
-| **either** | B6 heartbeat runner | `scripts/rally_heartbeat.*`, host config | `runner.idle-heartbeat` |
+| **either** | B6 heartbeat runner *(future / not started)* | `scripts/rally_heartbeat.*` (not yet present — only `scripts/rally_wake.py` exists today), host config | `runner.idle-heartbeat` |
 
 **Shared edge:** B1's `standby`/`wake` kinds are read by B4 (wake-due) and B2 (DAG nodes). Codex lands
 `facts.standby-wake` first → handoff to Claude (B2) and to its own B4. Dogfood via receipts.

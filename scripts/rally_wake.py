@@ -3,6 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """rally_wake — backend-agnostic DOORBELL wake for idle agents (tmux | herdr).
 
+Relationship to `rally inject`: `rally inject` is the shipped, in-binary delivery
+path for managed sessions started by `rally run` (it knows the session's pane and
+backend). `rally_wake.py` is a standalone, backend-agnostic doorbell for *idle,
+unmanaged* TUIs — it resolves a tool name → its herdr/tmux pane, gates on idle, and
+confirms via channel post rather than TUI scraping. Use `rally inject` for managed
+sessions; use this script for waking an external agent terminal that Rally did not
+launch. Live-test protocol and per-backend routing: `docs/WAKE_TEST_PROTOCOL.md`;
+roadmap context: `docs/WAKE_COORDINATION_PLAN.md`.
+
 Design: doorbell + mailbox.
   The wake is a SHORT nudge, not a payload. A short message stays INLINE in the
   agent TUI — it never crosses the paste-collapse threshold that turns input into a

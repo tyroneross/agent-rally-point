@@ -22,7 +22,8 @@ Rally owns the primary product path:
 - Linked git worktrees share one room through the repo's git common dir.
 - Room state is derived from the fact store on demand.
 - `enter`, `next`, `say`, `room`, `check`, `run`, `sessions`, `inject`,
-  `attach`, `capture`, and `stop` are the load-bearing commands.
+  `attach`, `capture`, `stop`, `locate`, and `recent` are the load-bearing
+  commands.
 - Managed sessions own live delivery into tmux, Herdr, and cmux panes.
 
 Network transport remains out of scope. Files, Git, rsync, shared folders, A2A,

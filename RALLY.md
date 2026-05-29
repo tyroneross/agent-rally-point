@@ -87,6 +87,24 @@ rally capture <session|name|tool> --json
 Agents can still call `rally check before-write` explicitly before shared
 edits. Rally no longer installs host hooks or prompt injection glue.
 
+## Discovery & Session Management
+
+Beyond the core loop, Rally ships discovery and session-lifecycle commands:
+
+```bash
+rally sessions --json                          # list managed sessions in the room
+rally attach <session|name|tool> --json        # attach to an existing managed session
+rally capture <session|name|tool> --json       # capture a managed session's current output
+rally stop <session|name|tool> --json          # stop a managed session
+rally locate <event-id> [--include-legacy] --json   # find which channel an event lives in
+rally recent [--all] [--limit N] [--include-legacy] --json   # recent activity across channels
+```
+
+`sessions`, `attach`, `capture`, and `stop` operate on managed sessions started
+by `rally run`. `locate` and `recent` answer "where is this?" / "what just
+happened?" across the channels Rally knows about; `--include-legacy` also scans
+the retiring `~/.build-loop/apps/` root.
+
 ## Useful Fact Writes
 
 ```bash

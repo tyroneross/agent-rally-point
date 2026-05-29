@@ -74,5 +74,5 @@ Rules: verdicts gate (don't advance a piece past `verification-pending` until th
 ## 6. References
 - Research: `~/dev/research/projects/agent-rally-point/cross-agent-terminal-wake-inject-herdr-tmux-2026-05-28.md`
 - Wake test protocol: `docs/WAKE_TEST_PROTOCOL.md`
-- Live coord file (verdict log): `.build-loop/coordination/rally-diff-integration-assessment-2026-05-28.md`
+- Live coord file (verdict log): `.build-loop/coordination/rally-diff-integration-assessment-2026-05-28.md` (external — transient build-loop coordination file from the 2026-05-28 integration run; not committed to this repo)
 - Standby/wake contract: commit `85550a5`; discovery design: commit `9b623f6`

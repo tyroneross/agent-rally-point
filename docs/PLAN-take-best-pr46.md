@@ -100,7 +100,7 @@ re-pins the fields, Codex sees a `stale_base` finding on its own claim — the f
   `before-write` emits `declare-contracts`.
 
 ### A4 — Schema chain + golden tests + doc (Claude)
-- Update `docs/schemas/{fact,next,room,check}.v1.json` (+produces/+depends; +stale_bases/+coordination_required;
+- Update `docs/schemas/agent-rally.fact.v1.json` + `docs/schemas/agent-rally.command.{next,room,check}.v1.json` (+produces/+depends; +stale_bases/+coordination_required;
   required +receipts; phase enum +ci). Thread through the kind→schema source. Extend golden-contract test to
   validate the new fields. Fix RALLY.md evidence wording.
 - F-criteria: `cargo test` golden-contract suite green; every command's JSON validates against its schema.
