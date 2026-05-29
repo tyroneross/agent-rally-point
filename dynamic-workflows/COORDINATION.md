@@ -85,13 +85,14 @@ authority:edit+commit · base:own-worktree off main · mode:fix · tier:executin
 exec:build-loop · validate:cargo test → evidence in artifact · done:rally say artifact then resolve ·
 stop:requires-human|core-decision`.
 
-**Execution substrate is host-relative** (field 8): substantive code changes route through a structured
-plan→execute→review→verify loop, not raw edits — but the *loop* is each host's own. **Build-loop is a
-Claude Code skill**, so Claude agents use `/build-loop:run`; **Codex's runtime does not have build-loop**
-(confirmed this session — seq283), so Codex uses its host-equivalent: rally `check before-write` + tests
-+ `git diff --check` + commit. Same discipline, host-native mechanism — exactly like model tiers (rule 5):
-never impose a Claude-host tool on a non-Claude host. Rally coordinates *across* agents; the verify-loop
-drives *within* each lane. (Lead board/doc syncs are coordination artifacts, not code changes.)
+**Execution substrate — route through a structured plan→execute→review→verify loop, not raw edits**
+(field 8). Build-loop is **install-dependent, not host-locked**: it ships as a plugin available wherever
+cached — Claude always; **Codex where installed** (build-loop@0.13.3 confirmed in one Codex runtime
+seq306; *absent* in another seq283). So: **use build-loop if present in YOUR runtime** (`/build-loop:run`);
+**else the host-equivalent verify-loop** (rally `check before-write` + tests + `git diff --check` + commit).
+The host-relative principle still holds (rule 5): never *assume* a peer has your tooling — check, then use
+the richest verify-loop available. Rally coordinates *across* agents; the verify-loop drives *within* each
+lane. (Lead board/doc syncs are coordination artifacts, not code changes.)
 
 ## Joining checklist (drop-in)
 
