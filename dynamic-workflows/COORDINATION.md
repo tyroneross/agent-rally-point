@@ -58,6 +58,38 @@ decision / blocker / claim / artifact is visible. **The lead (an agent) routes; 
    sets the principle — "defined task → economical tier" — not the specific model name across hosts.)
    Tier↔model mapping (frontier / executing / fast) and task→tier defaults: see `MODEL-TIERS.md`.
 
+## Instruction contract (handoff / assignment standard)
+
+**Why this exists:** free-text handoffs are inconsistently shaped, so a receiving agent can't
+deterministically tell what it may do, where, and when it's done — so it re-asks or stands by. That's
+a **protocol gap, not an agent limitation**. Every assignment (lead→agent, or a backlog pickup) fills
+this compact contract — put it in the handoff `--summary` (one field per line, or a small JSON blob).
+A receiver that has all 11 fields never needs to ask "what next?".
+
+| # | Field | Meaning |
+|---|-------|---------|
+| 1 | **ref + action** | target fact/backlog-id + verb: `fix \| review \| audit \| build \| wire` |
+| 2 | **priority** | `P0 \| P1 \| P2` |
+| 3 | **owns / no-touch** | canonical paths owned + explicit no-touch (e.g. another lane's files) |
+| 4 | **authority** | `read-only \| edit \| commit \| push` |
+| 5 | **base** | branch + worktree (default: your **own worktree off `main`**; canonical paths) |
+| 6 | **mode** | `fix` vs `review-only` (resolve the issue, or only report risks) |
+| 7 | **model/tier + fan-out** | host-relative tier (cheapest sufficient, your own family) + parallel cap |
+| 8 | **execution** | **route through build-loop** (`/build-loop:run` or the build-orchestrator) — not raw edits |
+| 9 | **validation + evidence** | the verify command + the evidence to post |
+| 10 | **completion** | closing action: `rally say artifact --evidence …` → `resolve` / handoff-back |
+| 11 | **stop** | `blocker \| requires-human \| core-decision \| budget` |
+
+Example (`--summary`): `ref:B9 fix · P1 · owns:crates/rally-cli/src/lib.rs no-touch:next.rs,store.rs ·
+authority:edit+commit · base:own-worktree off main · mode:fix · tier:executing fan-out:≤4 ·
+exec:build-loop · validate:cargo test → evidence in artifact · done:rally say artifact then resolve ·
+stop:requires-human|core-decision`.
+
+**Build-loop is the execution substrate for every agent** (field 8): substantive code changes route
+through build-loop's plan→execute→review→verify, not direct edits. Rally coordinates *across* agents;
+build-loop drives *within* each agent's lane. (Lead board/doc syncs are coordination artifacts, not
+code changes — they don't require a build-loop run.)
+
 ## Joining checklist (drop-in)
 
 ```bash
