@@ -5,7 +5,7 @@ use chrono::{SecondsFormat, Utc};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -277,15 +277,17 @@ fn command_run(args: RunArgs) -> Result<Output> {
     let backend_name = backend.as_str().to_string();
     let repo = repo_root()?;
     let agent_spec = AgentSpec::from_name(&args.agent)?;
-    let name = args
-        .name
-        .unwrap_or_else(|| format!("{}-{}", agent_spec.agent, short_id()));
-    let session_id = args
-        .session_id
-        .unwrap_or_else(|| format!("{}-{}", agent_spec.agent, sanitize_id(&name)));
-    let tool = args
-        .tool
-        .unwrap_or_else(|| format!("{}:{}", agent_spec.tool, sanitize_id(&name)));
+    let active_sessions = read_session_records()?;
+    let identity = numbered_session_identity(
+        &agent_spec,
+        args.name,
+        args.session_id,
+        args.tool,
+        &active_sessions,
+    )?;
+    let name = identity.name;
+    let session_id = identity.session_id;
+    let tool = identity.tool;
     let backend_target = backend_target(backend, &session_id);
     let command = agent_spec.command_line(&name);
     let backend_runner = BackendRunner::new(backend, args.bins);
@@ -325,6 +327,146 @@ fn command_run(args: RunArgs) -> Result<Output> {
         session.agent, session.backend, session.session_id
     );
     Ok(Output::new(args.json, text, body))
+}
+
+struct SessionIdentity {
+    name: String,
+    session_id: String,
+    tool: String,
+}
+
+fn numbered_session_identity(
+    agent_spec: &AgentSpec,
+    requested_name: Option<String>,
+    requested_session_id: Option<String>,
+    requested_tool: Option<String>,
+    active_sessions: &[ManagedSession],
+) -> Result<SessionIdentity> {
+    let raw_base_name = requested_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(agent_spec.agent);
+    let stripped_name_base = strip_numbered_suffix(raw_base_name);
+    let name_base = if sanitize_id(stripped_name_base).is_empty() {
+        agent_spec.agent
+    } else {
+        stripped_name_base
+    };
+    let name = format!(
+        "{}-{:02}",
+        name_base,
+        next_identity_number(agent_spec, name_base, active_sessions)
+    );
+    let name_key = sanitize_id(&name);
+    let default_session_id = if name_key.starts_with(&format!("{}-", agent_spec.agent)) {
+        name_key.clone()
+    } else {
+        format!("{}-{}", agent_spec.agent, name_key)
+    };
+    let tool_suffix = name_key
+        .strip_prefix(&format!("{}-", agent_spec.agent))
+        .unwrap_or(&name_key);
+    let identity = SessionIdentity {
+        name,
+        session_id: requested_session_id.unwrap_or(default_session_id),
+        tool: requested_tool.unwrap_or_else(|| format!("{}:{tool_suffix}", agent_spec.tool)),
+    };
+    ensure_unique_session_identity(&identity, active_sessions)?;
+    Ok(identity)
+}
+
+fn next_identity_number(
+    agent_spec: &AgentSpec,
+    name_base: &str,
+    active_sessions: &[ManagedSession],
+) -> u16 {
+    let base_key = sanitize_id(name_base);
+    let mut used = BTreeSet::new();
+    for session in active_sessions {
+        note_used_identity_number(&base_key, &sanitize_id(&session.name), &mut used);
+        if let Some(tool_suffix) = session
+            .tool
+            .strip_prefix(agent_spec.tool)
+            .and_then(|suffix| suffix.strip_prefix(':'))
+        {
+            note_used_identity_number(&base_key, tool_suffix, &mut used);
+            if base_key == agent_spec.agent {
+                note_used_bare_identity_number(tool_suffix, &mut used);
+            }
+        }
+    }
+    (1..=999)
+        .find(|number| !used.contains(number))
+        .unwrap_or(1000)
+}
+
+fn note_used_identity_number(base_key: &str, value: &str, used: &mut BTreeSet<u16>) {
+    if value == base_key {
+        used.insert(1);
+        return;
+    }
+    let Some((prefix, number)) = split_numbered_suffix(value) else {
+        return;
+    };
+    if prefix == base_key {
+        used.insert(number);
+    }
+}
+
+fn note_used_bare_identity_number(value: &str, used: &mut BTreeSet<u16>) {
+    if value.len() >= 2 && value.chars().all(|ch| ch.is_ascii_digit()) {
+        if let Ok(number) = value.parse::<u16>() {
+            if number != 0 {
+                used.insert(number);
+            }
+        }
+    }
+}
+
+fn split_numbered_suffix(value: &str) -> Option<(&str, u16)> {
+    let (prefix, suffix) = value.rsplit_once('-')?;
+    if suffix.len() < 2 || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let number = suffix.parse::<u16>().ok()?;
+    if number == 0 {
+        return None;
+    }
+    Some((prefix, number))
+}
+
+fn strip_numbered_suffix(value: &str) -> &str {
+    split_numbered_suffix(value)
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(value)
+}
+
+fn ensure_unique_session_identity(
+    identity: &SessionIdentity,
+    active_sessions: &[ManagedSession],
+) -> Result<()> {
+    for session in active_sessions {
+        if session.session_id == identity.session_id {
+            return Err(RallyError::Usage(format!(
+                "active managed session already uses session-id {}",
+                identity.session_id
+            )));
+        }
+        if session.tool == identity.tool {
+            return Err(RallyError::Usage(format!(
+                "active managed session already uses tool {}",
+                identity.tool
+            )));
+        }
+        if session.name == identity.name {
+            return Err(RallyError::Usage(format!(
+                "active managed session already uses name {}",
+                identity.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn command_sessions(args: SessionsArgs) -> Result<Output> {
@@ -690,7 +832,7 @@ fn sanitize_id(value: &str) -> String {
         .to_string()
 }
 
-fn short_id() -> String {
+pub(crate) fn short_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -947,6 +1089,7 @@ fn help_text() -> String {
         "  rally check before-write --tool <tool> --path <path> [--strict] [--json]",
         "  rally check before-complete --tool <tool> [--strict] [--json]",
         "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|herdr|cmux>] [--dry-run] [--json]",
+        "    managed run ids auto-number active agents, e.g. claude-01 / claude_code:01",
         "  rally sessions [--json]",
         "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--require-ack] [--json]",
         "  rally attach <session|name|tool> [--dry-run] [--json]",

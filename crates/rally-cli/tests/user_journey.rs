@@ -766,11 +766,12 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     ]);
     assert_eq!(run["schema"], "agent-rally.command.run.v1");
     assert_matches_schema("agent-rally.command.run.v1.json", &run);
-    assert_eq!(run["data"]["session"]["name"], "reviewer");
+    assert_eq!(run["data"]["session"]["name"], "reviewer-01");
+    assert_eq!(run["data"]["session"]["session_id"], "claude-reviewer-01");
     assert_eq!(run["data"]["session"]["agent"], "claude");
-    assert_eq!(run["data"]["session"]["tool"], "claude_code:reviewer");
+    assert_eq!(run["data"]["session"]["tool"], "claude_code:reviewer-01");
     assert_eq!(run["data"]["session"]["backend"], "tmux");
-    assert_eq!(run["data"]["session"]["target"], "rally-claude-reviewer");
+    assert_eq!(run["data"]["session"]["target"], "rally-claude-reviewer-01");
     assert!(
         run["data"]["commands"]["start"]
             .as_array()
@@ -784,14 +785,14 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     assert_eq!(sessions["schema"], "agent-rally.command.sessions.v1");
     assert_matches_schema("agent-rally.command.sessions.v1.json", &sessions);
     assert_eq!(sessions["data"]["sessions"].as_array().unwrap().len(), 1);
-    assert_eq!(sessions["data"]["sessions"][0]["name"], "reviewer");
+    assert_eq!(sessions["data"]["sessions"][0]["name"], "reviewer-01");
     assert!(!workspace.cwd.join(".rally/sessions.json").exists());
     let room = workspace.json(&["room", "--json"]);
     assert_eq!(room["data"]["room"]["max_seq"], 1);
 
     let inject = workspace.json(&[
         "inject",
-        "reviewer",
+        "reviewer-01",
         "--json",
         "--text",
         "hello from rally",
@@ -800,7 +801,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     ]);
     assert_eq!(inject["schema"], "agent-rally.command.inject.v1");
     assert_matches_schema("agent-rally.command.inject.v1.json", &inject);
-    assert_eq!(inject["data"]["session"]["name"], "reviewer");
+    assert_eq!(inject["data"]["session"]["name"], "reviewer-01");
     assert_eq!(inject["data"]["commands"].as_array().unwrap().len(), 4);
 
     let handoff = workspace.json(&[
@@ -810,7 +811,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "--tool",
         "codex",
         "--target",
-        "claude_code:reviewer",
+        "claude_code:reviewer-01",
         "--subject",
         "managed session handoff",
     ]);
@@ -820,7 +821,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "resolve",
         "--json",
         "--tool",
-        "claude_code:reviewer",
+        "claude_code:reviewer-01",
         "--ref",
         handoff_id,
         "--subject",
@@ -828,7 +829,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     ]);
     let acked = workspace.json(&[
         "inject",
-        "reviewer",
+        "reviewer-01",
         "--json",
         "--handoff",
         handoff_id,
@@ -839,11 +840,11 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "/usr/bin/true",
     ]);
     assert_eq!(acked["data"]["ack"]["resolved"], true);
-    assert_eq!(acked["data"]["ack"]["tool"], "claude_code:reviewer");
+    assert_eq!(acked["data"]["ack"]["tool"], "claude_code:reviewer-01");
 
     let capture = workspace.json(&[
         "capture",
-        "reviewer",
+        "reviewer-01",
         "--json",
         "--lines",
         "20",
@@ -857,7 +858,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
 
     let attach = workspace.json(&[
         "attach",
-        "reviewer",
+        "reviewer-01",
         "--json",
         "--dry-run",
         "--tmux-bin",
@@ -881,13 +882,118 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     let sessions = workspace.json(&["sessions", "--json"]);
     assert_eq!(sessions["data"]["sessions"].as_array().unwrap().len(), 1);
 
-    let stop = workspace.json(&["stop", "reviewer", "--json", "--tmux-bin", "/usr/bin/true"]);
+    let stop = workspace.json(&[
+        "stop",
+        "reviewer-01",
+        "--json",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
     assert_eq!(stop["schema"], "agent-rally.command.session-action.v1");
     assert_matches_schema("agent-rally.command.session-action.v1.json", &stop);
     assert_eq!(stop["data"]["action"], "stop");
     let sessions = workspace.json(&["sessions", "--json"]);
     assert_eq!(sessions["data"]["sessions"].as_array().unwrap().len(), 0);
     assert!(!workspace.cwd.join(".rally/sessions.json").exists());
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_run_assigns_numbered_agent_ids() {
+    let workspace = Workspace::new("rally-run-numbered-ids");
+
+    let first_claude = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(first_claude["data"]["session"]["name"], "claude-01");
+    assert_eq!(first_claude["data"]["session"]["session_id"], "claude-01");
+    assert_eq!(first_claude["data"]["session"]["tool"], "claude_code:01");
+    assert_eq!(first_claude["data"]["session"]["target"], "rally-claude-01");
+
+    let second_claude = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(second_claude["data"]["session"]["name"], "claude-02");
+    assert_eq!(second_claude["data"]["session"]["session_id"], "claude-02");
+    assert_eq!(second_claude["data"]["session"]["tool"], "claude_code:02");
+
+    let reviewer = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "reviewer",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(reviewer["data"]["session"]["name"], "reviewer-01");
+    assert_eq!(
+        reviewer["data"]["session"]["session_id"],
+        "claude-reviewer-01"
+    );
+    assert_eq!(
+        reviewer["data"]["session"]["tool"],
+        "claude_code:reviewer-01"
+    );
+
+    let second_reviewer = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "reviewer",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(second_reviewer["data"]["session"]["name"], "reviewer-02");
+    assert_eq!(
+        second_reviewer["data"]["session"]["tool"],
+        "claude_code:reviewer-02"
+    );
+
+    let first_codex = workspace.json(&[
+        "run",
+        "codex",
+        "--json",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(first_codex["data"]["session"]["name"], "codex-01");
+    assert_eq!(first_codex["data"]["session"]["session_id"], "codex-01");
+    assert_eq!(first_codex["data"]["session"]["tool"], "codex:01");
+
+    let duplicate_tool = workspace.output(&[
+        "run",
+        "codex",
+        "--json",
+        "--backend",
+        "tmux",
+        "--tool",
+        "codex:01",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert!(!duplicate_tool.status.success());
+    assert!(String::from_utf8_lossy(&duplicate_tool.stderr).contains("already uses tool codex:01"));
 
     workspace.cleanup();
 }
@@ -931,10 +1037,10 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
         "--tmux-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(run["data"]["session"]["tool"], "claude_code:reviewer");
+    assert_eq!(run["data"]["session"]["tool"], "claude_code:reviewer-01");
     let inject = workspace.json(&[
         "inject",
-        "reviewer",
+        "reviewer-01",
         "--json",
         "--handoff",
         handoff_id,
@@ -945,7 +1051,7 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
     assert_eq!(inject["data"]["wake_intent"]["kind"], "wake");
     assert_eq!(
         inject["data"]["wake_intent"]["target"],
-        "claude_code:reviewer"
+        "claude_code:reviewer-01"
     );
     assert_eq!(inject["data"]["wake_intent"]["ref"], handoff_id);
     assert_eq!(inject["data"]["wake_intent"]["status"], "delivered");
@@ -1102,13 +1208,16 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
     assert_eq!(herdr["schema"], "agent-rally.command.run.v1");
     assert_matches_schema("agent-rally.command.run.v1.json", &herdr);
     assert_eq!(herdr["data"]["session"]["backend"], "herdr");
-    assert_eq!(herdr["data"]["session"]["target"], "claude-herdr-reviewer");
+    assert_eq!(
+        herdr["data"]["session"]["target"],
+        "claude-herdr-reviewer-01"
+    );
     assert_eq!(herdr["data"]["commands"]["start"][0][1], "agent");
     assert_eq!(herdr["data"]["commands"]["start"][0][2], "start");
 
     let herdr_inject = workspace.json(&[
         "inject",
-        "herdr-reviewer",
+        "herdr-reviewer-01",
         "--json",
         "--text",
         "hello herdr",
@@ -1127,7 +1236,7 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
 
     let herdr_capture = workspace.json(&[
         "capture",
-        "herdr-reviewer",
+        "herdr-reviewer-01",
         "--json",
         "--dry-run",
         "--lines",
@@ -1151,7 +1260,7 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
     assert_eq!(cmux["schema"], "agent-rally.command.run.v1");
     assert_matches_schema("agent-rally.command.run.v1.json", &cmux);
     assert_eq!(cmux["data"]["session"]["backend"], "cmux");
-    assert_eq!(cmux["data"]["session"]["target"], "codex-cmux-builder");
+    assert_eq!(cmux["data"]["session"]["target"], "codex-cmux-builder-01");
     assert_eq!(cmux["data"]["commands"]["start"][0][1], "new-workspace");
     assert!(
         !cmux["data"]["commands"]["start"][0]
@@ -1180,7 +1289,7 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
 
     let cmux_inject = workspace.json(&[
         "inject",
-        "cmux-builder",
+        "cmux-builder-01",
         "--json",
         "--text",
         "hello cmux",
@@ -1196,7 +1305,7 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
 
     let cmux_stop = workspace.json(&[
         "stop",
-        "cmux-builder",
+        "cmux-builder-01",
         "--json",
         "--cmux-bin",
         "/usr/bin/true",
@@ -1205,7 +1314,7 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
 
     let herdr_stop = workspace.json(&[
         "stop",
-        "herdr-reviewer",
+        "herdr-reviewer-01",
         "--json",
         "--herdr-bin",
         "/usr/bin/true",

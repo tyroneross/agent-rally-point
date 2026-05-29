@@ -76,6 +76,9 @@ rally say handoff --tool codex --target claude_code --subject "review docs" --su
 
 Managed sessions need no setup step. `rally run --backend <tmux|herdr|cmux>`
 starts the addressable pane/workspace, and `rally inject` delivers work to it.
+Rally assigns readable per-agent ids from the active room: `rally run claude`
+becomes `claude-01` with tool `claude_code:01`; a named reviewer becomes
+`reviewer-01` with tool `claude_code:reviewer-01`.
 
 ## Verification
 

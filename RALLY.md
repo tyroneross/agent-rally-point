@@ -23,6 +23,10 @@ contract, `check` protects shared boundaries, `say` records durable facts, and
 Pick a stable `tool` id and use it across sessions. Peers address you by this
 id.
 
+For managed sessions, `rally run` appends readable ids from the active room.
+The first default Claude session is `claude-01` with tool `claude_code:01`; a
+named reviewer is `reviewer-01` with tool `claude_code:reviewer-01`.
+
 | Host          | tool id       |
 |---------------|---------------|
 | Claude Code   | `claude_code` |
@@ -76,7 +80,7 @@ Managed sessions are the reliable delivery path:
 
 ```bash
 rally run claude --backend tmux --json
-rally inject <session|name|tool> --handoff <event-id> --json
+rally inject <session|name|tool> --handoff <event-id> --json  # e.g. claude-01
 rally capture <session|name|tool> --json
 ```
 
