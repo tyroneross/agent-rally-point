@@ -1,0 +1,27 @@
+{
+  "name": "dynamic-workflows",
+  "version": "0.1.0",
+  "description": "Portable workstream protocol + guardrail + host-facing skills for coordinating multiple agents through Agent Rally Point. Rally facilitates; hosts execute.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "workstream-lint": "./core/workstream-lint.mjs"
+  },
+  "exports": {
+    "./lint": "./core/workstream-lint.mjs",
+    "./limiter": "./core/limiter.mjs"
+  },
+  "scripts": {
+    "lint:example": "node core/workstream-lint.mjs examples/audit-repo.workstream.json",
+    "test": "node --test \"tests/**/*.test.mjs\""
+  },
+  "files": [
+    "core/",
+    "skills/",
+    "examples/",
+    "PROTOCOL.md",
+    "NOTICE",
+    "README.md"
+  ],
+  "dependencies": {}
+}

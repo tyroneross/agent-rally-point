@@ -1,0 +1,32 @@
+{
+  "workstream": "Audit the rally-cli crate for missing error context and add it",
+  "description": "Three agents harden error handling across disjoint modules of the rally CLI, coordinated through Rally so no two touch the same file. Each agent claims its paths, checks before writing, and posts an artifact with evidence.",
+  "thread": "ws_audit_rally_errors",
+  "tasks": [
+    {
+      "id": "store-errors",
+      "intent": "Add file/line context to fallible IO in the fact store",
+      "owns": ["crates/rally-cli/src/store.rs"],
+      "validation": "cargo test -p rally-cli store::",
+      "output": "store.rs returns Result with contextual messages; tests green",
+      "tier": "host-native"
+    },
+    {
+      "id": "check-errors",
+      "intent": "Add context to boundary-check failures",
+      "owns": ["crates/rally-cli/src/check.rs"],
+      "validation": "cargo test -p rally-cli check::",
+      "output": "check.rs surfaces actionable messages on malformed input; tests green",
+      "tier": "host-native"
+    },
+    {
+      "id": "review",
+      "intent": "Read both diffs and confirm consistent error style; no execution",
+      "owns": "read-only",
+      "validation": "cargo clippy --all-targets -- -D warnings",
+      "output": "a short review note posted as a rally artifact",
+      "tier": "host-native",
+      "depends_on": ["store-errors", "check-errors"]
+    }
+  ]
+}

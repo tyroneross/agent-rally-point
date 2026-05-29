@@ -1,0 +1,18 @@
+{
+  "workstream": "Example of a REJECTED descriptor: incomplete packet + boundary conflict",
+  "description": "Task 'a' is missing `validation` and `output`; tasks 'a' and 'b' both own overlapping paths under src/. workstream-lint rejects on both counts.",
+  "tasks": [
+    {
+      "id": "a",
+      "intent": "Edit the parser",
+      "owns": ["src/parser"]
+    },
+    {
+      "id": "b",
+      "intent": "Edit a parser submodule (overlaps task a)",
+      "owns": ["src/parser/tokens.rs"],
+      "validation": "cargo test",
+      "output": "tokens compile"
+    }
+  ]
+}
