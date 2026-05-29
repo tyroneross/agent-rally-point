@@ -3,7 +3,9 @@ SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.nor
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Dynamic Workflows — coordination protocol
+# Rally Flow — coordination protocol
+
+*Rally Flow is agent-rally-point's take on dynamic workflows.*
 
 A **workstream** is a coordination plan for several agents working the same repo. It is
 **not** an execution engine. Rally (the `rally` CLI) facilitates — it records facts, checks

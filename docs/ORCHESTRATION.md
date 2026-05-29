@@ -20,7 +20,7 @@ reads this + `rally room --json` and knows what is owned, in flight, landed, and
 - **One open milestone:** **L4/PR46 merge to `main`** — verified-done on branch `claude2/l4-audit-folds` (Claude #2), **not yet merged**. On merge → unblocks **B2 / L5** (observation seam) and full **B3** (parser audit).
 - **In flight:** Claude #2 → L4 (`next.rs`/`store.rs`, claims active). **Codex agents idle** — B1–B9 all done; only the L4-gated B10–B12 remain.
 - **Open backlog:** **B10–B12** (dogfood-3 quick-wins — gated on L4 merge; they touch check/store/next.rs). **B1–B9 all ✅ closed + verified.**
-- **Durable outputs this session:** dynamic-workflows module (L1+L6 — protocol, `workstream-lint`, `route.mjs`, `workstream-status` resume, host skills); doctrine `COORDINATION.md`; `MODEL-TIERS.md` (+ A/B verdict); `RALLY-AUTOMATION-PROPOSALS.md` (10 ranked, cross-host-corroborated).
+- **Durable outputs this session:** **Rally Flow** (agent-rally-point's take on dynamic workflows — the dynamic-workflows module: L1+L6 — protocol, `workstream-lint`, `route.mjs`, `workstream-status` resume, host skills); doctrine `COORDINATION.md`; `MODEL-TIERS.md` (+ A/B verdict); `RALLY-AUTOMATION-PROPOSALS.md` (10 ranked, cross-host-corroborated).
 - **Next lead actions:** (1) on L4 merge → flip B2/B3/L5, delegate **B10** (canonical-path matching — rank-1 linchpin) to Codex; (2) keep contracts **host-relative** (model tier + execution substrate); (3) sync board as facts land. Coordination is host-relative + charter-safe (rally facilitates, never executes/decides).
 
 ## Agent roster (2 Claude + 2 Codex)

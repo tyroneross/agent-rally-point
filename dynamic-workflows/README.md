@@ -1,7 +1,11 @@
 <!-- SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com> -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# dynamic-workflows
+# Rally Flow
+
+> **Rally Flow** — Agent Rally Point's take on dynamic workflows. The host-side workstream protocol
+> + guardrail + skills + durable resume that sits on rally. *Rally facilitates; hosts execute.*
+> (Implemented in this `dynamic-workflows/` directory.)
 
 A **portable, self-contained module** — workstream protocol + a zero-dependency descriptor linter
 (guardrail) + host-facing skills (Claude, Codex) — that lets any agent coordinate a multi-agent

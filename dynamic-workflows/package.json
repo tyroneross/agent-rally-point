@@ -1,7 +1,7 @@
 {
   "name": "dynamic-workflows",
   "version": "0.1.0",
-  "description": "Portable workstream protocol + guardrail + host-facing skills for coordinating multiple agents through Agent Rally Point. Rally facilitates; hosts execute.",
+  "description": "Rally Flow — Agent Rally Point's take on dynamic workflows: a portable workstream protocol + guardrail + host-facing skills + durable resume for coordinating multiple agents. Rally facilitates; hosts execute.",
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
