@@ -86,6 +86,42 @@ with evidence before declaring the workstream done. It never auto-trusts a peer'
 **Stop** (hand back to the user) when: `rally next.requires_human` is true, a `check before-write`
 blocks and can't be resolved, or a task hits a real blocker (`rally say blocker`).
 
+## 3b. Durable fan-out & resume (the long-running edge over pi-dynamic-workflows)
+
+pi-dynamic-workflows fans out cleanly (`agent()`/`parallel()`/`pipeline()`) but keeps all progress
+in one parent process's memory (`RuntimeState`). If that process dies — or the work spans sessions,
+hosts, or hours — everything is lost; there is no resume. This module keeps the same fan-out shape
+but **checkpoints every task to Rally**, so progress is durable and any fresh agent can resume.
+
+**Checkpoint convention** — a task is *started* by a claim and *done* by an artifact naming the id:
+
+```bash
+rally say claim    --tool <you> --subject "<task.id>" --path <owns...>
+rally say artifact --tool <you> --subject "<task.id>: <result>" --uri <path> --evidence "<validation>"
+```
+
+**Resume** (after a crash, a new session, or on a different host) — re-derive the remaining work from
+Rally instead of memory:
+
+```bash
+rally room --json > room.json
+node core/workstream-status.mjs my.workstream.json room.json
+# → per-task done|claimed|pending + `to_dispatch` (pending tasks whose deps are done)
+# exit 0 = complete · exit 3 = work remains
+```
+
+Re-dispatch ONLY the `to_dispatch` set; tasks with a done-artifact are skipped. A resumable host loop:
+
+```bash
+while ! node core/workstream-status.mjs ws.json <(rally room --json); do
+  : # spawn host-native agents for each id in to_dispatch (Tier 1), or rally run/inject (Tier 2)
+done
+```
+
+This is the piece pi structurally cannot have: **state lives in Rally, not a parent's RAM**, so a
+multi-hour / multi-session / multi-host workstream survives a crash and resumes exactly where it
+stopped. Bounded concurrency (`core/limiter.mjs`, lifted from pi) still caps in-flight fan-out.
+
 ## 4. Scaffolding scales to harness strength
 
 - **Strong harness** (Claude Code, Codex): stay thin. The skill points at this protocol, the host
