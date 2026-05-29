@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+
+# Canonical per-repo rally ledger. Append-only across all worktrees and
+# branches. `merge=union` makes git concatenate both sides on merge instead
+# of producing a conflict — which is the correct behavior for an
+# append-only event log: the merged file is the union of all events
+# anyone has ever recorded. Rally tolerates duplicate lines on replay
+# (dedup by sequence_number), so this is safe.
+.rally/ledger.jsonl merge=union

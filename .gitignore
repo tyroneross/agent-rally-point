@@ -47,8 +47,14 @@ Thumbs.db
 *.log
 target/
 
-# Local Rally room state
-.rally/
+# Local Rally room state.
+# `.rally/ledger.jsonl` IS committed — it is the canonical, append-only,
+# durable record of every fact in this repo's rally point. It survives
+# clone/machine with no external service. Everything else under .rally/
+# is a derived cache (facts.db, room.db, cursors.json, tmp files) that
+# `rally` rebuilds from the ledger on first open.
+.rally/*
+!.rally/ledger.jsonl
 .rally2/
 
 # Generated build-loop runtime state

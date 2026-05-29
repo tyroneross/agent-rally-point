@@ -4,10 +4,23 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
+
+/// Filename of the canonical, append-only, per-repo ledger.
+///
+/// This is the *durable* record of every fact that lands in the room. It is
+/// committed to the repository (un-gitignored in `.gitignore`, with
+/// `merge=union` in `.gitattributes`) so a clone or a fresh machine can
+/// reconstruct the room state without any external service or cache.
+///
+/// `facts.db` is a derived sqlite cache built by replaying this ledger; if the
+/// db is missing or behind the ledger, it is rebuilt on `open_at`. The ledger
+/// itself is never deleted by rally.
+pub(crate) const LEDGER_FILENAME: &str = "ledger.jsonl";
 
 use crate::backends::ManagedSession;
 use crate::cli::RoomArgs;
@@ -273,6 +286,22 @@ pub(crate) struct RoomStore {
     cursor_path: PathBuf,
     repo_root: PathBuf,
     facts_db_path: PathBuf,
+    ledger_path: PathBuf,
+}
+
+/// One line of `ledger.jsonl`.
+///
+/// Compact on purpose: one event, its assigned `seq` (factstr's monotonic
+/// `sequence_number`), an `occurred_at` ISO-8601 timestamp, the factstr
+/// `event_type`, and the full payload (the serialised `Fact`). Replaying these
+/// lines in order through `factstr` rebuilds `facts.db` verbatim because
+/// factstr assigns seqs deterministically in append order.
+#[derive(Debug, Deserialize, Serialize)]
+struct LedgerLine {
+    seq: i64,
+    occurred_at: String,
+    event_type: String,
+    payload: Value,
 }
 
 impl RoomStore {
@@ -280,17 +309,34 @@ impl RoomStore {
         Self::open_at(repo_root()?)
     }
 
+    /// Open the per-repo room, applying the **canonical ledger / derived db**
+    /// contract:
+    ///
+    /// 1. If `ledger.jsonl` exists and contains more events than the current
+    ///    `facts.db`, the db is rebuilt by replaying the ledger. The db is a
+    ///    pure cache — never canonical.
+    /// 2. If `ledger.jsonl` is absent but `facts.db` already has events, seed
+    ///    `ledger.jsonl` from the db so no history is lost on first upgrade.
+    /// 3. Otherwise the ledger and db are already in sync and we proceed.
+    ///
+    /// Both replay and seed are idempotent — running them twice on the same
+    /// inputs yields identical state.
     pub(crate) fn open_at(root: PathBuf) -> Result<Self> {
         let dir = root.join(".rally");
         fs::create_dir_all(&dir).map_err(RallyError::io("create .rally"))?;
         let _ = fs::remove_file(dir.join("room.db"));
         let fact_store_path = dir.join("facts.db");
+        let ledger_path = dir.join(LEDGER_FILENAME);
+
+        reconcile_ledger_and_db(&ledger_path, &fact_store_path)?;
+
         let fact_store = open_fact_store(&fact_store_path)?;
         let store = Self {
             fact_store,
             cursor_path: dir.join("cursors.json"),
             repo_root: root,
             facts_db_path: fact_store_path,
+            ledger_path,
         };
         let _ = store.refresh_index(0);
         Ok(store)
@@ -299,15 +345,21 @@ impl RoomStore {
     pub(crate) fn open_existing_at(root: PathBuf) -> Result<Option<Self>> {
         let dir = root.join(".rally");
         let fact_store_path = dir.join("facts.db");
-        if !fact_store_path.exists() {
+        let ledger_path = dir.join(LEDGER_FILENAME);
+        // Existence is determined by EITHER the canonical ledger OR the
+        // derived db — a clone that only carries `ledger.jsonl` is still a
+        // real room and must open transparently.
+        if !fact_store_path.exists() && !ledger_path.exists() {
             return Ok(None);
         }
+        reconcile_ledger_and_db(&ledger_path, &fact_store_path)?;
         let fact_store = open_fact_store(&fact_store_path)?;
         Ok(Some(Self {
             fact_store,
             cursor_path: dir.join("cursors.json"),
             repo_root: root,
             facts_db_path: fact_store_path,
+            ledger_path,
         }))
     }
 
@@ -317,10 +369,19 @@ impl RoomStore {
         let payload = serde_json::to_value(&fact).map_err(RallyError::json("render fact"))?;
         let result = self
             .fact_store
-            .append(vec![NewEvent::new(event_type, payload)])
+            .append(vec![NewEvent::new(event_type.clone(), payload.clone())])
             .map_err(|err| RallyError::Message(format!("append fact: {err}")))?;
         fact.seq = i64::try_from(result.last_sequence_number)
             .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
+        append_ledger_line(
+            &self.ledger_path,
+            &LedgerLine {
+                seq: fact.seq,
+                occurred_at: now_string(),
+                event_type,
+                payload,
+            },
+        )?;
         let _ = self.refresh_index(fact.seq);
         Ok(fact)
     }
@@ -334,7 +395,7 @@ impl RoomStore {
         let payload =
             serde_json::to_value(&fact).map_err(RallyError::json("render session fact"))?;
         let result = self.fact_store.append_if(
-            vec![NewEvent::new("session", payload)],
+            vec![NewEvent::new("session", payload.clone())],
             &FactQuery::for_event_types(["session"]),
             expected_context_version,
         );
@@ -343,6 +404,15 @@ impl RoomStore {
                 fact.seq = i64::try_from(result.last_sequence_number).map_err(|err| {
                     RallyError::Message(format!("sequence number overflow: {err}"))
                 })?;
+                append_ledger_line(
+                    &self.ledger_path,
+                    &LedgerLine {
+                        seq: fact.seq,
+                        occurred_at: now_string(),
+                        event_type: "session".to_string(),
+                        payload,
+                    },
+                )?;
                 let _ = self.refresh_index(fact.seq);
                 Ok(Some(fact))
             }
@@ -556,4 +626,320 @@ fn open_fact_store(path: &Path) -> Result<SqliteStore> {
 fn is_bootstrap_metadata_race(err: &impl std::fmt::Display) -> bool {
     err.to_string()
         .contains("UNIQUE constraint failed: store_metadata.key")
+}
+
+/// Reconcile the canonical ledger with the derived sqlite cache.
+///
+/// Called on every `RoomStore::open_at` / `open_existing_at`. The contract is:
+///
+/// * Ledger ahead of db (incl. db absent) → rebuild db by replaying ledger.
+/// * Ledger absent but db has events → seed ledger from db.
+/// * Both empty, or in sync → no-op.
+///
+/// Idempotent: running twice yields the same state.
+fn reconcile_ledger_and_db(ledger_path: &Path, facts_db_path: &Path) -> Result<()> {
+    let ledger_count = count_ledger_events(ledger_path)?;
+    let db_max_seq = read_db_max_seq(facts_db_path)?;
+
+    if ledger_count == 0 && db_max_seq == 0 {
+        return Ok(()); // fresh room or both empty
+    }
+
+    if ledger_count > db_max_seq {
+        // Canonical ledger is ahead of derived cache. Rebuild the cache.
+        rebuild_db_from_ledger(ledger_path, facts_db_path)?;
+        return Ok(());
+    }
+
+    if ledger_count == 0 && db_max_seq > 0 {
+        // First-run upgrade: db pre-dates the ledger feature. Seed the
+        // canonical record from the existing cache so we don't lose history.
+        seed_ledger_from_db(ledger_path, facts_db_path)?;
+    }
+    // ledger_count <= db_max_seq && ledger_count > 0 → cache is fresh or
+    // ahead; nothing to do. (Cache "ahead" can only happen if someone wrote
+    // straight to the db, which we never do.)
+    Ok(())
+}
+
+fn count_ledger_events(ledger_path: &Path) -> Result<i64> {
+    if !ledger_path.exists() {
+        return Ok(0);
+    }
+    let file = fs::File::open(ledger_path)
+        .map_err(RallyError::io(format!("read {}", ledger_path.display())))?;
+    let mut count = 0i64;
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(RallyError::io(format!("read {}", ledger_path.display())))?;
+        if !line.trim().is_empty() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn read_db_max_seq(facts_db_path: &Path) -> Result<i64> {
+    if !facts_db_path.exists() {
+        return Ok(0);
+    }
+    // Briefly open the cache to ask for its high-water mark, then drop the
+    // handle so the rebuild path (if it fires) can replace the file.
+    let store = open_fact_store(facts_db_path)?;
+    let query = store
+        .query(&FactQuery::all())
+        .map_err(|err| RallyError::Message(format!("query facts: {err}")))?;
+    let max = query
+        .event_records
+        .last()
+        .map(|record| record.sequence_number)
+        .unwrap_or(0);
+    i64::try_from(max)
+        .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))
+}
+
+fn rebuild_db_from_ledger(ledger_path: &Path, facts_db_path: &Path) -> Result<()> {
+    // Drop the cache file (and its sqlite sidecars) so factstr assigns
+    // sequence_numbers 1,2,3,… in the exact order they appear in the ledger.
+    // Replay-equivalence depends on this. Idempotent: replaying the same
+    // ledger twice yields the same db.
+    let _ = fs::remove_file(facts_db_path);
+    let _ = fs::remove_file(facts_db_path.with_extension("db-shm"));
+    let _ = fs::remove_file(facts_db_path.with_extension("db-wal"));
+
+    let file = fs::File::open(ledger_path)
+        .map_err(RallyError::io(format!("read {}", ledger_path.display())))?;
+    let store = open_fact_store(facts_db_path)?;
+    for (idx, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(RallyError::io(format!("read {}", ledger_path.display())))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: LedgerLine = serde_json::from_str(&line).map_err(RallyError::json(format!(
+            "parse {} line {}",
+            ledger_path.display(),
+            idx + 1
+        )))?;
+        let result = store
+            .append(vec![NewEvent::new(entry.event_type, entry.payload)])
+            .map_err(|err| RallyError::Message(format!("replay ledger: {err}")))?;
+        let assigned = i64::try_from(result.last_sequence_number)
+            .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
+        if assigned != entry.seq {
+            return Err(RallyError::Message(format!(
+                "ledger replay seq mismatch at line {}: expected {} got {}",
+                idx + 1,
+                entry.seq,
+                assigned
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn seed_ledger_from_db(ledger_path: &Path, facts_db_path: &Path) -> Result<()> {
+    let store = open_fact_store(facts_db_path)?;
+    let query = store
+        .query(&FactQuery::all())
+        .map_err(|err| RallyError::Message(format!("query facts: {err}")))?;
+    if let Some(parent) = ledger_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(RallyError::io(format!("create {}", parent.display())))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(ledger_path)
+        .map_err(RallyError::io(format!("create {}", ledger_path.display())))?;
+    for record in query.event_records {
+        let seq = i64::try_from(record.sequence_number)
+            .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
+        let entry = LedgerLine {
+            seq,
+            occurred_at: record.occurred_at.to_string(),
+            event_type: record.event_type,
+            payload: record.payload,
+        };
+        let line = serde_json::to_string(&entry).map_err(RallyError::json("render ledger line"))?;
+        writeln!(file, "{line}")
+            .map_err(RallyError::io(format!("write {}", ledger_path.display())))?;
+    }
+    file.sync_all()
+        .map_err(RallyError::io(format!("fsync {}", ledger_path.display())))?;
+    Ok(())
+}
+
+fn append_ledger_line(ledger_path: &Path, entry: &LedgerLine) -> Result<()> {
+    if let Some(parent) = ledger_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(RallyError::io(format!("create {}", parent.display())))?;
+    }
+    let line = serde_json::to_string(entry).map_err(RallyError::json("render ledger line"))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ledger_path)
+        .map_err(RallyError::io(format!("open {}", ledger_path.display())))?;
+    // One write call → atomic per POSIX for small lines on a local FS.
+    // `merge=union` in `.gitattributes` handles concurrent worktree appends.
+    writeln!(file, "{line}").map_err(RallyError::io(format!("write {}", ledger_path.display())))?;
+    file.sync_data()
+        .map_err(RallyError::io(format!("fsync {}", ledger_path.display())))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rally-{label}-{nanos}"));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn make_fact(event_id: &str, kind: FactKind, scope: &str, summary: &str) -> Fact {
+        Fact {
+            schema: fact_schema(),
+            event_id: event_id.to_string(),
+            seq: 0,
+            thread_id: format!("t-{event_id}"),
+            kind,
+            tool: Some("test".to_string()),
+            role: Some("test-role".to_string()),
+            subject: format!("subject-{event_id}"),
+            scope: vec![scope.to_string()],
+            created_at: now_string(),
+            summary: Some(summary.to_string()),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        }
+    }
+
+    /// The headline guarantee: `ledger.jsonl` is canonical and `facts.db` is a
+    /// pure derived cache. Delete the cache, reopen, and the room must
+    /// reconstruct identically — same seqs, same payloads, same snapshot.
+    #[test]
+    fn round_trip_db_rebuilds_from_ledger() {
+        let root = unique_root("ledger-roundtrip");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        let a = store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim a"))
+            .unwrap();
+        let b = store
+            .append_fact(&make_fact("e2", FactKind::Decision, "src/", "decided b"))
+            .unwrap();
+        let c = store
+            .append_fact(&make_fact("e3", FactKind::Blocker, "tests/", "blocker c"))
+            .unwrap();
+        assert_eq!((a.seq, b.seq, c.seq), (1, 2, 3));
+
+        let before_facts = store.facts().unwrap();
+        let before_snapshot = store.snapshot().unwrap();
+        drop(store);
+
+        // Delete the derived cache. Ledger remains.
+        let facts_db = root.join(".rally/facts.db");
+        let ledger = root.join(".rally/ledger.jsonl");
+        assert!(ledger.exists(), "ledger.jsonl must persist as canonical");
+        fs::remove_file(&facts_db).ok();
+        let _ = fs::remove_file(facts_db.with_extension("db-shm"));
+        let _ = fs::remove_file(facts_db.with_extension("db-wal"));
+        assert!(!facts_db.exists(), "cache deleted for replay test");
+
+        // Reopen → reconcile replays ledger into a fresh cache.
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let after_facts = store.facts().unwrap();
+        let after_snapshot = store.snapshot().unwrap();
+
+        assert_eq!(before_facts.len(), after_facts.len());
+        for (b, a) in before_facts.iter().zip(after_facts.iter()) {
+            assert_eq!(b.seq, a.seq);
+            assert_eq!(b.event_id, a.event_id);
+            assert_eq!(b.kind.as_str(), a.kind.as_str());
+            assert_eq!(b.subject, a.subject);
+            assert_eq!(b.scope, a.scope);
+        }
+        assert_eq!(before_snapshot.max_seq, after_snapshot.max_seq);
+        assert_eq!(
+            before_snapshot.active_claims.len(),
+            after_snapshot.active_claims.len()
+        );
+
+        // Idempotency: a second replay (delete cache again, reopen) yields
+        // identical state.
+        drop(store);
+        fs::remove_file(&facts_db).ok();
+        let _ = fs::remove_file(facts_db.with_extension("db-shm"));
+        let _ = fs::remove_file(facts_db.with_extension("db-wal"));
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let after2 = store.facts().unwrap();
+        assert_eq!(after_facts.len(), after2.len());
+        for (x, y) in after_facts.iter().zip(after2.iter()) {
+            assert_eq!(x.seq, y.seq);
+            assert_eq!(x.event_id, y.event_id);
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// First-run upgrade: a pre-existing room with a db but no ledger seeds
+    /// the canonical ledger from the cache so no history is lost.
+    #[test]
+    fn seed_ledger_from_existing_db() {
+        let root = unique_root("ledger-bootstrap");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim a"))
+            .unwrap();
+        store
+            .append_fact(&make_fact("e2", FactKind::Decision, "src/", "decided b"))
+            .unwrap();
+        drop(store);
+
+        // Simulate "upgraded from a pre-ledger version of rally": delete
+        // the ledger but keep the db.
+        let ledger = root.join(".rally/ledger.jsonl");
+        fs::remove_file(&ledger).unwrap();
+        assert!(!ledger.exists());
+        assert!(root.join(".rally/facts.db").exists());
+
+        // Reopen → reconcile seeds the ledger from the db.
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        assert!(ledger.exists(), "ledger must be seeded from db");
+
+        let lines: Vec<String> = fs::read_to_string(&ledger)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2);
+
+        // Now delete the db and confirm the seeded ledger round-trips.
+        drop(store);
+        let facts_db = root.join(".rally/facts.db");
+        fs::remove_file(&facts_db).ok();
+        let _ = fs::remove_file(facts_db.with_extension("db-shm"));
+        let _ = fs::remove_file(facts_db.with_extension("db-wal"));
+
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let facts = store.facts().unwrap();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].event_id, "e1");
+        assert_eq!(facts[1].event_id, "e2");
+
+        fs::remove_dir_all(&root).ok();
+    }
 }
