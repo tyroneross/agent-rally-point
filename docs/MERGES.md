@@ -68,3 +68,9 @@ branch→`main` merge (e.g. L4) gets the full entry above.
 - **Lead audit:** ✅ VERIFIED — re-ran gates myself (not envelope-trust): `npm test` 37/37 pass · `workstream-lint examples` exit 0 + bad fixtures reject · `cargo build` Finished clean · `git diff --stat a0140a4~1..641ca25` shows **0 `crates/**` files** (charter lane respected); 20 files all in owned lanes (incl. authorized B1 cross-ref in `skills/agent-rally-point/SKILL.md`).
 - **Reconciliation:** `codex:dynwf-coordinator` (seq391) correctly flagged a kind-vs-lane taxonomy mismatch (12/6 by kind ≠ 8/8/2 by lane) — documented crosswalk in the assessment doc; counts reconcile (18).
 - **Blast radius / reversibility:** docs + JS module only; `git revert a0140a4..641ca25` fully reverts; no schema/runtime change.
+
+## 2026-05-29 · 26de1c6..4b8f964 · R1 ledger persistence + R2 build-loop decouple + R3 segmentation — lead post-hoc audit
+- **Context (why):** user-directed — rally must be build-loop-independent, per-repo segmented, with a persistent per-repo ledger.
+- **Lead audit:** ✅ VERIFIED — re-ran `cargo test --all` (6 binaries ok, 41 tests incl. ledger round-trip + replay + no-global-index) · crate edits confined to store.rs/discovery.rs/+test · `.rally/ledger.jsonl` canonical (un-gitignored, merge=union) · `.build-loop/` untracked (0 files) · `git grep build.loop` shows only optional-example/historical mentions.
+- **Open follow-on (user reframe):** persistence ≠ discoverability. The "easily-findable front door + doc pointers" layer is NOT yet built — see assessment.
+- **Reversibility:** `git revert 26de1c6..4b8f964`; ledger is additive, db rebuilds either way.
