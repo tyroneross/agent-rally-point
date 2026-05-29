@@ -67,7 +67,7 @@ pub(crate) fn build_check(
         }
     }
     let stop = findings.iter().any(|finding| finding.severity == "stop");
-    let allow = !stop || !strict;
+    let allow = !stop;
     let exit_code = if strict && stop { 4 } else { 0 };
     let finding_count = findings.len();
     Ok(CheckOutcome {
@@ -101,7 +101,7 @@ fn check_before_write(
     path: Option<&str>,
     findings: &mut Vec<CheckFinding>,
 ) {
-    let Some(path) = path else {
+    if path.is_none() {
         findings.push(CheckFinding {
             code: "missing-path",
             severity: "warn",
@@ -111,32 +111,35 @@ fn check_before_write(
             path: None,
             scope: Vec::new(),
         });
-        return;
-    };
-    for claim in &snapshot.active_claims {
-        if claim
-            .scope
-            .iter()
-            .any(|scope| path_matches_scope(scope, path))
-            && claim.tool.as_deref() != Some(tool)
-        {
-            findings.push(CheckFinding {
-                code: "claimed-path",
-                severity: "stop",
-                message: "another agent has claimed this path".to_string(),
-                fact_id: Some(claim.event_id.clone()),
-                owner: claim.tool.clone(),
-                path: Some(path.to_string()),
-                scope: Vec::new(),
-            });
+    }
+    if let Some(path) = path {
+        for claim in &snapshot.active_claims {
+            if claim
+                .scope
+                .iter()
+                .any(|scope| path_matches_scope(scope, path))
+                && claim.tool.as_deref() != Some(tool)
+            {
+                findings.push(CheckFinding {
+                    code: "claimed-path",
+                    severity: "stop",
+                    message: "another agent has claimed this path".to_string(),
+                    fact_id: Some(claim.event_id.clone()),
+                    owner: claim.tool.clone(),
+                    path: Some(path.to_string()),
+                    scope: Vec::new(),
+                });
+            }
         }
     }
     for decision in &snapshot.current_decisions {
-        if decision
-            .scope
-            .iter()
-            .any(|scope| path_matches_scope(scope, path))
-            || decision.scope.is_empty()
+        if decision.scope.is_empty()
+            || path.is_some_and(|path| {
+                decision
+                    .scope
+                    .iter()
+                    .any(|scope| path_matches_scope(scope, path))
+            })
         {
             findings.push(CheckFinding {
                 code: "binding-decision",
@@ -144,17 +147,19 @@ fn check_before_write(
                 message: decision.subject.clone(),
                 fact_id: Some(decision.event_id.clone()),
                 owner: None,
-                path: Some(path.to_string()),
+                path: path.map(str::to_string),
                 scope: Vec::new(),
             });
         }
     }
     for blocker in &snapshot.active_blockers {
         if blocker.scope.is_empty()
-            || blocker
-                .scope
-                .iter()
-                .any(|scope| path_matches_scope(scope, path))
+            || path.is_some_and(|path| {
+                blocker
+                    .scope
+                    .iter()
+                    .any(|scope| path_matches_scope(scope, path))
+            })
         {
             findings.push(CheckFinding {
                 code: "active-blocker",
@@ -162,7 +167,7 @@ fn check_before_write(
                 message: blocker.subject.clone(),
                 fact_id: Some(blocker.event_id.clone()),
                 owner: None,
-                path: Some(path.to_string()),
+                path: path.map(str::to_string),
                 scope: Vec::new(),
             });
         }

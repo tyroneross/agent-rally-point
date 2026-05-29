@@ -267,7 +267,20 @@ fn command_recent(args: RecentArgs) -> Result<Output> {
 
 fn command_check(args: CheckArgs) -> Result<Output> {
     let phase = args.phase;
-    let tool = args.tool.unwrap_or_else(|| "unknown".to_string());
+    let tool = match args.tool {
+        Some(tool) if phase == "before-write" && tool == "unknown" => {
+            return Err(RallyError::Usage(
+                "check before-write requires a real --tool <tool>".to_string(),
+            ));
+        }
+        Some(tool) => tool,
+        None if phase == "before-write" => {
+            return Err(RallyError::Usage(
+                "check before-write requires --tool <tool>".to_string(),
+            ));
+        }
+        None => "unknown".to_string(),
+    };
     let path = args.path.map(normalize_path);
     let room = RoomStore::open()?;
     let snapshot = room.snapshot()?;
