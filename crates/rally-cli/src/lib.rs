@@ -18,6 +18,8 @@ const SCHEMA_ENTER: &str = "agent-rally.command.enter.v1";
 const SCHEMA_SAY: &str = "agent-rally.command.say.v1";
 const SCHEMA_ROOM: &str = "agent-rally.command.room.v1";
 const SCHEMA_NEXT: &str = "agent-rally.command.next.v1";
+const SCHEMA_LOCATE: &str = "agent-rally.command.locate.v1";
+const SCHEMA_RECENT: &str = "agent-rally.command.recent.v1";
 const SCHEMA_CHECK: &str = "agent-rally.command.check.v1";
 const SCHEMA_RUN: &str = "agent-rally.command.run.v1";
 const SCHEMA_SESSIONS: &str = "agent-rally.command.sessions.v1";
@@ -34,6 +36,7 @@ macro_rules! cmd {
 mod backends;
 mod check;
 mod cli;
+mod discovery;
 mod error;
 mod next;
 mod output;
@@ -80,6 +83,8 @@ fn run_inner() -> Result<Output> {
         CliCommand::Say(args) => command_say(args),
         CliCommand::Room(args) => command_room(args),
         CliCommand::Next(args) => command_next(args),
+        CliCommand::Locate(args) => command_locate(args),
+        CliCommand::Recent(args) => command_recent(args),
         CliCommand::Check(args) => command_check(args),
         CliCommand::Run(args) => command_run(args),
         CliCommand::Sessions(args) => command_sessions(args),
@@ -216,6 +221,12 @@ fn command_next(args: NextArgs) -> Result<Output> {
         .target_event_id
         .clone()
         .unwrap_or_else(|| "none".to_string());
+    let wake_intent = append_next_wake_intent(&room, &tool, &paths, &next)?;
+    let snapshot = if wake_intent.is_some() {
+        room.snapshot()?
+    } else {
+        snapshot
+    };
     let body = envelope(
         "next",
         SCHEMA_NEXT,
@@ -224,10 +235,27 @@ fn command_next(args: NextArgs) -> Result<Output> {
             role,
             paths,
             next,
+            wake_intent,
             room: RoomSummary::from(&snapshot),
         },
     );
     let text = format!("next action={action} target={target_event_id}");
+    Ok(Output::new(args.json, text, body))
+}
+
+fn command_locate(args: LocateArgs) -> Result<Output> {
+    let data = discovery::locate(&args.event_id, args.include_legacy)?;
+    let found = data.located.is_some();
+    let body = envelope("locate", SCHEMA_LOCATE, data);
+    let text = format!("locate event={} found={}", args.event_id, found);
+    Ok(Output::new(args.json, text, body))
+}
+
+fn command_recent(args: RecentArgs) -> Result<Output> {
+    let data = discovery::recent(args.all, args.include_legacy, args.limit)?;
+    let count = data.rows.len();
+    let body = envelope("recent", SCHEMA_RECENT, data);
+    let text = format!("recent rows={count}");
     Ok(Output::new(args.json, text, body))
 }
 
@@ -343,6 +371,7 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     if !dry_run {
         backend_runner.inject(&live_target, &text)?;
     }
+    let wake_intent = inject_wake_intent(&session, handoff.as_deref(), &commands, dry_run)?;
     let ack = if require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
         Some(wait_for_resolution(handoff, timeout)?)
@@ -358,6 +387,7 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
             handoff,
             require_ack,
             ack,
+            wake_intent,
             commands: command_plan_json(&commands),
         },
     );
@@ -515,6 +545,93 @@ fn session_fact(session: &ManagedSession, status: &str, ref_id: Option<String>) 
     }
 }
 
+fn append_next_wake_intent(
+    room: &RoomStore,
+    tool: &str,
+    paths: &[String],
+    next: &NextResult,
+) -> Result<Option<Fact>> {
+    if matches!(next.action, "wait" | "proceed_solo") {
+        return Ok(None);
+    }
+    let subject = format!("wake intent for {tool}: {}", next.action);
+    let summary = format!(
+        "rally next found actionable work for {tool}: {}",
+        next.action
+    );
+    let fact = wake_fact(
+        tool,
+        &subject,
+        paths.to_vec(),
+        Some(summary),
+        vec!["rally next --tool <tool> --json".to_string()],
+        next.target_event_id.clone(),
+        Some("pending".to_string()),
+    );
+    room.append_fact(&fact).map(Some)
+}
+
+fn inject_wake_intent(
+    session: &ManagedSession,
+    handoff: Option<&str>,
+    commands: &[Vec<String>],
+    dry_run: bool,
+) -> Result<Option<Fact>> {
+    let status = if dry_run { "planned" } else { "delivered" };
+    let subject = format!("wake intent delivered to {}", session.tool);
+    let summary = Some(format!(
+        "rally inject {status} for managed session {} via {}",
+        session.name, session.backend
+    ));
+    let evidence = commands.iter().map(|command| command.join(" ")).collect();
+    let fact = wake_fact(
+        &session.tool,
+        &subject,
+        Vec::new(),
+        summary,
+        evidence,
+        handoff.map(str::to_string),
+        Some(status.to_string()),
+    );
+    if dry_run {
+        Ok(Some(fact))
+    } else {
+        let room = RoomStore::open()?;
+        room.append_fact(&fact).map(Some)
+    }
+}
+
+fn wake_fact(
+    target_tool: &str,
+    subject: &str,
+    scope: Vec<String>,
+    summary: Option<String>,
+    evidence: Vec<String>,
+    ref_id: Option<String>,
+    status: Option<String>,
+) -> Fact {
+    Fact {
+        schema: FACT_SCHEMA.to_string(),
+        event_id: new_id("wake"),
+        seq: 0,
+        thread_id: format!("wake-{}", sanitize_id(target_tool)),
+        kind: FactKind::Wake,
+        tool: Some("rally".to_string()),
+        role: None,
+        subject: subject.to_string(),
+        scope,
+        created_at: now_string(),
+        summary,
+        evidence,
+        target: Some(target_tool.to_string()),
+        ref_id,
+        status,
+        severity: None,
+        uri: None,
+        session: None,
+    }
+}
+
 fn find_session(target: &str) -> Result<ManagedSession> {
     read_session_records()?
         .into_iter()
@@ -622,6 +739,7 @@ struct NextData {
     role: Option<String>,
     paths: Vec<String>,
     next: NextResult,
+    wake_intent: Option<Fact>,
     room: RoomSummary,
 }
 
@@ -726,6 +844,7 @@ fn default_subject(kind: &str) -> String {
         "risk" => "risk".to_string(),
         "lesson" => "lesson".to_string(),
         "session" => "managed session".to_string(),
+        "wake" => "wake intent".to_string(),
         _ => kind.to_string(),
     }
 }
@@ -783,6 +902,8 @@ fn help_text() -> String {
         "  rally say <kind> --tool <tool> --subject <subject> [--path <path>] [--json]",
         "  rally room [--tool <tool>] [--role <role>] [--path <path>] [--since <seq>] [--json]",
         "  rally next --tool <tool> [--path <path>] [--role <role>] [--limit <n>] [--json]",
+        "  rally locate <event-id> [--include-legacy] [--json]",
+        "  rally recent [--all] [--include-legacy] [--limit <n>] [--json]",
         "  rally check before-write --tool <tool> --path <path> [--strict] [--json]",
         "  rally check before-complete --tool <tool> [--strict] [--json]",
         "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|herdr|cmux>] [--dry-run] [--json]",
@@ -792,7 +913,7 @@ fn help_text() -> String {
         "  rally capture <session|name|tool> [--lines <n>] [--dry-run] [--json]",
         "  rally stop <session|name|tool> [--dry-run] [--json]",
         "",
-        "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session",
+        "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake",
     ]
     .join("\n")
 }

@@ -18,6 +18,7 @@
         "handoff": { "type": ["string", "null"] },
         "require_ack": { "type": "boolean" },
         "ack": { "type": ["object", "null"] },
+        "wake_intent": { "type": ["object", "null"] },
         "commands": { "type": "array" }
       }
     }

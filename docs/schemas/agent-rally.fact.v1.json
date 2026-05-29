@@ -32,7 +32,8 @@
         "handoff",
         "risk",
         "lesson",
-        "session"
+        "session",
+        "wake"
       ]
     },
     "subject": { "type": "string" },

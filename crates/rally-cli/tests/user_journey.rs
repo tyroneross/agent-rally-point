@@ -4,7 +4,7 @@
 use chrono::DateTime;
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,6 +21,17 @@ impl Workspace {
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
         Self { cwd, home }
+    }
+
+    fn new_with_home(name: &str, home: &Path) -> Self {
+        let cwd = temp_path(&format!("{name}-cwd"));
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(home).unwrap();
+        fs::create_dir_all(cwd.join(".git")).unwrap();
+        Self {
+            cwd,
+            home: home.to_path_buf(),
+        }
     }
 
     fn json(&self, args: &[&str]) -> Value {
@@ -879,6 +890,160 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     assert!(!workspace.cwd.join(".rally/sessions.json").exists());
 
     workspace.cleanup();
+}
+
+#[test]
+fn rally_next_and_inject_emit_wake_intent_facts() {
+    let workspace = Workspace::new("rally-wake-intent");
+
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--target",
+        "codex",
+        "--subject",
+        "wake codex for review",
+    ]);
+    let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
+
+    let next = workspace.json(&["next", "--json", "--tool", "codex"]);
+    assert_matches_schema("agent-rally.command.next.v1.json", &next);
+    assert_eq!(next["data"]["next"]["action"], "respond_to_handoff");
+    assert_eq!(next["data"]["wake_intent"]["kind"], "wake");
+    assert_eq!(next["data"]["wake_intent"]["target"], "codex");
+    assert_eq!(next["data"]["wake_intent"]["ref"], handoff_id);
+    assert_eq!(next["data"]["wake_intent"]["status"], "pending");
+    let next_wake_id = next["data"]["wake_intent"]["event_id"].as_str().unwrap();
+    let located_next_wake = workspace.json(&["locate", next_wake_id, "--json"]);
+    assert_eq!(located_next_wake["data"]["located"]["source"], "room");
+
+    let run = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "reviewer",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(run["data"]["session"]["tool"], "claude_code:reviewer");
+    let inject = workspace.json(&[
+        "inject",
+        "reviewer",
+        "--json",
+        "--handoff",
+        handoff_id,
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert_matches_schema("agent-rally.command.inject.v1.json", &inject);
+    assert_eq!(inject["data"]["wake_intent"]["kind"], "wake");
+    assert_eq!(
+        inject["data"]["wake_intent"]["target"],
+        "claude_code:reviewer"
+    );
+    assert_eq!(inject["data"]["wake_intent"]["ref"], handoff_id);
+    assert_eq!(inject["data"]["wake_intent"]["status"], "delivered");
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_locate_and_recent_discover_rooms_and_legacy_channels() {
+    let home = temp_path("rally-discovery-home");
+    let repo_a = Workspace::new_with_home("rally-discovery-a", &home);
+    let repo_b = Workspace::new_with_home("rally-discovery-b", &home);
+
+    let decision = repo_a.json(&[
+        "say",
+        "decision",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "repo a decision",
+    ]);
+    let decision_id = decision["data"]["fact"]["event_id"].as_str().unwrap();
+    let artifact = repo_b.json(&[
+        "say",
+        "artifact",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--subject",
+        "repo b artifact",
+        "--uri",
+        "file:artifact.md",
+    ]);
+    let artifact_id = artifact["data"]["fact"]["event_id"].as_str().unwrap();
+
+    let located = repo_b.json(&["locate", decision_id, "--json"]);
+    assert_matches_schema("agent-rally.command.locate.v1.json", &located);
+    assert_eq!(located["data"]["located"]["source"], "room");
+    assert_eq!(
+        located["data"]["located"]["fact"]["event_id"].as_str(),
+        Some(decision_id)
+    );
+    assert!(
+        located["data"]["located"]["repo_root"]
+            .as_str()
+            .unwrap()
+            .contains("rally-discovery-a-cwd")
+    );
+
+    let legacy_dir = home.join(".agent-rally-point/apps/repo_legacy");
+    fs::create_dir_all(&legacy_dir).unwrap();
+    fs::write(
+        legacy_dir.join("changes.jsonl"),
+        r#"{"local_seq":7,"event":{"id":"evt_legacy_wake","kind":"handoff","subject":"legacy wake","time":"2026-05-28T00:00:00Z"}}"#,
+    )
+    .unwrap();
+
+    let hidden = repo_b.json(&["recent", "--all", "--json", "--limit", "10"]);
+    assert_matches_schema("agent-rally.command.recent.v1.json", &hidden);
+    assert!(
+        hidden["data"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["code"] == "legacy_hidden")
+    );
+
+    let legacy = repo_b.json(&["locate", "evt_legacy_wake", "--include-legacy", "--json"]);
+    assert_eq!(legacy["data"]["located"]["source"], "legacy_channel");
+    assert_eq!(legacy["data"]["located"]["local_seq"], 7);
+
+    let recent = repo_b.json(&[
+        "recent",
+        "--all",
+        "--include-legacy",
+        "--json",
+        "--limit",
+        "10",
+    ]);
+    assert!(
+        recent["data"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["fact"]["event_id"].as_str() == Some(artifact_id))
+    );
+    assert!(
+        recent["data"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["record"]["event"]["id"] == "evt_legacy_wake")
+    );
+
+    repo_a.cleanup();
+    repo_b.cleanup();
+    fs::remove_dir_all(home).ok();
 }
 
 #[test]

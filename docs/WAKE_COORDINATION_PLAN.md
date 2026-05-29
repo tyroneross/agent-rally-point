@@ -59,6 +59,8 @@ Rules: verdicts gate (don't advance a piece past `verification-pending` until th
 
 ## 5. Decisions log (P4 + any mid-flight)
 <!-- append: date — decision — ratified-by -->
+- 2026-05-28 — Default wake confirmation should be Rally channel-confirm; Herdr v4 status is useful only after target session restart and should remain a secondary liveness/delivery signal. Token echo remains valid for direct reply tests; tmux/no-integration paths use channel-confirm. — ratified-by: codex; pending: claude_code
+- 2026-05-28 — Coordination for this integration run uses the original Rally channel for `/Users/tyroneross/dev/git-folder/agent-rally-point` (`repo_196422842096be12`) even though the integration worktree resolves to a separate room; use explicit `--workdir /Users/tyroneross/dev/git-folder/agent-rally-point` for cross-agent status until the plan is updated or rooms are bridged. — ratified-by: codex; pending: claude_code
 
 ## 6. References
 - Research: `~/dev/research/projects/agent-rally-point/cross-agent-terminal-wake-inject-herdr-tmux-2026-05-28.md`

@@ -7,6 +7,7 @@ use std::process::Command;
 use crate::cli::BackendBins;
 use crate::error::{RallyError, Result};
 use crate::shell_quote;
+use crate::store::Fact;
 
 #[derive(Clone, Debug)]
 pub(crate) struct AgentSpec {
@@ -85,6 +86,7 @@ pub(crate) struct InjectData {
     pub(crate) handoff: Option<String>,
     pub(crate) require_ack: bool,
     pub(crate) ack: Option<Value>,
+    pub(crate) wake_intent: Option<Fact>,
     pub(crate) commands: Vec<Value>,
 }
 

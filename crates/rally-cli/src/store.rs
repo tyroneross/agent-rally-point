@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use crate::backends::ManagedSession;
 use crate::cli::RoomArgs;
+use crate::discovery::refresh_room_index;
 use crate::error::{RallyError, Result};
 use crate::{FACT_SCHEMA, normalize_paths, now_string, path_matches_scope, repo_root, short_id};
 
@@ -25,6 +26,7 @@ pub(crate) enum FactKind {
     Risk,
     Lesson,
     Session,
+    Wake,
     #[serde(other)]
     #[default]
     Unknown,
@@ -43,6 +45,7 @@ impl FactKind {
             "risk" => Some(Self::Risk),
             "lesson" => Some(Self::Lesson),
             "session" => Some(Self::Session),
+            "wake" => Some(Self::Wake),
             "unknown" => Some(Self::Unknown),
             _ => None,
         }
@@ -60,6 +63,7 @@ impl FactKind {
             Self::Risk => "risk",
             Self::Lesson => "lesson",
             Self::Session => "session",
+            Self::Wake => "wake",
             Self::Unknown => "unknown",
         }
     }
@@ -265,21 +269,46 @@ impl From<&RoomSnapshot> for RoomSummary {
 pub(crate) struct RoomStore {
     fact_store: SqliteStore,
     cursor_path: PathBuf,
+    repo_root: PathBuf,
+    facts_db_path: PathBuf,
 }
 
 impl RoomStore {
     pub(crate) fn open() -> Result<Self> {
-        let root = repo_root()?;
+        Self::open_at(repo_root()?)
+    }
+
+    pub(crate) fn open_at(root: PathBuf) -> Result<Self> {
         let dir = root.join(".rally");
         fs::create_dir_all(&dir).map_err(RallyError::io("create .rally"))?;
         let _ = fs::remove_file(dir.join("room.db"));
         let fact_store_path = dir.join("facts.db");
         let fact_store = SqliteStore::open(&fact_store_path)
             .map_err(|err| RallyError::Message(format!("open fact store: {err}")))?;
-        Ok(Self {
+        let store = Self {
             fact_store,
             cursor_path: dir.join("cursors.json"),
-        })
+            repo_root: root,
+            facts_db_path: fact_store_path,
+        };
+        let _ = store.refresh_index(0);
+        Ok(store)
+    }
+
+    pub(crate) fn open_existing_at(root: PathBuf) -> Result<Option<Self>> {
+        let dir = root.join(".rally");
+        let fact_store_path = dir.join("facts.db");
+        if !fact_store_path.exists() {
+            return Ok(None);
+        }
+        let fact_store = SqliteStore::open(&fact_store_path)
+            .map_err(|err| RallyError::Message(format!("open fact store: {err}")))?;
+        Ok(Some(Self {
+            fact_store,
+            cursor_path: dir.join("cursors.json"),
+            repo_root: root,
+            facts_db_path: fact_store_path,
+        }))
     }
 
     pub(crate) fn append_fact(&self, fact: &Fact) -> Result<Fact> {
@@ -291,6 +320,7 @@ impl RoomStore {
             .append(vec![NewEvent::new(event_type, payload)])
             .map_err(|err| RallyError::Message(format!("append fact: {err}")))?;
         fact.seq = result.last_sequence_number as i64;
+        let _ = self.refresh_index(fact.seq);
         Ok(fact)
     }
 
@@ -440,6 +470,10 @@ impl RoomStore {
             .iter()
             .filter_map(|(tool, seq)| seq.as_i64().map(|seq| (tool.clone(), seq)))
             .collect())
+    }
+
+    fn refresh_index(&self, last_seen_seq: i64) -> Result<()> {
+        refresh_room_index(&self.repo_root, &self.facts_db_path, last_seen_seq)
     }
 }
 

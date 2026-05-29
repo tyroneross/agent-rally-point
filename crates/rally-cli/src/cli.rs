@@ -15,6 +15,8 @@ pub(crate) enum CliCommand {
     Sessions(SessionsArgs),
     Inject(InjectArgs),
     Session(SessionActionArgs),
+    Locate(LocateArgs),
+    Recent(RecentArgs),
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +66,21 @@ pub(crate) struct NextArgs {
     pub(crate) tool: String,
     pub(crate) role: Option<String>,
     pub(crate) paths: Vec<String>,
+    pub(crate) limit: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LocateArgs {
+    pub(crate) json: bool,
+    pub(crate) event_id: String,
+    pub(crate) include_legacy: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RecentArgs {
+    pub(crate) json: bool,
+    pub(crate) all: bool,
+    pub(crate) include_legacy: bool,
     pub(crate) limit: i64,
 }
 
@@ -134,7 +151,7 @@ impl Default for BackendBins {
 
 const COMMANDS: &[&str] = &[
     "enter", "say", "room", "next", "check", "run", "sessions", "inject", "attach", "capture",
-    "stop",
+    "stop", "locate", "recent",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -182,6 +199,14 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("next")
         .map(CliCommand::Next);
+    let locate = locate_parser()
+        .to_options()
+        .command("locate")
+        .map(CliCommand::Locate);
+    let recent = recent_parser()
+        .to_options()
+        .command("recent")
+        .map(CliCommand::Recent);
     let check = check_parser()
         .to_options()
         .command("check")
@@ -212,7 +237,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .map(CliCommand::Session);
 
     construct!([
-        enter, say, room, next, check, run, sessions, inject, attach, capture, stop
+        enter, say, room, next, locate, recent, check, run, sessions, inject, attach, capture, stop
     ])
     .to_options()
 }
@@ -301,6 +326,30 @@ fn next_parser() -> impl Parser<NextArgs> {
         tool,
         role,
         paths,
+        limit
+    })
+}
+
+fn locate_parser() -> impl Parser<LocateArgs> {
+    let json = json_flag();
+    let event_id = positional::<String>("EVENT_ID");
+    let include_legacy = long("include-legacy").switch();
+    construct!(LocateArgs {
+        json,
+        event_id,
+        include_legacy
+    })
+}
+
+fn recent_parser() -> impl Parser<RecentArgs> {
+    let json = json_flag();
+    let all = long("all").switch();
+    let include_legacy = long("include-legacy").switch();
+    let limit = bounded_i64_arg("limit", "N", 20, 1, 500);
+    construct!(RecentArgs {
+        json,
+        all,
+        include_legacy,
         limit
     })
 }
