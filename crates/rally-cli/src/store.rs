@@ -425,6 +425,7 @@ impl RoomStore {
         let current_risks = facts
             .iter()
             .filter(|f| f.kind == "risk")
+            .filter(|f| !resolved.contains(&f.event_id))
             .rev()
             .take(20)
             .cloned()

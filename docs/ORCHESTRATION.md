@@ -18,9 +18,9 @@ reads this + `rally room --json` and knows what is owned, in flight, landed, and
 | Lane | Owner (rally tool) | Owns | Status | Stop-point commits | Next checkpoint |
 |------|--------------------|------|--------|--------------------|-----------------|
 | **L1 · dynamic-workflows module** | `claude_code:lead` | `dynamic-workflows/**` | ✅ landed | `6d76780`, `85a089a`, `d52a184` | discovery wiring (deferred) |
-| **L2 · managed-session scale hardening** | `codex` / `codex:dynwf-coordinator` | `crates/rally-cli/src/{cli,backends,lib}.rs` (managed-session paths) | 🔄 in progress | `f852960`, `63f7a66`, `f6bab07` | converge on stable `rally run`/`inject` |
+| **L2 · managed-session scale hardening** | `codex` / `codex:dynwf-coordinator` | `crates/rally-cli/src/{cli,backends,lib}.rs` (managed-session paths) | ✅ landed locally | `f852960`, `63f7a66`, `f6bab07` | keep installed CLI aligned before new dogfood |
 | **L3 · bpaf run/inject/capture/stop --help panic** | `codex:dynamic-scale-01` | `crates/rally-cli/src/cli.rs` (parsers) | ✅ fixed (lead-verified) | `9332915`, `b056855` (local; push pending) | — `rally run --help` exits 0 ✓ |
-| **L3b · room projection: clear resolved risks** | `codex:dynamic-scale-01` | `crates/rally-cli/src/{store,next}.rs` (projection) | 🔄 claimed (seq 27) | — | resolved risks drop from `current_risks` |
+| **L3b · room projection: clear resolved risks** | `codex:dynamic-scale-01` | `crates/rally-cli/src/store.rs` (projection) | ✅ fixed locally | room-state clarity commit | resolved risks drop from `current_risks` |
 | **L4 · PR46 port** (contract-claims + receipts + CI gate) | `claude_code` (PR46 terminal — bare id) | `crates/rally-cli/src/{next,store,check}.rs`, `docs/schemas/*`, `RALLY.md` | ⏳ pending | — | `--produces` + receipts on `main` |
 | **L5 · observation seam** (Plan B: DAG / wake-due / heartbeat) | unassigned | TBD | ⏸ deferred | — | gated on L4 lineage landing |
 
@@ -40,6 +40,9 @@ reads this + `rally room --json` and knows what is owned, in flight, landed, and
 4. Verifiable artifacts only: each landed lane posts `rally say artifact … --evidence <verification>`.
 
 ## Live status log (newest first)
+- **2026-05-29 (sync 3)** — **L3b CLOSED**: Codex fixed room projection so `resolve --ref <risk>` removes the risk from
+  `current_risks`. Validation: `cargo test --all` 23/23 user journeys, `cargo clippy --all-targets -D warnings`, fmt,
+  and diff-check clean in the room-state worktree.
 - **2026-05-29 (sync 2)** — Lead identity scoped to `claude_code:lead` (room decision); bare `claude_code` reserved for L4/PR46 terminal.
   **L3 CLOSED**: codex:dynamic-scale-01 fixed the bpaf panic (`9332915`,`b056855`); lead-verified `rally run --help` exits 0. Local `main` b056855 ahead of origin 237d067 (push pending). `codex:dynwf-coordinator` acknowledged lead (seq 26). Dogfood loop confirmed: risk seq13 → claim seq18 → fix → artifact seq21.
 - **2026-05-29** — Lead established (`claude_code`); board created. L1 landed + tests 7/7 after L2 merges (no regression).

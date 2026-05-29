@@ -629,6 +629,58 @@ fn rally_artifact_ref_consumes_handoff_but_not_blocker_or_claim() {
 }
 
 #[test]
+fn rally_resolve_closes_risks_in_room_projection() {
+    let workspace = Workspace::new("rally-resolve-risks");
+
+    let risk = workspace.json(&[
+        "say",
+        "risk",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--subject",
+        "help path is broken",
+        "--severity",
+        "high",
+    ]);
+    let risk_id = risk["data"]["fact"]["event_id"].as_str().unwrap();
+
+    let room_before = workspace.json(&["room", "--json"]);
+    assert!(
+        room_before["data"]["room"]["current_risks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["event_id"] == risk_id),
+        "unresolved risk should be current"
+    );
+
+    workspace.json(&[
+        "say",
+        "resolve",
+        "--json",
+        "--tool",
+        "codex",
+        "--ref",
+        risk_id,
+        "--subject",
+        "risk fixed",
+    ]);
+
+    let room_after = workspace.json(&["room", "--json"]);
+    assert!(
+        !room_after["data"]["room"]["current_risks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["event_id"] == risk_id),
+        "resolved risk should not remain current"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
 fn rally_next_waits_only_when_no_useful_work_exists() {
     let workspace = Workspace::new("rally-next-wait");
     let handoff = workspace.json(&[
