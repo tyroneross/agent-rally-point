@@ -13,6 +13,14 @@ SPDX-License-Identifier: Apache-2.0
 This board is **dogfoodable**: it is the human-readable projection of the rally facts. A fresh agent (Claude or Codex)
 reads this + `rally room --json` and knows what is owned, in flight, landed, and next — without the user relaying it.
 
+## Agent roster (2 Claude + 2 Codex)
+
+| Agent | rally tool id(s) | Role / lane |
+|-------|------------------|-------------|
+| **Claude #1** | `claude_code:lead` | Lead orchestration, board, dynamic-workflows (L1), audits/dogfood. **No `crates/**` writes.** |
+| **Claude #2** | `claude_code` | **L4/PR46** (next.rs, store.rs, `check ci`) — folds audit findings for its own files (B7-store, B8-next). |
+| **Codex #1 / #2** | `codex` · `codex:dynwf-coordinator` · `codex:dynamic-scale-01` | `crates/**` fixes on non-L4 files (B4 check.rs, B5 lib.rs, B6 backends.rs, B7 discovery.rs) + managed-session (L2). |
+
 ## Lanes
 
 | Lane | Owner (rally tool) | Owns | Status | Stop-point commits | Next checkpoint |
@@ -21,7 +29,7 @@ reads this + `rally room --json` and knows what is owned, in flight, landed, and
 | **L2 · managed-session scale hardening** | `codex` / `codex:dynwf-coordinator` | `crates/rally-cli/src/{cli,backends,lib}.rs` (managed-session paths) | ✅ landed locally | `f852960`, `63f7a66`, `f6bab07` | keep installed CLI aligned before new dogfood |
 | **L3 · bpaf run/inject/capture/stop --help panic** | `codex:dynamic-scale-01` | `crates/rally-cli/src/cli.rs` (parsers) | ✅ fixed (lead-verified) | `9332915`, `b056855` (local; push pending) | — `rally run --help` exits 0 ✓ |
 | **L3b · room projection: clear resolved risks** | `codex:dynamic-scale-01` | `crates/rally-cli/src/store.rs` (projection) | ✅ fixed locally | `0d41d4a` | resolved risks drop from `current_risks` |
-| **L4 · PR46 port** (contract-claims + receipts + CI gate) | `claude_code` (PR46 terminal — bare id) | `crates/rally-cli/src/{next,store,check}.rs`, `docs/schemas/*`, `RALLY.md` | ⏳ pending | — | `--produces` + receipts on `main` |
+| **L4 · PR46 port** (contract-claims + receipts + CI gate) | `claude_code` (Claude #2) | `crates/rally-cli/src/{next,store}.rs` + PR46 additions; **folds** B7-store (seq cast) + B8-next (scope-match/confidence). check.rs via Codex B4 (rebase). | 🔄 assigned | — | `--produces` + receipts on `main`; folded findings fixed |
 | **L5 · observation seam** (Plan B: DAG / wake-due / heartbeat) | unassigned | TBD | ⏸ deferred | — | gated on L4 lineage landing |
 
 ## Dogfood linkages
@@ -60,10 +68,11 @@ A task the user gives the lead can be resolved three ways — the lead chooses:
 | **B4** | `check.rs` boundary-gate integrity (HIGH, security) | `rally check before-write` is bypassable: `allow` true in warn mode w/ stop findings (:70); missing `--path` skips all checks (:104-115); `--tool` omitted → `"unknown"` suppresses conflicts (:120-122). Undermines the "agents don't conflict" guarantee. Detail: `docs/audit-2026-05-29-rally-cli.md`. | none (coordinate w/ L4 — shares check.rs) | `crates/rally-cli/src/check.rs` | tests: stop⇒allow=false in warn; missing-path still evaluates global facts; unknown-tool rejected | **claimed · codex** |
 | **B5** | `lib.rs` NUL-byte panic + session-cleanup (HIGH) | `shell_quote` `.expect` panics on NUL (:950); error-recovery discards stopped-session write (:337) → session stuck active; + lib mediums (envelope swallow, repo_root fallback) | none | `crates/rally-cli/src/lib.rs` | NUL input → handled error not panic; `cargo test` | claimed · codex |
 | **B6** | `backends.rs` NUL-byte panic + parse fallbacks (HIGH) | `shell_words` `.expect` panics on NUL (:497); cmux target falls back to arbitrary first line (:388); herdr focused-tab not excluded (:341) | none | `crates/rally-cli/src/backends.rs` | NUL → error; cmux parse failure surfaces; `cargo test` | claimed · codex |
-| **B7** | `discovery.rs`+`store.rs` data-integrity (HIGH) | index clobbered on read-error (discovery:95 — destroys recorded rooms); unchecked `u64 as i64` seq cast (store:322+); + TOCTOU + error-context swaps | none (coordinate w/ L4 — shares store.rs) | `crates/rally-cli/src/{discovery,store}.rs` | corrupt-index doesn't wipe; seq overflow errors; `cargo test` | claimed · codex |
-| **B8** | `next.rs`/`cli.rs`/`output.rs` consistency (MED/LOW) | scope-match inconsistency (next:561); score/confidence disagree (next:213); `bounded_i64` silent clamp (cli:514); aliased-flag drop (cli:526); dead arms | none (coordinate w/ L4 — shares next.rs) | `crates/rally-cli/src/{next,cli,output}.rs` | findings addressed; `cargo test` | open |
+| **B7** | `discovery.rs` data-integrity (HIGH) | index clobbered on read-error (discovery:95 — destroys recorded rooms) + TOCTOU/context-swaps. **store.rs seq-cast moved to L4** (Claude #2 owns the file). | none | `crates/rally-cli/src/discovery.rs` | corrupt-index doesn't wipe; `cargo test` | claimed · codex |
+| **B8** | `cli.rs`/`output.rs` consistency (MED/LOW) | `bounded_i64` silent clamp (cli:514); aliased-flag drop (cli:526); dead arms; infallible-serialize fallback (output:31). **next.rs items moved to L4.** | none | `crates/rally-cli/src/{cli,output}.rs` | findings addressed; `cargo test` | open |
 
 ## Live status log (newest first)
+- **2026-05-29 (sync 9)** — **Roster engaged (2 Claude + 2 Codex)** per user. Rebalanced to use Claude #2 and remove file collisions: **Claude #2 → L4/PR46** (next.rs+store.rs) and folds B7-store + B8-next audit findings into PR46. **B7 re-scoped to discovery.rs only** (Codex); **B8 re-scoped to cli.rs+output.rs**; **B4 stays Codex** (check.rs, claimed seq73). No two agents now own the same file. Codex: B4/B5/B6/B7(discovery). Roster section added above.
 - **2026-05-29 (sync 8)** — **Lead decision**: HIGH audit fixes **B5/B6/B7 delegated to codex** (parallel — file-disjoint: lib.rs / backends.rs / discovery+store.rs), not left idle. **B8 (med/low) stays open** for free pickup. Codex now owns B1+B4+B5+B6+B7 (it manages its own fan-out). B7 shares store.rs with pending L4 — coordinate.
 - **2026-05-29 (sync 7)** — **Scale dogfood RESULT**: workflow `wnll6qruh` (10 Sonnet read-only agents, 2 scales) returned **34 findings (8 high, 14 med, 12 low)**, 0 failures, ~3.3 min. Full triage: `docs/audit-2026-05-29-rally-cli.md`. Scale A (3 agents/big files) density 5.3/agent vs Scale B (7 agents) 2.6/agent. Backlog **B4–B8** opened (file-scoped, MECE). **B4 (check.rs gate bypass — security) delegated to codex**; B5–B8 open for free pickup. Flagged the high cluster via rally `risk`. NOTE: B4/B7/B8 share files with the pending L4/PR46 lane — coordinate if concurrent.
 - **2026-05-29 (sync 6)** — **Scale dogfood launched**: read-only audit workflow `wnll6qruh` — 10 Sonnet `Explore` agents across two scales (A=3 core files, B=7 per-file), structured findings → backlog (results pending). Descriptor lint-validated. **B1 delegated to codex** (answering coordinator check-in seq49; mostly `.codex-plugin` surface). Codex landed a 3rd small fix — "artifact review completion loop" (`5a6726e`, pushed). Board-ownership rule (policy 5) held: Codex didn't touch this file.
