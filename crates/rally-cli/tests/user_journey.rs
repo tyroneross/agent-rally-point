@@ -465,12 +465,9 @@ fn rally_next_finds_useful_work_while_waiting() {
             .any(|item| item
                 .as_str()
                 .unwrap()
-                .contains("rally say artifact --tool codex --ref"))
+                .contains("rally say resolve --tool codex --ref"))
     );
-    assert_eq!(
-        next["data"]["next"]["completion"]["record_kind"],
-        "artifact"
-    );
+    assert_eq!(next["data"]["next"]["completion"]["record_kind"], "resolve");
     assert_eq!(next["data"]["next"]["completion"]["rerun_next"], true);
     assert!(
         next["data"]["next"]["waiting_on"]
@@ -485,6 +482,29 @@ fn rally_next_finds_useful_work_while_waiting() {
             .unwrap()
             .iter()
             .any(|item| item["action"] == "clarify_handoff")
+    );
+
+    workspace.json(&[
+        "say",
+        "resolve",
+        "--json",
+        "--tool",
+        "codex",
+        "--ref",
+        artifact_id,
+        "--subject",
+        "reviewed artifact",
+        "--evidence",
+        "notes checked",
+    ]);
+    let room = workspace.json(&["room", "--json"]);
+    assert!(
+        !room["data"]["room"]["unconsumed_artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["event_id"] == artifact_id),
+        "artifact review resolve should consume the reviewed artifact"
     );
 
     workspace.cleanup();

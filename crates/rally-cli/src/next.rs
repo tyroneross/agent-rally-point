@@ -477,9 +477,8 @@ fn suggested_commands(tool: &str, candidate: &NextCandidate) -> Vec<String> {
             tool = tool_arg
         )),
         "review_artifact" => commands.push(format!(
-            "rally say artifact --tool {tool} --ref {} --subject \"reviewed artifact\" --uri {} --evidence \"<verification>\" --json",
+            "rally say resolve --tool {tool} --ref {} --subject \"reviewed artifact\" --evidence \"<verification>\" --json",
             event_arg,
-            shell_quote(fact.uri.as_deref().unwrap_or("<path>")),
             tool = tool_arg
         )),
         "clarify_handoff" => commands.push(format!(
@@ -497,7 +496,7 @@ fn completion_contract(action: &str, actionable: bool) -> CompletionContract {
     let record_kind = match action {
         "respond_to_handoff" | "resolve_owned_blocker" => "resolve",
         "continue_or_release_claim" => "artifact_or_release",
-        "review_artifact" => "artifact",
+        "review_artifact" => "resolve",
         "clarify_handoff" => "handoff",
         _ => "none",
     };
