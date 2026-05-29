@@ -75,7 +75,7 @@ A receiver that has all 11 fields never needs to ask "what next?".
 | 5 | **base** | branch + worktree (default: your **own worktree off `main`**; canonical paths) |
 | 6 | **mode** | `fix` vs `review-only` (resolve the issue, or only report risks) |
 | 7 | **model/tier + fan-out** | host-relative tier (cheapest sufficient, your own family) + parallel cap |
-| 8 | **execution** | **route through build-loop** (`/build-loop:run` or the build-orchestrator) — not raw edits |
+| 8 | **execution** | structured plan→execute→review→verify loop, not raw edits — **host-relative**: build-loop (`/build-loop:run`) on Claude; on Codex/other hosts the host-equivalent (rally `check before-write` + tests + `git diff --check` + commit) |
 | 9 | **validation + evidence** | the verify command + the evidence to post |
 | 10 | **completion** | closing action: `rally say artifact --evidence …` → `resolve` / handoff-back |
 | 11 | **stop** | `blocker \| requires-human \| core-decision \| budget` |
@@ -85,10 +85,13 @@ authority:edit+commit · base:own-worktree off main · mode:fix · tier:executin
 exec:build-loop · validate:cargo test → evidence in artifact · done:rally say artifact then resolve ·
 stop:requires-human|core-decision`.
 
-**Build-loop is the execution substrate for every agent** (field 8): substantive code changes route
-through build-loop's plan→execute→review→verify, not direct edits. Rally coordinates *across* agents;
-build-loop drives *within* each agent's lane. (Lead board/doc syncs are coordination artifacts, not
-code changes — they don't require a build-loop run.)
+**Execution substrate is host-relative** (field 8): substantive code changes route through a structured
+plan→execute→review→verify loop, not raw edits — but the *loop* is each host's own. **Build-loop is a
+Claude Code skill**, so Claude agents use `/build-loop:run`; **Codex's runtime does not have build-loop**
+(confirmed this session — seq283), so Codex uses its host-equivalent: rally `check before-write` + tests
++ `git diff --check` + commit. Same discipline, host-native mechanism — exactly like model tiers (rule 5):
+never impose a Claude-host tool on a non-Claude host. Rally coordinates *across* agents; the verify-loop
+drives *within* each lane. (Lead board/doc syncs are coordination artifacts, not code changes.)
 
 ## Joining checklist (drop-in)
 
