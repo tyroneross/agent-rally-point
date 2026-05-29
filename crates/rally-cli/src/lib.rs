@@ -26,6 +26,7 @@ const SCHEMA_SESSIONS: &str = "agent-rally.command.sessions.v1";
 const SCHEMA_INJECT: &str = "agent-rally.command.inject.v1";
 const SCHEMA_SESSION_ACTION: &str = "agent-rally.command.session-action.v1";
 pub(crate) const FACT_SCHEMA: &str = "agent-rally.fact.v1";
+const SESSION_IDENTITY_RETRIES: usize = 4096;
 
 macro_rules! cmd {
     ($($arg:expr),+ $(,)?) => {
@@ -272,43 +273,82 @@ fn command_check(args: CheckArgs) -> Result<Output> {
 }
 
 fn command_run(args: RunArgs) -> Result<Output> {
-    let dry_run = args.dry_run;
-    let backend = args.backend;
+    let RunArgs {
+        json,
+        dry_run,
+        agent,
+        name,
+        backend,
+        session_id,
+        tool,
+        bins,
+    } = args;
     let backend_name = backend.as_str().to_string();
     let repo = repo_root()?;
-    let agent_spec = AgentSpec::from_name(&args.agent)?;
-    let active_sessions = read_session_records()?;
-    let identity = numbered_session_identity(
-        &agent_spec,
-        args.name,
-        args.session_id,
-        args.tool,
-        &active_sessions,
-    )?;
-    let name = identity.name;
-    let session_id = identity.session_id;
-    let tool = identity.tool;
-    let backend_target = backend_target(backend, &session_id);
-    let command = agent_spec.command_line(&name);
-    let backend_runner = BackendRunner::new(backend, args.bins);
-    let start_commands = backend_runner.start_commands(&backend_target, &repo, &command, &name);
+    let agent_spec = AgentSpec::from_name(&agent)?;
+    let room = RoomStore::open()?;
+    let reservation = if dry_run {
+        let active_sessions = active_session_records(&room)?;
+        let identity =
+            numbered_session_identity(&agent_spec, name, session_id, tool, &active_sessions)?;
+        ReservedSession {
+            fact: None,
+            session: ManagedSession {
+                session_id: identity.session_id.clone(),
+                name: identity.name.clone(),
+                agent: agent_spec.agent.to_string(),
+                tool: identity.tool.clone(),
+                backend: backend_name.clone(),
+                cwd: repo.clone(),
+                target: backend_target(backend, &identity.session_id),
+            },
+        }
+    } else {
+        reserve_numbered_session(
+            &room,
+            &agent_spec,
+            SessionReservationInput {
+                requested_name: name,
+                requested_session_id: session_id,
+                requested_tool: tool,
+                backend,
+                backend_name: &backend_name,
+                repo: &repo,
+            },
+        )?
+    };
+    let mut session = reservation.session;
+    let command = agent_spec.command_line(&session.name);
+    let backend_runner = BackendRunner::new(backend, bins);
+    let start_commands =
+        backend_runner.start_commands(&session.target, &repo, &command, &session.name);
 
     let actual_target = if dry_run {
-        backend_target.clone()
+        session.target.clone()
     } else {
-        backend_runner.start(&backend_target, &repo, &command, &name)?
+        match backend_runner.start(&session.target, &repo, &command, &session.name) {
+            Ok(target) => target,
+            Err(err) => {
+                if let Some(fact) = &reservation.fact {
+                    let _ = room.append_fact(&session_fact(
+                        &session,
+                        "stopped",
+                        Some(fact.event_id.clone()),
+                    ));
+                }
+                return Err(err);
+            }
+        }
     };
-    let session = ManagedSession {
-        session_id: session_id.clone(),
-        name: name.clone(),
-        agent: agent_spec.agent.to_string(),
-        tool: tool.clone(),
-        backend: backend_name.clone(),
-        cwd: repo.clone(),
-        target: actual_target,
-    };
-    if !dry_run {
-        write_session_record(&session)?;
+    if actual_target != session.target {
+        session.target = actual_target;
+        if let Some(fact) = &reservation.fact {
+            room.append_fact(&session_fact(
+                &session,
+                "active",
+                Some(fact.event_id.clone()),
+            ))?;
+        }
     }
 
     let body = envelope(
@@ -326,13 +366,64 @@ fn command_run(args: RunArgs) -> Result<Output> {
         "run agent={} backend={} session={}",
         session.agent, session.backend, session.session_id
     );
-    Ok(Output::new(args.json, text, body))
+    Ok(Output::new(json, text, body))
 }
 
 struct SessionIdentity {
     name: String,
     session_id: String,
     tool: String,
+}
+
+struct ReservedSession {
+    fact: Option<Fact>,
+    session: ManagedSession,
+}
+
+struct SessionReservationInput<'a> {
+    requested_name: Option<String>,
+    requested_session_id: Option<String>,
+    requested_tool: Option<String>,
+    backend: Backend,
+    backend_name: &'a str,
+    repo: &'a Path,
+}
+
+fn reserve_numbered_session(
+    room: &RoomStore,
+    agent_spec: &AgentSpec,
+    input: SessionReservationInput<'_>,
+) -> Result<ReservedSession> {
+    for _ in 0..SESSION_IDENTITY_RETRIES {
+        let (session_facts, context_version) = room.session_facts_with_context_version()?;
+        let active_sessions = active_session_records_from_facts(session_facts);
+        let identity = numbered_session_identity(
+            agent_spec,
+            input.requested_name.clone(),
+            input.requested_session_id.clone(),
+            input.requested_tool.clone(),
+            &active_sessions,
+        )?;
+        let session = ManagedSession {
+            session_id: identity.session_id.clone(),
+            name: identity.name,
+            agent: agent_spec.agent.to_string(),
+            tool: identity.tool,
+            backend: input.backend_name.to_string(),
+            cwd: input.repo.to_path_buf(),
+            target: backend_target(input.backend, &identity.session_id),
+        };
+        let fact = session_fact(&session, "active", None);
+        if let Some(fact) = room.append_session_fact_if_context(&fact, context_version)? {
+            return Ok(ReservedSession {
+                fact: Some(fact),
+                session,
+            });
+        }
+    }
+    Err(RallyError::Usage(format!(
+        "could not reserve a unique managed session after {SESSION_IDENTITY_RETRIES} concurrent changes"
+    )))
 }
 
 fn numbered_session_identity(
@@ -356,7 +447,7 @@ fn numbered_session_identity(
     let name = format!(
         "{}-{:02}",
         name_base,
-        next_identity_number(agent_spec, name_base, active_sessions)
+        next_identity_number(agent_spec, name_base, active_sessions)?
     );
     let name_key = sanitize_id(&name);
     let default_session_id = if name_key.starts_with(&format!("{}-", agent_spec.agent)) {
@@ -380,7 +471,7 @@ fn next_identity_number(
     agent_spec: &AgentSpec,
     name_base: &str,
     active_sessions: &[ManagedSession],
-) -> u16 {
+) -> Result<u64> {
     let base_key = sanitize_id(name_base);
     let mut used = BTreeSet::new();
     for session in active_sessions {
@@ -396,12 +487,16 @@ fn next_identity_number(
             }
         }
     }
-    (1..=999)
-        .find(|number| !used.contains(number))
-        .unwrap_or(1000)
+    let mut number = 1_u64;
+    while used.contains(&number) {
+        number = number.checked_add(1).ok_or_else(|| {
+            RallyError::Usage(format!("no available numbered identity for {base_key}"))
+        })?;
+    }
+    Ok(number)
 }
 
-fn note_used_identity_number(base_key: &str, value: &str, used: &mut BTreeSet<u16>) {
+fn note_used_identity_number(base_key: &str, value: &str, used: &mut BTreeSet<u64>) {
     if value == base_key {
         used.insert(1);
         return;
@@ -414,9 +509,9 @@ fn note_used_identity_number(base_key: &str, value: &str, used: &mut BTreeSet<u1
     }
 }
 
-fn note_used_bare_identity_number(value: &str, used: &mut BTreeSet<u16>) {
+fn note_used_bare_identity_number(value: &str, used: &mut BTreeSet<u64>) {
     if value.len() >= 2 && value.chars().all(|ch| ch.is_ascii_digit()) {
-        if let Ok(number) = value.parse::<u16>() {
+        if let Ok(number) = value.parse::<u64>() {
             if number != 0 {
                 used.insert(number);
             }
@@ -424,12 +519,12 @@ fn note_used_bare_identity_number(value: &str, used: &mut BTreeSet<u16>) {
     }
 }
 
-fn split_numbered_suffix(value: &str) -> Option<(&str, u16)> {
+fn split_numbered_suffix(value: &str) -> Option<(&str, u64)> {
     let (prefix, suffix) = value.rsplit_once('-')?;
     if suffix.len() < 2 || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
         return None;
     }
-    let number = suffix.parse::<u16>().ok()?;
+    let number = suffix.parse::<u64>().ok()?;
     if number == 0 {
         return None;
     }
@@ -619,12 +714,6 @@ fn read_session_records() -> Result<Vec<ManagedSession>> {
     active_session_records(&room)
 }
 
-fn write_session_record(session: &ManagedSession) -> Result<()> {
-    let room = RoomStore::open()?;
-    room.append_fact(&session_fact(session, "active", None))?;
-    Ok(())
-}
-
 fn remove_session_record(session_id: &str) -> Result<()> {
     let room = RoomStore::open()?;
     let Some((fact, session)) = active_session_facts(&room)?
@@ -645,8 +734,19 @@ fn active_session_records(room: &RoomStore) -> Result<Vec<ManagedSession>> {
 }
 
 fn active_session_facts(room: &RoomStore) -> Result<Vec<(Fact, ManagedSession)>> {
+    Ok(active_session_facts_from_facts(room.facts()?))
+}
+
+fn active_session_records_from_facts(facts: Vec<Fact>) -> Vec<ManagedSession> {
+    active_session_facts_from_facts(facts)
+        .into_iter()
+        .map(|(_, session)| session)
+        .collect()
+}
+
+fn active_session_facts_from_facts(facts: Vec<Fact>) -> Vec<(Fact, ManagedSession)> {
     let mut active = BTreeMap::new();
-    let mut facts = room.facts()?;
+    let mut facts = facts;
     facts.sort_by_key(|fact| fact.seq);
     for fact in facts.into_iter().filter(|fact| fact.kind == "session") {
         let Some(session) = fact.session.clone() else {
@@ -658,7 +758,7 @@ fn active_session_facts(room: &RoomStore) -> Result<Vec<(Fact, ManagedSession)>>
             active.insert(session.session_id.clone(), (fact, session));
         }
     }
-    Ok(active.into_values().collect())
+    active.into_values().collect()
 }
 
 fn session_fact(session: &ManagedSession, status: &str, ref_id: Option<String>) -> Fact {
@@ -844,6 +944,59 @@ pub(crate) fn shell_quote(value: &str) -> String {
     shlex::try_quote(value)
         .expect("shell argument contains NUL byte")
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn managed_session(name: String, tool: String) -> ManagedSession {
+        ManagedSession {
+            session_id: name.clone(),
+            name,
+            agent: "claude".to_string(),
+            tool,
+            backend: "tmux".to_string(),
+            cwd: PathBuf::from("/tmp/rally-test"),
+            target: "rally-test".to_string(),
+        }
+    }
+
+    #[test]
+    fn numbered_session_identity_scales_beyond_one_thousand() {
+        let agent_spec = AgentSpec::from_name("claude").unwrap();
+        let active_sessions = (1..=1000)
+            .map(|number| {
+                managed_session(
+                    format!("claude-{number:02}"),
+                    format!("claude_code:{number:02}"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let identity =
+            numbered_session_identity(&agent_spec, None, None, None, &active_sessions).unwrap();
+
+        assert_eq!(identity.name, "claude-1001");
+        assert_eq!(identity.session_id, "claude-1001");
+        assert_eq!(identity.tool, "claude_code:1001");
+    }
+
+    #[test]
+    fn numbered_session_identity_reuses_lowest_available_gap() {
+        let agent_spec = AgentSpec::from_name("claude").unwrap();
+        let active_sessions = vec![
+            managed_session("claude-01".to_string(), "claude_code:01".to_string()),
+            managed_session("claude-03".to_string(), "claude_code:03".to_string()),
+        ];
+
+        let identity =
+            numbered_session_identity(&agent_spec, None, None, None, &active_sessions).unwrap();
+
+        assert_eq!(identity.name, "claude-02");
+        assert_eq!(identity.session_id, "claude-02");
+        assert_eq!(identity.tool, "claude_code:02");
+    }
 }
 
 #[derive(JsonSchema, Serialize)]

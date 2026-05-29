@@ -1,11 +1,13 @@
-use factstr::{EventQuery as FactQuery, EventStore, NewEvent};
+use factstr::{EventQuery as FactQuery, EventStore, EventStoreError, NewEvent};
 use factstr_sqlite::SqliteStore;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use crate::backends::ManagedSession;
 use crate::cli::RoomArgs;
@@ -283,8 +285,7 @@ impl RoomStore {
         fs::create_dir_all(&dir).map_err(RallyError::io("create .rally"))?;
         let _ = fs::remove_file(dir.join("room.db"));
         let fact_store_path = dir.join("facts.db");
-        let fact_store = SqliteStore::open(&fact_store_path)
-            .map_err(|err| RallyError::Message(format!("open fact store: {err}")))?;
+        let fact_store = open_fact_store(&fact_store_path)?;
         let store = Self {
             fact_store,
             cursor_path: dir.join("cursors.json"),
@@ -301,8 +302,7 @@ impl RoomStore {
         if !fact_store_path.exists() {
             return Ok(None);
         }
-        let fact_store = SqliteStore::open(&fact_store_path)
-            .map_err(|err| RallyError::Message(format!("open fact store: {err}")))?;
+        let fact_store = open_fact_store(&fact_store_path)?;
         Ok(Some(Self {
             fact_store,
             cursor_path: dir.join("cursors.json"),
@@ -324,6 +324,30 @@ impl RoomStore {
         Ok(fact)
     }
 
+    pub(crate) fn append_session_fact_if_context(
+        &self,
+        fact: &Fact,
+        expected_context_version: Option<u64>,
+    ) -> Result<Option<Fact>> {
+        let mut fact = fact.clone();
+        let payload =
+            serde_json::to_value(&fact).map_err(RallyError::json("render session fact"))?;
+        let result = self.fact_store.append_if(
+            vec![NewEvent::new("session", payload)],
+            &FactQuery::for_event_types(["session"]),
+            expected_context_version,
+        );
+        match result {
+            Ok(result) => {
+                fact.seq = result.last_sequence_number as i64;
+                let _ = self.refresh_index(fact.seq);
+                Ok(Some(fact))
+            }
+            Err(EventStoreError::ConditionalAppendConflict { .. }) => Ok(None),
+            Err(err) => Err(RallyError::Message(format!("append session fact: {err}"))),
+        }
+    }
+
     pub(crate) fn facts(&self) -> Result<Vec<Fact>> {
         let query = self
             .fact_store
@@ -334,6 +358,23 @@ impl RoomStore {
             .into_iter()
             .map(|record| Fact::from_value(record.payload, record.sequence_number as i64))
             .collect()
+    }
+
+    pub(crate) fn session_facts_with_context_version(&self) -> Result<(Vec<Fact>, Option<u64>)> {
+        let query = self
+            .fact_store
+            .query(&FactQuery::for_event_types(["session"]))
+            .map_err(|err| RallyError::Message(format!("query session facts: {err}")))?;
+        let context_version = query
+            .event_records
+            .last()
+            .map(|record| record.sequence_number);
+        let facts = query
+            .event_records
+            .into_iter()
+            .map(|record| Fact::from_value(record.payload, record.sequence_number as i64))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((facts, context_version))
     }
 
     pub(crate) fn snapshot(&self) -> Result<RoomSnapshot> {
@@ -482,4 +523,23 @@ fn filter_facts(facts: Vec<Fact>, query: &RoomQuery) -> Vec<Fact> {
         .into_iter()
         .filter(|fact| query.matches(fact))
         .collect()
+}
+
+fn open_fact_store(path: &Path) -> Result<SqliteStore> {
+    let mut attempts = 0;
+    loop {
+        match SqliteStore::open(path) {
+            Ok(store) => return Ok(store),
+            Err(err) if attempts < 5 && is_bootstrap_metadata_race(&err) => {
+                attempts += 1;
+                thread::sleep(Duration::from_millis(25 * attempts));
+            }
+            Err(err) => return Err(RallyError::Message(format!("open fact store: {err}"))),
+        }
+    }
+}
+
+fn is_bootstrap_metadata_race(err: &impl std::fmt::Display) -> bool {
+    err.to_string()
+        .contains("UNIQUE constraint failed: store_metadata.key")
 }

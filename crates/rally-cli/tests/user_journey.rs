@@ -3,9 +3,11 @@
 
 use chrono::DateTime;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Workspace {
@@ -994,6 +996,84 @@ fn rally_run_assigns_numbered_agent_ids() {
     ]);
     assert!(!duplicate_tool.status.success());
     assert!(String::from_utf8_lossy(&duplicate_tool.stderr).contains("already uses tool codex:01"));
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_run_reserves_numbered_ids_under_parallel_launch() {
+    let workspace = Workspace::new("rally-run-parallel-numbered-ids");
+    let handles = (0..24)
+        .map(|_| {
+            let cwd = workspace.cwd.clone();
+            let home = workspace.home.clone();
+            thread::spawn(move || {
+                Command::new(env!("CARGO_BIN_EXE_rally"))
+                    .current_dir(cwd)
+                    .env("HOME", home)
+                    .args([
+                        "run",
+                        "claude",
+                        "--json",
+                        "--backend",
+                        "tmux",
+                        "--tmux-bin",
+                        "/usr/bin/true",
+                    ])
+                    .output()
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        let output = handle.join().unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    let sessions = workspace.json(&["sessions", "--json"]);
+    let sessions = sessions["data"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 24);
+    let names = sessions
+        .iter()
+        .map(|session| session["name"].as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    let tools = sessions
+        .iter()
+        .map(|session| session["tool"].as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(names.len(), 24);
+    assert_eq!(tools.len(), 24);
+    assert!(names.contains("claude-01"));
+    assert!(names.contains("claude-24"));
+    assert!(tools.contains("claude_code:01"));
+    assert!(tools.contains("claude_code:24"));
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_run_removes_session_reservation_when_backend_start_fails() {
+    let workspace = Workspace::new("rally-run-failed-start");
+
+    let output = workspace.output(&[
+        "run",
+        "claude",
+        "--json",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/false",
+    ]);
+    assert!(!output.status.success());
+
+    let sessions = workspace.json(&["sessions", "--json"]);
+    assert_eq!(sessions["data"]["sessions"].as_array().unwrap().len(), 0);
 
     workspace.cleanup();
 }
