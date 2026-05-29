@@ -1,0 +1,13 @@
+{
+  "workstream": "Example of a REJECTED descriptor: non-deterministic validation command",
+  "description": "The validation command embeds Date.now(), which is not reproducible across the agents that share this workstream. workstream-lint rejects it.",
+  "tasks": [
+    {
+      "id": "flaky",
+      "intent": "Stamp a build with the current time",
+      "owns": ["build/stamp.txt"],
+      "validation": "node -e \"require('fs').writeFileSync('build/stamp.txt', String(Date.now()))\"",
+      "output": "a timestamp file"
+    }
+  ]
+}
