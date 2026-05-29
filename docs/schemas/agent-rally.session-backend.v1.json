@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally:session-backend:v1",
+  "title": "Rally Session Backend Contract",
+  "type": "object",
+  "required": ["schema", "backend", "available", "surfaces", "standby"],
+  "properties": {
+    "schema": { "const": "agent-rally.session-backend.v1" },
+    "backend": {
+      "type": "string",
+      "description": "Concrete backend id such as tmux, herdr, cmux, or ci."
+    },
+    "available": {
+      "type": "boolean",
+      "description": "Whether the backend can currently address sessions."
+    },
+    "surfaces": {
+      "type": "object",
+      "required": ["run", "inject", "capture", "stop", "wake_signal"],
+      "properties": {
+        "run": { "type": "boolean" },
+        "inject": { "type": "boolean" },
+        "capture": { "type": "boolean" },
+        "stop": { "type": "boolean" },
+        "wake_signal": {
+          "type": "string",
+          "description": "Primary delivery surface for standby work, such as inject, notify, resume, or policy."
+        }
+      }
+    },
+    "standby": {
+      "type": "object",
+      "required": [
+        "wake_intent",
+        "delivery",
+        "watcher_role",
+        "rally_owns_daemon"
+      ],
+      "properties": {
+        "wake_intent": {
+          "type": "string",
+          "description": "Command or condition the host checks to decide whether this agent should act."
+        },
+        "delivery": {
+          "type": "string",
+          "description": "Backend-specific delivery mode: native_wake, managed_session_injection, pane_notification, resume_or_prompt, or automation_policy."
+        },
+        "watcher_role": {
+          "const": "transition_signal_only"
+        },
+        "rally_owns_daemon": {
+          "const": false
+        }
+      }
+    },
+    "commands": {
+      "type": "object",
+      "description": "Optional command templates for run, inject, capture, stop, or backend-native wake."
+    },
+    "failure_policy": {
+      "type": "object",
+      "description": "Optional classification of blocking, warning-only, and invisible backend failures."
+    }
+  }
+}

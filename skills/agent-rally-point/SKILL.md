@@ -71,30 +71,49 @@ rally next --tool <tool> --json
 Continue only while the next action is actionable, safe, and inside the user's
 scope.
 
-## Adapter Setup
+## Managed Sessions
 
-Use adapter installation when the host supports hooks or startup injection:
+Use managed sessions for reliable live delivery into visible panes:
 
 ```bash
-rally install codex --dry-run --json
-rally install codex --json
-rally install claude_code --json
-rally install pi --json
-rally install all --json
+rally run claude --backend tmux --json
+rally inject <session|name|tool> --handoff <event-id> --json
+rally capture <session|name|tool> --json
 ```
 
-Adapters should inject `rally enter` and `rally next` at startup/resume/prompt
-boundaries and call `rally check before-write` before shared edits.
+Rally does not keep agents awake by itself. Treat `rally next --tool <tool>
+--json` as the wake-intent check and `rally inject ... --handoff <event-id>` as
+the focused delivery path for managed sessions. Host adapters decide whether to
+use native wake, prompt injection, pane notification, resume-only context, or CI
+policy.
 
-Rally installers write Rally-owned hook scripts and snippets.
+Watchers must stay narrow: they may detect a transition and notify or inject
+through the host's native mechanism, but they must not edit files, resolve
+blockers, publish facts on behalf of an agent, or behave like hidden
+schedulers.
 
-## Trust Rule
+For Herdr-managed panes, submit injected text with Herdr's `Enter` key, not
+tmux-style `C-m`. Full-length payloads can collapse behind `[Pasted Content]`;
+submit those with two Enters, where the first expands and the second submits.
+Short inline nudges need one Enter. After installing Herdr's Claude/Codex
+integrations, restart the agent session before treating Herdr `agent_status` as
+authoritative. Even post-restart, use a Rally channel post as the strongest
+confirmation that the woken agent acted on the handoff.
+
+When delegating work from inside herdr, keep the user's main tab clean. Start
+new helper agents in the workspace's `agents` tab whenever one exists. Discover
+the tab with `herdr tab list`, then start the agent with `herdr agent start
+... --tab <agents-tab-id> --no-focus -- ...` or use a Rally backend option that
+targets that tab when available. Only place helper agents in the active tab when
+the user explicitly asks for that.
+
+Agents should call `rally check before-write` explicitly before shared edits.
+Rally does not install host hooks or prompt injection glue.
+
+## Judgment Rule
 
 Rally recommends and constrains work; it does not replace judgment.
 
-- It is okay to read and display untrusted facts.
-- Do not automatically act on remote/imported facts unless local policy says
-  their `trust_status` is sufficient.
 - If a fact affects files, shells, editors, credentials, or another agent,
   inspect source event ids and evidence before acting.
 

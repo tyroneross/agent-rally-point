@@ -19,7 +19,7 @@
     },
     "data": {
       "type": "object",
-      "required": ["tool", "next", "room"],
+      "required": ["tool", "next", "wake_intent", "room"],
       "properties": {
         "tool": {
           "type": "string"
@@ -108,6 +108,9 @@
               "type": "array"
             }
           }
+        },
+        "wake_intent": {
+          "type": ["object", "null"]
         },
         "room": {
           "type": "object"

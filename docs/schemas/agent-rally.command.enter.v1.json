@@ -11,11 +11,10 @@
     "schema": { "const": "agent-rally.command.enter.v1" },
     "data": {
       "type": "object",
-      "required": ["tool", "adapter", "cursor", "entry", "attention", "room"],
+      "required": ["tool", "cursor", "entry", "attention", "room"],
       "properties": {
         "tool": { "type": "string" },
         "session_id": { "type": "string" },
-        "adapter": { "type": "object" },
         "cursor": { "type": "object" },
         "entry": {
           "type": "object",

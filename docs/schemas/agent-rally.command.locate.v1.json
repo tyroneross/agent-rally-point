@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally:command:locate:v1",
+  "title": "Rally Locate Command",
+  "type": "object",
+  "required": ["ok", "product", "command", "schema", "data"],
+  "properties": {
+    "ok": { "const": true },
+    "product": { "const": "rally" },
+    "command": { "const": "locate" },
+    "schema": { "const": "agent-rally.command.locate.v1" },
+    "data": {
+      "type": "object",
+      "required": ["event_id", "located", "warnings"],
+      "properties": {
+        "event_id": { "type": "string" },
+        "located": { "type": ["object", "null"] },
+        "warnings": { "type": "array" }
+      }
+    }
+  }
+}

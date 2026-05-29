@@ -47,7 +47,8 @@ Thumbs.db
 *.log
 target/
 
-# Local Rally 2 room state
+# Local Rally room state
+.rally/
 .rally2/
 
 # uv lockfile — library-style project; downstream pipx installs resolve own deps.

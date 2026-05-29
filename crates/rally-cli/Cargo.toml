@@ -13,9 +13,12 @@ name = "rally"
 path = "src/main.rs"
 
 [dependencies]
+bpaf.workspace = true
 chrono.workspace = true
 factstr.workspace = true
 factstr-sqlite.workspace = true
-rusqlite.workspace = true
+schemars.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 shlex.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally:command:recent:v1",
+  "title": "Rally Recent Command",
+  "type": "object",
+  "required": ["ok", "product", "command", "schema", "data"],
+  "properties": {
+    "ok": { "const": true },
+    "product": { "const": "rally" },
+    "command": { "const": "recent" },
+    "schema": { "const": "agent-rally.command.recent.v1" },
+    "data": {
+      "type": "object",
+      "required": ["all", "include_legacy", "limit", "rows", "warnings"],
+      "properties": {
+        "all": { "type": "boolean" },
+        "include_legacy": { "type": "boolean" },
+        "limit": { "type": "integer" },
+        "rows": { "type": "array" },
+        "warnings": { "type": "array" }
+      }
+    }
+  }
+}
