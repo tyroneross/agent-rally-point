@@ -37,15 +37,22 @@ Out of scope: pushing `origin/main`; deleting worktrees; re-introducing rally-co
 
 ## 3. Coordinate via agent-rally-point (the dogfood)
 
-`S=/Users/tyroneross/.claude/plugins/cache/rosslabs-ai-toolkit/build-loop/0.12.16/scripts`
-(Codex: same path works; or use the host-neutral `agent_rally.py`.)
+> ⚠️ **ROOM-SPLIT — read this or you will silently coordinate alone.** Rally keys the room on the *worktree path*, so this `integration` worktree resolves to an **empty room** (`repo_2d586a64350cdfbd`) while all real traffic is in the **main repo's room** (`repo_196422842096be12`). Until canonical room-keying lands (P3), **force every coordination command to the main repo workdir**:
+
+```bash
+S=/Users/tyroneross/.claude/plugins/cache/rosslabs-ai-toolkit/build-loop/0.12.16/scripts
+RALLYDIR=/Users/tyroneross/dev/git-folder/agent-rally-point   # the SHARED room — not the integration worktree
+CH=$HOME/.agent-rally-point/apps/repo_196422842096be12/changes.jsonl
+```
+(Codex: same paths; or use the host-neutral `agent_rally.py` with the same `--workdir`.)
 
 1. **Join** the channel + announce your piece:
-   `python3 $S/coordination_rally.py --workdir . --session-id <you>-$(date +%s) --tool <claude_code|codex> --to peer --message "joined, claiming P<n>" --owns "<your files>" --json`
+   `python3 $S/coordination_rally.py --workdir "$RALLYDIR" --session-id <you>-$(date +%s) --tool <claude_code|codex> --to <peer-tool> --message "joined, claiming P<n>" --owns "<your files>" --json`
+   (use a concrete `--to claude_code|codex`, **not** `--to peer` — generic addressing does not surface as unread.)
 2. **Check** before each step boundary:
-   `python3 $S/coordination_status.py --workdir . --session-id <you> --json`
+   `python3 $S/coordination_status.py --workdir "$RALLYDIR" --session-id <you> --json`
 3. **Wake your peer** when you have a handoff — short doorbell, payload in the channel:
-   `python3 scripts/rally_wake.py --tool <peer> "Unread in Rally — run coordination_status + read this plan §<n>" --require-idle --confirm-channel ~/.agent-rally-point/apps/repo_196422842096be12/changes.jsonl`
+   `python3 scripts/rally_wake.py --tool <peer> "Unread in Rally — run coordination_status + read this plan §<n>" --require-idle --confirm-channel "$CH"`
    (herdr submit handled per-backend automatically; the channel post is the confirm.)
 4. **Post verdicts/handoffs** to the channel (revision bump) — that bump is also how your peer's `rally_wake --confirm-channel` knows you acted.
 
@@ -59,8 +66,9 @@ Rules: verdicts gate (don't advance a piece past `verification-pending` until th
 
 ## 5. Decisions log (P4 + any mid-flight)
 <!-- append: date — decision — ratified-by -->
-- 2026-05-28 — Default wake confirmation should be Rally channel-confirm; Herdr v4 status is useful only after target session restart and should remain a secondary liveness/delivery signal. Token echo remains valid for direct reply tests; tmux/no-integration paths use channel-confirm. — ratified-by: codex; pending: claude_code
-- 2026-05-28 — Coordination for this integration run uses the original Rally channel for `/Users/tyroneross/dev/git-folder/agent-rally-point` (`repo_196422842096be12`) even though the integration worktree resolves to a separate room; use explicit `--workdir /Users/tyroneross/dev/git-folder/agent-rally-point` for cross-agent status until the plan is updated or rooms are bridged. — ratified-by: codex; pending: claude_code
+- 2026-05-28 — Default wake confirmation should be Rally channel-confirm; Herdr v4 status is useful only after target session restart and should remain a secondary liveness/delivery signal. Token echo remains valid for direct reply tests; tmux/no-integration paths use channel-confirm. — ratified-by: codex + claude_code ✅
+- 2026-05-28 — Coordination for this integration run uses the original Rally channel for `/Users/tyroneross/dev/git-folder/agent-rally-point` (`repo_196422842096be12`); the integration worktree resolves to a separate empty room. Force `--workdir /Users/tyroneross/dev/git-folder/agent-rally-point` on all coordination commands (now baked into §3) until canonical room-keying lands. — ratified-by: codex + claude_code ✅
+- 2026-05-28 — **Room-keying fix (folded into P3):** the room-split root cause is the rally CLI keying `repo_id` on the *worktree path*. Fix = derive the channel/repo identity from `git rev-parse --git-common-dir` (worktree-invariant). Reference implementation already exists and is proven: build-loop `scripts/rally_point/channel_paths.py::app_slug()` (both worktrees → identical git-common-dir → one room). Port that logic into the rally CLI's discovery/repo-id; build-loop's `discovery_bridge` then inherits the fix automatically. — proposed-by: claude_code; pending: codex (P3 owner)
 
 ## 6. References
 - Research: `~/dev/research/projects/agent-rally-point/cross-agent-terminal-wake-inject-herdr-tmux-2026-05-28.md`
