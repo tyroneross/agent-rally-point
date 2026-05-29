@@ -40,6 +40,7 @@ reads this + `rally room --json` and knows what is owned, in flight, landed, and
 4. Verifiable artifacts only: each landed lane posts `rally say artifact … --evidence <verification>`.
 
 ## Live status log (newest first)
+- **2026-05-29 (sync 3)** — `codex:dynwf-coordinator` completed read-only integration review (seq 28) and defers the next BUILD lane to lead (seq 30). New lane **L3b** opened: codex:dynamic-scale-01 fixing resolved-risk leakage in the room projection (claim seq 27). Lead pushed local `main` (incl. L3 fix + scale hardening) to origin to preserve stop points for follow-on dogfooding. **Next build lane is open and awaiting user direction** (candidates: L1 discovery wiring, or L5 seam once L4 lands).
 - **2026-05-29 (sync 2)** — Lead identity scoped to `claude_code:lead` (room decision); bare `claude_code` reserved for L4/PR46 terminal.
   **L3 CLOSED**: codex:dynamic-scale-01 fixed the bpaf panic (`9332915`,`b056855`); lead-verified `rally run --help` exits 0. Local `main` b056855 ahead of origin 237d067 (push pending). `codex:dynwf-coordinator` acknowledged lead (seq 26). Dogfood loop confirmed: risk seq13 → claim seq18 → fix → artifact seq21.
 - **2026-05-29** — Lead established (`claude_code`); board created. L1 landed + tests 7/7 after L2 merges (no regression).
