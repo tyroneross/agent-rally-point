@@ -50,8 +50,11 @@ When work spans hosts, terminals, or machines, use managed rally sessions instea
 subagents:
 
 ```bash
-rally run --tool claude_code --json   # start a managed session
-rally inject <task-packet.json>        # deliver a task packet across the host boundary
+# AGENT is a positional (claude | codex | …); pick a backend you have installed.
+rally run claude --name <session> --backend tmux --tool claude_code --json   # start a managed session
+# Deliver work as a handoff FACT, then inject its event id (inject takes --handoff/--text, not a file):
+rally say handoff --tool claude_code --target <session> --subject "<task.intent>" --json   # → returns <event-id>
+rally inject <session> --handoff <event-id> --require-ack --json
 ```
 
 Rally behavior is identical either way — it stays a facilitator regardless of tier.

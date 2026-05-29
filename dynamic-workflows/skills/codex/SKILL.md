@@ -68,8 +68,11 @@ returning changed files + validation output. No prose after the result block.
 When a task's `tier` is `cross-host` or the work must reach another terminal:
 
 ```bash
-rally run <host> --json
-rally inject <session|name|tool> --handoff <event-id> --json
+# AGENT is a positional (claude | codex | …); choose an installed backend.
+rally run codex --name <session> --backend tmux --tool codex --json
+# inject delivers a handoff FACT by id (or --text), not a file path:
+rally say handoff --tool codex --target <session> --subject "<task.intent>" --json   # → <event-id>
+rally inject <session> --handoff <event-id> --require-ack --json
 ```
 
 ## 6. Per-task rally loop
