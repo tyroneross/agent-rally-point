@@ -972,8 +972,9 @@ pub(crate) fn short_id() -> String {
 }
 
 pub(crate) fn shell_quote(value: &str) -> String {
-    shlex::try_quote(value)
-        .expect("shell argument contains NUL byte")
+    let safe_value = value.replace('\0', "?");
+    shlex::try_quote(&safe_value)
+        .expect("NUL-stripped shell argument should be quoteable")
         .into_owned()
 }
 
@@ -1027,6 +1028,13 @@ mod tests {
         assert_eq!(identity.name, "claude-02");
         assert_eq!(identity.session_id, "claude-02");
         assert_eq!(identity.tool, "claude_code:02");
+    }
+
+    #[test]
+    fn shell_quote_replaces_nul_bytes_instead_of_panicking() {
+        let quoted = shell_quote("bad\0arg");
+        assert!(quoted.contains('?'));
+        assert!(!quoted.contains('\0'));
     }
 }
 
