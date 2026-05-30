@@ -1621,6 +1621,106 @@ mod tests {
             "error message must name the conflicting tool and name; got: {msg}"
         );
     }
+
+    // B10 — canonical-path matching unit tests
+
+    /// B10.normalize: relative and dotslash forms canonicalize to the same stored path.
+    #[test]
+    fn normalize_path_relative_forms_are_equivalent() {
+        assert_eq!(normalize_path("src/x.rs".to_string()), "file:src/x.rs");
+        assert_eq!(normalize_path("./src/x.rs".to_string()), "file:src/x.rs");
+    }
+
+    /// B10.normalize: already-prefixed paths are idempotent.
+    #[test]
+    fn normalize_path_already_file_prefixed_is_idempotent() {
+        let input = "file:src/lib.rs".to_string();
+        assert_eq!(normalize_path(input.clone()), input);
+    }
+
+    /// B10.normalize: dot and dotdot components are collapsed.
+    #[test]
+    fn normalize_path_collapses_dot_and_dotdot() {
+        assert_eq!(
+            normalize_path("src/../src/lib.rs".to_string()),
+            "file:src/lib.rs"
+        );
+        assert_eq!(
+            normalize_path("./crates/./rally-cli/src/lib.rs".to_string()),
+            "file:crates/rally-cli/src/lib.rs"
+        );
+    }
+
+    /// B10.suffix: the motivating bug — `src/lib.rs` and `crates/rally-cli/src/lib.rs`
+    /// share the 2-component suffix `src/lib.rs` and must flag.
+    #[test]
+    fn paths_suffix_collide_detects_lessons_case() {
+        assert!(
+            paths_suffix_collide("crates/rally-cli/src/lib.rs", "src/lib.rs"),
+            "shorter path 'src/lib.rs' is a suffix of 'crates/rally-cli/src/lib.rs'"
+        );
+        // Symmetric.
+        assert!(
+            paths_suffix_collide("src/lib.rs", "crates/rally-cli/src/lib.rs"),
+            "suffix check must be symmetric"
+        );
+    }
+
+    /// B10.suffix: sibling crates share the `src/lib.rs` suffix and flag.
+    /// Chosen behavior: WARN because the lead should adjudicate; rally never decides.
+    #[test]
+    fn paths_suffix_collide_sibling_crates_flag() {
+        // `crates/a/src/lib.rs` and `crates/b/src/lib.rs` share `src/lib.rs` (2 components).
+        // They are genuinely different files, but the warning is correct — the lead must verify.
+        assert!(
+            paths_suffix_collide("crates/a/src/lib.rs", "crates/b/src/lib.rs"),
+            "sibling-crate paths sharing suffix src/lib.rs must flag as ambiguous"
+        );
+    }
+
+    /// B10.suffix: a single-component basename must NOT trigger suffix collision.
+    #[test]
+    fn paths_suffix_collide_single_component_basename_does_not_flag() {
+        // "lib.rs" alone is only 1 component — below the 2-component threshold.
+        assert!(
+            !paths_suffix_collide("src/lib.rs", "lib.rs"),
+            "single-component basename must not flag"
+        );
+        assert!(
+            !paths_suffix_collide("lib.rs", "other/lib.rs"),
+            "single-component basename must not flag (reversed)"
+        );
+    }
+
+    /// B10.suffix: genuinely unrelated paths must not flag.
+    #[test]
+    fn paths_suffix_collide_distinct_paths_do_not_flag() {
+        // `crates/a/mod.rs` and `crates/b/lib.rs` share no common suffix.
+        assert!(
+            !paths_suffix_collide("crates/a/mod.rs", "crates/b/lib.rs"),
+            "distinct filenames must not produce a suffix collision"
+        );
+    }
+
+    /// B10.suffix: exact-match paths must not produce a suffix collision (already
+    /// caught by the exact-match / dir-prefix check which emits `claimed-path`).
+    #[test]
+    fn paths_suffix_collide_exact_match_returns_false() {
+        assert!(
+            !paths_suffix_collide("src/lib.rs", "src/lib.rs"),
+            "exact match is handled by path_matches_scope, not suffix collision"
+        );
+    }
+
+    /// B10.suffix: dir-prefix case must not produce a suffix collision either.
+    #[test]
+    fn paths_suffix_collide_dir_prefix_returns_false() {
+        // `src` is a dir-prefix of `src/lib.rs` — caught by path_matches_scope already.
+        assert!(
+            !paths_suffix_collide("src", "src/lib.rs"),
+            "dir-prefix is handled by path_matches_scope, not suffix collision"
+        );
+    }
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -1680,11 +1780,91 @@ pub(crate) fn normalize_paths(paths: Vec<String>) -> Vec<String> {
 }
 
 pub(crate) fn normalize_path(path: String) -> String {
-    if path.starts_with("file:") {
-        return path;
+    // Strip existing file: prefix before canonicalizing.
+    let raw = if let Some(s) = path.strip_prefix("file:") {
+        s
+    } else {
+        &path
+    };
+
+    // Strip leading ./ for relative paths.
+    let raw = raw.strip_prefix("./").unwrap_or(raw);
+
+    let p = Path::new(raw);
+
+    // For absolute paths that live under the repo root, make them repo-relative.
+    let canonical = if p.is_absolute() {
+        if let Ok(root) = repo_root() {
+            if let Ok(rel) = p.strip_prefix(&root) {
+                normalize_components(rel)
+            } else if let Some(canonical_root) = fs::canonicalize(&root).ok() {
+                if let Some(canonical_p) = canonicalize_maybe_missing(p) {
+                    if let Ok(rel) = canonical_p.strip_prefix(&canonical_root) {
+                        normalize_components(rel)
+                    } else {
+                        normalize_components(p)
+                    }
+                } else {
+                    normalize_components(p)
+                }
+            } else {
+                normalize_components(p)
+            }
+        } else {
+            normalize_components(p)
+        }
+    } else {
+        // Relative path: collapse . / .. components.
+        normalize_components(p)
+    };
+
+    if canonical.is_empty() {
+        // Fallback: return original with file: prefix but no double slash.
+        format!("file:{raw}")
+    } else {
+        format!("file:{canonical}")
     }
-    let stripped = path.strip_prefix("./").unwrap_or(&path);
-    format!("file:{stripped}")
+}
+
+/// Returns true when `a` and `b` share a common component-boundary suffix of
+/// length ≥ 2 components, AND they are not already caught by exact / dir-prefix
+/// matching.  This detects same-file collisions across different path forms, e.g.
+/// `src/lib.rs` ↔ `crates/rally-cli/src/lib.rs` (shared suffix: `src/lib.rs`).
+///
+/// Single-component basenames (`lib.rs`, `config.json`) are intentionally excluded
+/// to avoid over-flagging ubiquitous filenames.
+///
+/// NOTE: sibling crates like `crates/a/src/lib.rs` and `crates/b/src/lib.rs` share
+/// the 2-component suffix `src/lib.rs` and WILL flag even though they are different
+/// files.  This is intentional — the warning surfaces potential ambiguity for the
+/// lead to adjudicate.  Rally facilitates; it never decides.
+pub(crate) fn paths_suffix_collide(a: &str, b: &str) -> bool {
+    // Use comparable_path so we work on canonicalized, repo-relative strings.
+    let a_cmp = comparable_path(a);
+    let b_cmp = comparable_path(b);
+
+    // Already caught by exact / dir-prefix — don't double-report.
+    if path_matches_scope(a, b) || path_matches_scope(b, a) {
+        return false;
+    }
+
+    let a_parts: Vec<&str> = a_cmp.split('/').filter(|s| !s.is_empty()).collect();
+    let b_parts: Vec<&str> = b_cmp.split('/').filter(|s| !s.is_empty()).collect();
+
+    // The shared suffix length is the trailing overlap.
+    let shared = a_parts
+        .iter()
+        .rev()
+        .zip(b_parts.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+
+    // Require ≥ 2 shared trailing components.  The shorter path does NOT need to be
+    // fully consumed — sibling crates like `crates/a/src/lib.rs` and
+    // `crates/b/src/lib.rs` share `src/lib.rs` (2 components) and will flag.
+    // This is intentional: the warning surfaces potential ambiguity for the lead to
+    // adjudicate.  Rally facilitates; it never decides.
+    shared >= 2
 }
 
 pub(crate) fn path_matches_scope(scope: &str, path: &str) -> bool {

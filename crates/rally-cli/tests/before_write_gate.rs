@@ -163,3 +163,145 @@ fn before_write_gate_cannot_be_bypassed_by_warn_mode_missing_path_or_unknown_too
 
     workspace.cleanup();
 }
+
+// B10 — canonical-path matching integration tests
+
+/// B10a (lessons case): tool X claims `crates/rally-cli/src/lib.rs`; tool Y checks
+/// `src/lib.rs`.  These are the same 2-component suffix.  The gate must emit an
+/// `ambiguous-path-collision` WARN — not silently allow the write.
+#[test]
+fn b10_suffix_collision_lessons_case_is_flagged() {
+    let workspace = Workspace::new("b10-lessons-case");
+
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "claude_code:01",
+        "--path",
+        "crates/rally-cli/src/lib.rs",
+        "--subject",
+        "own rally-cli lib",
+    ]);
+
+    let result = workspace.json(&[
+        "check",
+        "before-write",
+        "--json",
+        "--tool",
+        "codex:01",
+        "--path",
+        "src/lib.rs",
+    ]);
+
+    let findings = result["data"]["check"]["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["code"] == "ambiguous-path-collision"),
+        "must emit ambiguous-path-collision when suffix collides; got findings: {findings:#?}"
+    );
+    // Must NOT be silently allowed — allow should be true only when there are no stop findings,
+    // but a WARN does not block, so allow=true is expected here (the signal is the finding itself).
+    let has_code = findings
+        .iter()
+        .any(|f| f["code"] == "ambiguous-path-collision" && f["severity"] == "warn");
+    assert!(
+        has_code,
+        "ambiguous-path-collision must have severity=warn; findings: {findings:#?}"
+    );
+
+    workspace.cleanup();
+}
+
+/// B10b (absolute-vs-relative): tool X claims `src/x` by relative path; tool Y checks
+/// an absolute path pointing to the same file.  Must resolve to an exact match → STOP
+/// `claimed-path`.
+#[test]
+fn b10_absolute_vs_relative_exact_match_is_stop() {
+    let workspace = Workspace::new("b10-abs-vs-rel");
+
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "claude_code:01",
+        "--path",
+        "src/x.rs",
+        "--subject",
+        "own src/x",
+    ]);
+
+    // Construct the absolute path from the workspace cwd.
+    let abs_path = workspace.cwd.join("src").join("x.rs");
+    let abs_str = abs_path.to_str().unwrap();
+
+    let result = workspace.json(&[
+        "check",
+        "before-write",
+        "--json",
+        "--tool",
+        "codex:01",
+        "--path",
+        abs_str,
+    ]);
+
+    let findings = result["data"]["check"]["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().any(|f| f["code"] == "claimed-path"),
+        "absolute path pointing to claimed relative path must produce claimed-path STOP; \
+         findings: {findings:#?}"
+    );
+    assert_eq!(
+        result["data"]["check"]["allow"],
+        false,
+        "allow must be false when a STOP finding is present"
+    );
+
+    workspace.cleanup();
+}
+
+/// B10c (single-component basename): tool X claims `src/lib.rs`; tool Y checks bare
+/// `lib.rs`.  Single-component baseline — must NOT flag as ambiguous-path-collision.
+#[test]
+fn b10_single_component_basename_does_not_flag() {
+    let workspace = Workspace::new("b10-single-component");
+
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "claude_code:01",
+        "--path",
+        "src/lib.rs",
+        "--subject",
+        "own src/lib",
+    ]);
+
+    let result = workspace.json(&[
+        "check",
+        "before-write",
+        "--json",
+        "--tool",
+        "codex:01",
+        "--path",
+        "lib.rs",
+    ]);
+
+    let findings = result["data"]["check"]["findings"].as_array().unwrap();
+    assert!(
+        !findings.iter().any(|f| f["code"] == "ambiguous-path-collision"),
+        "single-component basename must not trigger ambiguous-path-collision; \
+         findings: {findings:#?}"
+    );
+    assert!(
+        !findings.iter().any(|f| f["code"] == "claimed-path"),
+        "bare 'lib.rs' must not be an exact/dir-prefix match for 'src/lib.rs'; \
+         findings: {findings:#?}"
+    );
+
+    workspace.cleanup();
+}

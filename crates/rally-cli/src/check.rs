@@ -3,6 +3,7 @@ use serde::Serialize;
 
 use crate::error::{RallyError, Result};
 use crate::path_matches_scope;
+use crate::paths_suffix_collide;
 use crate::store::RoomSnapshot;
 
 #[derive(JsonSchema, Serialize)]
@@ -114,12 +115,13 @@ fn check_before_write(
     }
     if let Some(path) = path {
         for claim in &snapshot.active_claims {
-            if claim
+            let is_different_tool = claim.tool.as_deref() != Some(tool);
+            let exact_or_dir = claim
                 .scope
                 .iter()
-                .any(|scope| path_matches_scope(scope, path))
-                && claim.tool.as_deref() != Some(tool)
-            {
+                .any(|scope| path_matches_scope(scope, path));
+
+            if exact_or_dir && is_different_tool {
                 findings.push(CheckFinding {
                     code: "claimed-path",
                     severity: "stop",
@@ -129,6 +131,30 @@ fn check_before_write(
                     path: Some(path.to_string()),
                     scope: Vec::new(),
                 });
+            } else if is_different_tool {
+                // Suffix-collision: same file reached via a different path form.
+                // Does NOT hard-block — emits a WARN for the lead to adjudicate.
+                for scope in &claim.scope {
+                    if paths_suffix_collide(scope, path) {
+                        findings.push(CheckFinding {
+                            code: "ambiguous-path-collision",
+                            severity: "warn",
+                            message: format!(
+                                "submitted path '{}' may refer to the same file as claimed \
+                                 path '{}' held by {} — lead should verify before writing",
+                                path,
+                                scope,
+                                claim.tool.as_deref().unwrap_or("unknown"),
+                            ),
+                            fact_id: Some(claim.event_id.clone()),
+                            owner: claim.tool.clone(),
+                            path: Some(path.to_string()),
+                            scope: Vec::new(),
+                        });
+                        // One warning per claim is enough; don't fan out across scopes.
+                        break;
+                    }
+                }
             }
         }
     }
