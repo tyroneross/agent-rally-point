@@ -70,9 +70,14 @@ WARN, B11 duplicate-id risk fact) so work continues and any mistake is traceable
 > `command_route_findings`/`command_backlog` don't `classify_scope` on write (their facts are repo-local or
 > already-safe risk facts — low value).
 >
-> **Genuinely open:** housekeeping (B-whoami, B11-race, B-arch-doc, B-index-monolith, B-ledger-cadence) +
-> automation **rank-11** (queryable `rally goal`/intent + per-agent autonomy-envelope fact). Everything in
-> the ranked table below is closed.
+> **Housekeeping — all closed (2026-05-30):** B-arch-doc (`e46c083`), B-ledger-cadence (`e46c083`),
+> B-whoami + B11-race (`fcb81ca`), B-index-monolith (verified non-issue). **Genuinely open:** only
+> automation **rank-11** (queryable `rally goal`/intent + per-agent autonomy-envelope fact — net-new).
+>
+> **Code-scan pass (2026-05-30, `fcb81ca`):** a sonnet+haiku rally-workflow scan (7 scanners, rally-lineage
+> coordinated — see `rally dag --run scan-20260530`) surfaced 20 findings (0 false positives); all fixed —
+> 1 correctness bug (inject_content_fact durability/R9-readback), 6 efficiency (redundant full-ledger scans),
+> simplicity/dedup/deadcode (net **−3 lines** across the batch incl. a new command). cargo test 207→210.
 
 | Rank | ID | Item | Why it matters | Depends on |
 |------|----|------|----------------|-----------|
@@ -91,11 +96,11 @@ WARN, B11 duplicate-id risk fact) so work continues and any mistake is traceable
 
 | ID | Item | Notes |
 |----|------|-------|
-| **B-arch-doc** | Update [`docs/RALLY_ARCHITECTURE.md`](docs/RALLY_ARCHITECTURE.md) — still R1-era prose ("ledger.jsonl is the source of truth"); contradicts the R5/R8 segmented design. | MED |
-| **B-whoami** | `rally whoami` — report tool id / clone / worktree / expected binary in one call (reduce two-clone identity confusion). | MED |
-| **B11-race** | Harden parallel-launch id-reservation race — `rally_run_reserves_numbered_ids_under_parallel_launch` flakes in isolation; retry-on-collision or `#[ignore]` + tracking note. | MED |
-| **B-index-monolith** | Filter the migration monolith from `refresh_log_index` — committed `index.json` double-counts 489 phantom events (canonical replay already excludes it; the advisory index doesn't). | LOW |
-| **B-ledger-cadence** | Commit-ledger cadence policy — committed history lags on-disk; commit on a cadence (merge=union is conflict-free) or document `.rally/log/` as a live working-tree artifact. | LOW |
+| **B-arch-doc** | ~~Update RALLY_ARCHITECTURE.md~~ **DONE** (`e46c083`) — data-model rewritten R1→R5 segmented; global-index section corrected to B17 default-off. | shipped |
+| **B-whoami** | ~~`rally whoami`~~ **DONE** (`fcb81ca`) — reports tool / repo_root / repo_id / worktree / build_id / cwd in one call. | shipped |
+| **B11-race** | ~~Parallel-launch id-reservation race~~ **DONE** (`fcb81ca`) — durable fix: session-id backoff (#16) breaks the thundering herd; CAS already prevents duplicate ids, the flake was retry-budget exhaustion. | shipped |
+| **B-index-monolith** | ~~Filter the migration monolith from `refresh_log_index`~~ **VERIFIED NON-ISSUE** (scan 2026-05-30) — index entries over-count the archived monolith, but `max(seq)` consumption is idempotent and DB rebuild dedups independently; no correctness impact. | closed |
+| **B-ledger-cadence** | ~~Commit-ledger cadence policy~~ **DONE** (`e46c083`) — documented in RALLY_ARCHITECTURE.md: segments are a live working-tree artifact, `merge=union` makes lagging commits safe; no required cadence. | shipped |
 | **B2 / L5** | ~~Observation seam~~ **DONE** — `dag.rs` + `dag`/`wake-due`/`say standby`/`say wake` + `--run/--step/--parent-step` lineage; rally derives the DAG + wake-due, never executes. Tested e2e 2026-05-30; wired into `skills/rally-workflows/SKILL.md` §7. | shipped |
 
 ## Automation proposals — facilitator self-coordination
