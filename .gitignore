@@ -48,7 +48,7 @@ Thumbs.db
 target/
 
 # Local Rally room state.
-# Three things in .rally/ are canonical (committed) and survive clone/machine
+# Four things in .rally/ are canonical (committed) and survive clone/machine
 # with no external service:
 #   - `.rally/ledger.jsonl` (R1) and/or `.rally/log/**` (R5): the append-only
 #     durable record of every fact. R5 supersedes the monolith with
@@ -57,12 +57,16 @@ target/
 #   - `.rally/archive/**` (R7): rotated old segments, still replayable.
 #   - `.rally/manifest.json` (R4): self-describing pointers to docs + ledger
 #     so any agent landing in the repo finds the rally point.
+#   - `.rally/RETROSPECTIVE.md` (R6): human-readable digest grouped by
+#     engagement. Derived view (regenerate via `rally retrospective`; do
+#     not hand-edit) but committed so a fresh clone sees the history.
 # Everything else under .rally/ is a derived cache (facts.db, room.db,
 # cursors.json, tmp files) that `rally` rebuilds from the ledger on first
 # open.
 .rally/*
 !.rally/ledger.jsonl
 !.rally/manifest.json
+!.rally/RETROSPECTIVE.md
 !.rally/log/
 !.rally/archive/
 .rally/log/*.tmp-*

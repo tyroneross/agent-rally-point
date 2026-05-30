@@ -18,6 +18,7 @@ pub(crate) enum CliCommand {
     Session(SessionActionArgs),
     Locate(LocateArgs),
     Recent(RecentArgs),
+    Retrospective(RetrospectiveArgs),
 }
 
 pub(crate) enum CliParse {
@@ -28,6 +29,17 @@ pub(crate) enum CliParse {
 #[derive(Clone, Debug)]
 pub(crate) struct InitArgs {
     pub(crate) json: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RetrospectiveArgs {
+    pub(crate) json: bool,
+    /// Optional explicit output path. Defaults to `.rally/RETROSPECTIVE.md`
+    /// under the shared repo root.
+    pub(crate) out: Option<String>,
+    /// Filter to a single engagement label. Default: all engagements present
+    /// in the segment set (including the migrated archive).
+    pub(crate) engagement: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -165,8 +177,21 @@ impl Default for BackendBins {
 }
 
 const COMMANDS: &[&str] = &[
-    "init", "enter", "say", "room", "next", "check", "run", "sessions", "inject", "attach",
-    "capture", "stop", "locate", "recent",
+    "init",
+    "enter",
+    "say",
+    "room",
+    "next",
+    "check",
+    "run",
+    "sessions",
+    "inject",
+    "attach",
+    "capture",
+    "stop",
+    "locate",
+    "recent",
+    "retrospective",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -260,10 +285,27 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("stop")
         .map(CliCommand::Session);
+    let retrospective = retrospective_parser()
+        .to_options()
+        .command("retrospective")
+        .map(CliCommand::Retrospective);
 
     construct!([
-        init, enter, say, room, next, locate, recent, check, run, sessions, inject, attach,
-        capture, stop
+        init,
+        enter,
+        say,
+        room,
+        next,
+        locate,
+        recent,
+        check,
+        run,
+        sessions,
+        inject,
+        attach,
+        capture,
+        stop,
+        retrospective
     ])
     .to_options()
 }
@@ -271,6 +313,17 @@ fn cli_parser() -> OptionParser<CliCommand> {
 fn init_parser() -> impl Parser<InitArgs> {
     let json = json_flag();
     construct!(InitArgs { json })
+}
+
+fn retrospective_parser() -> impl Parser<RetrospectiveArgs> {
+    let json = json_flag();
+    let out = optional_string_arg("out", "PATH");
+    let engagement = optional_string_arg("engagement", "LABEL");
+    construct!(RetrospectiveArgs {
+        json,
+        out,
+        engagement
+    })
 }
 
 fn enter_parser() -> impl Parser<EnterArgs> {

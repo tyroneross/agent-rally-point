@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_INIT: &str = "agent-rally.command.init.v1";
+const SCHEMA_RETROSPECTIVE: &str = "agent-rally.command.retrospective.v1";
 const SCHEMA_ENTER: &str = "agent-rally.command.enter.v1";
 const SCHEMA_SAY: &str = "agent-rally.command.say.v1";
 const SCHEMA_ROOM: &str = "agent-rally.command.room.v1";
@@ -43,6 +44,7 @@ mod error;
 mod init;
 mod next;
 mod output;
+mod retrospective;
 mod store;
 
 use backends::*;
@@ -99,7 +101,20 @@ fn run_inner() -> Result<Output> {
         CliCommand::Sessions(args) => command_sessions(args),
         CliCommand::Inject(args) => command_inject(args),
         CliCommand::Session(args) => command_session_action(args),
+        CliCommand::Retrospective(args) => command_retrospective(args),
     }
+}
+
+fn command_retrospective(args: RetrospectiveArgs) -> Result<Output> {
+    let root = repo_root()?;
+    let outcome =
+        retrospective::run_retrospective(root, args.engagement.as_deref(), args.out.as_deref())?;
+    let text = format!(
+        "retrospective: {} ({}) — {} fact(s) across {} engagement(s)",
+        outcome.output_path, outcome.action, outcome.total_facts, outcome.total_engagements,
+    );
+    let body = envelope("retrospective", SCHEMA_RETROSPECTIVE, outcome)?;
+    Ok(Output::new(args.json, text, body))
 }
 
 fn command_init(args: InitArgs) -> Result<Output> {
@@ -1344,7 +1359,8 @@ fn help_text() -> String {
         "",
         "Usage:",
         "  rally init [--json]",
-        "  rally enter --tool <tool> [--path <path>] [--role <role>] [--json]",
+        "  rally retrospective [--engagement <label>] [--out <path>] [--json]",
+        "  rally enter --tool <tool> [--engagement <label>] [--path <path>] [--role <role>] [--json]",
         "  rally say <kind> --tool <tool> --subject <subject> [--path <path>] [--json]",
         "  rally room [--tool <tool>] [--role <role>] [--path <path>] [--since <seq>] [--json]",
         "  rally next --tool <tool> [--path <path>] [--role <role>] [--limit <n>] [--json]",
