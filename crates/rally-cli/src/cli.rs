@@ -156,6 +156,9 @@ pub(crate) struct CheckArgs {
     pub(crate) tool: Option<String>,
     pub(crate) path: Option<String>,
     pub(crate) strict: bool,
+    // #9 tier-fit advisory fields (None for non-tier-fit phases)
+    pub(crate) role: Option<String>,
+    pub(crate) proposed_tier: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -614,16 +617,23 @@ fn check_parser() -> impl Parser<CheckArgs> {
     let tool = optional_string_arg("tool", "TOOL");
     let path = optional_string_arg("path", "PATH");
     let strict = long("strict").switch();
+    // #9 tier-fit advisory args (ignored for non-tier-fit phases)
+    let role = optional_string_arg("role", "ROLE");
+    let proposed_tier = optional_string_arg("proposed-tier", "TIER");
     let phase = positional::<String>("PHASE")
         .optional()
         .map(|phase| phase.unwrap_or_else(|| "before-write".to_string()));
-    construct!(json, tool, path, strict, phase).map(|(json, tool, path, strict, phase)| CheckArgs {
-        json,
-        phase,
-        tool,
-        path,
-        strict,
-    })
+    construct!(json, tool, path, strict, role, proposed_tier, phase).map(
+        |(json, tool, path, strict, role, proposed_tier, phase)| CheckArgs {
+            json,
+            phase,
+            tool,
+            path,
+            strict,
+            role,
+            proposed_tier,
+        },
+    )
 }
 
 fn run_parser() -> impl Parser<RunArgs> {
