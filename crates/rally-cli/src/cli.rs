@@ -22,6 +22,7 @@ pub(crate) enum CliCommand {
     Rotate(RotateArgs),
     Status(StatusArgs),
     Watch(WatchArgs),
+    MigrateLegacy(MigrateLegacyArgs),
 }
 
 pub(crate) enum CliParse {
@@ -114,15 +115,18 @@ pub(crate) struct NextArgs {
 pub(crate) struct LocateArgs {
     pub(crate) json: bool,
     pub(crate) event_id: String,
-    pub(crate) include_legacy: bool,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct RecentArgs {
     pub(crate) json: bool,
     pub(crate) all: bool,
-    pub(crate) include_legacy: bool,
     pub(crate) limit: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MigrateLegacyArgs {
+    pub(crate) json: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -245,6 +249,7 @@ const COMMANDS: &[&str] = &[
     "rotate",
     "status",
     "watch",
+    "migrate-legacy",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -354,6 +359,10 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("watch")
         .map(CliCommand::Watch);
+    let migrate_legacy = migrate_legacy_parser()
+        .to_options()
+        .command("migrate-legacy")
+        .map(CliCommand::MigrateLegacy);
 
     construct!([
         init,
@@ -373,7 +382,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         retrospective,
         rotate,
         status,
-        watch
+        watch,
+        migrate_legacy
     ])
     .to_options()
 }
@@ -526,26 +536,20 @@ fn next_parser() -> impl Parser<NextArgs> {
 
 fn locate_parser() -> impl Parser<LocateArgs> {
     let json = json_flag();
-    let include_legacy = long("include-legacy").switch();
     let event_id = positional::<String>("EVENT_ID");
-    construct!(json, include_legacy, event_id).map(|(json, include_legacy, event_id)| LocateArgs {
-        json,
-        event_id,
-        include_legacy,
-    })
+    construct!(json, event_id).map(|(json, event_id)| LocateArgs { json, event_id })
 }
 
 fn recent_parser() -> impl Parser<RecentArgs> {
     let json = json_flag();
     let all = long("all").switch();
-    let include_legacy = long("include-legacy").switch();
     let limit = bounded_i64_arg("limit", "N", 20, 1, 500);
-    construct!(RecentArgs {
-        json,
-        all,
-        include_legacy,
-        limit
-    })
+    construct!(RecentArgs { json, all, limit })
+}
+
+fn migrate_legacy_parser() -> impl Parser<MigrateLegacyArgs> {
+    let json = json_flag();
+    construct!(MigrateLegacyArgs { json })
 }
 
 fn check_parser() -> impl Parser<CheckArgs> {

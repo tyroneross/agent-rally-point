@@ -58,6 +58,8 @@ use next::{AttentionItem, EntryData, NextResult, build_attention, build_entry, b
 use output::{CliError, Output};
 use store::{Fact, FactKind, RoomQuery, RoomSnapshot, RoomStore, RoomSummary};
 
+const SCHEMA_MIGRATE_LEGACY: &str = "agent-rally.command.migrate-legacy.v1";
+
 pub fn main() -> ExitCode {
     let wants_json = env::args().any(|arg| arg == "--json");
     match run_inner() {
@@ -108,6 +110,7 @@ fn run_inner() -> Result<Output> {
         CliCommand::Rotate(args) => command_rotate(args),
         CliCommand::Status(args) => command_status(args),
         CliCommand::Watch(args) => command_watch(args),
+        CliCommand::MigrateLegacy(args) => command_migrate_legacy(args),
     }
 }
 
@@ -510,7 +513,7 @@ fn command_next(args: NextArgs) -> Result<Output> {
 }
 
 fn command_locate(args: LocateArgs) -> Result<Output> {
-    let data = discovery::locate(&args.event_id, args.include_legacy)?;
+    let data = discovery::locate(&args.event_id)?;
     let found = data.located.is_some();
     let body = envelope("locate", SCHEMA_LOCATE, data)?;
     let text = format!("locate event={} found={}", args.event_id, found);
@@ -518,10 +521,29 @@ fn command_locate(args: LocateArgs) -> Result<Output> {
 }
 
 fn command_recent(args: RecentArgs) -> Result<Output> {
-    let data = discovery::recent(args.all, args.include_legacy, args.limit)?;
+    let data = discovery::recent(args.all, args.limit)?;
     let count = data.rows.len();
     let body = envelope("recent", SCHEMA_RECENT, data)?;
     let text = format!("recent rows={count}");
+    Ok(Output::new(args.json, text, body))
+}
+
+fn command_migrate_legacy(args: MigrateLegacyArgs) -> Result<Output> {
+    let root = repo_root()?;
+    let repo_basename = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
+    let room = RoomStore::open()?;
+    let data = discovery::migrate_legacy(&room, &repo_basename)?;
+    let text = format!(
+        "migrate-legacy slugs={} facts_read={} migrated={} skipped_existing={}",
+        data.slugs_found.len(),
+        data.facts_read,
+        data.facts_migrated,
+        data.facts_skipped_existing,
+    );
+    let body = envelope("migrate-legacy", SCHEMA_MIGRATE_LEGACY, data)?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -3424,8 +3446,9 @@ fn help_text() -> String {
         "  rally say <kind> --tool <tool> --subject <subject> [--path <path>] [--json]",
         "  rally room [--tool <tool>] [--role <role>] [--path <path>] [--since <seq>] [--json]",
         "  rally next --tool <tool> [--path <path>] [--role <role>] [--limit <n>] [--json]",
-        "  rally locate <event-id> [--include-legacy] [--json]",
-        "  rally recent [--all] [--include-legacy] [--limit <n>] [--json]",
+        "  rally locate <event-id> [--json]",
+        "  rally recent [--all] [--limit <n>] [--json]",
+        "  rally migrate-legacy [--json]  # one-shot replay of legacy ~/.agent-rally-point/apps/<slug>/changes.jsonl into this repo ledger",
         "  rally check before-write --tool <tool> --path <path> [--strict] [--json]",
         "  rally check before-complete --tool <tool> [--strict] [--json]",
         "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|herdr|cmux>] [--dry-run] [--json]",

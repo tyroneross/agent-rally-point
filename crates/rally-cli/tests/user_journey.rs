@@ -1301,8 +1301,12 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
     workspace.cleanup();
 }
 
+/// B17: verify that `locate` and `recent` use only the rooms registry (per-repo
+/// `.rally/log`) — legacy-only facts in `apps/<slug>/changes.jsonl` are NOT
+/// returned because the `--include-legacy` flag has been retired. Cross-repo
+/// rooms-based discovery still works normally via the global index.
 #[test]
-fn rally_locate_and_recent_discover_rooms_and_legacy_channels() {
+fn rally_locate_and_recent_discover_rooms_without_legacy() {
     let home = temp_path("rally-discovery-home");
     let repo_a = Workspace::new_with_home("rally-discovery-a", &home);
     let repo_b = Workspace::new_with_home("rally-discovery-b", &home);
@@ -1330,6 +1334,8 @@ fn rally_locate_and_recent_discover_rooms_and_legacy_channels() {
     ]);
     let artifact_id = artifact["data"]["fact"]["event_id"].as_str().unwrap();
 
+    // Cross-repo locate: repo_b can locate a fact written by repo_a via the
+    // global rooms index.
     let located = repo_b.json(&["locate", decision_id, "--json"]);
     assert_matches_schema("agent-rally.command.locate.v1.json", &located);
     assert_eq!(located["data"]["located"]["source"], "room");
@@ -1344,6 +1350,7 @@ fn rally_locate_and_recent_discover_rooms_and_legacy_channels() {
             .contains("rally-discovery-a-cwd")
     );
 
+    // Seed a legacy-only fact under apps/ — it must NOT surface in locate or recent.
     let legacy_dir = home.join(".agent-rally-point/apps/repo_legacy");
     fs::create_dir_all(&legacy_dir).unwrap();
     fs::write(
@@ -1352,41 +1359,33 @@ fn rally_locate_and_recent_discover_rooms_and_legacy_channels() {
     )
     .unwrap();
 
-    let hidden = repo_b.json(&["recent", "--all", "--json", "--limit", "10"]);
-    assert_matches_schema("agent-rally.command.recent.v1.json", &hidden);
+    // locate does NOT find the legacy-only event (no --include-legacy flag exists).
+    let not_found = repo_b.json(&["locate", "evt_legacy_wake", "--json"]);
     assert!(
-        hidden["data"]["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|warning| warning["code"] == "legacy_hidden")
+        not_found["data"]["located"].is_null(),
+        "legacy-only event must NOT be found by locate after flag retirement; got: {:?}",
+        not_found["data"]["located"]
     );
 
-    let legacy = repo_b.json(&["locate", "evt_legacy_wake", "--include-legacy", "--json"]);
-    assert_eq!(legacy["data"]["located"]["source"], "legacy_channel");
-    assert_eq!(legacy["data"]["located"]["local_seq"], 7);
-
-    let recent = repo_b.json(&[
-        "recent",
-        "--all",
-        "--include-legacy",
-        "--json",
-        "--limit",
-        "10",
-    ]);
+    // recent --all returns room-based rows (including artifact from repo_b);
+    // the legacy-only record is not present.
+    let recent = repo_b.json(&["recent", "--all", "--json", "--limit", "10"]);
+    assert_matches_schema("agent-rally.command.recent.v1.json", &recent);
     assert!(
         recent["data"]["rows"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|row| row["fact"]["event_id"].as_str() == Some(artifact_id))
+            .any(|row| row["fact"]["event_id"].as_str() == Some(artifact_id)),
+        "recent must include the room-based artifact fact"
     );
     assert!(
-        recent["data"]["rows"]
+        !recent["data"]["rows"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|row| row["record"]["event"]["id"] == "evt_legacy_wake")
+            .any(|row| row["record"]["event"]["id"] == "evt_legacy_wake"),
+        "recent must NOT include the legacy-only event after flag retirement"
     );
 
     repo_a.cleanup();
@@ -2056,4 +2055,129 @@ fn presence_substrate_enter_writes_presence_and_lead() {
     );
 
     workspace.cleanup();
+}
+
+/// B17 — migrate-legacy: one-shot replay of legacy changes.jsonl into per-repo
+/// ledger; idempotent on second run; legacy file untouched.
+#[test]
+fn rally_migrate_legacy_replays_and_is_idempotent() {
+    let home = temp_path("rally-migrate-legacy-home");
+    let workspace = Workspace::new_with_home("rally-migrate-legacy", &home);
+
+    // Seed a legacy channel whose slug matches the workspace repo basename.
+    let repo_basename = workspace
+        .cwd
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("rally-migrate-legacy")
+        .to_string();
+
+    // Construct a minimal current-format rally fact line.
+    let fact_json = serde_json::json!({
+        "schema": "agent-rally.fact.v1",
+        "event_id": "evt_migrate_test_001",
+        "seq": 1,
+        "thread_id": "thr_migrate_test",
+        "kind": "decision",
+        "tool": "codex",
+        "role": null,
+        "subject": "legacy migrate decision",
+        "scope": [],
+        "created_at": "2026-05-28T12:00:00Z",
+        "summary": "seeded for B17 migrate test",
+        "evidence": [],
+        "target": null,
+        "ref_id": null,
+        "status": null,
+        "severity": null,
+        "uri": null,
+        "session": null,
+    })
+    .to_string();
+
+    // Seed legacy channel under the matching slug directory.
+    let apps_dir = home.join(".agent-rally-point/apps").join(&repo_basename);
+    fs::create_dir_all(&apps_dir).unwrap();
+    let legacy_file = apps_dir.join("changes.jsonl");
+    fs::write(&legacy_file, format!("{fact_json}\n")).unwrap();
+
+    // Also seed a non-matching slug to confirm it is not migrated.
+    let unrelated_dir = home.join(".agent-rally-point/apps/_unscoped");
+    fs::create_dir_all(&unrelated_dir).unwrap();
+    let unrelated_fact = serde_json::json!({
+        "schema": "agent-rally.fact.v1",
+        "event_id": "evt_unrelated_999",
+        "seq": 1,
+        "thread_id": "thr_unrelated",
+        "kind": "decision",
+        "tool": "codex",
+        "role": null,
+        "subject": "unrelated repo decision",
+        "scope": [],
+        "created_at": "2026-05-28T12:00:00Z",
+        "summary": null,
+        "evidence": [],
+        "target": null,
+        "ref_id": null,
+        "status": null,
+        "severity": null,
+        "uri": null,
+        "session": null,
+    })
+    .to_string();
+    fs::write(unrelated_dir.join("changes.jsonl"), format!("{unrelated_fact}\n")).unwrap();
+
+    // First migrate-legacy run.
+    let first = workspace.json(&["migrate-legacy", "--json"]);
+    assert!(
+        first["ok"].as_bool().unwrap_or(false),
+        "migrate-legacy must return ok:true on first run"
+    );
+    let migrated = first["data"]["facts_migrated"].as_u64().unwrap_or(0);
+    assert_eq!(migrated, 1, "first run must migrate exactly 1 fact");
+    assert_eq!(
+        first["data"]["facts_skipped_existing"].as_u64().unwrap_or(99),
+        0,
+        "no facts should be skipped on first run"
+    );
+
+    // Verify the fact appears in recent.
+    let recent = workspace.json(&["recent", "--json"]);
+    assert!(
+        recent["data"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["fact"]["event_id"].as_str() == Some("evt_migrate_test_001")),
+        "migrated fact must appear in recent after first run"
+    );
+
+    // Unrelated fact must NOT appear (different slug).
+    assert!(
+        !recent["data"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["fact"]["event_id"].as_str() == Some("evt_unrelated_999")),
+        "unrelated-slug fact must NOT be migrated"
+    );
+
+    // Second migrate-legacy run: idempotent.
+    let second = workspace.json(&["migrate-legacy", "--json"]);
+    assert_eq!(
+        second["data"]["facts_migrated"].as_u64().unwrap_or(99),
+        0,
+        "second run must migrate 0 facts (already in ledger)"
+    );
+    assert_eq!(
+        second["data"]["facts_skipped_existing"].as_u64().unwrap_or(0),
+        1,
+        "second run must count 1 skipped-existing"
+    );
+
+    // Legacy file untouched (non-destructive migrator).
+    assert!(legacy_file.exists(), "migrate-legacy must not delete the legacy file");
+
+    workspace.cleanup();
+    fs::remove_dir_all(home).ok();
 }

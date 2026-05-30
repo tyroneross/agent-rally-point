@@ -69,9 +69,21 @@ pub(crate) struct RecentRow {
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub(crate) struct RecentData {
     pub(crate) all: bool,
-    pub(crate) include_legacy: bool,
     pub(crate) limit: i64,
     pub(crate) rows: Vec<RecentRow>,
+    pub(crate) warnings: Vec<DiscoveryWarning>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct MigrateLegacyData {
+    /// Directory names (app slugs) matched and examined.
+    pub(crate) slugs_found: Vec<String>,
+    /// Total records read across all matched legacy channels.
+    pub(crate) facts_read: usize,
+    /// Records successfully replayed into the repo ledger.
+    pub(crate) facts_migrated: usize,
+    /// Records skipped because their event_id already exists in the ledger.
+    pub(crate) facts_skipped_existing: usize,
     pub(crate) warnings: Vec<DiscoveryWarning>,
 }
 
@@ -154,7 +166,7 @@ pub(crate) fn refresh_room_index(
     write_room_index_at(&path, &index)
 }
 
-pub(crate) fn locate(event_id: &str, include_legacy: bool) -> Result<LocateData> {
+pub(crate) fn locate(event_id: &str) -> Result<LocateData> {
     let current = repo_root()?;
     let mut warnings = Vec::new();
     let rooms = known_rooms_with_current(&current, &mut warnings)?;
@@ -166,17 +178,6 @@ pub(crate) fn locate(event_id: &str, include_legacy: bool) -> Result<LocateData>
                 warnings,
             });
         }
-    }
-    if include_legacy {
-        if let Some(record) = locate_in_legacy(event_id, &mut warnings)? {
-            return Ok(LocateData {
-                event_id: event_id.to_string(),
-                located: Some(record),
-                warnings,
-            });
-        }
-    } else {
-        warn_if_legacy_exists(&mut warnings);
     }
     Ok(LocateData {
         event_id: event_id.to_string(),
@@ -279,7 +280,7 @@ pub(crate) fn status_global() -> Result<GlobalStatusData> {
     Ok(GlobalStatusData { repos, warnings })
 }
 
-pub(crate) fn recent(all: bool, include_legacy: bool, limit: i64) -> Result<RecentData> {
+pub(crate) fn recent(all: bool, limit: i64) -> Result<RecentData> {
     let current = repo_root()?;
     let mut warnings = Vec::new();
     let mut rows = Vec::new();
@@ -306,11 +307,6 @@ pub(crate) fn recent(all: bool, include_legacy: bool, limit: i64) -> Result<Rece
             missing_count,
         ));
     }
-    if include_legacy {
-        rows.extend(recent_legacy(&mut warnings)?);
-    } else {
-        warn_if_legacy_exists(&mut warnings);
-    }
     rows.sort_by(|left, right| {
         right
             .created_at
@@ -321,7 +317,6 @@ pub(crate) fn recent(all: bool, include_legacy: bool, limit: i64) -> Result<Rece
     rows.truncate(limit.max(0) as usize);
     Ok(RecentData {
         all,
-        include_legacy,
         limit,
         rows,
         warnings,
@@ -452,122 +447,6 @@ fn open_indexed_room(
     }
 }
 
-fn locate_in_legacy(
-    event_id: &str,
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<Option<LocatedRecord>> {
-    for (path, local_seq, record) in legacy_records(warnings)? {
-        if legacy_event_id(&record).as_deref() == Some(event_id) {
-            return Ok(Some(LocatedRecord {
-                source: "legacy_channel".to_string(),
-                repo_root: None,
-                display_name: None,
-                facts_db: None,
-                legacy_channel: Some(path),
-                local_seq,
-                fact: None,
-                record: Some(record),
-            }));
-        }
-    }
-    Ok(None)
-}
-
-fn recent_legacy(warnings: &mut Vec<DiscoveryWarning>) -> Result<Vec<RecentRow>> {
-    Ok(legacy_records(warnings)?
-        .into_iter()
-        .map(|(path, local_seq, record)| RecentRow {
-            source: "legacy_channel".to_string(),
-            repo_root: None,
-            display_name: None,
-            facts_db: None,
-            legacy_channel: Some(path),
-            local_seq,
-            seq: None,
-            created_at: legacy_created_at(&record),
-            fact: None,
-            record: Some(record),
-        })
-        .collect())
-}
-
-fn legacy_records(
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<Vec<(PathBuf, Option<i64>, Value)>> {
-    let mut records = Vec::new();
-    let root = legacy_apps_root();
-    if !root.exists() {
-        return Ok(records);
-    }
-    let entries =
-        fs::read_dir(&root).map_err(RallyError::io(format!("read {}", root.display())))?;
-    for entry in entries {
-        let entry = entry.map_err(RallyError::io(format!("read {}", root.display())))?;
-        let path = entry.path().join("changes.jsonl");
-        if !path.exists() {
-            continue;
-        }
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) => {
-                warnings.push(warning(
-                    "legacy_channel_unreadable",
-                    format!("failed to read legacy channel: {err}"),
-                    Some(path),
-                ));
-                continue;
-            }
-        };
-        for (idx, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Value>(line) {
-                Ok(record) => {
-                    let local_seq = record
-                        .get("local_seq")
-                        .and_then(Value::as_i64)
-                        .or(Some(idx as i64 + 1));
-                    records.push((path.clone(), local_seq, record));
-                }
-                Err(err) => warnings.push(warning(
-                    "legacy_channel_malformed",
-                    format!("failed to parse legacy channel line {}: {err}", idx + 1),
-                    Some(path.clone()),
-                )),
-            }
-        }
-    }
-    Ok(records)
-}
-
-fn warn_if_legacy_exists(warnings: &mut Vec<DiscoveryWarning>) {
-    let root = legacy_apps_root();
-    if root.exists() {
-        warnings.push(warning(
-            "legacy_hidden",
-            "legacy ~/.agent-rally-point/apps channels exist; pass --include-legacy to read them",
-            Some(root),
-        ));
-    }
-}
-
-fn legacy_event_id(record: &Value) -> Option<String> {
-    record
-        .pointer("/event/id")
-        .or_else(|| record.get("id"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-fn legacy_created_at(record: &Value) -> Option<String> {
-    record
-        .pointer("/event/time")
-        .or_else(|| record.get("received_at"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
 fn read_room_index_at(path: &Path) -> Result<RoomIndex> {
     if !path.exists() {
         return Ok(RoomIndex::default());
@@ -655,6 +534,191 @@ fn legacy_apps_root() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".agent-rally-point/apps")
+}
+
+/// Migrate surviving rally facts from the legacy `~/.agent-rally-point/apps/<slug>/changes.jsonl`
+/// store into the current repo's `.rally/log` ledger.
+///
+/// Slug matching: any directory under `apps/` whose name equals the current repo's
+/// basename, or starts with `{basename}-` followed by 8+ hex characters (the
+/// suffix that the old coordinator appended as a path-hash disambiguator).
+///
+/// Only records that (a) have a current-format rally fact schema
+/// (`agent-rally.fact.v1`) AND (b) whose `event_id` does not yet exist in the
+/// ledger are replayed. All other records are counted in `facts_read` but
+/// contribute to neither `facts_migrated` nor `facts_skipped_existing`.
+///
+/// The legacy files are NOT deleted — this is a replay-only, non-destructive
+/// migrator. Running it twice is safe: the second run produces
+/// `facts_migrated == 0` because all event_ids are already present.
+pub(crate) fn migrate_legacy(
+    room: &RoomStore,
+    repo_basename: &str,
+) -> Result<MigrateLegacyData> {
+    migrate_legacy_from(room, repo_basename, &legacy_apps_root())
+}
+
+fn migrate_legacy_from(
+    room: &RoomStore,
+    repo_basename: &str,
+    apps_root: &PathBuf,
+) -> Result<MigrateLegacyData> {
+    let apps_root = apps_root.clone();
+    let mut slugs_found: Vec<String> = Vec::new();
+    let mut facts_read: usize = 0;
+    let mut facts_migrated: usize = 0;
+    let mut facts_skipped_existing: usize = 0;
+    let mut warnings: Vec<DiscoveryWarning> = Vec::new();
+
+    if !apps_root.exists() {
+        return Ok(MigrateLegacyData {
+            slugs_found,
+            facts_read,
+            facts_migrated,
+            facts_skipped_existing,
+            warnings,
+        });
+    }
+
+    // Collect the set of event_ids already present in the repo ledger for
+    // idempotency checks.
+    let existing_ids: std::collections::BTreeSet<String> = room
+        .facts()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| f.event_id)
+        .collect();
+
+    // Enumerate candidate slug directories.
+    let entries = match fs::read_dir(&apps_root) {
+        Ok(e) => e,
+        Err(err) => {
+            warnings.push(warning(
+                "legacy_apps_unreadable",
+                format!("failed to read legacy apps dir: {err}"),
+                Some(apps_root),
+            ));
+            return Ok(MigrateLegacyData {
+                slugs_found,
+                facts_read,
+                facts_migrated,
+                facts_skipped_existing,
+                warnings,
+            });
+        }
+    };
+
+    for entry in entries.flatten() {
+        let slug = entry.file_name().to_string_lossy().into_owned();
+        if !slug_matches_repo(&slug, repo_basename) {
+            continue;
+        }
+        let channel = entry.path().join("changes.jsonl");
+        if !channel.exists() {
+            continue;
+        }
+        slugs_found.push(slug.clone());
+
+        let text = match fs::read_to_string(&channel) {
+            Ok(t) => t,
+            Err(err) => {
+                warnings.push(warning(
+                    "legacy_channel_unreadable",
+                    format!("failed to read legacy channel {slug}: {err}"),
+                    Some(channel),
+                ));
+                continue;
+            }
+        };
+
+        for (idx, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            // Parse as a serde_json::Value first to check schema.
+            let record: Value = match serde_json::from_str(line) {
+                Ok(r) => r,
+                Err(err) => {
+                    warnings.push(warning(
+                        "legacy_channel_malformed",
+                        format!("failed to parse {slug} line {}: {err}", idx + 1),
+                        Some(channel.clone()),
+                    ));
+                    continue;
+                }
+            };
+
+            // Only migrate current-format rally facts.
+            let schema = record.get("schema").and_then(Value::as_str).unwrap_or("");
+            if schema != crate::FACT_SCHEMA {
+                continue;
+            }
+
+            facts_read += 1;
+
+            // Deserialize as a Fact.
+            let fact: Fact = match serde_json::from_value(record) {
+                Ok(f) => f,
+                Err(err) => {
+                    warnings.push(warning(
+                        "legacy_fact_malformed",
+                        format!("failed to deserialize {slug} line {} as Fact: {err}", idx + 1),
+                        Some(channel.clone()),
+                    ));
+                    continue;
+                }
+            };
+
+            if existing_ids.contains(&fact.event_id) {
+                facts_skipped_existing += 1;
+                continue;
+            }
+
+            // Replay into the repo ledger via the normal append path.
+            // seq is reset to 0 so the store assigns the next local seq.
+            let replay = Fact { seq: 0, ..fact };
+            match room.append_fact(&replay) {
+                Ok(_) => facts_migrated += 1,
+                Err(err) => {
+                    warnings.push(warning(
+                        "legacy_fact_replay_failed",
+                        format!("failed to replay fact from {slug}: {err}"),
+                        Some(channel.clone()),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Sort slugs for deterministic output.
+    slugs_found.sort();
+
+    Ok(MigrateLegacyData {
+        slugs_found,
+        facts_read,
+        facts_migrated,
+        facts_skipped_existing,
+        warnings,
+    })
+}
+
+/// Returns true when the given `slug` directory name matches the repo `basename`.
+///
+/// Match rules (both cover known slug derivation patterns):
+/// - Exact match: `slug == basename`
+/// - Hash-suffix match: `slug` starts with `{basename}-` and the remainder is
+///   8+ lowercase hex characters (the old coordinator's path-hash suffix).
+pub(crate) fn slug_matches_repo(slug: &str, basename: &str) -> bool {
+    if slug == basename {
+        return true;
+    }
+    if let Some(suffix) = slug.strip_prefix(&format!("{basename}-")) {
+        // Require ≥ 8 hex chars (path hash suffix pattern).
+        if suffix.len() >= 8 && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return true;
+        }
+    }
+    false
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -806,5 +870,249 @@ mod tests {
         );
         assert_eq!(warnings[0].code, "rooms_missing");
         assert_eq!(warnings[0].count, Some(3));
+    }
+
+    // =========================================================================
+    // B17 — slug_matches_repo unit tests
+    // =========================================================================
+
+    /// Exact slug name matches the repo basename.
+    #[test]
+    fn slug_matches_exact_basename() {
+        assert!(slug_matches_repo("agent-rally-point", "agent-rally-point"));
+    }
+
+    /// Slug with 8-char hex suffix matches.
+    #[test]
+    fn slug_matches_with_8char_hex_suffix() {
+        assert!(slug_matches_repo("agent-rally-point-2b14b480", "agent-rally-point"));
+    }
+
+    /// Slug with longer hex suffix (16 chars) matches.
+    #[test]
+    fn slug_matches_with_longer_hex_suffix() {
+        assert!(slug_matches_repo("my-repo-abcdef0123456789", "my-repo"));
+    }
+
+    /// Slug with only 7 hex chars after the dash does NOT match (too short).
+    #[test]
+    fn slug_does_not_match_short_hex_suffix() {
+        assert!(!slug_matches_repo("agent-rally-point-2b14b48", "agent-rally-point"));
+    }
+
+    /// Slug with non-hex suffix does NOT match.
+    #[test]
+    fn slug_does_not_match_non_hex_suffix() {
+        assert!(!slug_matches_repo("agent-rally-point-worker", "agent-rally-point"));
+    }
+
+    /// Completely unrelated slug does NOT match.
+    #[test]
+    fn slug_does_not_match_unrelated() {
+        assert!(!slug_matches_repo("atomize-ai", "agent-rally-point"));
+    }
+
+    // =========================================================================
+    // B17 — migrate_legacy idempotency tests
+    // =========================================================================
+
+    fn tmp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rally-migrate-{label}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Build a minimal rally fact JSON line for the legacy store.
+    fn make_rally_fact_line(event_id: &str, subject: &str) -> String {
+        serde_json::json!({
+            "schema": crate::FACT_SCHEMA,
+            "event_id": event_id,
+            "seq": 1,
+            "thread_id": "thr_test",
+            "kind": "decision",
+            "tool": "test-tool",
+            "role": null,
+            "subject": subject,
+            "scope": [],
+            "created_at": "2026-05-29T00:00:00Z",
+            "summary": null,
+            "evidence": [],
+            "target": null,
+            "ref_id": null,
+            "status": null,
+            "severity": null,
+            "uri": null,
+            "session": null,
+        })
+        .to_string()
+    }
+
+    /// B17.migrate: seeding a legacy channel with rally facts and running
+    /// migrate_legacy replays them into the repo ledger. A second run
+    /// migrates 0 facts (idempotent).
+    #[test]
+    fn migrate_legacy_replays_facts_and_is_idempotent() {
+        let root = tmp_dir("migrate-idempotent");
+        let home = tmp_dir("migrate-idempotent-home");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        // Build the legacy channel under a temp home — pass apps_root directly
+        // to avoid global HOME mutation (which would race with parallel tests).
+        let apps_root = home.join(".agent-rally-point/apps");
+        let apps_dir = apps_root.join("my-repo");
+        fs::create_dir_all(&apps_dir).unwrap();
+        let channel = apps_dir.join("changes.jsonl");
+        fs::write(
+            &channel,
+            format!(
+                "{}\n{}\n",
+                make_rally_fact_line("evt_b17_001", "b17 migrate test decision 1"),
+                make_rally_fact_line("evt_b17_002", "b17 migrate test decision 2"),
+            ),
+        )
+        .unwrap();
+
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        // First run: should migrate both facts.
+        let result = migrate_legacy_from(&room, "my-repo", &apps_root).unwrap();
+        assert_eq!(result.slugs_found, vec!["my-repo".to_string()]);
+        assert_eq!(result.facts_read, 2, "two rally facts in the channel");
+        assert_eq!(result.facts_migrated, 2, "both replayed on first run");
+        assert_eq!(result.facts_skipped_existing, 0);
+
+        // Verify facts are in the ledger.
+        let facts = room.facts().unwrap();
+        let event_ids: Vec<&str> = facts.iter().map(|f| f.event_id.as_str()).collect();
+        assert!(event_ids.contains(&"evt_b17_001"), "evt_b17_001 must be in ledger");
+        assert!(event_ids.contains(&"evt_b17_002"), "evt_b17_002 must be in ledger");
+
+        // Second run: both already exist → migrated == 0.
+        let result2 = migrate_legacy_from(&room, "my-repo", &apps_root).unwrap();
+        assert_eq!(result2.facts_migrated, 0, "second run must migrate nothing");
+        assert_eq!(
+            result2.facts_skipped_existing, 2,
+            "second run must skip both as existing"
+        );
+
+        // Legacy file is untouched (not deleted).
+        assert!(channel.exists(), "migrate_legacy must not delete the legacy file");
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// B17.migrate: non-rally records (build-loop phase events without rally schema)
+    /// are counted in facts_read=0 — only records with schema==agent-rally.fact.v1
+    /// are counted as facts_read.
+    #[test]
+    fn migrate_legacy_skips_non_rally_records() {
+        let root = tmp_dir("migrate-non-rally");
+        let home = tmp_dir("migrate-non-rally-home");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        let apps_root = home.join(".agent-rally-point/apps");
+        let apps_dir = apps_root.join("my-repo");
+        fs::create_dir_all(&apps_dir).unwrap();
+        let channel = apps_dir.join("changes.jsonl");
+        // One build-loop phase record (no rally schema) + one rally fact.
+        fs::write(
+            &channel,
+            format!(
+                "{}\n{}\n",
+                r#"{"ts":1780000000.0,"kind":"phase","tool":"claude_code","app_slug":"my-repo","payload":{"phase":"rally-start"}}"#,
+                make_rally_fact_line("evt_b17_003", "b17 non-rally skip test"),
+            ),
+        )
+        .unwrap();
+
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        let result = migrate_legacy_from(&room, "my-repo", &apps_root).unwrap();
+        assert_eq!(
+            result.facts_read, 1,
+            "only the rally-schema record is counted as facts_read"
+        );
+        assert_eq!(result.facts_migrated, 1, "the rally fact is migrated");
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// B17.migrate: recent and locate do NOT return legacy-only facts (flag retired).
+    /// The repo ledger is the only source; legacy facts are invisible until migrated.
+    #[test]
+    fn recent_and_locate_do_not_read_legacy() {
+        let root = tmp_dir("recent-no-legacy");
+        let home = tmp_dir("recent-no-legacy-home");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        // Seed a legacy channel with a rally fact — should NOT appear in repo ledger.
+        let apps_root = home.join(".agent-rally-point/apps");
+        let apps_dir = apps_root.join("my-repo");
+        fs::create_dir_all(&apps_dir).unwrap();
+        let channel = apps_dir.join("changes.jsonl");
+        fs::write(
+            &channel,
+            format!("{}\n", make_rally_fact_line("evt_b17_legacy_only", "legacy only fact")),
+        )
+        .unwrap();
+
+        // Write one fact in the real repo ledger.
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        let live_fact = crate::store::Fact {
+            schema: crate::FACT_SCHEMA.to_string(),
+            event_id: "evt_b17_live".to_string(),
+            seq: 0,
+            thread_id: "thr_b17".to_string(),
+            kind: crate::store::FactKind::Decision,
+            tool: Some("b17-tool".to_string()),
+            role: None,
+            subject: "live fact".to_string(),
+            scope: Vec::new(),
+            created_at: "2026-05-29T00:00:00Z".to_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&live_fact).unwrap();
+        drop(room);
+
+        // Verify via the room facts API: the legacy-only fact is NOT in the ledger
+        // (discover::recent/locate no longer reads the legacy store).
+        let reader = RoomStore::open_at(root.clone()).unwrap();
+        let facts = reader.facts().unwrap();
+        assert!(
+            facts.iter().any(|f| f.event_id == "evt_b17_live"),
+            "live fact must be in ledger"
+        );
+        assert!(
+            !facts.iter().any(|f| f.event_id == "evt_b17_legacy_only"),
+            "legacy-only fact must NOT be in ledger before migrate"
+        );
+
+        // After migrate_legacy_from, the legacy fact IS in the ledger.
+        let room2 = RoomStore::open_at(root.clone()).unwrap();
+        migrate_legacy_from(&room2, "my-repo", &apps_root).unwrap();
+        let facts_after = room2.facts().unwrap();
+        assert!(
+            facts_after.iter().any(|f| f.event_id == "evt_b17_legacy_only"),
+            "after migration, legacy fact must appear in ledger"
+        );
+
+        // Legacy file still exists (non-destructive).
+        assert!(channel.exists(), "legacy file must not be deleted by migrator");
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&home).ok();
     }
 }

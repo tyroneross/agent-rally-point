@@ -11,10 +11,9 @@
     "schema": { "const": "agent-rally.command.recent.v1" },
     "data": {
       "type": "object",
-      "required": ["all", "include_legacy", "limit", "rows", "warnings"],
+      "required": ["all", "limit", "rows", "warnings"],
       "properties": {
         "all": { "type": "boolean" },
-        "include_legacy": { "type": "boolean" },
         "limit": { "type": "integer" },
         "rows": { "type": "array" },
         "warnings": { "type": "array" }
