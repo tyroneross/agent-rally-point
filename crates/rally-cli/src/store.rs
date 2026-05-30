@@ -105,6 +105,17 @@ pub(crate) enum FactKind {
     /// RALLY RECORDS ONLY. The actual model wake is performed by the external
     /// runner (rally watch / LaunchAgent / cron). Rally never calls exec/spawn.
     Standby,
+    /// Room north-star (mission) or per-agent autonomy envelope. Additive-marker
+    /// pattern — no Fact struct fields change; specifics encoded in existing fields:
+    ///   - Mission fact:   `scope = ["mission"]`, `subject = <north-star text>`.
+    ///   - Envelope fact:  `scope = ["envelope", "agent:<name>"]`,
+    ///                     `subject = "autonomy envelope for <name>"`,
+    ///                     `summary = "may:<...>"`,
+    ///                     `evidence = ["must_check:<...>"]`.
+    ///
+    /// RALLY RECORDS AND EXPOSES ONLY. Never checks, gates, or grants anything.
+    /// Setting again supersedes: latest-by-seq wins on read.
+    Mission,
     #[serde(other)]
     #[default]
     Unknown,
@@ -129,6 +140,7 @@ impl FactKind {
             "backlog-item" => Some(Self::BacklogItem),
             "receipt" => Some(Self::Receipt),
             "standby" => Some(Self::Standby),
+            "mission" => Some(Self::Mission),
             "unknown" => Some(Self::Unknown),
             _ => None,
         }
@@ -152,6 +164,7 @@ impl FactKind {
             Self::BacklogItem => "backlog-item",
             Self::Receipt => "receipt",
             Self::Standby => "standby",
+            Self::Mission => "mission",
             Self::Unknown => "unknown",
         }
     }
@@ -283,6 +296,12 @@ pub(crate) struct RoomSnapshot {
     /// `RoomStore::snapshot_with_readers`); empty in the default snapshot.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) readers: Vec<ReadReceipt>,
+    /// Current room north-star text, projected from the latest `FactKind::Mission`
+    /// fact whose scope contains `"mission"`. `None` when no mission has been set.
+    /// Omitted from JSON when unset so existing B16-style round-trip tests are
+    /// unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mission: Option<String>,
 }
 
 impl RoomSnapshot {
@@ -302,10 +321,11 @@ impl RoomSnapshot {
             recent_artifacts: filter_facts(self.recent_artifacts, query),
             unconsumed_artifacts: filter_facts(self.unconsumed_artifacts, query),
             stale_facts: filter_facts(self.stale_facts, query),
-            // squads, lead, and readers are room-level aggregates; not filtered by path/tool query.
+            // squads, lead, readers, and mission are room-level aggregates; not filtered by path/tool query.
             squads: self.squads,
             lead: self.lead,
             readers: self.readers,
+            mission: self.mission,
         }
     }
 }
@@ -1249,6 +1269,14 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
         .max_by_key(|f| f.seq)
         .and_then(|f| f.tool.clone());
 
+    // Mission: latest-by-seq Mission fact whose scope contains "mission".
+    // "mission" scope distinguishes north-star facts from envelope facts.
+    let mission = facts
+        .iter()
+        .filter(|f| f.kind == "mission" && f.scope.iter().any(|s| s == "mission"))
+        .max_by_key(|f| f.seq)
+        .map(|f| f.subject.clone());
+
     RoomSnapshot {
         max_seq,
         content_max_seq,
@@ -1264,6 +1292,7 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
         squads,
         lead,
         readers: Vec::new(),
+        mission,
     }
 }
 

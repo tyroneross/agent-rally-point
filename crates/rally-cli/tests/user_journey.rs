@@ -2846,3 +2846,253 @@ fn rally_whoami_with_tool_reflects_tool_in_output() {
 
     workspace.cleanup();
 }
+
+// =============================================================================
+// Rank-11: rally mission — room north-star + per-agent autonomy envelope
+// =============================================================================
+
+/// (a) `mission --set` then `mission` (GET) returns the text + set_by.
+#[test]
+fn mission_set_then_get_returns_text_and_set_by() {
+    let workspace = Workspace::new("rally-mission-set-get");
+
+    // SET
+    let set_result = workspace.json(&[
+        "mission",
+        "--json",
+        "--set",
+        "ship the MVP by end of sprint",
+        "--tool",
+        "claude_code:01",
+    ]);
+    assert_eq!(set_result["ok"], true);
+    assert_eq!(set_result["data"]["action"], "set-mission");
+    let seq = set_result["data"]["fact"]["seq"].as_i64().unwrap_or(0);
+    assert!(seq > 0, "seq must be > 0 after set");
+
+    // GET
+    let get_result = workspace.json(&["mission", "--json"]);
+    assert_eq!(get_result["ok"], true);
+    assert_eq!(
+        get_result["data"]["mission"],
+        "ship the MVP by end of sprint"
+    );
+    assert_eq!(get_result["data"]["set_by"], "claude_code:01");
+    assert!(
+        get_result["data"]["set_at"].is_string(),
+        "set_at must be a string timestamp"
+    );
+
+    workspace.cleanup();
+}
+
+/// (b) A second `--set` supersedes the first (latest-by-seq wins).
+#[test]
+fn mission_second_set_supersedes_first() {
+    let workspace = Workspace::new("rally-mission-supersede");
+
+    workspace.json(&[
+        "mission",
+        "--json",
+        "--set",
+        "old mission",
+        "--tool",
+        "lead:01",
+    ]);
+    workspace.json(&[
+        "mission",
+        "--json",
+        "--set",
+        "new mission",
+        "--tool",
+        "lead:01",
+    ]);
+
+    let get_result = workspace.json(&["mission", "--json"]);
+    assert_eq!(get_result["ok"], true);
+    assert_eq!(
+        get_result["data"]["mission"],
+        "new mission",
+        "second set must supersede first"
+    );
+
+    workspace.cleanup();
+}
+
+/// (c) The mission appears in `enter --json` output after being set.
+#[test]
+fn mission_appears_in_enter_json_after_set() {
+    let workspace = Workspace::new("rally-mission-enter");
+
+    // Set the mission first.
+    workspace.json(&[
+        "mission",
+        "--json",
+        "--set",
+        "focus on stability",
+        "--tool",
+        "lead:01",
+    ]);
+
+    // Enter and check mission field.
+    let enter = workspace.json(&["enter", "--json", "--tool", "claude_code:01"]);
+    assert_eq!(enter["ok"], true);
+    assert_eq!(
+        enter["data"]["mission"],
+        "focus on stability",
+        "mission must appear in enter output after being set"
+    );
+
+    workspace.cleanup();
+}
+
+/// Enter output has no `mission` key when none has been set (skip_serializing_if).
+#[test]
+fn mission_absent_from_enter_when_unset() {
+    let workspace = Workspace::new("rally-mission-absent-enter");
+
+    let enter = workspace.json(&["enter", "--json", "--tool", "tool-x"]);
+    assert_eq!(enter["ok"], true);
+    assert!(
+        enter["data"]["mission"].is_null(),
+        "mission must not appear in enter output when unset; got: {}",
+        enter["data"]["mission"]
+    );
+
+    workspace.cleanup();
+}
+
+/// (d) Envelope set→get round-trips for a named agent.
+#[test]
+fn mission_envelope_set_then_get_round_trips() {
+    let workspace = Workspace::new("rally-mission-envelope");
+
+    // SET ENVELOPE
+    let env_result = workspace.json(&[
+        "mission",
+        "--json",
+        "--tool",
+        "codex:01",
+        "--may",
+        "refactor within claimed files",
+        "--must-check",
+        "before touching shared interfaces",
+    ]);
+    assert_eq!(env_result["ok"], true);
+    assert_eq!(env_result["data"]["action"], "set-envelope");
+
+    // GET: envelope must appear in envelopes array.
+    let get_result = workspace.json(&["mission", "--json"]);
+    assert_eq!(get_result["ok"], true);
+
+    let envelopes = get_result["data"]["envelopes"]
+        .as_array()
+        .expect("envelopes must be an array");
+    let entry = envelopes
+        .iter()
+        .find(|e| e["agent"] == "codex:01")
+        .expect("codex:01 envelope must be present");
+
+    assert_eq!(entry["may"], "refactor within claimed files");
+    assert_eq!(entry["must_check"], "before touching shared interfaces");
+    assert_eq!(entry["set_by"], "codex:01");
+
+    workspace.cleanup();
+}
+
+/// A second envelope set for the same agent supersedes (latest-by-seq wins).
+#[test]
+fn mission_envelope_second_set_supersedes() {
+    let workspace = Workspace::new("rally-mission-envelope-supersede");
+
+    workspace.json(&[
+        "mission",
+        "--json",
+        "--tool",
+        "codex:01",
+        "--may",
+        "old autonomy",
+    ]);
+    workspace.json(&[
+        "mission",
+        "--json",
+        "--tool",
+        "codex:01",
+        "--may",
+        "new autonomy",
+    ]);
+
+    let get_result = workspace.json(&["mission", "--json"]);
+    let envelopes = get_result["data"]["envelopes"]
+        .as_array()
+        .expect("envelopes must be an array");
+    let entry = envelopes
+        .iter()
+        .find(|e| e["agent"] == "codex:01")
+        .expect("codex:01 envelope must be present");
+
+    assert_eq!(
+        entry["may"],
+        "new autonomy",
+        "second envelope set must supersede first"
+    );
+
+    workspace.cleanup();
+}
+
+/// (e) Mission fact survives ledger replay: set, re-open store, confirm mission reads back.
+#[test]
+fn mission_fact_survives_ledger_replay() {
+    let workspace = Workspace::new("rally-mission-replay");
+
+    workspace.json(&[
+        "mission",
+        "--json",
+        "--set",
+        "survive the replay",
+        "--tool",
+        "lead",
+    ]);
+
+    // Re-read via room (fresh store open) — confirms segment→db replay keeps the fact.
+    let room = workspace.json(&["room", "--json"]);
+    assert_eq!(room["ok"], true);
+    assert_eq!(
+        room["data"]["mission"],
+        "survive the replay",
+        "mission must survive ledger replay and appear in room output"
+    );
+
+    // Also verify directly via mission GET (another fresh open).
+    let get = workspace.json(&["mission", "--json"]);
+    assert_eq!(
+        get["data"]["mission"],
+        "survive the replay",
+        "mission must survive ledger replay and appear in mission GET"
+    );
+
+    workspace.cleanup();
+}
+
+/// GET when no mission is set returns null mission and empty envelopes.
+#[test]
+fn mission_get_with_no_mission_set() {
+    let workspace = Workspace::new("rally-mission-empty");
+
+    let result = workspace.json(&["mission", "--json"]);
+    assert_eq!(result["ok"], true);
+    assert!(
+        result["data"]["mission"].is_null(),
+        "mission must be null when unset"
+    );
+    assert_eq!(
+        result["data"]["envelopes"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        0,
+        "envelopes must be empty when no envelopes have been set"
+    );
+
+    workspace.cleanup();
+}

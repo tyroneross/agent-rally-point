@@ -91,6 +91,8 @@ const SCHEMA_CHECK_CI: &str = "agent-rally.command.check-ci.v1";
 // B1/B2/B4: pi-dynamic observation seam
 const SCHEMA_DAG: &str = "agent-rally.command.dag.v1";
 const SCHEMA_WAKE_DUE: &str = "agent-rally.command.wake-due.v1";
+// Rank-11: room north-star + per-agent autonomy envelope
+const SCHEMA_MISSION: &str = "agent-rally.command.mission.v1";
 
 pub fn main() -> ExitCode {
     let wants_json = env::args().any(|arg| arg == "--json");
@@ -156,6 +158,8 @@ fn run_inner() -> Result<Output> {
         CliCommand::WakeDue(args) => command_wake_due(args),
         // B-whoami: identity report
         CliCommand::Whoami(args) => command_whoami(args),
+        // Rank-11: room north-star + per-agent autonomy envelope
+        CliCommand::Mission(args) => command_mission(args),
     }
 }
 
@@ -402,6 +406,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // maybe_append_read_checkpoint's own guard prevents double-counting when
     // cursor_after == last_checkpoint_seq (coalesces if no advancement).
     room.maybe_append_read_checkpoint(&tool, snapshot.content_max_seq)?;
+    let mission = snapshot.mission.clone();
     let body = envelope(
         "enter",
         SCHEMA_ENTER,
@@ -418,6 +423,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
             attention,
             room: RoomSummary::from(&snapshot),
             warnings,
+            mission,
         },
     )?;
     let text = format!(
@@ -694,6 +700,8 @@ fn command_room(args: RoomArgs) -> Result<Output> {
     };
     // R10: extract readers from snapshot (populated by snapshot_with_readers).
     let readers = snapshot.readers.clone();
+    // Rank-11: surface mission at the top level so agents see it without parsing snapshot.
+    let mission = snapshot.mission.clone();
     let body = envelope(
         "room",
         SCHEMA_ROOM,
@@ -701,6 +709,7 @@ fn command_room(args: RoomArgs) -> Result<Output> {
             query,
             room: snapshot.clone(),
             readers,
+            mission,
         },
     )?;
     let text = format!(
@@ -4713,6 +4722,10 @@ struct EnterData {
     /// Non-blocking advisories (omitted from JSON when empty).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<EnterWarning>,
+    /// Rank-11: current room north-star text, or null when unset.
+    /// Omitted from JSON when no mission has been set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mission: Option<String>,
 }
 
 /// Non-blocking advisory emitted by `rally say` when an external-intake
@@ -4757,6 +4770,10 @@ struct RoomData {
     /// into the full room snapshot.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     readers: Vec<ReadReceipt>,
+    /// Rank-11: current room north-star text, or null when unset.
+    /// Omitted from JSON when no mission has been set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mission: Option<String>,
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -5283,6 +5300,235 @@ fn command_wake_due(args: WakeDueArgs) -> Result<Output> {
     Ok(Output::new(args.json, text, body))
 }
 
+// =============================================================================
+// Rank-11: rally mission — room north-star + per-agent autonomy envelope
+// =============================================================================
+//
+// CHARTER ASSERTION: rally records and exposes; it NEVER executes, enforces,
+// or grants anything. The autonomy envelope is descriptive metadata — rally
+// never checks it, gates on it, or grants autonomy.
+//
+// Three modes:
+//   GET (no mutation flags)  → read latest Mission north-star + all envelopes.
+//   SET (--set "<text>")     → append Mission fact; scope=["mission"].
+//   ENVELOPE (--tool + --may/--must-check) → append Mission fact; scope=["envelope","agent:<name>"].
+//
+// Latest-by-seq wins on read for both mission and per-agent envelopes.
+
+/// One per-agent autonomy envelope surfaced by `rally mission` GET.
+#[derive(JsonSchema, Serialize)]
+struct EnvelopeEntry {
+    agent: String,
+    /// What the agent may do autonomously (from `summary` field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    may: Option<String>,
+    /// What the agent must check-in before doing (from first `must_check:` evidence marker).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    must_check: Option<String>,
+    set_by: Option<String>,
+    set_at: String,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct MissionGetData {
+    /// Current north-star text, or null if no mission has been set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mission: Option<String>,
+    /// Tool that set the current mission, or null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    set_by: Option<String>,
+    /// Timestamp (ISO-8601) when the mission was set, or null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    set_at: Option<String>,
+    /// Per-agent autonomy envelopes (one per agent, latest-by-seq).
+    envelopes: Vec<EnvelopeEntry>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct MissionSetData {
+    action: String,
+    fact: Fact,
+}
+
+#[derive(JsonSchema, Serialize)]
+#[serde(untagged)]
+enum MissionData {
+    Get(MissionGetData),
+    Set(MissionSetData),
+}
+
+fn command_mission(args: MissionArgs) -> Result<Output> {
+    let is_set = args.set.is_some();
+    let is_envelope = args.may.is_some() || args.must_check.is_some();
+
+    // ENVELOPE mode: --tool + (--may and/or --must-check)
+    if is_envelope {
+        let agent = args.tool.as_deref().ok_or_else(|| {
+            RallyError::Usage(
+                "rally mission envelope requires --tool <agent> with --may and/or --must-check".to_string(),
+            )
+        })?;
+        let tool_attr = args.tool.clone().unwrap_or_else(|| agent.to_string());
+        let room = RoomStore::open()?;
+        let may_text = args.may.as_deref().unwrap_or("");
+        let must_check_text = args.must_check.as_deref().unwrap_or("");
+        let fact = Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("mission"),
+            seq: 0,
+            thread_id: format!("mission-envelope-{}", sanitize_id(agent)),
+            kind: FactKind::Mission,
+            tool: Some(tool_attr),
+            role: None,
+            subject: format!("autonomy envelope for {agent}"),
+            scope: vec!["envelope".to_string(), format!("agent:{agent}")],
+            created_at: now_string(),
+            // `summary` carries the `may` text.
+            summary: if may_text.is_empty() { None } else { Some(may_text.to_string()) },
+            // `evidence` carries `must_check:<text>` marker.
+            evidence: if must_check_text.is_empty() {
+                Vec::new()
+            } else {
+                vec![format!("must_check:{must_check_text}")]
+            },
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        let appended = room.append_fact_verified(&fact)?;
+        let text = format!("mission envelope set agent={agent} seq={}", appended.seq);
+        let body = envelope(
+            "mission",
+            SCHEMA_MISSION,
+            MissionData::Set(MissionSetData {
+                action: "set-envelope".to_string(),
+                fact: appended,
+            }),
+        )?;
+        return Ok(Output::new(args.json, text, body));
+    }
+
+    // SET mode: --set "<north-star text>"
+    if is_set {
+        let text_val = args.set.unwrap();
+        let tool_attr = args.tool.clone().unwrap_or_else(|| "unknown".to_string());
+        let room = RoomStore::open()?;
+        let fact = Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("mission"),
+            seq: 0,
+            thread_id: "mission-northstar".to_string(),
+            kind: FactKind::Mission,
+            tool: Some(tool_attr),
+            role: None,
+            subject: text_val.clone(),
+            scope: vec!["mission".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        let appended = room.append_fact_verified(&fact)?;
+        let text = format!("mission set seq={}", appended.seq);
+        let body = envelope(
+            "mission",
+            SCHEMA_MISSION,
+            MissionData::Set(MissionSetData {
+                action: "set-mission".to_string(),
+                fact: appended,
+            }),
+        )?;
+        return Ok(Output::new(args.json, text, body));
+    }
+
+    // GET mode (read-only — no appends).
+    let room = RoomStore::open()?;
+    let facts = room.facts()?;
+
+    // Derive current mission from latest Mission fact with scope containing "mission".
+    let mission_fact = facts
+        .iter()
+        .filter(|f| f.kind == "mission" && f.scope.iter().any(|s| s == "mission"))
+        .max_by_key(|f| f.seq);
+
+    let (mission, set_by, set_at) = match mission_fact {
+        Some(f) => (
+            Some(f.subject.clone()),
+            f.tool.clone(),
+            Some(f.created_at.clone()),
+        ),
+        None => (None, None, None),
+    };
+
+    // Derive per-agent envelopes: for each agent, take the latest envelope fact.
+    let mut envelope_map: std::collections::BTreeMap<String, &Fact> = std::collections::BTreeMap::new();
+    for f in facts.iter() {
+        if f.kind != "mission" {
+            continue;
+        }
+        // Envelope facts have scope containing "envelope" and "agent:<name>".
+        if !f.scope.iter().any(|s| s == "envelope") {
+            continue;
+        }
+        let agent_tag = f.scope.iter().find(|s| s.starts_with("agent:"));
+        let Some(agent_name) = agent_tag.and_then(|s| s.strip_prefix("agent:")) else {
+            continue;
+        };
+        let entry = envelope_map.entry(agent_name.to_string()).or_insert(f);
+        if f.seq > entry.seq {
+            *entry = f;
+        }
+    }
+
+    let envelopes: Vec<EnvelopeEntry> = envelope_map
+        .into_iter()
+        .map(|(agent, f)| {
+            let may = f.summary.clone();
+            let must_check = f
+                .evidence
+                .iter()
+                .find(|e| e.starts_with("must_check:"))
+                .and_then(|e| e.strip_prefix("must_check:"))
+                .map(str::to_string);
+            EnvelopeEntry {
+                agent,
+                may,
+                must_check,
+                set_by: f.tool.clone(),
+                set_at: f.created_at.clone(),
+            }
+        })
+        .collect();
+
+    let mission_text = mission
+        .as_deref()
+        .unwrap_or("(no mission set)");
+    let text = format!(
+        "mission mission={:?} envelopes={}",
+        mission_text,
+        envelopes.len()
+    );
+    let body = envelope(
+        "mission",
+        SCHEMA_MISSION,
+        MissionData::Get(MissionGetData {
+            mission,
+            set_by,
+            set_at,
+            envelopes,
+        }),
+    )?;
+    Ok(Output::new(args.json, text, body))
+}
+
 fn help_text() -> String {
     [
         "rally: repo-local coordination room for parallel agents",
@@ -5318,7 +5564,10 @@ fn help_text() -> String {
         "  rally board [--json]",
         "  rally route-findings --file <findings.json> [--tool <tool>] --verified [--json]",
         "  rally check-ci [--strict] [--receipt-threshold <secs>] [--json]  # read-only CI gate: exits 0 (pass) or 4 with --strict (fail)",
-        "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake, standby, presence, backlog-item",
+        "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake, standby, presence, backlog-item, mission",
+        "  rally mission [--json]                                        # GET: current north-star + agent envelopes",
+        "  rally mission --set \"<north-star>\" [--tool <t>] [--json]    # SET mission",
+        "  rally mission --tool <agent> --may \"<...>\" --must-check \"<...>\" [--json]  # SET envelope",
         "",
         "  rally say standby --tool <tool> --reason <r> --wake-after <+30m|iso> [--run <id>] [--step <id>] [--parent-step <id>] [--tool] [--json]",
         "  rally say wake --tool <tool> --ref-standby <standby-event-id> [--run <id>] [--step <id>] [--json]",

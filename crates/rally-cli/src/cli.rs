@@ -37,6 +37,8 @@ pub(crate) enum CliCommand {
     WakeDue(WakeDueArgs),
     /// B-whoami: identity report — repo_root, repo_id, worktree, build_id, cwd.
     Whoami(WhoamiArgs),
+    /// Rank-11: room north-star + per-agent autonomy envelope.
+    Mission(MissionArgs),
 }
 
 pub(crate) enum CliParse {
@@ -363,6 +365,26 @@ pub(crate) struct CheckCiArgs {
     pub(crate) receipt_threshold_secs: u64,
 }
 
+/// Rank-11: `rally mission` args.
+///
+/// Three modes (mutually exclusive by flag presence):
+///   - GET (no mutation flags)        → return current mission + envelopes.
+///   - SET (`--set "<text>"`)         → append a Mission north-star fact.
+///   - SET ENVELOPE (`--tool` + `--may` or `--must-check`) → append an envelope fact.
+#[derive(Clone, Debug)]
+pub(crate) struct MissionArgs {
+    pub(crate) json: bool,
+    /// North-star text (SET mission mode). When present, appends a Mission fact.
+    pub(crate) set: Option<String>,
+    /// Tool identity to attribute the mission write to (SET + envelope modes).
+    /// Falls back to resolved presence tool on GET.
+    pub(crate) tool: Option<String>,
+    /// Envelope: what the named agent may do autonomously (SET ENVELOPE mode).
+    pub(crate) may: Option<String>,
+    /// Envelope: what the named agent must check-in before doing (SET ENVELOPE mode).
+    pub(crate) must_check: Option<String>,
+}
+
 const COMMANDS: &[&str] = &[
     "init",
     "enter",
@@ -396,6 +418,8 @@ const COMMANDS: &[&str] = &[
     "wake-due",
     // B-whoami: identity report
     "whoami",
+    // Rank-11: room north-star + per-agent autonomy envelope
+    "mission",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -564,6 +588,13 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .command("route-findings")
         .map(CliCommand::RouteFindings);
 
+    // Rank-11: room north-star + per-agent autonomy envelope (read-only get or append)
+    let mission = mission_parser()
+        .to_options()
+        .descr("Get or set the room north-star (mission) and per-agent autonomy envelopes. Rally records and exposes only — never enforces.")
+        .command("mission")
+        .map(CliCommand::Mission);
+
     construct!([
         init,
         enter,
@@ -592,7 +623,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         check_ci,
         dag,
         wake_due,
-        whoami
+        whoami,
+        mission
     ])
     .to_options()
 }
@@ -1172,6 +1204,24 @@ fn wake_due_parser() -> impl Parser<WakeDueArgs> {
     let json = json_flag();
     let tool = optional_string_arg("tool", "TOOL");
     construct!(json, tool).map(|(json, tool)| WakeDueArgs { json, tool })
+}
+
+// Rank-11: mission parser
+fn mission_parser() -> impl Parser<MissionArgs> {
+    let json = json_flag();
+    let set = optional_string_arg("set", "TEXT");
+    let tool = optional_string_arg("tool", "TOOL");
+    let may = optional_string_arg("may", "TEXT");
+    let must_check = optional_string_arg("must-check", "TEXT");
+    construct!(json, set, tool, may, must_check).map(|(json, set, tool, may, must_check)| {
+        MissionArgs {
+            json,
+            set,
+            tool,
+            may,
+            must_check,
+        }
+    })
 }
 
 // B13: check-ci parser
