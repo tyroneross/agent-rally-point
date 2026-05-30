@@ -849,23 +849,41 @@ fn reconcile_segments_and_db(
     facts_db_path: &Path,
 ) -> Result<()> {
     let segments = read_segment_files(log_dir)?;
-    let archived = read_segment_files(archive_dir)?;
-    let total_count = count_segment_events(&segments)? + count_segment_events(&archived)?;
-    let db_max_seq = read_db_max_seq(facts_db_path)?;
+    // Replay walks live segments + rotated archive segments, but NOT the R5
+    // migration monolith: post-migration its events already live verbatim in
+    // the live segments, so counting/replaying it double-counts every event
+    // (see [`replay_archive_segments`]).
+    let archived = replay_archive_segments(archive_dir)?;
 
-    if total_count == 0 && db_max_seq == 0 {
+    // The canonical record is the *set of distinct seqs* across replay sources.
+    // The cache is fresh iff it holds exactly that many events — replay
+    // reassigns factstr seqs 1..N, so `db_event_count == distinct_replay_seqs`
+    // exactly when in sync. Comparing distinct-seq COUNT (not max seq, not raw
+    // line count) is what makes this correct under (a) seq gaps from rotation
+    // and (b) the same seq appearing in two files (archive + live).
+    let canonical_count = distinct_segment_seqs(&segments, &archived)?;
+    let db_count = read_db_event_count(facts_db_path)?;
+
+    if canonical_count == 0 && db_count == 0 {
         return Ok(());
     }
 
-    if total_count > db_max_seq {
+    if canonical_count == 0 && db_count > 0 {
+        // No segments yet but the db has events: first-run upgrade from a
+        // pre-segment install. Seed a segment so the canonical record exists.
+        seed_segment_from_db(log_dir, facts_db_path)?;
+        return Ok(());
+    }
+
+    if canonical_count != db_count {
+        // Segment set and cache disagree on event count → cache is stale (or
+        // absent). Rebuild it from the canonical segments. Replay is a pure
+        // function of the deduped segment set, so this is idempotent.
         rebuild_db_from_segments(&segments, &archived, facts_db_path)?;
         return Ok(());
     }
 
-    if total_count == 0 && db_max_seq > 0 {
-        seed_segment_from_db(log_dir, facts_db_path)?;
-    }
-    // total_count <= db_max_seq && total_count > 0 → cache is fresh; nothing to do.
+    // canonical_count == db_count > 0 → cache is fresh; leave it untouched.
     Ok(())
 }
 
@@ -895,6 +913,10 @@ fn read_segment_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Raw count of non-empty lines across the given segment files. Test-only:
+/// production reconcile compares *distinct* seqs (see [`distinct_segment_seqs`]),
+/// but tests assert on physical line counts to verify on-disk layout.
+#[cfg(test)]
 fn count_segment_events(paths: &[PathBuf]) -> Result<i64> {
     let mut total = 0i64;
     for path in paths {
@@ -910,7 +932,48 @@ fn count_segment_events(paths: &[PathBuf]) -> Result<i64> {
     Ok(total)
 }
 
-fn read_db_max_seq(facts_db_path: &Path) -> Result<i64> {
+/// Archive segments eligible for **replay**, i.e. every rotated
+/// `<engagement>.jsonl` segment but NOT the R5 migration monolith
+/// `ledger-pre-segment.jsonl`. The monolith's events are already present
+/// verbatim in the live segments after migration; replaying it would
+/// double-count every event (inflating the reconcile trigger) without adding
+/// any history. Rotated segments keep their original `<engagement>.jsonl`
+/// name (see `rotate.rs`), so a filename-constant match cleanly separates the
+/// two — only the constant-named monolith is excluded.
+fn replay_archive_segments(archive_dir: &Path) -> Result<Vec<PathBuf>> {
+    Ok(read_segment_files(archive_dir)?
+        .into_iter()
+        .filter(|p| p.file_name().and_then(|n| n.to_str()) != Some(ARCHIVED_MONOLITH_FILENAME))
+        .collect())
+}
+
+/// Number of *distinct* sequence numbers across the replay sources. This is
+/// the canonical event count: the same seq appearing in two files (e.g. a
+/// rotated segment and a stray copy) counts once, and gaps in the seq range
+/// don't inflate it. Used to decide whether the derived cache is in sync.
+fn distinct_segment_seqs(live: &[PathBuf], archived: &[PathBuf]) -> Result<i64> {
+    let mut seqs: BTreeSet<i64> = BTreeSet::new();
+    for path in live.iter().chain(archived.iter()) {
+        let file =
+            fs::File::open(path).map_err(RallyError::io(format!("read {}", path.display())))?;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(RallyError::io(format!("read {}", path.display())))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: LedgerLine = serde_json::from_str(&line)
+                .map_err(RallyError::json(format!("parse {}", path.display())))?;
+            seqs.insert(entry.seq);
+        }
+    }
+    i64::try_from(seqs.len())
+        .map_err(|err| RallyError::Message(format!("distinct seq count overflow: {err}")))
+}
+
+/// Number of events currently held by the derived sqlite cache. Compared
+/// against [`distinct_segment_seqs`] to detect a stale/absent cache. Returns
+/// 0 when the db file does not exist.
+fn read_db_event_count(facts_db_path: &Path) -> Result<i64> {
     if !facts_db_path.exists() {
         return Ok(0);
     }
@@ -918,13 +981,8 @@ fn read_db_max_seq(facts_db_path: &Path) -> Result<i64> {
     let query = store
         .query(&FactQuery::all())
         .map_err(|err| RallyError::Message(format!("query facts: {err}")))?;
-    let max = query
-        .event_records
-        .last()
-        .map(|record| record.sequence_number)
-        .unwrap_or(0);
-    i64::try_from(max)
-        .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))
+    i64::try_from(query.event_records.len())
+        .map_err(|err| RallyError::Message(format!("event count overflow: {err}")))
 }
 
 /// Rebuild the derived sqlite cache by replaying every segment line in seq
@@ -932,6 +990,13 @@ fn read_db_max_seq(facts_db_path: &Path) -> Result<i64> {
 /// Dedup by `sequence_number` (re-running migration twice can otherwise
 /// duplicate). Hard error on conflict (two different payloads at the same
 /// seq is corruption, not noise).
+///
+/// Replay is a **pure function of the deduped event set**: each surviving
+/// line is appended in seq order and factstr assigns fresh monotonic seqs
+/// 1..N. We do NOT assert the reassigned seq equals the stored seq — after
+/// rotation or any historical gap the stored seqs are not contiguous from 1,
+/// and contiguity is not required for the cache to faithfully reflect the
+/// canonical record. Ordering (sort-by stored seq) is what we preserve.
 fn rebuild_db_from_segments(
     live: &[PathBuf],
     archived: &[PathBuf],
@@ -977,25 +1042,13 @@ fn rebuild_db_from_segments(
     }
 
     let store = open_fact_store(facts_db_path)?;
-    let total = deduped.len();
-    for (replay_idx, entry) in deduped.iter().enumerate() {
-        let result = store
+    for entry in &deduped {
+        store
             .append(vec![NewEvent::new(
                 entry.event_type.clone(),
                 entry.payload.clone(),
             )])
             .map_err(|err| RallyError::Message(format!("replay segments: {err}")))?;
-        let assigned = i64::try_from(result.last_sequence_number)
-            .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
-        if assigned != entry.seq {
-            return Err(RallyError::Message(format!(
-                "segment replay seq mismatch: expected {} got {} (replay #{}/{})",
-                entry.seq,
-                assigned,
-                replay_idx + 1,
-                total
-            )));
-        }
     }
     Ok(())
 }
@@ -1619,5 +1672,236 @@ mod ledger_tests {
         assert!(!cleaned.contains('/'));
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// Write a raw segment file (lines already JSON) under `.rally/<dir>/`.
+    fn write_segment(root: &Path, dir: &str, filename: &str, lines: &[&str]) {
+        let seg_dir = root.join(".rally").join(dir);
+        fs::create_dir_all(&seg_dir).unwrap();
+        let body = format!("{}\n", lines.join("\n"));
+        fs::write(seg_dir.join(filename), body).unwrap();
+    }
+
+    /// Render one segment line for `event_id` at `seq`/`kind`/`engagement`.
+    fn ledger_line(seq: i64, kind: &str, event_id: &str, engagement: &str) -> String {
+        let entry = LedgerLine {
+            seq,
+            occurred_at: format!("2026-05-01T00:00:{:02}Z", seq.min(59)),
+            event_type: kind.to_string(),
+            payload: json!({
+                "schema": fact_schema(),
+                "event_id": event_id,
+                "seq": seq,
+                "kind": kind,
+                "subject": format!("subject-{event_id}"),
+                "scope": ["src/"],
+            }),
+            engagement: Some(engagement.to_string()),
+        };
+        serde_json::to_string(&entry).unwrap()
+    }
+
+    /// Inode of `.rally/facts.db`. A destructive rebuild deletes + recreates
+    /// the file, so the inode changes; a no-op reconcile leaves it stable.
+    /// This is the canary for "was the cache rebuilt" WITHOUT perturbing the
+    /// event count (planting a sentinel row would itself desync the count and
+    /// force the very rebuild we're testing against).
+    fn db_inode(root: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(root.join(".rally/facts.db")).unwrap().ino()
+    }
+
+    /// TEST A — A healthy cache must NOT be destroyed on open merely because
+    /// the raw segment-line count exceeds the db's max sequence number. Count
+    /// and max-seq are only comparable when seqs are contiguous from 1; a
+    /// double-counted archive (same seqs in two files) makes line-count >
+    /// max-seq with a perfectly fresh cache. RED against the
+    /// `total_count > db_max_seq` trigger; GREEN once the trigger compares
+    /// distinct-seq count to db event count.
+    #[test]
+    fn healthy_cache_not_rebuilt_when_count_exceeds_max_seq() {
+        let root = unique_root("reconcile-no-false-rebuild");
+
+        // Live segment + an archived monolith copy carrying the SAME seqs.
+        // Raw line count across files = 6, but distinct seqs = {1,2,3} → the
+        // rebuilt db's max_seq = 3. 6 > 3 must NOT mean "segments ahead".
+        let lines: Vec<String> = (1..=3)
+            .map(|s| ledger_line(s, "decision", &format!("e{s}"), "alpha"))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_segment(&root, "log", "alpha.jsonl", &refs);
+        write_segment(&root, "archive", ARCHIVED_MONOLITH_FILENAME, &refs);
+
+        // First open builds the cache from the (deduped) segment set.
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        assert_eq!(
+            store.facts().unwrap().len(),
+            3,
+            "deduped to 3 distinct seqs"
+        );
+        assert_eq!(store.snapshot().unwrap().max_seq, 3);
+        drop(store);
+        let before = db_inode(&root);
+
+        // Reopen. A correct reconcile sees the cache is fresh and does NOT
+        // rebuild it → the db file is the same inode.
+        let store = RoomStore::open_existing_at(root.clone()).unwrap().unwrap();
+        assert_eq!(store.facts().unwrap().len(), 3);
+        drop(store);
+        assert_eq!(
+            db_inode(&root),
+            before,
+            "healthy cache was destroyed: count > max_seq false-triggered a rebuild"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// TEST B — The R5 archived monolith `ledger-pre-segment.jsonl` is excluded
+    /// from replay sources. Post-migration its events already live in the live
+    /// segments; counting + replaying it double-counts every event, which
+    /// inflates the reconcile trigger (false rebuild on every open). The
+    /// distinctly-named file must be skipped. RED against today's "archive
+    /// walked wholesale"; GREEN once the constant-named monolith is filtered.
+    #[test]
+    fn archived_monolith_excluded_from_replay_no_double_count() {
+        let root = unique_root("reconcile-monolith-excluded");
+
+        let lines: Vec<String> = (1..=4)
+            .map(|s| ledger_line(s, "claim", &format!("e{s}"), "alpha"))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_segment(&root, "log", "alpha.jsonl", &refs);
+        // Verbatim monolith copy in archive — same seqs as the live segment.
+        write_segment(&root, "archive", ARCHIVED_MONOLITH_FILENAME, &refs);
+
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        assert_eq!(
+            store.facts().unwrap().len(),
+            4,
+            "monolith not double-counted"
+        );
+        drop(store);
+        let before = db_inode(&root);
+
+        // Reopen: fresh cache, monolith excluded → no rebuild.
+        let store = RoomStore::open_existing_at(root.clone()).unwrap().unwrap();
+        assert_eq!(store.facts().unwrap().len(), 4);
+        drop(store);
+        assert_eq!(
+            db_inode(&root),
+            before,
+            "archived monolith double-counted: triggered a rebuild of a fresh cache"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// TEST D — Replay tolerates a non-contiguous seq set. After rotation +
+    /// dedup the surviving event set may start above 1 or contain gaps; replay
+    /// is a pure function of the deduped events, not an assertion that the
+    /// freshly-assigned seq equals the stored seq. RED against the strict
+    /// `assigned != entry.seq` check; GREEN once that assertion is dropped.
+    #[test]
+    fn replay_tolerates_non_contiguous_seqs() {
+        let root = unique_root("reconcile-noncontiguous");
+
+        // Seqs {2, 5, 9} — gaps everywhere, none starting at 1. factstr will
+        // reassign 1,2,3 on replay; the old strict check fired here.
+        let lines = [
+            ledger_line(2, "decision", "e2", "alpha"),
+            ledger_line(5, "decision", "e5", "alpha"),
+            ledger_line(9, "blocker", "e9", "alpha"),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_segment(&root, "log", "alpha.jsonl", &refs);
+
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let facts = store.facts().unwrap();
+        assert_eq!(facts.len(), 3, "all 3 non-contiguous events replayed");
+        let ids: Vec<&str> = facts.iter().map(|f| f.event_id.as_str()).collect();
+        assert_eq!(ids, ["e2", "e5", "e9"], "order preserved by stored seq");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// TEST C — R7 rotated segments (kept under their original
+    /// `<engagement>.jsonl` name, NOT the monolith constant) must still be
+    /// replayed from the archive. Guards against the exclusion being too broad
+    /// (filtering all archive files instead of just the monolith).
+    #[test]
+    fn rotated_engagement_segment_in_archive_still_replays() {
+        let root = unique_root("reconcile-rotated-replays");
+
+        // Old engagement rotated to archive under its own name.
+        let archived = [
+            ledger_line(1, "decision", "old1", "2024-old"),
+            ledger_line(2, "decision", "old2", "2024-old"),
+        ];
+        let arch_refs: Vec<&str> = archived.iter().map(String::as_str).collect();
+        write_segment(&root, "archive", "2024-old.jsonl", &arch_refs);
+
+        // Recent engagement still live.
+        let live = [ledger_line(3, "claim", "new3", "beta")];
+        let live_refs: Vec<&str> = live.iter().map(String::as_str).collect();
+        write_segment(&root, "log", "beta.jsonl", &live_refs);
+
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let ids: Vec<String> = store
+            .facts()
+            .unwrap()
+            .iter()
+            .map(|f| f.event_id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["old1", "old2", "new3"],
+            "rotated archive segment + live segment both replay"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// TEST E — Parallel reads (concurrent `open_existing_at`) must not destroy
+    /// the cache or race each other into an error. With the false-rebuild
+    /// trigger fixed, a reader never rebuilds a fresh db, so N concurrent
+    /// readers all see the same 5 facts and the db file is never recreated.
+    #[test]
+    fn parallel_reads_do_not_destroy_cache() {
+        use std::sync::Arc;
+
+        let root = unique_root("reconcile-parallel-read");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        for n in 1..=5 {
+            store
+                .append_fact(&make_fact(
+                    &format!("e{n}"),
+                    FactKind::Decision,
+                    "src/",
+                    "x",
+                ))
+                .unwrap();
+        }
+        drop(store);
+        let before = db_inode(&root);
+
+        let root = Arc::new(root);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let root = Arc::clone(&root);
+                thread::spawn(move || {
+                    let store = RoomStore::open_existing_at((*root).clone())
+                        .unwrap()
+                        .unwrap();
+                    store.facts().unwrap().len()
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), 5, "reader saw a destroyed/racing cache");
+        }
+        assert_eq!(db_inode(&root), before, "parallel reads rebuilt the cache");
+
+        fs::remove_dir_all(&*root).ok();
     }
 }
