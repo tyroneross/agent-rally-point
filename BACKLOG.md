@@ -71,8 +71,10 @@ WARN, B11 duplicate-id risk fact) so work continues and any mistake is traceable
 > already-safe risk facts — low value).
 >
 > **Housekeeping — all closed (2026-05-30):** B-arch-doc (`e46c083`), B-ledger-cadence (`e46c083`),
-> B-whoami + B11-race (`fcb81ca`), B-index-monolith (verified non-issue). **Genuinely open:** only
-> automation **rank-11** (queryable `rally goal`/intent + per-agent autonomy-envelope fact — net-new).
+> B-whoami + B11-race (`fcb81ca`), B-index-monolith (verified non-issue). **Automation rank-11 — DONE**
+> (`8faa9de`): shipped as `rally mission` (queryable room north-star + per-agent autonomy envelopes,
+> surfaced on enter/room; charter-pure — rally records/exposes, never enforces). **The ranked + automation
+> backlogs are now fully closed; nothing open remains below.**
 >
 > **Code-scan pass (2026-05-30, `fcb81ca`):** a sonnet+haiku rally-workflow scan (7 scanners, rally-lineage
 > coordinated — see `rally dag --run scan-20260530`) surfaced 20 findings (0 false positives); all fixed —
@@ -115,7 +117,7 @@ From [`docs/RALLY-AUTOMATION-PROPOSALS.md`](docs/RALLY-AUTOMATION-PROPOSALS.md) 
 | 7 | `rally next --backlog` — proactive self-routing: parse backlog, resolve deps vs landed artifacts, tier-affinity rank → `suggested_backlog_item` | **DONE** (`next_returns_suggested_backlog_item` test) | shipped |
 | 8 | Cross-lane ripple detector — grep changed `pub` signatures at artifact/check, post non-blocking `ripple-alert` + handoffs to affected owners | **DONE** (`ripple.rs`) | shipped |
 | 9 | `rally check tier-fit` — derive task class, compare to room MODEL-TIERS calibration, flag `tier_mismatch` (never blocks/selects) | **DONE** (`tier_fit.rs`) | shipped |
-| 11 | Presence/liveness + queryable `rally goal`/intent + per-agent autonomy-envelope fact | **open** — liveness done (B12); `rally goal`/intent + envelope fact net-new | only genuinely-open automation item |
+| 11 | Presence/liveness + queryable goal/intent + per-agent autonomy-envelope fact | **DONE** (`8faa9de`) — shipped as `rally mission` (set/get north-star + envelopes, surfaced on enter/room); liveness was already B12 | shipped |
 
 Shipped from this family: `rally locate` / `rally recent --all` (the [discovery re-port](docs/DISCOVERY_RE_PORT_DESIGN.md) design — done; the legacy-visibility tie-in is tracked as **B17**). Also pending: `rally doctor --canonical-paths` (rank-1 retro-scan helper).
 
