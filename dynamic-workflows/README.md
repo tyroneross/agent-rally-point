@@ -26,7 +26,7 @@ Drop this directory into any repo. No install required; no runtime dependencies.
 | `core/workstream-status.mjs` | **Resume helper** — derives done/claimed/pending + the `to_dispatch` set from a `rally room` snapshot (the durable counterpart to pi's in-memory progress) |
 | `core/route.mjs` | **Deterministic routing** (ported host-neutral from pi): `parallel`/`pipeline`/`budget` + onError/abort failure-visibility |
 | `core/limiter.mjs` | Bounded-concurrency helper hosts can use to cap their own Tier-1 fan-out |
-| `skills/claude/SKILL.md` · `skills/codex/SKILL.md` | Skills mapping a workstream onto rally primitives, per host |
+| [`../skills/rally-workflows/SKILL.md`](../skills/rally-workflows/SKILL.md) | Host-neutral Rally Flow skill (moved out of this module) mapping a workstream onto rally primitives; references `PROTOCOL.md` |
 | `examples/*.workstream.json` | One valid + two invalid descriptors (linter demos) |
 | `tests/*.test.mjs` | Tests across lint / status / route / limiter (Node built-in runner) — run `npm test` |
 | `package.json` | Module manifest; no runtime dependencies (exports: lint/status/route/limiter) |

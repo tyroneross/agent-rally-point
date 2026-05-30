@@ -122,11 +122,11 @@ Rally recommends and constrains work; it does not replace judgment.
 To coordinate *several* agents on one objective — fan out parallel subagents, run a dynamic
 workflow, or split a workstream across hosts — use **Rally Flow** (the `dynamic-workflows/` module).
 It adds a lint-checked workstream descriptor (MECE write boundaries + determinism) on top of the
-rally loop above. Host-specific entry points:
+rally loop above. One host-neutral entry point — the same skill for every host; you supply your own
+`--tool` value at runtime:
 
-- Claude: [`dynamic-workflows/skills/claude/SKILL.md`](../../dynamic-workflows/skills/claude/SKILL.md)
-- Codex: [`dynamic-workflows/skills/codex/SKILL.md`](../../dynamic-workflows/skills/codex/SKILL.md)
-- Shared protocol both reference: [`dynamic-workflows/skills/SHARED.md`](../../dynamic-workflows/skills/SHARED.md)
+- [`rally-workflows`](../rally-workflows/SKILL.md) — workstream descriptor + lint + the two fan-out tiers + the per-task rally loop.
+- Canonical wire spec it references: [`dynamic-workflows/PROTOCOL.md`](../../dynamic-workflows/PROTOCOL.md).
 
 ## Finish Work Cleanly
 

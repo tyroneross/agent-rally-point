@@ -1,22 +1,39 @@
-<!-- SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com> -->
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+---
+name: rally-workflows
+description: Use when fanning out work across multiple agents, running a dynamic workflow, coordinating parallel subagents, or splitting a workstream across hosts, terminals, or machines through Agent Rally Point. Defines the workstream descriptor + task-packet protocol and the per-task rally coordination loop. Host-neutral — works for any coding agent.
+---
 
-# Rally Flow — shared host protocol
+<!--
+SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+SPDX-License-Identifier: Apache-2.0
+-->
 
-> Single source of truth for the host-neutral parts of the Rally Flow skill. The per-host
-> skills (`claude/SKILL.md`, `codex/SKILL.md`) reference this file and add ONLY their
-> host-different bits (framing, permission gate, `--tool` value, flag conventions). Keep
-> protocol changes here so the two hosts cannot drift. Canonical spec: [../PROTOCOL.md](../PROTOCOL.md).
+# Rally Flow — host-neutral skill
 
-Substitute `<TOOL>` below with your host's `--tool` value (Claude → `claude_code`, Codex → `codex`).
-Where a host's convention differs (e.g. whether to pass `--json`, or `--severity` on a blocker),
-the per-host SKILL.md states it; otherwise these commands are identical across hosts.
+Rally facilitates; the host executes. Rally records claims, checks write boundaries, routes
+handoffs, and exposes room state — it never spawns, schedules, or retries agents. This skill turns a
+goal into a *workstream descriptor*, lints it to prove boundary safety, then fans out agents that
+coordinate through `rally`. The same protocol runs on any coding host; the host supplies the few
+runtime values below. Canonical wire spec: [`../../dynamic-workflows/PROTOCOL.md`](../../dynamic-workflows/PROTOCOL.md).
+
+## Host adapter (resolve these for your runtime)
+
+This skill names no specific agent. Before running, resolve three host values:
+
+| Knob | How to resolve |
+|------|----------------|
+| `<TOOL>` | Your host's rally tool id — the value you pass to `rally enter --tool …`. Use one stable id per terminal/role, e.g. `<host>:<role>:<n>`. The model belongs in the id, not in a separate registration. |
+| Fan-out authorization | Tier-1 in-process fan-out is allowed when the work is parallelizable **and** the descriptor lints clean — **unless your host requires explicit user authorization before spawning subagents/delegating**. If it does, gate Tier-1 on that explicit request; otherwise fan out by default. The rally loop is always active either way; only fan-out is conditional. |
+| Flag conventions | If your host parses structured output, pass `--json` on every `rally` command. Add `--severity` on `rally say blocker` when your host distinguishes severities. |
+
+Do not hard-code another agent's identity in a descriptor or command — each host supplies its own
+`<TOOL>` at runtime. Substitute `<TOOL>` wherever it appears below.
 
 ## 1 · Decompose — author the descriptor
 
-Write a JSON workstream descriptor per `../PROTOCOL.md` (§1). Required top-level fields:
-`workstream` (objective), `description` (drop-in context), `tasks` (non-empty). Each task needs
-`id` (unique), `intent`, `owns`, `validation`, `output`.
+Write a JSON workstream descriptor per `../../dynamic-workflows/PROTOCOL.md` (§1). Required
+top-level fields: `workstream` (objective), `description` (drop-in context), `tasks` (non-empty).
+Each task needs `id` (unique), `intent`, `owns`, `validation`, `output`.
 
 - `owns` — either `"read-only"` or a non-empty array of path strings. Paths across write-tasks must
   be **disjoint** (no prefix overlap). That MECE guarantee is what lets agents run in parallel.
@@ -100,3 +117,7 @@ Hand back to the user when any of:
 - `rally next` returns `requires_human: true`
 - `rally check before-write --strict` blocks and cannot be resolved
 - A task hits a real blocker → `rally say blocker --tool <TOOL> --subject "<reason>"`
+
+Reference: canonical spec [`../../dynamic-workflows/PROTOCOL.md`](../../dynamic-workflows/PROTOCOL.md) ·
+coordination doctrine [`../../dynamic-workflows/COORDINATION.md`](../../dynamic-workflows/COORDINATION.md) ·
+model tiers [`../../dynamic-workflows/MODEL-TIERS.md`](../../dynamic-workflows/MODEL-TIERS.md)
