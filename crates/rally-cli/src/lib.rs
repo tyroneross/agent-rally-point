@@ -655,6 +655,13 @@ fn reserve_numbered_session(
                 session,
             });
         }
+        // Yield the thread so that a competing writer that already holds the
+        // SQLite IMMEDIATE lock can complete and advance the context. Without
+        // this, all N losers spin back into the read immediately, hammering
+        // the DB and increasing the chance they all read the same stale version
+        // again (thundering herd). yield_now is deterministic and never
+        // introduces wall-clock delays that would break unit tests.
+        thread::yield_now();
     }
     Err(RallyError::Usage(format!(
         "could not reserve a unique managed session after {SESSION_IDENTITY_RETRIES} concurrent changes"

@@ -1181,12 +1181,18 @@ fn append_segment_line(segment_path: &Path, entry: &LedgerLine) -> Result<()> {
             .map_err(RallyError::io(format!("create {}", parent.display())))?;
     }
     let line = serde_json::to_string(entry).map_err(RallyError::json("render segment line"))?;
+    // Append `line\n` as a single write(2) call so that O_APPEND atomicity
+    // prevents interleaving with concurrent writers. writeln!(file, "{line}")
+    // expands to write_fmt which issues two separate write() calls (content
+    // then '\n'), allowing another process's bytes to land between them and
+    // corrupt the JSONL record. write_all issues a single syscall.
+    let record = format!("{line}\n");
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(segment_path)
         .map_err(RallyError::io(format!("open {}", segment_path.display())))?;
-    writeln!(file, "{line}")
+    file.write_all(record.as_bytes())
         .map_err(RallyError::io(format!("write {}", segment_path.display())))?;
     file.sync_data()
         .map_err(RallyError::io(format!("fsync {}", segment_path.display())))?;
