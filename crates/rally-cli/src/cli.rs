@@ -19,6 +19,7 @@ pub(crate) enum CliCommand {
     Locate(LocateArgs),
     Recent(RecentArgs),
     Retrospective(RetrospectiveArgs),
+    Rotate(RotateArgs),
 }
 
 pub(crate) enum CliParse {
@@ -29,6 +30,17 @@ pub(crate) enum CliParse {
 #[derive(Clone, Debug)]
 pub(crate) struct InitArgs {
     pub(crate) json: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RotateArgs {
+    pub(crate) json: bool,
+    /// Override the rotation threshold (days). Falls back to the
+    /// `RALLY_ROTATE_DAYS` env var, then `.rally/manifest.json`'s
+    /// `rotate_threshold_days`, then a built-in default of 90.
+    pub(crate) days: Option<i64>,
+    /// Preview mode — list segments that would rotate without moving anything.
+    pub(crate) dry_run: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -192,6 +204,7 @@ const COMMANDS: &[&str] = &[
     "locate",
     "recent",
     "retrospective",
+    "rotate",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -289,6 +302,10 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("retrospective")
         .map(CliCommand::Retrospective);
+    let rotate = rotate_parser()
+        .to_options()
+        .command("rotate")
+        .map(CliCommand::Rotate);
 
     construct!([
         init,
@@ -305,7 +322,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         attach,
         capture,
         stop,
-        retrospective
+        retrospective,
+        rotate
     ])
     .to_options()
 }
@@ -313,6 +331,17 @@ fn cli_parser() -> OptionParser<CliCommand> {
 fn init_parser() -> impl Parser<InitArgs> {
     let json = json_flag();
     construct!(InitArgs { json })
+}
+
+fn rotate_parser() -> impl Parser<RotateArgs> {
+    let json = json_flag();
+    let days = optional_i64_arg("days", "N");
+    let dry_run = dry_run_flag();
+    construct!(RotateArgs {
+        json,
+        days,
+        dry_run
+    })
 }
 
 fn retrospective_parser() -> impl Parser<RetrospectiveArgs> {

@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_INIT: &str = "agent-rally.command.init.v1";
 const SCHEMA_RETROSPECTIVE: &str = "agent-rally.command.retrospective.v1";
+const SCHEMA_ROTATE: &str = "agent-rally.command.rotate.v1";
 const SCHEMA_ENTER: &str = "agent-rally.command.enter.v1";
 const SCHEMA_SAY: &str = "agent-rally.command.say.v1";
 const SCHEMA_ROOM: &str = "agent-rally.command.room.v1";
@@ -45,6 +46,7 @@ mod init;
 mod next;
 mod output;
 mod retrospective;
+mod rotate;
 mod store;
 
 use backends::*;
@@ -102,7 +104,26 @@ fn run_inner() -> Result<Output> {
         CliCommand::Inject(args) => command_inject(args),
         CliCommand::Session(args) => command_session_action(args),
         CliCommand::Retrospective(args) => command_retrospective(args),
+        CliCommand::Rotate(args) => command_rotate(args),
     }
+}
+
+fn command_rotate(args: RotateArgs) -> Result<Output> {
+    let root = repo_root()?;
+    let outcome = rotate::run_rotate(root, args.days, args.dry_run)?;
+    let text = format!(
+        "rally rotate: threshold={}d (source={}) cutoff={} {}rotated={} skipped={} (live {} → {})",
+        outcome.threshold_days,
+        outcome.threshold_source,
+        outcome.cutoff_utc,
+        if outcome.dry_run { "dry-run " } else { "" },
+        outcome.rotated.len(),
+        outcome.skipped.len(),
+        outcome.live_segment_count_before,
+        outcome.live_segment_count_after,
+    );
+    let body = envelope("rotate", SCHEMA_ROTATE, outcome)?;
+    Ok(Output::new(args.json, text, body))
 }
 
 fn command_retrospective(args: RetrospectiveArgs) -> Result<Output> {
@@ -1360,6 +1381,7 @@ fn help_text() -> String {
         "Usage:",
         "  rally init [--json]",
         "  rally retrospective [--engagement <label>] [--out <path>] [--json]",
+        "  rally rotate [--days <n>] [--dry-run] [--json]",
         "  rally enter --tool <tool> [--engagement <label>] [--path <path>] [--role <role>] [--json]",
         "  rally say <kind> --tool <tool> --subject <subject> [--path <path>] [--json]",
         "  rally room [--tool <tool>] [--role <role>] [--path <path>] [--since <seq>] [--json]",
