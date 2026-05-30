@@ -88,6 +88,11 @@ pub(crate) enum FactKind {
     /// existing fields (summary/scope/evidence) using the additive-marker pattern.
     /// Never surfaced in active_claims / open_handoffs / next candidates.
     BacklogItem,
+    /// B13: handoff receipt — durable record that a handoff was acted on by the
+    /// recipient.  `ref_id` points to the originating handoff `event_id`.
+    /// Subject prefix: `"receipt:"`.  Closes the referenced handoff from
+    /// `open_handoffs` (same projection logic as `resolve`).
+    Receipt,
     #[serde(other)]
     #[default]
     Unknown,
@@ -110,6 +115,7 @@ impl FactKind {
             "presence" => Some(Self::Presence),
             "read" => Some(Self::Read),
             "backlog-item" => Some(Self::BacklogItem),
+            "receipt" => Some(Self::Receipt),
             "unknown" => Some(Self::Unknown),
             _ => None,
         }
@@ -131,6 +137,7 @@ impl FactKind {
             Self::Presence => "presence",
             Self::Read => "read",
             Self::BacklogItem => "backlog-item",
+            Self::Receipt => "receipt",
             Self::Unknown => "unknown",
         }
     }
@@ -833,9 +840,10 @@ impl RoomStore {
             .map(|f| f.seq)
             .max()
             .unwrap_or(0);
+        // B13: receipts close handoffs (same projection as resolve).
         let resolved = facts
             .iter()
-            .filter(|f| f.kind == "resolve" || f.kind == "release")
+            .filter(|f| f.kind == "resolve" || f.kind == "release" || f.kind == "receipt")
             .filter_map(|f| f.ref_id.clone())
             .collect::<BTreeSet<_>>();
         let released_scopes = facts
@@ -1177,6 +1185,49 @@ impl RoomStore {
         let mut snapshot = self.snapshot()?;
         snapshot.readers = self.project_read_receipts(snapshot.max_seq)?;
         Ok(snapshot)
+    }
+
+    // -------------------------------------------------------------------------
+    // B13: handoff receipt helper
+    // -------------------------------------------------------------------------
+
+    /// Emit a `FactKind::Receipt` fact that records the acting tool accepted
+    /// and began processing the handoff identified by `handoff_event_id`.
+    ///
+    /// The receipt closes the handoff from `open_handoffs` projection (same as
+    /// `resolve`).  The `summary` may carry additional context; leave `None`
+    /// for a minimal receipt.
+    ///
+    /// Uses `append_fact_verified` so the durable record is confirmed in the
+    /// canonical ledger before returning.
+    pub(crate) fn append_receipt(
+        &self,
+        tool: &str,
+        handoff_event_id: &str,
+        subject: &str,
+        summary: Option<String>,
+    ) -> Result<Fact> {
+        let fact = Fact {
+            schema: crate::FACT_SCHEMA.to_string(),
+            event_id: crate::new_id("receipt"),
+            seq: 0,
+            thread_id: format!("receipt-{}", handoff_event_id),
+            kind: FactKind::Receipt,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("receipt: {subject}"),
+            scope: Vec::new(),
+            created_at: crate::now_string(),
+            summary,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: Some(handoff_event_id.to_string()),
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        self.append_fact_verified(&fact)
     }
 }
 
