@@ -206,7 +206,7 @@ fn command_init(args: InitArgs) -> Result<Output> {
     let repo = repo_root()?;
     let worktree = worktree_root()?;
     let outcome = init::run_init(repo, worktree)?;
-    let manifest_action = outcome.manifest.action.clone();
+    let manifest_action = outcome.manifest.action;
     let pointers_summary: Vec<String> = outcome
         .pointers
         .iter()
@@ -2203,9 +2203,12 @@ fn wait_for_resolution(
         }
         thread::sleep(remaining.min(Duration::from_millis(250)));
     }
-    Err(RallyError::Message(format!(
-        "timed out after {timeout_seconds}s waiting for resolve fact for {handoff} after seq {after_seq} (last seen seq {last_seen_seq})"
-    )))
+    Ok(json!({
+        "resolved": false,
+        "timed_out": true,
+        "waited_seconds": timeout_seconds,
+        "after_seq": after_seq
+    }))
 }
 
 fn sanitize_id(value: &str) -> String {

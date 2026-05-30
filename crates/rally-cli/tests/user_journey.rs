@@ -1067,6 +1067,81 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
 }
 
 #[test]
+fn rally_inject_require_ack_timeout_returns_ok_with_timeout_ack() {
+    // Verifies that when --require-ack times out (no resolver writes a resolve
+    // fact), the command exits 0 with ok:true and a structured timeout ack,
+    // NOT an error envelope.  The message was durably recorded (content_fact
+    // present) before the ack wait began — the caller must NOT re-inject.
+    let workspace = Workspace::new("rally-inject-ack-timeout");
+
+    workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "reviewer",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "codex",
+        "--target",
+        "claude_code:reviewer-01",
+        "--subject",
+        "handoff for ack-timeout test",
+    ]);
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+
+    // Inject with --require-ack but NO resolver thread — must time out.
+    let (body, output) = workspace.json_with_status(&[
+        "inject",
+        "reviewer-01",
+        "--json",
+        "--handoff",
+        handoff_id,
+        "--require-ack",
+        "--timeout-seconds",
+        "1",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+
+    // Must be ok:true (inject succeeded; only ack is pending).
+    assert_eq!(output.status.code(), Some(0), "ack-timeout must exit 0");
+    assert_eq!(body["ok"], true, "ack-timeout must return ok:true");
+
+    // delivery + content fact must be present (message was recorded before wait).
+    assert_eq!(
+        body["data"]["inject"]["delivered"], true,
+        "delivered must be true even on ack-timeout"
+    );
+    // --handoff inject: content_fact is None (handoff fact already in channel).
+    // That's expected — just confirm the field exists (it's null/absent for --handoff).
+
+    // ack must be the structured timeout object.
+    let ack = &body["data"]["inject"]["ack"];
+    assert_eq!(ack["resolved"], false, "ack.resolved must be false on timeout");
+    assert_eq!(ack["timed_out"], true, "ack.timed_out must be true");
+    assert!(
+        ack["waited_seconds"].as_u64().unwrap_or(0) >= 1,
+        "ack.waited_seconds must reflect the timeout duration"
+    );
+    assert!(
+        !ack["after_seq"].is_null(),
+        "ack.after_seq must be present"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
 fn rally_run_assigns_numbered_agent_ids() {
     let workspace = Workspace::new("rally-run-numbered-ids");
 

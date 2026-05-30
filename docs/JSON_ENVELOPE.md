@@ -53,6 +53,15 @@ print(d['data'][d['command']])
 | `sessions` | `sessions: { sessions: [...] }` | — |
 | `run` | `run: { mode, session, commands }` | — |
 | `inject` | `inject: { mode, session, handoff?, require_ack, ack?, wake_intent?, commands, sender_tool, content_fact?, delivered }` | — |
+
+**`inject.ack` shapes** (only present when `--require-ack` is passed):
+
+| Scenario | `ack` value |
+|----------|-------------|
+| Resolve fact arrived in time | `{ "resolved": true, "event_id": "...", "tool": "...", "subject": "..." }` |
+| Timed out before resolve fact | `{ "resolved": false, "timed_out": true, "waited_seconds": N, "after_seq": N }` |
+
+An ack-timeout response is **`ok: true` / exit 0** — the inject *succeeded* (message was delivered to the backend and, for `--text` injects, durably recorded as a content fact via `content_fact`). Only the optional downstream acknowledgement did not arrive within the timeout window. Callers must check `ack.resolved`, not `ok`, to determine whether the peer acknowledged. **Do NOT re-inject on an ack-timeout** — the message is already in the channel.
 | `attach` | `attach: { mode, action, session, output?, commands }` | — |
 | `capture` | `capture: { mode, action, session, output?, commands }` | — |
 | `stop` | `stop: { mode, action, session, output?, commands }` | — |
