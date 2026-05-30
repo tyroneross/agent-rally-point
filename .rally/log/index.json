@@ -1,0 +1,32 @@
+{
+  "segments": [
+    {
+      "count": 489,
+      "engagement": "2026-05-29",
+      "first_seq": 1,
+      "first_ts": "2026-05-29 6:19:29.35018 +00:00:00",
+      "last_seq": 489,
+      "last_ts": "2026-05-29T19:38:55Z",
+      "segment": "2026-05-29.jsonl"
+    },
+    {
+      "count": 6,
+      "engagement": "2026-05-30",
+      "first_seq": 490,
+      "first_ts": "2026-05-30T00:12:01Z",
+      "last_seq": 495,
+      "last_ts": "2026-05-30T00:34:06Z",
+      "segment": "2026-05-30.jsonl"
+    },
+    {
+      "count": 489,
+      "engagement": "ledger-pre-segment",
+      "first_seq": 1,
+      "first_ts": "2026-05-29 6:19:29.35018 +00:00:00",
+      "last_seq": 489,
+      "last_ts": "2026-05-29T19:38:55Z",
+      "segment": "ledger-pre-segment.jsonl"
+    }
+  ],
+  "updated_at": "2026-05-30T00:37:01Z"
+}

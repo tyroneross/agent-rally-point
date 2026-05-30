@@ -1,0 +1,18 @@
+{
+  "docs": {
+    "board": "docs/ORCHESTRATION.md",
+    "doctrine": "dynamic-workflows/COORDINATION.md",
+    "guide": "RALLY.md",
+    "protocol": "dynamic-workflows/PROTOCOL.md"
+  },
+  "init_cmd": "rally init",
+  "ledger": ".rally/log/",
+  "ledger_filename_legacy": ".rally/ledger.jsonl",
+  "pointer_markers": {
+    "end": "<!-- rally:end -->",
+    "start": "<!-- rally:start -->"
+  },
+  "repo": "agent-rally-point",
+  "room_cmd": "rally room",
+  "schema": "agent-rally.manifest.v1"
+}
