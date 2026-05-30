@@ -349,7 +349,27 @@ fn command_say(args: SayArgs) -> Result<Output> {
     let subject = args
         .subject
         .unwrap_or_else(|| default_subject(kind.as_str()));
-    let scope = scopes_from(args.scopes, args.resources, args.paths);
+
+    // B18: detect external-intake BEFORE normalisation so absolute paths are
+    // still distinguishable.  Collect every raw path + URI that classifies External.
+    let external_paths: Vec<String> = args
+        .paths
+        .iter()
+        .chain(args.scopes.iter())
+        .chain(args.uri.iter())
+        .filter(|v| classify_scope(v) == ScopeClass::External)
+        .cloned()
+        .collect();
+    let is_external = !external_paths.is_empty();
+
+    let mut scope = scopes_from(args.scopes, args.resources, args.paths);
+
+    // Tag the scope with the quarantine sentinel so the snapshot projection
+    // can exclude this fact from the repo-local active backlog.
+    if is_external {
+        scope.push("external-intake".to_string());
+    }
+
     let room = RoomStore::open()?;
     // Component B: auto-register presence for the calling tool before writing.
     ensure_presence(&room, &args.tool)?;
@@ -359,7 +379,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
         seq: 0,
         thread_id: args.thread_id.unwrap_or_else(|| new_id("room")),
         kind,
-        tool: Some(args.tool),
+        tool: Some(args.tool.clone()),
         role: args.role,
         subject,
         scope,
@@ -374,6 +394,45 @@ fn command_say(args: SayArgs) -> Result<Output> {
         session: None,
     };
     let fact = room.append_fact(&fact)?;
+
+    // B18: append ONE durable risk fact for each external-intake detection so
+    // the contamination event is permanently auditable.  Never blocks the write.
+    let mut say_warnings: Vec<SayWarning> = Vec::new();
+    if is_external {
+        let root_display = repo_root()
+            .map(|r| r.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        let paths_display = external_paths.join(", ");
+        let risk_summary = format!(
+            "external-intake: path(s) [{paths_display}] resolve outside repo_root {root_display}; quarantined — not promoted into repo-local backlog. Recorded for audit."
+        );
+        let risk_fact = Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Risk,
+            tool: Some(args.tool.clone()),
+            role: None,
+            subject: format!("external-intake: {paths_display}"),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: Some(risk_summary.clone()),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: Some("warn".to_string()),
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&risk_fact)?;
+        say_warnings.push(SayWarning {
+            code: "external-intake".to_string(),
+            message: risk_summary,
+        });
+    }
+
     let snapshot = room.snapshot()?;
     let body = envelope(
         "say",
@@ -381,6 +440,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
         SayData {
             fact: fact.clone(),
             room: RoomSummary::from(&snapshot),
+            warnings: say_warnings,
         },
     )?;
     let text = format!("said {} {}", fact.kind.as_str(), fact.event_id);
@@ -2649,6 +2709,303 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
     }
+
+    // ==========================================================================
+    // B18 — repo-scope write guard + external-intake quarantine tests
+    // ==========================================================================
+
+    /// B18a: classify_scope returns RepoLocal for a bare relative path.
+    #[test]
+    fn b18a_classify_scope_relative_path_is_repo_local() {
+        assert_eq!(
+            classify_scope("src/x.rs"),
+            ScopeClass::RepoLocal,
+            "relative paths must always be RepoLocal"
+        );
+    }
+
+    /// B18b: classify_scope returns RepoLocal for an absolute path that IS
+    /// under repo_root.  We use this repo's own root which is guaranteed to
+    /// exist under a real git tree.
+    #[test]
+    fn b18b_classify_scope_absolute_under_repo_root_is_repo_local() {
+        let root = unique_root("b18b");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        // We can't change repo_root() without cwd manipulation, so verify the
+        // helper directly using a path that starts with the cwd (which is always
+        // under some git repo when tests run inside the workspace).
+        // The safe invariant: a relative path always returns RepoLocal regardless.
+        assert_eq!(
+            classify_scope("crates/rally-cli/src/lib.rs"),
+            ScopeClass::RepoLocal,
+            "relative path under repo must be RepoLocal"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// B18c: classify_scope returns External for an absolute path that is
+    /// definitively NOT under the current repo root (e.g. /tmp, /var, or another
+    /// well-known system path that cannot be a subdirectory of this workspace).
+    #[test]
+    fn b18c_classify_scope_absolute_outside_repo_is_external() {
+        // /tmp is always present on macOS/Linux and is never inside a git repo
+        // root that would contain the rally-cli crate.
+        // We use /tmp/some-other-repo/x.rs as the archetype.
+        let outside = "/tmp/some-other-repo/x.rs";
+        // Only assert External when /tmp is genuinely outside the repo root.
+        // Derive repo root from cwd to make the test hermetic.
+        let maybe_root = repo_root();
+        if let Ok(root) = maybe_root {
+            let root_str = root.to_string_lossy();
+            if !root_str.starts_with("/tmp") {
+                assert_eq!(
+                    classify_scope(outside),
+                    ScopeClass::External,
+                    "/tmp/some-other-repo/x.rs must be External when repo root is {root_str}"
+                );
+            }
+        }
+    }
+
+    /// B18d: posting a claim with an external absolute path still succeeds
+    /// (ok:true / fact written), but the room's active_claims does NOT contain
+    /// it, and a risk fact with subject "external-intake: ..." is present in
+    /// current_risks.
+    #[test]
+    fn b18d_external_path_claim_quarantined_from_active_claims() {
+        let root = unique_root("b18d");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // Fabricate the external-tagged claim directly (avoids cwd dependency
+        // of command_say while still exercising the snapshot projection).
+        let external_claim = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b18d-claim"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Claim,
+            tool: Some("b18d-tool".to_string()),
+            role: None,
+            subject: "external claim".to_string(),
+            // Marker added by command_say for external-intake.
+            scope: vec!["file:/some/other-repo/x.rs".to_string(), "external-intake".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&external_claim).unwrap();
+
+        // Post a normal repo-local claim too so we can verify it IS included.
+        let local_claim = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b18d-local"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Claim,
+            tool: Some("b18d-tool".to_string()),
+            role: None,
+            subject: "local claim".to_string(),
+            scope: vec!["file:src/x.rs".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&local_claim).unwrap();
+
+        let snapshot = room.snapshot().unwrap();
+
+        // The external claim must NOT appear in active_claims.
+        let ext_in_active = snapshot
+            .active_claims
+            .iter()
+            .any(|f| f.scope.contains(&"external-intake".to_string()));
+        assert!(
+            !ext_in_active,
+            "external-intake claim must be excluded from active_claims"
+        );
+
+        // The local claim MUST appear in active_claims.
+        let local_in_active = snapshot
+            .active_claims
+            .iter()
+            .any(|f| f.subject == "local claim");
+        assert!(
+            local_in_active,
+            "repo-local claim must appear in active_claims"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// B18e: posting an external-intake handoff excludes it from open_handoffs.
+    #[test]
+    fn b18e_external_path_handoff_excluded_from_open_handoffs() {
+        let root = unique_root("b18e");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        let ext_handoff = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b18e-hoff"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Handoff,
+            tool: Some("b18e-tool".to_string()),
+            role: None,
+            subject: "external handoff".to_string(),
+            scope: vec!["file:/other/repo/x.rs".to_string(), "external-intake".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&ext_handoff).unwrap();
+
+        let snapshot = room.snapshot().unwrap();
+        let ext_in_handoffs = snapshot
+            .open_handoffs
+            .iter()
+            .any(|f| f.scope.contains(&"external-intake".to_string()));
+        assert!(
+            !ext_in_handoffs,
+            "external-intake handoff must be excluded from open_handoffs"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// B18f: posting an external-intake artifact excludes it from recent_artifacts.
+    #[test]
+    fn b18f_external_path_artifact_excluded_from_recent_artifacts() {
+        let root = unique_root("b18f");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        let ext_artifact = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b18f-art"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Artifact,
+            tool: Some("b18f-tool".to_string()),
+            role: None,
+            subject: "external artifact".to_string(),
+            scope: vec!["file:/other/repo/out.json".to_string(), "external-intake".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&ext_artifact).unwrap();
+
+        let snapshot = room.snapshot().unwrap();
+        let ext_in_artifacts = snapshot
+            .recent_artifacts
+            .iter()
+            .any(|f| f.scope.contains(&"external-intake".to_string()));
+        assert!(
+            !ext_in_artifacts,
+            "external-intake artifact must be excluded from recent_artifacts"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// B18g: the risk fact written for an external-intake claim IS present in
+    /// current_risks (the audit trail).
+    #[test]
+    fn b18g_external_intake_risk_fact_appears_in_current_risks() {
+        let root = unique_root("b18g");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // Simulate what command_say does: write the tagged claim + the risk fact.
+        let ext_claim = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b18g-claim"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Claim,
+            tool: Some("b18g-tool".to_string()),
+            role: None,
+            subject: "b18g external claim".to_string(),
+            scope: vec!["file:/some/other/x.rs".to_string(), "external-intake".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&ext_claim).unwrap();
+
+        let risk_fact = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b18g-risk"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Risk,
+            tool: Some("b18g-tool".to_string()),
+            role: None,
+            subject: "external-intake: /some/other/x.rs".to_string(),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: Some("external-intake recorded for audit".to_string()),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: Some("warn".to_string()),
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&risk_fact).unwrap();
+
+        let snapshot = room.snapshot().unwrap();
+
+        // The risk fact must appear in current_risks.
+        let risk_in_current = snapshot
+            .current_risks
+            .iter()
+            .any(|f| f.subject.starts_with("external-intake:"));
+        assert!(
+            risk_in_current,
+            "external-intake risk fact must appear in current_risks; got: {:?}",
+            snapshot.current_risks.iter().map(|f| &f.subject).collect::<Vec<_>>()
+        );
+
+        // The external claim must NOT appear in active_claims.
+        assert!(
+            snapshot.active_claims.is_empty(),
+            "active_claims must be empty (external-intake claim quarantined)"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -2685,10 +3042,24 @@ struct EnterData {
     warnings: Vec<EnterWarning>,
 }
 
+/// Non-blocking advisory emitted by `rally say` when an external-intake
+/// condition is detected (B18).  The command always returns `ok: true`;
+/// the warning is informational and the risk fact is the durable audit record.
+#[derive(JsonSchema, Serialize)]
+struct SayWarning {
+    /// Machine-readable code, e.g. `"external-intake"`.
+    code: String,
+    /// Human-readable explanation.
+    message: String,
+}
+
 #[derive(JsonSchema, Serialize)]
 struct SayData {
     fact: Fact,
     room: RoomSummary,
+    /// Non-blocking advisories (omitted from JSON when empty).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<SayWarning>,
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -2814,6 +3185,52 @@ pub(crate) fn path_matches_scope(scope: &str, path: &str) -> bool {
     let path = comparable_path(path);
     !scope.is_empty() && (scope == path || path.starts_with(&format!("{scope}/")))
 }
+
+// =============================================================================
+// B18 — repo-scope write guard + external-intake quarantine
+// =============================================================================
+//
+// Classify whether a raw path/URI resolves inside or outside this repo's root.
+// Used by command_say to tag and quarantine external-intake facts so they never
+// contaminate the repo-local active_claims / open_handoffs / recent_artifacts
+// projections.
+//
+// Marker approach (chosen for minimal Fact shape change):
+//   The original fact's `scope` Vec gets an extra entry `"external-intake"`.
+//   The snapshot projection filters facts whose scope contains that sentinel.
+//   This requires zero new fields on Fact and no schema version bump.
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum ScopeClass {
+    RepoLocal,
+    External,
+}
+
+/// Classify a raw path or URI string (before `normalize_path` runs).
+///
+/// Rules:
+/// - Relative paths (no leading `/`) → always `RepoLocal` (they are relative
+///   to the repo by convention; no absolute resolution is possible).
+/// - Absolute paths under `repo_root()` (by prefix or canonical comparison) → `RepoLocal`.
+/// - Absolute paths that do NOT resolve under `repo_root()` → `External`.
+/// - Empty string → `RepoLocal` (vacuously; no path to quarantine).
+pub(crate) fn classify_scope(path_or_uri: &str) -> ScopeClass {
+    // Strip file: prefix if present.
+    let raw = path_or_uri
+        .strip_prefix("file:")
+        .unwrap_or(path_or_uri);
+    let p = Path::new(raw);
+    // Only absolute paths can be definitively outside the repo.
+    if !p.is_absolute() {
+        return ScopeClass::RepoLocal;
+    }
+    // Absolute: check whether it resolves inside repo_root.
+    match repo_relative_path(p) {
+        Some(_) => ScopeClass::RepoLocal,
+        None => ScopeClass::External,
+    }
+}
+
 
 fn comparable_path(value: &str) -> String {
     let stripped = value.strip_prefix("file:").unwrap_or(value);

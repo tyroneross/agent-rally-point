@@ -621,6 +621,8 @@ impl RoomStore {
             .filter(|f| f.kind == "claim")
             .filter(|f| !resolved.contains(&f.event_id))
             .filter(|f| !f.scope.iter().any(|scope| released_scopes.contains(scope)))
+            // B18: exclude external-intake facts from repo-local backlog.
+            .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
             .cloned()
             .collect::<Vec<_>>();
         let active_blockers = facts
@@ -639,6 +641,8 @@ impl RoomStore {
             .filter(|f| f.kind == "handoff")
             .filter(|f| !resolved.contains(&f.event_id))
             .filter(|f| !artifact_consumed_handoffs.contains(&f.event_id))
+            // B18: exclude external-intake facts from repo-local backlog.
+            .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
             .cloned()
             .collect::<Vec<_>>();
         let current_decisions = facts
@@ -659,6 +663,8 @@ impl RoomStore {
         let recent_artifacts = facts
             .iter()
             .filter(|f| f.kind == "artifact")
+            // B18: exclude external-intake facts from repo-local backlog.
+            .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
             .rev()
             .take(20)
             .cloned()

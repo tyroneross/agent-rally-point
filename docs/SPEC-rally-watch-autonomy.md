@@ -74,3 +74,23 @@ index and would break). Document this as the B17/autonomy co-design.
 - `--print-launchd` emits a valid plist referencing `rally watch` + the repo cwd.
 - Cross-agent: the same binary + a different `--on-activity` command serves Codex (`codex exec`),
   Claude, or any agent — no agent name in the watcher core.
+
+## Engage adapters (build-loop-free)
+
+The watcher core is host-neutral; the `--on-activity` command is the only per-agent piece, and none
+of these need build-loop:
+
+**Codex** (autonomous, `approval_policy="never"`):
+```bash
+rally watch --print-launchd --on-activity 'codex exec "You are codex:auto on this rally-point repo. Run: rally next --tool codex:auto --json. If it returns claimable, deps-met work: rally say claim it, do it, then rally say artifact + release. Coordinate via rally; never block."' \
+  > ~/Library/LaunchAgents/com.agent-rally-point.watch.codex.plist
+launchctl load ~/Library/LaunchAgents/com.agent-rally-point.watch.codex.plist
+```
+
+**Claude** (headless): swap the engage for `claude -p "<same self-contained autonomy prompt>"`.
+
+**Any other agent:** point `--on-activity` at its own non-interactive entrypoint. The watcher passes
+`RALLY_ROOM`/`RALLY_FROM_SEQ`/`RALLY_TO_SEQ`/`RALLY_TOOL`/`RALLY_REPO` in the env for the prompt to use.
+
+This fully replaces the emergent `.build-loop` Python poller path: autonomy now lives in the `rally`
+binary + a one-line adapter, with **zero build-loop dependency** and per-repo (B17-safe) reads.
