@@ -10,12 +10,12 @@
       "segment": "2026-05-29.jsonl"
     },
     {
-      "count": 537,
+      "count": 568,
       "engagement": "2026-05-30",
       "first_seq": 490,
       "first_ts": "2026-05-30T00:12:01Z",
-      "last_seq": 1026,
-      "last_ts": "2026-05-30T23:12:30Z",
+      "last_seq": 1057,
+      "last_ts": "2026-05-30T23:36:57Z",
       "segment": "2026-05-30.jsonl"
     },
     {
@@ -28,5 +28,5 @@
       "segment": "ledger-pre-segment.jsonl"
     }
   ],
-  "updated_at": "2026-05-30T23:12:31Z"
+  "updated_at": "2026-05-30T23:36:57Z"
 }
