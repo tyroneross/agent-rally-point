@@ -46,6 +46,7 @@ macro_rules! cmd {
 
 mod backends;
 mod check;
+mod check_ci;
 mod cli;
 mod discovery;
 mod doctor;
@@ -59,6 +60,7 @@ mod store;
 
 use backends::*;
 use check::build_check;
+use check_ci::build_check_ci;
 use cli::*;
 use error::{RallyError, Result};
 use next::{AttentionItem, EntryData, NextResult, build_attention, build_entry, build_next};
@@ -68,6 +70,8 @@ use store::{Fact, FactKind, ReadReceipt, RoomQuery, RoomSnapshot, RoomStore, Roo
 const SCHEMA_MIGRATE_LEGACY: &str = "agent-rally.command.migrate-legacy.v1";
 const SCHEMA_DOCTOR: &str = "agent-rally.command.doctor.v1";
 const SCHEMA_VERSION: &str = "agent-rally.command.version.v1";
+// B13
+const SCHEMA_CHECK_CI: &str = "agent-rally.command.check-ci.v1";
 
 pub fn main() -> ExitCode {
     let wants_json = env::args().any(|arg| arg == "--json");
@@ -122,6 +126,8 @@ fn run_inner() -> Result<Output> {
         CliCommand::MigrateLegacy(args) => command_migrate_legacy(args),
         CliCommand::Doctor(args) => command_doctor(args),
         CliCommand::Version(args) => command_version(args),
+        // B13
+        CliCommand::CheckCi(args) => command_check_ci(args),
     }
 }
 
@@ -449,6 +455,20 @@ fn command_say(args: SayArgs) -> Result<Output> {
     let room = RoomStore::open()?;
     // Component B: auto-register presence for the calling tool before writing.
     ensure_presence(&room, &args.tool)?;
+
+    // B13: encode --produces / --depends as markers in evidence so the
+    // claim is self-describing without any Fact struct changes.
+    // Format mirrors existing patterns (build_id:, read_seq:, external-intake):
+    //   produces:<path-or-symbol>
+    //   depends:<path-or-symbol>
+    let mut evidence = args.evidence;
+    for p in &args.produces {
+        evidence.push(format!("produces:{p}"));
+    }
+    for d in &args.depends {
+        evidence.push(format!("depends:{d}"));
+    }
+
     let fact = Fact {
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
@@ -461,7 +481,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
         scope,
         created_at: now_string(),
         summary: args.summary,
-        evidence: args.evidence,
+        evidence,
         target: args.target,
         ref_id: args.ref_id,
         status: args.status,
@@ -679,6 +699,21 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
     Err(RallyError::Usage(
         "rally doctor requires --canonical-paths or --prune-rooms".to_string(),
     ))
+}
+
+// B13 -----------------------------------------------------------------------
+fn command_check_ci(args: CheckCiArgs) -> Result<Output> {
+    let room = RoomStore::open()?;
+    let snapshot = room.snapshot()?;
+    let outcome = build_check_ci(args.strict, args.receipt_threshold_secs, &snapshot);
+    let pass = outcome.data.check_ci.pass;
+    let offenders = outcome.offender_count;
+    let body = envelope("check-ci", SCHEMA_CHECK_CI, outcome.data)?;
+    let text = format!(
+        "check-ci pass={pass} offenders={offenders} mode={}",
+        if args.strict { "strict" } else { "warn" }
+    );
+    Ok(Output::new(args.json, text, body).with_exit_code(outcome.exit_code))
 }
 
 fn command_version(args: VersionArgs) -> Result<Output> {

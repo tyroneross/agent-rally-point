@@ -2211,3 +2211,299 @@ fn rally_migrate_legacy_replays_and_is_idempotent() {
     workspace.cleanup();
     fs::remove_dir_all(home).ok();
 }
+
+// =============================================================================
+// B13 tests: produces/depends round-trip, receipt links a handoff, check ci
+// =============================================================================
+
+/// B13-1: `rally say claim --produces`/`--depends` round-trips through the fact.
+///
+/// The markers are encoded as `produces:<x>` / `depends:<x>` in the fact's
+/// `evidence` array.  This test verifies the claim is readable back from the
+/// room with both markers present.
+#[test]
+fn b13_produces_depends_round_trip_on_claim() {
+    let workspace = Workspace::new("b13-produces-depends");
+
+    let claim = workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "claude_code:01",
+        "--subject",
+        "implement auth module",
+        "--produces",
+        "src/auth.rs",
+        "--produces",
+        "src/auth/token.rs",
+        "--depends",
+        "src/config.rs",
+    ]);
+    assert_eq!(claim["schema"], "agent-rally.command.say.v1");
+    let claim_id = claim["data"]["fact"]["event_id"].as_str().unwrap();
+
+    // Read back via room and verify evidence markers are present.
+    let room = workspace.json(&["room", "--json"]);
+    let claims = room["data"]["room"]["active_claims"].as_array().unwrap();
+    let stored_claim = claims
+        .iter()
+        .find(|c| c["event_id"].as_str() == Some(claim_id))
+        .expect("claim must appear in active_claims");
+
+    let evidence: Vec<&str> = stored_claim["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.as_str())
+        .collect();
+
+    assert!(
+        evidence.iter().any(|e| *e == "produces:src/auth.rs"),
+        "evidence must contain produces:src/auth.rs; got: {:?}",
+        evidence
+    );
+    assert!(
+        evidence.iter().any(|e| *e == "produces:src/auth/token.rs"),
+        "evidence must contain produces:src/auth/token.rs; got: {:?}",
+        evidence
+    );
+    assert!(
+        evidence.iter().any(|e| *e == "depends:src/config.rs"),
+        "evidence must contain depends:src/config.rs; got: {:?}",
+        evidence
+    );
+
+    workspace.cleanup();
+}
+
+/// B13-2: a receipt fact links to a handoff and closes it from `open_handoffs`.
+///
+/// The 2-hop chain is: handoff → receipt → (handoff closed).
+/// The receipt is emitted via `rally say receipt --ref <handoff-id>`.
+#[test]
+fn b13_receipt_links_handoff_and_closes_it() {
+    let workspace = Workspace::new("b13-receipt-links-handoff");
+
+    // Emit a handoff.
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "codex:01",
+        "--target",
+        "claude_code:01",
+        "--subject",
+        "please review auth module",
+    ]);
+    let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
+
+    // Verify handoff is open.
+    let room_before = workspace.json(&["room", "--json"]);
+    assert!(
+        room_before["data"]["room"]["open_handoffs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["event_id"].as_str() == Some(handoff_id)),
+        "handoff must be open before receipt"
+    );
+
+    // Emit a receipt referencing the handoff.
+    let receipt = workspace.json(&[
+        "say",
+        "receipt",
+        "--json",
+        "--tool",
+        "claude_code:01",
+        "--subject",
+        "acknowledged auth review request",
+        "--ref",
+        handoff_id,
+        "--summary",
+        "started reviewing the auth module",
+    ]);
+    assert_eq!(receipt["schema"], "agent-rally.command.say.v1");
+    let receipt_id = receipt["data"]["fact"]["event_id"].as_str().unwrap();
+    assert!(!receipt_id.is_empty(), "receipt must have a valid event_id");
+
+    // The receipt's ref must point to the handoff.
+    assert_eq!(
+        receipt["data"]["fact"]["ref"].as_str(),
+        Some(handoff_id),
+        "receipt ref must equal the handoff event_id"
+    );
+    assert_eq!(
+        receipt["data"]["fact"]["kind"].as_str(),
+        Some("receipt"),
+        "fact kind must be 'receipt'"
+    );
+
+    // Verify the handoff is now closed (removed from open_handoffs).
+    let room_after = workspace.json(&["room", "--json"]);
+    let open_handoffs = room_after["data"]["room"]["open_handoffs"]
+        .as_array()
+        .unwrap();
+    assert!(
+        !open_handoffs.iter().any(|f| f["event_id"].as_str() == Some(handoff_id)),
+        "handoff must be closed after receipt"
+    );
+
+    workspace.cleanup();
+}
+
+/// B13-3a: `rally check ci --strict` exits 0 when the room is clean.
+#[test]
+fn b13_check_ci_strict_exits_zero_clean_room() {
+    let workspace = Workspace::new("b13-check-ci-clean");
+
+    // No blockers, no unsatisfied depends, no old handoffs — room is clean.
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "codex:01",
+        "--subject",
+        "clean room claim",
+    ]);
+
+    let (result, output) = workspace.json_with_status(&["check-ci", "--json", "--strict"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "check-ci --strict must exit 0 on a clean room; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(result["schema"], "agent-rally.command.check-ci.v1");
+    assert_eq!(result["data"]["check_ci"]["pass"], true);
+    assert_eq!(
+        result["data"]["check_ci"]["offenders"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    workspace.cleanup();
+}
+
+/// B13-3b: `rally check ci --strict` exits 4 with an unresolved blocker.
+#[test]
+fn b13_check_ci_strict_exits_4_with_unresolved_blocker() {
+    let workspace = Workspace::new("b13-check-ci-blocker");
+
+    let blocker = workspace.json(&[
+        "say",
+        "blocker",
+        "--json",
+        "--tool",
+        "codex:01",
+        "--subject",
+        "CI pipeline broken",
+    ]);
+    let blocker_id = blocker["data"]["fact"]["event_id"].as_str().unwrap();
+
+    let (result, output) = workspace.json_with_status(&["check-ci", "--json", "--strict"]);
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "check-ci --strict must exit 4 when an unresolved blocker exists; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(result["data"]["check_ci"]["pass"], false);
+    let offenders = result["data"]["check_ci"]["offenders"].as_array().unwrap();
+    assert!(
+        offenders
+            .iter()
+            .any(|o| o["code"] == "unresolved-blocker" && o["fact_id"] == blocker_id),
+        "offenders must include the unresolved blocker; got: {:?}",
+        offenders
+    );
+
+    workspace.cleanup();
+}
+
+/// B13-3c: `rally check ci --strict` exits 4 with a dep-not-met offender.
+///
+/// A claim with `depends:src/config.rs` is an offender when no fact in the
+/// room carries `produces:src/config.rs` in its evidence.
+#[test]
+fn b13_check_ci_strict_exits_4_with_dep_not_met() {
+    let workspace = Workspace::new("b13-check-ci-dep-not-met");
+
+    // A claim with an unsatisfied depends.
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "codex:01",
+        "--subject",
+        "auth impl",
+        "--depends",
+        "src/config.rs",
+    ]);
+
+    let (result, output) = workspace.json_with_status(&["check-ci", "--json", "--strict"]);
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "check-ci --strict must exit 4 with an unsatisfied dependency; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(result["data"]["check_ci"]["pass"], false);
+    let offenders = result["data"]["check_ci"]["offenders"].as_array().unwrap();
+    assert!(
+        offenders.iter().any(|o| o["code"] == "dep-not-met"),
+        "offenders must include a dep-not-met entry; got: {:?}",
+        offenders
+    );
+
+    // Satisfying the dep removes the offender.
+    workspace.json(&[
+        "say",
+        "artifact",
+        "--json",
+        "--tool",
+        "claude_code:01",
+        "--subject",
+        "config module done",
+        "--evidence",
+        "produces:src/config.rs",
+    ]);
+
+    let (result2, output2) = workspace.json_with_status(&["check-ci", "--json", "--strict"]);
+    // The dep-not-met offender is gone; the blocker list is also empty.
+    // (active_claims may still include the original claim with depends marker,
+    //  but now produces:src/config.rs is in the room so it is satisfied.)
+    let offenders2 = result2["data"]["check_ci"]["offenders"].as_array().unwrap();
+    assert!(
+        !offenders2.iter().any(|o| o["code"] == "dep-not-met"),
+        "dep-not-met offender must be gone after a produces fact is emitted; got: {:?} (exit: {})",
+        offenders2,
+        output2.status.code().unwrap_or(-1)
+    );
+
+    workspace.cleanup();
+}
+
+/// B13-4: `rally check ci --help` exits 0.
+#[test]
+fn b13_check_ci_help_exits_zero() {
+    let workspace = Workspace::new("b13-check-ci-help");
+    let output = workspace.output(&["check-ci", "--help"]);
+    assert!(
+        output.status.success(),
+        "check-ci --help must exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("strict") || stdout.contains("CI"),
+        "help text must mention --strict; got: {stdout}"
+    );
+
+    workspace.cleanup();
+}

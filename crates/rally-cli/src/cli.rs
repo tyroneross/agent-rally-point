@@ -25,6 +25,8 @@ pub(crate) enum CliCommand {
     MigrateLegacy(MigrateLegacyArgs),
     Doctor(DoctorArgs),
     Version(VersionArgs),
+    /// B13: CI gate — read-only health check of the room state.
+    CheckCi(CheckCiArgs),
 }
 
 pub(crate) enum CliParse {
@@ -91,6 +93,12 @@ pub(crate) struct SayArgs {
     pub(crate) status: Option<String>,
     pub(crate) severity: Option<String>,
     pub(crate) uri: Option<String>,
+    /// B13: predictive contract — paths/symbols this claim will produce.
+    /// Stored as `produces:<x>` markers in the fact's `evidence` Vec.
+    pub(crate) produces: Vec<String>,
+    /// B13: predictive contract — paths/symbols this claim depends on.
+    /// Stored as `depends:<x>` markers in the fact's `evidence` Vec.
+    pub(crate) depends: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -250,6 +258,17 @@ impl Default for BackendBins {
     }
 }
 
+/// B13: arguments for `rally check ci`.
+#[derive(Clone, Debug)]
+pub(crate) struct CheckCiArgs {
+    pub(crate) json: bool,
+    /// Exit 4 (fail) when any offender is found; default is exit 0 (warn only).
+    pub(crate) strict: bool,
+    /// Threshold in seconds after which an unreceipted handoff is flagged.
+    /// Default: 3600 (1 hour).
+    pub(crate) receipt_threshold_secs: u64,
+}
+
 const COMMANDS: &[&str] = &[
     "init",
     "enter",
@@ -272,6 +291,8 @@ const COMMANDS: &[&str] = &[
     "migrate-legacy",
     "doctor",
     "version",
+    // B13: CI gate
+    "check-ci",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -395,6 +416,12 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .descr("Print the rally build-id (version + git hash). Exits 0.")
         .command("version")
         .map(CliCommand::Version);
+    // B13: CI gate (read-only)
+    let check_ci = check_ci_parser()
+        .to_options()
+        .descr("Read-only CI gate: exits 0 (pass) or 4 with --strict (fail) listing unresolved blockers, unsatisfied depends, and long-unreceipted handoffs.")
+        .command("check-ci")
+        .map(CliCommand::CheckCi);
 
     construct!([
         init,
@@ -417,7 +444,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         watch,
         migrate_legacy,
         doctor,
-        version
+        version,
+        check_ci
     ])
     .to_options()
 }
@@ -490,10 +518,13 @@ fn say_parser() -> impl Parser<SayArgs> {
     let status = optional_string_arg("status", "STATUS");
     let severity = optional_string_arg("severity", "SEVERITY");
     let uri = optional_string_arg("uri", "URI");
+    // B13: predictive contract markers (repeatable)
+    let produces = many_string_arg("produces", "PATH_OR_SYMBOL");
+    let depends = many_string_arg("depends", "PATH_OR_SYMBOL");
     let kind = positional::<String>("KIND").parse(parse_fact_kind);
     construct!(
         json, tool, subject, thread_id, role, summary, scopes, resources, paths, evidence, target,
-        ref_id, status, severity, uri, kind
+        ref_id, status, severity, uri, produces, depends, kind
     )
     .map(
         |(
@@ -512,6 +543,8 @@ fn say_parser() -> impl Parser<SayArgs> {
             status,
             severity,
             uri,
+            produces,
+            depends,
             kind,
         )| SayArgs {
             json,
@@ -530,6 +563,8 @@ fn say_parser() -> impl Parser<SayArgs> {
             status,
             severity,
             uri,
+            produces,
+            depends,
         },
     )
 }
@@ -886,4 +921,26 @@ fn parse_i64_arg(name: &str, value: String) -> Result<i64> {
 fn version_parser() -> impl Parser<VersionArgs> {
     let json = json_flag();
     construct!(VersionArgs { json })
+}
+
+// B13: check-ci parser
+fn check_ci_parser() -> impl Parser<CheckCiArgs> {
+    let json = json_flag();
+    let strict = long("strict")
+        .help("Exit 4 when any offender is found (default: exit 0, warn only)")
+        .switch();
+    let receipt_threshold_secs = string_arg("receipt-threshold-secs", "SECS")
+        .parse(|v| {
+            v.parse::<u64>().map_err(|_| {
+                RallyError::Usage(format!("invalid --receipt-threshold-secs value {v}"))
+            })
+        })
+        .fallback(3600u64);
+    construct!(json, strict, receipt_threshold_secs).map(
+        |(json, strict, receipt_threshold_secs)| CheckCiArgs {
+            json,
+            strict,
+            receipt_threshold_secs,
+        },
+    )
 }
