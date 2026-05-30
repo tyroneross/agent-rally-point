@@ -19,6 +19,29 @@ fail-loud, read-back-verified) and *liveness-aware*, then enforce the two guaran
 model rests on — one-owner-per-path and one-store-per-repo — so agents coordinate without a human
 referee.
 
+## Delivered — coordination program (2026-05-30)
+
+Shipped this session (see `docs/PROGRAM-rally-coordination-spec.md`). Triaged into tiers; **Tier 1
+done**.
+
+- **Presence substrate (B11/B12/B16 — largely delivered):** `enter` emits a `presence` fact; `room`
+  projects `squads[]` (active/idle) + `lead`; first-enter asserts lead; `enter --json` returns a
+  non-null room id; round-trip test. **Remaining for B11:** reject a *duplicate* squad id at enter.
+- **Lazy auto-enter:** any tool-scoped command registers presence (no hook).
+- **`rally status --global`** cross-repo rollup (read-only) + **resilient room-index reader**
+  (recovers a torn index; also repaired `recent --all`). Partial **B12** (board projection).
+- **mini-loop** skill (per-task quality loop for Rally Flow).
+- **Inject channel-of-record (asks):** `inject --tool <sender>` records a content fact
+  `{sender → recipient: message}` before delivery, so coordination is durable even if live tmux
+  delivery fails; verify via ledger, not TUI scrape.
+- **Tier-1 fixes:** `room_missing` warning collapsed to one summary; system author `rally` excluded
+  from `squads[]`; **multiple managed sessions per caller tool** (a lead can spawn N subagents).
+
+**Tier 2 (next):** B10 canonical-path matching (rank-1 linchpin) · formal B16 round-trip gate ·
+close/verify B11 (duplicate-id reject) + B12. **Tier 3 (later):** B13 · B17 · B18 · automation
+ranks 4–9. **Still open:** B11-race (rapid back-to-back `run` drops a session); stale-registry prune
+(B-index-monolith — the registry now has ~340 dead entries, warning-collapsed but not pruned).
+
 ## Open — ranked
 
 | Rank | ID | Item | Why it matters | Depends on |
