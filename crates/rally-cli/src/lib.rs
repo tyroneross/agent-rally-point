@@ -63,7 +63,7 @@ use cli::*;
 use error::{RallyError, Result};
 use next::{AttentionItem, EntryData, NextResult, build_attention, build_entry, build_next};
 use output::{CliError, Output};
-use store::{Fact, FactKind, RoomQuery, RoomSnapshot, RoomStore, RoomSummary};
+use store::{Fact, FactKind, ReadReceipt, RoomQuery, RoomSnapshot, RoomStore, RoomSummary};
 
 const SCHEMA_MIGRATE_LEGACY: &str = "agent-rally.command.migrate-legacy.v1";
 const SCHEMA_DOCTOR: &str = "agent-rally.command.doctor.v1";
@@ -542,13 +542,22 @@ fn command_room(args: RoomArgs) -> Result<Output> {
     let room = RoomStore::open()?;
     let json_output = args.json;
     let query = RoomQuery::from(args);
-    let snapshot = room.snapshot()?.filtered(&query);
+    // R10: use snapshot_with_readers when --readers is passed so that
+    // ReadReceipt projection happens; otherwise use the cheaper default path.
+    let snapshot = if query.readers {
+        room.snapshot_with_readers()?.filtered(&query)
+    } else {
+        room.snapshot()?.filtered(&query)
+    };
+    // R10: extract readers from snapshot (populated by snapshot_with_readers).
+    let readers = snapshot.readers.clone();
     let body = envelope(
         "room",
         SCHEMA_ROOM,
         RoomData {
             query,
             room: snapshot.clone(),
+            readers,
         },
     )?;
     let text = format!(
@@ -584,6 +593,16 @@ fn command_next(args: NextArgs) -> Result<Output> {
     } else {
         snapshot
     };
+    // R10: append a read-checkpoint fact when the tool's read position advances.
+    // Use `content_max_seq` (max seq of non-read-checkpoint facts) rather than
+    // `max_seq` so that the read-checkpoint's own seq is never fed back as the
+    // read position on the next poll — this breaks the self-inflation loop.
+    // E.g. if content_max_seq = 5 and we write a checkpoint at seq 6 recording
+    // "read_seq:5", the next poll sees content_max_seq = 5 again (the checkpoint
+    // at seq 6 is excluded) → last_checkpoint = 5 → no new checkpoint written.
+    // This call uses `append_fact` (not `append_fact_verified`) — read-checkpoints
+    // are low-stakes metadata and must not trigger a segment readback loop.
+    let _ = room.maybe_append_read_checkpoint(&tool, snapshot.content_max_seq);
     let body = envelope(
         "next",
         SCHEMA_NEXT,
@@ -3990,6 +4009,11 @@ struct SayVerified {
 struct RoomData {
     query: RoomQuery,
     room: RoomSnapshot,
+    /// R10: per-tool read receipts. Populated only when `--readers` is passed.
+    /// Lives at top-level `readers` so consumers can access it without digging
+    /// into the full room snapshot.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    readers: Vec<ReadReceipt>,
 }
 
 #[derive(JsonSchema, Serialize)]

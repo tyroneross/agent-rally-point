@@ -73,6 +73,17 @@ pub(crate) enum FactKind {
     Wake,
     /// Agent presence heartbeat — emitted once per `rally enter` call.
     Presence,
+    /// R10 read-checkpoint — durable record that a tool deliberately read up to
+    /// a given sequence number. Appended by `rally next --tool X` (and optionally
+    /// `rally room --tool X`) only when the tool's read position has ADVANCED
+    /// since its last recorded checkpoint (coalesced — no-op polls write nothing).
+    ///
+    /// `summary` encodes the read sequence number as `"read_seq:<N>"` (same
+    /// pattern as `build_id:<BUILD_ID>` in presence facts — no schema bump).
+    ///
+    /// EXCLUDED from claimable-work surfaces: not surfaced in `active_claims`,
+    /// `next` candidates, `open_handoffs`, or any backlog bucket.
+    Read,
     #[serde(other)]
     #[default]
     Unknown,
@@ -93,6 +104,7 @@ impl FactKind {
             "session" => Some(Self::Session),
             "wake" => Some(Self::Wake),
             "presence" => Some(Self::Presence),
+            "read" => Some(Self::Read),
             "unknown" => Some(Self::Unknown),
             _ => None,
         }
@@ -112,6 +124,7 @@ impl FactKind {
             Self::Session => "session",
             Self::Wake => "wake",
             Self::Presence => "presence",
+            Self::Read => "read",
             Self::Unknown => "unknown",
         }
     }
@@ -195,9 +208,32 @@ pub(crate) struct Squad {
 /// Seconds of inactivity after which a squad member is marked "idle".
 const IDLE_THRESHOLD_SECS: i64 = 15 * 60;
 
+/// R10: per-tool read receipt projected from `FactKind::Read` checkpoints.
+///
+/// `last_read_seq` is the highest sequence number the tool has durably
+/// recorded as read. `behind_by` is `max_seq - last_read_seq` (0 = caught up).
+/// `status` is "caught_up" when `behind_by == 0`, else "behind".
+///
+/// Surfaced only under `rally room --readers`; omitted from the default room
+/// output to avoid bloat.
+#[derive(Clone, Debug, Default, JsonSchema, Serialize)]
+pub(crate) struct ReadReceipt {
+    pub(crate) tool: String,
+    pub(crate) last_read_seq: i64,
+    pub(crate) behind_by: i64,
+    /// "caught_up" | "behind"
+    pub(crate) status: String,
+}
+
 #[derive(Clone, Debug, Default, JsonSchema, Serialize)]
 pub(crate) struct RoomSnapshot {
     pub(crate) max_seq: i64,
+    /// R10: highest seq of a substantive (non-read-checkpoint) fact.
+    /// Used internally by `command_next` to record the read position WITHOUT
+    /// inflating it with the read-checkpoint's own seq (anti-loop).
+    /// Not serialized to JSON — internal field only.
+    #[serde(skip)]
+    pub(crate) content_max_seq: i64,
     pub(crate) active_claims: Vec<Fact>,
     pub(crate) active_blockers: Vec<Fact>,
     pub(crate) open_handoffs: Vec<Fact>,
@@ -210,6 +246,11 @@ pub(crate) struct RoomSnapshot {
     pub(crate) squads: Vec<Squad>,
     /// Tool asserting the `role:lead` decision, if any.
     pub(crate) lead: Option<String>,
+    /// R10: per-tool read receipts projected from `FactKind::Read` checkpoints.
+    /// Populated only when `include_readers` is requested (see
+    /// `RoomStore::snapshot_with_readers`); empty in the default snapshot.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) readers: Vec<ReadReceipt>,
 }
 
 impl RoomSnapshot {
@@ -219,6 +260,7 @@ impl RoomSnapshot {
         }
         Self {
             max_seq: self.max_seq,
+            content_max_seq: self.content_max_seq,
             active_claims: filter_facts(self.active_claims, query),
             active_blockers: filter_facts(self.active_blockers, query),
             open_handoffs: filter_facts(self.open_handoffs, query),
@@ -227,9 +269,10 @@ impl RoomSnapshot {
             recent_artifacts: filter_facts(self.recent_artifacts, query),
             unconsumed_artifacts: filter_facts(self.unconsumed_artifacts, query),
             stale_facts: filter_facts(self.stale_facts, query),
-            // squads and lead are room-level aggregates; not filtered by path/tool query.
+            // squads, lead, and readers are room-level aggregates; not filtered by path/tool query.
             squads: self.squads,
             lead: self.lead,
+            readers: self.readers,
         }
     }
 }
@@ -244,6 +287,10 @@ pub(crate) struct RoomQuery {
     #[serde(rename = "thread")]
     pub(crate) thread_id: Option<String>,
     pub(crate) since: Option<i64>,
+    /// R10: when true, `command_room` projects per-tool read receipts.
+    /// Not serialized into the query output (internal routing only).
+    #[serde(skip)]
+    pub(crate) readers: bool,
 }
 
 impl RoomQuery {
@@ -255,6 +302,7 @@ impl RoomQuery {
             event_id: args.event_id,
             thread_id: args.thread_id,
             since: args.since,
+            readers: args.readers,
         }
     }
 
@@ -769,6 +817,16 @@ impl RoomStore {
     pub(crate) fn snapshot(&self) -> Result<RoomSnapshot> {
         let facts = self.facts()?;
         let max_seq = facts.iter().map(|f| f.seq).max().unwrap_or(0);
+        // R10: `content_max_seq` is the highest seq of a non-read-checkpoint
+        // fact. Used by command_next to derive the read position to record
+        // WITHOUT including the read-checkpoint's own seq (which would inflate
+        // the position on every poll and create a feedback loop).
+        let content_max_seq = facts
+            .iter()
+            .filter(|f| f.kind != "read")
+            .map(|f| f.seq)
+            .max()
+            .unwrap_or(0);
         let resolved = facts
             .iter()
             .filter(|f| f.kind == "resolve" || f.kind == "release")
@@ -897,6 +955,7 @@ impl RoomStore {
 
         Ok(RoomSnapshot {
             max_seq,
+            content_max_seq,
             active_claims,
             active_blockers,
             open_handoffs,
@@ -907,6 +966,7 @@ impl RoomStore {
             stale_facts: Vec::new(),
             squads,
             lead,
+            readers: Vec::new(),
         })
     }
 
@@ -966,6 +1026,151 @@ impl RoomStore {
 
     fn refresh_index(&self, last_seen_seq: i64) -> Result<()> {
         refresh_room_index(&self.repo_root, &self.facts_db_path, last_seen_seq)
+    }
+
+    // -------------------------------------------------------------------------
+    // R10: read-checkpoint ledger facts
+    // -------------------------------------------------------------------------
+
+    /// Return the highest `read_seq` recorded in `FactKind::Read` checkpoint
+    /// facts for `tool`, or 0 if none exist.
+    ///
+    /// The read-seq is encoded in the fact's `summary` field as `"read_seq:<N>"`.
+    pub(crate) fn last_checkpoint_seq(&self, tool: &str) -> Result<i64> {
+        let facts = self.facts()?;
+        let max = facts
+            .iter()
+            .filter(|f| f.kind == "read" && f.tool.as_deref() == Some(tool))
+            .filter_map(|f| {
+                f.summary
+                    .as_deref()
+                    .and_then(|s| s.strip_prefix("read_seq:"))
+                    .and_then(|n| n.parse::<i64>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+        Ok(max)
+    }
+
+    /// Append a `FactKind::Read` checkpoint for `tool` recording that it has
+    /// read up to `read_seq`, BUT ONLY IF `read_seq` is strictly greater than
+    /// the tool's last recorded checkpoint (coalescing guard — no-op polls must
+    /// not inflate the ledger).
+    ///
+    /// Returns `Ok(Some(fact))` when a checkpoint was written, `Ok(None)` when
+    /// the read position did not advance beyond the last checkpoint.
+    ///
+    /// Uses `append_fact` (not `append_fact_verified`) — a dropped checkpoint is
+    /// low-stakes metadata and must NOT trigger a second readback (which itself
+    /// would be another append and could loop). R9-readback is reserved for
+    /// load-bearing state transitions.
+    pub(crate) fn maybe_append_read_checkpoint(
+        &self,
+        tool: &str,
+        read_seq: i64,
+    ) -> Result<Option<Fact>> {
+        let last_checkpoint = self.last_checkpoint_seq(tool)?;
+        if read_seq <= last_checkpoint {
+            // No advancement — coalesce.
+            return Ok(None);
+        }
+        let fact = Fact {
+            schema: crate::FACT_SCHEMA.to_string(),
+            event_id: crate::new_id("read"),
+            seq: 0,
+            thread_id: format!("read-{}", tool.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>()),
+            kind: FactKind::Read,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("read-checkpoint: {tool} at seq {read_seq}"),
+            scope: Vec::new(),
+            created_at: crate::now_string(),
+            summary: Some(format!("read_seq:{read_seq}")),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        let appended = self.append_fact(&fact)?;
+        Ok(Some(appended))
+    }
+
+    /// Project per-tool read receipts from `FactKind::Read` checkpoint facts,
+    /// merged with `cursors.json` as the fast-path fallback.
+    ///
+    /// For each tool that has either a read-checkpoint fact OR an entry in
+    /// `cursors.json`, emit a `ReadReceipt` with `last_read_seq`, `behind_by`,
+    /// and `status`. Read-checkpoint facts take precedence over `cursors.json`
+    /// when both exist for the same tool (the ledger is the durable record;
+    /// `cursors.json` is the fast-path cache).
+    pub(crate) fn project_read_receipts(&self, max_seq: i64) -> Result<Vec<ReadReceipt>> {
+        let facts = self.facts()?;
+
+        // Collect highest read_seq per tool from checkpoint facts.
+        let mut ledger_reads: BTreeMap<String, i64> = BTreeMap::new();
+        for fact in &facts {
+            if fact.kind != "read" {
+                continue;
+            }
+            let Some(tool) = fact.tool.as_deref() else {
+                continue;
+            };
+            let Some(seq) = fact
+                .summary
+                .as_deref()
+                .and_then(|s| s.strip_prefix("read_seq:"))
+                .and_then(|n| n.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            let entry = ledger_reads.entry(tool.to_string()).or_insert(0);
+            if seq > *entry {
+                *entry = seq;
+            }
+        }
+
+        // Merge with cursors.json (fast-path cache); ledger takes precedence.
+        let cursors = self.read_cursors().unwrap_or_default();
+        let mut combined: BTreeMap<String, i64> = cursors;
+        for (tool, seq) in ledger_reads {
+            let entry = combined.entry(tool).or_insert(0);
+            if seq > *entry {
+                *entry = seq;
+            }
+        }
+
+        // Build receipts.
+        let receipts = combined
+            .into_iter()
+            .map(|(tool, last_read_seq)| {
+                let behind_by = (max_seq - last_read_seq).max(0);
+                let status = if behind_by == 0 {
+                    "caught_up".to_string()
+                } else {
+                    "behind".to_string()
+                };
+                ReadReceipt {
+                    tool,
+                    last_read_seq,
+                    behind_by,
+                    status,
+                }
+            })
+            .collect();
+        Ok(receipts)
+    }
+
+    /// Variant of `snapshot()` that additionally populates `readers` by
+    /// projecting `FactKind::Read` checkpoints. Only called when `--readers`
+    /// is passed to `rally room`; the default snapshot leaves `readers` empty
+    /// to avoid the extra projection cost on every room query.
+    pub(crate) fn snapshot_with_readers(&self) -> Result<RoomSnapshot> {
+        let mut snapshot = self.snapshot()?;
+        snapshot.readers = self.project_read_receipts(snapshot.max_seq)?;
+        Ok(snapshot)
     }
 }
 
@@ -2535,5 +2740,258 @@ mod ledger_tests {
         assert_eq!(db_inode(&root), before, "parallel reads rebuilt the cache");
 
         fs::remove_dir_all(&*root).ok();
+    }
+
+    // =========================================================================
+    // R10 read-checkpoint tests
+    // =========================================================================
+
+    /// R10-a: After a tool records a read-checkpoint, a `FactKind::Read` fact
+    /// exists in the ledger with the correct `read_seq`, and
+    /// `project_read_receipts` surfaces it with the right `last_read_seq` and
+    /// `behind_by`.
+    #[test]
+    fn r10_a_read_checkpoint_lands_in_ledger_and_projects_correctly() {
+        let root = unique_root("r10-a-read-checkpoint");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        // Post two substantive facts.
+        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim one")).unwrap();
+        store.append_fact(&make_fact("e2", FactKind::Decision, "src/", "decided")).unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        let content_max = snapshot.content_max_seq;
+        assert_eq!(content_max, 2, "content_max_seq after 2 substantive facts");
+
+        // Record a read-checkpoint for "tool-a" at content_max.
+        let cp = store.maybe_append_read_checkpoint("tool-a", content_max).unwrap();
+        assert!(cp.is_some(), "checkpoint must be written when read position advances");
+
+        // The checkpoint fact must be in the ledger.
+        let facts = store.facts().unwrap();
+        let read_facts: Vec<&Fact> = facts
+            .iter()
+            .filter(|f| f.kind == "read" && f.tool.as_deref() == Some("tool-a"))
+            .collect();
+        assert_eq!(read_facts.len(), 1, "exactly one read-checkpoint fact for tool-a");
+        let cp_fact = read_facts[0];
+        let expected_summary = format!("read_seq:{content_max}");
+        assert_eq!(
+            cp_fact.summary.as_deref(),
+            Some(expected_summary.as_str()),
+            "summary encodes read_seq"
+        );
+
+        // project_read_receipts: tool-a is caught up (behind_by = 0) since no
+        // substantive facts have landed after the checkpoint.
+        // snapshot.max_seq includes the checkpoint itself, but behind_by is
+        // relative to the total ledger tip (max_seq).
+        let total_max = store.snapshot().unwrap().max_seq;
+        let receipts = store.project_read_receipts(total_max).unwrap();
+        let tool_a = receipts.iter().find(|r| r.tool == "tool-a").expect("tool-a in receipts");
+        assert_eq!(tool_a.last_read_seq, content_max, "last_read_seq = content_max");
+        // behind_by = total_max - last_read_seq; since tool-a read at content_max
+        // and there's 1 more fact (the checkpoint itself), behind_by = 1.
+        // This is intentional: the checkpoint is also a ledger fact.
+        assert!(tool_a.behind_by <= 1, "tool-a is at most 1 behind (checkpoint fact itself)");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// R10-b: BLOAT GUARD — calling `maybe_append_read_checkpoint` twice with
+    /// the same `read_seq` (no new substantive activity between calls) writes
+    /// only ONE checkpoint — the second call is a no-op.
+    #[test]
+    fn r10_b_no_bloat_repeated_checkpoint_at_same_seq_is_noop() {
+        let root = unique_root("r10-b-no-bloat");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim")).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let content_max = snapshot.content_max_seq;
+
+        // First checkpoint — must write.
+        let cp1 = store.maybe_append_read_checkpoint("tool-a", content_max).unwrap();
+        assert!(cp1.is_some(), "first checkpoint must write");
+
+        // Second checkpoint at the same position — must be a no-op.
+        let cp2 = store.maybe_append_read_checkpoint("tool-a", content_max).unwrap();
+        assert!(cp2.is_none(), "second checkpoint at same seq must be a no-op (coalesced)");
+
+        // Only ONE read-checkpoint fact in the ledger for tool-a.
+        let facts = store.facts().unwrap();
+        let read_count = facts.iter().filter(|f| f.kind == "read" && f.tool.as_deref() == Some("tool-a")).count();
+        assert_eq!(read_count, 1, "BLOAT GUARD: exactly one read-checkpoint fact for tool-a after two no-advance polls");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// R10-b extension: after posting a NEW substantive fact, a further
+    /// checkpoint IS written (position genuinely advanced).
+    #[test]
+    fn r10_b_new_activity_allows_second_checkpoint() {
+        let root = unique_root("r10-b-new-activity");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "first claim")).unwrap();
+        let snap1 = store.snapshot().unwrap();
+        let c1 = snap1.content_max_seq;
+
+        // First checkpoint.
+        let cp1 = store.maybe_append_read_checkpoint("tool-a", c1).unwrap();
+        assert!(cp1.is_some());
+
+        // Post a new substantive fact.
+        store.append_fact(&make_fact("e2", FactKind::Decision, "src/", "new decision")).unwrap();
+        let snap2 = store.snapshot().unwrap();
+        let c2 = snap2.content_max_seq;
+        assert!(c2 > c1, "content_max_seq must advance after new substantive fact");
+
+        // Second checkpoint at the new position — must write.
+        let cp2 = store.maybe_append_read_checkpoint("tool-a", c2).unwrap();
+        assert!(cp2.is_some(), "checkpoint after new activity must write");
+
+        // Two read-checkpoint facts now.
+        let facts = store.facts().unwrap();
+        let read_count = facts.iter().filter(|f| f.kind == "read" && f.tool.as_deref() == Some("tool-a")).count();
+        assert_eq!(read_count, 2, "two read-checkpoints after two distinct advances");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// R10-c: `FactKind::Read` facts do NOT appear in `active_claims`,
+    /// `open_handoffs`, `active_blockers`, or `current_risks` — they are
+    /// invisible to claimable-work projection.
+    #[test]
+    fn r10_c_read_checkpoint_facts_excluded_from_claimable_work() {
+        let root = unique_root("r10-c-excluded-from-work");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        // Post some substantive facts, then record a checkpoint.
+        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "real claim")).unwrap();
+        store.append_fact(&make_fact("e2", FactKind::Blocker, "src/", "real blocker")).unwrap();
+        let snap = store.snapshot().unwrap();
+        store.maybe_append_read_checkpoint("tool-a", snap.content_max_seq).unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+
+        // active_claims contains only the claim fact, not the read-checkpoint.
+        assert!(
+            snapshot.active_claims.iter().all(|f| f.kind != "read"),
+            "active_claims must not contain read-checkpoint facts"
+        );
+        // active_blockers contains only the blocker.
+        assert!(
+            snapshot.active_blockers.iter().all(|f| f.kind != "read"),
+            "active_blockers must not contain read-checkpoint facts"
+        );
+        // open_handoffs is empty (we posted none).
+        assert!(snapshot.open_handoffs.is_empty());
+        // current_risks is empty.
+        assert!(snapshot.current_risks.is_empty());
+
+        // The ledger DOES contain the read-checkpoint fact.
+        let all_facts = store.facts().unwrap();
+        let read_count = all_facts.iter().filter(|f| f.kind == "read").count();
+        assert_eq!(read_count, 1, "read-checkpoint fact is in the ledger");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// R10-d: Two distinct tools both record checkpoints; `project_read_receipts`
+    /// reports both with correct `behind_by` values.
+    #[test]
+    fn r10_d_two_tools_both_appear_in_read_receipts() {
+        let root = unique_root("r10-d-two-tools");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        // Post 3 substantive facts.
+        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim one")).unwrap();
+        store.append_fact(&make_fact("e2", FactKind::Decision, "src/", "decided")).unwrap();
+        store.append_fact(&make_fact("e3", FactKind::Blocker, "src/", "blocker")).unwrap();
+
+        let snap1 = store.snapshot().unwrap();
+        let after_3_substantive = snap1.content_max_seq;
+        // content_max_seq = 3 (3 substantive facts, no checkpoints yet)
+        assert_eq!(after_3_substantive, 3);
+
+        // tool-a reads all 3 facts.
+        store.maybe_append_read_checkpoint("tool-a", after_3_substantive).unwrap();
+        // Ledger now: seqs 1,2,3 (facts) + 4 (tool-a checkpoint).
+
+        // Post one more substantive fact (gets next seq after tool-a's checkpoint).
+        store.append_fact(&make_fact("e4", FactKind::Artifact, "src/", "artifact")).unwrap();
+
+        let snap2 = store.snapshot().unwrap();
+        let after_4_substantive = snap2.content_max_seq;
+        // content_max_seq = seq of e4 (the checkpoint at seq 4 is excluded).
+        assert!(after_4_substantive > after_3_substantive, "content_max_seq advances with e4");
+
+        // tool-b reads only up to after_3 (missed the new artifact).
+        store.maybe_append_read_checkpoint("tool-b", after_3_substantive).unwrap();
+
+        // Project read receipts.
+        let total_max = store.snapshot().unwrap().max_seq;
+        let receipts = store.project_read_receipts(total_max).unwrap();
+
+        let a = receipts.iter().find(|r| r.tool == "tool-a").expect("tool-a in receipts");
+        let b = receipts.iter().find(|r| r.tool == "tool-b").expect("tool-b in receipts");
+
+        // Both tools checkpointed at after_3_substantive.
+        assert_eq!(a.last_read_seq, after_3_substantive, "tool-a last_read_seq = after_3_substantive");
+        assert_eq!(b.last_read_seq, after_3_substantive, "tool-b last_read_seq = after_3_substantive");
+
+        // Both are behind the ledger head (e4 + checkpoints landed after their read).
+        assert_eq!(a.behind_by, b.behind_by, "both tools are equally behind (same checkpoint position)");
+        assert!(a.behind_by > 0, "both tools are behind (e4 and its checkpoints landed after their read)");
+
+        // Status: both "behind".
+        assert_eq!(a.status, "behind", "tool-a status = behind");
+        assert_eq!(b.status, "behind", "tool-b status = behind");
+
+        // tool-a with higher read (caught up after e4) would show caught_up —
+        // simulate by checking tool-a after it reads e4.
+        let read_seq_e4 = after_4_substantive;
+        store.maybe_append_read_checkpoint("tool-a", read_seq_e4).unwrap();
+        let receipts2 = store.project_read_receipts(store.snapshot().unwrap().max_seq).unwrap();
+        let a2 = receipts2.iter().find(|r| r.tool == "tool-a").expect("tool-a in receipts2");
+        // tool-a now has higher last_read_seq; tool-b is still at after_3.
+        assert_eq!(a2.last_read_seq, read_seq_e4, "tool-a advanced to e4 read_seq");
+        let b2 = receipts2.iter().find(|r| r.tool == "tool-b").expect("tool-b in receipts2");
+        assert_eq!(b2.last_read_seq, after_3_substantive, "tool-b unchanged");
+        // tool-b is further behind than tool-a.
+        assert!(b2.behind_by > a2.behind_by, "tool-b is further behind than tool-a");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// R10-anti-loop: calling `maybe_append_read_checkpoint` repeatedly with
+    /// `content_max_seq` (which EXCLUDES read-checkpoint seqs) must never create
+    /// more than one checkpoint per substantive advancement — no feedback loop.
+    #[test]
+    fn r10_anti_loop_content_max_seq_prevents_self_inflation() {
+        let root = unique_root("r10-anti-loop");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        // Post one substantive fact.
+        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "lone claim")).unwrap();
+
+        // Simulate 5 polls with no new substantive activity.
+        for _ in 0..5 {
+            let snap = store.snapshot().unwrap();
+            // Use content_max_seq (excludes read checkpoints) — mimics command_next.
+            let _ = store.maybe_append_read_checkpoint("tool-a", snap.content_max_seq);
+        }
+
+        // Only ONE read-checkpoint fact must exist (first poll wrote it; subsequent
+        // polls saw content_max_seq unchanged and were coalesced).
+        let facts = store.facts().unwrap();
+        let read_count = facts.iter().filter(|f| f.kind == "read").count();
+        assert_eq!(
+            read_count, 1,
+            "5 no-advance polls with content_max_seq must produce only 1 read-checkpoint (anti-loop guard)"
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 }

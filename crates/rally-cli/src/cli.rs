@@ -102,6 +102,8 @@ pub(crate) struct RoomArgs {
     pub(crate) event_id: Option<String>,
     pub(crate) thread_id: Option<String>,
     pub(crate) since: Option<i64>,
+    /// R10: project per-tool read receipts from ledger read-checkpoint facts.
+    pub(crate) readers: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -540,6 +542,9 @@ fn room_parser() -> impl Parser<RoomArgs> {
     let event_id = optional_string_arg("event", "EVENT_ID");
     let thread_id = optional_string_arg("thread", "THREAD_ID");
     let since = optional_i64_arg("since", "SEQ");
+    let readers = long("readers")
+        .help("R10: project per-tool read receipts from ledger read-checkpoint facts")
+        .switch();
     construct!(RoomArgs {
         json,
         tool,
@@ -547,7 +552,8 @@ fn room_parser() -> impl Parser<RoomArgs> {
         paths,
         event_id,
         thread_id,
-        since
+        since,
+        readers
     })
 }
 
