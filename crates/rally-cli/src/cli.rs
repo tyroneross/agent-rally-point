@@ -25,6 +25,10 @@ pub(crate) enum CliCommand {
     MigrateLegacy(MigrateLegacyArgs),
     Doctor(DoctorArgs),
     Version(VersionArgs),
+    // Work surface commands (appended — do not reorder above)
+    Backlog(BacklogArgs),
+    Board(BoardArgs),
+    RouteFindings(RouteFindingsArgs),
 }
 
 pub(crate) enum CliParse {
@@ -233,6 +237,49 @@ pub(crate) struct WatchArgs {
     pub(crate) print_systemd: bool,
 }
 
+// ─── Work surface args (appended — do not reorder above) ─────────────────────
+
+/// `rally backlog add` or `rally backlog list`
+#[derive(Clone, Debug)]
+pub(crate) struct BacklogArgs {
+    pub(crate) json: bool,
+    pub(crate) subcommand: BacklogSubcommand,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum BacklogSubcommand {
+    Add(BacklogAddArgs),
+    List,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BacklogAddArgs {
+    pub(crate) tool: String,
+    pub(crate) id: String,
+    pub(crate) intent: String,
+    pub(crate) owns: Vec<String>,
+    pub(crate) depends_on: Vec<String>,
+}
+
+/// `rally board [--json]`
+#[derive(Clone, Debug)]
+pub(crate) struct BoardArgs {
+    pub(crate) json: bool,
+}
+
+/// `rally route-findings --file <path> [--verified] [--json]`
+#[derive(Clone, Debug)]
+pub(crate) struct RouteFindingsArgs {
+    pub(crate) json: bool,
+    /// Path to a JSON file containing an array of `{file, severity, description, evidence?}`.
+    pub(crate) file: String,
+    /// Tool identity of the scanner/sender.
+    pub(crate) tool: String,
+    /// Affirm that FP-adjudication has already happened. Required — without it
+    /// the command refuses.
+    pub(crate) verified: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct BackendBins {
     pub(crate) tmux_bin: String,
@@ -272,6 +319,10 @@ const COMMANDS: &[&str] = &[
     "migrate-legacy",
     "doctor",
     "version",
+    // Work surface commands (appended — do not reorder above)
+    "backlog",
+    "board",
+    "route-findings",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -396,6 +447,23 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .command("version")
         .map(CliCommand::Version);
 
+    // Work surface commands (appended — do not reorder above)
+    let backlog = backlog_parser()
+        .to_options()
+        .descr("Per-room claimable backlog: `add` an item or `list` open items.")
+        .command("backlog")
+        .map(CliCommand::Backlog);
+    let board = board_parser()
+        .to_options()
+        .descr("Read-only board: lanes (in-flight/landed/closed), backlog, and delta.")
+        .command("board")
+        .map(CliCommand::Board);
+    let route_findings = route_findings_parser()
+        .to_options()
+        .descr("Route findings from a JSON file to active claim owners; unowned → risk facts.")
+        .command("route-findings")
+        .map(CliCommand::RouteFindings);
+
     construct!([
         init,
         enter,
@@ -417,7 +485,10 @@ fn cli_parser() -> OptionParser<CliCommand> {
         watch,
         migrate_legacy,
         doctor,
-        version
+        version,
+        backlog,
+        board,
+        route_findings
     ])
     .to_options()
 }
@@ -886,4 +957,59 @@ fn parse_i64_arg(name: &str, value: String) -> Result<i64> {
 fn version_parser() -> impl Parser<VersionArgs> {
     let json = json_flag();
     construct!(VersionArgs { json })
+}
+
+// ─── Work surface parsers (appended) ─────────────────────────────────────────
+
+fn backlog_parser() -> impl Parser<BacklogArgs> {
+    // `rally backlog add --tool .. --id .. --intent .. [--owns ..] [--depends-on ..]`
+    let tool = string_arg("tool", "TOOL");
+    let id = string_arg("id", "ID");
+    let intent = string_arg("intent", "INTENT");
+    let owns = many_string_arg("owns", "PATH");
+    let depends_on = many_string_arg("depends-on", "ID");
+    let add_parser = construct!(tool, id, intent, owns, depends_on)
+        .map(|(tool, id, intent, owns, depends_on)| BacklogAddArgs {
+            tool,
+            id,
+            intent,
+            owns,
+            depends_on,
+        })
+        .to_options()
+        .descr("Add a new backlog item to the room ledger.")
+        .command("add")
+        .map(BacklogSubcommand::Add);
+
+    // `rally backlog list [--json]`
+    let list_parser = bpaf::pure(())
+        .to_options()
+        .descr("List open backlog items.")
+        .command("list")
+        .map(|_| BacklogSubcommand::List);
+
+    let json = json_flag();
+    let subcommand = construct!([add_parser, list_parser]);
+    construct!(json, subcommand).map(|(json, subcommand)| BacklogArgs { json, subcommand })
+}
+
+fn board_parser() -> impl Parser<BoardArgs> {
+    let json = json_flag();
+    construct!(BoardArgs { json })
+}
+
+fn route_findings_parser() -> impl Parser<RouteFindingsArgs> {
+    let json = json_flag();
+    let file = string_arg("file", "PATH");
+    let tool = optional_string_arg("tool", "TOOL")
+        .map(|v| v.unwrap_or_else(|| "unknown".to_string()));
+    let verified = long("verified")
+        .help("Affirm that FP-adjudication has already happened (required)")
+        .switch();
+    construct!(json, file, tool, verified).map(|(json, file, tool, verified)| RouteFindingsArgs {
+        json,
+        file,
+        tool,
+        verified,
+    })
 }

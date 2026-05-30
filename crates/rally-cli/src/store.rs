@@ -84,6 +84,10 @@ pub(crate) enum FactKind {
     /// EXCLUDED from claimable-work surfaces: not surfaced in `active_claims`,
     /// `next` candidates, `open_handoffs`, or any backlog bucket.
     Read,
+    /// Backlog item — encodes `{id, intent, owns[], depends_on[], status}` in
+    /// existing fields (summary/scope/evidence) using the additive-marker pattern.
+    /// Never surfaced in active_claims / open_handoffs / next candidates.
+    BacklogItem,
     #[serde(other)]
     #[default]
     Unknown,
@@ -105,6 +109,7 @@ impl FactKind {
             "wake" => Some(Self::Wake),
             "presence" => Some(Self::Presence),
             "read" => Some(Self::Read),
+            "backlog-item" => Some(Self::BacklogItem),
             "unknown" => Some(Self::Unknown),
             _ => None,
         }
@@ -125,6 +130,7 @@ impl FactKind {
             Self::Wake => "wake",
             Self::Presence => "presence",
             Self::Read => "read",
+            Self::BacklogItem => "backlog-item",
             Self::Unknown => "unknown",
         }
     }

@@ -45,6 +45,8 @@ macro_rules! cmd {
 }
 
 mod backends;
+mod backlog;
+mod board;
 mod check;
 mod cli;
 mod discovery;
@@ -55,19 +57,27 @@ mod next;
 mod output;
 mod retrospective;
 mod rotate;
+mod route_findings;
 mod store;
 
 use backends::*;
+use backlog::{BacklogItem, add_backlog_item, list_backlog_items};
+use board::{BoardOutput, build_board};
 use check::build_check;
 use cli::*;
 use error::{RallyError, Result};
 use next::{AttentionItem, EntryData, NextResult, build_attention, build_entry, build_next};
 use output::{CliError, Output};
+use route_findings::{Finding, RoutingSummary, route_findings};
 use store::{Fact, FactKind, ReadReceipt, RoomQuery, RoomSnapshot, RoomStore, RoomSummary};
 
 const SCHEMA_MIGRATE_LEGACY: &str = "agent-rally.command.migrate-legacy.v1";
 const SCHEMA_DOCTOR: &str = "agent-rally.command.doctor.v1";
 const SCHEMA_VERSION: &str = "agent-rally.command.version.v1";
+// Work surface schemas
+const SCHEMA_BACKLOG: &str = "agent-rally.command.backlog.v1";
+const SCHEMA_BOARD: &str = "agent-rally.command.board.v1";
+const SCHEMA_ROUTE_FINDINGS: &str = "agent-rally.command.route-findings.v1";
 
 pub fn main() -> ExitCode {
     let wants_json = env::args().any(|arg| arg == "--json");
@@ -122,6 +132,10 @@ fn run_inner() -> Result<Output> {
         CliCommand::MigrateLegacy(args) => command_migrate_legacy(args),
         CliCommand::Doctor(args) => command_doctor(args),
         CliCommand::Version(args) => command_version(args),
+        // Work surface commands (appended — do not reorder above)
+        CliCommand::Backlog(args) => command_backlog(args),
+        CliCommand::Board(args) => command_board(args),
+        CliCommand::RouteFindings(args) => command_route_findings(args),
     }
 }
 
@@ -581,7 +595,9 @@ fn command_next(args: NextArgs) -> Result<Output> {
     // Component B: auto-register presence for the calling tool.
     ensure_presence(&room, &tool)?;
     let snapshot = room.snapshot()?;
-    let next = build_next(&snapshot, &tool, role.as_deref(), &paths, limit);
+    // #7: always read the backlog store and surface ready items in next output.
+    let backlog_items = list_backlog_items(&room).unwrap_or_default();
+    let next = build_next(&snapshot, &tool, role.as_deref(), &paths, limit, backlog_items);
     let action = next.action;
     let target_event_id = next
         .target_event_id
@@ -4366,6 +4382,117 @@ pub(crate) fn now_string() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+// =============================================================================
+// Work surface commands
+// =============================================================================
+
+#[derive(JsonSchema, Serialize)]
+struct BacklogData {
+    action: String,
+    items: Vec<BacklogItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    added: Option<Fact>,
+}
+
+fn command_backlog(args: BacklogArgs) -> Result<Output> {
+    let room = RoomStore::open()?;
+    match args.subcommand {
+        BacklogSubcommand::Add(add_args) => {
+            ensure_presence(&room, &add_args.tool)?;
+            let fact = add_backlog_item(
+                &room,
+                &add_args.tool,
+                &add_args.id,
+                &add_args.intent,
+                &add_args.owns,
+                &add_args.depends_on,
+            )?;
+            let items = list_backlog_items(&room).unwrap_or_default();
+            let text = format!(
+                "backlog add id={} intent={:?} seq={}",
+                add_args.id, add_args.intent, fact.seq
+            );
+            let body = envelope(
+                "backlog",
+                SCHEMA_BACKLOG,
+                BacklogData {
+                    action: "add".to_string(),
+                    items,
+                    added: Some(fact),
+                },
+            )?;
+            Ok(Output::new(args.json, text, body))
+        }
+        BacklogSubcommand::List => {
+            let items = list_backlog_items(&room).unwrap_or_default();
+            let count = items.len();
+            let text = format!("backlog list items={count}");
+            let body = envelope(
+                "backlog",
+                SCHEMA_BACKLOG,
+                BacklogData {
+                    action: "list".to_string(),
+                    items,
+                    added: None,
+                },
+            )?;
+            Ok(Output::new(args.json, text, body))
+        }
+    }
+}
+
+#[derive(JsonSchema, Serialize)]
+struct BoardData {
+    board: BoardOutput,
+}
+
+fn command_board(args: BoardArgs) -> Result<Output> {
+    let room = RoomStore::open()?;
+    let board = build_board(&room)?;
+    let in_flight = board
+        .lanes
+        .iter()
+        .filter(|l| matches!(l.status, board::LaneStatus::InFlight))
+        .count();
+    let backlog_open = board.backlog.open.len();
+    let text = format!(
+        "board in_flight={in_flight} backlog_open={backlog_open} delta={}",
+        board.delta.len()
+    );
+    let body = envelope("board", SCHEMA_BOARD, BoardData { board })?;
+    Ok(Output::new(args.json, text, body))
+}
+
+#[derive(JsonSchema, Serialize)]
+struct RouteFindingsData {
+    routing: RoutingSummary,
+}
+
+fn command_route_findings(args: RouteFindingsArgs) -> Result<Output> {
+    // Read findings file
+    let content = fs::read_to_string(&args.file).map_err(RallyError::io(format!(
+        "read findings file {}",
+        args.file
+    )))?;
+    let findings: Vec<Finding> = serde_json::from_str(&content)
+        .map_err(RallyError::json("parse findings JSON"))?;
+
+    let room = RoomStore::open()?;
+    ensure_presence(&room, &args.tool)?;
+    let routing = route_findings(&room, &args.tool, findings, args.verified)?;
+
+    let text = format!(
+        "route-findings total={} routed={} unowned={}",
+        routing.findings_total, routing.routed, routing.unowned
+    );
+    let body = envelope(
+        "route-findings",
+        SCHEMA_ROUTE_FINDINGS,
+        RouteFindingsData { routing },
+    )?;
+    Ok(Output::new(args.json, text, body))
+}
+
 fn help_text() -> String {
     [
         "rally: repo-local coordination room for parallel agents",
@@ -4395,7 +4522,11 @@ fn help_text() -> String {
         "  rally watch [--tool <id>] [--interval <secs=5>] [--max-interval <secs=300>] [--on-activity <cmd>]",
         "              [--once] [--duration-hours <h>] [--json] [--print-launchd] [--print-systemd]",
         "  rally version [--json]  # print build-id (version + git hash); exits 0",
-        "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake, presence",
+        "  rally backlog add --tool <tool> --id <id> --intent <text> [--owns <path>] [--depends-on <id>] [--json]",
+        "  rally backlog list [--json]",
+        "  rally board [--json]",
+        "  rally route-findings --file <findings.json> [--tool <tool>] --verified [--json]",
+        "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake, presence, backlog-item",
     ]
     .join("\n")
 }

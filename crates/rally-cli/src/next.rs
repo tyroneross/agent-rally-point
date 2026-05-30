@@ -1,6 +1,7 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 
+use crate::backlog::BacklogItem;
 use crate::store::{Fact, FactKind, RoomSnapshot};
 use crate::{normalize_path, path_matches_scope, shell_quote};
 
@@ -60,6 +61,11 @@ pub(crate) struct NextResult {
     completion: CompletionContract,
     waiting_on: Vec<Fact>,
     alternatives: Vec<NextCandidateData>,
+    /// #7: open backlog items whose deps are all satisfied and whose owned
+    /// paths are not actively claimed. Read-only suggestion — agent must still
+    /// `rally say claim` to take the work.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) suggested_backlog_items: Vec<SuggestedBacklogItem>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -77,6 +83,19 @@ pub(crate) struct NextCandidateData {
 pub(crate) struct SuggestedClaim {
     scope: String,
     command: String,
+}
+
+/// A backlog item suggested as next work when its deps are satisfied and its
+/// owned paths are not actively claimed by another tool.
+///
+/// Read-only suggestion — the agent still must `rally say claim` to take it.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct SuggestedBacklogItem {
+    pub(crate) id: String,
+    pub(crate) intent: String,
+    pub(crate) owns: Vec<String>,
+    pub(crate) depends_on: Vec<String>,
+    pub(crate) event_id: String,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -230,6 +249,7 @@ pub(crate) fn build_next(
     role: Option<&str>,
     paths: &[String],
     limit: usize,
+    backlog_items: Vec<BacklogItem>,
 ) -> NextResult {
     let waiting_on = waiting_on_facts(snapshot, tool);
     let waiting = !waiting_on.is_empty();
@@ -250,6 +270,51 @@ pub(crate) fn build_next(
     let contract = action_contract(&top, tool);
     let top_data = top.to_data();
 
+    // #7: filter backlog items to those ready for pickup:
+    //   - status is not "done"
+    //   - all depends_on ids are satisfied (done)
+    //   - no owned path is actively claimed by another tool
+    let all_item_ids: std::collections::BTreeSet<String> =
+        backlog_items.iter().map(|i| i.id.clone()).collect();
+    let done_ids: std::collections::BTreeSet<String> = backlog_items
+        .iter()
+        .filter(|i| i.status == "done")
+        .map(|i| i.id.clone())
+        .collect();
+    // Collect paths actively claimed by any tool (for exclusion)
+    let claimed_scopes: std::collections::BTreeSet<String> = snapshot
+        .active_claims
+        .iter()
+        .flat_map(|c| c.scope.clone())
+        .collect();
+    let suggested_backlog_items: Vec<SuggestedBacklogItem> = backlog_items
+        .into_iter()
+        .filter(|item| item.status != "done")
+        .filter(|item| {
+            // All deps satisfied
+            item.depends_on.iter().all(|dep| {
+                // dep is satisfied if it's not in all_item_ids (unknown = considered done)
+                // or if it's in done_ids
+                !all_item_ids.contains(dep) || done_ids.contains(dep)
+            })
+        })
+        .filter(|item| {
+            // No owned path actively claimed by another tool
+            item.owns.iter().all(|path| {
+                let normalized = crate::normalize_path(path.clone());
+                !claimed_scopes.contains(&normalized)
+                    && !claimed_scopes.contains(path)
+            })
+        })
+        .map(|item| SuggestedBacklogItem {
+            id: item.id,
+            intent: item.intent,
+            owns: item.owns,
+            depends_on: item.depends_on,
+            event_id: item.event_id,
+        })
+        .collect();
+
     NextResult {
         mode,
         action: top_data.action,
@@ -267,6 +332,7 @@ pub(crate) fn build_next(
         completion: contract.completion,
         waiting_on,
         alternatives,
+        suggested_backlog_items,
     }
 }
 
