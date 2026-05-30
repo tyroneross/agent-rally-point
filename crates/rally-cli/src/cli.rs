@@ -21,6 +21,7 @@ pub(crate) enum CliCommand {
     Retrospective(RetrospectiveArgs),
     Rotate(RotateArgs),
     Status(StatusArgs),
+    Watch(WatchArgs),
 }
 
 pub(crate) enum CliParse {
@@ -183,6 +184,32 @@ pub(crate) struct StatusArgs {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct WatchArgs {
+    /// Optional tool label — used only to annotate heartbeat output, not to
+    /// impersonate the engaged agent.
+    pub(crate) tool: Option<String>,
+    /// Polling interval in seconds (base; doubled toward max while idle).
+    pub(crate) interval: u64,
+    /// Maximum adaptive polling interval in seconds.
+    pub(crate) max_interval: u64,
+    /// Shell command to run when new activity is detected. Receives context
+    /// via env vars: RALLY_ROOM, RALLY_FROM_SEQ, RALLY_TO_SEQ, RALLY_TOOL,
+    /// RALLY_REPO.
+    pub(crate) on_activity: Option<String>,
+    /// Poll exactly once (for cron/launchd cadence); persist cursor in
+    /// `.rally/watch-cursor.json`.
+    pub(crate) once: bool,
+    /// Bound the long-running loop to this many hours (default: unbounded).
+    pub(crate) duration_hours: Option<f64>,
+    /// Emit JSONL output (including idle heartbeats and stop events).
+    pub(crate) json: bool,
+    /// Print a ready launchd plist to stdout then exit.
+    pub(crate) print_launchd: bool,
+    /// Print a ready systemd unit to stdout then exit.
+    pub(crate) print_systemd: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct BackendBins {
     pub(crate) tmux_bin: String,
     pub(crate) herdr_bin: String,
@@ -217,6 +244,7 @@ const COMMANDS: &[&str] = &[
     "retrospective",
     "rotate",
     "status",
+    "watch",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -322,6 +350,10 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("status")
         .map(CliCommand::Status);
+    let watch = watch_parser()
+        .to_options()
+        .command("watch")
+        .map(CliCommand::Watch);
 
     construct!([
         init,
@@ -340,7 +372,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         stop,
         retrospective,
         rotate,
-        status
+        status,
+        watch
     ])
     .to_options()
 }
@@ -613,6 +646,78 @@ fn session_action_parser(action: SessionAction) -> impl Parser<SessionActionArgs
             target,
             lines,
             bins,
+        },
+    )
+}
+
+fn watch_parser() -> impl Parser<WatchArgs> {
+    let tool = optional_string_arg("tool", "TOOL");
+    let interval = string_arg("interval", "SECS")
+        .parse(|v| parse_i64_arg("interval", v))
+        .parse(|v| {
+            if v > 0 {
+                Ok(v as u64)
+            } else {
+                Err(RallyError::Usage("--interval must be > 0".to_string()))
+            }
+        })
+        .fallback(5u64);
+    let max_interval = string_arg("max-interval", "SECS")
+        .parse(|v| parse_i64_arg("max-interval", v))
+        .parse(|v| {
+            if v > 0 {
+                Ok(v as u64)
+            } else {
+                Err(RallyError::Usage(
+                    "--max-interval must be > 0".to_string(),
+                ))
+            }
+        })
+        .fallback(300u64);
+    let on_activity = optional_string_arg("on-activity", "CMD");
+    let once = long("once").switch();
+    let duration_hours = string_arg("duration-hours", "HOURS")
+        .parse(|v| {
+            v.parse::<f64>().map_err(|_| {
+                RallyError::Usage(format!("invalid --duration-hours value {v}"))
+            })
+        })
+        .optional();
+    let json = json_flag();
+    let print_launchd = long("print-launchd").switch();
+    let print_systemd = long("print-systemd").switch();
+    construct!(
+        tool,
+        interval,
+        max_interval,
+        on_activity,
+        once,
+        duration_hours,
+        json,
+        print_launchd,
+        print_systemd
+    )
+    .map(
+        |(
+            tool,
+            interval,
+            max_interval,
+            on_activity,
+            once,
+            duration_hours,
+            json,
+            print_launchd,
+            print_systemd,
+        )| WatchArgs {
+            tool,
+            interval,
+            max_interval,
+            on_activity,
+            once,
+            duration_hours,
+            json,
+            print_launchd,
+            print_systemd,
         },
     )
 }

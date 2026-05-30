@@ -870,6 +870,12 @@ fn resolve_active_engagement(rally_dir: &Path) -> String {
     utc_date_label()
 }
 
+/// Public wrapper so `command_watch` in lib.rs can resolve the engagement
+/// label without opening a full RoomStore (cheap, no db access needed).
+pub(crate) fn resolve_active_engagement_pub(rally_dir: &Path) -> String {
+    resolve_active_engagement(rally_dir)
+}
+
 /// Persist an engagement label so subsequent rally invocations inherit it.
 /// Used by `rally enter --engagement <name>`. Idempotent — writing the same
 /// label is a no-op.
