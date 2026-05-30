@@ -98,3 +98,10 @@ branch→`main` merge (e.g. L4) gets the full entry above.
 - **Lead audit:** ✅ VERIFIED — re-ran `cargo test --all` (6 binaries ok, 41 tests incl. ledger round-trip + replay + no-global-index) · crate edits confined to store.rs/discovery.rs/+test · `.rally/ledger.jsonl` canonical (un-gitignored, merge=union) · `.build-loop/` untracked (0 files) · `git grep build.loop` shows only optional-example/historical mentions.
 - **Open follow-on (user reframe):** persistence ≠ discoverability. The "easily-findable front door + doc pointers" layer is NOT yet built — see assessment.
 - **Reversibility:** `git revert 26de1c6..4b8f964`; ledger is additive, db rebuilds either way.
+
+## 2026-05-29 · 743b970..637fd9f + 72e735c · R4-R7 rally front door + segmented ledger + retrospective + rotation — lead audit
+- **Context (why):** user goals — findable rally point + per-engagement history for retrospectives + doc pointers + bounded growth.
+- **Lead audit:** ✅ VERIFIED — `cargo test --all` 6 binaries green (57 tests) · crate scope = new init.rs/retrospective.rs/rotate.rs + store.rs refactor, NO next/check/backends.rs · CLAUDE.md+AGENTS.md pointer block committed + idempotent (1 start/1 end each) · manifest.json pointers all resolve · zero build-loop coupling.
+- **Gap caught + fixed:** the ledger DATA (manifest, log segments, archived 489-event monolith, RETROSPECTIVE.md) lived only in the `agent-rally-point` clone's `.rally/` and was uncommitted (lead commits from the separate `arp-lead` clone). Committed it from the holding clone (`72e735c`) so the ledger actually persists + travels. facts.db/room.db/cursors stay gitignored caches.
+- **Architecture finding (for user):** the two-clone split (arp-lead=lead commits, agent-rally-point=live ledger) is the root of the gap — recommend consolidating to ONE canonical clone per repo (matches "one folder, one branch").
+- **Reversibility:** `git revert 743b970..637fd9f` for code; ledger artifacts are additive.
