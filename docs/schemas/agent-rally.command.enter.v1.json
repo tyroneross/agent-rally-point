@@ -15,6 +15,7 @@
       "properties": {
         "tool": { "type": "string" },
         "session_id": { "type": "string" },
+        "room_id": { "type": "string" },
         "cursor": { "type": "object" },
         "entry": {
           "type": "object",

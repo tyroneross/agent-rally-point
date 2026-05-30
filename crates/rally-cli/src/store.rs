@@ -1,3 +1,4 @@
+use chrono;
 use factstr::{EventQuery as FactQuery, EventStore, EventStoreError, NewEvent};
 use factstr_sqlite::SqliteStore;
 use schemars::JsonSchema;
@@ -70,6 +71,8 @@ pub(crate) enum FactKind {
     Lesson,
     Session,
     Wake,
+    /// Agent presence heartbeat — emitted once per `rally enter` call.
+    Presence,
     #[serde(other)]
     #[default]
     Unknown,
@@ -89,6 +92,7 @@ impl FactKind {
             "lesson" => Some(Self::Lesson),
             "session" => Some(Self::Session),
             "wake" => Some(Self::Wake),
+            "presence" => Some(Self::Presence),
             "unknown" => Some(Self::Unknown),
             _ => None,
         }
@@ -107,6 +111,7 @@ impl FactKind {
             Self::Lesson => "lesson",
             Self::Session => "session",
             Self::Wake => "wake",
+            Self::Presence => "presence",
             Self::Unknown => "unknown",
         }
     }
@@ -173,6 +178,23 @@ fn fact_schema() -> String {
     FACT_SCHEMA.to_string()
 }
 
+/// A tool that has entered the room, derived from presence + authored facts.
+///
+/// `status` is "active" if `last_seen_ts` is within the last 15 minutes,
+/// "idle" otherwise.  The 15-minute threshold is intentionally generous so
+/// agents that are doing long computes don't flicker out of the squad view.
+#[derive(Clone, Debug, Default, JsonSchema, Serialize)]
+pub(crate) struct Squad {
+    pub(crate) tool: String,
+    pub(crate) last_seen_seq: i64,
+    pub(crate) last_seen_ts: String,
+    /// "active" or "idle".  Active = last_seen_ts within 15 minutes of now.
+    pub(crate) status: String,
+}
+
+/// Seconds of inactivity after which a squad member is marked "idle".
+const IDLE_THRESHOLD_SECS: i64 = 15 * 60;
+
 #[derive(Clone, Debug, Default, JsonSchema, Serialize)]
 pub(crate) struct RoomSnapshot {
     pub(crate) max_seq: i64,
@@ -184,6 +206,10 @@ pub(crate) struct RoomSnapshot {
     pub(crate) recent_artifacts: Vec<Fact>,
     pub(crate) unconsumed_artifacts: Vec<Fact>,
     pub(crate) stale_facts: Vec<Fact>,
+    /// Distinct tools that have entered or authored facts in this room.
+    pub(crate) squads: Vec<Squad>,
+    /// Tool asserting the `role:lead` decision, if any.
+    pub(crate) lead: Option<String>,
 }
 
 impl RoomSnapshot {
@@ -201,6 +227,9 @@ impl RoomSnapshot {
             recent_artifacts: filter_facts(self.recent_artifacts, query),
             unconsumed_artifacts: filter_facts(self.unconsumed_artifacts, query),
             stale_facts: filter_facts(self.stale_facts, query),
+            // squads and lead are room-level aggregates; not filtered by path/tool query.
+            squads: self.squads,
+            lead: self.lead,
         }
     }
 }
@@ -644,6 +673,54 @@ impl RoomStore {
             .filter(|f| !consumed_refs.contains(&f.event_id))
             .cloned()
             .collect::<Vec<_>>();
+
+        // --- Presence projection ---
+        // Collect the highest-seq fact per tool (any kind counts; presence is
+        // the primary signal but a claim or artifact also proves presence).
+        let mut tool_last: BTreeMap<String, (i64, String)> = BTreeMap::new();
+        for fact in &facts {
+            if let Some(tool) = &fact.tool {
+                let entry = tool_last
+                    .entry(tool.clone())
+                    .or_insert((0, String::new()));
+                if fact.seq > entry.0 {
+                    *entry = (fact.seq, fact.created_at.clone());
+                }
+            }
+        }
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let squads = tool_last
+            .into_iter()
+            .map(|(tool, (seq, ts))| {
+                // Parse ISO-8601 ts to epoch secs for idle check; fall back to
+                // treating the tool as active if parsing fails.
+                let seen_secs = chrono::DateTime::parse_from_rfc3339(&ts)
+                    .map(|dt| dt.timestamp())
+                    .unwrap_or(now_secs);
+                let status = if now_secs - seen_secs <= IDLE_THRESHOLD_SECS {
+                    "active".to_string()
+                } else {
+                    "idle".to_string()
+                };
+                Squad {
+                    tool,
+                    last_seen_seq: seq,
+                    last_seen_ts: ts,
+                    status,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Lead is the tool from the most-recent decision with subject "role:lead".
+        let lead = facts
+            .iter()
+            .filter(|f| f.kind == "decision" && f.subject == "role:lead")
+            .max_by_key(|f| f.seq)
+            .and_then(|f| f.tool.clone());
+
         Ok(RoomSnapshot {
             max_seq,
             active_claims,
@@ -654,6 +731,8 @@ impl RoomStore {
             recent_artifacts,
             unconsumed_artifacts,
             stale_facts: Vec::new(),
+            squads,
+            lead,
         })
     }
 

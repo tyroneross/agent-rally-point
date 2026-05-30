@@ -33,7 +33,8 @@
         "risk",
         "lesson",
         "session",
-        "wake"
+        "wake",
+        "presence"
       ]
     },
     "subject": { "type": "string" },

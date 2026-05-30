@@ -173,13 +173,71 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         store::persist_active_engagement(&rally_dir, label)?;
     }
     let room = RoomStore::open()?;
-    let snapshot = room.snapshot()?;
+    let room_id = room.active_engagement().to_string();
+
+    // Snapshot BEFORE writing presence so the cursor window reflects peer work
+    // only (not the agent's own enter heartbeat).
+    let snapshot_before = room.snapshot()?;
     let cursor_before = args
         .since
         .unwrap_or_else(|| room.cursor_for(&tool).unwrap_or(0));
-    let max_seq = snapshot.max_seq;
+    let max_seq = snapshot_before.max_seq;
+
+    // --- Component A: emit one presence fact per enter call (B16) ---
+    let presence_fact = Fact {
+        schema: FACT_SCHEMA.to_string(),
+        event_id: new_id("fact"),
+        seq: 0,
+        thread_id: new_id("room"),
+        kind: FactKind::Presence,
+        tool: Some(tool.clone()),
+        role: None,
+        subject: format!("agent presence: {tool}"),
+        scope: Vec::new(),
+        created_at: now_string(),
+        summary: None,
+        evidence: Vec::new(),
+        target: None,
+        ref_id: None,
+        status: None,
+        severity: None,
+        uri: None,
+        session: None,
+    };
+    room.append_fact(&presence_fact)?;
+
+    // First-enter-is-lead: if no role:lead decision exists yet, self-assert lead.
+    if snapshot_before.lead.is_none() {
+        let lead_fact = Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Decision,
+            tool: Some(tool.clone()),
+            role: None,
+            subject: "role:lead".to_string(),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: Some(format!("{tool} is lead (first to enter)")),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&lead_fact)?;
+    }
+
+    // Re-snapshot after presence/lead writes so room summary and squads are current.
+    let snapshot = room.snapshot()?;
+
     let attention = build_attention(&snapshot, &tool, cursor_before, &paths);
     let entry = build_entry(&snapshot, &tool, role.as_deref(), &paths, &attention);
+    // Set cursor to the pre-enter max_seq so subsequent enters see peer facts
+    // that arrived before this enter, not the presence fact we just wrote.
     room.set_cursor(&tool, max_seq)?;
     let body = envelope(
         "enter",
@@ -187,6 +245,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         EnterData {
             tool,
             session_id,
+            room_id,
             cursor: CursorData {
                 before: cursor_before,
                 after: max_seq,
@@ -1139,6 +1198,9 @@ struct CursorData {
 struct EnterData {
     tool: String,
     session_id: String,
+    /// Resolved room id (the active engagement label, e.g. "2026-05-29").
+    /// Non-null after Component A — use this to identify the room in output.
+    room_id: String,
     cursor: CursorData,
     entry: EntryData,
     attention: Vec<AttentionItem>,
@@ -1269,6 +1331,7 @@ fn default_subject(kind: &str) -> String {
         "lesson" => "lesson".to_string(),
         "session" => "managed session".to_string(),
         "wake" => "wake intent".to_string(),
+        "presence" => "agent presence".to_string(),
         _ => kind.to_string(),
     }
 }
@@ -1398,7 +1461,7 @@ fn help_text() -> String {
         "  rally capture <session|name|tool> [--lines <n>] [--dry-run] [--json]",
         "  rally stop <session|name|tool> [--dry-run] [--json]",
         "",
-        "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake",
+        "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake, presence",
     ]
     .join("\n")
 }

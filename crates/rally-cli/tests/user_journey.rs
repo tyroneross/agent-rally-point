@@ -240,9 +240,11 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
         "--path",
         "src/room.rs",
     ]);
+    // The first enter wrote 2 facts (presence + role:lead decision), so the
+    // room advanced to seq 4. The second enter sees those and advances its cursor.
     assert_eq!(enter_again["data"]["cursor"]["before"], 2);
-    assert_eq!(enter_again["data"]["cursor"]["after"], 2);
-    assert_eq!(enter_again["data"]["cursor"]["advanced"], false);
+    assert_eq!(enter_again["data"]["cursor"]["after"], 4);
+    assert_eq!(enter_again["data"]["cursor"]["advanced"], true);
 
     let (check, check_output) = workspace.json_with_status(&[
         "check",
@@ -290,12 +292,14 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
             .len(),
         1
     );
-    assert_eq!(
+    // At least 2 decisions: the original "Rally uses enter/say/room/check"
+    // plus the "role:lead" decision written by `enter` (Component A).
+    assert!(
         room["data"]["room"]["current_decisions"]
             .as_array()
             .unwrap()
-            .len(),
-        1
+            .len()
+            >= 2
     );
     assert_eq!(
         room["data"]["room"]["recent_artifacts"]
@@ -1945,5 +1949,90 @@ fn rally_supports_all_required_fact_kinds() {
 
     let room = workspace.json(&["room", "--json"]);
     assert_eq!(room["data"]["room"]["max_seq"], 9);
+    workspace.cleanup();
+}
+
+/// Component A: presence substrate (B16 acceptance test).
+///
+/// Verifies:
+/// - `enter` as tool X → squads[] contains X, lead == X, room_id non-null.
+/// - Second `enter` as tool Y → Y added to squads, lead still X.
+/// - Presence fact survives a ledger replay (segment round-trip).
+#[test]
+fn presence_substrate_enter_writes_presence_and_lead() {
+    let workspace = Workspace::new("rally-presence");
+
+    // --- First enter: tool "alpha" ---
+    let enter_a = workspace.json(&["enter", "--json", "--tool", "alpha"]);
+    assert_eq!(enter_a["schema"], "agent-rally.command.enter.v1");
+    // room_id must be a non-null, non-empty string (Component A requirement).
+    let room_id = enter_a["data"]["room_id"].as_str().unwrap();
+    assert!(!room_id.is_empty(), "room_id must be non-empty");
+
+    // Room projection after first enter must have alpha in squads and as lead.
+    let room_a = workspace.json(&["room", "--json"]);
+    let squads_a = room_a["data"]["room"]["squads"].as_array().unwrap();
+    assert!(
+        squads_a.iter().any(|s| s["tool"] == "alpha"),
+        "squads must contain alpha after enter"
+    );
+    assert_eq!(
+        room_a["data"]["room"]["lead"], "alpha",
+        "first entrant is lead"
+    );
+
+    // --- Second enter: tool "beta" ---
+    let enter_b = workspace.json(&["enter", "--json", "--tool", "beta"]);
+    let room_id_b = enter_b["data"]["room_id"].as_str().unwrap();
+    assert_eq!(room_id, room_id_b, "room_id stable across enters");
+
+    let room_b = workspace.json(&["room", "--json"]);
+    let squads_b = room_b["data"]["room"]["squads"].as_array().unwrap();
+    assert!(
+        squads_b.iter().any(|s| s["tool"] == "alpha"),
+        "alpha still in squads after beta enters"
+    );
+    assert!(
+        squads_b.iter().any(|s| s["tool"] == "beta"),
+        "beta in squads after entering"
+    );
+    // Lead must still be alpha (first entrant).
+    assert_eq!(
+        room_b["data"]["room"]["lead"], "alpha",
+        "lead stays with first entrant"
+    );
+
+    // --- B16 round-trip: delete facts.db, reopen from segments, re-check ---
+    // Presence and lead facts must survive a full ledger replay.
+    let facts_db = workspace.cwd.join(".rally/facts.db");
+    std::fs::remove_file(&facts_db).ok();
+    let _ = std::fs::remove_file(facts_db.with_extension("db-shm"));
+    let _ = std::fs::remove_file(facts_db.with_extension("db-wal"));
+
+    let room_replay = workspace.json(&["room", "--json"]);
+    let squads_replay = room_replay["data"]["room"]["squads"]
+        .as_array()
+        .unwrap();
+    assert!(
+        squads_replay.iter().any(|s| s["tool"] == "alpha"),
+        "alpha survives ledger replay"
+    );
+    assert!(
+        squads_replay.iter().any(|s| s["tool"] == "beta"),
+        "beta survives ledger replay"
+    );
+    assert_eq!(
+        room_replay["data"]["room"]["lead"], "alpha",
+        "lead survives ledger replay"
+    );
+
+    // Presence facts are readable via `recent` (the main non-room read path).
+    let recent = workspace.json(&["recent", "--json"]);
+    let rows = recent["data"]["rows"].as_array().unwrap();
+    assert!(
+        rows.iter().any(|r| r["fact"]["kind"] == "presence"),
+        "presence facts appear in recent rows"
+    );
+
     workspace.cleanup();
 }
