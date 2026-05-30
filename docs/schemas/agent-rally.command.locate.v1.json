@@ -11,11 +11,17 @@
     "schema": { "const": "agent-rally.command.locate.v1" },
     "data": {
       "type": "object",
-      "required": ["event_id", "located", "warnings"],
+      "required": ["locate"],
       "properties": {
-        "event_id": { "type": "string" },
-        "located": { "type": ["object", "null"] },
-        "warnings": { "type": "array" }
+        "locate": {
+          "type": "object",
+          "required": ["event_id", "warnings"],
+          "properties": {
+            "event_id": { "type": "string" },
+            "located": { "type": ["object", "null"] },
+            "warnings": { "type": "array" }
+          }
+        }
       }
     }
   }

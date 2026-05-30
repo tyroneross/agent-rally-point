@@ -11,13 +11,20 @@
     "schema": { "const": "agent-rally.command.say.v1" },
     "data": {
       "type": "object",
-      "required": ["fact", "room"],
+      "required": ["say", "room", "verified"],
       "properties": {
-        "fact": {
+        "say": {
           "type": "object",
-          "required": ["schema", "event_id", "thread_id", "created_at", "tool", "kind", "subject", "scope", "evidence"]
+          "required": ["fact"],
+          "properties": {
+            "fact": {
+              "type": "object",
+              "required": ["schema", "event_id", "thread_id", "created_at", "tool", "kind", "subject", "scope", "evidence"]
+            }
+          }
         },
-        "room": { "type": "object" }
+        "room": { "type": "object" },
+        "verified": { "type": "object" }
       }
     }
   }

@@ -11,22 +11,28 @@
     "schema": { "const": "agent-rally.command.run.v1" },
     "data": {
       "type": "object",
-      "required": ["mode", "session", "commands"],
+      "required": ["run"],
       "properties": {
-        "mode": { "type": "string" },
-        "session": {
+        "run": {
           "type": "object",
-          "required": [
-            "session_id",
-            "name",
-            "agent",
-            "tool",
-            "backend",
-            "cwd",
-            "target"
-          ]
-        },
-        "commands": { "type": "object" }
+          "required": ["mode", "session", "commands"],
+          "properties": {
+            "mode": { "type": "string" },
+            "session": {
+              "type": "object",
+              "required": [
+                "session_id",
+                "name",
+                "agent",
+                "tool",
+                "backend",
+                "cwd",
+                "target"
+              ]
+            },
+            "commands": { "type": "object" }
+          }
+        }
       }
     }
   }

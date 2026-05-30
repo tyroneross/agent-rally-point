@@ -11,27 +11,30 @@
     "schema": { "type": "string", "const": "agent-rally.command.wake-due.v1" },
     "data": {
       "type": "object",
+      "required": ["wake-due"],
       "properties": {
-        "due": {
-          "type": "array",
-          "description": "Standbys whose wake_after has passed and whose owner is a known room participant.",
-          "items": {
-            "type": "object",
-            "properties": {
-              "standby_event_id": { "type": "string", "description": "event_id of the standby fact." },
-              "owner": { "type": ["string", "null"], "description": "Tool that went standby." },
-              "reason": { "type": ["string", "null"], "description": "Human-readable reason from reason: marker in summary." },
-              "wake_after": { "type": "string", "description": "ISO-8601 wake_after timestamp that has passed." },
-              "suggested_command": {
-                "type": "string",
-                "description": "Suggested shell command string for the external runner to invoke. Rally never executes this."
+        "wake-due": {
+          "type": "object",
+          "required": ["due"],
+          "properties": {
+            "due": {
+              "type": "array",
+              "description": "Standbys whose wake_after has passed and whose owner is a known room participant.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "standby_event_id": { "type": "string" },
+                  "owner": { "type": ["string", "null"] },
+                  "reason": { "type": ["string", "null"] },
+                  "wake_after": { "type": "string" },
+                  "suggested_command": { "type": "string" }
+                },
+                "required": ["standby_event_id", "wake_after", "suggested_command"]
               }
-            },
-            "required": ["standby_event_id", "wake_after", "suggested_command"]
+            }
           }
         }
-      },
-      "required": ["due"]
+      }
     }
   },
   "required": ["ok", "command", "schema", "data"]

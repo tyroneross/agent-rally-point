@@ -11,12 +11,18 @@
     "schema": { "const": "agent-rally.command.recent.v1" },
     "data": {
       "type": "object",
-      "required": ["all", "limit", "rows", "warnings"],
+      "required": ["recent"],
       "properties": {
-        "all": { "type": "boolean" },
-        "limit": { "type": "integer" },
-        "rows": { "type": "array" },
-        "warnings": { "type": "array" }
+        "recent": {
+          "type": "object",
+          "required": ["all", "limit", "rows", "warnings"],
+          "properties": {
+            "all": { "type": "boolean" },
+            "limit": { "type": "integer" },
+            "rows": { "type": "array" },
+            "warnings": { "type": "array" }
+          }
+        }
       }
     }
   }

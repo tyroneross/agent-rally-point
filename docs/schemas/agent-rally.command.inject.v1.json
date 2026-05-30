@@ -11,15 +11,21 @@
     "schema": { "const": "agent-rally.command.inject.v1" },
     "data": {
       "type": "object",
-      "required": ["mode", "session", "require_ack", "commands"],
+      "required": ["inject"],
       "properties": {
-        "mode": { "type": "string" },
-        "session": { "type": "object" },
-        "handoff": { "type": ["string", "null"] },
-        "require_ack": { "type": "boolean" },
-        "ack": { "type": ["object", "null"] },
-        "wake_intent": { "type": ["object", "null"] },
-        "commands": { "type": "array" }
+        "inject": {
+          "type": "object",
+          "required": ["mode", "session", "require_ack", "commands"],
+          "properties": {
+            "mode": { "type": "string" },
+            "session": { "type": "object" },
+            "handoff": { "type": ["string", "null"] },
+            "require_ack": { "type": "boolean" },
+            "ack": { "type": ["object", "null"] },
+            "wake_intent": { "type": ["object", "null"] },
+            "commands": { "type": "array" }
+          }
+        }
       }
     }
   }

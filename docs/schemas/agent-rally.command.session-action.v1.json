@@ -11,14 +11,8 @@
     "schema": { "const": "agent-rally.command.session-action.v1" },
     "data": {
       "type": "object",
-      "required": ["mode", "action", "session", "output", "commands"],
-      "properties": {
-        "mode": { "type": "string" },
-        "action": { "type": "string" },
-        "session": { "type": "object" },
-        "output": { "type": ["string", "null"] },
-        "commands": { "type": "array" }
-      }
+      "minProperties": 1,
+      "description": "Has one key matching the action name (attach/capture/stop), containing the session action result."
     }
   }
 }
