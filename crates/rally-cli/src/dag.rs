@@ -226,17 +226,6 @@ pub(crate) fn build_dag(facts: &[Fact], run_id: &str) -> DagOutput {
         .map(|(step, _)| step.clone())
         .collect();
 
-    // Collect step_ids that have a wake fact (partially terminates stall).
-    let wake_steps: BTreeSet<String> = step_facts
-        .iter()
-        .filter(|(_, facts)| facts.iter().any(|f| f.kind == "wake" || f.kind == "standby" && {
-            // A "woken" standby: a subsequent wake or artifact fact exists for the step.
-            false // handled below per-step
-        }))
-        .map(|(step, _)| step.clone())
-        .collect();
-    let _ = wake_steps; // used below per-step
-
     // Build nodes.
     let nodes: Vec<DagNode> = step_facts
         .iter()

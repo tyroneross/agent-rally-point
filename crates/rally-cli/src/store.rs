@@ -261,6 +261,11 @@ pub(crate) struct RoomSnapshot {
     /// Not serialized to JSON — internal field only.
     #[serde(skip)]
     pub(crate) content_max_seq: i64,
+    /// `created_at` of the highest-seq fact; `None` when the room is empty.
+    /// Populated by `snapshot_from_facts` so `status_global` avoids a second
+    /// `store.facts()` call. Not serialized to the public room JSON.
+    #[serde(skip)]
+    pub(crate) last_activity_ts: Option<String>,
     pub(crate) active_claims: Vec<Fact>,
     pub(crate) active_blockers: Vec<Fact>,
     pub(crate) open_handoffs: Vec<Fact>,
@@ -288,6 +293,7 @@ impl RoomSnapshot {
         Self {
             max_seq: self.max_seq,
             content_max_seq: self.content_max_seq,
+            last_activity_ts: self.last_activity_ts,
             active_claims: filter_facts(self.active_claims, query),
             active_blockers: filter_facts(self.active_blockers, query),
             open_handoffs: filter_facts(self.open_handoffs, query),
@@ -563,7 +569,6 @@ impl RoomStore {
     }
 
     /// The engagement label currently being stamped on appends.
-    #[allow(dead_code)] // public for future R6 retrospective consumers
     pub(crate) fn active_engagement(&self) -> &str {
         &self.active_engagement
     }
@@ -843,159 +848,7 @@ impl RoomStore {
 
     pub(crate) fn snapshot(&self) -> Result<RoomSnapshot> {
         let facts = self.facts()?;
-        let max_seq = facts.iter().map(|f| f.seq).max().unwrap_or(0);
-        // R10: `content_max_seq` is the highest seq of a non-read-checkpoint
-        // fact. Used by command_next to derive the read position to record
-        // WITHOUT including the read-checkpoint's own seq (which would inflate
-        // the position on every poll and create a feedback loop).
-        let content_max_seq = facts
-            .iter()
-            .filter(|f| f.kind != "read")
-            .map(|f| f.seq)
-            .max()
-            .unwrap_or(0);
-        // B13: receipts close handoffs (same projection as resolve).
-        let resolved = facts
-            .iter()
-            .filter(|f| f.kind == "resolve" || f.kind == "release" || f.kind == "receipt")
-            .filter_map(|f| f.ref_id.clone())
-            .collect::<BTreeSet<_>>();
-        let released_scopes = facts
-            .iter()
-            .filter(|f| f.kind == "release")
-            .flat_map(|f| f.scope.clone())
-            .collect::<BTreeSet<_>>();
-        let active_claims = facts
-            .iter()
-            .filter(|f| f.kind == "claim")
-            .filter(|f| !resolved.contains(&f.event_id))
-            .filter(|f| !f.scope.iter().any(|scope| released_scopes.contains(scope)))
-            // B18: exclude external-intake facts from repo-local backlog.
-            .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
-            .cloned()
-            .collect::<Vec<_>>();
-        let active_blockers = facts
-            .iter()
-            .filter(|f| f.kind == "blocker")
-            .filter(|f| !resolved.contains(&f.event_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        let artifact_consumed_handoffs = facts
-            .iter()
-            .filter(|f| f.kind == "artifact")
-            .filter_map(|f| f.ref_id.clone())
-            .collect::<BTreeSet<_>>();
-        let open_handoffs = facts
-            .iter()
-            .filter(|f| f.kind == "handoff")
-            .filter(|f| !resolved.contains(&f.event_id))
-            .filter(|f| !artifact_consumed_handoffs.contains(&f.event_id))
-            // B18: exclude external-intake facts from repo-local backlog.
-            .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
-            .cloned()
-            .collect::<Vec<_>>();
-        let current_decisions = facts
-            .iter()
-            .filter(|f| f.kind == "decision")
-            .rev()
-            .take(20)
-            .cloned()
-            .collect::<Vec<_>>();
-        let current_risks = facts
-            .iter()
-            .filter(|f| f.kind == "risk")
-            .filter(|f| !resolved.contains(&f.event_id))
-            .rev()
-            .take(20)
-            .cloned()
-            .collect::<Vec<_>>();
-        let recent_artifacts = facts
-            .iter()
-            .filter(|f| f.kind == "artifact")
-            // B18: exclude external-intake facts from repo-local backlog.
-            .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
-            .rev()
-            .take(20)
-            .cloned()
-            .collect::<Vec<_>>();
-        let consumed_refs = facts
-            .iter()
-            .filter(|f| f.kind == "handoff" || f.kind == "resolve")
-            .filter_map(|f| f.ref_id.clone())
-            .collect::<BTreeSet<_>>();
-        let unconsumed_artifacts = recent_artifacts
-            .iter()
-            .filter(|f| !consumed_refs.contains(&f.event_id))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        // --- Presence projection ---
-        // Collect the highest-seq fact per tool (any kind counts; presence is
-        // the primary signal but a claim or artifact also proves presence).
-        // "rally" is the reserved system author (used by wake_fact); it is not
-        // a participating agent and must not appear in squads[].
-        let mut tool_last: BTreeMap<String, (i64, String)> = BTreeMap::new();
-        for fact in &facts {
-            if let Some(tool) = &fact.tool {
-                if tool == "rally" {
-                    continue;
-                }
-                let entry = tool_last
-                    .entry(tool.clone())
-                    .or_insert((0, String::new()));
-                if fact.seq > entry.0 {
-                    *entry = (fact.seq, fact.created_at.clone());
-                }
-            }
-        }
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let squads = tool_last
-            .into_iter()
-            .map(|(tool, (seq, ts))| {
-                // Parse ISO-8601 ts to epoch secs for idle check; fall back to
-                // treating the tool as active if parsing fails.
-                let seen_secs = chrono::DateTime::parse_from_rfc3339(&ts)
-                    .map(|dt| dt.timestamp())
-                    .unwrap_or(now_secs);
-                let status = if now_secs - seen_secs <= IDLE_THRESHOLD_SECS {
-                    "active".to_string()
-                } else {
-                    "idle".to_string()
-                };
-                Squad {
-                    tool,
-                    last_seen_seq: seq,
-                    last_seen_ts: ts,
-                    status,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        // Lead is the tool from the most-recent decision with subject "role:lead".
-        let lead = facts
-            .iter()
-            .filter(|f| f.kind == "decision" && f.subject == "role:lead")
-            .max_by_key(|f| f.seq)
-            .and_then(|f| f.tool.clone());
-
-        Ok(RoomSnapshot {
-            max_seq,
-            content_max_seq,
-            active_claims,
-            active_blockers,
-            open_handoffs,
-            current_decisions,
-            current_risks,
-            recent_artifacts,
-            unconsumed_artifacts,
-            stale_facts: Vec::new(),
-            squads,
-            lead,
-            readers: Vec::new(),
-        })
+        Ok(snapshot_from_facts(&facts))
     }
 
     /// Return the current read cursor for `tool`.
@@ -1075,12 +928,20 @@ impl RoomStore {
     ///
     /// The read-seq is encoded in the fact's `summary` field as `"read_seq:<N>"`.
     pub(crate) fn last_checkpoint_seq(&self, tool: &str) -> Result<i64> {
-        let facts = self.facts()?;
-        let max = facts
-            .iter()
-            .filter(|f| f.kind == "read" && f.tool.as_deref() == Some(tool))
-            .filter_map(|f| {
-                f.summary
+        let query = self
+            .fact_store
+            .query(&FactQuery::for_event_types(["read"]))
+            .map_err(|err| RallyError::Message(format!("query read checkpoints: {err}")))?;
+        let max = query
+            .event_records
+            .into_iter()
+            .filter_map(|record| {
+                let seq = i64::try_from(record.sequence_number).ok()?;
+                let fact = Fact::from_value(record.payload, seq).ok()?;
+                if fact.tool.as_deref() != Some(tool) {
+                    return None;
+                }
+                fact.summary
                     .as_deref()
                     .and_then(|s| s.strip_prefix("read_seq:"))
                     .and_then(|n| n.parse::<i64>().ok())
@@ -1144,12 +1005,26 @@ impl RoomStore {
     /// and `status`. Read-checkpoint facts take precedence over `cursors.json`
     /// when both exist for the same tool (the ledger is the durable record;
     /// `cursors.json` is the fast-path cache).
+    ///
+    /// Prefer `snapshot_with_readers` when you also need the full snapshot —
+    /// that path loads facts once. This method is the standalone entry point
+    /// used by tests and any future caller that only needs receipts.
+    #[allow(dead_code)] // used in tests; kept as standalone entry point for future callers
     pub(crate) fn project_read_receipts(&self, max_seq: i64) -> Result<Vec<ReadReceipt>> {
         let facts = self.facts()?;
+        self.project_read_receipts_from_facts(&facts, max_seq)
+    }
 
+    /// Same as `project_read_receipts` but operates on an already-loaded facts
+    /// slice. Used by `snapshot_with_readers` to avoid a second DB round-trip.
+    fn project_read_receipts_from_facts(
+        &self,
+        facts: &[Fact],
+        max_seq: i64,
+    ) -> Result<Vec<ReadReceipt>> {
         // Collect highest read_seq per tool from checkpoint facts.
         let mut ledger_reads: BTreeMap<String, i64> = BTreeMap::new();
-        for fact in &facts {
+        for fact in facts {
             if fact.kind != "read" {
                 continue;
             }
@@ -1205,54 +1080,16 @@ impl RoomStore {
     /// projecting `FactKind::Read` checkpoints. Only called when `--readers`
     /// is passed to `rally room`; the default snapshot leaves `readers` empty
     /// to avoid the extra projection cost on every room query.
+    ///
+    /// Loads facts ONCE and passes the same slice to both `snapshot_from_facts`
+    /// and `project_read_receipts_from_facts` — one DB round-trip instead of two.
     pub(crate) fn snapshot_with_readers(&self) -> Result<RoomSnapshot> {
-        let mut snapshot = self.snapshot()?;
-        snapshot.readers = self.project_read_receipts(snapshot.max_seq)?;
+        let facts = self.facts()?;
+        let mut snapshot = snapshot_from_facts(&facts);
+        snapshot.readers = self.project_read_receipts_from_facts(&facts, snapshot.max_seq)?;
         Ok(snapshot)
     }
 
-    // -------------------------------------------------------------------------
-    // B13: handoff receipt helper
-    // -------------------------------------------------------------------------
-
-    /// Emit a `FactKind::Receipt` fact that records the acting tool accepted
-    /// and began processing the handoff identified by `handoff_event_id`.
-    ///
-    /// The receipt closes the handoff from `open_handoffs` projection (same as
-    /// `resolve`).  The `summary` may carry additional context; leave `None`
-    /// for a minimal receipt.
-    ///
-    /// Uses `append_fact_verified` so the durable record is confirmed in the
-    /// canonical ledger before returning.
-    pub(crate) fn append_receipt(
-        &self,
-        tool: &str,
-        handoff_event_id: &str,
-        subject: &str,
-        summary: Option<String>,
-    ) -> Result<Fact> {
-        let fact = Fact {
-            schema: crate::FACT_SCHEMA.to_string(),
-            event_id: crate::new_id("receipt"),
-            seq: 0,
-            thread_id: format!("receipt-{}", handoff_event_id),
-            kind: FactKind::Receipt,
-            tool: Some(tool.to_string()),
-            role: None,
-            subject: format!("receipt: {subject}"),
-            scope: Vec::new(),
-            created_at: crate::now_string(),
-            summary,
-            evidence: Vec::new(),
-            target: None,
-            ref_id: Some(handoff_event_id.to_string()),
-            status: None,
-            severity: None,
-            uri: None,
-            session: None,
-        };
-        self.append_fact_verified(&fact)
-    }
 }
 
 fn filter_facts(facts: Vec<Fact>, query: &RoomQuery) -> Vec<Fact> {
@@ -1260,6 +1097,174 @@ fn filter_facts(facts: Vec<Fact>, query: &RoomQuery) -> Vec<Fact> {
         .into_iter()
         .filter(|fact| query.matches(fact))
         .collect()
+}
+
+/// Pure projection of a `RoomSnapshot` from an already-loaded facts slice.
+///
+/// This is the body formerly inlined in `RoomStore::snapshot`. Extracted so
+/// that both `snapshot()` and `snapshot_with_readers()` can call it without
+/// loading facts twice (fix #2 — one DB round-trip instead of two).
+fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
+    let max_seq = facts.iter().map(|f| f.seq).max().unwrap_or(0);
+    // R10: `content_max_seq` is the highest seq of a non-read-checkpoint
+    // fact. Used by command_next to derive the read position to record
+    // WITHOUT including the read-checkpoint's own seq (which would inflate
+    // the position on every poll and create a feedback loop).
+    let content_max_seq = facts
+        .iter()
+        .filter(|f| f.kind != "read")
+        .map(|f| f.seq)
+        .max()
+        .unwrap_or(0);
+    // `last_activity_ts`: created_at of the highest-seq fact.  Computed here
+    // (from the same slice) so status_global avoids a redundant store.facts() call.
+    let last_activity_ts = facts
+        .iter()
+        .max_by_key(|f| f.seq)
+        .map(|f| f.created_at.clone());
+    // B13: receipts close handoffs (same projection as resolve).
+    let resolved = facts
+        .iter()
+        .filter(|f| f.kind == "resolve" || f.kind == "release" || f.kind == "receipt")
+        .filter_map(|f| f.ref_id.clone())
+        .collect::<BTreeSet<_>>();
+    let released_scopes = facts
+        .iter()
+        .filter(|f| f.kind == "release")
+        .flat_map(|f| f.scope.clone())
+        .collect::<BTreeSet<_>>();
+    let active_claims = facts
+        .iter()
+        .filter(|f| f.kind == "claim")
+        .filter(|f| !resolved.contains(&f.event_id))
+        .filter(|f| !f.scope.iter().any(|scope| released_scopes.contains(scope)))
+        // B18: exclude external-intake facts from repo-local backlog.
+        .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let active_blockers = facts
+        .iter()
+        .filter(|f| f.kind == "blocker")
+        .filter(|f| !resolved.contains(&f.event_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let artifact_consumed_handoffs = facts
+        .iter()
+        .filter(|f| f.kind == "artifact")
+        .filter_map(|f| f.ref_id.clone())
+        .collect::<BTreeSet<_>>();
+    let open_handoffs = facts
+        .iter()
+        .filter(|f| f.kind == "handoff")
+        .filter(|f| !resolved.contains(&f.event_id))
+        .filter(|f| !artifact_consumed_handoffs.contains(&f.event_id))
+        // B18: exclude external-intake facts from repo-local backlog.
+        .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let current_decisions = facts
+        .iter()
+        .filter(|f| f.kind == "decision")
+        .rev()
+        .take(20)
+        .cloned()
+        .collect::<Vec<_>>();
+    let current_risks = facts
+        .iter()
+        .filter(|f| f.kind == "risk")
+        .filter(|f| !resolved.contains(&f.event_id))
+        .rev()
+        .take(20)
+        .cloned()
+        .collect::<Vec<_>>();
+    let recent_artifacts = facts
+        .iter()
+        .filter(|f| f.kind == "artifact")
+        // B18: exclude external-intake facts from repo-local backlog.
+        .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
+        .rev()
+        .take(20)
+        .cloned()
+        .collect::<Vec<_>>();
+    let consumed_refs = facts
+        .iter()
+        .filter(|f| f.kind == "handoff" || f.kind == "resolve")
+        .filter_map(|f| f.ref_id.clone())
+        .collect::<BTreeSet<_>>();
+    let unconsumed_artifacts = recent_artifacts
+        .iter()
+        .filter(|f| !consumed_refs.contains(&f.event_id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    // --- Presence projection ---
+    // Collect the highest-seq fact per tool (any kind counts; presence is
+    // the primary signal but a claim or artifact also proves presence).
+    // "rally" is the reserved system author (used by wake_fact); it is not
+    // a participating agent and must not appear in squads[].
+    let mut tool_last: BTreeMap<String, (i64, String)> = BTreeMap::new();
+    for fact in facts {
+        if let Some(tool) = &fact.tool {
+            if tool == "rally" {
+                continue;
+            }
+            let entry = tool_last
+                .entry(tool.clone())
+                .or_insert((0, String::new()));
+            if fact.seq > entry.0 {
+                *entry = (fact.seq, fact.created_at.clone());
+            }
+        }
+    }
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let squads = tool_last
+        .into_iter()
+        .map(|(tool, (seq, ts))| {
+            // Parse ISO-8601 ts to epoch secs for idle check; fall back to
+            // treating the tool as active if parsing fails.
+            let seen_secs = chrono::DateTime::parse_from_rfc3339(&ts)
+                .map(|dt| dt.timestamp())
+                .unwrap_or(now_secs);
+            let status = if now_secs - seen_secs <= IDLE_THRESHOLD_SECS {
+                "active".to_string()
+            } else {
+                "idle".to_string()
+            };
+            Squad {
+                tool,
+                last_seen_seq: seq,
+                last_seen_ts: ts,
+                status,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // Lead is the tool from the most-recent decision with subject "role:lead".
+    let lead = facts
+        .iter()
+        .filter(|f| f.kind == "decision" && f.subject == "role:lead")
+        .max_by_key(|f| f.seq)
+        .and_then(|f| f.tool.clone());
+
+    RoomSnapshot {
+        max_seq,
+        content_max_seq,
+        last_activity_ts,
+        active_claims,
+        active_blockers,
+        open_handoffs,
+        current_decisions,
+        current_risks,
+        recent_artifacts,
+        unconsumed_artifacts,
+        stale_facts: Vec::new(),
+        squads,
+        lead,
+        readers: Vec::new(),
+    }
 }
 
 fn open_fact_store(path: &Path) -> Result<SqliteStore> {
@@ -1559,6 +1564,7 @@ fn read_db_event_count(facts_db_path: &Path) -> Result<i64> {
         return Ok(0);
     }
     let store = open_fact_store(facts_db_path)?;
+    // TODO(perf): O(N) full load — replace with count() when factstr exposes one.
     let query = store
         .query(&FactQuery::all())
         .map_err(|err| RallyError::Message(format!("query facts: {err}")))?;
@@ -1604,26 +1610,31 @@ fn rebuild_db_from_segments(
     }
     all_entries.sort_by_key(|e| e.seq);
 
-    // Dedup by seq (keep first occurrence); hard-error if two seqs disagree
-    // on payload.
-    let mut deduped: Vec<LedgerLine> = Vec::with_capacity(all_entries.len());
-    for entry in all_entries {
-        if let Some(prev) = deduped.last()
-            && prev.seq == entry.seq
-        {
-            if prev.payload != entry.payload || prev.event_type != entry.event_type {
+    // Dedup by seq in-place (keep first occurrence); hard-error if two seqs
+    // disagree on payload.  Operates on the same Vec to avoid a second allocation.
+    let mut write = 0usize;
+    for read in 0..all_entries.len() {
+        if write > 0 && all_entries[write - 1].seq == all_entries[read].seq {
+            if all_entries[write - 1].payload != all_entries[read].payload
+                || all_entries[write - 1].event_type != all_entries[read].event_type
+            {
                 return Err(RallyError::Message(format!(
                     "segment replay conflict at seq {}: two distinct events recorded with the same sequence number",
-                    entry.seq
+                    all_entries[read].seq
                 )));
             }
-            continue;
+            // duplicate — skip
+        } else {
+            if read != write {
+                all_entries.swap(read, write);
+            }
+            write += 1;
         }
-        deduped.push(entry);
     }
+    all_entries.truncate(write);
 
     let store = open_fact_store(facts_db_path)?;
-    for entry in &deduped {
+    for entry in &all_entries {
         store
             .append(vec![NewEvent::new(
                 entry.event_type.clone(),

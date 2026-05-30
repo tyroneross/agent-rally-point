@@ -111,14 +111,14 @@ pub(crate) struct GlobalStatusData {
 }
 
 #[derive(Default, Deserialize, Serialize)]
-struct RoomIndex {
+pub(crate) struct RoomIndex {
     #[serde(default = "room_index_schema")]
-    schema: String,
+    pub(crate) schema: String,
     #[serde(default)]
-    rooms: Vec<KnownRoom>,
+    pub(crate) rooms: Vec<KnownRoom>,
 }
 
-fn room_index_schema() -> String {
+pub(crate) fn room_index_schema() -> String {
     ROOM_INDEX_SCHEMA.to_string()
 }
 
@@ -237,17 +237,9 @@ pub(crate) fn status_global() -> Result<GlobalStatusData> {
             }
         };
 
-        // last_activity_ts = created_at of the highest-seq fact.
-        let last_activity_ts = {
-            let facts = match store.facts() {
-                Ok(f) => f,
-                Err(_) => Vec::new(),
-            };
-            facts
-                .into_iter()
-                .max_by_key(|f| f.seq)
-                .map(|f| f.created_at)
-        };
+        // last_activity_ts is populated by snapshot_from_facts from the same
+        // facts slice — no second store.facts() call needed (fix #4).
+        let last_activity_ts = snapshot.last_activity_ts.clone();
 
         let alive_agents = snapshot
             .squads
@@ -447,7 +439,7 @@ fn open_indexed_room(
     }
 }
 
-fn read_room_index_at(path: &Path) -> Result<RoomIndex> {
+pub(crate) fn read_room_index_at(path: &Path) -> Result<RoomIndex> {
     if !path.exists() {
         return Ok(RoomIndex::default());
     }
@@ -485,7 +477,7 @@ fn read_room_index_at(path: &Path) -> Result<RoomIndex> {
     ))
 }
 
-fn write_room_index_at(path: &Path, index: &RoomIndex) -> Result<()> {
+pub(crate) fn write_room_index_at(path: &Path, index: &RoomIndex) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(RallyError::io(format!("create {}", parent.display())))?;
@@ -526,7 +518,7 @@ fn write_room_index_at(path: &Path, index: &RoomIndex) -> Result<()> {
 /// cross-repo index reads or writes.  Set `RALLY_GLOBAL_INDEX=1` to opt in.
 /// Setting `RALLY_NO_GLOBAL_INDEX` always overrides regardless of
 /// `RALLY_GLOBAL_INDEX` (back-compat: existing opt-out scripts still work).
-fn room_index_path() -> Option<PathBuf> {
+pub(crate) fn room_index_path() -> Option<PathBuf> {
     // Kill-switch wins unconditionally (back-compat).
     if env::var_os("RALLY_NO_GLOBAL_INDEX")
         .map(|v| !v.is_empty())
@@ -575,9 +567,9 @@ pub(crate) fn migrate_legacy(
 fn migrate_legacy_from(
     room: &RoomStore,
     repo_basename: &str,
-    apps_root: &PathBuf,
+    apps_root: &Path,
 ) -> Result<MigrateLegacyData> {
-    let apps_root = apps_root.clone();
+    let apps_root = apps_root.to_path_buf();
     let mut slugs_found: Vec<String> = Vec::new();
     let mut facts_read: usize = 0;
     let mut facts_migrated: usize = 0;

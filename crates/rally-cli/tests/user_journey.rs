@@ -2798,3 +2798,51 @@ fn advisory_9_tier_fit_ok_when_matching_calibration() {
 
     workspace.cleanup();
 }
+
+/// B-whoami smoke test: `rally whoami --json` exits 0 and returns repo_root + build_id.
+///
+/// Fields are flat in `data` (no nested "whoami" key) — mirrors how `version`
+/// serialises its data.
+#[test]
+fn rally_whoami_json_exits_zero_and_returns_identity() {
+    let workspace = Workspace::new("rally-whoami");
+
+    let result = workspace.json(&["whoami", "--json"]);
+    assert!(
+        result["ok"].as_bool().unwrap_or(false),
+        "whoami must return ok:true; got: {result}"
+    );
+
+    let data = &result["data"];
+    let repo_root = data["repo_root"].as_str().unwrap_or("");
+    assert!(!repo_root.is_empty(), "repo_root must be non-empty");
+
+    let build_id = data["build_id"].as_str().unwrap_or("");
+    assert!(!build_id.is_empty(), "build_id must be non-empty");
+    assert!(
+        build_id.contains('+'),
+        "build_id must be <version>+<hash>; got: {build_id}"
+    );
+
+    // cwd and worktree must also be present and non-empty.
+    let cwd = data["cwd"].as_str().unwrap_or("");
+    assert!(!cwd.is_empty(), "cwd must be non-empty");
+    let worktree = data["worktree"].as_str().unwrap_or("");
+    assert!(!worktree.is_empty(), "worktree must be non-empty");
+
+    workspace.cleanup();
+}
+
+/// B-whoami: --tool flag is echoed back in the output.
+#[test]
+fn rally_whoami_with_tool_reflects_tool_in_output() {
+    let workspace = Workspace::new("rally-whoami-tool");
+
+    let result = workspace.json(&["whoami", "--json", "--tool", "claude_code:01"]);
+    assert!(result["ok"].as_bool().unwrap_or(false));
+
+    let tool = result["data"]["tool"].as_str().unwrap_or("");
+    assert_eq!(tool, "claude_code:01", "tool must be echoed back");
+
+    workspace.cleanup();
+}

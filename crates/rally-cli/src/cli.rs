@@ -35,6 +35,8 @@ pub(crate) enum CliCommand {
     Dag(DagArgs),
     /// B4: trust-gated wake eligibility projection.
     WakeDue(WakeDueArgs),
+    /// B-whoami: identity report — repo_root, repo_id, worktree, build_id, cwd.
+    Whoami(WhoamiArgs),
 }
 
 pub(crate) enum CliParse {
@@ -167,6 +169,13 @@ pub(crate) struct MigrateLegacyArgs {
 #[derive(Clone, Debug)]
 pub(crate) struct VersionArgs {
     pub(crate) json: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WhoamiArgs {
+    pub(crate) json: bool,
+    /// Optional tool/role label to echo back in the output.
+    pub(crate) tool: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -385,6 +394,8 @@ const COMMANDS: &[&str] = &[
     // B1/B2/B4: pi-dynamic observation seam
     "dag",
     "wake-due",
+    // B-whoami: identity report
+    "whoami",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -529,6 +540,13 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .command("wake-due")
         .map(CliCommand::WakeDue);
 
+    // B-whoami: identity report (read-only)
+    let whoami = whoami_parser()
+        .to_options()
+        .descr("Print identity: repo_root, repo_id, worktree, build_id, cwd. Read-only, --json supported.")
+        .command("whoami")
+        .map(CliCommand::Whoami);
+
     // Work surface commands (appended — do not reorder above)
     let backlog = backlog_parser()
         .to_options()
@@ -573,7 +591,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         route_findings,
         check_ci,
         dag,
-        wake_due
+        wake_due,
+        whoami
     ])
     .to_options()
 }
@@ -1078,6 +1097,12 @@ fn parse_i64_arg(name: &str, value: String) -> Result<i64> {
 fn version_parser() -> impl Parser<VersionArgs> {
     let json = json_flag();
     construct!(VersionArgs { json })
+}
+
+fn whoami_parser() -> impl Parser<WhoamiArgs> {
+    let json = json_flag();
+    let tool = optional_string_arg("tool", "TOOL");
+    construct!(WhoamiArgs { json, tool })
 }
 
 // ─── Work surface parsers (appended) ─────────────────────────────────────────

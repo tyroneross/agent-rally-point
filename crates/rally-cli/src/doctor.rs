@@ -11,8 +11,11 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use std::path::PathBuf;
 
-use crate::discovery::{DiscoveryWarning, KnownRoom};
-use crate::error::{RallyError, Result};
+use crate::discovery::{
+    DiscoveryWarning, KnownRoom, RoomIndex, read_room_index_at, room_index_path,
+    write_room_index_at,
+};
+use crate::error::Result;
 use crate::store::RoomStore;
 use crate::{normalize_path, paths_suffix_collide};
 
@@ -151,8 +154,7 @@ fn is_stale(room: &KnownRoom) -> bool {
 }
 
 pub(crate) fn run_prune_rooms(apply: bool) -> Result<PruneRoomsReport> {
-    // Read the index via the internal helper — we re-expose read/write here.
-    let index_path = match room_index_path_pub() {
+    let index_path = match room_index_path() {
         Some(p) => p,
         None => {
             return Ok(PruneRoomsReport {
@@ -169,7 +171,7 @@ pub(crate) fn run_prune_rooms(apply: bool) -> Result<PruneRoomsReport> {
         }
     };
 
-    let index = read_index_for_prune(&index_path)?;
+    let index = read_room_index_at(&index_path)?;
 
     let mut live_rooms: Vec<KnownRoom> = Vec::new();
     let mut stale_rooms: Vec<StaleRoom> = Vec::new();
@@ -188,7 +190,11 @@ pub(crate) fn run_prune_rooms(apply: bool) -> Result<PruneRoomsReport> {
     let live_count = live_rooms.len();
 
     if apply && !stale_rooms.is_empty() {
-        write_index_for_prune(&index_path, live_rooms, &index.schema)?;
+        let updated = RoomIndex {
+            schema: index.schema,
+            rooms: live_rooms,
+        };
+        write_room_index_at(&index_path, &updated)?;
     }
 
     Ok(PruneRoomsReport {
@@ -196,118 +202,5 @@ pub(crate) fn run_prune_rooms(apply: bool) -> Result<PruneRoomsReport> {
         stale: stale_rooms,
         applied: apply,
         warnings: Vec::new(),
-    })
-}
-
-// =============================================================================
-// Internal helpers — thin wrappers that avoid re-exporting private discovery types
-// =============================================================================
-
-/// Mirror of `discovery::room_index_path` — global index is opt-in (default off).
-///
-/// Returns `Some(path)` only when `RALLY_GLOBAL_INDEX` is set and non-empty,
-/// AND `RALLY_NO_GLOBAL_INDEX` is not set.  No env vars → `None`.
-fn room_index_path_pub() -> Option<std::path::PathBuf> {
-    use std::env;
-    // Kill-switch wins unconditionally (back-compat).
-    if env::var_os("RALLY_NO_GLOBAL_INDEX")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-    {
-        return None;
-    }
-    // Must explicitly opt in.
-    if !env::var_os("RALLY_GLOBAL_INDEX")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-    {
-        return None;
-    }
-    let home = env::var_os("HOME").map(std::path::PathBuf::from)?;
-    Some(home.join(".agent-rally-point/rooms/v1/index.json"))
-}
-
-// Minimal room index representation for reading/writing during prune.
-// We cannot import the private `RoomIndex` from discovery, so we duplicate
-// only what we need here.
-#[derive(serde::Deserialize, serde::Serialize)]
-struct PruneIndex {
-    #[serde(default = "default_schema")]
-    schema: String,
-    #[serde(default)]
-    rooms: Vec<KnownRoom>,
-}
-
-fn default_schema() -> String {
-    "agent-rally.room-index.v1".to_string()
-}
-
-fn read_index_for_prune(path: &std::path::Path) -> Result<PruneIndex> {
-    if !path.exists() {
-        return Ok(PruneIndex {
-            schema: default_schema(),
-            rooms: Vec::new(),
-        });
-    }
-    let text = std::fs::read_to_string(path)
-        .map_err(RallyError::io(format!("read {}", path.display())))?;
-    if text.trim().is_empty() {
-        return Ok(PruneIndex {
-            schema: default_schema(),
-            rooms: Vec::new(),
-        });
-    }
-    // Try the wrapped schema first, then fall back to a bare Vec<KnownRoom>.
-    if let Ok(idx) = serde_json::from_str::<PruneIndex>(&text) {
-        return Ok(idx);
-    }
-    if let Some(Ok(idx)) = serde_json::Deserializer::from_str(&text)
-        .into_iter::<PruneIndex>()
-        .next()
-    {
-        return Ok(idx);
-    }
-    if let Some(Ok(rooms)) = serde_json::Deserializer::from_str(&text)
-        .into_iter::<Vec<KnownRoom>>()
-        .next()
-    {
-        return Ok(PruneIndex {
-            schema: default_schema(),
-            rooms,
-        });
-    }
-    Err(RallyError::json(format!("parse {}", path.display()))(
-        serde_json::from_str::<serde_json::Value>(&text).unwrap_err(),
-    ))
-}
-
-fn write_index_for_prune(
-    path: &std::path::Path,
-    live_rooms: Vec<KnownRoom>,
-    schema: &str,
-) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(RallyError::io(format!("create {}", parent.display())))?;
-    }
-    let index = PruneIndex {
-        schema: schema.to_string(),
-        rooms: live_rooms,
-    };
-    let content = serde_json::to_string_pretty(&index)
-        .map_err(RallyError::json("render room index for prune"))?;
-    let temp_path = path.with_extension("json.tmp-prune");
-    std::fs::write(&temp_path, content)
-        .map_err(RallyError::io(format!("write {}", temp_path.display())))?;
-    std::fs::rename(&temp_path, path).map_err(|err| {
-        let _ = std::fs::remove_file(&temp_path);
-        RallyError::Io {
-            context: format!(
-                "replace {} with {}",
-                path.display(),
-                temp_path.display()
-            ),
-            source: err,
-        }
     })
 }

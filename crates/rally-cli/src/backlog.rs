@@ -51,7 +51,7 @@ fn extract_id(fact: &Fact) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Extract intent text (everything after the first newline in summary).
+/// Extract intent text — returns the fact's `subject` field directly.
 fn extract_intent(fact: &Fact) -> String {
     fact.subject.clone()
 }

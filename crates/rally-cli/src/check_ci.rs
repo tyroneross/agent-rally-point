@@ -114,7 +114,7 @@ pub(crate) fn build_check_ci(
 
     for handoff in &snapshot.open_handoffs {
         let age_secs = DateTime::parse_from_rfc3339(&handoff.created_at)
-            .map(|dt| now_secs.saturating_sub(dt.timestamp() as u64))
+            .map(|dt| now_secs.saturating_sub(u64::try_from(dt.timestamp()).unwrap_or(0)))
             .unwrap_or(0);
         if age_secs > receipt_threshold_secs {
             offenders.push(CiOffender {

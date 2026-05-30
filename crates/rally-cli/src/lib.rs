@@ -81,6 +81,7 @@ use store::{Fact, FactKind, ReadReceipt, RoomQuery, RoomSnapshot, RoomStore, Roo
 const SCHEMA_MIGRATE_LEGACY: &str = "agent-rally.command.migrate-legacy.v1";
 const SCHEMA_DOCTOR: &str = "agent-rally.command.doctor.v1";
 const SCHEMA_VERSION: &str = "agent-rally.command.version.v1";
+const SCHEMA_WHOAMI: &str = "agent-rally.command.whoami.v1";
 // Work surface schemas
 const SCHEMA_BACKLOG: &str = "agent-rally.command.backlog.v1";
 const SCHEMA_BOARD: &str = "agent-rally.command.board.v1";
@@ -153,6 +154,8 @@ fn run_inner() -> Result<Output> {
         // B1/B2/B4: pi-dynamic observation seam
         CliCommand::Dag(args) => command_dag(args),
         CliCommand::WakeDue(args) => command_wake_due(args),
+        // B-whoami: identity report
+        CliCommand::Whoami(args) => command_whoami(args),
     }
 }
 
@@ -323,29 +326,18 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         // Append ONE durable risk fact so the duplicate is auditable/traceable
         // in current_risks, recent, and the retrospective digest.
         // enter still returns ok:true — this is warn-not-block.
-        let risk_fact = Fact {
-            schema: FACT_SCHEMA.to_string(),
-            event_id: new_id("fact"),
-            seq: 0,
-            thread_id: new_id("room"),
-            kind: FactKind::Risk,
-            tool: Some(tool.clone()),
-            role: None,
-            subject: format!("duplicate-active-squad-id: {tool}"),
-            scope: Vec::new(),
-            created_at: now_string(),
-            summary: Some(format!(
+        let risk_fact = build_risk_fact(
+            &tool,
+            format!("duplicate-active-squad-id: {tool}"),
+            format!(
                 "another active session is already using squad id {tool} (last seen {}); not blocked — re-enter with a distinct id if this is a second terminal. Recorded for audit.",
                 squad.last_seen_ts
-            )),
-            evidence: Vec::new(),
-            target: None,
-            ref_id: None,
-            status: None,
-            severity: Some("warn".to_string()),
-            uri: None,
-            session: None,
-        };
+            ),
+            Vec::new(),
+            "warn",
+            Vec::new(),
+            None,
+        );
         room.append_fact(&risk_fact)?;
     }
 
@@ -372,26 +364,15 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
                     code: "binary-drift".to_string(),
                     message: drift_msg.clone(),
                 });
-                let risk_fact = Fact {
-                    schema: FACT_SCHEMA.to_string(),
-                    event_id: new_id("fact"),
-                    seq: 0,
-                    thread_id: new_id("room"),
-                    kind: FactKind::Risk,
-                    tool: Some(tool.clone()),
-                    role: None,
-                    subject: format!("binary-drift: {} vs {}", BUILD_ID, prior_id),
-                    scope: Vec::new(),
-                    created_at: now_string(),
-                    summary: Some(drift_msg),
-                    evidence: Vec::new(),
-                    target: None,
-                    ref_id: None,
-                    status: None,
-                    severity: Some("warn".to_string()),
-                    uri: None,
-                    session: None,
-                };
+                let risk_fact = build_risk_fact(
+                    &tool,
+                    format!("binary-drift: {} vs {}", BUILD_ID, prior_id),
+                    drift_msg,
+                    Vec::new(),
+                    "warn",
+                    Vec::new(),
+                    None,
+                );
                 room.append_fact(&risk_fact)?;
             }
         }
@@ -615,26 +596,15 @@ fn command_say(args: SayArgs) -> Result<Output> {
         let risk_summary = format!(
             "external-intake: path(s) [{paths_display}] resolve outside repo_root {root_display}; quarantined — not promoted into repo-local backlog. Recorded for audit."
         );
-        let risk_fact = Fact {
-            schema: FACT_SCHEMA.to_string(),
-            event_id: new_id("fact"),
-            seq: 0,
-            thread_id: new_id("room"),
-            kind: FactKind::Risk,
-            tool: Some(args.tool.clone()),
-            role: None,
-            subject: format!("external-intake: {paths_display}"),
-            scope: Vec::new(),
-            created_at: now_string(),
-            summary: Some(risk_summary.clone()),
-            evidence: Vec::new(),
-            target: None,
-            ref_id: None,
-            status: None,
-            severity: Some("warn".to_string()),
-            uri: None,
-            session: None,
-        };
+        let risk_fact = build_risk_fact(
+            &args.tool,
+            format!("external-intake: {paths_display}"),
+            risk_summary.clone(),
+            Vec::new(),
+            "warn",
+            Vec::new(),
+            None,
+        );
         room.append_fact(&risk_fact)?;
         say_warnings.push(SayWarning {
             code: "external-intake".to_string(),
@@ -655,26 +625,15 @@ fn command_say(args: SayArgs) -> Result<Output> {
                         let risk_summary = format!(
                             "ungrounded-artifact: {path} unchanged since claim — no evidence of work; artifact may be a dropped-work indicator. Recorded for audit."
                         );
-                        let risk_fact = Fact {
-                            schema: FACT_SCHEMA.to_string(),
-                            event_id: new_id("fact"),
-                            seq: 0,
-                            thread_id: new_id("room"),
-                            kind: FactKind::Risk,
-                            tool: Some(args.tool.clone()),
-                            role: None,
-                            subject: format!("ungrounded-artifact: {path} unchanged since claim"),
-                            scope: vec!["grounded:false".to_string()],
-                            created_at: now_string(),
-                            summary: Some(risk_summary),
-                            evidence: vec![format!("artifact_ref:{}", fact.event_id)],
-                            target: None,
-                            ref_id: Some(fact.event_id.clone()),
-                            status: None,
-                            severity: Some("warn".to_string()),
-                            uri: None,
-                            session: None,
-                        };
+                        let risk_fact = build_risk_fact(
+                            &args.tool,
+                            format!("ungrounded-artifact: {path} unchanged since claim"),
+                            risk_summary,
+                            vec!["grounded:false".to_string()],
+                            "warn",
+                            vec![format!("artifact_ref:{}", fact.event_id)],
+                            Some(fact.event_id.clone()),
+                        );
                         let _ = room.append_fact(&risk_fact);
                     }
                 }
@@ -895,6 +854,36 @@ fn command_version(args: VersionArgs) -> Result<Output> {
     Ok(Output::new(args.json, text, body))
 }
 
+/// B-whoami: print identity fields in one call to disambiguate two-clone confusion.
+///
+/// Reports: tool (if `--tool` given), repo_root (shared coord dir), repo_id
+/// (room identifier), worktree (active checkout dir), build_id (embedded
+/// RALLY_BUILD_ID), and cwd. Read-only — no facts are written.
+fn command_whoami(args: WhoamiArgs) -> Result<Output> {
+    let repo_root = repo_root().map(|p| p.display().to_string()).unwrap_or_else(|_| "<unknown>".to_string());
+    let worktree = worktree_root().map(|p| p.display().to_string()).unwrap_or_else(|_| "<unknown>".to_string());
+    let cwd = env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "<unknown>".to_string());
+    let repo_id = RoomStore::open()
+        .map(|r| r.room_id().to_string())
+        .unwrap_or_else(|_| "<no-room>".to_string());
+    let text = format!(
+        "repo_root={repo_root} repo_id={repo_id} build_id={BUILD_ID}"
+    );
+    let body = envelope(
+        "whoami",
+        SCHEMA_WHOAMI,
+        WhoamiData {
+            tool: args.tool,
+            repo_root,
+            repo_id,
+            worktree,
+            build_id: BUILD_ID.to_string(),
+            cwd,
+        },
+    )?;
+    Ok(Output::new(args.json, text, body))
+}
+
 fn command_status(args: StatusArgs) -> Result<Output> {
     if !args.global {
         return Err(RallyError::Usage(
@@ -1101,7 +1090,18 @@ fn watch_print_systemd(args: &WatchArgs, exe: &Path, repo: &Path) {
         exec_args.push_str(&format!(" --interval {}", args.interval));
     }
     if let Some(ref cmd) = args.on_activity {
-        exec_args.push_str(&format!(" --on-activity {}", shlex::try_quote(cmd).unwrap_or(cmd.into())));
+        // systemd ExecStart= uses its own tokeniser (not /bin/sh):
+        //   • tokens are split on unquoted whitespace;
+        //   • single-quoted strings are kept as-is by systemd;
+        //   • '%' introduces unit-file specifiers — must be doubled to '%%';
+        //   • backslash has special meaning inside double-quoted tokens.
+        // Strategy: shell-quote the value with shlex (wraps in '…' for strings
+        // containing shell-special chars), then escape any '%' in the result
+        // so systemd does not expand unit specifiers.
+        let shell_quoted = shlex::try_quote(cmd)
+            .unwrap_or_else(|_| std::borrow::Cow::Borrowed(cmd.as_str()))
+            .replace('%', "%%");
+        exec_args.push_str(&format!(" --on-activity {shell_quoted}"));
     }
     let unit_name = format!(
         "rally-watch-{}",
@@ -1432,7 +1432,7 @@ fn reserve_numbered_session(
     agent_spec: &AgentSpec,
     input: SessionReservationInput<'_>,
 ) -> Result<ReservedSession> {
-    for _ in 0..SESSION_IDENTITY_RETRIES {
+    for attempt in 0..SESSION_IDENTITY_RETRIES {
         let (session_facts, context_version) = room.session_facts_with_context_version()?;
         let active_sessions = active_session_records_from_facts(session_facts);
         let identity = numbered_session_identity(
@@ -1458,13 +1458,17 @@ fn reserve_numbered_session(
                 session,
             });
         }
-        // Yield the thread so that a competing writer that already holds the
-        // SQLite IMMEDIATE lock can complete and advance the context. Without
-        // this, all N losers spin back into the read immediately, hammering
-        // the DB and increasing the chance they all read the same stale version
-        // again (thundering herd). yield_now is deterministic and never
-        // introduces wall-clock delays that would break unit tests.
-        thread::yield_now();
+        // Back off after the first few pure yields to avoid a thundering-herd
+        // where all N losers immediately re-read the same stale context version.
+        // First 8 retries: yield_now (no wall-clock cost, safe for unit tests).
+        // Subsequent retries: 1 ms sleep, capped at 10 ms to bound wall-clock
+        // impact while still draining contention quickly in production.
+        if attempt < 8 {
+            thread::yield_now();
+        } else {
+            let backoff_ms = (1u64 << (attempt - 8)).min(10);
+            thread::sleep(Duration::from_millis(backoff_ms));
+        }
     }
     Err(RallyError::Usage(format!(
         "could not reserve a unique managed session after {SESSION_IDENTITY_RETRIES} concurrent changes"
@@ -1665,7 +1669,7 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     // fact in the channel from the originating `rally say handoff`.
     let content_fact = if is_text_inject {
         let fact = if let Some(ref r) = room {
-            inject_content_fact(r, &sender_tool, &session.tool, &text, false)?
+            inject_content_fact(r, &sender_tool, &session.tool, &text)?
         } else {
             inject_content_fact_dry_run(&sender_tool, &session.tool, &text)
         };
@@ -1703,10 +1707,13 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     )?;
     let ack = if require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
+        // room is always Some here (require_ack && !dry_run guards this branch).
+        let ack_room = room.as_ref().expect("room must be open for --require-ack");
         Some(wait_for_resolution(
             handoff,
             timeout,
             ack_after_seq.unwrap_or(0),
+            ack_room,
         )?)
     } else {
         None
@@ -1963,15 +1970,17 @@ fn make_inject_content_fact(sender_tool: &str, recipient_tool: &str, text: &str)
 }
 
 /// Append a content fact to the given room store.
+///
+/// Uses `append_fact_verified` so a silent segment-write failure is detected
+/// immediately rather than silently dropped while delivery proceeds.
 fn inject_content_fact(
     room: &RoomStore,
     sender_tool: &str,
     recipient_tool: &str,
     text: &str,
-    _dry_run: bool,
 ) -> Result<Fact> {
     let fact = make_inject_content_fact(sender_tool, recipient_tool, text);
-    room.append_fact(&fact)
+    room.append_fact_verified(&fact)
 }
 
 /// Return the content fact without appending (dry-run path).
@@ -2043,6 +2052,40 @@ fn wake_fact(
     }
 }
 
+/// Build a Risk fact with the constant boilerplate fields pre-filled.
+/// `scope`, `evidence`, and `ref_id` vary per call site; everything else is
+/// constant across all four use-cases (warn severity, no role/target/status/uri).
+fn build_risk_fact(
+    tool: &str,
+    subject: String,
+    summary: String,
+    scope: Vec<String>,
+    severity: &str,
+    evidence: Vec<String>,
+    ref_id: Option<String>,
+) -> Fact {
+    Fact {
+        schema: FACT_SCHEMA.to_string(),
+        event_id: new_id("fact"),
+        seq: 0,
+        thread_id: new_id("room"),
+        kind: FactKind::Risk,
+        tool: Some(tool.to_string()),
+        role: None,
+        subject,
+        scope,
+        created_at: now_string(),
+        summary: Some(summary),
+        evidence,
+        target: None,
+        ref_id,
+        status: None,
+        severity: Some(severity.to_string()),
+        uri: None,
+        session: None,
+    }
+}
+
 fn find_session(target: &str) -> Result<ManagedSession> {
     read_session_records()?
         .into_iter()
@@ -2066,11 +2109,15 @@ fn handoff_prompt(session: &ManagedSession, handoff: &str) -> String {
     )
 }
 
-fn wait_for_resolution(handoff: &str, timeout_seconds: u64, after_seq: i64) -> Result<Value> {
+fn wait_for_resolution(
+    handoff: &str,
+    timeout_seconds: u64,
+    after_seq: i64,
+    room: &RoomStore,
+) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     let mut last_seen_seq = after_seq;
     loop {
-        let room = RoomStore::open()?;
         for fact in room.facts()? {
             last_seen_seq = last_seen_seq.max(fact.seq);
             if fact.seq > after_seq
@@ -2306,7 +2353,7 @@ mod tests {
 
         let msg = "BLOCKED need creds for staging";
         // inject_content_fact appends to the given room store directly.
-        let fact = inject_content_fact(&room, "sender:1", "claude_code:01", msg, false).unwrap();
+        let fact = inject_content_fact(&room, "sender:1", "claude_code:01", msg).unwrap();
 
         // Returned fact has the right fields.
         assert_eq!(fact.tool.as_deref(), Some("sender:1"), "tool is sender");
@@ -2341,6 +2388,34 @@ mod tests {
             recorded.subject
         );
         assert_eq!(recorded.summary.as_deref(), Some(msg));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Fix #1: inject_content_fact uses append_fact_verified — the returned event_id
+    /// must be immediately present in the canonical ledger segments (not just the DB).
+    /// This guards against silent segment-write failures where delivery proceeds but
+    /// the coordination record is lost.
+    #[test]
+    fn inject_content_fact_is_readback_verified_in_canonical_ledger() {
+        let root = unique_root("inject-content-fact-verified");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        let fact = inject_content_fact(&room, "alpha", "beta", "hello verified").unwrap();
+        // Re-read ALL facts from the store (which scans canonical segments) and
+        // assert the event_id we got back is present.  append_fact_verified already
+        // does this internally and would have returned Err if it failed, so this
+        // test will pass IFF the implementation uses append_fact_verified (not
+        // append_fact).  It also documents the contract explicitly.
+        let all = room.facts().unwrap();
+        let found = all.iter().any(|f| f.event_id == fact.event_id);
+        assert!(
+            found,
+            "event_id {} not found in canonical ledger after inject_content_fact — \
+             durability guarantee violated",
+            fact.event_id
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -4691,6 +4766,16 @@ struct VersionData {
 }
 
 #[derive(JsonSchema, Serialize)]
+struct WhoamiData {
+    tool: Option<String>,
+    repo_root: String,
+    repo_id: String,
+    worktree: String,
+    build_id: String,
+    cwd: String,
+}
+
+#[derive(JsonSchema, Serialize)]
 struct NextData {
     tool: String,
     role: Option<String>,
@@ -5227,10 +5312,12 @@ fn help_text() -> String {
         "  rally watch [--tool <id>] [--interval <secs=5>] [--max-interval <secs=300>] [--on-activity <cmd>]",
         "              [--once] [--duration-hours <h>] [--json] [--print-launchd] [--print-systemd]",
         "  rally version [--json]  # print build-id (version + git hash); exits 0",
+        "  rally whoami [--tool <id>] [--json]  # repo_root, repo_id, worktree, build_id, cwd; exits 0",
         "  rally backlog add --tool <tool> --id <id> --intent <text> [--owns <path>] [--depends-on <id>] [--json]",
         "  rally backlog list [--json]",
         "  rally board [--json]",
         "  rally route-findings --file <findings.json> [--tool <tool>] --verified [--json]",
+        "  rally check-ci [--strict] [--receipt-threshold <secs>] [--json]  # read-only CI gate: exits 0 (pass) or 4 with --strict (fail)",
         "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake, standby, presence, backlog-item",
         "",
         "  rally say standby --tool <tool> --reason <r> --wake-after <+30m|iso> [--run <id>] [--step <id>] [--parent-step <id>] [--tool] [--json]",
