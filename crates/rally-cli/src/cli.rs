@@ -24,6 +24,7 @@ pub(crate) enum CliCommand {
     Watch(WatchArgs),
     MigrateLegacy(MigrateLegacyArgs),
     Doctor(DoctorArgs),
+    Version(VersionArgs),
 }
 
 pub(crate) enum CliParse {
@@ -127,6 +128,11 @@ pub(crate) struct RecentArgs {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MigrateLegacyArgs {
+    pub(crate) json: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VersionArgs {
     pub(crate) json: bool,
 }
 
@@ -263,6 +269,7 @@ const COMMANDS: &[&str] = &[
     "watch",
     "migrate-legacy",
     "doctor",
+    "version",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -381,6 +388,11 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .descr("Read-only diagnostics: path hygiene (--canonical-paths) and room registry pruning (--prune-rooms).")
         .command("doctor")
         .map(CliCommand::Doctor);
+    let version = version_parser()
+        .to_options()
+        .descr("Print the rally build-id (version + git hash). Exits 0.")
+        .command("version")
+        .map(CliCommand::Version);
 
     construct!([
         init,
@@ -402,7 +414,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         status,
         watch,
         migrate_legacy,
-        doctor
+        doctor,
+        version
     ])
     .to_options()
 }
@@ -862,4 +875,9 @@ fn parse_i64_arg(name: &str, value: String) -> Result<i64> {
     value
         .parse::<i64>()
         .map_err(|_| RallyError::Usage(format!("invalid --{name} value {value}")))
+}
+
+fn version_parser() -> impl Parser<VersionArgs> {
+    let json = json_flag();
+    construct!(VersionArgs { json })
 }

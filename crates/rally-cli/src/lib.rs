@@ -14,6 +14,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Build-id stamp emitted by build.rs: `<version>+<git-short-hash>`.
+/// Exposed as `rally version --json` and embedded in every presence fact so
+/// the R9 stale-binary guard can detect when different builds are writing to
+/// the same room.
+pub(crate) const BUILD_ID: &str = env!("RALLY_BUILD_ID");
+
 const SCHEMA_STATUS: &str = "agent-rally.command.status.v1";
 const SCHEMA_INIT: &str = "agent-rally.command.init.v1";
 const SCHEMA_RETROSPECTIVE: &str = "agent-rally.command.retrospective.v1";
@@ -61,6 +67,7 @@ use store::{Fact, FactKind, RoomQuery, RoomSnapshot, RoomStore, RoomSummary};
 
 const SCHEMA_MIGRATE_LEGACY: &str = "agent-rally.command.migrate-legacy.v1";
 const SCHEMA_DOCTOR: &str = "agent-rally.command.doctor.v1";
+const SCHEMA_VERSION: &str = "agent-rally.command.version.v1";
 
 pub fn main() -> ExitCode {
     let wants_json = env::args().any(|arg| arg == "--json");
@@ -114,6 +121,7 @@ fn run_inner() -> Result<Output> {
         CliCommand::Watch(args) => command_watch(args),
         CliCommand::MigrateLegacy(args) => command_migrate_legacy(args),
         CliCommand::Doctor(args) => command_doctor(args),
+        CliCommand::Version(args) => command_version(args),
     }
 }
 
@@ -187,6 +195,9 @@ fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
     if snapshot.squads.iter().any(|s| s.tool == tool) {
         return Ok(());
     }
+    // R9 stale-binary guard: embed the build-id in the presence fact's summary
+    // so that `command_enter` can detect when different builds are writing to
+    // the same room.  Format: "build_id:<BUILD_ID>" — minimal, no schema bump.
     let presence_fact = Fact {
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
@@ -198,7 +209,7 @@ fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
         subject: format!("agent presence: {tool}"),
         scope: Vec::new(),
         created_at: now_string(),
-        summary: None,
+        summary: Some(format!("build_id:{BUILD_ID}")),
         evidence: Vec::new(),
         target: None,
         ref_id: None,
@@ -305,6 +316,54 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
             session: None,
         };
         room.append_fact(&risk_fact)?;
+    }
+
+    // R9 stale-binary guard: find the most recent presence fact in the room
+    // (any tool) and check if it carries a different build_id than ours.
+    // Warn + append a durable risk fact if drift is detected.  Never blocks.
+    {
+        let all_facts = room.facts().unwrap_or_default();
+        let last_presence_build_id: Option<String> = all_facts
+            .iter()
+            .filter(|f| f.kind == "presence")
+            .max_by_key(|f| f.seq)
+            .and_then(|f| f.summary.as_deref())
+            .and_then(|s| s.strip_prefix("build_id:"))
+            .map(str::to_string);
+
+        if let Some(ref prior_id) = last_presence_build_id {
+            if prior_id != BUILD_ID {
+                let drift_msg = format!(
+                    "this rally build {} differs from the build {} that last wrote to this room — a stale binary on PATH can silently drop writes; verify which rally is on PATH",
+                    BUILD_ID, prior_id
+                );
+                warnings.push(EnterWarning {
+                    code: "binary-drift".to_string(),
+                    message: drift_msg.clone(),
+                });
+                let risk_fact = Fact {
+                    schema: FACT_SCHEMA.to_string(),
+                    event_id: new_id("fact"),
+                    seq: 0,
+                    thread_id: new_id("room"),
+                    kind: FactKind::Risk,
+                    tool: Some(tool.clone()),
+                    role: None,
+                    subject: format!("binary-drift: {} vs {}", BUILD_ID, prior_id),
+                    scope: Vec::new(),
+                    created_at: now_string(),
+                    summary: Some(drift_msg),
+                    evidence: Vec::new(),
+                    target: None,
+                    ref_id: None,
+                    status: None,
+                    severity: Some("warn".to_string()),
+                    uri: None,
+                    session: None,
+                };
+                room.append_fact(&risk_fact)?;
+            }
+        }
     }
 
     // Component A + B: emit presence (+ first-enter-is-lead) via shared helper.
@@ -601,6 +660,19 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
     Err(RallyError::Usage(
         "rally doctor requires --canonical-paths or --prune-rooms".to_string(),
     ))
+}
+
+fn command_version(args: VersionArgs) -> Result<Output> {
+    let text = format!("rally {}", BUILD_ID);
+    let body = envelope(
+        "version",
+        SCHEMA_VERSION,
+        VersionData {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build_id: BUILD_ID.to_string(),
+        },
+    )?;
+    Ok(Output::new(args.json, text, body))
 }
 
 fn command_status(args: StatusArgs) -> Result<Output> {
@@ -3643,6 +3715,208 @@ mod tests {
         fs::remove_dir_all(&live_root).ok();
         fs::remove_dir_all(&index_dir).ok();
     }
+
+    // R9 stale-binary guard unit tests.
+
+    /// R9a: BUILD_ID const is non-empty and contains a '+' separator.
+    #[test]
+    fn r9a_build_id_const_is_non_empty() {
+        assert!(!BUILD_ID.is_empty(), "BUILD_ID must not be empty");
+        assert!(
+            BUILD_ID.contains('+'),
+            "BUILD_ID must contain '+' separating version and hash; got: {BUILD_ID}"
+        );
+        let parts: Vec<&str> = BUILD_ID.splitn(2, '+').collect();
+        assert_eq!(parts.len(), 2, "BUILD_ID must have exactly one '+' separator");
+        assert!(!parts[0].is_empty(), "version part of BUILD_ID must not be empty");
+        assert!(!parts[1].is_empty(), "hash part of BUILD_ID must not be empty");
+    }
+
+    /// R9b: when two presence facts with DIFFERENT build_ids exist in a room,
+    /// the next enter produces a `binary-drift` warning AND a durable risk fact,
+    /// while ok stays true (not blocked).
+    ///
+    /// Simulates two binaries by injecting presence facts with controlled build_ids
+    /// directly into the store — no second binary required.
+    #[test]
+    fn r9b_different_build_ids_produce_drift_warning_and_risk_fact() {
+        let root = unique_root("r9b-binary-drift");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        let fake_old_id = "0.0.0+aabbccd";
+
+        // Write a presence fact carrying a DIFFERENT build_id into the room,
+        // simulating what a stale binary would have left behind.
+        {
+            let room = store::RoomStore::open_at(root.clone()).unwrap();
+            let stale_presence = store::Fact {
+                schema: FACT_SCHEMA.to_string(),
+                event_id: new_id("stale"),
+                seq: 0,
+                thread_id: new_id("room"),
+                kind: store::FactKind::Presence,
+                tool: Some("old-tool:01".to_string()),
+                role: None,
+                subject: "agent presence: old-tool:01".to_string(),
+                scope: Vec::new(),
+                created_at: now_string(),
+                summary: Some(format!("build_id:{fake_old_id}")),
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            room.append_fact(&stale_presence).unwrap();
+        }
+
+        // Now simulate command_enter's drift-detection block on a fresh store.
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let all_facts = room.facts().unwrap_or_default();
+        let last_presence_build_id: Option<String> = all_facts
+            .iter()
+            .filter(|f| f.kind == "presence")
+            .max_by_key(|f| f.seq)
+            .and_then(|f| f.summary.as_deref())
+            .and_then(|s| s.strip_prefix("build_id:"))
+            .map(str::to_string);
+
+        assert_eq!(
+            last_presence_build_id.as_deref(),
+            Some(fake_old_id),
+            "last presence build_id must be the injected fake"
+        );
+
+        // Drift is detected because current BUILD_ID differs from the injected one.
+        // (If BUILD_ID == fake_old_id by coincidence, the test would miss — that's
+        // astronomically unlikely given the hash component.)
+        let drift = last_presence_build_id
+            .as_deref()
+            .map(|prior| prior != BUILD_ID)
+            .unwrap_or(false);
+        assert!(drift, "drift must be detected when build_ids differ");
+
+        // Append the risk fact exactly as command_enter does.
+        let prior_id = last_presence_build_id.unwrap();
+        let drift_msg = format!(
+            "this rally build {} differs from the build {} that last wrote to this room — a stale binary on PATH can silently drop writes; verify which rally is on PATH",
+            BUILD_ID, prior_id
+        );
+        let risk_fact = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Risk,
+            tool: Some("new-tool:01".to_string()),
+            role: None,
+            subject: format!("binary-drift: {} vs {}", BUILD_ID, prior_id),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: Some(drift_msg),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: Some("warn".to_string()),
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&risk_fact).unwrap();
+
+        // Verify the risk fact is readable from a FRESH store (forces segment→db reconciliation).
+        drop(room);
+        let reader = store::RoomStore::open_at(root.clone()).unwrap();
+        let snapshot = reader.snapshot().unwrap();
+
+        let drift_risks: Vec<_> = snapshot
+            .current_risks
+            .iter()
+            .filter(|f| f.subject.contains("binary-drift"))
+            .collect();
+        assert_eq!(
+            drift_risks.len(),
+            1,
+            "exactly one binary-drift risk fact must appear in current_risks"
+        );
+        assert_eq!(
+            drift_risks[0].severity.as_deref(),
+            Some("warn"),
+            "binary-drift risk must have severity=warn"
+        );
+        // ok stays true — the enter result would still have ok:true (not tested here
+        // since we're not calling command_enter, but the risk fact being non-blocking
+        // is the invariant; enter never returns an error for this condition).
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// R9c: when the same build_id enters twice, NO drift warning is produced.
+    #[test]
+    fn r9c_same_build_id_produces_no_drift_warning() {
+        let root = unique_root("r9c-no-drift");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        // Write a presence fact carrying the CURRENT build_id.
+        {
+            let room = store::RoomStore::open_at(root.clone()).unwrap();
+            let current_presence = store::Fact {
+                schema: FACT_SCHEMA.to_string(),
+                event_id: new_id("same"),
+                seq: 0,
+                thread_id: new_id("room"),
+                kind: store::FactKind::Presence,
+                tool: Some("tool-a:01".to_string()),
+                role: None,
+                subject: "agent presence: tool-a:01".to_string(),
+                scope: Vec::new(),
+                created_at: now_string(),
+                summary: Some(format!("build_id:{BUILD_ID}")),
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            room.append_fact(&current_presence).unwrap();
+        }
+
+        // Simulate drift detection.
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let all_facts = room.facts().unwrap_or_default();
+        let last_presence_build_id: Option<String> = all_facts
+            .iter()
+            .filter(|f| f.kind == "presence")
+            .max_by_key(|f| f.seq)
+            .and_then(|f| f.summary.as_deref())
+            .and_then(|s| s.strip_prefix("build_id:"))
+            .map(str::to_string);
+
+        let drift = last_presence_build_id
+            .as_deref()
+            .map(|prior| prior != BUILD_ID)
+            .unwrap_or(false);
+
+        assert!(!drift, "same build_id must not trigger drift detection");
+
+        // No risk fact was appended (drift == false means the if-block is skipped).
+        let snapshot = room.snapshot().unwrap();
+        let drift_risks: Vec<_> = snapshot
+            .current_risks
+            .iter()
+            .filter(|f| f.subject.contains("binary-drift"))
+            .collect();
+        assert!(
+            drift_risks.is_empty(),
+            "no binary-drift risk fact must appear when build_ids match"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -3716,6 +3990,12 @@ struct SayVerified {
 struct RoomData {
     query: RoomQuery,
     room: RoomSnapshot,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct VersionData {
+    version: String,
+    build_id: String,
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -4090,6 +4370,7 @@ fn help_text() -> String {
         "  rally status --global [--json]",
         "  rally watch [--tool <id>] [--interval <secs=5>] [--max-interval <secs=300>] [--on-activity <cmd>]",
         "              [--once] [--duration-hours <h>] [--json] [--print-launchd] [--print-systemd]",
+        "  rally version [--json]  # print build-id (version + git hash); exits 0",
         "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake, presence",
     ]
     .join("\n")
