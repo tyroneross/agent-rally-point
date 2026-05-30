@@ -45,6 +45,22 @@ referee.
 | **B-ledger-cadence** | Commit-ledger cadence policy — committed history lags on-disk; commit on a cadence (merge=union is conflict-free) or document `.rally/log/` as a live working-tree artifact. | LOW |
 | **B2 / L5** | **Observation seam** — orchestrators emit `handoff/artifact/decision/standby/wake`; rally derives a DAG + wake-due; **never executes**. | Blocked on B13. |
 
+## Automation proposals — facilitator self-coordination
+
+From [`docs/RALLY-AUTOMATION-PROPOSALS.md`](docs/RALLY-AUTOMATION-PROPOSALS.md) (11 ranked; every one charter-safe — rally records/flags, never decides or executes). Ranks 1/2/3/10 are tracked above as **B10/B11/B12**; ranks 4–9 + 11 below are the rest. Most gate on **B10** (canonical paths) and on FP-adjudication *before* any routing.
+
+| Rank | Capability | Status | Note |
+|------|-----------|--------|------|
+| 4 | `rally route-findings` — match each `{file,severity,evidence}` to the owning claim via canonical paths → typed handoff; unowned → `risk` fact | open | needs B10; never auto-route unverified findings |
+| 5 | `rally board` — read-only board projection from facts (lanes + backlog + live-status delta); emits a draft, never writes `ORCHESTRATION.md` | open (also in B12) | High impact |
+| 6 | Artifact source-grounding + verify gate — content-hash snapshot at `say artifact`; byte-identical to claim-open → `grounded:false` + risk; parse `--evidence` into a `verification_contract` checked by `rally verify artifact` | open (overlaps R9-readback) | verify-before-trust at the artifact layer |
+| 7 | `rally next --backlog` — proactive self-routing: parse backlog, resolve deps vs landed artifacts, tier-affinity rank → `suggested_backlog_item` | open | needs B10; lead sets `safe_to_self_route` |
+| 8 | Cross-lane ripple detector — grep changed `pub` signatures at artifact/check, post non-blocking `ripple-alert` + handoffs to affected owners | open | needs B10; notification only |
+| 9 | `rally check tier-fit` — derive task class, compare to room MODEL-TIERS calibration, flag `tier_mismatch` (never blocks/selects) | open | host-relative tiers |
+| 11 | Presence/liveness + queryable `rally goal`/intent + per-agent autonomy-envelope fact | open (liveness in B12; goal/intent + envelope net-new) | from Claude #2 cross-host input |
+
+Shipped from this family: `rally locate` / `rally recent --all` (the [discovery re-port](docs/DISCOVERY_RE_PORT_DESIGN.md) design — done; the legacy-visibility tie-in is tracked as **B17**). Also pending: `rally doctor --canonical-paths` (rank-1 retro-scan helper).
+
 ## Done (archive)
 
 B1, B3, B4, B5, B6, B7, B8, B9, B14, B15 are landed and verified — see the status column + commit
