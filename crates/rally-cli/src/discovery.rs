@@ -72,6 +72,29 @@ pub(crate) struct RecentData {
     pub(crate) warnings: Vec<DiscoveryWarning>,
 }
 
+/// Per-repo entry in the global status rollup.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct RepoStatus {
+    /// Repo root path.
+    pub(crate) repo: PathBuf,
+    /// Room display name (basename of repo root).
+    pub(crate) room: String,
+    /// Tool holding `role:lead`, if any.
+    pub(crate) lead: Option<String>,
+    /// Count of active (unreleased, unresolved) claims.
+    pub(crate) open_claims: usize,
+    /// Timestamp of the highest-seq fact in this room, or null if empty.
+    pub(crate) last_activity_ts: Option<String>,
+    /// Tools whose most-recent fact is within the active threshold.
+    pub(crate) alive_agents: Vec<String>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct GlobalStatusData {
+    pub(crate) repos: Vec<RepoStatus>,
+    pub(crate) warnings: Vec<DiscoveryWarning>,
+}
+
 #[derive(Default, Deserialize, Serialize)]
 struct RoomIndex {
     #[serde(default = "room_index_schema")]
@@ -157,6 +180,87 @@ pub(crate) fn locate(event_id: &str, include_legacy: bool) -> Result<LocateData>
         located: None,
         warnings,
     })
+}
+
+/// Derive a high-level rollup across all known repo rooms.
+///
+/// Walks the global room index at `~/.agent-rally-point/rooms/v1/index.json`
+/// and, for each registered room, opens its ledger read-only and projects a
+/// `RepoStatus`. Never appends any fact to any ledger.
+pub(crate) fn status_global() -> Result<GlobalStatusData> {
+    let mut warnings = Vec::new();
+    let mut repos = Vec::new();
+
+    let Some(index_path) = room_index_path() else {
+        warnings.push(warning(
+            "global_index_disabled",
+            "RALLY_NO_GLOBAL_INDEX is set; cross-repo status unavailable",
+            None,
+        ));
+        return Ok(GlobalStatusData { repos, warnings });
+    };
+
+    let index = match read_room_index_at(&index_path) {
+        Ok(idx) => idx,
+        Err(err) => {
+            warnings.push(warning(
+                "room_index_unreadable",
+                format!("failed to read room index: {err}"),
+                Some(index_path),
+            ));
+            return Ok(GlobalStatusData { repos, warnings });
+        }
+    };
+
+    for room_entry in &index.rooms {
+        let Some(store) = open_indexed_room(room_entry, &mut warnings)? else {
+            continue;
+        };
+        let snapshot = match store.snapshot() {
+            Ok(s) => s,
+            Err(err) => {
+                warnings.push(warning(
+                    "room_snapshot_failed",
+                    format!(
+                        "failed to snapshot {}: {err}",
+                        room_entry.repo_root.display()
+                    ),
+                    Some(room_entry.facts_db.clone()),
+                ));
+                continue;
+            }
+        };
+
+        // last_activity_ts = created_at of the highest-seq fact.
+        let last_activity_ts = {
+            let facts = match store.facts() {
+                Ok(f) => f,
+                Err(_) => Vec::new(),
+            };
+            facts
+                .into_iter()
+                .max_by_key(|f| f.seq)
+                .map(|f| f.created_at)
+        };
+
+        let alive_agents = snapshot
+            .squads
+            .iter()
+            .filter(|s| s.status == "active")
+            .map(|s| s.tool.clone())
+            .collect::<Vec<_>>();
+
+        repos.push(RepoStatus {
+            repo: room_entry.repo_root.clone(),
+            room: room_entry.display_name.clone(),
+            lead: snapshot.lead.clone(),
+            open_claims: snapshot.active_claims.len(),
+            last_activity_ts,
+            alive_agents,
+        });
+    }
+
+    Ok(GlobalStatusData { repos, warnings })
 }
 
 pub(crate) fn recent(all: bool, include_legacy: bool, limit: i64) -> Result<RecentData> {
@@ -426,15 +530,33 @@ fn read_room_index_at(path: &Path) -> Result<RoomIndex> {
     if text.trim().is_empty() {
         return Ok(RoomIndex::default());
     }
+    // Fast path: clean, single-document file.
     if let Ok(index) = serde_json::from_str::<RoomIndex>(&text) {
         return Ok(index);
     }
-    let rooms = serde_json::from_str::<Vec<KnownRoom>>(&text)
-        .map_err(RallyError::json(format!("parse {}", path.display())))?;
-    Ok(RoomIndex {
-        schema: ROOM_INDEX_SCHEMA.to_string(),
-        rooms,
-    })
+    // Resilient path: file may be torn (valid JSON followed by trailing garbage).
+    // A streaming deserializer reads only the first well-formed value and stops,
+    // so it succeeds even when trailing bytes would break a strict parse.
+    if let Some(Ok(index)) = serde_json::Deserializer::from_str(&text)
+        .into_iter::<RoomIndex>()
+        .next()
+    {
+        return Ok(index);
+    }
+    // Legacy fallback: bare Vec<KnownRoom> (streaming, tolerates trailing data too).
+    if let Some(Ok(rooms)) = serde_json::Deserializer::from_str(&text)
+        .into_iter::<Vec<KnownRoom>>()
+        .next()
+    {
+        return Ok(RoomIndex {
+            schema: ROOM_INDEX_SCHEMA.to_string(),
+            rooms,
+        });
+    }
+    // Return the original strict-parse error (we already know it fails).
+    Err(RallyError::json(format!("parse {}", path.display()))(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap_err(),
+    ))
 }
 
 fn write_room_index_at(path: &Path, index: &RoomIndex) -> Result<()> {
@@ -511,5 +633,78 @@ fn warning(
         code: code.into(),
         message: message.into(),
         path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("rally-discovery-{label}-{nanos}.json"))
+    }
+
+    fn make_known_room(repo: &str) -> KnownRoom {
+        KnownRoom {
+            schema: ROOM_INDEX_SCHEMA.to_string(),
+            repo_root: PathBuf::from(repo),
+            display_name: repo.to_string(),
+            facts_db: PathBuf::from(format!("{repo}/.rally/facts.db")),
+            last_seen_seq: 1,
+            last_seen_at: "2026-05-29T00:00:00Z".to_string(),
+        }
+    }
+
+    /// A clean (non-torn) index still parses correctly.
+    #[test]
+    fn read_room_index_clean_round_trips() {
+        let path = tmp_path("clean");
+        let room = make_known_room("/home/user/my-repo");
+        let index = RoomIndex {
+            schema: ROOM_INDEX_SCHEMA.to_string(),
+            rooms: vec![room],
+        };
+        fs::write(&path, serde_json::to_string_pretty(&index).unwrap()).unwrap();
+
+        let result = read_room_index_at(&path).unwrap();
+        assert_eq!(result.rooms.len(), 1);
+        assert_eq!(
+            result.rooms[0].repo_root,
+            PathBuf::from("/home/user/my-repo")
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A torn file (valid JSON + trailing garbage) returns the rooms from the
+    /// first valid document instead of erroring.
+    #[test]
+    fn read_room_index_torn_file_recovers_rooms() {
+        let path = tmp_path("torn");
+        let room = make_known_room("/home/user/agent-rally-point");
+        let index = RoomIndex {
+            schema: ROOM_INDEX_SCHEMA.to_string(),
+            rooms: vec![room],
+        };
+        // Simulate a torn/concatenated write: valid document + leftover bytes.
+        let clean = serde_json::to_string_pretty(&index).unwrap();
+        let torn = format!("{clean}\n  ]\n}}5:11Z\"\n}}");
+        fs::write(&path, &torn).unwrap();
+
+        let result = read_room_index_at(&path).unwrap();
+        assert_eq!(
+            result.rooms.len(),
+            1,
+            "torn file must recover the 1 room, not error or return empty"
+        );
+        assert_eq!(
+            result.rooms[0].repo_root,
+            PathBuf::from("/home/user/agent-rally-point")
+        );
+        let _ = fs::remove_file(&path);
     }
 }

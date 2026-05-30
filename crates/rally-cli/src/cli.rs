@@ -20,6 +20,7 @@ pub(crate) enum CliCommand {
     Recent(RecentArgs),
     Retrospective(RetrospectiveArgs),
     Rotate(RotateArgs),
+    Status(StatusArgs),
 }
 
 pub(crate) enum CliParse {
@@ -172,6 +173,13 @@ pub(crate) struct SessionActionArgs {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct StatusArgs {
+    pub(crate) json: bool,
+    /// Aggregate status across all known repo rooms (required flag).
+    pub(crate) global: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct BackendBins {
     pub(crate) tmux_bin: String,
     pub(crate) herdr_bin: String,
@@ -205,6 +213,7 @@ const COMMANDS: &[&str] = &[
     "recent",
     "retrospective",
     "rotate",
+    "status",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -306,6 +315,10 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("rotate")
         .map(CliCommand::Rotate);
+    let status = status_parser()
+        .to_options()
+        .command("status")
+        .map(CliCommand::Status);
 
     construct!([
         init,
@@ -323,9 +336,16 @@ fn cli_parser() -> OptionParser<CliCommand> {
         capture,
         stop,
         retrospective,
-        rotate
+        rotate,
+        status
     ])
     .to_options()
+}
+
+fn status_parser() -> impl Parser<StatusArgs> {
+    let json = json_flag();
+    let global = long("global").switch();
+    construct!(StatusArgs { json, global })
 }
 
 fn init_parser() -> impl Parser<InitArgs> {

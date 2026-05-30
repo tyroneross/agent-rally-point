@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const SCHEMA_STATUS: &str = "agent-rally.command.status.v1";
 const SCHEMA_INIT: &str = "agent-rally.command.init.v1";
 const SCHEMA_RETROSPECTIVE: &str = "agent-rally.command.retrospective.v1";
 const SCHEMA_ROTATE: &str = "agent-rally.command.rotate.v1";
@@ -105,6 +106,7 @@ fn run_inner() -> Result<Output> {
         CliCommand::Session(args) => command_session_action(args),
         CliCommand::Retrospective(args) => command_retrospective(args),
         CliCommand::Rotate(args) => command_rotate(args),
+        CliCommand::Status(args) => command_status(args),
     }
 }
 
@@ -389,6 +391,19 @@ fn command_recent(args: RecentArgs) -> Result<Output> {
     let count = data.rows.len();
     let body = envelope("recent", SCHEMA_RECENT, data)?;
     let text = format!("recent rows={count}");
+    Ok(Output::new(args.json, text, body))
+}
+
+fn command_status(args: StatusArgs) -> Result<Output> {
+    if !args.global {
+        return Err(RallyError::Usage(
+            "rally status requires --global".to_string(),
+        ));
+    }
+    let data = discovery::status_global()?;
+    let repo_count = data.repos.len();
+    let text = format!("status repos={repo_count}");
+    let body = envelope("status", SCHEMA_STATUS, data)?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -1461,6 +1476,7 @@ fn help_text() -> String {
         "  rally capture <session|name|tool> [--lines <n>] [--dry-run] [--json]",
         "  rally stop <session|name|tool> [--dry-run] [--json]",
         "",
+        "  rally status --global [--json]",
         "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake, presence",
     ]
     .join("\n")
