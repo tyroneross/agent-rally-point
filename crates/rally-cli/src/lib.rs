@@ -769,8 +769,10 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
 fn command_inject(args: InjectArgs) -> Result<Output> {
     let dry_run = args.dry_run;
     let target = args.target;
+    let sender_tool = args.tool;
     let session = find_session(&target)?;
     let handoff = args.handoff;
+    let is_text_inject = args.text.is_some();
     let text = match (args.text, handoff.as_deref()) {
         (Some(text), _) => text,
         (None, Some(handoff)) => handoff_prompt(&session, handoff),
@@ -787,11 +789,31 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
         ));
     }
     let timeout = args.timeout_seconds as u64;
+
+    // Open the room once for all appends in this command.
+    let room = if !dry_run { Some(RoomStore::open()?) } else { None };
+
     let ack_after_seq = if require_ack && !dry_run {
-        Some(RoomStore::open()?.snapshot()?.max_seq)
+        room.as_ref().map(|r| r.snapshot().map(|s| s.max_seq)).transpose()?
     } else {
         None
     };
+
+    // Record message content in the channel BEFORE live delivery so the
+    // coordination record is durable even if the backend session is gone.
+    // Only --text injects need this; --handoff injects already have a handoff
+    // fact in the channel from the originating `rally say handoff`.
+    let content_fact = if is_text_inject {
+        let fact = if let Some(ref r) = room {
+            inject_content_fact(r, &sender_tool, &session.tool, &text, false)?
+        } else {
+            inject_content_fact_dry_run(&sender_tool, &session.tool, &text)
+        };
+        Some(fact)
+    } else {
+        None
+    };
+
     let backend_runner = BackendRunner::new(Backend::parse(&session.backend)?, args.bins);
     let live_target = if dry_run {
         session.target.clone()
@@ -799,10 +821,26 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
         backend_runner.live_target(&session)?
     };
     let commands = backend_runner.inject_commands(&live_target, &text);
-    if !dry_run {
-        backend_runner.inject(&live_target, &text)?;
-    }
-    let wake_intent = inject_wake_intent(&session, handoff.as_deref(), &commands, dry_run)?;
+
+    // Attempt live delivery. If the backend session is gone, the content fact
+    // is already recorded above — log the failure but do not propagate it so
+    // the caller gets `delivered: false` rather than a hard error.
+    let delivered = if dry_run {
+        false
+    } else {
+        match backend_runner.inject(&live_target, &text) {
+            Ok(()) => true,
+            Err(_) => false,
+        }
+    };
+
+    let wake_intent = inject_wake_intent_with_room(
+        room.as_ref(),
+        &session,
+        handoff.as_deref(),
+        &commands,
+        dry_run,
+    )?;
     let ack = if require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
         Some(wait_for_resolution(
@@ -824,11 +862,15 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
             ack,
             wake_intent,
             commands: command_plan_json(&commands),
+            sender_tool,
+            content_fact,
+            delivered,
         },
     )?;
     let text = format!(
-        "inject session={} ack={}",
+        "inject session={} delivered={} ack={}",
         session.session_id,
+        delivered,
         body["data"]["ack"].is_object()
     );
     Ok(Output::new(args.json, text, body))
@@ -1027,7 +1069,58 @@ fn append_next_wake_intent(
     room.append_fact(&fact).map(Some)
 }
 
-fn inject_wake_intent(
+/// Build the coordination fact that records inject message content.
+///
+/// Uses `FactKind::Handoff` — it carries tool/target/subject/summary semantics
+/// and represents "sender has information for recipient". The "inject:" subject
+/// prefix distinguishes it from work-transfer handoffs.
+///
+/// Subject is truncated to 120 chars so ledger lines stay readable in `rally room`.
+/// Full text lands in summary so nothing is lost.
+fn make_inject_content_fact(sender_tool: &str, recipient_tool: &str, text: &str) -> Fact {
+    let subject_text: String = text.chars().take(120).collect();
+    let subject = format!("inject: {subject_text}");
+    Fact {
+        schema: FACT_SCHEMA.to_string(),
+        event_id: new_id("inject"),
+        seq: 0,
+        thread_id: format!("inject-{}", sanitize_id(sender_tool)),
+        kind: FactKind::Handoff,
+        tool: Some(sender_tool.to_string()),
+        role: None,
+        subject,
+        scope: Vec::new(),
+        created_at: now_string(),
+        summary: Some(text.to_string()),
+        evidence: Vec::new(),
+        target: Some(recipient_tool.to_string()),
+        ref_id: None,
+        status: Some("pending".to_string()),
+        severity: None,
+        uri: None,
+        session: None,
+    }
+}
+
+/// Append a content fact to the given room store.
+fn inject_content_fact(
+    room: &RoomStore,
+    sender_tool: &str,
+    recipient_tool: &str,
+    text: &str,
+    _dry_run: bool,
+) -> Result<Fact> {
+    let fact = make_inject_content_fact(sender_tool, recipient_tool, text);
+    room.append_fact(&fact)
+}
+
+/// Return the content fact without appending (dry-run path).
+fn inject_content_fact_dry_run(sender_tool: &str, recipient_tool: &str, text: &str) -> Fact {
+    make_inject_content_fact(sender_tool, recipient_tool, text)
+}
+
+fn inject_wake_intent_with_room(
+    room: Option<&RoomStore>,
     session: &ManagedSession,
     handoff: Option<&str>,
     commands: &[Vec<String>],
@@ -1051,9 +1144,11 @@ fn inject_wake_intent(
     );
     if dry_run {
         Ok(Some(fact))
+    } else if let Some(r) = room {
+        r.append_fact(&fact).map(Some)
     } else {
-        let room = RoomStore::open()?;
-        room.append_fact(&fact).map(Some)
+        let r = RoomStore::open()?;
+        r.append_fact(&fact).map(Some)
     }
 }
 
@@ -1339,6 +1434,95 @@ mod tests {
         let quoted = shell_quote("bad\0arg");
         assert!(quoted.contains('?'));
         assert!(!quoted.contains('\0'));
+    }
+
+    /// inject content fact authored by sender, targeting recipient, with message
+    /// content in subject and summary — verifiable from the ledger alone, no tmux.
+    #[test]
+    fn inject_content_fact_records_sender_target_and_message() {
+        let root = unique_root("inject-content-fact");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        let msg = "BLOCKED need creds for staging";
+        // inject_content_fact appends to the given room store directly.
+        let fact = inject_content_fact(&room, "sender:1", "claude_code:01", msg, false).unwrap();
+
+        // Returned fact has the right fields.
+        assert_eq!(fact.tool.as_deref(), Some("sender:1"), "tool is sender");
+        assert_eq!(
+            fact.target.as_deref(),
+            Some("claude_code:01"),
+            "target is recipient"
+        );
+        assert!(
+            fact.subject.contains("BLOCKED need creds"),
+            "subject contains message: {}",
+            fact.subject
+        );
+        assert_eq!(
+            fact.summary.as_deref(),
+            Some(msg),
+            "summary holds full text"
+        );
+        assert_eq!(fact.kind, FactKind::Handoff, "kind is handoff");
+
+        // Verify the fact is readable from the ledger alone (no tmux needed).
+        let facts = room.facts().unwrap();
+        let recorded = facts
+            .iter()
+            .find(|f| f.event_id == fact.event_id)
+            .expect("fact must be in the ledger");
+        assert_eq!(recorded.tool.as_deref(), Some("sender:1"));
+        assert_eq!(recorded.target.as_deref(), Some("claude_code:01"));
+        assert!(
+            recorded.subject.contains("BLOCKED need creds"),
+            "ledger subject: {}",
+            recorded.subject
+        );
+        assert_eq!(recorded.summary.as_deref(), Some(msg));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Long messages are truncated to 120 chars in subject but preserved in full in summary.
+    #[test]
+    fn inject_content_fact_truncates_subject_preserves_summary() {
+        let long_msg = "X".repeat(200);
+        // make_inject_content_fact is pure — no store needed.
+        let fact = make_inject_content_fact("sender:2", "codex:01", &long_msg);
+
+        // Subject starts with "inject: " (8 chars) + up to 120 chars of text.
+        let content_in_subject: String = fact.subject.chars().skip("inject: ".len()).collect();
+        assert_eq!(
+            content_in_subject.len(),
+            120,
+            "subject content capped at 120 chars"
+        );
+        assert_eq!(
+            fact.summary.as_deref(),
+            Some(long_msg.as_str()),
+            "summary holds full 200-char text"
+        );
+    }
+
+    /// inject_content_fact_dry_run returns a fact without touching any store.
+    #[test]
+    fn inject_content_fact_dry_run_does_not_write_to_ledger() {
+        let root = unique_root("inject-content-fact-dry-run");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // dry_run path goes through inject_content_fact_dry_run — no room append.
+        let _fact = inject_content_fact_dry_run("sender:3", "codex:01", "dry run message");
+
+        let facts = room.facts().unwrap();
+        assert!(
+            facts.is_empty(),
+            "dry_run must not append any fact to the ledger"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
 

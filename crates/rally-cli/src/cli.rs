@@ -160,6 +160,9 @@ pub(crate) struct InjectArgs {
     pub(crate) require_ack: bool,
     pub(crate) timeout_seconds: i64,
     pub(crate) bins: BackendBins,
+    /// Identity of the agent sending the injection. Defaults to "unknown" when
+    /// omitted. Stored in the coordination channel so recipients know the source.
+    pub(crate) tool: String,
 }
 
 #[derive(Clone, Debug)]
@@ -565,6 +568,8 @@ fn inject_parser() -> impl Parser<InjectArgs> {
     let require_ack = long("require-ack").switch();
     let timeout_seconds = bounded_i64_arg("timeout-seconds", "SECONDS", 60, 1, 600);
     let bins = backend_bins_parser();
+    let tool = optional_string_arg("tool", "TOOL")
+        .map(|value| value.unwrap_or_else(|| "unknown".to_string()));
     let target = positional::<String>("TARGET");
     construct!(
         json,
@@ -574,18 +579,22 @@ fn inject_parser() -> impl Parser<InjectArgs> {
         require_ack,
         timeout_seconds,
         bins,
+        tool,
         target
     )
     .map(
-        |(json, dry_run, text, handoff, require_ack, timeout_seconds, bins, target)| InjectArgs {
-            json,
-            dry_run,
-            target,
-            text,
-            handoff,
-            require_ack,
-            timeout_seconds,
-            bins,
+        |(json, dry_run, text, handoff, require_ack, timeout_seconds, bins, tool, target)| {
+            InjectArgs {
+                json,
+                dry_run,
+                target,
+                text,
+                handoff,
+                require_ack,
+                timeout_seconds,
+                bins,
+                tool,
+            }
         },
     )
 }

@@ -88,6 +88,13 @@ pub(crate) struct InjectData {
     pub(crate) ack: Option<Value>,
     pub(crate) wake_intent: Option<Fact>,
     pub(crate) commands: Vec<Value>,
+    /// The tool that initiated the injection (from --tool; "unknown" when omitted).
+    pub(crate) sender_tool: String,
+    /// The coordination fact recording message content, or None for --handoff injects
+    /// (which already have a handoff fact in the channel).
+    pub(crate) content_fact: Option<Fact>,
+    /// Whether the live backend delivery succeeded.
+    pub(crate) delivered: bool,
 }
 
 #[derive(JsonSchema, Serialize)]
