@@ -207,7 +207,7 @@ fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
         uri: None,
         session: None,
     };
-    room.append_fact(&presence_fact)?;
+    room.append_fact_verified(&presence_fact)?;
     // First-enter-is-lead: assert lead only when no role:lead decision exists.
     if snapshot.lead.is_none() {
         let lead_fact = Fact {
@@ -230,7 +230,7 @@ fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
             uri: None,
             session: None,
         };
-        room.append_fact(&lead_fact)?;
+        room.append_fact_verified(&lead_fact)?;
     }
     Ok(())
 }
@@ -395,7 +395,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
         event_id: new_id("fact"),
         seq: 0,
         thread_id: args.thread_id.unwrap_or_else(|| new_id("room")),
-        kind,
+        kind: kind.clone(),
         tool: Some(args.tool.clone()),
         role: args.role,
         subject,
@@ -410,7 +410,16 @@ fn command_say(args: SayArgs) -> Result<Output> {
         uri: args.uri,
         session: None,
     };
-    let fact = room.append_fact(&fact)?;
+    // R9-readback: state-transition facts (release/resolve) go through the
+    // stricter verified path that also asserts the projection flipped.
+    // All other mutating facts go through append_fact_verified (segment readback
+    // only — no projection assertion needed).
+    let fact = match kind {
+        FactKind::Release | FactKind::Resolve => {
+            room.append_state_transition_verified(&fact)?
+        }
+        _ => room.append_fact_verified(&fact)?,
+    };
 
     // B18: append ONE durable risk fact for each external-intake detection so
     // the contamination event is permanently auditable.  Never blocks the write.
@@ -451,6 +460,11 @@ fn command_say(args: SayArgs) -> Result<Output> {
     }
 
     let snapshot = room.snapshot()?;
+    // R9-readback: capture verified {room, seq} from the confirmed fact.
+    let verified = SayVerified {
+        room: room.room_id().to_string(),
+        seq: fact.seq,
+    };
     let body = envelope(
         "say",
         SCHEMA_SAY,
@@ -458,9 +472,10 @@ fn command_say(args: SayArgs) -> Result<Output> {
             fact: fact.clone(),
             room: RoomSummary::from(&snapshot),
             warnings: say_warnings,
+            verified,
         },
     )?;
-    let text = format!("said {} {}", fact.kind.as_str(), fact.event_id);
+    let text = format!("said {} {} room={} seq={}", fact.kind.as_str(), fact.event_id, room.room_id(), fact.seq);
     Ok(Output::new(args.json, text, body))
 }
 
@@ -3682,6 +3697,19 @@ struct SayData {
     /// Non-blocking advisories (omitted from JSON when empty).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<SayWarning>,
+    /// R9-readback: verified room id (engagement label) and sequence number.
+    /// Present after every successful mutation confirms the fact landed in the
+    /// canonical ledger.  Consumers can use these to assert ordering.
+    verified: SayVerified,
+}
+
+/// R9-readback confirmation surfaced in every successful `rally say` response.
+#[derive(JsonSchema, Serialize)]
+struct SayVerified {
+    /// The canonical room id (engagement label) the fact landed in.
+    room: String,
+    /// The monotonic sequence number assigned to this fact.
+    seq: i64,
 }
 
 #[derive(JsonSchema, Serialize)]

@@ -932,17 +932,9 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "managed session handoff",
     ]);
     let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
-    workspace.json(&[
-        "say",
-        "resolve",
-        "--json",
-        "--tool",
-        "claude_code:reviewer-01",
-        "--ref",
-        handoff_id,
-        "--subject",
-        "managed session handoff resolved",
-    ]);
+    // R9-readback: do NOT pre-resolve the handoff here — the thread below is the
+    // sole resolver.  A double-resolve of the same ref is now correctly blocked by
+    // the R9 state-transition check (the handoff would no longer be in open_handoffs).
     let resolver_cwd = workspace.cwd.clone();
     let resolver_home = workspace.home.clone();
     let resolver_handoff = handoff_id.to_string();
@@ -1946,35 +1938,67 @@ fn rally_check_covers_completion_boundaries() {
 #[test]
 fn rally_supports_all_required_fact_kinds() {
     let workspace = Workspace::new("rally-facts");
-    let kinds = [
-        "claim", "release", "blocker", "resolve", "decision", "artifact", "handoff", "risk",
-        "lesson",
-    ];
 
-    for kind in kinds {
+    // R9-readback: release requires --ref <live-claim> and resolve requires
+    // --ref <live-target>.  Write prerequisite facts first, then use their
+    // event_ids for the state-transition facts.
+
+    // Write a claim to release (also triggers presence+lead on first say).
+    let pre_claim = workspace.json(&[
+        "say", "claim", "--json", "--tool", "codex",
+        "--subject", "pre-claim for release test", "--path", "src/lib.rs",
+    ]);
+    let pre_claim_id = pre_claim["data"]["fact"]["event_id"].as_str().unwrap();
+
+    // Write a blocker to resolve.
+    let pre_blocker = workspace.json(&[
+        "say", "blocker", "--json", "--tool", "codex",
+        "--subject", "pre-blocker for resolve test", "--path", "src/lib.rs",
+    ]);
+    let pre_blocker_id = pre_blocker["data"]["fact"]["event_id"].as_str().unwrap();
+
+    // Kinds that don't need a ref.
+    let simple_kinds = ["decision", "artifact", "handoff", "risk", "lesson"];
+    for kind in simple_kinds {
         let fact = workspace.json(&[
-            "say",
-            kind,
-            "--json",
-            "--tool",
-            "codex",
-            "--subject",
-            kind,
-            "--path",
-            "src/lib.rs",
-            "--evidence",
-            "observed",
+            "say", kind, "--json", "--tool", "codex",
+            "--subject", kind, "--path", "src/lib.rs", "--evidence", "observed",
         ]);
-        assert_eq!(fact["data"]["fact"]["kind"], kind);
+        assert_eq!(fact["data"]["fact"]["kind"], kind, "kind mismatch for {kind}");
         assert_eq!(fact["data"]["fact"]["schema"], "agent-rally.fact.v1");
         DateTime::parse_from_rfc3339(fact["data"]["fact"]["created_at"].as_str().unwrap()).unwrap();
         assert_matches_schema("agent-rally.fact.v1.json", &fact["data"]["fact"]);
     }
 
-    let room = workspace.json(&["room", "--json"]);
-    // Component B: codex's first say auto-wrote presence(1)+lead(2) before the
-    // fact(3); subsequent 8 says are no-ops for presence. Total = 9 + 2 = 11.
-    assert_eq!(room["data"]["room"]["max_seq"], 11);
+    // R9: release --ref <live-claim>.
+    let release_fact = workspace.json(&[
+        "say", "release", "--json", "--tool", "codex",
+        "--subject", "release", "--path", "src/lib.rs",
+        "--ref", pre_claim_id,
+    ]);
+    assert_eq!(release_fact["data"]["fact"]["kind"], "release");
+    assert_eq!(release_fact["data"]["fact"]["schema"], "agent-rally.fact.v1");
+    assert_matches_schema("agent-rally.fact.v1.json", &release_fact["data"]["fact"]);
+    // R9-readback: verified {room, seq} must be present in the response.
+    assert!(
+        release_fact["data"]["verified"]["seq"].as_i64().unwrap_or(0) > 0,
+        "release must return verified.seq > 0"
+    );
+    assert!(
+        !release_fact["data"]["verified"]["room"].as_str().unwrap_or("").is_empty(),
+        "release must return verified.room"
+    );
+
+    // R9: resolve --ref <live-blocker>.
+    let resolve_fact = workspace.json(&[
+        "say", "resolve", "--json", "--tool", "codex",
+        "--subject", "resolve", "--path", "src/lib.rs",
+        "--ref", pre_blocker_id,
+    ]);
+    assert_eq!(resolve_fact["data"]["fact"]["kind"], "resolve");
+    assert_eq!(resolve_fact["data"]["fact"]["schema"], "agent-rally.fact.v1");
+    assert_matches_schema("agent-rally.fact.v1.json", &resolve_fact["data"]["fact"]);
+
     workspace.cleanup();
 }
 

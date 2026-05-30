@@ -527,6 +527,169 @@ impl RoomStore {
         Ok(fact)
     }
 
+    // -------------------------------------------------------------------------
+    // R9-readback: canonical-ledger verification after every mutation
+    // -------------------------------------------------------------------------
+
+    /// The engagement label (room id) currently being stamped on appends.
+    /// Exposed for R9 readback output in command results.
+    pub(crate) fn room_id(&self) -> &str {
+        &self.active_engagement
+    }
+
+    /// Append `fact` and immediately re-read the CANONICAL SEGMENTS (not
+    /// `facts.db`) to assert the returned `event_id` is actually present.
+    ///
+    /// This catches the silent-corruption class: stale-binary write-drop,
+    /// no-op release, wrong-room write. `facts.db` is a DERIVED cache and is
+    /// deliberately NOT consulted here — reading it would false-pass a scenario
+    /// where the segment write silently dropped but the db write succeeded.
+    ///
+    /// Returns the verified `Fact` (with `seq` populated) on success.
+    /// Returns `Err` with a clear message if the `event_id` is absent from
+    /// the canonical segment record after write.
+    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<Fact> {
+        let appended = self.append_fact(fact)?;
+        let event_id = &appended.event_id;
+
+        // Re-read the canonical segments (live + archive) and scan every line
+        // for the exact event_id we just appended.
+        let live_segments = read_segment_files(&self.log_dir)?;
+        let archive_segments = read_segment_files(&self.archive_dir)?;
+
+        let found = segment_event_id_present(
+            live_segments.iter().chain(archive_segments.iter()),
+            event_id,
+        )?;
+
+        if !found {
+            return Err(RallyError::Message(format!(
+                "readback failed: {event_id} not found in canonical ledger after append"
+            )));
+        }
+
+        Ok(appended)
+    }
+
+    /// For `release` and `resolve` facts: enforce that `--ref` names a live
+    /// target, write via `append_fact_verified`, then re-`snapshot()` to confirm
+    /// the state transition actually took effect.
+    ///
+    /// * `release` requires the referenced `event_id` to have been an active
+    ///   claim (no longer in `active_claims` after the write).
+    /// * `resolve` requires the referenced `event_id` to have been an active
+    ///   blocker/risk/handoff/claim (no longer un-resolved after the write).
+    ///
+    /// Returns the verified `Fact` on success, or a loud error with the reason.
+    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<Fact> {
+        let ref_id = fact.ref_id.as_deref().ok_or_else(|| {
+            RallyError::Usage(format!(
+                "{} requires --ref <event-id> targeting a live fact; none provided",
+                fact.kind.as_str()
+            ))
+        })?;
+
+        // Assert the target is live BEFORE writing.
+        let snapshot_before = self.snapshot()?;
+        match fact.kind {
+            FactKind::Release => {
+                // A release must reference an active claim (or resolve any fact by
+                // event_id).  We check the broader "is this event_id currently
+                // un-released" by looking at active_claims.
+                let is_live = snapshot_before
+                    .active_claims
+                    .iter()
+                    .any(|c| c.event_id == ref_id);
+                if !is_live {
+                    return Err(RallyError::Usage(format!(
+                        "release failed: ref {ref_id} is not an active claim (already released, never existed, or invalid); nothing to release"
+                    )));
+                }
+            }
+            FactKind::Resolve => {
+                // Resolve must reference a live blocker, risk, handoff, claim,
+                // or an unconsumed artifact.  Artifacts are consumed by resolve
+                // (via the `consumed_refs` projection) which drops them from
+                // `unconsumed_artifacts`.
+                let is_live = snapshot_before
+                    .active_blockers
+                    .iter()
+                    .any(|f| f.event_id == ref_id)
+                    || snapshot_before
+                        .active_claims
+                        .iter()
+                        .any(|f| f.event_id == ref_id)
+                    || snapshot_before
+                        .open_handoffs
+                        .iter()
+                        .any(|f| f.event_id == ref_id)
+                    || snapshot_before
+                        .current_risks
+                        .iter()
+                        .any(|f| f.event_id == ref_id)
+                    || snapshot_before
+                        .unconsumed_artifacts
+                        .iter()
+                        .any(|f| f.event_id == ref_id);
+                if !is_live {
+                    return Err(RallyError::Usage(format!(
+                        "resolve failed: ref {ref_id} is not a live blocker, claim, handoff, risk, or unconsumed artifact (already resolved, never existed, or invalid); nothing to resolve"
+                    )));
+                }
+            }
+            _ => {}
+        }
+
+        // Write + canonical readback.
+        let appended = self.append_fact_verified(fact)?;
+
+        // Assert the projected status flipped.
+        let snapshot_after = self.snapshot()?;
+        match fact.kind {
+            FactKind::Release => {
+                let still_active = snapshot_after
+                    .active_claims
+                    .iter()
+                    .any(|c| c.event_id == ref_id);
+                if still_active {
+                    return Err(RallyError::Message(format!(
+                        "release readback failed: {ref_id} is still in active_claims after release — the release fact was recorded but the projection did not flip; this is a corruption signal"
+                    )));
+                }
+            }
+            FactKind::Resolve => {
+                let still_active = snapshot_after
+                    .active_blockers
+                    .iter()
+                    .any(|f| f.event_id == ref_id)
+                    || snapshot_after
+                        .active_claims
+                        .iter()
+                        .any(|f| f.event_id == ref_id)
+                    || snapshot_after
+                        .open_handoffs
+                        .iter()
+                        .any(|f| f.event_id == ref_id)
+                    || snapshot_after
+                        .current_risks
+                        .iter()
+                        .any(|f| f.event_id == ref_id)
+                    || snapshot_after
+                        .unconsumed_artifacts
+                        .iter()
+                        .any(|f| f.event_id == ref_id);
+                if still_active {
+                    return Err(RallyError::Message(format!(
+                        "resolve readback failed: {ref_id} is still active after resolve — the resolve fact was recorded but the projection did not flip; this is a corruption signal"
+                    )));
+                }
+            }
+            _ => {}
+        }
+
+        Ok(appended)
+    }
+
     pub(crate) fn append_session_fact_if_context(
         &self,
         fact: &Fact,
@@ -1007,6 +1170,42 @@ fn read_segment_files(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     paths.sort();
     Ok(paths)
+}
+
+/// R9-readback: scan segment files for the presence of a specific `event_id`
+/// in any `LedgerLine.payload.event_id` field.  Returns `true` if found.
+///
+/// Reads each line of each segment file; parses as `LedgerLine`; deserializes
+/// `payload` as a minimal struct that exposes `event_id`.  Uses the segment
+/// *files* as the authoritative source — never `facts.db`.
+fn segment_event_id_present<'a>(
+    paths: impl Iterator<Item = &'a PathBuf>,
+    event_id: &str,
+) -> Result<bool> {
+    for path in paths {
+        let file = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        for line in BufReader::new(file).lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(entry) = serde_json::from_str::<LedgerLine>(&line) else {
+                continue;
+            };
+            // The payload is a serialized Fact.  Extract event_id without a
+            // full Fact deserialization to keep this path allocation-light.
+            if entry.payload.get("event_id").and_then(|v| v.as_str()) == Some(event_id) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Raw count of non-empty lines across the given segment files. Test-only:
@@ -1959,6 +2158,337 @@ mod ledger_tests {
             ids,
             vec!["old1", "old2", "new3"],
             "rotated archive segment + live segment both replay"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // =========================================================================
+    // R9-readback tests
+    // =========================================================================
+
+    /// R9-case-6 (green baseline): a genuine successful mutation → readback
+    /// passes and the returned fact carries {room, seq}.
+    #[test]
+    fn r9_case6_successful_mutation_readback_passes_with_room_and_seq() {
+        let root = unique_root("r9-case6-green");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        let fact = make_fact("ev-r9-6", FactKind::Claim, "src/", "r9 green baseline");
+        let verified = store.append_fact_verified(&fact).unwrap();
+
+        assert!(verified.seq > 0, "seq must be > 0 after verified append");
+        assert_eq!(verified.event_id, "ev-r9-6", "event_id must be preserved");
+        // room_id is available from the store.
+        let room = store.room_id();
+        assert!(!room.is_empty(), "room_id must be non-empty");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// R9-case-1 (stale-binary drop): a fact that lands only in `facts.db` but
+    /// NOT a segment → `append_fact_verified`'s readback MUST fail.
+    ///
+    /// Simulation: call `append_fact` to write both db + segment, then truncate
+    /// the segment file (removing the line), then call the segment-readback path
+    /// directly. This proves the readback reads SEGMENTS, not the db.
+    #[test]
+    fn r9_case1_segment_drop_readback_fails() {
+        let root = unique_root("r9-case1-drop");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        let fact = make_fact("ev-r9-1", FactKind::Decision, "src/", "segment drop test");
+        // Write normally — both db and segment get the line.
+        let appended = store.append_fact(&fact).unwrap();
+        let event_id = &appended.event_id;
+
+        // Simulate segment drop: truncate the active segment file so the line
+        // is absent from the canonical record (db still has it).
+        let seg_path = store.active_segment_path();
+        assert!(seg_path.exists(), "segment file must exist after append");
+        // Truncate: remove all content from the segment.
+        fs::write(&seg_path, b"").unwrap();
+
+        // Now run the segment-only readback logic.  It must not find the event.
+        let live_segs = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
+        let arch_segs = read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
+        let found = segment_event_id_present(
+            live_segs.iter().chain(arch_segs.iter()),
+            event_id,
+        )
+        .unwrap();
+        assert!(
+            !found,
+            "readback must NOT find event_id in segments after segment truncation (drop simulation)"
+        );
+
+        // Confirm db still has it — proving the readback correctly targets segments.
+        let db_facts = store.facts().unwrap();
+        let in_db = db_facts.iter().any(|f| f.event_id == *event_id);
+        assert!(
+            in_db,
+            "fact must still exist in facts.db (cache) after segment truncation — proving split state"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// R9-case-4 (cache-false-pass guard): prove that a readback reading
+    /// `facts.db` instead of segments WOULD false-pass the stale-binary drop
+    /// case — i.e., after segment truncation `facts.db` still contains the fact,
+    /// confirming our readback's segment-only approach is necessary.
+    ///
+    /// This test is the companion to case-1: it explicitly asserts that the db
+    /// contains the event_id even though the segment does not, proving that
+    /// ANY readback path that checked the db would false-pass.
+    #[test]
+    fn r9_case4_db_false_passes_where_segment_readback_correctly_fails() {
+        let root = unique_root("r9-case4-db-false-pass");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        let fact = make_fact("ev-r9-4", FactKind::Claim, "src/", "db false-pass guard");
+        let appended = store.append_fact(&fact).unwrap();
+        let event_id = &appended.event_id;
+
+        // Drop the segment (truncate), leaving the db intact.
+        let seg_path = store.active_segment_path();
+        fs::write(&seg_path, b"").unwrap();
+
+        // Assert 1: segment-based readback returns false (correct).
+        let live_segs = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
+        let arch_segs = read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
+        let seg_found = segment_event_id_present(
+            live_segs.iter().chain(arch_segs.iter()),
+            event_id,
+        )
+        .unwrap();
+        assert!(
+            !seg_found,
+            "segment readback must return false after truncation (correct)"
+        );
+
+        // Assert 2: db-based readback returns true (false-pass territory).
+        let db_facts = store.facts().unwrap();
+        let db_found = db_facts.iter().any(|f| f.event_id == *event_id);
+        assert!(
+            db_found,
+            "db readback returns true even with the segment gone — this is the false-pass that our segment-only readback avoids"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// R9-case-2 (no-op release): `release` without a valid `--ref` that names
+    /// a live active claim → MUST fail loud via `append_state_transition_verified`.
+    #[test]
+    fn r9_case2_noop_release_fails_loud_without_valid_ref() {
+        let root = unique_root("r9-case2-noop-release");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        // Write a claim first.
+        let claim = make_fact("ev-claim-r9", FactKind::Claim, "src/", "claim to release");
+        store.append_fact(&claim).unwrap();
+
+        // Case A: release with no ref_id at all → must fail.
+        let release_no_ref = Fact {
+            schema: fact_schema(),
+            event_id: "ev-release-no-ref".to_string(),
+            seq: 0,
+            thread_id: "t-r".to_string(),
+            kind: FactKind::Release,
+            tool: Some("test".to_string()),
+            role: None,
+            subject: "release no ref".to_string(),
+            scope: vec!["src/".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None, // no ref
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        let err_no_ref = store.append_state_transition_verified(&release_no_ref).unwrap_err();
+        let msg_no_ref = err_no_ref.to_string();
+        assert!(
+            msg_no_ref.contains("requires --ref"),
+            "error for missing ref must mention --ref; got: {msg_no_ref}"
+        );
+
+        // Case B: release with a bogus ref that is not a live claim → must fail.
+        let release_bogus = Fact {
+            schema: fact_schema(),
+            event_id: "ev-release-bogus".to_string(),
+            seq: 0,
+            thread_id: "t-rb".to_string(),
+            kind: FactKind::Release,
+            tool: Some("test".to_string()),
+            role: None,
+            subject: "release bogus ref".to_string(),
+            scope: vec!["src/".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: Some("nonexistent-event-id".to_string()),
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        let err_bogus = store.append_state_transition_verified(&release_bogus).unwrap_err();
+        let msg_bogus = err_bogus.to_string();
+        assert!(
+            msg_bogus.contains("not an active claim") || msg_bogus.contains("release failed"),
+            "error for bogus ref must indicate the target is not a live claim; got: {msg_bogus}"
+        );
+
+        // Verify neither release fact landed in the canonical segments.
+        let segs = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
+        let arch = read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
+        for bad_id in ["ev-release-no-ref", "ev-release-bogus"] {
+            let found = segment_event_id_present(segs.iter().chain(arch.iter()), bad_id).unwrap();
+            assert!(
+                !found,
+                "failed release fact {bad_id} must NOT appear in canonical segments"
+            );
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// R9-case-3 (wrong-room write): a readback expecting the event_id in room A
+    /// when it landed in room B MUST fail.
+    ///
+    /// Simulation: write a fact to store-B, then run the segment-readback against
+    /// store-A's log dir — the event_id is absent from A's segments.
+    #[test]
+    fn r9_case3_wrong_room_event_absent_in_other_room_segments() {
+        let root_a = unique_root("r9-case3-room-a");
+        let root_b = unique_root("r9-case3-room-b");
+        let _store_a = RoomStore::open_at(root_a.clone()).unwrap();
+        let store_b = RoomStore::open_at(root_b.clone()).unwrap();
+
+        // Write a fact to room B.
+        let fact = make_fact("ev-room-b", FactKind::Artifact, "src/", "wrong room test");
+        let appended_b = store_b.append_fact(&fact).unwrap();
+        let event_id = &appended_b.event_id;
+
+        // Readback against room A's segments — must return false (wrong room).
+        let segs_a = read_segment_files(&root_a.join(".rally").join(LOG_DIRNAME)).unwrap();
+        let arch_a = read_segment_files(&root_a.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
+        let found_in_a = segment_event_id_present(
+            segs_a.iter().chain(arch_a.iter()),
+            event_id,
+        )
+        .unwrap();
+        assert!(
+            !found_in_a,
+            "event written to room B must NOT be found in room A's canonical segments"
+        );
+
+        // Confirm it IS in room B's segments (for sanity).
+        let segs_b = read_segment_files(&root_b.join(".rally").join(LOG_DIRNAME)).unwrap();
+        let arch_b = read_segment_files(&root_b.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
+        let found_in_b = segment_event_id_present(
+            segs_b.iter().chain(arch_b.iter()),
+            event_id,
+        )
+        .unwrap();
+        assert!(
+            found_in_b,
+            "event written to room B must be found in room B's canonical segments"
+        );
+
+        fs::remove_dir_all(&root_a).ok();
+        fs::remove_dir_all(&root_b).ok();
+    }
+
+    /// R9-case-5 (concurrency): a peer append between write and readback MUST NOT
+    /// false-pass — assert the EXACT event_id is found, not merely that seq advanced.
+    ///
+    /// Simulation: write fact-A, then simulate a concurrent peer write (manually
+    /// insert a segment line for fact-B with a higher seq), then run readback for
+    /// fact-A's event_id — must return true (exact match, not max-seq advancement).
+    /// Then verify fact-B's (different) event_id is also present — but searching
+    /// for a nonexistent id still returns false.
+    #[test]
+    fn r9_case5_concurrent_peer_append_does_not_false_pass_exact_event_id() {
+        let root = unique_root("r9-case5-concurrency");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        // Write fact-A (our mutation).
+        let fact_a = make_fact("ev-r9-5a", FactKind::Claim, "src/", "our fact");
+        let appended_a = store.append_fact(&fact_a).unwrap();
+
+        // Simulate a concurrent peer append: manually write a segment line for
+        // a peer fact at a higher seq.  This is what a concurrent writer would do.
+        let peer_seq = appended_a.seq + 100; // jump to simulate concurrent write
+        let peer_event_id = "ev-r9-5b-peer";
+        let peer_line = LedgerLine {
+            seq: peer_seq,
+            occurred_at: now_string(),
+            event_type: "claim".to_string(),
+            payload: serde_json::json!({
+                "schema": fact_schema(),
+                "event_id": peer_event_id,
+                "seq": peer_seq,
+                "kind": "claim",
+                "subject": "peer concurrent fact",
+                "scope": ["src/"],
+            }),
+            engagement: Some(store.active_engagement.clone()),
+        };
+        let seg_path = store.active_segment_path();
+        let peer_line_str = serde_json::to_string(&peer_line).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&seg_path)
+            .unwrap();
+        writeln!(file, "{peer_line_str}").unwrap();
+        drop(file);
+
+        // Now run the segment readback for fact-A's exact event_id.
+        // It must find fact-A (not merely see that max_seq advanced to peer_seq).
+        let segs = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
+        let arch = read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
+
+        let found_a = segment_event_id_present(
+            segs.iter().chain(arch.iter()),
+            &appended_a.event_id,
+        )
+        .unwrap();
+        assert!(
+            found_a,
+            "exact event_id for fact-A must be found even with a concurrent peer append present"
+        );
+
+        // Also verify the peer event is present.
+        let segs2 = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
+        let arch2 = read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
+        let found_peer = segment_event_id_present(
+            segs2.iter().chain(arch2.iter()),
+            peer_event_id,
+        )
+        .unwrap();
+        assert!(found_peer, "peer event_id must also be findable");
+
+        // Key concurrency assertion: searching for a NONEXISTENT event_id must
+        // still return false even though seq advanced (disproves max-seq advancement
+        // as a false-pass proxy).
+        let segs3 = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
+        let arch3 = read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
+        let found_ghost = segment_event_id_present(
+            segs3.iter().chain(arch3.iter()),
+            "ev-does-not-exist",
+        )
+        .unwrap();
+        assert!(
+            !found_ghost,
+            "a nonexistent event_id must NOT be found even though seq advanced (exact-match, not seq-advance check)"
         );
 
         fs::remove_dir_all(&root).ok();
