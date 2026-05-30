@@ -43,21 +43,36 @@ Rally should not own:
 ## Architecture
 
 ```text
-.rally/ledger.jsonl  canonical append-only event log (committed)
-.rally/facts.db      derived sqlite cache (gitignored; rebuildable)
-.rally/cursors.json  per-tool read cursors (gitignored; advisory)
-enter/next/room/check product APIs derived from facts.db
-managed sessions     tmux, Herdr, and cmux launch/inject/capture/stop
+.rally/log/<engagement>.jsonl  canonical append-only event segments (committed; one file per engagement)
+.rally/ledger.jsonl            R1 legacy single-log — still replayed on read for pre-segmentation repos
+.rally/manifest.json           self-describing pointers to docs + log (committed)
+.rally/RETROSPECTIVE.md        human-readable digest grouped by engagement (committed)
+.rally/archive/**              rotated old segments, still replayable (committed)
+.rally/facts.db                derived sqlite cache (gitignored; rebuildable)
+.rally/cursors.json            per-tool read cursors (gitignored; a write-through cache — the ledger is authoritative)
+enter/next/room/check          product APIs derived from the segments
+managed sessions               tmux, Herdr, and cmux launch/inject/capture/stop
 ```
 
-`ledger.jsonl` is the source of truth. It is append-only, one event per line
-(`{seq, occurred_at, event_type, payload}`), and committed to the repository
-(see `.gitignore` and `.gitattributes`: `merge=union` for conflict-free
-concurrent appends from sibling worktrees). `facts.db` is a *derived* sqlite
-cache backed by `factstr-sqlite` that `RoomStore::open_at` rebuilds by
-replaying the ledger whenever the cache is missing or behind. A clone or a
-fresh machine reconstructs the room state from the ledger alone — no external
-service, no migration step.
+The per-repo **`.rally/log/` segments are the source of truth** (R5 segmentation).
+The R1 single `.rally/ledger.jsonl` remains a valid canonical log and is still
+replayed on read for repos that predate segmentation. Each segment is
+append-only, one event per line (`{seq, occurred_at, event_type, payload}`),
+committed, and carries `merge=union` (see `.gitattributes`) so concurrent
+appends from sibling worktrees merge without conflict.
+
+**Commit cadence.** The committed segments may lag the on-disk segments during
+active work — that is fine: the segments are a live working-tree artifact, and
+`merge=union` makes a lagging commit safe to catch up at any time. Commit them
+on whatever cadence the engagement uses (per chunk, per closeout, or batched);
+there is no daemon and no required cadence.
+
+`facts.db` is a *derived* sqlite cache (factstr-sqlite) that `RoomStore` rebuilds
+by replaying the segments whenever the cache is missing or behind. `cursors.json`
+is a write-through read-cursor cache, **never** the source of truth — a tool's
+read position is derived from ledger `Read` checkpoints (R10), with `cursors.json`
+consulted only as a fast-path fallback. A clone or fresh machine reconstructs room
+state from the committed segments alone — no external service, no migration step.
 
 Room snapshots and managed session lists are derived from the event log on
 demand, not stored in a second projection DB.
@@ -70,45 +85,54 @@ Data never co-mingles across repos: claims, blockers, decisions, artifacts,
 and managed sessions in repo A are invisible to a `rally` invocation in
 repo B.
 
-The home-dir directory `~/.agent-rally-point/rooms/v1/index.json` is a
-**pointers-only** discovery hint — it lists `(repo_root, facts_db_path,
+The home-dir directory `~/.agent-rally-point/rooms/v1/index.json` is an
+**opt-in, pointers-only** discovery hint — it lists `(repo_root, facts_db_path,
 last_seen_seq)` so `rally locate --all` and `rally recent --all` can answer
 "what other rooms exist on this machine?" without a network call. It holds
-**zero canonical fact data**; the per-repo `ledger.jsonl` files do. Deleting
+**zero canonical fact data**; the per-repo `.rally/log/` segments do. Deleting
 the global index loses cross-repo visibility but not a single fact.
 
 ```text
-~/.agent-rally-point/rooms/v1/index.json   global discovery hint (pointers)
-~/dev/repo-a/.rally/ledger.jsonl           repo A — canonical facts
+~/.agent-rally-point/rooms/v1/index.json   global discovery hint (pointers; opt-in via RALLY_GLOBAL_INDEX=1)
+~/dev/repo-a/.rally/log/<engagement>.jsonl repo A — canonical fact segments
 ~/dev/repo-a/.rally/facts.db               repo A — derived cache
-~/dev/repo-b/.rally/ledger.jsonl           repo B — canonical facts (isolated)
+~/dev/repo-b/.rally/log/<engagement>.jsonl repo B — canonical fact segments (isolated)
 ~/dev/repo-b/.rally/facts.db               repo B — derived cache (isolated)
 ```
 
-### Disabling the global index (`RALLY_NO_GLOBAL_INDEX=1`)
+### The global index is opt-in (`RALLY_GLOBAL_INDEX=1`)
 
-For privacy-isolated, multi-tenant, sandboxed, or CI scenarios where rally
-must not touch the user's home directory, set the environment variable
-`RALLY_NO_GLOBAL_INDEX=1` (any non-empty value) on the `rally` process.
-This:
+**As of B17 the global index is OFF by default** (one-store north-star — the
+home-dir store was a cross-repo contamination and trust-drift surface). By
+default rally never touches the user's home directory. To enable cross-repo
+discovery, set `RALLY_GLOBAL_INDEX=1` (any non-empty value) on the `rally`
+process. `RALLY_NO_GLOBAL_INDEX=1` still **force-disables unconditionally** even
+when opted in (back-compat, and for privacy-isolated / multi-tenant / sandboxed /
+CI scenarios). With the index disabled (the default):
 
-- Skips every write to `~/.agent-rally-point/rooms/v1/index.json`.
-- Skips every read of the same file.
-- Collapses `rally locate --all` / `rally recent --all` to "this repo only".
+- No write to `~/.agent-rally-point/rooms/v1/index.json`.
+- No read of the same file.
+- `rally locate --all` / `rally recent --all` collapse to "this repo only".
 
-Per-repo coordination is **unaffected** — `.rally/ledger.jsonl` and
+Per-repo coordination is **unaffected** — `.rally/log/` segments and
 `.rally/facts.db` work exactly as before. Only the cross-repo "what other
-rooms exist?" surface goes silent.
+rooms exist?" surface is gated.
 
 ```bash
+# Default: no env var needed — the global index is already off (B17).
+rally recent --all --json                          # silent on other repos (this repo only)
+
+# Opt in to cross-repo discovery:
+RALLY_GLOBAL_INDEX=1 rally recent --all --json      # lists other rooms on this machine
+RALLY_GLOBAL_INDEX=1 rally locate --all --json
+
+# Force-off even when opted in (privacy-isolated / multi-tenant / CI):
 RALLY_NO_GLOBAL_INDEX=1 rally enter --tool codex --json
-RALLY_NO_GLOBAL_INDEX=1 rally say claim --tool codex --subject "..." --json
-RALLY_NO_GLOBAL_INDEX=1 rally recent --all --json   # silent on other repos
 ```
 
 There is no CLI flag — env-var-only is the minimum surface that does the
 job, and it composes cleanly with `direnv`, container env files, and CI
-secret panels. A future release may add `--no-global-index` if the env-var
+secret panels. A future release may add `--global-index` if the env-var
 form proves insufficient.
 
 ## Command Surface
