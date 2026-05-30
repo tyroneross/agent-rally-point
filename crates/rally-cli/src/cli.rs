@@ -31,6 +31,10 @@ pub(crate) enum CliCommand {
     RouteFindings(RouteFindingsArgs),
     /// B13: CI gate — read-only health check of the room state.
     CheckCi(CheckCiArgs),
+    /// B1/B2: fan-out DAG view derived from lineage markers.
+    Dag(DagArgs),
+    /// B4: trust-gated wake eligibility projection.
+    WakeDue(WakeDueArgs),
 }
 
 pub(crate) enum CliParse {
@@ -103,6 +107,21 @@ pub(crate) struct SayArgs {
     /// B13: predictive contract — paths/symbols this claim depends on.
     /// Stored as `depends:<x>` markers in the fact's `evidence` Vec.
     pub(crate) depends: Vec<String>,
+    // B1 lineage markers — all optional; stored as scope markers.
+    /// Lineage: run identifier shared by a fan-out batch. Stored as `run:<id>` in scope.
+    pub(crate) run_id: Option<String>,
+    /// Lineage: step identifier for this specific fact. Stored as `step:<id>` in scope.
+    pub(crate) step_id: Option<String>,
+    /// Lineage: parent step that caused this step. Stored as `parent-step:<id>` in scope.
+    pub(crate) parent_step_id: Option<String>,
+    // B1 standby-specific args (only meaningful when kind == standby)
+    /// Standby: human-readable reason for going dormant. Encoded as `reason:<r>` in summary.
+    pub(crate) reason: Option<String>,
+    /// Standby: when to wake, as ISO-8601 or relative offset `+30m`/`+2h`. Encoded as `wake_after:<iso>` in summary.
+    pub(crate) wake_after: Option<String>,
+    // B1 wake-specific args (only meaningful when kind == wake)
+    /// Wake: event-id of the standby fact being acknowledged. Stored in ref_id.
+    pub(crate) ref_standby: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -308,6 +327,22 @@ impl Default for BackendBins {
     }
 }
 
+/// B2: arguments for `rally dag`.
+#[derive(Clone, Debug)]
+pub(crate) struct DagArgs {
+    pub(crate) json: bool,
+    /// Run identifier whose facts form the DAG (required).
+    pub(crate) run_id: String,
+}
+
+/// B4: arguments for `rally wake-due`.
+#[derive(Clone, Debug)]
+pub(crate) struct WakeDueArgs {
+    pub(crate) json: bool,
+    /// Filter to a specific tool (optional; surfaces only standbys owned by this tool).
+    pub(crate) tool: Option<String>,
+}
+
 /// B13: arguments for `rally check ci`.
 #[derive(Clone, Debug)]
 pub(crate) struct CheckCiArgs {
@@ -347,6 +382,9 @@ const COMMANDS: &[&str] = &[
     "route-findings",
     // B13: CI gate
     "check-ci",
+    // B1/B2/B4: pi-dynamic observation seam
+    "dag",
+    "wake-due",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -477,6 +515,20 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .command("check-ci")
         .map(CliCommand::CheckCi);
 
+    // B2: fan-out DAG view (read-only)
+    let dag = dag_parser()
+        .to_options()
+        .descr("Read-only causation DAG derived from run/step/parent-step lineage markers. Nodes tagged landed|in-flight|stalled.")
+        .command("dag")
+        .map(CliCommand::Dag);
+
+    // B4: trust-gated wake eligibility (read-only)
+    let wake_due = wake_due_parser()
+        .to_options()
+        .descr("Read-only projection of standby facts whose wake_after has passed. Emits suggested_command strings only — never executes anything.")
+        .command("wake-due")
+        .map(CliCommand::WakeDue);
+
     // Work surface commands (appended — do not reorder above)
     let backlog = backlog_parser()
         .to_options()
@@ -519,7 +571,9 @@ fn cli_parser() -> OptionParser<CliCommand> {
         backlog,
         board,
         route_findings,
-        check_ci
+        check_ci,
+        dag,
+        wake_due
     ])
     .to_options()
 }
@@ -595,10 +649,20 @@ fn say_parser() -> impl Parser<SayArgs> {
     // B13: predictive contract markers (repeatable)
     let produces = many_string_arg("produces", "PATH_OR_SYMBOL");
     let depends = many_string_arg("depends", "PATH_OR_SYMBOL");
+    // B1: lineage markers (all optional)
+    let run_id = optional_string_arg("run", "RUN_ID");
+    let step_id = optional_string_arg("step", "STEP_ID");
+    let parent_step_id = optional_string_arg("parent-step", "STEP_ID");
+    // B1: standby/wake specific args
+    let reason = optional_string_arg("reason", "REASON");
+    let wake_after = optional_string_arg("wake-after", "OFFSET_OR_ISO");
+    let ref_standby = optional_string_arg("ref-standby", "EVENT_ID");
     let kind = positional::<String>("KIND").parse(parse_fact_kind);
     construct!(
         json, tool, subject, thread_id, role, summary, scopes, resources, paths, evidence, target,
-        ref_id, status, severity, uri, produces, depends, kind
+        ref_id, status, severity, uri, produces, depends,
+        run_id, step_id, parent_step_id, reason, wake_after, ref_standby,
+        kind
     )
     .map(
         |(
@@ -619,6 +683,12 @@ fn say_parser() -> impl Parser<SayArgs> {
             uri,
             produces,
             depends,
+            run_id,
+            step_id,
+            parent_step_id,
+            reason,
+            wake_after,
+            ref_standby,
             kind,
         )| SayArgs {
             json,
@@ -639,6 +709,12 @@ fn say_parser() -> impl Parser<SayArgs> {
             uri,
             produces,
             depends,
+            run_id,
+            step_id,
+            parent_step_id,
+            reason,
+            wake_after,
+            ref_standby,
         },
     )
 }
@@ -1057,6 +1133,20 @@ fn route_findings_parser() -> impl Parser<RouteFindingsArgs> {
         tool,
         verified,
     })
+}
+
+// B2: dag parser
+fn dag_parser() -> impl Parser<DagArgs> {
+    let json = json_flag();
+    let run_id = string_arg("run", "RUN_ID");
+    construct!(json, run_id).map(|(json, run_id)| DagArgs { json, run_id })
+}
+
+// B4: wake-due parser
+fn wake_due_parser() -> impl Parser<WakeDueArgs> {
+    let json = json_flag();
+    let tool = optional_string_arg("tool", "TOOL");
+    construct!(json, tool).map(|(json, tool)| WakeDueArgs { json, tool })
 }
 
 // B13: check-ci parser

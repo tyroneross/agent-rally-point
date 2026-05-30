@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-rally.command.dag.v1",
+  "title": "rally dag response",
+  "description": "B2: read-only causation DAG derived from run/step/parent-step lineage markers in fact scope fields. Rally records and derives; it never executes.",
+  "type": "object",
+  "properties": {
+    "ok": { "type": "boolean" },
+    "product": { "type": "string", "const": "rally" },
+    "command": { "type": "string", "const": "dag" },
+    "schema": { "type": "string", "const": "agent-rally.command.dag.v1" },
+    "data": {
+      "type": "object",
+      "properties": {
+        "dag": {
+          "type": "object",
+          "description": "The reconstructed causation DAG for a single run.",
+          "properties": {
+            "run_id": { "type": "string", "description": "The run identifier all nodes belong to." },
+            "nodes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "step_id": { "type": "string" },
+                  "run_id": { "type": "string" },
+                  "event_ids": { "type": "array", "items": { "type": "string" } },
+                  "status": {
+                    "type": "string",
+                    "enum": ["landed", "in_flight", "stalled"],
+                    "description": "landed=has artifact; in_flight=active; stalled=standby past wake_after with no wake/artifact."
+                  },
+                  "tool": { "type": ["string", "null"] },
+                  "subjects": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["step_id", "run_id", "event_ids", "status", "subjects"]
+              }
+            },
+            "edges": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "from_step": { "type": "string" },
+                  "to_step": { "type": "string" },
+                  "kind": { "type": "string", "enum": ["parent_step", "ref"] }
+                },
+                "required": ["from_step", "to_step", "kind"]
+              }
+            },
+            "facts_scanned": { "type": "integer", "description": "Total facts belonging to this run that were scanned." }
+          },
+          "required": ["run_id", "nodes", "edges", "facts_scanned"]
+        }
+      },
+      "required": ["dag"]
+    }
+  },
+  "required": ["ok", "command", "schema", "data"]
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-rally.fact.wake.v1",
+  "title": "wake fact encoding",
+  "description": "B1: wake fact — agent acknowledges a standby and records re-activation. Links to the standby via ref_id (stored as 'ref' in JSON).",
+  "type": "object",
+  "properties": {
+    "kind": { "type": "string", "const": "wake" },
+    "tool": { "type": ["string", "null"], "description": "The waking tool." },
+    "ref": {
+      "type": ["string", "null"],
+      "description": "event_id of the standby fact being acknowledged. Set via --ref-standby on the CLI."
+    },
+    "scope": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Optional lineage markers: 'run:<id>', 'step:<id>', 'parent-step:<id>'."
+    }
+  },
+  "required": ["kind"],
+  "examples": [
+    {
+      "kind": "wake",
+      "tool": "claude_code:01",
+      "ref": "fact_abc123_...",
+      "scope": ["run:RUN-42", "step:S3"]
+    }
+  ]
+}

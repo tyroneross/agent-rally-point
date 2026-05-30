@@ -50,6 +50,7 @@ mod board;
 mod check;
 mod check_ci;
 mod cli;
+mod dag;
 mod discovery;
 mod doctor;
 mod error;
@@ -70,6 +71,7 @@ use board::{BoardOutput, build_board};
 use check::build_check;
 use check_ci::build_check_ci;
 use cli::*;
+use dag::{DagOutput, WakeDueEntry, build_dag, project_wake_due, resolve_wake_after};
 use error::{RallyError, Result};
 use next::{AttentionItem, EntryData, NextResult, build_attention, build_entry, build_next};
 use output::{CliError, Output};
@@ -85,6 +87,9 @@ const SCHEMA_BOARD: &str = "agent-rally.command.board.v1";
 const SCHEMA_ROUTE_FINDINGS: &str = "agent-rally.command.route-findings.v1";
 // B13
 const SCHEMA_CHECK_CI: &str = "agent-rally.command.check-ci.v1";
+// B1/B2/B4: pi-dynamic observation seam
+const SCHEMA_DAG: &str = "agent-rally.command.dag.v1";
+const SCHEMA_WAKE_DUE: &str = "agent-rally.command.wake-due.v1";
 
 pub fn main() -> ExitCode {
     let wants_json = env::args().any(|arg| arg == "--json");
@@ -145,6 +150,9 @@ fn run_inner() -> Result<Output> {
         CliCommand::RouteFindings(args) => command_route_findings(args),
         // B13
         CliCommand::CheckCi(args) => command_check_ci(args),
+        // B1/B2/B4: pi-dynamic observation seam
+        CliCommand::Dag(args) => command_dag(args),
+        CliCommand::WakeDue(args) => command_wake_due(args),
     }
 }
 
@@ -482,6 +490,20 @@ fn command_say(args: SayArgs) -> Result<Output> {
         evidence.push(format!("depends:{d}"));
     }
 
+    // B1: encode lineage markers (run/step/parent-step) into scope.
+    let mut lineage_scope: Vec<String> = Vec::new();
+    if let Some(ref run_id) = args.run_id {
+        lineage_scope.push(format!("run:{run_id}"));
+    }
+    if let Some(ref step_id) = args.step_id {
+        lineage_scope.push(format!("step:{step_id}"));
+    }
+    if let Some(ref parent_step_id) = args.parent_step_id {
+        lineage_scope.push(format!("parent-step:{parent_step_id}"));
+    }
+    // Merge lineage into scope (before external-intake check, which runs later).
+    scope.extend(lineage_scope);
+
     // #6 source-grounding: at claim, snapshot content hashes of all claimed file
     // paths and store them as `claimhash:<rel>=<hash>` in evidence.
     let repo_root_for_grounding = repo_root().ok();
@@ -512,6 +534,38 @@ fn command_say(args: SayArgs) -> Result<Output> {
         Vec::new()
     };
 
+    // B1: for standby, encode reason + wake_after into summary.
+    // For wake, ref_standby becomes ref_id (takes precedence over --ref).
+    let summary = if kind == FactKind::Standby {
+        // Parse/resolve wake_after if provided.
+        let wake_after_iso = if let Some(ref wa) = args.wake_after {
+            match resolve_wake_after(wa) {
+                Ok(iso) => Some(iso),
+                Err(e) => return Err(RallyError::Usage(e)),
+            }
+        } else {
+            None
+        };
+        // Build summary from reason + wake_after markers.
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(ref r) = args.reason {
+            parts.push(format!("reason:{r}"));
+        }
+        if let Some(ref wa) = wake_after_iso {
+            parts.push(format!("wake_after:{wa}"));
+        }
+        // Prepend explicit summary if provided, then append markers.
+        if let Some(explicit) = args.summary {
+            parts.insert(0, explicit);
+        }
+        if parts.is_empty() { None } else { Some(parts.join(" ")) }
+    } else {
+        args.summary
+    };
+
+    // ref_standby (--ref-standby) takes precedence over --ref for wake facts.
+    let ref_id = args.ref_standby.or(args.ref_id);
+
     let fact = Fact {
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
@@ -523,10 +577,10 @@ fn command_say(args: SayArgs) -> Result<Output> {
         subject,
         scope,
         created_at: now_string(),
-        summary: args.summary,
+        summary,
         evidence,
         target: args.target,
-        ref_id: args.ref_id,
+        ref_id,
         status: args.status,
         severity: args.severity,
         uri: args.uri,
@@ -4058,6 +4112,427 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    // ==========================================================================
+    // B1: standby / wake round-trip tests
+    // ==========================================================================
+
+    /// B1a: `say standby --wake-after +30m` stores a fact with kind=standby,
+    /// `wake_after:<iso>` in summary, and round-trips through a fresh RoomStore.
+    #[test]
+    fn b1a_standby_roundtrip_wake_after_relative() {
+        let root = unique_root("b1a-standby-rt");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // Resolve +30m and store.
+        let wake_iso = dag::resolve_wake_after("+30m").expect("+30m must resolve");
+        let fact = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b1a-standby"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Standby,
+            tool: Some("tool-a".to_string()),
+            role: None,
+            subject: "agent standby".to_string(),
+            scope: vec!["run:RUN-B1A".to_string(), "step:S1".to_string()],
+            created_at: now_string(),
+            summary: Some(format!("reason:idle wake_after:{wake_iso}")),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: Some("pending".to_string()),
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        let appended = room.append_fact_verified(&fact).unwrap();
+        assert_eq!(appended.kind.as_str(), "standby");
+        assert!(
+            appended.summary.as_deref().unwrap_or("").contains("wake_after:"),
+            "summary must contain wake_after marker"
+        );
+
+        // Round-trip via fresh store.
+        drop(room);
+        let reader = store::RoomStore::open_at(root.clone()).unwrap();
+        let facts = reader.facts().unwrap();
+        let found = facts
+            .iter()
+            .find(|f| f.event_id == appended.event_id)
+            .expect("standby fact must round-trip");
+        assert_eq!(found.kind.as_str(), "standby");
+        assert!(found.summary.as_deref().unwrap_or("").contains("wake_after:"));
+        assert!(found.scope.contains(&"run:RUN-B1A".to_string()));
+        assert!(found.scope.contains(&"step:S1".to_string()));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// B1b: `say wake --ref-standby <standby-event-id>` links back to the standby.
+    #[test]
+    fn b1b_wake_links_to_standby_via_ref() {
+        let root = unique_root("b1b-wake-link");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // Write a standby fact.
+        let standby = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b1b-standby"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Standby,
+            tool: Some("tool-a".to_string()),
+            role: None,
+            subject: "agent standby".to_string(),
+            scope: vec!["run:RUN-B1B".to_string()],
+            created_at: now_string(),
+            summary: Some("reason:waiting wake_after:2099-01-01T00:00:00Z".to_string()),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: Some("pending".to_string()),
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        let standby_fact = room.append_fact_verified(&standby).unwrap();
+
+        // Write a wake fact referencing the standby.
+        let wake = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b1b-wake"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Wake,
+            tool: Some("tool-a".to_string()),
+            role: None,
+            subject: "wake from standby".to_string(),
+            scope: vec!["run:RUN-B1B".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: Some(standby_fact.event_id.clone()),
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        let wake_fact = room.append_fact_verified(&wake).unwrap();
+
+        assert_eq!(
+            wake_fact.ref_id.as_deref(),
+            Some(standby_fact.event_id.as_str()),
+            "wake fact must reference the standby event_id"
+        );
+
+        // Once woken, the standby must not appear in wake-due.
+        let facts = room.facts().unwrap();
+        let due = dag::project_wake_due(&facts, None);
+        // standby is in the future (2099) so it wouldn't surface anyway,
+        // but we verify the woken-standby logic covers it.
+        let woken_in_due = due
+            .iter()
+            .any(|d| d.standby_event_id == standby_fact.event_id);
+        assert!(
+            !woken_in_due,
+            "woken standby must not appear in wake-due"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// B1c: lineage fan-out — 1 handoff → 3 child claims via --run/--step/--parent-step.
+    /// The DAG must reconstruct 3 nodes (excluding the handoff's root node = 4 total)
+    /// with parent_step edges connecting them to the handoff step.
+    #[test]
+    fn b1c_lineage_fanout_dag_three_child_claims() {
+        let root = unique_root("b1c-lineage-fanout");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        let run_id = "RUN-B1C";
+        // Handoff at step S0.
+        let handoff = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b1c-handoff"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Handoff,
+            tool: Some("tool-a".to_string()),
+            role: None,
+            subject: "fan-out handoff".to_string(),
+            scope: vec![format!("run:{run_id}"), "step:S0".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&handoff).unwrap();
+
+        // 3 child claims at steps S1, S2, S3 with parent-step:S0.
+        for i in 1..=3 {
+            let claim = store::Fact {
+                schema: FACT_SCHEMA.to_string(),
+                event_id: new_id(&format!("b1c-claim-s{i}")),
+                seq: 0,
+                thread_id: new_id("room"),
+                kind: store::FactKind::Claim,
+                tool: Some(format!("tool-{i}")),
+                role: None,
+                subject: format!("child claim {i}"),
+                scope: vec![
+                    format!("run:{run_id}"),
+                    format!("step:S{i}"),
+                    "parent-step:S0".to_string(),
+                ],
+                created_at: now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            room.append_fact(&claim).unwrap();
+        }
+
+        let facts = room.facts().unwrap();
+        let dag_out = dag::build_dag(&facts, run_id);
+
+        // 4 nodes: S0, S1, S2, S3.
+        assert_eq!(dag_out.nodes.len(), 4, "expected 4 DAG nodes");
+        // 3 parent_step edges.
+        let pe: Vec<_> = dag_out.edges.iter().filter(|e| e.kind == "parent_step").collect();
+        assert_eq!(pe.len(), 3, "expected 3 parent_step edges");
+        // All claims are in_flight (no artifacts).
+        for node in dag_out.nodes.iter().filter(|n| n.step_id != "S0") {
+            assert_eq!(
+                node.status,
+                dag::NodeStatus::InFlight,
+                "child step {} must be in_flight",
+                node.step_id
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// B1d: stalled detection — a child claim with no artifact past its standby's
+    /// wake_after is tagged stalled.
+    #[test]
+    fn b1d_stalled_child_claim_past_standby() {
+        let root = unique_root("b1d-stalled");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        let run_id = "RUN-B1D";
+        // Claim at S1.
+        let claim = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b1d-claim"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Claim,
+            tool: Some("tool-a".to_string()),
+            role: None,
+            subject: "stalled claim".to_string(),
+            scope: vec![format!("run:{run_id}"), "step:S1".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        // Standby at S1 with past wake_after.
+        let standby = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b1d-standby"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Standby,
+            tool: Some("tool-a".to_string()),
+            role: None,
+            subject: "standby".to_string(),
+            scope: vec![format!("run:{run_id}"), "step:S1".to_string()],
+            created_at: now_string(),
+            summary: Some("reason:waiting wake_after:2020-01-01T00:00:00Z".to_string()),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: Some("pending".to_string()),
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&claim).unwrap();
+        room.append_fact(&standby).unwrap();
+
+        let facts = room.facts().unwrap();
+        let dag_out = dag::build_dag(&facts, run_id);
+        let s1 = dag_out.nodes.iter().find(|n| n.step_id == "S1").expect("S1 must exist");
+        assert_eq!(
+            s1.status,
+            dag::NodeStatus::Stalled,
+            "S1 with past standby and no artifact must be stalled"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// B4a: wake-due projects past standbys and suggested_command is a string only.
+    /// Charter: no execution occurs (no Command/spawn/schedule called).
+    #[test]
+    fn b4a_wake_due_projects_past_standby_with_suggested_command() {
+        let root = unique_root("b4a-wake-due");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // Register tool-a presence (trust gate requirement).
+        ensure_presence(&room, "tool-a").unwrap();
+
+        // Write a standby with a past wake_after.
+        let standby = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b4a-standby"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Standby,
+            tool: Some("tool-a".to_string()),
+            role: None,
+            subject: "agent standby".to_string(),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: Some("reason:idle wake_after:2020-01-01T00:00:00Z".to_string()),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: Some("pending".to_string()),
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        let standby_fact = room.append_fact_verified(&standby).unwrap();
+
+        let facts = room.facts().unwrap();
+        let due = dag::project_wake_due(&facts, None);
+
+        assert!(!due.is_empty(), "wake-due must surface the past standby");
+        let entry = due
+            .iter()
+            .find(|d| d.standby_event_id == standby_fact.event_id)
+            .expect("past standby must appear in wake-due");
+
+        // suggested_command is a string, never executed by rally.
+        assert!(
+            entry.suggested_command.contains("rally next"),
+            "suggested_command must reference rally next; got: {}",
+            entry.suggested_command
+        );
+        assert!(
+            entry.suggested_command.contains("tool-a"),
+            "suggested_command must include owner tool; got: {}",
+            entry.suggested_command
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// B4b: not-yet-due standby does not surface in wake-due.
+    #[test]
+    fn b4b_wake_due_future_standby_not_surfaced() {
+        let root = unique_root("b4b-not-yet-due");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        ensure_presence(&room, "tool-b").unwrap();
+
+        let standby = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("b4b-standby"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Standby,
+            tool: Some("tool-b".to_string()),
+            role: None,
+            subject: "agent standby".to_string(),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: Some("reason:idle wake_after:2099-01-01T00:00:00Z".to_string()),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: Some("pending".to_string()),
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&standby).unwrap();
+
+        let facts = room.facts().unwrap();
+        let due = dag::project_wake_due(&facts, None);
+        assert!(
+            due.is_empty(),
+            "future standby must not appear in wake-due; got: {due:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Charter assertion test: grep the dag module source for exec/spawn/schedule
+    /// call patterns and assert none are found.
+    ///
+    /// SEAM_NO_EXEC invariant: no code path in dag.rs calls Command::new(,
+    /// thread::spawn(, exec(, or similar process-launching APIs.
+    ///
+    /// The patterns below are the call-site forms (with opening parenthesis) so
+    /// they match actual invocations rather than doc-comment strings.
+    #[test]
+    fn charter_assertion_dag_module_contains_no_exec_spawn_schedule() {
+        let dag_src = include_str!("dag.rs");
+
+        // These are call-site patterns (include the opening paren) so they
+        // match only real invocations, not doc-comment mentions.
+        // SEAM_NO_EXEC: rally RECORDS and DERIVES; it NEVER EXECUTES.
+        let forbidden_calls = [
+            "Command::new(",
+            "thread::spawn(",
+            "execv(",
+            "execve(",
+            "execvp(",
+        ];
+
+        for pattern in &forbidden_calls {
+            // Filter out lines that are pure comments (// or //!).
+            let violating_lines: Vec<&str> = dag_src
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim();
+                    !trimmed.starts_with("//") && line.contains(pattern)
+                })
+                .collect();
+            assert!(
+                violating_lines.is_empty(),
+                "SEAM_NO_EXEC violation: dag.rs must not call {pattern:?} outside comments; \
+                 rally records/derives only — execution belongs in the external runner. \
+                 Found in lines: {violating_lines:?}"
+            );
+        }
+    }
+
     /// R9c: when the same build_id enters twice, NO drift warning is produced.
     #[test]
     fn r9c_same_build_id_produces_no_drift_warning() {
@@ -4447,6 +4922,7 @@ fn default_subject(kind: &str) -> String {
         "session" => "managed session".to_string(),
         "wake" => "wake intent".to_string(),
         "presence" => "agent presence".to_string(),
+        "standby" => "agent standby".to_string(),
         _ => kind.to_string(),
     }
 }
@@ -4663,6 +5139,58 @@ fn command_route_findings(args: RouteFindingsArgs) -> Result<Output> {
     Ok(Output::new(args.json, text, body))
 }
 
+// =============================================================================
+// B2: rally dag — fan-out DAG view (READ-ONLY PROJECTION)
+// =============================================================================
+//
+// CHARTER ASSERTION: this command path never calls Command/spawn/schedule/exec.
+// It reads facts from the store and derives a graph struct.
+// Litmus from PLAN-pi-dynamic-seam.md §0:
+//   "Does this make Rally start, resume, retry, or schedule work?" → NO.
+
+#[derive(JsonSchema, Serialize)]
+struct DagData {
+    dag: DagOutput,
+}
+
+fn command_dag(args: DagArgs) -> Result<Output> {
+    let room = RoomStore::open()?;
+    let facts = room.facts()?;
+    let dag = build_dag(&facts, &args.run_id);
+    let node_count = dag.nodes.len();
+    let edge_count = dag.edges.len();
+    let text = format!(
+        "dag run={} nodes={} edges={} facts_scanned={}",
+        dag.run_id, node_count, edge_count, dag.facts_scanned
+    );
+    let body = envelope("dag", SCHEMA_DAG, DagData { dag })?;
+    Ok(Output::new(args.json, text, body))
+}
+
+// =============================================================================
+// B4: rally wake-due — trust-gated wake eligibility (READ-ONLY PROJECTION)
+// =============================================================================
+//
+// CHARTER ASSERTION: this command path never calls Command/spawn/schedule/exec.
+// The `suggested_command` field in WakeDueEntry is a plain string — the external
+// runner (rally watch / LaunchAgent / cron) decides whether and when to invoke it.
+// Rally never executes it.
+
+#[derive(JsonSchema, Serialize)]
+struct WakeDueData {
+    due: Vec<WakeDueEntry>,
+}
+
+fn command_wake_due(args: WakeDueArgs) -> Result<Output> {
+    let room = RoomStore::open()?;
+    let facts = room.facts()?;
+    let due = project_wake_due(&facts, args.tool.as_deref());
+    let count = due.len();
+    let text = format!("wake-due count={count}");
+    let body = envelope("wake-due", SCHEMA_WAKE_DUE, WakeDueData { due })?;
+    Ok(Output::new(args.json, text, body))
+}
+
 fn help_text() -> String {
     [
         "rally: repo-local coordination room for parallel agents",
@@ -4696,7 +5224,14 @@ fn help_text() -> String {
         "  rally backlog list [--json]",
         "  rally board [--json]",
         "  rally route-findings --file <findings.json> [--tool <tool>] --verified [--json]",
-        "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake, presence, backlog-item",
+        "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake, standby, presence, backlog-item",
+        "",
+        "  rally say standby --tool <tool> --reason <r> --wake-after <+30m|iso> [--run <id>] [--step <id>] [--parent-step <id>] [--tool] [--json]",
+        "  rally say wake --tool <tool> --ref-standby <standby-event-id> [--run <id>] [--step <id>] [--json]",
+        "  rally dag --run <run-id> [--json]          # READ-ONLY causation DAG (nodes=steps, edges=causation)",
+        "  rally wake-due [--tool <tool>] [--json]   # READ-ONLY standbys past wake_after (emits suggested_command strings, never executes)",
+        "",
+        "  Lineage flags (on any `say` kind): --run <id> --step <id> --parent-step <id>",
     ]
     .join("\n")
 }

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-rally.fact.standby.v1",
+  "title": "standby fact encoding",
+  "description": "B1: standby fact — agent declares it is going dormant and requests a future wake signal. Uses additive marker pattern; no Fact struct fields added.",
+  "type": "object",
+  "properties": {
+    "kind": { "type": "string", "const": "standby" },
+    "tool": { "type": ["string", "null"], "description": "The sleeping tool (owner of the wakeup)." },
+    "status": { "type": "string", "const": "pending", "description": "Always 'pending' until woken." },
+    "summary": {
+      "type": ["string", "null"],
+      "description": "Space-separated tokens: 'reason:<r>' and 'wake_after:<iso-8601>'. Example: 'reason:idle wake_after:2026-05-30T14:00:00Z'."
+    },
+    "scope": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Optional lineage markers: 'run:<id>', 'step:<id>', 'parent-step:<id>'."
+    }
+  },
+  "required": ["kind"],
+  "examples": [
+    {
+      "kind": "standby",
+      "tool": "claude_code:01",
+      "status": "pending",
+      "summary": "reason:idle wake_after:2026-05-30T14:30:00Z",
+      "scope": ["run:RUN-42", "step:S3"]
+    }
+  ]
+}

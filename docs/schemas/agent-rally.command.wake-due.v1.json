@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-rally.command.wake-due.v1",
+  "title": "rally wake-due response",
+  "description": "B4: trust-gated wake eligibility projection. Lists standby facts whose wake_after has passed. Emits suggested_command strings only — rally never executes anything.",
+  "type": "object",
+  "properties": {
+    "ok": { "type": "boolean" },
+    "product": { "type": "string", "const": "rally" },
+    "command": { "type": "string", "const": "wake-due" },
+    "schema": { "type": "string", "const": "agent-rally.command.wake-due.v1" },
+    "data": {
+      "type": "object",
+      "properties": {
+        "due": {
+          "type": "array",
+          "description": "Standbys whose wake_after has passed and whose owner is a known room participant.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "standby_event_id": { "type": "string", "description": "event_id of the standby fact." },
+              "owner": { "type": ["string", "null"], "description": "Tool that went standby." },
+              "reason": { "type": ["string", "null"], "description": "Human-readable reason from reason: marker in summary." },
+              "wake_after": { "type": "string", "description": "ISO-8601 wake_after timestamp that has passed." },
+              "suggested_command": {
+                "type": "string",
+                "description": "Suggested shell command string for the external runner to invoke. Rally never executes this."
+              }
+            },
+            "required": ["standby_event_id", "wake_after", "suggested_command"]
+          }
+        }
+      },
+      "required": ["due"]
+    }
+  },
+  "required": ["ok", "command", "schema", "data"]
+}

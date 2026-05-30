@@ -93,6 +93,18 @@ pub(crate) enum FactKind {
     /// Subject prefix: `"receipt:"`.  Closes the referenced handoff from
     /// `open_handoffs` (same projection logic as `resolve`).
     Receipt,
+    /// B1 (pi-dynamic seam): agent declares it is going dormant and requests a
+    /// future wake signal.  Encoded fields (additive marker pattern, no struct
+    /// field changes):
+    ///   - `summary`: `"reason:<r>"` + whitespace-separated `"wake_after:<iso>"`.
+    ///   - `scope`: optional `"run:<id>"`, `"step:<id>"`, `"parent-step:<id>"`
+    ///     lineage markers so a causation DAG can be reconstructed.
+    ///   - `tool`: the sleeping tool (the one requesting the wake).
+    ///   - `status`: `"pending"` until woken.
+    ///
+    /// RALLY RECORDS ONLY. The actual model wake is performed by the external
+    /// runner (rally watch / LaunchAgent / cron). Rally never calls exec/spawn.
+    Standby,
     #[serde(other)]
     #[default]
     Unknown,
@@ -116,6 +128,7 @@ impl FactKind {
             "read" => Some(Self::Read),
             "backlog-item" => Some(Self::BacklogItem),
             "receipt" => Some(Self::Receipt),
+            "standby" => Some(Self::Standby),
             "unknown" => Some(Self::Unknown),
             _ => None,
         }
@@ -138,6 +151,7 @@ impl FactKind {
             Self::Read => "read",
             Self::BacklogItem => "backlog-item",
             Self::Receipt => "receipt",
+            Self::Standby => "standby",
             Self::Unknown => "unknown",
         }
     }
