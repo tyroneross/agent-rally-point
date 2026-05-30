@@ -737,10 +737,14 @@ fn ensure_unique_session_identity(
                 identity.session_id
             )));
         }
-        if session.tool == identity.tool {
+        // A single caller tool may hold multiple active managed sessions as
+        // long as each session's name is distinct.  Reject only a true
+        // duplicate: same tool *and* same name (which also implies the same
+        // session_id under auto-numbering, but guard it here for explicit ids).
+        if session.tool == identity.tool && session.name == identity.name {
             return Err(RallyError::Usage(format!(
-                "active managed session already uses tool {}",
-                identity.tool
+                "active managed session already uses tool {} with name {}",
+                identity.tool, identity.name
             )));
         }
         if session.name == identity.name {
@@ -1523,6 +1527,99 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Fix 1: squads[] must not contain the reserved system author "rally".
+    ///
+    /// `rally next` emits wake facts with `tool = "rally"`.  These must be
+    /// excluded from the squads projection so the system author never appears
+    /// alongside real agents.
+    #[test]
+    fn squads_excludes_reserved_system_author_rally() {
+        let root = unique_root("squads-excludes-rally");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // Register a real agent.
+        ensure_presence(&room, "claude_code:01").unwrap();
+
+        // Append a wake fact authored by the system ("rally"), as `rally next` does.
+        let wake = Fact {
+            schema: crate::FACT_SCHEMA.to_string(),
+            event_id: new_id("wake"),
+            seq: 0,
+            thread_id: "wake-thread".to_string(),
+            kind: store::FactKind::Wake,
+            tool: Some("rally".to_string()),
+            role: None,
+            subject: "wake: check in".to_string(),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: Some("claude_code:01".to_string()),
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&wake).unwrap();
+
+        let snapshot = room.snapshot().unwrap();
+        assert!(
+            !snapshot.squads.iter().any(|s| s.tool == "rally"),
+            "system author 'rally' must not appear in squads; got: {:?}",
+            snapshot.squads.iter().map(|s| &s.tool).collect::<Vec<_>>()
+        );
+        assert!(
+            snapshot.squads.iter().any(|s| s.tool == "claude_code:01"),
+            "real agent claude_code:01 must still appear in squads"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Fix 2a: a single caller tool may hold multiple active managed sessions
+    /// when each session has a distinct name.
+    #[test]
+    fn ensure_unique_session_identity_allows_distinct_names_under_same_tool() {
+        // Two sessions: same tool "lead", different names.
+        let session_a = managed_session("codex-01".to_string(), "lead".to_string());
+        let active = vec![session_a];
+
+        let identity_b = SessionIdentity {
+            name: "codex-02".to_string(),
+            session_id: "codex-02".to_string(),
+            tool: "lead".to_string(),
+        };
+        // Must succeed — different name, same tool is now allowed.
+        ensure_unique_session_identity(&identity_b, &active).expect(
+            "two distinct-name sessions under the same tool must both be accepted",
+        );
+    }
+
+    /// Fix 2b: a true duplicate (same tool + same name) must still be rejected.
+    #[test]
+    fn ensure_unique_session_identity_rejects_same_tool_and_same_name() {
+        let session_a = managed_session("codex-01".to_string(), "lead".to_string());
+        let active = vec![session_a];
+
+        let identity_dup = SessionIdentity {
+            name: "codex-01".to_string(),
+            session_id: "codex-01-b".to_string(), // different session_id to isolate the name check
+            tool: "lead".to_string(),
+        };
+        let result = ensure_unique_session_identity(&identity_dup, &active);
+        assert!(
+            result.is_err(),
+            "same tool + same name must be rejected as a duplicate session"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("lead") && msg.contains("codex-01"),
+            "error message must name the conflicting tool and name; got: {msg}"
+        );
     }
 }
 

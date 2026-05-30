@@ -28,6 +28,9 @@ pub(crate) struct DiscoveryWarning {
     pub(crate) code: String,
     pub(crate) message: String,
     pub(crate) path: Option<PathBuf>,
+    /// Set on collapsed/summary warnings that represent multiple occurrences.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) count: Option<usize>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -212,8 +215,10 @@ pub(crate) fn status_global() -> Result<GlobalStatusData> {
         }
     };
 
+    let mut missing_count: usize = 0;
     for room_entry in &index.rooms {
-        let Some(store) = open_indexed_room(room_entry, &mut warnings)? else {
+        let Some(store) = try_open_indexed_room(room_entry)? else {
+            missing_count += 1;
             continue;
         };
         let snapshot = match store.snapshot() {
@@ -260,6 +265,17 @@ pub(crate) fn status_global() -> Result<GlobalStatusData> {
         });
     }
 
+    if missing_count > 0 {
+        warnings.push(warning_count(
+            "rooms_missing",
+            format!(
+                "{missing_count} room{} in the registry no longer exist",
+                if missing_count == 1 { "" } else { "s" }
+            ),
+            missing_count,
+        ));
+    }
+
     Ok(GlobalStatusData { repos, warnings })
 }
 
@@ -272,8 +288,23 @@ pub(crate) fn recent(all: bool, include_legacy: bool, limit: i64) -> Result<Rece
     } else {
         vec![known_room_for_current(&current)?]
     };
+    let mut missing_count: usize = 0;
     for room in rooms {
-        rows.extend(recent_in_room(&room, &mut warnings)?);
+        let (room_rows, was_missing) = recent_in_room(&room, &mut warnings)?;
+        rows.extend(room_rows);
+        if was_missing {
+            missing_count += 1;
+        }
+    }
+    if missing_count > 0 {
+        warnings.push(warning_count(
+            "rooms_missing",
+            format!(
+                "{missing_count} room{} in the registry no longer exist",
+                if missing_count == 1 { "" } else { "s" }
+            ),
+            missing_count,
+        ));
     }
     if include_legacy {
         rows.extend(recent_legacy(&mut warnings)?);
@@ -365,11 +396,12 @@ fn locate_in_room(
 fn recent_in_room(
     room: &KnownRoom,
     warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<Vec<RecentRow>> {
-    let Some(store) = open_indexed_room(room, warnings)? else {
-        return Ok(Vec::new());
+) -> Result<(Vec<RecentRow>, bool)> {
+    let Some(store) = try_open_indexed_room(room)? else {
+        return Ok((Vec::new(), true));
     };
-    Ok(store
+    let _ = warnings; // retained for future per-room warnings that are not room_missing
+    let rows = store
         .facts()?
         .into_iter()
         .map(|fact| RecentRow {
@@ -384,25 +416,40 @@ fn recent_in_room(
             fact: Some(fact),
             record: None,
         })
-        .collect())
+        .collect();
+    Ok((rows, false))
 }
 
+/// Opens an indexed room without touching the warnings vec.
+/// Returns `Ok(None)` when the facts db is absent (room is stale/deleted).
+fn try_open_indexed_room(room: &KnownRoom) -> Result<Option<RoomStore>> {
+    if !room.facts_db.exists() {
+        return Ok(None);
+    }
+    RoomStore::open_existing_at(room.repo_root.clone())
+}
+
+/// Opens an indexed room, pushing a per-item `room_missing` warning when the
+/// facts db is absent. Only use this in non-looping contexts (e.g. `locate`)
+/// where at most one stale entry will be encountered per call.
 fn open_indexed_room(
     room: &KnownRoom,
     warnings: &mut Vec<DiscoveryWarning>,
 ) -> Result<Option<RoomStore>> {
-    if !room.facts_db.exists() {
-        warnings.push(warning(
-            "room_missing",
-            format!(
-                "indexed room is missing facts db: {}",
-                room.facts_db.display()
-            ),
-            Some(room.facts_db.clone()),
-        ));
-        return Ok(None);
+    match try_open_indexed_room(room)? {
+        Some(store) => Ok(Some(store)),
+        None => {
+            warnings.push(warning(
+                "room_missing",
+                format!(
+                    "indexed room is missing facts db: {}",
+                    room.facts_db.display()
+                ),
+                Some(room.facts_db.clone()),
+            ));
+            Ok(None)
+        }
     }
-    RoomStore::open_existing_at(room.repo_root.clone())
 }
 
 fn locate_in_legacy(
@@ -633,6 +680,20 @@ fn warning(
         code: code.into(),
         message: message.into(),
         path,
+        count: None,
+    }
+}
+
+fn warning_count(
+    code: impl Into<String>,
+    message: impl Into<String>,
+    count: usize,
+) -> DiscoveryWarning {
+    DiscoveryWarning {
+        code: code.into(),
+        message: message.into(),
+        path: None,
+        count: Some(count),
     }
 }
 
@@ -706,5 +767,44 @@ mod tests {
             PathBuf::from("/home/user/agent-rally-point")
         );
         let _ = fs::remove_file(&path);
+    }
+
+    /// Multiple stale registry entries must produce exactly one `rooms_missing`
+    /// warning (with `count` set) — not one warning per missing room.
+    #[test]
+    fn open_indexed_room_collapsed_warning_for_missing_rooms() {
+        // All three rooms point to paths that don't exist.
+        let rooms = vec![
+            make_known_room("/nonexistent/repo-a"),
+            make_known_room("/nonexistent/repo-b"),
+            make_known_room("/nonexistent/repo-c"),
+        ];
+
+        let mut missing_count: usize = 0;
+        let mut warnings: Vec<DiscoveryWarning> = Vec::new();
+        for room in &rooms {
+            if try_open_indexed_room(room).unwrap().is_none() {
+                missing_count += 1;
+            }
+        }
+        if missing_count > 0 {
+            warnings.push(warning_count(
+                "rooms_missing",
+                format!(
+                    "{missing_count} room{} in the registry no longer exist",
+                    if missing_count == 1 { "" } else { "s" }
+                ),
+                missing_count,
+            ));
+        }
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one collapsed warning, got {}: {warnings:?}",
+            warnings.len()
+        );
+        assert_eq!(warnings[0].code, "rooms_missing");
+        assert_eq!(warnings[0].count, Some(3));
     }
 }

@@ -677,9 +677,14 @@ impl RoomStore {
         // --- Presence projection ---
         // Collect the highest-seq fact per tool (any kind counts; presence is
         // the primary signal but a claim or artifact also proves presence).
+        // "rally" is the reserved system author (used by wake_fact); it is not
+        // a participating agent and must not appear in squads[].
         let mut tool_last: BTreeMap<String, (i64, String)> = BTreeMap::new();
         for fact in &facts {
             if let Some(tool) = &fact.tool {
+                if tool == "rally" {
+                    continue;
+                }
                 let entry = tool_last
                     .entry(tool.clone())
                     .or_insert((0, String::new()));

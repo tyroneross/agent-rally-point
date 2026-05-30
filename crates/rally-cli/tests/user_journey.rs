@@ -1137,19 +1137,27 @@ fn rally_run_assigns_numbered_agent_ids() {
     assert_eq!(first_codex["data"]["session"]["session_id"], "codex-01");
     assert_eq!(first_codex["data"]["session"]["tool"], "codex:01");
 
-    let duplicate_tool = workspace.output(&[
+    // A second session with the same --tool but a different name is now
+    // allowed (a lead may hold multiple managed sessions).  The rejection
+    // guard fires only on a true duplicate: same session-id.
+    // Force the collision by pinning --session-id to the already-live id.
+    let duplicate_session_id = workspace.output(&[
         "run",
         "codex",
         "--json",
         "--backend",
         "tmux",
-        "--tool",
-        "codex:01",
+        "--session-id",
+        "codex-01",
         "--tmux-bin",
         "/usr/bin/true",
     ]);
-    assert!(!duplicate_tool.status.success());
-    assert!(String::from_utf8_lossy(&duplicate_tool.stderr).contains("already uses tool codex:01"));
+    assert!(!duplicate_session_id.status.success());
+    let stderr = String::from_utf8_lossy(&duplicate_session_id.stderr);
+    assert!(
+        stderr.contains("already uses") && stderr.contains("codex-01"),
+        "error must name the conflicting session-id; got: {stderr}"
+    );
 
     workspace.cleanup();
 }
