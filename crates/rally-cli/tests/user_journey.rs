@@ -2507,3 +2507,278 @@ fn b13_check_ci_help_exits_zero() {
 
     workspace.cleanup();
 }
+// #6 Source-grounding integration tests
+// =========================================================================
+
+/// claim→artifact with unchanged file: expect grounded:false risk and ungrounded-artifact subject.
+/// claim→artifact with changed file: no grounded:false risk.
+#[test]
+fn advisory_6_source_grounding_unchanged_file_flags_ungrounded_artifact() {
+    let workspace = Workspace::new("advisory-6-unchanged");
+
+    // Create a source file.
+    let src = workspace.cwd.join("mylib.rs");
+    fs::write(&src, b"fn placeholder() {}").unwrap();
+
+    // claim with --path pointing to mylib.rs
+    let claim = workspace.json(&[
+        "say", "claim",
+        "--json",
+        "--tool", "test-agent",
+        "--subject", "working on mylib",
+        "--path", "mylib.rs",
+    ]);
+    assert!(claim["ok"].as_bool().unwrap_or(false), "claim must succeed");
+    let claim_id = claim["data"]["fact"]["event_id"].as_str().unwrap().to_string();
+
+    // Post artifact WITHOUT modifying mylib.rs (unchanged → ungrounded).
+    let artifact = workspace.json(&[
+        "say", "artifact",
+        "--json",
+        "--tool", "test-agent",
+        "--subject", "done with mylib",
+        "--ref", &claim_id,
+    ]);
+    assert!(artifact["ok"].as_bool().unwrap_or(false), "artifact must succeed");
+
+    // Room must have a risk fact with subject containing "ungrounded-artifact"
+    // and scope containing "grounded:false".
+    let room = workspace.json(&["room", "--json"]);
+    let risks = room["data"]["room"]["current_risks"].as_array().unwrap();
+    let ungrounded: Vec<_> = risks.iter()
+        .filter(|r| r["subject"].as_str().unwrap_or("").contains("ungrounded-artifact"))
+        .collect();
+    assert!(
+        !ungrounded.is_empty(),
+        "expected ungrounded-artifact risk fact; risks: {:?}",
+        risks.iter().map(|r| r["subject"].as_str().unwrap_or("")).collect::<Vec<_>>()
+    );
+    let scope = ungrounded[0]["scope"].as_array().unwrap();
+    assert!(
+        scope.iter().any(|s| s.as_str() == Some("grounded:false")),
+        "risk scope must contain grounded:false; scope: {:?}", scope
+    );
+    assert_eq!(
+        ungrounded[0]["severity"].as_str().unwrap_or(""),
+        "warn",
+        "risk severity must be warn"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn advisory_6_source_grounding_changed_file_does_not_flag() {
+    let workspace = Workspace::new("advisory-6-changed");
+
+    let src = workspace.cwd.join("changed.rs");
+    fs::write(&src, b"fn before() {}").unwrap();
+
+    let claim = workspace.json(&[
+        "say", "claim",
+        "--json",
+        "--tool", "test-agent",
+        "--subject", "working on changed",
+        "--path", "changed.rs",
+    ]);
+    let claim_id = claim["data"]["fact"]["event_id"].as_str().unwrap().to_string();
+
+    // Modify the file before posting the artifact.
+    fs::write(&src, b"fn after_modification() {}").unwrap();
+
+    let artifact = workspace.json(&[
+        "say", "artifact",
+        "--json",
+        "--tool", "test-agent",
+        "--subject", "done with changed",
+        "--ref", &claim_id,
+    ]);
+    assert!(artifact["ok"].as_bool().unwrap_or(false), "artifact must succeed");
+
+    let room = workspace.json(&["room", "--json"]);
+    let risks = room["data"]["room"]["current_risks"].as_array().unwrap();
+    let ungrounded: Vec<_> = risks.iter()
+        .filter(|r| r["subject"].as_str().unwrap_or("").contains("ungrounded-artifact"))
+        .collect();
+    assert!(
+        ungrounded.is_empty(),
+        "changed file must NOT produce ungrounded-artifact risk; risks: {:?}",
+        ungrounded
+    );
+
+    workspace.cleanup();
+}
+
+// =========================================================================
+// #8 Ripple detector integration test
+// =========================================================================
+
+/// Ripple alert fires when a changed file's pub fn is referenced by a peer claim's file.
+#[test]
+fn advisory_8_ripple_alert_fires_on_pub_sig_change_affecting_peer_claim() {
+    let workspace = Workspace::new("advisory-8-ripple");
+
+    // Set up source structure.
+    fs::create_dir_all(workspace.cwd.join("src")).unwrap();
+    fs::create_dir_all(workspace.cwd.join("consumer")).unwrap();
+
+    let provider = workspace.cwd.join("src/provider.rs");
+    fs::write(&provider, b"pub fn shared_api() -> i32 { 0 }").unwrap();
+
+    let consumer = workspace.cwd.join("consumer/main.rs");
+    fs::write(&consumer, b"let x = shared_api();").unwrap();
+
+    // peer-tool claims consumer/main.rs
+    let peer_claim = workspace.json(&[
+        "say", "claim",
+        "--json",
+        "--tool", "peer-tool",
+        "--subject", "peer owns consumer",
+        "--path", "consumer/main.rs",
+    ]);
+    assert!(peer_claim["ok"].as_bool().unwrap_or(false));
+    let peer_claim_id = peer_claim["data"]["fact"]["event_id"].as_str().unwrap().to_string();
+
+    // my-tool claims src/provider.rs
+    let my_claim = workspace.json(&[
+        "say", "claim",
+        "--json",
+        "--tool", "my-tool",
+        "--subject", "my-tool owns provider",
+        "--path", "src/provider.rs",
+    ]);
+    assert!(my_claim["ok"].as_bool().unwrap_or(false));
+    let my_claim_id = my_claim["data"]["fact"]["event_id"].as_str().unwrap().to_string();
+
+    // Modify src/provider.rs (so grounding sees it as changed).
+    fs::write(&provider, b"pub fn shared_api() -> i32 { 1 } pub fn new_fn() {}").unwrap();
+
+    // my-tool posts artifact closing its claim (ref → my_claim_id).
+    let artifact = workspace.json(&[
+        "say", "artifact",
+        "--json",
+        "--tool", "my-tool",
+        "--subject", "provider updated",
+        "--ref", &my_claim_id,
+    ]);
+    assert!(artifact["ok"].as_bool().unwrap_or(false), "artifact must succeed");
+
+    // Room must have a ripple-alert risk fact targeting peer-tool.
+    let room = workspace.json(&["room", "--json"]);
+    let risks = room["data"]["room"]["current_risks"].as_array().unwrap();
+    let ripple: Vec<_> = risks.iter()
+        .filter(|r| r["subject"].as_str().unwrap_or("").contains("ripple-alert"))
+        .collect();
+    assert!(
+        !ripple.is_empty(),
+        "expected ripple-alert risk fact; risks: {:?}",
+        risks.iter().map(|r| r["subject"].as_str().unwrap_or("")).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        ripple[0]["severity"].as_str().unwrap_or(""),
+        "warn",
+        "ripple-alert severity must be warn"
+    );
+    assert!(
+        ripple[0]["subject"].as_str().unwrap_or("").contains("peer-tool"),
+        "ripple-alert subject must name the affected peer; got: {:?}",
+        ripple[0]["subject"]
+    );
+
+    // Suppress unused variable warning for peer_claim_id.
+    let _ = peer_claim_id;
+
+    workspace.cleanup();
+}
+
+// =========================================================================
+// #9 Tier-fit advisory integration tests
+// =========================================================================
+
+/// tier-fit --help exits 0.
+#[test]
+fn advisory_9_tier_fit_help_exits_zero() {
+    let workspace = Workspace::new("advisory-9-help");
+    let output = workspace.output(&["check", "tier-fit", "--help"]);
+    assert!(
+        output.status.success(),
+        "rally check tier-fit --help must exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    workspace.cleanup();
+}
+
+/// Without a calibration fact, tier-fit returns neutral no_calibration status.
+#[test]
+fn advisory_9_tier_fit_no_calibration_returns_neutral() {
+    let workspace = Workspace::new("advisory-9-no-cal");
+    let result = workspace.json(&[
+        "check", "tier-fit",
+        "--json",
+        "--role", "executor",
+        "--proposed-tier", "opus",
+    ]);
+    assert!(result["ok"].as_bool().unwrap_or(false), "tier-fit must succeed (advisory)");
+    let status = result["data"]["check"]["tier_fit"]["status"].as_str().unwrap_or("");
+    assert_eq!(status, "no_calibration", "must return no_calibration when no fact present");
+    workspace.cleanup();
+}
+
+/// With a calibration fact, mismatch emits a tier_mismatch finding.
+#[test]
+fn advisory_9_tier_fit_mismatch_emits_finding_vs_calibration() {
+    let workspace = Workspace::new("advisory-9-mismatch");
+
+    // Post a tier-calibration decision fact.
+    workspace.json(&[
+        "say", "decision",
+        "--json",
+        "--tool", "lead",
+        "--subject", "tier-calibration",
+        "--scope", "tier-calibration",
+        "--summary", "role:executor=cheapest:sonnet",
+    ]);
+
+    let result = workspace.json(&[
+        "check", "tier-fit",
+        "--json",
+        "--role", "executor",
+        "--proposed-tier", "opus",
+    ]);
+    assert!(result["ok"].as_bool().unwrap_or(false));
+    let status = result["data"]["check"]["tier_fit"]["status"].as_str().unwrap_or("");
+    assert_eq!(status, "mismatch", "must be mismatch when proposed tier != calibrated cheapest");
+    let finding_code = result["data"]["check"]["tier_fit"]["finding"]["code"].as_str().unwrap_or("");
+    assert_eq!(finding_code, "tier_mismatch");
+    let finding_severity = result["data"]["check"]["tier_fit"]["finding"]["severity"].as_str().unwrap_or("");
+    assert_eq!(finding_severity, "info", "tier mismatch is advisory info, not blocking");
+
+    workspace.cleanup();
+}
+
+/// With a matching tier, tier-fit returns ok.
+#[test]
+fn advisory_9_tier_fit_ok_when_matching_calibration() {
+    let workspace = Workspace::new("advisory-9-ok");
+
+    workspace.json(&[
+        "say", "decision",
+        "--json",
+        "--tool", "lead",
+        "--subject", "tier-calibration",
+        "--scope", "tier-calibration",
+        "--summary", "role:executor=cheapest:sonnet",
+    ]);
+
+    let result = workspace.json(&[
+        "check", "tier-fit",
+        "--json",
+        "--role", "executor",
+        "--proposed-tier", "sonnet",
+    ]);
+    assert!(result["ok"].as_bool().unwrap_or(false));
+    let status = result["data"]["check"]["tier_fit"]["status"].as_str().unwrap_or("");
+    assert_eq!(status, "ok");
+
+    workspace.cleanup();
+}

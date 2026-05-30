@@ -80,3 +80,4 @@ target/
 
 # uv lockfile — library-style project; downstream pipx installs resolve own deps.
 uv.lock
+.claude/worktrees/

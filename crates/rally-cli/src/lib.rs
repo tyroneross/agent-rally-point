@@ -59,7 +59,10 @@ mod output;
 mod retrospective;
 mod rotate;
 mod route_findings;
+mod source_grounding;
+mod ripple;
 mod store;
+mod tier_fit;
 
 use backends::*;
 use backlog::{BacklogItem, add_backlog_item, list_backlog_items};
@@ -470,11 +473,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
     // Component B: auto-register presence for the calling tool before writing.
     ensure_presence(&room, &args.tool)?;
 
-    // B13: encode --produces / --depends as markers in evidence so the
-    // claim is self-describing without any Fact struct changes.
-    // Format mirrors existing patterns (build_id:, read_seq:, external-intake):
-    //   produces:<path-or-symbol>
-    //   depends:<path-or-symbol>
+    // B13: encode --produces / --depends as markers in evidence (self-describing claim).
     let mut evidence = args.evidence;
     for p in &args.produces {
         evidence.push(format!("produces:{p}"));
@@ -482,6 +481,36 @@ fn command_say(args: SayArgs) -> Result<Output> {
     for d in &args.depends {
         evidence.push(format!("depends:{d}"));
     }
+
+    // #6 source-grounding: at claim, snapshot content hashes of all claimed file
+    // paths and store them as `claimhash:<rel>=<hash>` in evidence.
+    let repo_root_for_grounding = repo_root().ok();
+    if kind == FactKind::Claim {
+        if let Some(ref root) = repo_root_for_grounding {
+            // Collect file: scope entries only (exclude external-intake).
+            let file_scopes: Vec<String> = scope
+                .iter()
+                .filter(|s| s.starts_with("file:") && !scope.contains(&"external-intake".to_string()))
+                .cloned()
+                .collect();
+            if !file_scopes.is_empty() {
+                let hashes = source_grounding::claim_hashes(root, &file_scopes);
+                evidence.extend(hashes);
+            }
+        }
+    }
+
+    // #6 source-grounding (artifact): look up claim-open hashes from the ref'd claim fact.
+    let grounding_claim_evidence: Vec<String> = if kind == FactKind::Artifact {
+        args.ref_id.as_ref()
+            .and_then(|ref_id| {
+                room.facts().ok()?.into_iter().find(|f| f.event_id == *ref_id)
+            })
+            .map(|f| f.evidence)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     let fact = Fact {
         schema: FACT_SCHEMA.to_string(),
@@ -550,6 +579,66 @@ fn command_say(args: SayArgs) -> Result<Output> {
             code: "external-intake".to_string(),
             message: risk_summary,
         });
+    }
+
+    // #6 source-grounding (artifact): re-hash claimed files; flag ungrounded ones.
+    // #8 ripple: detect changed pub signatures affecting peer claims.
+    if kind == FactKind::Artifact {
+        if let Some(ref root) = repo_root_for_grounding {
+            let original_hashes = source_grounding::parse_claim_hashes(&grounding_claim_evidence);
+            if !original_hashes.is_empty() {
+                let unchanged = source_grounding::ungrounded_paths(root, &original_hashes);
+                if !unchanged.is_empty() {
+                    // Append grounded:false marker risk facts — one per unchanged file.
+                    for path in &unchanged {
+                        let risk_summary = format!(
+                            "ungrounded-artifact: {path} unchanged since claim — no evidence of work; artifact may be a dropped-work indicator. Recorded for audit."
+                        );
+                        let risk_fact = Fact {
+                            schema: FACT_SCHEMA.to_string(),
+                            event_id: new_id("fact"),
+                            seq: 0,
+                            thread_id: new_id("room"),
+                            kind: FactKind::Risk,
+                            tool: Some(args.tool.clone()),
+                            role: None,
+                            subject: format!("ungrounded-artifact: {path} unchanged since claim"),
+                            scope: vec!["grounded:false".to_string()],
+                            created_at: now_string(),
+                            summary: Some(risk_summary),
+                            evidence: vec![format!("artifact_ref:{}", fact.event_id)],
+                            target: None,
+                            ref_id: Some(fact.event_id.clone()),
+                            status: None,
+                            severity: Some("warn".to_string()),
+                            uri: None,
+                            session: None,
+                        };
+                        let _ = room.append_fact(&risk_fact);
+                    }
+                }
+
+                // #8 ripple: for files that CHANGED, detect pub sig changes
+                // affecting peer claims. Best-effort; never blocks.
+                let changed_files: Vec<String> = original_hashes
+                    .keys()
+                    .filter(|p| !unchanged.contains(p))
+                    .cloned()
+                    .collect();
+                if !changed_files.is_empty() {
+                    let snap_for_ripple = room.snapshot().unwrap_or_default();
+                    let ripple_facts = ripple::build_ripple_alerts(
+                        &changed_files,
+                        root,
+                        &args.tool,
+                        &snap_for_ripple,
+                    );
+                    for rf in ripple_facts {
+                        let _ = room.append_fact(&rf);
+                    }
+                }
+            }
+        }
     }
 
     let snapshot = room.snapshot()?;
@@ -1086,6 +1175,52 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
 
 fn command_check(args: CheckArgs) -> Result<Output> {
     let phase = args.phase;
+
+    // #9 tier-fit advisory: handled before the standard check phases.
+    if phase == "tier-fit" {
+        let role = args.role.as_deref().unwrap_or("").to_string();
+        if role.is_empty() {
+            return Err(RallyError::Usage(
+                "check tier-fit requires --role <role>".to_string(),
+            ));
+        }
+        let room = RoomStore::open()?;
+        let snapshot = room.snapshot()?;
+        let result = tier_fit::check_tier_fit(
+            &role,
+            args.proposed_tier.as_deref(),
+            &snapshot,
+        );
+        let finding_count = if result.finding.is_some() { 1 } else { 0 };
+        let text = format!(
+            "check tier-fit status={} role={} findings={finding_count}",
+            result.status, role
+        );
+
+        #[derive(schemars::JsonSchema, serde::Serialize)]
+        struct TierFitCheckData {
+            check: TierFitCheckResult,
+        }
+        #[derive(schemars::JsonSchema, serde::Serialize)]
+        struct TierFitCheckResult {
+            phase: &'static str,
+            advisory: bool,
+            tier_fit: tier_fit::TierFitResult,
+        }
+        let body = envelope(
+            "check",
+            SCHEMA_CHECK,
+            TierFitCheckData {
+                check: TierFitCheckResult {
+                    phase: "tier-fit",
+                    advisory: true,
+                    tier_fit: result,
+                },
+            },
+        )?;
+        return Ok(Output::new(args.json, text, body));
+    }
+
     let tool = match args.tool {
         Some(tool) if phase == "before-write" && tool == "unknown" => {
             return Err(RallyError::Usage(
