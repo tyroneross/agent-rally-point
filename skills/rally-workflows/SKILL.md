@@ -101,6 +101,11 @@ rally next --tool <TOOL>
 A `check before-write --strict` that returns a blocking finding **stops the agent** — it does not
 proceed; it either resolves the conflict or moves to a non-overlapping task.
 
+**Quality wrapper (recommended):** run each task's *do the work* step through
+[`mini-loop`](../mini-loop/SKILL.md) — a zero-dependency assess → plan → execute → mini-judge loop
+that checks the result against the task's own `validation` and `output` contract before it posts an
+artifact. It catches a wrong-but-plausible result at the task instead of at integration.
+
 ## 5 · Aggregate
 
 ```bash
