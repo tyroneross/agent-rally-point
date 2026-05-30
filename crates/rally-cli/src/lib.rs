@@ -413,7 +413,14 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // ensure_presence ran will still appear as new (its seq < snapshot_before.max_seq
     // was already captured in the pre-enter max_seq, which is the same lower bound).
     let cursor_after = snapshot.max_seq;
+    // Write-through cache (cursors.json) kept for fast-path readers.
     room.set_cursor(&tool, cursor_after)?;
+    // R10: also advance the ledger so cursor_for() is ledger-derived on
+    // re-enter. Uses content_max_seq (excludes Read facts) to prevent the
+    // checkpoint itself from inflating the cursor on the next enter.
+    // maybe_append_read_checkpoint's own guard prevents double-counting when
+    // cursor_after == last_checkpoint_seq (coalesces if no advancement).
+    room.maybe_append_read_checkpoint(&tool, snapshot.content_max_seq)?;
     let body = envelope(
         "enter",
         SCHEMA_ENTER,

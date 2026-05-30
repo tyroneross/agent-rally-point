@@ -10,6 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct Workspace {
     cwd: PathBuf,
     home: PathBuf,
+    /// When true, passes RALLY_GLOBAL_INDEX=1 to every command (opt-in for
+    /// tests that exercise cross-repo status).
+    global_index: bool,
 }
 
 impl Workspace {
@@ -19,7 +22,7 @@ impl Workspace {
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
-        Self { cwd, home }
+        Self { cwd, home, global_index: false }
     }
 
     /// Create a workspace sharing an existing home directory.
@@ -27,7 +30,13 @@ impl Workspace {
         let cwd = temp_path(&format!("{name}-cwd"));
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
-        Self { cwd, home }
+        Self { cwd, home, global_index: false }
+    }
+
+    /// Enable RALLY_GLOBAL_INDEX=1 for all commands run through this workspace.
+    fn with_global_index(mut self) -> Self {
+        self.global_index = true;
+        self
     }
 
     fn json(&self, args: &[&str]) -> Value {
@@ -43,12 +52,12 @@ impl Workspace {
     }
 
     fn output(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_rally"))
-            .current_dir(&self.cwd)
-            .env("HOME", &self.home)
-            .args(args)
-            .output()
-            .unwrap()
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
+        cmd.current_dir(&self.cwd).env("HOME", &self.home);
+        if self.global_index {
+            cmd.env("RALLY_GLOBAL_INDEX", "1");
+        }
+        cmd.args(args).output().unwrap()
     }
 
     fn cleanup(self) {
@@ -209,7 +218,10 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
     fs::create_dir_all(&home).unwrap();
 
     // --- Repo A ---
-    let repo_a = Workspace::new_with_home("rally-status-global-repo-a", home.clone());
+    // B17: global index is opt-in; set RALLY_GLOBAL_INDEX=1 so enter writes to
+    // the cross-repo index and status --global can see both repos.
+    let repo_a = Workspace::new_with_home("rally-status-global-repo-a", home.clone())
+        .with_global_index();
     // Enter as tool_a (first enter → lead)
     let enter_a = repo_a.json(&["enter", "--tool", "tool_a", "--json"]);
     assert_eq!(enter_a["data"]["tool"], "tool_a", "repo_a enter failed");
@@ -222,7 +234,8 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
     ]);
 
     // --- Repo B ---
-    let repo_b = Workspace::new_with_home("rally-status-global-repo-b", home.clone());
+    let repo_b = Workspace::new_with_home("rally-status-global-repo-b", home.clone())
+        .with_global_index();
     // Enter as tool_b (first enter → lead)
     let enter_b = repo_b.json(&["enter", "--tool", "tool_b", "--json"]);
     assert_eq!(enter_b["data"]["tool"], "tool_b", "repo_b enter failed");

@@ -203,10 +203,21 @@ pub(crate) fn run_prune_rooms(apply: bool) -> Result<PruneRoomsReport> {
 // Internal helpers — thin wrappers that avoid re-exporting private discovery types
 // =============================================================================
 
-/// Mirror of `discovery::room_index_path` — returns None when RALLY_NO_GLOBAL_INDEX is set.
+/// Mirror of `discovery::room_index_path` — global index is opt-in (default off).
+///
+/// Returns `Some(path)` only when `RALLY_GLOBAL_INDEX` is set and non-empty,
+/// AND `RALLY_NO_GLOBAL_INDEX` is not set.  No env vars → `None`.
 fn room_index_path_pub() -> Option<std::path::PathBuf> {
     use std::env;
+    // Kill-switch wins unconditionally (back-compat).
     if env::var_os("RALLY_NO_GLOBAL_INDEX")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    // Must explicitly opt in.
+    if !env::var_os("RALLY_GLOBAL_INDEX")
         .map(|v| !v.is_empty())
         .unwrap_or(false)
     {

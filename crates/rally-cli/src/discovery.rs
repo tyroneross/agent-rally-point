@@ -198,7 +198,7 @@ pub(crate) fn status_global() -> Result<GlobalStatusData> {
     let Some(index_path) = room_index_path() else {
         warnings.push(warning(
             "global_index_disabled",
-            "RALLY_NO_GLOBAL_INDEX is set; cross-repo status unavailable",
+            "global index disabled (opt in with RALLY_GLOBAL_INDEX=1); showing this repo only",
             None,
         ));
         return Ok(GlobalStatusData { repos, warnings });
@@ -516,12 +516,26 @@ fn write_room_index_at(path: &Path, index: &RoomIndex) -> Result<()> {
 /// within any single repo — only the cross-repo "what other rooms do I
 /// know about?" surface.
 ///
-/// Setting `RALLY_NO_GLOBAL_INDEX=1` (any non-empty value) returns `None`,
-/// which both `refresh_room_index` and `known_rooms_with_current` already
-/// treat as the fully-isolated mode: no writes to the index, no reads of
-/// the index, and `--all` collapses to "this repo only".
+/// Global index is **opt-in** (default: off / one-store mode).
+///
+/// Returns `Some(path)` only when ALL of the following hold:
+///   1. `RALLY_GLOBAL_INDEX` is set to a non-empty value (`1`, `true`, etc.)
+///   2. `RALLY_NO_GLOBAL_INDEX` is NOT set (legacy kill-switch takes priority)
+///
+/// With no env vars set the default is `None` — per-repo isolation, no
+/// cross-repo index reads or writes.  Set `RALLY_GLOBAL_INDEX=1` to opt in.
+/// Setting `RALLY_NO_GLOBAL_INDEX` always overrides regardless of
+/// `RALLY_GLOBAL_INDEX` (back-compat: existing opt-out scripts still work).
 fn room_index_path() -> Option<PathBuf> {
+    // Kill-switch wins unconditionally (back-compat).
     if env::var_os("RALLY_NO_GLOBAL_INDEX")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    // Must explicitly opt in.
+    if !env::var_os("RALLY_GLOBAL_INDEX")
         .map(|v| !v.is_empty())
         .unwrap_or(false)
     {
@@ -1114,5 +1128,67 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&home).ok();
+    }
+
+    /// B17: room_index_path() must default to None (global index off by default).
+    ///
+    /// Three cases:
+    ///   1. No env vars → None (one-store default)
+    ///   2. RALLY_GLOBAL_INDEX=1 → Some(path)
+    ///   3. RALLY_GLOBAL_INDEX=1 + RALLY_NO_GLOBAL_INDEX=1 → None (kill-switch wins)
+    ///
+    /// Uses a process-level mutex so env mutations don't race other tests that
+    /// also read these env vars.
+    #[test]
+    fn b17_room_index_path_defaults_off_opt_in_and_killswitch() {
+        use std::sync::Mutex;
+        // One global lock for all env-touching tests in this binary.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // SAFETY: single-threaded via mutex; no other threads read these vars
+        // while the lock is held. Required by Rust's unsafe contract on set/remove_var.
+
+        // --- Case 1: no env vars → None ---
+        unsafe {
+            std::env::remove_var("RALLY_GLOBAL_INDEX");
+            std::env::remove_var("RALLY_NO_GLOBAL_INDEX");
+        }
+        assert!(
+            room_index_path().is_none(),
+            "default (no env vars) must return None — global index is off by default"
+        );
+
+        // --- Case 2: opt-in → Some ---
+        unsafe {
+            std::env::set_var("RALLY_GLOBAL_INDEX", "1");
+            std::env::remove_var("RALLY_NO_GLOBAL_INDEX");
+        }
+        let path = room_index_path();
+        assert!(
+            path.is_some(),
+            "RALLY_GLOBAL_INDEX=1 must return Some(path)"
+        );
+        let p = path.unwrap();
+        assert!(
+            p.ends_with(".agent-rally-point/rooms/v1/index.json"),
+            "opt-in path must point at the global index: got {p:?}"
+        );
+
+        // --- Case 3: both set — kill-switch wins → None ---
+        unsafe {
+            std::env::set_var("RALLY_GLOBAL_INDEX", "1");
+            std::env::set_var("RALLY_NO_GLOBAL_INDEX", "1");
+        }
+        assert!(
+            room_index_path().is_none(),
+            "RALLY_NO_GLOBAL_INDEX must override RALLY_GLOBAL_INDEX (kill-switch wins)"
+        );
+
+        // Restore clean state.
+        unsafe {
+            std::env::remove_var("RALLY_GLOBAL_INDEX");
+            std::env::remove_var("RALLY_NO_GLOBAL_INDEX");
+        }
     }
 }

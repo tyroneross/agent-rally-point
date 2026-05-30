@@ -998,7 +998,17 @@ impl RoomStore {
         })
     }
 
+    /// Return the current read cursor for `tool`.
+    ///
+    /// R10 ledger-first: if the ledger contains a `FactKind::Read` checkpoint
+    /// for this tool, that value is the source of truth (durable, survives
+    /// `cursors.json` deletion). Falls back to `cursors.json` only when no
+    /// ledger checkpoint exists, preserving backwards compatibility.
     pub(crate) fn cursor_for(&self, tool: &str) -> Result<i64> {
+        let ledger_seq = self.last_checkpoint_seq(tool)?;
+        if ledger_seq > 0 {
+            return Ok(ledger_seq);
+        }
         Ok(self.read_cursors()?.get(tool).copied().unwrap_or(0))
     }
 
@@ -3061,6 +3071,81 @@ mod ledger_tests {
         assert_eq!(
             read_count, 1,
             "5 no-advance polls with content_max_seq must produce only 1 read-checkpoint (anti-loop guard)"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// R10-cursor-ledger-primary: cursor_for() must return the ledger-derived
+    /// position even when cursors.json is absent, and must not drift on
+    /// repeated checkpoints (enter → append → re-enter stability).
+    ///
+    /// Simulates the pattern `command_enter` uses:
+    ///   1. set_cursor + maybe_append_read_checkpoint (enter)
+    ///   2. append substantive facts (peer activity)
+    ///   3. delete cursors.json (simulate lost side-file)
+    ///   4. assert cursor_for still returns ledger value
+    ///   5. advance checkpoint (second enter) — assert stable, not inflating
+    #[test]
+    fn r10_cursor_for_is_ledger_derived_survives_cursors_json_deletion() {
+        let root = unique_root("r10-cursor-ledger-primary");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        // Step 1: simulate first enter — write both the side-file cache and a ledger checkpoint.
+        let snap0 = store.snapshot().unwrap();
+        let cursor_after_enter1 = snap0.max_seq; // 0 at start
+        store.set_cursor("tool-a", cursor_after_enter1).unwrap();
+        // content_max_seq is 0 here; maybe_append_read_checkpoint coalesces at 0 (no-op is ok).
+        // Post a substantive fact first so content_max > 0 before the checkpoint.
+        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "first claim")).unwrap();
+        let snap1 = store.snapshot().unwrap();
+        let content_max1 = snap1.content_max_seq;
+        assert_eq!(content_max1, 1, "one substantive fact → content_max_seq == 1");
+
+        // Record a real ledger checkpoint for tool-a.
+        let cp = store.maybe_append_read_checkpoint("tool-a", content_max1).unwrap();
+        assert!(cp.is_some(), "first checkpoint must be written");
+
+        // Step 2: append more substantive facts (peer activity after the enter).
+        store.append_fact(&make_fact("e2", FactKind::Decision, "src/", "decision")).unwrap();
+        store.append_fact(&make_fact("e3", FactKind::Risk, "src/", "risk")).unwrap();
+
+        // Step 3: delete cursors.json to prove ledger is the source of truth.
+        let cursor_path = root.join(".rally").join("cursors.json");
+        if cursor_path.exists() {
+            fs::remove_file(&cursor_path).expect("delete cursors.json for test");
+        }
+        assert!(!cursor_path.exists(), "cursors.json must be gone before testing cursor_for");
+
+        // Step 4: cursor_for must still return content_max1 from the ledger checkpoint.
+        let recovered = store.cursor_for("tool-a").unwrap();
+        assert_eq!(
+            recovered, content_max1,
+            "cursor_for must return ledger checkpoint value even with cursors.json deleted"
+        );
+
+        // Step 5: simulate second enter — advance checkpoint to current content_max.
+        let snap2 = store.snapshot().unwrap();
+        let content_max2 = snap2.content_max_seq;
+        // e1 (seq=1) + read-checkpoint (seq=2, excluded from content_max) +
+        // e2 (seq=3) + e3 (seq=4) → content_max_seq = 4 (highest non-read seq).
+        assert_eq!(content_max2, 4, "three substantive facts (e1/e2/e3) with one intervening read-checkpoint → content_max_seq == 4");
+
+        let cp2 = store.maybe_append_read_checkpoint("tool-a", content_max2).unwrap();
+        assert!(cp2.is_some(), "second checkpoint must advance (content advanced from 1 to 3)");
+
+        // cursor_for must now return the new higher value — no inflation, stable.
+        let after_re_enter = store.cursor_for("tool-a").unwrap();
+        assert_eq!(
+            after_re_enter, content_max2,
+            "cursor_for after re-enter must equal advanced checkpoint, not inflate further"
+        );
+
+        // Calling cursor_for a third time must return the same value (idempotent).
+        let idempotent = store.cursor_for("tool-a").unwrap();
+        assert_eq!(
+            idempotent, after_re_enter,
+            "cursor_for must be idempotent — no side effects on repeated reads"
         );
 
         fs::remove_dir_all(&root).ok();

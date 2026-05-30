@@ -14,6 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 struct Workspace {
     cwd: PathBuf,
     home: PathBuf,
+    /// When true, passes RALLY_GLOBAL_INDEX=1 to every command.
+    global_index: bool,
 }
 
 impl Workspace {
@@ -23,7 +25,7 @@ impl Workspace {
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
-        Self { cwd, home }
+        Self { cwd, home, global_index: false }
     }
 
     fn new_with_home(name: &str, home: &Path) -> Self {
@@ -34,7 +36,14 @@ impl Workspace {
         Self {
             cwd,
             home: home.to_path_buf(),
+            global_index: false,
         }
+    }
+
+    /// Enable RALLY_GLOBAL_INDEX=1 for all commands run through this workspace.
+    fn with_global_index(mut self) -> Self {
+        self.global_index = true;
+        self
     }
 
     fn json(&self, args: &[&str]) -> Value {
@@ -55,12 +64,12 @@ impl Workspace {
     }
 
     fn output(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_rally"))
-            .current_dir(&self.cwd)
-            .env("HOME", &self.home)
-            .args(args)
-            .output()
-            .unwrap()
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
+        cmd.current_dir(&self.cwd).env("HOME", &self.home);
+        if self.global_index {
+            cmd.env("RALLY_GLOBAL_INDEX", "1");
+        }
+        cmd.args(args).output().unwrap()
     }
 
     fn cleanup(self) {
@@ -246,15 +255,19 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
         "--path",
         "src/room.rs",
     ]);
-    // Quirk fix: second enter's cursor_before = 6 (post-presence max_seq from
-    // first enter). The second enter detects codex as already active (B11) and
-    // writes a durable risk fact (seq 7) before ensure_presence runs; then
-    // ensure_presence is idempotent (no new presence/lead). cursor_after is set
-    // to post-presence max_seq=7 (risk fact included — it's a real audit event).
-    // Codex's own presence fact (seq 6) is correctly excluded: cursor_before=6
-    // means it is below the window's lower bound.
+    // R10/cursor: second enter's cursor_before = 6 (ledger-derived from the
+    // Read checkpoint written by the first enter, which recorded content_max_seq=6).
+    // The second enter detects codex as already active (B11) and writes a durable
+    // risk fact before ensure_presence runs; then ensure_presence is idempotent
+    // (no new presence/lead).
+    // Seq breakdown after first enter:
+    //   1: presence(claude), 2: lead(claude), 3: claim, 4: presence(pi), 5: decision
+    //   6: presence(codex) — first enter's ensure_presence
+    //   7: Read checkpoint (first enter's maybe_append_read_checkpoint at content_max=6)
+    //   8: B11 risk fact (second enter's drift detection)
+    // cursor_after = snapshot.max_seq = 8.
     assert_eq!(enter_again["data"]["cursor"]["before"], 6);
-    assert_eq!(enter_again["data"]["cursor"]["after"], 7);
+    assert_eq!(enter_again["data"]["cursor"]["after"], 8);
     assert_eq!(enter_again["data"]["cursor"]["advanced"], true);
 
     let (check, check_output) = workspace.json_with_status(&[
@@ -1306,8 +1319,9 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
 #[test]
 fn rally_locate_and_recent_discover_rooms_without_legacy() {
     let home = temp_path("rally-discovery-home");
-    let repo_a = Workspace::new_with_home("rally-discovery-a", &home);
-    let repo_b = Workspace::new_with_home("rally-discovery-b", &home);
+    // B17: global index is opt-in; these workspaces use cross-repo locate/recent.
+    let repo_a = Workspace::new_with_home("rally-discovery-a", &home).with_global_index();
+    let repo_b = Workspace::new_with_home("rally-discovery-b", &home).with_global_index();
 
     let decision = repo_a.json(&[
         "say",
@@ -1394,7 +1408,8 @@ fn rally_locate_and_recent_discover_rooms_without_legacy() {
 #[test]
 fn rally_refresh_does_not_clobber_corrupt_room_index() {
     let home = temp_path("rally-corrupt-index-home");
-    let workspace = Workspace::new_with_home("rally-corrupt-index", &home);
+    // B17: global index is opt-in; this test exercises the corrupt-index recovery path.
+    let workspace = Workspace::new_with_home("rally-corrupt-index", &home).with_global_index();
     let index_path = home.join(".agent-rally-point/rooms/v1/index.json");
     fs::create_dir_all(index_path.parent().unwrap()).unwrap();
     fs::write(&index_path, "{not-json").unwrap();
@@ -1531,6 +1546,7 @@ fn linked_git_worktree_uses_common_room() {
     let linked = Workspace {
         cwd: temp_path("rally-common-room-linked"),
         home: home.clone(),
+        global_index: false,
     };
     fs::create_dir_all(&linked.cwd).unwrap();
     let linked_git_dir = primary.cwd.join(".git/worktrees/rally-common-room-linked");
