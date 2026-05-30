@@ -164,7 +164,8 @@ fn rally_uses_factstr_sqlite_as_the_fact_store() {
 
     let room = workspace.json(&["room", "--json"]);
     assert_eq!(room["ok"], true);
-    assert_eq!(room["data"]["room"]["max_seq"], 1);
+    // Component B: say auto-registers presence (1) + lead (2) + artifact (3).
+    assert_eq!(room["data"]["room"]["max_seq"], 3);
 
     workspace.cleanup();
 }
@@ -214,7 +215,9 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
     assert_eq!(enter["schema"], "agent-rally.command.enter.v1");
     assert_matches_schema("agent-rally.command.enter.v1.json", &enter);
     assert_eq!(enter["data"]["cursor"]["before"], 0);
-    assert_eq!(enter["data"]["cursor"]["after"], 2);
+    // Component B: say claim (claude) wrote presence(1)+lead(2)+claim(3);
+    // say decision (pi) wrote presence(4)+decision(5). Enter cursor_after = 5.
+    assert_eq!(enter["data"]["cursor"]["after"], 5);
     assert_eq!(enter["data"]["cursor"]["advanced"], true);
     assert!(
         enter["data"]["entry"]["do_not"]
@@ -240,10 +243,12 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
         "--path",
         "src/room.rs",
     ]);
-    // The first enter wrote 2 facts (presence + role:lead decision), so the
-    // room advanced to seq 4. The second enter sees those and advances its cursor.
-    assert_eq!(enter_again["data"]["cursor"]["before"], 2);
-    assert_eq!(enter_again["data"]["cursor"]["after"], 4);
+    // Component B: first enter (codex) wrote presence(6) via ensure_presence
+    // (lead already set by claude). cursor was set to 5 (pre-enter max_seq).
+    // Second enter: cursor_before=5, max_seq before=6, no new facts (codex
+    // already in squads), cursor_after=6.
+    assert_eq!(enter_again["data"]["cursor"]["before"], 5);
+    assert_eq!(enter_again["data"]["cursor"]["after"], 6);
     assert_eq!(enter_again["data"]["cursor"]["advanced"], true);
 
     let (check, check_output) = workspace.json_with_status(&[
@@ -1545,7 +1550,8 @@ fn linked_git_worktree_uses_common_room() {
     assert!(primary.cwd.join(".rally/facts.db").exists());
     assert!(!linked.cwd.join(".rally/facts.db").exists());
     let room = primary.json(&["room", "--json"]);
-    assert_eq!(room["data"]["room"]["max_seq"], 1);
+    // Component B: say claim auto-registers presence(1)+lead(2)+claim(3).
+    assert_eq!(room["data"]["room"]["max_seq"], 3);
 
     linked.cleanup();
     primary.cleanup();
@@ -1736,12 +1742,14 @@ fn rally_room_is_queryable_by_tool_role_path_event_thread_and_since() {
             .len(),
         1
     );
+    // Component B: codex's first say auto-wrote a role:lead decision (tool=codex),
+    // so querying by tool=codex returns 1 decision.
     assert_eq!(
         by_tool["data"]["room"]["current_decisions"]
             .as_array()
             .unwrap()
             .len(),
-        0
+        1
     );
 
     let by_role_path = workspace.json(&[
@@ -1769,7 +1777,10 @@ fn rally_room_is_queryable_by_tool_role_path_event_thread_and_since() {
         "thread-query"
     );
 
-    let since = workspace.json(&["room", "--json", "--since", "1"]);
+    // Component B: say claim (codex) wrote presence(1)+lead(2)+claim(3).
+    // say decision (pi) wrote presence(4)+decision(5). Use --since 3 so
+    // the claim (seq=3) is excluded; the pi decision (seq=5) is included.
+    let since = workspace.json(&["room", "--json", "--since", "3"]);
     assert_eq!(
         since["data"]["room"]["active_claims"]
             .as_array()
@@ -1948,7 +1959,9 @@ fn rally_supports_all_required_fact_kinds() {
     }
 
     let room = workspace.json(&["room", "--json"]);
-    assert_eq!(room["data"]["room"]["max_seq"], 9);
+    // Component B: codex's first say auto-wrote presence(1)+lead(2) before the
+    // fact(3); subsequent 8 says are no-ops for presence. Total = 9 + 2 = 11.
+    assert_eq!(room["data"]["room"]["max_seq"], 11);
     workspace.cleanup();
 }
 

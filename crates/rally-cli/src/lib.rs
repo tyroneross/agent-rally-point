@@ -163,6 +163,71 @@ fn command_init(args: InitArgs) -> Result<Output> {
     Ok(Output::new(args.json, text, body))
 }
 
+/// Ensure `tool` is registered in the current room engagement.
+///
+/// Called at the start of every tool-scoped command that writes or reads room
+/// state (`say`, `check`, `next`, `enter`, …) so that an agent that skips an
+/// explicit `rally enter` still appears in `room.squads[]`.
+///
+/// Idempotent: if a presence fact for `tool` already exists in this engagement
+/// (i.e. the tool already appears in `snapshot.squads`), this is a no-op.
+/// If no presence exists, writes exactly one `presence` fact, and if no
+/// `role:lead` decision exists yet, also writes one `decision` fact asserting
+/// `tool` as lead (first-enter-is-lead).
+fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
+    let snapshot = room.snapshot()?;
+    // Already in the room — nothing to do.
+    if snapshot.squads.iter().any(|s| s.tool == tool) {
+        return Ok(());
+    }
+    let presence_fact = Fact {
+        schema: FACT_SCHEMA.to_string(),
+        event_id: new_id("fact"),
+        seq: 0,
+        thread_id: new_id("room"),
+        kind: FactKind::Presence,
+        tool: Some(tool.to_string()),
+        role: None,
+        subject: format!("agent presence: {tool}"),
+        scope: Vec::new(),
+        created_at: now_string(),
+        summary: None,
+        evidence: Vec::new(),
+        target: None,
+        ref_id: None,
+        status: None,
+        severity: None,
+        uri: None,
+        session: None,
+    };
+    room.append_fact(&presence_fact)?;
+    // First-enter-is-lead: assert lead only when no role:lead decision exists.
+    if snapshot.lead.is_none() {
+        let lead_fact = Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Decision,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: "role:lead".to_string(),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: Some(format!("{tool} is lead (first to enter)")),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&lead_fact)?;
+    }
+    Ok(())
+}
+
 fn command_enter(args: EnterArgs) -> Result<Output> {
     let tool = args.tool;
     let session_id = args.session_id.unwrap_or_else(|| format!("session-{tool}"));
@@ -185,53 +250,8 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         .unwrap_or_else(|| room.cursor_for(&tool).unwrap_or(0));
     let max_seq = snapshot_before.max_seq;
 
-    // --- Component A: emit one presence fact per enter call (B16) ---
-    let presence_fact = Fact {
-        schema: FACT_SCHEMA.to_string(),
-        event_id: new_id("fact"),
-        seq: 0,
-        thread_id: new_id("room"),
-        kind: FactKind::Presence,
-        tool: Some(tool.clone()),
-        role: None,
-        subject: format!("agent presence: {tool}"),
-        scope: Vec::new(),
-        created_at: now_string(),
-        summary: None,
-        evidence: Vec::new(),
-        target: None,
-        ref_id: None,
-        status: None,
-        severity: None,
-        uri: None,
-        session: None,
-    };
-    room.append_fact(&presence_fact)?;
-
-    // First-enter-is-lead: if no role:lead decision exists yet, self-assert lead.
-    if snapshot_before.lead.is_none() {
-        let lead_fact = Fact {
-            schema: FACT_SCHEMA.to_string(),
-            event_id: new_id("fact"),
-            seq: 0,
-            thread_id: new_id("room"),
-            kind: FactKind::Decision,
-            tool: Some(tool.clone()),
-            role: None,
-            subject: "role:lead".to_string(),
-            scope: Vec::new(),
-            created_at: now_string(),
-            summary: Some(format!("{tool} is lead (first to enter)")),
-            evidence: Vec::new(),
-            target: None,
-            ref_id: None,
-            status: None,
-            severity: None,
-            uri: None,
-            session: None,
-        };
-        room.append_fact(&lead_fact)?;
-    }
+    // Component A + B: emit presence (+ first-enter-is-lead) via shared helper.
+    ensure_presence(&room, &tool)?;
 
     // Re-snapshot after presence/lead writes so room summary and squads are current.
     let snapshot = room.snapshot()?;
@@ -283,6 +303,9 @@ fn command_say(args: SayArgs) -> Result<Output> {
         .subject
         .unwrap_or_else(|| default_subject(kind.as_str()));
     let scope = scopes_from(args.scopes, args.resources, args.paths);
+    let room = RoomStore::open()?;
+    // Component B: auto-register presence for the calling tool before writing.
+    ensure_presence(&room, &args.tool)?;
     let fact = Fact {
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
@@ -303,7 +326,6 @@ fn command_say(args: SayArgs) -> Result<Output> {
         uri: args.uri,
         session: None,
     };
-    let room = RoomStore::open()?;
     let fact = room.append_fact(&fact)?;
     let snapshot = room.snapshot()?;
     let body = envelope(
@@ -349,6 +371,8 @@ fn command_next(args: NextArgs) -> Result<Output> {
     let paths = normalize_paths(args.paths);
     let limit = args.limit as usize;
     let room = RoomStore::open()?;
+    // Component B: auto-register presence for the calling tool.
+    ensure_presence(&room, &tool)?;
     let snapshot = room.snapshot()?;
     let next = build_next(&snapshot, &tool, role.as_deref(), &paths, limit);
     let action = next.action;
@@ -425,6 +449,11 @@ fn command_check(args: CheckArgs) -> Result<Output> {
     };
     let path = args.path.map(normalize_path);
     let room = RoomStore::open()?;
+    // Component B: auto-register presence when a real tool identity is known.
+    // Skip "unknown" (no-tool before-complete calls) — nothing meaningful to register.
+    if tool != "unknown" {
+        ensure_presence(&room, &tool)?;
+    }
     let snapshot = room.snapshot()?;
     let check = build_check(phase, tool, path, args.strict, &snapshot)?;
     let body = envelope("check", SCHEMA_CHECK, check.data)?;
@@ -1145,6 +1174,117 @@ pub(crate) fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rally-lib-{label}-{nanos}"));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Component B acceptance test 1: running `ensure_presence` without a prior
+    /// `enter` registers the tool in squads and asserts it as lead (first tool).
+    #[test]
+    fn ensure_presence_auto_enters_tool_and_sets_lead() {
+        let root = unique_root("ensure-presence-auto-enter");
+        // Simulate a git repo so RoomStore::open() resolves correctly.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let snapshot_before = room.snapshot().unwrap();
+        assert!(
+            snapshot_before.squads.is_empty(),
+            "room starts empty"
+        );
+
+        // Call ensure_presence directly (mimics what command_say would do).
+        ensure_presence(&room, "tool-x").unwrap();
+
+        let snapshot = room.snapshot().unwrap();
+        assert!(
+            snapshot.squads.iter().any(|s| s.tool == "tool-x"),
+            "tool-x must appear in squads after ensure_presence"
+        );
+        assert_eq!(
+            snapshot.lead.as_deref(),
+            Some("tool-x"),
+            "first tool to call ensure_presence is lead"
+        );
+
+        // Presence fact count for tool-x in the ledger must be exactly 1.
+        let presence_count = room
+            .facts()
+            .unwrap()
+            .iter()
+            .filter(|f| f.kind == "presence" && f.tool.as_deref() == Some("tool-x"))
+            .count();
+        assert_eq!(presence_count, 1, "exactly one presence fact for tool-x");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Component B acceptance test 2: a second call for the same tool writes no
+    /// duplicate presence fact (idempotent per engagement).
+    #[test]
+    fn ensure_presence_is_idempotent_no_duplicate_facts() {
+        let root = unique_root("ensure-presence-idempotent");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        ensure_presence(&room, "tool-x").unwrap();
+        ensure_presence(&room, "tool-x").unwrap(); // second call — must be no-op
+
+        let presence_count = room
+            .facts()
+            .unwrap()
+            .iter()
+            .filter(|f| f.kind == "presence" && f.tool.as_deref() == Some("tool-x"))
+            .count();
+        assert_eq!(
+            presence_count, 1,
+            "second ensure_presence must not write a duplicate presence fact"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Component B acceptance test 3: a second tool auto-enters but lead stays
+    /// with the first tool.
+    #[test]
+    fn ensure_presence_second_tool_does_not_steal_lead() {
+        let root = unique_root("ensure-presence-second-tool");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        ensure_presence(&room, "tool-x").unwrap();
+        ensure_presence(&room, "tool-y").unwrap();
+
+        let snapshot = room.snapshot().unwrap();
+        assert!(snapshot.squads.iter().any(|s| s.tool == "tool-x"), "tool-x in squads");
+        assert!(snapshot.squads.iter().any(|s| s.tool == "tool-y"), "tool-y in squads");
+        assert_eq!(
+            snapshot.lead.as_deref(),
+            Some("tool-x"),
+            "lead must remain tool-x (first to enter)"
+        );
+
+        // tool-x has exactly one presence fact.
+        let x_count = room
+            .facts()
+            .unwrap()
+            .iter()
+            .filter(|f| f.kind == "presence" && f.tool.as_deref() == Some("tool-x"))
+            .count();
+        assert_eq!(x_count, 1, "exactly one presence fact for tool-x");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     fn managed_session(name: String, tool: String) -> ManagedSession {
         ManagedSession {

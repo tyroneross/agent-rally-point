@@ -46,18 +46,25 @@ participants; `enter --json` returns `channel:null`. Agents are invisible until 
 
 ---
 
-### B. Auto-start hook (opt-in per repo)
+### B. Auto-start = lazy auto-enter in the CLI (NO hook)
 
-**Change:** the rally plugin ships **one** silent, command-type `SessionStart` hook. On session
-start it resolves the git repo root and, **only if the repo opts in** (`.rally/` already exists, or
-a `rally.toml`/marker present), runs `rally enter` and launches **one** lightweight background
-`rally watch` poll. Non-opted repos → silent exit 0. No daemon; reuse `scripts/rally_wake.py` /
-`coordination_watch` shape for the poll.
+**Decision (2026-05-30):** not a SessionStart hook (hooks kept rare per project doctrine). Instead,
+**any tool-scoped rally command auto-registers presence if the calling `--tool` has not yet entered
+this room's current engagement.** Reuses Component A's presence-write (+ first-enter-is-lead).
+Navigate-to-repo is the CLI's existing repo-root resolution. Deterministic, zero hook, zero new
+process, cross-host — any agent that touches `rally` at all is registered. **No persistent
+background watcher** (YAGNI); revisit an MCP server only if a live watcher is later needed.
+
+**Change:** extract A's presence-write into a reusable `ensure_presence(tool)` and call it at the
+start of tool-scoped command handlers (`say`, `check`, `next`, `inject`, `run`, …) — write the
+presence fact only when no presence fact for that tool exists in the current engagement. Explicit
+`rally enter` is unchanged. Read-only commands without `--tool` do nothing new.
 
 **Acceptance:**
-- Session start in an opted-in repo → a `presence` fact appears for the auto id; watcher process
-  is running. Session start in a non-rally repo → nothing happens, no error, no room created.
-- Hook is silent (no stdout noise), exits 0 always.
+- A fresh agent that runs `rally say claim …` (no explicit `enter`) appears in `rally room`
+  `squads[]` (auto-entered) and `lead` is set if it was first.
+- A second command by the same tool writes NO duplicate presence fact (idempotent per engagement).
+- Existing explicit `enter` and all work-loop tests stay green.
 
 ---
 
