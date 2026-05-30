@@ -40,10 +40,12 @@ done**.
 **Tier 2 — DONE:** B10 canonical-path matching (exact/dir-prefix STOP + suffix WARN); B16 round-trip
 gate (all 9 fact kinds reload-verified); **B11** duplicate-id = warn-not-block + durable `risk` audit
 fact (never stops work, fully traceable — the auditability principle); **B12** delivered by
-`status --global` (board) + `squads[]` active/idle (liveness). **Tier 3 (next):** B17 one-store
-retirement · B18 repo-scope guard · B13 PR46 receipts · automation ranks 4–9. **Still open:**
-B11-race (rapid back-to-back `run` drops a session); stale-registry prune (B-index-monolith — ~340
-dead entries, warning-collapsed not pruned); `doctor --canonical-paths` retro-scan (deferred from B10).
+`status --global` (board) + `squads[]` active/idle (liveness). **Tier 3 — DONE (2026-05-30):** B17
+one-store retirement (global index default-off, commit `3b2c292`) · B18 repo-scope guard (via
+quarantine, the charter-aligned approach — not hard-reject) · B13 PR46 surface · automation ranks 4–9
+· R10 ledger-cursor · `doctor`. **Still open:** B11-race (rapid back-to-back `run` drops a session);
+stale-registry prune (B-index-monolith — ~340 dead entries, warning-collapsed not pruned); + the other
+housekeeping rows below.
 
 **Design principle now embodied (from user):** coordination is *never blocked* — collisions and
 duplicate ids **warn + record a durable audit fact** (inject channel-of-record, B10 ambiguous-path
@@ -51,9 +53,26 @@ WARN, B11 duplicate-id risk fact) so work continues and any mistake is traceable
 
 ## Open — ranked
 
-> **Reconciliation (2026-05-30):** rows **B10, B11, B12, B16 are DONE** (Tier 2 — see Delivered
-> above; commits `1944ae4`, `c99b835`, `d1c9eeb`). They remain in the table for traceability but are
-> no longer open. Genuinely open below: R9-readback, R9, R10, B13, B17, B18.
+> **Reconciliation (2026-05-30 #2 — validated against real code + call-graph scan):** most rows below
+> shipped this session. **DONE (verified):** R9-readback (`append_fact_verified` across commands), R9
+> stale-binary (`BUILD_ID`/drift in `command_enter`), **R10** (ledger-derived enter-cursor —
+> `cursor_for` now ledger-first, `cursors.json` demoted to write-through cache; commit `3b2c292`),
+> B10/B11/B12/B16 (commits `1944ae4`/`c99b835`/`d1c9eeb`), **B13** (PR46 surface: `--produces`/`--depends`/
+> `require-ack` + `check ci`), **B17** (legacy global index now default-**OFF**, opt-in `RALLY_GLOBAL_INDEX=1`,
+> `RALLY_NO_GLOBAL_INDEX` still wins; `--include-legacy` never existed; `migrate-legacy` ships the one-shot
+> import; commit `3b2c292`), the **B2/L5 observation seam** (`dag`/`wake-due`/`standby`/`wake`, tested e2e),
+> and automation ranks **4–9** + `doctor`.
+>
+> **B18 is DONE via quarantine** — repo_root-anchored ledger + `external-intake` scope tag + durable `Risk`
+> audit fact + projection filtering + tests b18b/d/e/f/g. The backlog's **"hard-reject" framing is REJECTED**
+> as contrary to the never-block charter (*coordination is never blocked — warn + record a durable audit
+> fact*); quarantine-and-filter IS the charter-aligned approach. Optional micro-hardening only:
+> `command_route_findings`/`command_backlog` don't `classify_scope` on write (their facts are repo-local or
+> already-safe risk facts — low value).
+>
+> **Genuinely open:** housekeeping (B-whoami, B11-race, B-arch-doc, B-index-monolith, B-ledger-cadence) +
+> automation **rank-11** (queryable `rally goal`/intent + per-agent autonomy-envelope fact). Everything in
+> the ranked table below is closed.
 
 | Rank | ID | Item | Why it matters | Depends on |
 |------|----|------|----------------|-----------|
@@ -77,7 +96,7 @@ WARN, B11 duplicate-id risk fact) so work continues and any mistake is traceable
 | **B11-race** | Harden parallel-launch id-reservation race — `rally_run_reserves_numbered_ids_under_parallel_launch` flakes in isolation; retry-on-collision or `#[ignore]` + tracking note. | MED |
 | **B-index-monolith** | Filter the migration monolith from `refresh_log_index` — committed `index.json` double-counts 489 phantom events (canonical replay already excludes it; the advisory index doesn't). | LOW |
 | **B-ledger-cadence** | Commit-ledger cadence policy — committed history lags on-disk; commit on a cadence (merge=union is conflict-free) or document `.rally/log/` as a live working-tree artifact. | LOW |
-| **B2 / L5** | **Observation seam** — orchestrators emit `handoff/artifact/decision/standby/wake`; rally derives a DAG + wake-due; **never executes**. | Blocked on B13. |
+| **B2 / L5** | ~~Observation seam~~ **DONE** — `dag.rs` + `dag`/`wake-due`/`say standby`/`say wake` + `--run/--step/--parent-step` lineage; rally derives the DAG + wake-due, never executes. Tested e2e 2026-05-30; wired into `skills/rally-workflows/SKILL.md` §7. | shipped |
 
 ## Automation proposals — facilitator self-coordination
 
@@ -85,13 +104,13 @@ From [`docs/RALLY-AUTOMATION-PROPOSALS.md`](docs/RALLY-AUTOMATION-PROPOSALS.md) 
 
 | Rank | Capability | Status | Note |
 |------|-----------|--------|------|
-| 4 | `rally route-findings` — match each `{file,severity,evidence}` to the owning claim via canonical paths → typed handoff; unowned → `risk` fact | open | needs B10; never auto-route unverified findings |
-| 5 | `rally board` — read-only board projection from facts (lanes + backlog + live-status delta); emits a draft, never writes `ORCHESTRATION.md` | open (also in B12) | High impact |
-| 6 | Artifact source-grounding + verify gate — content-hash snapshot at `say artifact`; byte-identical to claim-open → `grounded:false` + risk; parse `--evidence` into a `verification_contract` checked by `rally verify artifact` | open (overlaps R9-readback) | verify-before-trust at the artifact layer |
-| 7 | `rally next --backlog` — proactive self-routing: parse backlog, resolve deps vs landed artifacts, tier-affinity rank → `suggested_backlog_item` | open | needs B10; lead sets `safe_to_self_route` |
-| 8 | Cross-lane ripple detector — grep changed `pub` signatures at artifact/check, post non-blocking `ripple-alert` + handoffs to affected owners | open | needs B10; notification only |
-| 9 | `rally check tier-fit` — derive task class, compare to room MODEL-TIERS calibration, flag `tier_mismatch` (never blocks/selects) | open | host-relative tiers |
-| 11 | Presence/liveness + queryable `rally goal`/intent + per-agent autonomy-envelope fact | open (liveness in B12; goal/intent + envelope net-new) | from Claude #2 cross-host input |
+| 4 | `rally route-findings` — match each `{file,severity,evidence}` to the owning claim via canonical paths → typed handoff; unowned → `risk` fact | **DONE** (`route_findings.rs` + subcommand + tests) | shipped |
+| 5 | `rally board` — read-only board projection from facts (lanes + backlog + live-status delta); emits a draft, never writes `ORCHESTRATION.md` | **DONE** (`board.rs` + subcommand; B12) | shipped |
+| 6 | Artifact source-grounding + verify gate — content-hash snapshot at `say artifact`; byte-identical to claim-open → `grounded:false` + risk; parse `--evidence` into a `verification_contract` | **DONE** (`source_grounding.rs`) | shipped |
+| 7 | `rally next --backlog` — proactive self-routing: parse backlog, resolve deps vs landed artifacts, tier-affinity rank → `suggested_backlog_item` | **DONE** (`next_returns_suggested_backlog_item` test) | shipped |
+| 8 | Cross-lane ripple detector — grep changed `pub` signatures at artifact/check, post non-blocking `ripple-alert` + handoffs to affected owners | **DONE** (`ripple.rs`) | shipped |
+| 9 | `rally check tier-fit` — derive task class, compare to room MODEL-TIERS calibration, flag `tier_mismatch` (never blocks/selects) | **DONE** (`tier_fit.rs`) | shipped |
+| 11 | Presence/liveness + queryable `rally goal`/intent + per-agent autonomy-envelope fact | **open** — liveness done (B12); `rally goal`/intent + envelope fact net-new | only genuinely-open automation item |
 
 Shipped from this family: `rally locate` / `rally recent --all` (the [discovery re-port](docs/DISCOVERY_RE_PORT_DESIGN.md) design — done; the legacy-visibility tie-in is tracked as **B17**). Also pending: `rally doctor --canonical-paths` (rank-1 retro-scan helper).
 
