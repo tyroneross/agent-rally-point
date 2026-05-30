@@ -23,6 +23,7 @@ pub(crate) enum CliCommand {
     Status(StatusArgs),
     Watch(WatchArgs),
     MigrateLegacy(MigrateLegacyArgs),
+    Doctor(DoctorArgs),
 }
 
 pub(crate) enum CliParse {
@@ -127,6 +128,17 @@ pub(crate) struct RecentArgs {
 #[derive(Clone, Debug)]
 pub(crate) struct MigrateLegacyArgs {
     pub(crate) json: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DoctorArgs {
+    pub(crate) json: bool,
+    /// Report non-canonical and suffix-colliding claim scopes in the current room.
+    pub(crate) canonical_paths: bool,
+    /// Classify rooms registry entries as live/stale; with --apply, rewrite the index.
+    pub(crate) prune_rooms: bool,
+    /// Apply the prune (rewrite index); only meaningful with --prune-rooms.
+    pub(crate) apply: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -250,6 +262,7 @@ const COMMANDS: &[&str] = &[
     "status",
     "watch",
     "migrate-legacy",
+    "doctor",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -363,6 +376,11 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("migrate-legacy")
         .map(CliCommand::MigrateLegacy);
+    let doctor = doctor_parser()
+        .to_options()
+        .descr("Read-only diagnostics: path hygiene (--canonical-paths) and room registry pruning (--prune-rooms).")
+        .command("doctor")
+        .map(CliCommand::Doctor);
 
     construct!([
         init,
@@ -383,7 +401,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         rotate,
         status,
         watch,
-        migrate_legacy
+        migrate_legacy,
+        doctor
     ])
     .to_options()
 }
@@ -550,6 +569,25 @@ fn recent_parser() -> impl Parser<RecentArgs> {
 fn migrate_legacy_parser() -> impl Parser<MigrateLegacyArgs> {
     let json = json_flag();
     construct!(MigrateLegacyArgs { json })
+}
+
+fn doctor_parser() -> impl Parser<DoctorArgs> {
+    let json = json_flag();
+    let canonical_paths = long("canonical-paths")
+        .help("Report non-canonical scopes and suffix collisions in active claims")
+        .switch();
+    let prune_rooms = long("prune-rooms")
+        .help("Classify rooms registry entries as live/stale (dry-run by default)")
+        .switch();
+    let apply = long("apply")
+        .help("Apply the prune: rewrite the registry index, keeping only live entries")
+        .switch();
+    construct!(DoctorArgs {
+        json,
+        canonical_paths,
+        prune_rooms,
+        apply
+    })
 }
 
 fn check_parser() -> impl Parser<CheckArgs> {

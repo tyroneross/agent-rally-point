@@ -216,8 +216,11 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
     assert_matches_schema("agent-rally.command.enter.v1.json", &enter);
     assert_eq!(enter["data"]["cursor"]["before"], 0);
     // Component B: say claim (claude) wrote presence(1)+lead(2)+claim(3);
-    // say decision (pi) wrote presence(4)+decision(5). Enter cursor_after = 5.
-    assert_eq!(enter["data"]["cursor"]["after"], 5);
+    // say decision (pi) wrote presence(4)+decision(5). codex enter writes
+    // presence(6) via ensure_presence (lead already set by claude).
+    // cursor_after is set to post-presence max_seq=6 so that codex's own
+    // presence fact is excluded from "new peer content" on the next enter.
+    assert_eq!(enter["data"]["cursor"]["after"], 6);
     assert_eq!(enter["data"]["cursor"]["advanced"], true);
     assert!(
         enter["data"]["entry"]["do_not"]
@@ -243,12 +246,15 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
         "--path",
         "src/room.rs",
     ]);
-    // Component B: first enter (codex) wrote presence(6) via ensure_presence
-    // (lead already set by claude). cursor was set to 5 (pre-enter max_seq).
-    // Second enter: cursor_before=5, max_seq before=6, no new facts (codex
-    // already in squads), cursor_after=6.
-    assert_eq!(enter_again["data"]["cursor"]["before"], 5);
-    assert_eq!(enter_again["data"]["cursor"]["after"], 6);
+    // Quirk fix: second enter's cursor_before = 6 (post-presence max_seq from
+    // first enter). The second enter detects codex as already active (B11) and
+    // writes a durable risk fact (seq 7) before ensure_presence runs; then
+    // ensure_presence is idempotent (no new presence/lead). cursor_after is set
+    // to post-presence max_seq=7 (risk fact included — it's a real audit event).
+    // Codex's own presence fact (seq 6) is correctly excluded: cursor_before=6
+    // means it is below the window's lower bound.
+    assert_eq!(enter_again["data"]["cursor"]["before"], 6);
+    assert_eq!(enter_again["data"]["cursor"]["after"], 7);
     assert_eq!(enter_again["data"]["cursor"]["advanced"], true);
 
     let (check, check_output) = workspace.json_with_status(&[
