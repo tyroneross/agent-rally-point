@@ -37,10 +37,17 @@ done**.
 - **Tier-1 fixes:** `room_missing` warning collapsed to one summary; system author `rally` excluded
   from `squads[]`; **multiple managed sessions per caller tool** (a lead can spawn N subagents).
 
-**Tier 2 (next):** B10 canonical-path matching (rank-1 linchpin) · formal B16 round-trip gate ·
-close/verify B11 (duplicate-id reject) + B12. **Tier 3 (later):** B13 · B17 · B18 · automation
-ranks 4–9. **Still open:** B11-race (rapid back-to-back `run` drops a session); stale-registry prune
-(B-index-monolith — the registry now has ~340 dead entries, warning-collapsed but not pruned).
+**Tier 2 — DONE:** B10 canonical-path matching (exact/dir-prefix STOP + suffix WARN); B16 round-trip
+gate (all 9 fact kinds reload-verified); **B11** duplicate-id = warn-not-block + durable `risk` audit
+fact (never stops work, fully traceable — the auditability principle); **B12** delivered by
+`status --global` (board) + `squads[]` active/idle (liveness). **Tier 3 (next):** B17 one-store
+retirement · B18 repo-scope guard · B13 PR46 receipts · automation ranks 4–9. **Still open:**
+B11-race (rapid back-to-back `run` drops a session); stale-registry prune (B-index-monolith — ~340
+dead entries, warning-collapsed not pruned); `doctor --canonical-paths` retro-scan (deferred from B10).
+
+**Design principle now embodied (from user):** coordination is *never blocked* — collisions and
+duplicate ids **warn + record a durable audit fact** (inject channel-of-record, B10 ambiguous-path
+WARN, B11 duplicate-id risk fact) so work continues and any mistake is traceable + fixable after.
 
 ## Open — ranked
 
