@@ -26,11 +26,10 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{RallyError, Result};
 use crate::short_id;
-use crate::store::LEDGER_FILENAME;
+use crate::store::{LEDGER_FILENAME, LOG_DIRNAME};
 
 pub(crate) const MANIFEST_SCHEMA: &str = "agent-rally.manifest.v1";
 pub(crate) const MANIFEST_FILENAME: &str = "manifest.json";
-pub(crate) const LOG_DIRNAME: &str = "log";
 
 pub(crate) const POINTER_START: &str = "<!-- rally:start -->";
 pub(crate) const POINTER_END: &str = "<!-- rally:end -->";

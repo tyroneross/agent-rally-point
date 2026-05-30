@@ -130,6 +130,12 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     let session_id = args.session_id.unwrap_or_else(|| format!("session-{tool}"));
     let role = args.role;
     let paths = normalize_paths(args.paths);
+    // R5: persist `--engagement <label>` before opening the room so the
+    // RoomStore picks it up on construction (matching env-var precedence).
+    if let Some(label) = args.engagement.as_deref() {
+        let rally_dir = repo_root()?.join(".rally");
+        store::persist_active_engagement(&rally_dir, label)?;
+    }
     let room = RoomStore::open()?;
     let snapshot = room.snapshot()?;
     let cursor_before = args

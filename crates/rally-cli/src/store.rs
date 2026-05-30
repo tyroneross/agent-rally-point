@@ -4,23 +4,51 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-/// Filename of the canonical, append-only, per-repo ledger.
+/// Filename of the **legacy** monolithic ledger (R1).
 ///
-/// This is the *durable* record of every fact that lands in the room. It is
-/// committed to the repository (un-gitignored in `.gitignore`, with
-/// `merge=union` in `.gitattributes`) so a clone or a fresh machine can
-/// reconstruct the room state without any external service or cache.
-///
-/// `facts.db` is a derived sqlite cache built by replaying this ledger; if the
-/// db is missing or behind the ledger, it is rebuilt on `open_at`. The ledger
-/// itself is never deleted by rally.
+/// Prior to R5, every event in the room landed in this one append-only file
+/// at `.rally/ledger.jsonl`. R5 supersedes the monolith with per-engagement
+/// segments at `.rally/log/<engagement>.jsonl`. On first open in R5, the
+/// monolith is partitioned into segments and moved to
+/// `.rally/archive/ledger-pre-segment.jsonl`. The file name is kept exported
+/// because rooms cloned at the R1 layer still carry it, and the replay path
+/// transparently unions segments + legacy monolith + archive.
 pub(crate) const LEDGER_FILENAME: &str = "ledger.jsonl";
+
+/// Directory holding per-engagement segment files (R5). Each segment is a
+/// `<engagement-or-utc-date>.jsonl` append-only file with the same LedgerLine
+/// shape as the legacy monolith. All segment files together form the
+/// canonical record; replaying them in seq order rebuilds `facts.db`.
+pub(crate) const LOG_DIRNAME: &str = "log";
+
+/// Index file inside the log dir. Maps each segment to `{first_seq, last_seq,
+/// count, engagement, span: {first_ts, last_ts}}`. Refreshed on append and on
+/// open. Read by R6 (`rally retrospective`) and R7 (rotation).
+pub(crate) const LOG_INDEX_FILENAME: &str = "index.json";
+
+/// Directory holding rotated/migrated segments (R5 migration, R7 rotation).
+/// Same line format as live segments; replay walks here too.
+pub(crate) const ARCHIVE_DIRNAME: &str = "archive";
+
+/// Filename used by the R5 migration to preserve the R1 monolith verbatim.
+pub(crate) const ARCHIVED_MONOLITH_FILENAME: &str = "ledger-pre-segment.jsonl";
+
+/// Env var that pins the active engagement label for this process. Set by
+/// host wrappers, direnv, CI runners, etc.
+pub(crate) const ENGAGEMENT_ENV_VAR: &str = "RALLY_ENGAGEMENT";
+
+/// On-disk file holding the persisted active engagement label, written by
+/// `rally enter --engagement <name>` so subsequent calls without the env var
+/// or flag inherit the label. Plain text, one line, no trailing newline
+/// required.
+pub(crate) const ACTIVE_ENGAGEMENT_FILENAME: &str = "active-engagement";
 
 use crate::backends::ManagedSession;
 use crate::cli::RoomArgs;
@@ -286,22 +314,50 @@ pub(crate) struct RoomStore {
     cursor_path: PathBuf,
     repo_root: PathBuf,
     facts_db_path: PathBuf,
-    ledger_path: PathBuf,
+    /// Per-engagement segment directory (R5). All segment files together form
+    /// the canonical append-only record.
+    log_dir: PathBuf,
+    /// Rotated/migrated segments (R5 migration on first open; R7 rotation).
+    /// Replay walks here too, after live segments.
+    archive_dir: PathBuf,
+    /// Engagement label stamped into every segment append. Resolved once at
+    /// open via [`resolve_active_engagement`] (env var → on-disk file → UTC
+    /// date). Empty string is never produced.
+    active_engagement: String,
 }
 
-/// One line of `ledger.jsonl`.
+/// One line of a segment file.
 ///
 /// Compact on purpose: one event, its assigned `seq` (factstr's monotonic
 /// `sequence_number`), an `occurred_at` ISO-8601 timestamp, the factstr
 /// `event_type`, and the full payload (the serialised `Fact`). Replaying these
 /// lines in order through `factstr` rebuilds `facts.db` verbatim because
 /// factstr assigns seqs deterministically in append order.
+///
+/// `engagement` is the per-row engagement tag (R5). Older lines migrated from
+/// the R1 monolith may carry the UTC date that the row was first observed (no
+/// tag was recorded pre-R5). `serde(default)` keeps the format
+/// forward-compatible — readers that don't know the field treat it as absent.
 #[derive(Debug, Deserialize, Serialize)]
 struct LedgerLine {
     seq: i64,
     occurred_at: String,
     event_type: String,
     payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    engagement: Option<String>,
+}
+
+/// One entry of `.rally/log/index.json`.
+#[derive(Debug, Deserialize, Serialize)]
+struct SegmentIndexEntry {
+    segment: String,    // filename only (e.g. "2026-05-29.jsonl")
+    engagement: String, // segment key
+    first_seq: i64,
+    last_seq: i64,
+    count: i64,
+    first_ts: Option<String>,
+    last_ts: Option<String>,
 }
 
 impl RoomStore {
@@ -309,35 +365,52 @@ impl RoomStore {
         Self::open_at(repo_root()?)
     }
 
-    /// Open the per-repo room, applying the **canonical ledger / derived db**
-    /// contract:
+    /// Open the per-repo room, applying the **canonical segments / derived
+    /// db** contract (R5; supersedes R1's single-monolith contract):
     ///
-    /// 1. If `ledger.jsonl` exists and contains more events than the current
-    ///    `facts.db`, the db is rebuilt by replaying the ledger. The db is a
-    ///    pure cache — never canonical.
-    /// 2. If `ledger.jsonl` is absent but `facts.db` already has events, seed
-    ///    `ledger.jsonl` from the db so no history is lost on first upgrade.
-    /// 3. Otherwise the ledger and db are already in sync and we proceed.
+    /// 1. If a legacy `.rally/ledger.jsonl` monolith exists, partition its
+    ///    lines into per-engagement segments under `.rally/log/` (key = each
+    ///    line's engagement tag if present, else the UTC date from its
+    ///    `occurred_at`), then **move** the monolith to
+    ///    `.rally/archive/ledger-pre-segment.jsonl`. Every event survives;
+    ///    the monolith is preserved verbatim in the archive.
+    /// 2. If the union of live segments + archived segments contains more
+    ///    events than the current `facts.db`, the db is rebuilt by replaying
+    ///    every segment in seq order. The db is a pure cache — never
+    ///    canonical.
+    /// 3. If no segment / monolith / archive exists but `facts.db` already
+    ///    has events, seed a single segment from the db so no history is
+    ///    lost on first upgrade.
+    /// 4. Otherwise segments and db are already in sync and we proceed.
     ///
-    /// Both replay and seed are idempotent — running them twice on the same
-    /// inputs yields identical state.
+    /// Replay, migration, and seed are all idempotent — running them twice
+    /// on the same inputs yields identical state.
     pub(crate) fn open_at(root: PathBuf) -> Result<Self> {
         let dir = root.join(".rally");
         fs::create_dir_all(&dir).map_err(RallyError::io("create .rally"))?;
         let _ = fs::remove_file(dir.join("room.db"));
         let fact_store_path = dir.join("facts.db");
-        let ledger_path = dir.join(LEDGER_FILENAME);
+        let log_dir = dir.join(LOG_DIRNAME);
+        let archive_dir = dir.join(ARCHIVE_DIRNAME);
+        let legacy_ledger_path = dir.join(LEDGER_FILENAME);
 
-        reconcile_ledger_and_db(&ledger_path, &fact_store_path)?;
+        // R1 → R5 migration (idempotent, see [`migrate_monolith_to_segments`]).
+        migrate_monolith_to_segments(&legacy_ledger_path, &log_dir, &archive_dir)?;
+
+        reconcile_segments_and_db(&log_dir, &archive_dir, &fact_store_path)?;
 
         let fact_store = open_fact_store(&fact_store_path)?;
+        let active_engagement = resolve_active_engagement(&dir);
         let store = Self {
             fact_store,
             cursor_path: dir.join("cursors.json"),
             repo_root: root,
             facts_db_path: fact_store_path,
-            ledger_path,
+            log_dir,
+            archive_dir,
+            active_engagement,
         };
+        let _ = store.refresh_log_index();
         let _ = store.refresh_index(0);
         Ok(store)
     }
@@ -345,22 +418,56 @@ impl RoomStore {
     pub(crate) fn open_existing_at(root: PathBuf) -> Result<Option<Self>> {
         let dir = root.join(".rally");
         let fact_store_path = dir.join("facts.db");
-        let ledger_path = dir.join(LEDGER_FILENAME);
-        // Existence is determined by EITHER the canonical ledger OR the
-        // derived db — a clone that only carries `ledger.jsonl` is still a
-        // real room and must open transparently.
-        if !fact_store_path.exists() && !ledger_path.exists() {
+        let log_dir = dir.join(LOG_DIRNAME);
+        let archive_dir = dir.join(ARCHIVE_DIRNAME);
+        let legacy_ledger_path = dir.join(LEDGER_FILENAME);
+        // Existence is determined by ANY canonical input: derived db, live
+        // segments, archived segments, or the legacy R1 monolith. A clone
+        // carrying only segments OR only the monolith is still a real room.
+        let has_segments = read_segment_files(&log_dir).is_ok_and(|v| !v.is_empty());
+        let has_archive = read_segment_files(&archive_dir).is_ok_and(|v| !v.is_empty());
+        if !fact_store_path.exists()
+            && !legacy_ledger_path.exists()
+            && !has_segments
+            && !has_archive
+        {
             return Ok(None);
         }
-        reconcile_ledger_and_db(&ledger_path, &fact_store_path)?;
+        migrate_monolith_to_segments(&legacy_ledger_path, &log_dir, &archive_dir)?;
+        reconcile_segments_and_db(&log_dir, &archive_dir, &fact_store_path)?;
         let fact_store = open_fact_store(&fact_store_path)?;
-        Ok(Some(Self {
+        let active_engagement = resolve_active_engagement(&dir);
+        let store = Self {
             fact_store,
             cursor_path: dir.join("cursors.json"),
             repo_root: root,
             facts_db_path: fact_store_path,
-            ledger_path,
-        }))
+            log_dir,
+            archive_dir,
+            active_engagement,
+        };
+        let _ = store.refresh_log_index();
+        Ok(Some(store))
+    }
+
+    /// Override the active engagement for this RoomStore instance. Used by
+    /// `rally enter --engagement <name>` and tests. Persisting to disk so
+    /// future opens inherit the label is a separate step ([`persist_active_engagement`]).
+    #[cfg(test)]
+    pub(crate) fn set_active_engagement_for_test(&mut self, engagement: &str) {
+        self.active_engagement = engagement.to_string();
+    }
+
+    /// The engagement label currently being stamped on appends.
+    #[allow(dead_code)] // public for future R6 retrospective consumers
+    pub(crate) fn active_engagement(&self) -> &str {
+        &self.active_engagement
+    }
+
+    /// Path of the segment file the next append will land in.
+    pub(crate) fn active_segment_path(&self) -> PathBuf {
+        self.log_dir
+            .join(format!("{}.jsonl", self.active_engagement))
     }
 
     pub(crate) fn append_fact(&self, fact: &Fact) -> Result<Fact> {
@@ -373,15 +480,20 @@ impl RoomStore {
             .map_err(|err| RallyError::Message(format!("append fact: {err}")))?;
         fact.seq = i64::try_from(result.last_sequence_number)
             .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
-        append_ledger_line(
-            &self.ledger_path,
+        append_segment_line(
+            &self.active_segment_path(),
             &LedgerLine {
                 seq: fact.seq,
                 occurred_at: now_string(),
                 event_type,
                 payload,
+                engagement: Some(self.active_engagement.clone()),
             },
         )?;
+        // Both index refreshes are best-effort caches; swallow failures so a
+        // racing parallel writer never poisons the append path. Replay
+        // rebuilds them on next open from segments.
+        let _ = self.refresh_log_index();
         let _ = self.refresh_index(fact.seq);
         Ok(fact)
     }
@@ -404,15 +516,17 @@ impl RoomStore {
                 fact.seq = i64::try_from(result.last_sequence_number).map_err(|err| {
                     RallyError::Message(format!("sequence number overflow: {err}"))
                 })?;
-                append_ledger_line(
-                    &self.ledger_path,
+                append_segment_line(
+                    &self.active_segment_path(),
                     &LedgerLine {
                         seq: fact.seq,
                         occurred_at: now_string(),
                         event_type: "session".to_string(),
                         payload,
+                        engagement: Some(self.active_engagement.clone()),
                     },
                 )?;
+                let _ = self.refresh_log_index();
                 let _ = self.refresh_index(fact.seq);
                 Ok(Some(fact))
             }
@@ -614,7 +728,9 @@ fn open_fact_store(path: &Path) -> Result<SqliteStore> {
     loop {
         match SqliteStore::open(path) {
             Ok(store) => return Ok(store),
-            Err(err) if attempts < 5 && is_bootstrap_metadata_race(&err) => {
+            Err(err)
+                if attempts < 8 && (is_bootstrap_metadata_race(&err) || is_db_locked(&err)) =>
+            {
                 attempts += 1;
                 thread::sleep(Duration::from_millis(25 * attempts));
             }
@@ -628,62 +744,176 @@ fn is_bootstrap_metadata_race(err: &impl std::fmt::Display) -> bool {
         .contains("UNIQUE constraint failed: store_metadata.key")
 }
 
-/// Reconcile the canonical ledger with the derived sqlite cache.
+fn is_db_locked(err: &impl std::fmt::Display) -> bool {
+    let msg = err.to_string();
+    msg.contains("database is locked") || msg.contains("code: 5")
+}
+
+// =============================================================================
+// R5: per-engagement segment ledger
+// =============================================================================
+//
+// The "ledger" is now a set of files: `.rally/log/<engagement>.jsonl` for live
+// segments plus `.rally/archive/<engagement>.jsonl` for rotated/migrated ones.
+// Each line has the same `LedgerLine` shape as the R1 monolith. Replaying every
+// line in **seq order** rebuilds `facts.db`. The replay is concat-and-sort —
+// segment file names don't have to match append order, only the per-line seqs.
+
+/// Resolve the engagement label used to stamp new appends.
+///
+/// Priority:
+/// 1. `RALLY_ENGAGEMENT` env var (non-empty after trim, sanitised).
+/// 2. `.rally/active-engagement` file (one line, sanitised).
+/// 3. UTC date `YYYY-MM-DD` from the current clock.
+///
+/// Sanitisation strips path separators and trims whitespace so a label can
+/// never escape the log dir. The fallback never fails — if the clock returns
+/// something exotic, `"unknown-engagement"` is used.
+fn resolve_active_engagement(rally_dir: &Path) -> String {
+    if let Ok(value) = env::var(ENGAGEMENT_ENV_VAR) {
+        let cleaned = sanitise_engagement(&value);
+        if !cleaned.is_empty() {
+            return cleaned;
+        }
+    }
+    let active_path = rally_dir.join(ACTIVE_ENGAGEMENT_FILENAME);
+    if let Ok(text) = fs::read_to_string(&active_path) {
+        let cleaned = sanitise_engagement(text.trim());
+        if !cleaned.is_empty() {
+            return cleaned;
+        }
+    }
+    utc_date_label()
+}
+
+/// Persist an engagement label so subsequent rally invocations inherit it.
+/// Used by `rally enter --engagement <name>`. Idempotent — writing the same
+/// label is a no-op.
+pub(crate) fn persist_active_engagement(rally_dir: &Path, engagement: &str) -> Result<()> {
+    let cleaned = sanitise_engagement(engagement);
+    if cleaned.is_empty() {
+        return Err(RallyError::Usage(format!(
+            "engagement label {engagement:?} is empty after sanitising"
+        )));
+    }
+    fs::create_dir_all(rally_dir)
+        .map_err(RallyError::io(format!("create {}", rally_dir.display())))?;
+    let target = rally_dir.join(ACTIVE_ENGAGEMENT_FILENAME);
+    if let Ok(existing) = fs::read_to_string(&target)
+        && existing.trim() == cleaned
+    {
+        return Ok(());
+    }
+    let temp_path = target.with_extension(format!("tmp-{}", short_id()));
+    fs::write(&temp_path, format!("{cleaned}\n"))
+        .map_err(RallyError::io(format!("write {}", temp_path.display())))?;
+    fs::rename(&temp_path, &target).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        RallyError::Io {
+            context: format!("replace {} with {}", target.display(), temp_path.display()),
+            source: err,
+        }
+    })
+}
+
+/// Strip path separators + leading/trailing whitespace so an engagement label
+/// can't escape the log directory or trip on shell quoting.
+fn sanitise_engagement(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, '/' | '\\' | '\0'))
+        .collect()
+}
+
+/// UTC date `YYYY-MM-DD` from `chrono::Utc::now()`.
+fn utc_date_label() -> String {
+    // chrono::Utc is already a dep (lib.rs uses it for `now_string`); avoid
+    // pulling another crate.
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
+/// Reconcile the canonical segment set with the derived sqlite cache.
 ///
 /// Called on every `RoomStore::open_at` / `open_existing_at`. The contract is:
 ///
-/// * Ledger ahead of db (incl. db absent) → rebuild db by replaying ledger.
-/// * Ledger absent but db has events → seed ledger from db.
+/// * Segments ahead of db (incl. db absent) → rebuild db by replaying segments.
+/// * Segments absent but db has events → seed one segment from db (first-run
+///   upgrade from a pre-R1 db that never had a ledger).
 /// * Both empty, or in sync → no-op.
 ///
 /// Idempotent: running twice yields the same state.
-fn reconcile_ledger_and_db(ledger_path: &Path, facts_db_path: &Path) -> Result<()> {
-    let ledger_count = count_ledger_events(ledger_path)?;
+fn reconcile_segments_and_db(
+    log_dir: &Path,
+    archive_dir: &Path,
+    facts_db_path: &Path,
+) -> Result<()> {
+    let segments = read_segment_files(log_dir)?;
+    let archived = read_segment_files(archive_dir)?;
+    let total_count = count_segment_events(&segments)? + count_segment_events(&archived)?;
     let db_max_seq = read_db_max_seq(facts_db_path)?;
 
-    if ledger_count == 0 && db_max_seq == 0 {
-        return Ok(()); // fresh room or both empty
-    }
-
-    if ledger_count > db_max_seq {
-        // Canonical ledger is ahead of derived cache. Rebuild the cache.
-        rebuild_db_from_ledger(ledger_path, facts_db_path)?;
+    if total_count == 0 && db_max_seq == 0 {
         return Ok(());
     }
 
-    if ledger_count == 0 && db_max_seq > 0 {
-        // First-run upgrade: db pre-dates the ledger feature. Seed the
-        // canonical record from the existing cache so we don't lose history.
-        seed_ledger_from_db(ledger_path, facts_db_path)?;
+    if total_count > db_max_seq {
+        rebuild_db_from_segments(&segments, &archived, facts_db_path)?;
+        return Ok(());
     }
-    // ledger_count <= db_max_seq && ledger_count > 0 → cache is fresh or
-    // ahead; nothing to do. (Cache "ahead" can only happen if someone wrote
-    // straight to the db, which we never do.)
+
+    if total_count == 0 && db_max_seq > 0 {
+        seed_segment_from_db(log_dir, facts_db_path)?;
+    }
+    // total_count <= db_max_seq && total_count > 0 → cache is fresh; nothing to do.
     Ok(())
 }
 
-fn count_ledger_events(ledger_path: &Path) -> Result<i64> {
-    if !ledger_path.exists() {
-        return Ok(0);
+/// Sorted segment file paths in a directory. Empty / missing dir → empty Vec.
+fn read_segment_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
     }
-    let file = fs::File::open(ledger_path)
-        .map_err(RallyError::io(format!("read {}", ledger_path.display())))?;
-    let mut count = 0i64;
-    for line in BufReader::new(file).lines() {
-        let line = line.map_err(RallyError::io(format!("read {}", ledger_path.display())))?;
-        if !line.trim().is_empty() {
-            count += 1;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(dir).map_err(RallyError::io(format!("read_dir {}", dir.display())))? {
+        let entry = entry.map_err(RallyError::io(format!("readdir entry {}", dir.display())))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.contains(".tmp-")
+        {
+            continue;
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn count_segment_events(paths: &[PathBuf]) -> Result<i64> {
+    let mut total = 0i64;
+    for path in paths {
+        let file =
+            fs::File::open(path).map_err(RallyError::io(format!("read {}", path.display())))?;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(RallyError::io(format!("read {}", path.display())))?;
+            if !line.trim().is_empty() {
+                total += 1;
+            }
         }
     }
-    Ok(count)
+    Ok(total)
 }
 
 fn read_db_max_seq(facts_db_path: &Path) -> Result<i64> {
     if !facts_db_path.exists() {
         return Ok(0);
     }
-    // Briefly open the cache to ask for its high-water mark, then drop the
-    // handle so the rebuild path (if it fires) can replace the file.
     let store = open_fact_store(facts_db_path)?;
     let query = store
         .query(&FactQuery::all())
@@ -697,60 +927,96 @@ fn read_db_max_seq(facts_db_path: &Path) -> Result<i64> {
         .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))
 }
 
-fn rebuild_db_from_ledger(ledger_path: &Path, facts_db_path: &Path) -> Result<()> {
-    // Drop the cache file (and its sqlite sidecars) so factstr assigns
-    // sequence_numbers 1,2,3,… in the exact order they appear in the ledger.
-    // Replay-equivalence depends on this. Idempotent: replaying the same
-    // ledger twice yields the same db.
+/// Rebuild the derived sqlite cache by replaying every segment line in seq
+/// order (live segments first, then archive — the union — sorted by seq).
+/// Dedup by `sequence_number` (re-running migration twice can otherwise
+/// duplicate). Hard error on conflict (two different payloads at the same
+/// seq is corruption, not noise).
+fn rebuild_db_from_segments(
+    live: &[PathBuf],
+    archived: &[PathBuf],
+    facts_db_path: &Path,
+) -> Result<()> {
     let _ = fs::remove_file(facts_db_path);
     let _ = fs::remove_file(facts_db_path.with_extension("db-shm"));
     let _ = fs::remove_file(facts_db_path.with_extension("db-wal"));
 
-    let file = fs::File::open(ledger_path)
-        .map_err(RallyError::io(format!("read {}", ledger_path.display())))?;
-    let store = open_fact_store(facts_db_path)?;
-    for (idx, line) in BufReader::new(file).lines().enumerate() {
-        let line = line.map_err(RallyError::io(format!("read {}", ledger_path.display())))?;
-        if line.trim().is_empty() {
+    let mut all_entries: Vec<LedgerLine> = Vec::new();
+    for path in live.iter().chain(archived.iter()) {
+        let file =
+            fs::File::open(path).map_err(RallyError::io(format!("read {}", path.display())))?;
+        for (idx, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.map_err(RallyError::io(format!("read {}", path.display())))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: LedgerLine = serde_json::from_str(&line).map_err(RallyError::json(
+                format!("parse {} line {}", path.display(), idx + 1),
+            ))?;
+            all_entries.push(entry);
+        }
+    }
+    all_entries.sort_by_key(|e| e.seq);
+
+    // Dedup by seq (keep first occurrence); hard-error if two seqs disagree
+    // on payload.
+    let mut deduped: Vec<LedgerLine> = Vec::with_capacity(all_entries.len());
+    for entry in all_entries {
+        if let Some(prev) = deduped.last()
+            && prev.seq == entry.seq
+        {
+            if prev.payload != entry.payload || prev.event_type != entry.event_type {
+                return Err(RallyError::Message(format!(
+                    "segment replay conflict at seq {}: two distinct events recorded with the same sequence number",
+                    entry.seq
+                )));
+            }
             continue;
         }
-        let entry: LedgerLine = serde_json::from_str(&line).map_err(RallyError::json(format!(
-            "parse {} line {}",
-            ledger_path.display(),
-            idx + 1
-        )))?;
+        deduped.push(entry);
+    }
+
+    let store = open_fact_store(facts_db_path)?;
+    let total = deduped.len();
+    for (replay_idx, entry) in deduped.iter().enumerate() {
         let result = store
-            .append(vec![NewEvent::new(entry.event_type, entry.payload)])
-            .map_err(|err| RallyError::Message(format!("replay ledger: {err}")))?;
+            .append(vec![NewEvent::new(
+                entry.event_type.clone(),
+                entry.payload.clone(),
+            )])
+            .map_err(|err| RallyError::Message(format!("replay segments: {err}")))?;
         let assigned = i64::try_from(result.last_sequence_number)
             .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
         if assigned != entry.seq {
             return Err(RallyError::Message(format!(
-                "ledger replay seq mismatch at line {}: expected {} got {}",
-                idx + 1,
+                "segment replay seq mismatch: expected {} got {} (replay #{}/{})",
                 entry.seq,
-                assigned
+                assigned,
+                replay_idx + 1,
+                total
             )));
         }
     }
     Ok(())
 }
 
-fn seed_ledger_from_db(ledger_path: &Path, facts_db_path: &Path) -> Result<()> {
+/// Seed a single segment file from the existing db when no segment exists
+/// yet. Used as a forward-compat path: a pre-R1 install that only had
+/// `facts.db` still ends up with a canonical segment record.
+fn seed_segment_from_db(log_dir: &Path, facts_db_path: &Path) -> Result<()> {
     let store = open_fact_store(facts_db_path)?;
     let query = store
         .query(&FactQuery::all())
         .map_err(|err| RallyError::Message(format!("query facts: {err}")))?;
-    if let Some(parent) = ledger_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(RallyError::io(format!("create {}", parent.display())))?;
-    }
+    fs::create_dir_all(log_dir).map_err(RallyError::io(format!("create {}", log_dir.display())))?;
+    let seed_label = utc_date_label();
+    let target = log_dir.join(format!("{seed_label}.jsonl"));
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
-        .open(ledger_path)
-        .map_err(RallyError::io(format!("create {}", ledger_path.display())))?;
+        .open(&target)
+        .map_err(RallyError::io(format!("create {}", target.display())))?;
     for record in query.event_records {
         let seq = i64::try_from(record.sequence_number)
             .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
@@ -759,33 +1025,231 @@ fn seed_ledger_from_db(ledger_path: &Path, facts_db_path: &Path) -> Result<()> {
             occurred_at: record.occurred_at.to_string(),
             event_type: record.event_type,
             payload: record.payload,
+            engagement: Some(seed_label.clone()),
         };
-        let line = serde_json::to_string(&entry).map_err(RallyError::json("render ledger line"))?;
-        writeln!(file, "{line}")
-            .map_err(RallyError::io(format!("write {}", ledger_path.display())))?;
+        let line =
+            serde_json::to_string(&entry).map_err(RallyError::json("render segment line"))?;
+        writeln!(file, "{line}").map_err(RallyError::io(format!("write {}", target.display())))?;
     }
     file.sync_all()
-        .map_err(RallyError::io(format!("fsync {}", ledger_path.display())))?;
+        .map_err(RallyError::io(format!("fsync {}", target.display())))?;
     Ok(())
 }
 
-fn append_ledger_line(ledger_path: &Path, entry: &LedgerLine) -> Result<()> {
-    if let Some(parent) = ledger_path.parent() {
+/// Append a single line to a segment file. Path/payload format identical to
+/// the R1 monolith; only the *location* moved.
+fn append_segment_line(segment_path: &Path, entry: &LedgerLine) -> Result<()> {
+    if let Some(parent) = segment_path.parent() {
         fs::create_dir_all(parent)
             .map_err(RallyError::io(format!("create {}", parent.display())))?;
     }
-    let line = serde_json::to_string(entry).map_err(RallyError::json("render ledger line"))?;
+    let line = serde_json::to_string(entry).map_err(RallyError::json("render segment line"))?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(ledger_path)
-        .map_err(RallyError::io(format!("open {}", ledger_path.display())))?;
-    // One write call → atomic per POSIX for small lines on a local FS.
-    // `merge=union` in `.gitattributes` handles concurrent worktree appends.
-    writeln!(file, "{line}").map_err(RallyError::io(format!("write {}", ledger_path.display())))?;
+        .open(segment_path)
+        .map_err(RallyError::io(format!("open {}", segment_path.display())))?;
+    writeln!(file, "{line}")
+        .map_err(RallyError::io(format!("write {}", segment_path.display())))?;
     file.sync_data()
-        .map_err(RallyError::io(format!("fsync {}", ledger_path.display())))?;
+        .map_err(RallyError::io(format!("fsync {}", segment_path.display())))?;
     Ok(())
+}
+
+/// One-time partition of the R1 `.rally/ledger.jsonl` monolith into
+/// per-engagement segments under `.rally/log/`, then **move** the monolith to
+/// `.rally/archive/ledger-pre-segment.jsonl`. Idempotent — running twice on
+/// already-migrated state is a no-op.
+///
+/// Partition key for each row: persisted `engagement` field if present (R5
+/// rows in a mixed monolith), else the UTC date from `occurred_at`. Rows
+/// with an unparseable `occurred_at` are filed under `"undated"`.
+///
+/// Every row of the monolith is preserved verbatim — also retained in the
+/// archive copy as a belt-and-braces guarantee.
+fn migrate_monolith_to_segments(
+    legacy_ledger_path: &Path,
+    log_dir: &Path,
+    archive_dir: &Path,
+) -> Result<()> {
+    if !legacy_ledger_path.exists() {
+        return Ok(());
+    }
+    let archived_target = archive_dir.join(ARCHIVED_MONOLITH_FILENAME);
+    if archived_target.exists() {
+        // Migration already happened (rerun, or someone left both files
+        // somehow). Either way: ensure live segments contain the events.
+        // If the archive exists and the monolith still exists, the previous
+        // run died after writing segments but before moving the monolith —
+        // we can safely delete the monolith.
+        let _ = fs::remove_file(legacy_ledger_path);
+        return Ok(());
+    }
+
+    fs::create_dir_all(log_dir).map_err(RallyError::io(format!("create {}", log_dir.display())))?;
+    fs::create_dir_all(archive_dir)
+        .map_err(RallyError::io(format!("create {}", archive_dir.display())))?;
+
+    // Partition pass.
+    let file = fs::File::open(legacy_ledger_path).map_err(RallyError::io(format!(
+        "read {}",
+        legacy_ledger_path.display()
+    )))?;
+    let mut by_engagement: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (idx, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(RallyError::io(format!(
+            "read {}",
+            legacy_ledger_path.display()
+        )))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: LedgerLine = serde_json::from_str(&line).map_err(RallyError::json(format!(
+            "parse {} line {}",
+            legacy_ledger_path.display(),
+            idx + 1
+        )))?;
+        let key = entry.engagement.clone().unwrap_or_else(|| {
+            // Default key = UTC date from occurred_at, else "undated".
+            extract_date_prefix(&entry.occurred_at).unwrap_or_else(|| "undated".to_string())
+        });
+        by_engagement.entry(key).or_default().push(line);
+    }
+
+    // Atomic write per partition: write to tmp file, rename into place. If a
+    // segment for the same engagement already exists (rerun under partial
+    // failure), append rather than truncate.
+    for (engagement, lines) in &by_engagement {
+        let segment_path = log_dir.join(format!("{engagement}.jsonl"));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&segment_path)
+            .map_err(RallyError::io(format!("open {}", segment_path.display())))?;
+        for line in lines {
+            writeln!(file, "{line}")
+                .map_err(RallyError::io(format!("write {}", segment_path.display())))?;
+        }
+        file.sync_data()
+            .map_err(RallyError::io(format!("fsync {}", segment_path.display())))?;
+    }
+
+    // Move the monolith into the archive verbatim.
+    fs::rename(legacy_ledger_path, &archived_target).map_err(RallyError::io(format!(
+        "move {} -> {}",
+        legacy_ledger_path.display(),
+        archived_target.display()
+    )))?;
+    Ok(())
+}
+
+/// Pull a `YYYY-MM-DD` prefix off a RFC3339 timestamp, or None if the input
+/// doesn't look like one.
+fn extract_date_prefix(occurred_at: &str) -> Option<String> {
+    let head = occurred_at.get(..10)?;
+    let bytes = head.as_bytes();
+    if bytes.len() != 10 {
+        return None;
+    }
+    let ok = bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit);
+    if !ok {
+        return None;
+    }
+    Some(head.to_string())
+}
+
+impl RoomStore {
+    /// Refresh `.rally/log/index.json` from the current segment set.
+    /// Best-effort — failure does not block reads or appends.
+    fn refresh_log_index(&self) -> Result<()> {
+        let segments = read_segment_files(&self.log_dir)?;
+        let archived = read_segment_files(&self.archive_dir)?;
+        let mut entries = Vec::new();
+        for path in segments.iter().chain(archived.iter()) {
+            let label = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let file =
+                fs::File::open(path).map_err(RallyError::io(format!("read {}", path.display())))?;
+            let mut first_seq = i64::MAX;
+            let mut last_seq = 0i64;
+            let mut count = 0i64;
+            let mut first_ts: Option<String> = None;
+            let mut last_ts: Option<String> = None;
+            for line in BufReader::new(file).lines() {
+                let line = line.map_err(RallyError::io(format!("read {}", path.display())))?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_str::<LedgerLine>(&line) else {
+                    continue;
+                };
+                count += 1;
+                if entry.seq < first_seq {
+                    first_seq = entry.seq;
+                    first_ts = Some(entry.occurred_at.clone());
+                }
+                if entry.seq > last_seq {
+                    last_seq = entry.seq;
+                    last_ts = Some(entry.occurred_at);
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            entries.push(SegmentIndexEntry {
+                segment: path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+                engagement: label,
+                first_seq,
+                last_seq,
+                count,
+                first_ts,
+                last_ts,
+            });
+        }
+
+        let index_path = self.log_dir.join(LOG_INDEX_FILENAME);
+        fs::create_dir_all(&self.log_dir)
+            .map_err(RallyError::io(format!("create {}", self.log_dir.display())))?;
+        let rendered =
+            serde_json::to_string_pretty(&json!({"segments": entries, "updated_at": now_string()}))
+                .map_err(RallyError::json("render log index"))?;
+        let rendered = format!("{rendered}\n");
+        let temp_path = index_path.with_extension(format!("json.tmp-{}", short_id()));
+        fs::write(&temp_path, rendered)
+            .map_err(RallyError::io(format!("write {}", temp_path.display())))?;
+        match fs::rename(&temp_path, &index_path) {
+            Ok(()) => Ok(()),
+            // Parallel-writer race: another append refreshed the index
+            // between our write and rename, removing our temp file. The
+            // peer's index is current; ours is just stale. Treat as no-op.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let _ = fs::remove_file(&temp_path);
+                Ok(())
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&temp_path);
+                Err(RallyError::Io {
+                    context: format!(
+                        "replace {} with {}",
+                        index_path.display(),
+                        temp_path.display()
+                    ),
+                    source: err,
+                })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -826,12 +1290,21 @@ mod ledger_tests {
         }
     }
 
-    /// The headline guarantee: `ledger.jsonl` is canonical and `facts.db` is a
-    /// pure derived cache. Delete the cache, reopen, and the room must
-    /// reconstruct identically — same seqs, same payloads, same snapshot.
+    fn segments_under(root: &Path) -> Vec<PathBuf> {
+        read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap_or_default()
+    }
+
+    fn archive_under(root: &Path) -> Vec<PathBuf> {
+        read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap_or_default()
+    }
+
+    /// R1-era guarantee, ported to R5: the segments under `.rally/log/` are
+    /// canonical and `facts.db` is a pure derived cache. Delete the cache,
+    /// reopen, and the room must reconstruct identically — same seqs, same
+    /// payloads, same snapshot.
     #[test]
-    fn round_trip_db_rebuilds_from_ledger() {
-        let root = unique_root("ledger-roundtrip");
+    fn round_trip_db_rebuilds_from_segments() {
+        let root = unique_root("segments-roundtrip");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         let a = store
@@ -849,16 +1322,21 @@ mod ledger_tests {
         let before_snapshot = store.snapshot().unwrap();
         drop(store);
 
-        // Delete the derived cache. Ledger remains.
+        // Delete the derived cache. Segments remain.
         let facts_db = root.join(".rally/facts.db");
-        let ledger = root.join(".rally/ledger.jsonl");
-        assert!(ledger.exists(), "ledger.jsonl must persist as canonical");
+        let live_segments = segments_under(&root);
+        assert!(
+            !live_segments.is_empty(),
+            "segments must persist as canonical"
+        );
+        // Sum of live-segment lines = 3 events.
+        assert_eq!(count_segment_events(&live_segments).unwrap(), 3);
         fs::remove_file(&facts_db).ok();
         let _ = fs::remove_file(facts_db.with_extension("db-shm"));
         let _ = fs::remove_file(facts_db.with_extension("db-wal"));
         assert!(!facts_db.exists(), "cache deleted for replay test");
 
-        // Reopen → reconcile replays ledger into a fresh cache.
+        // Reopen → reconcile replays segments into a fresh cache.
         let store = RoomStore::open_at(root.clone()).unwrap();
         let after_facts = store.facts().unwrap();
         let after_snapshot = store.snapshot().unwrap();
@@ -894,11 +1372,11 @@ mod ledger_tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// First-run upgrade: a pre-existing room with a db but no ledger seeds
-    /// the canonical ledger from the cache so no history is lost.
+    /// First-run upgrade: a pre-existing room with a db but no segments
+    /// seeds a segment from the cache so no history is lost.
     #[test]
-    fn seed_ledger_from_existing_db() {
-        let root = unique_root("ledger-bootstrap");
+    fn seed_segment_from_existing_db() {
+        let root = unique_root("segments-bootstrap");
         let store = RoomStore::open_at(root.clone()).unwrap();
         store
             .append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim a"))
@@ -908,26 +1386,25 @@ mod ledger_tests {
             .unwrap();
         drop(store);
 
-        // Simulate "upgraded from a pre-ledger version of rally": delete
-        // the ledger but keep the db.
-        let ledger = root.join(".rally/ledger.jsonl");
-        fs::remove_file(&ledger).unwrap();
-        assert!(!ledger.exists());
+        // Simulate "upgraded from a pre-segment version of rally": delete
+        // every segment but keep the db. Also remove the index so first-open
+        // can't accidentally short-circuit.
+        let log_dir = root.join(".rally/log");
+        if log_dir.exists() {
+            for entry in fs::read_dir(&log_dir).unwrap() {
+                let _ = fs::remove_file(entry.unwrap().path());
+            }
+        }
+        assert!(segments_under(&root).is_empty());
         assert!(root.join(".rally/facts.db").exists());
 
-        // Reopen → reconcile seeds the ledger from the db.
+        // Reopen → reconcile seeds a segment from the db.
         let store = RoomStore::open_at(root.clone()).unwrap();
-        assert!(ledger.exists(), "ledger must be seeded from db");
+        let segs = segments_under(&root);
+        assert_eq!(segs.len(), 1, "exactly one seeded segment");
+        assert_eq!(count_segment_events(&segs).unwrap(), 2);
 
-        let lines: Vec<String> = fs::read_to_string(&ledger)
-            .unwrap()
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(str::to_string)
-            .collect();
-        assert_eq!(lines.len(), 2);
-
-        // Now delete the db and confirm the seeded ledger round-trips.
+        // Now delete the db and confirm the seeded segment round-trips.
         drop(store);
         let facts_db = root.join(".rally/facts.db");
         fs::remove_file(&facts_db).ok();
@@ -939,6 +1416,207 @@ mod ledger_tests {
         assert_eq!(facts.len(), 2);
         assert_eq!(facts[0].event_id, "e1");
         assert_eq!(facts[1].event_id, "e2");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// R5 round-trip: seed events under TWO different engagement labels, then
+    /// blow away the cache and confirm the room reconstructs identically,
+    /// from per-engagement segments.
+    #[test]
+    fn round_trip_two_engagements_reconstruct_from_segments() {
+        let root = unique_root("segments-two-engagements");
+        let mut store = RoomStore::open_at(root.clone()).unwrap();
+
+        store.set_active_engagement_for_test("alpha");
+        let a = store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "alpha claim"))
+            .unwrap();
+        let b = store
+            .append_fact(&make_fact(
+                "e2",
+                FactKind::Decision,
+                "src/",
+                "alpha decided",
+            ))
+            .unwrap();
+
+        store.set_active_engagement_for_test("beta");
+        let c = store
+            .append_fact(&make_fact(
+                "e3",
+                FactKind::Blocker,
+                "tests/",
+                "beta blocker",
+            ))
+            .unwrap();
+        let d = store
+            .append_fact(&make_fact(
+                "e4",
+                FactKind::Resolve,
+                "tests/",
+                "beta resolved",
+            ))
+            .unwrap();
+        assert_eq!((a.seq, b.seq, c.seq, d.seq), (1, 2, 3, 4));
+
+        let before_facts = store.facts().unwrap();
+        drop(store);
+
+        // Two distinct segment files exist.
+        let segs = segments_under(&root);
+        let names: Vec<String> = segs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"alpha.jsonl".to_string()), "got: {names:?}");
+        assert!(names.contains(&"beta.jsonl".to_string()), "got: {names:?}");
+        assert_eq!(count_segment_events(&segs).unwrap(), 4);
+
+        // Delete the cache, reopen, reconstruct.
+        let facts_db = root.join(".rally/facts.db");
+        fs::remove_file(&facts_db).ok();
+        let _ = fs::remove_file(facts_db.with_extension("db-shm"));
+        let _ = fs::remove_file(facts_db.with_extension("db-wal"));
+
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let after_facts = store.facts().unwrap();
+        assert_eq!(before_facts.len(), after_facts.len());
+        for (b, a) in before_facts.iter().zip(after_facts.iter()) {
+            assert_eq!(b.seq, a.seq);
+            assert_eq!(b.event_id, a.event_id);
+            assert_eq!(b.kind.as_str(), a.kind.as_str());
+        }
+
+        // Index file written and parseable.
+        let index_path = root.join(".rally/log").join(LOG_INDEX_FILENAME);
+        assert!(index_path.exists());
+        let index_val: Value =
+            serde_json::from_str(&fs::read_to_string(&index_path).unwrap()).unwrap();
+        assert!(index_val["segments"].is_array());
+        assert_eq!(index_val["segments"].as_array().unwrap().len(), 2);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// R1 → R5 migration: a pre-existing monolith on disk gets partitioned
+    /// into segments + the monolith moves to archive. Every event survives.
+    #[test]
+    fn migrates_r1_monolith_into_segments_preserving_all_events() {
+        let root = unique_root("segments-migrate");
+        // Phase 1: seed the room as if R1 had written every event into the
+        // monolith (no segments dir).
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        for n in 0..10 {
+            store
+                .append_fact(&make_fact(
+                    &format!("e{n}"),
+                    FactKind::Decision,
+                    "src/",
+                    "monolith seed",
+                ))
+                .unwrap();
+        }
+        drop(store);
+
+        // Simulate the on-disk state of an R1 install: move every line back
+        // into a synthetic `.rally/ledger.jsonl` and remove the segments.
+        let log_dir = root.join(".rally/log");
+        let monolith_path = root.join(".rally/ledger.jsonl");
+        let mut all_lines = Vec::new();
+        if log_dir.exists() {
+            for entry in fs::read_dir(&log_dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                    for line in fs::read_to_string(&path).unwrap().lines() {
+                        if !line.trim().is_empty() {
+                            all_lines.push(line.to_string());
+                        }
+                    }
+                    fs::remove_file(&path).ok();
+                }
+            }
+        }
+        fs::write(&monolith_path, all_lines.join("\n") + "\n").unwrap();
+        assert_eq!(all_lines.len(), 10);
+        // Also delete the cache so reopen has to migrate + replay.
+        let facts_db = root.join(".rally/facts.db");
+        fs::remove_file(&facts_db).ok();
+        let _ = fs::remove_file(facts_db.with_extension("db-shm"));
+        let _ = fs::remove_file(facts_db.with_extension("db-wal"));
+
+        // Phase 2: reopen. Migration should partition + archive.
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let after_facts = store.facts().unwrap();
+        assert_eq!(after_facts.len(), 10, "all 10 events preserved");
+
+        // Live segments exist (at least one).
+        let segs = segments_under(&root);
+        assert!(!segs.is_empty());
+        assert_eq!(count_segment_events(&segs).unwrap(), 10);
+
+        // Archive contains the monolith verbatim.
+        let archive = archive_under(&root);
+        assert_eq!(archive.len(), 1);
+        let archived_name = archive[0].file_name().unwrap().to_string_lossy();
+        assert_eq!(archived_name, ARCHIVED_MONOLITH_FILENAME);
+        assert_eq!(count_segment_events(&archive).unwrap(), 10);
+
+        // Monolith file gone from `.rally/`.
+        assert!(!monolith_path.exists());
+
+        // Phase 3: re-run migration (reopen). Idempotent — no duplication.
+        drop(store);
+        let _ = RoomStore::open_at(root.clone()).unwrap();
+        let segs2 = segments_under(&root);
+        assert_eq!(
+            count_segment_events(&segs2).unwrap(),
+            10,
+            "no event duplicated on second open"
+        );
+        let archive2 = archive_under(&root);
+        assert_eq!(archive2.len(), 1);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Engagement resolution priority: env var > persisted file > UTC date.
+    #[test]
+    fn engagement_resolution_priority_env_then_file_then_date() {
+        let root = unique_root("engagement-resolve");
+        let dir = root.join(".rally");
+        fs::create_dir_all(&dir).unwrap();
+
+        // 1. No env, no file → UTC date.
+        // Unset the env var if it's set in the test environment.
+        // (cargo test isolates env vars per process; the var may leak from
+        // outer shells if someone set it. Defensive remove.)
+        // SAFETY: env mutation is safe in single-threaded test execution.
+        unsafe {
+            env::remove_var(ENGAGEMENT_ENV_VAR);
+        }
+        let label = resolve_active_engagement(&dir);
+        let today = utc_date_label();
+        assert_eq!(label, today);
+
+        // 2. Persisted file → that label.
+        persist_active_engagement(&dir, "  my-sprint  ").unwrap();
+        assert_eq!(resolve_active_engagement(&dir), "my-sprint");
+
+        // 3. Env var wins over file.
+        // SAFETY: env mutation, single-threaded test.
+        unsafe {
+            env::set_var(ENGAGEMENT_ENV_VAR, "env-engagement");
+        }
+        assert_eq!(resolve_active_engagement(&dir), "env-engagement");
+        // SAFETY: env mutation, single-threaded test.
+        unsafe {
+            env::remove_var(ENGAGEMENT_ENV_VAR);
+        }
+
+        // Sanitise strips path separators.
+        let cleaned = sanitise_engagement("../escape/me");
+        assert!(!cleaned.contains('/'));
 
         fs::remove_dir_all(&root).ok();
     }

@@ -1459,9 +1459,30 @@ fn rally_no_global_index_env_var_skips_home_index() {
         index_path.display()
     );
 
-    // The per-repo ledger + db, however, *must* exist — coordination within
-    // this repo is unaffected.
-    assert!(workspace.cwd.join(".rally/ledger.jsonl").exists());
+    // The per-repo segment log + db, however, *must* exist — coordination
+    // within this repo is unaffected. R5 superseded the R1 monolith
+    // (`.rally/ledger.jsonl`) with per-engagement segments under
+    // `.rally/log/<engagement>.jsonl`; at least one segment must be present
+    // after a successful `rally enter` / `rally say` round-trip.
+    let log_dir = workspace.cwd.join(".rally/log");
+    assert!(
+        log_dir.exists() && log_dir.is_dir(),
+        "expected .rally/log/ to exist"
+    );
+    let segment_count = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| x == "jsonl")
+        })
+        .count();
+    assert!(
+        segment_count >= 1,
+        "expected at least one .rally/log/*.jsonl segment, got {segment_count}"
+    );
     assert!(workspace.cwd.join(".rally/facts.db").exists());
 
     // `recent --all` still works; it just collapses to "this repo only" and

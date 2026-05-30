@@ -38,6 +38,10 @@ pub(crate) struct EnterArgs {
     pub(crate) role: Option<String>,
     pub(crate) paths: Vec<String>,
     pub(crate) since: Option<i64>,
+    /// Optional engagement label. When set, persists to
+    /// `.rally/active-engagement` so subsequent `say` calls in the same repo
+    /// inherit it. Composes with the `RALLY_ENGAGEMENT` env var (env wins).
+    pub(crate) engagement: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -276,13 +280,15 @@ fn enter_parser() -> impl Parser<EnterArgs> {
     let role = optional_string_arg("role", "ROLE");
     let paths = many_string_arg("path", "PATH");
     let since = optional_i64_arg("since", "SEQ");
+    let engagement = optional_string_arg("engagement", "LABEL");
     construct!(EnterArgs {
         json,
         tool,
         session_id,
         role,
         paths,
-        since
+        since,
+        engagement
     })
 }
 
