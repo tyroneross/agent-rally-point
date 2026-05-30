@@ -41,6 +41,13 @@ Each task needs `id` (unique), `intent`, `owns`, `validation`, `output`.
 - `output` — the expected artifact shape (what a reviewer would confirm).
 - `depends_on` — optional; ids must resolve; no cycles permitted.
 
+**Pick one `run_id` per workstream** (any stable string — e.g. the descriptor filename or a UUID
+minted at batch start). It is the lineage handle: every fact a fanned-out agent emits carries
+`--run <run_id>`, each task's `id` becomes its `--step`, and each `depends_on` entry becomes a
+`--parent-step`. That is what lets the orchestrator reconstruct the whole fan-out with
+`rally dag --run <run_id>` (see §7). The `run_id` is not a descriptor field — it is generated/chosen
+at fan-out time and threaded through the loop below.
+
 **Lint before any fan-out.** The linter enforces all four rules (structure, MECE, determinism,
 dependency integrity):
 
@@ -82,24 +89,42 @@ Rally behavior is identical either way — it stays a facilitator regardless of 
 
 ## 4 · Per-task rally loop
 
-Each agent executes this loop for its assigned task:
+Each agent executes this loop for its assigned task. The `--run`/`--step`/`--parent-step` markers
+are what make the fan-out **observable** — drop them and `rally dag` reconstructs nothing:
 
 ```bash
 rally enter --tool <TOOL>
-rally say claim --tool <TOOL> --subject "<task.intent>" --path <owns...>
+rally say claim --tool <TOOL> --subject "<task.intent>" --path <owns...> \
+  --run <run_id> --step <task.id> --parent-step <dep>   # --parent-step once per depends_on entry; omit if none
 rally check before-write --tool <TOOL> --path <owns...> --strict
 # blocking finding → stop; resolve or pick a non-overlapping task
 
 # do the work
 <run task.validation>
 
-rally say artifact --tool <TOOL> --subject "<task.output>" --uri <path> --evidence "<validation result>"
+rally say artifact --tool <TOOL> --subject "<task.output>" --uri <path> --evidence "<validation result>" \
+  --run <run_id> --step <task.id>
 rally say release --tool <TOOL> --ref <claim-id> --subject "done"
 rally next --tool <TOOL>
 ```
 
 A `check before-write --strict` that returns a blocking finding **stops the agent** — it does not
 proceed; it either resolves the conflict or moves to a non-overlapping task.
+
+**Idle → standby (dormant, not stopped).** If the agent must *wait* — an unfinished `depends_on`
+dependency, or an external signal that hasn't arrived — it goes **dormant** instead of handing back
+or busy-waiting. This is distinct from the §6 hard-stop `blocker` (a real failure): standby is a
+recoverable pause that stays observable and resumable.
+
+```bash
+rally say standby --tool <TOOL> --reason idle --wake-after +30m --run <run_id> --step <task.id>
+# … later, when the dependency lands or the signal arrives, on resume:
+rally say wake --tool <TOOL> --ref-standby <standby-event-id>
+# then continue the loop (re-check, do the work, artifact, release)
+```
+
+A standby surfaces the agent in `rally wake-due` once `--wake-after` passes; the external runner
+(`rally watch`, §7) is what fires the resume. Rally signals; it never wakes the agent itself.
 
 **Quality wrapper (recommended):** run each task's *do the work* step through
 [`mini-loop`](../mini-loop/SKILL.md) — a zero-dependency assess → plan → execute → mini-judge loop
@@ -117,11 +142,40 @@ Re-run `task.validation` for any change with shared impact. Never auto-trust a s
 
 ## 6 · Stop conditions
 
-Hand back to the user when any of:
+**Hard stop** (hand back to the user) when any of:
 
 - `rally next` returns `requires_human: true`
 - `rally check before-write --strict` blocks and cannot be resolved
 - A task hits a real blocker → `rally say blocker --tool <TOOL> --subject "<reason>"`
+
+A hard stop is a *failure* the user must resolve. Do not use it for *waiting* — a recoverable wait
+(unmet dependency, pending external signal) is a `standby` (§4), not a `blocker`.
+
+## 7 · Observe & resume
+
+The orchestrator watches a running fan-out and resumes idle agents through three read-only views.
+The hard rule holds throughout: **Rally observes and signals; the external runner fires the work.**
+
+```bash
+# Progress: every step as landed | in-flight | stalled, edges from parent-step/ref lineage.
+rally dag --run <run_id> --json
+
+# Resumable agents: standby facts whose --wake-after has passed (trust-gated to room squads).
+# Each entry carries a `suggested_command` STRING — Rally never runs it.
+rally wake-due --json
+
+# The runner that actually fires: polls wake-due / new activity and invokes the suggestion.
+rally watch --on-activity 'rally next --tool <TOOL> --json'
+```
+
+Split of responsibility, never blurred:
+- `rally dag` / `rally wake-due` — **Rally**: read-only projections over the ledger. They report and
+  suggest; they start nothing.
+- `rally watch` — the **runner**: the only piece that executes a `suggested_command`. Substitute a
+  LaunchAgent / cron / Build Loop here if you prefer; Rally's contract is unchanged.
+
+Full event vocabulary, lineage encoding, and the runner contract:
+[`../../docs/ORCHESTRATOR_SEAM.md`](../../docs/ORCHESTRATOR_SEAM.md).
 
 Reference: canonical spec [`../../dynamic-workflows/PROTOCOL.md`](../../dynamic-workflows/PROTOCOL.md) ·
 coordination doctrine [`../../dynamic-workflows/COORDINATION.md`](../../dynamic-workflows/COORDINATION.md) ·

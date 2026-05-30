@@ -48,6 +48,19 @@ documents the same contract.
 }
 ```
 
+### Lineage (run / step / parent-step)
+
+A fan-out batch shares one **`run_id`** (any stable string, minted at batch start — it is *not* a
+descriptor field). Each task's `id` is its **step**, each `depends_on` entry a **parent-step**. Agents
+stamp these as scope markers on every fact they emit (`rally say … --run <run_id> --step <task.id>
+--parent-step <dep>`), which lets the orchestrator reconstruct the whole fan-out via
+`rally dag --run <run_id>` and resume dormant agents via `rally wake-due` (an idle agent emits
+`rally say standby --reason idle --wake-after +30m`; the runner fires the resume). The host skill
+([`../skills/rally-workflows/SKILL.md`](../skills/rally-workflows/SKILL.md) §4, §7) carries the exact
+call shapes; the event vocabulary and encoding are in
+[`../docs/ORCHESTRATOR_SEAM.md`](../docs/ORCHESTRATOR_SEAM.md). Markers are optional and additive —
+omitting them costs only observability, never correctness.
+
 ### Lint rules (enforced)
 
 1. **Structural completeness** — every task declares `id`, `intent`, `owns`, `validation`, `output`.
@@ -128,6 +141,13 @@ done
 This is the piece pi structurally cannot have: **state lives in Rally, not a parent's RAM**, so a
 multi-hour / multi-session / multi-host workstream survives a crash and resumes exactly where it
 stopped. Bounded concurrency (`core/limiter.mjs`, lifted from pi) still caps in-flight fan-out.
+
+**Lineage from the .mjs path.** `core/route.mjs` owns concurrency/ordering only — it does **not**
+shell out to `rally`; the host supplies each task body as a thunk. So the lineage markers
+(`--run`/`--step`, §1) are emitted **inside that host thunk** — the same `rally say claim/artifact`
+calls the SKILL §4 loop documents — not by `route.mjs`. Stamping them there is what makes a
+`route.mjs`-driven fan-out visible to `rally dag --run <run_id>`. The thunk *is* the integration
+point; `route.mjs` needs no change.
 
 ## 4. Scaffolding scales to harness strength
 
