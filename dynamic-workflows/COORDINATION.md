@@ -72,9 +72,13 @@ above). So: 10 terminals → 10 squad ids in the room, regardless of how many ag
 3. **De-conflict before writing.** `rally say claim` + `rally check before-write` on **canonical
    paths** (`crates/.../<file>`); one owner per file. A change whose signature ripples into another
    agent's file is a **cross-lane ripple → route it to the lead**, don't reach across.
-   **Shared checkout:** the primary checkout stays on `main`. Branch-isolated work (a PR branch)
-   MUST use a dedicated `git worktree` — never switch the shared checkout's branch under peers
-   (it lands their in-flight commits on your branch). The lead operates from its own worktree.
+   **One canonical clone on `main`** (the default): all squads — including the lead — work the single
+   repo clone on `main`. Reach for a dedicated **ephemeral** `git worktree` ONLY for genuinely
+   branch-isolated work, and **collapse it back to `main` immediately at close** — do not leave standing
+   per-agent worktrees/branches (the `arp-lead`/`arp-claude2` split caused a wrong-branch commit and a
+   ledger-commit gap; retired 2026-05-30). Never switch the shared checkout's branch under peers (it
+   lands their in-flight commits on your branch). Keep the canonical `.rally/` ledger in this one clone
+   so coordination travels with commits.
 4. **Checkpoint to rally.** claim (start) → artifact (done), so progress is durable and any fresh
    agent can resume a long-running workstream (`core/workstream-status.mjs`). This is the long-running
    edge over pi, whose progress lives only in one parent's memory.
