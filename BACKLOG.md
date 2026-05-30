@@ -51,6 +51,10 @@ WARN, B11 duplicate-id risk fact) so work continues and any mistake is traceable
 
 ## Open — ranked
 
+> **Reconciliation (2026-05-30):** rows **B10, B11, B12, B16 are DONE** (Tier 2 — see Delivered
+> above; commits `1944ae4`, `c99b835`, `d1c9eeb`). They remain in the table for traceability but are
+> no longer open. Genuinely open below: R9-readback, R9, R10, B13, B17, B18.
+
 | Rank | ID | Item | Why it matters | Depends on |
 |------|----|------|----------------|-----------|
 | 1 | **R9-readback** | **Post-mutation readback** — after any mutating command (`say`/`claim`/`release`/`handoff`/`resolve`/`enter`), re-read the canonical ledger and assert the new `event_id` landed before reporting success; return the resolved `{room, seq}`, fail loud otherwise. | Kills the whole silent-corruption class (release no-op · stale-binary write-drop · "landed"-on-exit-0 · wrong-room write) at **one** cause-agnostic anchor. Falsifiable acceptance block already written (ORCHESTRATION §R9-readback). | none |
