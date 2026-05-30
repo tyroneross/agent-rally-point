@@ -224,7 +224,7 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
         .with_global_index();
     // Enter as tool_a (first enter → lead)
     let enter_a = repo_a.json(&["enter", "--tool", "tool_a", "--json"]);
-    assert_eq!(enter_a["data"]["tool"], "tool_a", "repo_a enter failed");
+    assert_eq!(enter_a["data"]["enter"]["tool"], "tool_a", "repo_a enter failed");
     // Add two open claims in repo_a
     repo_a.json(&[
         "say", "claim", "--tool", "tool_a", "--subject", "work alpha-1", "--json",
@@ -238,7 +238,7 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
         .with_global_index();
     // Enter as tool_b (first enter → lead)
     let enter_b = repo_b.json(&["enter", "--tool", "tool_b", "--json"]);
-    assert_eq!(enter_b["data"]["tool"], "tool_b", "repo_b enter failed");
+    assert_eq!(enter_b["data"]["enter"]["tool"], "tool_b", "repo_b enter failed");
     // Add one open claim in repo_b
     repo_b.json(&[
         "say", "claim", "--tool", "tool_b", "--subject", "work beta-1", "--json",
@@ -263,9 +263,9 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
     assert_eq!(status["ok"], true);
     assert_eq!(status["command"], "status");
 
-    let repos = status["data"]["repos"]
+    let repos = status["data"]["status"]["repos"]
         .as_array()
-        .expect("data.repos must be an array");
+        .expect("data.status.repos must be an array");
 
     // Both repos must appear.
     assert!(

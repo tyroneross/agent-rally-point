@@ -196,8 +196,8 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
     ]);
     assert_eq!(claim["schema"], "agent-rally.command.say.v1");
     assert_matches_schema("agent-rally.command.say.v1.json", &claim);
-    assert_matches_schema("agent-rally.fact.v1.json", &claim["data"]["fact"]);
-    let claim_id = claim["data"]["fact"]["event_id"].as_str().unwrap();
+    assert_matches_schema("agent-rally.fact.v1.json", &claim["data"]["say"]["fact"]);
+    let claim_id = claim["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     workspace.json(&[
         "say",
@@ -223,23 +223,23 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
     ]);
     assert_eq!(enter["schema"], "agent-rally.command.enter.v1");
     assert_matches_schema("agent-rally.command.enter.v1.json", &enter);
-    assert_eq!(enter["data"]["cursor"]["before"], 0);
+    assert_eq!(enter["data"]["enter"]["cursor"]["before"], 0);
     // Component B: say claim (claude) wrote presence(1)+lead(2)+claim(3);
     // say decision (pi) wrote presence(4)+decision(5). codex enter writes
     // presence(6) via ensure_presence (lead already set by claude).
     // cursor_after is set to post-presence max_seq=6 so that codex's own
     // presence fact is excluded from "new peer content" on the next enter.
-    assert_eq!(enter["data"]["cursor"]["after"], 6);
-    assert_eq!(enter["data"]["cursor"]["advanced"], true);
+    assert_eq!(enter["data"]["enter"]["cursor"]["after"], 6);
+    assert_eq!(enter["data"]["enter"]["cursor"]["advanced"], true);
     assert!(
-        enter["data"]["entry"]["do_not"]
+        enter["data"]["enter"]["entry"]["do_not"]
             .as_array()
             .unwrap()
             .iter()
             .any(|item| item["event_id"] == claim_id)
     );
     assert!(
-        enter["data"]["entry"]["know"]
+        enter["data"]["enter"]["entry"]["know"]
             .as_array()
             .unwrap()
             .iter()
@@ -266,9 +266,9 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
     //   7: Read checkpoint (first enter's maybe_append_read_checkpoint at content_max=6)
     //   8: B11 risk fact (second enter's drift detection)
     // cursor_after = snapshot.max_seq = 8.
-    assert_eq!(enter_again["data"]["cursor"]["before"], 6);
-    assert_eq!(enter_again["data"]["cursor"]["after"], 8);
-    assert_eq!(enter_again["data"]["cursor"]["advanced"], true);
+    assert_eq!(enter_again["data"]["enter"]["cursor"]["before"], 6);
+    assert_eq!(enter_again["data"]["enter"]["cursor"]["after"], 8);
+    assert_eq!(enter_again["data"]["enter"]["cursor"]["advanced"], true);
 
     let (check, check_output) = workspace.json_with_status(&[
         "check",
@@ -470,7 +470,7 @@ fn rally_next_finds_useful_work_while_waiting() {
         "--subject",
         "need review",
     ]);
-    let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"].as_str().unwrap();
     let artifact = workspace.json(&[
         "say",
         "artifact",
@@ -484,7 +484,7 @@ fn rally_next_finds_useful_work_while_waiting() {
         "--evidence",
         "notes captured",
     ]);
-    let artifact_id = artifact["data"]["fact"]["event_id"].as_str().unwrap();
+    let artifact_id = artifact["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     let next = workspace.json(&["next", "--json", "--tool", "codex", "--limit", "4"]);
     assert_eq!(next["schema"], "agent-rally.command.next.v1");
@@ -574,7 +574,7 @@ fn rally_artifact_ref_consumes_handoff_but_not_blocker_or_claim() {
         "--subject",
         "needs work",
     ]);
-    let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     let blocker = workspace.json(&[
         "say",
@@ -585,7 +585,7 @@ fn rally_artifact_ref_consumes_handoff_but_not_blocker_or_claim() {
         "--subject",
         "broken pipeline",
     ]);
-    let blocker_id = blocker["data"]["fact"]["event_id"].as_str().unwrap();
+    let blocker_id = blocker["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     let claim = workspace.json(&[
         "say",
@@ -598,7 +598,7 @@ fn rally_artifact_ref_consumes_handoff_but_not_blocker_or_claim() {
         "--path",
         "src/lib.rs",
     ]);
-    let claim_id = claim["data"]["fact"]["event_id"].as_str().unwrap();
+    let claim_id = claim["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     // Pre-condition: handoff is open before any artifact references it.
     let room_before = workspace.json(&["room", "--json"]);
@@ -708,7 +708,7 @@ fn rally_resolve_closes_risks_in_room_projection() {
         "--severity",
         "high",
     ]);
-    let risk_id = risk["data"]["fact"]["event_id"].as_str().unwrap();
+    let risk_id = risk["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     let room_before = workspace.json(&["room", "--json"]);
     assert!(
@@ -763,7 +763,7 @@ fn rally_next_waits_only_when_no_useful_work_exists() {
         "--evidence",
         "cargo test -p rally-cli",
     ]);
-    let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     let next = workspace.json(&["next", "--json", "--tool", "codex"]);
     assert_matches_schema("agent-rally.command.next.v1.json", &next);
@@ -843,8 +843,8 @@ fn rally_entry_and_handoff_split_response_and_work_buckets() {
     ]);
 
     let enter = workspace.json(&["enter", "--json", "--tool", "codex"]);
-    let do_items = enter["data"]["entry"]["do"].as_array().unwrap();
-    let respond_to = enter["data"]["entry"]["respond_to"].as_array().unwrap();
+    let do_items = enter["data"]["enter"]["entry"]["do"].as_array().unwrap();
+    let respond_to = enter["data"]["enter"]["entry"]["respond_to"].as_array().unwrap();
     assert!(
         respond_to
             .iter()
@@ -895,14 +895,14 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     ]);
     assert_eq!(run["schema"], "agent-rally.command.run.v1");
     assert_matches_schema("agent-rally.command.run.v1.json", &run);
-    assert_eq!(run["data"]["session"]["name"], "reviewer-01");
-    assert_eq!(run["data"]["session"]["session_id"], "claude-reviewer-01");
-    assert_eq!(run["data"]["session"]["agent"], "claude");
-    assert_eq!(run["data"]["session"]["tool"], "claude_code:reviewer-01");
-    assert_eq!(run["data"]["session"]["backend"], "tmux");
-    assert_eq!(run["data"]["session"]["target"], "rally-claude-reviewer-01");
+    assert_eq!(run["data"]["run"]["session"]["name"], "reviewer-01");
+    assert_eq!(run["data"]["run"]["session"]["session_id"], "claude-reviewer-01");
+    assert_eq!(run["data"]["run"]["session"]["agent"], "claude");
+    assert_eq!(run["data"]["run"]["session"]["tool"], "claude_code:reviewer-01");
+    assert_eq!(run["data"]["run"]["session"]["backend"], "tmux");
+    assert_eq!(run["data"]["run"]["session"]["target"], "rally-claude-reviewer-01");
     assert!(
-        run["data"]["commands"]["start"]
+        run["data"]["run"]["commands"]["start"]
             .as_array()
             .unwrap()
             .iter()
@@ -913,8 +913,8 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     let sessions = workspace.json(&["sessions", "--json"]);
     assert_eq!(sessions["schema"], "agent-rally.command.sessions.v1");
     assert_matches_schema("agent-rally.command.sessions.v1.json", &sessions);
-    assert_eq!(sessions["data"]["sessions"].as_array().unwrap().len(), 1);
-    assert_eq!(sessions["data"]["sessions"][0]["name"], "reviewer-01");
+    assert_eq!(sessions["data"]["sessions"]["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(sessions["data"]["sessions"]["sessions"][0]["name"], "reviewer-01");
     assert!(!workspace.cwd.join(".rally/sessions.json").exists());
     let room = workspace.json(&["room", "--json"]);
     assert_eq!(room["data"]["room"]["max_seq"], 1);
@@ -930,8 +930,8 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     ]);
     assert_eq!(inject["schema"], "agent-rally.command.inject.v1");
     assert_matches_schema("agent-rally.command.inject.v1.json", &inject);
-    assert_eq!(inject["data"]["session"]["name"], "reviewer-01");
-    assert_eq!(inject["data"]["commands"].as_array().unwrap().len(), 4);
+    assert_eq!(inject["data"]["inject"]["session"]["name"], "reviewer-01");
+    assert_eq!(inject["data"]["inject"]["commands"].as_array().unwrap().len(), 4);
 
     let handoff = workspace.json(&[
         "say",
@@ -944,7 +944,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "--subject",
         "managed session handoff",
     ]);
-    let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"].as_str().unwrap();
     // R9-readback: do NOT pre-resolve the handoff here — the thread below is the
     // sole resolver.  A double-resolve of the same ref is now correctly blocked by
     // the R9 state-transition check (the handoff would no longer be in open_handoffs).
@@ -989,10 +989,10 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "/usr/bin/true",
     ]);
     resolver.join().unwrap();
-    assert_eq!(acked["data"]["ack"]["resolved"], true);
-    assert_eq!(acked["data"]["ack"]["tool"], "claude_code:reviewer-01");
+    assert_eq!(acked["data"]["inject"]["ack"]["resolved"], true);
+    assert_eq!(acked["data"]["inject"]["ack"]["tool"], "claude_code:reviewer-01");
     assert_eq!(
-        acked["data"]["ack"]["subject"],
+        acked["data"]["inject"]["ack"]["subject"],
         "managed session handoff resolved after inject"
     );
 
@@ -1007,8 +1007,8 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     ]);
     assert_eq!(capture["schema"], "agent-rally.command.session-action.v1");
     assert_matches_schema("agent-rally.command.session-action.v1.json", &capture);
-    assert_eq!(capture["data"]["action"], "capture");
-    assert_eq!(capture["data"]["output"], "");
+    assert_eq!(capture["data"]["capture"]["action"], "capture");
+    assert_eq!(capture["data"]["capture"]["output"], "");
     let capture_text = workspace.output(&[
         "capture",
         "reviewer-01",
@@ -1033,7 +1033,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     ]);
     assert_eq!(attach["schema"], "agent-rally.command.session-action.v1");
     assert_matches_schema("agent-rally.command.session-action.v1.json", &attach);
-    assert_eq!(attach["data"]["commands"][0][1], "attach");
+    assert_eq!(attach["data"]["attach"]["commands"][0][1], "attach");
 
     let dry_run = workspace.json(&[
         "run",
@@ -1045,9 +1045,9 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "tmux",
         "--dry-run",
     ]);
-    assert_eq!(dry_run["data"]["mode"], "dry-run");
+    assert_eq!(dry_run["data"]["run"]["mode"], "dry-run");
     let sessions = workspace.json(&["sessions", "--json"]);
-    assert_eq!(sessions["data"]["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(sessions["data"]["sessions"]["sessions"].as_array().unwrap().len(), 1);
 
     let stop = workspace.json(&[
         "stop",
@@ -1058,9 +1058,9 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     ]);
     assert_eq!(stop["schema"], "agent-rally.command.session-action.v1");
     assert_matches_schema("agent-rally.command.session-action.v1.json", &stop);
-    assert_eq!(stop["data"]["action"], "stop");
+    assert_eq!(stop["data"]["stop"]["action"], "stop");
     let sessions = workspace.json(&["sessions", "--json"]);
-    assert_eq!(sessions["data"]["sessions"].as_array().unwrap().len(), 0);
+    assert_eq!(sessions["data"]["sessions"]["sessions"].as_array().unwrap().len(), 0);
     assert!(!workspace.cwd.join(".rally/sessions.json").exists());
 
     workspace.cleanup();
@@ -1079,10 +1079,10 @@ fn rally_run_assigns_numbered_agent_ids() {
         "--tmux-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(first_claude["data"]["session"]["name"], "claude-01");
-    assert_eq!(first_claude["data"]["session"]["session_id"], "claude-01");
-    assert_eq!(first_claude["data"]["session"]["tool"], "claude_code:01");
-    assert_eq!(first_claude["data"]["session"]["target"], "rally-claude-01");
+    assert_eq!(first_claude["data"]["run"]["session"]["name"], "claude-01");
+    assert_eq!(first_claude["data"]["run"]["session"]["session_id"], "claude-01");
+    assert_eq!(first_claude["data"]["run"]["session"]["tool"], "claude_code:01");
+    assert_eq!(first_claude["data"]["run"]["session"]["target"], "rally-claude-01");
 
     let second_claude = workspace.json(&[
         "run",
@@ -1093,9 +1093,9 @@ fn rally_run_assigns_numbered_agent_ids() {
         "--tmux-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(second_claude["data"]["session"]["name"], "claude-02");
-    assert_eq!(second_claude["data"]["session"]["session_id"], "claude-02");
-    assert_eq!(second_claude["data"]["session"]["tool"], "claude_code:02");
+    assert_eq!(second_claude["data"]["run"]["session"]["name"], "claude-02");
+    assert_eq!(second_claude["data"]["run"]["session"]["session_id"], "claude-02");
+    assert_eq!(second_claude["data"]["run"]["session"]["tool"], "claude_code:02");
 
     let reviewer = workspace.json(&[
         "run",
@@ -1108,13 +1108,13 @@ fn rally_run_assigns_numbered_agent_ids() {
         "--tmux-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(reviewer["data"]["session"]["name"], "reviewer-01");
+    assert_eq!(reviewer["data"]["run"]["session"]["name"], "reviewer-01");
     assert_eq!(
-        reviewer["data"]["session"]["session_id"],
+        reviewer["data"]["run"]["session"]["session_id"],
         "claude-reviewer-01"
     );
     assert_eq!(
-        reviewer["data"]["session"]["tool"],
+        reviewer["data"]["run"]["session"]["tool"],
         "claude_code:reviewer-01"
     );
 
@@ -1129,9 +1129,9 @@ fn rally_run_assigns_numbered_agent_ids() {
         "--tmux-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(second_reviewer["data"]["session"]["name"], "reviewer-02");
+    assert_eq!(second_reviewer["data"]["run"]["session"]["name"], "reviewer-02");
     assert_eq!(
-        second_reviewer["data"]["session"]["tool"],
+        second_reviewer["data"]["run"]["session"]["tool"],
         "claude_code:reviewer-02"
     );
 
@@ -1144,9 +1144,9 @@ fn rally_run_assigns_numbered_agent_ids() {
         "--tmux-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(first_codex["data"]["session"]["name"], "codex-01");
-    assert_eq!(first_codex["data"]["session"]["session_id"], "codex-01");
-    assert_eq!(first_codex["data"]["session"]["tool"], "codex:01");
+    assert_eq!(first_codex["data"]["run"]["session"]["name"], "codex-01");
+    assert_eq!(first_codex["data"]["run"]["session"]["session_id"], "codex-01");
+    assert_eq!(first_codex["data"]["run"]["session"]["tool"], "codex:01");
 
     // A second session with the same --tool but a different name is now
     // allowed (a lead may hold multiple managed sessions).  The rejection
@@ -1209,8 +1209,8 @@ fn rally_run_reserves_numbered_ids_under_parallel_launch() {
         );
     }
 
-    let sessions = workspace.json(&["sessions", "--json"]);
-    let sessions = sessions["data"]["sessions"].as_array().unwrap();
+    let sessions_resp = workspace.json(&["sessions", "--json"]);
+    let sessions = sessions_resp["data"]["sessions"]["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 24);
     let names = sessions
         .iter()
@@ -1246,7 +1246,7 @@ fn rally_run_removes_session_reservation_when_backend_start_fails() {
     assert!(!output.status.success());
 
     let sessions = workspace.json(&["sessions", "--json"]);
-    assert_eq!(sessions["data"]["sessions"].as_array().unwrap().len(), 0);
+    assert_eq!(sessions["data"]["sessions"]["sessions"].as_array().unwrap().len(), 0);
 
     workspace.cleanup();
 }
@@ -1266,7 +1266,7 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
         "--subject",
         "wake codex for review",
     ]);
-    let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     let next = workspace.json(&["next", "--json", "--tool", "codex"]);
     assert_matches_schema("agent-rally.command.next.v1.json", &next);
@@ -1277,7 +1277,7 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
     assert_eq!(next["data"]["wake_intent"]["status"], "pending");
     let next_wake_id = next["data"]["wake_intent"]["event_id"].as_str().unwrap();
     let located_next_wake = workspace.json(&["locate", next_wake_id, "--json"]);
-    assert_eq!(located_next_wake["data"]["located"]["source"], "room");
+    assert_eq!(located_next_wake["data"]["locate"]["located"]["source"], "room");
 
     let run = workspace.json(&[
         "run",
@@ -1290,7 +1290,7 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
         "--tmux-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(run["data"]["session"]["tool"], "claude_code:reviewer-01");
+    assert_eq!(run["data"]["run"]["session"]["tool"], "claude_code:reviewer-01");
     let inject = workspace.json(&[
         "inject",
         "reviewer-01",
@@ -1301,13 +1301,13 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
         "/usr/bin/true",
     ]);
     assert_matches_schema("agent-rally.command.inject.v1.json", &inject);
-    assert_eq!(inject["data"]["wake_intent"]["kind"], "wake");
+    assert_eq!(inject["data"]["inject"]["wake_intent"]["kind"], "wake");
     assert_eq!(
-        inject["data"]["wake_intent"]["target"],
+        inject["data"]["inject"]["wake_intent"]["target"],
         "claude_code:reviewer-01"
     );
-    assert_eq!(inject["data"]["wake_intent"]["ref"], handoff_id);
-    assert_eq!(inject["data"]["wake_intent"]["status"], "delivered");
+    assert_eq!(inject["data"]["inject"]["wake_intent"]["ref"], handoff_id);
+    assert_eq!(inject["data"]["inject"]["wake_intent"]["status"], "delivered");
 
     workspace.cleanup();
 }
@@ -1332,7 +1332,7 @@ fn rally_locate_and_recent_discover_rooms_without_legacy() {
         "--subject",
         "repo a decision",
     ]);
-    let decision_id = decision["data"]["fact"]["event_id"].as_str().unwrap();
+    let decision_id = decision["data"]["say"]["fact"]["event_id"].as_str().unwrap();
     let artifact = repo_b.json(&[
         "say",
         "artifact",
@@ -1344,19 +1344,19 @@ fn rally_locate_and_recent_discover_rooms_without_legacy() {
         "--uri",
         "file:artifact.md",
     ]);
-    let artifact_id = artifact["data"]["fact"]["event_id"].as_str().unwrap();
+    let artifact_id = artifact["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     // Cross-repo locate: repo_b can locate a fact written by repo_a via the
     // global rooms index.
     let located = repo_b.json(&["locate", decision_id, "--json"]);
     assert_matches_schema("agent-rally.command.locate.v1.json", &located);
-    assert_eq!(located["data"]["located"]["source"], "room");
+    assert_eq!(located["data"]["locate"]["located"]["source"], "room");
     assert_eq!(
-        located["data"]["located"]["fact"]["event_id"].as_str(),
+        located["data"]["locate"]["located"]["fact"]["event_id"].as_str(),
         Some(decision_id)
     );
     assert!(
-        located["data"]["located"]["repo_root"]
+        located["data"]["locate"]["located"]["repo_root"]
             .as_str()
             .unwrap()
             .contains("rally-discovery-a-cwd")
@@ -1374,9 +1374,9 @@ fn rally_locate_and_recent_discover_rooms_without_legacy() {
     // locate does NOT find the legacy-only event (no --include-legacy flag exists).
     let not_found = repo_b.json(&["locate", "evt_legacy_wake", "--json"]);
     assert!(
-        not_found["data"]["located"].is_null(),
+        not_found["data"]["locate"]["located"].is_null(),
         "legacy-only event must NOT be found by locate after flag retirement; got: {:?}",
-        not_found["data"]["located"]
+        not_found["data"]["locate"]["located"]
     );
 
     // recent --all returns room-based rows (including artifact from repo_b);
@@ -1384,7 +1384,7 @@ fn rally_locate_and_recent_discover_rooms_without_legacy() {
     let recent = repo_b.json(&["recent", "--all", "--json", "--limit", "10"]);
     assert_matches_schema("agent-rally.command.recent.v1.json", &recent);
     assert!(
-        recent["data"]["rows"]
+        recent["data"]["recent"]["rows"]
             .as_array()
             .unwrap()
             .iter()
@@ -1392,7 +1392,7 @@ fn rally_locate_and_recent_discover_rooms_without_legacy() {
         "recent must include the room-based artifact fact"
     );
     assert!(
-        !recent["data"]["rows"]
+        !recent["data"]["recent"]["rows"]
             .as_array()
             .unwrap()
             .iter()
@@ -1423,20 +1423,20 @@ fn rally_refresh_does_not_clobber_corrupt_room_index() {
         "--subject",
         "keeps corrupt index",
     ]);
-    let artifact_id = artifact["data"]["fact"]["event_id"].as_str().unwrap();
+    let artifact_id = artifact["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     assert_eq!(fs::read_to_string(&index_path).unwrap(), "{not-json");
 
     let recent = workspace.json(&["recent", "--all", "--json", "--limit", "10"]);
     assert!(
-        recent["data"]["warnings"]
+        recent["data"]["recent"]["warnings"]
             .as_array()
             .unwrap()
             .iter()
             .any(|warning| warning["code"] == "room_index_unreadable")
     );
     assert!(
-        recent["data"]["rows"]
+        recent["data"]["recent"]["rows"]
             .as_array()
             .unwrap()
             .iter()
@@ -1526,7 +1526,7 @@ fn rally_no_global_index_env_var_skips_home_index() {
     assert!(recent_output.status.success());
     let recent: Value = serde_json::from_slice(&recent_output.stdout).unwrap();
     assert!(
-        recent["data"]["warnings"]
+        recent["data"]["recent"]["warnings"]
             .as_array()
             .map(|w| w
                 .iter()
@@ -1596,13 +1596,13 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
     ]);
     assert_eq!(herdr["schema"], "agent-rally.command.run.v1");
     assert_matches_schema("agent-rally.command.run.v1.json", &herdr);
-    assert_eq!(herdr["data"]["session"]["backend"], "herdr");
+    assert_eq!(herdr["data"]["run"]["session"]["backend"], "herdr");
     assert_eq!(
-        herdr["data"]["session"]["target"],
+        herdr["data"]["run"]["session"]["target"],
         "claude-herdr-reviewer-01"
     );
-    assert_eq!(herdr["data"]["commands"]["start"][0][1], "agent");
-    assert_eq!(herdr["data"]["commands"]["start"][0][2], "start");
+    assert_eq!(herdr["data"]["run"]["commands"]["start"][0][1], "agent");
+    assert_eq!(herdr["data"]["run"]["commands"]["start"][0][2], "start");
 
     let herdr_inject = workspace.json(&[
         "inject",
@@ -1613,15 +1613,15 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
         "--herdr-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(herdr_inject["data"]["commands"][0][1], "pane");
-    assert_eq!(herdr_inject["data"]["commands"][0][2], "send-text");
-    assert_eq!(herdr_inject["data"]["commands"][0][4], "\u{15}");
-    assert_eq!(herdr_inject["data"]["commands"][1][1], "pane");
-    assert_eq!(herdr_inject["data"]["commands"][1][2], "send-text");
-    assert_eq!(herdr_inject["data"]["commands"][1][4], "hello herdr");
-    assert_eq!(herdr_inject["data"]["commands"][2][1], "pane");
-    assert_eq!(herdr_inject["data"]["commands"][2][2], "send-keys");
-    assert_eq!(herdr_inject["data"]["commands"][2][4], "enter");
+    assert_eq!(herdr_inject["data"]["inject"]["commands"][0][1], "pane");
+    assert_eq!(herdr_inject["data"]["inject"]["commands"][0][2], "send-text");
+    assert_eq!(herdr_inject["data"]["inject"]["commands"][0][4], "\u{15}");
+    assert_eq!(herdr_inject["data"]["inject"]["commands"][1][1], "pane");
+    assert_eq!(herdr_inject["data"]["inject"]["commands"][1][2], "send-text");
+    assert_eq!(herdr_inject["data"]["inject"]["commands"][1][4], "hello herdr");
+    assert_eq!(herdr_inject["data"]["inject"]["commands"][2][1], "pane");
+    assert_eq!(herdr_inject["data"]["inject"]["commands"][2][2], "send-keys");
+    assert_eq!(herdr_inject["data"]["inject"]["commands"][2][4], "enter");
 
     let herdr_capture = workspace.json(&[
         "capture",
@@ -1632,8 +1632,8 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
         "30",
     ]);
     assert_matches_schema("agent-rally.command.session-action.v1.json", &herdr_capture);
-    assert_eq!(herdr_capture["data"]["commands"][0][1], "agent");
-    assert_eq!(herdr_capture["data"]["commands"][0][2], "read");
+    assert_eq!(herdr_capture["data"]["capture"]["commands"][0][1], "agent");
+    assert_eq!(herdr_capture["data"]["capture"]["commands"][0][2], "read");
 
     let cmux_bin = workspace.cwd.join("fake-cmux");
     fs::write(
@@ -1659,24 +1659,24 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
     ]);
     assert_eq!(cmux["schema"], "agent-rally.command.run.v1");
     assert_matches_schema("agent-rally.command.run.v1.json", &cmux);
-    assert_eq!(cmux["data"]["session"]["backend"], "cmux");
-    assert_eq!(cmux["data"]["session"]["target"], "workspace:cmux-builder");
-    assert_eq!(cmux["data"]["commands"]["start"][0][1], "new-workspace");
+    assert_eq!(cmux["data"]["run"]["session"]["backend"], "cmux");
+    assert_eq!(cmux["data"]["run"]["session"]["target"], "workspace:cmux-builder");
+    assert_eq!(cmux["data"]["run"]["commands"]["start"][0][1], "new-workspace");
     assert!(
-        !cmux["data"]["commands"]["start"][0]
+        !cmux["data"]["run"]["commands"]["start"][0]
             .as_array()
             .unwrap()
             .iter()
             .any(|arg| arg == "--command")
     );
     assert!(
-        cmux["data"]["commands"]["start"][0]
+        cmux["data"]["run"]["commands"]["start"][0]
             .as_array()
             .unwrap()
             .iter()
             .any(|arg| arg == "--layout")
     );
-    let cmux_layout = cmux["data"]["commands"]["start"][0]
+    let cmux_layout = cmux["data"]["run"]["commands"]["start"][0]
         .as_array()
         .unwrap()
         .windows(2)
@@ -1696,15 +1696,15 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
         "--cmux-bin",
         cmux_bin,
     ]);
-    assert_eq!(cmux_inject["data"]["commands"][0][1], "send-key");
-    assert_eq!(cmux_inject["data"]["commands"][0][4], "ctrl+u");
-    assert_eq!(cmux_inject["data"]["commands"][1][1], "send");
-    assert_eq!(cmux_inject["data"]["commands"][1][4], "hello cmux");
-    assert_eq!(cmux_inject["data"]["commands"][2][1], "send-key");
-    assert_eq!(cmux_inject["data"]["commands"][2][4], "enter");
+    assert_eq!(cmux_inject["data"]["inject"]["commands"][0][1], "send-key");
+    assert_eq!(cmux_inject["data"]["inject"]["commands"][0][4], "ctrl+u");
+    assert_eq!(cmux_inject["data"]["inject"]["commands"][1][1], "send");
+    assert_eq!(cmux_inject["data"]["inject"]["commands"][1][4], "hello cmux");
+    assert_eq!(cmux_inject["data"]["inject"]["commands"][2][1], "send-key");
+    assert_eq!(cmux_inject["data"]["inject"]["commands"][2][4], "enter");
 
     let cmux_stop = workspace.json(&["stop", "cmux-builder-01", "--json", "--cmux-bin", cmux_bin]);
-    assert_eq!(cmux_stop["data"]["commands"][0][1], "close-workspace");
+    assert_eq!(cmux_stop["data"]["stop"]["commands"][0][1], "close-workspace");
 
     let herdr_stop = workspace.json(&[
         "stop",
@@ -1713,8 +1713,8 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
         "--herdr-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(herdr_stop["data"]["commands"][0][1], "pane");
-    assert_eq!(herdr_stop["data"]["commands"][0][2], "close");
+    assert_eq!(herdr_stop["data"]["stop"]["commands"][0][1], "pane");
+    assert_eq!(herdr_stop["data"]["stop"]["commands"][0][2], "close");
 
     workspace.cleanup();
 }
@@ -1737,7 +1737,7 @@ fn rally_room_is_queryable_by_tool_role_path_event_thread_and_since() {
         "--subject",
         "codex owns main",
     ]);
-    let claim_id = claim["data"]["fact"]["event_id"].as_str().unwrap();
+    let claim_id = claim["data"]["say"]["fact"]["event_id"].as_str().unwrap();
     workspace.json(&[
         "say",
         "decision",
@@ -1857,10 +1857,10 @@ fn rally_say_persists_summary_round_trip() {
         "Reviewer has enough context to proceed.",
     ]);
     assert_eq!(
-        handoff["data"]["fact"]["summary"], "Reviewer has enough context to proceed.",
+        handoff["data"]["say"]["fact"]["summary"], "Reviewer has enough context to proceed.",
         "space-separated --summary must round-trip into fact.summary"
     );
-    assert_eq!(handoff["data"]["fact"]["subject"], "needs review");
+    assert_eq!(handoff["data"]["say"]["fact"]["subject"], "needs review");
 
     let decision = workspace.json(&[
         "say",
@@ -1873,7 +1873,7 @@ fn rally_say_persists_summary_round_trip() {
         "--summary=Adopt the finite pickup protocol.",
     ]);
     assert_eq!(
-        decision["data"]["fact"]["summary"], "Adopt the finite pickup protocol.",
+        decision["data"]["say"]["fact"]["summary"], "Adopt the finite pickup protocol.",
         "--summary=value form must round-trip into fact.summary"
     );
 
@@ -1964,14 +1964,14 @@ fn rally_supports_all_required_fact_kinds() {
         "say", "claim", "--json", "--tool", "codex",
         "--subject", "pre-claim for release test", "--path", "src/lib.rs",
     ]);
-    let pre_claim_id = pre_claim["data"]["fact"]["event_id"].as_str().unwrap();
+    let pre_claim_id = pre_claim["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     // Write a blocker to resolve.
     let pre_blocker = workspace.json(&[
         "say", "blocker", "--json", "--tool", "codex",
         "--subject", "pre-blocker for resolve test", "--path", "src/lib.rs",
     ]);
-    let pre_blocker_id = pre_blocker["data"]["fact"]["event_id"].as_str().unwrap();
+    let pre_blocker_id = pre_blocker["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     // Kinds that don't need a ref.
     let simple_kinds = ["decision", "artifact", "handoff", "risk", "lesson"];
@@ -1980,10 +1980,10 @@ fn rally_supports_all_required_fact_kinds() {
             "say", kind, "--json", "--tool", "codex",
             "--subject", kind, "--path", "src/lib.rs", "--evidence", "observed",
         ]);
-        assert_eq!(fact["data"]["fact"]["kind"], kind, "kind mismatch for {kind}");
-        assert_eq!(fact["data"]["fact"]["schema"], "agent-rally.fact.v1");
-        DateTime::parse_from_rfc3339(fact["data"]["fact"]["created_at"].as_str().unwrap()).unwrap();
-        assert_matches_schema("agent-rally.fact.v1.json", &fact["data"]["fact"]);
+        assert_eq!(fact["data"]["say"]["fact"]["kind"], kind, "kind mismatch for {kind}");
+        assert_eq!(fact["data"]["say"]["fact"]["schema"], "agent-rally.fact.v1");
+        DateTime::parse_from_rfc3339(fact["data"]["say"]["fact"]["created_at"].as_str().unwrap()).unwrap();
+        assert_matches_schema("agent-rally.fact.v1.json", &fact["data"]["say"]["fact"]);
     }
 
     // R9: release --ref <live-claim>.
@@ -1992,9 +1992,9 @@ fn rally_supports_all_required_fact_kinds() {
         "--subject", "release", "--path", "src/lib.rs",
         "--ref", pre_claim_id,
     ]);
-    assert_eq!(release_fact["data"]["fact"]["kind"], "release");
-    assert_eq!(release_fact["data"]["fact"]["schema"], "agent-rally.fact.v1");
-    assert_matches_schema("agent-rally.fact.v1.json", &release_fact["data"]["fact"]);
+    assert_eq!(release_fact["data"]["say"]["fact"]["kind"], "release");
+    assert_eq!(release_fact["data"]["say"]["fact"]["schema"], "agent-rally.fact.v1");
+    assert_matches_schema("agent-rally.fact.v1.json", &release_fact["data"]["say"]["fact"]);
     // R9-readback: verified {room, seq} must be present in the response.
     assert!(
         release_fact["data"]["verified"]["seq"].as_i64().unwrap_or(0) > 0,
@@ -2011,9 +2011,9 @@ fn rally_supports_all_required_fact_kinds() {
         "--subject", "resolve", "--path", "src/lib.rs",
         "--ref", pre_blocker_id,
     ]);
-    assert_eq!(resolve_fact["data"]["fact"]["kind"], "resolve");
-    assert_eq!(resolve_fact["data"]["fact"]["schema"], "agent-rally.fact.v1");
-    assert_matches_schema("agent-rally.fact.v1.json", &resolve_fact["data"]["fact"]);
+    assert_eq!(resolve_fact["data"]["say"]["fact"]["kind"], "resolve");
+    assert_eq!(resolve_fact["data"]["say"]["fact"]["schema"], "agent-rally.fact.v1");
+    assert_matches_schema("agent-rally.fact.v1.json", &resolve_fact["data"]["say"]["fact"]);
 
     workspace.cleanup();
 }
@@ -2032,7 +2032,7 @@ fn presence_substrate_enter_writes_presence_and_lead() {
     let enter_a = workspace.json(&["enter", "--json", "--tool", "alpha"]);
     assert_eq!(enter_a["schema"], "agent-rally.command.enter.v1");
     // room_id must be a non-null, non-empty string (Component A requirement).
-    let room_id = enter_a["data"]["room_id"].as_str().unwrap();
+    let room_id = enter_a["data"]["enter"]["room_id"].as_str().unwrap();
     assert!(!room_id.is_empty(), "room_id must be non-empty");
 
     // Room projection after first enter must have alpha in squads and as lead.
@@ -2049,7 +2049,7 @@ fn presence_substrate_enter_writes_presence_and_lead() {
 
     // --- Second enter: tool "beta" ---
     let enter_b = workspace.json(&["enter", "--json", "--tool", "beta"]);
-    let room_id_b = enter_b["data"]["room_id"].as_str().unwrap();
+    let room_id_b = enter_b["data"]["enter"]["room_id"].as_str().unwrap();
     assert_eq!(room_id, room_id_b, "room_id stable across enters");
 
     let room_b = workspace.json(&["room", "--json"]);
@@ -2094,7 +2094,7 @@ fn presence_substrate_enter_writes_presence_and_lead() {
 
     // Presence facts are readable via `recent` (the main non-room read path).
     let recent = workspace.json(&["recent", "--json"]);
-    let rows = recent["data"]["rows"].as_array().unwrap();
+    let rows = recent["data"]["recent"]["rows"].as_array().unwrap();
     assert!(
         rows.iter().any(|r| r["fact"]["kind"] == "presence"),
         "presence facts appear in recent rows"
@@ -2179,10 +2179,10 @@ fn rally_migrate_legacy_replays_and_is_idempotent() {
         first["ok"].as_bool().unwrap_or(false),
         "migrate-legacy must return ok:true on first run"
     );
-    let migrated = first["data"]["facts_migrated"].as_u64().unwrap_or(0);
+    let migrated = first["data"]["migrate-legacy"]["facts_migrated"].as_u64().unwrap_or(0);
     assert_eq!(migrated, 1, "first run must migrate exactly 1 fact");
     assert_eq!(
-        first["data"]["facts_skipped_existing"].as_u64().unwrap_or(99),
+        first["data"]["migrate-legacy"]["facts_skipped_existing"].as_u64().unwrap_or(99),
         0,
         "no facts should be skipped on first run"
     );
@@ -2190,7 +2190,7 @@ fn rally_migrate_legacy_replays_and_is_idempotent() {
     // Verify the fact appears in recent.
     let recent = workspace.json(&["recent", "--json"]);
     assert!(
-        recent["data"]["rows"]
+        recent["data"]["recent"]["rows"]
             .as_array()
             .unwrap()
             .iter()
@@ -2200,7 +2200,7 @@ fn rally_migrate_legacy_replays_and_is_idempotent() {
 
     // Unrelated fact must NOT appear (different slug).
     assert!(
-        !recent["data"]["rows"]
+        !recent["data"]["recent"]["rows"]
             .as_array()
             .unwrap()
             .iter()
@@ -2211,12 +2211,12 @@ fn rally_migrate_legacy_replays_and_is_idempotent() {
     // Second migrate-legacy run: idempotent.
     let second = workspace.json(&["migrate-legacy", "--json"]);
     assert_eq!(
-        second["data"]["facts_migrated"].as_u64().unwrap_or(99),
+        second["data"]["migrate-legacy"]["facts_migrated"].as_u64().unwrap_or(99),
         0,
         "second run must migrate 0 facts (already in ledger)"
     );
     assert_eq!(
-        second["data"]["facts_skipped_existing"].as_u64().unwrap_or(0),
+        second["data"]["migrate-legacy"]["facts_skipped_existing"].as_u64().unwrap_or(0),
         1,
         "second run must count 1 skipped-existing"
     );
@@ -2257,7 +2257,7 @@ fn b13_produces_depends_round_trip_on_claim() {
         "src/config.rs",
     ]);
     assert_eq!(claim["schema"], "agent-rally.command.say.v1");
-    let claim_id = claim["data"]["fact"]["event_id"].as_str().unwrap();
+    let claim_id = claim["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     // Read back via room and verify evidence markers are present.
     let room = workspace.json(&["room", "--json"]);
@@ -2313,7 +2313,7 @@ fn b13_receipt_links_handoff_and_closes_it() {
         "--subject",
         "please review auth module",
     ]);
-    let handoff_id = handoff["data"]["fact"]["event_id"].as_str().unwrap();
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     // Verify handoff is open.
     let room_before = workspace.json(&["room", "--json"]);
@@ -2341,17 +2341,17 @@ fn b13_receipt_links_handoff_and_closes_it() {
         "started reviewing the auth module",
     ]);
     assert_eq!(receipt["schema"], "agent-rally.command.say.v1");
-    let receipt_id = receipt["data"]["fact"]["event_id"].as_str().unwrap();
+    let receipt_id = receipt["data"]["say"]["fact"]["event_id"].as_str().unwrap();
     assert!(!receipt_id.is_empty(), "receipt must have a valid event_id");
 
     // The receipt's ref must point to the handoff.
     assert_eq!(
-        receipt["data"]["fact"]["ref"].as_str(),
+        receipt["data"]["say"]["fact"]["ref"].as_str(),
         Some(handoff_id),
         "receipt ref must equal the handoff event_id"
     );
     assert_eq!(
-        receipt["data"]["fact"]["kind"].as_str(),
+        receipt["data"]["say"]["fact"]["kind"].as_str(),
         Some("receipt"),
         "fact kind must be 'receipt'"
     );
@@ -2393,9 +2393,9 @@ fn b13_check_ci_strict_exits_zero_clean_room() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(result["schema"], "agent-rally.command.check-ci.v1");
-    assert_eq!(result["data"]["check_ci"]["pass"], true);
+    assert_eq!(result["data"]["check-ci"]["pass"], true);
     assert_eq!(
-        result["data"]["check_ci"]["offenders"]
+        result["data"]["check-ci"]["offenders"]
             .as_array()
             .unwrap()
             .len(),
@@ -2419,7 +2419,7 @@ fn b13_check_ci_strict_exits_4_with_unresolved_blocker() {
         "--subject",
         "CI pipeline broken",
     ]);
-    let blocker_id = blocker["data"]["fact"]["event_id"].as_str().unwrap();
+    let blocker_id = blocker["data"]["say"]["fact"]["event_id"].as_str().unwrap();
 
     let (result, output) = workspace.json_with_status(&["check-ci", "--json", "--strict"]);
     assert_eq!(
@@ -2428,8 +2428,8 @@ fn b13_check_ci_strict_exits_4_with_unresolved_blocker() {
         "check-ci --strict must exit 4 when an unresolved blocker exists; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(result["data"]["check_ci"]["pass"], false);
-    let offenders = result["data"]["check_ci"]["offenders"].as_array().unwrap();
+    assert_eq!(result["data"]["check-ci"]["pass"], false);
+    let offenders = result["data"]["check-ci"]["offenders"].as_array().unwrap();
     assert!(
         offenders
             .iter()
@@ -2469,8 +2469,8 @@ fn b13_check_ci_strict_exits_4_with_dep_not_met() {
         "check-ci --strict must exit 4 with an unsatisfied dependency; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(result["data"]["check_ci"]["pass"], false);
-    let offenders = result["data"]["check_ci"]["offenders"].as_array().unwrap();
+    assert_eq!(result["data"]["check-ci"]["pass"], false);
+    let offenders = result["data"]["check-ci"]["offenders"].as_array().unwrap();
     assert!(
         offenders.iter().any(|o| o["code"] == "dep-not-met"),
         "offenders must include a dep-not-met entry; got: {:?}",
@@ -2494,7 +2494,7 @@ fn b13_check_ci_strict_exits_4_with_dep_not_met() {
     // The dep-not-met offender is gone; the blocker list is also empty.
     // (active_claims may still include the original claim with depends marker,
     //  but now produces:src/config.rs is in the room so it is satisfied.)
-    let offenders2 = result2["data"]["check_ci"]["offenders"].as_array().unwrap();
+    let offenders2 = result2["data"]["check-ci"]["offenders"].as_array().unwrap();
     assert!(
         !offenders2.iter().any(|o| o["code"] == "dep-not-met"),
         "dep-not-met offender must be gone after a produces fact is emitted; got: {:?} (exit: {})",
@@ -2545,7 +2545,7 @@ fn advisory_6_source_grounding_unchanged_file_flags_ungrounded_artifact() {
         "--path", "mylib.rs",
     ]);
     assert!(claim["ok"].as_bool().unwrap_or(false), "claim must succeed");
-    let claim_id = claim["data"]["fact"]["event_id"].as_str().unwrap().to_string();
+    let claim_id = claim["data"]["say"]["fact"]["event_id"].as_str().unwrap().to_string();
 
     // Post artifact WITHOUT modifying mylib.rs (unchanged → ungrounded).
     let artifact = workspace.json(&[
@@ -2597,7 +2597,7 @@ fn advisory_6_source_grounding_changed_file_does_not_flag() {
         "--subject", "working on changed",
         "--path", "changed.rs",
     ]);
-    let claim_id = claim["data"]["fact"]["event_id"].as_str().unwrap().to_string();
+    let claim_id = claim["data"]["say"]["fact"]["event_id"].as_str().unwrap().to_string();
 
     // Modify the file before posting the artifact.
     fs::write(&src, b"fn after_modification() {}").unwrap();
@@ -2653,7 +2653,7 @@ fn advisory_8_ripple_alert_fires_on_pub_sig_change_affecting_peer_claim() {
         "--path", "consumer/main.rs",
     ]);
     assert!(peer_claim["ok"].as_bool().unwrap_or(false));
-    let peer_claim_id = peer_claim["data"]["fact"]["event_id"].as_str().unwrap().to_string();
+    let peer_claim_id = peer_claim["data"]["say"]["fact"]["event_id"].as_str().unwrap().to_string();
 
     // my-tool claims src/provider.rs
     let my_claim = workspace.json(&[
@@ -2664,7 +2664,7 @@ fn advisory_8_ripple_alert_fires_on_pub_sig_change_affecting_peer_claim() {
         "--path", "src/provider.rs",
     ]);
     assert!(my_claim["ok"].as_bool().unwrap_or(false));
-    let my_claim_id = my_claim["data"]["fact"]["event_id"].as_str().unwrap().to_string();
+    let my_claim_id = my_claim["data"]["say"]["fact"]["event_id"].as_str().unwrap().to_string();
 
     // Modify src/provider.rs (so grounding sees it as changed).
     fs::write(&provider, b"pub fn shared_api() -> i32 { 1 } pub fn new_fn() {}").unwrap();
@@ -2813,11 +2813,11 @@ fn rally_whoami_json_exits_zero_and_returns_identity() {
         "whoami must return ok:true; got: {result}"
     );
 
-    let data = &result["data"];
-    let repo_root = data["repo_root"].as_str().unwrap_or("");
+    let whoami = &result["data"]["whoami"];
+    let repo_root = whoami["repo_root"].as_str().unwrap_or("");
     assert!(!repo_root.is_empty(), "repo_root must be non-empty");
 
-    let build_id = data["build_id"].as_str().unwrap_or("");
+    let build_id = whoami["build_id"].as_str().unwrap_or("");
     assert!(!build_id.is_empty(), "build_id must be non-empty");
     assert!(
         build_id.contains('+'),
@@ -2825,9 +2825,9 @@ fn rally_whoami_json_exits_zero_and_returns_identity() {
     );
 
     // cwd and worktree must also be present and non-empty.
-    let cwd = data["cwd"].as_str().unwrap_or("");
+    let cwd = whoami["cwd"].as_str().unwrap_or("");
     assert!(!cwd.is_empty(), "cwd must be non-empty");
-    let worktree = data["worktree"].as_str().unwrap_or("");
+    let worktree = whoami["worktree"].as_str().unwrap_or("");
     assert!(!worktree.is_empty(), "worktree must be non-empty");
 
     workspace.cleanup();
@@ -2841,7 +2841,7 @@ fn rally_whoami_with_tool_reflects_tool_in_output() {
     let result = workspace.json(&["whoami", "--json", "--tool", "claude_code:01"]);
     assert!(result["ok"].as_bool().unwrap_or(false));
 
-    let tool = result["data"]["tool"].as_str().unwrap_or("");
+    let tool = result["data"]["whoami"]["tool"].as_str().unwrap_or("");
     assert_eq!(tool, "claude_code:01", "tool must be echoed back");
 
     workspace.cleanup();
@@ -2866,20 +2866,20 @@ fn mission_set_then_get_returns_text_and_set_by() {
         "claude_code:01",
     ]);
     assert_eq!(set_result["ok"], true);
-    assert_eq!(set_result["data"]["action"], "set-mission");
-    let seq = set_result["data"]["fact"]["seq"].as_i64().unwrap_or(0);
+    assert_eq!(set_result["data"]["mission"]["action"], "set-mission");
+    let seq = set_result["data"]["mission"]["fact"]["seq"].as_i64().unwrap_or(0);
     assert!(seq > 0, "seq must be > 0 after set");
 
     // GET
     let get_result = workspace.json(&["mission", "--json"]);
     assert_eq!(get_result["ok"], true);
     assert_eq!(
-        get_result["data"]["mission"],
+        get_result["data"]["mission"]["text"],
         "ship the MVP by end of sprint"
     );
-    assert_eq!(get_result["data"]["set_by"], "claude_code:01");
+    assert_eq!(get_result["data"]["mission"]["set_by"], "claude_code:01");
     assert!(
-        get_result["data"]["set_at"].is_string(),
+        get_result["data"]["mission"]["set_at"].is_string(),
         "set_at must be a string timestamp"
     );
 
@@ -2911,7 +2911,7 @@ fn mission_second_set_supersedes_first() {
     let get_result = workspace.json(&["mission", "--json"]);
     assert_eq!(get_result["ok"], true);
     assert_eq!(
-        get_result["data"]["mission"],
+        get_result["data"]["mission"]["text"],
         "new mission",
         "second set must supersede first"
     );
@@ -2938,7 +2938,7 @@ fn mission_appears_in_enter_json_after_set() {
     let enter = workspace.json(&["enter", "--json", "--tool", "claude_code:01"]);
     assert_eq!(enter["ok"], true);
     assert_eq!(
-        enter["data"]["mission"],
+        enter["data"]["enter"]["mission"],
         "focus on stability",
         "mission must appear in enter output after being set"
     );
@@ -2954,9 +2954,9 @@ fn mission_absent_from_enter_when_unset() {
     let enter = workspace.json(&["enter", "--json", "--tool", "tool-x"]);
     assert_eq!(enter["ok"], true);
     assert!(
-        enter["data"]["mission"].is_null(),
+        enter["data"]["enter"]["mission"].is_null(),
         "mission must not appear in enter output when unset; got: {}",
-        enter["data"]["mission"]
+        enter["data"]["enter"]["mission"]
     );
 
     workspace.cleanup();
@@ -2979,13 +2979,13 @@ fn mission_envelope_set_then_get_round_trips() {
         "before touching shared interfaces",
     ]);
     assert_eq!(env_result["ok"], true);
-    assert_eq!(env_result["data"]["action"], "set-envelope");
+    assert_eq!(env_result["data"]["mission"]["action"], "set-envelope");
 
     // GET: envelope must appear in envelopes array.
     let get_result = workspace.json(&["mission", "--json"]);
     assert_eq!(get_result["ok"], true);
 
-    let envelopes = get_result["data"]["envelopes"]
+    let envelopes = get_result["data"]["mission"]["envelopes"]
         .as_array()
         .expect("envelopes must be an array");
     let entry = envelopes
@@ -3023,7 +3023,7 @@ fn mission_envelope_second_set_supersedes() {
     ]);
 
     let get_result = workspace.json(&["mission", "--json"]);
-    let envelopes = get_result["data"]["envelopes"]
+    let envelopes = get_result["data"]["mission"]["envelopes"]
         .as_array()
         .expect("envelopes must be an array");
     let entry = envelopes
@@ -3066,7 +3066,7 @@ fn mission_fact_survives_ledger_replay() {
     // Also verify directly via mission GET (another fresh open).
     let get = workspace.json(&["mission", "--json"]);
     assert_eq!(
-        get["data"]["mission"],
+        get["data"]["mission"]["text"],
         "survive the replay",
         "mission must survive ledger replay and appear in mission GET"
     );
@@ -3082,11 +3082,11 @@ fn mission_get_with_no_mission_set() {
     let result = workspace.json(&["mission", "--json"]);
     assert_eq!(result["ok"], true);
     assert!(
-        result["data"]["mission"].is_null(),
-        "mission must be null when unset"
+        result["data"]["mission"]["text"].is_null(),
+        "mission text must be null when unset"
     );
     assert_eq!(
-        result["data"]["envelopes"]
+        result["data"]["mission"]["envelopes"]
             .as_array()
             .map(Vec::len)
             .unwrap_or(0),

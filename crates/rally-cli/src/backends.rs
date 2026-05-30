@@ -74,9 +74,21 @@ pub(crate) struct RunCommands {
     pub(crate) start: Vec<Value>,
 }
 
+/// Envelope for `run`: result under `data.run`.
+#[derive(JsonSchema, Serialize)]
+pub(crate) struct RunEnvelope {
+    pub(crate) run: RunData,
+}
+
 #[derive(JsonSchema, Serialize)]
 pub(crate) struct SessionsData {
     pub(crate) sessions: Vec<ManagedSession>,
+}
+
+/// Envelope for `sessions`: result under `data.sessions`.
+#[derive(JsonSchema, Serialize)]
+pub(crate) struct SessionsEnvelope {
+    pub(crate) sessions: SessionsData,
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -97,6 +109,12 @@ pub(crate) struct InjectData {
     pub(crate) delivered: bool,
 }
 
+/// Envelope for `inject`: result under `data.inject`.
+#[derive(JsonSchema, Serialize)]
+pub(crate) struct InjectEnvelope {
+    pub(crate) inject: InjectData,
+}
+
 #[derive(JsonSchema, Serialize)]
 pub(crate) struct SessionActionData {
     pub(crate) mode: &'static str,
@@ -104,6 +122,30 @@ pub(crate) struct SessionActionData {
     pub(crate) session: ManagedSession,
     pub(crate) output: Option<String>,
     pub(crate) commands: Vec<Value>,
+}
+
+/// Envelope for session actions (attach/capture/stop): result under `data[action]`.
+///
+/// Since the action name is dynamic at runtime but the struct must be
+/// serialized with a fixed key, we serialize to `Value` and re-key at call time.
+pub(crate) struct SessionActionEnvelope {
+    pub(crate) action_name: &'static str,
+    pub(crate) data: SessionActionData,
+}
+
+impl SessionActionEnvelope {
+    pub(crate) fn new(action_name: &'static str, data: SessionActionData) -> Self {
+        Self { action_name, data }
+    }
+}
+
+impl serde::Serialize for SessionActionEnvelope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(self.action_name, &self.data)?;
+        map.end()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

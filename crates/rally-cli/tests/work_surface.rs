@@ -75,12 +75,12 @@ fn backlog_add_and_list_round_trip() {
         "--owns", "crates/widget/src/lib.rs",
     ]);
     assert_eq!(add["ok"], true);
-    assert_eq!(add["data"]["action"], "add");
-    let added_id = add["data"]["added"]["event_id"].as_str().unwrap();
+    assert_eq!(add["data"]["backlog"]["action"], "add");
+    let added_id = add["data"]["backlog"]["added"]["event_id"].as_str().unwrap();
     assert!(!added_id.is_empty());
 
     // The items array in the add response should include our item
-    let items = add["data"]["items"].as_array().unwrap();
+    let items = add["data"]["backlog"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"], "task-1");
     assert_eq!(items[0]["intent"], "implement the widget");
@@ -89,8 +89,8 @@ fn backlog_add_and_list_round_trip() {
     // List should return the same item
     let list = ws.json(&["backlog", "list", "--json"]);
     assert_eq!(list["ok"], true);
-    assert_eq!(list["data"]["action"], "list");
-    let list_items = list["data"]["items"].as_array().unwrap();
+    assert_eq!(list["data"]["backlog"]["action"], "list");
+    let list_items = list["data"]["backlog"]["items"].as_array().unwrap();
     assert_eq!(list_items.len(), 1);
     assert_eq!(list_items[0]["id"], "task-1");
     assert_eq!(list_items[0]["owns"][0], "crates/widget/src/lib.rs");
@@ -119,7 +119,7 @@ fn backlog_add_with_depends_on() {
     ]);
 
     let list = ws.json(&["backlog", "list", "--json"]);
-    let items = list["data"]["items"].as_array().unwrap();
+    let items = list["data"]["backlog"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 2);
     let main = items.iter().find(|i| i["id"] == "main-task").unwrap();
     assert_eq!(main["depends_on"][0], "dep-task");
@@ -294,7 +294,7 @@ fn route_findings_maps_finding_to_claim_owner() {
         "--verified",
     ]);
     assert_eq!(routed["ok"], true);
-    let routing = &routed["data"]["routing"];
+    let routing = &routed["data"]["route-findings"];
     assert_eq!(routing["findings_total"], 1);
     assert_eq!(routing["routed"], 1);
     assert_eq!(routing["unowned"], 0);
@@ -327,7 +327,7 @@ fn route_findings_unowned_path_emits_risk() {
         "--file", findings_path.to_str().unwrap(),
         "--verified",
     ]);
-    let routing = &routed["data"]["routing"];
+    let routing = &routed["data"]["route-findings"];
     assert_eq!(routing["findings_total"], 1);
     assert_eq!(routing["routed"], 0);
     assert_eq!(routing["unowned"], 1);

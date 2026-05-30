@@ -77,6 +77,8 @@ use next::{AttentionItem, EntryData, NextResult, build_attention, build_entry, b
 use output::{CliError, Output};
 use route_findings::{Finding, RoutingSummary, route_findings};
 use store::{Fact, FactKind, ReadReceipt, RoomQuery, RoomSnapshot, RoomStore, RoomSummary};
+// Envelope wrapper types from backends module.
+use backends::{InjectEnvelope, RunEnvelope, SessionActionEnvelope, SessionsEnvelope};
 
 const SCHEMA_MIGRATE_LEGACY: &str = "agent-rally.command.migrate-legacy.v1";
 const SCHEMA_DOCTOR: &str = "agent-rally.command.doctor.v1";
@@ -177,7 +179,9 @@ fn command_rotate(args: RotateArgs) -> Result<Output> {
         outcome.live_segment_count_before,
         outcome.live_segment_count_after,
     );
-    let body = envelope("rotate", SCHEMA_ROTATE, outcome)?;
+    // Wrap under `data.rotate` to satisfy the envelope contract.
+    let inner = serde_json::to_value(&outcome).map_err(RallyError::json("rotate outcome"))?;
+    let body = envelope_value("rotate", SCHEMA_ROTATE, json!({ "rotate": inner }))?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -189,7 +193,9 @@ fn command_retrospective(args: RetrospectiveArgs) -> Result<Output> {
         "retrospective: {} ({}) — {} fact(s) across {} engagement(s)",
         outcome.output_path, outcome.action, outcome.total_facts, outcome.total_engagements,
     );
-    let body = envelope("retrospective", SCHEMA_RETROSPECTIVE, outcome)?;
+    // Wrap under `data.retrospective` to satisfy the envelope contract.
+    let inner = serde_json::to_value(&outcome).map_err(RallyError::json("retrospective outcome"))?;
+    let body = envelope_value("retrospective", SCHEMA_RETROSPECTIVE, json!({ "retrospective": inner }))?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -200,7 +206,7 @@ fn command_init(args: InitArgs) -> Result<Output> {
     let repo = repo_root()?;
     let worktree = worktree_root()?;
     let outcome = init::run_init(repo, worktree)?;
-    let manifest_action = outcome.manifest.action;
+    let manifest_action = outcome.manifest.action.clone();
     let pointers_summary: Vec<String> = outcome
         .pointers
         .iter()
@@ -212,7 +218,9 @@ fn command_init(args: InitArgs) -> Result<Output> {
         ledger = outcome.ledger_dir,
         room = outcome.room_cmd,
     );
-    let body = envelope("init", SCHEMA_INIT, outcome)?;
+    // Wrap under `data.init` to satisfy the envelope contract.
+    let inner = serde_json::to_value(&outcome).map_err(RallyError::json("init outcome"))?;
+    let body = envelope_value("init", SCHEMA_INIT, json!({ "init": inner }))?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -407,40 +415,34 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // cursor_after == last_checkpoint_seq (coalesces if no advancement).
     room.maybe_append_read_checkpoint(&tool, snapshot.content_max_seq)?;
     let mission = snapshot.mission.clone();
+    let room_summary = RoomSummary::from(&snapshot);
+    let attention_count = attention.len();
+    let enter_payload = EnterPayload {
+        tool: tool.clone(),
+        session_id,
+        room_id,
+        cursor: CursorData {
+            before: cursor_before,
+            after: cursor_after,
+            advanced: cursor_after > cursor_before,
+        },
+        entry,
+        attention,
+        warnings,
+        mission,
+    };
     let body = envelope(
         "enter",
         SCHEMA_ENTER,
         EnterData {
-            tool,
-            session_id,
-            room_id,
-            cursor: CursorData {
-                before: cursor_before,
-                after: cursor_after,
-                advanced: cursor_after > cursor_before,
-            },
-            entry,
-            attention,
-            room: RoomSummary::from(&snapshot),
-            warnings,
-            mission,
+            enter: enter_payload,
+            room: room_summary,
         },
     )?;
     let text = format!(
-        "entered room tool={} do={} do_not={} attention={}",
-        body["data"]["tool"].as_str().unwrap_or("unknown"),
-        body["data"]["entry"]["do"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or(0),
-        body["data"]["entry"]["do_not"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or(0),
-        body["data"]["attention"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or(0)
+        "entered room tool={} attention={}",
+        tool,
+        attention_count,
     );
     Ok(Output::new(args.json, text, body))
 }
@@ -677,7 +679,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
         "say",
         SCHEMA_SAY,
         SayData {
-            fact: fact.clone(),
+            say: SayPayload { fact: fact.clone() },
             room: RoomSummary::from(&snapshot),
             warnings: say_warnings,
             verified,
@@ -773,20 +775,39 @@ fn command_next(args: NextArgs) -> Result<Output> {
     Ok(Output::new(args.json, text, body))
 }
 
+/// Wrapper: wraps locate result under `data.locate`.
+#[derive(JsonSchema, Serialize)]
+struct LocateEnvelope {
+    locate: discovery::LocateData,
+}
+
 fn command_locate(args: LocateArgs) -> Result<Output> {
     let data = discovery::locate(&args.event_id)?;
     let found = data.located.is_some();
-    let body = envelope("locate", SCHEMA_LOCATE, data)?;
+    let body = envelope("locate", SCHEMA_LOCATE, LocateEnvelope { locate: data })?;
     let text = format!("locate event={} found={}", args.event_id, found);
     Ok(Output::new(args.json, text, body))
+}
+
+/// Wrapper: wraps recent result under `data.recent`.
+#[derive(JsonSchema, Serialize)]
+struct RecentEnvelope {
+    recent: discovery::RecentData,
 }
 
 fn command_recent(args: RecentArgs) -> Result<Output> {
     let data = discovery::recent(args.all, args.limit)?;
     let count = data.rows.len();
-    let body = envelope("recent", SCHEMA_RECENT, data)?;
+    let body = envelope("recent", SCHEMA_RECENT, RecentEnvelope { recent: data })?;
     let text = format!("recent rows={count}");
     Ok(Output::new(args.json, text, body))
+}
+
+/// Wrapper: wraps migrate-legacy result under `data["migrate-legacy"]`.
+#[derive(JsonSchema, Serialize)]
+struct MigrateLegacyEnvelope {
+    #[serde(rename = "migrate-legacy")]
+    migrate_legacy: discovery::MigrateLegacyData,
 }
 
 fn command_migrate_legacy(args: MigrateLegacyArgs) -> Result<Output> {
@@ -804,8 +825,14 @@ fn command_migrate_legacy(args: MigrateLegacyArgs) -> Result<Output> {
         data.facts_migrated,
         data.facts_skipped_existing,
     );
-    let body = envelope("migrate-legacy", SCHEMA_MIGRATE_LEGACY, data)?;
+    let body = envelope("migrate-legacy", SCHEMA_MIGRATE_LEGACY, MigrateLegacyEnvelope { migrate_legacy: data })?;
     Ok(Output::new(args.json, text, body))
+}
+
+/// Wrapper: wraps doctor result under `data.doctor`.
+#[derive(JsonSchema, Serialize)]
+struct DoctorEnvelope<T: Serialize + schemars::JsonSchema> {
+    doctor: T,
 }
 
 fn command_doctor(args: DoctorArgs) -> Result<Output> {
@@ -816,7 +843,7 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
             data.non_canonical.len(),
             data.suffix_collisions.len(),
         );
-        let body = envelope("doctor", SCHEMA_DOCTOR, data)?;
+        let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
         return Ok(Output::new(args.json, text, body));
     }
     if args.prune_rooms {
@@ -827,7 +854,7 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
             data.stale.len(),
             data.applied,
         );
-        let body = envelope("doctor", SCHEMA_DOCTOR, data)?;
+        let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
         return Ok(Output::new(args.json, text, body));
     }
     Err(RallyError::Usage(
@@ -836,13 +863,25 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
 }
 
 // B13 -----------------------------------------------------------------------
+
+/// Wrapper: wraps check-ci result under `data["check-ci"]`.
+#[derive(JsonSchema, Serialize)]
+struct CheckCiEnvelope {
+    #[serde(rename = "check-ci")]
+    check_ci: check_ci::CheckCiResult,
+}
+
 fn command_check_ci(args: CheckCiArgs) -> Result<Output> {
     let room = RoomStore::open()?;
     let snapshot = room.snapshot()?;
     let outcome = build_check_ci(args.strict, args.receipt_threshold_secs, &snapshot);
     let pass = outcome.data.check_ci.pass;
     let offenders = outcome.offender_count;
-    let body = envelope("check-ci", SCHEMA_CHECK_CI, outcome.data)?;
+    let body = envelope(
+        "check-ci",
+        SCHEMA_CHECK_CI,
+        CheckCiEnvelope { check_ci: outcome.data.check_ci },
+    )?;
     let text = format!(
         "check-ci pass={pass} offenders={offenders} mode={}",
         if args.strict { "strict" } else { "warn" }
@@ -856,8 +895,10 @@ fn command_version(args: VersionArgs) -> Result<Output> {
         "version",
         SCHEMA_VERSION,
         VersionData {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            build_id: BUILD_ID.to_string(),
+            version: VersionPayload {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                build_id: BUILD_ID.to_string(),
+            },
         },
     )?;
     Ok(Output::new(args.json, text, body))
@@ -882,15 +923,23 @@ fn command_whoami(args: WhoamiArgs) -> Result<Output> {
         "whoami",
         SCHEMA_WHOAMI,
         WhoamiData {
-            tool: args.tool,
-            repo_root,
-            repo_id,
-            worktree,
-            build_id: BUILD_ID.to_string(),
-            cwd,
+            whoami: WhoamiPayload {
+                tool: args.tool,
+                repo_root,
+                repo_id,
+                worktree,
+                build_id: BUILD_ID.to_string(),
+                cwd,
+            },
         },
     )?;
     Ok(Output::new(args.json, text, body))
+}
+
+/// Wrapper: wraps status result under `data.status`.
+#[derive(JsonSchema, Serialize)]
+struct StatusEnvelope {
+    status: discovery::GlobalStatusData,
 }
 
 fn command_status(args: StatusArgs) -> Result<Output> {
@@ -902,7 +951,7 @@ fn command_status(args: StatusArgs) -> Result<Output> {
     let data = discovery::status_global()?;
     let repo_count = data.repos.len();
     let text = format!("status repos={repo_count}");
-    let body = envelope("status", SCHEMA_STATUS, data)?;
+    let body = envelope("status", SCHEMA_STATUS, StatusEnvelope { status: data })?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -1401,11 +1450,13 @@ fn command_run(args: RunArgs) -> Result<Output> {
     let body = envelope(
         "run",
         SCHEMA_RUN,
-        RunData {
-            mode: if dry_run { "dry-run" } else { "run" },
-            session: session.clone(),
-            commands: RunCommands {
-                start: command_plan_json(&start_commands),
+        RunEnvelope {
+            run: RunData {
+                mode: if dry_run { "dry-run" } else { "run" },
+                session: session.clone(),
+                commands: RunCommands {
+                    start: command_plan_json(&start_commands),
+                },
             },
         },
     )?;
@@ -1631,8 +1682,10 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
     let body = envelope(
         "sessions",
         SCHEMA_SESSIONS,
-        SessionsData {
-            sessions: sessions.clone(),
+        SessionsEnvelope {
+            sessions: SessionsData {
+                sessions: sessions.clone(),
+            },
         },
     )?;
     let text = format!("sessions {}", sessions.len());
@@ -1727,27 +1780,29 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     } else {
         None
     };
+    let inject_payload = InjectData {
+        mode: if dry_run { "dry-run" } else { "inject" },
+        session: session.clone(),
+        handoff,
+        require_ack,
+        ack: ack.clone(),
+        wake_intent,
+        commands: command_plan_json(&commands),
+        sender_tool,
+        content_fact,
+        delivered,
+    };
+    let has_ack = ack.is_some();
     let body = envelope(
         "inject",
         SCHEMA_INJECT,
-        InjectData {
-            mode: if dry_run { "dry-run" } else { "inject" },
-            session: session.clone(),
-            handoff,
-            require_ack,
-            ack,
-            wake_intent,
-            commands: command_plan_json(&commands),
-            sender_tool,
-            content_fact,
-            delivered,
-        },
+        InjectEnvelope { inject: inject_payload },
     )?;
     let text = format!(
         "inject session={} delivered={} ack={}",
         session.session_id,
         delivered,
-        body["data"]["ack"].is_object()
+        has_ack,
     );
     Ok(Output::new(args.json, text, body))
 }
@@ -1809,16 +1864,17 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
     };
     let output_text = output.clone();
     let command_name = action.as_str();
+    let action_payload = SessionActionData {
+        mode: if dry_run { "dry-run" } else { command_name },
+        action: command_name,
+        session: session.clone(),
+        output,
+        commands: command_plan_json(&commands),
+    };
     let body = envelope(
         command_name,
         SCHEMA_SESSION_ACTION,
-        SessionActionData {
-            mode: if dry_run { "dry-run" } else { command_name },
-            action: command_name,
-            session: session.clone(),
-            output,
-            commands: command_plan_json(&commands),
-        },
+        SessionActionEnvelope::new(command_name, action_payload),
     )?;
     let text = output_text
         .as_deref()
@@ -4708,24 +4764,30 @@ struct EnterWarning {
     message: String,
 }
 
+/// The primary enter result, nested under `data.enter`.
 #[derive(JsonSchema, Serialize)]
-struct EnterData {
+struct EnterPayload {
     tool: String,
     session_id: String,
     /// Resolved room id (the active engagement label, e.g. "2026-05-29").
-    /// Non-null after Component A — use this to identify the room in output.
     room_id: String,
     cursor: CursorData,
     entry: EntryData,
     attention: Vec<AttentionItem>,
-    room: RoomSummary,
     /// Non-blocking advisories (omitted from JSON when empty).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<EnterWarning>,
     /// Rank-11: current room north-star text, or null when unset.
-    /// Omitted from JSON when no mission has been set.
     #[serde(skip_serializing_if = "Option::is_none")]
     mission: Option<String>,
+}
+
+/// Envelope for `enter`: primary result at `data.enter`, shared room at `data.room`.
+#[derive(JsonSchema, Serialize)]
+struct EnterData {
+    enter: EnterPayload,
+    /// Shared contextual payload — the current room summary.
+    room: RoomSummary,
 }
 
 /// Non-blocking advisory emitted by `rally say` when an external-intake
@@ -4739,16 +4801,22 @@ struct SayWarning {
     message: String,
 }
 
+/// The primary say result, nested under `data.say`.
+#[derive(JsonSchema, Serialize)]
+struct SayPayload {
+    fact: Fact,
+}
+
+/// Envelope for `say`: primary result at `data.say`, shared fields as siblings.
 #[derive(JsonSchema, Serialize)]
 struct SayData {
-    fact: Fact,
+    say: SayPayload,
+    /// Shared contextual payload — the current room summary.
     room: RoomSummary,
     /// Non-blocking advisories (omitted from JSON when empty).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<SayWarning>,
     /// R9-readback: verified room id (engagement label) and sequence number.
-    /// Present after every successful mutation confirms the fact landed in the
-    /// canonical ledger.  Consumers can use these to assert ordering.
     verified: SayVerified,
 }
 
@@ -4776,20 +4844,34 @@ struct RoomData {
     mission: Option<String>,
 }
 
+/// Payload for `version`, nested under `data.version`.
 #[derive(JsonSchema, Serialize)]
-struct VersionData {
+struct VersionPayload {
     version: String,
     build_id: String,
 }
 
+/// Envelope for `version`.
 #[derive(JsonSchema, Serialize)]
-struct WhoamiData {
+struct VersionData {
+    version: VersionPayload,
+}
+
+/// Payload for `whoami`, nested under `data.whoami`.
+#[derive(JsonSchema, Serialize)]
+struct WhoamiPayload {
     tool: Option<String>,
     repo_root: String,
     repo_id: String,
     worktree: String,
     build_id: String,
     cwd: String,
+}
+
+/// Envelope for `whoami`.
+#[derive(JsonSchema, Serialize)]
+struct WhoamiData {
+    whoami: WhoamiPayload,
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -5056,6 +5138,18 @@ fn envelope<T: Serialize>(command: &str, schema: &str, data: T) -> Result<Value>
     .map_err(RallyError::json("render command envelope"))
 }
 
+/// Like `envelope`, but accepts a pre-serialized `Value` for data.
+/// Used for commands whose outcome types don't implement `JsonSchema`.
+fn envelope_value(command: &str, schema: &str, data: Value) -> Result<Value> {
+    Ok(json!({
+        "ok": true,
+        "product": "rally",
+        "command": command,
+        "schema": schema,
+        "data": data,
+    }))
+}
+
 pub(crate) fn repo_root() -> Result<PathBuf> {
     let mut dir = env::current_dir().map_err(RallyError::io("current dir"))?;
     loop {
@@ -5141,12 +5235,19 @@ pub(crate) fn now_string() -> String {
 // Work surface commands
 // =============================================================================
 
+/// Payload for backlog, nested under `data.backlog`.
 #[derive(JsonSchema, Serialize)]
-struct BacklogData {
+struct BacklogPayload {
     action: String,
     items: Vec<BacklogItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     added: Option<Fact>,
+}
+
+/// Envelope for `backlog`.
+#[derive(JsonSchema, Serialize)]
+struct BacklogData {
+    backlog: BacklogPayload,
 }
 
 fn command_backlog(args: BacklogArgs) -> Result<Output> {
@@ -5171,9 +5272,11 @@ fn command_backlog(args: BacklogArgs) -> Result<Output> {
                 "backlog",
                 SCHEMA_BACKLOG,
                 BacklogData {
-                    action: "add".to_string(),
-                    items,
-                    added: Some(fact),
+                    backlog: BacklogPayload {
+                        action: "add".to_string(),
+                        items,
+                        added: Some(fact),
+                    },
                 },
             )?;
             Ok(Output::new(args.json, text, body))
@@ -5186,9 +5289,11 @@ fn command_backlog(args: BacklogArgs) -> Result<Output> {
                 "backlog",
                 SCHEMA_BACKLOG,
                 BacklogData {
-                    action: "list".to_string(),
-                    items,
-                    added: None,
+                    backlog: BacklogPayload {
+                        action: "list".to_string(),
+                        items,
+                        added: None,
+                    },
                 },
             )?;
             Ok(Output::new(args.json, text, body))
@@ -5196,6 +5301,7 @@ fn command_backlog(args: BacklogArgs) -> Result<Output> {
     }
 }
 
+/// Envelope for `board`: `BoardOutput` at `data.board` (already conforming).
 #[derive(JsonSchema, Serialize)]
 struct BoardData {
     board: BoardOutput,
@@ -5218,9 +5324,11 @@ fn command_board(args: BoardArgs) -> Result<Output> {
     Ok(Output::new(args.json, text, body))
 }
 
+/// Envelope for `route-findings`: result under `data["route-findings"]`.
 #[derive(JsonSchema, Serialize)]
 struct RouteFindingsData {
-    routing: RoutingSummary,
+    #[serde(rename = "route-findings")]
+    route_findings: RoutingSummary,
 }
 
 fn command_route_findings(args: RouteFindingsArgs) -> Result<Output> {
@@ -5243,7 +5351,7 @@ fn command_route_findings(args: RouteFindingsArgs) -> Result<Output> {
     let body = envelope(
         "route-findings",
         SCHEMA_ROUTE_FINDINGS,
-        RouteFindingsData { routing },
+        RouteFindingsData { route_findings: routing },
     )?;
     Ok(Output::new(args.json, text, body))
 }
@@ -5257,6 +5365,7 @@ fn command_route_findings(args: RouteFindingsArgs) -> Result<Output> {
 // Litmus from PLAN-pi-dynamic-seam.md §0:
 //   "Does this make Rally start, resume, retry, or schedule work?" → NO.
 
+/// Envelope for `dag`: result under `data.dag`.
 #[derive(JsonSchema, Serialize)]
 struct DagData {
     dag: DagOutput,
@@ -5285,9 +5394,17 @@ fn command_dag(args: DagArgs) -> Result<Output> {
 // runner (rally watch / LaunchAgent / cron) decides whether and when to invoke it.
 // Rally never executes it.
 
+/// Payload for wake-due, nested under `data["wake-due"]`.
+#[derive(JsonSchema, Serialize)]
+struct WakeDuePayload {
+    due: Vec<WakeDueEntry>,
+}
+
+/// Envelope for `wake-due`: result under `data["wake-due"]`.
 #[derive(JsonSchema, Serialize)]
 struct WakeDueData {
-    due: Vec<WakeDueEntry>,
+    #[serde(rename = "wake-due")]
+    wake_due: WakeDuePayload,
 }
 
 fn command_wake_due(args: WakeDueArgs) -> Result<Output> {
@@ -5296,7 +5413,7 @@ fn command_wake_due(args: WakeDueArgs) -> Result<Output> {
     let due = project_wake_due(&facts, args.tool.as_deref());
     let count = due.len();
     let text = format!("wake-due count={count}");
-    let body = envelope("wake-due", SCHEMA_WAKE_DUE, WakeDueData { due })?;
+    let body = envelope("wake-due", SCHEMA_WAKE_DUE, WakeDueData { wake_due: WakeDuePayload { due } })?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -5329,11 +5446,13 @@ struct EnvelopeEntry {
     set_at: String,
 }
 
+/// Payload for `mission` GET, nested under `data.mission`.
 #[derive(JsonSchema, Serialize)]
-struct MissionGetData {
+struct MissionGetPayload {
     /// Current north-star text, or null if no mission has been set.
+    /// Named `text` (not `mission`) to avoid a self-collision with the key name.
     #[serde(skip_serializing_if = "Option::is_none")]
-    mission: Option<String>,
+    text: Option<String>,
     /// Tool that set the current mission, or null.
     #[serde(skip_serializing_if = "Option::is_none")]
     set_by: Option<String>,
@@ -5344,17 +5463,29 @@ struct MissionGetData {
     envelopes: Vec<EnvelopeEntry>,
 }
 
+/// Payload for `mission` SET/ENVELOPE, nested under `data.mission`.
 #[derive(JsonSchema, Serialize)]
-struct MissionSetData {
+struct MissionSetPayload {
     action: String,
     fact: Fact,
 }
 
+/// Envelope for `mission`: both GET and SET nest under `data.mission`.
 #[derive(JsonSchema, Serialize)]
 #[serde(untagged)]
 enum MissionData {
-    Get(MissionGetData),
-    Set(MissionSetData),
+    Get(MissionGetEnvelope),
+    Set(MissionSetEnvelope),
+}
+
+#[derive(JsonSchema, Serialize)]
+struct MissionGetEnvelope {
+    mission: MissionGetPayload,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct MissionSetEnvelope {
+    mission: MissionSetPayload,
 }
 
 fn command_mission(args: MissionArgs) -> Result<Output> {
@@ -5403,9 +5534,11 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
         let body = envelope(
             "mission",
             SCHEMA_MISSION,
-            MissionData::Set(MissionSetData {
-                action: "set-envelope".to_string(),
-                fact: appended,
+            MissionData::Set(MissionSetEnvelope {
+                mission: MissionSetPayload {
+                    action: "set-envelope".to_string(),
+                    fact: appended,
+                },
             }),
         )?;
         return Ok(Output::new(args.json, text, body));
@@ -5441,9 +5574,11 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
         let body = envelope(
             "mission",
             SCHEMA_MISSION,
-            MissionData::Set(MissionSetData {
-                action: "set-mission".to_string(),
-                fact: appended,
+            MissionData::Set(MissionSetEnvelope {
+                mission: MissionSetPayload {
+                    action: "set-mission".to_string(),
+                    fact: appended,
+                },
             }),
         )?;
         return Ok(Output::new(args.json, text, body));
@@ -5519,11 +5654,13 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
     let body = envelope(
         "mission",
         SCHEMA_MISSION,
-        MissionData::Get(MissionGetData {
-            mission,
-            set_by,
-            set_at,
-            envelopes,
+        MissionData::Get(MissionGetEnvelope {
+            mission: MissionGetPayload {
+                text: mission,
+                set_by,
+                set_at,
+                envelopes,
+            },
         }),
     )?;
     Ok(Output::new(args.json, text, body))
