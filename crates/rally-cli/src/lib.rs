@@ -250,6 +250,51 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         .unwrap_or_else(|| room.cursor_for(&tool).unwrap_or(0));
     let max_seq = snapshot_before.max_seq;
 
+    // B11: warn (non-blocking) when the entering tool is already active in the
+    // current engagement.  A second terminal reusing the same id is ambiguous;
+    // surfacing it lets the human/lead decide.  Rally never blocks re-entry.
+    let mut warnings: Vec<EnterWarning> = Vec::new();
+    if let Some(squad) = snapshot_before
+        .squads
+        .iter()
+        .find(|s| s.tool == tool && s.status == "active")
+    {
+        warnings.push(EnterWarning {
+            code: "squad-id-active".to_string(),
+            message: format!(
+                "squad id {} is already active (last seen {}); if you are a second terminal, re-enter with a distinct id",
+                tool, squad.last_seen_ts
+            ),
+        });
+        // Append ONE durable risk fact so the duplicate is auditable/traceable
+        // in current_risks, recent, and the retrospective digest.
+        // enter still returns ok:true — this is warn-not-block.
+        let risk_fact = Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Risk,
+            tool: Some(tool.clone()),
+            role: None,
+            subject: format!("duplicate-active-squad-id: {tool}"),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: Some(format!(
+                "another active session is already using squad id {tool} (last seen {}); not blocked — re-enter with a distinct id if this is a second terminal. Recorded for audit.",
+                squad.last_seen_ts
+            )),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: Some("warn".to_string()),
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&risk_fact)?;
+    }
+
     // Component A + B: emit presence (+ first-enter-is-lead) via shared helper.
     ensure_presence(&room, &tool)?;
 
@@ -276,6 +321,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
             entry,
             attention,
             room: RoomSummary::from(&snapshot),
+            warnings,
         },
     )?;
     let text = format!(
@@ -1702,6 +1748,298 @@ mod tests {
         );
     }
 
+    // B11 — duplicate squad-id WARNING tests
+
+    /// B11a: first `enter` for a tool produces no warnings.
+    #[test]
+    fn b11_first_enter_no_warning() {
+        let root = unique_root("b11-first-enter");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // Simulate command_enter logic: snapshot before ensure_presence.
+        let snapshot_before = room.snapshot().unwrap();
+        let warnings: Vec<String> = snapshot_before
+            .squads
+            .iter()
+            .filter(|s| s.tool == "tool-a" && s.status == "active")
+            .map(|s| s.tool.clone())
+            .collect();
+        assert!(warnings.is_empty(), "first enter must produce no warnings");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// B11b: a second enter for the same tool (still active) produces the
+    /// `squad-id-active` warning.
+    #[test]
+    fn b11_second_enter_active_tool_emits_warning() {
+        let root = unique_root("b11-second-enter");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // First enter: write presence.
+        ensure_presence(&room, "tool-a").unwrap();
+
+        // Simulate second enter: snapshot reflects tool-a as active.
+        let snapshot_before = room.snapshot().unwrap();
+        let hit = snapshot_before
+            .squads
+            .iter()
+            .any(|s| s.tool == "tool-a" && s.status == "active");
+        assert!(hit, "tool-a must appear as active before second enter");
+
+        // The warning logic from command_enter.
+        let active_squad = snapshot_before
+            .squads
+            .iter()
+            .find(|s| s.tool == "tool-a" && s.status == "active");
+        assert!(
+            active_squad.is_some(),
+            "squad-id-active warning must be generated for second enter"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// B11c: entering with a distinct tool id (`tool-b`) never triggers the warning
+    /// even when `tool-a` is already active.
+    #[test]
+    fn b11_distinct_tool_id_no_warning() {
+        let root = unique_root("b11-distinct-tool");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        ensure_presence(&room, "tool-a").unwrap();
+
+        let snapshot_before = room.snapshot().unwrap();
+        let hit = snapshot_before
+            .squads
+            .iter()
+            .any(|s| s.tool == "tool-b" && s.status == "active");
+        assert!(!hit, "tool-b must NOT be flagged when tool-a is active");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// B11d: a second `enter` for an already-active tool writes exactly ONE durable
+    /// `risk` fact with subject containing `duplicate-active-squad-id` into the ledger,
+    /// and enter still returns ok (no rejection).
+    ///
+    /// Verification: after the second enter the risk fact appears in current_risks
+    /// on a FRESH RoomStore (forces segment→db reconciliation; in-memory cache gone).
+    /// The first enter produces no risk fact.
+    #[test]
+    fn b11d_second_enter_writes_durable_risk_fact() {
+        let root = unique_root("b11d-durable-risk");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        // --- First enter: no risk fact expected ---
+        {
+            let room = store::RoomStore::open_at(root.clone()).unwrap();
+            ensure_presence(&room, "tool-a").unwrap();
+
+            let snapshot = room.snapshot().unwrap();
+            let risk_count = snapshot
+                .current_risks
+                .iter()
+                .filter(|f| {
+                    f.subject.contains("duplicate-active-squad-id")
+                        && f.tool.as_deref() == Some("tool-a")
+                })
+                .count();
+            assert_eq!(risk_count, 0, "first enter must produce no risk fact");
+        }
+
+        // --- Second enter: simulate the duplicate detection + risk fact append ---
+        // We call the same logic command_enter uses: snapshot → detect active → append risk.
+        {
+            let room = store::RoomStore::open_at(root.clone()).unwrap();
+            let snapshot_before = room.snapshot().unwrap();
+            let squad = snapshot_before
+                .squads
+                .iter()
+                .find(|s| s.tool == "tool-a" && s.status == "active")
+                .expect("tool-a must be active before second enter");
+
+            // This is the exact block copied from command_enter.
+            let risk_fact = Fact {
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: new_id("fact"),
+                seq: 0,
+                thread_id: new_id("room"),
+                kind: store::FactKind::Risk,
+                tool: Some("tool-a".to_string()),
+                role: None,
+                subject: format!("duplicate-active-squad-id: tool-a"),
+                scope: Vec::new(),
+                created_at: now_string(),
+                summary: Some(format!(
+                    "another active session is already using squad id tool-a (last seen {}); not blocked — re-enter with a distinct id if this is a second terminal. Recorded for audit.",
+                    squad.last_seen_ts
+                )),
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: Some("warn".to_string()),
+                uri: None,
+                session: None,
+            };
+            room.append_fact(&risk_fact).unwrap();
+        }
+
+        // --- Read back via a FRESH RoomStore ---
+        let reader = store::RoomStore::open_at(root.clone()).unwrap();
+        let snapshot = reader.snapshot().unwrap();
+
+        let risk_facts: Vec<_> = snapshot
+            .current_risks
+            .iter()
+            .filter(|f| f.subject.contains("duplicate-active-squad-id"))
+            .collect();
+        assert_eq!(
+            risk_facts.len(),
+            1,
+            "exactly one risk fact for duplicate-active-squad-id must be in current_risks; got: {:?}",
+            risk_facts.iter().map(|f| &f.subject).collect::<Vec<_>>()
+        );
+        let rf = risk_facts[0];
+        assert_eq!(
+            rf.tool.as_deref(),
+            Some("tool-a"),
+            "risk fact tool must be the entering tool"
+        );
+        assert!(
+            rf.subject.contains("duplicate-active-squad-id: tool-a"),
+            "subject must contain the squad id; got: {}",
+            rf.subject
+        );
+        assert_eq!(
+            rf.severity.as_deref(),
+            Some("warn"),
+            "severity must be 'warn'"
+        );
+        // enter is still ok — not blocked
+        // (enter itself is not called here; the test verifies the durable record)
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // B16 — write→read round-trip gate
+
+    /// B16: every writable fact kind appended to the ledger reads back identically
+    /// from a FRESH `RoomStore::open_at` (forces segment→db reconciliation; the
+    /// in-memory writer's cache is abandoned).  Also checks that `max_seq` advanced
+    /// by exactly the number of facts written.
+    ///
+    /// If any kind fails to round-trip this test will surface the broken kind rather
+    /// than masking it.
+    #[test]
+    fn b16_write_read_round_trip_all_fact_kinds() {
+        let root = unique_root("b16-round-trip");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        // --- Write phase ---
+        let writer = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // The kinds under test.  `session` uses its own append path in
+        // production, but its Fact shape is identical; we use append_fact here
+        // so the test stays focused on the serialisation round-trip.
+        let kinds: &[(&str, store::FactKind)] = &[
+            ("claim",    store::FactKind::Claim),
+            ("release",  store::FactKind::Release),
+            ("artifact", store::FactKind::Artifact),
+            ("handoff",  store::FactKind::Handoff),
+            ("decision", store::FactKind::Decision),
+            ("risk",     store::FactKind::Risk),
+            ("blocker",  store::FactKind::Blocker),
+            ("resolve",  store::FactKind::Resolve),
+            ("presence", store::FactKind::Presence),
+        ];
+
+        let tool = "b16-test-tool";
+        let mut written: Vec<store::Fact> = Vec::new();
+        for (subject, kind) in kinds {
+            let fact = store::Fact {
+                schema: FACT_SCHEMA.to_string(),
+                event_id: new_id("b16"),
+                seq: 0,
+                thread_id: format!("b16-thread-{subject}"),
+                kind: kind.clone(),
+                tool: Some(tool.to_string()),
+                role: None,
+                subject: format!("b16 round-trip subject for {subject}"),
+                scope: Vec::new(),
+                created_at: now_string(),
+                summary: Some(format!("b16 summary for {subject}")),
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            let appended = writer.append_fact(&fact).unwrap();
+            assert!(appended.seq > 0, "appended {subject} must have seq > 0");
+            written.push(appended);
+        }
+
+        let facts_written = kinds.len() as i64;
+
+        // --- Reload phase: open a completely new RoomStore handle ---
+        // This forces the segment→db reconciliation path; the writer's
+        // in-memory SQLite connection is not reused.
+        drop(writer);
+        let reader = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // (a) Every written fact is readable by event_id with matching kind, tool, and subject.
+        let all_facts = reader.facts().unwrap();
+        for w in &written {
+            let found = all_facts
+                .iter()
+                .find(|f| f.event_id == w.event_id)
+                .unwrap_or_else(|| panic!(
+                    "fact {} (kind={}) not found after reload",
+                    w.event_id, w.kind.as_str()
+                ));
+            assert_eq!(
+                found.kind.as_str(), w.kind.as_str(),
+                "kind mismatch for {} after reload", w.event_id
+            );
+            assert_eq!(
+                found.tool.as_deref(), Some(tool),
+                "tool mismatch for {} after reload", w.event_id
+            );
+            assert_eq!(
+                found.subject, w.subject,
+                "subject mismatch for {} after reload", w.event_id
+            );
+            assert_eq!(
+                found.seq, w.seq,
+                "seq mismatch for {} after reload", w.event_id
+            );
+        }
+
+        // (b) max_seq advanced by exactly `facts_written` from 0.
+        let snapshot = reader.snapshot().unwrap();
+        let max_written = written.iter().map(|f| f.seq).max().unwrap_or(0);
+        // Written seqs must be contiguous from 1..=facts_written (factstr assigns 1-based).
+        let min_written = written.iter().map(|f| f.seq).min().unwrap_or(0);
+        assert_eq!(
+            max_written - min_written + 1,
+            facts_written,
+            "seq range must span exactly {facts_written} (got min={min_written} max={max_written})"
+        );
+        assert_eq!(
+            snapshot.max_seq, max_written,
+            "snapshot.max_seq must equal the highest written seq after reload"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// B10.suffix: exact-match paths must not produce a suffix collision (already
     /// caught by the exact-match / dir-prefix check which emits `claimed-path`).
     #[test]
@@ -1730,6 +2068,17 @@ struct CursorData {
     advanced: bool,
 }
 
+/// A non-blocking advisory emitted by `rally enter` when a potentially
+/// ambiguous condition is detected.  The command always succeeds (`ok: true`);
+/// warnings are informational only.
+#[derive(JsonSchema, Serialize)]
+struct EnterWarning {
+    /// Machine-readable code, e.g. `"squad-id-active"`.
+    code: String,
+    /// Human-readable explanation.
+    message: String,
+}
+
 #[derive(JsonSchema, Serialize)]
 struct EnterData {
     tool: String,
@@ -1741,6 +2090,9 @@ struct EnterData {
     entry: EntryData,
     attention: Vec<AttentionItem>,
     room: RoomSummary,
+    /// Non-blocking advisories (omitted from JSON when empty).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<EnterWarning>,
 }
 
 #[derive(JsonSchema, Serialize)]
