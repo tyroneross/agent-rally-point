@@ -155,6 +155,48 @@ pub(crate) fn add_backlog_item(
     room.append_fact_verified(&fact)
 }
 
+/// Mark an existing backlog item `done` by appending a same-id status fact
+/// (append-only; `list_backlog_items` takes the latest fact per id). Errors if
+/// no item with that id exists, or it is already done.
+pub(crate) fn mark_backlog_done(room: &RoomStore, tool: &str, id: &str) -> Result<Fact> {
+    let existing = list_backlog_items(room)?
+        .into_iter()
+        .find(|i| i.id == id)
+        .ok_or_else(|| RallyError::Usage(format!("no backlog item with id '{id}'")))?;
+    if existing.status == "done" {
+        return Err(RallyError::Usage(format!(
+            "backlog item '{id}' is already done"
+        )));
+    }
+    let mut scope = vec!["backlog-item".to_string()];
+    for path in &existing.owns {
+        scope.push(format!("owns:{path}"));
+    }
+    scope.sort();
+    scope.dedup();
+    let fact = Fact {
+        schema: FACT_SCHEMA.to_string(),
+        event_id: new_id("backlog"),
+        seq: 0,
+        thread_id: format!("backlog-{}", id.chars().take(32).collect::<String>()),
+        kind: FactKind::BacklogItem,
+        tool: Some(tool.to_string()),
+        role: None,
+        subject: existing.intent.clone(),
+        scope,
+        created_at: now_string(),
+        summary: Some(format!("id:{id}")),
+        evidence: Vec::new(),
+        target: None,
+        ref_id: None,
+        status: Some("done".to_string()),
+        severity: None,
+        uri: None,
+        session: None,
+    };
+    room.append_fact_verified(&fact)
+}
+
 /// Return all backlog items for this room, ordered by seq ascending.
 pub(crate) fn list_backlog_items(room: &RoomStore) -> Result<Vec<BacklogItem>> {
     let facts = room.facts()?;
@@ -196,6 +238,19 @@ pub(crate) fn satisfied_ids(items: &[BacklogItem]) -> std::collections::BTreeSet
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backlog_done_marks_item_done() {
+        let (room, _root) = test_room();
+        add_backlog_item(&room, "t", "X-1", "do the thing", &[], &[]).unwrap();
+        assert_eq!(list_backlog_items(&room).unwrap()[0].status, "open");
+        mark_backlog_done(&room, "t", "X-1").unwrap();
+        let item = list_backlog_items(&room).unwrap().into_iter().find(|i| i.id == "X-1").unwrap();
+        assert_eq!(item.status, "done", "latest fact per id must be done");
+        assert!(mark_backlog_done(&room, "t", "missing").is_err(), "unknown id errors");
+        assert!(mark_backlog_done(&room, "t", "X-1").is_err(), "already-done errors");
+    }
+
     use crate::store::RoomStore;
     use std::time::{SystemTime, UNIX_EPOCH};
 

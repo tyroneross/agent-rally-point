@@ -67,7 +67,7 @@ mod tier_fit;
 mod worktree_guard;
 
 use backends::*;
-use backlog::{BacklogItem, add_backlog_item, list_backlog_items};
+use backlog::{BacklogItem, add_backlog_item, list_backlog_items, mark_backlog_done};
 use board::{BoardOutput, build_board};
 use check::build_check;
 use check_ci::build_check_ci;
@@ -5573,7 +5573,12 @@ fn command_backlog(args: BacklogArgs) -> Result<Output> {
             Ok(Output::new(args.json, text, body))
         }
         BacklogSubcommand::List => {
-            let items = list_backlog_items(&room).unwrap_or_default();
+            // `list` shows OPEN work only; done items live on the board's closed lane.
+            let items: Vec<_> = list_backlog_items(&room)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|i| i.status != "done")
+                .collect();
             let count = items.len();
             let text = format!("backlog list items={count}");
             let body = envelope(
@@ -5584,6 +5589,28 @@ fn command_backlog(args: BacklogArgs) -> Result<Output> {
                         action: "list".to_string(),
                         items,
                         added: None,
+                    },
+                },
+            )?;
+            Ok(Output::new(args.json, text, body))
+        }
+        BacklogSubcommand::Done(done_args) => {
+            ensure_presence(&room, &done_args.tool)?;
+            let fact = mark_backlog_done(&room, &done_args.tool, &done_args.id)?;
+            let items: Vec<_> = list_backlog_items(&room)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|i| i.status != "done")
+                .collect();
+            let text = format!("backlog done id={} seq={}", done_args.id, fact.seq);
+            let body = envelope(
+                "backlog",
+                SCHEMA_BACKLOG,
+                BacklogData {
+                    backlog: BacklogPayload {
+                        action: "done".to_string(),
+                        items,
+                        added: Some(fact),
                     },
                 },
             )?;

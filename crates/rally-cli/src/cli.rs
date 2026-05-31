@@ -295,6 +295,7 @@ pub(crate) struct BacklogArgs {
 pub(crate) enum BacklogSubcommand {
     Add(BacklogAddArgs),
     List,
+    Done(BacklogDoneArgs),
 }
 
 #[derive(Clone, Debug)]
@@ -304,6 +305,12 @@ pub(crate) struct BacklogAddArgs {
     pub(crate) intent: String,
     pub(crate) owns: Vec<String>,
     pub(crate) depends_on: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BacklogDoneArgs {
+    pub(crate) tool: String,
+    pub(crate) id: String,
 }
 
 /// `rally board [--json]`
@@ -1172,8 +1179,18 @@ fn backlog_parser() -> impl Parser<BacklogArgs> {
         .command("list")
         .map(|_| BacklogSubcommand::List);
 
+    // `rally backlog done --tool .. --id ..`
+    let done_tool = string_arg("tool", "TOOL");
+    let done_id = string_arg("id", "ID");
+    let done_parser = construct!(done_tool, done_id)
+        .map(|(tool, id)| BacklogDoneArgs { tool, id })
+        .to_options()
+        .descr("Mark a backlog item done (closes it; drops out of `list`).")
+        .command("done")
+        .map(BacklogSubcommand::Done);
+
     let json = json_flag();
-    let subcommand = construct!([add_parser, list_parser]);
+    let subcommand = construct!([add_parser, list_parser, done_parser]);
     construct!(json, subcommand).map(|(json, subcommand)| BacklogArgs { json, subcommand })
 }
 
