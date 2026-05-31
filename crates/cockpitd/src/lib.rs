@@ -32,6 +32,12 @@ pub mod store;
 pub mod clock;
 pub mod supervisor;
 
+// ── B1/B2 ─────────────────────────────────────────────────────────────────────
+pub mod adapter;
+
+// ── B3 ────────────────────────────────────────────────────────────────────────
+pub mod approval;
+
 #[cfg(test)]
 mod smoke {
     #[test]

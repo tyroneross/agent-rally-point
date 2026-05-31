@@ -1,0 +1,40 @@
+#!/usr/bin/env sh
+# Mock `codex` binary for cockpitd adapter tests.
+#
+# Emits a representative JSONL sequence to stdout and exits:
+#   1. session_started  — carries a mock session_id
+#   2. message          — assistant turn ("Hello from mock Codex")
+#   3. tool_call        — bash: ls /tmp
+#   4. tool_result      — output of the tool
+#   5. approval_request — asks for approval (sets requires_user_input=true)
+#   6. message          — follow-up assistant message
+#   7. completed        — exit_code:0 (terminal)
+#
+# Ignores all arguments; drains stdin; writes to stdout only.
+# Does NOT invoke real codex — no credits burned.
+
+# Drain stdin.
+if [ ! -t 0 ]; then
+  cat > /dev/null &
+fi
+
+# 1. session_started
+printf '{"type":"session_started","session_id":"mock-codex-session-456"}\n'
+
+# 2. message
+printf '{"type":"message","role":"assistant","content":"Hello from mock Codex"}\n'
+
+# 3. tool_call
+printf '{"type":"tool_call","id":"tc_001","tool":"shell","args":{"command":"ls /tmp"}}\n'
+
+# 4. tool_result
+printf '{"type":"tool_result","tool_call_id":"tc_001","output":"file1.txt\nfile2.txt"}\n'
+
+# 5. approval_request
+printf '{"type":"approval_request","id":"approval_001","tool":"shell","args":{"command":"rm -rf /important"}}\n'
+
+# 6. follow-up message
+printf '{"type":"message","role":"assistant","content":"Done with all tasks."}\n'
+
+# 7. completed
+printf '{"type":"completed","exit_code":0}\n'

@@ -359,7 +359,7 @@ mod tests {
         assert_eq!(events[2].seq, 3);
         assert_eq!(events[0].content, "line 1");
 
-        let status = sup.status(sid);
+        let _status = sup.status(sid);
         // Session removed from live map after terminal; check store
         let stored_status = sup.store.get_session(sid).unwrap().unwrap().status;
         assert!(
@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn open_agent_type_survives_launch() {
-        let placeholder = Uuid::nil();
+        let _placeholder = Uuid::nil();
         let script = vec![AdapterEvent::Completed];
         let mut sup = open_supervisor(script);
         let sid = sup

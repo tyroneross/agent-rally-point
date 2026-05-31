@@ -23,10 +23,16 @@ use crate::model::{Approval, Event, Session, SessionStatus};
 // ── Store ─────────────────────────────────────────────────────────────────────
 
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Store {
+    /// Expose the raw connection for extension traits (e.g. approval::StorePendingExt).
+    /// Not part of the public API — crate-internal only.
+    pub(crate) fn raw_conn(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Open (or create) an on-disk database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path).context("open sqlite db")?;
