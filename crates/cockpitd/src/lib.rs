@@ -21,6 +21,17 @@
 /// Crate version string, surfaced in the daemon hello banner and protocol handshake.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// ── A1 ────────────────────────────────────────────────────────────────────────
+pub mod model;
+pub mod protocol;
+
+// ── A2 ────────────────────────────────────────────────────────────────────────
+pub mod store;
+
+// ── A3 ────────────────────────────────────────────────────────────────────────
+pub mod clock;
+pub mod supervisor;
+
 #[cfg(test)]
 mod smoke {
     #[test]

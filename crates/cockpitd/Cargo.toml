@@ -22,7 +22,8 @@ serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
 thiserror.workspace = true
-chrono.workspace = true
+# Need `serde` feature for DateTime<Utc> serde support (workspace omits it)
+chrono = { workspace = true, features = ["serde"] }
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
