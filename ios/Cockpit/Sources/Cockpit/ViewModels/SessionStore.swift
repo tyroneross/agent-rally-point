@@ -1,4 +1,5 @@
 // D2 — Session store / list view-model
+// G3 — reads daemon URL + token from CockpitConfig (persisted UserDefaults).
 import Foundation
 import Combine
 
@@ -9,8 +10,10 @@ public final class SessionStore: ObservableObject {
 
     public let client = CockpitClient()
     public let resync = ResyncMachine()
+    public let config: CockpitConfig
 
-    public init() {
+    public init(config: CockpitConfig = CockpitConfig()) {
+        self.config = config
         client.onFrame = { [weak self] frame in
             guard let self else { return }
             Task { @MainActor in
@@ -22,7 +25,12 @@ public final class SessionStore: ObservableObject {
     // MARK: - Connect / disconnect
 
     public func connect() {
-        client.connect()
+        guard let url = config.daemonURL else {
+            // Config not valid — no-op; SettingsView guides user to fix it.
+            return
+        }
+        let token = config.devToken
+        client.connect(to: url, token: token)
         // After connect, list sessions
         Task {
             try? await Task.sleep(nanoseconds: 300_000_000)  // wait for hello_ok

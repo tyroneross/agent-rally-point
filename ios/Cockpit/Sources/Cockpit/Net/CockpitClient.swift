@@ -1,17 +1,9 @@
 // D1 — WebSocket client using URLSessionWebSocketTask
 // TAG:UNTESTED — dev bearer token auth; SE-mTLS replaces this in production.
 // TAG:UNTESTED — Full round-trip test requires a running cockpitd daemon.
+// G3 — URL + token now injected at call site (from CockpitConfig persisted store).
 
 import Foundation
-
-// MARK: - Config
-
-public enum CockpitConfig {
-    /// Dev bearer token. Replace with SE-mTLS credential in production.
-    // TAG:ASSUMED dev token; replaced per COCKPIT-WIRE §Auth
-    public static let devToken: String = ProcessInfo.processInfo.environment["COCKPIT_TOKEN"] ?? "dev-insecure-token"
-    public static let daemonURL: URL = URL(string: ProcessInfo.processInfo.environment["COCKPIT_URL"] ?? "ws://127.0.0.1:8765")!
-}
 
 // MARK: - Client
 
@@ -42,7 +34,7 @@ public final class CockpitClient: NSObject, ObservableObject {
 
     // MARK: - Connect
 
-    public func connect(to url: URL = CockpitConfig.daemonURL) {
+    public func connect(to url: URL, token: String) {
         guard connectionState == .disconnected else { return }
         connectionState = .connecting
 
@@ -57,7 +49,7 @@ public final class CockpitClient: NSObject, ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.sendCommand(.hello(token: CockpitConfig.devToken))
+                try await self.sendCommand(.hello(token: token))
                 self.scheduleReceive()
             } catch {
                 self.connectionState = .failed(error.localizedDescription)
