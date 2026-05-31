@@ -14,7 +14,7 @@ to do next.
 ## The Load-Bearing Commands
 
 ```bash
-rally enter --tool <you> --json
+rally enter --tool <you> [--tier frontier|executing|fast] --json   # --tier: first frontier agent auto-leads
 rally next --tool <you> --json
 rally check before-write --tool <you> --path <path> --strict --json
 rally say artifact --tool <you> --subject "<what changed>" --uri <path> --evidence "<verification>" --json
@@ -122,6 +122,22 @@ rally say blocker --tool <you> --subject "need decision" --severity high --json
 rally say resolve --tool <you> --ref <blocker-id> --subject "resolved" --json
 rally say decision --tool <you> --subject "Rally is primary" --status binding --json
 rally say risk --tool <you> --subject "managed session unavailable" --severity medium --json
+```
+
+## Lead & Backlog
+
+```bash
+# Lead-agent title — rally records/exposes only, never enforces (see COORDINATION.md):
+rally lead show --json                                          # current lead, tier, how-assigned
+rally lead handoff --tool <lead> --to <frontier-tool> --json    # transfer the title
+rally lead assign  --tool <you> --to <tool> [--user-designated] --json   # set lead (user-designated supersedes first-join)
+rally lead relinquish --tool <lead> --json                      # drop the title (reopens the seat)
+# Lead auto-assigns to the first FRONTIER agent to enter (rally enter --tier frontier).
+
+# Claimable backlog:
+rally backlog add  --tool <you> --id <id> --intent "<what>" [--owns <path>] [--depends-on <id>] --json
+rally backlog list --json                                       # OPEN items only
+rally backlog done --tool <you> --id <id> --json                # close an item (drops out of list)
 ```
 
 ## Where State Lives
