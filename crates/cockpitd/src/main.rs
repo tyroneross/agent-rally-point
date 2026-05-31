@@ -41,7 +41,6 @@ async fn main() -> Result<()> {
 async fn serve_cmd() -> Result<()> {
     use cockpitd::{
         adapter::claude::{ClaudeAdapter, ClaudeConfig},
-        approval::ApprovalManager,
         audit::AuditLog,
         clock::SystemClock,
         store::Store,
@@ -58,11 +57,11 @@ async fn serve_cmd() -> Result<()> {
     let audit_db_path = std::env::var("COCKPIT_AUDIT_DB")
         .unwrap_or_else(|_| format!("{db_path}.audit.db"));
 
+    // H1a: single store for sessions + events + approvals. The audit log
+    // retains its own separate store (intentional isolated record).
     let store = Store::open(&db_path)?;
-    let store2 = Store::open(&db_path)?; // second handle for ApprovalManager
 
     let clock = SystemClock;
-    let clock2 = SystemClock;
     let clock3 = SystemClock;
 
     // Default: use the real claude binary. Override via COCKPIT_CLAUDE_BIN for tests.
@@ -75,10 +74,9 @@ async fn serve_cmd() -> Result<()> {
         extra_flags: vec![],
     });
     let supervisor = Supervisor::new(store, clock, adapter);
-    let approval = ApprovalManager::new(store2, clock2);
     let audit = AuditLog::open(&audit_db_path, clock3)?;
 
-    let state = build_state(supervisor, approval, audit);
+    let state = build_state(supervisor, audit);
 
     tracing::info!("cockpitd {} — serving on ws://{}", cockpitd::VERSION, addr);
     DirectWs::new(addr, state).serve().await

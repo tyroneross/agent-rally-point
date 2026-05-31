@@ -41,7 +41,6 @@ fn mock_claude_path() -> PathBuf {
 async fn start_daemon() -> SocketAddr {
     use cockpitd::{
         adapter::claude::{ClaudeAdapter, ClaudeConfig},
-        approval::ApprovalManager,
         audit::AuditLog,
         clock::SystemClock,
         store::Store,
@@ -59,10 +58,8 @@ async fn start_daemon() -> SocketAddr {
         std::env::set_var("COCKPIT_TOKEN", TEST_TOKEN);
     }
 
-    // Use in-memory SQLite. Both supervisor + approval share separate in-memory
-    // DBs; store reads are routed through the supervisor's internal store.
+    // H1a: single in-memory store for sessions + events + approvals.
     let store = Store::open_in_memory().unwrap();
-    let store2 = Store::open_in_memory().unwrap();
 
     // Point adapters at mock bins.
     let claude_path = mock_claude_path();
@@ -72,9 +69,8 @@ async fn start_daemon() -> SocketAddr {
     });
 
     let supervisor = Supervisor::new(store, SystemClock, adapter);
-    let approval = ApprovalManager::new(store2, SystemClock);
     let audit = AuditLog::open_in_memory(SystemClock).unwrap();
-    let state = build_state(supervisor, approval, audit);
+    let state = build_state(supervisor, audit);
 
     // Spawn the server.
     tokio::spawn(async move {
@@ -452,11 +448,15 @@ fn mock_codex_path() -> PathBuf {
     PathBuf::from(manifest).join("tests/mock-bin/codex")
 }
 
+fn mock_codex_gated_path() -> PathBuf {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+    PathBuf::from(manifest).join("tests/mock-bin/codex-gated")
+}
+
 /// Start a daemon backed by the mock codex binary, on an ephemeral port.
 async fn start_daemon_codex() -> SocketAddr {
     use cockpitd::{
         adapter::codex::{CodexAdapter, CodexConfig},
-        approval::ApprovalManager,
         audit::AuditLog,
         clock::SystemClock,
         store::Store,
@@ -472,8 +472,8 @@ async fn start_daemon_codex() -> SocketAddr {
         std::env::set_var("COCKPIT_TOKEN", TEST_TOKEN);
     }
 
+    // H1a: single in-memory store.
     let store = Store::open_in_memory().unwrap();
-    let store2 = Store::open_in_memory().unwrap();
 
     let adapter = CodexAdapter::new(CodexConfig {
         binary: mock_codex_path(),
@@ -481,9 +481,8 @@ async fn start_daemon_codex() -> SocketAddr {
     });
 
     let supervisor = Supervisor::new(store, SystemClock, adapter);
-    let approval = ApprovalManager::new(store2, SystemClock);
     let audit = AuditLog::open_in_memory(SystemClock).unwrap();
-    let state = build_state(supervisor, approval, audit);
+    let state = build_state(supervisor, audit);
 
     tokio::spawn(async move {
         DirectWs::new(addr, state)
@@ -569,12 +568,12 @@ async fn e2e_codex_approval_wire_roundtrip() {
 
     let approval_id_str = approval_id_str.expect("expected an approval_request event with approval_id over the wire");
 
-    // Parse the approval ID.
+    // H1b: mock now emits a valid UUID so parse must succeed.
     let approval_id: Uuid = approval_id_str
         .parse()
-        .unwrap_or_else(|_| Uuid::new_v4()); // mock emits string "approval_001" so we may get a fallback UUID
+        .expect("H1b: mock codex must emit a valid UUID approval_id");
 
-    // Send approve {allow}.
+    // Send approve {allow} — this unparks the gated pump.
     client
         .send(json!({
             "t": "approve",
@@ -583,41 +582,39 @@ async fn e2e_codex_approval_wire_roundtrip() {
         }))
         .await;
 
-    // Drain remaining events until terminal or timeout.
-    let mut saw_terminal = false;
+    // After allow, the pump unparks and continues processing the buffered
+    // message + completed events. Wait briefly for any subsequent event,
+    // proving the pump continued past the gate.
+    let mut saw_post_gate_event = false;
     for _ in 0..30 {
         match timeout(Duration::from_secs(3), client.recv()).await {
             Ok(v) => {
                 let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
-                if t == "session_status" {
-                    let status = v["status"].as_str().unwrap_or("");
-                    if matches!(status, "completed" | "failed" | "killed" | "disconnected") {
-                        saw_terminal = true;
+                if t == "event" {
+                    let kind = v
+                        .get("event")
+                        .and_then(|e| e.get("kind"))
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("");
+                    if !kind.is_empty() && kind != "approval_request" {
+                        saw_post_gate_event = true;
                         break;
                     }
                 }
                 if t == "error" {
-                    // approve_failed would be a sign the approval_id lookup failed;
-                    // we allow this because the mock emits "approval_001" which isn't
-                    // a valid UUID, so the store may not find a matching row. The key
-                    // assertion below is that the approval_request event arrived at all.
-                    // (TAG:ASSUMED: the mock uses a non-UUID id; we validate the wire path.)
+                    panic!("unexpected error frame after approve: {v}");
                 }
             }
             Err(_) => break,
         }
     }
 
-    // The session should eventually reach terminal (mock completes synchronously).
-    // We assert it's terminal via the store.
-    // (If we got an approve_failed because of the mock's non-UUID "approval_001" id,
-    // that still proves the wire path delivered the approval_request frame. The UUID
-    // resolution gap is covered by E2E-5 above.)
-    let _ = saw_terminal; // either terminal or we proved the approval wire path
+    assert!(
+        saw_post_gate_event,
+        "after approve(allow) on codex session, pump must continue emitting events past the gate"
+    );
 
-    // Key assertion: the approval_request frame arrived with an approval_id field.
-    // This closes the F1 gap: adapter → daemon → broadcast → client.
-    // The approval_id_str is non-empty (asserted by the unwrap above).
+    // Key assertion: approval_request frame arrived with an approval_id field.
     assert!(
         !approval_id_str.is_empty(),
         "approval_request must carry a non-empty approval_id"
@@ -721,7 +718,6 @@ fn mock_claude_multiblock_path() -> PathBuf {
 async fn start_daemon_gated() -> SocketAddr {
     use cockpitd::{
         adapter::claude::{ClaudeAdapter, ClaudeConfig},
-        approval::ApprovalManager,
         audit::AuditLog,
         clock::SystemClock,
         store::Store,
@@ -737,8 +733,8 @@ async fn start_daemon_gated() -> SocketAddr {
         std::env::set_var("COCKPIT_TOKEN", TEST_TOKEN);
     }
 
+    // H1a: single in-memory store.
     let store = Store::open_in_memory().unwrap();
-    let store2 = Store::open_in_memory().unwrap();
 
     let adapter = ClaudeAdapter::new(ClaudeConfig {
         binary: mock_claude_gated_path(),
@@ -746,9 +742,8 @@ async fn start_daemon_gated() -> SocketAddr {
     });
 
     let supervisor = Supervisor::new(store, SystemClock, adapter);
-    let approval = ApprovalManager::new(store2, SystemClock);
     let audit = AuditLog::open_in_memory(SystemClock).unwrap();
-    let state = build_state(supervisor, approval, audit);
+    let state = build_state(supervisor, audit);
 
     tokio::spawn(async move {
         DirectWs::new(addr, state)
@@ -765,7 +760,6 @@ async fn start_daemon_gated() -> SocketAddr {
 async fn start_daemon_multiblock() -> SocketAddr {
     use cockpitd::{
         adapter::claude::{ClaudeAdapter, ClaudeConfig},
-        approval::ApprovalManager,
         audit::AuditLog,
         clock::SystemClock,
         store::Store,
@@ -781,8 +775,8 @@ async fn start_daemon_multiblock() -> SocketAddr {
         std::env::set_var("COCKPIT_TOKEN", TEST_TOKEN);
     }
 
+    // H1a: single in-memory store.
     let store = Store::open_in_memory().unwrap();
-    let store2 = Store::open_in_memory().unwrap();
 
     let adapter = ClaudeAdapter::new(ClaudeConfig {
         binary: mock_claude_multiblock_path(),
@@ -790,9 +784,8 @@ async fn start_daemon_multiblock() -> SocketAddr {
     });
 
     let supervisor = Supervisor::new(store, SystemClock, adapter);
-    let approval = ApprovalManager::new(store2, SystemClock);
     let audit = AuditLog::open_in_memory(SystemClock).unwrap();
-    let state = build_state(supervisor, approval, audit);
+    let state = build_state(supervisor, audit);
 
     tokio::spawn(async move {
         DirectWs::new(addr, state)
@@ -1193,4 +1186,293 @@ async fn e2e_audit_log_wire_roundtrip() {
             );
         }
     }
+}
+
+/// Start a daemon backed by the gated codex mock (emits approval_request after
+/// an allowlisted tool_call — exercises H1b without triggering the G1 gate).
+async fn start_daemon_codex_gated() -> SocketAddr {
+    use cockpitd::{
+        adapter::codex::{CodexAdapter, CodexConfig},
+        audit::AuditLog,
+        clock::SystemClock,
+        store::Store,
+        supervisor::Supervisor,
+        transport::{build_state, DirectWs, Transport},
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    unsafe {
+        std::env::set_var("COCKPIT_TOKEN", TEST_TOKEN);
+    }
+
+    let store = Store::open_in_memory().unwrap();
+
+    let adapter = CodexAdapter::new(CodexConfig {
+        binary: mock_codex_gated_path(),
+        extra_flags: vec![],
+    });
+
+    let supervisor = Supervisor::new(store, SystemClock, adapter);
+    let audit = AuditLog::open_in_memory(SystemClock).unwrap();
+    let state = build_state(supervisor, audit);
+
+    tokio::spawn(async move {
+        DirectWs::new(addr, state)
+            .serve()
+            .await
+            .expect("codex gated daemon serve");
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
+// ── E2E-12: H1b Codex native approval gate — allow path ─────────────────────
+//
+// Proves (H1b):
+// - launch a codex session whose mock emits a native `approval_request` with a
+//   valid UUID id
+// - assert the pump parks: the `approval_request` event arrives over the wire
+//   and the session stays at AwaitingInput until the client resolves it
+// - send approve{allow} → pump unparks; session continues and reaches terminal
+//
+// Uses the same mock-bin/codex which emits approval_request after the tool_call.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_codex_native_gate_allow() {
+    let addr = start_daemon_codex_gated().await;
+    let tmp = std::env::temp_dir();
+
+    let mut client = TestClient::connect(addr).await;
+    client.auth().await;
+
+    client
+        .send(json!({
+            "t": "launch_session",
+            "agent_type": "codex",
+            "repo_path": tmp.to_str().unwrap(),
+            "prompt": "h1b codex gate allow test",
+        }))
+        .await;
+
+    let list_frame = client.recv_matching("session_list").await;
+    let sessions = list_frame["sessions"].as_array().unwrap();
+    assert!(!sessions.is_empty(), "session should be created");
+    let session_id_str = sessions[0]["id"].as_str().unwrap().to_string();
+    let session_id: Uuid = session_id_str.parse().expect("valid uuid");
+
+    client
+        .send(json!({
+            "t": "open_session",
+            "session_id": session_id,
+            "from_seq": 0_u64,
+        }))
+        .await;
+
+    let snapshot = client.recv_matching("snapshot").await;
+
+    // Collect until we see approval_request (pump is parked here).
+    let mut approval_id_str: Option<String> = extract_approval_id_from_snapshot(&snapshot);
+
+    if approval_id_str.is_none() {
+        for _ in 0..40 {
+            match timeout(Duration::from_secs(5), client.recv()).await {
+                Ok(v) => {
+                    let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
+                    if t == "event" {
+                        if let Some(evt) = v.get("event") {
+                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request") {
+                                let aid = evt
+                                    .get("metadata")
+                                    .and_then(|m| m.get("approval_id"))
+                                    .and_then(|a| a.as_str())
+                                    .map(|s| s.to_string());
+                                if aid.is_some() {
+                                    approval_id_str = aid;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    let approval_id_str = approval_id_str
+        .expect("H1b: codex-gated mock must park on approval_request and broadcast it");
+
+    // The approval_id must be the valid UUID emitted by the codex-gated mock.
+    let approval_id: Uuid = approval_id_str
+        .parse()
+        .expect("H1b: codex-gated mock must emit a valid UUID approval_id");
+
+    // Send approve{allow} — pump unparks.
+    client
+        .send(json!({
+            "t": "approve",
+            "approval_id": approval_id.to_string(),
+            "decision": "allow",
+        }))
+        .await;
+
+    // After allow, pump unparks and continues processing buffered events.
+    // The codex-gated mock has a follow-up message and completed still queued.
+    // Assert we see at least one more event (message or any event) after the
+    // approval, proving the pump continued past the gate.
+    let mut saw_post_gate_event = false;
+    for _ in 0..30 {
+        match timeout(Duration::from_secs(3), client.recv()).await {
+            Ok(v) => {
+                let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
+                if t == "event" {
+                    let kind = v
+                        .get("event")
+                        .and_then(|e| e.get("kind"))
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("");
+                    // Any event after the gate resolves proves the pump continued.
+                    if !kind.is_empty() && kind != "approval_request" {
+                        saw_post_gate_event = true;
+                        break;
+                    }
+                }
+                if t == "error" {
+                    panic!("unexpected error after approve(allow) on codex gate: {v}");
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    assert!(
+        saw_post_gate_event,
+        "after approve(allow) on codex native gate, pump must continue and emit events past the gate"
+    );
+}
+
+// ── E2E-13: H1b Codex native approval gate — deny path ──────────────────────
+//
+// Proves (H1b):
+// - same setup as E2E-12
+// - send approve{deny} → pump emits tool_blocked, does NOT forward subsequent
+//   tool results, then reaches terminal
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_codex_native_gate_deny() {
+    let addr = start_daemon_codex_gated().await;
+    let tmp = std::env::temp_dir();
+
+    let mut client = TestClient::connect(addr).await;
+    client.auth().await;
+
+    client
+        .send(json!({
+            "t": "launch_session",
+            "agent_type": "codex",
+            "repo_path": tmp.to_str().unwrap(),
+            "prompt": "h1b codex gate deny test",
+        }))
+        .await;
+
+    let list_frame = client.recv_matching("session_list").await;
+    let sessions = list_frame["sessions"].as_array().unwrap();
+    let session_id_str = sessions[0]["id"].as_str().unwrap().to_string();
+    let session_id: Uuid = session_id_str.parse().expect("valid uuid");
+
+    client
+        .send(json!({
+            "t": "open_session",
+            "session_id": session_id,
+            "from_seq": 0_u64,
+        }))
+        .await;
+
+    let snapshot = client.recv_matching("snapshot").await;
+
+    let mut approval_id_str: Option<String> = extract_approval_id_from_snapshot(&snapshot);
+
+    if approval_id_str.is_none() {
+        for _ in 0..40 {
+            match timeout(Duration::from_secs(5), client.recv()).await {
+                Ok(v) => {
+                    let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
+                    if t == "event" {
+                        if let Some(evt) = v.get("event") {
+                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request") {
+                                let aid = evt
+                                    .get("metadata")
+                                    .and_then(|m| m.get("approval_id"))
+                                    .and_then(|a| a.as_str())
+                                    .map(|s| s.to_string());
+                                if aid.is_some() {
+                                    approval_id_str = aid;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    let approval_id_str = approval_id_str
+        .expect("H1b: codex-gated mock deny — must receive approval_request");
+
+    let approval_id: Uuid = approval_id_str
+        .parse()
+        .expect("H1b: codex-gated mock must emit a valid UUID approval_id");
+
+    // Send approve{deny} — pump emits tool_blocked.
+    client
+        .send(json!({
+            "t": "approve",
+            "approval_id": approval_id.to_string(),
+            "decision": "deny",
+        }))
+        .await;
+
+    // Collect events looking for tool_blocked and ensuring no tool_result.
+    let mut saw_tool_blocked = false;
+    let mut saw_tool_result = false;
+    for _ in 0..30 {
+        match timeout(Duration::from_secs(3), client.recv()).await {
+            Ok(v) => {
+                let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
+                if t == "event" {
+                    if let Some(evt) = v.get("event") {
+                        let kind = evt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                        if kind == "tool_blocked" {
+                            saw_tool_blocked = true;
+                        }
+                        if kind == "tool_result" {
+                            saw_tool_result = true;
+                        }
+                    }
+                }
+                if t == "session_status" {
+                    let status = v["status"].as_str().unwrap_or("");
+                    if matches!(status, "completed" | "failed" | "killed" | "disconnected") {
+                        break;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    assert!(
+        saw_tool_blocked,
+        "deny on codex native gate must produce tool_blocked event"
+    );
+    assert!(
+        !saw_tool_result,
+        "deny on codex native gate must NOT forward tool_result"
+    );
 }

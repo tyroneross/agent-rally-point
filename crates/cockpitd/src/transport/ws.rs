@@ -38,6 +38,10 @@ use crate::{
     VERSION,
 };
 
+// H1a: `approval` has been removed from AppState. All approval operations
+// (insert, get, resolve) go through `state.supervisor` which owns the single
+// authoritative store for sessions + events + approvals.
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Start the axum WebSocket server. Blocks until the server shuts down.
@@ -363,40 +367,19 @@ async fn handle_command(
                 ApproveDecision::Deny => "deny",
             };
 
-            // Determine session_id for audit (best-effort).
-            // Try the supervisor's store first (G1 gate approvals live there),
-            // then fall back to the ApprovalManager's store (codex native approvals).
-            let session_id_for_audit = {
-                let sup = ctx.state.supervisor.lock().await;
-                sup.0.get_approval(approval_id).ok().flatten().map(|a| a.session_id)
-                    .or_else(|| {
-                        // Can't hold two async locks simultaneously; do it sequentially.
-                        None // filled in below
-                    })
-            };
-            let session_id_for_audit = if session_id_for_audit.is_none() {
-                let apr = ctx.state.approval.lock().await;
-                apr.0.get(approval_id).ok().flatten().map(|a| a.session_id)
-            } else {
-                session_id_for_audit
-            };
-
-            // Resolve in supervisor's store (for G1 gate approvals).
-            let sup_resolve_result = {
+            // H1a: all approvals live in the supervisor's store (single store).
+            // Look up the session_id for audit, then resolve in one place.
+            let (session_id_for_audit, resolve_result) = {
                 let mut sup = ctx.state.supervisor.lock().await;
-                sup.0.resolve_approval(approval_id, decision_str)
+                let session_id = sup.0.get_approval(approval_id)
+                    .ok()
+                    .flatten()
+                    .map(|a| a.session_id);
+                let result = sup.0.resolve_approval(approval_id, decision_str);
+                (session_id, result)
             };
 
-            // Also resolve in ApprovalManager's store (for codex native approvals
-            // and the existing approval-round-trip tests).
-            let apr_resolve_result = {
-                let mut approval = ctx.state.approval.lock().await;
-                approval.0.resolve(approval_id, decision_str)
-            };
-
-            // Either resolution succeeding is acceptable; if both fail report error.
-            let resolve_ok = sup_resolve_result.is_ok() || apr_resolve_result.is_ok();
-            if resolve_ok {
+            if resolve_result.is_ok() {
                 // Audit the resolution.
                 {
                     let mut audit = ctx.state.audit.lock().await;
@@ -420,7 +403,7 @@ async fn handle_command(
                     notify.notify_one();
                 }
             } else {
-                let err_msg = apr_resolve_result.unwrap_err().to_string();
+                let err_msg = resolve_result.unwrap_err().to_string();
                 let err = ServerEvent::Error {
                     code: "approve_failed".into(),
                     message: err_msg,
@@ -497,11 +480,10 @@ async fn handle_command(
                     if let Some(rx) = rx {
                         let event_tx = ctx.state.event_tx.clone();
                         let sup_arc = ctx.state.supervisor.clone();
-                        let approval_arc = ctx.state.approval.clone();
                         let audit_arc = ctx.state.audit.clone();
                         let gates_arc = ctx.state.approval_gates.clone();
                         tokio::spawn(async move {
-                            run_pump(sid, rx, event_tx, sup_arc, approval_arc, audit_arc, gates_arc).await;
+                            run_pump(sid, rx, event_tx, sup_arc, audit_arc, gates_arc).await;
                         });
                     }
 
@@ -545,7 +527,7 @@ async fn handle_command(
 /// Drains AdapterEvents from `rx`, persists them to the supervisor's store, and
 /// broadcasts them as cockpit Events to all subscribed clients.
 ///
-/// ## Authz enforcement (G1)
+/// ## Authz enforcement (G1 + H1b)
 /// When the adapter emits a `tool_call` Event, `authz::decide` is called with
 /// the conservative policy.  Decision outcomes:
 /// - `Permit` → broadcast the event as normal.
@@ -558,6 +540,10 @@ async fn handle_command(
 ///   - `deny` / `auto_denied` / anything else → emit a `tool_blocked` status
 ///     event and skip forwarding the tool_call result.
 ///
+/// H1b: native `approval_request` events from the Codex adapter are now gated
+/// the same way: the pump parks on a `Notify` until the client resolves the
+/// approval via the `Approve` WS command.
+///
 /// The gate is per-approval (not global), so other sessions' pumps are never
 /// blocked.  A tokio `Notify` is used rather than a channel so spurious wakeups
 /// are harmless (we re-check the DB after every notify).
@@ -567,13 +553,15 @@ async fn handle_command(
 /// AdapterEvent by the adapter layer; the pump handles them as independent
 /// events with no special logic here.
 ///
+/// H1a: the separate `approval` Arc<Mutex<ApprovalBox>> parameter has been
+/// removed. All approval operations go through `supervisor` (single store).
+///
 /// Runs as a tokio task per session. Terminates when the adapter closes the channel.
 async fn run_pump(
     session_id: Uuid,
     mut rx: tokio::sync::mpsc::Receiver<AdapterEvent>,
     event_tx: broadcast::Sender<Event>,
     supervisor: Arc<Mutex<crate::transport::SupervisorBox>>,
-    approval: Arc<Mutex<crate::transport::ApprovalBox>>,
     audit: Arc<Mutex<crate::transport::AuditBox>>,
     gates: Arc<std::sync::Mutex<HashMap<Uuid, Arc<Notify>>>>,
 ) {
@@ -632,20 +620,17 @@ async fn run_pump(
                             resolution: None,
                         };
 
-                        // Insert the approval row into the supervisor's store
-                        // (which already holds the session row, satisfying the FK
-                        // constraint).  The separate ApprovalManager store is used
-                        // by the ErasedApproval Approve command path (resolve); we
-                        // keep registration in the supervisor store so both stores
-                        // stay consistent.  Also register in the ApprovalManager's
-                        // store so the Approve command handler can find the row.
+                        // H1a: insert into the single authoritative store (the
+                        // supervisor's store). The session row was created before
+                        // this point, so the FK constraint is always satisfied.
+                        // No `let _ =` — surface the error so FK violations are
+                        // visible rather than silently ignored.
                         {
                             let mut sup = supervisor.lock().await;
-                            let _ = sup.0.insert_approval(&pending);
-                        }
-                        {
-                            let mut apr = approval.lock().await;
-                            let _ = apr.0.register_pending(&pending);
+                            if let Err(e) = sup.0.insert_approval(&pending) {
+                                warn!("pump: insert_approval failed for {session_id}: {e}");
+                                continue;
+                            }
                         }
 
                         // Create per-approval Notify and register in gates map.
@@ -789,8 +774,10 @@ async fn run_pump(
                     );
                 }
 
-                // Handle approval_request from adapter (e.g. codex emits these
-                // directly): register pending Approval + broadcast ApprovalRequest.
+                // H1b: Gate native approval_request events from the Codex
+                // adapter (and any future adapter) the same way as tool_call
+                // events gated in G1. The pump parks on a per-approval Notify
+                // until the client resolves the approval over the wire.
                 if evt.kind == "approval_request" {
                     let approval_id_str = evt
                         .metadata
@@ -809,6 +796,8 @@ async fn run_pump(
                         .cloned()
                         .unwrap_or(serde_json::json!({}));
 
+                    // Parse the adapter-supplied ID (must be a valid UUID for
+                    // the wire round-trip; mock emits a valid UUID from H1b).
                     let approval_uuid = Uuid::parse_str(approval_id_str)
                         .unwrap_or_else(|_| Uuid::new_v4());
 
@@ -823,15 +812,33 @@ async fn run_pump(
                         resolution: None,
                     };
 
+                    // H1a: insert into the single store (no separate approval store).
                     {
-                        let mut apr = approval.lock().await;
-                        let _ = apr.0.register_pending(&pending);
+                        let mut sup = supervisor.lock().await;
+                        if let Err(e) = sup.0.insert_approval(&pending) {
+                            warn!("pump: insert_approval (native) failed for {session_id}: {e}");
+                            // Do not skip — still gate the pump so the session
+                            // doesn't proceed without client acknowledgement.
+                            // The row may already exist (idempotent insert failure
+                            // on retry); the gate ensures ordering.
+                        }
                     }
 
+                    // Create per-approval Notify and register in gates map.
+                    let notify = Arc::new(Notify::new());
+                    {
+                        let mut g = gates.lock().unwrap();
+                        g.insert(approval_uuid, notify.clone());
+                    }
+
+                    // Build the approval_request frame for the broadcast.
+                    // The event was already persisted (seq assigned above).
                     let frame = ServerEvent::ApprovalRequest {
                         approval: pending.clone(),
                     };
-                    let approval_evt = Event {
+                    // Update the persisted event's metadata to embed the frame
+                    // so late-joining clients can recover it from the snapshot.
+                    let broadcast_evt = Event {
                         session_id,
                         seq,
                         sender: "system".into(),
@@ -847,10 +854,84 @@ async fn run_pump(
                             "__approval_frame": serde_json::to_value(&frame).unwrap_or_default(),
                         }),
                     };
-                    let _ = event_tx.send(approval_evt);
-                    let mut sup = supervisor.lock().await;
-                    sup.0.set_status(session_id, SessionStatus::AwaitingInput);
-                    continue;
+                    let _ = event_tx.send(broadcast_evt);
+                    {
+                        let mut sup = supervisor.lock().await;
+                        sup.0.set_status(session_id, SessionStatus::AwaitingInput);
+                    }
+
+                    // PAUSE: await resolution of this approval.
+                    notify.notified().await;
+
+                    // Remove gate (cleanup regardless of outcome).
+                    {
+                        let mut g = gates.lock().unwrap();
+                        g.remove(&approval_uuid);
+                    }
+
+                    // Read resolution from the single store.
+                    let resolution = {
+                        let sup = supervisor.lock().await;
+                        sup.0
+                            .get_approval(approval_uuid)
+                            .ok()
+                            .flatten()
+                            .and_then(|a| a.resolution)
+                    };
+
+                    if resolution.as_deref() == Some("allow") {
+                        // Permitted — session continues normally.
+                        {
+                            let mut sup = supervisor.lock().await;
+                            sup.0.set_status(session_id, SessionStatus::Active);
+                        }
+                        // Do NOT re-broadcast the approval_request event; it was
+                        // already sent above. The pump continues to the next event.
+                    } else {
+                        // Denied — emit tool_blocked and mark session active.
+                        let denial_reason = resolution.as_deref().unwrap_or("denied");
+                        let mut blocked_evt = Event {
+                            session_id,
+                            seq: 0,
+                            sender: "system".into(),
+                            kind: "tool_blocked".into(),
+                            content: format!("tool '{tool}' blocked by authz ({denial_reason})"),
+                            requires_user_input: false,
+                            created_at: evt.created_at,
+                            metadata: serde_json::json!({
+                                "approval_id": approval_uuid.to_string(),
+                                "tool": tool,
+                                "reason": denial_reason,
+                            }),
+                        };
+                        let blocked_seq = {
+                            let mut sup = supervisor.lock().await;
+                            sup.0.append_event(&blocked_evt).unwrap_or(seq + 1)
+                        };
+                        blocked_evt.seq = blocked_seq;
+                        {
+                            let mut sup = supervisor.lock().await;
+                            sup.0.set_status(session_id, SessionStatus::Active);
+                        }
+                        let _ = event_tx.send(blocked_evt);
+                    }
+
+                    // Audit the gate decision.
+                    {
+                        let mut aud = audit.lock().await;
+                        let _ = aud.0.append(
+                            "system",
+                            "session:native_tool_gate",
+                            Some(session_id),
+                            serde_json::json!({
+                                "approval_id": approval_uuid.to_string(),
+                                "tool": tool,
+                                "resolution": resolution,
+                            }),
+                        );
+                    }
+
+                    continue; // already handled
                 }
 
                 // Update live status if awaiting input (non-approval events).

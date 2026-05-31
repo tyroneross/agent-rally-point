@@ -13,6 +13,13 @@
 //!   - Every command in the wire contract (COCKPIT-WIRE.md)
 //!   - Fan-out: events from running sessions broadcast to all subscribed clients
 //!   - Seq-numbered replay: reconnect with `from_seq=N` → events with seq>N
+//!
+//! H1a — unified approval store:
+//!   `AppState` no longer carries a separate approval box. All approval
+//!   operations (`insert_approval`, `get_approval`, `resolve_approval`) are
+//!   routed through the supervisor's store, which already owns the session
+//!   rows — satisfying the FK constraint on `approvals.session_id → sessions.id`
+//!   and eliminating the silent `let _ =` that masked FK errors in G1.
 
 pub mod auth;
 pub mod relay;
@@ -26,7 +33,6 @@ use tokio::sync::{broadcast, Notify};
 use uuid::Uuid;
 
 use crate::{
-    approval::ApprovalManager,
     audit::AuditLog,
     clock::Clock,
     model::Event,
@@ -43,15 +49,18 @@ pub trait Transport: Send + 'static {
 }
 
 /// Shared runtime state passed from `DirectWs` to each WebSocket handler.
+///
+/// H1a: `approval` has been removed. All approval operations go through
+/// `supervisor` (single store, FK always satisfied).
 pub struct AppState {
     /// In-memory event fan-out: events appended to sessions are broadcast here.
     pub event_tx: broadcast::Sender<Event>,
     /// Shared supervisor behind an Arc<Mutex<...>>.
-    /// Store reads are routed through the supervisor's internal store.
+    /// Store reads *and* approval operations are routed through the supervisor's
+    /// internal store — the single source of truth for sessions + events +
+    /// approvals.
     pub supervisor: std::sync::Arc<tokio::sync::Mutex<SupervisorBox>>,
-    /// Shared approval manager.
-    pub approval: std::sync::Arc<tokio::sync::Mutex<ApprovalBox>>,
-    /// Append-only audit log.
+    /// Append-only audit log (intentionally isolated in its own store).
     pub audit: std::sync::Arc<tokio::sync::Mutex<AuditBox>>,
     /// Per-session approval gate: a pump waiting for approval resolution
     /// stores a `Notify` here; the `Approve` WS command signals it.
@@ -65,9 +74,6 @@ pub struct AuditBox(pub Box<dyn ErasedAudit + Send>);
 
 /// Type-erased Supervisor (erases the Clock and Adapter type parameters).
 pub struct SupervisorBox(pub Box<dyn ErasedSupervisor + Send>);
-
-/// Type-erased ApprovalManager.
-pub struct ApprovalBox(pub Box<dyn ErasedApproval + Send>);
 
 // ── Erased supervisor interface ───────────────────────────────────────────────
 
@@ -113,14 +119,6 @@ pub trait ErasedSupervisor {
     fn get_approval(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::model::Approval>>;
     /// Resolve an approval in the supervisor's store.
     fn resolve_approval(&mut self, id: uuid::Uuid, decision: &str) -> anyhow::Result<()>;
-}
-
-// ── Erased approval interface ─────────────────────────────────────────────────
-
-pub trait ErasedApproval {
-    fn register_pending(&mut self, approval: &crate::model::Approval) -> Result<()>;
-    fn resolve(&mut self, id: uuid::Uuid, decision: &str) -> Result<()>;
-    fn get(&self, id: uuid::Uuid) -> Result<Option<crate::model::Approval>>;
 }
 
 // ── Erased audit interface ────────────────────────────────────────────────────
@@ -219,23 +217,6 @@ impl<C: Clock> ErasedSupervisor for ConcreteSupervisor<C> {
     }
 }
 
-/// Wraps a concrete `ApprovalManager<C>`.
-pub struct ConcreteApproval<C: Clock>(pub ApprovalManager<C>);
-
-impl<C: Clock> ErasedApproval for ConcreteApproval<C> {
-    fn register_pending(&mut self, approval: &crate::model::Approval) -> Result<()> {
-        self.0.register_pending(approval)
-    }
-
-    fn resolve(&mut self, id: uuid::Uuid, decision: &str) -> Result<()> {
-        self.0.resolve(id, decision)
-    }
-
-    fn get(&self, id: uuid::Uuid) -> Result<Option<crate::model::Approval>> {
-        self.0.get(id)
-    }
-}
-
 /// Wraps a concrete `AuditLog<C>`.
 pub struct ConcreteAudit<C: Clock>(pub AuditLog<C>);
 
@@ -259,15 +240,19 @@ impl<C: Clock> ErasedAudit for ConcreteAudit<C> {
     }
 }
 
-/// Build an `AppState` from concrete supervisor, approval manager, and audit log.
+/// Build an `AppState` from a concrete supervisor and audit log.
 ///
-/// Store reads (list_sessions, replay_from, etc.) are routed through the
-/// supervisor's internal store via `ErasedSupervisor`, so there is no
-/// separate store instance in AppState. This ensures in-memory tests use
-/// the same SQLite connection that the supervisor writes to.
+/// H1a: the `ApprovalManager` parameter has been removed. All approval
+/// operations are routed through the supervisor's internal store — a single
+/// SQLite connection that owns sessions + events + approvals. The FK constraint
+/// on `approvals.session_id → sessions.id` is always satisfied because the
+/// session row is created before any approval row, and there is no longer a
+/// `let _ =` masking FK violations.
+///
+/// The audit log retains its own separate store (intentional isolation for the
+/// append-only immutable record).
 pub fn build_state<C: Clock>(
     supervisor: Supervisor<C>,
-    approval: ApprovalManager<C>,
     audit: AuditLog<C>,
 ) -> AppState {
     let (event_tx, _) = broadcast::channel(512);
@@ -275,9 +260,6 @@ pub fn build_state<C: Clock>(
         event_tx,
         supervisor: std::sync::Arc::new(tokio::sync::Mutex::new(SupervisorBox(Box::new(
             ConcreteSupervisor(supervisor),
-        )))),
-        approval: std::sync::Arc::new(tokio::sync::Mutex::new(ApprovalBox(Box::new(
-            ConcreteApproval(approval),
         )))),
         audit: std::sync::Arc::new(tokio::sync::Mutex::new(AuditBox(Box::new(
             ConcreteAudit(audit),
