@@ -85,6 +85,9 @@ pub(crate) struct EnterArgs {
     /// `.rally/active-engagement` so subsequent `say` calls in the same repo
     /// inherit it. Composes with the `RALLY_ENGAGEMENT` env var (env wins).
     pub(crate) engagement: Option<String>,
+    /// Self-declared capability tier (frontier|executing|fast). Lead auto-assign
+    /// is frontier-only; undeclared (None) stays lead-eligible (back-compat).
+    pub(crate) tier: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -670,6 +673,7 @@ fn enter_parser() -> impl Parser<EnterArgs> {
     let paths = many_string_arg("path", "PATH");
     let since = optional_i64_arg("since", "SEQ");
     let engagement = optional_string_arg("engagement", "LABEL");
+    let tier = optional_string_arg("tier", "TIER");
     construct!(EnterArgs {
         json,
         tool,
@@ -677,7 +681,8 @@ fn enter_parser() -> impl Parser<EnterArgs> {
         role,
         paths,
         since,
-        engagement
+        engagement,
+        tier
     })
 }
 

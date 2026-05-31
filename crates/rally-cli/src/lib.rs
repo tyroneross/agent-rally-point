@@ -430,6 +430,15 @@ fn command_init(args: InitArgs) -> Result<Output> {
 /// `role:lead` decision exists yet, also writes one `decision` fact asserting
 /// `tool` as lead (first-enter-is-lead).
 fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
+    ensure_presence_tiered(room, tool, None)
+}
+
+/// Tier-aware presence. Lead auto-assign is **frontier-only**: an undeclared
+/// tier (`None`) stays lead-eligible (back-compat with lazy-auto-enter callers),
+/// but a declared `executing`/`fast` agent entering an empty room does NOT take
+/// the lead seat — it stays open until a frontier agent (or user-designated
+/// lead) joins. See docs/SPEC-lead-agent.md.
+fn ensure_presence_tiered(room: &RoomStore, tool: &str, tier: Option<&str>) -> Result<()> {
     let snapshot = room.snapshot()?;
     // Already in the room — nothing to do.
     if snapshot.squads.iter().any(|s| s.tool == tool) {
@@ -459,8 +468,10 @@ fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
         session: None,
     };
     room.append_fact_verified(&presence_fact)?;
-    // First-enter-is-lead: assert lead only when no role:lead decision exists.
-    if snapshot.lead.is_none() {
+    // First-FRONTIER-enter-is-lead: assert lead only when the seat is open AND
+    // this agent is lead-eligible (frontier tier, or undeclared for back-compat).
+    let lead_eligible = matches!(tier, None | Some("frontier"));
+    if snapshot.lead.is_none() && lead_eligible {
         let lead_fact = Fact {
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
@@ -472,8 +483,11 @@ fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
             subject: "role:lead".to_string(),
             scope: Vec::new(),
             created_at: now_string(),
-            summary: Some(format!("{tool} is lead (first to enter)")),
-            evidence: Vec::new(),
+            summary: Some(format!("{tool} is lead (first frontier to enter)")),
+            evidence: vec![
+                format!("tier:{}", tier.unwrap_or("undeclared")),
+                "assigned:first-join".to_string(),
+            ],
             target: None,
             ref_id: None,
             status: None,
@@ -624,8 +638,8 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         }
     }
 
-    // Component A + B: emit presence (+ first-enter-is-lead) via shared helper.
-    ensure_presence(&room, &tool)?;
+    // Component A + B: emit presence (+ first-frontier-enter-is-lead) via shared helper.
+    ensure_presence_tiered(&room, &tool, args.tier.as_deref())?;
 
     // Re-snapshot after presence/lead writes so room summary and squads are current.
     let snapshot = room.snapshot()?;
@@ -2559,6 +2573,46 @@ mod tests {
 
     /// Component B acceptance test 3: a second tool auto-enters but lead stays
     /// with the first tool.
+    #[test]
+    fn frontier_tier_gates_lead_assignment() {
+        // L-1 (docs/SPEC-lead-agent.md): lead auto-assign is frontier-only.
+        // A declared `fast` agent entering an empty room does NOT take the seat;
+        // a later `frontier` agent does. Undeclared tier stays lead-eligible.
+        let root = unique_root("lead-frontier-gate");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // fast agent first → seat stays open.
+        ensure_presence_tiered(&room, "haiku-1", Some("fast")).unwrap();
+        assert_eq!(
+            room.snapshot().unwrap().lead.as_deref(),
+            None,
+            "a fast-tier first-enter must NOT take the lead seat"
+        );
+
+        // frontier agent joins → becomes lead.
+        ensure_presence_tiered(&room, "opus-1", Some("frontier")).unwrap();
+        assert_eq!(
+            room.snapshot().unwrap().lead.as_deref(),
+            Some("opus-1"),
+            "first frontier agent takes the open lead seat"
+        );
+    }
+
+    #[test]
+    fn undeclared_tier_stays_lead_eligible_for_backcompat() {
+        // Back-compat: lazy-auto-enter callers pass no tier; first-enter still leads.
+        let root = unique_root("lead-undeclared-compat");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        ensure_presence(&room, "legacy-1").unwrap();
+        assert_eq!(
+            room.snapshot().unwrap().lead.as_deref(),
+            Some("legacy-1"),
+            "undeclared-tier first-enter must remain lead-eligible (back-compat)"
+        );
+    }
+
     #[test]
     fn ensure_presence_second_tool_does_not_steal_lead() {
         let root = unique_root("ensure-presence-second-tool");
