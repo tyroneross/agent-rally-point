@@ -46,6 +46,14 @@ use crate::{
 
 /// Start the axum WebSocket server. Blocks until the server shuts down.
 pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
+    // H2: spawn the TTL auto-deny sweep task before accepting connections.
+    // The task runs in the background for the lifetime of the server.
+    // Interval is configurable via COCKPIT_SWEEP_INTERVAL_MS (default 5 s).
+    crate::transport::sweep::spawn_sweep_task(
+        Arc::clone(&state.supervisor),
+        Arc::clone(&state.approval_gates),
+    );
+
     let state = Arc::new(state);
 
     let app = Router::new()

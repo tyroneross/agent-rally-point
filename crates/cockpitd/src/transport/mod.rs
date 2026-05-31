@@ -24,6 +24,7 @@
 pub mod auth;
 pub mod relay;
 pub mod seams;
+pub mod sweep;
 pub mod ws;
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
@@ -119,6 +120,8 @@ pub trait ErasedSupervisor {
     fn get_approval(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::model::Approval>>;
     /// Resolve an approval in the supervisor's store.
     fn resolve_approval(&mut self, id: uuid::Uuid, decision: &str) -> anyhow::Result<()>;
+    /// List all pending (unresolved) approvals from the supervisor's store.
+    fn list_pending_approvals(&self) -> anyhow::Result<Vec<crate::model::Approval>>;
 }
 
 // ── Erased audit interface ────────────────────────────────────────────────────
@@ -214,6 +217,11 @@ impl<C: Clock> ErasedSupervisor for ConcreteSupervisor<C> {
 
     fn resolve_approval(&mut self, id: uuid::Uuid, decision: &str) -> anyhow::Result<()> {
         self.0.store.resolve_approval(id, decision)
+    }
+
+    fn list_pending_approvals(&self) -> anyhow::Result<Vec<crate::model::Approval>> {
+        use crate::approval::StorePendingExt as _;
+        self.0.store.list_pending_approvals()
     }
 }
 

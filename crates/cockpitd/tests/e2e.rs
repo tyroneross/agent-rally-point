@@ -1476,3 +1476,130 @@ async fn e2e_codex_native_gate_deny() {
         "deny on codex native gate must NOT forward tool_result"
     );
 }
+
+// ── E2E-14: H2 TTL sweep unparks a gated pump ────────────────────────────────
+//
+// Proves end-to-end auto-deny without real wall-clock waits:
+// - An approval is inserted with a TTL that has already elapsed (created at
+//   epoch, TTL=10s, sweep called with now=epoch+11s).
+// - A gate Notify is planted in the gates map (simulating a parked pump).
+// - `sweep_once` is called with a `now` past the deadline.
+// - The Notify is woken (gate unblocks).
+// - The approval row shows `auto_denied`.
+// - The sweep returns count=1.
+
+#[tokio::test]
+async fn e2e_sweep_auto_deny_unparks_gate() {
+    use cockpitd::{
+        adapter::claude::{ClaudeAdapter, ClaudeConfig},
+        audit::AuditLog,
+        clock::FakeClock,
+        model::{Approval, Session, SessionStatus},
+        store::Store,
+        supervisor::Supervisor,
+        transport::{build_state, sweep::sweep_once},
+    };
+    use chrono::{DateTime, Duration as ChronoDuration};
+    use std::sync::{atomic::{AtomicBool, Ordering}, Arc as StdArc};
+    use std::time::Duration as StdDuration;
+
+    // Epoch as base time: approval created at T=0, TTL=10s → deadline T+10.
+    let epoch: DateTime<chrono::Utc> = DateTime::from_timestamp(0, 0).unwrap();
+    let fake_clock = FakeClock::new(epoch);
+    let fake_clock2 = fake_clock.clone();
+
+    // Build an in-memory supervisor backed by the mock claude binary.
+    // The adapter won't be called in this test — we only need the session row.
+    let store = Store::open_in_memory().unwrap();
+    let adapter = ClaudeAdapter::new(ClaudeConfig {
+        binary: mock_claude_path(),
+        extra_flags: vec![],
+    });
+    let supervisor = Supervisor::new(store, fake_clock, adapter);
+    let audit = AuditLog::open_in_memory(fake_clock2).unwrap();
+    let state = build_state(supervisor, audit);
+
+    // ── Create a session row via ErasedSupervisor::launch_session ────────────
+    // This creates the DB row the FK constraint requires.
+    // The resulting pump receiver is intentionally dropped (no pump needed).
+    let launched_sid = {
+        let (event_tx, _) = tokio::sync::broadcast::channel::<cockpitd::model::Event>(8);
+        let mut sup = state.supervisor.lock().await;
+        sup.0
+            .launch_session("claude", "/tmp", None, "local", event_tx)
+            .expect("launch session for E2E-14")
+    };
+
+    // ── Insert a pending approval with TTL=10s, created at epoch ─────────────
+    let approval_id = Uuid::new_v4();
+    let approval = Approval {
+        id: approval_id,
+        session_id: launched_sid,
+        event_seq: 1,
+        tool: "dangerous_shell".into(),
+        args: serde_json::json!({"cmd": "rm -rf /"}),
+        created_at: epoch,
+        ttl_secs: 10,
+        resolution: None,
+    };
+    {
+        let mut sup = state.supervisor.lock().await;
+        sup.0.insert_approval(&approval).expect("insert_approval");
+    }
+
+    // Sanity: approval is pending before the sweep.
+    {
+        let sup = state.supervisor.lock().await;
+        let a = sup.0.get_approval(approval_id).unwrap().unwrap();
+        assert!(a.resolution.is_none(), "approval must be pending before sweep");
+    }
+
+    // ── Plant a gate Notify (simulating the parked run_pump task) ────────────
+    let notify = StdArc::new(tokio::sync::Notify::new());
+    {
+        let mut g = state.approval_gates.lock().unwrap();
+        g.insert(approval_id, notify.clone());
+    }
+
+    // ── Spawn a task that parks on the gate and records being woken ───────────
+    let notify_for_task = notify.clone();
+    let woken = StdArc::new(AtomicBool::new(false));
+    let woken_for_task = woken.clone();
+    let park_task = tokio::spawn(async move {
+        notify_for_task.notified().await;
+        woken_for_task.store(true, Ordering::SeqCst);
+    });
+
+    // ── Call sweep_once with now = epoch + 11s (past the 10s deadline) ───────
+    let sweep_now = epoch + ChronoDuration::seconds(11);
+    let denied_count = sweep_once(&state.supervisor, &state.approval_gates, sweep_now).await;
+
+    // The park_task should complete immediately after sweep_once fires the gate.
+    timeout(StdDuration::from_secs(2), park_task)
+        .await
+        .expect("park_task timed out — gate was not woken within 2 s")
+        .expect("park_task panicked");
+
+    // ── Assertions ────────────────────────────────────────────────────────────
+    assert_eq!(
+        denied_count, 1,
+        "sweep_once must report 1 auto-denied approval"
+    );
+    assert!(
+        woken.load(Ordering::SeqCst),
+        "parked gate Notify must have been woken by sweep_once"
+    );
+    let resolution = {
+        let sup = state.supervisor.lock().await;
+        sup.0
+            .get_approval(approval_id)
+            .unwrap()
+            .unwrap()
+            .resolution
+    };
+    assert_eq!(
+        resolution.as_deref(),
+        Some("auto_denied"),
+        "approval row must show auto_denied after sweep"
+    );
+}
