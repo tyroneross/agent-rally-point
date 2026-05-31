@@ -19,13 +19,22 @@
       "segment": "2026-05-30.jsonl"
     },
     {
-      "count": 120,
+      "count": 145,
       "engagement": "2026-05-31",
       "first_seq": 1075,
       "first_ts": "2026-05-31T00:00:56Z",
-      "last_seq": 1194,
-      "last_ts": "2026-05-31T03:52:50Z",
+      "last_seq": 1240,
+      "last_ts": "2026-05-31T04:55:29Z",
       "segment": "2026-05-31.jsonl"
+    },
+    {
+      "count": 21,
+      "engagement": "b19-codex01-20260531",
+      "first_seq": 1201,
+      "first_ts": "2026-05-31T04:11:56Z",
+      "last_seq": 1221,
+      "last_ts": "2026-05-31T04:21:33Z",
+      "segment": "b19-codex01-20260531.jsonl"
     },
     {
       "count": 489,
@@ -37,5 +46,5 @@
       "segment": "ledger-pre-segment.jsonl"
     }
   ],
-  "updated_at": "2026-05-31T03:58:54Z"
+  "updated_at": "2026-05-31T04:55:29Z"
 }
