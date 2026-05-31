@@ -74,7 +74,7 @@ use cli::*;
 use dag::{DagOutput, WakeDueEntry, build_dag, project_wake_due, resolve_wake_after};
 use error::{RallyError, Result};
 use next::{AttentionItem, EntryData, NextResult, build_attention, build_entry, build_next};
-use output::{CliError, Output};
+use output::{CliError, Output, RenderedOutput};
 use route_findings::{Finding, RoutingSummary, route_findings};
 use store::{Fact, FactKind, ReadReceipt, RoomQuery, RoomSnapshot, RoomStore, RoomSummary};
 // Envelope wrapper types from backends module.
@@ -96,9 +96,175 @@ const SCHEMA_WAKE_DUE: &str = "agent-rally.command.wake-due.v1";
 // Rank-11: room north-star + per-agent autonomy envelope
 const SCHEMA_MISSION: &str = "agent-rally.command.mission.v1";
 
+/// Default hard wall-clock budget for a single `rally` invocation, in
+/// milliseconds. Any command that has not returned within this budget is
+/// abandoned and the process exits fail-open (see [`run_with_watchdog`]).
+///
+/// Rationale: rally is invoked synchronously from agent write-hooks. A hook
+/// that blocks on stuck filesystem I/O (NFS stall, a contended/zombie
+/// lockfile, a wedged segment replay) would otherwise hang forever — on
+/// 2026-05-30 four `before-write` hooks sat in uninterruptible (`UE`) kernel
+/// wait for 7h45m, unkillable even by SIGKILL. `--fail-open` only governs
+/// error-vs-block semantics; it does NOT bound execution time. This watchdog
+/// is the time bound, and it applies to *every* command path so the safety
+/// does not depend on which syscall happens to block.
+const DEFAULT_WATCHDOG_TIMEOUT_MS: u64 = 3000;
+/// Floor/ceiling for the configurable budget (defense against a `0` or absurd
+/// override that would re-introduce the hang or break fast commands).
+const MIN_WATCHDOG_TIMEOUT_MS: u64 = 100;
+const MAX_WATCHDOG_TIMEOUT_MS: u64 = 60_000;
+
+/// Resolve the watchdog budget from (in priority order) a `--timeout-ms VALUE`
+/// argument, the `RALLY_HOOK_TIMEOUT_MS` env var, then the default. Clamped to
+/// `[MIN, MAX]`. Out-of-range / unparseable inputs fall through to the next
+/// source rather than erroring — the watchdog must never be the thing that
+/// fails a hook.
+fn resolve_watchdog_timeout(args: &[String]) -> Duration {
+    let from_args = args
+        .iter()
+        .position(|a| a == "--timeout-ms")
+        .and_then(|i| args.get(i + 1).and_then(|v| v.parse::<u64>().ok()));
+    let from_eq = args.iter().find_map(|a| {
+        a.strip_prefix("--timeout-ms=")
+            .and_then(|v| v.parse::<u64>().ok())
+    });
+    let from_env = env::var("RALLY_HOOK_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let ms = from_args
+        .or(from_eq)
+        .or(from_env)
+        .unwrap_or(DEFAULT_WATCHDOG_TIMEOUT_MS)
+        .clamp(MIN_WATCHDOG_TIMEOUT_MS, MAX_WATCHDOG_TIMEOUT_MS);
+    Duration::from_millis(ms)
+}
+
+/// Remove the watchdog-only `--timeout-ms` flag (both `--timeout-ms VALUE` and
+/// `--timeout-ms=VALUE` forms) from the argument list so it is never forwarded
+/// to a subcommand parser. The flag controls only the wall-clock budget and is
+/// meaningless to any individual command.
+fn strip_timeout_flag(args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--timeout-ms" {
+            // Drop the flag, and drop the following token only when it is a
+            // numeric value (so a malformed `--timeout-ms --json` doesn't
+            // swallow `--json`).
+            i += 1;
+            if i < args.len() && args[i].parse::<u64>().is_ok() {
+                i += 1;
+            }
+            continue;
+        }
+        if arg.starts_with("--timeout-ms=") {
+            i += 1;
+            continue;
+        }
+        out.push(arg.clone());
+        i += 1;
+    }
+    out
+}
+
 pub fn main() -> ExitCode {
-    let wants_json = env::args().any(|arg| arg == "--json");
-    match run_inner() {
+    run_with_watchdog(env::args().skip(1).collect())
+}
+
+/// Run a single command under a hard wall-clock watchdog.
+///
+/// The command body executes on a worker thread; the main thread waits for it
+/// with a deadline. If the worker finishes in time, we print its output and
+/// return its exit code exactly as before. If the deadline elapses first, we
+/// **fail open**: emit the neutral envelope the hook wrapper expects and exit
+/// `0` immediately, abandoning the (possibly syscall-blocked) worker thread.
+///
+/// Abandoning the worker is safe and is the whole point: `std::process::exit`
+/// tears down the entire process, so any file descriptor, advisory lock, or
+/// child the worker was holding is released by the kernel at exit. Nothing the
+/// hook touched can outlive the budget. (A thread stuck in an uninterruptible
+/// kernel wait cannot be joined or cancelled from userspace — exiting the
+/// process is the only correct release, and it is what a fresh `rally`
+/// invocation would do anyway.)
+fn run_with_watchdog(args: Vec<String>) -> ExitCode {
+    // Resolve the budget from the *raw* args, then strip the watchdog-only
+    // `--timeout-ms` flag so it never reaches a subcommand parser (which would
+    // reject it as unknown). The env var path needs no stripping.
+    let timeout = resolve_watchdog_timeout(&args);
+    let args = strip_timeout_flag(args);
+
+    let wants_json = args.iter().any(|arg| arg == "--json");
+    // `--fail-open` (passed by the hook wrappers) means "never block the host
+    // tool on a rally problem". On timeout we honor it by emitting a neutral
+    // allow-everything envelope. Without it we still exit 0 (rally is an
+    // advisory coordinator — hanging the agent is strictly worse than skipping
+    // one advisory), but we surface a timeout note on stderr for visibility.
+    let fail_open = args.iter().any(|arg| arg == "--fail-open");
+
+    let (tx, rx) = std::sync::mpsc::channel::<WatchdogResult>();
+    let worker = thread::Builder::new()
+        .name("rally-command".to_string())
+        .spawn(move || {
+            let result = match run_inner_with(&args) {
+                Ok(output) => {
+                    let exit_code = output.exit_code;
+                    let rendered = output.render();
+                    WatchdogResult {
+                        rendered,
+                        exit_code,
+                    }
+                }
+                Err(err) => {
+                    let err = CliError::from_error(err, wants_json);
+                    WatchdogResult {
+                        rendered: err.render_err(),
+                        exit_code: err.exit_code,
+                    }
+                }
+            };
+            // Send may fail if the main thread already timed out and moved on;
+            // that's fine — we're abandoning this worker.
+            let _ = tx.send(result);
+        });
+
+    if worker.is_err() {
+        // Could not even spawn a thread (resource exhaustion). Run inline as a
+        // last resort rather than failing the hook — correctness over the
+        // watchdog guarantee in this degenerate case.
+        return run_inline(env::args().skip(1).collect());
+    }
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => {
+            let exit_code = result.exit_code;
+            result.print();
+            ExitCode::from(exit_code)
+        }
+        Err(_) => {
+            // Deadline elapsed (or the worker panicked without sending). Fail
+            // open and exit immediately, abandoning the worker thread.
+            emit_timeout_fail_open(wants_json, fail_open, timeout);
+            std::process::exit(0);
+        }
+    }
+}
+
+struct WatchdogResult {
+    rendered: RenderedOutput,
+    exit_code: u8,
+}
+
+impl WatchdogResult {
+    fn print(self) {
+        self.rendered.print();
+    }
+}
+
+/// Inline (no-watchdog) execution path used only when thread spawning fails.
+fn run_inline(args: Vec<String>) -> ExitCode {
+    let wants_json = args.iter().any(|arg| arg == "--json");
+    match run_inner_with(&args) {
         Ok(output) => {
             let exit_code = output.exit_code;
             output.print();
@@ -112,8 +278,35 @@ pub fn main() -> ExitCode {
     }
 }
 
-fn run_inner() -> Result<Output> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
+/// On watchdog timeout, print the neutral fail-open payload and return. For
+/// `--json` callers this is the empty/neutral envelope every hook wrapper
+/// already treats as "nothing to do" (`{}` → wrapper emits no agent-visible
+/// message). For human callers we print nothing to stdout and a single
+/// stderr note so the timeout is observable without polluting stdout.
+fn emit_timeout_fail_open(wants_json: bool, fail_open: bool, timeout: Duration) {
+    if wants_json {
+        // Neutral envelope: the codex/claude/gemini wrappers parse this and,
+        // finding no `agent_visible.present`, emit `{}` — i.e. allow the write.
+        println!("{}", json!({ "ok": true, "product": "rally" }));
+    }
+    let _ = fail_open; // semantics identical either way; kept for clarity/logging
+    eprintln!(
+        "rally: hook exceeded {}ms wall-clock budget — failing open (no coordination check applied)",
+        timeout.as_millis()
+    );
+}
+
+fn run_inner_with(args: &[String]) -> Result<Output> {
+    // Test-only blocking seam: simulates a command path wedged on slow/stuck
+    // I/O so the watchdog can be exercised deterministically. Compiled out of
+    // release builds (`debug_assertions` is false in `--release`), so the
+    // installed binary can never be made to hang by setting this var.
+    #[cfg(debug_assertions)]
+    if let Ok(ms) = env::var("RALLY_TEST_BLOCK_MS") {
+        if let Ok(ms) = ms.trim().parse::<u64>() {
+            thread::sleep(Duration::from_millis(ms));
+        }
+    }
     if args.is_empty()
         || matches!(
             args.first().map(String::as_str),
@@ -122,9 +315,9 @@ fn run_inner() -> Result<Output> {
     {
         return Ok(Output::new(false, help_text(), json!({})));
     }
-    reject_unknown_command(&args)?;
+    reject_unknown_command(args)?;
 
-    let command = match parse_cli(&args)? {
+    let command = match parse_cli(args)? {
         CliParse::Command(command) => *command,
         CliParse::Help(text) => return Ok(Output::new(false, text, json!({}))),
     };
