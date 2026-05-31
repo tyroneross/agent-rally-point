@@ -2602,6 +2602,43 @@ mod tests {
     }
 
     #[test]
+    fn relinquish_reopens_lead_seat() {
+        // L-2b: a role:lead:relinquished decision reopens the seat (lead = None);
+        // a later assign re-fills it. Projection: latest lead-family fact wins.
+        let root = unique_root("lead-relinquish");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root).unwrap();
+        ensure_presence_tiered(&room, "opus-1", Some("frontier")).unwrap();
+        assert_eq!(room.snapshot().unwrap().lead.as_deref(), Some("opus-1"));
+        let relinquish = Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Decision,
+            tool: Some("opus-1".to_string()),
+            role: None,
+            subject: "role:lead:relinquished".to_string(),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&relinquish).unwrap();
+        assert_eq!(
+            room.snapshot().unwrap().lead,
+            None,
+            "relinquish must reopen the lead seat"
+        );
+    }
+
+    #[test]
     fn undeclared_tier_stays_lead_eligible_for_backcompat() {
         // Back-compat: lazy-auto-enter callers pass no tier; first-enter still leads.
         let root = unique_root("lead-undeclared-compat");
@@ -5873,6 +5910,51 @@ fn command_lead(args: LeadArgs) -> Result<Output> {
         LeadSubcommand::Assign(t) => {
             let mode = if t.user_designated { "user-designated" } else { "assign" };
             set_lead(args.json, &t, mode)
+        }
+        LeadSubcommand::Relinquish(r) => {
+            let room = RoomStore::open()?;
+            ensure_presence(&room, &r.tool)?;
+            let prior = room.snapshot()?.lead;
+            let fact = Fact {
+                schema: FACT_SCHEMA.to_string(),
+                event_id: new_id("fact"),
+                seq: 0,
+                thread_id: new_id("room"),
+                kind: FactKind::Decision,
+                tool: Some(r.tool.clone()),
+                role: None,
+                subject: "role:lead:relinquished".to_string(),
+                scope: Vec::new(),
+                created_at: now_string(),
+                summary: Some(format!("{} relinquished the lead seat", r.tool)),
+                evidence: vec!["assigned:relinquished".to_string()],
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            let fact = room.append_fact_verified(&fact)?;
+            let text = format!(
+                "lead relinquished by {} (was {})",
+                r.tool,
+                prior.as_deref().unwrap_or("<none>")
+            );
+            let body = envelope(
+                "lead",
+                SCHEMA_LEAD,
+                LeadData {
+                    lead: LeadPayload {
+                        action: "relinquish".to_string(),
+                        current_lead: None,
+                        tier: None,
+                        assigned: Some("relinquished".to_string()),
+                        fact: Some(fact),
+                    },
+                },
+            )?;
+            Ok(Output::new(args.json, text, body))
         }
     }
 }

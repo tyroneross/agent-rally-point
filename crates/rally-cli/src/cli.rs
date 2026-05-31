@@ -326,6 +326,7 @@ pub(crate) enum LeadSubcommand {
     Show,
     Handoff(LeadTargetArgs),
     Assign(LeadTargetArgs),
+    Relinquish(LeadRelinquishArgs),
 }
 
 #[derive(Clone, Debug)]
@@ -333,6 +334,11 @@ pub(crate) struct LeadTargetArgs {
     pub(crate) tool: String,
     pub(crate) to: String,
     pub(crate) user_designated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LeadRelinquishArgs {
+    pub(crate) tool: String,
 }
 
 /// `rally board [--json]`
@@ -1250,8 +1256,15 @@ fn lead_parser() -> impl Parser<LeadArgs> {
         .descr("Assign the lead (user-designated supersedes first-join).")
         .command("assign")
         .map(LeadSubcommand::Assign);
+    let r_tool = string_arg("tool", "TOOL");
+    let relinquish = construct!(r_tool)
+        .map(|tool| LeadRelinquishArgs { tool })
+        .to_options()
+        .descr("Relinquish the lead title (reopens the seat).")
+        .command("relinquish")
+        .map(LeadSubcommand::Relinquish);
     let json = json_flag();
-    let subcommand = construct!([show, handoff, assign]);
+    let subcommand = construct!([show, handoff, assign, relinquish]);
     construct!(json, subcommand).map(|(json, subcommand)| LeadArgs { json, subcommand })
 }
 

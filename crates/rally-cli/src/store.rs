@@ -1354,10 +1354,16 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
         .collect::<Vec<_>>();
 
     // Lead is the tool from the most-recent decision with subject "role:lead".
+    // Lead = the tool of the latest `role:lead` decision, UNLESS the latest
+    // lead-family decision is a `role:lead:relinquished` (seat reopened → None).
     let lead = facts
         .iter()
-        .filter(|f| f.kind == "decision" && f.subject == "role:lead")
+        .filter(|f| {
+            f.kind == "decision"
+                && (f.subject == "role:lead" || f.subject == "role:lead:relinquished")
+        })
         .max_by_key(|f| f.seq)
+        .filter(|f| f.subject == "role:lead")
         .and_then(|f| f.tool.clone());
 
     // Mission: latest-by-seq Mission fact whose scope contains "mission".
