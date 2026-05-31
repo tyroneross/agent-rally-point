@@ -85,7 +85,8 @@ fn pointer_block() -> String {
         "This repo coordinates parallel coding agents via **agent-rally-point** \
          (per-repo, no external service).\n\n",
     );
-    s.push_str("- **Enter:** `rally enter --tool <host-llm-role-number>` (e.g. `claude_code:01`, `codex:01`)\n");
+    s.push_str("- **Self-locate FIRST:** `rally whoami --tool <you> --json` — host runtime, room, lead, mission, ack status. If `host_runtime.ambiguous` is true, STOP and resolve which host before acting (never guess).\n");
+    s.push_str("- **Enter + acknowledge:** `rally enter --tool <host-llm-role-number> --json` (e.g. `claude_code:01`), then `rally ack --tool <you>` to confirm you ingested the rules/guardrails/lead/mission.\n");
     s.push_str("- **What to do next:** `rally next --tool <you> --json`\n");
     s.push_str("- **Current state:** `rally room --json`\n");
     s.push_str("- **History (durable, per-engagement):** `.rally/log/`\n");
@@ -267,6 +268,7 @@ fn build_manifest(repo_root: &Path, worktree_root: &Path) -> Result<(Value, Mani
         "ledger": format!(".rally/{LOG_DIRNAME}/"),
         "ledger_filename_legacy": format!(".rally/{LEDGER_FILENAME}"),
         "room_cmd": "rally room",
+        "whoami_cmd": "rally whoami",
         "init_cmd": "rally init",
         "pointer_markers": {
             "start": POINTER_START,

@@ -7,7 +7,8 @@ This file is read by coding agents on entry. The rally pointer below tells agent
 
 This repo coordinates parallel coding agents via **agent-rally-point** (per-repo, no external service).
 
-- **Enter:** `rally enter --tool <host-llm-role-number>` (e.g. `claude_code:01`, `codex:01`)
+- **Self-locate FIRST:** `rally whoami --tool <you> --json` — host runtime, room, lead, mission, ack status. If `host_runtime.ambiguous` is true, STOP and resolve which host before acting (never guess).
+- **Enter + acknowledge:** `rally enter --tool <host-llm-role-number> --json` (e.g. `claude_code:01`), then `rally ack --tool <you>` to confirm you ingested the rules/guardrails/lead/mission.
 - **What to do next:** `rally next --tool <you> --json`
 - **Current state:** `rally room --json`
 - **History (durable, per-engagement):** `.rally/log/`

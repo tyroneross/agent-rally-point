@@ -140,7 +140,9 @@ board/doc syncs are coordination artifacts, not code changes.)
 ## Joining checklist (drop-in)
 
 ```bash
+rally whoami  --tool <your-stable-id> --json   # SELF-LOCATE FIRST: host runtime, room, lead, mission, ack — if host_runtime.ambiguous, STOP & resolve
 rally enter   --tool <your-stable-id> --json   # who's here, what changed, what's owned
+rally ack     --tool <your-stable-id>          # confirm you ingested rules/guardrails/lead/mission (coordination-mandate)
 rally mission --json                           # the room's north-star + your autonomy envelope — read before acting
 rally next    --tool <your-stable-id> --json   # a concrete next-action contract (or wait/ask)
 # read docs/ORCHESTRATION.md → roster, lanes, backlog. If no lead exists, you are lead.

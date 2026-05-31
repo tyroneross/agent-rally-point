@@ -46,7 +46,8 @@ named reviewer is `reviewer-01` with tool `claude_code:reviewer-01`.
 ## The Agent Loop
 
 ```text
-enter repo/session
+self-locate (rally whoami)   # host runtime, room, lead, mission, ambiguity — run FIRST
+  -> enter repo/session + ack
   -> run next
      -> if actionable, claim/check
         -> execute and verify
