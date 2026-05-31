@@ -85,3 +85,8 @@ uv.lock
 # Optional tool runtime dirs (per-tool data lives under .<toolname>/, not in-repo).
 .bookmark/
 .navgator/
+
+# cockpitd runtime SQLite (created by `cockpitd serve` default COCKPIT_DB)
+cockpitd.db
+cockpitd.db-shm
+cockpitd.db-wal
