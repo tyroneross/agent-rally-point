@@ -39,6 +39,20 @@ impl Workspace {
         (value, output)
     }
 
+    fn log_events(&self) -> Vec<Value> {
+        let log_dir = self.cwd.join(".rally/log");
+        let log_path = fs::read_dir(log_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .expect("rally jsonl log exists");
+        fs::read_to_string(log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
     fn output(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_rally"))
             .current_dir(&self.cwd)
@@ -164,6 +178,118 @@ fn before_write_gate_cannot_be_bypassed_by_warn_mode_missing_path_or_unknown_too
     workspace.cleanup();
 }
 
+#[test]
+fn before_write_live_sequence_reproduces_auto_claim_facts() {
+    let workspace = Workspace::new("rally-before-write-live-sequence");
+    fs::create_dir_all(workspace.cwd.join("src")).unwrap();
+    fs::write(workspace.cwd.join("src/lib.rs"), "").unwrap();
+
+    let (check, check_output) = workspace.json_with_status(&[
+        "check",
+        "before-write",
+        "--json",
+        "--tool",
+        "codex:01",
+        "--path",
+        "src/lib.rs",
+    ]);
+    assert!(check_output.status.success());
+    assert_eq!(check["data"]["check"]["allow"], true);
+    assert_eq!(check["data"]["check"]["agent_visible"]["present"], false);
+
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "codex:01",
+        "--path",
+        "src/lib.rs",
+        "--subject",
+        "auto-claim src/lib.rs",
+    ]);
+
+    let events = workspace.log_events();
+    assert!(
+        events.iter().any(|event| {
+            event["event_type"] == "presence"
+                && event["payload"]["tool"] == "codex:01"
+                && event["payload"]["subject"] == "agent presence: codex:01"
+        }),
+        "live check must lazy-register codex presence: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["event_type"] == "claim"
+                && event["payload"]["tool"] == "codex:01"
+                && event["payload"]["subject"] == "auto-claim src/lib.rs"
+                && event["payload"]["scope"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|scope| scope == "file:src/lib.rs")
+        }),
+        "explicit live claim must reproduce the old auto-claim path fact: {events:#?}"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn before_write_live_sequence_does_not_claim_when_gate_stops() {
+    let workspace = Workspace::new("rally-before-write-live-blocked");
+    fs::create_dir_all(workspace.cwd.join("src")).unwrap();
+    fs::write(workspace.cwd.join("src/lib.rs"), "").unwrap();
+
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "peer",
+        "--path",
+        "src/lib.rs",
+        "--subject",
+        "peer owns lib",
+    ]);
+
+    let (check, check_output) = workspace.json_with_status(&[
+        "check",
+        "before-write",
+        "--json",
+        "--tool",
+        "codex:01",
+        "--path",
+        "src/lib.rs",
+    ]);
+    assert!(check_output.status.success());
+    assert_eq!(check["data"]["check"]["allow"], false);
+    assert_eq!(check["data"]["check"]["agent_visible"]["present"], true);
+    assert!(
+        check["data"]["check"]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["code"] == "claimed-path")
+    );
+
+    let events = workspace.log_events();
+    assert!(
+        events.iter().any(|event| {
+            event["event_type"] == "presence" && event["payload"]["tool"] == "codex:01"
+        }),
+        "blocked check still reproduces codex presence: {events:#?}"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event["event_type"] == "claim" && event["payload"]["tool"] == "codex:01"
+        }),
+        "wrapper-compatible sequence must not claim when the gate stops: {events:#?}"
+    );
+
+    workspace.cleanup();
+}
+
 // B10 — canonical-path matching integration tests
 
 /// B10a (lessons case): tool X claims `crates/rally-cli/src/lib.rs`; tool Y checks
@@ -255,8 +381,7 @@ fn b10_absolute_vs_relative_exact_match_is_stop() {
          findings: {findings:#?}"
     );
     assert_eq!(
-        result["data"]["check"]["allow"],
-        false,
+        result["data"]["check"]["allow"], false,
         "allow must be false when a STOP finding is present"
     );
 
@@ -293,7 +418,9 @@ fn b10_single_component_basename_does_not_flag() {
 
     let findings = result["data"]["check"]["findings"].as_array().unwrap();
     assert!(
-        !findings.iter().any(|f| f["code"] == "ambiguous-path-collision"),
+        !findings
+            .iter()
+            .any(|f| f["code"] == "ambiguous-path-collision"),
         "single-component basename must not trigger ambiguous-path-collision; \
          findings: {findings:#?}"
     );
