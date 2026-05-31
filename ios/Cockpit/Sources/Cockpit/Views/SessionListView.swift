@@ -3,6 +3,7 @@ import SwiftUI
 
 public struct SessionListView: View {
     @EnvironmentObject var store: SessionStore
+    @State private var selected: Session?
 
     public init() {}
 
@@ -16,13 +17,21 @@ public struct SessionListView: View {
                 )
             } else {
                 List(store.sessions) { session in
-                    NavigationLink {
-                        SessionDetailView(session: session)
+                    Button {
+                        selected = session
                     } label: {
                         SessionRowView(session: session)
                     }
+                    .buttonStyle(.plain)
+                    .contentShape(Rectangle())
                 }
             }
+        }
+        // Detail opens as a pop-out sheet (persistent dismiss affordance) rather than
+        // a pushed view whose back chevron scrolls out of sight.
+        .sheet(item: $selected) { session in
+            SessionDetailView(session: session, store: store)
+                .presentationDragIndicator(.visible)
         }
     }
 }

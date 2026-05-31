@@ -2,40 +2,49 @@
 import SwiftUI
 
 public struct SessionDetailView: View {
-    @EnvironmentObject var store: SessionStore
+    @Environment(\.dismiss) private var dismiss
     @StateObject private var vm: SessionDetailViewModel
 
-    public init(session: Session) {
-        _vm = StateObject(wrappedValue: SessionDetailViewModel(session: session, store: SessionStore()))
+    // Takes the REAL store (passed from the list) so the timeline reads live events —
+    // not a throwaway SessionStore().
+    public init(session: Session, store: SessionStore) {
+        _vm = StateObject(wrappedValue: SessionDetailViewModel(session: session, store: store))
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            // Timeline
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(vm.events) { event in
-                            EventRowView(event: event)
-                                .id(event.id)
+        NavigationStack {
+            VStack(spacing: 0) {
+                // Timeline
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(vm.events) { event in
+                                EventRowView(event: event)
+                                    .id(event.id)
+                            }
+                        }
+                        .padding()
+                    }
+                    .onChange(of: vm.events.count) { _, _ in
+                        if let last = vm.events.last {
+                            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                         }
                     }
-                    .padding()
                 }
-                .onChange(of: vm.events.count) { _, _ in
-                    if let last = vm.events.last {
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                    }
+
+                Divider()
+
+                // D3 — Composer
+                ComposerView(vm: vm)
+            }
+            .navigationTitle(vm.session.title ?? "Session")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
                 }
             }
-
-            Divider()
-
-            // D3 — Composer
-            ComposerView(vm: vm)
         }
-        .navigationTitle(vm.session.title ?? "Session")
-        .navigationBarTitleDisplayMode(.inline)
         .onAppear { vm.onAppear() }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             vm.refresh()
