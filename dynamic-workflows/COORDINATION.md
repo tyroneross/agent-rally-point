@@ -130,10 +130,15 @@ board/doc syncs are coordination artifacts, not code changes.)
 ## Joining checklist (drop-in)
 
 ```bash
-rally enter --tool <your-stable-id> --json     # who's here, what changed, what's owned
-rally next  --tool <your-stable-id> --json     # a concrete next-action contract (or wait/ask)
+rally enter   --tool <your-stable-id> --json   # who's here, what changed, what's owned
+rally mission --json                           # the room's north-star + your autonomy envelope — read before acting
+rally next    --tool <your-stable-id> --json   # a concrete next-action contract (or wait/ask)
 # read docs/ORCHESTRATION.md → roster, lanes, backlog. If no lead exists, you are lead.
 # then: backlog → no-regrets → check-with-lead. Claim + check before any write.
 ```
+
+Every `--json` result follows one envelope: `{ ok, command, product, schema, data }`, and the
+command's result is always at `data[<command>]` (e.g. `data.room`, `data.next`, `data["wake-due"]`).
+Parse by that rule — don't guess per-command nesting. Full map: [`../docs/JSON_ENVELOPE.md`](../docs/JSON_ENVELOPE.md).
 
 Keep it light. The rules above are the whole contract — everything else is each agent's own judgment.

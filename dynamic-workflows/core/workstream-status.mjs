@@ -29,8 +29,10 @@ import { readFileSync } from "node:fs";
 
 /**
  * Pull the room object out of whatever shape `rally room --json` (or a raw room) gives.
- * - `raw.data.room`: the live CLI envelope shape — `rally room --json` emits
- *   `{ command, data: { query, room }, ok, ... }` (verified 2026-05-29).
+ * - `raw.data.room`: the live CLI envelope shape. Every rally command now follows one
+ *   contract — `{ ok, command, product, schema, data }` with the result at `data[<command>]`,
+ *   so `rally room --json` puts the room at `raw.data.room` (standardized 2026-05-31;
+ *   see ../docs/JSON_ENVELOPE.md). This is the canonical path.
  * - `raw.room`: a thinner `{ room }` wrapper some callers pass.
  * - else: `raw` is already a bare room object (tests + in-process callers).
  */
