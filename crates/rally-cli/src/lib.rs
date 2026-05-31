@@ -87,6 +87,7 @@ const SCHEMA_VERSION: &str = "agent-rally.command.version.v1";
 const SCHEMA_WHOAMI: &str = "agent-rally.command.whoami.v1";
 // Work surface schemas
 const SCHEMA_BACKLOG: &str = "agent-rally.command.backlog.v1";
+const SCHEMA_LEAD: &str = "agent-rally.command.lead.v1";
 const SCHEMA_BOARD: &str = "agent-rally.command.board.v1";
 const SCHEMA_ROUTE_FINDINGS: &str = "agent-rally.command.route-findings.v1";
 // B13
@@ -356,6 +357,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::Whoami(args) => command_whoami(args),
         // Rank-11: room north-star + per-agent autonomy envelope
         CliCommand::Mission(args) => command_mission(args),
+        CliCommand::Lead(args) => command_lead(args),
     }
 }
 
@@ -5805,6 +5807,127 @@ struct MissionGetEnvelope {
 #[derive(JsonSchema, Serialize)]
 struct MissionSetEnvelope {
     mission: MissionSetPayload,
+}
+
+/// Envelope for `lead`: payload at `data.lead`.
+#[derive(JsonSchema, Serialize)]
+struct LeadData {
+    lead: LeadPayload,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct LeadPayload {
+    action: String,
+    current_lead: Option<String>,
+    tier: Option<String>,
+    assigned: Option<String>,
+    fact: Option<Fact>,
+}
+
+/// `rally lead` — show / hand off / assign the lead-agent title.
+/// Charter: records + exposes only; the latest `role:lead` decision wins
+/// (same projection as first-frontier auto-assign). See docs/SPEC-lead-agent.md.
+fn command_lead(args: LeadArgs) -> Result<Output> {
+    let room = RoomStore::open()?;
+    match args.subcommand {
+        LeadSubcommand::Show => {
+            let snap = room.snapshot()?;
+            let current = snap.lead.clone();
+            let facts = room.facts().unwrap_or_default();
+            let latest = facts
+                .iter()
+                .filter(|f| f.kind == "decision" && f.subject == "role:lead")
+                .max_by_key(|f| f.seq);
+            let tier = latest.and_then(|f| {
+                f.evidence
+                    .iter()
+                    .find_map(|e| e.strip_prefix("tier:").map(str::to_string))
+            });
+            let assigned = latest.and_then(|f| {
+                f.evidence
+                    .iter()
+                    .find_map(|e| e.strip_prefix("assigned:").map(str::to_string))
+            });
+            let text = format!(
+                "lead={} tier={} assigned={}",
+                current.as_deref().unwrap_or("<none>"),
+                tier.as_deref().unwrap_or("-"),
+                assigned.as_deref().unwrap_or("-"),
+            );
+            let body = envelope(
+                "lead",
+                SCHEMA_LEAD,
+                LeadData {
+                    lead: LeadPayload {
+                        action: "show".to_string(),
+                        current_lead: current,
+                        tier,
+                        assigned,
+                        fact: None,
+                    },
+                },
+            )?;
+            Ok(Output::new(args.json, text, body))
+        }
+        LeadSubcommand::Handoff(t) => set_lead(args.json, &t, "handoff"),
+        LeadSubcommand::Assign(t) => {
+            let mode = if t.user_designated { "user-designated" } else { "assign" };
+            set_lead(args.json, &t, mode)
+        }
+    }
+}
+
+/// Append a `role:lead` decision transferring the title to `t.to`. The latest
+/// such decision wins in the projection, so this just records the transfer
+/// (charter: records/exposes, never enforces).
+fn set_lead(json: bool, t: &LeadTargetArgs, mode: &str) -> Result<Output> {
+    let room = RoomStore::open()?;
+    ensure_presence(&room, &t.tool)?;
+    let prior = room.snapshot()?.lead;
+    let mut evidence = vec![format!("assigned:{mode}")];
+    if let Some(p) = &prior {
+        evidence.push(format!("from:{p}"));
+    }
+    let fact = Fact {
+        schema: FACT_SCHEMA.to_string(),
+        event_id: new_id("fact"),
+        seq: 0,
+        thread_id: new_id("room"),
+        kind: FactKind::Decision,
+        tool: Some(t.to.clone()),
+        role: None,
+        subject: "role:lead".to_string(),
+        scope: Vec::new(),
+        created_at: now_string(),
+        summary: Some(format!("{} is lead (via {mode})", t.to)),
+        evidence,
+        target: None,
+        ref_id: None,
+        status: None,
+        severity: None,
+        uri: None,
+        session: None,
+    };
+    let fact = room.append_fact_verified(&fact)?;
+    let text = format!(
+        "lead {} -> {} (via {mode})",
+        prior.as_deref().unwrap_or("<none>"),
+        t.to
+    );
+    let body = envelope(
+        "lead",
+        SCHEMA_LEAD,
+        LeadData {
+            lead: LeadPayload {
+                action: mode.to_string(),
+                current_lead: Some(t.to.clone()),
+                tier: None,
+                assigned: Some(mode.to_string()),
+                fact: Some(fact),
+            },
+        },
+    )?;
+    Ok(Output::new(json, text, body))
 }
 
 fn command_mission(args: MissionArgs) -> Result<Output> {

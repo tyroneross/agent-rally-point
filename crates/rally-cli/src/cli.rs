@@ -40,6 +40,7 @@ pub(crate) enum CliCommand {
     Whoami(WhoamiArgs),
     /// Rank-11: room north-star + per-agent autonomy envelope.
     Mission(MissionArgs),
+    Lead(LeadArgs),
 }
 
 pub(crate) enum CliParse {
@@ -313,6 +314,27 @@ pub(crate) struct BacklogDoneArgs {
     pub(crate) id: String,
 }
 
+/// `rally lead show|handoff|assign` — lead-agent title (records/exposes only).
+#[derive(Clone, Debug)]
+pub(crate) struct LeadArgs {
+    pub(crate) json: bool,
+    pub(crate) subcommand: LeadSubcommand,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum LeadSubcommand {
+    Show,
+    Handoff(LeadTargetArgs),
+    Assign(LeadTargetArgs),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LeadTargetArgs {
+    pub(crate) tool: String,
+    pub(crate) to: String,
+    pub(crate) user_designated: bool,
+}
+
 /// `rally board [--json]`
 #[derive(Clone, Debug)]
 pub(crate) struct BoardArgs {
@@ -431,6 +453,8 @@ const COMMANDS: &[&str] = &[
     "whoami",
     // Rank-11: room north-star + per-agent autonomy envelope
     "mission",
+    // Lead-agent title surface (L-2)
+    "lead",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -606,6 +630,12 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .command("mission")
         .map(CliCommand::Mission);
 
+    let lead = lead_parser()
+        .to_options()
+        .descr("Lead-agent title: show, hand off, or assign. Rally records/exposes only — never enforces.")
+        .command("lead")
+        .map(CliCommand::Lead);
+
     construct!([
         init,
         enter,
@@ -635,7 +665,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         dag,
         wake_due,
         whoami,
-        mission
+        mission,
+        lead
     ])
     .to_options()
 }
@@ -1192,6 +1223,36 @@ fn backlog_parser() -> impl Parser<BacklogArgs> {
     let json = json_flag();
     let subcommand = construct!([add_parser, list_parser, done_parser]);
     construct!(json, subcommand).map(|(json, subcommand)| BacklogArgs { json, subcommand })
+}
+
+fn lead_parser() -> impl Parser<LeadArgs> {
+    let show = bpaf::pure(())
+        .to_options()
+        .descr("Show the current lead, its tier, and how it was assigned.")
+        .command("show")
+        .map(|_| LeadSubcommand::Show);
+    let h_tool = string_arg("tool", "TOOL");
+    let h_to = string_arg("to", "TOOL");
+    let handoff = construct!(h_tool, h_to)
+        .map(|(tool, to)| LeadTargetArgs { tool, to, user_designated: false })
+        .to_options()
+        .descr("Hand the lead title to another (frontier) agent.")
+        .command("handoff")
+        .map(LeadSubcommand::Handoff);
+    let a_tool = string_arg("tool", "TOOL");
+    let a_to = string_arg("to", "TOOL");
+    let a_ud = long("user-designated")
+        .help("Mark as user-designated (supersedes a first-join lead).")
+        .switch();
+    let assign = construct!(a_tool, a_to, a_ud)
+        .map(|(tool, to, user_designated)| LeadTargetArgs { tool, to, user_designated })
+        .to_options()
+        .descr("Assign the lead (user-designated supersedes first-join).")
+        .command("assign")
+        .map(LeadSubcommand::Assign);
+    let json = json_flag();
+    let subcommand = construct!([show, handoff, assign]);
+    construct!(json, subcommand).map(|(json, subcommand)| LeadArgs { json, subcommand })
 }
 
 fn board_parser() -> impl Parser<BoardArgs> {
