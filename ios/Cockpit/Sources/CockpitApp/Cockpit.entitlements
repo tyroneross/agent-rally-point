@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- CV6-B: shared iCloud Keychain access group for pairing item.
+         The Mac app (Easy Terminal) must declare the same group under the same Team ID.
+         $(AppIdentifierPrefix) is substituted by Xcode/codesign at build time.
+         TAG:UNTESTED — keychain access group requires a signed build with a real Team ID;
+         simulator tests use a stub reader and never touch the real keychain. -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)ai.rosslabs.cockpit.pairing</string>
+    </array>
+</dict>
+</plist>

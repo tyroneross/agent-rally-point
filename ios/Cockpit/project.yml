@@ -19,6 +19,14 @@ targets:
     sources:
       - path: Sources/Cockpit
       - path: Sources/CockpitApp
+    entitlements:
+      path: Sources/CockpitApp/Cockpit.entitlements
+      # CV6-B: keychain-access-groups declares the shared iCloud Keychain group.
+      # $(AppIdentifierPrefix) is substituted by codesign at build time.
+      # TAG:UNTESTED — requires a signed build + real Team ID; sim tests use stub reader.
+      properties:
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)ai.rosslabs.cockpit.pairing
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.rosslabs.cockpit
