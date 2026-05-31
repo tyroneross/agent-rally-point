@@ -1,4 +1,4 @@
-// G3 — SettingsViewModel validation + CockpitConfig UserDefaults round-trip tests.
+// CV5 — CockpitConfig + SettingsViewModel tests (ptyd config: host/port/token/fingerprint).
 import Foundation
 import Testing
 @testable import Cockpit
@@ -6,76 +6,103 @@ import Testing
 // MARK: - Helpers
 
 private func makeSuite() -> UserDefaults {
-    // Isolated UserDefaults suite — no pollution to .standard.
-    let suite = UserDefaults(suiteName: "ai.rosslabs.cockpitTests.settings-\(UUID().uuidString)")!
-    return suite
+    UserDefaults(suiteName: "ai.rosslabs.cockpitTests.settings-\(UUID().uuidString)")!
 }
+
+private let validFP = String(repeating: "a", count: 64)
 
 // MARK: - CockpitConfig round-trip
 
 @Suite("CockpitConfig")
 struct CockpitConfigTests {
 
-    @Test("default URL is ws://127.0.0.1:8787")
-    func defaultURL() {
+    @Test("default host is 127.0.0.1")
+    func defaultHost() {
         let cfg = CockpitConfig(defaults: makeSuite())
-        #expect(cfg.daemonURLString == "ws://127.0.0.1:8787")
+        #expect(cfg.host == "127.0.0.1")
     }
 
-    @Test("persists URL and token to UserDefaults")
+    @Test("default port string is 7333")
+    func defaultPort() {
+        let cfg = CockpitConfig(defaults: makeSuite())
+        #expect(cfg.portString == "7333")
+        #expect(cfg.port == 7333)
+    }
+
+    @Test("persists all four fields to UserDefaults")
     func roundTrip() {
         let suite = makeSuite()
         let cfg = CockpitConfig(defaults: suite)
-        cfg.daemonURLString = "wss://example.tailscale/cockpit"
-        cfg.devToken = "my-secret-token"
+        cfg.host = "tailscale.host"
+        cfg.portString = "9000"
+        cfg.pairingToken = "mytoken"
+        cfg.pinnedFingerprint = validFP
 
-        // Read back via a second instance on the same suite.
         let cfg2 = CockpitConfig(defaults: suite)
-        #expect(cfg2.daemonURLString == "wss://example.tailscale/cockpit")
-        #expect(cfg2.devToken == "my-secret-token")
+        #expect(cfg2.host == "tailscale.host")
+        #expect(cfg2.portString == "9000")
+        #expect(cfg2.pairingToken == "mytoken")
+        #expect(cfg2.pinnedFingerprint == validFP)
     }
 
-    @Test("daemonURL is nil for http scheme")
-    func httpSchemeIsInvalid() {
+    @Test("port is nil for non-numeric string")
+    func invalidPortStringIsNil() {
         let cfg = CockpitConfig(defaults: makeSuite())
-        cfg.daemonURLString = "http://127.0.0.1:8787"
-        #expect(cfg.daemonURL == nil)
+        cfg.portString = "notaport"
+        #expect(cfg.port == nil)
     }
 
-    @Test("daemonURL is nil for empty string")
-    func emptyURLIsInvalid() {
+    @Test("port is nil for empty string")
+    func emptyPortStringIsNil() {
         let cfg = CockpitConfig(defaults: makeSuite())
-        cfg.daemonURLString = ""
-        #expect(cfg.daemonURL == nil)
+        cfg.portString = ""
+        #expect(cfg.port == nil)
     }
 
-    @Test("daemonURL is non-nil for ws scheme")
-    func wsSchemeIsValid() {
+    @Test("isConnectable false when host is empty")
+    func notConnectableEmptyHost() {
         let cfg = CockpitConfig(defaults: makeSuite())
-        cfg.daemonURLString = "ws://127.0.0.1:8787"
-        #expect(cfg.daemonURL != nil)
-    }
-
-    @Test("daemonURL is non-nil for wss scheme")
-    func wssSchemeIsValid() {
-        let cfg = CockpitConfig(defaults: makeSuite())
-        cfg.daemonURLString = "wss://host.example.com/ws"
-        #expect(cfg.daemonURL != nil)
-    }
-
-    @Test("isConnectable false when token is empty")
-    func notConnectableWithEmptyToken() {
-        let cfg = CockpitConfig(defaults: makeSuite())
-        cfg.daemonURLString = "ws://127.0.0.1:8787"
-        cfg.devToken = ""
+        cfg.host = ""
+        cfg.portString = "7333"
+        cfg.pairingToken = "tok"
+        cfg.pinnedFingerprint = validFP
         #expect(!cfg.isConnectable)
     }
 
-    @Test("isConnectable true when URL and token are valid")
-    func connectableWithBoth() {
+    @Test("isConnectable false when port invalid")
+    func notConnectableInvalidPort() {
         let cfg = CockpitConfig(defaults: makeSuite())
-        cfg.daemonURLString = "ws://127.0.0.1:8787"
-        cfg.devToken = "tok"
+        cfg.portString = "bad"
+        cfg.pairingToken = "tok"
+        cfg.pinnedFingerprint = validFP
+        #expect(!cfg.isConnectable)
+    }
+
+    @Test("isConnectable false when token empty")
+    func notConnectableEmptyToken() {
+        let cfg = CockpitConfig(defaults: makeSuite())
+        cfg.portString = "7333"
+        cfg.pairingToken = ""
+        cfg.pinnedFingerprint = validFP
+        #expect(!cfg.isConnectable)
+    }
+
+    @Test("isConnectable false when fingerprint empty")
+    func notConnectableEmptyFingerprint() {
+        let cfg = CockpitConfig(defaults: makeSuite())
+        cfg.portString = "7333"
+        cfg.pairingToken = "tok"
+        cfg.pinnedFingerprint = ""
+        #expect(!cfg.isConnectable)
+    }
+
+    @Test("isConnectable true when all four fields valid")
+    func connectableWithAll() {
+        let cfg = CockpitConfig(defaults: makeSuite())
+        cfg.host = "127.0.0.1"
+        cfg.portString = "7333"
+        cfg.pairingToken = "tok"
+        cfg.pinnedFingerprint = validFP
         #expect(cfg.isConnectable)
     }
 }
@@ -86,91 +113,122 @@ struct CockpitConfigTests {
 @Suite("SettingsViewModel")
 struct SettingsViewModelTests {
 
-    private func makeVM(url: String = "ws://127.0.0.1:8787", token: String = "tok") -> SettingsViewModel {
+    private func makeVM(
+        host: String = "127.0.0.1",
+        port: String = "7333",
+        token: String = "tok",
+        fp: String = validFP
+    ) -> SettingsViewModel {
         let cfg = CockpitConfig(defaults: makeSuite())
-        cfg.daemonURLString = url
-        cfg.devToken = token
-        return SettingsViewModel(config: cfg)
+        cfg.host = host
+        cfg.portString = port
+        cfg.pairingToken = token
+        cfg.pinnedFingerprint = fp
+        let vm = SettingsViewModel(config: cfg)
+        vm.hostDraft = host
+        vm.portDraft = port
+        vm.tokenDraft = token
+        vm.fingerprintDraft = fp
+        return vm
     }
 
-    @Test("valid ws URL + non-empty token passes validation")
-    func validWS() {
-        let vm = makeVM(url: "ws://127.0.0.1:8787", token: "tok")
-        let ok = vm.validate()
-        #expect(ok)
+    @Test("valid config passes validation")
+    func validConfig() {
+        let vm = makeVM()
+        #expect(vm.validate())
         #expect(vm.validationErrors.isEmpty)
     }
 
-    @Test("valid wss URL passes validation")
-    func validWSS() {
-        let vm = makeVM(url: "wss://cockpit.example.com/ws", token: "tok")
-        #expect(vm.validate())
+    @Test("empty host fails with emptyHost")
+    func emptyHostFails() {
+        let vm = makeVM(host: "")
+        #expect(!vm.validate())
+        #expect(vm.validationErrors.contains(.emptyHost))
     }
 
-    @Test("http URL is rejected with invalidURLScheme")
-    func httpRejected() {
-        let vm = makeVM(url: "http://127.0.0.1:8787")
-        let ok = vm.validate()
-        #expect(!ok)
-        #expect(vm.validationErrors.contains(.invalidURLScheme))
+    @Test("invalid port fails with invalidPort")
+    func invalidPortFails() {
+        let vm = makeVM(port: "notaport")
+        #expect(!vm.validate())
+        #expect(vm.validationErrors.contains(.invalidPort))
     }
 
-    @Test("empty URL produces emptyURL error")
-    func emptyURL() {
-        let vm = makeVM(url: "")
-        let ok = vm.validate()
-        #expect(!ok)
-        #expect(vm.validationErrors.contains(.emptyURL))
+    @Test("empty port fails with emptyPort")
+    func emptyPortFails() {
+        let vm = makeVM(port: "")
+        #expect(!vm.validate())
+        #expect(vm.validationErrors.contains(.emptyPort))
     }
 
-    @Test("empty token produces emptyToken error")
-    func emptyToken() {
+    @Test("empty token fails with emptyToken")
+    func emptyTokenFails() {
         let vm = makeVM(token: "")
-        let ok = vm.validate()
-        #expect(!ok)
+        #expect(!vm.validate())
         #expect(vm.validationErrors.contains(.emptyToken))
     }
 
-    @Test("whitespace-only token produces emptyToken error")
-    func whitespaceToken() {
+    @Test("whitespace-only token fails")
+    func whitespaceTokenFails() {
         let vm = makeVM(token: "   ")
-        let ok = vm.validate()
-        #expect(!ok)
+        #expect(!vm.validate())
         #expect(vm.validationErrors.contains(.emptyToken))
+    }
+
+    @Test("short fingerprint fails with invalidFingerprint")
+    func shortFingerprintFails() {
+        let vm = makeVM(fp: "abc123")
+        #expect(!vm.validate())
+        #expect(vm.validationErrors.contains(.invalidFingerprint))
+    }
+
+    @Test("non-hex fingerprint fails with invalidFingerprint")
+    func nonHexFingerprintFails() {
+        let vm = makeVM(fp: String(repeating: "z", count: 64))
+        #expect(!vm.validate())
+        #expect(vm.validationErrors.contains(.invalidFingerprint))
+    }
+
+    @Test("uppercase hex fingerprint passes")
+    func upperHexFingerprintPasses() {
+        let vm = makeVM(fp: String(repeating: "A", count: 64))
+        #expect(vm.validate())
     }
 
     @Test("save persists trimmed values to config")
     func savePersists() {
         let cfg = CockpitConfig(defaults: makeSuite())
-        cfg.daemonURLString = "ws://127.0.0.1:8787"
-        cfg.devToken = "old"
         let vm = SettingsViewModel(config: cfg)
-        vm.urlDraft   = "  wss://new.host/ws  "
-        vm.tokenDraft = "  new-token  "
+        vm.hostDraft        = "  127.0.0.1  "
+        vm.portDraft        = "  7333  "
+        vm.tokenDraft       = "  newtoken  "
+        vm.fingerprintDraft = "  \(validFP)  "
         let saved = vm.save()
         #expect(saved)
-        #expect(cfg.daemonURLString == "wss://new.host/ws")
-        #expect(cfg.devToken == "new-token")
+        #expect(cfg.host == "127.0.0.1")
+        #expect(cfg.portString == "7333")
+        #expect(cfg.pairingToken == "newtoken")
+        #expect(cfg.pinnedFingerprint == validFP)
     }
 
-    @Test("save with invalid URL does not persist")
+    @Test("save with invalid config does not persist")
     func saveInvalidDoesNotPersist() {
         let cfg = CockpitConfig(defaults: makeSuite())
-        cfg.daemonURLString = "ws://127.0.0.1:8787"
-        cfg.devToken = "orig"
+        cfg.host = "original"
         let vm = SettingsViewModel(config: cfg)
-        vm.urlDraft = "http://bad"
+        vm.hostDraft = ""
         let saved = vm.save()
         #expect(!saved)
-        #expect(cfg.daemonURLString == "ws://127.0.0.1:8787") // unchanged
+        #expect(cfg.host == "original")
     }
 
-    @Test("reset restores default URL and clears token + errors")
+    @Test("reset restores defaults and clears errors")
     func resetRestoresDefaults() {
-        let vm = makeVM(url: "wss://changed.host", token: "tok")
+        let vm = makeVM(host: "changed", port: "9999", token: "tok", fp: validFP)
         vm.reset()
-        #expect(vm.urlDraft == CockpitConfig.defaultDaemonURL)
+        #expect(vm.hostDraft == CockpitConfig.defaultHost)
+        #expect(vm.portDraft == String(CockpitConfig.defaultPort))
         #expect(vm.tokenDraft == "")
+        #expect(vm.fingerprintDraft == "")
         #expect(vm.validationErrors.isEmpty)
     }
 }

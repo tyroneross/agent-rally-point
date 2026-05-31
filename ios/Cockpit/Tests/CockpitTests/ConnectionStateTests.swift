@@ -1,6 +1,4 @@
-// G4 — Unit tests for ConnectionState enum + SessionStore transitions.
-// Uses Swift Testing (matching SettingsTests.swift style).
-// No live socket required — transitions driven via SessionStore.transition(_:).
+// CV5 — ConnectionState + SessionStore transition tests (updated for ptyd config).
 import Foundation
 import Testing
 @testable import Cockpit
@@ -90,20 +88,25 @@ struct ConnectionStateEnumTests {
     }
 }
 
-// MARK: - SessionStore transition tests
+// MARK: - SessionStore transition tests (ptyd config)
 
 @MainActor
 @Suite("SessionStore.connectionState transitions")
 struct SessionStoreConnectionStateTests {
 
-    private func makeStore(urlString: String = "ws://127.0.0.1:8787", token: String = "tok") -> SessionStore {
+    private func makeStore(
+        host: String = "127.0.0.1",
+        port: String = "7333",
+        token: String = "tok",
+        fp: String = String(repeating: "a", count: 64)
+    ) -> SessionStore {
         let cfg = CockpitConfig(defaults: makeSuite())
-        cfg.daemonURLString = urlString
-        cfg.devToken = token
+        cfg.host = host
+        cfg.portString = port
+        cfg.pairingToken = token
+        cfg.pinnedFingerprint = fp
         return SessionStore(config: cfg)
     }
-
-    // MARK: idle → connecting → connected
 
     @Test("starts in idle state")
     func startsIdle() {
@@ -120,29 +123,26 @@ struct SessionStoreConnectionStateTests {
         #expect(store.connectionState == .connected)
     }
 
-    // MARK: invalid config → error
-
-    @Test("invalid URL produces error state on connect()")
-    func invalidURLProducesError() {
-        let store = makeStore(urlString: "http://not-ws")
+    @Test("empty host produces error state on connect()")
+    func emptyHostProducesError() {
+        let store = makeStore(host: "")
         store.connect()
         guard case .error(let msg) = store.connectionState else {
             Issue.record("Expected .error, got \(store.connectionState)")
             return
         }
-        #expect(!msg.isEmpty)
-        #expect(msg.contains("invalid"))
+        #expect(msg.lowercased().contains("host") || msg.lowercased().contains("empty"))
     }
 
-    @Test("empty URL produces error state on connect()")
-    func emptyURLProducesError() {
-        let store = makeStore(urlString: "")
+    @Test("invalid port produces error state on connect()")
+    func invalidPortProducesError() {
+        let store = makeStore(port: "notaport")
         store.connect()
         guard case .error(let msg) = store.connectionState else {
             Issue.record("Expected .error, got \(store.connectionState)")
             return
         }
-        #expect(msg.contains("empty") || msg.contains("URL"))
+        #expect(msg.lowercased().contains("port"))
     }
 
     @Test("missing token produces error state on connect()")
@@ -153,7 +153,7 @@ struct SessionStoreConnectionStateTests {
             Issue.record("Expected .error, got \(store.connectionState)")
             return
         }
-        #expect(msg.contains("token"))
+        #expect(msg.lowercased().contains("token"))
     }
 
     @Test("whitespace-only token produces error state on connect()")
@@ -166,7 +166,16 @@ struct SessionStoreConnectionStateTests {
         }
     }
 
-    // MARK: connected → disconnected
+    @Test("missing fingerprint produces error on connect()")
+    func missingFingerprintProducesError() {
+        let store = makeStore(fp: "")
+        store.connect()
+        guard case .error(let msg) = store.connectionState else {
+            Issue.record("Expected .error, got \(store.connectionState)")
+            return
+        }
+        #expect(msg.lowercased().contains("fingerprint") || msg.lowercased().contains("cert"))
+    }
 
     @Test("connected then disconnected via transition")
     func connectedToDisconnected() {
@@ -190,8 +199,6 @@ struct SessionStoreConnectionStateTests {
             return
         }
     }
-
-    // MARK: error message from server frame
 
     @Test("transition to error with a message")
     func transitionToError() {

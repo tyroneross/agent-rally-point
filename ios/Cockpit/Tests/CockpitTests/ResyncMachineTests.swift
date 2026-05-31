@@ -7,6 +7,7 @@ final class ResyncMachineTests: XCTestCase {
     // MARK: - Helpers
 
     private func makeEvent(sessionId: String = "s1", seq: UInt64, kind: String = "message") -> Event {
+        // CV5: createdAt is UInt64 (Unix seconds) to match ptyd structured.rs Event shape.
         Event(
             sessionId: sessionId,
             seq: seq,
@@ -14,7 +15,7 @@ final class ResyncMachineTests: XCTestCase {
             kind: kind,
             content: "content \(seq)",
             requiresUserInput: false,
-            createdAt: "2026-05-31T00:00:00Z",
+            createdAt: 1_748_736_000,
             metadata: [:]
         )
     }

@@ -1,4 +1,5 @@
-// G3 — Connection settings sheet (daemon URL + dev token).
+// CV5 — Connection settings sheet for ptyd TLS thin client.
+// Fields: host, port, pairing token, pinned cert fingerprint.
 import SwiftUI
 
 public struct SettingsView: View {
@@ -13,34 +14,68 @@ public struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
-                    LabeledContent("URL") {
-                        TextField("ws://127.0.0.1:8787", text: $vm.urlDraft)
+                    LabeledContent("Host") {
+                        TextField("127.0.0.1", text: $vm.hostDraft)
                             .keyboardType(.URL)
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.never)
                             .multilineTextAlignment(.trailing)
                     }
-                    if vm.validationErrors.contains(.emptyURL) {
-                        Text("URL is required.").font(.caption).foregroundStyle(.red)
-                    } else if vm.validationErrors.contains(.invalidURLScheme) {
-                        Text("URL must start with ws:// or wss://").font(.caption).foregroundStyle(.red)
-                    } else if vm.validationErrors.contains(.malformedURL) {
-                        Text("Invalid URL format.").font(.caption).foregroundStyle(.red)
+                    if vm.validationErrors.contains(.emptyHost) {
+                        Text("Host is required.").font(.caption).foregroundStyle(.red)
                     }
 
-                    LabeledContent("Dev Token") {
-                        SecureField("required", text: $vm.tokenDraft)
+                    LabeledContent("Port") {
+                        TextField("7333", text: $vm.portDraft)
+                            .keyboardType(.numberPad)
+                            .autocorrectionDisabled()
+                            .multilineTextAlignment(.trailing)
+                    }
+                    if vm.validationErrors.contains(.emptyPort) {
+                        Text("Port is required.").font(.caption).foregroundStyle(.red)
+                    } else if vm.validationErrors.contains(.invalidPort) {
+                        Text("Port must be 1–65535.").font(.caption).foregroundStyle(.red)
+                    }
+                } header: {
+                    Text("Daemon Address")
+                } footer: {
+                    Text("The ptyd TLS listener address. The daemon binds loopback only — reach it via your Tailscale/SSH tunnel.")
+                        .font(.caption)
+                }
+
+                Section {
+                    LabeledContent("Pairing Token") {
+                        SecureField("64-char hex token", text: $vm.tokenDraft)
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.never)
                             .multilineTextAlignment(.trailing)
                     }
                     if vm.validationErrors.contains(.emptyToken) {
-                        Text("Token is required to connect.").font(.caption).foregroundStyle(.red)
+                        Text("Pairing token is required.").font(.caption).foregroundStyle(.red)
                     }
                 } header: {
-                    Text("Daemon Connection")
+                    Text("Authentication")
                 } footer: {
-                    Text("ws:// for local/Tailscale; wss:// for TLS. Token is the dev bearer sent in the hello frame. Auth is dev-mode only — see DEFERRED.md for SE-mTLS.")
+                    Text("Token from ~/.config/ptyd/pairing_token on the daemon host. Share via QR code or secure copy.")
+                        .font(.caption)
+                }
+
+                Section {
+                    LabeledContent("Cert Fingerprint") {
+                        TextField("SHA-256 hex (64 chars)", text: $vm.fingerprintDraft)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    if vm.validationErrors.contains(.emptyFingerprint) {
+                        Text("Fingerprint is required.").font(.caption).foregroundStyle(.red)
+                    } else if vm.validationErrors.contains(.invalidFingerprint) {
+                        Text("Must be a 64-character hex string (SHA-256).").font(.caption).foregroundStyle(.red)
+                    }
+                } header: {
+                    Text("Certificate Pinning")
+                } footer: {
+                    Text("SHA-256 fingerprint of the daemon's self-signed TLS cert. Shown on daemon startup and in `ptyd status server --json` as tls_fingerprint. This client will reject any other cert.")
                         .font(.caption)
                 }
 

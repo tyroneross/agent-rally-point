@@ -26,12 +26,16 @@ public final class ApprovalViewModel: ObservableObject {
 
     public func allow(_ approval: Approval) async {
         guard await authenticateIfNeeded() else { return }
-        try? await store.client.approve(approvalId: approval.id, decision: .allow)
+        // Records the decision in the ptyd audit log (observe-model).
+        // To inject the actual approval input into the agent, use pane.send_text on the
+        // relevant pane_id — that is a follow-up step (ptyd pane.send_text).
+        store.client.approve(approvalID: approval.id, decision: "allow", sessionID: approval.sessionId)
         remove(approval)
     }
 
     public func deny(_ approval: Approval, reason: String? = nil) async {
-        try? await store.client.approve(approvalId: approval.id, decision: .deny, reason: reason)
+        // Same observe-model note as allow().
+        store.client.approve(approvalID: approval.id, decision: "deny", sessionID: approval.sessionId)
         remove(approval)
     }
 

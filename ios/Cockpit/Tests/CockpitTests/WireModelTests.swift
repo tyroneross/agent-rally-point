@@ -1,4 +1,5 @@
-// D1 tests — wire model decode round-trips + tolerance invariants
+// CV5 — Wire model tests (ptyd protocol shapes).
+// Replaces cockpit WebSocket ServerFrame / ClientCommand tests with ptyd equivalents.
 import XCTest
 @testable import Cockpit
 
@@ -6,230 +7,196 @@ final class WireModelTests: XCTestCase {
 
     private let decoder = JSONDecoder()
 
-    // MARK: - ServerFrame round-trips
+    // MARK: - PtydResponse / PtydResult
 
-    func testHelloOkDecodes() throws {
-        let json = """
-        {"t":"hello_ok","server_version":"0.1.0","protocol":1}
-        """.data(using: .utf8)!
-        let frame = try decoder.decode(ServerFrame.self, from: json)
-        guard case .helloOk(let p) = frame else { XCTFail("Expected helloOk"); return }
-        XCTAssertEqual(p.serverVersion, "0.1.0")
-        XCTAssertEqual(p.protocol, 1)
-    }
-
-    func testPongDecodes() throws {
-        let json = "{\"t\":\"pong\"}".data(using: .utf8)!
-        let frame = try decoder.decode(ServerFrame.self, from: json)
-        guard case .pong = frame else { XCTFail("Expected pong"); return }
-    }
-
-    func testErrorDecodes() throws {
-        let json = """
-        {"t":"error","code":"unauthorized","message":"bad token"}
-        """.data(using: .utf8)!
-        let frame = try decoder.decode(ServerFrame.self, from: json)
-        guard case .error(let p) = frame else { XCTFail("Expected error"); return }
-        XCTAssertEqual(p.code, "unauthorized")
-    }
-
-    func testSessionListDecodes() throws {
+    func testHelloAckOkDecodes() throws {
         let json = """
         {
-          "t":"session_list",
-          "sessions":[{
-            "id":"abc123","owner_id":"u1","agent_type":"claude",
-            "repo_path":"/repo","status":"active","title":null,
-            "created_at":"2026-05-31T00:00:00Z","last_seq":5
-          }]
-        }
-        """.data(using: .utf8)!
-        let frame = try decoder.decode(ServerFrame.self, from: json)
-        guard case .sessionList(let p) = frame else { XCTFail("Expected sessionList"); return }
-        XCTAssertEqual(p.sessions.count, 1)
-        XCTAssertEqual(p.sessions[0].agentType, "claude")
-        XCTAssertEqual(p.sessions[0].status, .active)
-    }
-
-    func testSnapshotDecodes() throws {
-        let json = """
-        {
-          "t":"snapshot",
-          "session_id":"s1",
-          "session":{"id":"s1","owner_id":"u1","agent_type":"codex","repo_path":"/r",
-                     "status":"awaiting_input","title":"Test","created_at":"2026-05-31T00:00:00Z","last_seq":2},
-          "events":[
-            {"session_id":"s1","seq":1,"sender":"user","kind":"message",
-             "content":"hello","requires_user_input":false,
-             "created_at":"2026-05-31T00:00:00Z","metadata":{}}
-          ],
-          "cursor_seq":1
-        }
-        """.data(using: .utf8)!
-        let frame = try decoder.decode(ServerFrame.self, from: json)
-        guard case .snapshot(let p) = frame else { XCTFail("Expected snapshot"); return }
-        XCTAssertEqual(p.sessionId, "s1")
-        XCTAssertEqual(p.events.count, 1)
-        XCTAssertEqual(p.cursorSeq, 1)
-    }
-
-    func testEventFrameDecodes() throws {
-        let json = """
-        {
-          "t":"event",
-          "session_id":"s1",
-          "event":{
-            "session_id":"s1","seq":3,"sender":"agent","kind":"tool_call",
-            "content":"ls -la","requires_user_input":false,
-            "created_at":"2026-05-31T00:00:00Z","metadata":{"cmd":"ls"}
+          "id": "h1",
+          "result": {
+            "type": "hello_ack",
+            "ok": true,
+            "protocol_version": 1,
+            "capabilities": ["agent.subscribe_structured", "agent.get_audit", "agent.approve"]
           }
         }
         """.data(using: .utf8)!
-        let frame = try decoder.decode(ServerFrame.self, from: json)
-        guard case .event(let p) = frame else { XCTFail("Expected event"); return }
-        XCTAssertEqual(p.event.kind, "tool_call")
-        XCTAssertEqual(p.event.seq, 3)
+        let r = try decoder.decode(PtydResponse.self, from: json)
+        guard case .helloAck(let ack) = r.result else {
+            XCTFail("Expected .helloAck"); return
+        }
+        XCTAssertTrue(ack.ok)
+        XCTAssertEqual(ack.protocolVersion, 1)
+        XCTAssertEqual(ack.capabilities.count, 3)
+        XCTAssertNil(ack.error)
     }
 
-    func testApprovalRequestDecodes() throws {
+    func testHelloAckRejectedDecodes() throws {
         let json = """
         {
-          "t":"approval_request",
-          "approval":{
-            "id":"app1","session_id":"s1","event_seq":4,"tool":"bash",
-            "args":{"cmd":"rm -rf /tmp/test"},"created_at":"2026-05-31T00:00:00Z",
-            "ttl_secs":30,"resolution":null
+          "id": "h1",
+          "result": {
+            "type": "hello_ack",
+            "ok": false,
+            "protocol_version": 1,
+            "error": "unauthorized: invalid pairing token",
+            "capabilities": []
           }
         }
         """.data(using: .utf8)!
-        let frame = try decoder.decode(ServerFrame.self, from: json)
-        guard case .approvalRequest(let p) = frame else { XCTFail("Expected approvalRequest"); return }
-        XCTAssertEqual(p.approval.tool, "bash")
-        XCTAssertNil(p.approval.resolution)
+        let r = try decoder.decode(PtydResponse.self, from: json)
+        guard case .helloAck(let ack) = r.result else {
+            XCTFail("Expected .helloAck"); return
+        }
+        XCTAssertFalse(ack.ok)
+        XCTAssertEqual(ack.error, "unauthorized: invalid pairing token")
     }
 
-    // MARK: - Tolerance invariants (wire contract §Invariants 1 & 2)
-
-    /// Unknown `t` must NOT throw — decodes to .unknown
-    func testUnknownFrameTypeToleratedNotThrown() throws {
+    func testStructuredSubscriptionStartedDecodes() throws {
         let json = """
-        {"t":"future_frame_type","some_field":"value"}
+        {
+          "id": "req-1",
+          "result": {
+            "type": "structured_subscription_started",
+            "session_id": "abc123"
+          }
+        }
         """.data(using: .utf8)!
-        let frame = try decoder.decode(ServerFrame.self, from: json)
-        guard case .unknown(let t) = frame else { XCTFail("Expected .unknown, got \(frame)"); return }
-        XCTAssertEqual(t, "future_frame_type")
+        let r = try decoder.decode(PtydResponse.self, from: json)
+        guard case .structuredSubscriptionStarted(let sid) = r.result else {
+            XCTFail("Expected .structuredSubscriptionStarted"); return
+        }
+        XCTAssertEqual(sid, "abc123")
     }
 
-    /// Unknown `kind` must NOT throw — kind is kept as-is String
+    func testAuditListDecodes() throws {
+        let json = """
+        {
+          "id": "req-2",
+          "result": {
+            "type": "audit_list",
+            "entries": [
+              {
+                "id": "e1",
+                "ts": 1748736000,
+                "actor": "client",
+                "action": "agent.approve",
+                "session_id": "s1",
+                "detail": {"decision": "allow"}
+              }
+            ]
+          }
+        }
+        """.data(using: .utf8)!
+        let r = try decoder.decode(PtydResponse.self, from: json)
+        guard case .auditList(let entries) = r.result else {
+            XCTFail("Expected .auditList"); return
+        }
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries[0].ts, 1_748_736_000)
+        XCTAssertEqual(entries[0].actor, "client")
+    }
+
+    func testApprovedDecodes() throws {
+        let json = """
+        {
+          "id": "req-3",
+          "result": {
+            "type": "approved",
+            "approval_id": "app-xyz",
+            "decision": "deny"
+          }
+        }
+        """.data(using: .utf8)!
+        let r = try decoder.decode(PtydResponse.self, from: json)
+        guard case .approved(let aid, let decision) = r.result else {
+            XCTFail("Expected .approved"); return
+        }
+        XCTAssertEqual(aid, "app-xyz")
+        XCTAssertEqual(decision, "deny")
+    }
+
+    func testPtydErrorDecodes() throws {
+        let json = """
+        {
+          "id": "req-4",
+          "error": {
+            "code": "transcript_not_found",
+            "message": "no transcript for session abc"
+          }
+        }
+        """.data(using: .utf8)!
+        let r = try decoder.decode(PtydResponse.self, from: json)
+        XCTAssertNil(r.result)
+        XCTAssertEqual(r.error?.code, "transcript_not_found")
+    }
+
+    func testUnknownResultTypeDecodes() throws {
+        let json = """
+        {
+          "id": "req-5",
+          "result": {
+            "type": "future_result_type_xyz"
+          }
+        }
+        """.data(using: .utf8)!
+        let r = try decoder.decode(PtydResponse.self, from: json)
+        guard case .unknown(let type_) = r.result else {
+            XCTFail("Expected .unknown result"); return
+        }
+        XCTAssertEqual(type_, "future_result_type_xyz")
+    }
+
+    // MARK: - Event model
+
+    func testEventDecodesAllFields() throws {
+        let json = """
+        {
+          "session_id": "sess-001",
+          "seq": 12,
+          "sender": "agent",
+          "kind": "tool_call",
+          "content": "bash: ls -la",
+          "requires_user_input": false,
+          "created_at": 1748736100,
+          "metadata": {"tool_name": "bash"}
+        }
+        """.data(using: .utf8)!
+        let event = try decoder.decode(Event.self, from: json)
+        XCTAssertEqual(event.sessionId, "sess-001")
+        XCTAssertEqual(event.seq, 12)
+        XCTAssertEqual(event.sender, "agent")
+        XCTAssertEqual(event.kind, "tool_call")
+        XCTAssertEqual(event.createdAt, 1_748_736_100)
+        XCTAssertFalse(event.requiresUserInput)
+    }
+
+    /// created_at must be UInt64 (Unix seconds), not a date string — matches ptyd structured.rs.
+    func testCreatedAtIsUInt64NotString() throws {
+        let json = """
+        {
+          "session_id": "s1", "seq": 1, "sender": "agent",
+          "kind": "message", "content": "hi",
+          "requires_user_input": false,
+          "created_at": 9999999999,
+          "metadata": {}
+        }
+        """.data(using: .utf8)!
+        let event = try decoder.decode(Event.self, from: json)
+        XCTAssertEqual(event.createdAt, 9_999_999_999)
+    }
+
+    /// Unknown kind must not throw — open string.
     func testUnknownEventKindTolerated() throws {
         let json = """
         {
-          "t":"event",
-          "session_id":"s1",
-          "event":{
-            "session_id":"s1","seq":7,"sender":"agent","kind":"future_kind",
-            "content":"something","requires_user_input":false,
-            "created_at":"2026-05-31T00:00:00Z","metadata":{}
-          }
+          "session_id": "s2", "seq": 5, "sender": "system",
+          "kind": "future_kind_xyz", "content": "?",
+          "requires_user_input": false, "created_at": 1, "metadata": {}
         }
         """.data(using: .utf8)!
-        let frame = try decoder.decode(ServerFrame.self, from: json)
-        guard case .event(let p) = frame else { XCTFail("Expected .event"); return }
-        XCTAssertEqual(p.event.kind, "future_kind")   // open string, no throw
-    }
-
-    /// Unknown `agent_type` must NOT throw — kept as-is String
-    func testUnknownAgentTypeTolerated() throws {
-        let json = """
-        {
-          "t":"session_list",
-          "sessions":[{
-            "id":"xyz","owner_id":"u1","agent_type":"gemini",
-            "repo_path":"/r","status":"active","title":null,
-            "created_at":"2026-05-31T00:00:00Z","last_seq":0
-          }]
-        }
-        """.data(using: .utf8)!
-        let frame = try decoder.decode(ServerFrame.self, from: json)
-        guard case .sessionList(let p) = frame else { XCTFail(); return }
-        XCTAssertEqual(p.sessions[0].agentType, "gemini")   // open string
-    }
-
-    /// Unknown `status` must NOT throw — decodes to .unknown
-    func testUnknownStatusTolerated() throws {
-        let json = """
-        {
-          "t":"session_status",
-          "session_id":"s1",
-          "status":"initializing"
-        }
-        """.data(using: .utf8)!
-        let frame = try decoder.decode(ServerFrame.self, from: json)
-        guard case .sessionStatus(let p) = frame else { XCTFail(); return }
-        guard case .unknown(let raw) = p.status else { XCTFail("Expected .unknown status, got \(p.status)"); return }
-        XCTAssertEqual(raw, "initializing")
-    }
-
-    /// Compound tolerance: event with future_kind + gemini agent_type + unknown frame t
-    func testCompoundForwardCompatTolerance() throws {
-        // 1. Unknown frame type
-        let unknownFrame = """
-        {"t":"x_new_frame","payload":"data"}
-        """.data(using: .utf8)!
-        let f1 = try decoder.decode(ServerFrame.self, from: unknownFrame)
-        guard case .unknown = f1 else { XCTFail("Should be .unknown"); return }
-
-        // 2. Event with kind "future_kind" and sender includes new agent "gemini"
-        let eventJSON = """
-        {
-          "t":"event",
-          "session_id":"s2",
-          "event":{
-            "session_id":"s2","seq":99,"sender":"gemini",
-            "kind":"future_kind","content":"hi",
-            "requires_user_input":false,"created_at":"2026-05-31T00:00:00Z","metadata":{}
-          }
-        }
-        """.data(using: .utf8)!
-        let f2 = try decoder.decode(ServerFrame.self, from: eventJSON)
-        guard case .event(let p) = f2 else { XCTFail("Should be .event"); return }
-        XCTAssertEqual(p.event.kind, "future_kind")
-        XCTAssertEqual(p.event.sender, "gemini")
-    }
-
-    // MARK: - ClientCommand encode
-
-    func testHelloCommandEncodes() throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = .sortedKeys
-        let cmd = ClientCommand.hello(token: "tok123")
-        let data = try encoder.encode(cmd)
-        let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        XCTAssertEqual(dict?["t"] as? String, "hello")
-        XCTAssertEqual(dict?["token"] as? String, "tok123")
-        XCTAssertEqual(dict?["protocol"] as? Int, 1)
-    }
-
-    func testOpenSessionCommandEncodes() throws {
-        let encoder = JSONEncoder()
-        let cmd = ClientCommand.openSession(sessionId: "s1", fromSeq: 42)
-        let data = try encoder.encode(cmd)
-        let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        XCTAssertEqual(dict?["t"] as? String, "open_session")
-        XCTAssertEqual(dict?["session_id"] as? String, "s1")
-        // JSON numbers may come back as Int or Double
-        let fromSeq = dict?["from_seq"]
-        XCTAssertTrue(fromSeq is Int || fromSeq is Double)
-    }
-
-    func testApproveCommandEncodes() throws {
-        let encoder = JSONEncoder()
-        let cmd = ClientCommand.approve(approvalId: "app1", decision: .allow, reason: nil)
-        let data = try encoder.encode(cmd)
-        let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        XCTAssertEqual(dict?["t"] as? String, "approve")
-        XCTAssertEqual(dict?["decision"] as? String, "allow")
-        XCTAssertNil(dict?["reason"])
+        let event = try decoder.decode(Event.self, from: json)
+        XCTAssertEqual(event.kind, "future_kind_xyz")
     }
 
     // MARK: - SessionStatus round-trips
@@ -245,11 +212,31 @@ final class WireModelTests: XCTestCase {
             ("killed", .killed),
             ("disconnected", .disconnected),
         ]
-        let dec = JSONDecoder()
         for (raw, expected) in cases {
             let data = "\"\(raw)\"".data(using: .utf8)!
-            let status = try dec.decode(SessionStatus.self, from: data)
+            let status = try decoder.decode(SessionStatus.self, from: data)
             XCTAssertEqual(status, expected, "Failed for \(raw)")
         }
+    }
+
+    func testUnknownStatusTolerated() throws {
+        let data = "\"initializing\"".data(using: .utf8)!
+        let status = try decoder.decode(SessionStatus.self, from: data)
+        guard case .unknown(let raw) = status else {
+            XCTFail("Expected .unknown, got \(status)"); return
+        }
+        XCTAssertEqual(raw, "initializing")
+    }
+
+    // MARK: - JSONValue
+
+    func testJSONValueBoolParsedAsBoolNotDouble() throws {
+        // Regression: Bool must be decoded before Double.
+        let trueData = "true".data(using: .utf8)!
+        let v = try decoder.decode(JSONValue.self, from: trueData)
+        guard case .bool(let b) = v else {
+            XCTFail("Expected .bool, got \(v)"); return
+        }
+        XCTAssertTrue(b)
     }
 }

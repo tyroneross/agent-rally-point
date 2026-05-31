@@ -1,4 +1,5 @@
-// G3 — SettingsViewModel: validates + commits connection config.
+// CV5 — SettingsViewModel: validates + commits ptyd TLS connection config.
+// Fields: host, port, pairingToken, pinnedFingerprint (replaces ws URL + dev token).
 import Foundation
 import Combine
 
@@ -8,18 +9,21 @@ public final class SettingsViewModel: ObservableObject {
     // MARK: - Validation errors
 
     public enum ValidationError: Equatable {
-        case emptyURL
-        case invalidURLScheme   // must be ws:// or wss://
-        case malformedURL
+        case emptyHost
+        case emptyPort
+        case invalidPort        // not a valid UInt16
         case emptyToken
+        case emptyFingerprint
+        case invalidFingerprint // not a 64-char hex string
     }
 
     // MARK: - State
 
-    @Published public var urlDraft: String
+    @Published public var hostDraft: String
+    @Published public var portDraft: String
     @Published public var tokenDraft: String
+    @Published public var fingerprintDraft: String
 
-    /// Non-nil when the current drafts have a validation problem.
     @Published public private(set) var validationErrors: [ValidationError] = []
 
     private let config: CockpitConfig
@@ -28,32 +32,36 @@ public final class SettingsViewModel: ObservableObject {
 
     public init(config: CockpitConfig) {
         self.config = config
-        self.urlDraft   = config.daemonURLString
-        self.tokenDraft = config.devToken
+        self.hostDraft        = config.host
+        self.portDraft        = config.portString
+        self.tokenDraft       = config.pairingToken
+        self.fingerprintDraft = config.pinnedFingerprint
     }
 
     // MARK: - Validation
 
-    /// Validates the current drafts and updates `validationErrors`.
-    /// Returns true if valid.
     @discardableResult
     public func validate() -> Bool {
         var errors: [ValidationError] = []
 
-        let trimmedURL = urlDraft.trimmingCharacters(in: .whitespaces)
-        if trimmedURL.isEmpty {
-            errors.append(.emptyURL)
-        } else if let url = URL(string: trimmedURL), let scheme = url.scheme {
-            if scheme != "ws" && scheme != "wss" {
-                errors.append(.invalidURLScheme)
-            }
-        } else {
-            errors.append(.malformedURL)
+        let trimHost = hostDraft.trimmingCharacters(in: .whitespaces)
+        if trimHost.isEmpty { errors.append(.emptyHost) }
+
+        let trimPort = portDraft.trimmingCharacters(in: .whitespaces)
+        if trimPort.isEmpty {
+            errors.append(.emptyPort)
+        } else if UInt16(trimPort) == nil {
+            errors.append(.invalidPort)
         }
 
-        let trimmedToken = tokenDraft.trimmingCharacters(in: .whitespaces)
-        if trimmedToken.isEmpty {
-            errors.append(.emptyToken)
+        let trimToken = tokenDraft.trimmingCharacters(in: .whitespaces)
+        if trimToken.isEmpty { errors.append(.emptyToken) }
+
+        let trimFP = fingerprintDraft.trimmingCharacters(in: .whitespaces)
+        if trimFP.isEmpty {
+            errors.append(.emptyFingerprint)
+        } else if !isValidSHA256Hex(trimFP) {
+            errors.append(.invalidFingerprint)
         }
 
         validationErrors = errors
@@ -62,21 +70,32 @@ public final class SettingsViewModel: ObservableObject {
 
     // MARK: - Save
 
-    /// Validates and, if valid, persists drafts to the config.
-    /// Returns true if saved.
     @discardableResult
     public func save() -> Bool {
         guard validate() else { return false }
-        config.daemonURLString = urlDraft.trimmingCharacters(in: .whitespaces)
-        config.devToken        = tokenDraft.trimmingCharacters(in: .whitespaces)
+        config.host              = hostDraft.trimmingCharacters(in: .whitespaces)
+        config.portString        = portDraft.trimmingCharacters(in: .whitespaces)
+        config.pairingToken      = tokenDraft.trimmingCharacters(in: .whitespaces)
+        config.pinnedFingerprint = fingerprintDraft.trimmingCharacters(in: .whitespaces)
         return true
     }
 
     // MARK: - Reset
 
     public func reset() {
-        urlDraft   = CockpitConfig.defaultDaemonURL
-        tokenDraft = ""
+        hostDraft        = CockpitConfig.defaultHost
+        portDraft        = String(CockpitConfig.defaultPort)
+        tokenDraft       = ""
+        fingerprintDraft = ""
         validationErrors = []
+    }
+
+    // MARK: - Helpers
+
+    /// SHA-256 fingerprint: exactly 64 lowercase or uppercase hex characters.
+    private func isValidSHA256Hex(_ s: String) -> Bool {
+        let trimmed = s.trimmingCharacters(in: .whitespaces)
+        guard trimmed.count == 64 else { return false }
+        return trimmed.allSatisfy { $0.isHexDigit }
     }
 }

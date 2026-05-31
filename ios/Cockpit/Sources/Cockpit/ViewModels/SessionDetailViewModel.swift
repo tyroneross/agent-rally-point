@@ -29,16 +29,22 @@ public final class SessionDetailViewModel: ObservableObject {
         events = store.events(for: session.id)
     }
 
-    // D3 — Send prompt
+    // D3 — Send prompt via pane.send_text (ptyd path).
+    // NOTE: requires a live pane_id for the session's agent pane — follow-up to
+    // wire pane discovery. For now a no-op stub keeps the UI compiling.
     public func sendPrompt() async {
         let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         composerText = ""
-        try? await store.client.sendPrompt(sessionId: session.id, text: text)
+        // TAG:UNTESTED — pane_id discovery needed; ptyd path is pane.send_text.
+        _ = store.client.sendRawForUI(method: "pane.send_text",
+                                      params: ["pane_id": "TBD", "text": text])
     }
 
-    // D3 — Steer
+    // D3 — Steer (ptyd: pane.send_text). Same stub as sendPrompt.
     public func steer(text: String) async {
-        try? await store.client.steer(sessionId: session.id, text: text)
+        // TAG:UNTESTED — pane_id discovery needed.
+        _ = store.client.sendRawForUI(method: "pane.send_text",
+                                      params: ["pane_id": "TBD", "text": text])
     }
 }

@@ -25,12 +25,15 @@ public final class LauncherViewModel: ObservableObject {
         }
         isLaunching = true
         errorMessage = nil
-        do {
-            let promptValue: String? = prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : prompt
-            try await store.client.launchSession(agentType: selectedAgentType, repoPath: repo, prompt: promptValue)
-        } catch {
-            errorMessage = error.localizedDescription
-        }
+        // ptyd is an observe-model: it tails existing sessions; it does not spawn new ones.
+        // "Launch" is a UI concept — the agent must already be running in a pane.
+        // This stub fires pane.create (if a workspace is active), which starts a pane that
+        // the caller can then attach an agent to via the shell prompt.
+        // TAG:UNTESTED — requires workspace_id discovery + pane.create round-trip.
+        let promptValue = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        var params: [String: Any] = [:]
+        if !promptValue.isEmpty { params["command"] = ["bash", "-c", promptValue] }
+        store.client.sendRawForUI(method: "pane.create", params: params)
         isLaunching = false
     }
 }
