@@ -1182,12 +1182,31 @@ fn command_version(args: VersionArgs) -> Result<Output> {
 fn command_whoami(args: WhoamiArgs) -> Result<Output> {
     let repo_root = repo_root().map(|p| p.display().to_string()).unwrap_or_else(|_| "<unknown>".to_string());
     let worktree = worktree_root().map(|p| p.display().to_string()).unwrap_or_else(|_| "<unknown>".to_string());
+    let branch = worktree_root().ok().and_then(|wt| worktree_guard::current_branch(&wt));
     let cwd = env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "<unknown>".to_string());
-    let repo_id = RoomStore::open()
+    // Best-effort: whoami stays a diagnostic that never hard-fails.
+    let room = RoomStore::open().ok();
+    let repo_id = room
+        .as_ref()
         .map(|r| r.room_id().to_string())
-        .unwrap_or_else(|_| "<no-room>".to_string());
+        .unwrap_or_else(|| "<no-room>".to_string());
+    let snapshot = room.as_ref().and_then(|r| r.snapshot().ok());
+    let lead = snapshot.as_ref().and_then(|s| s.lead.clone());
+    let mission = snapshot.as_ref().and_then(|s| s.mission.clone());
+    let acknowledged = match (&args.tool, &snapshot) {
+        (Some(tool), Some(snap)) => Some(
+            snap.squads
+                .iter()
+                .any(|sq| &sq.tool == tool && sq.acknowledged),
+        ),
+        _ => None,
+    };
+    let host_runtime = detect_host_runtime();
     let text = format!(
-        "repo_root={repo_root} repo_id={repo_id} build_id={BUILD_ID}"
+        "repo_root={repo_root} repo_id={repo_id} build_id={BUILD_ID} branch={} herdr_ambiguous={} lead={}",
+        branch.as_deref().unwrap_or("<none>"),
+        host_runtime.ambiguous,
+        lead.as_deref().unwrap_or("<none>"),
     );
     let body = envelope(
         "whoami",
@@ -1198,8 +1217,13 @@ fn command_whoami(args: WhoamiArgs) -> Result<Output> {
                 repo_root,
                 repo_id,
                 worktree,
+                branch,
                 build_id: BUILD_ID.to_string(),
                 cwd,
+                host_runtime,
+                lead,
+                mission,
+                acknowledged,
             },
         },
     )?;
@@ -2832,6 +2856,29 @@ mod tests {
             Some("opus-1"),
             "first frontier agent takes the open lead seat"
         );
+    }
+
+    #[test]
+    fn host_runtime_ambiguity_detection() {
+        // SL-1: >1 resolvable herdr socket => ambiguous (agents must not guess).
+        let base = unique_root("herdr-sockets");
+        let a = base.join("a"); let b = base.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let sa = a.join("herdr.sock"); let sb = b.join("herdr.sock");
+        std::fs::write(&sa, b"").unwrap();
+        let one = existing_unique_paths(&[
+            sa.to_string_lossy().to_string(),
+            sb.to_string_lossy().to_string(),
+        ]);
+        assert_eq!(one.len(), 1, "only one socket exists -> not ambiguous");
+        std::fs::write(&sb, b"").unwrap();
+        let two = existing_unique_paths(&[
+            sa.to_string_lossy().to_string(),
+            sb.to_string_lossy().to_string(),
+            sa.to_string_lossy().to_string(), // dup is ignored
+        ]);
+        assert_eq!(two.len(), 2, "two distinct sockets -> ambiguous (len>1)");
     }
 
     #[test]
@@ -5585,8 +5632,72 @@ struct WhoamiPayload {
     repo_root: String,
     repo_id: String,
     worktree: String,
+    /// Current branch of the active worktree (self-location: catches
+    /// shared-checkout-on-non-main hazards without manual git).
+    branch: Option<String>,
     build_id: String,
     cwd: String,
+    /// Self-location: which host runtime (herdr) this process is bound to, and
+    /// whether more than one is resolvable (ambiguous → agents must not guess).
+    host_runtime: HostRuntime,
+    /// Coordination context — resolves "who's lead / what's the goal" in one call.
+    lead: Option<String>,
+    mission: Option<String>,
+    /// Whether `--tool` has recorded a coordination:ack (None if no --tool).
+    acknowledged: Option<bool>,
+}
+
+/// Self-location of the host runtime (Easy Terminal / herdr). `bound_socket` is
+/// the socket THIS process is pinned to (`HERDR_SOCKET_PATH`); `sockets_found`
+/// is every resolvable herdr **server** socket on disk; `ambiguous` is true when
+/// more than one exists — the exact condition that made an agent guess which
+/// herdr it was on. Fail-loud on ambiguity instead of silently defaulting.
+#[derive(JsonSchema, Serialize)]
+struct HostRuntime {
+    under_herdr: bool,
+    bound_socket: Option<String>,
+    sockets_found: Vec<String>,
+    ambiguous: bool,
+}
+
+/// Pure: keep the candidate paths that exist on disk, de-duplicated, order-stable.
+/// Extracted so the ambiguity logic is unit-testable without env/$HOME.
+fn existing_unique_paths(candidates: &[String]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for c in candidates {
+        if std::path::Path::new(c).exists() && !found.contains(c) {
+            found.push(c.clone());
+        }
+    }
+    found
+}
+
+/// Detect resolvable herdr **server** sockets (`herdr.sock`, not the
+/// `-client.sock`). Pure-ish (reads env + filesystem existence only).
+fn detect_host_runtime() -> HostRuntime {
+    let bound = env::var("HERDR_SOCKET_PATH").ok().filter(|s| !s.is_empty());
+    let home = env::var("HOME").unwrap_or_default();
+    let mut candidates: Vec<String> = vec![
+        format!("{home}/Library/Application Support/EasyTerminal/herdr.sock"),
+        format!("{home}/Library/Application Support/herdr/herdr.sock"),
+        format!("{home}/.local/share/herdr/herdr.sock"),
+        format!("{home}/.config/herdr/herdr.sock"),
+    ];
+    if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
+        if !xdg.is_empty() {
+            candidates.push(format!("{xdg}/herdr.sock"));
+        }
+    }
+    if let Some(b) = &bound {
+        candidates.push(b.clone());
+    }
+    let found = existing_unique_paths(&candidates);
+    HostRuntime {
+        under_herdr: bound.is_some() || !found.is_empty(),
+        bound_socket: bound,
+        ambiguous: found.len() > 1,
+        sockets_found: found,
+    }
 }
 
 /// Envelope for `whoami`.
