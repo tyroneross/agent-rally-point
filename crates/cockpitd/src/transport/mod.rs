@@ -15,6 +15,7 @@
 //!   - Seq-numbered replay: reconnect with `from_seq=N` → events with seq>N
 
 pub mod auth;
+pub mod seams;
 pub mod ws;
 
 use std::net::SocketAddr;
