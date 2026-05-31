@@ -1,4 +1,5 @@
 // CV5 — SettingsViewModel: validates + commits ptyd TLS connection config.
+// CV6-A — adds QR-scan sheet state + apply(payload) path.
 // Fields: host, port, pairingToken, pinnedFingerprint (replaces ws URL + dev token).
 import Foundation
 import Combine
@@ -25,6 +26,10 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var fingerprintDraft: String
 
     @Published public private(set) var validationErrors: [ValidationError] = []
+
+    // CV6-A — QR scanner sheet
+    @Published public var showQRScanner = false
+    @Published public var qrDecodeError: PairingError?
 
     private let config: CockpitConfig
 
@@ -80,6 +85,27 @@ public final class SettingsViewModel: ObservableObject {
         return true
     }
 
+    // MARK: - CV6-A: QR apply
+
+    /// Called with the raw string from `QRScannerView.onScan`.
+    /// On success: applies payload to config and dismisses the sheet (sets `showQRScanner = false`).
+    /// On failure: sets `qrDecodeError`; caller can display inline.
+    public func handleScannedQR(_ raw: String) {
+        qrDecodeError = nil
+        switch PairingPayload.decode(fromQRString: raw) {
+        case .success(let payload):
+            config.apply(payload)
+            // Sync drafts so the manual fields reflect the new values if the user re-opens settings.
+            hostDraft        = config.host
+            portDraft        = config.portString
+            tokenDraft       = config.pairingToken
+            fingerprintDraft = config.pinnedFingerprint
+            showQRScanner    = false
+        case .failure(let err):
+            qrDecodeError = err
+        }
+    }
+
     // MARK: - Reset
 
     public func reset() {
@@ -88,6 +114,7 @@ public final class SettingsViewModel: ObservableObject {
         tokenDraft       = ""
         fingerprintDraft = ""
         validationErrors = []
+        qrDecodeError    = nil
     }
 
     // MARK: - Helpers

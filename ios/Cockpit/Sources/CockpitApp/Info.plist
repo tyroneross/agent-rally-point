@@ -35,5 +35,7 @@
 	</array>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Used to authorize sensitive actions in Agent Cockpit.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Scan the pairing QR shown by Easy Terminal on your Mac.</string>
 </dict>
 </plist>

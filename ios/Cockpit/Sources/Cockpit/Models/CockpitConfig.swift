@@ -59,6 +59,18 @@ public final class CockpitConfig: ObservableObject {
         self.pinnedFingerprint = defaults.string(forKey: Key.pinnedFingerprint) ?? ""
     }
 
+    // MARK: - Pairing apply (CV6-A)
+
+    /// Apply a validated `PairingPayload` to this config and persist all four fields.
+    /// Call from the main actor (same thread-safety contract as the `@Published` setters).
+    @MainActor
+    public func apply(_ p: PairingPayload) {
+        host              = p.host
+        portString        = String(p.port)
+        pairingToken      = p.token
+        pinnedFingerprint = p.fp
+    }
+
     // MARK: - Derived
 
     /// Parsed port, or nil if portString is not a valid UInt16.

@@ -1,4 +1,5 @@
 // CV5 — Connection settings sheet for ptyd TLS thin client.
+// CV6-A — "Scan QR to pair" button + PairingScannerSheet.
 // Fields: host, port, pairing token, pinned cert fingerprint.
 import SwiftUI
 
@@ -79,6 +80,25 @@ public struct SettingsView: View {
                         .font(.caption)
                 }
 
+                // CV6-A — QR pairing
+                Section {
+                    Button {
+                        vm.showQRScanner = true
+                    } label: {
+                        Label("Scan QR to pair", systemImage: "qrcode.viewfinder")
+                    }
+                    if let err = vm.qrDecodeError {
+                        Text(pairingErrorMessage(err))
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                } header: {
+                    Text("Quick Pair")
+                } footer: {
+                    Text("Open Easy Terminal on your Mac and tap \"Show pairing QR\". Scan the code to fill all fields automatically.")
+                        .font(.caption)
+                }
+
                 Section {
                     Button("Reset to Defaults", role: .destructive) {
                         vm.reset()
@@ -87,6 +107,11 @@ public struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
+            .sheet(isPresented: $vm.showQRScanner) {
+                PairingScannerSheet { raw in
+                    vm.handleScannedQR(raw)
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
@@ -97,6 +122,19 @@ public struct SettingsView: View {
                     }
                 }
             }
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func pairingErrorMessage(_ err: PairingError) -> String {
+        switch err {
+        case .malformedJSON:
+            return "Not a valid pairing QR (bad JSON). Try again."
+        case .badVersion(let v):
+            return "Unsupported payload version (\(v)). Update the app or Easy Terminal."
+        case .invalidField(let name):
+            return "Pairing QR has an invalid \(name). Try regenerating the QR in Easy Terminal."
         }
     }
 }
