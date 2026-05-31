@@ -64,6 +64,7 @@ mod source_grounding;
 mod ripple;
 mod store;
 mod tier_fit;
+mod worktree_guard;
 
 use backends::*;
 use backlog::{BacklogItem, add_backlog_item, list_backlog_items};
@@ -381,6 +382,46 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
                     format!("binary-drift: {} vs {}", BUILD_ID, prior_id),
                     drift_msg,
                     Vec::new(),
+                    "warn",
+                    Vec::new(),
+                    None,
+                );
+                room.append_fact(&risk_fact)?;
+            }
+        }
+    }
+
+    // R12 shared-branch / worktree hazard: detect when the canonical checkout is
+    // on a non-main branch while peers are active.  A commit here would silently
+    // land on a peer's branch.  Warn + append a durable risk fact; never blocks.
+    {
+        // Use worktree_root for is_linked and branch checks: .git is a FILE in
+        // linked worktrees, a DIR in the canonical clone.  repo_root() follows
+        // commondir to the main checkout (always a dir), so it cannot distinguish
+        // linked from canonical — worktree_root() stays at the process's cwd.
+        if let Ok(wt_root) = worktree_root() {
+            let is_linked = worktree_guard::is_linked_worktree(&wt_root);
+            let branch = worktree_guard::current_branch(&wt_root);
+            let active_peer_count = snapshot_before
+                .squads
+                .iter()
+                .filter(|s| s.tool != tool && s.status == "active")
+                .count();
+            if let Some(hazard_msg) = worktree_guard::detect_shared_branch_hazard(
+                &wt_root,
+                is_linked,
+                branch.as_deref(),
+                active_peer_count,
+            ) {
+                warnings.push(EnterWarning {
+                    code: "shared-branch-hazard".to_string(),
+                    message: hazard_msg.clone(),
+                });
+                let risk_fact = build_risk_fact(
+                    &tool,
+                    hazard_msg.clone(),
+                    hazard_msg,
+                    vec!["shared-branch-hazard".to_string()],
                     "warn",
                     Vec::new(),
                     None,

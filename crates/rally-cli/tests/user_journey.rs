@@ -3171,3 +3171,143 @@ fn mission_get_with_no_mission_set() {
 
     workspace.cleanup();
 }
+
+// ---------------------------------------------------------------------------
+// R12: shared-branch / worktree hazard detector integration tests
+// ---------------------------------------------------------------------------
+
+/// R12a: a second tool entering a canonical checkout that is on a non-main
+/// branch while the first tool is active receives a `shared-branch-hazard`
+/// warning and a durable risk fact is written to the room.
+///
+/// Setup:
+///   - Tool-A enters first (establishes presence, no hazard — solo).
+///   - The checkout's HEAD is set to a non-main branch.
+///   - Tool-B enters: now there is one active peer (tool-A), canonical clone,
+///     non-main branch — hazard must fire for tool-B.
+///
+/// Verification: `rally room --json` surfaces a `current_risks` entry whose
+/// subject contains "shared-branch-hazard".
+#[test]
+fn r12a_shared_branch_hazard_fires_for_second_tool_on_non_main_branch() {
+    let workspace = Workspace::new("r12a-shared-branch-hazard");
+
+    // Simulate a non-main branch by writing the HEAD file.
+    fs::write(
+        workspace.cwd.join(".git").join("HEAD"),
+        "ref: refs/heads/feat/dangerous-shared-branch\n",
+    )
+    .unwrap();
+
+    // Tool-A enters first: canonical clone, non-main branch, BUT no peers yet
+    // (active_peer_count == 0) — hazard must NOT fire for tool-A.
+    let enter_a = workspace.json(&["enter", "--tool", "tool-a:01", "--json"]);
+    assert_eq!(enter_a["ok"], true, "tool-a enter must succeed");
+    let warnings_a = enter_a["data"]["enter"]["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let has_hazard_a = warnings_a
+        .iter()
+        .any(|w| w["code"].as_str() == Some("shared-branch-hazard"));
+    assert!(
+        !has_hazard_a,
+        "solo tool-A must NOT produce shared-branch-hazard warning; got: {:?}",
+        warnings_a
+    );
+
+    // Tool-B enters: tool-A is active -> active_peer_count == 1 -> hazard fires.
+    let enter_b = workspace.json(&["enter", "--tool", "tool-b:01", "--json"]);
+    assert_eq!(enter_b["ok"], true, "tool-b enter must succeed (warn, not block)");
+    let warnings_b = enter_b["data"]["enter"]["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let has_hazard_b = warnings_b
+        .iter()
+        .any(|w| w["code"].as_str() == Some("shared-branch-hazard"));
+    assert!(
+        has_hazard_b,
+        "tool-B must get shared-branch-hazard warning; got warnings: {:?}",
+        warnings_b
+    );
+
+    // Verify a durable risk fact was recorded (not just a transient warning).
+    let room = workspace.json(&["room", "--json"]);
+    let risks = room["data"]["room"]["current_risks"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let hazard_risk = risks.iter().find(|r| {
+        r["subject"]
+            .as_str()
+            .map(|s| s.contains("shared-branch-hazard"))
+            .unwrap_or(false)
+    });
+    assert!(
+        hazard_risk.is_some(),
+        "a durable shared-branch-hazard risk fact must appear in current_risks; got: {:?}",
+        risks.iter().map(|r| &r["subject"]).collect::<Vec<_>>()
+    );
+    let risk = hazard_risk.unwrap();
+    assert_eq!(
+        risk["severity"].as_str(),
+        Some("warn"),
+        "shared-branch-hazard risk must have severity=warn"
+    );
+
+    workspace.cleanup();
+}
+
+/// R12b: entering the same canonical checkout when HEAD is on `main` must NOT
+/// produce a shared-branch-hazard warning or risk fact, even with an active peer.
+#[test]
+fn r12b_no_hazard_on_main_branch() {
+    let workspace = Workspace::new("r12b-no-hazard-main");
+
+    // Explicitly set HEAD to main.
+    fs::write(
+        workspace.cwd.join(".git").join("HEAD"),
+        "ref: refs/heads/main\n",
+    )
+    .unwrap();
+
+    // Tool-A enters first.
+    let enter_a = workspace.json(&["enter", "--tool", "tool-a:01", "--json"]);
+    assert_eq!(enter_a["ok"], true);
+
+    // Tool-B enters with a peer active -- branch is main -> no hazard.
+    let enter_b = workspace.json(&["enter", "--tool", "tool-b:01", "--json"]);
+    assert_eq!(enter_b["ok"], true, "enter must succeed");
+    let warnings_b = enter_b["data"]["enter"]["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let has_hazard = warnings_b
+        .iter()
+        .any(|w| w["code"].as_str() == Some("shared-branch-hazard"));
+    assert!(
+        !has_hazard,
+        "must NOT produce shared-branch-hazard when on main; warnings: {:?}",
+        warnings_b
+    );
+
+    // Verify no risk fact recorded.
+    let room = workspace.json(&["room", "--json"]);
+    let risks = room["data"]["room"]["current_risks"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let hazard_risk = risks.iter().any(|r| {
+        r["subject"]
+            .as_str()
+            .map(|s| s.contains("shared-branch-hazard"))
+            .unwrap_or(false)
+    });
+    assert!(
+        !hazard_risk,
+        "no shared-branch-hazard risk fact must appear when on main"
+    );
+
+    workspace.cleanup();
+}
