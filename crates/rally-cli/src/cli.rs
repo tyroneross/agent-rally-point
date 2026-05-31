@@ -41,6 +41,7 @@ pub(crate) enum CliCommand {
     /// Rank-11: room north-star + per-agent autonomy envelope.
     Mission(MissionArgs),
     Lead(LeadArgs),
+    Ack(AckArgs),
 }
 
 pub(crate) enum CliParse {
@@ -341,6 +342,13 @@ pub(crate) struct LeadRelinquishArgs {
     pub(crate) tool: String,
 }
 
+/// `rally ack --tool <t>` — acknowledge the coordination context (C1).
+#[derive(Clone, Debug)]
+pub(crate) struct AckArgs {
+    pub(crate) json: bool,
+    pub(crate) tool: String,
+}
+
 /// `rally board [--json]`
 #[derive(Clone, Debug)]
 pub(crate) struct BoardArgs {
@@ -461,6 +469,8 @@ const COMMANDS: &[&str] = &[
     "mission",
     // Lead-agent title surface (L-2)
     "lead",
+    // Coordination-mandate ack (C1)
+    "ack",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -642,6 +652,12 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .command("lead")
         .map(CliCommand::Lead);
 
+    let ack = ack_parser()
+        .to_options()
+        .descr("Acknowledge the rally context (rules, guardrails, lead, mission) — coordination-mandate C1.")
+        .command("ack")
+        .map(CliCommand::Ack);
+
     construct!([
         init,
         enter,
@@ -672,7 +688,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         wake_due,
         whoami,
         mission,
-        lead
+        lead,
+        ack
     ])
     .to_options()
 }
@@ -1229,6 +1246,12 @@ fn backlog_parser() -> impl Parser<BacklogArgs> {
     let json = json_flag();
     let subcommand = construct!([add_parser, list_parser, done_parser]);
     construct!(json, subcommand).map(|(json, subcommand)| BacklogArgs { json, subcommand })
+}
+
+fn ack_parser() -> impl Parser<AckArgs> {
+    let json = json_flag();
+    let tool = string_arg("tool", "TOOL");
+    construct!(AckArgs { json, tool })
 }
 
 fn lead_parser() -> impl Parser<LeadArgs> {

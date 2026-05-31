@@ -144,6 +144,14 @@ fn envelope_say() {
 
 /// `room` — reads room state; no required args (opens current repo room).
 #[test]
+fn envelope_ack() {
+    let ws = Workspace::new("ack");
+    ws.json(&["enter", "--json", "--tool", "test-agent"]);
+    let body = ws.json(&["ack", "--json", "--tool", "test-agent"]);
+    assert_envelope_contract("ack", &body);
+}
+
+#[test]
 fn envelope_lead() {
     let ws = Workspace::new("lead");
     let body = ws.json(&["lead", "show", "--json"]);

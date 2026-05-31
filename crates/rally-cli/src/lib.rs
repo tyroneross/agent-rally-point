@@ -88,6 +88,7 @@ const SCHEMA_WHOAMI: &str = "agent-rally.command.whoami.v1";
 // Work surface schemas
 const SCHEMA_BACKLOG: &str = "agent-rally.command.backlog.v1";
 const SCHEMA_LEAD: &str = "agent-rally.command.lead.v1";
+const SCHEMA_ACK: &str = "agent-rally.command.ack.v1";
 const SCHEMA_BOARD: &str = "agent-rally.command.board.v1";
 const SCHEMA_ROUTE_FINDINGS: &str = "agent-rally.command.route-findings.v1";
 // B13
@@ -358,6 +359,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         // Rank-11: room north-star + per-agent autonomy envelope
         CliCommand::Mission(args) => command_mission(args),
         CliCommand::Lead(args) => command_lead(args),
+        CliCommand::Ack(args) => command_ack(args),
     }
 }
 
@@ -665,6 +667,23 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // cursor_after == last_checkpoint_seq (coalesces if no advancement).
     room.maybe_append_read_checkpoint(&tool, snapshot.content_max_seq)?;
     let mission = snapshot.mission.clone();
+    let acknowledged = snapshot
+        .squads
+        .iter()
+        .find(|sq| sq.tool == tool)
+        .map(|sq| sq.acknowledged)
+        .unwrap_or(false);
+    let acknowledgment = Acknowledgment {
+        required: true,
+        acknowledged,
+        context: AckContext {
+            rules: "RALLY.md".to_string(),
+            doctrine: "dynamic-workflows/COORDINATION.md".to_string(),
+            lead: snapshot.lead.clone(),
+            mission: snapshot.mission.clone(),
+            how_to_ack: format!("rally ack --tool {tool}"),
+        },
+    };
     let room_summary = RoomSummary::from(&snapshot);
     let attention_count = attention.len();
     let enter_payload = EnterPayload {
@@ -687,6 +706,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         EnterData {
             enter: enter_payload,
             room: room_summary,
+            acknowledgment,
         },
     )?;
     let text = format!(
@@ -2599,6 +2619,47 @@ mod tests {
             Some("opus-1"),
             "first frontier agent takes the open lead seat"
         );
+    }
+
+    #[test]
+    fn ack_flips_squad_acknowledged() {
+        // Coordination-mandate C1: a coordination:ack fact flips the squad to acknowledged.
+        let root = unique_root("coord-ack");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root).unwrap();
+        ensure_presence_tiered(&room, "opus-1", Some("frontier")).unwrap();
+        let acked = |r: &store::RoomStore| {
+            r.snapshot()
+                .unwrap()
+                .squads
+                .iter()
+                .find(|sq| sq.tool == "opus-1")
+                .map(|sq| sq.acknowledged)
+                .unwrap_or(false)
+        };
+        assert!(!acked(&room), "squad must be unacknowledged before ack");
+        let ack = Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Decision,
+            tool: Some("opus-1".to_string()),
+            role: None,
+            subject: "coordination:ack".to_string(),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&ack).unwrap();
+        assert!(acked(&room), "squad must be acknowledged after coordination:ack");
     }
 
     #[test]
@@ -5118,6 +5179,43 @@ struct EnterData {
     enter: EnterPayload,
     /// Shared contextual payload — the current room summary.
     room: RoomSummary,
+    /// Coordination-mandate (C1): the context the agent must ingest + ack.
+    acknowledgment: Acknowledgment,
+}
+
+/// Coordination-mandate (C1): what `rally enter` surfaces for the agent to
+/// ingest and acknowledge before engaging. Advisory — never blocks.
+#[derive(JsonSchema, Serialize)]
+struct Acknowledgment {
+    required: bool,
+    acknowledged: bool,
+    context: AckContext,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct AckContext {
+    /// Pointer to the operating guide (rules + load-bearing commands).
+    rules: String,
+    /// Pointer to the coordination doctrine (guardrails + leadership structure).
+    doctrine: String,
+    /// Current lead, if any.
+    lead: Option<String>,
+    /// Room north-star / plan.
+    mission: Option<String>,
+    /// Exact command to acknowledge.
+    how_to_ack: String,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct AckData {
+    ack: AckPayload,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct AckPayload {
+    tool: String,
+    acknowledged: bool,
+    fact: Fact,
 }
 
 /// Non-blocking advisory emitted by `rally say` when an external-intake
@@ -5859,6 +5957,52 @@ struct LeadPayload {
     tier: Option<String>,
     assigned: Option<String>,
     fact: Option<Fact>,
+}
+
+/// `rally ack` — record that this agent ingested the rules/guardrails/lead/mission
+/// surfaced at enter (coordination-mandate C1). Advisory: never blocks; the squad
+/// projects `acknowledged: true` thereafter.
+fn command_ack(args: AckArgs) -> Result<Output> {
+    let room = RoomStore::open()?;
+    ensure_presence(&room, &args.tool)?;
+    let snapshot = room.snapshot()?;
+    let fact = Fact {
+        schema: FACT_SCHEMA.to_string(),
+        event_id: new_id("fact"),
+        seq: 0,
+        thread_id: new_id("room"),
+        kind: FactKind::Decision,
+        tool: Some(args.tool.clone()),
+        role: None,
+        subject: "coordination:ack".to_string(),
+        scope: Vec::new(),
+        created_at: now_string(),
+        summary: Some(format!(
+            "{} acknowledged the rally rules/guardrails/lead/mission",
+            args.tool
+        )),
+        evidence: vec![format!("acked-at-seq:{}", snapshot.max_seq)],
+        target: None,
+        ref_id: None,
+        status: None,
+        severity: None,
+        uri: None,
+        session: None,
+    };
+    let fact = room.append_fact_verified(&fact)?;
+    let text = format!("ack recorded for {} (seq {})", args.tool, fact.seq);
+    let body = envelope(
+        "ack",
+        SCHEMA_ACK,
+        AckData {
+            ack: AckPayload {
+                tool: args.tool,
+                acknowledged: true,
+                fact,
+            },
+        },
+    )?;
+    Ok(Output::new(args.json, text, body))
 }
 
 /// `rally lead` — show / hand off / assign the lead-agent title.

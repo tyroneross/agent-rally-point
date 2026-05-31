@@ -258,10 +258,23 @@ pub(crate) struct Squad {
     pub(crate) last_seen_ts: String,
     /// "active" or "idle".  Active = last_seen_ts within 15 minutes of now.
     pub(crate) status: String,
+    /// Coordination-mandate (C1): has this squad recorded a `coordination:ack`
+    /// fact? Acknowledged squads have ingested the rules/guardrails/lead/mission.
+    pub(crate) acknowledged: bool,
 }
 
 /// Seconds of inactivity after which a squad member is marked "idle".
 const IDLE_THRESHOLD_SECS: i64 = 15 * 60;
+
+/// Coordination-mandate (C1): tools that have recorded a `coordination:ack`
+/// decision. A squad is "acknowledged" iff it appears here.
+pub(crate) fn acknowledged_tools(facts: &[Fact]) -> std::collections::BTreeSet<String> {
+    facts
+        .iter()
+        .filter(|f| f.kind == "decision" && f.subject == "coordination:ack")
+        .filter_map(|f| f.tool.clone())
+        .collect()
+}
 
 /// R10: per-tool read receipt projected from `FactKind::Read` checkpoints.
 ///
@@ -1331,6 +1344,7 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    let acked = acknowledged_tools(facts);
     let squads = tool_last
         .into_iter()
         .map(|(tool, (seq, ts))| {
@@ -1344,11 +1358,13 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
             } else {
                 "idle".to_string()
             };
+            let acknowledged = acked.contains(&tool);
             Squad {
                 tool,
                 last_seen_seq: seq,
                 last_seen_ts: ts,
                 status,
+                acknowledged,
             }
         })
         .collect::<Vec<_>>();
