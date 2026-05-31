@@ -82,6 +82,32 @@ Everything below radiates from that.
    `repo_id`, `ledger_scope`; external material routes to its owning repo or a neutral intake
    surface; only distilled repo-local actions enter this backlog. → becomes **B18**.
 
+10. **A confusing-to-parse output contract is a product defect, not a parsing-discipline problem.**
+    *Why:* the `--json` envelope had three inconsistent nesting patterns (some results under
+    `data.<command>`, some flat, `wake-due` under `data.due`), so every consumer — and a verifier
+    ~5× in one session — guessed the path wrong. No amount of "dump raw first" discipline fixes an
+    output with no rule. *How:* standardize so `data[command]` ALWAYS holds the result, and enforce
+    it with a **COMMANDS-driven contract test** (`json_envelope_contract.rs`) so a new command can't
+    skip the contract. Generalize: ad-hoc `bash | python -c` parsing is itself a defect surface —
+    the in-repo test suite (correct args, correct fields) is the real verification, not a one-liner.
+
+11. **Async deliver-then-ack: an ack-timeout is not a failure of the primary action.** *Why:*
+    `inject --require-ack` recorded the content fact and delivered the message *before* waiting for
+    the ack, then on timeout returned `ok:false`/exit-1 — which a caller reads as "the whole inject
+    failed" and retries → **duplicate delivery**. *How:* the durable primary action (record +
+    deliver) reports its own success; the downstream ack is separate metadata. On timeout return
+    `ok:true, delivered:true, ack:{resolved:false, timed_out:true}` so the caller sees the message
+    landed and checks `ack.resolved` rather than re-sending. Record-then-deliver-then-ack is the
+    smooth shape; the timeout response must distinguish "not acked" from "not delivered".
+
+12. **A backlog item's prescribed FIX can be stale, or now wrong against the charter — re-validate
+    both before building.** *Why:* most "open" rows had already shipped (verify-the-negative again),
+    and B18's written prescription ("hard-reject foreign-repo writes") would have *violated* the
+    never-block charter — the shipped quarantine-and-filter was the correct approach. Building the
+    backlog literally would have regressed a core principle. *How:* Phase-1 assessment validates each
+    item twice — (a) is it still an issue, against current code; (b) is the prescribed approach still
+    right, against the charter/invariants. A backlog is a hypothesis, not an instruction.
+
 ## Top systemic fixes (ranked)
 
 1. **Verify-before-asserting-a-negative** — machine-stored `verified_by` on every closing fact +
