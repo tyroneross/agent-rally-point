@@ -10,6 +10,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, MutexGuard};
+
+/// Serializes the heavy `rally run` managed-session tests against each other.
+/// Each spawns subprocesses that write session-reservation facts to one SQLite
+/// store; running several concurrently compounds write-lock contention past the
+/// retry budget — a test-isolation artifact, not a runtime bug (see BACKLOG
+/// B-test-flake / B-write-burst-scale). Poison-tolerant so a panicking holder
+/// cannot wedge the rest of the suite.
+static RALLY_RUN_GUARD: Mutex<()> = Mutex::new(());
+fn serialize_rally_run() -> MutexGuard<'static, ()> {
+    RALLY_RUN_GUARD.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 struct Workspace {
     cwd: PathBuf,
@@ -880,6 +892,7 @@ fn rally_entry_and_handoff_split_response_and_work_buckets() {
 
 #[test]
 fn rally_runs_and_injects_managed_tmux_sessions() {
+    let _run_guard = serialize_rally_run();
     let workspace = Workspace::new("rally-run-tmux");
 
     let run = workspace.json(&[
@@ -1143,6 +1156,7 @@ fn rally_inject_require_ack_timeout_returns_ok_with_timeout_ack() {
 
 #[test]
 fn rally_run_assigns_numbered_agent_ids() {
+    let _run_guard = serialize_rally_run();
     let workspace = Workspace::new("rally-run-numbered-ids");
 
     let first_claude = workspace.json(&[
@@ -1250,6 +1264,7 @@ fn rally_run_assigns_numbered_agent_ids() {
 
 #[test]
 fn rally_run_reserves_numbered_ids_under_parallel_launch() {
+    let _run_guard = serialize_rally_run();
     let workspace = Workspace::new("rally-run-parallel-numbered-ids");
     let handles = (0..24)
         .map(|_| {
@@ -1307,6 +1322,7 @@ fn rally_run_reserves_numbered_ids_under_parallel_launch() {
 
 #[test]
 fn rally_run_removes_session_reservation_when_backend_start_fails() {
+    let _run_guard = serialize_rally_run();
     let workspace = Workspace::new("rally-run-failed-start");
 
     let output = workspace.output(&[
@@ -1656,6 +1672,7 @@ fn linked_git_worktree_uses_common_room() {
 
 #[test]
 fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
+    let _run_guard = serialize_rally_run();
     let workspace = Workspace::new("rally-native-session-backends");
 
     let herdr = workspace.json(&[

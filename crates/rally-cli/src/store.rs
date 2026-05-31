@@ -603,10 +603,30 @@ impl RoomStore {
         let mut fact = fact.clone();
         let event_type = fact.kind.as_str().to_string();
         let payload = serde_json::to_value(&fact).map_err(RallyError::json("render fact"))?;
-        let result = self
-            .fact_store
-            .append(vec![NewEvent::new(event_type.clone(), payload.clone())])
-            .map_err(|err| RallyError::Message(format!("append fact: {err}")))?;
+        // factstr-sqlite opens without busy_timeout, so a concurrent writer can
+        // hit transient SQLITE_BUSY ("database is locked"). Retry with a
+        // per-process jittered backoff to de-synchronize the herd rather than
+        // failing the write (B-write-burst-scale / B-test-flake). Safe to retry:
+        // a lock-rejected append committed nothing.
+        let result = {
+            let jitter = (std::process::id() % 17) as u64;
+            let mut attempts = 0;
+            loop {
+                match self
+                    .fact_store
+                    .append(vec![NewEvent::new(event_type.clone(), payload.clone())])
+                {
+                    Ok(r) => break r,
+                    Err(err) if attempts < 16 && is_db_locked(&err) => {
+                        attempts += 1;
+                        thread::sleep(Duration::from_millis(15 * attempts + jitter));
+                    }
+                    Err(err) => {
+                        return Err(RallyError::Message(format!("append fact: {err}")))
+                    }
+                }
+            }
+        };
         fact.seq = i64::try_from(result.last_sequence_number)
             .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
         append_segment_line(
@@ -1297,15 +1317,18 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
 }
 
 fn open_fact_store(path: &Path) -> Result<SqliteStore> {
+    // Per-process jitter de-synchronizes concurrent retriers (the thundering-herd
+    // cure); budget raised for write-burst tolerance (B-write-burst-scale).
+    let jitter = (std::process::id() % 17) as u64;
     let mut attempts = 0;
     loop {
         match SqliteStore::open(path) {
             Ok(store) => return Ok(store),
             Err(err)
-                if attempts < 8 && (is_bootstrap_metadata_race(&err) || is_db_locked(&err)) =>
+                if attempts < 16 && (is_bootstrap_metadata_race(&err) || is_db_locked(&err)) =>
             {
                 attempts += 1;
-                thread::sleep(Duration::from_millis(25 * attempts));
+                thread::sleep(Duration::from_millis(20 * attempts + jitter));
             }
             Err(err) => return Err(RallyError::Message(format!("open fact store: {err}"))),
         }
