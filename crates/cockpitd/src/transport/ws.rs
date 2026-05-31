@@ -30,7 +30,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    model::{Event, SessionStatus},
+    model::{Approval, Event, SessionStatus},
     protocol::{ApproveDecision, ClientCommand, ServerEvent},
     supervisor::AdapterEvent,
     transport::AppState,
@@ -361,12 +361,52 @@ async fn handle_command(
                 ApproveDecision::Allow => "allow",
                 ApproveDecision::Deny => "deny",
             };
+
+            // Determine session_id for audit (best-effort — read before resolving).
+            let session_id_for_audit = {
+                let apr = ctx.state.approval.lock().await;
+                apr.0.get(approval_id).ok().flatten().map(|a| a.session_id)
+            };
+
             let mut approval = ctx.state.approval.lock().await;
             match approval.0.resolve(approval_id, decision_str) {
-                Ok(()) => {}
+                Ok(()) => {
+                    // Audit the resolution.
+                    let mut audit = ctx.state.audit.lock().await;
+                    let _ = audit.0.append(
+                        "client",
+                        "approval:resolved",
+                        session_id_for_audit,
+                        serde_json::json!({
+                            "approval_id": approval_id.to_string(),
+                            "decision": decision_str,
+                        }),
+                    );
+                }
                 Err(e) => {
                     let err = ServerEvent::Error {
                         code: "approve_failed".into(),
+                        message: e.to_string(),
+                    };
+                    let _ = sink
+                        .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+                        .await;
+                }
+            }
+        }
+
+        ClientCommand::GetAudit { session_id, limit } => {
+            let audit = ctx.state.audit.lock().await;
+            match audit.0.list(session_id, limit) {
+                Ok(entries) => {
+                    let frame = ServerEvent::AuditList { entries };
+                    let _ = sink
+                        .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                        .await;
+                }
+                Err(e) => {
+                    let err = ServerEvent::Error {
+                        code: "audit_failed".into(),
                         message: e.to_string(),
                     };
                     let _ = sink
@@ -399,6 +439,20 @@ async fn handle_command(
                     return;
                 }
                 Ok(sid) => {
+                    // Audit: session launched.
+                    {
+                        let mut audit = ctx.state.audit.lock().await;
+                        let _ = audit.0.append(
+                            "client",
+                            "session:launch",
+                            Some(sid),
+                            serde_json::json!({
+                                "agent_type": agent_type,
+                                "repo_path": repo_path,
+                            }),
+                        );
+                    }
+
                     // Spawn the async pump for this session.
                     let rx = {
                         let mut sup = ctx.state.supervisor.lock().await;
@@ -407,8 +461,10 @@ async fn handle_command(
                     if let Some(rx) = rx {
                         let event_tx = ctx.state.event_tx.clone();
                         let sup_arc = ctx.state.supervisor.clone();
+                        let approval_arc = ctx.state.approval.clone();
+                        let audit_arc = ctx.state.audit.clone();
                         tokio::spawn(async move {
-                            run_pump(sid, rx, event_tx, sup_arc).await;
+                            run_pump(sid, rx, event_tx, sup_arc, approval_arc, audit_arc).await;
                         });
                     }
 
@@ -452,12 +508,18 @@ async fn handle_command(
 /// Drains AdapterEvents from `rx`, persists them to the supervisor's store, and
 /// broadcasts them as cockpit Events to all subscribed clients.
 ///
+/// For `approval_request` events: registers a pending Approval row and also
+/// broadcasts the `ApprovalRequest` server frame so subscribed clients can
+/// respond with `approve {approval_id, decision}`.
+///
 /// Runs as a tokio task per session. Terminates when the adapter closes the channel.
 async fn run_pump(
     session_id: Uuid,
     mut rx: tokio::sync::mpsc::Receiver<AdapterEvent>,
     event_tx: broadcast::Sender<Event>,
     supervisor: Arc<Mutex<crate::transport::SupervisorBox>>,
+    approval: Arc<Mutex<crate::transport::ApprovalBox>>,
+    audit: Arc<Mutex<crate::transport::AuditBox>>,
 ) {
     while let Some(adapter_evt) = rx.recv().await {
         match adapter_evt {
@@ -477,7 +539,97 @@ async fn run_pump(
                 };
                 evt.seq = seq;
 
-                // Update live status if awaiting input.
+                // Audit: session event (lifecycle transitions)
+                if matches!(evt.kind.as_str(), "status" | "approval_request") {
+                    let mut aud = audit.lock().await;
+                    let _ = aud.0.append(
+                        "system",
+                        &format!("session:{}", evt.kind),
+                        Some(session_id),
+                        serde_json::json!({ "seq": seq, "content": evt.content }),
+                    );
+                }
+
+                // Handle approval_request: register pending Approval + broadcast ApprovalRequest frame.
+                if evt.kind == "approval_request" {
+                    // Parse approval metadata from the event.
+                    let approval_id_str = evt
+                        .metadata
+                        .get("approval_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let tool = evt
+                        .metadata
+                        .get("tool")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let args = evt
+                        .metadata
+                        .get("args")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+
+                    // Generate a stable UUID for the Approval: use the adapter's id if valid,
+                    // otherwise mint a fresh one.
+                    let approval_uuid = Uuid::parse_str(approval_id_str)
+                        .unwrap_or_else(|_| Uuid::new_v4());
+
+                    let pending = Approval {
+                        id: approval_uuid,
+                        session_id,
+                        event_seq: seq,
+                        tool: tool.clone(),
+                        args: args.clone(),
+                        created_at: evt.created_at,
+                        ttl_secs: 300, // 5-minute default TTL
+                        resolution: None,
+                    };
+
+                    {
+                        let mut apr = approval.lock().await;
+                        // register_pending is idempotent on already-existing rows via the store's
+                        // PRIMARY KEY constraint — ignore the error if it already exists.
+                        let _ = apr.0.register_pending(&pending);
+                    }
+
+                    // Broadcast the ApprovalRequest server frame (with the full Approval object
+                    // so the client knows the approval_id, tool, args, and TTL).
+                    let frame = ServerEvent::ApprovalRequest {
+                        approval: pending.clone(),
+                    };
+                    // Broadcast as a raw event on the event_tx so subscribed clients receive it.
+                    // We encode it as a special "approval_request" event whose metadata carries
+                    // the serialized approval. Also send directly via a separate broadcast on the
+                    // approval_tx (here we reuse event_tx with kind=approval_request so it fans
+                    // out to all subscribers; the client filters on kind).
+                    // The wire frame is sent as the regular "event" frame carrying the evt,
+                    // plus an additional "approval_request" frame on the same channel via a
+                    // synthetic Event that carries the encoded Approval in metadata.
+                    let approval_evt = Event {
+                        session_id,
+                        seq,
+                        sender: "system".into(),
+                        kind: "approval_request".into(),
+                        content: format!("approval needed for tool: {tool}"),
+                        requires_user_input: true,
+                        created_at: evt.created_at,
+                        metadata: serde_json::json!({
+                            "approval_id": approval_uuid.to_string(),
+                            "tool": tool,
+                            "args": args,
+                            "ttl_secs": 300,
+                            "__approval_frame": serde_json::to_value(&frame).unwrap_or_default(),
+                        }),
+                    };
+                    let _ = event_tx.send(approval_evt);
+                    // Update live status to AwaitingInput.
+                    let mut sup = supervisor.lock().await;
+                    sup.0.set_status(session_id, SessionStatus::AwaitingInput);
+                    continue;
+                }
+
+                // Update live status if awaiting input (non-approval events).
                 if evt.requires_user_input {
                     let mut sup = supervisor.lock().await;
                     sup.0.set_status(session_id, SessionStatus::AwaitingInput);
@@ -488,6 +640,15 @@ async fn run_pump(
             }
 
             AdapterEvent::Completed => {
+                {
+                    let mut aud = audit.lock().await;
+                    let _ = aud.0.append(
+                        "system",
+                        "session:completed",
+                        Some(session_id),
+                        serde_json::json!({}),
+                    );
+                }
                 let mut sup = supervisor.lock().await;
                 let _ = sup.0.update_session_status(session_id, &SessionStatus::Completed);
                 sup.0.set_status(session_id, SessionStatus::Completed);
@@ -497,6 +658,15 @@ async fn run_pump(
 
             AdapterEvent::Failed(msg) => {
                 warn!("session {session_id} adapter failed: {msg}");
+                {
+                    let mut aud = audit.lock().await;
+                    let _ = aud.0.append(
+                        "system",
+                        "session:failed",
+                        Some(session_id),
+                        serde_json::json!({"msg": msg}),
+                    );
+                }
                 let mut sup = supervisor.lock().await;
                 let _ = sup.0.update_session_status(session_id, &SessionStatus::Failed);
                 sup.0.set_status(session_id, SessionStatus::Failed);

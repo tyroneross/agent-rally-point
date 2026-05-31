@@ -72,6 +72,13 @@ pub enum ClientCommand {
     },
     /// Keepalive.
     Ping,
+    /// Retrieve audit log entries. Optionally filter by session_id and cap with limit.
+    GetAudit {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<u64>,
+    },
     /// Forward-compat catch-all; any unknown `t` decodes here.
     #[serde(other)]
     Unknown,
@@ -128,6 +135,10 @@ pub enum ServerEvent {
     },
     /// Keepalive reply.
     Pong,
+    /// Response to `get_audit`: ordered list of audit entries.
+    AuditList {
+        entries: Vec<crate::audit::AuditEntry>,
+    },
     /// Forward-compat catch-all.
     #[serde(other)]
     Unknown,

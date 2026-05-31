@@ -42,6 +42,7 @@ async fn serve_cmd() -> Result<()> {
     use cockpitd::{
         adapter::claude::{ClaudeAdapter, ClaudeConfig},
         approval::ApprovalManager,
+        audit::AuditLog,
         clock::SystemClock,
         store::Store,
         supervisor::Supervisor,
@@ -54,12 +55,15 @@ async fn serve_cmd() -> Result<()> {
         .expect("invalid COCKPIT_ADDR");
 
     let db_path = std::env::var("COCKPIT_DB").unwrap_or_else(|_| "cockpitd.db".into());
+    let audit_db_path = std::env::var("COCKPIT_AUDIT_DB")
+        .unwrap_or_else(|_| format!("{db_path}.audit.db"));
 
     let store = Store::open(&db_path)?;
     let store2 = Store::open(&db_path)?; // second handle for ApprovalManager
 
     let clock = SystemClock;
     let clock2 = SystemClock;
+    let clock3 = SystemClock;
 
     // Default: use the real claude binary. Override via COCKPIT_CLAUDE_BIN for tests.
     let claude_bin = std::env::var("COCKPIT_CLAUDE_BIN")
@@ -72,8 +76,9 @@ async fn serve_cmd() -> Result<()> {
     });
     let supervisor = Supervisor::new(store, clock, adapter);
     let approval = ApprovalManager::new(store2, clock2);
+    let audit = AuditLog::open(&audit_db_path, clock3)?;
 
-    let state = build_state(supervisor, approval);
+    let state = build_state(supervisor, approval, audit);
 
     tracing::info!("cockpitd {} — serving on ws://{}", cockpitd::VERSION, addr);
     DirectWs::new(addr, state).serve().await

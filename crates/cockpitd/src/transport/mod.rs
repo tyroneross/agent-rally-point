@@ -25,6 +25,7 @@ use tokio::sync::broadcast;
 
 use crate::{
     approval::ApprovalManager,
+    audit::AuditLog,
     clock::Clock,
     model::Event,
     supervisor::Supervisor,
@@ -48,7 +49,12 @@ pub struct AppState {
     pub supervisor: std::sync::Arc<tokio::sync::Mutex<SupervisorBox>>,
     /// Shared approval manager.
     pub approval: std::sync::Arc<tokio::sync::Mutex<ApprovalBox>>,
+    /// Append-only audit log.
+    pub audit: std::sync::Arc<tokio::sync::Mutex<AuditBox>>,
 }
+
+/// Type-erased AuditLog (erases the Clock type parameter).
+pub struct AuditBox(pub Box<dyn ErasedAudit + Send>);
 
 /// Type-erased Supervisor (erases the Clock and Adapter type parameters).
 pub struct SupervisorBox(pub Box<dyn ErasedSupervisor + Send>);
@@ -96,7 +102,27 @@ pub trait ErasedSupervisor {
 // ── Erased approval interface ─────────────────────────────────────────────────
 
 pub trait ErasedApproval {
+    fn register_pending(&mut self, approval: &crate::model::Approval) -> Result<()>;
     fn resolve(&mut self, id: uuid::Uuid, decision: &str) -> Result<()>;
+    fn get(&self, id: uuid::Uuid) -> Result<Option<crate::model::Approval>>;
+}
+
+// ── Erased audit interface ────────────────────────────────────────────────────
+
+pub trait ErasedAudit {
+    fn append(
+        &mut self,
+        actor: &str,
+        action: &str,
+        session_id: Option<uuid::Uuid>,
+        detail: serde_json::Value,
+    ) -> Result<uuid::Uuid>;
+
+    fn list(
+        &self,
+        session_id: Option<uuid::Uuid>,
+        limit: Option<u64>,
+    ) -> Result<Vec<crate::audit::AuditEntry>>;
 }
 
 // ── Concrete erased wrappers ──────────────────────────────────────────────────
@@ -169,12 +195,43 @@ impl<C: Clock> ErasedSupervisor for ConcreteSupervisor<C> {
 pub struct ConcreteApproval<C: Clock>(pub ApprovalManager<C>);
 
 impl<C: Clock> ErasedApproval for ConcreteApproval<C> {
+    fn register_pending(&mut self, approval: &crate::model::Approval) -> Result<()> {
+        self.0.register_pending(approval)
+    }
+
     fn resolve(&mut self, id: uuid::Uuid, decision: &str) -> Result<()> {
         self.0.resolve(id, decision)
     }
+
+    fn get(&self, id: uuid::Uuid) -> Result<Option<crate::model::Approval>> {
+        self.0.get(id)
+    }
 }
 
-/// Build an `AppState` from concrete supervisor and approval manager.
+/// Wraps a concrete `AuditLog<C>`.
+pub struct ConcreteAudit<C: Clock>(pub AuditLog<C>);
+
+impl<C: Clock> ErasedAudit for ConcreteAudit<C> {
+    fn append(
+        &mut self,
+        actor: &str,
+        action: &str,
+        session_id: Option<uuid::Uuid>,
+        detail: serde_json::Value,
+    ) -> Result<uuid::Uuid> {
+        self.0.append(actor, action, session_id, detail)
+    }
+
+    fn list(
+        &self,
+        session_id: Option<uuid::Uuid>,
+        limit: Option<u64>,
+    ) -> Result<Vec<crate::audit::AuditEntry>> {
+        self.0.list(session_id, limit)
+    }
+}
+
+/// Build an `AppState` from concrete supervisor, approval manager, and audit log.
 ///
 /// Store reads (list_sessions, replay_from, etc.) are routed through the
 /// supervisor's internal store via `ErasedSupervisor`, so there is no
@@ -183,6 +240,7 @@ impl<C: Clock> ErasedApproval for ConcreteApproval<C> {
 pub fn build_state<C: Clock>(
     supervisor: Supervisor<C>,
     approval: ApprovalManager<C>,
+    audit: AuditLog<C>,
 ) -> AppState {
     let (event_tx, _) = broadcast::channel(512);
     AppState {
@@ -192,6 +250,9 @@ pub fn build_state<C: Clock>(
         )))),
         approval: std::sync::Arc::new(tokio::sync::Mutex::new(ApprovalBox(Box::new(
             ConcreteApproval(approval),
+        )))),
+        audit: std::sync::Arc::new(tokio::sync::Mutex::new(AuditBox(Box::new(
+            ConcreteAudit(audit),
         )))),
     }
 }
