@@ -98,6 +98,40 @@ impl Store {
             .context("list sessions")
     }
 
+    /// Return sessions belonging to `owner_id` only.
+    ///
+    /// This is the multi-user access path (§8): one owner cannot see
+    /// another's sessions.  The single-user `DirectWs` path uses
+    /// `list_sessions()` which is an unrestricted view.
+    pub fn list_sessions_for_owner(&self, owner_id: &str) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, owner_id, agent_type, repo_path, status, title, created_at, last_seq
+             FROM sessions WHERE owner_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![owner_id], row_to_session)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("list sessions for owner")
+    }
+
+    /// Fetch a session only if it belongs to `owner_id`; returns `None` if the
+    /// session exists but is owned by a different owner.
+    pub fn get_session_for_owner(
+        &self,
+        id: Uuid,
+        owner_id: &str,
+    ) -> Result<Option<Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, owner_id, agent_type, repo_path, status, title, created_at, last_seq
+             FROM sessions WHERE id = ?1 AND owner_id = ?2",
+        )?;
+        let rows =
+            stmt.query_map(params![id.to_string(), owner_id], row_to_session)?;
+        for row in rows {
+            return Ok(Some(row?));
+        }
+        Ok(None)
+    }
+
     pub fn update_session_status(&mut self, id: Uuid, status: &SessionStatus) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET status = ?1 WHERE id = ?2",
@@ -503,5 +537,55 @@ mod tests {
         store.resolve_approval(approval.id, "allow").unwrap();
         let resolved = store.get_approval(approval.id).unwrap().unwrap();
         assert_eq!(resolved.resolution.as_deref(), Some("allow"));
+    }
+
+    // ── F4 owner-scoping: owner A's sessions not visible to owner B ───────────
+
+    #[test]
+    fn list_sessions_for_owner_isolates_owners() {
+        let mut store = open_store();
+
+        let sid_a = Uuid::new_v4();
+        let sid_b = Uuid::new_v4();
+
+        let session_a = Session {
+            owner_id: "alice".into(),
+            ..make_session(sid_a)
+        };
+        let session_b = Session {
+            owner_id: "bob".into(),
+            ..make_session(sid_b)
+        };
+
+        store.create_session(&session_a).unwrap();
+        store.create_session(&session_b).unwrap();
+
+        let alice_sessions = store.list_sessions_for_owner("alice").unwrap();
+        assert_eq!(alice_sessions.len(), 1, "alice must see exactly her own session");
+        assert_eq!(alice_sessions[0].id, sid_a);
+
+        let bob_sessions = store.list_sessions_for_owner("bob").unwrap();
+        assert_eq!(bob_sessions.len(), 1, "bob must see exactly his own session");
+        assert_eq!(bob_sessions[0].id, sid_b);
+
+        // Cross-owner: alice asking for bob's session returns None.
+        let cross = store.get_session_for_owner(sid_b, "alice").unwrap();
+        assert!(cross.is_none(), "alice must not see bob's session");
+
+        // Own session is accessible.
+        let own = store.get_session_for_owner(sid_a, "alice").unwrap();
+        assert!(own.is_some(), "alice must be able to fetch her own session");
+    }
+
+    #[test]
+    fn list_sessions_all_still_works() {
+        // list_sessions() (DirectWs single-user path) must still return everyone.
+        let mut store = open_store();
+        let sid_a = Uuid::new_v4();
+        let sid_b = Uuid::new_v4();
+        store.create_session(&Session { owner_id: "alice".into(), ..make_session(sid_a) }).unwrap();
+        store.create_session(&Session { owner_id: "bob".into(), ..make_session(sid_b) }).unwrap();
+        let all = store.list_sessions().unwrap();
+        assert_eq!(all.len(), 2, "unscoped list must return all sessions");
     }
 }
