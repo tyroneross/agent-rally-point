@@ -1562,6 +1562,40 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
     Ok(Output::new(false, String::new(), serde_json::json!({})))
 }
 
+/// Coordination-mandate C3 predicate (merge gate): is `tool` coordinated for the
+/// `changed` files? Returns (has_presence, acknowledged, uncovered_paths) where
+/// uncovered = a changed file not covered by an open claim owned by `tool`
+/// (canonical exact- or dir-prefix match). Pure (testable); no I/O.
+pub(crate) fn coordination_offenders(
+    snapshot: &store::RoomSnapshot,
+    tool: &str,
+    changed: &[String],
+) -> (bool, bool, Vec<String>) {
+    let presence = snapshot.squads.iter().any(|s| s.tool == tool);
+    let acked = snapshot
+        .squads
+        .iter()
+        .any(|s| s.tool == tool && s.acknowledged);
+    let owned: Vec<String> = snapshot
+        .active_claims
+        .iter()
+        .filter(|c| c.tool.as_deref() == Some(tool))
+        .flat_map(|c| {
+            c.scope
+                .iter()
+                .filter_map(|sc| sc.strip_prefix("file:").map(|p| normalize_path(p.to_string())))
+        })
+        .collect();
+    let covers = |path: &str| -> bool {
+        let p = normalize_path(path.to_string());
+        owned
+            .iter()
+            .any(|o| *o == p || p.starts_with(&format!("{o}/")))
+    };
+    let uncovered: Vec<String> = changed.iter().filter(|p| !covers(p)).cloned().collect();
+    (presence, acked, uncovered)
+}
+
 /// Coordination-mandate C2 predicate: squads eligible for liveness conflict-out —
 /// unacknowledged AND idle AND still holding >=1 open claim. Returns
 /// (tool, held_claim_event_ids). Pure (testable); no I/O.
@@ -1737,6 +1771,56 @@ fn command_check(args: CheckArgs) -> Result<Output> {
             },
         )?;
         return Ok(Output::new(args.json, text, body));
+    }
+
+    // Coordination-mandate C3: the MERGE GATE. Given the committer --tool and the
+    // changed files (--changed, fed by the CI wrapper from `git diff --name-only`),
+    // verify presence + ack + claim-covers-every-changed-file. --strict exits
+    // non-zero on violation (wire as a required branch-protection check). This is
+    // the one layer with teeth — it blocks LANDING, never the keystroke.
+    if phase == "coordination" {
+        let tool = args.tool.clone().ok_or_else(|| {
+            RallyError::Usage("check coordination requires --tool <committer>".to_string())
+        })?;
+        let room = RoomStore::open()?;
+        let snapshot = room.snapshot()?;
+        let (presence, acknowledged, uncovered) =
+            coordination_offenders(&snapshot, &tool, &args.changed);
+        let pass = presence && acknowledged && uncovered.is_empty();
+
+        #[derive(schemars::JsonSchema, serde::Serialize)]
+        struct CoordResult {
+            phase: &'static str,
+            tool: String,
+            presence: bool,
+            acknowledged: bool,
+            uncovered_paths: Vec<String>,
+            pass: bool,
+        }
+        #[derive(schemars::JsonSchema, serde::Serialize)]
+        struct CoordData {
+            check: CoordResult,
+        }
+        let text = format!(
+            "check coordination tool={tool} pass={pass} presence={presence} acked={acknowledged} uncovered={}",
+            uncovered.len()
+        );
+        let body = envelope(
+            "check",
+            SCHEMA_CHECK,
+            CoordData {
+                check: CoordResult {
+                    phase: "coordination",
+                    tool,
+                    presence,
+                    acknowledged,
+                    uncovered_paths: uncovered,
+                    pass,
+                },
+            },
+        )?;
+        let exit = if !pass && args.strict { 4 } else { 0 };
+        return Ok(Output::new(args.json, text, body).with_exit_code(exit));
     }
 
     let tool = match args.tool {
@@ -2748,6 +2832,44 @@ mod tests {
             Some("opus-1"),
             "first frontier agent takes the open lead seat"
         );
+    }
+
+    #[test]
+    fn coordination_gate_predicate() {
+        // C3: presence + ack + claim-covers-every-changed-file.
+        let root = unique_root("coord-merge");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root).unwrap();
+        ensure_presence_tiered(&room, "opus-1", Some("frontier")).unwrap();
+        let mk = |subject: &str, scope: Vec<String>| Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: if subject == "coordination:ack" { FactKind::Decision } else { FactKind::Claim },
+            tool: Some("opus-1".to_string()),
+            role: None,
+            subject: subject.to_string(),
+            scope,
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&mk("coordination:ack", Vec::new())).unwrap();
+        room.append_fact(&mk("own a", vec!["file:src/a.rs".to_string()])).unwrap();
+        let snap = room.snapshot().unwrap();
+        let (p, a, unc) = coordination_offenders(&snap, "opus-1", &["src/a.rs".to_string()]);
+        assert!(p && a && unc.is_empty(), "acked + claimed file passes the gate");
+        let (_, _, unc2) = coordination_offenders(&snap, "opus-1", &["src/b.rs".to_string()]);
+        assert_eq!(unc2, vec!["src/b.rs".to_string()], "unclaimed changed file is uncovered");
+        let (p3, a3, _) = coordination_offenders(&snap, "ghost", &["src/a.rs".to_string()]);
+        assert!(!p3 && !a3, "unknown tool has no presence/ack");
     }
 
     #[test]

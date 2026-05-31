@@ -209,6 +209,8 @@ pub(crate) struct CheckArgs {
     pub(crate) proposed_tier: Option<String>,
     /// C2 liveness: --enforce releases conflicted-out squads' claims + alerts.
     pub(crate) enforce: bool,
+    /// C3 coordination merge-gate: changed files (from `git diff --name-only`).
+    pub(crate) changed: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -925,11 +927,12 @@ fn check_parser() -> impl Parser<CheckArgs> {
     let enforce = long("enforce")
         .help("liveness: release conflicted-out squads' claims + alert (never blocks).")
         .switch();
+    let changed = many_string_arg("changed", "PATH");
     let phase = positional::<String>("PHASE")
         .optional()
         .map(|phase| phase.unwrap_or_else(|| "before-write".to_string()));
-    construct!(json, tool, path, strict, role, proposed_tier, enforce, phase).map(
-        |(json, tool, path, strict, role, proposed_tier, enforce, phase)| CheckArgs {
+    construct!(json, tool, path, strict, role, proposed_tier, enforce, changed, phase).map(
+        |(json, tool, path, strict, role, proposed_tier, enforce, changed, phase)| CheckArgs {
             json,
             phase,
             tool,
@@ -938,6 +941,7 @@ fn check_parser() -> impl Parser<CheckArgs> {
             role,
             proposed_tier,
             enforce,
+            changed,
         },
     )
 }
