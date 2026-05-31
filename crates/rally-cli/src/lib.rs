@@ -1562,6 +1562,32 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
     Ok(Output::new(false, String::new(), serde_json::json!({})))
 }
 
+/// Coordination-mandate C2 predicate: squads eligible for liveness conflict-out —
+/// unacknowledged AND idle AND still holding >=1 open claim. Returns
+/// (tool, held_claim_event_ids). Pure (testable); no I/O.
+pub(crate) fn liveness_conflicted(snapshot: &store::RoomSnapshot) -> Vec<(String, Vec<String>)> {
+    snapshot
+        .squads
+        .iter()
+        .filter_map(|sq| {
+            if sq.acknowledged || sq.status != "idle" {
+                return None;
+            }
+            let held: Vec<String> = snapshot
+                .active_claims
+                .iter()
+                .filter(|c| c.tool.as_deref() == Some(sq.tool.as_str()))
+                .map(|c| c.event_id.clone())
+                .collect();
+            if held.is_empty() {
+                None
+            } else {
+                Some((sq.tool.clone(), held))
+            }
+        })
+        .collect()
+}
+
 fn command_check(args: CheckArgs) -> Result<Output> {
     let phase = args.phase;
 
@@ -1604,6 +1630,109 @@ fn command_check(args: CheckArgs) -> Result<Output> {
                     phase: "tier-fit",
                     advisory: true,
                     tier_fit: result,
+                },
+            },
+        )?;
+        return Ok(Output::new(args.json, text, body));
+    }
+
+    // Coordination-mandate C2: liveness conflict-out. Reports squads that are
+    // unacknowledged + idle + holding >=1 open claim ("grabbed paths, never
+    // coordinated, went quiet"). With --enforce: releases their claims (paths
+    // freed) + records a risk alert for the lead/user. NEVER blocks editing.
+    if phase == "liveness" {
+        let room = RoomStore::open()?;
+        let snapshot = room.snapshot()?;
+        let actor = args.tool.clone().unwrap_or_else(|| "rally:liveness".to_string());
+
+        #[derive(schemars::JsonSchema, serde::Serialize)]
+        struct ConflictedSquad {
+            tool: String,
+            reason: String,
+            released_claims: Vec<String>,
+        }
+        #[derive(schemars::JsonSchema, serde::Serialize)]
+        struct LivenessResult {
+            phase: &'static str,
+            advisory: bool,
+            enforced: bool,
+            conflicted: Vec<ConflictedSquad>,
+        }
+        #[derive(schemars::JsonSchema, serde::Serialize)]
+        struct LivenessData {
+            check: LivenessResult,
+        }
+
+        let mut conflicted: Vec<ConflictedSquad> = Vec::new();
+        for (sq_tool, held_ids) in liveness_conflicted(&snapshot) {
+            let held: Vec<&Fact> = snapshot
+                .active_claims
+                .iter()
+                .filter(|c| held_ids.contains(&c.event_id))
+                .collect();
+            let mut released = Vec::new();
+            if args.enforce {
+                for claim in &held {
+                    let release = Fact {
+                        schema: FACT_SCHEMA.to_string(),
+                        event_id: new_id("fact"),
+                        seq: 0,
+                        thread_id: new_id("room"),
+                        kind: FactKind::Release,
+                        tool: Some(actor.clone()),
+                        role: None,
+                        subject: format!("liveness conflict-out: release {} claim", sq_tool),
+                        scope: claim.scope.clone(),
+                        created_at: now_string(),
+                        summary: Some(format!(
+                            "{} released by liveness conflict-out (unacknowledged + idle)",
+                            sq_tool
+                        )),
+                        evidence: vec![format!("conflicted-out:{}", sq_tool)],
+                        target: None,
+                        ref_id: Some(claim.event_id.clone()),
+                        status: None,
+                        severity: None,
+                        uri: None,
+                        session: None,
+                    };
+                    room.append_fact(&release)?;
+                    released.push(claim.event_id.clone());
+                }
+                let alert = build_risk_fact(
+                    &actor,
+                    format!("conflicted-out: {} (unacknowledged + idle, holding claims)", sq_tool),
+                    format!(
+                        "{} grabbed paths but never acked the coordination context and went idle; claims released, alerting lead/user. Not blocked from editing.",
+                        sq_tool
+                    ),
+                    vec![format!("conflicted:{}", sq_tool)],
+                    "warn",
+                    vec![format!("released:{}", released.len())],
+                    None,
+                );
+                room.append_fact(&alert)?;
+            }
+            conflicted.push(ConflictedSquad {
+                tool: sq_tool.clone(),
+                reason: "unacknowledged + idle + holding open claims".to_string(),
+                released_claims: released,
+            });
+        }
+        let text = format!(
+            "check liveness enforced={} conflicted={}",
+            args.enforce,
+            conflicted.len()
+        );
+        let body = envelope(
+            "check",
+            SCHEMA_CHECK,
+            LivenessData {
+                check: LivenessResult {
+                    phase: "liveness",
+                    advisory: !args.enforce,
+                    enforced: args.enforce,
+                    conflicted,
                 },
             },
         )?;
@@ -2618,6 +2747,48 @@ mod tests {
             room.snapshot().unwrap().lead.as_deref(),
             Some("opus-1"),
             "first frontier agent takes the open lead seat"
+        );
+    }
+
+    #[test]
+    fn liveness_conflicts_unacked_idle_claim_holder() {
+        // C2: an unacknowledged + idle squad still holding an open claim is
+        // conflict-out eligible; recording an ack clears it.
+        let root = unique_root("coord-liveness");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root).unwrap();
+        let old = "2020-01-01T00:00:00Z";
+        let mk = |kind: FactKind, subject: &str, scope: Vec<String>| Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind,
+            tool: Some("ghost-1".to_string()),
+            role: None,
+            subject: subject.to_string(),
+            scope,
+            created_at: old.to_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&mk(FactKind::Presence, "agent presence: ghost-1", Vec::new())).unwrap();
+        room.append_fact(&mk(FactKind::Claim, "claim x", vec!["file:x.rs".to_string()])).unwrap();
+        let conflicted = liveness_conflicted(&room.snapshot().unwrap());
+        assert_eq!(conflicted.len(), 1, "unacked+idle+claim must be conflicted");
+        assert_eq!(conflicted[0].0, "ghost-1");
+        assert_eq!(conflicted[0].1.len(), 1, "one held claim");
+        // ack (kept old-dated so it stays idle) clears the conflict via acknowledged.
+        room.append_fact(&mk(FactKind::Decision, "coordination:ack", Vec::new())).unwrap();
+        assert!(
+            liveness_conflicted(&room.snapshot().unwrap()).is_empty(),
+            "ack must clear conflict-out eligibility"
         );
     }
 

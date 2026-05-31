@@ -207,6 +207,8 @@ pub(crate) struct CheckArgs {
     // #9 tier-fit advisory fields (None for non-tier-fit phases)
     pub(crate) role: Option<String>,
     pub(crate) proposed_tier: Option<String>,
+    /// C2 liveness: --enforce releases conflicted-out squads' claims + alerts.
+    pub(crate) enforce: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -920,11 +922,14 @@ fn check_parser() -> impl Parser<CheckArgs> {
     // #9 tier-fit advisory args (ignored for non-tier-fit phases)
     let role = optional_string_arg("role", "ROLE");
     let proposed_tier = optional_string_arg("proposed-tier", "TIER");
+    let enforce = long("enforce")
+        .help("liveness: release conflicted-out squads' claims + alert (never blocks).")
+        .switch();
     let phase = positional::<String>("PHASE")
         .optional()
         .map(|phase| phase.unwrap_or_else(|| "before-write".to_string()));
-    construct!(json, tool, path, strict, role, proposed_tier, phase).map(
-        |(json, tool, path, strict, role, proposed_tier, phase)| CheckArgs {
+    construct!(json, tool, path, strict, role, proposed_tier, enforce, phase).map(
+        |(json, tool, path, strict, role, proposed_tier, enforce, phase)| CheckArgs {
             json,
             phase,
             tool,
@@ -932,6 +937,7 @@ fn check_parser() -> impl Parser<CheckArgs> {
             strict,
             role,
             proposed_tier,
+            enforce,
         },
     )
 }
