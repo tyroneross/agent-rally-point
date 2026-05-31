@@ -64,6 +64,16 @@ above). So: 10 terminals → 10 squad ids in the room, regardless of how many ag
    The lead **routes**, and may delegate not only execution but **integration/synthesis** (e.g.,
    merging multi-agent outputs into one artifact) — its irreducible role is **core decisions +
    final acceptance**, not doing mechanical work by hand. Delegate, then verify.
+   - **Title lifecycle** (L-1 landed; `rally lead` surface per [`../docs/SPEC-lead-agent.md`](../docs/SPEC-lead-agent.md)).
+     Lead auto-assign is **frontier-only** (`rally enter --tier frontier`); a declared `executing`/`fast`
+     first-enter leaves the seat open until a frontier agent joins. The lead may **hand off** the title
+     to another frontier agent or **relinquish** it; a **user-designated** lead supersedes a first-join lead.
+   - **Decide from goals + app knowledge; when uncertain, resolve from the mission.** The lead makes
+     tradeoffs and decisions from the work's goal and its knowledge of the app. When information is
+     insufficient, it resolves from the **ultimate intent / outcome of the work** — the queryable
+     `rally mission` north-star + per-agent autonomy envelopes. *Resolve from the mission; don't stall.*
+     (Charter: rally **records + exposes** the lead and the mission; it never **enforces** — lead
+     authority is doctrine the agents honor, not a CLI gate.)
 2. **Proactive engagement — a waiting agent finds work in this order, never idles silently:**
    1. **Backlog** — claim an `open` item whose dependencies are met.
    2. **No-regrets move** — if the backlog is empty or blocked, do work valuable under *any* likely
