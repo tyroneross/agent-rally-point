@@ -207,12 +207,18 @@ async fn read_loop(
         match serde_json::from_str::<Value>(&line) {
             Ok(v) => {
                 let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if let Some(evt) = map_claude_event(session_id, event_type, &v) {
-                    if tx.send(evt).await.is_err() {
-                        break; // Receiver dropped — supervisor is gone.
-                    }
-                } else {
+                let evts = map_claude_events(session_id, event_type, &v);
+                if evts.is_empty() {
                     debug!("claude: skipping unknown event type {:?}", event_type);
+                }
+                for evt in evts {
+                    let done = matches!(&evt, AdapterEvent::Completed | AdapterEvent::Failed(_));
+                    if tx.send(evt).await.is_err() {
+                        return; // Receiver dropped — supervisor is gone.
+                    }
+                    if done {
+                        return;
+                    }
                 }
             }
             Err(e) => {
@@ -225,15 +231,17 @@ async fn read_loop(
     let _ = tx.send(AdapterEvent::Completed).await;
 }
 
-/// Map a parsed Claude stream-json object to an `AdapterEvent`.
+/// Map a parsed Claude stream-json object to zero or more `AdapterEvent`s.
 ///
-/// Returns `None` for event types we don't handle (logged + skipped by caller).
+/// Returns an empty `Vec` for event types we don't handle (logged + skipped by
+/// caller).  An `assistant` turn with N content blocks produces N events so
+/// that every block gets its own persisted row with a monotonic seq number.
 ///
 /// Claude stream-json format (confirmed from `claude --verbose` output):
 /// - `system` with `subtype:"init"` carries `session_id`
 /// - `assistant` carries `message.content` (array of blocks)
 /// - `result` with `is_error:true` → Failed; `is_error:false` → terminal status
-fn map_claude_event(session_id: Uuid, event_type: &str, v: &Value) -> Option<AdapterEvent> {
+pub(crate) fn map_claude_events(session_id: Uuid, event_type: &str, v: &Value) -> Vec<AdapterEvent> {
     let now = Utc::now();
     match event_type {
         "system" => {
@@ -254,14 +262,16 @@ fn map_claude_event(session_id: Uuid, event_type: &str, v: &Value) -> Option<Ada
                     created_at: now,
                     metadata: serde_json::json!({ "claude_session_id": captured_session_id }),
                 };
-                Some(AdapterEvent::Event(event))
+                vec![AdapterEvent::Event(event)]
             } else {
-                None
+                vec![]
             }
         }
 
         "assistant" => {
-            // Extract content blocks from message.content array.
+            // Extract ALL content blocks from message.content array.
+            // Each block becomes its own AdapterEvent so every block gets a
+            // distinct persisted row with a monotonic seq number (G2).
             let content_blocks = v
                 .get("message")
                 .and_then(|m| m.get("content"))
@@ -325,19 +335,15 @@ fn map_claude_event(session_id: Uuid, event_type: &str, v: &Value) -> Option<Ada
                         }
                     }
                 }
-                // Return the first event; subsequent blocks are lost in this
-                // simplification. For full multi-block support, the trait
-                // would need to support returning a Vec. TAG:ASSUMED single
-                // meaningful block per assistant turn for now.
-                events.into_iter().next()
+                events
             } else {
-                None
+                vec![]
             }
         }
 
         "user" => {
             // User turn echoed back — we don't need to re-emit this.
-            None
+            vec![]
         }
 
         "tool_result" => {
@@ -346,7 +352,7 @@ fn map_claude_event(session_id: Uuid, event_type: &str, v: &Value) -> Option<Ada
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(AdapterEvent::Event(Event {
+            vec![AdapterEvent::Event(Event {
                 session_id,
                 seq: 0,
                 sender: "agent".into(),
@@ -355,7 +361,7 @@ fn map_claude_event(session_id: Uuid, event_type: &str, v: &Value) -> Option<Ada
                 requires_user_input: false,
                 created_at: now,
                 metadata: serde_json::json!({}),
-            }))
+            })]
         }
 
         "result" => {
@@ -370,13 +376,13 @@ fn map_claude_event(session_id: Uuid, event_type: &str, v: &Value) -> Option<Ada
                     .and_then(|r| r.as_str())
                     .unwrap_or("unknown error")
                     .to_string();
-                Some(AdapterEvent::Failed(msg))
+                vec![AdapterEvent::Failed(msg)]
             } else {
-                Some(AdapterEvent::Completed)
+                vec![AdapterEvent::Completed]
             }
         }
 
-        _ => None, // unknown type: caller logs + skips
+        _ => vec![], // unknown type: caller logs + skips
     }
 }
 
@@ -495,26 +501,62 @@ mod tests {
     /// B1-3: unknown event types are skipped (no panic, no error).
     #[tokio::test]
     async fn unknown_event_types_are_skipped() {
-        // map_claude_event returns None for unknown types.
         let v = serde_json::json!({ "type": "some_future_type", "data": "x" });
-        let result = map_claude_event(Uuid::new_v4(), "some_future_type", &v);
-        assert!(result.is_none(), "unknown event type should map to None");
+        let result = map_claude_events(Uuid::new_v4(), "some_future_type", &v);
+        assert!(result.is_empty(), "unknown event type should map to empty vec");
     }
 
     /// B1-4: result with is_error:true maps to Failed.
     #[tokio::test]
     async fn result_is_error_maps_to_failed() {
         let v = serde_json::json!({ "type": "result", "is_error": true, "result": "something broke" });
-        let result = map_claude_event(Uuid::new_v4(), "result", &v);
-        assert!(matches!(result, Some(AdapterEvent::Failed(_))));
+        let result = map_claude_events(Uuid::new_v4(), "result", &v);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], AdapterEvent::Failed(_)));
     }
 
     /// B1-5: result with is_error:false maps to Completed.
     #[tokio::test]
     async fn result_ok_maps_to_completed() {
         let v = serde_json::json!({ "type": "result", "is_error": false, "result": "done" });
-        let result = map_claude_event(Uuid::new_v4(), "result", &v);
-        assert!(matches!(result, Some(AdapterEvent::Completed)));
+        let result = map_claude_events(Uuid::new_v4(), "result", &v);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], AdapterEvent::Completed));
+    }
+
+    /// G2-1: assistant turn with text + two tool_use blocks yields 3 events with correct kinds.
+    #[tokio::test]
+    async fn multi_block_assistant_turn_yields_all_events() {
+        let session_id = Uuid::new_v4();
+        let v = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg_multi",
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "I'll do two things." },
+                    { "type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "/a"} },
+                    { "type": "tool_use", "id": "t2", "name": "write_file", "input": {"path": "/b", "content": "x"} }
+                ]
+            }
+        });
+        let events = map_claude_events(session_id, "assistant", &v);
+        assert_eq!(events.len(), 3, "expected 3 events: 1 message + 2 tool_call");
+
+        // kinds in order
+        let kinds: Vec<&str> = events.iter().map(|e| match e {
+            AdapterEvent::Event(ev) => ev.kind.as_str(),
+            _ => "terminal",
+        }).collect();
+        assert_eq!(kinds, vec!["message", "tool_call", "tool_call"]);
+
+        // tool names in metadata
+        if let AdapterEvent::Event(ev1) = &events[1] {
+            assert_eq!(ev1.metadata["tool_name"], "read_file");
+        }
+        if let AdapterEvent::Event(ev2) = &events[2] {
+            assert_eq!(ev2.metadata["tool_name"], "write_file");
+        }
     }
 
     /// B1-live: optional live smoke (requires COCKPIT_LIVE=1).

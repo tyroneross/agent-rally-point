@@ -19,10 +19,11 @@ pub mod relay;
 pub mod seams;
 pub mod ws;
 
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
+use uuid::Uuid;
 
 use crate::{
     approval::ApprovalManager,
@@ -52,6 +53,11 @@ pub struct AppState {
     pub approval: std::sync::Arc<tokio::sync::Mutex<ApprovalBox>>,
     /// Append-only audit log.
     pub audit: std::sync::Arc<tokio::sync::Mutex<AuditBox>>,
+    /// Per-session approval gate: a pump waiting for approval resolution
+    /// stores a `Notify` here; the `Approve` WS command signals it.
+    /// Keyed by approval_id (not session_id) so concurrent approvals per
+    /// session are individually gated.
+    pub approval_gates: Arc<std::sync::Mutex<HashMap<Uuid, Arc<Notify>>>>,
 }
 
 /// Type-erased AuditLog (erases the Clock type parameter).
@@ -98,6 +104,15 @@ pub trait ErasedSupervisor {
     fn replay_from(&self, session_id: uuid::Uuid, from_seq: u64) -> anyhow::Result<Vec<crate::model::Event>>;
     fn update_session_status(&mut self, id: uuid::Uuid, status: &crate::model::SessionStatus) -> anyhow::Result<()>;
     fn append_event(&mut self, e: &crate::model::Event) -> anyhow::Result<u64>;
+
+    // ── Approval passthrough via supervisor's store ───────────────────────────
+    /// Insert a pending approval row into the supervisor's store (which already
+    /// holds the session row, satisfying the FK constraint).
+    fn insert_approval(&mut self, a: &crate::model::Approval) -> anyhow::Result<()>;
+    /// Look up an approval by ID in the supervisor's store.
+    fn get_approval(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::model::Approval>>;
+    /// Resolve an approval in the supervisor's store.
+    fn resolve_approval(&mut self, id: uuid::Uuid, decision: &str) -> anyhow::Result<()>;
 }
 
 // ── Erased approval interface ─────────────────────────────────────────────────
@@ -190,6 +205,18 @@ impl<C: Clock> ErasedSupervisor for ConcreteSupervisor<C> {
     fn append_event(&mut self, e: &crate::model::Event) -> anyhow::Result<u64> {
         self.0.store.append_event(e)
     }
+
+    fn insert_approval(&mut self, a: &crate::model::Approval) -> anyhow::Result<()> {
+        self.0.store.insert_approval(a)
+    }
+
+    fn get_approval(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::model::Approval>> {
+        self.0.store.get_approval(id)
+    }
+
+    fn resolve_approval(&mut self, id: uuid::Uuid, decision: &str) -> anyhow::Result<()> {
+        self.0.store.resolve_approval(id, decision)
+    }
 }
 
 /// Wraps a concrete `ApprovalManager<C>`.
@@ -255,6 +282,7 @@ pub fn build_state<C: Clock>(
         audit: std::sync::Arc::new(tokio::sync::Mutex::new(AuditBox(Box::new(
             ConcreteAudit(audit),
         )))),
+        approval_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
     }
 }
 

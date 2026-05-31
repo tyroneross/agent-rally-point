@@ -1,0 +1,24 @@
+#!/usr/bin/env sh
+# Mock `claude` binary that emits a tool_call for a NON-allowlisted tool.
+# Used by G1 e2e tests (authz enforcement loop).
+#
+# Sequence:
+#   1. system/init
+#   2. assistant: tool_use "write_file" (not on conservative allowlist → RequireApproval)
+#   3. result (terminal)
+#
+# The daemon's authz gate must pause execution after event 2 and wait for
+# an approve{allow} or approve{deny} before proceeding.
+
+if [ ! -t 0 ]; then
+  cat > /dev/null &
+fi
+
+# 1. system/init
+printf '{"type":"system","subtype":"init","session_id":"mock-gated-session","tools":[]}\n'
+
+# 2. assistant: single tool_use block for "write_file" (NOT on conservative allowlist)
+printf '{"type":"assistant","message":{"id":"msg_g1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"tg1","name":"write_file","input":{"path":"/tmp/test","content":"data"}}],"model":"claude-mock","stop_reason":"tool_use"}}\n'
+
+# 3. result (terminal)
+printf '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"mock-gated-session","cost_usd":0,"duration_ms":10,"num_turns":1}\n'

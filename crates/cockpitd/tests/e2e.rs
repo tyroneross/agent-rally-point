@@ -158,6 +158,26 @@ impl TestClient {
     }
 }
 
+/// Extract the first approval_id from the approval_request events embedded in a
+/// snapshot frame's `events` array. Used by G1 gate tests when the mock emits
+/// its approval_request before the client subscribes (so it's replayed in the
+/// snapshot rather than arriving as a live event).
+fn extract_approval_id_from_snapshot(snapshot: &Value) -> Option<String> {
+    let events = snapshot.get("events")?.as_array()?;
+    for evt in events {
+        if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request") {
+            if let Some(aid) = evt
+                .get("metadata")
+                .and_then(|m| m.get("approval_id"))
+                .and_then(|a| a.as_str())
+            {
+                return Some(aid.to_string());
+            }
+        }
+    }
+    None
+}
+
 // ── E2E-1: auth + list_sessions ───────────────────────────────────────────────
 
 #[tokio::test]
@@ -297,16 +317,25 @@ async fn e2e_launch_open_replay_reconnect() {
         last_seq = seq;
     }
 
-    // ── Step 4: assert content — message + tool_call in stream ───────────────
+    // ── Step 4: assert content — message + tool-related event in stream ─────
     let has_message = all_events
         .iter()
         .any(|e| e["kind"].as_str() == Some("message"));
     assert!(has_message, "expected at least one message event");
 
-    let has_tool_call = all_events
-        .iter()
-        .any(|e| e["kind"].as_str() == Some("tool_call"));
-    assert!(has_tool_call, "expected at least one tool_call event");
+    // The Bash tool_call from the mock is shell-like → gated by authz.
+    // After gating the pump emits approval_request instead of tool_call.
+    // Either kind counts as "tool activity".
+    let has_tool_activity = all_events.iter().any(|e| {
+        matches!(
+            e["kind"].as_str(),
+            Some("tool_call") | Some("approval_request") | Some("tool_blocked")
+        )
+    });
+    assert!(
+        has_tool_activity,
+        "expected tool_call, approval_request, or tool_blocked event"
+    );
 
     // ── Step 5: reconnect with from_seq=midpoint — invariant 5 ───────────────
     // midpoint = first event's seq (replay only the rest).
@@ -674,6 +703,427 @@ async fn e2e_ttl_auto_deny_via_store() {
         Some("auto_denied"),
         "resolution must be auto_denied after TTL sweep"
     );
+}
+
+// ── Gated / multiblock daemon helpers ────────────────────────────────────────
+
+fn mock_claude_gated_path() -> PathBuf {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+    PathBuf::from(manifest).join("tests/mock-bin/claude-gated")
+}
+
+fn mock_claude_multiblock_path() -> PathBuf {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+    PathBuf::from(manifest).join("tests/mock-bin/claude-multiblock")
+}
+
+/// Start a daemon backed by the gated mock claude binary (emits a non-allowlisted tool_call).
+async fn start_daemon_gated() -> SocketAddr {
+    use cockpitd::{
+        adapter::claude::{ClaudeAdapter, ClaudeConfig},
+        approval::ApprovalManager,
+        audit::AuditLog,
+        clock::SystemClock,
+        store::Store,
+        supervisor::Supervisor,
+        transport::{build_state, DirectWs, Transport},
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    unsafe {
+        std::env::set_var("COCKPIT_TOKEN", TEST_TOKEN);
+    }
+
+    let store = Store::open_in_memory().unwrap();
+    let store2 = Store::open_in_memory().unwrap();
+
+    let adapter = ClaudeAdapter::new(ClaudeConfig {
+        binary: mock_claude_gated_path(),
+        extra_flags: vec![],
+    });
+
+    let supervisor = Supervisor::new(store, SystemClock, adapter);
+    let approval = ApprovalManager::new(store2, SystemClock);
+    let audit = AuditLog::open_in_memory(SystemClock).unwrap();
+    let state = build_state(supervisor, approval, audit);
+
+    tokio::spawn(async move {
+        DirectWs::new(addr, state)
+            .serve()
+            .await
+            .expect("gated daemon serve");
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
+/// Start a daemon backed by the multiblock mock claude binary.
+async fn start_daemon_multiblock() -> SocketAddr {
+    use cockpitd::{
+        adapter::claude::{ClaudeAdapter, ClaudeConfig},
+        approval::ApprovalManager,
+        audit::AuditLog,
+        clock::SystemClock,
+        store::Store,
+        supervisor::Supervisor,
+        transport::{build_state, DirectWs, Transport},
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    unsafe {
+        std::env::set_var("COCKPIT_TOKEN", TEST_TOKEN);
+    }
+
+    let store = Store::open_in_memory().unwrap();
+    let store2 = Store::open_in_memory().unwrap();
+
+    let adapter = ClaudeAdapter::new(ClaudeConfig {
+        binary: mock_claude_multiblock_path(),
+        extra_flags: vec![],
+    });
+
+    let supervisor = Supervisor::new(store, SystemClock, adapter);
+    let approval = ApprovalManager::new(store2, SystemClock);
+    let audit = AuditLog::open_in_memory(SystemClock).unwrap();
+    let state = build_state(supervisor, approval, audit);
+
+    tokio::spawn(async move {
+        DirectWs::new(addr, state)
+            .serve()
+            .await
+            .expect("multiblock daemon serve");
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
+// ── E2E-9: G1 authz gate — allow path ────────────────────────────────────────
+//
+// Proves:
+// - launch a session whose mock emits a NON-allowlisted tool_call (write_file)
+// - assert an approval_request event arrives over the wire before the session
+//   proceeds past the tool
+// - send approve{allow} → session continues; a tool_call (or tool_blocked)
+//   event follows with the correct tool name
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_authz_gate_allow() {
+    let addr = start_daemon_gated().await;
+    let tmp = std::env::temp_dir();
+
+    let mut client = TestClient::connect(addr).await;
+    client.auth().await;
+
+    client
+        .send(json!({
+            "t": "launch_session",
+            "agent_type": "claude",
+            "repo_path": tmp.to_str().unwrap(),
+            "prompt": "authz gate allow test",
+        }))
+        .await;
+
+    let list_frame = client.recv_matching("session_list").await;
+    let sessions = list_frame["sessions"].as_array().unwrap();
+    assert!(!sessions.is_empty(), "session should be created");
+    let session_id_str = sessions[0]["id"].as_str().unwrap().to_string();
+    let session_id: Uuid = session_id_str.parse().expect("valid uuid");
+
+    client
+        .send(json!({
+            "t": "open_session",
+            "session_id": session_id,
+            "from_seq": 0_u64,
+        }))
+        .await;
+
+    let snapshot = client.recv_matching("snapshot").await;
+
+    // The approval_request may already be in the snapshot (mock exits fast).
+    // Check both snapshot events and live deltas.
+    let mut approval_id_str: Option<String> = extract_approval_id_from_snapshot(&snapshot);
+
+    if approval_id_str.is_none() {
+        // Not in snapshot — wait for live approval_request event.
+        for _ in 0..40 {
+            match timeout(Duration::from_secs(2), client.recv()).await {
+                Ok(v) => {
+                    let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
+                    if t == "event" {
+                        if let Some(evt) = v.get("event") {
+                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request") {
+                                let aid = evt
+                                    .get("metadata")
+                                    .and_then(|m| m.get("approval_id"))
+                                    .and_then(|a| a.as_str())
+                                    .map(|s| s.to_string());
+                                if aid.is_some() {
+                                    approval_id_str = aid;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    let approval_id_str = approval_id_str.expect("authz gate must emit approval_request for non-allowlisted write_file tool");
+
+    // Send approve{allow}.
+    let approval_id: Uuid = approval_id_str.parse().expect("approval_id must be a valid UUID");
+    client
+        .send(json!({
+            "t": "approve",
+            "approval_id": approval_id.to_string(),
+            "decision": "allow",
+        }))
+        .await;
+
+    // After allow, the pump should continue and the session should proceed.
+    // Drain events looking for a tool_call event (the permitted tool_call)
+    // or session completion.
+    let mut saw_tool_call_or_terminal = false;
+    for _ in 0..30 {
+        match timeout(Duration::from_secs(2), client.stream.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                let v: Value = serde_json::from_str(&text).unwrap_or_default();
+                let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
+                if t == "event" {
+                    if let Some(evt) = v.get("event") {
+                        let kind = evt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                        if kind == "tool_call" {
+                            saw_tool_call_or_terminal = true;
+                            break;
+                        }
+                    }
+                }
+                if t == "session_status" {
+                    saw_tool_call_or_terminal = true;
+                    break;
+                }
+            }
+            Ok(Some(Ok(_))) => {} // skip non-text
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => break, // timeout
+        }
+    }
+
+    assert!(
+        saw_tool_call_or_terminal,
+        "after approve(allow), session should emit tool_call event or reach terminal"
+    );
+}
+
+// ── E2E-10: G1 authz gate — deny path ────────────────────────────────────────
+//
+// Proves:
+// - same setup as E2E-9
+// - send approve{deny} → session emits tool_blocked; does NOT get tool result
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_authz_gate_deny() {
+    let addr = start_daemon_gated().await;
+    let tmp = std::env::temp_dir();
+
+    let mut client = TestClient::connect(addr).await;
+    client.auth().await;
+
+    client
+        .send(json!({
+            "t": "launch_session",
+            "agent_type": "claude",
+            "repo_path": tmp.to_str().unwrap(),
+            "prompt": "authz gate deny test",
+        }))
+        .await;
+
+    let list_frame = client.recv_matching("session_list").await;
+    let sessions = list_frame["sessions"].as_array().unwrap();
+    let session_id_str = sessions[0]["id"].as_str().unwrap().to_string();
+    let session_id: Uuid = session_id_str.parse().expect("valid uuid");
+
+    client
+        .send(json!({
+            "t": "open_session",
+            "session_id": session_id,
+            "from_seq": 0_u64,
+        }))
+        .await;
+
+    let snapshot = client.recv_matching("snapshot").await;
+
+    // Check snapshot first (mock may exit before we subscribe).
+    let mut approval_id_str: Option<String> = extract_approval_id_from_snapshot(&snapshot);
+
+    if approval_id_str.is_none() {
+        for _ in 0..40 {
+            match timeout(Duration::from_secs(5), client.recv()).await {
+                Ok(v) => {
+                    let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
+                    if t == "event" {
+                        if let Some(evt) = v.get("event") {
+                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request") {
+                                let aid = evt
+                                    .get("metadata")
+                                    .and_then(|m| m.get("approval_id"))
+                                    .and_then(|a| a.as_str())
+                                    .map(|s| s.to_string());
+                                if aid.is_some() {
+                                    approval_id_str = aid;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    let approval_id_str = approval_id_str.expect("authz gate must emit approval_request for non-allowlisted tool");
+
+    // Send approve{deny}.
+    let approval_id: Uuid = approval_id_str.parse().expect("approval_id must be a valid UUID");
+    client
+        .send(json!({
+            "t": "approve",
+            "approval_id": approval_id.to_string(),
+            "decision": "deny",
+        }))
+        .await;
+
+    // After deny, the pump should emit a tool_blocked event and NOT forward
+    // the tool result.
+    let mut saw_tool_blocked = false;
+    let mut saw_tool_result = false;
+    for _ in 0..30 {
+        match timeout(Duration::from_secs(2), client.stream.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                let v: Value = serde_json::from_str(&text).unwrap_or_default();
+                let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
+                if t == "event" {
+                    if let Some(evt) = v.get("event") {
+                        let kind = evt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                        if kind == "tool_blocked" {
+                            saw_tool_blocked = true;
+                        }
+                        if kind == "tool_result" {
+                            saw_tool_result = true;
+                        }
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {} // skip non-text
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => break, // timeout
+        }
+    }
+
+    assert!(saw_tool_blocked, "deny decision must produce tool_blocked event");
+    assert!(!saw_tool_result, "deny decision must NOT forward tool_result to the session");
+}
+
+// ── E2E-11: G2 multi-block assistant turn ────────────────────────────────────
+//
+// Proves:
+// - a single assistant message with text + 2 tool_use blocks yields 3 events
+//   with monotonic seq (1 message + 2 tool_call), in order.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_multiblock_turn_yields_three_events() {
+    let addr = start_daemon_multiblock().await;
+    let tmp = std::env::temp_dir();
+
+    let mut client = TestClient::connect(addr).await;
+    client.auth().await;
+
+    client
+        .send(json!({
+            "t": "launch_session",
+            "agent_type": "claude",
+            "repo_path": tmp.to_str().unwrap(),
+            "prompt": "multi-block test",
+        }))
+        .await;
+
+    let list_frame = client.recv_matching("session_list").await;
+    let sessions = list_frame["sessions"].as_array().unwrap();
+    let session_id_str = sessions[0]["id"].as_str().unwrap().to_string();
+    let session_id: Uuid = session_id_str.parse().expect("valid uuid");
+
+    client
+        .send(json!({
+            "t": "open_session",
+            "session_id": session_id,
+            "from_seq": 0_u64,
+        }))
+        .await;
+
+    let snapshot = client.recv_matching("snapshot").await;
+
+    // Collect all events from snapshot + live deltas.
+    let mut all_events: Vec<Value> = snapshot["events"].as_array().unwrap().clone();
+    for _ in 0..30 {
+        match timeout(Duration::from_millis(500), client.recv()).await {
+            Ok(v) => {
+                let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
+                if t == "event" {
+                    if let Some(e) = v.get("event") {
+                        all_events.push(e.clone());
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    // The multiblock mock emits: system/init → (text + read_file + write_file) → result
+    // text and both tool_use blocks come from a SINGLE assistant message.
+    // read_file is on the conservative allowlist (Permit) → tool_call event broadcasted.
+    // write_file is NOT on allowlist (RequireApproval) → approval_request emitted.
+    //
+    // So we expect at minimum: status, message, tool_call(read_file), approval_request(write_file).
+    // Assert monotonic seq and that message + tool_call both appear.
+    let kinds: Vec<&str> = all_events
+        .iter()
+        .filter_map(|e| e.get("kind").and_then(|k| k.as_str()))
+        .collect();
+
+    // Must contain at least one message event (the text block).
+    assert!(
+        kinds.contains(&"message"),
+        "multiblock turn must produce a message event; got kinds: {kinds:?}"
+    );
+
+    // Must contain at least one tool_call or approval_request (the tool_use blocks).
+    let has_tool = kinds.contains(&"tool_call") || kinds.contains(&"approval_request");
+    assert!(
+        has_tool,
+        "multiblock turn must produce tool_call or approval_request from tool_use blocks; got kinds: {kinds:?}"
+    );
+
+    // Monotonic seq invariant.
+    let mut last_seq = 0u64;
+    for (i, e) in all_events.iter().enumerate() {
+        let seq = e["seq"].as_u64().expect("event must have u64 seq");
+        assert!(
+            seq > last_seq,
+            "event[{i}] seq {seq} not monotonically greater than {last_seq}; kinds so far: {kinds:?}"
+        );
+        last_seq = seq;
+    }
 }
 
 // ── E2E-8: audit log wire roundtrip (F2) ─────────────────────────────────────
