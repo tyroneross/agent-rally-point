@@ -122,10 +122,46 @@ and retire the desynced external wrapper rather than patch it in place:
 | commit `29e263f` / branch `fix/rally-hook-walltime-timeout` | The wall-clock watchdog fix. |
 | `build-loop/scripts/agent_rally.py` · `~/.agent-rally-point/apps/<slug>/` | The Python legacy surface to migrate + retire (B17). |
 
+## Resolution (2026-05-31)
+
+**Core landed (merge `40d641d`, on `origin/main`):** steps 1–2 above shipped — the
+wall-clock watchdog plus the codex wrapper repointed off the removed `rally hook`
+to the lazy model (`rally enter` + `rally check before-write`, envelope parser →
+`data.check.*`). The field no-op is fixed: codex's automatic before-write now
+records presence/claims again. Auto-merged conflict-free with main's
+`worktree_guard` (`763be1c`); full suite green (275 tests; the one parallel-launch
+flake is pre-existing — see BACKLOG `B-test-flake`).
+
+**Hook made advisory-only (charter fix, 2026-05-31).** Review of the repointed
+wrapper found a charter violation: its envelope translator mapped
+`data.check.allow == false → permissionDecision: "deny"` (and `Stop → decision:
+"block"`), i.e. it **blocked** the write. That contradicts the never-block charter
+(*coordination is never blocked — collisions warn + record a durable audit fact*)
+and `rally mission`'s own *"records and exposes only — never enforces."* Fix: the
+wrapper's translator now forces `stop = false`, so every `PreToolUse`/`Stop` branch
+emits **advisory** output (`additionalContext` / `systemMessage`) — high-severity
+collisions are surfaced with a visible `⚠️` prefix but **never deny or block**.
+`rally check`/`say` still record the durable collision fact, so nothing is lost;
+the agent decides. Verified: synthetic stop-severity envelope → `additionalContext`,
+no `deny`/`block`. (Decision: *strip-deny, keep advisory* — user, 2026-05-31.)
+
+**Deferred (deliberately separate):** step 3 Claude PreToolUse hook is **on hold** —
+under the advisory-only + lazy-auto-enter model a bespoke per-tool Claude hook may
+be unnecessary; revisit after the `run/inject/capture/stop` lifecycle (step 5)
+lands. Steps 4 (`migrate-legacy` + retire Python writers) and 5 (ET/herdr
+lifecycle) are tracked as `LANE-C` / `LANE-D` on the rally backlog board.
+
+> ⚠️ **Recurrence risk — wrapper is not version-controlled.** `~/.codex/rally-hook.sh`
+> is a hand-installed external file with no repo source; that is exactly what let it
+> desync from the CLI (the root cause here). Recommended follow-up: vendor the
+> canonical advisory wrapper into the repo (e.g. `integrations/codex/`) with an
+> installer, so the CLI and its host adapters can't drift silently again.
+
 ## Cross-refs
 
 - **B17** (one-store retirement) — this is the concrete external-wrapper instance
   of the "build-loop-side legacy writers retired separately" follow-through.
 - **Lazy auto-enter (no hook)** — the directional fix for step 2/3: agents call
-  tool-scoped `rally` commands; no bespoke per-tool hook script.
+  tool-scoped `rally` commands; no bespoke per-tool hook script. The advisory-only
+  hook above is the interim model until lazy-auto-enter fully replaces it.
 - build-loop-memory lesson: `lessons/2026-05-31-rally-wrapper-desync-and-watchdog.md`.
