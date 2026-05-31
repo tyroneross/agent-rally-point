@@ -1,4 +1,3 @@
-use chrono;
 use factstr::{EventQuery as FactQuery, EventStore, EventStoreError, NewEvent};
 use factstr_sqlite::SqliteStore;
 use schemars::JsonSchema;
@@ -125,9 +124,9 @@ pub(crate) enum FactKind {
     /// pattern — no Fact struct fields change; specifics encoded in existing fields:
     ///   - Mission fact:   `scope = ["mission"]`, `subject = <north-star text>`.
     ///   - Envelope fact:  `scope = ["envelope", "agent:<name>"]`,
-    ///                     `subject = "autonomy envelope for <name>"`,
-    ///                     `summary = "may:<...>"`,
-    ///                     `evidence = ["must_check:<...>"]`.
+    ///     `subject = "autonomy envelope for <name>"`,
+    ///     `summary = "may:<...>"`,
+    ///     `evidence = ["must_check:<...>"]`.
     ///
     /// RALLY RECORDS AND EXPOSES ONLY. Never checks, gates, or grants anything.
     /// Setting again supersedes: latest-by-seq wins on read.

@@ -5,6 +5,7 @@ use crate::backends::Backend;
 use crate::error::{RallyError, Result};
 use crate::store::FactKind;
 
+#[allow(clippy::large_enum_variant)] // short-lived dispatch enum; boxing adds indirection for no runtime benefit
 pub(crate) enum CliCommand {
     Init(InitArgs),
     Enter(EnterArgs),

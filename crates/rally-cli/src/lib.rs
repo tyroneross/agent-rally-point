@@ -1351,7 +1351,7 @@ fn watch_print_launchd(args: &WatchArgs, exe: &Path, repo: &Path) {
     let mut program_args = vec![format!("  <string>{exe_str}</string>")];
     program_args.push("  <string>watch</string>".to_string());
     if let Some(interval) = Some(args.interval).filter(|&i| i != 5) {
-        program_args.push(format!("  <string>--interval</string>"));
+        program_args.push("  <string>--interval</string>".to_string());
         program_args.push(format!("  <string>{interval}</string>"));
     }
     if let Some(ref cmd) = args.on_activity {
@@ -1405,7 +1405,7 @@ fn watch_print_systemd(args: &WatchArgs, exe: &Path, repo: &Path) {
         // containing shell-special chars), then escape any '%' in the result
         // so systemd does not expand unit specifiers.
         let shell_quoted = shlex::try_quote(cmd)
-            .unwrap_or_else(|_| std::borrow::Cow::Borrowed(cmd.as_str()))
+            .unwrap_or(std::borrow::Cow::Borrowed(cmd.as_str()))
             .replace('%', "%%");
         exec_args.push_str(&format!(" --on-activity {shell_quoted}"));
     }
@@ -5207,7 +5207,7 @@ pub(crate) fn normalize_path(path: String) -> String {
         if let Ok(root) = repo_root() {
             if let Ok(rel) = p.strip_prefix(&root) {
                 normalize_components(rel)
-            } else if let Some(canonical_root) = fs::canonicalize(&root).ok() {
+            } else if let Ok(canonical_root) = fs::canonicalize(&root) {
                 if let Some(canonical_p) = canonicalize_maybe_missing(p) {
                     if let Ok(rel) = canonical_p.strip_prefix(&canonical_root) {
                         normalize_components(rel)
@@ -5763,6 +5763,7 @@ struct MissionSetPayload {
 
 /// Envelope for `mission`: both GET and SET nest under `data.mission`.
 #[derive(JsonSchema, Serialize)]
+#[allow(clippy::large_enum_variant)] // short-lived JSON envelope; boxing would break serde(untagged) ergonomics for no gain
 #[serde(untagged)]
 enum MissionData {
     Get(MissionGetEnvelope),

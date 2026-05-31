@@ -31,7 +31,7 @@ use crate::store::Fact;
 /// - `landed`    — has an artifact fact referencing the step's claim.
 /// - `in_flight` — has a claim (or standby within wake_after) but no artifact yet.
 /// - `stalled`   — has a standby whose wake_after has passed with no subsequent
-///                 wake or artifact fact.
+///   wake or artifact fact.
 #[derive(Clone, Debug, JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NodeStatus {
@@ -194,7 +194,7 @@ pub(crate) fn resolve_wake_after(input: &str) -> Result<String, String> {
 /// Node status:
 ///   - `landed`    if a fact of kind `artifact` shares the step_id in this run.
 ///   - `stalled`   if a standby fact in the step has a past `wake_after` and no
-///                 subsequent wake or artifact fact exists for that step.
+///     subsequent wake or artifact fact exists for that step.
 ///   - `in_flight` otherwise.
 pub(crate) fn build_dag(facts: &[Fact], run_id: &str) -> DagOutput {
     // Filter to facts belonging to this run.

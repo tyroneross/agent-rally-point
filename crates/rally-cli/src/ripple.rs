@@ -31,16 +31,8 @@ pub(crate) fn extract_pub_fn_names(path: &Path) -> Vec<String> {
         // Match `pub fn` or `pub(crate) fn` or `pub(super) fn` etc.
         let after_pub = if let Some(rest) = trimmed.strip_prefix("pub(") {
             // pub(…) fn: skip to `fn`
-            if let Some(pos) = rest.find(") fn ") {
-                Some(&rest[pos + 5..])
-            } else {
-                None
-            }
-        } else if let Some(rest) = trimmed.strip_prefix("pub fn ") {
-            Some(rest)
-        } else {
-            None
-        };
+            rest.find(") fn ").map(|pos| &rest[pos + 5..])
+        } else { trimmed.strip_prefix("pub fn ") };
 
         if let Some(rest) = after_pub {
             // fn name ends at `(` or `<`
