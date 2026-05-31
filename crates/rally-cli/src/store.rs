@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -50,6 +52,20 @@ pub(crate) const ENGAGEMENT_ENV_VAR: &str = "RALLY_ENGAGEMENT";
 /// or flag inherit the label. Plain text, one line, no trailing newline
 /// required.
 pub(crate) const ACTIVE_ENGAGEMENT_FILENAME: &str = "active-engagement";
+
+/// Cross-process guard for critical sections that must keep `facts.db` and the
+/// canonical JSONL segments in lock-step.
+const ROOM_MUTATION_LOCK_FILENAME: &str = "mutation.lock";
+
+#[cfg(unix)]
+mod unix_lock {
+    pub(crate) const LOCK_EX: i32 = 2;
+    pub(crate) const LOCK_UN: i32 = 8;
+
+    unsafe extern "C" {
+        pub(crate) fn flock(fd: i32, operation: i32) -> i32;
+    }
+}
 
 use crate::backends::ManagedSession;
 use crate::cli::RoomArgs;
@@ -456,6 +472,48 @@ pub(crate) struct RoomStore {
     active_engagement: String,
 }
 
+#[cfg(unix)]
+struct RoomMutationLock {
+    file: fs::File,
+}
+
+#[cfg(not(unix))]
+struct RoomMutationLock;
+
+#[cfg(unix)]
+fn acquire_room_mutation_lock(room_dir: &Path) -> Result<RoomMutationLock> {
+    fs::create_dir_all(room_dir)
+        .map_err(RallyError::io(format!("create {}", room_dir.display())))?;
+    let path = room_dir.join(ROOM_MUTATION_LOCK_FILENAME);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(RallyError::io(format!("open {}", path.display())))?;
+    let rc = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX) };
+    if rc != 0 {
+        return Err(RallyError::Io {
+            context: format!("lock {}", path.display()),
+            source: io::Error::last_os_error(),
+        });
+    }
+    Ok(RoomMutationLock { file })
+}
+
+#[cfg(not(unix))]
+fn acquire_room_mutation_lock(_room_dir: &Path) -> Result<RoomMutationLock> {
+    Ok(RoomMutationLock)
+}
+
+#[cfg(unix)]
+impl Drop for RoomMutationLock {
+    fn drop(&mut self) {
+        let _ = unsafe { unix_lock::flock(self.file.as_raw_fd(), unix_lock::LOCK_UN) };
+    }
+}
+
 /// One line of a segment file.
 ///
 /// Compact on purpose: one event, its assigned `seq` (factstr's monotonic
@@ -518,6 +576,7 @@ impl RoomStore {
     pub(crate) fn open_at(root: PathBuf) -> Result<Self> {
         let dir = root.join(".rally");
         fs::create_dir_all(&dir).map_err(RallyError::io("create .rally"))?;
+        let _guard = acquire_room_mutation_lock(&dir)?;
         let _ = fs::remove_file(dir.join("room.db"));
         let fact_store_path = dir.join("facts.db");
         let log_dir = dir.join(LOG_DIRNAME);
@@ -563,6 +622,7 @@ impl RoomStore {
         {
             return Ok(None);
         }
+        let _guard = acquire_room_mutation_lock(&dir)?;
         migrate_monolith_to_segments(&legacy_ledger_path, &log_dir, &archive_dir)?;
         reconcile_segments_and_db(&log_dir, &archive_dir, &fact_store_path)?;
         let fact_store = open_fact_store(&fact_store_path)?;
@@ -600,30 +660,29 @@ impl RoomStore {
     }
 
     pub(crate) fn append_fact(&self, fact: &Fact) -> Result<Fact> {
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
+        let fact_store = open_fact_store(&self.facts_db_path)?;
         let mut fact = fact.clone();
         let event_type = fact.kind.as_str().to_string();
         let payload = serde_json::to_value(&fact).map_err(RallyError::json("render fact"))?;
-        // factstr-sqlite opens without busy_timeout, so a concurrent writer can
-        // hit transient SQLITE_BUSY ("database is locked"). Retry with a
-        // per-process jittered backoff to de-synchronize the herd rather than
-        // failing the write (B-write-burst-scale / B-test-flake). Safe to retry:
-        // a lock-rejected append committed nothing.
+        // The room lock serializes Rally writers; keep a short retry for
+        // transient SQLite lock errors from readers or older Rally binaries.
         let result = {
             let jitter = (std::process::id() % 17) as u64;
             let mut attempts = 0;
             loop {
-                match self
-                    .fact_store
-                    .append(vec![NewEvent::new(event_type.clone(), payload.clone())])
-                {
+                match fact_store.append(vec![NewEvent::new(event_type.clone(), payload.clone())]) {
                     Ok(r) => break r,
                     Err(err) if attempts < 16 && is_db_locked(&err) => {
                         attempts += 1;
                         thread::sleep(Duration::from_millis(15 * attempts + jitter));
                     }
-                    Err(err) => {
-                        return Err(RallyError::Message(format!("append fact: {err}")))
-                    }
+                    Err(err) => return Err(RallyError::Message(format!("append fact: {err}"))),
                 }
             }
         };
@@ -815,10 +874,17 @@ impl RoomStore {
         fact: &Fact,
         expected_context_version: Option<u64>,
     ) -> Result<Option<Fact>> {
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
+        let fact_store = open_fact_store(&self.facts_db_path)?;
         let mut fact = fact.clone();
         let payload =
             serde_json::to_value(&fact).map_err(RallyError::json("render session fact"))?;
-        let result = self.fact_store.append_if(
+        let result = fact_store.append_if(
             vec![NewEvent::new("session", payload.clone())],
             &FactQuery::for_event_types(["session"]),
             expected_context_version,
@@ -865,8 +931,14 @@ impl RoomStore {
     }
 
     pub(crate) fn session_facts_with_context_version(&self) -> Result<(Vec<Fact>, Option<u64>)> {
-        let query = self
-            .fact_store
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
+        let fact_store = open_fact_store(&self.facts_db_path)?;
+        let query = fact_store
             .query(&FactQuery::for_event_types(["session"]))
             .map_err(|err| RallyError::Message(format!("query session facts: {err}")))?;
         let context_version = query
@@ -2882,6 +2954,55 @@ mod ledger_tests {
             assert_eq!(h.join().unwrap(), 5, "reader saw a destroyed/racing cache");
         }
         assert_eq!(db_inode(&root), before, "parallel reads rebuilt the cache");
+
+        fs::remove_dir_all(&*root).ok();
+    }
+
+    #[test]
+    fn parallel_opens_and_appends_keep_db_and_segments_in_lockstep() {
+        use std::sync::Arc;
+
+        let root = Arc::new(unique_root("parallel-open-append-lockstep"));
+        let store = RoomStore::open_at((*root).clone()).unwrap();
+        drop(store);
+
+        let handles: Vec<_> = (0..24)
+            .map(|n| {
+                let root = Arc::clone(&root);
+                thread::spawn(move || {
+                    let store = RoomStore::open_at((*root).clone()).unwrap();
+                    let event_id = format!("parallel-event-{n}");
+                    store
+                        .append_fact_verified(&make_fact(
+                            &event_id,
+                            FactKind::Decision,
+                            "src/",
+                            "parallel append",
+                        ))
+                        .unwrap();
+                    event_id
+                })
+            })
+            .collect();
+
+        let expected_ids = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<BTreeSet<_>>();
+
+        let reader = RoomStore::open_at((*root).clone()).unwrap();
+        let facts = reader.facts().unwrap();
+        let actual_ids = facts
+            .iter()
+            .map(|fact| fact.event_id.clone())
+            .collect::<BTreeSet<_>>();
+        let seqs = facts.iter().map(|fact| fact.seq).collect::<BTreeSet<_>>();
+
+        assert_eq!(facts.len(), 24);
+        assert_eq!(actual_ids, expected_ids);
+        assert_eq!(seqs.len(), 24);
+        assert!(seqs.contains(&1));
+        assert!(seqs.contains(&24));
 
         fs::remove_dir_all(&*root).ok();
     }
