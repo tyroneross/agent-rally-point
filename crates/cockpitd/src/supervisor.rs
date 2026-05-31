@@ -22,7 +22,7 @@ use std::{
 
 use anyhow::{bail, Result};
 use chrono::Utc;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::{
@@ -70,7 +70,7 @@ pub enum AdapterEvent {
 // ── Supervisor ────────────────────────────────────────────────────────────────
 
 /// Live session state tracked in-memory.
-struct LiveSession {
+pub(crate) struct LiveSession {
     #[allow(dead_code)] // used by chunk B for session lookup
     session_id: Uuid,
     status: SessionStatus,
@@ -79,16 +79,20 @@ struct LiveSession {
     // by the #[allow(dead_code)] below.
     #[allow(dead_code)]
     _cmd_tx: Option<mpsc::Sender<()>>, // placeholder; real type defined in chunk B
+    /// Abort handle for the async event-pump task (C1).
+    _pump_abort: Option<tokio::task::AbortHandle>,
 }
 
 /// Supervises all active sessions: owns the Store and drives state transitions.
 pub struct Supervisor<C: Clock> {
-    store: Store,
+    pub(crate) store: Store,
     clock: C,
-    sessions: HashMap<Uuid, LiveSession>,
+    pub(crate) sessions: HashMap<Uuid, LiveSession>,
     /// Adapter factory: maps agent_type → boxed adapter.
     /// In tests this is populated with a FakeAdapter.
-    adapter: Box<dyn Adapter>,
+    pub(crate) adapter: Box<dyn Adapter>,
+    /// Pending event receivers for async pump hand-off (C1 transport).
+    pub(crate) pending_pumps: HashMap<Uuid, mpsc::Receiver<AdapterEvent>>,
 }
 
 impl<C: Clock> Supervisor<C> {
@@ -98,6 +102,7 @@ impl<C: Clock> Supervisor<C> {
             clock,
             sessions: HashMap::new(),
             adapter: Box::new(adapter),
+            pending_pumps: HashMap::new(),
         }
     }
 
@@ -138,6 +143,7 @@ impl<C: Clock> Supervisor<C> {
                 session_id: id,
                 status: SessionStatus::Active,
                 _cmd_tx: None, // TODO(chunk-B): wire real command channel
+                _pump_abort: None,
             },
         );
 
@@ -147,6 +153,78 @@ impl<C: Clock> Supervisor<C> {
         self.drain_events(id, rx)?;
 
         Ok(id)
+    }
+
+    /// Launch a session for the async transport path (C1).
+    ///
+    /// Creates the session row, starts the adapter, and stores the event receiver
+    /// in `pending_pumps` so the transport can pick it up via `take_pending_pump`
+    /// and spawn an async pump task with access to `Arc<Mutex<Store>>`.
+    ///
+    /// Does NOT drain synchronously — the pump is spawned by the caller (ws.rs).
+    pub fn launch_session_async(
+        &mut self,
+        agent_type: &str,
+        repo_path: &str,
+        prompt: Option<&str>,
+        owner_id: &str,
+        event_tx: broadcast::Sender<Event>,
+    ) -> Result<Uuid> {
+        let _ = event_tx; // stored in AppState; passed to the pump by ws.rs
+        let id = Uuid::new_v4();
+        let now = self.clock.now();
+
+        let session = Session {
+            id,
+            owner_id: owner_id.to_string(),
+            agent_type: agent_type.to_string(),
+            repo_path: repo_path.to_string(),
+            status: SessionStatus::Active,
+            title: None,
+            created_at: now,
+            last_seq: 0,
+        };
+        self.store.create_session(&session)?;
+
+        let (tx, rx) = mpsc::channel::<AdapterEvent>(128);
+        self.adapter.start(id, agent_type, repo_path, prompt, tx)?;
+
+        self.sessions.insert(
+            id,
+            LiveSession {
+                session_id: id,
+                status: SessionStatus::Active,
+                _cmd_tx: None,
+                _pump_abort: None,
+            },
+        );
+
+        // Store rx for the transport to pick up and pump asynchronously.
+        self.pending_pumps.insert(id, rx);
+
+        Ok(id)
+    }
+
+    /// Pop the pending event receiver for a just-launched session (for the async pump).
+    pub fn take_pending_pump(&mut self, id: Uuid) -> Option<mpsc::Receiver<AdapterEvent>> {
+        self.pending_pumps.remove(&id)
+    }
+
+    /// Update the live status for a session (called by the async pump).
+    pub fn set_status(&mut self, session_id: Uuid, status: SessionStatus) {
+        if let Some(live) = self.sessions.get_mut(&session_id) {
+            live.status = status;
+        }
+    }
+
+    /// Remove a session from the live map (called when the pump sees a terminal event).
+    pub fn remove_live(&mut self, session_id: Uuid) {
+        self.sessions.remove(&session_id);
+    }
+
+    /// Send a prompt to a running session via the adapter.
+    pub fn adapter_send(&mut self, session_id: Uuid, text: &str) -> Result<()> {
+        self.adapter.send(session_id, text)
     }
 
     /// Kill a running session.
@@ -423,6 +501,7 @@ mod tests {
                 session_id: sid,
                 status: SessionStatus::Active,
                 _cmd_tx: None,
+                _pump_abort: None,
             },
         );
 
