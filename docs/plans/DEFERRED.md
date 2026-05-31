@@ -16,7 +16,20 @@ here is claimed working.
 | **CloudKit history/settings sync** | Not built (P3) | Add CloudKit entitlement + container; mirror session history/settings to the private DB. |
 | **launchctl load of cockpitd** | plist lints; `install.sh` parses | Run `deploy/install.sh install` on the target Mac (needs a login session). |
 | **Live agent adapters** | Verified against MOCK `claude`/`codex`; real CLIs present (claude 2.1.158, codex 0.130.0) | Run the gated smoke (`COCKPIT_LIVE=1 cargo test -p cockpitd -- --ignored live`) against the real CLIs (burns credit). |
-| **Multi-user / zero-knowledge relay** | `owner_id` in schema + `Transport` trait seam only | Implement the relay + per-session wrapped-key E2E crypto when going multi-user (see spec §8). |
+| **Multi-user / zero-knowledge relay** | **BUILT + tested in-process** — `crypto.rs` (Ed25519 identity/challenge-response, X25519-wrapped AES/secretbox per-session keys), `transport/relay.rs` `ZeroKnowledgeRelay` (proven ciphertext-only), `owner_id` isolation in the store. | Only the *hosted deployment* remains: run the relay as a reachable service, wire device pairing/QR, and the app-layer E2E on the wire (the primitives are done). |
+
+## Built since the MVP (no longer deferred)
+
+These were "seams" in the original plan and are now real, tested code:
+- **Append-only audit log** (`audit.rs`) — commands/approvals/lifecycle, `get_audit` wire cmd.
+- **Deny-by-default command authorization** (`authz.rs` + enforcement loop in `run_pump`) — non-allowlisted tool_calls + Codex native approvals are gated per-session until approved.
+- **Multi-user crypto + zero-knowledge relay** (`crypto.rs`, `transport/relay.rs`) — see row above.
+- **WS-level approval round-trip** with TTL/auto-deny logic (`approval.rs`).
+
+## Small software items still open (verifiable, not hardware-gated)
+
+- **TTL auto-deny background task** — `ApprovalManager.sweep()` exists + is unit-tested, but no daemon task calls it periodically (and it must also wake parked gates with a deny). One focused chunk.
+- **Live app↔daemon UI E2E** — a simulator UITest driving a running `cockpitd`; deferred for flakiness, `cockpit-cli` E2E is the verified stand-in.
 
 ## [CLEANUP] dev shortcuts introduced (must close before any "production" claim)
 
