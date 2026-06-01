@@ -1889,6 +1889,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
     let backend_name = backend.as_str().to_string();
     let repo = repo_root()?;
     let agent_spec = AgentSpec::from_name(&agent)?;
+    enforce_easy_terminal_self_host_guard(&repo, backend, bins.herdr_socket.as_deref(), dry_run)?;
     let room = RoomStore::open()?;
     let reservation = if dry_run {
         let active_sessions = active_session_records(&room)?;
@@ -1972,6 +1973,52 @@ fn command_run(args: RunArgs) -> Result<Output> {
         session.agent, session.backend, session.session_id
     );
     Ok(Output::new(json, text, body))
+}
+
+fn enforce_easy_terminal_self_host_guard(
+    repo: &Path,
+    backend: Backend,
+    herdr_socket: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run || backend != Backend::Herdr || !looks_like_easy_terminal_repo(repo) {
+        return Ok(());
+    }
+    let Some(target_socket) = herdr_socket.map(normalize_socket_path) else {
+        return Ok(());
+    };
+    let current_sockets = [
+        env::var("PTYD_SOCKET_PATH").ok(),
+        env::var("HERDR_SOCKET_PATH").ok(),
+    ];
+    let hosted_in_same_daemon = current_sockets
+        .iter()
+        .flatten()
+        .map(|socket| normalize_socket_path(socket))
+        .any(|socket| socket == target_socket);
+    if !hosted_in_same_daemon {
+        return Ok(());
+    }
+    if env::var("RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH").as_deref() == Ok("1") {
+        return Ok(());
+    }
+
+    Err(RallyError::Usage(format!(
+        "refusing to launch a Rally-managed agent into the same Easy Terminal daemon socket ({target_socket}) from an Easy Terminal worktree. Build/relaunch lanes must run outside that ET instance or detach first; set RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH=1 only after confirming this agent will not rebuild or relaunch its own host app."
+    )))
+}
+
+fn looks_like_easy_terminal_repo(repo: &Path) -> bool {
+    repo.join("Sources/Ptyd/DaemonController.swift").is_file() && repo.join("build.sh").is_file()
+}
+
+fn normalize_socket_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    path.to_string()
 }
 
 struct SessionIdentity {
@@ -2751,7 +2798,10 @@ pub(crate) fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_root(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -2761,6 +2811,76 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rally-lib-{label}-{nanos}"));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn seed_easy_terminal_markers(root: &Path) {
+        std::fs::create_dir_all(root.join("Sources/Ptyd")).unwrap();
+        std::fs::write(root.join("Sources/Ptyd/DaemonController.swift"), "").unwrap();
+        std::fs::write(root.join("build.sh"), "#!/usr/bin/env bash\n").unwrap();
+    }
+
+    #[test]
+    fn self_host_guard_rejects_same_easy_terminal_socket_for_real_launch() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let root = unique_root("self-host-guard");
+        seed_easy_terminal_markers(&root);
+        let old_ptyd = env::var("PTYD_SOCKET_PATH").ok();
+        let old_herdr = env::var("HERDR_SOCKET_PATH").ok();
+        let old_allow = env::var("RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH").ok();
+
+        unsafe {
+            env::set_var("PTYD_SOCKET_PATH", "/tmp/easy-terminal/herdr.sock");
+            env::remove_var("HERDR_SOCKET_PATH");
+            env::remove_var("RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH");
+        }
+        let err = enforce_easy_terminal_self_host_guard(
+            &root,
+            Backend::Herdr,
+            Some("/tmp/easy-terminal/herdr.sock"),
+            false,
+        )
+        .unwrap_err();
+
+        restore_env("PTYD_SOCKET_PATH", old_ptyd);
+        restore_env("HERDR_SOCKET_PATH", old_herdr);
+        restore_env("RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH", old_allow);
+
+        assert!(
+            err.to_string().contains("same Easy Terminal daemon socket"),
+            "unexpected guard error: {err}"
+        );
+    }
+
+    #[test]
+    fn self_host_guard_allows_dry_run_socket_targeting() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let root = unique_root("self-host-guard-dry-run");
+        seed_easy_terminal_markers(&root);
+        let old_ptyd = env::var("PTYD_SOCKET_PATH").ok();
+
+        unsafe {
+            env::set_var("PTYD_SOCKET_PATH", "/tmp/easy-terminal/herdr.sock");
+        }
+        enforce_easy_terminal_self_host_guard(
+            &root,
+            Backend::Herdr,
+            Some("/tmp/easy-terminal/herdr.sock"),
+            true,
+        )
+        .expect("dry-run should show the ET target without blocking");
+
+        restore_env("PTYD_SOCKET_PATH", old_ptyd);
+    }
+
+    fn restore_env(key: &str, value: Option<String>) {
+        unsafe {
+            match value {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
+        }
     }
 
     /// Component B acceptance test 1: running `ensure_presence` without a prior
@@ -6755,7 +6875,7 @@ fn help_text() -> String {
         "  rally migrate-legacy [--json]  # one-shot replay of legacy ~/.agent-rally-point/apps/<slug>/changes.jsonl into this repo ledger",
         "  rally check before-write --tool <tool> --path <path> [--strict] [--json]",
         "  rally check before-complete --tool <tool> [--strict] [--json]",
-        "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|herdr|cmux>] [--dry-run] [--json]",
+        "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|herdr|cmux>] [--herdr-socket <path>] [--dry-run] [--json]",
         "    managed run ids auto-number active agents, e.g. claude-01 / claude_code:01",
         "  rally sessions [--json]",
         "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--require-ack] [--json]",

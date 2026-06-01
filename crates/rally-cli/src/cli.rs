@@ -376,6 +376,7 @@ pub(crate) struct RouteFindingsArgs {
 pub(crate) struct BackendBins {
     pub(crate) tmux_bin: String,
     pub(crate) herdr_bin: String,
+    pub(crate) herdr_socket: Option<String>,
     pub(crate) cmux_bin: String,
 }
 
@@ -384,6 +385,7 @@ impl Default for BackendBins {
         Self {
             tmux_bin: "tmux".to_string(),
             herdr_bin: "herdr".to_string(),
+            herdr_socket: None,
             cmux_bin: "cmux".to_string(),
         }
     }
@@ -1108,11 +1110,13 @@ fn backend_bins_parser() -> impl Parser<BackendBins> {
         .map(|value| value.unwrap_or_else(|| "tmux".to_string()));
     let herdr_bin = optional_string_arg("herdr-bin", "PATH")
         .map(|value| value.unwrap_or_else(|| "herdr".to_string()));
+    let herdr_socket = optional_string_arg("herdr-socket", "PATH");
     let cmux_bin = optional_string_arg("cmux-bin", "PATH")
         .map(|value| value.unwrap_or_else(|| "cmux".to_string()));
     construct!(BackendBins {
         tmux_bin,
         herdr_bin,
+        herdr_socket,
         cmux_bin
     })
 }

@@ -1696,6 +1696,30 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
     assert_eq!(herdr["data"]["run"]["commands"]["start"][0][1], "agent");
     assert_eq!(herdr["data"]["run"]["commands"]["start"][0][2], "start");
 
+    let herdr_socket = workspace.json(&[
+        "run",
+        "codex",
+        "--json",
+        "--dry-run",
+        "--name",
+        "et-pane",
+        "--backend",
+        "herdr",
+        "--herdr-bin",
+        "/usr/bin/true",
+        "--herdr-socket",
+        "/tmp/easy-terminal-herdr.sock",
+    ]);
+    let socket_command = herdr_socket["data"]["run"]["commands"]["start"][0]
+        .as_array()
+        .unwrap();
+    assert_eq!(socket_command[0], "env");
+    assert_eq!(socket_command[1], "PTYD_SOCKET_PATH=/tmp/easy-terminal-herdr.sock");
+    assert_eq!(socket_command[2], "HERDR_SOCKET_PATH=/tmp/easy-terminal-herdr.sock");
+    assert_eq!(socket_command[3], "/usr/bin/true");
+    assert_eq!(socket_command[4], "agent");
+    assert_eq!(socket_command[5], "start");
+
     let herdr_inject = workspace.json(&[
         "inject",
         "herdr-reviewer-01",
@@ -1805,8 +1829,8 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
         "--herdr-bin",
         "/usr/bin/true",
     ]);
-    assert_eq!(herdr_stop["data"]["stop"]["commands"][0][1], "pane");
-    assert_eq!(herdr_stop["data"]["stop"]["commands"][0][2], "close");
+    assert_eq!(herdr_stop["data"]["stop"]["commands"][0][1], "agent");
+    assert_eq!(herdr_stop["data"]["stop"]["commands"][0][2], "stop");
 
     workspace.cleanup();
 }

@@ -178,6 +178,7 @@ pub(crate) struct BackendRunner {
     pub(crate) backend: Backend,
     tmux_bin: String,
     herdr_bin: String,
+    herdr_socket: Option<String>,
     cmux_bin: String,
 }
 
@@ -187,6 +188,7 @@ impl BackendRunner {
             backend,
             tmux_bin: bins.tmux_bin,
             herdr_bin: bins.herdr_bin,
+            herdr_socket: bins.herdr_socket,
             cmux_bin: bins.cmux_bin,
         }
     }
@@ -205,7 +207,8 @@ impl BackendRunner {
                 target,
                 cwd,
                 command,
-                herdr_agents_tab(&self.herdr_bin),
+                herdr_agents_tab(&self.herdr_bin, self.herdr_socket.as_deref()),
+                self.herdr_socket.as_deref(),
             )],
             Backend::Cmux => vec![cmux_start_command(
                 &self.cmux_bin,
@@ -237,7 +240,9 @@ impl BackendRunner {
 
     pub(crate) fn live_target(&self, session: &ManagedSession) -> Result<String> {
         match self.backend {
-            Backend::Herdr => herdr_live_pane(&self.herdr_bin, session),
+            Backend::Herdr => {
+                herdr_live_pane(&self.herdr_bin, self.herdr_socket.as_deref(), session)
+            }
             Backend::Tmux | Backend::Cmux => Ok(session.target.clone()),
         }
     }
@@ -246,9 +251,21 @@ impl BackendRunner {
         match self.backend {
             Backend::Tmux => tmux_inject_commands(&self.tmux_bin, target, text),
             Backend::Herdr => vec![
-                cmd![&self.herdr_bin, "pane", "send-text", target, "\u{15}"],
-                cmd![&self.herdr_bin, "pane", "send-text", target, text],
-                cmd![&self.herdr_bin, "pane", "send-keys", target, "enter"],
+                herdr_command(
+                    &self.herdr_bin,
+                    self.herdr_socket.as_deref(),
+                    cmd![&self.herdr_bin, "pane", "send-text", target, "\u{15}"],
+                ),
+                herdr_command(
+                    &self.herdr_bin,
+                    self.herdr_socket.as_deref(),
+                    cmd![&self.herdr_bin, "pane", "send-text", target, text],
+                ),
+                herdr_command(
+                    &self.herdr_bin,
+                    self.herdr_socket.as_deref(),
+                    cmd![&self.herdr_bin, "pane", "send-keys", target, "enter"],
+                ),
             ],
             Backend::Cmux => vec![
                 cmd![&self.cmux_bin, "send-key", "--workspace", target, "ctrl+u"],
@@ -265,7 +282,11 @@ impl BackendRunner {
     pub(crate) fn attach_commands(&self, target: &str) -> Vec<Vec<String>> {
         match self.backend {
             Backend::Tmux => vec![cmd![&self.tmux_bin, "attach", "-t", target]],
-            Backend::Herdr => vec![cmd![&self.herdr_bin, "agent", "attach", target]],
+            Backend::Herdr => vec![herdr_command(
+                &self.herdr_bin,
+                self.herdr_socket.as_deref(),
+                cmd![&self.herdr_bin, "agent", "attach", target],
+            )],
             Backend::Cmux => vec![cmd![
                 &self.cmux_bin,
                 "select-workspace",
@@ -289,16 +310,20 @@ impl BackendRunner {
                 "-S",
                 format!("-{lines}"),
             ]],
-            Backend::Herdr => vec![cmd![
+            Backend::Herdr => vec![herdr_command(
                 &self.herdr_bin,
-                "agent",
-                "read",
-                target,
-                "--source",
-                "recent-unwrapped",
-                "--lines",
-                lines,
-            ]],
+                self.herdr_socket.as_deref(),
+                cmd![
+                    &self.herdr_bin,
+                    "agent",
+                    "read",
+                    target,
+                    "--source",
+                    "recent-unwrapped",
+                    "--lines",
+                    lines,
+                ],
+            )],
             Backend::Cmux => vec![cmd![
                 &self.cmux_bin,
                 "read-screen",
@@ -318,7 +343,11 @@ impl BackendRunner {
     pub(crate) fn stop_commands(&self, target: &str) -> Vec<Vec<String>> {
         match self.backend {
             Backend::Tmux => vec![cmd![&self.tmux_bin, "kill-session", "-t", target]],
-            Backend::Herdr => vec![cmd![&self.herdr_bin, "pane", "close", target]],
+            Backend::Herdr => vec![herdr_command(
+                &self.herdr_bin,
+                self.herdr_socket.as_deref(),
+                cmd![&self.herdr_bin, "agent", "stop", target],
+            )],
             Backend::Cmux => vec![cmd![
                 &self.cmux_bin,
                 "close-workspace",
@@ -374,6 +403,7 @@ fn herdr_start_command(
     cwd: &Path,
     command: &[String],
     tab: Option<String>,
+    socket: Option<&str>,
 ) -> Vec<String> {
     let mut args = cmd![bin, "agent", "start", target, "--cwd", cwd.display(),];
     if let Some(tab) = tab {
@@ -381,11 +411,27 @@ fn herdr_start_command(
     }
     args.extend(cmd!["--no-focus", "--"]);
     args.extend(command.iter().cloned());
-    args
+    herdr_command(bin, socket, args)
 }
 
-fn herdr_agents_tab(bin: &str) -> Option<String> {
-    let command = [bin.to_string(), "tab".to_string(), "list".to_string()];
+fn herdr_command(bin: &str, socket: Option<&str>, command: Vec<String>) -> Vec<String> {
+    match socket {
+        Some(socket) => {
+            let mut wrapped = cmd![
+                "env",
+                format!("PTYD_SOCKET_PATH={socket}"),
+                format!("HERDR_SOCKET_PATH={socket}"),
+                bin,
+            ];
+            wrapped.extend(command.into_iter().skip(1));
+            wrapped
+        }
+        None => command,
+    }
+}
+
+fn herdr_agents_tab(bin: &str, socket: Option<&str>) -> Option<String> {
+    let command = herdr_command(bin, socket, cmd![bin, "tab", "list"]);
     let output = run_command_output(&command).ok()?;
     parse_herdr_agents_tab(&output)
 }
@@ -462,18 +508,25 @@ pub(crate) fn parse_cmux_start_target(output: &str, fallback: &str) -> Result<St
         })
 }
 
-fn herdr_live_pane(bin: &str, session: &ManagedSession) -> Result<String> {
-    let command = cmd![bin, "agent", "list"];
+fn herdr_live_pane(bin: &str, socket: Option<&str>, session: &ManagedSession) -> Result<String> {
+    let command = herdr_command(bin, socket, cmd![bin, "agent", "list"]);
     let output = run_command_output(&command)?;
     if output.trim().is_empty() {
         return Ok(session.target.clone());
     }
     let value: Value =
         serde_json::from_str(&output).map_err(RallyError::json("parse herdr agent list"))?;
+    resolve_agent_pane_from_list(&value, session)
+}
+
+fn resolve_agent_pane_from_list(value: &Value, session: &ManagedSession) -> Result<String> {
     let agents = value
         .pointer("/result/agents")
+        .or_else(|| value.pointer("/result/panes"))
         .and_then(Value::as_array)
-        .ok_or_else(|| RallyError::Message("herdr agent list did not return agents".to_string()))?;
+        .ok_or_else(|| {
+            RallyError::Message("herdr agent list did not return agents or panes".to_string())
+        })?;
     for agent in agents {
         let matches = ["name", "pane_id", "terminal_id", "label"]
             .iter()
@@ -555,7 +608,10 @@ fn shell_words(words: &[String]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{InjectData, RunData, SessionActionData, SessionsData};
-    use super::{parse_cmux_start_target, parse_herdr_agents_tab, shell_words};
+    use super::{
+        herdr_command, parse_cmux_start_target, parse_herdr_agents_tab,
+        resolve_agent_pane_from_list, shell_words,
+    };
     use crate::check::CheckData;
     use crate::store::Fact;
     use crate::{EnterData, Envelope, NextData, RoomData, SayData};
@@ -634,6 +690,60 @@ mod tests {
         .to_string();
 
         assert_eq!(parse_herdr_agents_tab(&output), None);
+    }
+
+    #[test]
+    fn herdr_command_wraps_private_socket_for_ptyd_and_herdr_clients() {
+        let command = herdr_command(
+            "ptyd",
+            Some("/tmp/easy-terminal/herdr.sock"),
+            vec![
+                "ptyd".to_string(),
+                "agent".to_string(),
+                "start".to_string(),
+                "codex-01".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            command,
+            vec![
+                "env",
+                "PTYD_SOCKET_PATH=/tmp/easy-terminal/herdr.sock",
+                "HERDR_SOCKET_PATH=/tmp/easy-terminal/herdr.sock",
+                "ptyd",
+                "agent",
+                "start",
+                "codex-01",
+            ]
+        );
+    }
+
+    #[test]
+    fn ptyd_agent_list_shape_resolves_live_herdr_target() {
+        let session = super::ManagedSession {
+            session_id: "codex-01".to_string(),
+            name: "codex-01".to_string(),
+            agent: "codex".to_string(),
+            tool: "codex:01".to_string(),
+            backend: "herdr".to_string(),
+            cwd: std::path::PathBuf::from("/tmp/repo"),
+            target: "codex-01".to_string(),
+        };
+        let output = json!({
+            "result": {
+                "panes": [
+                    {
+                        "pane_id": "pane-abc",
+                        "terminal_id": "term-abc",
+                        "label": "codex-01"
+                    }
+                ]
+            }
+        });
+
+        let pane_id = resolve_agent_pane_from_list(&output, &session).unwrap();
+        assert_eq!(pane_id, "pane-abc");
     }
 
     #[test]
