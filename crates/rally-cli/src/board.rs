@@ -97,7 +97,10 @@ fn project_lanes(facts: &[Fact]) -> Vec<LaneItem> {
         let has_artifact = artifacts_per_claim.contains_key(&fact.event_id);
 
         // Is the artifact consumed/resolved?
-        let artifacts = artifacts_per_claim.get(&fact.event_id).cloned().unwrap_or_default();
+        let artifacts = artifacts_per_claim
+            .get(&fact.event_id)
+            .cloned()
+            .unwrap_or_default();
         let artifact_resolved = artifacts
             .iter()
             .any(|a_id| resolved_ids.contains(a_id) || artifact_consumed.contains(a_id));
@@ -138,8 +141,7 @@ fn project_backlog_view(
     items: &[BacklogItem],
     active_claim_scopes: &std::collections::BTreeSet<String>,
 ) -> BacklogView {
-    let all_ids: std::collections::BTreeSet<String> =
-        items.iter().map(|i| i.id.clone()).collect();
+    let all_ids: std::collections::BTreeSet<String> = items.iter().map(|i| i.id.clone()).collect();
     let done_ids = satisfied_ids(items);
 
     let mut open = Vec::new();
@@ -168,7 +170,11 @@ fn project_backlog_view(
         }
     }
 
-    BacklogView { open, dep_blocked, done }
+    BacklogView {
+        open,
+        dep_blocked,
+        done,
+    }
 }
 
 // ─── Delta ────────────────────────────────────────────────────────────────────
@@ -331,7 +337,10 @@ mod tests {
 
         let board = build_board(&room).unwrap();
         assert_eq!(board.lanes.len(), 1);
-        assert!(matches!(board.lanes[0].status, LaneStatus::LandedUnverified));
+        assert!(matches!(
+            board.lanes[0].status,
+            LaneStatus::LandedUnverified
+        ));
         std::fs::remove_dir_all(root).ok();
     }
 

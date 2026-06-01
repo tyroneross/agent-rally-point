@@ -302,8 +302,7 @@ pub(crate) fn build_next(
             // No owned path actively claimed by another tool
             item.owns.iter().all(|path| {
                 let normalized = crate::normalize_path(path.clone());
-                !claimed_scopes.contains(&normalized)
-                    && !claimed_scopes.contains(path)
+                !claimed_scopes.contains(&normalized) && !claimed_scopes.contains(path)
             })
         })
         .map(|item| SuggestedBacklogItem {

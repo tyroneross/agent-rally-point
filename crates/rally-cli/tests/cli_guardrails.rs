@@ -22,7 +22,11 @@ impl Workspace {
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
-        Self { cwd, home, global_index: false }
+        Self {
+            cwd,
+            home,
+            global_index: false,
+        }
     }
 
     /// Create a workspace sharing an existing home directory.
@@ -30,7 +34,11 @@ impl Workspace {
         let cwd = temp_path(&format!("{name}-cwd"));
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
-        Self { cwd, home, global_index: false }
+        Self {
+            cwd,
+            home,
+            global_index: false,
+        }
     }
 
     /// Enable RALLY_GLOBAL_INDEX=1 for all commands run through this workspace.
@@ -220,28 +228,52 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
     // --- Repo A ---
     // B17: global index is opt-in; set RALLY_GLOBAL_INDEX=1 so enter writes to
     // the cross-repo index and status --global can see both repos.
-    let repo_a = Workspace::new_with_home("rally-status-global-repo-a", home.clone())
-        .with_global_index();
+    let repo_a =
+        Workspace::new_with_home("rally-status-global-repo-a", home.clone()).with_global_index();
     // Enter as tool_a (first enter → lead)
     let enter_a = repo_a.json(&["enter", "--tool", "tool_a", "--json"]);
-    assert_eq!(enter_a["data"]["enter"]["tool"], "tool_a", "repo_a enter failed");
+    assert_eq!(
+        enter_a["data"]["enter"]["tool"], "tool_a",
+        "repo_a enter failed"
+    );
     // Add two open claims in repo_a
     repo_a.json(&[
-        "say", "claim", "--tool", "tool_a", "--subject", "work alpha-1", "--json",
+        "say",
+        "claim",
+        "--tool",
+        "tool_a",
+        "--subject",
+        "work alpha-1",
+        "--json",
     ]);
     repo_a.json(&[
-        "say", "claim", "--tool", "tool_a", "--subject", "work alpha-2", "--json",
+        "say",
+        "claim",
+        "--tool",
+        "tool_a",
+        "--subject",
+        "work alpha-2",
+        "--json",
     ]);
 
     // --- Repo B ---
-    let repo_b = Workspace::new_with_home("rally-status-global-repo-b", home.clone())
-        .with_global_index();
+    let repo_b =
+        Workspace::new_with_home("rally-status-global-repo-b", home.clone()).with_global_index();
     // Enter as tool_b (first enter → lead)
     let enter_b = repo_b.json(&["enter", "--tool", "tool_b", "--json"]);
-    assert_eq!(enter_b["data"]["enter"]["tool"], "tool_b", "repo_b enter failed");
+    assert_eq!(
+        enter_b["data"]["enter"]["tool"], "tool_b",
+        "repo_b enter failed"
+    );
     // Add one open claim in repo_b
     repo_b.json(&[
-        "say", "claim", "--tool", "tool_b", "--subject", "work beta-1", "--json",
+        "say",
+        "claim",
+        "--tool",
+        "tool_b",
+        "--subject",
+        "work beta-1",
+        "--json",
     ]);
 
     // Snapshot fact counts before reading status.
@@ -255,8 +287,14 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
         .as_array()
         .map(Vec::len)
         .unwrap_or(0);
-    assert_eq!(claims_a_before, 2, "repo_a should have 2 open claims before status");
-    assert_eq!(claims_b_before, 1, "repo_b should have 1 open claim before status");
+    assert_eq!(
+        claims_a_before, 2,
+        "repo_a should have 2 open claims before status"
+    );
+    assert_eq!(
+        claims_b_before, 1,
+        "repo_b should have 1 open claim before status"
+    );
 
     // Run `rally status --global --json` from repo_a's cwd.
     let status = repo_a.json(&["status", "--global", "--json"]);
@@ -293,9 +331,7 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
                 .map(|p| p == repo_a_canonical)
                 .unwrap_or(false)
         })
-        .unwrap_or_else(|| {
-            panic!("repo_a ({repo_a_canonical}) not found in status: {repos:#?}")
-        });
+        .unwrap_or_else(|| panic!("repo_a ({repo_a_canonical}) not found in status: {repos:#?}"));
 
     let entry_b = repos
         .iter()
@@ -305,9 +341,7 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
                 .map(|p| p == repo_b_canonical)
                 .unwrap_or(false)
         })
-        .unwrap_or_else(|| {
-            panic!("repo_b ({repo_b_canonical}) not found in status: {repos:#?}")
-        });
+        .unwrap_or_else(|| panic!("repo_b ({repo_b_canonical}) not found in status: {repos:#?}"));
 
     // repo_a: lead=tool_a, open_claims=2
     assert_eq!(

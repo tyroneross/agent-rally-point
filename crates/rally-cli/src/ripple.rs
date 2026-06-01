@@ -32,7 +32,9 @@ pub(crate) fn extract_pub_fn_names(path: &Path) -> Vec<String> {
         let after_pub = if let Some(rest) = trimmed.strip_prefix("pub(") {
             // pub(…) fn: skip to `fn`
             rest.find(") fn ").map(|pos| &rest[pos + 5..])
-        } else { trimmed.strip_prefix("pub fn ") };
+        } else {
+            trimmed.strip_prefix("pub fn ")
+        };
 
         if let Some(rest) = after_pub {
             // fn name ends at `(` or `<`
@@ -282,12 +284,36 @@ let x = beta(1, 2);
         let changed_files = vec!["src/lib.rs".to_string()];
         let alerts = build_ripple_alerts(&changed_files, &dir, "my-tool", &snapshot);
 
-        assert_eq!(alerts.len(), 1, "one ripple-alert expected; got {}", alerts.len());
+        assert_eq!(
+            alerts.len(),
+            1,
+            "one ripple-alert expected; got {}",
+            alerts.len()
+        );
         let alert = &alerts[0];
-        assert!(alert.subject.contains("ripple-alert"), "subject: {}", alert.subject);
-        assert!(alert.subject.contains("peer-tool"), "subject: {}", alert.subject);
-        assert!(alert.evidence.iter().any(|e| e.contains("my_func")), "evidence: {:?}", alert.evidence);
-        assert!(alert.evidence.iter().any(|e| e == "affected_tool:peer-tool"), "evidence: {:?}", alert.evidence);
+        assert!(
+            alert.subject.contains("ripple-alert"),
+            "subject: {}",
+            alert.subject
+        );
+        assert!(
+            alert.subject.contains("peer-tool"),
+            "subject: {}",
+            alert.subject
+        );
+        assert!(
+            alert.evidence.iter().any(|e| e.contains("my_func")),
+            "evidence: {:?}",
+            alert.evidence
+        );
+        assert!(
+            alert
+                .evidence
+                .iter()
+                .any(|e| e == "affected_tool:peer-tool"),
+            "evidence: {:?}",
+            alert.evidence
+        );
         assert_eq!(alert.severity.as_deref(), Some("warn"));
 
         fs::remove_dir_all(&dir).ok();
@@ -335,7 +361,10 @@ let x = beta(1, 2);
 
         let changed_files = vec!["src/lib.rs".to_string()];
         let alerts = build_ripple_alerts(&changed_files, &dir, "my-tool", &snapshot);
-        assert!(alerts.is_empty(), "no alert expected when peer does not reference changed symbol");
+        assert!(
+            alerts.is_empty(),
+            "no alert expected when peer does not reference changed symbol"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

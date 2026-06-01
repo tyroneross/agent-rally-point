@@ -783,9 +783,29 @@ fn say_parser() -> impl Parser<SayArgs> {
     let ref_standby = optional_string_arg("ref-standby", "EVENT_ID");
     let kind = positional::<String>("KIND").parse(parse_fact_kind);
     construct!(
-        json, tool, subject, thread_id, role, summary, scopes, resources, paths, evidence, target,
-        ref_id, status, severity, uri, produces, depends,
-        run_id, step_id, parent_step_id, reason, wake_after, ref_standby,
+        json,
+        tool,
+        subject,
+        thread_id,
+        role,
+        summary,
+        scopes,
+        resources,
+        paths,
+        evidence,
+        target,
+        ref_id,
+        status,
+        severity,
+        uri,
+        produces,
+        depends,
+        run_id,
+        step_id,
+        parent_step_id,
+        reason,
+        wake_after,
+        ref_standby,
         kind
     )
     .map(
@@ -933,7 +953,18 @@ fn check_parser() -> impl Parser<CheckArgs> {
     let phase = positional::<String>("PHASE")
         .optional()
         .map(|phase| phase.unwrap_or_else(|| "before-write".to_string()));
-    construct!(json, tool, path, strict, role, proposed_tier, enforce, changed, phase).map(
+    construct!(
+        json,
+        tool,
+        path,
+        strict,
+        role,
+        proposed_tier,
+        enforce,
+        changed,
+        phase
+    )
+    .map(
         |(json, tool, path, strict, role, proposed_tier, enforce, changed, phase)| CheckArgs {
             json,
             phase,
@@ -1051,9 +1082,7 @@ fn watch_parser() -> impl Parser<WatchArgs> {
             if v > 0 {
                 Ok(v as u64)
             } else {
-                Err(RallyError::Usage(
-                    "--max-interval must be > 0".to_string(),
-                ))
+                Err(RallyError::Usage("--max-interval must be > 0".to_string()))
             }
         })
         .fallback(300u64);
@@ -1061,9 +1090,8 @@ fn watch_parser() -> impl Parser<WatchArgs> {
     let once = long("once").switch();
     let duration_hours = string_arg("duration-hours", "HOURS")
         .parse(|v| {
-            v.parse::<f64>().map_err(|_| {
-                RallyError::Usage(format!("invalid --duration-hours value {v}"))
-            })
+            v.parse::<f64>()
+                .map_err(|_| RallyError::Usage(format!("invalid --duration-hours value {v}")))
         })
         .optional();
     let json = json_flag();
@@ -1277,7 +1305,11 @@ fn lead_parser() -> impl Parser<LeadArgs> {
     let h_tool = string_arg("tool", "TOOL");
     let h_to = string_arg("to", "TOOL");
     let handoff = construct!(h_tool, h_to)
-        .map(|(tool, to)| LeadTargetArgs { tool, to, user_designated: false })
+        .map(|(tool, to)| LeadTargetArgs {
+            tool,
+            to,
+            user_designated: false,
+        })
         .to_options()
         .descr("Hand the lead title to another (frontier) agent.")
         .command("handoff")
@@ -1288,7 +1320,11 @@ fn lead_parser() -> impl Parser<LeadArgs> {
         .help("Mark as user-designated (supersedes a first-join lead).")
         .switch();
     let assign = construct!(a_tool, a_to, a_ud)
-        .map(|(tool, to, user_designated)| LeadTargetArgs { tool, to, user_designated })
+        .map(|(tool, to, user_designated)| LeadTargetArgs {
+            tool,
+            to,
+            user_designated,
+        })
         .to_options()
         .descr("Assign the lead (user-designated supersedes first-join).")
         .command("assign")
@@ -1313,8 +1349,8 @@ fn board_parser() -> impl Parser<BoardArgs> {
 fn route_findings_parser() -> impl Parser<RouteFindingsArgs> {
     let json = json_flag();
     let file = string_arg("file", "PATH");
-    let tool = optional_string_arg("tool", "TOOL")
-        .map(|v| v.unwrap_or_else(|| "unknown".to_string()));
+    let tool =
+        optional_string_arg("tool", "TOOL").map(|v| v.unwrap_or_else(|| "unknown".to_string()));
     let verified = long("verified")
         .help("Affirm that FP-adjudication has already happened (required)")
         .switch();

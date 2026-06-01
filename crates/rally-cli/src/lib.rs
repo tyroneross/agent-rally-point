@@ -58,10 +58,10 @@ mod init;
 mod next;
 mod output;
 mod retrospective;
+mod ripple;
 mod rotate;
 mod route_findings;
 mod source_grounding;
-mod ripple;
 mod store;
 mod tier_fit;
 mod worktree_guard;
@@ -392,8 +392,13 @@ fn command_retrospective(args: RetrospectiveArgs) -> Result<Output> {
         outcome.output_path, outcome.action, outcome.total_facts, outcome.total_engagements,
     );
     // Wrap under `data.retrospective` to satisfy the envelope contract.
-    let inner = serde_json::to_value(&outcome).map_err(RallyError::json("retrospective outcome"))?;
-    let body = envelope_value("retrospective", SCHEMA_RETROSPECTIVE, json!({ "retrospective": inner }))?;
+    let inner =
+        serde_json::to_value(&outcome).map_err(RallyError::json("retrospective outcome"))?;
+    let body = envelope_value(
+        "retrospective",
+        SCHEMA_RETROSPECTIVE,
+        json!({ "retrospective": inner }),
+    )?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -709,11 +714,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
             acknowledgment,
         },
     )?;
-    let text = format!(
-        "entered room tool={} attention={}",
-        tool,
-        attention_count,
-    );
+    let text = format!("entered room tool={} attention={}", tool, attention_count,);
     Ok(Output::new(args.json, text, body))
 }
 
@@ -778,7 +779,9 @@ fn command_say(args: SayArgs) -> Result<Output> {
             // Collect file: scope entries only (exclude external-intake).
             let file_scopes: Vec<String> = scope
                 .iter()
-                .filter(|s| s.starts_with("file:") && !scope.contains(&"external-intake".to_string()))
+                .filter(|s| {
+                    s.starts_with("file:") && !scope.contains(&"external-intake".to_string())
+                })
                 .cloned()
                 .collect();
             if !file_scopes.is_empty() {
@@ -790,9 +793,13 @@ fn command_say(args: SayArgs) -> Result<Output> {
 
     // #6 source-grounding (artifact): look up claim-open hashes from the ref'd claim fact.
     let grounding_claim_evidence: Vec<String> = if kind == FactKind::Artifact {
-        args.ref_id.as_ref()
+        args.ref_id
+            .as_ref()
             .and_then(|ref_id| {
-                room.facts().ok()?.into_iter().find(|f| f.event_id == *ref_id)
+                room.facts()
+                    .ok()?
+                    .into_iter()
+                    .find(|f| f.event_id == *ref_id)
             })
             .map(|f| f.evidence)
             .unwrap_or_default()
@@ -824,7 +831,11 @@ fn command_say(args: SayArgs) -> Result<Output> {
         if let Some(explicit) = args.summary {
             parts.insert(0, explicit);
         }
-        if parts.is_empty() { None } else { Some(parts.join(" ")) }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        }
     } else {
         args.summary
     };
@@ -857,9 +868,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
     // All other mutating facts go through append_fact_verified (segment readback
     // only — no projection assertion needed).
     let fact = match kind {
-        FactKind::Release | FactKind::Resolve => {
-            room.append_state_transition_verified(&fact)?
-        }
+        FactKind::Release | FactKind::Resolve => room.append_state_transition_verified(&fact)?,
         _ => room.append_fact_verified(&fact)?,
     };
 
@@ -955,7 +964,13 @@ fn command_say(args: SayArgs) -> Result<Output> {
             verified,
         },
     )?;
-    let text = format!("said {} {} room={} seq={}", fact.kind.as_str(), fact.event_id, room.room_id(), fact.seq);
+    let text = format!(
+        "said {} {} room={} seq={}",
+        fact.kind.as_str(),
+        fact.event_id,
+        room.room_id(),
+        fact.seq
+    );
     Ok(Output::new(args.json, text, body))
 }
 
@@ -1007,7 +1022,14 @@ fn command_next(args: NextArgs) -> Result<Output> {
     let snapshot = room.snapshot()?;
     // #7: always read the backlog store and surface ready items in next output.
     let backlog_items = list_backlog_items(&room).unwrap_or_default();
-    let next = build_next(&snapshot, &tool, role.as_deref(), &paths, limit, backlog_items);
+    let next = build_next(
+        &snapshot,
+        &tool,
+        role.as_deref(),
+        &paths,
+        limit,
+        backlog_items,
+    );
     let action = next.action;
     let target_event_id = next
         .target_event_id
@@ -1095,7 +1117,13 @@ fn command_migrate_legacy(args: MigrateLegacyArgs) -> Result<Output> {
         data.facts_migrated,
         data.facts_skipped_existing,
     );
-    let body = envelope("migrate-legacy", SCHEMA_MIGRATE_LEGACY, MigrateLegacyEnvelope { migrate_legacy: data })?;
+    let body = envelope(
+        "migrate-legacy",
+        SCHEMA_MIGRATE_LEGACY,
+        MigrateLegacyEnvelope {
+            migrate_legacy: data,
+        },
+    )?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -1150,7 +1178,9 @@ fn command_check_ci(args: CheckCiArgs) -> Result<Output> {
     let body = envelope(
         "check-ci",
         SCHEMA_CHECK_CI,
-        CheckCiEnvelope { check_ci: outcome.data.check_ci },
+        CheckCiEnvelope {
+            check_ci: outcome.data.check_ci,
+        },
     )?;
     let text = format!(
         "check-ci pass={pass} offenders={offenders} mode={}",
@@ -1180,10 +1210,18 @@ fn command_version(args: VersionArgs) -> Result<Output> {
 /// (room identifier), worktree (active checkout dir), build_id (embedded
 /// RALLY_BUILD_ID), and cwd. Read-only — no facts are written.
 fn command_whoami(args: WhoamiArgs) -> Result<Output> {
-    let repo_root = repo_root().map(|p| p.display().to_string()).unwrap_or_else(|_| "<unknown>".to_string());
-    let worktree = worktree_root().map(|p| p.display().to_string()).unwrap_or_else(|_| "<unknown>".to_string());
-    let branch = worktree_root().ok().and_then(|wt| worktree_guard::current_branch(&wt));
-    let cwd = env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "<unknown>".to_string());
+    let repo_root = repo_root()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let worktree = worktree_root()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let branch = worktree_root()
+        .ok()
+        .and_then(|wt| worktree_guard::current_branch(&wt));
+    let cwd = env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
     // Best-effort: whoami stays a diagnostic that never hard-fails.
     let room = RoomStore::open().ok();
     let repo_id = room
@@ -1388,9 +1426,7 @@ fn watch_run_on_activity(
 fn watch_print_launchd(args: &WatchArgs, exe: &Path, repo: &Path) {
     let label = format!(
         "com.agent-rally-point.watch.{}",
-        repo.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("repo")
+        repo.file_name().and_then(|n| n.to_str()).unwrap_or("repo")
     );
     let exe_str = exe.to_string_lossy();
     let repo_str = repo.to_string_lossy();
@@ -1401,7 +1437,10 @@ fn watch_print_launchd(args: &WatchArgs, exe: &Path, repo: &Path) {
         program_args.push(format!("  <string>{interval}</string>"));
     }
     if let Some(ref cmd) = args.on_activity {
-        let escaped = cmd.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let escaped = cmd
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
         program_args.push("  <string>--on-activity</string>".to_string());
         program_args.push(format!("  <string>{escaped}</string>"));
     }
@@ -1457,9 +1496,7 @@ fn watch_print_systemd(args: &WatchArgs, exe: &Path, repo: &Path) {
     }
     let unit_name = format!(
         "rally-watch-{}",
-        repo.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("repo")
+        repo.file_name().and_then(|n| n.to_str()).unwrap_or("repo")
     );
     println!(
         r#"[Unit]
@@ -1512,17 +1549,13 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
             // Persist updated cursor even when unchanged (ensures cursor tracks reality).
             watch_write_once_cursor(&rally_dir, current_seq);
         }
-        return Ok(Output::new(
-            false,
-            String::new(),
-            serde_json::json!({}),
-        ));
+        return Ok(Output::new(false, String::new(), serde_json::json!({})));
     }
 
     // Long-running loop mode.
-    let deadline: Option<std::time::Instant> = args.duration_hours.map(|h| {
-        std::time::Instant::now() + Duration::from_secs_f64(h * 3600.0)
-    });
+    let deadline: Option<std::time::Instant> = args
+        .duration_hours
+        .map(|h| std::time::Instant::now() + Duration::from_secs_f64(h * 3600.0));
 
     // Start cursor at the current max_seq so we react only to NEW activity.
     let mut last_seq = watch_read_max_seq(&log_dir);
@@ -1546,13 +1579,7 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
 
         if new_seq > last_seq {
             // Activity detected.
-            watch_emit_activity(
-                args.json,
-                last_seq,
-                new_seq,
-                &room_id,
-                args.tool.as_deref(),
-            );
+            watch_emit_activity(args.json, last_seq, new_seq, &room_id, args.tool.as_deref());
             // Run --on-activity command if set (one in-flight; blocks here).
             if let Some(ref cmd) = args.on_activity {
                 watch_run_on_activity(
@@ -1570,12 +1597,7 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
         } else {
             // Idle: emit heartbeat under --json, then back off.
             if args.json {
-                watch_emit_heartbeat(
-                    &room_id,
-                    args.tool.as_deref(),
-                    last_seq,
-                    current_interval,
-                );
+                watch_emit_heartbeat(&room_id, args.tool.as_deref(), last_seq, current_interval);
             }
             // Adaptive back-off: multiply by 1.5, cap at max_interval.
             let next = ((current_interval as f64) * 1.5) as u64;
@@ -1605,9 +1627,10 @@ pub(crate) fn coordination_offenders(
         .iter()
         .filter(|c| c.tool.as_deref() == Some(tool))
         .flat_map(|c| {
-            c.scope
-                .iter()
-                .filter_map(|sc| sc.strip_prefix("file:").map(|p| normalize_path(p.to_string())))
+            c.scope.iter().filter_map(|sc| {
+                sc.strip_prefix("file:")
+                    .map(|p| normalize_path(p.to_string()))
+            })
         })
         .collect();
     let covers = |path: &str| -> bool {
@@ -1659,11 +1682,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
         }
         let room = RoomStore::open()?;
         let snapshot = room.snapshot()?;
-        let result = tier_fit::check_tier_fit(
-            &role,
-            args.proposed_tier.as_deref(),
-            &snapshot,
-        );
+        let result = tier_fit::check_tier_fit(&role, args.proposed_tier.as_deref(), &snapshot);
         let finding_count = if result.finding.is_some() { 1 } else { 0 };
         let text = format!(
             "check tier-fit status={} role={} findings={finding_count}",
@@ -1701,7 +1720,10 @@ fn command_check(args: CheckArgs) -> Result<Output> {
     if phase == "liveness" {
         let room = RoomStore::open()?;
         let snapshot = room.snapshot()?;
-        let actor = args.tool.clone().unwrap_or_else(|| "rally:liveness".to_string());
+        let actor = args
+            .tool
+            .clone()
+            .unwrap_or_else(|| "rally:liveness".to_string());
 
         #[derive(schemars::JsonSchema, serde::Serialize)]
         struct ConflictedSquad {
@@ -1759,7 +1781,10 @@ fn command_check(args: CheckArgs) -> Result<Output> {
                 }
                 let alert = build_risk_fact(
                     &actor,
-                    format!("conflicted-out: {} (unacknowledged + idle, holding claims)", sq_tool),
+                    format!(
+                        "conflicted-out: {} (unacknowledged + idle, holding claims)",
+                        sq_tool
+                    ),
                     format!(
                         "{} grabbed paths but never acked the coordination context and went idle; claims released, alerting lead/user. Not blocked from editing.",
                         sq_tool
@@ -2271,10 +2296,16 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     let timeout = args.timeout_seconds as u64;
 
     // Open the room once for all appends in this command.
-    let room = if !dry_run { Some(RoomStore::open()?) } else { None };
+    let room = if !dry_run {
+        Some(RoomStore::open()?)
+    } else {
+        None
+    };
 
     let ack_after_seq = if require_ack && !dry_run {
-        room.as_ref().map(|r| r.snapshot().map(|s| s.max_seq)).transpose()?
+        room.as_ref()
+            .map(|r| r.snapshot().map(|s| s.max_seq))
+            .transpose()?
     } else {
         None
     };
@@ -2350,13 +2381,13 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     let body = envelope(
         "inject",
         SCHEMA_INJECT,
-        InjectEnvelope { inject: inject_payload },
+        InjectEnvelope {
+            inject: inject_payload,
+        },
     )?;
     let text = format!(
         "inject session={} delivered={} ack={}",
-        session.session_id,
-        delivered,
-        has_ack,
+        session.session_id, delivered, has_ack,
     );
     Ok(Output::new(args.json, text, body))
 }
@@ -2893,10 +2924,7 @@ mod tests {
 
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let snapshot_before = room.snapshot().unwrap();
-        assert!(
-            snapshot_before.squads.is_empty(),
-            "room starts empty"
-        );
+        assert!(snapshot_before.squads.is_empty(), "room starts empty");
 
         // Call ensure_presence directly (mimics what command_say would do).
         ensure_presence(&room, "tool-x").unwrap();
@@ -2982,10 +3010,12 @@ mod tests {
     fn host_runtime_ambiguity_detection() {
         // SL-1: >1 resolvable herdr socket => ambiguous (agents must not guess).
         let base = unique_root("herdr-sockets");
-        let a = base.join("a"); let b = base.join("b");
+        let a = base.join("a");
+        let b = base.join("b");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
-        let sa = a.join("herdr.sock"); let sb = b.join("herdr.sock");
+        let sa = a.join("herdr.sock");
+        let sb = b.join("herdr.sock");
         std::fs::write(&sa, b"").unwrap();
         let one = existing_unique_paths(&[
             sa.to_string_lossy().to_string(),
@@ -3013,7 +3043,11 @@ mod tests {
             event_id: new_id("fact"),
             seq: 0,
             thread_id: new_id("room"),
-            kind: if subject == "coordination:ack" { FactKind::Decision } else { FactKind::Claim },
+            kind: if subject == "coordination:ack" {
+                FactKind::Decision
+            } else {
+                FactKind::Claim
+            },
             tool: Some("opus-1".to_string()),
             role: None,
             subject: subject.to_string(),
@@ -3028,13 +3062,22 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact(&mk("coordination:ack", Vec::new())).unwrap();
-        room.append_fact(&mk("own a", vec!["file:src/a.rs".to_string()])).unwrap();
+        room.append_fact(&mk("coordination:ack", Vec::new()))
+            .unwrap();
+        room.append_fact(&mk("own a", vec!["file:src/a.rs".to_string()]))
+            .unwrap();
         let snap = room.snapshot().unwrap();
         let (p, a, unc) = coordination_offenders(&snap, "opus-1", &["src/a.rs".to_string()]);
-        assert!(p && a && unc.is_empty(), "acked + claimed file passes the gate");
+        assert!(
+            p && a && unc.is_empty(),
+            "acked + claimed file passes the gate"
+        );
         let (_, _, unc2) = coordination_offenders(&snap, "opus-1", &["src/b.rs".to_string()]);
-        assert_eq!(unc2, vec!["src/b.rs".to_string()], "unclaimed changed file is uncovered");
+        assert_eq!(
+            unc2,
+            vec!["src/b.rs".to_string()],
+            "unclaimed changed file is uncovered"
+        );
         let (p3, a3, _) = coordination_offenders(&snap, "ghost", &["src/a.rs".to_string()]);
         assert!(!p3 && !a3, "unknown tool has no presence/ack");
     }
@@ -3067,14 +3110,25 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact(&mk(FactKind::Presence, "agent presence: ghost-1", Vec::new())).unwrap();
-        room.append_fact(&mk(FactKind::Claim, "claim x", vec!["file:x.rs".to_string()])).unwrap();
+        room.append_fact(&mk(
+            FactKind::Presence,
+            "agent presence: ghost-1",
+            Vec::new(),
+        ))
+        .unwrap();
+        room.append_fact(&mk(
+            FactKind::Claim,
+            "claim x",
+            vec!["file:x.rs".to_string()],
+        ))
+        .unwrap();
         let conflicted = liveness_conflicted(&room.snapshot().unwrap());
         assert_eq!(conflicted.len(), 1, "unacked+idle+claim must be conflicted");
         assert_eq!(conflicted[0].0, "ghost-1");
         assert_eq!(conflicted[0].1.len(), 1, "one held claim");
         // ack (kept old-dated so it stays idle) clears the conflict via acknowledged.
-        room.append_fact(&mk(FactKind::Decision, "coordination:ack", Vec::new())).unwrap();
+        room.append_fact(&mk(FactKind::Decision, "coordination:ack", Vec::new()))
+            .unwrap();
         assert!(
             liveness_conflicted(&room.snapshot().unwrap()).is_empty(),
             "ack must clear conflict-out eligibility"
@@ -3119,7 +3173,10 @@ mod tests {
             session: None,
         };
         room.append_fact_verified(&ack).unwrap();
-        assert!(acked(&room), "squad must be acknowledged after coordination:ack");
+        assert!(
+            acked(&room),
+            "squad must be acknowledged after coordination:ack"
+        );
     }
 
     #[test]
@@ -3184,8 +3241,14 @@ mod tests {
         ensure_presence(&room, "tool-y").unwrap();
 
         let snapshot = room.snapshot().unwrap();
-        assert!(snapshot.squads.iter().any(|s| s.tool == "tool-x"), "tool-x in squads");
-        assert!(snapshot.squads.iter().any(|s| s.tool == "tool-y"), "tool-y in squads");
+        assert!(
+            snapshot.squads.iter().any(|s| s.tool == "tool-x"),
+            "tool-x in squads"
+        );
+        assert!(
+            snapshot.squads.iter().any(|s| s.tool == "tool-y"),
+            "tool-y in squads"
+        );
         assert_eq!(
             snapshot.lead.as_deref(),
             Some("tool-x"),
@@ -3441,9 +3504,8 @@ mod tests {
             tool: "lead".to_string(),
         };
         // Must succeed — different name, same tool is now allowed.
-        ensure_unique_session_identity(&identity_b, &active).expect(
-            "two distinct-name sessions under the same tool must both be accepted",
-        );
+        ensure_unique_session_identity(&identity_b, &active)
+            .expect("two distinct-name sessions under the same tool must both be accepted");
     }
 
     /// Fix 2b: a true duplicate (same tool + same name) must still be rejected.
@@ -3672,7 +3734,7 @@ mod tests {
                 kind: store::FactKind::Risk,
                 tool: Some("tool-a".to_string()),
                 role: None,
-                subject: format!("duplicate-active-squad-id: tool-a"),
+                subject: "duplicate-active-squad-id: tool-a".to_string(),
                 scope: Vec::new(),
                 created_at: now_string(),
                 summary: Some(format!(
@@ -3754,7 +3816,10 @@ mod tests {
         room.set_cursor("tool-a", cursor_after_1).unwrap();
 
         // First enter: cursor advances from 0 to wherever ensure_presence left off.
-        assert!(cursor_after_1 >= cursor_before_1, "first enter cursor must be >= 0");
+        assert!(
+            cursor_after_1 >= cursor_before_1,
+            "first enter cursor must be >= 0"
+        );
 
         // --- No other activity between the two enters ---
 
@@ -3863,14 +3928,14 @@ mod tests {
         // production, but its Fact shape is identical; we use append_fact here
         // so the test stays focused on the serialisation round-trip.
         let kinds: &[(&str, store::FactKind)] = &[
-            ("claim",    store::FactKind::Claim),
-            ("release",  store::FactKind::Release),
+            ("claim", store::FactKind::Claim),
+            ("release", store::FactKind::Release),
             ("artifact", store::FactKind::Artifact),
-            ("handoff",  store::FactKind::Handoff),
+            ("handoff", store::FactKind::Handoff),
             ("decision", store::FactKind::Decision),
-            ("risk",     store::FactKind::Risk),
-            ("blocker",  store::FactKind::Blocker),
-            ("resolve",  store::FactKind::Resolve),
+            ("risk", store::FactKind::Risk),
+            ("blocker", store::FactKind::Blocker),
+            ("resolve", store::FactKind::Resolve),
             ("presence", store::FactKind::Presence),
         ];
 
@@ -3916,25 +3981,34 @@ mod tests {
             let found = all_facts
                 .iter()
                 .find(|f| f.event_id == w.event_id)
-                .unwrap_or_else(|| panic!(
-                    "fact {} (kind={}) not found after reload",
-                    w.event_id, w.kind.as_str()
-                ));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "fact {} (kind={}) not found after reload",
+                        w.event_id,
+                        w.kind.as_str()
+                    )
+                });
             assert_eq!(
-                found.kind.as_str(), w.kind.as_str(),
-                "kind mismatch for {} after reload", w.event_id
+                found.kind.as_str(),
+                w.kind.as_str(),
+                "kind mismatch for {} after reload",
+                w.event_id
             );
             assert_eq!(
-                found.tool.as_deref(), Some(tool),
-                "tool mismatch for {} after reload", w.event_id
+                found.tool.as_deref(),
+                Some(tool),
+                "tool mismatch for {} after reload",
+                w.event_id
             );
             assert_eq!(
                 found.subject, w.subject,
-                "subject mismatch for {} after reload", w.event_id
+                "subject mismatch for {} after reload",
+                w.event_id
             );
             assert_eq!(
                 found.seq, w.seq,
-                "seq mismatch for {} after reload", w.event_id
+                "seq mismatch for {} after reload",
+                w.event_id
             );
         }
 
@@ -4023,23 +4097,35 @@ mod tests {
 
         // Cursor starts at 0 (no watch-cursor.json yet).
         let cursor_before = watch_read_once_cursor(&rally_dir);
-        assert_eq!(cursor_before, 0, "cursor must start at 0 before first --once call");
+        assert_eq!(
+            cursor_before, 0,
+            "cursor must start at 0 before first --once call"
+        );
 
         // First --once: max_seq > 0, so activity should be detected.
         let current_seq = watch_read_max_seq(&log_dir);
         assert!(current_seq > 0, "max_seq must be > 0 after posting a fact");
         let activity_detected = current_seq > cursor_before;
-        assert!(activity_detected, "first --once must detect activity (seq advanced from 0)");
+        assert!(
+            activity_detected,
+            "first --once must detect activity (seq advanced from 0)"
+        );
 
         // Simulate what command_watch --once does: persist cursor.
         watch_write_once_cursor(&rally_dir, current_seq);
 
         // Second --once: cursor now equals current_seq → no activity.
         let cursor_after = watch_read_once_cursor(&rally_dir);
-        assert_eq!(cursor_after, current_seq, "cursor must be persisted after first call");
+        assert_eq!(
+            cursor_after, current_seq,
+            "cursor must be persisted after first call"
+        );
         let new_seq = watch_read_max_seq(&log_dir);
         let activity_second = new_seq > cursor_after;
-        assert!(!activity_second, "second --once must not detect activity when no new fact posted");
+        assert!(
+            !activity_second,
+            "second --once must not detect activity when no new fact posted"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -4090,9 +4176,14 @@ mod tests {
         // Verify the output file contains the correct TO_SEQ value.
         let written = std::fs::read_to_string(&out_file)
             .expect("--on-activity command must have written RALLY_TO_SEQ to the file");
-        let parsed: i64 = written.trim().parse()
+        let parsed: i64 = written
+            .trim()
+            .parse()
             .expect("file content must be a valid i64");
-        assert_eq!(parsed, to_seq, "RALLY_TO_SEQ in child env must equal the detected to_seq");
+        assert_eq!(
+            parsed, to_seq,
+            "RALLY_TO_SEQ in child env must equal the detected to_seq"
+        );
 
         std::fs::remove_file(&out_file).ok();
         std::fs::remove_dir_all(&root).ok();
@@ -4131,8 +4222,7 @@ mod tests {
 
         // Verify the rendered plist text using the actual function.
         // Redirect stdout to a file via a child `sh -c` that uses the compiled binary.
-        let out_path = std::env::temp_dir()
-            .join(format!("rally-launchd-{}.plist", short_id()));
+        let out_path = std::env::temp_dir().join(format!("rally-launchd-{}.plist", short_id()));
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rally"));
         // Run the watch --print-launchd subcommand inside the temp git root.
         let status = std::process::Command::new("sh")
@@ -4311,7 +4401,10 @@ mod tests {
             role: None,
             subject: "external claim".to_string(),
             // Marker added by command_say for external-intake.
-            scope: vec!["file:/some/other-repo/x.rs".to_string(), "external-intake".to_string()],
+            scope: vec![
+                "file:/some/other-repo/x.rs".to_string(),
+                "external-intake".to_string(),
+            ],
             created_at: now_string(),
             summary: None,
             evidence: Vec::new(),
@@ -4388,7 +4481,10 @@ mod tests {
             tool: Some("b18e-tool".to_string()),
             role: None,
             subject: "external handoff".to_string(),
-            scope: vec!["file:/other/repo/x.rs".to_string(), "external-intake".to_string()],
+            scope: vec![
+                "file:/other/repo/x.rs".to_string(),
+                "external-intake".to_string(),
+            ],
             created_at: now_string(),
             summary: None,
             evidence: Vec::new(),
@@ -4429,7 +4525,10 @@ mod tests {
             tool: Some("b18f-tool".to_string()),
             role: None,
             subject: "external artifact".to_string(),
-            scope: vec!["file:/other/repo/out.json".to_string(), "external-intake".to_string()],
+            scope: vec![
+                "file:/other/repo/out.json".to_string(),
+                "external-intake".to_string(),
+            ],
             created_at: now_string(),
             summary: None,
             evidence: Vec::new(),
@@ -4472,7 +4571,10 @@ mod tests {
             tool: Some("b18g-tool".to_string()),
             role: None,
             subject: "b18g external claim".to_string(),
-            scope: vec!["file:/some/other/x.rs".to_string(), "external-intake".to_string()],
+            scope: vec![
+                "file:/some/other/x.rs".to_string(),
+                "external-intake".to_string(),
+            ],
             created_at: now_string(),
             summary: None,
             evidence: Vec::new(),
@@ -4517,7 +4619,11 @@ mod tests {
         assert!(
             risk_in_current,
             "external-intake risk fact must appear in current_risks; got: {:?}",
-            snapshot.current_risks.iter().map(|f| &f.subject).collect::<Vec<_>>()
+            snapshot
+                .current_risks
+                .iter()
+                .map(|f| &f.subject)
+                .collect::<Vec<_>>()
         );
 
         // The external claim must NOT appear in active_claims.
@@ -4594,10 +4700,19 @@ mod tests {
         // No suffix collisions (only one claim).
         let has_collision = claim_scopes.len() >= 2
             && paths_suffix_collide(
-                claim_scopes[0].1.strip_prefix("file:").unwrap_or(&claim_scopes[0].1),
-                claim_scopes[1].1.strip_prefix("file:").unwrap_or(&claim_scopes[1].1),
+                claim_scopes[0]
+                    .1
+                    .strip_prefix("file:")
+                    .unwrap_or(&claim_scopes[0].1),
+                claim_scopes[1]
+                    .1
+                    .strip_prefix("file:")
+                    .unwrap_or(&claim_scopes[1].1),
             );
-        assert!(!has_collision, "single claim must produce no suffix collision");
+        assert!(
+            !has_collision,
+            "single claim must produce no suffix collision"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -4821,7 +4936,11 @@ mod tests {
                 }
             ]
         });
-        fs::write(&index_path, serde_json::to_string_pretty(&index_content).unwrap()).unwrap();
+        fs::write(
+            &index_path,
+            serde_json::to_string_pretty(&index_content).unwrap(),
+        )
+        .unwrap();
 
         // Exercise the internal prune helpers from doctor.rs.
         // We call the module's internal prune logic via its pub(crate) API
@@ -4914,7 +5033,11 @@ mod tests {
                 "last_seen_at": "2026-05-30T00:00:00Z"
             }
         ]));
-        fs::write(&index_path, serde_json::to_string_pretty(&initial_index).unwrap()).unwrap();
+        fs::write(
+            &index_path,
+            serde_json::to_string_pretty(&initial_index).unwrap(),
+        )
+        .unwrap();
 
         // Simulate --apply: rewrite the index keeping only live entries.
         let index_text = fs::read_to_string(&index_path).unwrap();
@@ -4984,9 +5107,19 @@ mod tests {
             "BUILD_ID must contain '+' separating version and hash; got: {BUILD_ID}"
         );
         let parts: Vec<&str> = BUILD_ID.splitn(2, '+').collect();
-        assert_eq!(parts.len(), 2, "BUILD_ID must have exactly one '+' separator");
-        assert!(!parts[0].is_empty(), "version part of BUILD_ID must not be empty");
-        assert!(!parts[1].is_empty(), "hash part of BUILD_ID must not be empty");
+        assert_eq!(
+            parts.len(),
+            2,
+            "BUILD_ID must have exactly one '+' separator"
+        );
+        assert!(
+            !parts[0].is_empty(),
+            "version part of BUILD_ID must not be empty"
+        );
+        assert!(
+            !parts[1].is_empty(),
+            "hash part of BUILD_ID must not be empty"
+        );
     }
 
     /// R9b: when two presence facts with DIFFERENT build_ids exist in a room,
@@ -5147,7 +5280,11 @@ mod tests {
         let appended = room.append_fact_verified(&fact).unwrap();
         assert_eq!(appended.kind.as_str(), "standby");
         assert!(
-            appended.summary.as_deref().unwrap_or("").contains("wake_after:"),
+            appended
+                .summary
+                .as_deref()
+                .unwrap_or("")
+                .contains("wake_after:"),
             "summary must contain wake_after marker"
         );
 
@@ -5160,7 +5297,13 @@ mod tests {
             .find(|f| f.event_id == appended.event_id)
             .expect("standby fact must round-trip");
         assert_eq!(found.kind.as_str(), "standby");
-        assert!(found.summary.as_deref().unwrap_or("").contains("wake_after:"));
+        assert!(
+            found
+                .summary
+                .as_deref()
+                .unwrap_or("")
+                .contains("wake_after:")
+        );
         assert!(found.scope.contains(&"run:RUN-B1A".to_string()));
         assert!(found.scope.contains(&"step:S1".to_string()));
 
@@ -5234,10 +5377,7 @@ mod tests {
         let woken_in_due = due
             .iter()
             .any(|d| d.standby_event_id == standby_fact.event_id);
-        assert!(
-            !woken_in_due,
-            "woken standby must not appear in wake-due"
-        );
+        assert!(!woken_in_due, "woken standby must not appear in wake-due");
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -5310,7 +5450,11 @@ mod tests {
         // 4 nodes: S0, S1, S2, S3.
         assert_eq!(dag_out.nodes.len(), 4, "expected 4 DAG nodes");
         // 3 parent_step edges.
-        let pe: Vec<_> = dag_out.edges.iter().filter(|e| e.kind == "parent_step").collect();
+        let pe: Vec<_> = dag_out
+            .edges
+            .iter()
+            .filter(|e| e.kind == "parent_step")
+            .collect();
         assert_eq!(pe.len(), 3, "expected 3 parent_step edges");
         // All claims are in_flight (no artifacts).
         for node in dag_out.nodes.iter().filter(|n| n.step_id != "S0") {
@@ -5381,7 +5525,11 @@ mod tests {
 
         let facts = room.facts().unwrap();
         let dag_out = dag::build_dag(&facts, run_id);
-        let s1 = dag_out.nodes.iter().find(|n| n.step_id == "S1").expect("S1 must exist");
+        let s1 = dag_out
+            .nodes
+            .iter()
+            .find(|n| n.step_id == "S1")
+            .expect("S1 must exist");
         assert_eq!(
             s1.status,
             dag::NodeStatus::Stalled,
@@ -5974,9 +6122,7 @@ pub(crate) enum ScopeClass {
 /// - Empty string → `RepoLocal` (vacuously; no path to quarantine).
 pub(crate) fn classify_scope(path_or_uri: &str) -> ScopeClass {
     // Strip file: prefix if present.
-    let raw = path_or_uri
-        .strip_prefix("file:")
-        .unwrap_or(path_or_uri);
+    let raw = path_or_uri.strip_prefix("file:").unwrap_or(path_or_uri);
     let p = Path::new(raw);
     // Only absolute paths can be definitively outside the repo.
     if !p.is_absolute() {
@@ -5988,7 +6134,6 @@ pub(crate) fn classify_scope(path_or_uri: &str) -> ScopeClass {
         None => ScopeClass::External,
     }
 }
-
 
 fn comparable_path(value: &str) -> String {
     let stripped = value.strip_prefix("file:").unwrap_or(value);
@@ -6312,12 +6457,10 @@ struct RouteFindingsData {
 
 fn command_route_findings(args: RouteFindingsArgs) -> Result<Output> {
     // Read findings file
-    let content = fs::read_to_string(&args.file).map_err(RallyError::io(format!(
-        "read findings file {}",
-        args.file
-    )))?;
-    let findings: Vec<Finding> = serde_json::from_str(&content)
-        .map_err(RallyError::json("parse findings JSON"))?;
+    let content = fs::read_to_string(&args.file)
+        .map_err(RallyError::io(format!("read findings file {}", args.file)))?;
+    let findings: Vec<Finding> =
+        serde_json::from_str(&content).map_err(RallyError::json("parse findings JSON"))?;
 
     let room = RoomStore::open()?;
     ensure_presence(&room, &args.tool)?;
@@ -6330,7 +6473,9 @@ fn command_route_findings(args: RouteFindingsArgs) -> Result<Output> {
     let body = envelope(
         "route-findings",
         SCHEMA_ROUTE_FINDINGS,
-        RouteFindingsData { route_findings: routing },
+        RouteFindingsData {
+            route_findings: routing,
+        },
     )?;
     Ok(Output::new(args.json, text, body))
 }
@@ -6392,7 +6537,13 @@ fn command_wake_due(args: WakeDueArgs) -> Result<Output> {
     let due = project_wake_due(&facts, args.tool.as_deref());
     let count = due.len();
     let text = format!("wake-due count={count}");
-    let body = envelope("wake-due", SCHEMA_WAKE_DUE, WakeDueData { wake_due: WakeDuePayload { due } })?;
+    let body = envelope(
+        "wake-due",
+        SCHEMA_WAKE_DUE,
+        WakeDueData {
+            wake_due: WakeDuePayload { due },
+        },
+    )?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -6576,7 +6727,11 @@ fn command_lead(args: LeadArgs) -> Result<Output> {
         }
         LeadSubcommand::Handoff(t) => set_lead(args.json, &t, "handoff"),
         LeadSubcommand::Assign(t) => {
-            let mode = if t.user_designated { "user-designated" } else { "assign" };
+            let mode = if t.user_designated {
+                "user-designated"
+            } else {
+                "assign"
+            };
             set_lead(args.json, &t, mode)
         }
         LeadSubcommand::Relinquish(r) => {
@@ -6688,7 +6843,8 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
     if is_envelope {
         let agent = args.tool.as_deref().ok_or_else(|| {
             RallyError::Usage(
-                "rally mission envelope requires --tool <agent> with --may and/or --must-check".to_string(),
+                "rally mission envelope requires --tool <agent> with --may and/or --must-check"
+                    .to_string(),
             )
         })?;
         let tool_attr = args.tool.clone().unwrap_or_else(|| agent.to_string());
@@ -6707,7 +6863,11 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
             scope: vec!["envelope".to_string(), format!("agent:{agent}")],
             created_at: now_string(),
             // `summary` carries the `may` text.
-            summary: if may_text.is_empty() { None } else { Some(may_text.to_string()) },
+            summary: if may_text.is_empty() {
+                None
+            } else {
+                Some(may_text.to_string())
+            },
             // `evidence` carries `must_check:<text>` marker.
             evidence: if must_check_text.is_empty() {
                 Vec::new()
@@ -6796,7 +6956,8 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
     };
 
     // Derive per-agent envelopes: for each agent, take the latest envelope fact.
-    let mut envelope_map: std::collections::BTreeMap<String, &Fact> = std::collections::BTreeMap::new();
+    let mut envelope_map: std::collections::BTreeMap<String, &Fact> =
+        std::collections::BTreeMap::new();
     for f in facts.iter() {
         if f.kind != "mission" {
             continue;
@@ -6835,9 +6996,7 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
         })
         .collect();
 
-    let mission_text = mission
-        .as_deref()
-        .unwrap_or("(no mission set)");
+    let mission_text = mission.as_deref().unwrap_or("(no mission set)");
     let text = format!(
         "mission mission={:?} envelopes={}",
         mission_text,

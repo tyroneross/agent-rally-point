@@ -154,7 +154,11 @@ mod tests {
     fn current_branch_returns_branch_name() {
         let root = tmp_dir("branch-parse");
         fs::create_dir_all(root.join(".git")).unwrap();
-        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/feat/my-feature\n").unwrap();
+        fs::write(
+            root.join(".git").join("HEAD"),
+            "ref: refs/heads/feat/my-feature\n",
+        )
+        .unwrap();
         assert_eq!(
             current_branch(&root).as_deref(),
             Some("feat/my-feature"),
@@ -227,12 +231,7 @@ mod tests {
     #[test]
     fn hazard_fires_with_multiple_peers() {
         let dummy = tmp_dir("hazard-multi-peer");
-        let result = detect_shared_branch_hazard(
-            &dummy,
-            false,
-            Some("fix/bug-42"),
-            3,
-        );
+        let result = detect_shared_branch_hazard(&dummy, false, Some("fix/bug-42"), 3);
         assert!(result.is_some(), "hazard must fire with 3 peers");
         let msg = result.unwrap();
         assert!(
@@ -248,11 +247,14 @@ mod tests {
         let dummy = tmp_dir("no-hazard-main");
         let result = detect_shared_branch_hazard(
             &dummy,
-            false,       // canonical clone
+            false,        // canonical clone
             Some("main"), // main branch
             2,            // peers present
         );
-        assert!(result.is_none(), "hazard must NOT fire when branch is 'main'");
+        assert!(
+            result.is_none(),
+            "hazard must NOT fire when branch is 'main'"
+        );
         fs::remove_dir_all(&dummy).ok();
     }
 
@@ -260,12 +262,7 @@ mod tests {
     #[test]
     fn no_hazard_on_master_branch() {
         let dummy = tmp_dir("no-hazard-master");
-        let result = detect_shared_branch_hazard(
-            &dummy,
-            false,
-            Some("master"),
-            2,
-        );
+        let result = detect_shared_branch_hazard(&dummy, false, Some("master"), 2);
         assert!(
             result.is_none(),
             "hazard must NOT fire when branch is 'master'"
@@ -279,9 +276,9 @@ mod tests {
         let dummy = tmp_dir("no-hazard-linked");
         let result = detect_shared_branch_hazard(
             &dummy,
-            true,                 // linked worktree — CORRECT pattern
-            Some("feat/danger"),  // non-main branch
-            5,                    // peers present
+            true,                // linked worktree — CORRECT pattern
+            Some("feat/danger"), // non-main branch
+            5,                   // peers present
         );
         assert!(
             result.is_none(),
@@ -295,9 +292,8 @@ mod tests {
     fn no_hazard_on_detached_head() {
         let dummy = tmp_dir("no-hazard-detached");
         let result = detect_shared_branch_hazard(
-            &dummy,
-            false,  // canonical clone
-            None,   // detached HEAD
+            &dummy, false, // canonical clone
+            None,  // detached HEAD
             3,
         );
         assert!(

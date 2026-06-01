@@ -557,10 +557,7 @@ fn legacy_apps_root() -> PathBuf {
 /// The legacy files are NOT deleted — this is a replay-only, non-destructive
 /// migrator. Running it twice is safe: the second run produces
 /// `facts_migrated == 0` because all event_ids are already present.
-pub(crate) fn migrate_legacy(
-    room: &RoomStore,
-    repo_basename: &str,
-) -> Result<MigrateLegacyData> {
+pub(crate) fn migrate_legacy(room: &RoomStore, repo_basename: &str) -> Result<MigrateLegacyData> {
     migrate_legacy_from(room, repo_basename, &legacy_apps_root())
 }
 
@@ -668,7 +665,10 @@ fn migrate_legacy_from(
                 Err(err) => {
                     warnings.push(warning(
                         "legacy_fact_malformed",
-                        format!("failed to deserialize {slug} line {} as Fact: {err}", idx + 1),
+                        format!(
+                            "failed to deserialize {slug} line {} as Fact: {err}",
+                            idx + 1
+                        ),
                         Some(channel.clone()),
                     ));
                     continue;
@@ -891,7 +891,10 @@ mod tests {
     /// Slug with 8-char hex suffix matches.
     #[test]
     fn slug_matches_with_8char_hex_suffix() {
-        assert!(slug_matches_repo("agent-rally-point-2b14b480", "agent-rally-point"));
+        assert!(slug_matches_repo(
+            "agent-rally-point-2b14b480",
+            "agent-rally-point"
+        ));
     }
 
     /// Slug with longer hex suffix (16 chars) matches.
@@ -903,13 +906,19 @@ mod tests {
     /// Slug with only 7 hex chars after the dash does NOT match (too short).
     #[test]
     fn slug_does_not_match_short_hex_suffix() {
-        assert!(!slug_matches_repo("agent-rally-point-2b14b48", "agent-rally-point"));
+        assert!(!slug_matches_repo(
+            "agent-rally-point-2b14b48",
+            "agent-rally-point"
+        ));
     }
 
     /// Slug with non-hex suffix does NOT match.
     #[test]
     fn slug_does_not_match_non_hex_suffix() {
-        assert!(!slug_matches_repo("agent-rally-point-worker", "agent-rally-point"));
+        assert!(!slug_matches_repo(
+            "agent-rally-point-worker",
+            "agent-rally-point"
+        ));
     }
 
     /// Completely unrelated slug does NOT match.
@@ -994,8 +1003,14 @@ mod tests {
         // Verify facts are in the ledger.
         let facts = room.facts().unwrap();
         let event_ids: Vec<&str> = facts.iter().map(|f| f.event_id.as_str()).collect();
-        assert!(event_ids.contains(&"evt_b17_001"), "evt_b17_001 must be in ledger");
-        assert!(event_ids.contains(&"evt_b17_002"), "evt_b17_002 must be in ledger");
+        assert!(
+            event_ids.contains(&"evt_b17_001"),
+            "evt_b17_001 must be in ledger"
+        );
+        assert!(
+            event_ids.contains(&"evt_b17_002"),
+            "evt_b17_002 must be in ledger"
+        );
 
         // Second run: both already exist → migrated == 0.
         let result2 = migrate_legacy_from(&room, "my-repo", &apps_root).unwrap();
@@ -1006,7 +1021,10 @@ mod tests {
         );
 
         // Legacy file is untouched (not deleted).
-        assert!(channel.exists(), "migrate_legacy must not delete the legacy file");
+        assert!(
+            channel.exists(),
+            "migrate_legacy must not delete the legacy file"
+        );
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&home).ok();
@@ -1064,7 +1082,10 @@ mod tests {
         let channel = apps_dir.join("changes.jsonl");
         fs::write(
             &channel,
-            format!("{}\n", make_rally_fact_line("evt_b17_legacy_only", "legacy only fact")),
+            format!(
+                "{}\n",
+                make_rally_fact_line("evt_b17_legacy_only", "legacy only fact")
+            ),
         )
         .unwrap();
 
@@ -1111,12 +1132,17 @@ mod tests {
         migrate_legacy_from(&room2, "my-repo", &apps_root).unwrap();
         let facts_after = room2.facts().unwrap();
         assert!(
-            facts_after.iter().any(|f| f.event_id == "evt_b17_legacy_only"),
+            facts_after
+                .iter()
+                .any(|f| f.event_id == "evt_b17_legacy_only"),
             "after migration, legacy fact must appear in ledger"
         );
 
         // Legacy file still exists (non-destructive).
-        assert!(channel.exists(), "legacy file must not be deleted by migrator");
+        assert!(
+            channel.exists(),
+            "legacy file must not be deleted by migrator"
+        );
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&home).ok();

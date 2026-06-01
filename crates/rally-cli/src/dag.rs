@@ -152,13 +152,11 @@ pub(crate) fn resolve_wake_after(input: &str) -> Result<String, String> {
                 "invalid relative wake-after offset {input:?}; use +Nm (minutes), +Nh (hours), or +Nd (days)"
             ));
         };
-        let amount: i64 = amount_str.parse().map_err(|_| {
-            format!("invalid number in wake-after offset {input:?}")
-        })?;
+        let amount: i64 = amount_str
+            .parse()
+            .map_err(|_| format!("invalid number in wake-after offset {input:?}"))?;
         if amount <= 0 {
-            return Err(format!(
-                "wake-after offset must be positive; got {input:?}"
-            ));
+            return Err(format!("wake-after offset must be positive; got {input:?}"));
         }
         let duration = match unit {
             "m" => chrono::Duration::minutes(amount),
@@ -232,10 +230,7 @@ pub(crate) fn build_dag(facts: &[Fact], run_id: &str) -> DagOutput {
         .map(|(step_id, facts)| {
             let tool = facts.first().and_then(|f| f.tool.clone());
             let event_ids: Vec<String> = facts.iter().map(|f| f.event_id.clone()).collect();
-            let subjects: Vec<String> = facts
-                .iter()
-                .map(|f| f.subject.clone())
-                .collect();
+            let subjects: Vec<String> = facts.iter().map(|f| f.subject.clone()).collect();
 
             // Status logic:
             // 1. landed if any artifact in this step.
@@ -244,15 +239,17 @@ pub(crate) fn build_dag(facts: &[Fact], run_id: &str) -> DagOutput {
             let has_artifact = artifact_steps.contains(step_id);
             let has_wake = facts.iter().any(|f| f.kind == "wake");
 
-            let stalled = !has_artifact && !has_wake && facts.iter().any(|f| {
-                if f.kind != "standby" {
-                    return false;
-                }
-                extract_wake_after(f)
-                    .as_deref()
-                    .map(wake_after_is_past)
-                    .unwrap_or(false)
-            });
+            let stalled = !has_artifact
+                && !has_wake
+                && facts.iter().any(|f| {
+                    if f.kind != "standby" {
+                        return false;
+                    }
+                    extract_wake_after(f)
+                        .as_deref()
+                        .map(wake_after_is_past)
+                        .unwrap_or(false)
+                });
 
             let status = if has_artifact {
                 NodeStatus::Landed
@@ -345,15 +342,9 @@ pub(crate) struct WakeDueEntry {
 /// or an unrecognised tool are omitted.
 ///
 /// Returns an empty vec when nothing is due.
-pub(crate) fn project_wake_due(
-    facts: &[Fact],
-    tool_filter: Option<&str>,
-) -> Vec<WakeDueEntry> {
+pub(crate) fn project_wake_due(facts: &[Fact], tool_filter: Option<&str>) -> Vec<WakeDueEntry> {
     // Collect known tool names (any tool that has authored any fact).
-    let known_tools: BTreeSet<String> = facts
-        .iter()
-        .filter_map(|f| f.tool.clone())
-        .collect();
+    let known_tools: BTreeSet<String> = facts.iter().filter_map(|f| f.tool.clone()).collect();
 
     // Collect standby event_ids that have a subsequent wake or artifact fact
     // referencing them (= already woken; skip).
@@ -396,10 +387,8 @@ pub(crate) fn project_wake_due(
             // Build suggested_command — a string the runner can use.
             // NEVER executed by rally itself.
             let owner_arg = owner.as_deref().unwrap_or("unknown");
-            let suggested_command = format!(
-                "rally next --tool {} --json",
-                shell_quote_simple(owner_arg)
-            );
+            let suggested_command =
+                format!("rally next --tool {} --json", shell_quote_simple(owner_arg));
             Some(WakeDueEntry {
                 standby_event_id: f.event_id.clone(),
                 owner,
@@ -478,7 +467,10 @@ mod tests {
     fn resolve_wake_after_absolute_iso() {
         let iso = "2030-01-01T00:00:00Z";
         let result = resolve_wake_after(iso).expect("absolute ISO must parse");
-        assert!(result.contains("2030"), "absolute ISO must round-trip; got {result}");
+        assert!(
+            result.contains("2030"),
+            "absolute ISO must round-trip; got {result}"
+        );
     }
 
     #[test]
@@ -502,10 +494,7 @@ mod tests {
             let mut f = make_fact(
                 "handoff",
                 "tool-a",
-                vec![
-                    format!("run:{run}"),
-                    "step:S0".to_string(),
-                ],
+                vec![format!("run:{run}"), "step:S0".to_string()],
                 None,
             );
             f.event_id = "evt-handoff-s0".to_string();
@@ -595,8 +584,16 @@ mod tests {
         };
 
         let dag = build_dag(&[claim, artifact], run);
-        let s1 = dag.nodes.iter().find(|n| n.step_id == "S1").expect("S1 must exist");
-        assert_eq!(s1.status, NodeStatus::Landed, "S1 with artifact must be landed");
+        let s1 = dag
+            .nodes
+            .iter()
+            .find(|n| n.step_id == "S1")
+            .expect("S1 must exist");
+        assert_eq!(
+            s1.status,
+            NodeStatus::Landed,
+            "S1 with artifact must be landed"
+        );
     }
 
     #[test]
@@ -619,7 +616,11 @@ mod tests {
         );
 
         let dag = build_dag(&[claim, standby], run);
-        let s1 = dag.nodes.iter().find(|n| n.step_id == "S1").expect("S1 must exist");
+        let s1 = dag
+            .nodes
+            .iter()
+            .find(|n| n.step_id == "S1")
+            .expect("S1 must exist");
         assert_eq!(
             s1.status,
             NodeStatus::Stalled,
@@ -669,7 +670,10 @@ mod tests {
         let presence = make_fact("presence", "tool-a", vec![], None);
 
         let due = project_wake_due(&[standby, presence], None);
-        assert!(due.is_empty(), "future standby must not surface in wake-due");
+        assert!(
+            due.is_empty(),
+            "future standby must not surface in wake-due"
+        );
     }
 
     #[test]

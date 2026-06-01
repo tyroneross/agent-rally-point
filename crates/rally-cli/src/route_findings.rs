@@ -280,7 +280,10 @@ mod tests {
         let result = route_findings(&room, "scanner", findings, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("--verified"), "error should mention --verified: {msg}");
+        assert!(
+            msg.contains("--verified"),
+            "error should mention --verified: {msg}"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -349,7 +352,10 @@ mod tests {
 
         // suffix collision means it routes to tool-b
         assert_eq!(summary.routed, 1);
-        assert_eq!(summary.routed_findings[0].routed_to.as_deref(), Some("tool-b"));
+        assert_eq!(
+            summary.routed_findings[0].routed_to.as_deref(),
+            Some("tool-b")
+        );
 
         std::fs::remove_dir_all(root).ok();
     }

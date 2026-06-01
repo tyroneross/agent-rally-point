@@ -1101,7 +1101,12 @@ impl RoomStore {
             schema: crate::FACT_SCHEMA.to_string(),
             event_id: crate::new_id("read"),
             seq: 0,
-            thread_id: format!("read-{}", tool.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>()),
+            thread_id: format!(
+                "read-{}",
+                tool.chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect::<String>()
+            ),
             kind: FactKind::Read,
             tool: Some(tool.to_string()),
             role: None,
@@ -1213,7 +1218,6 @@ impl RoomStore {
         snapshot.readers = self.project_read_receipts_from_facts(&facts, snapshot.max_seq)?;
         Ok(snapshot)
     }
-
 }
 
 fn filter_facts(facts: Vec<Fact>, query: &RoomQuery) -> Vec<Fact> {
@@ -1332,9 +1336,7 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
             if tool == "rally" {
                 continue;
             }
-            let entry = tool_last
-                .entry(tool.clone())
-                .or_insert((0, String::new()));
+            let entry = tool_last.entry(tool.clone()).or_insert((0, String::new()));
             if fact.seq > entry.0 {
                 *entry = (fact.seq, fact.created_at.clone());
             }
@@ -2672,11 +2674,8 @@ mod ledger_tests {
         // Now run the segment-only readback logic.  It must not find the event.
         let live_segs = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
         let arch_segs = read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
-        let found = segment_event_id_present(
-            live_segs.iter().chain(arch_segs.iter()),
-            event_id,
-        )
-        .unwrap();
+        let found =
+            segment_event_id_present(live_segs.iter().chain(arch_segs.iter()), event_id).unwrap();
         assert!(
             !found,
             "readback must NOT find event_id in segments after segment truncation (drop simulation)"
@@ -2717,11 +2716,8 @@ mod ledger_tests {
         // Assert 1: segment-based readback returns false (correct).
         let live_segs = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
         let arch_segs = read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
-        let seg_found = segment_event_id_present(
-            live_segs.iter().chain(arch_segs.iter()),
-            event_id,
-        )
-        .unwrap();
+        let seg_found =
+            segment_event_id_present(live_segs.iter().chain(arch_segs.iter()), event_id).unwrap();
         assert!(
             !seg_found,
             "segment readback must return false after truncation (correct)"
@@ -2770,7 +2766,9 @@ mod ledger_tests {
             uri: None,
             session: None,
         };
-        let err_no_ref = store.append_state_transition_verified(&release_no_ref).unwrap_err();
+        let err_no_ref = store
+            .append_state_transition_verified(&release_no_ref)
+            .unwrap_err();
         let msg_no_ref = err_no_ref.to_string();
         assert!(
             msg_no_ref.contains("requires --ref"),
@@ -2798,7 +2796,9 @@ mod ledger_tests {
             uri: None,
             session: None,
         };
-        let err_bogus = store.append_state_transition_verified(&release_bogus).unwrap_err();
+        let err_bogus = store
+            .append_state_transition_verified(&release_bogus)
+            .unwrap_err();
         let msg_bogus = err_bogus.to_string();
         assert!(
             msg_bogus.contains("not an active claim") || msg_bogus.contains("release failed"),
@@ -2839,11 +2839,8 @@ mod ledger_tests {
         // Readback against room A's segments — must return false (wrong room).
         let segs_a = read_segment_files(&root_a.join(".rally").join(LOG_DIRNAME)).unwrap();
         let arch_a = read_segment_files(&root_a.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
-        let found_in_a = segment_event_id_present(
-            segs_a.iter().chain(arch_a.iter()),
-            event_id,
-        )
-        .unwrap();
+        let found_in_a =
+            segment_event_id_present(segs_a.iter().chain(arch_a.iter()), event_id).unwrap();
         assert!(
             !found_in_a,
             "event written to room B must NOT be found in room A's canonical segments"
@@ -2852,11 +2849,8 @@ mod ledger_tests {
         // Confirm it IS in room B's segments (for sanity).
         let segs_b = read_segment_files(&root_b.join(".rally").join(LOG_DIRNAME)).unwrap();
         let arch_b = read_segment_files(&root_b.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
-        let found_in_b = segment_event_id_present(
-            segs_b.iter().chain(arch_b.iter()),
-            event_id,
-        )
-        .unwrap();
+        let found_in_b =
+            segment_event_id_present(segs_b.iter().chain(arch_b.iter()), event_id).unwrap();
         assert!(
             found_in_b,
             "event written to room B must be found in room B's canonical segments"
@@ -2916,11 +2910,8 @@ mod ledger_tests {
         let segs = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
         let arch = read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
 
-        let found_a = segment_event_id_present(
-            segs.iter().chain(arch.iter()),
-            &appended_a.event_id,
-        )
-        .unwrap();
+        let found_a =
+            segment_event_id_present(segs.iter().chain(arch.iter()), &appended_a.event_id).unwrap();
         assert!(
             found_a,
             "exact event_id for fact-A must be found even with a concurrent peer append present"
@@ -2929,11 +2920,8 @@ mod ledger_tests {
         // Also verify the peer event is present.
         let segs2 = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
         let arch2 = read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
-        let found_peer = segment_event_id_present(
-            segs2.iter().chain(arch2.iter()),
-            peer_event_id,
-        )
-        .unwrap();
+        let found_peer =
+            segment_event_id_present(segs2.iter().chain(arch2.iter()), peer_event_id).unwrap();
         assert!(found_peer, "peer event_id must also be findable");
 
         // Key concurrency assertion: searching for a NONEXISTENT event_id must
@@ -2941,11 +2929,9 @@ mod ledger_tests {
         // as a false-pass proxy).
         let segs3 = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
         let arch3 = read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
-        let found_ghost = segment_event_id_present(
-            segs3.iter().chain(arch3.iter()),
-            "ev-does-not-exist",
-        )
-        .unwrap();
+        let found_ghost =
+            segment_event_id_present(segs3.iter().chain(arch3.iter()), "ev-does-not-exist")
+                .unwrap();
         assert!(
             !found_ghost,
             "a nonexistent event_id must NOT be found even though seq advanced (exact-match, not seq-advance check)"
@@ -3060,16 +3046,25 @@ mod ledger_tests {
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Post two substantive facts.
-        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim one")).unwrap();
-        store.append_fact(&make_fact("e2", FactKind::Decision, "src/", "decided")).unwrap();
+        store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim one"))
+            .unwrap();
+        store
+            .append_fact(&make_fact("e2", FactKind::Decision, "src/", "decided"))
+            .unwrap();
 
         let snapshot = store.snapshot().unwrap();
         let content_max = snapshot.content_max_seq;
         assert_eq!(content_max, 2, "content_max_seq after 2 substantive facts");
 
         // Record a read-checkpoint for "tool-a" at content_max.
-        let cp = store.maybe_append_read_checkpoint("tool-a", content_max).unwrap();
-        assert!(cp.is_some(), "checkpoint must be written when read position advances");
+        let cp = store
+            .maybe_append_read_checkpoint("tool-a", content_max)
+            .unwrap();
+        assert!(
+            cp.is_some(),
+            "checkpoint must be written when read position advances"
+        );
 
         // The checkpoint fact must be in the ledger.
         let facts = store.facts().unwrap();
@@ -3077,7 +3072,11 @@ mod ledger_tests {
             .iter()
             .filter(|f| f.kind == "read" && f.tool.as_deref() == Some("tool-a"))
             .collect();
-        assert_eq!(read_facts.len(), 1, "exactly one read-checkpoint fact for tool-a");
+        assert_eq!(
+            read_facts.len(),
+            1,
+            "exactly one read-checkpoint fact for tool-a"
+        );
         let cp_fact = read_facts[0];
         let expected_summary = format!("read_seq:{content_max}");
         assert_eq!(
@@ -3092,12 +3091,21 @@ mod ledger_tests {
         // relative to the total ledger tip (max_seq).
         let total_max = store.snapshot().unwrap().max_seq;
         let receipts = store.project_read_receipts(total_max).unwrap();
-        let tool_a = receipts.iter().find(|r| r.tool == "tool-a").expect("tool-a in receipts");
-        assert_eq!(tool_a.last_read_seq, content_max, "last_read_seq = content_max");
+        let tool_a = receipts
+            .iter()
+            .find(|r| r.tool == "tool-a")
+            .expect("tool-a in receipts");
+        assert_eq!(
+            tool_a.last_read_seq, content_max,
+            "last_read_seq = content_max"
+        );
         // behind_by = total_max - last_read_seq; since tool-a read at content_max
         // and there's 1 more fact (the checkpoint itself), behind_by = 1.
         // This is intentional: the checkpoint is also a ledger fact.
-        assert!(tool_a.behind_by <= 1, "tool-a is at most 1 behind (checkpoint fact itself)");
+        assert!(
+            tool_a.behind_by <= 1,
+            "tool-a is at most 1 behind (checkpoint fact itself)"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -3110,22 +3118,37 @@ mod ledger_tests {
         let root = unique_root("r10-b-no-bloat");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
-        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim")).unwrap();
+        store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim"))
+            .unwrap();
         let snapshot = store.snapshot().unwrap();
         let content_max = snapshot.content_max_seq;
 
         // First checkpoint — must write.
-        let cp1 = store.maybe_append_read_checkpoint("tool-a", content_max).unwrap();
+        let cp1 = store
+            .maybe_append_read_checkpoint("tool-a", content_max)
+            .unwrap();
         assert!(cp1.is_some(), "first checkpoint must write");
 
         // Second checkpoint at the same position — must be a no-op.
-        let cp2 = store.maybe_append_read_checkpoint("tool-a", content_max).unwrap();
-        assert!(cp2.is_none(), "second checkpoint at same seq must be a no-op (coalesced)");
+        let cp2 = store
+            .maybe_append_read_checkpoint("tool-a", content_max)
+            .unwrap();
+        assert!(
+            cp2.is_none(),
+            "second checkpoint at same seq must be a no-op (coalesced)"
+        );
 
         // Only ONE read-checkpoint fact in the ledger for tool-a.
         let facts = store.facts().unwrap();
-        let read_count = facts.iter().filter(|f| f.kind == "read" && f.tool.as_deref() == Some("tool-a")).count();
-        assert_eq!(read_count, 1, "BLOAT GUARD: exactly one read-checkpoint fact for tool-a after two no-advance polls");
+        let read_count = facts
+            .iter()
+            .filter(|f| f.kind == "read" && f.tool.as_deref() == Some("tool-a"))
+            .count();
+        assert_eq!(
+            read_count, 1,
+            "BLOAT GUARD: exactly one read-checkpoint fact for tool-a after two no-advance polls"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -3137,7 +3160,9 @@ mod ledger_tests {
         let root = unique_root("r10-b-new-activity");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
-        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "first claim")).unwrap();
+        store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "first claim"))
+            .unwrap();
         let snap1 = store.snapshot().unwrap();
         let c1 = snap1.content_max_seq;
 
@@ -3146,10 +3171,15 @@ mod ledger_tests {
         assert!(cp1.is_some());
 
         // Post a new substantive fact.
-        store.append_fact(&make_fact("e2", FactKind::Decision, "src/", "new decision")).unwrap();
+        store
+            .append_fact(&make_fact("e2", FactKind::Decision, "src/", "new decision"))
+            .unwrap();
         let snap2 = store.snapshot().unwrap();
         let c2 = snap2.content_max_seq;
-        assert!(c2 > c1, "content_max_seq must advance after new substantive fact");
+        assert!(
+            c2 > c1,
+            "content_max_seq must advance after new substantive fact"
+        );
 
         // Second checkpoint at the new position — must write.
         let cp2 = store.maybe_append_read_checkpoint("tool-a", c2).unwrap();
@@ -3157,8 +3187,14 @@ mod ledger_tests {
 
         // Two read-checkpoint facts now.
         let facts = store.facts().unwrap();
-        let read_count = facts.iter().filter(|f| f.kind == "read" && f.tool.as_deref() == Some("tool-a")).count();
-        assert_eq!(read_count, 2, "two read-checkpoints after two distinct advances");
+        let read_count = facts
+            .iter()
+            .filter(|f| f.kind == "read" && f.tool.as_deref() == Some("tool-a"))
+            .count();
+        assert_eq!(
+            read_count, 2,
+            "two read-checkpoints after two distinct advances"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -3172,10 +3208,16 @@ mod ledger_tests {
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Post some substantive facts, then record a checkpoint.
-        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "real claim")).unwrap();
-        store.append_fact(&make_fact("e2", FactKind::Blocker, "src/", "real blocker")).unwrap();
+        store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "real claim"))
+            .unwrap();
+        store
+            .append_fact(&make_fact("e2", FactKind::Blocker, "src/", "real blocker"))
+            .unwrap();
         let snap = store.snapshot().unwrap();
-        store.maybe_append_read_checkpoint("tool-a", snap.content_max_seq).unwrap();
+        store
+            .maybe_append_read_checkpoint("tool-a", snap.content_max_seq)
+            .unwrap();
 
         let snapshot = store.snapshot().unwrap();
 
@@ -3210,9 +3252,15 @@ mod ledger_tests {
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Post 3 substantive facts.
-        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim one")).unwrap();
-        store.append_fact(&make_fact("e2", FactKind::Decision, "src/", "decided")).unwrap();
-        store.append_fact(&make_fact("e3", FactKind::Blocker, "src/", "blocker")).unwrap();
+        store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim one"))
+            .unwrap();
+        store
+            .append_fact(&make_fact("e2", FactKind::Decision, "src/", "decided"))
+            .unwrap();
+        store
+            .append_fact(&make_fact("e3", FactKind::Blocker, "src/", "blocker"))
+            .unwrap();
 
         let snap1 = store.snapshot().unwrap();
         let after_3_substantive = snap1.content_max_seq;
@@ -3220,34 +3268,61 @@ mod ledger_tests {
         assert_eq!(after_3_substantive, 3);
 
         // tool-a reads all 3 facts.
-        store.maybe_append_read_checkpoint("tool-a", after_3_substantive).unwrap();
+        store
+            .maybe_append_read_checkpoint("tool-a", after_3_substantive)
+            .unwrap();
         // Ledger now: seqs 1,2,3 (facts) + 4 (tool-a checkpoint).
 
         // Post one more substantive fact (gets next seq after tool-a's checkpoint).
-        store.append_fact(&make_fact("e4", FactKind::Artifact, "src/", "artifact")).unwrap();
+        store
+            .append_fact(&make_fact("e4", FactKind::Artifact, "src/", "artifact"))
+            .unwrap();
 
         let snap2 = store.snapshot().unwrap();
         let after_4_substantive = snap2.content_max_seq;
         // content_max_seq = seq of e4 (the checkpoint at seq 4 is excluded).
-        assert!(after_4_substantive > after_3_substantive, "content_max_seq advances with e4");
+        assert!(
+            after_4_substantive > after_3_substantive,
+            "content_max_seq advances with e4"
+        );
 
         // tool-b reads only up to after_3 (missed the new artifact).
-        store.maybe_append_read_checkpoint("tool-b", after_3_substantive).unwrap();
+        store
+            .maybe_append_read_checkpoint("tool-b", after_3_substantive)
+            .unwrap();
 
         // Project read receipts.
         let total_max = store.snapshot().unwrap().max_seq;
         let receipts = store.project_read_receipts(total_max).unwrap();
 
-        let a = receipts.iter().find(|r| r.tool == "tool-a").expect("tool-a in receipts");
-        let b = receipts.iter().find(|r| r.tool == "tool-b").expect("tool-b in receipts");
+        let a = receipts
+            .iter()
+            .find(|r| r.tool == "tool-a")
+            .expect("tool-a in receipts");
+        let b = receipts
+            .iter()
+            .find(|r| r.tool == "tool-b")
+            .expect("tool-b in receipts");
 
         // Both tools checkpointed at after_3_substantive.
-        assert_eq!(a.last_read_seq, after_3_substantive, "tool-a last_read_seq = after_3_substantive");
-        assert_eq!(b.last_read_seq, after_3_substantive, "tool-b last_read_seq = after_3_substantive");
+        assert_eq!(
+            a.last_read_seq, after_3_substantive,
+            "tool-a last_read_seq = after_3_substantive"
+        );
+        assert_eq!(
+            b.last_read_seq, after_3_substantive,
+            "tool-b last_read_seq = after_3_substantive"
+        );
 
         // Both are behind the ledger head (e4 + checkpoints landed after their read).
-        assert_eq!(a.behind_by, b.behind_by, "both tools are equally behind (same checkpoint position)");
-        assert!(a.behind_by > 0, "both tools are behind (e4 and its checkpoints landed after their read)");
+        assert_eq!(
+            a.behind_by, b.behind_by,
+            "both tools are equally behind (same checkpoint position)"
+        );
+        assert!(
+            a.behind_by > 0,
+            "both tools are behind (e4 and its checkpoints landed after their read)"
+        );
 
         // Status: both "behind".
         assert_eq!(a.status, "behind", "tool-a status = behind");
@@ -3256,15 +3331,31 @@ mod ledger_tests {
         // tool-a with higher read (caught up after e4) would show caught_up —
         // simulate by checking tool-a after it reads e4.
         let read_seq_e4 = after_4_substantive;
-        store.maybe_append_read_checkpoint("tool-a", read_seq_e4).unwrap();
-        let receipts2 = store.project_read_receipts(store.snapshot().unwrap().max_seq).unwrap();
-        let a2 = receipts2.iter().find(|r| r.tool == "tool-a").expect("tool-a in receipts2");
+        store
+            .maybe_append_read_checkpoint("tool-a", read_seq_e4)
+            .unwrap();
+        let receipts2 = store
+            .project_read_receipts(store.snapshot().unwrap().max_seq)
+            .unwrap();
+        let a2 = receipts2
+            .iter()
+            .find(|r| r.tool == "tool-a")
+            .expect("tool-a in receipts2");
         // tool-a now has higher last_read_seq; tool-b is still at after_3.
-        assert_eq!(a2.last_read_seq, read_seq_e4, "tool-a advanced to e4 read_seq");
-        let b2 = receipts2.iter().find(|r| r.tool == "tool-b").expect("tool-b in receipts2");
+        assert_eq!(
+            a2.last_read_seq, read_seq_e4,
+            "tool-a advanced to e4 read_seq"
+        );
+        let b2 = receipts2
+            .iter()
+            .find(|r| r.tool == "tool-b")
+            .expect("tool-b in receipts2");
         assert_eq!(b2.last_read_seq, after_3_substantive, "tool-b unchanged");
         // tool-b is further behind than tool-a.
-        assert!(b2.behind_by > a2.behind_by, "tool-b is further behind than tool-a");
+        assert!(
+            b2.behind_by > a2.behind_by,
+            "tool-b is further behind than tool-a"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -3278,7 +3369,9 @@ mod ledger_tests {
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Post one substantive fact.
-        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "lone claim")).unwrap();
+        store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "lone claim"))
+            .unwrap();
 
         // Simulate 5 polls with no new substantive activity.
         for _ in 0..5 {
@@ -3320,25 +3413,39 @@ mod ledger_tests {
         store.set_cursor("tool-a", cursor_after_enter1).unwrap();
         // content_max_seq is 0 here; maybe_append_read_checkpoint coalesces at 0 (no-op is ok).
         // Post a substantive fact first so content_max > 0 before the checkpoint.
-        store.append_fact(&make_fact("e1", FactKind::Claim, "src/", "first claim")).unwrap();
+        store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "first claim"))
+            .unwrap();
         let snap1 = store.snapshot().unwrap();
         let content_max1 = snap1.content_max_seq;
-        assert_eq!(content_max1, 1, "one substantive fact → content_max_seq == 1");
+        assert_eq!(
+            content_max1, 1,
+            "one substantive fact → content_max_seq == 1"
+        );
 
         // Record a real ledger checkpoint for tool-a.
-        let cp = store.maybe_append_read_checkpoint("tool-a", content_max1).unwrap();
+        let cp = store
+            .maybe_append_read_checkpoint("tool-a", content_max1)
+            .unwrap();
         assert!(cp.is_some(), "first checkpoint must be written");
 
         // Step 2: append more substantive facts (peer activity after the enter).
-        store.append_fact(&make_fact("e2", FactKind::Decision, "src/", "decision")).unwrap();
-        store.append_fact(&make_fact("e3", FactKind::Risk, "src/", "risk")).unwrap();
+        store
+            .append_fact(&make_fact("e2", FactKind::Decision, "src/", "decision"))
+            .unwrap();
+        store
+            .append_fact(&make_fact("e3", FactKind::Risk, "src/", "risk"))
+            .unwrap();
 
         // Step 3: delete cursors.json to prove ledger is the source of truth.
         let cursor_path = root.join(".rally").join("cursors.json");
         if cursor_path.exists() {
             fs::remove_file(&cursor_path).expect("delete cursors.json for test");
         }
-        assert!(!cursor_path.exists(), "cursors.json must be gone before testing cursor_for");
+        assert!(
+            !cursor_path.exists(),
+            "cursors.json must be gone before testing cursor_for"
+        );
 
         // Step 4: cursor_for must still return content_max1 from the ledger checkpoint.
         let recovered = store.cursor_for("tool-a").unwrap();
@@ -3352,10 +3459,18 @@ mod ledger_tests {
         let content_max2 = snap2.content_max_seq;
         // e1 (seq=1) + read-checkpoint (seq=2, excluded from content_max) +
         // e2 (seq=3) + e3 (seq=4) → content_max_seq = 4 (highest non-read seq).
-        assert_eq!(content_max2, 4, "three substantive facts (e1/e2/e3) with one intervening read-checkpoint → content_max_seq == 4");
+        assert_eq!(
+            content_max2, 4,
+            "three substantive facts (e1/e2/e3) with one intervening read-checkpoint → content_max_seq == 4"
+        );
 
-        let cp2 = store.maybe_append_read_checkpoint("tool-a", content_max2).unwrap();
-        assert!(cp2.is_some(), "second checkpoint must advance (content advanced from 1 to 3)");
+        let cp2 = store
+            .maybe_append_read_checkpoint("tool-a", content_max2)
+            .unwrap();
+        assert!(
+            cp2.is_some(),
+            "second checkpoint must advance (content advanced from 1 to 3)"
+        );
 
         // cursor_for must now return the new higher value — no inflation, stable.
         let after_re_enter = store.cursor_for("tool-a").unwrap();

@@ -67,16 +67,23 @@ fn backlog_add_and_list_round_trip() {
 
     // Add a backlog item
     let add = ws.json(&[
-        "backlog", "add",
+        "backlog",
+        "add",
         "--json",
-        "--tool", "tool-a",
-        "--id", "task-1",
-        "--intent", "implement the widget",
-        "--owns", "crates/widget/src/lib.rs",
+        "--tool",
+        "tool-a",
+        "--id",
+        "task-1",
+        "--intent",
+        "implement the widget",
+        "--owns",
+        "crates/widget/src/lib.rs",
     ]);
     assert_eq!(add["ok"], true);
     assert_eq!(add["data"]["backlog"]["action"], "add");
-    let added_id = add["data"]["backlog"]["added"]["event_id"].as_str().unwrap();
+    let added_id = add["data"]["backlog"]["added"]["event_id"]
+        .as_str()
+        .unwrap();
     assert!(!added_id.is_empty());
 
     // The items array in the add response should include our item
@@ -103,19 +110,28 @@ fn backlog_add_with_depends_on() {
     let ws = Workspace::new("backlog-deps");
 
     ws.json(&[
-        "backlog", "add",
+        "backlog",
+        "add",
         "--json",
-        "--tool", "tool-a",
-        "--id", "dep-task",
-        "--intent", "prerequisite work",
+        "--tool",
+        "tool-a",
+        "--id",
+        "dep-task",
+        "--intent",
+        "prerequisite work",
     ]);
     ws.json(&[
-        "backlog", "add",
+        "backlog",
+        "add",
         "--json",
-        "--tool", "tool-a",
-        "--id", "main-task",
-        "--intent", "depends on dep-task",
-        "--depends-on", "dep-task",
+        "--tool",
+        "tool-a",
+        "--id",
+        "main-task",
+        "--intent",
+        "depends on dep-task",
+        "--depends-on",
+        "dep-task",
     ]);
 
     let list = ws.json(&["backlog", "list", "--json"]);
@@ -135,22 +151,32 @@ fn next_returns_suggested_backlog_item_when_deps_met() {
 
     // Add a backlog item with no deps — should surface in next
     ws.json(&[
-        "backlog", "add",
+        "backlog",
+        "add",
         "--json",
-        "--tool", "tool-a",
-        "--id", "ready-task",
-        "--intent", "no deps, ready to pick up",
-        "--owns", "src/ready.rs",
+        "--tool",
+        "tool-a",
+        "--id",
+        "ready-task",
+        "--intent",
+        "no deps, ready to pick up",
+        "--owns",
+        "src/ready.rs",
     ]);
 
     // Add a dep-blocked item — should NOT surface
     ws.json(&[
-        "backlog", "add",
+        "backlog",
+        "add",
         "--json",
-        "--tool", "tool-a",
-        "--id", "blocked-task",
-        "--intent", "depends on missing",
-        "--depends-on", "ready-task",
+        "--tool",
+        "tool-a",
+        "--id",
+        "blocked-task",
+        "--intent",
+        "depends on missing",
+        "--depends-on",
+        "ready-task",
     ]);
 
     let next = ws.json(&["next", "--json", "--tool", "tool-a"]);
@@ -179,20 +205,29 @@ fn next_excludes_backlog_item_whose_path_is_claimed() {
 
     // Another tool claims the path the backlog item owns
     ws.json(&[
-        "say", "claim",
+        "say",
+        "claim",
         "--json",
-        "--tool", "other-tool",
-        "--path", "src/owned.rs",
-        "--subject", "other-tool owns this",
+        "--tool",
+        "other-tool",
+        "--path",
+        "src/owned.rs",
+        "--subject",
+        "other-tool owns this",
     ]);
 
     ws.json(&[
-        "backlog", "add",
+        "backlog",
+        "add",
         "--json",
-        "--tool", "tool-a",
-        "--id", "claimed-path-task",
-        "--intent", "owns a path claimed by another",
-        "--owns", "src/owned.rs",
+        "--tool",
+        "tool-a",
+        "--id",
+        "claimed-path-task",
+        "--intent",
+        "owns a path claimed by another",
+        "--owns",
+        "src/owned.rs",
     ]);
 
     let next = ws.json(&["next", "--json", "--tool", "tool-a"]);
@@ -216,20 +251,28 @@ fn board_projects_claim_lanes_and_backlog() {
 
     // An in-flight claim
     ws.json(&[
-        "say", "claim",
+        "say",
+        "claim",
         "--json",
-        "--tool", "tool-a",
-        "--path", "src/active.rs",
-        "--subject", "active work",
+        "--tool",
+        "tool-a",
+        "--path",
+        "src/active.rs",
+        "--subject",
+        "active work",
     ]);
 
     // A backlog item
     ws.json(&[
-        "backlog", "add",
+        "backlog",
+        "add",
         "--json",
-        "--tool", "tool-a",
-        "--id", "board-task",
-        "--intent", "pending backlog item",
+        "--tool",
+        "tool-a",
+        "--id",
+        "board-task",
+        "--intent",
+        "pending backlog item",
     ]);
 
     let board = ws.json(&["board", "--json"]);
@@ -240,7 +283,9 @@ fn board_projects_claim_lanes_and_backlog() {
     assert_eq!(lanes[0]["status"], "in_flight");
     assert_eq!(lanes[0]["owner"], "tool-a");
 
-    let backlog_open = board["data"]["board"]["backlog"]["open"].as_array().unwrap();
+    let backlog_open = board["data"]["board"]["backlog"]["open"]
+        .as_array()
+        .unwrap();
     assert_eq!(backlog_open.len(), 1);
     assert_eq!(backlog_open[0]["id"], "board-task");
 
@@ -259,11 +304,15 @@ fn route_findings_maps_finding_to_claim_owner() {
 
     // A tool claims a path
     ws.json(&[
-        "say", "claim",
+        "say",
+        "claim",
         "--json",
-        "--tool", "owner-tool",
-        "--path", "src/lib.rs",
-        "--subject", "owns src/lib.rs",
+        "--tool",
+        "owner-tool",
+        "--path",
+        "src/lib.rs",
+        "--subject",
+        "owns src/lib.rs",
     ]);
 
     // Write a findings file
@@ -280,17 +329,24 @@ fn route_findings_maps_finding_to_claim_owner() {
     let no_verified = ws.run(&[
         "route-findings",
         "--json",
-        "--tool", "scanner",
-        "--file", findings_path.to_str().unwrap(),
+        "--tool",
+        "scanner",
+        "--file",
+        findings_path.to_str().unwrap(),
     ]);
-    assert!(!no_verified.status.success(), "must refuse without --verified");
+    assert!(
+        !no_verified.status.success(),
+        "must refuse without --verified"
+    );
 
     // Route with --verified
     let routed = ws.json(&[
         "route-findings",
         "--json",
-        "--tool", "scanner",
-        "--file", findings_path.to_str().unwrap(),
+        "--tool",
+        "scanner",
+        "--file",
+        findings_path.to_str().unwrap(),
         "--verified",
     ]);
     assert_eq!(routed["ok"], true);
@@ -323,8 +379,10 @@ fn route_findings_unowned_path_emits_risk() {
     let routed = ws.json(&[
         "route-findings",
         "--json",
-        "--tool", "scanner",
-        "--file", findings_path.to_str().unwrap(),
+        "--tool",
+        "scanner",
+        "--file",
+        findings_path.to_str().unwrap(),
         "--verified",
     ]);
     let routing = &routed["data"]["route-findings"];

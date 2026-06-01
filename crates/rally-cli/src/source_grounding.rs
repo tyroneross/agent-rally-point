@@ -151,7 +151,10 @@ mod tests {
         let root = tmp_dir("claim-hashes-missing");
         let paths = vec!["file:no_such_file.rs".to_string()];
         let result = claim_hashes(&root, &paths);
-        assert!(result.is_empty(), "missing file must produce no hash marker");
+        assert!(
+            result.is_empty(),
+            "missing file must produce no hash marker"
+        );
         fs::remove_dir_all(&root).ok();
     }
 

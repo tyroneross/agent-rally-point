@@ -52,7 +52,10 @@ impl Workspace {
         assert!(
             out.status.success(),
             "cmd {:?} failed (exit {:?})\nstdout: {}\nstderr: {}",
-            args, out.status.code(), stdout, stderr
+            args,
+            out.status.code(),
+            stdout,
+            stderr
         );
         serde_json::from_str(&stdout).unwrap_or_else(|e| {
             panic!(
@@ -133,10 +136,13 @@ fn envelope_enter() {
 fn envelope_say() {
     let ws = Workspace::new("say");
     let body = ws.json(&[
-        "say", "claim",
+        "say",
+        "claim",
         "--json",
-        "--tool", "test-agent",
-        "--subject", "test claim",
+        "--tool",
+        "test-agent",
+        "--subject",
+        "test claim",
     ]);
     assert_envelope_contract("say", &body);
     ws.cleanup();
@@ -182,10 +188,13 @@ fn envelope_check() {
     // before-write requires a --tool
     ws.json(&["enter", "--json", "--tool", "test-agent"]);
     let body = ws.json(&[
-        "check", "before-write",
+        "check",
+        "before-write",
         "--json",
-        "--tool", "test-agent",
-        "--path", "src/lib.rs",
+        "--tool",
+        "test-agent",
+        "--path",
+        "src/lib.rs",
     ]);
     assert_envelope_contract("check", &body);
     ws.cleanup();
@@ -215,8 +224,10 @@ fn envelope_retrospective() {
     let ws = Workspace::new("retrospective");
     let out_path = ws.cwd.join("retro.md");
     let body = ws.json(&[
-        "retrospective", "--json",
-        "--out", out_path.to_str().unwrap(),
+        "retrospective",
+        "--json",
+        "--out",
+        out_path.to_str().unwrap(),
     ]);
     assert_envelope_contract("retrospective", &body);
     ws.cleanup();
@@ -297,9 +308,12 @@ fn envelope_route_findings() {
     let f = ws.cwd.join("findings.json");
     fs::write(&f, findings.to_string()).unwrap();
     let body = ws.json(&[
-        "route-findings", "--json",
-        "--tool", "scanner",
-        "--file", f.to_str().unwrap(),
+        "route-findings",
+        "--json",
+        "--tool",
+        "scanner",
+        "--file",
+        f.to_str().unwrap(),
         "--verified",
     ]);
     assert_envelope_contract("route-findings", &body);
@@ -393,9 +407,13 @@ fn envelope_sessions() {
 fn envelope_run_dry_run() {
     let ws = Workspace::new("run-dry");
     let body = ws.json(&[
-        "run", "claude", "--json",
-        "--backend", "tmux",
-        "--tmux-bin", "/usr/bin/true",
+        "run",
+        "claude",
+        "--json",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
         "--dry-run",
     ]);
     assert_envelope_contract("run", &body);
@@ -409,8 +427,14 @@ fn envelope_whoami_data_fields() {
     let body = ws.json(&["whoami", "--json"]);
     let whoami = &body["data"]["whoami"];
     assert!(whoami.is_object(), "data.whoami must be an object");
-    assert!(!whoami["repo_root"].is_null(), "data.whoami.repo_root missing");
-    assert!(!whoami["build_id"].is_null(), "data.whoami.build_id missing");
+    assert!(
+        !whoami["repo_root"].is_null(),
+        "data.whoami.repo_root missing"
+    );
+    assert!(
+        !whoami["build_id"].is_null(),
+        "data.whoami.build_id missing"
+    );
     ws.cleanup();
 }
 
@@ -421,8 +445,14 @@ fn envelope_version_data_fields() {
     let body = ws.json(&["version", "--json"]);
     let v = &body["data"]["version"];
     assert!(v.is_object(), "data.version must be an object");
-    assert!(v["build_id"].is_string(), "data.version.build_id must be a string");
-    assert!(v["version"].is_string(), "data.version.version must be a string");
+    assert!(
+        v["build_id"].is_string(),
+        "data.version.build_id must be a string"
+    );
+    assert!(
+        v["version"].is_string(),
+        "data.version.version must be a string"
+    );
     ws.cleanup();
 }
 
@@ -431,17 +461,27 @@ fn envelope_version_data_fields() {
 fn envelope_say_data_fields() {
     let ws = Workspace::new("say-fields");
     let body = ws.json(&[
-        "say", "claim", "--json",
-        "--tool", "agent-a",
-        "--subject", "test claim for envelope",
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "agent-a",
+        "--subject",
+        "test claim for envelope",
     ]);
     let say = &body["data"]["say"];
     assert!(say.is_object(), "data.say must be an object; got: {body:#}");
     assert!(!say["fact"].is_null(), "data.say.fact must be present");
     // room is a sibling of say (shared contextual payload)
-    assert!(body["data"]["room"].is_object(), "data.room must be a sibling object");
+    assert!(
+        body["data"]["room"].is_object(),
+        "data.room must be a sibling object"
+    );
     // verified is a sibling
-    assert!(body["data"]["verified"].is_object(), "data.verified must be a sibling");
+    assert!(
+        body["data"]["verified"].is_object(),
+        "data.verified must be a sibling"
+    );
     ws.cleanup();
 }
 
@@ -455,7 +495,10 @@ fn envelope_enter_data_fields() {
     assert!(!enter["tool"].is_null(), "data.enter.tool missing");
     assert!(!enter["cursor"].is_null(), "data.enter.cursor missing");
     // room is a sibling
-    assert!(body["data"]["room"].is_object(), "data.room must be a sibling object");
+    assert!(
+        body["data"]["room"].is_object(),
+        "data.room must be a sibling object"
+    );
     ws.cleanup();
 }
 
@@ -466,7 +509,10 @@ fn envelope_wake_due_data_fields() {
     let body = ws.json(&["wake-due", "--json"]);
     let wd = &body["data"]["wake-due"];
     assert!(wd.is_object(), "data[\"wake-due\"] must be an object");
-    assert!(wd["due"].is_array(), "data[\"wake-due\"].due must be an array");
+    assert!(
+        wd["due"].is_array(),
+        "data[\"wake-due\"].due must be an array"
+    );
     ws.cleanup();
 }
 
@@ -480,8 +526,14 @@ fn envelope_mission_get_data_fields() {
     let m = &body["data"]["mission"];
     assert!(m.is_object(), "data.mission must be an object");
     // GET mode: must have text field (not mission field — that was the old shape)
-    assert!(!m["text"].is_null(), "data.mission.text must be present in GET mode");
-    assert!(m["envelopes"].is_array(), "data.mission.envelopes must be an array");
+    assert!(
+        !m["text"].is_null(),
+        "data.mission.text must be present in GET mode"
+    );
+    assert!(
+        m["envelopes"].is_array(),
+        "data.mission.envelopes must be an array"
+    );
     ws.cleanup();
 }
 
@@ -492,7 +544,10 @@ fn envelope_check_ci_data_fields() {
     let body = ws.json(&["check-ci", "--json"]);
     let ci = &body["data"]["check-ci"];
     assert!(ci.is_object(), "data[\"check-ci\"] must be an object");
-    assert!(ci["pass"].is_boolean(), "data[\"check-ci\"].pass must be a bool");
+    assert!(
+        ci["pass"].is_boolean(),
+        "data[\"check-ci\"].pass must be a bool"
+    );
     ws.cleanup();
 }
 
@@ -508,14 +563,20 @@ fn envelope_route_findings_data_fields() {
     let f = ws.cwd.join("findings.json");
     fs::write(&f, findings.to_string()).unwrap();
     let body = ws.json(&[
-        "route-findings", "--json",
-        "--tool", "scanner",
-        "--file", f.to_str().unwrap(),
+        "route-findings",
+        "--json",
+        "--tool",
+        "scanner",
+        "--file",
+        f.to_str().unwrap(),
         "--verified",
     ]);
     let rf = &body["data"]["route-findings"];
     assert!(rf.is_object(), "data[\"route-findings\"] must be an object");
-    assert!(!rf["findings_total"].is_null(), "data[\"route-findings\"].findings_total missing");
+    assert!(
+        !rf["findings_total"].is_null(),
+        "data[\"route-findings\"].findings_total missing"
+    );
     ws.cleanup();
 }
 
@@ -537,7 +598,10 @@ fn envelope_backlog_data_fields() {
     let body = ws.json(&["backlog", "list", "--json"]);
     let bl = &body["data"]["backlog"];
     assert!(bl.is_object(), "data.backlog must be an object");
-    assert!(bl["items"].is_array(), "data.backlog.items must be an array");
+    assert!(
+        bl["items"].is_array(),
+        "data.backlog.items must be an array"
+    );
     ws.cleanup();
 }
 
@@ -548,6 +612,9 @@ fn envelope_migrate_legacy_data_fields() {
     let body = ws.json(&["migrate-legacy", "--json"]);
     let ml = &body["data"]["migrate-legacy"];
     assert!(ml.is_object(), "data[\"migrate-legacy\"] must be an object");
-    assert!(ml["facts_migrated"].is_number(), "data[\"migrate-legacy\"].facts_migrated must be present");
+    assert!(
+        ml["facts_migrated"].is_number(),
+        "data[\"migrate-legacy\"].facts_migrated must be present"
+    );
     ws.cleanup();
 }

@@ -141,7 +141,10 @@ impl SessionActionEnvelope {
 }
 
 impl serde::Serialize for SessionActionEnvelope {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let mut map = serializer.serialize_map(Some(1))?;
         map.serialize_entry(self.action_name, &self.data)?;

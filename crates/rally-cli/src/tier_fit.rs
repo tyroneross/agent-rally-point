@@ -79,7 +79,8 @@ pub(crate) fn check_tier_fit(
         return TierFitResult {
             advisory: true,
             status: "no_calibration".to_string(),
-            message: "no tier-calibration decision fact found in room; advisory skipped".to_string(),
+            message: "no tier-calibration decision fact found in room; advisory skipped"
+                .to_string(),
             proposed_tier: proposed_tier.map(str::to_string),
             calibrated_tier: None,
             role: role.to_string(),
@@ -252,10 +253,7 @@ mod tests {
 
     #[test]
     fn tier_fit_matching_tier_returns_ok() {
-        let cal = make_calibration_fact(
-            "role:executor=cheapest:sonnet",
-            "cal-001",
-        );
+        let cal = make_calibration_fact("role:executor=cheapest:sonnet", "cal-001");
         let snapshot = snapshot_with_decision(cal);
         let result = check_tier_fit("executor", Some("sonnet"), &snapshot);
         assert_eq!(result.status, "ok");
@@ -265,10 +263,7 @@ mod tests {
 
     #[test]
     fn tier_fit_mismatch_emits_finding() {
-        let cal = make_calibration_fact(
-            "role:executor=cheapest:sonnet",
-            "cal-002",
-        );
+        let cal = make_calibration_fact("role:executor=cheapest:sonnet", "cal-002");
         let snapshot = snapshot_with_decision(cal);
         let result = check_tier_fit("executor", Some("opus"), &snapshot);
         assert_eq!(result.status, "mismatch");
@@ -282,10 +277,7 @@ mod tests {
 
     #[test]
     fn tier_fit_no_proposed_tier_returns_ok_with_calibration() {
-        let cal = make_calibration_fact(
-            "role:planner=cheapest:opus",
-            "cal-003",
-        );
+        let cal = make_calibration_fact("role:planner=cheapest:opus", "cal-003");
         let snapshot = snapshot_with_decision(cal);
         let result = check_tier_fit("planner", None, &snapshot);
         assert_eq!(result.status, "ok");
@@ -295,10 +287,7 @@ mod tests {
 
     #[test]
     fn tier_fit_calibration_fact_present_but_no_entry_for_role_is_neutral() {
-        let cal = make_calibration_fact(
-            "role:executor=cheapest:sonnet",
-            "cal-004",
-        );
+        let cal = make_calibration_fact("role:executor=cheapest:sonnet", "cal-004");
         let snapshot = snapshot_with_decision(cal);
         // Role "reviewer" not in calibration.
         let result = check_tier_fit("reviewer", Some("haiku"), &snapshot);

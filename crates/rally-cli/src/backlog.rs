@@ -19,9 +19,9 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 
+use crate::error::{RallyError, Result};
 use crate::store::{Fact, FactKind, RoomStore};
 use crate::{FACT_SCHEMA, new_id, now_string};
-use crate::error::{RallyError, Result};
 
 // ─── Domain types ────────────────────────────────────────────────────────────
 
@@ -126,10 +126,7 @@ pub(crate) fn add_backlog_item(
     scope.sort();
     scope.dedup();
 
-    let mut evidence: Vec<String> = depends_on
-        .iter()
-        .map(|dep| format!("dep:{dep}"))
-        .collect();
+    let mut evidence: Vec<String> = depends_on.iter().map(|dep| format!("dep:{dep}")).collect();
     evidence.sort();
 
     let fact = Fact {
@@ -218,10 +215,7 @@ pub(crate) fn list_backlog_items(room: &RoomStore) -> Result<Vec<BacklogItem>> {
             *entry = fact.clone();
         }
     }
-    let mut items: Vec<BacklogItem> = by_id
-        .values()
-        .filter_map(fact_to_backlog_item)
-        .collect();
+    let mut items: Vec<BacklogItem> = by_id.values().filter_map(fact_to_backlog_item).collect();
     items.sort_by_key(|i| i.seq);
     Ok(items)
 }
@@ -245,10 +239,20 @@ mod tests {
         add_backlog_item(&room, "t", "X-1", "do the thing", &[], &[]).unwrap();
         assert_eq!(list_backlog_items(&room).unwrap()[0].status, "open");
         mark_backlog_done(&room, "t", "X-1").unwrap();
-        let item = list_backlog_items(&room).unwrap().into_iter().find(|i| i.id == "X-1").unwrap();
+        let item = list_backlog_items(&room)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == "X-1")
+            .unwrap();
         assert_eq!(item.status, "done", "latest fact per id must be done");
-        assert!(mark_backlog_done(&room, "t", "missing").is_err(), "unknown id errors");
-        assert!(mark_backlog_done(&room, "t", "X-1").is_err(), "already-done errors");
+        assert!(
+            mark_backlog_done(&room, "t", "missing").is_err(),
+            "unknown id errors"
+        );
+        assert!(
+            mark_backlog_done(&room, "t", "X-1").is_err(),
+            "already-done errors"
+        );
     }
 
     use crate::store::RoomStore;
