@@ -1,6 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -184,10 +185,18 @@ pub(crate) struct BackendRunner {
 
 impl BackendRunner {
     pub(crate) fn new(backend: Backend, bins: BackendBins) -> Self {
+        let herdr_bin = if bins.herdr_socket.is_some() && bins.herdr_bin == "herdr" {
+            // Easy Terminal exposes a herdr-compatible daemon through ptyd; a
+            // private socket without an explicit client should use that proven
+            // CLI path instead of assuming a standalone `herdr` binary exists.
+            default_private_socket_client()
+        } else {
+            bins.herdr_bin
+        };
         Self {
             backend,
             tmux_bin: bins.tmux_bin,
-            herdr_bin: bins.herdr_bin,
+            herdr_bin,
             herdr_socket: bins.herdr_socket,
             cmux_bin: bins.cmux_bin,
         }
@@ -360,6 +369,46 @@ impl BackendRunner {
     pub(crate) fn stop(&self, target: &str) -> Result<()> {
         run_commands(&self.stop_commands(target))
     }
+}
+
+fn default_private_socket_client() -> String {
+    if binary_on_path("ptyd") {
+        return "ptyd".to_string();
+    }
+    ptyd_candidate_paths()
+        .into_iter()
+        .find(|path| path.is_file())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "ptyd".to_string())
+}
+
+fn binary_on_path(name: &str) -> bool {
+    env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+fn ptyd_candidate_paths() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = env::current_dir() {
+        candidates.push(
+            cwd.join("build/Build/Products/Release/Easy Terminal.app/Contents/Resources/bin/ptyd"),
+        );
+    }
+    if let Ok(home) = env::var("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(
+            home.join(
+                "dev/git-folder/easy-terminal/build/Build/Products/Release/Easy Terminal.app/Contents/Resources/bin/ptyd",
+            ),
+        );
+        candidates.push(home.join("dev/git-folder/ptyd/target/debug/ptyd"));
+        candidates.push(home.join("dev/git-folder/ptyd/target/release/ptyd"));
+    }
+    candidates.push(PathBuf::from(
+        "/Applications/Easy Terminal.app/Contents/Resources/bin/ptyd",
+    ));
+    candidates
 }
 
 fn tmux_start_command(

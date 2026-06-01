@@ -1720,6 +1720,26 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
     assert_eq!(socket_command[4], "agent");
     assert_eq!(socket_command[5], "start");
 
+    let default_socket_client = workspace.json(&[
+        "run",
+        "codex",
+        "--json",
+        "--dry-run",
+        "--name",
+        "et-default",
+        "--backend",
+        "herdr",
+        "--herdr-socket",
+        "/tmp/easy-terminal-herdr.sock",
+    ]);
+    let default_socket_command = default_socket_client["data"]["run"]["commands"]["start"][0]
+        .as_array()
+        .unwrap();
+    assert_eq!(default_socket_command[0], "env");
+    assert_eq!(default_socket_command[3], "ptyd");
+    assert_eq!(default_socket_command[4], "agent");
+    assert_eq!(default_socket_command[5], "start");
+
     let herdr_inject = workspace.json(&[
         "inject",
         "herdr-reviewer-01",
