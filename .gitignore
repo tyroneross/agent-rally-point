@@ -68,6 +68,7 @@ target/
 !.rally/manifest.json
 !.rally/RETROSPECTIVE.md
 !.rally/log/
+.rally/log/index.json
 !.rally/archive/
 .rally/log/*.tmp-*
 .rally/archive/*.tmp-*
@@ -85,3 +86,5 @@ uv.lock
 # Optional tool runtime dirs (per-tool data lives under .<toolname>/, not in-repo).
 .bookmark/
 .navgator/
+.claude/
+.ibr/

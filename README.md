@@ -13,6 +13,9 @@ operating guide for the Rally loop.
 
 The full product boundary is [`docs/RALLY_ARCHITECTURE.md`](docs/RALLY_ARCHITECTURE.md).
 
+Checkout and active-ledger migration rules live in
+[`docs/CANONICAL-CHECKOUT-MIGRATION.md`](docs/CANONICAL-CHECKOUT-MIGRATION.md).
+
 ## Status
 
 Rally owns the primary product path:
@@ -110,8 +113,9 @@ The short version:
 - The product model is room, fact, enter, next, say, check.
 - **One repo = one rally point.** Coordination lives at
   `<repo_root>/.rally/`, segmented per-repo, never co-mingled.
-- **`.rally/ledger.jsonl` is canonical** — append-only, committed,
-  `merge=union`. Survives clone and machine with no external service.
+- **`.rally/log/<engagement>.jsonl` is canonical** — append-only,
+  committed, `merge=union`. The legacy `.rally/ledger.jsonl` remains a
+  replayable migration input.
 - `.rally/facts.db` is a derived sqlite cache rebuilt by replaying the
   ledger when missing or behind.
 - `~/.agent-rally-point/rooms/v1/index.json` is a global discovery hint

@@ -8,8 +8,7 @@ Practical guide for handing a build off to a fresh agent session and launching m
 ```bash
 cd <repo>                                   # rally is repo-local — cwd must be the repo
 rally run claude --name <label>             # launch a managed Claude in tmux, auto-numbered (claude-<label>-01)
-rally inject <session> --text "<prompt>"    # deliver the first instruction…
-tmux send-keys -t rally-<session-target> Enter   # …then SUBMIT it (inject does NOT press Enter — see gotcha)
+rally inject <session> --text "<prompt>"    # deliver and submit the first instruction
 rally capture <session> --lines 30          # snapshot what it's doing
 rally attach <session>                      # watch live  ·  rally stop <session> to halt
 ```
@@ -24,22 +23,28 @@ rally attach <session>                      # watch live  ·  rally stop <sessio
 - Self-relaunch guard: an agent hosted by that same Easy Terminal socket must not launch a build/relaunch lane back into its own host. Start build/relaunch workers outside that ET instance, or detach first; `RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH=1` is only for a consciously detached/non-relaunch launch.
 - The agent starts at its normal prompt with **auto mode on** (Claude Code) — it does nothing until you inject an instruction.
 
-## 2. Injecting the instruction (and the Enter gotcha)
+## 2. Injecting the instruction
 
-`rally inject <session|name|tool> --text "<prompt>"` delivers text into the session's input. **It pastes but does NOT submit** — the prompt sits as `[Pasted text #1]`. You MUST follow with an Enter:
+`rally inject <session|name|tool> --text "<prompt>"` delivers text into the session input and submits one Enter through the managed backend:
 
 ```bash
 rally inject claude-foo-01 --text "Read docs/HANDOFF.md and continue …"
-tmux send-keys -t rally-claude-foo-01 Enter        # submit
 ```
 
 - `--require-ack` requires `--handoff <event-id>` or `--ref` — it does **not** work with free `--text`. For a plain steer, omit it.
 - `delivered=true ack=false` is normal for a `--text` inject (no ack channel).
 - Inject only works against a **`rally run`-managed** session. Fact-only / externally-launched agents are not injectable — hand those off via a committed doc instead.
+- If `rally capture` shows the prompt pasted but not acted on, wait briefly and send one bounded backend-specific Enter as troubleshooting. That is a fallback, not the normal contract.
 
-## 3. The handoff itself — a committed doc is the source of truth
+## 3. The handoff itself — Rally is the source of truth
 
-Rally `handoff` *records* (`rally say handoff …` / `agent_rally.py handoff …`) can be policy-rejected (e.g. no active run/lease) and return opaquely. **Do not rely on the record alone.** The durable handoff is a **committed `docs/HANDOFF-<date>-<topic>.md`** that the incoming session reads first. The record is a pointer to it.
+Rally `.rally/log/**` records are the coordination source of truth. A committed `docs/HANDOFF-<date>-<topic>.md` is a durable payload for longer context; the Rally fact points to it, and managed sessions receive focused work through `rally inject`.
+
+Default communication order:
+
+1. Post targeted `handoff`, `decision`, `risk`, `blocker`, `resolve`, and `artifact` facts to the owning repo's Rally ledger.
+2. Use `rally inject` to deliver the first instruction or urgent steering into a `rally run`-managed session.
+3. Use a committed handoff doc only when the payload is too long or durable enough to review outside the ledger.
 
 A good handoff doc contains: mission · what's DONE (with the **canonical branch + HEAD**, build status) · PENDING in priority order · verification gaps · cleanup register · conventions/gotchas · key paths · coordination instructions.
 
@@ -62,7 +67,7 @@ Commit each chunk; keep <branch> green. Start by reading the handoff doc + confi
 | | Claude (`rally run claude`) | Codex (`rally run codex`) |
 |---|---|---|
 | Launch | tmux, starts at prompt, auto mode | tmux; Codex TUI / `codex exec` per backend |
-| Inject | `rally inject … --text` **+ Enter** | same; some Codex modes are non-injectable (fact-only) → use the doc + `rally say` |
+| Inject | `rally inject … --text` | same; some Codex modes are non-injectable (fact-only) → use the doc + `rally say` |
 | Permissions | fresh session may prompt to trust folder / approve tools — pre-approve or run in an already-trusted repo | Codex sandbox/approval per its config |
 | Coordination | reads CLAUDE.md + rally room on entry | reads AGENTS.md + rally room on entry |
 | Identity | `claude_code:<name>` | `codex:<name>` |

@@ -2017,9 +2017,18 @@ impl RoomStore {
         let index_path = self.log_dir.join(LOG_INDEX_FILENAME);
         fs::create_dir_all(&self.log_dir)
             .map_err(RallyError::io(format!("create {}", self.log_dir.display())))?;
-        let rendered =
-            serde_json::to_string_pretty(&json!({"segments": entries, "updated_at": now_string()}))
-                .map_err(RallyError::json("render log index"))?;
+        let segments_value =
+            serde_json::to_value(&entries).map_err(RallyError::json("render log index"))?;
+        if let Ok(existing_text) = fs::read_to_string(&index_path)
+            && let Ok(existing) = serde_json::from_str::<Value>(&existing_text)
+            && existing.get("segments") == Some(&segments_value)
+        {
+            return Ok(());
+        }
+        let rendered = serde_json::to_string_pretty(
+            &json!({"segments": segments_value, "updated_at": now_string()}),
+        )
+        .map_err(RallyError::json("render log index"))?;
         let rendered = format!("{rendered}\n");
         let temp_path = index_path.with_extension(format!("json.tmp-{}", short_id()));
         fs::write(&temp_path, rendered)
@@ -2291,6 +2300,15 @@ mod ledger_tests {
             serde_json::from_str(&fs::read_to_string(&index_path).unwrap()).unwrap();
         assert!(index_val["segments"].is_array());
         assert_eq!(index_val["segments"].as_array().unwrap().len(), 2);
+
+        let index_before_noop_open = fs::read_to_string(&index_path).unwrap();
+        drop(store);
+        let _store = RoomStore::open_at(root.clone()).unwrap();
+        let index_after_noop_open = fs::read_to_string(&index_path).unwrap();
+        assert_eq!(
+            index_after_noop_open, index_before_noop_open,
+            "opening an unchanged room must not dirty the derived segment index"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
