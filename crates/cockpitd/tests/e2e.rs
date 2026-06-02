@@ -1066,10 +1066,27 @@ async fn e2e_multiblock_turn_yields_three_events() {
 
     let snapshot = client.recv_matching("snapshot").await;
 
-    // Collect all events from snapshot + live deltas.
+    // Collect all events from snapshot + live deltas. Under full-suite load the
+    // async pump can start after an initial quiet window, so keep polling until
+    // the expected signal arrives or the overall deadline expires.
     let mut all_events: Vec<Value> = snapshot["events"].as_array().unwrap().clone();
-    for _ in 0..30 {
-        match timeout(Duration::from_millis(500), client.recv()).await {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let kinds: Vec<&str> = all_events
+            .iter()
+            .filter_map(|e| e.get("kind").and_then(|k| k.as_str()))
+            .collect();
+        let has_message = kinds.contains(&"message");
+        let has_tool = kinds.contains(&"tool_call") || kinds.contains(&"approval_request");
+        if has_message && has_tool {
+            break;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+
+        match timeout(Duration::from_millis(100), client.recv()).await {
             Ok(v) => {
                 let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
                 if t == "event" {
@@ -1078,7 +1095,7 @@ async fn e2e_multiblock_turn_yields_three_events() {
                     }
                 }
             }
-            Err(_) => break,
+            Err(_) => continue,
         }
     }
 
