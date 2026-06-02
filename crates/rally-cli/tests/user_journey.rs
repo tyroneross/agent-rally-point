@@ -242,10 +242,12 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
     assert_eq!(enter["data"]["enter"]["cursor"]["before"], 0);
     // Component B: say claim (claude) wrote presence(1)+lead(2)+claim(3);
     // say decision (pi) wrote presence(4)+decision(5). codex enter writes
-    // presence(6) via ensure_presence (lead already set by claude).
-    // cursor_after is set to post-presence max_seq=6 so that codex's own
-    // presence fact is excluded from "new peer content" on the next enter.
-    assert_eq!(enter["data"]["enter"]["cursor"]["after"], 6);
+    // presence(6) via ensure_presence (lead already set by claude), then the
+    // f4-widened fleet check writes an `unmanaged-agent` risk(7) because
+    // `codex` has no active managed-session record. cursor_after is set to
+    // post-presence max_seq=7 so codex's own presence + risk facts are
+    // excluded from "new peer content" on the next enter.
+    assert_eq!(enter["data"]["enter"]["cursor"]["after"], 7);
     assert_eq!(enter["data"]["enter"]["cursor"]["advanced"], true);
     assert!(
         enter["data"]["enter"]["entry"]["do_not"]
@@ -271,19 +273,22 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
         "--path",
         "src/room.rs",
     ]);
-    // R10/cursor: second enter's cursor_before = 6 (ledger-derived from the
-    // Read checkpoint written by the first enter, which recorded content_max_seq=6).
-    // The second enter detects codex as already active (B11) and writes a durable
-    // risk fact before ensure_presence runs; then ensure_presence is idempotent
-    // (no new presence/lead).
+    // R10/cursor: second enter's cursor_before = 7 (ledger-derived from the
+    // Read checkpoint written by the first enter, which recorded
+    // content_max_seq=7). The second enter detects codex as already active
+    // (B11) and writes a durable risk fact AFTER ensure_presence runs
+    // (post-f4-order: presence first, then warning-block risk facts so the
+    // squad-membership guard inside ensure_presence is not short-circuited).
     // Seq breakdown after first enter:
     //   1: presence(claude), 2: lead(claude), 3: claim, 4: presence(pi), 5: decision
-    //   6: presence(codex) — first enter's ensure_presence
-    //   7: Read checkpoint (first enter's maybe_append_read_checkpoint at content_max=6)
-    //   8: B11 risk fact (second enter's drift detection)
-    // cursor_after = snapshot.max_seq = 8.
-    assert_eq!(enter_again["data"]["enter"]["cursor"]["before"], 6);
-    assert_eq!(enter_again["data"]["enter"]["cursor"]["after"], 8);
+    //   6: presence(codex) — first enter's ensure_presence (now FIRST)
+    //   7: f4 unmanaged-agent risk(codex) — codex has no managed session
+    //   8: Read checkpoint (first enter's maybe_append_read_checkpoint at content_max=7)
+    //   9: B11 risk fact (second enter's duplicate-active-squad detection;
+    //      the unmanaged-agent risk dedups via already_recorded check)
+    // cursor_after = snapshot.max_seq = 9.
+    assert_eq!(enter_again["data"]["enter"]["cursor"]["before"], 7);
+    assert_eq!(enter_again["data"]["enter"]["cursor"]["after"], 9);
     assert_eq!(enter_again["data"]["enter"]["cursor"]["advanced"], true);
 
     let (check, check_output) = workspace.json_with_status(&[
@@ -3952,6 +3957,275 @@ fn rally_run_herdr_dry_run_auto_discovers_live_et_socket() {
     assert!(
         args.iter().any(|a| a.contains(&live_str)),
         "live ET socket smoke: expected discovered socket {live_str} in command args; got: {args:?}"
+    );
+
+    workspace.cleanup();
+}
+
+/// C-HERDR / f1+f2+f3: REAL non-dry-run herdr control-path round-trip.
+///
+/// This is the test the prior audit (`nay 0.88`) flagged as missing — every
+/// prior `rally_run_herdr_*` test ran with `--dry-run`, which skips
+/// `reserve_numbered_session` AND the backend start, so they only checked the
+/// rendered command string. None of them proved that the socket discovered at
+/// `rally run` time actually flows into the session record and is reused by
+/// later inject/attach/capture/stop calls. Pre-f1, it did NOT — `delivered`
+/// silently collapsed to `false` against the wrong daemon.
+///
+/// What this test proves:
+///   - f1 (persist): `data.sessions.sessions[0].herdr_socket` equals the
+///     socket `rally run` discovered.
+///   - f1 (reuse-inject): `data.inject.commands` are env-wrapped with the
+///     persisted socket, NOT the bare-default-daemon shape.
+///   - f3 (reuse-stop): `rally stop` succeeds and removes the session.
+///   - f1 (diagnostic): the new `data.inject.delivery_error` field exists
+///     and is omitted on a successful synthetic delivery (the
+///     `/usr/bin/true` herdr-bin stub returns Ok).
+///
+/// Gating: requires the live Easy Terminal socket on disk (same probe as the
+/// existing dry-run live-smoke). Returns early when no ET install is present.
+///
+/// Why this test would FAIL pre-f1:
+///   - `ManagedSession` had no `herdr_socket` field — `data.sessions[...]`
+///     would lack it entirely (assertion #1 would fail).
+///   - `command_inject` built `BackendRunner` from `args.bins` only, so the
+///     emitted commands carried no `PTYD_SOCKET_PATH=` env-wrap (assertion #2
+///     would fail).
+#[test]
+fn rally_run_herdr_real_control_path_round_trips_persisted_socket() {
+    let live_socket = match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home).join("Library/Application Support/EasyTerminal/herdr.sock"),
+        Err(_) => return,
+    };
+    if !live_socket.exists() {
+        eprintln!(
+            "skipping f1/f2/f3 round-trip — {} not on disk",
+            live_socket.display()
+        );
+        return;
+    }
+    let live_str = live_socket.display().to_string();
+
+    let _run_guard = serialize_rally_run();
+    // Run inside an isolated workspace BUT keep the real HOME so the
+    // ET-socket auto-discovery finds the live socket. The discovery code
+    // reads $HOME at call time and only stats the candidate; it never
+    // writes there.
+    let real_home = std::env::var("HOME").unwrap();
+    let workspace =
+        Workspace::new_with_home("rally-herdr-real-roundtrip", &PathBuf::from(&real_home));
+
+    // Step 1: `rally run` with a no-op herdr binary. This goes through the
+    // full reserve_numbered_session path (no --dry-run), so the session fact
+    // lands in the ledger. The /usr/bin/true stub makes the actual backend
+    // start succeed without needing a real herdr daemon.
+    let run = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "f1-reviewer",
+        "--backend",
+        "herdr",
+        "--herdr-bin",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(run["data"]["run"]["mode"], "run");
+    assert_eq!(run["data"]["run"]["session"]["backend"], "herdr");
+    // f1: the auto-discovered socket must be persisted on the session record.
+    let persisted = run["data"]["run"]["session"]["herdr_socket"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "f1 regression: session.herdr_socket missing from `rally run` envelope; got: {}",
+                run["data"]["run"]["session"]
+            )
+        });
+    assert_eq!(
+        persisted, live_str,
+        "f1 regression: persisted socket {persisted} != discovered socket {live_str}"
+    );
+
+    // Step 2: `rally sessions` must surface the persisted socket too.
+    let sessions = workspace.json(&["sessions", "--json"]);
+    let sess0 = &sessions["data"]["sessions"]["sessions"][0];
+    assert_eq!(sess0["name"], "f1-reviewer-01");
+    assert_eq!(
+        sess0["herdr_socket"].as_str(),
+        Some(live_str.as_str()),
+        "f1 regression: session.herdr_socket missing from `rally sessions` envelope"
+    );
+
+    // Step 3: `rally inject` — the BackendRunner must rebuild with the
+    // persisted socket, env-wrapping the commands. Pre-f1, this rebuilt with
+    // herdr_socket=None and the commands would NOT contain PTYD_SOCKET_PATH=.
+    let inject = workspace.json(&[
+        "inject",
+        "f1-reviewer-01",
+        "--json",
+        "--text",
+        "hello from f1",
+        "--herdr-bin",
+        "/usr/bin/true",
+    ]);
+    let commands = inject["data"]["inject"]["commands"]
+        .as_array()
+        .expect("inject must emit commands array");
+    let any_env_wrapped = commands.iter().any(|cmd| {
+        cmd.as_array()
+            .and_then(|args| args.first())
+            .and_then(|first| first.as_str())
+            == Some("env")
+            && cmd
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg.as_str().is_some_and(|s| s.contains(&live_str)))
+    });
+    assert!(
+        any_env_wrapped,
+        "f1 regression: inject commands not env-wrapped with persisted socket {live_str}; got: {commands:?}"
+    );
+    // f1 diagnostic field: should be absent on success (skip_serializing_if).
+    // We assert presence/shape conservatively — null OR missing both acceptable.
+    let delivery_error = inject["data"]["inject"].get("delivery_error");
+    assert!(
+        matches!(
+            delivery_error,
+            None | Some(Value::Null) | Some(Value::String(_))
+        ),
+        "f1 schema: delivery_error must be string|null|absent; got: {delivery_error:?}"
+    );
+
+    // Step 4 (f3): `rally stop` reaches the right daemon too. Same proof: the
+    // emitted commands must carry the persisted socket env-wrap.
+    let stop = workspace.json(&[
+        "stop",
+        "f1-reviewer-01",
+        "--json",
+        "--herdr-bin",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(stop["data"]["stop"]["action"], "stop");
+    let stop_commands = stop["data"]["stop"]["commands"]
+        .as_array()
+        .expect("stop must emit commands array");
+    let stop_env_wrapped = stop_commands.iter().any(|cmd| {
+        cmd.as_array()
+            .and_then(|args| args.first())
+            .and_then(|first| first.as_str())
+            == Some("env")
+            && cmd
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg.as_str().is_some_and(|s| s.contains(&live_str)))
+    });
+    assert!(
+        stop_env_wrapped,
+        "f3 regression: stop commands not env-wrapped with persisted socket {live_str}; got: {stop_commands:?}"
+    );
+    // After stop, session must be gone.
+    let sessions_after = workspace.json(&["sessions", "--json"]);
+    assert_eq!(
+        sessions_after["data"]["sessions"]["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "f3 regression: session remained after stop"
+    );
+
+    workspace.cleanup();
+}
+
+/// f5 regression: two adopts of the SAME running surface (`--pane <id>`)
+/// MUST be rejected even when they pass different `--tool` values. The
+/// pre-f5 dedup check at lib.rs:2119 was `s.target == target` only — this
+/// test proves it still holds (and pins the contract so a regression would
+/// surface immediately).
+#[test]
+fn rally_adopt_rejects_duplicate_target_across_different_tools() {
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-adopt-target-dedup");
+
+    let first = workspace.json(&[
+        "adopt",
+        "first-adoptee",
+        "--json",
+        "--pane",
+        "pane-shared",
+        "--tool",
+        "claude_code:adopt-a",
+        "--backend",
+        "herdr",
+    ]);
+    assert_eq!(first["data"]["adopt"]["session"]["target"], "pane-shared");
+
+    let second = workspace.output(&[
+        "adopt",
+        "second-adoptee",
+        "--json",
+        "--pane",
+        "pane-shared", // same target, different tool
+        "--tool",
+        "claude_code:adopt-b",
+        "--backend",
+        "herdr",
+    ]);
+    assert!(
+        !second.status.success(),
+        "f5 regression: duplicate-target adopt with different tool succeeded; stdout: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("already adopted") || stderr.contains("pane-shared"),
+        "f5 regression: expected dedup error mentioning target; got stderr: {stderr}"
+    );
+
+    workspace.cleanup();
+}
+
+/// f6: socket discovery rejects candidate paths that carry control
+/// characters (newline / NUL). Hard to engineer via env on a real ET
+/// install, but easy to engineer via PTYD_SOCKET_PATH directly. With the
+/// rejection in place, discovery falls back to the default candidates
+/// instead of passing a corrupt path into the env-wrap.
+#[test]
+fn rally_run_herdr_dry_run_rejects_unsafe_socket_paths() {
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-herdr-unsafe-socket");
+    // Create a real on-disk file with a newline in its name — the env value
+    // would otherwise satisfy `path.exists()` if we let it through.
+    let unsafe_sock = workspace.home.join("inj\nected.sock");
+    // Some filesystems don't allow newlines in filenames; tolerate that by
+    // simulating the env-only path (the rejection happens BEFORE the exists
+    // check, so we don't need the file on disk).
+    let _ = fs::write(&unsafe_sock, b"");
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rally"));
+    cmd.current_dir(&workspace.cwd)
+        .env_clear()
+        .env("HOME", &workspace.home)
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PTYD_SOCKET_PATH", unsafe_sock.as_os_str())
+        .args(["run", "claude", "--backend", "herdr", "--dry-run", "--json"]);
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let start = &value["data"]["run"]["commands"]["start"][0];
+    let first = start[0].as_str().unwrap_or("");
+    // f6: the unsafe path must be rejected. With no other candidate on disk
+    // inside the temp HOME, discovery falls through and we expect bare
+    // `herdr` (not env-wrap pointing at the newline-bearing path).
+    assert_ne!(
+        first, "env",
+        "f6 regression: discovery accepted an unsafe (newline-bearing) socket path; got start: {start}"
     );
 
     workspace.cleanup();

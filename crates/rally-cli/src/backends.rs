@@ -61,6 +61,20 @@ pub(crate) struct ManagedSession {
     pub(crate) backend: String,
     pub(crate) cwd: PathBuf,
     pub(crate) target: String,
+    /// C-HERDR/f1: the Easy Terminal (or standalone herdr) socket path the
+    /// session was launched against, or `None` for non-herdr backends and
+    /// pre-f1 facts that did not record it. Persisted on the session fact so
+    /// later `rally inject`/`attach`/`capture`/`stop` calls can rebuild a
+    /// `BackendRunner` that targets the SAME daemon — without this, those
+    /// commands silently target the wrong daemon and `delivered:false` with
+    /// no diagnostic.
+    ///
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]` keeps
+    /// existing serialized facts (without this field) deserializing cleanly,
+    /// and keeps non-herdr session payloads from acquiring a `null` field in
+    /// `rally sessions --json` output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) herdr_socket: Option<String>,
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -122,6 +136,12 @@ pub(crate) struct InjectData {
     pub(crate) content_fact: Option<Fact>,
     /// Whether the live backend delivery succeeded.
     pub(crate) delivered: bool,
+    /// f1: a human-readable diagnostic when live delivery failed. `None` on
+    /// success and on dry-run. Pre-f1, errors were silently swallowed into a
+    /// bare `delivered:false`; this field surfaces the cause so a control-path
+    /// failure (wrong daemon, pane gone, etc.) is debuggable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) delivery_error: Option<String>,
 }
 
 /// Envelope for `inject`: result under `data.inject`.
@@ -418,7 +438,7 @@ fn default_private_socket_client() -> String {
 pub(crate) fn find_easy_terminal_socket() -> Option<PathBuf> {
     for env_var in ["PTYD_SOCKET_PATH", "HERDR_SOCKET_PATH"] {
         if let Ok(value) = env::var(env_var) {
-            if !value.is_empty() {
+            if !value.is_empty() && is_safe_socket_path(&value) {
                 let path = PathBuf::from(&value);
                 if path.exists() {
                     return Some(path);
@@ -428,7 +448,19 @@ pub(crate) fn find_easy_terminal_socket() -> Option<PathBuf> {
     }
     easy_terminal_socket_candidates()
         .into_iter()
+        .filter(|c| c.to_str().map(is_safe_socket_path).unwrap_or(false))
         .find(|candidate| candidate.exists())
+}
+
+/// f6: a socket path is safe to use when it does not contain control
+/// characters that could break downstream env wrapping (newline injects
+/// extra env vars when the path is concatenated into a shell command;
+/// NUL truncates the string before the kernel sees the rest). Rejecting
+/// the candidate is always safer than passing it through — discovery is
+/// a best-effort probe with an explicit fallback to the bare `herdr`
+/// binary, so a rejected candidate just means we don't use it.
+fn is_safe_socket_path(path: &str) -> bool {
+    !path.chars().any(|c| c == '\n' || c == '\r' || c == '\0')
 }
 
 /// Disk locations to probe for the Easy Terminal herdr socket, in order.
@@ -846,6 +878,7 @@ mod tests {
             backend: "herdr".to_string(),
             cwd: std::path::PathBuf::from("/tmp/repo"),
             target: "codex-01".to_string(),
+            herdr_socket: None,
         };
         let output = json!({
             "result": {
