@@ -9,6 +9,12 @@ SPDX-License-Identifier: Apache-2.0
 installable rally feature that works for **Claude, Codex, and any other agent** — not a build-loop
 Python poller watching the soon-retired legacy global index.
 
+> **Reference implementation:** the legacy Python push-based watcher lives at
+> [`tools/agent-rally-watcher/`](../tools/agent-rally-watcher/) (vendored from
+> the standalone [agent-rally-watcher](https://github.com/tyroneross/agent-rally-watcher),
+> v0.1.1). When this spec ships and reaches feature parity, that subtree is
+> retired. See [`tools/agent-rally-watcher/MIGRATION.md`](../tools/agent-rally-watcher/MIGRATION.md).
+
 **Language: Rust**, as a new `rally watch` subcommand. Rationale: it ships in the single `rally`
 binary every agent already installs (host-neutral by construction); zero new deps (rally-cli is
 std-only — a poll-thread on `index.json`, no async/notify needed); and it reads the **per-repo

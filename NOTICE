@@ -5,3 +5,15 @@ This product was authored by Tyrone Ross, Jr (https://github.com/tyroneross/agen
 Portions of this software were developed with the assistance of Anthropic's Claude
 (via Claude Code) and OpenAI's Codex (via Codex CLI); AI-pair-programming
 contributions are attributed via Co-Authored-By trailers in the git history.
+
+------------------------------------------------------------------------
+Vendored components
+------------------------------------------------------------------------
+
+tools/agent-rally-watcher/
+    Vendored snapshot of agent-rally-watcher (v0.1.1, Apache-2.0),
+    originally at https://github.com/tyroneross/agent-rally-watcher.
+    See tools/agent-rally-watcher/NOTICE and tools/agent-rally-watcher/LICENSE
+    for the original attribution and license terms. Migration context lives
+    in tools/agent-rally-watcher/MIGRATION.md. Full pre-import history is
+    preserved in archive/bundles/agent-rally-watcher.bundle.

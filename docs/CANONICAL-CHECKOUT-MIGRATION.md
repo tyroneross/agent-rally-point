@@ -18,6 +18,9 @@ product itself:
 - Rally CLI, store, discovery, managed-session, and schema changes.
 - Rally documentation and migration guides.
 - Plugin extraction surfaces that are part of the Rally product.
+- Vendored legacy references under `tools/` (e.g.
+  [`tools/agent-rally-watcher/`](../tools/agent-rally-watcher/), superseded by
+  [`docs/SPEC-rally-watch-autonomy.md`](SPEC-rally-watch-autonomy.md)).
 
 Keep project coordination in the project repo that owns the work:
 

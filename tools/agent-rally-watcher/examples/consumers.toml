@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Example consumers.toml — copy to ~/.agent-rally-watcher/consumers.toml and edit.
+#
+# Each [consumers.<id>] table defines one consumer (the table key is also the cursor name).
+# Each consumer has two sub-tables:
+#
+#   [consumers.<id>.filter]   — AND-combined rules; missing fields match everything.
+#     kinds          = ["…"]  channel record kinds to include
+#     kinds_not      = ["…"]  kinds to exclude
+#     tools          = ["…"]  `tool` values to include
+#     tools_not      = ["…"]  `tool` values to exclude (e.g. don't echo self)
+#     senders        = ["…"]  `run_id` values to include
+#     payload_match  = { key = "value" }   payload.<key> == value (string equality)
+#
+#   [consumers.<id>.sink]     — where matched records go.
+#     type = "file"   + path  = "<path>"                — append JSONL
+#     type = "notify" + title = "<str>"                 — macOS osascript
+#                     [+ body_field = "<payload-key>"]
+#     type = "http"   + url   = "<url>"                 — POST JSON (stubbed in v0.1)
+
+[consumers.claude_code.filter]
+kinds = ["feedback", "handoff", "dep-change"]
+tools_not = ["claude_code"]
+
+[consumers.claude_code.sink]
+type = "file"
+path = "~/.agent-rally-watcher/streams/claude_code.jsonl"
+
+
+[consumers.codex.filter]
+kinds = ["feedback", "handoff"]
+tools_not = ["codex"]
+
+[consumers.codex.sink]
+type = "file"
+path = "~/.agent-rally-watcher/streams/codex.jsonl"
+
+
+[consumers.urgent_notify.filter]
+kinds = ["feedback"]
+payload_match = { verdict = "BLOCKED" }
+
+[consumers.urgent_notify.sink]
+type = "notify"
+title = "Rally Watcher — blocker"

@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-rally-watcher"
+version = "0.1.1"
+description = "Daemon companion to agent-rally-point: push-based watcher for Rally Point streams with per-consumer filtering and dispatch."
+requires-python = ">=3.11"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Tyrone Ross, Jr" }]
+keywords = ["agent", "coordination", "multi-agent", "claude-code", "codex", "ai-tools", "developer-tools", "watcher", "daemon"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "watchfiles>=0.21",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+]
+
+[project.scripts]
+agent-rally-watcher = "agent_rally_watcher.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/tyroneross/agent-rally-watcher"
+Repository = "https://github.com/tyroneross/agent-rally-watcher"
+Issues = "https://github.com/tyroneross/agent-rally-watcher/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["agent_rally_watcher*"]

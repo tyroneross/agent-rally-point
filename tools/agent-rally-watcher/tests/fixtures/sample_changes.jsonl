@@ -1,0 +1,5 @@
+{"ts":1716480000.0,"kind":"feedback","tool":"codex","model":"gpt-5","run_id":"run-001","app_slug":"demo","payload":{"verdict":"PASS","evidence":{"commit":"abc1234"}},"revision":1}
+{"ts":1716480001.0,"kind":"handoff","tool":"claude_code","model":"claude-opus-4-7","run_id":"run-002","app_slug":"demo","payload":{"to":"codex","scope":"verify chunk-2"},"revision":2}
+{"ts":1716480002.0,"kind":"feedback","tool":"codex","model":"gpt-5","run_id":"run-002","app_slug":"demo","payload":{"verdict":"BLOCKED","reason":"schema drift"},"revision":3}
+{"ts":1716480003.0,"kind":"dep-change","tool":"claude_code","model":"claude-opus-4-7","run_id":"run-003","app_slug":"demo","payload":{"pkg":"pyyaml","from":"6.0.1","to":"6.0.2"},"revision":4}
+{"ts":1716480004.0,"kind":"commit","tool":"claude_code","model":"claude-opus-4-7","run_id":"run-003","app_slug":"demo","payload":{"sha":"def5678"},"revision":5}

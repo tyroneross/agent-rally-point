@@ -128,6 +128,17 @@ The short version:
 See [docs/RALLY_ARCHITECTURE.md](docs/RALLY_ARCHITECTURE.md) for the full
 per-repo segmentation contract.
 
+## Vendored tools
+
+- [`tools/agent-rally-watcher/`](tools/agent-rally-watcher/) — vendored snapshot of
+  the standalone [agent-rally-watcher](https://github.com/tyroneross/agent-rally-watcher)
+  Python daemon (v0.1.1, Apache-2.0), kept as a legacy reference for the
+  push-based watcher/dispatch surface. Superseded by the planned native
+  [`rally watch`](docs/SPEC-rally-watch-autonomy.md) subcommand. See
+  [`tools/agent-rally-watcher/MIGRATION.md`](tools/agent-rally-watcher/MIGRATION.md)
+  for the path-lineage table and the relationship to
+  [`docs/CANONICAL-CHECKOUT-MIGRATION.md`](docs/CANONICAL-CHECKOUT-MIGRATION.md).
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
