@@ -223,6 +223,12 @@ pub(crate) struct RunArgs {
     pub(crate) session_id: Option<String>,
     pub(crate) tool: Option<String>,
     pub(crate) bins: BackendBins,
+    /// When true, launch the agent in the canonical shared checkout (today's
+    /// behavior) instead of provisioning a dedicated linked worktree.
+    /// Accepts both `--shared` and `--no-worktree` on the command line.
+    /// Default = false (worktree-per-agent is the default, structural fix for
+    /// the shared-branch hazard documented in worktree_guard.rs).
+    pub(crate) shared: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -988,8 +994,16 @@ fn run_parser() -> impl Parser<RunArgs> {
     let tool = optional_string_arg("tool", "TOOL");
     let bins = backend_bins_parser();
     let agent = positional::<String>("AGENT");
-    construct!(json, dry_run, name, backend, session_id, tool, bins, agent).map(
-        |(json, dry_run, name, backend, session_id, tool, bins, agent)| RunArgs {
+    // Two spellings, both meaning "opt out of per-agent worktree provisioning".
+    // Either flag yields `shared = true`; default = false (isolated).
+    let shared = long("shared").switch();
+    let no_worktree = long("no-worktree").switch();
+    let shared = construct!(shared, no_worktree).map(|(a, b)| a || b);
+    construct!(
+        json, dry_run, name, backend, session_id, tool, bins, shared, agent
+    )
+    .map(
+        |(json, dry_run, name, backend, session_id, tool, bins, shared, agent)| RunArgs {
             json,
             dry_run,
             agent,
@@ -998,6 +1012,7 @@ fn run_parser() -> impl Parser<RunArgs> {
             session_id,
             tool,
             bins,
+            shared,
         },
     )
 }
