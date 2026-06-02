@@ -81,6 +81,8 @@ target/
 
 # uv lockfile — library-style project; downstream pipx installs resolve own deps.
 uv.lock
+# Exception: vendored watcher is an app-style daemon + port reference — ship its lock for reproducible installs.
+!tools/agent-rally-watcher/uv.lock
 .claude/worktrees/
 
 # Optional tool runtime dirs (per-tool data lives under .<toolname>/, not in-repo).
