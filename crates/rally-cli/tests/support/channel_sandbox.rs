@@ -12,10 +12,10 @@
 //! The point of this sandbox: a fresh scratch workspace in a temp dir,
 //! RAII-cleaned, so a test can:
 //! 1. Spin up a scratch rally workspace (its own `.git/`, isolated `HOME`).
-    //! 2. Register a managed session via `rally run --shared --backend tmux
-    //!    --tmux-bin /usr/bin/true` (the existing test idiom — no real tmux
-    //!    needed, no linked worktree, and the session record lands in the
-    //!    workspace's `.rally/facts.db`).
+//! 2. Register a managed session via `rally run --shared --backend tmux
+//!    --tmux-bin /usr/bin/true` (the existing test idiom — no real tmux
+//!    needed, no linked worktree, and the session record lands in the
+//!    workspace's `.rally/facts.db`).
 //! 3. Invoke the REAL `rally inject` binary against that workspace.
 //! 4. Read the Directive back via `rally_protocol::ledger::FileInbox` —
 //!    PROVING the writer + reader agree byte-for-byte (this is the H1
