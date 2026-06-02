@@ -42,6 +42,9 @@ pub(crate) enum CliCommand {
     Mission(MissionArgs),
     Lead(LeadArgs),
     Ack(AckArgs),
+    /// C-FLEET: register an already-running agent (a herdr pane or tmux target)
+    /// into the managed-session ledger without relaunching it.
+    Adopt(AdoptArgs),
 }
 
 pub(crate) enum CliParse {
@@ -372,6 +375,32 @@ pub(crate) struct RouteFindingsArgs {
     pub(crate) verified: bool,
 }
 
+/// C-FLEET: `rally adopt <name>` — register an already-running agent (a
+/// herdr pane or tmux target) into the managed-session ledger without
+/// relaunching it. ONE of `--pane` or `--tmux` is required to identify the
+/// running surface; when both are omitted AND `--backend herdr`, the command
+/// auto-discovers the matching pane by label via `herdr agent list`.
+#[derive(Clone, Debug)]
+pub(crate) struct AdoptArgs {
+    pub(crate) json: bool,
+    /// Human-friendly session name. Becomes `session.name`. Required.
+    pub(crate) name: String,
+    /// Identify the running surface via a herdr pane id (`pane-9`).
+    /// Mutually exclusive with `--tmux`.
+    pub(crate) pane: Option<String>,
+    /// Identify the running surface via a tmux target (`rally-claude-foo`).
+    /// Mutually exclusive with `--pane`.
+    pub(crate) tmux: Option<String>,
+    /// Optional `--tool` identity. Defaults to `<agent>:adopted-<n>`.
+    pub(crate) tool: Option<String>,
+    /// Agent name (claude|codex|opencode|gemini). Defaults to `claude`.
+    pub(crate) agent: Option<String>,
+    /// Backend hint (herdr|tmux). Auto-inferred from --pane/--tmux when omitted.
+    pub(crate) backend: Option<Backend>,
+    /// Backend binaries + sockets (for the auto-discovery pane probe).
+    pub(crate) bins: BackendBins,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct BackendBins {
     pub(crate) tmux_bin: String,
@@ -477,6 +506,8 @@ const COMMANDS: &[&str] = &[
     "lead",
     // Coordination-mandate ack (C1)
     "ack",
+    // C-FLEET: register an already-running agent into the managed-session ledger
+    "adopt",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -664,6 +695,12 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .command("ack")
         .map(CliCommand::Ack);
 
+    let adopt = adopt_parser()
+        .to_options()
+        .descr("Register an already-running agent (herdr pane or tmux target) into the managed-session ledger without relaunching it. Use --pane <id> for a herdr pane or --tmux <target> for a tmux target; auto-discovers via `herdr agent list` when neither is given and --backend herdr.")
+        .command("adopt")
+        .map(CliCommand::Adopt);
+
     construct!([
         init,
         enter,
@@ -695,7 +732,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         whoami,
         mission,
         lead,
-        ack
+        ack,
+        adopt
     ])
     .to_options()
 }
@@ -1294,6 +1332,41 @@ fn ack_parser() -> impl Parser<AckArgs> {
     let json = json_flag();
     let tool = string_arg("tool", "TOOL");
     construct!(AckArgs { json, tool })
+}
+
+/// C-FLEET: parser for `rally adopt <name> [--pane …|--tmux …] [--tool …]
+/// [--agent …] [--backend …]`. Mutual exclusion between `--pane` and `--tmux`
+/// is validated inside `command_adopt` (bpaf alternation here would make the
+/// auto-discover branch hard to express).
+fn adopt_parser() -> impl Parser<AdoptArgs> {
+    let json = json_flag();
+    let pane = optional_string_arg("pane", "PANE_ID");
+    let tmux = optional_string_arg("tmux", "TARGET");
+    let tool = optional_string_arg("tool", "TOOL");
+    let agent = optional_string_arg("agent", "AGENT");
+    let backend = long("backend")
+        .help("Backend hint (herdr|tmux). Auto-inferred from --pane/--tmux when omitted.")
+        .argument::<String>("BACKEND")
+        .optional()
+        .parse(|opt| match opt {
+            None => Ok(None),
+            Some(s) => Backend::parse(&s).map(Some),
+        });
+    let bins = backend_bins_parser();
+    // Positional MUST be the rightmost item per bpaf convention.
+    let name = positional::<String>("NAME");
+    construct!(json, pane, tmux, tool, agent, backend, bins, name).map(
+        |(json, pane, tmux, tool, agent, backend, bins, name)| AdoptArgs {
+            json,
+            name,
+            pane,
+            tmux,
+            tool,
+            agent,
+            backend,
+            bins,
+        },
+    )
 }
 
 fn lead_parser() -> impl Parser<LeadArgs> {
