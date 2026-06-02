@@ -62,6 +62,7 @@ mod retrospective;
 mod ripple;
 mod rotate;
 mod route_findings;
+mod run_worktree;
 mod source_grounding;
 mod store;
 mod tier_fit;
@@ -1971,6 +1972,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
         session_id,
         tool,
         bins,
+        shared,
     } = args;
     let backend_name = backend.as_str().to_string();
     let repo = repo_root()?;
@@ -1978,6 +1980,10 @@ fn command_run(args: RunArgs) -> Result<Output> {
     // Plan F functional core (Chunk 3): the herdr self-host guard was
     // removed; tmux/cmux do not share Easy Terminal's daemon socket so
     // the reentrancy risk it guarded against no longer exists.
+    // Worktree-per-agent isolation is the default; `--shared`/`--no-worktree`
+    // and the `RALLY_NO_WORKTREE=1` escape hatch (for hosts that already
+    // operate inside a per-agent worktree) opt out.
+    let isolate_worktree = !shared && env::var("RALLY_NO_WORKTREE").as_deref() != Ok("1");
     let room = RoomStore::open()?;
     let reservation = if dry_run {
         let active_sessions = active_session_records(&room)?;
@@ -1993,6 +1999,8 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 backend: backend_name.clone(),
                 cwd: repo.clone(),
                 target: backend_target(backend, &identity.session_id),
+                worktree_path: None,
+                branch: None,
             },
         }
     } else {
@@ -2010,17 +2018,80 @@ fn command_run(args: RunArgs) -> Result<Output> {
         )?
     };
     let mut session = reservation.session;
+
+    // Provision the per-agent worktree (default-on).  Under dry-run we
+    // advertise the planned path/branch in the envelope but never touch
+    // the filesystem.
+    let mut provisioned_path: Option<PathBuf> = None;
+    if isolate_worktree {
+        if dry_run {
+            session.worktree_path = Some(run_worktree::planned_worktree_path(
+                &repo,
+                &session.session_id,
+            ));
+            session.branch = Some(run_worktree::planned_branch_name(&session.session_id));
+            session.cwd = session
+                .worktree_path
+                .clone()
+                .expect("planned worktree path");
+        } else {
+            match run_worktree::provision(&repo, &session.session_id, "git") {
+                Ok(pw) => {
+                    session.cwd = pw.path.clone();
+                    session.worktree_path = Some(pw.path.clone());
+                    session.branch = Some(pw.branch);
+                    provisioned_path = Some(pw.path);
+                    // Refresh the session fact so the durable record reflects
+                    // the worktree-rooted cwd + branch.
+                    if let Some(fact) = &reservation.fact {
+                        room.append_fact(&session_fact(
+                            &session,
+                            "active",
+                            Some(fact.event_id.clone()),
+                        ))?;
+                    }
+                }
+                Err(err) => {
+                    // Fail-closed: surface the provisioning error rather than
+                    // silently falling back to the shared checkout. Mark the
+                    // reservation stopped so the room doesn't leak an active
+                    // record for a session that never launched.
+                    if let Some(fact) = &reservation.fact {
+                        if let Err(cleanup_err) =
+                            append_stopped_session_record(&room, &session, fact)
+                        {
+                            return Err(RallyError::Message(format!(
+                                "worktree provisioning failed: {err}; additionally failed to mark managed session stopped: {cleanup_err}"
+                            )));
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     let command = agent_spec.command_line(&session.name);
     let backend_runner = BackendRunner::new(backend, bins);
+    // Backend launches the agent in the worktree (when provisioned) so the
+    // agent's HEAD, commits and working tree are isolated from peers.
+    let backend_cwd = session.cwd.clone();
     let start_commands =
-        backend_runner.start_commands(&session.target, &repo, &command, &session.name)?;
+        backend_runner.start_commands(&session.target, &backend_cwd, &command, &session.name)?;
 
     let actual_target = if dry_run {
         session.target.clone()
     } else {
-        match backend_runner.start(&session.target, &repo, &command, &session.name) {
+        match backend_runner.start(&session.target, &backend_cwd, &command, &session.name) {
             Ok(target) => target,
             Err(err) => {
+                // Best-effort cleanup of the worktree we just provisioned, so
+                // a failed backend start doesn't leave orphan worktrees.
+                if let (Some(path), Some(branch)) =
+                    (provisioned_path.as_deref(), session.branch.as_deref())
+                {
+                    let _ = run_worktree::cleanup(&repo, path, branch, "git");
+                }
                 if let Some(fact) = &reservation.fact {
                     if let Err(cleanup_err) = append_stopped_session_record(&room, &session, fact) {
                         return Err(RallyError::Message(format!(
@@ -2156,6 +2227,8 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
         // target), NOT the derived `backend_target(backend, session_id)`. This
         // is the whole point of adopt — register an existing target as-is.
         target,
+        worktree_path: None,
+        branch: None,
     };
 
     // Append the session fact under the same context-version race guard as
@@ -2233,6 +2306,8 @@ fn reserve_numbered_session(
             backend: input.backend_name.to_string(),
             cwd: input.repo.to_path_buf(),
             target: backend_target(input.backend, &identity.session_id),
+            worktree_path: None,
+            branch: None,
         };
         let fact = session_fact(&session, "active", None);
         if let Some(fact) = room.append_session_fact_if_context(&fact, context_version)? {
@@ -2661,6 +2736,16 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
             let commands = backend_runner.stop_commands(&live_target);
             if !dry_run {
                 backend_runner.stop(&live_target)?;
+                // Cleanup the per-agent worktree (when present) before
+                // marking the session stopped.  Best-effort: warnings are
+                // discarded so `rally stop` never blocks on a leftover
+                // worktree.
+                if let (Some(path), Some(branch)) =
+                    (session.worktree_path.as_deref(), session.branch.as_deref())
+                {
+                    let repo = repo_root().unwrap_or_else(|_| PathBuf::from("."));
+                    let _ = run_worktree::cleanup(&repo, path, branch, "git");
+                }
                 remove_session_record(&session.session_id)?;
             }
             (commands, None)
@@ -3161,10 +3246,7 @@ pub(crate) fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_root(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -3176,26 +3258,11 @@ mod tests {
         root
     }
 
-    fn seed_easy_terminal_markers(root: &Path) {
-        std::fs::create_dir_all(root.join("Sources/Ptyd")).unwrap();
-        std::fs::write(root.join("Sources/Ptyd/DaemonController.swift"), "").unwrap();
-        std::fs::write(root.join("build.sh"), "#!/usr/bin/env bash\n").unwrap();
-    }
-
     // Plan F functional core (Chunk 3): self_host_guard_* tests removed
     // alongside enforce_easy_terminal_self_host_guard (the herdr-specific
     // reentrancy guard). With Backend::Herdr removed, the failure mode
     // these guarded against (rally launching a herdr-backed session into
     // the same ET daemon socket as the host) no longer exists.
-
-    fn restore_env(key: &str, value: Option<String>) {
-        unsafe {
-            match value {
-                Some(value) => env::set_var(key, value),
-                None => env::remove_var(key),
-            }
-        }
-    }
 
     /// Component B acceptance test 1: running `ensure_presence` without a prior
     /// `enter` registers the tool in squads and asserts it as lead (first tool).
@@ -3559,6 +3626,8 @@ mod tests {
             backend: "tmux".to_string(),
             cwd: PathBuf::from("/tmp/rally-test"),
             target: "rally-test".to_string(),
+            worktree_path: None,
+            branch: None,
         }
     }
 
@@ -4263,6 +4332,8 @@ mod tests {
             backend: "cmux".to_string(),
             cwd: root.clone(),
             target: "cmux-target-9".to_string(), // caller-provided, NOT derived
+            worktree_path: None,
+            branch: None,
         };
         let (_facts, ctx) = room.session_facts_with_context_version().unwrap();
         let fact = session_fact(&session, "active", None);
@@ -4323,6 +4394,8 @@ mod tests {
             backend: "tmux".to_string(),
             cwd: root.clone(),
             target: "rally-legacy".to_string(),
+            worktree_path: None,
+            branch: None,
         };
         let (_facts, ctx) = room.session_facts_with_context_version().unwrap();
         room.append_session_fact_if_context(&session_fact(&session, "active", None), ctx)
@@ -4359,6 +4432,8 @@ mod tests {
             backend: "tmux".to_string(),
             cwd: root.clone(),
             target: "rally-claude-99".to_string(),
+            worktree_path: None,
+            branch: None,
         };
         room.append_fact(&session_fact(&session, "active", None))
             .unwrap();

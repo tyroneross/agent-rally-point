@@ -60,6 +60,17 @@ pub(crate) struct ManagedSession {
     pub(crate) backend: String,
     pub(crate) cwd: PathBuf,
     pub(crate) target: String,
+    /// Filesystem path of the dedicated linked git worktree provisioned for
+    /// this agent, when worktree-per-agent isolation is in effect. `None`
+    /// for sessions launched with `--shared`/`--no-worktree`, for sessions
+    /// recorded before Phase 1b shipped, or under dry-run when no worktree
+    /// is actually created.  Used at session stop to clean up the worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) worktree_path: Option<PathBuf>,
+    /// Name of the per-agent git branch created off the run base when the
+    /// worktree was provisioned.  Set together with `worktree_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) branch: Option<String>,
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -532,7 +543,6 @@ mod tests {
     use crate::store::Fact;
     use crate::{EnterData, Envelope, NextData, RoomData, SayData};
     use schemars::schema_for;
-    use serde_json::json;
 
     #[test]
     fn cmux_start_target_uses_workspace_ref_from_status_output() {

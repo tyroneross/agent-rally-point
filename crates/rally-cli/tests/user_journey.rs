@@ -28,6 +28,14 @@ struct Workspace {
     home: PathBuf,
     /// When true, passes RALLY_GLOBAL_INDEX=1 to every command.
     global_index: bool,
+    /// When true, passes RALLY_NO_WORKTREE=1 to every command so `rally run`
+    /// skips the per-agent worktree provisioning step.  Default = true,
+    /// because the bulk of the test corpus uses stub `.git` directories
+    /// where `git worktree add` cannot succeed and where the agent-launch
+    /// surface is what's being tested, not the isolation.  Tests that
+    /// exercise the default-on worktree provisioning use [`real_repo`]
+    /// instead.
+    suppress_worktree: bool,
 }
 
 impl Workspace {
@@ -41,6 +49,7 @@ impl Workspace {
             cwd,
             home,
             global_index: false,
+            suppress_worktree: true,
         }
     }
 
@@ -53,6 +62,7 @@ impl Workspace {
             cwd,
             home: home.to_path_buf(),
             global_index: false,
+            suppress_worktree: true,
         }
     }
 
@@ -85,6 +95,9 @@ impl Workspace {
         if self.global_index {
             cmd.env("RALLY_GLOBAL_INDEX", "1");
         }
+        if self.suppress_worktree {
+            cmd.env("RALLY_NO_WORKTREE", "1");
+        }
         cmd.args(args).output().unwrap()
     }
 
@@ -102,6 +115,58 @@ fn temp_path(name: &str) -> PathBuf {
             .unwrap()
             .as_nanos()
     ))
+}
+
+/// True when the `git` binary is on PATH; used to skip worktree-isolation
+/// tests in stripped CI environments rather than failing them spuriously.
+fn git_available() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Initialize a real git repository at `root` with one empty commit on
+/// `main`.  Used by tests that exercise the default-on worktree
+/// provisioning path (which calls real `git worktree add`).
+fn init_real_repo(root: &Path) {
+    let run = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git invocation");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["init", "-q", "-b", "main"]);
+    run(&["config", "user.email", "rally@example.test"]);
+    run(&["config", "user.name", "Rally Test"]);
+    run(&["commit", "--allow-empty", "-q", "-m", "initial"]);
+}
+
+/// Build a [`Workspace`] backed by a REAL git repo (not a stub `.git` dir)
+/// AND with the worktree-isolation env-var escape OFF, so `rally run`
+/// exercises its default-on per-agent worktree provisioning.  This is
+/// the harness for the Phase 1b acceptance tests.
+fn real_repo_workspace(name: &str) -> Workspace {
+    let cwd = temp_path(&format!("{name}-cwd"));
+    let home = temp_path(&format!("{name}-home"));
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    init_real_repo(&cwd);
+    Workspace {
+        cwd,
+        home,
+        global_index: false,
+        suppress_worktree: false, // default-ON path under test.
+    }
 }
 
 fn assert_matches_schema(schema_name: &str, value: &Value) {
@@ -1347,6 +1412,7 @@ fn rally_run_reserves_numbered_ids_under_parallel_launch() {
                 Command::new(env!("CARGO_BIN_EXE_rally"))
                     .current_dir(cwd)
                     .env("HOME", home)
+                    .env("RALLY_NO_WORKTREE", "1")
                     .args([
                         "run",
                         "claude",
@@ -1734,6 +1800,7 @@ fn linked_git_worktree_uses_common_room() {
         cwd: temp_path("rally-common-room-linked"),
         home: home.clone(),
         global_index: false,
+        suppress_worktree: true,
     };
     fs::create_dir_all(&linked.cwd).unwrap();
     let linked_git_dir = primary.cwd.join(".git/worktrees/rally-common-room-linked");
@@ -3785,6 +3852,356 @@ fn rally_adopt_rejects_duplicate_target_across_different_tools() {
     assert!(
         stderr.contains("already adopted") || stderr.contains("rally-shared"),
         "expected dedup error mentioning target; got stderr: {stderr}"
+    );
+
+    workspace.cleanup();
+}
+
+// ===========================================================================
+// Phase 1b: per-agent linked worktree provisioning.
+// ===========================================================================
+
+/// Default behavior: `rally run` with no special flag and no env override
+/// provisions a dedicated linked git worktree on a per-agent branch.
+#[test]
+fn rally_run_default_provisions_per_agent_worktree() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let _run_guard = serialize_rally_run();
+    let workspace = real_repo_workspace("rally-run-default-worktree");
+
+    let run = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "reviewer",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(run["schema"], "agent-rally.command.run.v1");
+    assert_matches_schema("agent-rally.command.run.v1.json", &run);
+
+    let session_id = run["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .expect("session_id");
+    let branch = run["data"]["run"]["session"]["branch"]
+        .as_str()
+        .expect("branch must be populated under default isolation");
+    let worktree_path = run["data"]["run"]["session"]["worktree_path"]
+        .as_str()
+        .expect("worktree_path must be populated under default isolation");
+    let cwd = run["data"]["run"]["session"]["cwd"].as_str().expect("cwd");
+
+    assert_eq!(branch, format!("rally/{session_id}"));
+    assert_ne!(branch, "main", "agent branch must not be main");
+
+    let wt = PathBuf::from(worktree_path);
+    assert!(
+        wt.exists(),
+        "worktree path {} must exist on disk after rally run",
+        wt.display()
+    );
+    let expected_wt = workspace
+        .cwd
+        .join(".rally")
+        .join("worktrees")
+        .join(session_id);
+    assert_eq!(
+        wt.canonicalize().unwrap_or(wt.clone()),
+        expected_wt
+            .canonicalize()
+            .unwrap_or_else(|_| expected_wt.clone()),
+        "worktree must live under .rally/worktrees/<session-id>/"
+    );
+
+    assert_eq!(cwd, worktree_path);
+
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(&wt)
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        branch,
+        "the worktree's HEAD must be the per-agent branch"
+    );
+
+    let start = run["data"]["run"]["commands"]["start"][0]
+        .as_array()
+        .unwrap();
+    let joined = start
+        .iter()
+        .map(|v| v.as_str().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        joined.contains(worktree_path),
+        "backend start command must cd into the worktree; got: {joined}"
+    );
+
+    workspace.cleanup();
+}
+
+/// Two agents launched in the same repo get two distinct linked worktrees on
+/// two distinct branches, but both resolve to the same `.rally/` room.
+#[test]
+fn two_rally_runs_get_distinct_worktrees_sharing_one_room() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let _run_guard = serialize_rally_run();
+    let workspace = real_repo_workspace("rally-run-two-worktrees");
+
+    let first = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "alpha",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    let second = workspace.json(&[
+        "run",
+        "codex",
+        "--json",
+        "--name",
+        "beta",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+
+    let wt_a = first["data"]["run"]["session"]["worktree_path"]
+        .as_str()
+        .unwrap();
+    let wt_b = second["data"]["run"]["session"]["worktree_path"]
+        .as_str()
+        .unwrap();
+    let br_a = first["data"]["run"]["session"]["branch"].as_str().unwrap();
+    let br_b = second["data"]["run"]["session"]["branch"].as_str().unwrap();
+    assert_ne!(wt_a, wt_b, "the two worktrees must be distinct paths");
+    assert_ne!(br_a, br_b, "the two agents must be on distinct branches");
+    assert!(PathBuf::from(wt_a).exists());
+    assert!(PathBuf::from(wt_b).exists());
+
+    let canonical_room = workspace.cwd.join(".rally").join("facts.db");
+    assert!(
+        canonical_room.exists(),
+        "canonical room must exist at {}",
+        canonical_room.display()
+    );
+    assert!(
+        !PathBuf::from(wt_a).join(".rally").join("facts.db").exists(),
+        "linked worktree A must not carry its own facts.db"
+    );
+    assert!(
+        !PathBuf::from(wt_b).join(".rally").join("facts.db").exists(),
+        "linked worktree B must not carry its own facts.db"
+    );
+
+    let mut room_from_wt = Command::new(env!("CARGO_BIN_EXE_rally"));
+    room_from_wt
+        .current_dir(wt_a)
+        .env("HOME", &workspace.home)
+        .args(["sessions", "--json"]);
+    let out = room_from_wt.output().unwrap();
+    assert!(
+        out.status.success(),
+        "sessions from inside linked worktree must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sessions = value["data"]["sessions"]["sessions"].as_array().unwrap();
+    assert_eq!(
+        sessions.len(),
+        2,
+        "sessions from one linked worktree must see both agents"
+    );
+
+    workspace.cleanup();
+}
+
+/// `rally stop` removes the per-agent worktree and, when safe, its branch.
+#[test]
+fn rally_stop_removes_per_agent_worktree() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let _run_guard = serialize_rally_run();
+    let workspace = real_repo_workspace("rally-run-stop-removes-wt");
+
+    let run = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "stoppable",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    let session_id = run["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let worktree_path = run["data"]["run"]["session"]["worktree_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let branch = run["data"]["run"]["session"]["branch"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert!(PathBuf::from(&worktree_path).exists());
+
+    let stop = workspace.json(&["stop", &session_id, "--json", "--tmux-bin", "/usr/bin/true"]);
+    assert_eq!(stop["schema"], "agent-rally.command.session-action.v1");
+
+    assert!(
+        !PathBuf::from(&worktree_path).exists(),
+        "worktree path {worktree_path} must be removed by rally stop"
+    );
+
+    let wl = Command::new("git")
+        .arg("-C")
+        .arg(&workspace.cwd)
+        .args(["worktree", "list"])
+        .output()
+        .unwrap();
+    assert!(wl.status.success());
+    let listing = String::from_utf8_lossy(&wl.stdout);
+    assert!(
+        !listing.contains(&worktree_path),
+        "git worktree list must not mention removed worktree; got: {listing}"
+    );
+
+    let branch_check = Command::new("git")
+        .arg("-C")
+        .arg(&workspace.cwd)
+        .args(["rev-parse", "--verify", "--quiet", &branch])
+        .output()
+        .unwrap();
+    assert!(
+        !branch_check.status.success(),
+        "empty per-agent branch {branch} must be deleted after stop"
+    );
+
+    workspace.cleanup();
+}
+
+/// `rally run --shared` and `--no-worktree` opt out of worktree isolation.
+#[test]
+fn rally_run_shared_flag_opts_out_of_worktree() {
+    let _run_guard = serialize_rally_run();
+    let mut workspace = Workspace::new("rally-run-shared-flag");
+    workspace.suppress_worktree = false;
+
+    let run = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--shared",
+        "--name",
+        "shared-mode",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(run["schema"], "agent-rally.command.run.v1");
+    assert!(
+        run["data"]["run"]["session"]["worktree_path"].is_null(),
+        "--shared must skip worktree provisioning"
+    );
+    assert!(
+        run["data"]["run"]["session"]["branch"].is_null(),
+        "--shared must skip branch creation"
+    );
+    let cwd = run["data"]["run"]["session"]["cwd"].as_str().unwrap();
+    let cwd_path = PathBuf::from(cwd);
+    assert_eq!(
+        cwd_path.canonicalize().unwrap_or(cwd_path),
+        workspace
+            .cwd
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.cwd.clone()),
+        "--shared session's cwd must be the canonical checkout"
+    );
+
+    let run_alt = workspace.json(&[
+        "run",
+        "codex",
+        "--json",
+        "--no-worktree",
+        "--name",
+        "alt-mode",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert!(
+        run_alt["data"]["run"]["session"]["worktree_path"].is_null(),
+        "--no-worktree must also skip worktree provisioning"
+    );
+
+    workspace.cleanup();
+}
+
+/// `rally run --dry-run` reports the planned worktree path and branch without
+/// touching the filesystem.
+#[test]
+fn rally_run_dry_run_reports_planned_worktree_without_touching_disk() {
+    let _run_guard = serialize_rally_run();
+    let mut workspace = Workspace::new("rally-run-dryrun-plan");
+    workspace.suppress_worktree = false;
+
+    let run = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--dry-run",
+        "--name",
+        "planner",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(run["data"]["run"]["mode"], "dry-run");
+    let planned_wt = run["data"]["run"]["session"]["worktree_path"]
+        .as_str()
+        .expect("dry-run must still advertise planned worktree path");
+    let planned_branch = run["data"]["run"]["session"]["branch"]
+        .as_str()
+        .expect("dry-run must still advertise planned branch");
+    assert!(
+        planned_wt.contains(".rally/worktrees/"),
+        "planned worktree path must point under .rally/worktrees/; got {planned_wt}"
+    );
+    assert!(
+        planned_branch.starts_with("rally/"),
+        "planned branch must use rally/ prefix; got {planned_branch}"
+    );
+    assert!(
+        !PathBuf::from(planned_wt).exists(),
+        "dry-run must not create the worktree on disk"
     );
 
     workspace.cleanup();
