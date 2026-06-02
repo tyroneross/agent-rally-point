@@ -22,3 +22,9 @@ serde.workspace = true
 serde_json.workspace = true
 shlex.workspace = true
 thiserror.workspace = true
+
+# Plan F: the shared rally <-> daemon coupling surface. rally-cli writes
+# typed Directives; rally-termd subscribes and posts Receipts. ZERO further
+# dependencies (the H4 architectural lint asserts rally-cli does not depend
+# on `ptyd` either directly or transitively).
+rally-protocol = { path = "../rally-protocol" }

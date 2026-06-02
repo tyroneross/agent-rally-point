@@ -106,8 +106,29 @@ pub(crate) struct InjectData {
     /// The coordination fact recording message content, or None for --handoff injects
     /// (which already have a handoff fact in the channel).
     pub(crate) content_fact: Option<Fact>,
-    /// Whether the live backend delivery succeeded.
+    /// **Compatibility field.** Whether the synchronous backend delivery
+    /// succeeded. Becomes `true` ONLY when `delivery_state in
+    /// {Delivered, Seen, Acted}`; `false` covers BOTH `Pending` (in-flight)
+    /// AND `Failed` outcomes. Prefer `delivery_state` for new code; this
+    /// field is preserved for downstream tools that scrape the existing JSON
+    /// envelope.
     pub(crate) delivered: bool,
+    /// **Plan F.** The truthful delivery state, mirroring
+    /// `rally_protocol::DeliveryStatus`. `Pending` means the Directive has
+    /// been durably appended to the ledger but no Receipt has arrived yet
+    /// (the daemon is the canonical receipt-poster; absent it, a cooperating
+    /// agent self-acks). Wire shape: snake_case (`pending|delivered|seen|
+    /// acted|failed`).
+    pub(crate) delivery_state: &'static str,
+    /// **Plan F.** The assigned per-inbox sequence of the Directive this
+    /// inject wrote. `None` in dry-run or when the inject was a no-op.
+    /// Consumers may pass this through to `rally status` to look up the
+    /// matching Receipt.
+    pub(crate) directive_seq: Option<u64>,
+    /// **Plan F.** Logical agent id the Directive was written to (mirrors
+    /// `session.tool` for the common case; surfaced explicitly so consumer
+    /// tools don't have to thread through the session blob).
+    pub(crate) directive_to: Option<String>,
 }
 
 /// Envelope for `inject`: result under `data.inject`.

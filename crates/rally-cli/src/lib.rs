@@ -2325,7 +2325,8 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
         None
     };
 
-    let backend_runner = BackendRunner::new(Backend::parse(&session.backend)?, args.bins);
+    let backend_parsed = Backend::parse(&session.backend)?;
+    let backend_runner = BackendRunner::new(backend_parsed, args.bins);
     let live_target = if dry_run {
         session.target.clone()
     } else {
@@ -2333,16 +2334,67 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     };
     let commands = backend_runner.inject_commands(&live_target, &text);
 
-    // Attempt live delivery. If the backend session is gone, the content fact
-    // is already recorded above — log the failure but do not propagate it so
-    // the caller gets `delivered: false` rather than a hard error.
+    // Plan F: ALWAYS write a typed Directive to the .rally ledger first.
+    // This is the new canonical delivery contract — the daemon (rally-termd,
+    // P3) subscribes via kernel file-events and performs the PTY-write. For
+    // tmux/cmux backends in P2 (pre-daemon), the legacy synchronous backend
+    // delivery still runs ALONGSIDE the ledger write so those paths are
+    // unchanged behavior. For Backend::Herdr, the ledger write IS the
+    // delivery once P3 lands; until then, we still call backend_runner.inject
+    // so existing herdr smoke tests stay green (the legacy herdr inject is a
+    // no-op on the inverted architecture but does no harm).
+    let (directive_seq, directive_to, delivery_state_initial): (
+        Option<u64>,
+        Option<String>,
+        &'static str,
+    ) = if dry_run {
+        (None, None, "pending")
+    } else {
+        match inject_via_ledger(&repo_root()?, &session.tool, &sender_tool, &text, false) {
+            Ok(seq) => (Some(seq), Some(session.tool.clone()), "pending"),
+            Err(_) => (None, Some(session.tool.clone()), "failed"),
+        }
+    };
+
+    // Legacy synchronous backend delivery — preserved for backward compat
+    // with tmux/cmux backends and pre-daemon herdr smoke tests. Once
+    // rally-termd (P3) is universally deployed, this branch becomes
+    // redundant for Backend::Herdr.
     let delivered = if dry_run {
+        false
+    } else if delivery_state_initial == "failed" {
+        // Ledger write failed — do not attempt backend inject. The content
+        // fact is already recorded.
         false
     } else {
         match backend_runner.inject(&live_target, &text) {
             Ok(()) => true,
             Err(_) => false,
         }
+    };
+
+    // Reconcile delivery_state: legacy sync success => Delivered; otherwise
+    // the Pending state propagated from the ledger write stands (the daemon
+    // will post a Receipt once P3 ships, at which point this field updates
+    // out-of-band via `rally status`).
+    //
+    // Failure cases (both produce `delivery_state: "failed"`):
+    //   1. Ledger write failed (`delivery_state_initial == "failed"`).
+    //   2. Tmux/Cmux backend inject failed AND the ledger write succeeded —
+    //      these backends have no daemon-side recovery in the Plan F window,
+    //      so a missed legacy delivery is a real failure.
+    // Herdr pre-daemon: backend inject is a no-op-or-best-effort by design;
+    // a `delivered: false` is EXPECTED (the daemon will pick the Directive
+    // up once it lands) so we surface `Pending` rather than `Failed`.
+    let ledger_failed = delivery_state_initial == "failed";
+    let legacy_tmux_cmux_failed =
+        !dry_run && !delivered && backend_parsed != Backend::Herdr && !ledger_failed;
+    let delivery_state: &'static str = if ledger_failed || legacy_tmux_cmux_failed {
+        "failed"
+    } else if delivered {
+        "delivered"
+    } else {
+        delivery_state_initial
     };
 
     let wake_intent = inject_wake_intent_with_room(
@@ -2376,6 +2428,12 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
         sender_tool,
         content_fact,
         delivered,
+        // Plan F: surface the truthful delivery state + the Directive's
+        // assigned sequence so downstream callers can look up the matching
+        // Receipt via `rally status` once rally-termd (P3) is live.
+        delivery_state,
+        directive_seq,
+        directive_to,
     };
     let has_ack = ack.is_some();
     let body = envelope(
@@ -2669,6 +2727,54 @@ fn inject_wake_intent_with_room(
         let r = RoomStore::open()?;
         r.append_fact(&fact).map(Some)
     }
+}
+
+/// **Plan F.** Append a typed [`Directive`] to the target agent's inbox in
+/// the `.rally` ledger. This is the NEW canonical delivery path for
+/// `rally inject`: the daemon ([`rally-termd`], P3) subscribes to the
+/// ledger via kernel file-events and executes the directive.
+///
+/// Until the daemon ships (P3 not yet deployed) this path serves as the
+/// durable, append-only record of every inject; the legacy
+/// `BackendRunner::inject` keeps the synchronous PTY-write path for
+/// tmux/cmux backends. For `Backend::Herdr`, the daemon is the only
+/// delivery path once P3 lands; in P2 (pre-daemon), the legacy backend
+/// still runs alongside so existing herdr smoke tests stay green.
+///
+/// Returns `Ok((assigned_seq, "pending"))` on success — the Directive is
+/// durably appended but the daemon's Receipt has not yet arrived
+/// (`DeliveryStatus::Pending`). Errors propagate; callers convert a write
+/// failure into `delivery_state: failed` on the JSON envelope.
+fn inject_via_ledger(
+    repo: &std::path::Path,
+    target_tool: &str,
+    sender_tool: &str,
+    text: &str,
+    urgent: bool,
+) -> Result<u64> {
+    use rally_protocol::ledger::FileInbox;
+    use rally_protocol::{Directive, DirectiveKind, Inbox, InterruptType, now_ts};
+
+    let ledger_root = repo.join(".rally");
+    let inbox = FileInbox::open(&ledger_root).map_err(RallyError::io("open .rally for inject"))?;
+
+    let directive = Directive {
+        seq: 0, // FileInbox assigns the next monotonic seq.
+        to: target_tool.to_string(),
+        from: sender_tool.to_string(),
+        kind: DirectiveKind::Deliver,
+        // P2 only delivers ADDITION semantics. Revision/Retraction land
+        // when P4 surfaces `--urgent` and the InterruptBench-style
+        // semantics shipped on top.
+        itype: InterruptType::Addition,
+        text: Some(text.to_string()),
+        urgent,
+        ts: now_ts(),
+    };
+
+    inbox
+        .append_directive(&directive)
+        .map_err(RallyError::io("append directive"))
 }
 
 fn wake_fact(
