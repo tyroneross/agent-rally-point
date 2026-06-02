@@ -1,0 +1,40 @@
+#!/usr/bin/env sh
+# Mock `codex` binary for H1b native approval gate tests.
+#
+# Emits a sequence designed to exercise the H1b gate:
+#   1. session_started  — carries a mock session_id
+#   2. message          — assistant turn
+#   3. tool_call        — read_file (on the conservative allowlist → Permit, not gated)
+#   4. approval_request — native approval request with a valid UUID
+#                         (H1b gate: pump must park here)
+#   5. message          — follow-up (only reaches client after gate is resolved)
+#   6. completed        — terminal
+#
+# The tool_call uses "read_file" which is on the conservative allowlist,
+# so it passes through the G1 authz gate without parking. The approval_request
+# then triggers the H1b native gate.
+#
+# Ignores all arguments; drains stdin; writes to stdout only.
+
+# Drain stdin.
+if [ ! -t 0 ]; then
+  cat > /dev/null &
+fi
+
+# 1. session_started
+printf '{"type":"session_started","session_id":"mock-codex-gated-789"}\n'
+
+# 2. message
+printf '{"type":"message","role":"assistant","content":"Starting task"}\n'
+
+# 3. tool_call — read_file is on the allowlist, passes G1 without gating
+printf '{"type":"tool_call","id":"tc_read","tool":"read_file","args":{"path":"/tmp/test.txt"}}\n'
+
+# 4. approval_request — H1b gate; id must be a valid UUID
+printf '{"type":"approval_request","id":"b2c3d4e5-0000-0000-0000-000000000002","tool":"delete_file","args":{"path":"/important/data.txt"}}\n'
+
+# 5. follow-up message (only seen after gate resolves with allow)
+printf '{"type":"message","role":"assistant","content":"Task complete."}\n'
+
+# 6. completed
+printf '{"type":"completed","exit_code":0}\n'

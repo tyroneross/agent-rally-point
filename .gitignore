@@ -90,3 +90,8 @@ uv.lock
 .navgator/
 .claude/
 .ibr/
+
+# cockpitd runtime SQLite (created by `cockpitd serve` default COCKPIT_DB)
+cockpitd.db
+cockpitd.db-shm
+cockpitd.db-wal

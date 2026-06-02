@@ -1,0 +1,32 @@
+#!/usr/bin/env sh
+# Mock `claude` binary for cockpitd adapter tests.
+#
+# Emits a representative stream-json sequence to stdout and exits:
+#   1. system/init  — carries a mock session_id
+#   2. assistant    — text block ("Hello from mock Claude")
+#   3. assistant    — tool_use block (bash ls /tmp)
+#   4. result       — is_error:false (terminal)
+#
+# The script ignores all arguments (behaves identically regardless of flags),
+# reads and discards stdin so the pipe doesn't block, and writes to stdout.
+# It does NOT invoke the real claude — no credits burned.
+
+# Drain stdin so the parent's pipe write doesn't stall.
+if [ -t 0 ]; then
+  :
+else
+  # stdin is a pipe; read and discard it in background so we don't block.
+  cat > /dev/null &
+fi
+
+# 1. system/init
+printf '{"type":"system","subtype":"init","session_id":"mock-session-123","tools":[]}\n'
+
+# 2. assistant: text block
+printf '{"type":"assistant","message":{"id":"msg_001","type":"message","role":"assistant","content":[{"type":"text","text":"Hello from mock Claude"}],"model":"claude-mock","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}}\n'
+
+# 3. assistant: tool_use block
+printf '{"type":"assistant","message":{"id":"msg_002","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_001","name":"Bash","input":{"command":"ls /tmp"}}],"model":"claude-mock","stop_reason":"tool_use","usage":{"input_tokens":15,"output_tokens":8}}}\n'
+
+# 4. result (terminal)
+printf '{"type":"result","subtype":"success","is_error":false,"result":"Task complete","session_id":"mock-session-123","cost_usd":0,"duration_ms":100,"num_turns":1}\n'

@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "cockpitd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agent Cockpit daemon: supervises Claude/Codex sessions on an always-on Mac and serves them to the iOS app."
+
+[lib]
+name = "cockpitd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cockpitd"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+# Need `serde` feature for DateTime<Utc> serde support (workspace omits it)
+chrono = { workspace = true, features = ["serde"] }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+axum.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dryoc = { workspace = true }
+rand = { workspace = true }

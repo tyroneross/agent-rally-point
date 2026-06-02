@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for cockpitd — the Agent Cockpit daemon.
+
+  A LaunchAgent (per-user, runs in the GUI login session) is the correct choice
+  over a LaunchDaemon: cockpitd spawns the `claude` / `codex` CLIs, which need the
+  user's login keychain and signed-in dev-tool credentials. RunAtLoad starts it at
+  login; KeepAlive restarts it on crash.
+
+  install.sh substitutes __COCKPITD_BIN__ and __LOG_DIR__, then copies this to
+  ~/Library/LaunchAgents/ and `launchctl bootstrap`s it.
+
+  NOTE (TAG:UNTESTED): actual launchctl load is a deploy-time step on the target
+  Mac and is not exercised by the autonomous build (which has no persistent login
+  session to bootstrap into). install.sh is lint-checked only.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.rosslabs.cockpitd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__COCKPITD_BIN__</string>
+        <string>serve</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/cockpitd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/cockpitd.err.log</string>
+</dict>
+</plist>

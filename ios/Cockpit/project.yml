@@ -1,0 +1,55 @@
+name: Cockpit
+
+options:
+  bundleIdPrefix: ai.rosslabs
+  deploymentTarget:
+    iOS: "18.0"
+  xcodeVersion: "16"
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    ENABLE_STRICT_CONCURRENCY_CHECKING: complete
+
+targets:
+  Cockpit:
+    type: application
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Sources/Cockpit
+      - path: Sources/CockpitApp
+    entitlements:
+      path: Sources/CockpitApp/Cockpit.entitlements
+      # CV6-B: keychain-access-groups declares the shared iCloud Keychain group.
+      # $(AppIdentifierPrefix) is substituted by codesign at build time.
+      # TAG:UNTESTED — requires a signed build + real Team ID; sim tests use stub reader.
+      properties:
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)ai.rosslabs.cockpit.pairing
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.rosslabs.cockpit
+        INFOPLIST_FILE: Sources/CockpitApp/Info.plist
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: ""
+        TARGETED_DEVICE_FAMILY: "1,2"
+
+  CockpitTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Tests/CockpitTests
+      - path: Sources/Cockpit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.rosslabs.cockpitTests
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: ""
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: Cockpit
+        embed: false

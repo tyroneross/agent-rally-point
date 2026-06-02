@@ -1,0 +1,8 @@
+# xcodegen generates the project from project.yml — regenerate with `xcodegen generate`
+Cockpit.xcodeproj/
+# Xcode build artifacts
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+.DS_Store
