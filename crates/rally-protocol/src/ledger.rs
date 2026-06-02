@@ -74,13 +74,21 @@ impl FileInbox {
         &self.root
     }
 
-    fn directives_path(&self, agent: &str) -> PathBuf {
+    /// Path to the agent's directives file. Public so consumers (the
+    /// daemon) can attach a kernel file-event watcher to the exact path
+    /// the writer appends to. Plan F functional core: `rally-termd`
+    /// watches `directives_path(agent)` and wakes on inotify/kqueue
+    /// EVFILT_VNODE so the wake is event-driven (sub-poll-floor latency)
+    /// instead of timer-driven.
+    pub fn directives_path(&self, agent: &str) -> PathBuf {
         self.root
             .join("inbox")
             .join(format!("{}.jsonl", sanitize(agent)))
     }
 
-    fn receipts_path(&self, agent: &str) -> PathBuf {
+    /// Path to the agent's receipts file. Public for the same reason
+    /// as [`directives_path`].
+    pub fn receipts_path(&self, agent: &str) -> PathBuf {
         self.root
             .join("receipts")
             .join(format!("{}.jsonl", sanitize(agent)))
