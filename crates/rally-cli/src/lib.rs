@@ -570,6 +570,46 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         room.append_fact(&risk_fact)?;
     }
 
+    // C-FLEET / "all fleet workers must be rally-managed": when a tool enters
+    // with a managed-style identifier (e.g. claude-01, claude_code:01,
+    // toolbar-launch-01) but no active managed-session record exists for it,
+    // surface an `unmanaged-agent` warning + append ONE durable risk fact.
+    // Skips human/lead-style identifiers (claude_code:lead, lead, human:*,
+    // *:l<N>) — those are not expected to be managed sessions. This is the
+    // detection arm of the fleet-enforcement rule; the response arm is
+    // `rally adopt` (register without relaunch).
+    if is_managed_style_tool(&tool) {
+        let active_sessions = active_session_records(&room).unwrap_or_default();
+        let has_managed = active_sessions
+            .iter()
+            .any(|s| s.tool == tool || s.session_id == tool || s.name == tool);
+        if !has_managed {
+            let already_recorded = snapshot_before.current_risks.iter().any(|f| {
+                f.subject == format!("unmanaged-agent: {tool}")
+                    && f.tool.as_deref() == Some(tool.as_str())
+            });
+            let msg = format!(
+                "tool {tool} entered the room but is not under managed-session control (no active `session` fact). Use `rally adopt {tool} --pane <pane-id>` or `--tmux <target>` to register the running surface so `rally inject/attach/capture/stop` work; or relaunch via `rally run`. Not blocked — informational."
+            );
+            warnings.push(EnterWarning {
+                code: "unmanaged-agent".to_string(),
+                message: msg.clone(),
+            });
+            if !already_recorded {
+                let risk_fact = build_risk_fact(
+                    &tool,
+                    format!("unmanaged-agent: {tool}"),
+                    msg,
+                    Vec::new(),
+                    "warn",
+                    Vec::new(),
+                    None,
+                );
+                room.append_fact(&risk_fact)?;
+            }
+        }
+    }
+
     // R9 stale-binary guard: find the most recent presence fact in the room
     // (any tool) and check if it carries a different build_id than ours.
     // Warn + append a durable risk fact if drift is detected.  Never blocks.
@@ -2705,6 +2745,35 @@ fn wake_fact(
 /// Build a Risk fact with the constant boilerplate fields pre-filled.
 /// `scope`, `evidence`, and `ref_id` vary per call site; everything else is
 /// constant across all four use-cases (warn severity, no role/target/status/uri).
+/// Returns true when a `--tool` identifier looks like a managed-session
+/// identity (e.g. `claude-01`, `claude_code:01`, `toolbar-launch-01`) rather
+/// than a human/lead identity (`claude_code:lead`, `*:l<N>`, `human:*`,
+/// `lead`). Used by `command_enter` to gate the `unmanaged-agent` risk record:
+/// human leads are NEVER expected to be managed sessions, so silently skip
+/// them rather than flood the room with spurious risk facts.
+fn is_managed_style_tool(tool: &str) -> bool {
+    let lower = tool.to_ascii_lowercase();
+    if lower == "lead" || lower.starts_with("human") || lower.starts_with("user") {
+        return false;
+    }
+    // Lead-style suffixes: `:lead`, `:l1`, `:l42`, `:l<N>`. A digit after `:l`
+    // is the canonical lead-number form; `:lead` is the human-readable form.
+    if let Some(suffix) = lower.split(':').next_back() {
+        if suffix == "lead" {
+            return false;
+        }
+        if let Some(rest) = suffix.strip_prefix('l') {
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+        }
+    }
+    // Managed identifiers always contain a digit somewhere (the auto-numbered
+    // session ordinal). Identifiers without digits are exotic / human-named
+    // and we don't want to spam risk records for them.
+    tool.chars().any(|c| c.is_ascii_digit())
+}
+
 fn build_risk_fact(
     tool: &str,
     subject: String,
@@ -3785,6 +3854,167 @@ mod tests {
         );
         // enter is still ok — not blocked
         // (enter itself is not called here; the test verifies the durable record)
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-FLEET unit test: `is_managed_style_tool` correctly classifies managed
+    /// vs human/lead identifiers — managed-style ids always carry a digit AND
+    /// are not human/lead-suffixed; human/lead ids return false so they don't
+    /// flood the room with spurious `unmanaged-agent` risk records.
+    #[test]
+    fn fleet_is_managed_style_tool_classification() {
+        // Managed-style — should detect.
+        for t in [
+            "claude-01",
+            "claude_code:01",
+            "claude_code:42",
+            "toolbar-launch-01",
+            "BuildBluePoint-3",
+            "redesign-coord-1",
+            "codex-2",
+        ] {
+            assert!(is_managed_style_tool(t), "expected managed: {t}");
+        }
+        // Human/lead-style — should NOT detect.
+        for t in [
+            "lead",
+            "claude_code:lead",
+            "claude_code:l1",
+            "claude_code:l42",
+            "human:alice",
+            "user-friendly",
+            "no-digits-here",
+        ] {
+            assert!(!is_managed_style_tool(t), "expected NOT managed: {t}");
+        }
+    }
+
+    /// C-FLEET: `enter` for a managed-style tool with NO active managed-session
+    /// record writes exactly ONE `unmanaged-agent` risk fact into the ledger;
+    /// a second `enter` does not duplicate it. Re-uses the b11d read-back
+    /// pattern (fresh RoomStore) so segment→db reconciliation is verified.
+    #[test]
+    fn fleet_unmanaged_agent_writes_durable_risk_fact() {
+        let root = unique_root("fleet-unmanaged-risk");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        // Simulate the exact `command_enter` block: snapshot → query active
+        // managed sessions → if none AND managed-style → append risk.
+        let stray_tool = "stray-01";
+        {
+            let room = store::RoomStore::open_at(root.clone()).unwrap();
+            let snapshot_before = room.snapshot().unwrap();
+            let active_sessions = active_session_records(&room).unwrap_or_default();
+            let has_managed = active_sessions
+                .iter()
+                .any(|s| s.tool == stray_tool || s.session_id == stray_tool || s.name == stray_tool);
+            assert!(!has_managed, "no managed session expected for stray-01");
+            assert!(is_managed_style_tool(stray_tool), "managed-style tool id");
+            let already_recorded = snapshot_before.current_risks.iter().any(|f| {
+                f.subject == format!("unmanaged-agent: {stray_tool}")
+                    && f.tool.as_deref() == Some(stray_tool)
+            });
+            assert!(!already_recorded, "no prior risk fact expected");
+            let risk_fact = build_risk_fact(
+                stray_tool,
+                format!("unmanaged-agent: {stray_tool}"),
+                "test".to_string(),
+                Vec::new(),
+                "warn",
+                Vec::new(),
+                None,
+            );
+            room.append_fact(&risk_fact).unwrap();
+        }
+
+        // Read back via fresh RoomStore.
+        {
+            let reader = store::RoomStore::open_at(root.clone()).unwrap();
+            let snapshot = reader.snapshot().unwrap();
+            let risk_facts: Vec<_> = snapshot
+                .current_risks
+                .iter()
+                .filter(|f| f.subject == format!("unmanaged-agent: {stray_tool}"))
+                .collect();
+            assert_eq!(
+                risk_facts.len(),
+                1,
+                "exactly one unmanaged-agent risk expected; got: {:?}",
+                risk_facts.iter().map(|f| &f.subject).collect::<Vec<_>>()
+            );
+            assert_eq!(risk_facts[0].severity.as_deref(), Some("warn"));
+        }
+
+        // Simulate second enter: idempotency check via current_risks scan.
+        {
+            let room = store::RoomStore::open_at(root.clone()).unwrap();
+            let snapshot_before = room.snapshot().unwrap();
+            let already_recorded = snapshot_before.current_risks.iter().any(|f| {
+                f.subject == format!("unmanaged-agent: {stray_tool}")
+                    && f.tool.as_deref() == Some(stray_tool)
+            });
+            assert!(
+                already_recorded,
+                "second enter must see the prior risk fact (idempotency gate)"
+            );
+            // command_enter would skip the append. Verify nothing duplicates.
+            let reader = store::RoomStore::open_at(root.clone()).unwrap();
+            let snapshot = reader.snapshot().unwrap();
+            let risk_facts: Vec<_> = snapshot
+                .current_risks
+                .iter()
+                .filter(|f| f.subject == format!("unmanaged-agent: {stray_tool}"))
+                .collect();
+            assert_eq!(risk_facts.len(), 1, "idempotent — still exactly one");
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-FLEET: `enter` for a tool that DOES have an active managed session
+    /// does NOT emit an `unmanaged-agent` risk fact.
+    #[test]
+    fn fleet_managed_tool_does_not_emit_risk() {
+        let root = unique_root("fleet-managed-no-risk");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // Manually append a `session` fact making `claude-99` active.
+        let session = ManagedSession {
+            session_id: "claude-99".to_string(),
+            name: "claude-99".to_string(),
+            agent: "claude".to_string(),
+            tool: "claude_code:99".to_string(),
+            backend: "tmux".to_string(),
+            cwd: root.clone(),
+            target: "rally-claude-99".to_string(),
+        };
+        room.append_fact(&session_fact(&session, "active", None))
+            .unwrap();
+
+        let active = active_session_records(&room).unwrap();
+        let has_managed = active
+            .iter()
+            .any(|s| s.tool == "claude_code:99" || s.session_id == "claude_code:99");
+        assert!(
+            has_managed,
+            "managed session match must succeed by tool name"
+        );
+
+        // With a managed session present, command_enter would skip the risk
+        // append. Verify nothing is in current_risks.
+        let snapshot = room.snapshot().unwrap();
+        let unmanaged_risks: Vec<_> = snapshot
+            .current_risks
+            .iter()
+            .filter(|f| f.subject.starts_with("unmanaged-agent"))
+            .collect();
+        assert!(
+            unmanaged_risks.is_empty(),
+            "managed tool must not emit unmanaged-agent risk; got: {:?}",
+            unmanaged_risks.iter().map(|f| &f.subject).collect::<Vec<_>>()
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
