@@ -131,6 +131,42 @@ fn envelope_enter() {
     ws.cleanup();
 }
 
+/// `adopt` — registers an already-running tmux/cmux target as a managed
+/// session; requires a name positional + one of --tmux/--cmux. Closes the
+/// audit gap: adopt is the response arm of the fleet-enforcement rule and
+/// must honor the same envelope contract as every other schema-stamped
+/// command. HERDR-INDEPENDENT (no --pane arm).
+#[test]
+fn envelope_adopt() {
+    let ws = Workspace::new("adopt");
+    let body = ws.json(&[
+        "adopt",
+        "adopted-agent",
+        "--json",
+        "--tmux",
+        "rally-adopted-agent",
+        "--tool",
+        "codex:adopted-01",
+        "--agent",
+        "codex",
+    ]);
+    assert_envelope_contract("adopt", &body);
+    assert_eq!(body["schema"], "agent-rally.command.adopt.v1");
+    assert!(
+        !body["data"]["adopt"]["session"]["session_id"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty(),
+        "adopt envelope must carry a non-empty session_id\nbody={body:#}"
+    );
+    assert_eq!(
+        body["data"]["adopt"]["session"]["target"],
+        "rally-adopted-agent"
+    );
+    assert_eq!(body["data"]["adopt"]["session"]["backend"], "tmux");
+    ws.cleanup();
+}
+
 /// `say` — appends a fact; requires --tool and kind positional.
 #[test]
 fn envelope_say() {

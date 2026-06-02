@@ -242,10 +242,12 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
     assert_eq!(enter["data"]["enter"]["cursor"]["before"], 0);
     // Component B: say claim (claude) wrote presence(1)+lead(2)+claim(3);
     // say decision (pi) wrote presence(4)+decision(5). codex enter writes
-    // presence(6) via ensure_presence (lead already set by claude).
-    // cursor_after is set to post-presence max_seq=6 so that codex's own
-    // presence fact is excluded from "new peer content" on the next enter.
-    assert_eq!(enter["data"]["enter"]["cursor"]["after"], 6);
+    // presence(6) via ensure_presence (lead already set by claude), then the
+    // f4-widened fleet check writes an `unmanaged-agent` risk(7) because
+    // `codex` has no active managed-session record. cursor_after is set to
+    // post-presence max_seq=7 so codex's own presence + risk facts are
+    // excluded from "new peer content" on the next enter.
+    assert_eq!(enter["data"]["enter"]["cursor"]["after"], 7);
     assert_eq!(enter["data"]["enter"]["cursor"]["advanced"], true);
     assert!(
         enter["data"]["enter"]["entry"]["do_not"]
@@ -271,19 +273,22 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
         "--path",
         "src/room.rs",
     ]);
-    // R10/cursor: second enter's cursor_before = 6 (ledger-derived from the
-    // Read checkpoint written by the first enter, which recorded content_max_seq=6).
-    // The second enter detects codex as already active (B11) and writes a durable
-    // risk fact before ensure_presence runs; then ensure_presence is idempotent
-    // (no new presence/lead).
+    // R10/cursor: second enter's cursor_before = 7 (ledger-derived from the
+    // Read checkpoint written by the first enter, which recorded
+    // content_max_seq=7). The second enter detects codex as already active
+    // (B11) and writes a durable risk fact AFTER ensure_presence runs
+    // (post-f4-order: presence first, then warning-block risk facts so the
+    // squad-membership guard inside ensure_presence is not short-circuited).
     // Seq breakdown after first enter:
     //   1: presence(claude), 2: lead(claude), 3: claim, 4: presence(pi), 5: decision
-    //   6: presence(codex) — first enter's ensure_presence
-    //   7: Read checkpoint (first enter's maybe_append_read_checkpoint at content_max=6)
-    //   8: B11 risk fact (second enter's drift detection)
-    // cursor_after = snapshot.max_seq = 8.
-    assert_eq!(enter_again["data"]["enter"]["cursor"]["before"], 6);
-    assert_eq!(enter_again["data"]["enter"]["cursor"]["after"], 8);
+    //   6: presence(codex) — first enter's ensure_presence (now FIRST)
+    //   7: f4 unmanaged-agent risk(codex) — codex has no managed session
+    //   8: Read checkpoint (first enter's maybe_append_read_checkpoint at content_max=7)
+    //   9: B11 risk fact (second enter's duplicate-active-squad detection;
+    //      the unmanaged-agent risk dedups via already_recorded check)
+    // cursor_after = snapshot.max_seq = 9.
+    assert_eq!(enter_again["data"]["enter"]["cursor"]["before"], 7);
+    assert_eq!(enter_again["data"]["enter"]["cursor"]["after"], 9);
     assert_eq!(enter_again["data"]["enter"]["cursor"]["advanced"], true);
 
     let (check, check_output) = workspace.json_with_status(&[
