@@ -2242,6 +2242,14 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     let target = args.target;
     let sender_tool = args.tool;
     let urgent = args.urgent;
+    // SEC-006: `Directive.from` is caller-supplied. The daemon treats it as
+    // INFORMATIONAL ONLY (it never branches on `from` for trust — the
+    // authoritative sender-roster + capability check lives in ptyd's termd
+    // `authorize()`). The write-side gate here rejects a malformed / traversal /
+    // control-char sender id so a garbage identity can never reach the ledger
+    // or the SEC-015 audit trail.
+    rally_protocol::ledger::validate_agent_id(&sender_tool)
+        .map_err(|e| RallyError::Usage(format!("invalid --tool sender id: {e}")))?;
     let session = find_session(&target)?;
     let handoff = args.handoff;
     let is_text_inject = args.text.is_some();
@@ -2332,6 +2340,16 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     } else if delivery_state_initial == "failed" {
         // Ledger write failed — do not attempt backend inject. The content
         // fact is already recorded.
+        false
+    } else if urgent {
+        // SEC-009: split-enforcement guard. `rally inject` only ever emits
+        // `Deliver + Addition` semantics (see inject_via_ledger), and the
+        // daemon restricts `urgent=true` to Stop/Retraction (it rejects an
+        // urgent Addition/Revision with a Failed receipt). The LEGACY
+        // synchronous tmux/cmux inject path must be gated the SAME way, or the
+        // two delivery paths disagree: the daemon refuses but the legacy
+        // backend still writes the raw keystrokes. Gate it here so an urgent
+        // Addition is delivered by NO backend.
         false
     } else {
         match backend_runner.inject(&live_target, &text) {
@@ -2632,7 +2650,15 @@ fn make_inject_content_fact(sender_tool: &str, recipient_tool: &str, text: &str)
         scope: Vec::new(),
         created_at: now_string(),
         summary: Some(text.to_string()),
-        evidence: Vec::new(),
+        // SEC-015: `from` is caller-supplied and unverifiable at write time, so
+        // stamp an audit trail — the self-declared sender id plus the OS pid of
+        // the writing process — into the durable coordination record. An auditor
+        // (or the daemon's Failed-receipt diagnostics) can cross-check this
+        // against `directive.from` instead of trusting the string blindly.
+        evidence: vec![
+            format!("sender:{sender_tool}"),
+            format!("pid:{}", std::process::id()),
+        ],
         target: Some(recipient_tool.to_string()),
         ref_id: None,
         status: Some("pending".to_string()),
@@ -3389,6 +3415,36 @@ mod tests {
             recorded.subject
         );
         assert_eq!(recorded.summary.as_deref(), Some(msg));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// SEC-015: the inject content fact carries an audit trail — the
+    /// self-declared sender id plus the writing process's pid — so `from`
+    /// (which is unverifiable at write time) can be cross-checked rather than
+    /// trusted blindly.
+    #[test]
+    fn sec015_inject_content_fact_stamps_sender_and_pid_evidence() {
+        let root = unique_root("sec015-inject-evidence");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        let fact = inject_content_fact(&room, "claude_code:sender-1", "claude_code:target", "hi")
+            .unwrap();
+
+        assert!(
+            fact.evidence
+                .iter()
+                .any(|e| e == "sender:claude_code:sender-1"),
+            "evidence must record the sender id: {:?}",
+            fact.evidence
+        );
+        let pid = std::process::id();
+        assert!(
+            fact.evidence.iter().any(|e| e == &format!("pid:{pid}")),
+            "evidence must record the writer pid: {:?}",
+            fact.evidence
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

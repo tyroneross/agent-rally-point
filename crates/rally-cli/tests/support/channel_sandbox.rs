@@ -147,6 +147,19 @@ impl ChannelSandbox {
         })
     }
 
+    /// Run `rally <args>` inside this sandbox WITHOUT panicking on failure.
+    /// Returns the raw process output so a caller can assert a NON-zero exit
+    /// (e.g. a rejected/forged input). The success path uses [`rally_json`].
+    pub fn rally_try(&self, args: &[&str]) -> std::process::Output {
+        Command::new(RALLY_BIN)
+            .args(args)
+            .current_dir(&self.cwd)
+            .env("HOME", &self.home)
+            .env_remove("PWD")
+            .output()
+            .expect("spawn rally")
+    }
+
     /// Register a managed tmux-backed session named `name` using `/usr/bin/true`
     /// as the tmux stub. Returns the rally-assigned target name (e.g.
     /// `reviewer-01` for `--name reviewer`).
