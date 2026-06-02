@@ -1272,9 +1272,11 @@ fn command_version(args: VersionArgs) -> Result<Output> {
 /// (room identifier), worktree (active checkout dir), build_id (embedded
 /// RALLY_BUILD_ID), and cwd. Read-only — no facts are written.
 fn command_whoami(args: WhoamiArgs) -> Result<Output> {
-    let repo_root = repo_root()
+    let repo_root_path = repo_root().ok();
+    let repo_root = repo_root_path
+        .as_ref()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string());
+        .unwrap_or_else(|| "<unknown>".to_string());
     let worktree = worktree_root()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
@@ -1286,7 +1288,8 @@ fn command_whoami(args: WhoamiArgs) -> Result<Output> {
         .unwrap_or_else(|_| "<unknown>".to_string());
     // Best-effort: whoami stays a diagnostic that never hard-fails.
     let room = RoomStore::open().ok();
-    let repo_id = room
+    let repo_id = resolve_repo_id(repo_root_path.as_deref());
+    let room_id = room
         .as_ref()
         .map(|r| r.room_id().to_string())
         .unwrap_or_else(|| "<no-room>".to_string());
@@ -1303,7 +1306,7 @@ fn command_whoami(args: WhoamiArgs) -> Result<Output> {
     };
     let host_runtime = detect_host_runtime();
     let text = format!(
-        "repo_root={repo_root} repo_id={repo_id} build_id={BUILD_ID} branch={} herdr_ambiguous={} lead={}",
+        "repo_root={repo_root} repo_id={repo_id} room_id={room_id} build_id={BUILD_ID} branch={} herdr_ambiguous={} lead={}",
         branch.as_deref().unwrap_or("<none>"),
         host_runtime.ambiguous,
         lead.as_deref().unwrap_or("<none>"),
@@ -1316,6 +1319,7 @@ fn command_whoami(args: WhoamiArgs) -> Result<Output> {
                 tool: args.tool,
                 repo_root,
                 repo_id,
+                room_id,
                 worktree,
                 branch,
                 build_id: BUILD_ID.to_string(),
@@ -1328,6 +1332,31 @@ fn command_whoami(args: WhoamiArgs) -> Result<Output> {
         },
     )?;
     Ok(Output::new(args.json, text, body))
+}
+
+fn resolve_repo_id(repo_root: Option<&Path>) -> String {
+    repo_root
+        .and_then(manifest_repo_id)
+        .or_else(|| {
+            repo_root
+                .and_then(|root| root.file_name())
+                .and_then(|name| name.to_str())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "<unknown-repo>".to_string())
+}
+
+fn manifest_repo_id(repo_root: &Path) -> Option<String> {
+    let path = repo_root.join(".rally").join("manifest.json");
+    let text = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    value["repo"]
+        .as_str()
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())
+        .map(str::to_string)
 }
 
 /// Wrapper: wraps status result under `data.status`.
@@ -6576,7 +6605,11 @@ struct VersionData {
 struct WhoamiPayload {
     tool: Option<String>,
     repo_root: String,
+    /// Stable repo identity from `.rally/manifest.json` when present, else the
+    /// repo-root directory name. This is intentionally not the engagement label.
     repo_id: String,
+    /// Active engagement/room label used for `.rally/log/<room_id>.jsonl`.
+    room_id: String,
     worktree: String,
     /// Current branch of the active worktree (self-location: catches
     /// shared-checkout-on-non-main hazards without manual git).

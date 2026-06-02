@@ -118,9 +118,10 @@ The short version:
   replayable migration input.
 - `.rally/facts.db` is a derived sqlite cache rebuilt by replaying the
   ledger when missing or behind.
-- `~/.agent-rally-point/rooms/v1/index.json` is a global discovery hint
-  (pointers-only, no canonical data). Disable with
-  `RALLY_NO_GLOBAL_INDEX=1`.
+- `~/.agent-rally-point/rooms/v1/index.json` is an opt-in global discovery
+  hint (pointers-only, no canonical data). It is off by default; enable with
+  `RALLY_GLOBAL_INDEX=1`. `RALLY_NO_GLOBAL_INDEX=1` force-disables it even
+  when opted in.
 - JSON contracts are designed for agents first.
 - Managed session delivery is how Rally becomes part of normal agent
   behavior.

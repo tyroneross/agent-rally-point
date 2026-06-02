@@ -3246,8 +3246,7 @@ fn advisory_9_tier_fit_ok_when_matching_calibration() {
 
 /// B-whoami smoke test: `rally whoami --json` exits 0 and returns repo_root + build_id.
 ///
-/// Fields are flat in `data` (no nested "whoami" key) — mirrors how `version`
-/// serialises its data.
+/// Fields are nested under `data.whoami`, matching the JSON envelope contract.
 #[test]
 fn rally_whoami_json_exits_zero_and_returns_identity() {
     let workspace = Workspace::new("rally-whoami");
@@ -3261,6 +3260,10 @@ fn rally_whoami_json_exits_zero_and_returns_identity() {
     let whoami = &result["data"]["whoami"];
     let repo_root = whoami["repo_root"].as_str().unwrap_or("");
     assert!(!repo_root.is_empty(), "repo_root must be non-empty");
+    let repo_id = whoami["repo_id"].as_str().unwrap_or("");
+    assert!(!repo_id.is_empty(), "repo_id must be non-empty");
+    let room_id = whoami["room_id"].as_str().unwrap_or("");
+    assert!(!room_id.is_empty(), "room_id must be non-empty");
 
     let build_id = whoami["build_id"].as_str().unwrap_or("");
     assert!(!build_id.is_empty(), "build_id must be non-empty");
@@ -3274,6 +3277,31 @@ fn rally_whoami_json_exits_zero_and_returns_identity() {
     assert!(!cwd.is_empty(), "cwd must be non-empty");
     let worktree = whoami["worktree"].as_str().unwrap_or("");
     assert!(!worktree.is_empty(), "worktree must be non-empty");
+
+    workspace.cleanup();
+}
+
+/// `repo_id` is the stable repo identity, not the active engagement label.
+#[test]
+fn rally_whoami_repo_id_uses_manifest_not_active_engagement() {
+    let workspace = Workspace::new("rally-whoami-repo-id");
+    let rally_dir = workspace.cwd.join(".rally");
+    fs::create_dir_all(&rally_dir).unwrap();
+    fs::write(
+        rally_dir.join("manifest.json"),
+        r#"{"schema":"agent-rally.manifest.v1","repo":"agent-rally-point"}"#,
+    )
+    .unwrap();
+    fs::write(rally_dir.join("active-engagement"), "test\n").unwrap();
+
+    let result = workspace.json(&["whoami", "--json"]);
+    assert!(result["ok"].as_bool().unwrap_or(false));
+    let whoami = &result["data"]["whoami"];
+    assert_eq!(
+        whoami["repo_id"].as_str().unwrap_or(""),
+        "agent-rally-point"
+    );
+    assert_eq!(whoami["room_id"].as_str().unwrap_or(""), "test");
 
     workspace.cleanup();
 }

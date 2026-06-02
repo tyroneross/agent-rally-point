@@ -49,7 +49,7 @@ print(d['data'][d['command']])
 | `migrate-legacy` | `migrate-legacy: { slugs_found, facts_read, facts_migrated, facts_skipped_existing, warnings }` | — |
 | `doctor` | `doctor: { non_canonical?, suffix_collisions? } \| { live, stale, applied }` | — |
 | `version` | `version: { version, build_id }` | — |
-| `whoami` | `whoami: { tool?, repo_root, repo_id, worktree, build_id, cwd }` | — |
+| `whoami` | `whoami: { tool?, repo_root, repo_id, room_id, worktree, build_id, cwd }` | `repo_id` is stable repo identity; `room_id` is the active engagement label |
 | `sessions` | `sessions: { sessions: [...] }` | — |
 | `run` | `run: { mode, session, commands }` | — |
 | `inject` | `inject: { mode, session, handoff?, require_ack, ack?, wake_intent?, commands, sender_tool, content_fact?, delivered }` | — |

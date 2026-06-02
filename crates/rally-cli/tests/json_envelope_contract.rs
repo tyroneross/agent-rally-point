@@ -467,6 +467,8 @@ fn envelope_whoami_data_fields() {
         !whoami["repo_root"].is_null(),
         "data.whoami.repo_root missing"
     );
+    assert!(!whoami["repo_id"].is_null(), "data.whoami.repo_id missing");
+    assert!(!whoami["room_id"].is_null(), "data.whoami.room_id missing");
     assert!(
         !whoami["build_id"].is_null(),
         "data.whoami.build_id missing"
