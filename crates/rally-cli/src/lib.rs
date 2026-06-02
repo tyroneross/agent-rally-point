@@ -2275,6 +2275,7 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     let dry_run = args.dry_run;
     let target = args.target;
     let sender_tool = args.tool;
+    let urgent = args.urgent;
     let session = find_session(&target)?;
     let handoff = args.handoff;
     let is_text_inject = args.text.is_some();
@@ -2350,7 +2351,7 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     ) = if dry_run {
         (None, None, "pending")
     } else {
-        match inject_via_ledger(&repo_root()?, &session.tool, &sender_tool, &text, false) {
+        match inject_via_ledger(&repo_root()?, &session.tool, &sender_tool, &text, urgent) {
             Ok(seq) => (Some(seq), Some(session.tool.clone()), "pending"),
             Err(_) => (None, Some(session.tool.clone()), "failed"),
         }

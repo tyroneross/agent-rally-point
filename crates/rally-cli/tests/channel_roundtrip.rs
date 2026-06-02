@@ -135,6 +135,43 @@ fn receipt_roundtrip_simulating_self_ack_or_daemon() {
 }
 
 #[test]
+fn urgent_flag_propagates_to_directive_urgent_field() {
+    // Plan F P4: --urgent on the CLI writes a Directive with urgent: true.
+    // The daemon then decides whether to honor the override (Stop|Retraction
+    // only — Deliver+Addition with urgent=true is rejected by the daemon
+    // per the contract). Here we only verify the writer side: the flag
+    // PROPAGATES correctly to the ledger.
+    let sandbox = ChannelSandbox::spawn();
+    let name = unique_name("urgent");
+    let target = sandbox.add_tmux_session(&name);
+    let expected_tool = format!("claude_code:{target}");
+
+    let outcome = sandbox.inject_with_flags(&target, "s", "stop", true);
+    assert!(outcome.directive_seq.is_some());
+
+    let directives = sandbox.read_directives(&expected_tool, 0);
+    assert_eq!(directives.len(), 1);
+    assert!(
+        directives[0].urgent,
+        "the --urgent CLI flag must propagate as Directive::urgent=true"
+    );
+}
+
+#[test]
+fn urgent_default_false_when_flag_not_passed() {
+    // Default `urgent: false` keeps the contract safe for the common case.
+    let sandbox = ChannelSandbox::spawn();
+    let name = unique_name("urgent-default");
+    let target = sandbox.add_tmux_session(&name);
+    let expected_tool = format!("claude_code:{target}");
+
+    sandbox.inject(&target, "s", "ordinary message");
+    let directives = sandbox.read_directives(&expected_tool, 0);
+    assert_eq!(directives.len(), 1);
+    assert!(!directives[0].urgent, "default urgent must be false");
+}
+
+#[test]
 fn delivery_state_field_is_pending_or_delivered_never_unknown() {
     // Plan F H5: never silent-false. `delivered: false` due to a backend
     // hiccup must NEVER manifest as `delivery_state: unknown` — the

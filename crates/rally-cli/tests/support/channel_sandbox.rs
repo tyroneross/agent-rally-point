@@ -170,7 +170,18 @@ impl ChannelSandbox {
 
     /// Invoke `rally inject` inside this sandbox. Returns the parsed outcome.
     pub fn inject(&self, target: &str, sender_tool: &str, text: &str) -> InjectOutcome {
-        let envelope = self.rally_json(&[
+        self.inject_with_flags(target, sender_tool, text, false)
+    }
+
+    /// Variant that accepts the Plan F `--urgent` flag.
+    pub fn inject_with_flags(
+        &self,
+        target: &str,
+        sender_tool: &str,
+        text: &str,
+        urgent: bool,
+    ) -> InjectOutcome {
+        let mut args: Vec<&str> = vec![
             "inject",
             target,
             "--json",
@@ -180,7 +191,11 @@ impl ChannelSandbox {
             sender_tool,
             "--tmux-bin",
             "/usr/bin/true",
-        ]);
+        ];
+        if urgent {
+            args.push("--urgent");
+        }
+        let envelope = self.rally_json(&args);
         let inject = envelope
             .pointer("/data/inject")
             .unwrap_or_else(|| panic!("envelope has no /data/inject: {envelope}"))

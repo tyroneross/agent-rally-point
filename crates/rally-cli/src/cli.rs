@@ -243,6 +243,14 @@ pub(crate) struct InjectArgs {
     /// Identity of the agent sending the injection. Defaults to "unknown" when
     /// omitted. Stored in the coordination channel so recipients know the source.
     pub(crate) tool: String,
+    /// Plan F sync override. When `true`, the Directive is written with
+    /// `urgent: true` AND the daemon performs an immediate PTY-write
+    /// instead of waiting for the agent's next checkpoint. RESTRICTED to
+    /// `Stop|Retraction` semantics (see F plan §sync override; research
+    /// §F4). The daemon (`rally-termd`) rejects `urgent` on
+    /// `Deliver+Addition` / `Deliver+Revision` with a Failed Receipt to
+    /// preserve TUI integrity.
+    pub(crate) urgent: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1017,6 +1025,11 @@ fn inject_parser() -> impl Parser<InjectArgs> {
     let bins = backend_bins_parser();
     let tool = optional_string_arg("tool", "TOOL")
         .map(|value| value.unwrap_or_else(|| "unknown".to_string()));
+    // Plan F sync override. Restricted by the daemon to Stop|Retraction
+    // semantics — see InjectArgs::urgent docstring + F plan §sync override.
+    let urgent = long("urgent")
+        .help("Plan F sync override: daemon writes the directive synchronously to the PTY. Only honored for Stop|Retraction; the daemon REJECTS urgent on Deliver+Addition/Revision to protect TUI integrity.")
+        .switch();
     let target = positional::<String>("TARGET");
     construct!(
         json,
@@ -1027,10 +1040,11 @@ fn inject_parser() -> impl Parser<InjectArgs> {
         timeout_seconds,
         bins,
         tool,
+        urgent,
         target
     )
     .map(
-        |(json, dry_run, text, handoff, require_ack, timeout_seconds, bins, tool, target)| {
+        |(json, dry_run, text, handoff, require_ack, timeout_seconds, bins, tool, urgent, target)| {
             InjectArgs {
                 json,
                 dry_run,
@@ -1041,6 +1055,7 @@ fn inject_parser() -> impl Parser<InjectArgs> {
                 timeout_seconds,
                 bins,
                 tool,
+                urgent,
             }
         },
     )
