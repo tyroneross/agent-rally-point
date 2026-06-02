@@ -92,6 +92,20 @@ pub(crate) struct SessionsEnvelope {
     pub(crate) sessions: SessionsData,
 }
 
+/// C-FLEET: shape of `data.adopt` for `rally adopt` responses. Carries the
+/// freshly-registered `ManagedSession` so the caller has the assigned
+/// `session_id` (which differs from `name` when adoption auto-numbers).
+#[derive(JsonSchema, Serialize)]
+pub(crate) struct AdoptData {
+    pub(crate) session: ManagedSession,
+}
+
+/// Envelope for `adopt`: result under `data.adopt`.
+#[derive(JsonSchema, Serialize)]
+pub(crate) struct AdoptEnvelope {
+    pub(crate) adopt: AdoptData,
+}
+
 #[derive(JsonSchema, Serialize)]
 pub(crate) struct InjectData {
     pub(crate) mode: &'static str,
@@ -383,6 +397,57 @@ fn default_private_socket_client() -> String {
         .find(|path| path.is_file())
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "ptyd".to_string())
+}
+
+/// C-HERDR: discover an Easy Terminal herdr/ptyd socket path for `rally run
+/// --backend herdr` callers that did NOT pass `--herdr-socket`. Without this,
+/// `rally run --backend herdr` silently targets `~/.config/herdr/herdr.sock`
+/// (the standalone daemon) instead of the Easy Terminal app's private socket,
+/// so the launched agent ends up invisible to the Easy Terminal UI.
+///
+/// Precedence:
+///   1. `PTYD_SOCKET_PATH` env (preferred — caller-explicit, no guesswork).
+///   2. `HERDR_SOCKET_PATH` env.
+///   3. macOS: `~/Library/Application Support/EasyTerminal/herdr.sock`.
+///   4. Linux: `$XDG_RUNTIME_DIR/easy-terminal/herdr.sock` (future-proofing —
+///      macOS ships now; Linux falls through to None until ET ports).
+///
+/// Returns `None` when no candidate exists on disk; callers should preserve
+/// today's behavior (use the bare `herdr` binary against its default socket)
+/// rather than fabricate a path that does not exist.
+pub(crate) fn find_easy_terminal_socket() -> Option<PathBuf> {
+    for env_var in ["PTYD_SOCKET_PATH", "HERDR_SOCKET_PATH"] {
+        if let Ok(value) = env::var(env_var) {
+            if !value.is_empty() {
+                let path = PathBuf::from(&value);
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    easy_terminal_socket_candidates()
+        .into_iter()
+        .find(|candidate| candidate.exists())
+}
+
+/// Disk locations to probe for the Easy Terminal herdr socket, in order.
+/// Extracted as a separate function so unit tests can lock the candidate list
+/// without invoking the env-first path.
+fn easy_terminal_socket_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(home) = env::var("HOME") {
+        let home = PathBuf::from(home);
+        // macOS app sandbox / Application Support layout.
+        candidates.push(home.join("Library/Application Support/EasyTerminal/herdr.sock"));
+    }
+    // Linux XDG runtime dir layout (future port; macOS will never match).
+    if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
+        if !xdg.is_empty() {
+            candidates.push(PathBuf::from(xdg).join("easy-terminal/herdr.sock"));
+        }
+    }
+    candidates
 }
 
 fn binary_on_path(name: &str) -> bool {
@@ -813,5 +878,143 @@ mod tests {
             serde_json::to_value(schema_for!(Envelope<SessionActionData>)).unwrap(),
         ];
         assert!(schemas.iter().all(|schema| schema.is_object()));
+    }
+
+    /// C-HERDR: PTYD_SOCKET_PATH always wins when set and the file exists.
+    #[test]
+    fn find_et_socket_prefers_ptyd_socket_path_env() {
+        let tmp = std::env::temp_dir().join(format!("rally-et-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sock = tmp.join("herdr.sock");
+        std::fs::write(&sock, b"").unwrap();
+        let prior_ptyd = std::env::var("PTYD_SOCKET_PATH").ok();
+        let prior_herdr = std::env::var("HERDR_SOCKET_PATH").ok();
+        let prior_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        let prior_home = std::env::var("HOME").ok();
+        // SAFETY: these unsafe blocks are intentional — tests must control env
+        // for the duration of the assertion. Restored in the finally-equivalent
+        // tail of the test.
+        unsafe {
+            std::env::set_var("PTYD_SOCKET_PATH", &sock);
+            std::env::remove_var("HERDR_SOCKET_PATH");
+            // Set HOME to nonexistent so candidate list misses, isolating
+            // the env-first arm.
+            std::env::set_var("HOME", "/nonexistent-rally-et-test");
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+
+        let found = super::find_easy_terminal_socket();
+        assert_eq!(found.as_deref(), Some(sock.as_path()));
+
+        unsafe {
+            match prior_ptyd {
+                Some(v) => std::env::set_var("PTYD_SOCKET_PATH", v),
+                None => std::env::remove_var("PTYD_SOCKET_PATH"),
+            }
+            match prior_herdr {
+                Some(v) => std::env::set_var("HERDR_SOCKET_PATH", v),
+                None => std::env::remove_var("HERDR_SOCKET_PATH"),
+            }
+            match prior_xdg {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+            match prior_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// C-HERDR: empty env + no candidate socket on disk returns None — caller
+    /// preserves the pre-discovery default (bare `herdr`).
+    #[test]
+    fn find_et_socket_returns_none_when_no_candidate_exists() {
+        let prior_ptyd = std::env::var("PTYD_SOCKET_PATH").ok();
+        let prior_herdr = std::env::var("HERDR_SOCKET_PATH").ok();
+        let prior_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        let prior_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::remove_var("PTYD_SOCKET_PATH");
+            std::env::remove_var("HERDR_SOCKET_PATH");
+            std::env::remove_var("XDG_RUNTIME_DIR");
+            std::env::set_var("HOME", "/nonexistent-rally-et-noop");
+        }
+
+        let found = super::find_easy_terminal_socket();
+        assert!(
+            found.is_none(),
+            "expected None when no env + no on-disk socket; got: {:?}",
+            found
+        );
+
+        unsafe {
+            match prior_ptyd {
+                Some(v) => std::env::set_var("PTYD_SOCKET_PATH", v),
+                None => std::env::remove_var("PTYD_SOCKET_PATH"),
+            }
+            match prior_herdr {
+                Some(v) => std::env::set_var("HERDR_SOCKET_PATH", v),
+                None => std::env::remove_var("HERDR_SOCKET_PATH"),
+            }
+            match prior_xdg {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+            match prior_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// C-HERDR: PTYD_SOCKET_PATH pointing at a NONEXISTENT path falls through
+    /// to disk candidates — env-set-but-stale must not poison the search.
+    #[test]
+    fn find_et_socket_falls_through_stale_env() {
+        let tmp = std::env::temp_dir().join(format!("rally-et-fallthrough-{}", std::process::id()));
+        let appsupp = tmp.join("Library/Application Support/EasyTerminal");
+        std::fs::create_dir_all(&appsupp).unwrap();
+        let sock = appsupp.join("herdr.sock");
+        std::fs::write(&sock, b"").unwrap();
+
+        let prior_ptyd = std::env::var("PTYD_SOCKET_PATH").ok();
+        let prior_herdr = std::env::var("HERDR_SOCKET_PATH").ok();
+        let prior_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        let prior_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("PTYD_SOCKET_PATH", "/this/path/never/exists.sock");
+            std::env::remove_var("HERDR_SOCKET_PATH");
+            std::env::remove_var("XDG_RUNTIME_DIR");
+            std::env::set_var("HOME", &tmp);
+        }
+
+        let found = super::find_easy_terminal_socket();
+        assert_eq!(
+            found.as_deref(),
+            Some(sock.as_path()),
+            "stale env path must fall through to disk candidate"
+        );
+
+        unsafe {
+            match prior_ptyd {
+                Some(v) => std::env::set_var("PTYD_SOCKET_PATH", v),
+                None => std::env::remove_var("PTYD_SOCKET_PATH"),
+            }
+            match prior_herdr {
+                Some(v) => std::env::set_var("HERDR_SOCKET_PATH", v),
+                None => std::env::remove_var("HERDR_SOCKET_PATH"),
+            }
+            match prior_xdg {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+            match prior_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

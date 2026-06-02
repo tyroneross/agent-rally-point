@@ -35,6 +35,7 @@ const SCHEMA_RUN: &str = "agent-rally.command.run.v1";
 const SCHEMA_SESSIONS: &str = "agent-rally.command.sessions.v1";
 const SCHEMA_INJECT: &str = "agent-rally.command.inject.v1";
 const SCHEMA_SESSION_ACTION: &str = "agent-rally.command.session-action.v1";
+const SCHEMA_ADOPT: &str = "agent-rally.command.adopt.v1";
 pub(crate) const FACT_SCHEMA: &str = "agent-rally.fact.v1";
 const SESSION_IDENTITY_RETRIES: usize = 4096;
 
@@ -79,7 +80,9 @@ use output::{CliError, Output, RenderedOutput};
 use route_findings::{Finding, RoutingSummary, route_findings};
 use store::{Fact, FactKind, ReadReceipt, RoomQuery, RoomSnapshot, RoomStore, RoomSummary};
 // Envelope wrapper types from backends module.
-use backends::{InjectEnvelope, RunEnvelope, SessionActionEnvelope, SessionsEnvelope};
+use backends::{
+    AdoptData, AdoptEnvelope, InjectEnvelope, RunEnvelope, SessionActionEnvelope, SessionsEnvelope,
+};
 
 const SCHEMA_MIGRATE_LEGACY: &str = "agent-rally.command.migrate-legacy.v1";
 const SCHEMA_DOCTOR: &str = "agent-rally.command.doctor.v1";
@@ -360,6 +363,8 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::Mission(args) => command_mission(args),
         CliCommand::Lead(args) => command_lead(args),
         CliCommand::Ack(args) => command_ack(args),
+        // C-FLEET: adopt an already-running agent into the managed-session ledger
+        CliCommand::Adopt(args) => command_adopt(args),
     }
 }
 
@@ -568,6 +573,46 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
             None,
         );
         room.append_fact(&risk_fact)?;
+    }
+
+    // C-FLEET / "all fleet workers must be rally-managed": when a tool enters
+    // with a managed-style identifier (e.g. claude-01, claude_code:01,
+    // toolbar-launch-01) but no active managed-session record exists for it,
+    // surface an `unmanaged-agent` warning + append ONE durable risk fact.
+    // Skips human/lead-style identifiers (claude_code:lead, lead, human:*,
+    // *:l<N>) — those are not expected to be managed sessions. This is the
+    // detection arm of the fleet-enforcement rule; the response arm is
+    // `rally adopt` (register without relaunch).
+    if is_managed_style_tool(&tool) {
+        let active_sessions = active_session_records(&room).unwrap_or_default();
+        let has_managed = active_sessions
+            .iter()
+            .any(|s| s.tool == tool || s.session_id == tool || s.name == tool);
+        if !has_managed {
+            let already_recorded = snapshot_before.current_risks.iter().any(|f| {
+                f.subject == format!("unmanaged-agent: {tool}")
+                    && f.tool.as_deref() == Some(tool.as_str())
+            });
+            let msg = format!(
+                "tool {tool} entered the room but is not under managed-session control (no active `session` fact). Use `rally adopt {tool} --pane <pane-id>` or `--tmux <target>` to register the running surface so `rally inject/attach/capture/stop` work; or relaunch via `rally run`. Not blocked — informational."
+            );
+            warnings.push(EnterWarning {
+                code: "unmanaged-agent".to_string(),
+                message: msg.clone(),
+            });
+            if !already_recorded {
+                let risk_fact = build_risk_fact(
+                    &tool,
+                    format!("unmanaged-agent: {tool}"),
+                    msg,
+                    Vec::new(),
+                    "warn",
+                    Vec::new(),
+                    None,
+                );
+                room.append_fact(&risk_fact)?;
+            }
+        }
     }
 
     // R9 stale-binary guard: find the most recent presence fact in the room
@@ -1909,11 +1954,27 @@ fn command_run(args: RunArgs) -> Result<Output> {
         backend,
         session_id,
         tool,
-        bins,
+        mut bins,
     } = args;
     let backend_name = backend.as_str().to_string();
     let repo = repo_root()?;
     let agent_spec = AgentSpec::from_name(&agent)?;
+
+    // C-HERDR: auto-discover the Easy Terminal herdr socket when the caller
+    // did NOT pass `--herdr-socket`. Without this, `rally run --backend herdr`
+    // silently targets the bare `herdr` binary against `~/.config/herdr/
+    // herdr.sock` (the standalone daemon), so the launched agent ends up
+    // invisible to the Easy Terminal UI on a Mac that has both running.
+    //
+    // The user-supplied `--herdr-socket` is preserved verbatim; discovery
+    // only fills `None`. When no candidate exists on disk, behavior is
+    // unchanged from before this commit.
+    if backend == Backend::Herdr && bins.herdr_socket.is_none() {
+        if let Some(discovered) = backends::find_easy_terminal_socket() {
+            bins.herdr_socket = Some(discovered.display().to_string());
+        }
+    }
+
     enforce_easy_terminal_self_host_guard(&repo, backend, bins.herdr_socket.as_deref(), dry_run)?;
     let room = RoomStore::open()?;
     let reservation = if dry_run {
@@ -1996,6 +2057,120 @@ fn command_run(args: RunArgs) -> Result<Output> {
     let text = format!(
         "run agent={} backend={} session={}",
         session.agent, session.backend, session.session_id
+    );
+    Ok(Output::new(json, text, body))
+}
+
+/// C-FLEET: register an already-running agent into the managed-session ledger
+/// without relaunching it. This is the response arm of the "all fleet workers
+/// must be rally-managed" rule — turns a presence-only stray (detected via
+/// `unmanaged-agent` risk in `command_enter`) into a controllable session.
+///
+/// Required: `<name>` positional + ONE of `--pane` / `--tmux` (mutually
+/// exclusive). Backend is auto-inferred from which flag was passed.
+///
+/// Optional: `--tool` (defaults to `<agent>:adopted-<n>`), `--agent` (defaults
+/// to `claude`), `--backend` (overrides the inferred backend — useful for
+/// adopting a tmux target whose name does not match the pane convention).
+///
+/// Idempotency: refuses to adopt the same target twice; the caller gets a
+/// clear `Usage` error naming the existing session_id.
+fn command_adopt(args: AdoptArgs) -> Result<Output> {
+    let AdoptArgs {
+        json,
+        name,
+        pane,
+        tmux,
+        tool,
+        agent,
+        backend,
+        bins: _bins,
+    } = args;
+
+    // Validate mutual exclusion: must pass exactly one of --pane / --tmux.
+    // (Auto-discovery via `herdr agent list` is a future extension; today the
+    // running surface is always caller-provided to keep the command
+    // dependency-free and unit-testable.)
+    let (target, inferred_backend) = match (pane.as_deref(), tmux.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(RallyError::Usage(
+                "adopt: --pane and --tmux are mutually exclusive".to_string(),
+            ));
+        }
+        (Some(p), None) => (p.to_string(), Backend::Herdr),
+        (None, Some(t)) => (t.to_string(), Backend::Tmux),
+        (None, None) => {
+            return Err(RallyError::Usage(
+                "adopt: one of --pane <pane-id> or --tmux <target> is required".to_string(),
+            ));
+        }
+    };
+
+    // Backend resolution: explicit --backend wins; otherwise use inference.
+    let resolved_backend = backend.unwrap_or(inferred_backend);
+    let agent_name = agent.unwrap_or_else(|| "claude".to_string());
+    let agent_spec = AgentSpec::from_name(&agent_name)?;
+    let backend_name = resolved_backend.as_str().to_string();
+    let repo = repo_root()?;
+
+    // Refuse to re-adopt the same target. Read existing sessions and check.
+    let room = RoomStore::open()?;
+    let existing = active_session_records(&room)?;
+    if let Some(prior) = existing.iter().find(|s| s.target == target) {
+        return Err(RallyError::Usage(format!(
+            "adopt: target {target} already adopted as session {} (tool {}); use `rally inject {} --text ...` directly",
+            prior.session_id, prior.tool, prior.session_id
+        )));
+    }
+
+    // Reserve identity via the same machinery `command_run` uses.
+    let (session_facts, context_version) = room.session_facts_with_context_version()?;
+    let active_sessions = active_session_records_from_facts(session_facts);
+    let identity = numbered_session_identity(
+        &agent_spec,
+        Some(name.clone()),
+        None,
+        tool,
+        &active_sessions,
+    )?;
+
+    let session = ManagedSession {
+        session_id: identity.session_id.clone(),
+        name: identity.name.clone(),
+        agent: agent_spec.agent.to_string(),
+        tool: identity.tool.clone(),
+        backend: backend_name.clone(),
+        cwd: repo.clone(),
+        // NOTE: target is the CALLER-PROVIDED running surface (pane id or tmux
+        // target), NOT the derived `backend_target(backend, session_id)`. This
+        // is the whole point of adopt — register an existing pane.
+        target,
+    };
+
+    // Append the session fact under the same context-version race guard as
+    // run uses.
+    let fact = session_fact(&session, "active", None);
+    if room
+        .append_session_fact_if_context(&fact, context_version)?
+        .is_none()
+    {
+        return Err(RallyError::Message(
+            "adopt: concurrent session-fact write detected; retry".to_string(),
+        ));
+    }
+
+    let body = envelope(
+        "adopt",
+        SCHEMA_ADOPT,
+        AdoptEnvelope {
+            adopt: AdoptData {
+                session: session.clone(),
+            },
+        },
+    )?;
+    let text = format!(
+        "adopt agent={} backend={} session={} target={}",
+        session.agent, session.backend, session.session_id, session.target
     );
     Ok(Output::new(json, text, body))
 }
@@ -2705,6 +2880,35 @@ fn wake_fact(
 /// Build a Risk fact with the constant boilerplate fields pre-filled.
 /// `scope`, `evidence`, and `ref_id` vary per call site; everything else is
 /// constant across all four use-cases (warn severity, no role/target/status/uri).
+/// Returns true when a `--tool` identifier looks like a managed-session
+/// identity (e.g. `claude-01`, `claude_code:01`, `toolbar-launch-01`) rather
+/// than a human/lead identity (`claude_code:lead`, `*:l<N>`, `human:*`,
+/// `lead`). Used by `command_enter` to gate the `unmanaged-agent` risk record:
+/// human leads are NEVER expected to be managed sessions, so silently skip
+/// them rather than flood the room with spurious risk facts.
+fn is_managed_style_tool(tool: &str) -> bool {
+    let lower = tool.to_ascii_lowercase();
+    if lower == "lead" || lower.starts_with("human") || lower.starts_with("user") {
+        return false;
+    }
+    // Lead-style suffixes: `:lead`, `:l1`, `:l42`, `:l<N>`. A digit after `:l`
+    // is the canonical lead-number form; `:lead` is the human-readable form.
+    if let Some(suffix) = lower.split(':').next_back() {
+        if suffix == "lead" {
+            return false;
+        }
+        if let Some(rest) = suffix.strip_prefix('l') {
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+        }
+    }
+    // Managed identifiers always contain a digit somewhere (the auto-numbered
+    // session ordinal). Identifiers without digits are exotic / human-named
+    // and we don't want to spam risk records for them.
+    tool.chars().any(|c| c.is_ascii_digit())
+}
+
 fn build_risk_fact(
     tool: &str,
     subject: String,
@@ -3785,6 +3989,277 @@ mod tests {
         );
         // enter is still ok — not blocked
         // (enter itself is not called here; the test verifies the durable record)
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-FLEET unit test: `is_managed_style_tool` correctly classifies managed
+    /// vs human/lead identifiers — managed-style ids always carry a digit AND
+    /// are not human/lead-suffixed; human/lead ids return false so they don't
+    /// flood the room with spurious `unmanaged-agent` risk records.
+    #[test]
+    fn fleet_is_managed_style_tool_classification() {
+        // Managed-style — should detect.
+        for t in [
+            "claude-01",
+            "claude_code:01",
+            "claude_code:42",
+            "toolbar-launch-01",
+            "BuildBluePoint-3",
+            "redesign-coord-1",
+            "codex-2",
+        ] {
+            assert!(is_managed_style_tool(t), "expected managed: {t}");
+        }
+        // Human/lead-style — should NOT detect.
+        for t in [
+            "lead",
+            "claude_code:lead",
+            "claude_code:l1",
+            "claude_code:l42",
+            "human:alice",
+            "user-friendly",
+            "no-digits-here",
+        ] {
+            assert!(!is_managed_style_tool(t), "expected NOT managed: {t}");
+        }
+    }
+
+    /// C-FLEET: `enter` for a managed-style tool with NO active managed-session
+    /// record writes exactly ONE `unmanaged-agent` risk fact into the ledger;
+    /// a second `enter` does not duplicate it. Re-uses the b11d read-back
+    /// pattern (fresh RoomStore) so segment→db reconciliation is verified.
+    #[test]
+    fn fleet_unmanaged_agent_writes_durable_risk_fact() {
+        let root = unique_root("fleet-unmanaged-risk");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        // Simulate the exact `command_enter` block: snapshot → query active
+        // managed sessions → if none AND managed-style → append risk.
+        let stray_tool = "stray-01";
+        {
+            let room = store::RoomStore::open_at(root.clone()).unwrap();
+            let snapshot_before = room.snapshot().unwrap();
+            let active_sessions = active_session_records(&room).unwrap_or_default();
+            let has_managed = active_sessions.iter().any(|s| {
+                s.tool == stray_tool || s.session_id == stray_tool || s.name == stray_tool
+            });
+            assert!(!has_managed, "no managed session expected for stray-01");
+            assert!(is_managed_style_tool(stray_tool), "managed-style tool id");
+            let already_recorded = snapshot_before.current_risks.iter().any(|f| {
+                f.subject == format!("unmanaged-agent: {stray_tool}")
+                    && f.tool.as_deref() == Some(stray_tool)
+            });
+            assert!(!already_recorded, "no prior risk fact expected");
+            let risk_fact = build_risk_fact(
+                stray_tool,
+                format!("unmanaged-agent: {stray_tool}"),
+                "test".to_string(),
+                Vec::new(),
+                "warn",
+                Vec::new(),
+                None,
+            );
+            room.append_fact(&risk_fact).unwrap();
+        }
+
+        // Read back via fresh RoomStore.
+        {
+            let reader = store::RoomStore::open_at(root.clone()).unwrap();
+            let snapshot = reader.snapshot().unwrap();
+            let risk_facts: Vec<_> = snapshot
+                .current_risks
+                .iter()
+                .filter(|f| f.subject == format!("unmanaged-agent: {stray_tool}"))
+                .collect();
+            assert_eq!(
+                risk_facts.len(),
+                1,
+                "exactly one unmanaged-agent risk expected; got: {:?}",
+                risk_facts.iter().map(|f| &f.subject).collect::<Vec<_>>()
+            );
+            assert_eq!(risk_facts[0].severity.as_deref(), Some("warn"));
+        }
+
+        // Simulate second enter: idempotency check via current_risks scan.
+        {
+            let room = store::RoomStore::open_at(root.clone()).unwrap();
+            let snapshot_before = room.snapshot().unwrap();
+            let already_recorded = snapshot_before.current_risks.iter().any(|f| {
+                f.subject == format!("unmanaged-agent: {stray_tool}")
+                    && f.tool.as_deref() == Some(stray_tool)
+            });
+            assert!(
+                already_recorded,
+                "second enter must see the prior risk fact (idempotency gate)"
+            );
+            // command_enter would skip the append. Verify nothing duplicates.
+            let reader = store::RoomStore::open_at(root.clone()).unwrap();
+            let snapshot = reader.snapshot().unwrap();
+            let risk_facts: Vec<_> = snapshot
+                .current_risks
+                .iter()
+                .filter(|f| f.subject == format!("unmanaged-agent: {stray_tool}"))
+                .collect();
+            assert_eq!(risk_facts.len(), 1, "idempotent — still exactly one");
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-FLEET adopt: an adopted session shows up in `active_session_records`
+    /// with the caller-provided target (a pane id), and a second adopt of the
+    /// same target is rejected with a clear error.
+    #[test]
+    fn fleet_adopt_registers_running_pane_and_rejects_duplicate() {
+        let root = unique_root("fleet-adopt-pane");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // Build a session as command_adopt would (helper-level test).
+        let agent_spec = AgentSpec::from_name("claude").unwrap();
+        let active_before = active_session_records(&room).unwrap();
+        let identity = numbered_session_identity(
+            &agent_spec,
+            Some("stray-pane".to_string()),
+            None,
+            None,
+            &active_before,
+        )
+        .unwrap();
+        let session = ManagedSession {
+            session_id: identity.session_id.clone(),
+            name: identity.name.clone(),
+            agent: agent_spec.agent.to_string(),
+            tool: identity.tool.clone(),
+            backend: "herdr".to_string(),
+            cwd: root.clone(),
+            target: "pane-9".to_string(), // caller-provided, NOT derived
+        };
+        let (_facts, ctx) = room.session_facts_with_context_version().unwrap();
+        let fact = session_fact(&session, "active", None);
+        let written = room.append_session_fact_if_context(&fact, ctx).unwrap();
+        assert!(written.is_some(), "session fact must land");
+
+        // Active sessions now include the adopted target.
+        let active = active_session_records(&room).unwrap();
+        assert!(
+            active.iter().any(|s| s.target == "pane-9"),
+            "adopted pane-9 must appear in active sessions; got: {:?}",
+            active.iter().map(|s| &s.target).collect::<Vec<_>>()
+        );
+
+        // find_session by tool/name/session_id works — the same path
+        // `command_inject` uses.
+        let found = active
+            .iter()
+            .find(|s| {
+                s.target == "pane-9"
+                    || s.session_id == identity.session_id
+                    || s.name == "stray-pane"
+            })
+            .cloned();
+        assert!(found.is_some(), "adopted session must be discoverable");
+
+        // Idempotency: a second adopt of `pane-9` must be rejected by the
+        // command_adopt pre-check. Simulate that scan.
+        let collision = active.iter().any(|s| s.target == "pane-9");
+        assert!(collision, "second adopt must detect prior target");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-FLEET adopt: a tmux-backend adoption stores the tmux target as the
+    /// session.target so inject/attach/stop route through the right backend.
+    #[test]
+    fn fleet_adopt_stores_tmux_target_verbatim() {
+        let root = unique_root("fleet-adopt-tmux");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        let agent_spec = AgentSpec::from_name("codex").unwrap();
+        let active_before = active_session_records(&room).unwrap();
+        let identity = numbered_session_identity(
+            &agent_spec,
+            Some("legacy-codex".to_string()),
+            None,
+            None,
+            &active_before,
+        )
+        .unwrap();
+        let session = ManagedSession {
+            session_id: identity.session_id,
+            name: identity.name,
+            agent: agent_spec.agent.to_string(),
+            tool: identity.tool,
+            backend: "tmux".to_string(),
+            cwd: root.clone(),
+            target: "rally-legacy".to_string(),
+        };
+        let (_facts, ctx) = room.session_facts_with_context_version().unwrap();
+        room.append_session_fact_if_context(&session_fact(&session, "active", None), ctx)
+            .unwrap();
+
+        let active = active_session_records(&room).unwrap();
+        let adopted = active
+            .iter()
+            .find(|s| s.target == "rally-legacy")
+            .expect("tmux target must round-trip");
+        assert_eq!(adopted.backend, "tmux");
+        assert_eq!(adopted.agent, "codex");
+        // target is the caller-provided tmux name, NOT the
+        // backend_target(Tmux, session_id) shape (`rally-codex-NN`).
+        assert_eq!(adopted.target, "rally-legacy");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-FLEET: `enter` for a tool that DOES have an active managed session
+    /// does NOT emit an `unmanaged-agent` risk fact.
+    #[test]
+    fn fleet_managed_tool_does_not_emit_risk() {
+        let root = unique_root("fleet-managed-no-risk");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // Manually append a `session` fact making `claude-99` active.
+        let session = ManagedSession {
+            session_id: "claude-99".to_string(),
+            name: "claude-99".to_string(),
+            agent: "claude".to_string(),
+            tool: "claude_code:99".to_string(),
+            backend: "tmux".to_string(),
+            cwd: root.clone(),
+            target: "rally-claude-99".to_string(),
+        };
+        room.append_fact(&session_fact(&session, "active", None))
+            .unwrap();
+
+        let active = active_session_records(&room).unwrap();
+        let has_managed = active
+            .iter()
+            .any(|s| s.tool == "claude_code:99" || s.session_id == "claude_code:99");
+        assert!(
+            has_managed,
+            "managed session match must succeed by tool name"
+        );
+
+        // With a managed session present, command_enter would skip the risk
+        // append. Verify nothing is in current_risks.
+        let snapshot = room.snapshot().unwrap();
+        let unmanaged_risks: Vec<_> = snapshot
+            .current_risks
+            .iter()
+            .filter(|f| f.subject.starts_with("unmanaged-agent"))
+            .collect();
+        assert!(
+            unmanaged_risks.is_empty(),
+            "managed tool must not emit unmanaged-agent risk; got: {:?}",
+            unmanaged_risks
+                .iter()
+                .map(|f| &f.subject)
+                .collect::<Vec<_>>()
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -7041,6 +7516,8 @@ fn help_text() -> String {
         "  rally attach <session|name|tool> [--dry-run] [--json]",
         "  rally capture <session|name|tool> [--lines <n>] [--dry-run] [--json]",
         "  rally stop <session|name|tool> [--dry-run] [--json]",
+        "  rally adopt <name> (--pane <pane-id>|--tmux <target>) [--tool <tool>] [--agent <claude|codex|opencode|gemini>] [--backend <herdr|tmux>] [--json]",
+        "    register an already-running agent (herdr pane or tmux target) without relaunching it; flips strays into injectable managed sessions",
         "",
         "  rally status --global [--json]",
         "  rally watch [--tool <id>] [--interval <secs=5>] [--max-interval <secs=300>] [--on-activity <cmd>]",

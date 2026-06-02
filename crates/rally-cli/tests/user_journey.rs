@@ -3690,3 +3690,269 @@ fn r12b_no_hazard_on_main_branch() {
 
     workspace.cleanup();
 }
+
+// ─── C-FLEET / C-HERDR integration tests ─────────────────────────────────────
+
+/// C-FLEET: `rally enter --tool <managed-style>` against a room with no
+/// active managed-session for that tool surfaces the new `unmanaged-agent`
+/// warning AND appends a durable risk fact visible via `rally room --json`.
+#[test]
+fn rally_enter_emits_unmanaged_agent_for_presence_only_tool() {
+    let workspace = Workspace::new("rally-fleet-unmanaged");
+    let enter = workspace.json(&["enter", "--tool", "claude_code:99", "--json"]);
+    let warnings = enter["data"]["enter"]["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let has_unmanaged = warnings
+        .iter()
+        .any(|w| w["code"] == "unmanaged-agent" && w["message"].as_str().is_some());
+    assert!(
+        has_unmanaged,
+        "expected unmanaged-agent warning; got warnings: {warnings:?}"
+    );
+
+    let room = workspace.json(&["room", "--json"]);
+    let risks = room["data"]["room"]["current_risks"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let unmanaged_count = risks
+        .iter()
+        .filter(|r| {
+            r["subject"]
+                .as_str()
+                .map(|s| s.starts_with("unmanaged-agent: claude_code:99"))
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(
+        unmanaged_count, 1,
+        "expected exactly one unmanaged-agent risk fact; risks: {risks:?}"
+    );
+
+    workspace.cleanup();
+}
+
+/// C-FLEET: a tool that LATER runs `rally adopt` flips out of the
+/// unmanaged-agent state — subsequent `rally enter` calls do not emit the
+/// warning (because there is now an active managed session matching the tool).
+#[test]
+fn rally_adopt_flips_stray_to_managed() {
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-fleet-adopt");
+    // 1. Pretend a presence-only stray entered.
+    let first_enter = workspace.json(&["enter", "--tool", "claude_code:42", "--json"]);
+    let first_warnings = first_enter["data"]["enter"]["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        first_warnings
+            .iter()
+            .any(|w| w["code"] == "unmanaged-agent"),
+        "first enter must warn"
+    );
+
+    // 2. Adopt the stray as a herdr pane.
+    let adopt = workspace.json(&[
+        "adopt",
+        "stray-pane",
+        "--pane",
+        "pane-42",
+        "--tool",
+        "claude_code:42",
+        "--agent",
+        "claude",
+        "--json",
+    ]);
+    assert_eq!(adopt["schema"], "agent-rally.command.adopt.v1");
+    assert_matches_schema("agent-rally.command.adopt.v1.json", &adopt);
+    assert_eq!(adopt["data"]["adopt"]["session"]["target"], "pane-42");
+    assert_eq!(adopt["data"]["adopt"]["session"]["backend"], "herdr");
+    assert_eq!(
+        adopt["data"]["adopt"]["session"]["tool"], "claude_code:42",
+        "explicit --tool must round-trip"
+    );
+
+    // 3. Subsequent enter must NOT emit unmanaged-agent (managed session
+    //    now exists for claude_code:42).
+    let second_enter = workspace.json(&["enter", "--tool", "claude_code:42", "--json"]);
+    let second_warnings = second_enter["data"]["enter"]["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let still_unmanaged = second_warnings
+        .iter()
+        .any(|w| w["code"] == "unmanaged-agent");
+    assert!(
+        !still_unmanaged,
+        "after adopt, unmanaged-agent warning must not fire; warnings: {second_warnings:?}"
+    );
+
+    // 4. Sessions list now shows the adopted target.
+    let sessions = workspace.json(&["sessions", "--json"]);
+    let names: Vec<String> = sessions["data"]["sessions"]["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|s| s["target"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        names.iter().any(|t| t == "pane-42"),
+        "adopted pane-42 must show in sessions; got: {names:?}"
+    );
+
+    workspace.cleanup();
+}
+
+/// C-FLEET: `rally adopt` with neither --pane nor --tmux is a clear usage
+/// error — not a silent success.
+#[test]
+fn rally_adopt_requires_pane_or_tmux() {
+    let workspace = Workspace::new("rally-fleet-adopt-noargs");
+    let output = workspace.output(&["adopt", "foo", "--json"]);
+    assert!(!output.status.success(), "expected non-zero exit");
+    // Usage errors are written to stderr by the rally CLI; stdout is empty.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let value: Value =
+        serde_json::from_str(stderr.trim()).expect("stderr must be JSON on usage error");
+    let msg = value["error"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("--pane") && msg.contains("--tmux"),
+        "expected --pane/--tmux usage error; got: {msg}"
+    );
+
+    workspace.cleanup();
+}
+
+/// C-HERDR: `rally run --backend herdr --dry-run` with no `--herdr-socket`
+/// AND no socket-env AND no ET socket on disk emits the bare `herdr` command
+/// (today's behavior preserved when nothing to discover). Run under env-clear
+/// at the harness level so the env-first arm misses.
+#[test]
+fn rally_run_herdr_dry_run_falls_back_to_bare_herdr_when_no_socket() {
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-herdr-no-socket");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rally"));
+    cmd.current_dir(&workspace.cwd)
+        .env_clear()
+        .env("HOME", &workspace.home)
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .args(["run", "claude", "--backend", "herdr", "--dry-run", "--json"]);
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let start = &value["data"]["run"]["commands"]["start"][0];
+    let first = start[0].as_str().unwrap_or("");
+    assert_eq!(
+        first, "herdr",
+        "with no socket discoverable, expected bare herdr; got first arg {first:?}: {start}"
+    );
+
+    workspace.cleanup();
+}
+
+/// C-HERDR: `rally run --backend herdr --dry-run` with `PTYD_SOCKET_PATH`
+/// pointed at an on-disk socket file env-wraps the command. The brief's
+/// "fix the herdr backend" finding — this is the happy path it asked for.
+#[test]
+fn rally_run_herdr_dry_run_auto_discovers_socket_from_env() {
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-herdr-discover-env");
+    let sock = workspace.home.join("fake-ptyd.sock");
+    fs::write(&sock, b"").unwrap();
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rally"));
+    cmd.current_dir(&workspace.cwd)
+        .env_clear()
+        .env("HOME", &workspace.home)
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PTYD_SOCKET_PATH", &sock)
+        .args(["run", "claude", "--backend", "herdr", "--dry-run", "--json"]);
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let start = &value["data"]["run"]["commands"]["start"][0];
+    let args: Vec<String> = start
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(
+        args.first().map(String::as_str),
+        Some("env"),
+        "discovered socket must env-wrap the command; got: {args:?}"
+    );
+    assert!(
+        args.iter()
+            .any(|a| a.starts_with("PTYD_SOCKET_PATH=") && a.contains(sock.to_str().unwrap())),
+        "PTYD_SOCKET_PATH= prefix missing or mismatched; got: {args:?}"
+    );
+    assert!(
+        args.iter()
+            .any(|a| a.starts_with("HERDR_SOCKET_PATH=") && a.contains(sock.to_str().unwrap())),
+        "HERDR_SOCKET_PATH= prefix missing or mismatched; got: {args:?}"
+    );
+
+    workspace.cleanup();
+}
+
+/// C-HERDR live smoke: when the real Easy Terminal socket exists on disk
+/// (the developer's local machine), `rally run --backend herdr --dry-run`
+/// from a clean cwd auto-discovers it. Gated by socket-present probe — never
+/// runs on machines without ET installed.
+#[test]
+fn rally_run_herdr_dry_run_auto_discovers_live_et_socket() {
+    let live_socket = match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home).join("Library/Application Support/EasyTerminal/herdr.sock"),
+        Err(_) => return,
+    };
+    if !live_socket.exists() {
+        eprintln!(
+            "skipping live ET socket smoke — {} not on disk",
+            live_socket.display()
+        );
+        return;
+    }
+
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-herdr-live");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rally"));
+    cmd.current_dir(&workspace.cwd)
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .args(["run", "claude", "--backend", "herdr", "--dry-run", "--json"]);
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let start = &value["data"]["run"]["commands"]["start"][0];
+    let args: Vec<String> = start
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect();
+    let live_str = live_socket.display().to_string();
+    assert!(
+        args.iter().any(|a| a.contains(&live_str)),
+        "live ET socket smoke: expected discovered socket {live_str} in command args; got: {args:?}"
+    );
+
+    workspace.cleanup();
+}
