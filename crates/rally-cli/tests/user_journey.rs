@@ -3699,12 +3699,7 @@ fn r12b_no_hazard_on_main_branch() {
 #[test]
 fn rally_enter_emits_unmanaged_agent_for_presence_only_tool() {
     let workspace = Workspace::new("rally-fleet-unmanaged");
-    let enter = workspace.json(&[
-        "enter",
-        "--tool",
-        "claude_code:99",
-        "--json",
-    ]);
+    let enter = workspace.json(&["enter", "--tool", "claude_code:99", "--json"]);
     let warnings = enter["data"]["enter"]["warnings"]
         .as_array()
         .cloned()
@@ -3747,18 +3742,15 @@ fn rally_adopt_flips_stray_to_managed() {
     let _run_guard = serialize_rally_run();
     let workspace = Workspace::new("rally-fleet-adopt");
     // 1. Pretend a presence-only stray entered.
-    let first_enter = workspace.json(&[
-        "enter",
-        "--tool",
-        "claude_code:42",
-        "--json",
-    ]);
+    let first_enter = workspace.json(&["enter", "--tool", "claude_code:42", "--json"]);
     let first_warnings = first_enter["data"]["enter"]["warnings"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     assert!(
-        first_warnings.iter().any(|w| w["code"] == "unmanaged-agent"),
+        first_warnings
+            .iter()
+            .any(|w| w["code"] == "unmanaged-agent"),
         "first enter must warn"
     );
 
@@ -3785,12 +3777,7 @@ fn rally_adopt_flips_stray_to_managed() {
 
     // 3. Subsequent enter must NOT emit unmanaged-agent (managed session
     //    now exists for claude_code:42).
-    let second_enter = workspace.json(&[
-        "enter",
-        "--tool",
-        "claude_code:42",
-        "--json",
-    ]);
+    let second_enter = workspace.json(&["enter", "--tool", "claude_code:42", "--json"]);
     let second_warnings = second_enter["data"]["enter"]["warnings"]
         .as_array()
         .cloned()
@@ -3853,14 +3840,7 @@ fn rally_run_herdr_dry_run_falls_back_to_bare_herdr_when_no_socket() {
         .env_clear()
         .env("HOME", &workspace.home)
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .args([
-            "run",
-            "claude",
-            "--backend",
-            "herdr",
-            "--dry-run",
-            "--json",
-        ]);
+        .args(["run", "claude", "--backend", "herdr", "--dry-run", "--json"]);
     let output = cmd.output().unwrap();
     assert!(
         output.status.success(),
@@ -3894,14 +3874,7 @@ fn rally_run_herdr_dry_run_auto_discovers_socket_from_env() {
         .env("HOME", &workspace.home)
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("PTYD_SOCKET_PATH", &sock)
-        .args([
-            "run",
-            "claude",
-            "--backend",
-            "herdr",
-            "--dry-run",
-            "--json",
-        ]);
+        .args(["run", "claude", "--backend", "herdr", "--dry-run", "--json"]);
     let output = cmd.output().unwrap();
     assert!(
         output.status.success(),
@@ -3923,14 +3896,12 @@ fn rally_run_herdr_dry_run_auto_discovers_socket_from_env() {
     );
     assert!(
         args.iter()
-            .any(|a| a.starts_with("PTYD_SOCKET_PATH=")
-                && a.contains(sock.to_str().unwrap())),
+            .any(|a| a.starts_with("PTYD_SOCKET_PATH=") && a.contains(sock.to_str().unwrap())),
         "PTYD_SOCKET_PATH= prefix missing or mismatched; got: {args:?}"
     );
     assert!(
         args.iter()
-            .any(|a| a.starts_with("HERDR_SOCKET_PATH=")
-                && a.contains(sock.to_str().unwrap())),
+            .any(|a| a.starts_with("HERDR_SOCKET_PATH=") && a.contains(sock.to_str().unwrap())),
         "HERDR_SOCKET_PATH= prefix missing or mismatched; got: {args:?}"
     );
 
@@ -3944,8 +3915,7 @@ fn rally_run_herdr_dry_run_auto_discovers_socket_from_env() {
 #[test]
 fn rally_run_herdr_dry_run_auto_discovers_live_et_socket() {
     let live_socket = match std::env::var("HOME") {
-        Ok(home) => PathBuf::from(home)
-            .join("Library/Application Support/EasyTerminal/herdr.sock"),
+        Ok(home) => PathBuf::from(home).join("Library/Application Support/EasyTerminal/herdr.sock"),
         Err(_) => return,
     };
     if !live_socket.exists() {
@@ -3963,14 +3933,7 @@ fn rally_run_herdr_dry_run_auto_discovers_live_et_socket() {
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .args([
-            "run",
-            "claude",
-            "--backend",
-            "herdr",
-            "--dry-run",
-            "--json",
-        ]);
+        .args(["run", "claude", "--backend", "herdr", "--dry-run", "--json"]);
     let output = cmd.output().unwrap();
     assert!(
         output.status.success(),

@@ -4041,9 +4041,9 @@ mod tests {
             let room = store::RoomStore::open_at(root.clone()).unwrap();
             let snapshot_before = room.snapshot().unwrap();
             let active_sessions = active_session_records(&room).unwrap_or_default();
-            let has_managed = active_sessions
-                .iter()
-                .any(|s| s.tool == stray_tool || s.session_id == stray_tool || s.name == stray_tool);
+            let has_managed = active_sessions.iter().any(|s| {
+                s.tool == stray_tool || s.session_id == stray_tool || s.name == stray_tool
+            });
             assert!(!has_managed, "no managed session expected for stray-01");
             assert!(is_managed_style_tool(stray_tool), "managed-style tool id");
             let already_recorded = snapshot_before.current_risks.iter().any(|f| {
@@ -4255,7 +4255,10 @@ mod tests {
         assert!(
             unmanaged_risks.is_empty(),
             "managed tool must not emit unmanaged-agent risk; got: {:?}",
-            unmanaged_risks.iter().map(|f| &f.subject).collect::<Vec<_>>()
+            unmanaged_risks
+                .iter()
+                .map(|f| &f.subject)
+                .collect::<Vec<_>>()
         );
 
         std::fs::remove_dir_all(&root).ok();

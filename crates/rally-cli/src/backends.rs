@@ -426,12 +426,9 @@ pub(crate) fn find_easy_terminal_socket() -> Option<PathBuf> {
             }
         }
     }
-    for candidate in easy_terminal_socket_candidates() {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    easy_terminal_socket_candidates()
+        .into_iter()
+        .find(|candidate| candidate.exists())
 }
 
 /// Disk locations to probe for the Easy Terminal herdr socket, in order.
@@ -886,10 +883,7 @@ mod tests {
     /// C-HERDR: PTYD_SOCKET_PATH always wins when set and the file exists.
     #[test]
     fn find_et_socket_prefers_ptyd_socket_path_env() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rally-et-test-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("rally-et-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let sock = tmp.join("herdr.sock");
         std::fs::write(&sock, b"").unwrap();
@@ -910,7 +904,7 @@ mod tests {
         }
 
         let found = super::find_easy_terminal_socket();
-        assert_eq!(found.as_ref().map(|p| p.as_path()), Some(sock.as_path()));
+        assert_eq!(found.as_deref(), Some(sock.as_path()));
 
         unsafe {
             match prior_ptyd {
@@ -979,10 +973,7 @@ mod tests {
     /// to disk candidates — env-set-but-stale must not poison the search.
     #[test]
     fn find_et_socket_falls_through_stale_env() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rally-et-fallthrough-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("rally-et-fallthrough-{}", std::process::id()));
         let appsupp = tmp.join("Library/Application Support/EasyTerminal");
         std::fs::create_dir_all(&appsupp).unwrap();
         let sock = appsupp.join("herdr.sock");
@@ -1001,7 +992,7 @@ mod tests {
 
         let found = super::find_easy_terminal_socket();
         assert_eq!(
-            found.as_ref().map(|p| p.as_path()),
+            found.as_deref(),
             Some(sock.as_path()),
             "stale env path must fall through to disk candidate"
         );
