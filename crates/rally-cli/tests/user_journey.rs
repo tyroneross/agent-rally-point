@@ -3614,3 +3614,178 @@ fn r12b_no_hazard_on_main_branch() {
 
     workspace.cleanup();
 }
+
+// C-FLEET / Plan F adoption integration tests.
+
+/// C-FLEET: `rally enter --tool <managed-style>` against a room with no
+/// active managed-session for that tool surfaces the `unmanaged-agent`
+/// warning and appends a durable risk fact visible via `rally room --json`.
+#[test]
+fn rally_enter_emits_unmanaged_agent_for_presence_only_tool() {
+    let workspace = Workspace::new("rally-fleet-unmanaged");
+    let enter = workspace.json(&["enter", "--tool", "claude_code:99", "--json"]);
+    let warnings = enter["data"]["enter"]["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let has_unmanaged = warnings
+        .iter()
+        .any(|w| w["code"] == "unmanaged-agent" && w["message"].as_str().is_some());
+    assert!(
+        has_unmanaged,
+        "expected unmanaged-agent warning; got warnings: {warnings:?}"
+    );
+
+    let room = workspace.json(&["room", "--json"]);
+    let risks = room["data"]["room"]["current_risks"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let unmanaged_count = risks
+        .iter()
+        .filter(|r| {
+            r["subject"]
+                .as_str()
+                .map(|s| s.starts_with("unmanaged-agent: claude_code:99"))
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(
+        unmanaged_count, 1,
+        "expected exactly one unmanaged-agent risk fact; risks: {risks:?}"
+    );
+
+    workspace.cleanup();
+}
+
+/// C-FLEET: a tool that later runs `rally adopt` flips out of the
+/// unmanaged-agent state. Under Plan F, adoption is limited to tmux/cmux
+/// targets because Herdr is no longer a managed backend.
+#[test]
+fn rally_adopt_flips_stray_to_managed_with_cmux() {
+    let workspace = Workspace::new("rally-fleet-adopt-cmux");
+
+    let first_enter = workspace.json(&["enter", "--tool", "claude_code:42", "--json"]);
+    let first_warnings = first_enter["data"]["enter"]["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        first_warnings
+            .iter()
+            .any(|w| w["code"] == "unmanaged-agent"),
+        "first enter must warn"
+    );
+
+    let adopt = workspace.json(&[
+        "adopt",
+        "stray-cmux",
+        "--cmux",
+        "workspace:42",
+        "--tool",
+        "claude_code:42",
+        "--agent",
+        "claude",
+        "--json",
+    ]);
+    assert_eq!(adopt["schema"], "agent-rally.command.adopt.v1");
+    assert_matches_schema("agent-rally.command.adopt.v1.json", &adopt);
+    assert_eq!(adopt["data"]["adopt"]["session"]["target"], "workspace:42");
+    assert_eq!(adopt["data"]["adopt"]["session"]["backend"], "cmux");
+    assert_eq!(
+        adopt["data"]["adopt"]["session"]["tool"], "claude_code:42",
+        "explicit --tool must round-trip"
+    );
+
+    let second_enter = workspace.json(&["enter", "--tool", "claude_code:42", "--json"]);
+    let second_warnings = second_enter["data"]["enter"]["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let still_unmanaged = second_warnings
+        .iter()
+        .any(|w| w["code"] == "unmanaged-agent");
+    assert!(
+        !still_unmanaged,
+        "after adopt, unmanaged-agent warning must not fire; warnings: {second_warnings:?}"
+    );
+
+    let sessions = workspace.json(&["sessions", "--json"]);
+    let targets: Vec<String> = sessions["data"]["sessions"]["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|s| s["target"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        targets.iter().any(|target| target == "workspace:42"),
+        "adopted workspace:42 must show in sessions; got: {targets:?}"
+    );
+
+    workspace.cleanup();
+}
+
+/// C-FLEET: `rally adopt` with neither --tmux nor --cmux is a clear usage
+/// error, not a silent success.
+#[test]
+fn rally_adopt_requires_tmux_or_cmux() {
+    let workspace = Workspace::new("rally-fleet-adopt-noargs");
+    let output = workspace.output(&["adopt", "foo", "--json"]);
+    assert!(!output.status.success(), "expected non-zero exit");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let value: Value =
+        serde_json::from_str(stderr.trim()).expect("stderr must be JSON on usage error");
+    let msg = value["error"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("--tmux") && msg.contains("--cmux"),
+        "expected --tmux/--cmux usage error; got: {msg}"
+    );
+
+    workspace.cleanup();
+}
+
+/// Duplicate adoption must be rejected by target, even if a later caller uses
+/// a different `--tool` value.
+#[test]
+fn rally_adopt_rejects_duplicate_target_across_different_tools() {
+    let workspace = Workspace::new("rally-adopt-target-dedup");
+
+    let first = workspace.json(&[
+        "adopt",
+        "first-adoptee",
+        "--json",
+        "--tmux",
+        "rally-shared",
+        "--tool",
+        "claude_code:adopt-a",
+        "--backend",
+        "tmux",
+    ]);
+    assert_eq!(first["data"]["adopt"]["session"]["target"], "rally-shared");
+
+    let second = workspace.output(&[
+        "adopt",
+        "second-adoptee",
+        "--json",
+        "--tmux",
+        "rally-shared",
+        "--tool",
+        "claude_code:adopt-b",
+        "--backend",
+        "tmux",
+    ]);
+    assert!(
+        !second.status.success(),
+        "duplicate-target adopt with different tool succeeded; stdout: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("already adopted") || stderr.contains("rally-shared"),
+        "expected dedup error mentioning target; got stderr: {stderr}"
+    );
+
+    workspace.cleanup();
+}
