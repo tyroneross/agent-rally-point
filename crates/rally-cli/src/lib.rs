@@ -1954,11 +1954,27 @@ fn command_run(args: RunArgs) -> Result<Output> {
         backend,
         session_id,
         tool,
-        bins,
+        mut bins,
     } = args;
     let backend_name = backend.as_str().to_string();
     let repo = repo_root()?;
     let agent_spec = AgentSpec::from_name(&agent)?;
+
+    // C-HERDR: auto-discover the Easy Terminal herdr socket when the caller
+    // did NOT pass `--herdr-socket`. Without this, `rally run --backend herdr`
+    // silently targets the bare `herdr` binary against `~/.config/herdr/
+    // herdr.sock` (the standalone daemon), so the launched agent ends up
+    // invisible to the Easy Terminal UI on a Mac that has both running.
+    //
+    // The user-supplied `--herdr-socket` is preserved verbatim; discovery
+    // only fills `None`. When no candidate exists on disk, behavior is
+    // unchanged from before this commit.
+    if backend == Backend::Herdr && bins.herdr_socket.is_none() {
+        if let Some(discovered) = backends::find_easy_terminal_socket() {
+            bins.herdr_socket = Some(discovered.display().to_string());
+        }
+    }
+
     enforce_easy_terminal_self_host_guard(&repo, backend, bins.herdr_socket.as_deref(), dry_run)?;
     let room = RoomStore::open()?;
     let reservation = if dry_run {
