@@ -1761,124 +1761,49 @@ fn linked_git_worktree_uses_common_room() {
     fs::remove_dir_all(home).ok();
 }
 
+// Plan F functional core (Chunk 3): the herdr backend is removed; the
+// `rally_uses_native_herdr_and_cmux_managed_session_commands` test split
+// into two: (1) `rally_run_rejects_herdr_backend_with_clear_error` and
+// (2) `rally_uses_native_cmux_managed_session_commands` (the cmux half
+// is preserved verbatim — tmux + cmux are the only remaining backends).
 #[test]
-fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
+fn rally_run_rejects_herdr_backend_with_clear_error() {
     let _run_guard = serialize_rally_run();
-    let workspace = Workspace::new("rally-native-session-backends");
+    let workspace = Workspace::new("rally-herdr-removed");
 
-    let herdr = workspace.json(&[
+    // `rally run --backend herdr` must now fail with a clear, actionable
+    // error pointing at Plan F. The 34-caller audit
+    // (tools/check_inject_callsites.sh) is unaffected because no rally
+    // CALLER passes `--backend herdr` on the inject critical path
+    // (audit-verified pre-removal).
+    let output = workspace.output(&[
         "run",
         "claude",
         "--json",
         "--name",
-        "herdr-reviewer",
+        "herdr-removed",
         "--backend",
         "herdr",
-        "--herdr-bin",
-        "/usr/bin/true",
     ]);
-    assert_eq!(herdr["schema"], "agent-rally.command.run.v1");
-    assert_matches_schema("agent-rally.command.run.v1.json", &herdr);
-    assert_eq!(herdr["data"]["run"]["session"]["backend"], "herdr");
-    assert_eq!(
-        herdr["data"]["run"]["session"]["target"],
-        "claude-herdr-reviewer-01"
+    assert!(
+        !output.status.success(),
+        "--backend herdr must fail; got success"
     );
-    assert_eq!(herdr["data"]["run"]["commands"]["start"][0][1], "agent");
-    assert_eq!(herdr["data"]["run"]["commands"]["start"][0][2], "start");
+    // The error envelope is JSON-on-stderr per rally's error contract.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("backend \\\"herdr\\\" is removed (Plan F)")
+            && stderr.contains(".rally ledger"),
+        "error must reference Plan F and the ledger; got: {stderr}"
+    );
 
-    let herdr_socket = workspace.json(&[
-        "run",
-        "codex",
-        "--json",
-        "--dry-run",
-        "--name",
-        "et-pane",
-        "--backend",
-        "herdr",
-        "--herdr-bin",
-        "/usr/bin/true",
-        "--herdr-socket",
-        "/tmp/easy-terminal-herdr.sock",
-    ]);
-    let socket_command = herdr_socket["data"]["run"]["commands"]["start"][0]
-        .as_array()
-        .unwrap();
-    assert_eq!(socket_command[0], "env");
-    assert_eq!(
-        socket_command[1],
-        "PTYD_SOCKET_PATH=/tmp/easy-terminal-herdr.sock"
-    );
-    assert_eq!(
-        socket_command[2],
-        "HERDR_SOCKET_PATH=/tmp/easy-terminal-herdr.sock"
-    );
-    assert_eq!(socket_command[3], "/usr/bin/true");
-    assert_eq!(socket_command[4], "agent");
-    assert_eq!(socket_command[5], "start");
+    workspace.cleanup();
+}
 
-    let default_socket_client = workspace.json(&[
-        "run",
-        "codex",
-        "--json",
-        "--dry-run",
-        "--name",
-        "et-default",
-        "--backend",
-        "herdr",
-        "--herdr-socket",
-        "/tmp/easy-terminal-herdr.sock",
-    ]);
-    let default_socket_command = default_socket_client["data"]["run"]["commands"]["start"][0]
-        .as_array()
-        .unwrap();
-    assert_eq!(default_socket_command[0], "env");
-    assert_eq!(default_socket_command[3], "ptyd");
-    assert_eq!(default_socket_command[4], "agent");
-    assert_eq!(default_socket_command[5], "start");
-
-    let herdr_inject = workspace.json(&[
-        "inject",
-        "herdr-reviewer-01",
-        "--json",
-        "--text",
-        "hello herdr",
-        "--herdr-bin",
-        "/usr/bin/true",
-    ]);
-    assert_eq!(herdr_inject["data"]["inject"]["commands"][0][1], "pane");
-    assert_eq!(
-        herdr_inject["data"]["inject"]["commands"][0][2],
-        "send-text"
-    );
-    assert_eq!(herdr_inject["data"]["inject"]["commands"][0][4], "\u{15}");
-    assert_eq!(herdr_inject["data"]["inject"]["commands"][1][1], "pane");
-    assert_eq!(
-        herdr_inject["data"]["inject"]["commands"][1][2],
-        "send-text"
-    );
-    assert_eq!(
-        herdr_inject["data"]["inject"]["commands"][1][4],
-        "hello herdr"
-    );
-    assert_eq!(herdr_inject["data"]["inject"]["commands"][2][1], "pane");
-    assert_eq!(
-        herdr_inject["data"]["inject"]["commands"][2][2],
-        "send-keys"
-    );
-    assert_eq!(herdr_inject["data"]["inject"]["commands"][2][4], "enter");
-
-    let herdr_capture = workspace.json(&[
-        "capture",
-        "herdr-reviewer-01",
-        "--json",
-        "--dry-run",
-        "--lines",
-        "30",
-    ]);
-    assert_matches_schema("agent-rally.command.session-action.v1.json", &herdr_capture);
-    assert_eq!(herdr_capture["data"]["capture"]["commands"][0][1], "agent");
-    assert_eq!(herdr_capture["data"]["capture"]["commands"][0][2], "read");
+#[test]
+fn rally_uses_native_cmux_managed_session_commands() {
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-native-session-backends");
 
     let cmux_bin = workspace.cwd.join("fake-cmux");
     fs::write(
@@ -1963,15 +1888,9 @@ fn rally_uses_native_herdr_and_cmux_managed_session_commands() {
         "close-workspace"
     );
 
-    let herdr_stop = workspace.json(&[
-        "stop",
-        "herdr-reviewer-01",
-        "--json",
-        "--herdr-bin",
-        "/usr/bin/true",
-    ]);
-    assert_eq!(herdr_stop["data"]["stop"]["commands"][0][1], "agent");
-    assert_eq!(herdr_stop["data"]["stop"]["commands"][0][2], "stop");
+    // Plan F functional core (Chunk 3): herdr_stop assertion removed
+    // (Backend::Herdr is gone; the corresponding rally_run_rejects_*
+    // test above covers the negative path).
 
     workspace.cleanup();
 }

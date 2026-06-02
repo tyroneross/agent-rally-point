@@ -162,6 +162,89 @@ fn inject_via_ledger_writes_to_rally_protocol_not_backend() {
     );
 }
 
+#[test]
+fn rally_cli_source_contains_zero_backend_herdr_variant_uses() {
+    // Plan F functional core (Chunk 3): the `Backend::Herdr` variant is
+    // REMOVED — the entire run/start/attach/capture/stop/inject path for
+    // the herdr backend is gone (the daemon is the authority on the
+    // .rally ledger now). This gate makes a regression a compile-or-test
+    // failure rather than a silent slip.
+    //
+    // ALLOWED: comments mentioning "Backend::Herdr" (documentation of
+    // the removal). Heuristic: skip lines that start with `//`. A line
+    // like `        Backend::Herdr | Backend::Cmux => ...` (a match arm)
+    // would fail; a line like `// removed alongside Backend::Herdr.`
+    // is fine.
+    //
+    // NOT enforced here: the BackendBins.herdr_bin/herdr_socket struct
+    // fields and the CLI `--herdr-bin`/`--herdr-socket` flags. Those
+    // remain for now as deprecation-soft compatibility (deliberately
+    // ignored at runtime via BackendRunner::new) so existing scripts
+    // and the 34-caller audit do not break. A future cleanup pass can
+    // delete them; tracked as a follow-up.
+    let src_dir = rally_cli_root().join("src");
+    let files = ["lib.rs", "backends.rs", "cli.rs"];
+    let mut violations: Vec<String> = Vec::new();
+    for file in &files {
+        let path = src_dir.join(file);
+        let body = read_to_string(&path);
+        for (i, line) in body.lines().enumerate() {
+            let trimmed = line.trim_start();
+            // Skip comments + doc-strings (allow naming the removed
+            // variant for narrative continuity).
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            if line.contains("Backend::Herdr") {
+                violations.push(format!(
+                    "{}:{}: {}",
+                    file,
+                    i + 1,
+                    line.trim_end()
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "rally-cli source contains Backend::Herdr uses (Plan F Chunk 3 violated):\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn rally_cli_backends_enum_no_longer_has_herdr_variant() {
+    // Stronger pin than the previous test: read backends.rs and assert
+    // the `enum Backend { ... }` block does not list `Herdr`. This
+    // catches a regression where the variant is re-introduced but its
+    // call sites are split across many files (the per-line scan above
+    // would still catch each, but THIS test names the enum directly).
+    let backends_rs = read_to_string(
+        &rally_cli_root().join("src").join("backends.rs"),
+    );
+    // Extract the enum body via a small grep.
+    let enum_start = backends_rs
+        .find("pub(crate) enum Backend")
+        .expect("Backend enum must exist");
+    let enum_block_end = backends_rs[enum_start..]
+        .find('}')
+        .expect("Backend enum body must close");
+    let enum_body = &backends_rs[enum_start..enum_start + enum_block_end + 1];
+    assert!(
+        !enum_body.contains("Herdr"),
+        "Backend enum must NOT list Herdr (Plan F Chunk 3): {enum_body}"
+    );
+    // Positive pin: tmux + cmux MUST still be there.
+    assert!(
+        enum_body.contains("Tmux"),
+        "Backend enum must still list Tmux: {enum_body}"
+    );
+    assert!(
+        enum_body.contains("Cmux"),
+        "Backend enum must still list Cmux: {enum_body}"
+    );
+}
+
 /// Best-effort extract a `fn <name>(...)` body — finds the function
 /// signature, walks `{` to balanced `}`. Returns `None` if the function
 /// isn't found. Good enough for an arch lint that just greps for

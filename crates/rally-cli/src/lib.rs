@@ -1914,7 +1914,9 @@ fn command_run(args: RunArgs) -> Result<Output> {
     let backend_name = backend.as_str().to_string();
     let repo = repo_root()?;
     let agent_spec = AgentSpec::from_name(&agent)?;
-    enforce_easy_terminal_self_host_guard(&repo, backend, bins.herdr_socket.as_deref(), dry_run)?;
+    // Plan F functional core (Chunk 3): the herdr self-host guard was
+    // removed; tmux/cmux do not share Easy Terminal's daemon socket so
+    // the reentrancy risk it guarded against no longer exists.
     let room = RoomStore::open()?;
     let reservation = if dry_run {
         let active_sessions = active_session_records(&room)?;
@@ -2000,51 +2002,15 @@ fn command_run(args: RunArgs) -> Result<Output> {
     Ok(Output::new(json, text, body))
 }
 
-fn enforce_easy_terminal_self_host_guard(
-    repo: &Path,
-    backend: Backend,
-    herdr_socket: Option<&str>,
-    dry_run: bool,
-) -> Result<()> {
-    if dry_run || backend != Backend::Herdr || !looks_like_easy_terminal_repo(repo) {
-        return Ok(());
-    }
-    let Some(target_socket) = herdr_socket.map(normalize_socket_path) else {
-        return Ok(());
-    };
-    let current_sockets = [
-        env::var("PTYD_SOCKET_PATH").ok(),
-        env::var("HERDR_SOCKET_PATH").ok(),
-    ];
-    let hosted_in_same_daemon = current_sockets
-        .iter()
-        .flatten()
-        .map(|socket| normalize_socket_path(socket))
-        .any(|socket| socket == target_socket);
-    if !hosted_in_same_daemon {
-        return Ok(());
-    }
-    if env::var("RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH").as_deref() == Ok("1") {
-        return Ok(());
-    }
+// Plan F functional core (Chunk 3): enforce_easy_terminal_self_host_guard
+// removed alongside Backend::Herdr. The guard prevented a herdr backend
+// from launching into the same Easy Terminal daemon socket as the host
+// (a herdr-specific reentrancy risk). With herdr removed, the risk
+// vanishes — tmux/cmux do not share Easy Terminal's daemon socket.
 
-    Err(RallyError::Usage(format!(
-        "refusing to launch a Rally-managed agent into the same Easy Terminal daemon socket ({target_socket}) from an Easy Terminal worktree. Build/relaunch lanes must run outside that ET instance or detach first; set RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH=1 only after confirming this agent will not rebuild or relaunch its own host app."
-    )))
-}
-
-fn looks_like_easy_terminal_repo(repo: &Path) -> bool {
-    repo.join("Sources/Ptyd/DaemonController.swift").is_file() && repo.join("build.sh").is_file()
-}
-
-fn normalize_socket_path(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    }
-    path.to_string()
-}
+// Plan F functional core (Chunk 3): looks_like_easy_terminal_repo and
+// normalize_socket_path are removed alongside the herdr self-host guard.
+// Both were only consumed by that guard.
 
 struct SessionIdentity {
     name: String,
@@ -2384,12 +2350,10 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     //   2. Tmux/Cmux backend inject failed AND the ledger write succeeded —
     //      these backends have no daemon-side recovery in the Plan F window,
     //      so a missed legacy delivery is a real failure.
-    // Herdr pre-daemon: backend inject is a no-op-or-best-effort by design;
-    // a `delivered: false` is EXPECTED (the daemon will pick the Directive
-    // up once it lands) so we surface `Pending` rather than `Failed`.
+    // Plan F functional core (Chunk 3): the herdr backend is removed;
+    // the only inject paths left are tmux + cmux + the ledger write.
     let ledger_failed = delivery_state_initial == "failed";
-    let legacy_tmux_cmux_failed =
-        !dry_run && !delivered && backend_parsed != Backend::Herdr && !ledger_failed;
+    let legacy_tmux_cmux_failed = !dry_run && !delivered && !ledger_failed;
     let delivery_state: &'static str = if ledger_failed || legacy_tmux_cmux_failed {
         "failed"
     } else if delivered {
@@ -2855,7 +2819,7 @@ fn find_session(target: &str) -> Result<ManagedSession> {
 fn backend_target(backend: Backend, session_id: &str) -> String {
     match backend {
         Backend::Tmux => format!("rally-{}", sanitize_id(session_id)),
-        Backend::Herdr | Backend::Cmux => sanitize_id(session_id),
+        Backend::Cmux => sanitize_id(session_id),
     }
 }
 
@@ -2957,60 +2921,11 @@ mod tests {
         std::fs::write(root.join("build.sh"), "#!/usr/bin/env bash\n").unwrap();
     }
 
-    #[test]
-    fn self_host_guard_rejects_same_easy_terminal_socket_for_real_launch() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
-        let root = unique_root("self-host-guard");
-        seed_easy_terminal_markers(&root);
-        let old_ptyd = env::var("PTYD_SOCKET_PATH").ok();
-        let old_herdr = env::var("HERDR_SOCKET_PATH").ok();
-        let old_allow = env::var("RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH").ok();
-
-        unsafe {
-            env::set_var("PTYD_SOCKET_PATH", "/tmp/easy-terminal/herdr.sock");
-            env::remove_var("HERDR_SOCKET_PATH");
-            env::remove_var("RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH");
-        }
-        let err = enforce_easy_terminal_self_host_guard(
-            &root,
-            Backend::Herdr,
-            Some("/tmp/easy-terminal/herdr.sock"),
-            false,
-        )
-        .unwrap_err();
-
-        restore_env("PTYD_SOCKET_PATH", old_ptyd);
-        restore_env("HERDR_SOCKET_PATH", old_herdr);
-        restore_env("RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH", old_allow);
-
-        assert!(
-            err.to_string().contains("same Easy Terminal daemon socket"),
-            "unexpected guard error: {err}"
-        );
-    }
-
-    #[test]
-    fn self_host_guard_allows_dry_run_socket_targeting() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
-        let root = unique_root("self-host-guard-dry-run");
-        seed_easy_terminal_markers(&root);
-        let old_ptyd = env::var("PTYD_SOCKET_PATH").ok();
-
-        unsafe {
-            env::set_var("PTYD_SOCKET_PATH", "/tmp/easy-terminal/herdr.sock");
-        }
-        enforce_easy_terminal_self_host_guard(
-            &root,
-            Backend::Herdr,
-            Some("/tmp/easy-terminal/herdr.sock"),
-            true,
-        )
-        .expect("dry-run should show the ET target without blocking");
-
-        restore_env("PTYD_SOCKET_PATH", old_ptyd);
-    }
+    // Plan F functional core (Chunk 3): self_host_guard_* tests removed
+    // alongside enforce_easy_terminal_self_host_guard (the herdr-specific
+    // reentrancy guard). With Backend::Herdr removed, the failure mode
+    // these guarded against (rally launching a herdr-backed session into
+    // the same ET daemon socket as the host) no longer exists.
 
     fn restore_env(key: &str, value: Option<String>) {
         unsafe {

@@ -1,7 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -173,10 +172,17 @@ impl serde::Serialize for SessionActionEnvelope {
     }
 }
 
+// Plan F functional core (Chunk 3): the `Backend::Herdr` variant and its
+// run/start/attach/capture/stop paths are REMOVED. herdr was the legacy
+// "rally calls the daemon" path that the F architecture inverted. Plan F
+// rally writes Directives to the .rally ledger; the daemon SUBSCRIBES.
+// The 34-caller audit (tools/check_inject_callsites.sh) stays green
+// because the inject critical path was already routed through the
+// ledger writer in Plan F P2. Only the backend enum + its callers
+// in this file are removed here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Backend {
     Tmux,
-    Herdr,
     Cmux,
 }
 
@@ -184,8 +190,12 @@ impl Backend {
     pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "auto" | "tmux" => Ok(Self::Tmux),
-            "herdr" => Ok(Self::Herdr),
             "cmux" => Ok(Self::Cmux),
+            "herdr" => Err(RallyError::Usage(
+                "backend \"herdr\" is removed (Plan F): use the .rally ledger \
+                 (rally inject) and the rally-termd daemon; or fall back to tmux/cmux"
+                    .to_string(),
+            )),
             other => Err(RallyError::Usage(format!("unsupported backend {other}"))),
         }
     }
@@ -193,7 +203,6 @@ impl Backend {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Tmux => "tmux",
-            Self::Herdr => "herdr",
             Self::Cmux => "cmux",
         }
     }
@@ -202,26 +211,20 @@ impl Backend {
 pub(crate) struct BackendRunner {
     pub(crate) backend: Backend,
     tmux_bin: String,
-    herdr_bin: String,
-    herdr_socket: Option<String>,
     cmux_bin: String,
 }
 
 impl BackendRunner {
     pub(crate) fn new(backend: Backend, bins: BackendBins) -> Self {
-        let herdr_bin = if bins.herdr_socket.is_some() && bins.herdr_bin == "herdr" {
-            // Easy Terminal exposes a herdr-compatible daemon through ptyd; a
-            // private socket without an explicit client should use that proven
-            // CLI path instead of assuming a standalone `herdr` binary exists.
-            default_private_socket_client()
-        } else {
-            bins.herdr_bin
-        };
+        // herdr_bin / herdr_socket fields removed with Backend::Herdr;
+        // callers that pass them get ignored fields (BackendBins still
+        // carries them for now to keep CLI parsing stable — they're
+        // de-facto dead but a separate cleanup pass).
+        let _ = bins.herdr_bin;
+        let _ = bins.herdr_socket;
         Self {
             backend,
             tmux_bin: bins.tmux_bin,
-            herdr_bin,
-            herdr_socket: bins.herdr_socket,
             cmux_bin: bins.cmux_bin,
         }
     }
@@ -235,14 +238,6 @@ impl BackendRunner {
     ) -> Result<Vec<Vec<String>>> {
         let commands = match self.backend {
             Backend::Tmux => vec![tmux_start_command(&self.tmux_bin, target, cwd, command)?],
-            Backend::Herdr => vec![herdr_start_command(
-                &self.herdr_bin,
-                target,
-                cwd,
-                command,
-                herdr_agents_tab(&self.herdr_bin, self.herdr_socket.as_deref()),
-                self.herdr_socket.as_deref(),
-            )],
             Backend::Cmux => vec![cmux_start_command(
                 &self.cmux_bin,
                 target,
@@ -263,7 +258,7 @@ impl BackendRunner {
     ) -> Result<String> {
         let commands = self.start_commands(target, cwd, command, name)?;
         match self.backend {
-            Backend::Tmux | Backend::Herdr => run_commands(&commands).map(|()| target.to_string()),
+            Backend::Tmux => run_commands(&commands).map(|()| target.to_string()),
             Backend::Cmux => {
                 let output = run_command_output(first_command(&commands)?)?;
                 parse_cmux_start_target(&output, target)
@@ -273,9 +268,6 @@ impl BackendRunner {
 
     pub(crate) fn live_target(&self, session: &ManagedSession) -> Result<String> {
         match self.backend {
-            Backend::Herdr => {
-                herdr_live_pane(&self.herdr_bin, self.herdr_socket.as_deref(), session)
-            }
             Backend::Tmux | Backend::Cmux => Ok(session.target.clone()),
         }
     }
@@ -283,23 +275,6 @@ impl BackendRunner {
     pub(crate) fn inject_commands(&self, target: &str, text: &str) -> Vec<Vec<String>> {
         match self.backend {
             Backend::Tmux => tmux_inject_commands(&self.tmux_bin, target, text),
-            Backend::Herdr => vec![
-                herdr_command(
-                    &self.herdr_bin,
-                    self.herdr_socket.as_deref(),
-                    cmd![&self.herdr_bin, "pane", "send-text", target, "\u{15}"],
-                ),
-                herdr_command(
-                    &self.herdr_bin,
-                    self.herdr_socket.as_deref(),
-                    cmd![&self.herdr_bin, "pane", "send-text", target, text],
-                ),
-                herdr_command(
-                    &self.herdr_bin,
-                    self.herdr_socket.as_deref(),
-                    cmd![&self.herdr_bin, "pane", "send-keys", target, "enter"],
-                ),
-            ],
             Backend::Cmux => vec![
                 cmd![&self.cmux_bin, "send-key", "--workspace", target, "ctrl+u"],
                 cmd![&self.cmux_bin, "send", "--workspace", target, text],
@@ -315,11 +290,6 @@ impl BackendRunner {
     pub(crate) fn attach_commands(&self, target: &str) -> Vec<Vec<String>> {
         match self.backend {
             Backend::Tmux => vec![cmd![&self.tmux_bin, "attach", "-t", target]],
-            Backend::Herdr => vec![herdr_command(
-                &self.herdr_bin,
-                self.herdr_socket.as_deref(),
-                cmd![&self.herdr_bin, "agent", "attach", target],
-            )],
             Backend::Cmux => vec![cmd![
                 &self.cmux_bin,
                 "select-workspace",
@@ -343,20 +313,6 @@ impl BackendRunner {
                 "-S",
                 format!("-{lines}"),
             ]],
-            Backend::Herdr => vec![herdr_command(
-                &self.herdr_bin,
-                self.herdr_socket.as_deref(),
-                cmd![
-                    &self.herdr_bin,
-                    "agent",
-                    "read",
-                    target,
-                    "--source",
-                    "recent-unwrapped",
-                    "--lines",
-                    lines,
-                ],
-            )],
             Backend::Cmux => vec![cmd![
                 &self.cmux_bin,
                 "read-screen",
@@ -376,11 +332,6 @@ impl BackendRunner {
     pub(crate) fn stop_commands(&self, target: &str) -> Vec<Vec<String>> {
         match self.backend {
             Backend::Tmux => vec![cmd![&self.tmux_bin, "kill-session", "-t", target]],
-            Backend::Herdr => vec![herdr_command(
-                &self.herdr_bin,
-                self.herdr_socket.as_deref(),
-                cmd![&self.herdr_bin, "agent", "stop", target],
-            )],
             Backend::Cmux => vec![cmd![
                 &self.cmux_bin,
                 "close-workspace",
@@ -395,45 +346,11 @@ impl BackendRunner {
     }
 }
 
-fn default_private_socket_client() -> String {
-    if binary_on_path("ptyd") {
-        return "ptyd".to_string();
-    }
-    ptyd_candidate_paths()
-        .into_iter()
-        .find(|path| path.is_file())
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "ptyd".to_string())
-}
-
-fn binary_on_path(name: &str) -> bool {
-    env::var_os("PATH")
-        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
-        .unwrap_or(false)
-}
-
-fn ptyd_candidate_paths() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(cwd) = env::current_dir() {
-        candidates.push(
-            cwd.join("build/Build/Products/Release/Easy Terminal.app/Contents/Resources/bin/ptyd"),
-        );
-    }
-    if let Ok(home) = env::var("HOME") {
-        let home = PathBuf::from(home);
-        candidates.push(
-            home.join(
-                "dev/git-folder/easy-terminal/build/Build/Products/Release/Easy Terminal.app/Contents/Resources/bin/ptyd",
-            ),
-        );
-        candidates.push(home.join("dev/git-folder/ptyd/target/debug/ptyd"));
-        candidates.push(home.join("dev/git-folder/ptyd/target/release/ptyd"));
-    }
-    candidates.push(PathBuf::from(
-        "/Applications/Easy Terminal.app/Contents/Resources/bin/ptyd",
-    ));
-    candidates
-}
+// Plan F functional core (Chunk 3): default_private_socket_client +
+// binary_on_path + ptyd_candidate_paths used to resolve the herdr-or-ptyd
+// CLI client when Backend::Herdr was active. With the herdr backend
+// removed, all three are dead. The Plan F daemon (rally-termd) is
+// addressed via the .rally ledger, not via a CLI client path.
 
 fn tmux_start_command(
     bin: &str,
@@ -470,61 +387,10 @@ fn tmux_inject_commands(bin: &str, session: &str, text: &str) -> Vec<Vec<String>
     ]
 }
 
-fn herdr_start_command(
-    bin: &str,
-    target: &str,
-    cwd: &Path,
-    command: &[String],
-    tab: Option<String>,
-    socket: Option<&str>,
-) -> Vec<String> {
-    let mut args = cmd![bin, "agent", "start", target, "--cwd", cwd.display(),];
-    if let Some(tab) = tab {
-        args.extend(cmd!["--tab", tab]);
-    }
-    args.extend(cmd!["--no-focus", "--"]);
-    args.extend(command.iter().cloned());
-    herdr_command(bin, socket, args)
-}
-
-fn herdr_command(bin: &str, socket: Option<&str>, command: Vec<String>) -> Vec<String> {
-    match socket {
-        Some(socket) => {
-            let mut wrapped = cmd![
-                "env",
-                format!("PTYD_SOCKET_PATH={socket}"),
-                format!("HERDR_SOCKET_PATH={socket}"),
-                bin,
-            ];
-            wrapped.extend(command.into_iter().skip(1));
-            wrapped
-        }
-        None => command,
-    }
-}
-
-fn herdr_agents_tab(bin: &str, socket: Option<&str>) -> Option<String> {
-    let command = herdr_command(bin, socket, cmd![bin, "tab", "list"]);
-    let output = run_command_output(&command).ok()?;
-    parse_herdr_agents_tab(&output)
-}
-
-fn parse_herdr_agents_tab(output: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(output).ok()?;
-    let tabs = value.pointer("/result/tabs").and_then(Value::as_array)?;
-    let workspace_id = tabs
-        .iter()
-        .find(|tab| tab.get("focused").and_then(Value::as_bool) == Some(true))
-        .and_then(|tab| tab.get("workspace_id").and_then(Value::as_str))?;
-    tabs.iter()
-        .find(|tab| {
-            tab.get("workspace_id").and_then(Value::as_str) == Some(workspace_id)
-                && tab.get("label").and_then(Value::as_str) == Some("agents")
-                && tab.get("focused").and_then(Value::as_bool) != Some(true)
-        })
-        .and_then(|tab| tab.get("tab_id").and_then(Value::as_str))
-        .map(str::to_string)
-}
+// Plan F functional core (Chunk 3): herdr_* helpers are removed with
+// the Backend::Herdr enum arm. The Plan F daemon addresses agents by
+// logical id through the .rally ledger; there is no rally-side CLI
+// shim into a daemon binary anymore.
 
 fn cmux_start_command(
     bin: &str,
@@ -581,46 +447,10 @@ pub(crate) fn parse_cmux_start_target(output: &str, fallback: &str) -> Result<St
         })
 }
 
-fn herdr_live_pane(bin: &str, socket: Option<&str>, session: &ManagedSession) -> Result<String> {
-    let command = herdr_command(bin, socket, cmd![bin, "agent", "list"]);
-    let output = run_command_output(&command)?;
-    if output.trim().is_empty() {
-        return Ok(session.target.clone());
-    }
-    let value: Value =
-        serde_json::from_str(&output).map_err(RallyError::json("parse herdr agent list"))?;
-    resolve_agent_pane_from_list(&value, session)
-}
-
-fn resolve_agent_pane_from_list(value: &Value, session: &ManagedSession) -> Result<String> {
-    let agents = value
-        .pointer("/result/agents")
-        .or_else(|| value.pointer("/result/panes"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            RallyError::Message("herdr agent list did not return agents or panes".to_string())
-        })?;
-    for agent in agents {
-        let matches = ["name", "pane_id", "terminal_id", "label"]
-            .iter()
-            .filter_map(|key| agent.get(*key).and_then(Value::as_str))
-            .any(|value| {
-                value == session.target
-                    || value == session.session_id
-                    || value == session.name
-                    || value == session.tool
-            });
-        if matches {
-            if let Some(pane_id) = agent.get("pane_id").and_then(Value::as_str) {
-                return Ok(pane_id.to_string());
-            }
-        }
-    }
-    Err(RallyError::NotFound(format!(
-        "herdr managed session {} is not currently live",
-        session.session_id
-    )))
-}
+// Plan F functional core (Chunk 3): herdr_live_pane and
+// resolve_agent_pane_from_list are removed with the Backend::Herdr
+// enum arm — the Plan F daemon addresses agents by logical id via the
+// .rally ledger, not by walking a daemon-side pane list.
 
 pub(crate) fn command_plan_json(commands: &[Vec<String>]) -> Vec<Value> {
     commands.iter().map(|command| json!(command)).collect()
@@ -681,10 +511,9 @@ fn shell_words(words: &[String]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{InjectData, RunData, SessionActionData, SessionsData};
-    use super::{
-        herdr_command, parse_cmux_start_target, parse_herdr_agents_tab,
-        resolve_agent_pane_from_list, shell_words,
-    };
+    // Plan F functional core (Chunk 3): herdr_command, parse_herdr_agents_tab,
+    // and resolve_agent_pane_from_list removed with the Backend::Herdr arm.
+    use super::{parse_cmux_start_target, shell_words};
     use crate::check::CheckData;
     use crate::store::Fact;
     use crate::{EnterData, Envelope, NextData, RoomData, SayData};
@@ -712,112 +541,9 @@ mod tests {
         assert!(err.to_string().contains("cannot be shell-quoted"));
     }
 
-    #[test]
-    fn herdr_agents_tab_uses_agents_tab_from_focused_workspace() {
-        let output = json!({
-            "result": {
-                "tabs": [
-                    {
-                        "focused": false,
-                        "label": "agents",
-                        "tab_id": "other:2",
-                        "workspace_id": "other"
-                    },
-                    {
-                        "focused": true,
-                        "label": "main",
-                        "tab_id": "current:1",
-                        "workspace_id": "current"
-                    },
-                    {
-                        "focused": false,
-                        "label": "agents",
-                        "tab_id": "current:2",
-                        "workspace_id": "current"
-                    }
-                ]
-            }
-        })
-        .to_string();
-
-        assert_eq!(
-            parse_herdr_agents_tab(&output).as_deref(),
-            Some("current:2")
-        );
-    }
-
-    #[test]
-    fn herdr_agents_tab_does_not_return_focused_agents_tab() {
-        let output = json!({
-            "result": {
-                "tabs": [
-                    {
-                        "focused": true,
-                        "label": "agents",
-                        "tab_id": "current:1",
-                        "workspace_id": "current"
-                    }
-                ]
-            }
-        })
-        .to_string();
-
-        assert_eq!(parse_herdr_agents_tab(&output), None);
-    }
-
-    #[test]
-    fn herdr_command_wraps_private_socket_for_ptyd_and_herdr_clients() {
-        let command = herdr_command(
-            "ptyd",
-            Some("/tmp/easy-terminal/herdr.sock"),
-            vec![
-                "ptyd".to_string(),
-                "agent".to_string(),
-                "start".to_string(),
-                "codex-01".to_string(),
-            ],
-        );
-
-        assert_eq!(
-            command,
-            vec![
-                "env",
-                "PTYD_SOCKET_PATH=/tmp/easy-terminal/herdr.sock",
-                "HERDR_SOCKET_PATH=/tmp/easy-terminal/herdr.sock",
-                "ptyd",
-                "agent",
-                "start",
-                "codex-01",
-            ]
-        );
-    }
-
-    #[test]
-    fn ptyd_agent_list_shape_resolves_live_herdr_target() {
-        let session = super::ManagedSession {
-            session_id: "codex-01".to_string(),
-            name: "codex-01".to_string(),
-            agent: "codex".to_string(),
-            tool: "codex:01".to_string(),
-            backend: "herdr".to_string(),
-            cwd: std::path::PathBuf::from("/tmp/repo"),
-            target: "codex-01".to_string(),
-        };
-        let output = json!({
-            "result": {
-                "panes": [
-                    {
-                        "pane_id": "pane-abc",
-                        "terminal_id": "term-abc",
-                        "label": "codex-01"
-                    }
-                ]
-            }
-        });
-
-        let pane_id = resolve_agent_pane_from_list(&output, &session).unwrap();
-        assert_eq!(pane_id, "pane-abc");
-    }
+    // Plan F functional core (Chunk 3): herdr_agents_tab_*, herdr_command_*,
+    // and ptyd_agent_list_shape_resolves_live_herdr_target unit tests
+    // removed alongside the Backend::Herdr arm and its parser helpers.
 
     #[test]
     fn command_contracts_have_typed_json_schemas() {
