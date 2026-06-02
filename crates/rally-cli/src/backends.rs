@@ -91,6 +91,20 @@ pub(crate) struct SessionsEnvelope {
     pub(crate) sessions: SessionsData,
 }
 
+/// C-FLEET: shape of `data.adopt` for `rally adopt` responses. Carries the
+/// freshly-registered `ManagedSession` so the caller has the assigned
+/// `session_id` (which differs from `name` when adoption auto-numbers).
+#[derive(JsonSchema, Serialize)]
+pub(crate) struct AdoptData {
+    pub(crate) session: ManagedSession,
+}
+
+/// Envelope for `adopt`: result under `data.adopt`.
+#[derive(JsonSchema, Serialize)]
+pub(crate) struct AdoptEnvelope {
+    pub(crate) adopt: AdoptData,
+}
+
 #[derive(JsonSchema, Serialize)]
 pub(crate) struct InjectData {
     pub(crate) mode: &'static str,

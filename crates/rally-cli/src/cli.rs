@@ -42,6 +42,9 @@ pub(crate) enum CliCommand {
     Mission(MissionArgs),
     Lead(LeadArgs),
     Ack(AckArgs),
+    /// C-FLEET: register an already-running agent (a tmux or cmux target)
+    /// into the managed-session ledger without relaunching it.
+    Adopt(AdoptArgs),
 }
 
 pub(crate) enum CliParse {
@@ -380,6 +383,31 @@ pub(crate) struct RouteFindingsArgs {
     pub(crate) verified: bool,
 }
 
+/// C-FLEET: `rally adopt <name>` — register an already-running agent (a
+/// tmux or cmux target) into the managed-session ledger without relaunching
+/// it. ONE of `--tmux` or `--cmux` is required to identify the running
+/// surface. HERDR-INDEPENDENT: the original `--pane` (herdr) arm and its
+/// `herdr agent list` auto-discovery were dropped with `Backend::Herdr`
+/// (Plan F Chunk 3); adopt now targets only the two live backends.
+#[derive(Clone, Debug)]
+pub(crate) struct AdoptArgs {
+    pub(crate) json: bool,
+    /// Human-friendly session name. Becomes `session.name`. Required.
+    pub(crate) name: String,
+    /// Identify the running surface via a tmux target (`rally-claude-foo`).
+    /// Mutually exclusive with `--cmux`.
+    pub(crate) tmux: Option<String>,
+    /// Identify the running surface via a cmux target.
+    /// Mutually exclusive with `--tmux`.
+    pub(crate) cmux: Option<String>,
+    /// Optional `--tool` identity. Defaults to `<agent>:adopted-<n>`.
+    pub(crate) tool: Option<String>,
+    /// Agent name (claude|codex|opencode|gemini). Defaults to `claude`.
+    pub(crate) agent: Option<String>,
+    /// Backend hint (tmux|cmux). Auto-inferred from --tmux/--cmux when omitted.
+    pub(crate) backend: Option<Backend>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct BackendBins {
     pub(crate) tmux_bin: String,
@@ -485,6 +513,8 @@ const COMMANDS: &[&str] = &[
     "lead",
     // Coordination-mandate ack (C1)
     "ack",
+    // C-FLEET: register an already-running agent into the managed-session ledger
+    "adopt",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -672,6 +702,12 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .command("ack")
         .map(CliCommand::Ack);
 
+    let adopt = adopt_parser()
+        .to_options()
+        .descr("Register an already-running agent (tmux or cmux target) into the managed-session ledger without relaunching it. Use --tmux <target> or --cmux <target>; --backend (tmux|cmux) overrides the inferred backend.")
+        .command("adopt")
+        .map(CliCommand::Adopt);
+
     construct!([
         init,
         enter,
@@ -703,7 +739,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         whoami,
         mission,
         lead,
-        ack
+        ack,
+        adopt
     ])
     .to_options()
 }
@@ -1309,6 +1346,38 @@ fn ack_parser() -> impl Parser<AckArgs> {
     let json = json_flag();
     let tool = string_arg("tool", "TOOL");
     construct!(AckArgs { json, tool })
+}
+
+/// C-FLEET: parser for `rally adopt <name> [--tmux …|--cmux …] [--tool …]
+/// [--agent …] [--backend …]`. Mutual exclusion between `--tmux` and `--cmux`
+/// is validated inside `command_adopt`. HERDR-INDEPENDENT: no `--pane` arm.
+fn adopt_parser() -> impl Parser<AdoptArgs> {
+    let json = json_flag();
+    let tmux = optional_string_arg("tmux", "TARGET");
+    let cmux = optional_string_arg("cmux", "TARGET");
+    let tool = optional_string_arg("tool", "TOOL");
+    let agent = optional_string_arg("agent", "AGENT");
+    let backend = long("backend")
+        .help("Backend hint (tmux|cmux). Auto-inferred from --tmux/--cmux when omitted.")
+        .argument::<String>("BACKEND")
+        .optional()
+        .parse(|opt| match opt {
+            None => Ok(None),
+            Some(s) => Backend::parse(&s).map(Some),
+        });
+    // Positional MUST be the rightmost item per bpaf convention.
+    let name = positional::<String>("NAME");
+    construct!(json, tmux, cmux, tool, agent, backend, name).map(
+        |(json, tmux, cmux, tool, agent, backend, name)| AdoptArgs {
+            json,
+            name,
+            tmux,
+            cmux,
+            tool,
+            agent,
+            backend,
+        },
+    )
 }
 
 fn lead_parser() -> impl Parser<LeadArgs> {
