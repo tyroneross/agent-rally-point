@@ -541,6 +541,21 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // snapshot.max_seq (post-presence) further below.
     let _max_seq_pre_enter = snapshot_before.max_seq;
 
+    // f4 follow-up: emit presence (+ first-frontier-enter-is-lead) BEFORE any
+    // warning blocks write risk facts. The squads projection at store.rs picks
+    // up the entering tool from ANY fact carrying it in `Fact.tool`, so a
+    // warning-driven risk_fact written before presence would short-circuit
+    // `ensure_presence_tiered`'s squad-membership guard and skip the lead-
+    // assignment write — a pre-existing latent bug that only became visible
+    // when f4 widened the fleet-enforcement gate to cover bare worker ids
+    // without a digit suffix (e.g. `tool_a` in the cli_guardrails test). The
+    // squad-id-active, binary-drift, shared-branch-hazard, AND unmanaged-agent
+    // blocks all wrote tool-attributed risk facts before this point — the
+    // re-order fixes all four at once. The blocks still use `snapshot_before`
+    // (pre-presence) for their dedup checks, so behavior is unchanged when
+    // none of them fire.
+    ensure_presence_tiered(&room, &tool, args.tier.as_deref())?;
+
     // B11: warn (non-blocking) when the entering tool is already active in the
     // current engagement.  A second terminal reusing the same id is ambiguous;
     // surfacing it lets the human/lead decide.  Rally never blocks re-entry.
@@ -692,10 +707,12 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         }
     }
 
-    // Component A + B: emit presence (+ first-frontier-enter-is-lead) via shared helper.
-    ensure_presence_tiered(&room, &tool, args.tier.as_deref())?;
-
-    // Re-snapshot after presence/lead writes so room summary and squads are current.
+    // Component A + B: presence + first-frontier-enter-is-lead were emitted
+    // at the top of `command_enter` (before the warning blocks) so risk facts
+    // never short-circuit the squad-membership guard inside
+    // `ensure_presence_tiered`. Re-snapshot here so the room summary +
+    // squads reflect the just-written presence/lead facts AND any
+    // warning-block risk facts.
     let snapshot = room.snapshot()?;
 
     let attention = build_attention(&snapshot, &tool, cursor_before, &paths);
@@ -1991,6 +2008,14 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 backend: backend_name.clone(),
                 cwd: repo.clone(),
                 target: backend_target(backend, &identity.session_id),
+                // f1: persist the herdr socket on dry-run too so the dry-run
+                // session record round-trips identically to a real launch and
+                // downstream tests can assert on it.
+                herdr_socket: if backend == Backend::Herdr {
+                    bins.herdr_socket.clone()
+                } else {
+                    None
+                },
             },
         }
     } else {
@@ -2004,6 +2029,15 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 backend,
                 backend_name: &backend_name,
                 repo: &repo,
+                // f1: by the time we reach here, `bins.herdr_socket` carries
+                // the resolved socket (user-supplied or auto-discovered).
+                // Persist it on the session so later inject/control commands
+                // can rebuild the same BackendRunner.
+                herdr_socket: if backend == Backend::Herdr {
+                    bins.herdr_socket.clone()
+                } else {
+                    None
+                },
             },
         )?
     };
@@ -2084,7 +2118,7 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
         tool,
         agent,
         backend,
-        bins: _bins,
+        bins,
     } = args;
 
     // Validate mutual exclusion: must pass exactly one of --pane / --tmux.
@@ -2134,6 +2168,20 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
         &active_sessions,
     )?;
 
+    // f1: when adopting a herdr pane, resolve the ET socket the same way
+    // `command_run` does (explicit --herdr-socket wins, else auto-discover),
+    // and persist it on the session fact. Without this, a later
+    // `rally inject` / `attach` / `capture` / `stop` against the adopted
+    // session targets the wrong daemon. Adopt of a tmux target ignores the
+    // socket (always None).
+    let herdr_socket = if resolved_backend == Backend::Herdr {
+        bins.herdr_socket
+            .clone()
+            .or_else(|| backends::find_easy_terminal_socket().map(|p| p.display().to_string()))
+    } else {
+        None
+    };
+
     let session = ManagedSession {
         session_id: identity.session_id.clone(),
         name: identity.name.clone(),
@@ -2145,6 +2193,7 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
         // target), NOT the derived `backend_target(backend, session_id)`. This
         // is the whole point of adopt — register an existing pane.
         target,
+        herdr_socket,
     };
 
     // Append the session fact under the same context-version race guard as
@@ -2239,6 +2288,11 @@ struct SessionReservationInput<'a> {
     backend: Backend,
     backend_name: &'a str,
     repo: &'a Path,
+    /// f1: persisted on the session fact when backend == Herdr so
+    /// `command_inject` / `command_session_action` can rebuild a
+    /// `BackendRunner` that targets the SAME daemon. `None` for other
+    /// backends or when no socket was discovered.
+    herdr_socket: Option<String>,
 }
 
 fn reserve_numbered_session(
@@ -2264,6 +2318,9 @@ fn reserve_numbered_session(
             backend: input.backend_name.to_string(),
             cwd: input.repo.to_path_buf(),
             target: backend_target(input.backend, &identity.session_id),
+            // f1: persist the herdr socket so later inject/attach/capture/stop
+            // rebuild a BackendRunner pointed at the SAME daemon.
+            herdr_socket: input.herdr_socket.clone(),
         };
         let fact = session_fact(&session, "active", None);
         if let Some(fact) = room.append_session_fact_if_context(&fact, context_version)? {
@@ -2500,25 +2557,52 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
         None
     };
 
-    let backend_runner = BackendRunner::new(Backend::parse(&session.backend)?, args.bins);
-    let live_target = if dry_run {
-        session.target.clone()
+    // f1: rebuild `BackendBins` with the herdr socket persisted on the
+    // session record so this BackendRunner targets the SAME daemon the
+    // session was originally launched against. Without this overlay, a
+    // session launched into Easy Terminal (Application Support socket) is
+    // injected into the standalone herdr daemon (~/.config/herdr/herdr.sock)
+    // — the pane is not found, `herdr_live_pane` returns NotFound, and the
+    // whole call collapses to `delivered:false` with no diagnostic.
+    let runner_bins = bins_with_persisted_socket(args.bins, &session);
+    let backend_runner = BackendRunner::new(Backend::parse(&session.backend)?, runner_bins);
+    // f1: capture both the live-target resolution error and any subsequent
+    // inject error so a silent control-path failure can be surfaced on the
+    // result envelope AND on stderr. Pre-f1 we collapsed all errors into a
+    // bare `delivered:false` with zero diagnostic — that hid the bug.
+    let (live_target, mut delivery_error) = if dry_run {
+        (session.target.clone(), None)
     } else {
-        backend_runner.live_target(&session)?
+        match backend_runner.live_target(&session) {
+            Ok(t) => (t, None),
+            Err(e) => {
+                let msg = format!("live target resolution failed: {e}");
+                (session.target.clone(), Some(msg))
+            }
+        }
     };
     let commands = backend_runner.inject_commands(&live_target, &text);
 
     // Attempt live delivery. If the backend session is gone, the content fact
-    // is already recorded above — log the failure but do not propagate it so
-    // the caller gets `delivered: false` rather than a hard error.
-    let delivered = if dry_run {
+    // is already recorded above — record the failure on `delivery_error` so
+    // the caller sees the cause instead of an unexplained `delivered:false`.
+    let delivered = if dry_run || delivery_error.is_some() {
         false
     } else {
         match backend_runner.inject(&live_target, &text) {
             Ok(()) => true,
-            Err(_) => false,
+            Err(e) => {
+                delivery_error = Some(format!("inject failed: {e}"));
+                false
+            }
         }
     };
+    // f1: emit the diagnostic to stderr so operators see WHY a non-dry-run
+    // inject reports `delivered:false`. JSON callers also see it via the new
+    // `delivery_error` field on `data.inject`.
+    if let Some(ref err) = delivery_error {
+        eprintln!("rally inject: live delivery failed: {err}");
+    }
 
     let wake_intent = inject_wake_intent_with_room(
         room.as_ref(),
@@ -2551,6 +2635,7 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
         sender_tool,
         content_fact,
         delivered,
+        delivery_error,
     };
     let has_ack = ack.is_some();
     let body = envelope(
@@ -2589,7 +2674,11 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
     let dry_run = args.dry_run;
     let target = args.target;
     let session = find_session(&target)?;
-    let backend_runner = BackendRunner::new(Backend::parse(&session.backend)?, args.bins);
+    // f1/f3: rebuild BackendBins with the herdr socket persisted on the
+    // session record so attach/capture/stop target the SAME daemon the
+    // session was originally launched against (matches command_inject).
+    let runner_bins = bins_with_persisted_socket(args.bins, &session);
+    let backend_runner = BackendRunner::new(Backend::parse(&session.backend)?, runner_bins);
     let live_target = if dry_run {
         session.target.clone()
     } else {
@@ -2880,19 +2969,47 @@ fn wake_fact(
 /// Build a Risk fact with the constant boilerplate fields pre-filled.
 /// `scope`, `evidence`, and `ref_id` vary per call site; everything else is
 /// constant across all four use-cases (warn severity, no role/target/status/uri).
-/// Returns true when a `--tool` identifier looks like a managed-session
-/// identity (e.g. `claude-01`, `claude_code:01`, `toolbar-launch-01`) rather
-/// than a human/lead identity (`claude_code:lead`, `*:l<N>`, `human:*`,
-/// `lead`). Used by `command_enter` to gate the `unmanaged-agent` risk record:
-/// human leads are NEVER expected to be managed sessions, so silently skip
-/// them rather than flood the room with spurious risk facts.
+/// Returns true when a `--tool` identifier should be treated as a fleet
+/// worker (i.e. expected to live under a `rally`-managed session).
+///
+/// The rule is **opt-out, not opt-in**: every identifier is a fleet worker
+/// UNLESS it matches one of the explicit human/lead exemptions below. This
+/// is the f4 fix — the prior implementation also required the identifier to
+/// contain a digit, which created a silent enforcement hole: bare worker
+/// names without a numeric suffix (`claude`, `codex`, `opencode`,
+/// `gemini`, `no-digits-here`) entered the room WITHOUT a managed-session
+/// record and WITHOUT raising an `unmanaged-agent` risk fact — silently
+/// defeating the "all workers managed" rule the fleet check was supposed to
+/// enforce.
+///
+/// Exempt (returns false):
+///   - The literal `lead` / human-facing driver name.
+///   - Anything starting with `human:` or `user:` (case-insensitive). These
+///     are explicit human identifiers, not workers.
+///   - Suffix `:lead` (the human-readable lead form, e.g. `claude_code:lead`).
+///   - Suffix `:l<N>` where `<N>` is one or more digits (the canonical
+///     lead-number form, e.g. `claude_code:l4`).
+///
+/// Everything else — including bare worker names without numbers — is a
+/// managed-style identifier. In-context subagents that the host coding agent
+/// dispatches stay implicit; they don't `rally enter` from a separate process
+/// so they never reach this gate.
 fn is_managed_style_tool(tool: &str) -> bool {
     let lower = tool.to_ascii_lowercase();
-    if lower == "lead" || lower.starts_with("human") || lower.starts_with("user") {
+    // Explicit human / lead literals.
+    if lower == "lead" {
         return false;
     }
-    // Lead-style suffixes: `:lead`, `:l1`, `:l42`, `:l<N>`. A digit after `:l`
-    // is the canonical lead-number form; `:lead` is the human-readable form.
+    // `human:*` and `user:*` are explicit human identifiers — note the
+    // colon: this MUST NOT silence worker ids that happen to start with the
+    // substring "user" (e.g. `user-friendly-codex-01`). The pre-f4 code used
+    // bare `starts_with("user")`, which over-matched; we narrow it here.
+    if lower.starts_with("human:") || lower.starts_with("user:") {
+        return false;
+    }
+    // Lead-style suffixes: `:lead` (human-readable) and `:l<N>` (canonical
+    // numeric lead form). A trailing colon-segment that is exactly `lead`
+    // or `l<digits>` exempts the identifier.
     if let Some(suffix) = lower.split(':').next_back() {
         if suffix == "lead" {
             return false;
@@ -2903,10 +3020,10 @@ fn is_managed_style_tool(tool: &str) -> bool {
             }
         }
     }
-    // Managed identifiers always contain a digit somewhere (the auto-numbered
-    // session ordinal). Identifiers without digits are exotic / human-named
-    // and we don't want to spam risk records for them.
-    tool.chars().any(|c| c.is_ascii_digit())
+    // Default: every other identifier is a fleet worker. No digit
+    // requirement — the prior gate let bare `claude`/`codex`/`gemini` slip
+    // through without a managed-session record (f4 hole).
+    true
 }
 
 fn build_risk_fact(
@@ -2937,6 +3054,32 @@ fn build_risk_fact(
         severity: Some(severity.to_string()),
         uri: None,
         session: None,
+    }
+}
+
+/// f1: overlay a session's persisted `herdr_socket` onto a `BackendBins`
+/// so the resulting `BackendRunner` targets the same daemon the session
+/// was originally launched against. Caller-supplied `--herdr-socket` takes
+/// precedence so operators can still override on a one-off basis.
+///
+/// Without this overlay, `command_inject` and `command_session_action`
+/// silently build a `BackendRunner` with `herdr_socket: None`, which
+/// targets the bare `herdr` default socket (`~/.config/herdr/herdr.sock`)
+/// even when the session was launched into Easy Terminal — and the pane
+/// is invisible to that daemon's `agent list`.
+fn bins_with_persisted_socket(bins: BackendBins, session: &ManagedSession) -> BackendBins {
+    if bins.herdr_socket.is_some() {
+        // Operator explicitly overrode; honor it (also handles tmux sessions
+        // where `session.herdr_socket` is always None — no change needed).
+        return bins;
+    }
+    if let Some(ref persisted) = session.herdr_socket {
+        BackendBins {
+            herdr_socket: Some(persisted.clone()),
+            ..bins
+        }
+    } else {
+        bins
     }
 }
 
@@ -3480,6 +3623,7 @@ mod tests {
             backend: "tmux".to_string(),
             cwd: PathBuf::from("/tmp/rally-test"),
             target: "rally-test".to_string(),
+            herdr_socket: None,
         }
     }
 
@@ -3993,13 +4137,19 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// C-FLEET unit test: `is_managed_style_tool` correctly classifies managed
-    /// vs human/lead identifiers — managed-style ids always carry a digit AND
-    /// are not human/lead-suffixed; human/lead ids return false so they don't
-    /// flood the room with spurious `unmanaged-agent` risk records.
+    /// C-FLEET / f4 unit test: `is_managed_style_tool` classifies fleet
+    /// workers vs human/lead identifiers.
+    ///
+    /// The rule is OPT-OUT: everything is a worker unless explicitly
+    /// human/lead. This closes the f4 silent enforcement hole — pre-f4 the
+    /// function additionally required a digit somewhere in the id, so bare
+    /// `claude` / `codex` / `gemini` / `opencode` could enter the room
+    /// without a managed-session record AND without raising the
+    /// `unmanaged-agent` risk fact.
     #[test]
     fn fleet_is_managed_style_tool_classification() {
-        // Managed-style — should detect.
+        // Managed-style — should detect (including the f4-newly-covered
+        // bare worker ids without a digit suffix).
         for t in [
             "claude-01",
             "claude_code:01",
@@ -4008,6 +4158,18 @@ mod tests {
             "BuildBluePoint-3",
             "redesign-coord-1",
             "codex-2",
+            // f4: bare worker ids without digits — previously slipped
+            // through the digit-only exemption.
+            "claude",
+            "codex",
+            "opencode",
+            "gemini",
+            "no-digits-here",
+            // f4: substrings starting with `user` but NOT `user:` are
+            // workers, not humans. Pre-f4 the `starts_with("user")` check
+            // over-matched and silenced these.
+            "user-friendly",
+            "user-friendly-codex-01",
         ] {
             assert!(is_managed_style_tool(t), "expected managed: {t}");
         }
@@ -4018,8 +4180,8 @@ mod tests {
             "claude_code:l1",
             "claude_code:l42",
             "human:alice",
-            "user-friendly",
-            "no-digits-here",
+            "user:bob",
+            "USER:CAROL", // case-insensitive
         ] {
             assert!(!is_managed_style_tool(t), "expected NOT managed: {t}");
         }
@@ -4135,6 +4297,7 @@ mod tests {
             backend: "herdr".to_string(),
             cwd: root.clone(),
             target: "pane-9".to_string(), // caller-provided, NOT derived
+            herdr_socket: None,
         };
         let (_facts, ctx) = room.session_facts_with_context_version().unwrap();
         let fact = session_fact(&session, "active", None);
@@ -4195,6 +4358,7 @@ mod tests {
             backend: "tmux".to_string(),
             cwd: root.clone(),
             target: "rally-legacy".to_string(),
+            herdr_socket: None,
         };
         let (_facts, ctx) = room.session_facts_with_context_version().unwrap();
         room.append_session_fact_if_context(&session_fact(&session, "active", None), ctx)
@@ -4231,6 +4395,7 @@ mod tests {
             backend: "tmux".to_string(),
             cwd: root.clone(),
             target: "rally-claude-99".to_string(),
+            herdr_socket: None,
         };
         room.append_fact(&session_fact(&session, "active", None))
             .unwrap();
