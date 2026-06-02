@@ -880,9 +880,22 @@ mod tests {
         assert!(schemas.iter().all(|schema| schema.is_object()));
     }
 
+    /// Shared mutex for all `find_et_socket_*` tests. Each test mutates
+    /// process-global env (`PTYD_SOCKET_PATH`, `HOME`, etc.) and reads it
+    /// back; without serialization, concurrent test threads race and one
+    /// reads the other's mutated env. Matches the discovery.rs::b17 pattern.
+    /// Poison-tolerant so a panicking holder cannot wedge the rest of the
+    /// suite.
+    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// C-HERDR: PTYD_SOCKET_PATH always wins when set and the file exists.
     #[test]
     fn find_et_socket_prefers_ptyd_socket_path_env() {
+        let _guard = env_test_lock();
         let tmp = std::env::temp_dir().join(format!("rally-et-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let sock = tmp.join("herdr.sock");
@@ -931,6 +944,7 @@ mod tests {
     /// preserves the pre-discovery default (bare `herdr`).
     #[test]
     fn find_et_socket_returns_none_when_no_candidate_exists() {
+        let _guard = env_test_lock();
         let prior_ptyd = std::env::var("PTYD_SOCKET_PATH").ok();
         let prior_herdr = std::env::var("HERDR_SOCKET_PATH").ok();
         let prior_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
@@ -973,6 +987,7 @@ mod tests {
     /// to disk candidates — env-set-but-stale must not poison the search.
     #[test]
     fn find_et_socket_falls_through_stale_env() {
+        let _guard = env_test_lock();
         let tmp = std::env::temp_dir().join(format!("rally-et-fallthrough-{}", std::process::id()));
         let appsupp = tmp.join("Library/Application Support/EasyTerminal");
         std::fs::create_dir_all(&appsupp).unwrap();
