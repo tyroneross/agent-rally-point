@@ -2,6 +2,24 @@
 
 # Agent Wake / Inject — Test Protocol & Signals
 
+> **Current state (2026-06-03) — read first.** Wake routing today, no `herdr`:
+> - **ptyd / Easy Terminal / `rally run`-managed** peer: `rally inject` (ledger). Daemon (`rally-termd`) subscribes and performs the PTY-inject. This is the Plan F inversion (`crates/rally-cli/tests/arch_no_herdr_dep.rs`).
+> - **Unmanaged tmux pane**: `scripts/rally_wake.py --tmux-target <session:window.pane>`. tmux-only doorbell, channel-confirmed.
+>
+> The herdr-specific test commands in §3, §5, §6, §9 below are kept for historical context — the doorbell-vs-mailbox, idle-precondition, and channel-confirm shapes generalize, but the literal `herdr ...` commands and `--tool` / `--herdr-pane` / `--require-idle` flags are gone from `scripts/rally_wake.py`. For a tmux-only smoke today:
+>
+> ```bash
+> # In one pane (the wake target):
+> tmux new -s waker -d
+> tmux send-keys -t waker:0.0 'cat > /tmp/woke.txt' C-m
+> # In another shell:
+> python3 scripts/rally_wake.py --tmux-target waker:0.0 "[WAKE-T7] doorbell" --dry-run
+> python3 scripts/rally_wake.py --tmux-target waker:0.0 "[WAKE-T7] doorbell"
+> # Verify the target pane received the doorbell line.
+> ```
+>
+> For ptyd panes, do not write a python shim; use `rally inject` so the ledger inversion stays the single coupling surface.
+
 > **Historical (2026-05-28).** Wake protocol validated against the legacy `herdr` delivery primitive. Herdr was removed in Plan F; the Easy Terminal app daemon socket was renamed `herdr.sock` → `ptyd.sock` and the CLI is now `ptyd`. The protocol shapes (idle gate, channel-confirm vs status-flip, paste/submit handling) generalize to ptyd, but the literal commands below are out of date.
 
 **Audience:** codex (and any peer agent) helping validate cross-agent wake.

@@ -2,6 +2,12 @@
 
 # Wake + Integration Plan — shared by Claude & Codex (dogfoods agent-rally-point)
 
+> **Current state (2026-06-03) — read first.** Wake routing today is two paths, no `herdr`:
+> - **Managed sessions** (`rally run`) and **Easy Terminal / ptyd**: use `rally inject`. It appends a typed Directive to the `.rally` ledger; the `rally-termd` daemon subscribes and performs the PTY-inject. This is the Plan F inversion the Rust core enforces (`crates/rally-cli/tests/arch_no_herdr_dep.rs`).
+> - **Unmanaged tmux pane** (external agent terminal that Rally did not launch and that has no daemon integration): `scripts/rally_wake.py --tmux-target <session:window.pane>`. tmux-only doorbell, channel-confirmed.
+>
+> The `herdr` backend was removed from `scripts/rally_wake.py` alongside the Rust removal of `Backend::Herdr`. The historical plan below records the 2026-05-28 multi-backend design for context.
+
 > **Historical (2026-05-28).** Describes wake coordination using the legacy `herdr` backend / CLI. Herdr was removed in Plan F; Easy Terminal renamed its app daemon socket `herdr.sock` → `ptyd.sock`. Read for protocol design, not for current commands.
 
 **Read this first, in a fresh terminal, as either Claude Code or Codex.** This single file is the entry point: it gives you the full context, your owned piece, and how to coordinate with your peer **through agent-rally-point itself** (this build dogfoods the tool we're building).
@@ -54,8 +60,9 @@ CH=$HOME/.agent-rally-point/apps/repo_196422842096be12/changes.jsonl
 2. **Check** before each step boundary:
    `python3 $S/coordination_status.py --workdir "$RALLYDIR" --session-id <you> --json`
 3. **Wake your peer** when you have a handoff — short doorbell, payload in the channel:
-   `python3 scripts/rally_wake.py --tool <peer> "Unread in Rally — run coordination_status + read this plan §<n>" --require-idle --confirm-channel "$CH"`
-   (herdr submit handled per-backend automatically; the channel post is the confirm.)
+   - **ptyd / Easy Terminal / `rally run`-managed** peer: `rally inject` (ledger). The daemon performs the PTY-inject.
+   - **Unmanaged tmux pane**: `python3 scripts/rally_wake.py --tmux-target <session:window.pane> "Unread in Rally — run coordination_status + read this plan §<n>" --confirm-channel "$CH"`. The channel post is the confirm.
+   - The original 2026-05-28 form `--tool <peer> --require-idle` was the herdr resolver path; herdr was removed.
 4. **Post verdicts/handoffs** to the channel (revision bump) — that bump is also how your peer's `rally_wake --confirm-channel` knows you acted.
 
 Rules: verdicts gate (don't advance a piece past `verification-pending` until the peer posts PASS or resolved VARIANCE); every write-handoff names owns / does-not-own / interface / checkpoint; one owner per file.
