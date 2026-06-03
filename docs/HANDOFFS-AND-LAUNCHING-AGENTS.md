@@ -15,12 +15,12 @@ rally attach <session>                      # watch live  ·  rally stop <sessio
 
 ## 1. Launching a managed agent
 
-`rally run <claude|codex|opencode|gemini> [--name <label>] [--backend tmux|herdr|cmux] [--herdr-socket <path>] [--dry-run] [--json]`
+`rally run <claude|codex|opencode|gemini> [--name <label>] [--backend tmux|cmux] [--dry-run] [--json]`
 
 - **Always `--dry-run --json` first** to see the exact `tmux new-session …` command and the resolved `session_id` / `target` / `tool` before spawning.
 - Run ids auto-number active agents: `claude-<label>-01`, `tool=claude_code:<label>-01`. The tmux target is `rally-<agent>-<label>-NN`.
-- Default backend is `tmux`. `herdr`/`cmux` launch into those multiplexers instead. For a private Easy Terminal daemon, pass `--backend herdr --herdr-socket "$HOME/Library/Application Support/EasyTerminal/herdr.sock"`; Rally pins the backend command with both `PTYD_SOCKET_PATH` and `HERDR_SOCKET_PATH`. Without an explicit `--herdr-bin`, that private-socket path resolves `ptyd` (PATH, bundled app, or local dev build) and uses `agent start ... -- <agent>` so it lands in Easy Terminal's daemon.
-- Self-relaunch guard: an agent hosted by that same Easy Terminal socket must not launch a build/relaunch lane back into its own host. Start build/relaunch workers outside that ET instance, or detach first; `RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH=1` is only for a consciously detached/non-relaunch launch.
+- Default backend is `tmux`; `cmux` launches into cmux instead. The legacy `herdr` backend (and its `--herdr-bin` / `--herdr-socket` flags) were removed in Plan F. For Easy Terminal / ptyd integration, use the `.rally` ledger directly: rally writes Directives and the `rally-termd` daemon subscribes.
+- Self-relaunch guard: an agent hosted by an Easy Terminal socket must not launch a build/relaunch lane back into its own host. Start build/relaunch workers outside that ET instance, or detach first; `RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH=1` is only for a consciously detached/non-relaunch launch.
 - The agent starts at its normal prompt with **auto mode on** (Claude Code) — it does nothing until you inject an instruction.
 
 ## 2. Injecting the instruction

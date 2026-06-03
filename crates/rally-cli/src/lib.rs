@@ -7815,7 +7815,7 @@ fn help_text() -> String {
         "  rally migrate-legacy [--json]  # one-shot replay of legacy ~/.agent-rally-point/apps/<slug>/changes.jsonl into this repo ledger",
         "  rally check before-write --tool <tool> --path <path> [--strict] [--json]",
         "  rally check before-complete --tool <tool> [--strict] [--json]",
-        "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|herdr|cmux>] [--herdr-socket <path>] [--dry-run] [--json]",
+        "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|cmux>] [--dry-run] [--json]",
         "    managed run ids auto-number active agents, e.g. claude-01 / claude_code:01",
         "  rally sessions [--json]",
         "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--require-ack] [--json]",

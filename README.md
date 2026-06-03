@@ -90,15 +90,12 @@ explicit handoff targets to identify the current recipient. A targeted handoff
 is the durable action request; `rally inject` is only a wake/delivery path for a
 target already listed by `rally sessions --json`.
 
-Managed sessions need no setup step. `rally run --backend <tmux|herdr|cmux>`
+Managed sessions need no setup step. `rally run --backend <tmux|cmux>`
 starts the addressable pane/workspace, and `rally inject` delivers work to it.
-Use `--herdr-socket <path>` to target a private herdr-compatible daemon socket
-such as Easy Terminal's `~/Library/Application Support/EasyTerminal/herdr.sock`;
-the backend command receives both `PTYD_SOCKET_PATH` and `HERDR_SOCKET_PATH`.
-When a private socket is supplied without `--herdr-bin`, Rally resolves a
-`ptyd` client (PATH first, then common Easy Terminal bundled/dev locations) so
-`rally run codex --backend herdr --herdr-socket <sock>` follows Easy Terminal's
-live `ptyd agent start ... -- codex` path.
+The legacy `herdr` backend (and its `--herdr-bin` / `--herdr-socket` flags)
+were removed in Plan F: rally writes to the `.rally` ledger and the
+`rally-termd` daemon subscribes, replacing the previous "rally calls the
+daemon" path.
 Rally assigns readable per-agent ids from the active room: `rally run claude`
 becomes `claude-01` with tool `claude_code:01`; a named reviewer becomes
 `reviewer-01` with tool `claude_code:reviewer-01`.

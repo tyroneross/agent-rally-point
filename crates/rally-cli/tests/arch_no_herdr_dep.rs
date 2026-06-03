@@ -176,12 +176,10 @@ fn rally_cli_source_contains_zero_backend_herdr_variant_uses() {
     // would fail; a line like `// removed alongside Backend::Herdr.`
     // is fine.
     //
-    // NOT enforced here: the BackendBins.herdr_bin/herdr_socket struct
-    // fields and the CLI `--herdr-bin`/`--herdr-socket` flags. Those
-    // remain for now as deprecation-soft compatibility (deliberately
-    // ignored at runtime via BackendRunner::new) so existing scripts
-    // and the 34-caller audit do not break. A future cleanup pass can
-    // delete them; tracked as a follow-up.
+    // ALSO enforced (post-cleanup): the BackendBins.herdr_bin/herdr_socket
+    // struct fields and the CLI `--herdr-bin`/`--herdr-socket` flags are
+    // gone. See `backend_bins_struct_has_no_herdr_fields` and
+    // `rally_cli_help_no_longer_advertises_herdr_flags` below.
     let src_dir = rally_cli_root().join("src");
     let files = ["lib.rs", "backends.rs", "cli.rs"];
     let mut violations: Vec<String> = Vec::new();
@@ -242,6 +240,94 @@ fn rally_cli_backends_enum_no_longer_has_herdr_variant() {
     assert!(
         enum_body.contains("Cmux"),
         "Backend enum must still list Cmux: {enum_body}"
+    );
+}
+
+/// Vestigial-flag cleanup: the CLI surface must no longer parse or
+/// advertise `--herdr-bin` / `--herdr-socket`. These flags were ignored at
+/// runtime once `Backend::Herdr` was removed, so a script that still passed
+/// them was getting silent no-ops; the cleanup pass deletes the surface so
+/// they are now visibly rejected by bpaf as unknown arguments.
+#[test]
+fn backend_bins_struct_has_no_herdr_fields() {
+    let cli_rs = read_to_string(&rally_cli_root().join("src").join("cli.rs"));
+    // Locate the `pub(crate) struct BackendBins { ... }` block. The walker
+    // is the same shape as `extract_function_body`, just keyed on the struct
+    // signature.
+    let sig = "pub(crate) struct BackendBins";
+    let start = cli_rs
+        .find(sig)
+        .expect("BackendBins struct must exist in cli.rs");
+    let after = &cli_rs[start..];
+    let open = after.find('{').expect("BackendBins struct must have a body");
+    let body_start = start + open;
+    let mut depth = 0_i32;
+    let bytes = cli_rs.as_bytes();
+    let mut body_end = body_start;
+    for i in body_start..bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    body_end = i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &cli_rs[body_start..body_end];
+    assert!(
+        !body.contains("herdr_bin"),
+        "BackendBins MUST NOT carry a `herdr_bin` field after Plan F cleanup: {body}"
+    );
+    assert!(
+        !body.contains("herdr_socket"),
+        "BackendBins MUST NOT carry a `herdr_socket` field after Plan F cleanup: {body}"
+    );
+    // Positive pin: tmux_bin + cmux_bin remain (the two live backends).
+    assert!(
+        body.contains("tmux_bin"),
+        "BackendBins must still declare tmux_bin: {body}"
+    );
+    assert!(
+        body.contains("cmux_bin"),
+        "BackendBins must still declare cmux_bin: {body}"
+    );
+}
+
+#[test]
+fn rally_cli_help_no_longer_advertises_herdr_flags() {
+    // The CLI top-level help text (printed when the binary is invoked with
+    // no args, or `rally help`) must not name `--herdr-bin` or
+    // `--herdr-socket`. The user-visible surface is the contract; a help
+    // string that still showed the dead flag would mislead operators.
+    //
+    // Two assertions: the help line MUST omit them, AND the clap-style
+    // `--herdr-bin=PATH`/`--herdr-socket=PATH` token must not appear in
+    // any line of the help text (defense against a future help variant).
+    use std::process::Command;
+    let bin = env!("CARGO_BIN_EXE_rally");
+    let output = Command::new(bin)
+        .arg("help")
+        .output()
+        .expect("spawn rally help");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    for forbidden in ["--herdr-bin", "--herdr-socket"] {
+        assert!(
+            !combined.contains(forbidden),
+            "`rally help` must not advertise `{forbidden}` (Plan F flag cleanup); \
+             full help:\n{combined}"
+        );
+    }
+    // Positive pin: the run-subcommand summary line stays present (we did
+    // not accidentally delete the whole entry while removing the flag).
+    assert!(
+        combined.contains("rally run"),
+        "`rally help` is missing the `rally run` summary line: {combined}"
     );
 }
 
