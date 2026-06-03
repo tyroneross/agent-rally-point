@@ -29,7 +29,7 @@ Rally owns the primary product path:
 - `enter`, `next`, `say`, `room`, `check`, `run`, `sessions`, `inject`,
   `attach`, `capture`, `stop`, `locate`, `recent`, `lead`, `backlog`, and
   `mission` are the load-bearing commands.
-- Managed sessions own live delivery into tmux, Herdr, and cmux panes.
+- Managed sessions own live delivery into tmux, cmux, and ptyd panes.
 
 Network transport remains out of scope. Files, Git, rsync, shared folders, A2A,
 or a future service can move facts; Rally defines what the bytes mean.

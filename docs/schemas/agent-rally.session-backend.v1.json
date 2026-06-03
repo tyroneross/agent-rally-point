@@ -8,7 +8,7 @@
     "schema": { "const": "agent-rally.session-backend.v1" },
     "backend": {
       "type": "string",
-      "description": "Concrete backend id such as tmux, herdr, cmux, or ci."
+      "description": "Concrete backend id such as tmux, cmux, ptyd, or ci."
     },
     "available": {
       "type": "boolean",

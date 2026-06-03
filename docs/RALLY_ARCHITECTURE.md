@@ -29,7 +29,7 @@ Rally should own:
 - Current room state projected from those facts.
 - Agent entry state.
 - Boundary checks before shared work collides.
-- Managed-session delivery into addressable tmux, Herdr, and cmux panes.
+- Managed-session delivery into addressable tmux, cmux, and ptyd panes.
 
 Rally should not own:
 
@@ -51,7 +51,7 @@ Rally should not own:
 .rally/facts.db                derived sqlite cache (gitignored; rebuildable)
 .rally/cursors.json            per-tool read cursors (gitignored; a write-through cache — the ledger is authoritative)
 enter/next/room/check          product APIs derived from the segments
-managed sessions               tmux, Herdr, and cmux launch/inject/capture/stop
+managed sessions               tmux, cmux, and ptyd launch/inject/capture/stop
 ```
 
 The per-repo **`.rally/log/` segments are the source of truth** (R5 segmentation).
@@ -239,7 +239,7 @@ The contract:
   injection, pane notification, resume-only context, or automation
   failure/warning.
 - Durable always-on monitoring belongs in host-native packaging such as launchd,
-  systemd, CI, Herdr, or cmux. Ad hoc background shells are for short active
+  systemd, CI, cmux, or ptyd. Ad hoc background shells are for short active
   sessions only.
 
 This keeps Rally optimized for coordination instead of process supervision. If
@@ -417,10 +417,11 @@ optionally wait for a resolve/ack fact
 Hard-coded backends, in order:
 
 - tmux: first implementation and baseline for macOS/Linux/WSL.
-- Herdr: visible pane/workspace backend with native `agent start`,
-  `agent send`, `agent read`, `agent attach`, and pane lifecycle commands.
 - cmux: visible surface/workspace backend with native `new-workspace`, `send`,
   `read-screen`, `select-workspace`, and `close-workspace` commands.
+- ptyd: visible pane/workspace backend with `pane send-keys`, `pane send-text`,
+  `agent send`, and pane lifecycle commands. (Replaces the legacy Herdr backend
+  removed in Plan F; Easy Terminal's app daemon socket is `ptyd.sock`.)
 
 No dynamic backend/plugin system is needed until this contract stabilizes and a
 third-party runtime needs to implement it. Unmanaged existing panes remain
@@ -435,8 +436,8 @@ and records completion through Rally facts.
 Required managed backends:
 
 - tmux
-- Herdr
 - cmux
+- ptyd
 - CI
 
 Backend status should report addressability, not abstract health:
@@ -473,10 +474,10 @@ Each backend must define:
 
 Backend expectations by surface:
 
-- Herdr: implement the managed-session backend, track pane/tool identity, and
-  make it easy for an operator agent to read panes and route work. Herdr may
+- ptyd: implement the managed-session backend, track pane/tool identity, and
+  make it easy for an operator agent to read panes and route work. ptyd may
   wake a standby pane with focused `agent send` or pane injection when the host
-  exposes that primitive.
+  exposes that primitive. (Replaces the legacy Herdr backend removed in Plan F.)
 - cmux: implement the managed-session backend without pretending cmux owns the
   coordination state. cmux may notify or inject into sessions, but the room
   state remains Rally-owned.
@@ -543,13 +544,13 @@ Phase 2: Product build.
 - Use `facts.db` as the internal SQLite projection for queries.
 - Add journey tests for stable command contracts.
 
-Phase 3: Managed-session loop.
+Phase 3: Managed-session loop. (historical — Herdr was removed in Plan F; ptyd is the current visible-pane backend.)
 
 - Implement tmux-backed `run`, `sessions`, and `inject`.
 - Add Herdr and cmux managed-session backends.
 - Add CI read-only room checks and optional handoff export checks.
 
-Phase 4: Dogfood.
+Phase 4: Dogfood. (historical — see Phase 3 note.)
 
 - Run Claude + Codex in Herdr against the same repo.
 - Verify a fresh agent becomes useful in under 10 seconds.

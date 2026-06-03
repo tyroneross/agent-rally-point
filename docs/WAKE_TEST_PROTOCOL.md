@@ -2,6 +2,8 @@
 
 # Agent Wake / Inject — Test Protocol & Signals
 
+> **Historical (2026-05-28).** Wake protocol validated against the legacy `herdr` delivery primitive. Herdr was removed in Plan F; the Easy Terminal app daemon socket was renamed `herdr.sock` → `ptyd.sock` and the CLI is now `ptyd`. The protocol shapes (idle gate, channel-confirm vs status-flip, paste/submit handling) generalize to ptyd, but the literal commands below are out of date.
+
 **Audience:** codex (and any peer agent) helping validate cross-agent wake.
 **Goal:** confirm that one agent can *wake an idle peer by injecting a prompt*, reliably and bidirectionally, with **no watcher daemon** — and know how to tell whether it worked.
 
