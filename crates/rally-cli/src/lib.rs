@@ -2701,10 +2701,43 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     // or the SEC-015 audit trail.
     rally_protocol::ledger::validate_agent_id(&sender_tool)
         .map_err(|e| RallyError::Usage(format!("invalid --tool sender id: {e}")))?;
-    let session = find_session(&target)?;
-    let handoff = args.handoff;
-    let is_text_inject = args.text.is_some();
-    let text = match (args.text, handoff.as_deref()) {
+
+    // Two-arm target resolution: managed session (legacy dual-delivery,
+    // unchanged), or rally-termd-registered ledger agent (ledger-only). See
+    // `InjectTarget` for the order-matters rationale (managed wins over id).
+    let inject_target = resolve_inject_target(&target)?;
+    match inject_target {
+        InjectTarget::Managed(session) => {
+            command_inject_managed(args.json, dry_run, urgent, sender_tool, session, args.handoff, args.text, args.require_ack, args.timeout_seconds, args.bins)
+        }
+        InjectTarget::LedgerAgent(agent_id) => {
+            command_inject_ledger(args.json, dry_run, urgent, sender_tool, agent_id, args.handoff, args.text, args.require_ack, args.timeout_seconds)
+        }
+    }
+}
+
+/// Managed-session inject arm — the path that existed before the
+/// `resolve_inject_target` split. Behavior is byte-identical to the pre-split
+/// implementation: ledger write FIRST, then the legacy synchronous tmux/cmux
+/// backend delivery runs ALONGSIDE (intentional dual-delivery in P2; see the
+/// SEC-009 and split-enforcement notes inline below). Once rally-termd (P3) is
+/// universally deployed and the legacy backends are retired, this arm folds
+/// into the ledger-only one.
+#[allow(clippy::too_many_arguments)]
+fn command_inject_managed(
+    json: bool,
+    dry_run: bool,
+    urgent: bool,
+    sender_tool: String,
+    session: ManagedSession,
+    handoff: Option<String>,
+    text_arg: Option<String>,
+    require_ack: bool,
+    timeout_seconds: i64,
+    bins: BackendBins,
+) -> Result<Output> {
+    let is_text_inject = text_arg.is_some();
+    let text = match (text_arg, handoff.as_deref()) {
         (Some(text), _) => text,
         (None, Some(handoff)) => handoff_prompt(&session, handoff),
         (None, None) => {
@@ -2713,13 +2746,12 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
             ));
         }
     };
-    let require_ack = args.require_ack;
     if require_ack && handoff.is_none() {
         return Err(RallyError::Usage(
             "--require-ack requires --handoff or --ref".to_string(),
         ));
     }
-    let timeout = args.timeout_seconds as u64;
+    let timeout = timeout_seconds as u64;
 
     // Open the room once for all appends in this command.
     let room = if !dry_run {
@@ -2752,7 +2784,7 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     };
 
     let backend_parsed = Backend::parse(&session.backend)?;
-    let backend_runner = BackendRunner::new(backend_parsed, args.bins);
+    let backend_runner = BackendRunner::new(backend_parsed, bins);
     let live_target = if dry_run {
         session.target.clone()
     } else {
@@ -2833,7 +2865,8 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
 
     let wake_intent = inject_wake_intent_with_room(
         room.as_ref(),
-        &session,
+        Some(&session),
+        &session.tool,
         handoff.as_deref(),
         &commands,
         dry_run,
@@ -2851,9 +2884,11 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     } else {
         None
     };
+    let session_id_for_text = session.session_id.clone();
     let inject_payload = InjectData {
         mode: if dry_run { "dry-run" } else { "inject" },
-        session: session.clone(),
+        session: Some(session),
+        target_kind: "managed_session",
         handoff,
         require_ack,
         ack: ack.clone(),
@@ -2878,10 +2913,152 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
         },
     )?;
     let text = format!(
-        "inject session={} delivered={} ack={}",
-        session.session_id, delivered, has_ack,
+        "inject session={session_id_for_text} delivered={delivered} ack={has_ack}",
     );
-    Ok(Output::new(args.json, text, body))
+    Ok(Output::new(json, text, body))
+}
+
+/// Ledger-only inject arm — the new path that unblocks rally-termd-registered
+/// ptyd-pane agents (e.g. an `agent.register`-bound `claude` identity that has
+/// NO `ManagedSession` record). Delivery is ledger-only: the typed Directive
+/// lands in `.rally/inbox/<agent>.jsonl` and the daemon (`rally-termd`)
+/// performs the PTY-write + posts the Receipt. NO legacy tmux/cmux backend
+/// fires — that's the second-bug fix referenced in the orchestrator brief
+/// (the managed-session arm intentionally double-delivers in P2; the
+/// ledger-only arm never did and never should).
+///
+/// SEC-017 boundary: this function only WRITES the Directive. The actual
+/// PTY-write is rally-termd's responsibility — its `authorize()` gate /
+/// `--injector` allowlist is the runtime authorization check, NOT this writer.
+#[allow(clippy::too_many_arguments)]
+fn command_inject_ledger(
+    json: bool,
+    dry_run: bool,
+    urgent: bool,
+    sender_tool: String,
+    agent_id: String,
+    handoff: Option<String>,
+    text_arg: Option<String>,
+    require_ack: bool,
+    timeout_seconds: i64,
+) -> Result<Output> {
+    let is_text_inject = text_arg.is_some();
+    let text = match (text_arg, handoff.as_deref()) {
+        (Some(text), _) => text,
+        (None, Some(handoff)) => handoff_prompt_ledger(&agent_id, handoff),
+        (None, None) => {
+            return Err(RallyError::Usage(
+                "inject requires --text or --handoff".to_string(),
+            ));
+        }
+    };
+    if require_ack && handoff.is_none() {
+        return Err(RallyError::Usage(
+            "--require-ack requires --handoff or --ref".to_string(),
+        ));
+    }
+    let timeout = timeout_seconds as u64;
+
+    let room = if !dry_run {
+        Some(RoomStore::open()?)
+    } else {
+        None
+    };
+
+    let ack_after_seq = if require_ack && !dry_run {
+        room.as_ref()
+            .map(|r| r.snapshot().map(|s| s.max_seq))
+            .transpose()?
+    } else {
+        None
+    };
+
+    let content_fact = if is_text_inject {
+        let fact = if let Some(ref r) = room {
+            inject_content_fact(r, &sender_tool, &agent_id, &text)?
+        } else {
+            inject_content_fact_dry_run(&sender_tool, &agent_id, &text)
+        };
+        Some(fact)
+    } else {
+        None
+    };
+
+    // Ledger-only delivery: write the Directive, report `pending`. No backend
+    // is parsed, no backend runner is constructed, no `backend_runner.inject`
+    // is called — this is the fix for the orchestrator brief's "second bug"
+    // (double-delivery on the ledger-only path). The managed-session arm
+    // above keeps its intentional dual-delivery for P2 tmux/cmux.
+    let (directive_seq, directive_to, delivery_state): (
+        Option<u64>,
+        Option<String>,
+        &'static str,
+    ) = if dry_run {
+        (None, None, "pending")
+    } else {
+        match inject_via_ledger(&repo_root()?, &agent_id, &sender_tool, &text, urgent) {
+            Ok(seq) => (Some(seq), Some(agent_id.clone()), "pending"),
+            Err(_) => (None, Some(agent_id.clone()), "failed"),
+        }
+    };
+
+    // No backend commands on the ledger-only path; surface an empty plan.
+    let commands: Vec<Vec<String>> = Vec::new();
+
+    let wake_intent = inject_wake_intent_with_room(
+        room.as_ref(),
+        None,
+        &agent_id,
+        handoff.as_deref(),
+        &commands,
+        dry_run,
+    )?;
+    let ack = if require_ack && !dry_run {
+        let handoff = handoff.as_deref().unwrap_or_default();
+        let ack_room = room.as_ref().expect("room must be open for --require-ack");
+        Some(wait_for_resolution(
+            handoff,
+            timeout,
+            ack_after_seq.unwrap_or(0),
+            ack_room,
+        )?)
+    } else {
+        None
+    };
+    let inject_payload = InjectData {
+        mode: if dry_run { "dry-run" } else { "inject" },
+        session: None,
+        target_kind: "ledger_agent",
+        handoff,
+        require_ack,
+        ack: ack.clone(),
+        wake_intent,
+        commands: command_plan_json(&commands),
+        sender_tool,
+        content_fact,
+        // `delivered` is the legacy bool gated to the synchronous backend
+        // outcome. The ledger-only path never runs a backend, so `delivered`
+        // is always false here — consumers should branch on `delivery_state`
+        // (which is `pending` on a successful ledger write; rally-termd posts
+        // a Receipt to flip it to `delivered`/`seen`/`acted` out-of-band).
+        delivered: false,
+        delivery_state,
+        directive_seq,
+        directive_to,
+    };
+    let has_ack = ack.is_some();
+    let agent_for_text = agent_id;
+    let body = envelope(
+        "inject",
+        SCHEMA_INJECT,
+        InjectEnvelope {
+            inject: inject_payload,
+        },
+    )?;
+    let text = format!(
+        "inject agent={agent_for_text} delivery_state={delivery_state} ack={has_ack}",
+    );
+    Ok(Output::new(json, text, body))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3148,22 +3325,37 @@ fn inject_content_fact_dry_run(sender_tool: &str, recipient_tool: &str, text: &s
     make_inject_content_fact(sender_tool, recipient_tool, text)
 }
 
+/// Append a `wake_intent` Fact for an inject. The Fact's subject + summary
+/// vary by target kind:
+///   * managed session (legacy path) — `"wake intent delivered to <tool>"` +
+///     summary referencing the session name and backend (unchanged).
+///   * ledger-only agent (rally-termd-registered) — `"wake intent delivered
+///     to <agent>"` + summary noting the ledger-only path; no backend
+///     reference because there is no `ManagedSession.backend`.
+///
+/// `target_tool` is the logical id the Directive landed on (mirrors the
+/// `directive_to` field of `InjectData`). For managed sessions this is
+/// `session.tool`; for ledger-only it is the validated agent-id.
 fn inject_wake_intent_with_room(
     room: Option<&RoomStore>,
-    session: &ManagedSession,
+    session: Option<&ManagedSession>,
+    target_tool: &str,
     handoff: Option<&str>,
     commands: &[Vec<String>],
     dry_run: bool,
 ) -> Result<Option<Fact>> {
     let status = if dry_run { "planned" } else { "delivered" };
-    let subject = format!("wake intent delivered to {}", session.tool);
-    let summary = Some(format!(
-        "rally inject {status} for managed session {} via {}",
-        session.name, session.backend
-    ));
+    let subject = format!("wake intent delivered to {target_tool}");
+    let summary = Some(match session {
+        Some(s) => format!(
+            "rally inject {status} for managed session {} via {}",
+            s.name, s.backend
+        ),
+        None => format!("rally inject {status} via ledger for agent {target_tool}"),
+    });
     let evidence = commands.iter().map(|command| command.join(" ")).collect();
     let fact = wake_fact(
-        &session.tool,
+        target_tool,
         &subject,
         Vec::new(),
         summary,
@@ -3360,6 +3552,71 @@ fn find_session(target: &str) -> Result<ManagedSession> {
         .ok_or_else(|| RallyError::NotFound(format!("unknown managed session {target}")))
 }
 
+/// What kind of injection target a string resolves to. The two arms are the
+/// reason this enum exists at all: managed sessions go through the legacy
+/// dual-delivery path (ledger + synchronous tmux/cmux backend, intentional in
+/// P2 — see `command_inject` for the SEC-009 / split-enforcement notes); a
+/// `LedgerAgent` is a rally-termd-registered ptyd-pane identity with NO
+/// `ManagedSession` record. For those, the ledger write IS the delivery; the
+/// daemon (`rally-termd`) subscribes via kernel file-events and performs the
+/// actual PTY-write, then posts a Receipt.
+///
+/// The previous `command_inject` called `find_session(&target)?` unconditionally,
+/// which meant any agent bound through `agent.register` (without a tmux/cmux
+/// managed session record) was rejected with `"unknown managed session ..."` —
+/// even though Plan F P2 already shipped the ledger-side machinery that would
+/// have delivered the inject just fine. Resolution order is now: managed-session
+/// first (preserves all existing behavior, including the dual-delivery), then
+/// valid agent-id (ledger-only delivery), then error.
+enum InjectTarget {
+    /// `target` matched an active managed session (by `session_id`, `name`, or
+    /// `tool`). Delivery is the existing dual path: ledger write + legacy
+    /// synchronous backend inject.
+    Managed(ManagedSession),
+    /// `target` did not match a managed session but is a syntactically valid
+    /// agent-id (passes `rally_protocol::ledger::validate_agent_id`). Delivery
+    /// is ledger-only: the typed Directive lands in `.rally/inbox/<id>.jsonl`
+    /// and the daemon performs the PTY-write asynchronously.
+    LedgerAgent(String),
+}
+
+/// Resolve a positional `inject` target to either a managed session (legacy
+/// path) or a rally-termd-registered agent id (ledger-only path).
+///
+/// **Order matters**: managed-session match wins over agent-id validity. A
+/// `target` string that happens to be both a registered managed-session tool
+/// name AND a syntactically valid agent-id resolves to `Managed(_)` so the
+/// behavior for genuine tmux/cmux sessions is byte-identical to pre-change. An
+/// invalid `target` (path traversal, control char, etc.) returns the existing
+/// error rather than a generic `InvalidInput` so the failure message is
+/// unchanged for the common typo case.
+///
+/// SEC-006 / SEC-003 note: `validate_agent_id` is the same gate the ledger
+/// writer applies, so a malformed `target` cannot reach
+/// `inject_via_ledger`/`append_directive` here; ledger-side defenses stay
+/// active too.
+fn resolve_inject_target(target: &str) -> Result<InjectTarget> {
+    // 1. Active managed session (existing behavior; preserves dual-delivery).
+    if let Some(session) = read_session_records()?.into_iter().find(|session| {
+        session.session_id == target || session.name == target || session.tool == target
+    }) {
+        return Ok(InjectTarget::Managed(session));
+    }
+
+    // 2. Else, syntactically valid agent-id → ledger-only delivery to a
+    //    rally-termd-registered ptyd-pane identity (e.g. `agent.register`-bound
+    //    `claude` with no tmux/cmux session record).
+    if rally_protocol::ledger::validate_agent_id(target).is_ok() {
+        return Ok(InjectTarget::LedgerAgent(target.to_string()));
+    }
+
+    // 3. Neither managed nor a valid id — preserve the legacy error so existing
+    //    consumers (incl. tests) see the same NotFound message.
+    Err(RallyError::NotFound(format!(
+        "unknown managed session {target}"
+    )))
+}
+
 fn backend_target(backend: Backend, session_id: &str) -> String {
     match backend {
         Backend::Tmux => format!("rally-{}", sanitize_id(session_id)),
@@ -3371,6 +3628,17 @@ fn handoff_prompt(session: &ManagedSession, handoff: &str) -> String {
     format!(
         "Rally managed-session injection for {}. Run: rally next --tool {} --json. If it is actionable for handoff {}, execute the suggested Rally completion command or run: rally say resolve --tool {} --ref {} --subject 'resolved via Rally managed session' --json. Do not edit files unless the Rally action explicitly requires it. Do not ask for confirmation after the Rally command succeeds.",
         session.name, session.tool, handoff, session.tool, handoff
+    )
+}
+
+/// Ledger-only handoff prompt: same shape as [`handoff_prompt`] but addressed
+/// to a rally-termd-registered agent that has no `ManagedSession` record. The
+/// `target` is the validated agent-id used as both the `rally next --tool`
+/// argument and the resolve sender — those are the recipient's identity, not
+/// any session name.
+fn handoff_prompt_ledger(target: &str, handoff: &str) -> String {
+    format!(
+        "Rally ledger injection for {target}. Run: rally next --tool {target} --json. If it is actionable for handoff {handoff}, execute the suggested Rally completion command or run: rally say resolve --tool {target} --ref {handoff} --subject 'resolved via Rally ledger' --json. Do not edit files unless the Rally action explicitly requires it. Do not ask for confirmation after the Rally command succeeds."
     )
 }
 

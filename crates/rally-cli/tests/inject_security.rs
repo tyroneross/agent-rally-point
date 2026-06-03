@@ -84,6 +84,71 @@ fn sec006_malformed_sender_ids_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// feat/inject-ledger-target — target-side gate for the ledger-only arm.
+//
+// The pre-change resolution went through `find_session(&target)?` which
+// implicitly bounded the input to the managed-session id space. The new
+// `resolve_inject_target` falls back to `validate_agent_id` for unregistered
+// strings, so the target-side gate must reject the same SEC-003 / SEC-006
+// adversarial inputs as the sender-side gate.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn target_traversal_id_does_not_resolve_to_ledger_agent() {
+    let sandbox = ChannelSandbox::spawn();
+    // No `add_tmux_session` — there is no managed session to mask the
+    // resolution. The traversal target must NOT silently resolve via the
+    // ledger arm; it must be rejected.
+    let out = sandbox.rally_try(&[
+        "inject",
+        "../../etc/passwd",
+        "--json",
+        "--text",
+        "pwn",
+        "--tool",
+        "claude_code:test-sender",
+    ]);
+    assert!(
+        !out.status.success(),
+        "traversal target id MUST be rejected; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // No directive was written to the obvious adversarial inbox name (an
+    // implementation that mistakenly sanitized then wrote would land here).
+    assert!(
+        sandbox.read_directives("etc/passwd", 0).is_empty(),
+        "a rejected target must not have written a directive anywhere",
+    );
+    assert!(
+        sandbox.read_directives("..", 0).is_empty(),
+        "a rejected target must not have written a directive anywhere",
+    );
+}
+
+#[test]
+fn target_malformed_ids_rejected_at_resolution() {
+    let sandbox = ChannelSandbox::spawn();
+    for bad in ["", "bad/slash", ".hidden", "has space", "a\\b"] {
+        let out = sandbox.rally_try(&[
+            "inject",
+            bad,
+            "--json",
+            "--text",
+            "x",
+            "--tool",
+            "claude_code:test-sender",
+        ]);
+        assert!(
+            !out.status.success(),
+            "malformed target {bad:?} must be rejected; stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SEC-009 — urgent inject is delivered by NO backend
 // ---------------------------------------------------------------------------
 
