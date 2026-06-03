@@ -119,7 +119,19 @@ pub(crate) struct AdoptEnvelope {
 #[derive(JsonSchema, Serialize)]
 pub(crate) struct InjectData {
     pub(crate) mode: &'static str,
-    pub(crate) session: ManagedSession,
+    /// The matched managed session for `target_kind == "managed_session"`;
+    /// `None` for `target_kind == "ledger_agent"` (rally-termd-registered
+    /// ptyd-pane identities have no `ManagedSession` record).
+    ///
+    /// Serialized as `null` for ledger-only injects rather than omitted, so
+    /// downstream JSON consumers can branch on a stable field shape (the
+    /// `target_kind` field below is the authoritative discriminator).
+    pub(crate) session: Option<ManagedSession>,
+    /// Discriminator: `"managed_session"` (tmux/cmux/herdr — dual-delivery
+    /// path, intentional in P2) or `"ledger_agent"` (rally-termd-registered
+    /// agent — ledger-only delivery; rally-termd performs the PTY-write and
+    /// posts a Receipt). Consumers should branch on this, not on `session`.
+    pub(crate) target_kind: &'static str,
     pub(crate) handoff: Option<String>,
     pub(crate) require_ack: bool,
     pub(crate) ack: Option<Value>,

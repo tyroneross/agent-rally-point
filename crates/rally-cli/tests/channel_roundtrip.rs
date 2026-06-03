@@ -192,3 +192,188 @@ fn delivery_state_field_is_pending_or_delivered_never_unknown() {
         "H5: never silent-unknown — every inject MUST report a truthful state"
     );
 }
+
+// ---------------------------------------------------------------------------
+// feat/inject-ledger-target — ledger-only delivery to a rally-termd-registered
+// agent (no managed session). These tests prove the new `resolve_inject_target`
+// resolution order and the second-bug fix (no double-delivery on the
+// ledger-only path).
+// ---------------------------------------------------------------------------
+
+/// PROBLEM: before this change, `rally inject` with a target that wasn't a
+/// registered managed session errored `"unknown managed session ..."` — even
+/// though the target was a perfectly valid `agent.register`-bound ptyd-pane
+/// identity. PROOF: a fresh sandbox (no `rally run` first) accepts an inject
+/// against a valid agent-id and writes the Directive to the ledger.
+#[test]
+fn inject_to_unregistered_valid_agent_id_writes_ledger_directive() {
+    let sandbox = ChannelSandbox::spawn();
+    // No `add_tmux_session` call — the sandbox has NO registered managed
+    // sessions. The target is a syntactically valid agent-id only.
+    let agent = "claude";
+
+    let outcome = sandbox.inject_unregistered(agent, "claude_code:test-sender", "wake up");
+
+    // Directive landed.
+    assert!(
+        outcome.directive_seq.is_some(),
+        "ledger-only inject must assign a Directive seq; outcome={outcome:?}",
+    );
+    // Reports `pending` (rally-termd will post a Receipt when it executes the
+    // PTY-write; absent the daemon the state stays `pending`).
+    assert_eq!(
+        outcome.delivery_state, "pending",
+        "ledger-only inject must report pending (no legacy backend to flip it); outcome={outcome:?}",
+    );
+    assert!(
+        !outcome.delivered,
+        "the `delivered` legacy bool tracks the synchronous backend outcome; \
+         the ledger-only path never runs one. outcome={outcome:?}",
+    );
+    // directive_to mirrors the resolved agent id (not a session.tool).
+    assert_eq!(
+        outcome.directive_to.as_deref(),
+        Some(agent),
+        "directive_to must be the resolved agent-id on the ledger-only path",
+    );
+    // target_kind discriminator is the authoritative shape signal.
+    assert_eq!(
+        outcome.raw["target_kind"].as_str(),
+        Some("ledger_agent"),
+        "target_kind must signal ledger_agent for an unregistered valid id",
+    );
+    // session is null on the ledger-only path (was unconditionally required
+    // before the change — that's the root cause of the bug we're fixing).
+    assert!(
+        outcome.raw["session"].is_null(),
+        "session must be null when there is no ManagedSession backing the target",
+    );
+
+    // Reader-side proof: the Directive is on disk under the agent's inbox,
+    // not under any session.tool name.
+    let directives = sandbox.read_directives(agent, 0);
+    assert_eq!(
+        directives.len(),
+        1,
+        "exactly one Directive in the agent's ledger inbox",
+    );
+    let d = &directives[0];
+    assert_eq!(d.to, agent, "Directive.to is the agent-id, not a session.tool");
+    assert_eq!(d.from, "claude_code:test-sender");
+    assert_eq!(d.text.as_deref(), Some("wake up"));
+    assert!(!d.urgent);
+}
+
+/// SECOND-BUG FIX: the orchestrator brief calls out that the managed-session
+/// arm DELIBERATELY double-delivers (ledger Directive + legacy tmux/cmux
+/// backend, intentional in P2). The ledger-only arm MUST NOT — it has no
+/// backend to call. PROOF: a ledger-only inject's `commands` plan is empty
+/// (the legacy backend was never queried) and the `delivered` bool is always
+/// false (no backend success could have flipped it true).
+#[test]
+fn inject_ledger_only_does_not_double_deliver_via_backend() {
+    let sandbox = ChannelSandbox::spawn();
+    let agent = "termd-pane-agent";
+
+    let outcome = sandbox.inject_unregistered(agent, "claude_code:test-sender", "x");
+
+    // The legacy `delivered` bool tracks the synchronous backend outcome. On
+    // the ledger-only path there is no backend; this MUST be false.
+    assert!(
+        !outcome.delivered,
+        "ledger-only inject must NOT report `delivered: true` — that would mean \
+         the legacy synchronous backend ran ALONGSIDE the ledger write, which is \
+         the second bug we're fixing. outcome={outcome:?}",
+    );
+    // The `commands` plan is the legacy backend's keystroke plan. Empty here
+    // proves the backend path was never traversed.
+    let commands = outcome.raw["commands"].as_array().expect("commands array");
+    assert!(
+        commands.is_empty(),
+        "ledger-only inject must have an empty commands plan (no backend to \
+         build keystrokes for); got {commands:?}",
+    );
+}
+
+/// PROOF of the resolution-order contract: managed-session match wins over
+/// agent-id validity. If a `target` string happens to be both a registered
+/// managed-session tool AND a syntactically valid agent-id, the managed arm
+/// fires and the legacy dual-delivery is preserved.
+#[test]
+fn inject_managed_session_wins_over_agent_id_when_both_resolve() {
+    let sandbox = ChannelSandbox::spawn();
+    let name = unique_name("dual");
+    let target = sandbox.add_tmux_session(&name);
+    // `target` is now BOTH a valid managed-session name AND a valid agent-id
+    // (it's an allowlist-clean string). The managed-session arm must fire.
+
+    let outcome = sandbox.inject(&target, "claude_code:test-sender", "hello");
+
+    assert_eq!(
+        outcome.raw["target_kind"].as_str(),
+        Some("managed_session"),
+        "a target that matches an active managed session MUST resolve as \
+         managed_session, NOT ledger_agent (resolution-order contract)",
+    );
+    // session must be present (preserves existing consumers that read
+    // /data/inject/session/name etc.).
+    assert!(
+        outcome.raw["session"].is_object(),
+        "session must be present on the managed-session arm; got {:?}",
+        outcome.raw["session"],
+    );
+    // commands plan is non-empty (the legacy backend produces tmux keystrokes
+    // even with the tmux-true stub).
+    let commands = outcome.raw["commands"].as_array().expect("commands array");
+    assert!(
+        !commands.is_empty(),
+        "managed-session inject must produce a backend command plan; got empty"
+    );
+}
+
+/// PROOF the invalid-id arm preserves the existing error message so an
+/// operator who typo'd a session name doesn't get a confusing path-traversal
+/// error. The lib's `resolve_inject_target` returns `unknown managed session
+/// {target}` for both (a) a clean string that just doesn't match any session
+/// AND (b) garbage that can't be a valid agent-id either. Together with
+/// `inject_security.rs::sec006_malformed_sender_ids_rejected` (which covers
+/// the sender id), this gates the target-side too.
+#[test]
+fn inject_to_invalid_target_id_is_rejected_at_resolution() {
+    let sandbox = ChannelSandbox::spawn();
+
+    // `..` is not a valid agent-id AND not a registered session. Must error.
+    let out = sandbox.rally_try(&[
+        "inject",
+        "..",
+        "--json",
+        "--text",
+        "x",
+        "--tool",
+        "claude_code:test-sender",
+    ]);
+    assert!(
+        !out.status.success(),
+        "an invalid target id MUST be rejected; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // A target carrying a path separator likewise must not write anything to
+    // a ledger inbox.
+    let bad = sandbox.rally_try(&[
+        "inject",
+        "bad/slash",
+        "--json",
+        "--text",
+        "x",
+        "--tool",
+        "claude_code:test-sender",
+    ]);
+    assert!(
+        !bad.status.success(),
+        "a target id with a path separator MUST be rejected; stdout={} stderr={}",
+        String::from_utf8_lossy(&bad.stdout),
+        String::from_utf8_lossy(&bad.stderr),
+    );
+}

@@ -188,6 +188,48 @@ impl ChannelSandbox {
         self.inject_with_flags(target, sender_tool, text, false)
     }
 
+    /// Invoke `rally inject` against a target that is NOT a registered managed
+    /// session (the ledger-only path: rally-termd-registered ptyd-pane agent).
+    /// Skips the `--tmux-bin` flag because the ledger arm never touches a
+    /// backend runner. Used by the feat/inject-ledger-target tests.
+    pub fn inject_unregistered(
+        &self,
+        agent_id: &str,
+        sender_tool: &str,
+        text: &str,
+    ) -> InjectOutcome {
+        let envelope = self.rally_json(&[
+            "inject",
+            agent_id,
+            "--json",
+            "--text",
+            text,
+            "--tool",
+            sender_tool,
+        ]);
+        let inject = envelope
+            .pointer("/data/inject")
+            .unwrap_or_else(|| panic!("envelope has no /data/inject: {envelope}"))
+            .clone();
+        InjectOutcome {
+            delivered: inject
+                .get("delivered")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            delivery_state: inject
+                .get("delivery_state")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            directive_seq: inject.get("directive_seq").and_then(Value::as_u64),
+            directive_to: inject
+                .get("directive_to")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            raw: inject,
+        }
+    }
+
     /// Variant that accepts the Plan F `--urgent` flag.
     pub fn inject_with_flags(
         &self,
