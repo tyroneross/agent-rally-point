@@ -25,7 +25,7 @@ agent-rally-point has **two structurally divergent architecture lines**, and `ma
 | Where | `main` (HEAD 62c8dbf, 05-28), `integration` (fc08d85, 05-28 — freshest), PR46's base | `codex/rally-global-discovery` ← **your current checkout** (3d9e567, **05-26**), `codex/rally2-primary-path`, `codex/rally2-standby-wake-contract` |
 | Crates | **1**: `rally-cli` only (`check.rs` / `next.rs` / `store.rs` / `discovery.rs` / `backends.rs`) | **4–5**: `rally-core` + `rally-trust` + `rally-protocol` + `rally-cli` (+`rally2-cli`) |
 | Event model | one flat `Fact` struct, `RoomSnapshot` of `Vec<Fact>` buckets | typed `EventKind` + per-kind `EventPayload` enum, `TraceProjection` over `Vec<Value>` |
-| Features | predictive contracts + receipts (PR46), wake-intent facts, room discovery, managed sessions | roles/specialization, trust six-state policy, judgment layer (`judge`/`hook`), adapters (cmux/herdr), ranked `next`, ContextBrief |
+| Features | predictive contracts + receipts (PR46), wake-intent facts, room discovery, managed sessions | roles/specialization, trust six-state policy, judgment layer (`judge`/`hook`), adapters (cmux/herdr — historical; herdr removed in Plan F), ranked `next`, ContextBrief |
 | Status | **won** — `main` is now the product | **abandoned by main** — `0d5024b refactor: remove legacy rally implementation` |
 
 **Timeline (verified):** the two lines share merge-base `96b057f` (05-26 22:23). Your attuned

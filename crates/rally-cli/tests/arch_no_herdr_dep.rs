@@ -331,6 +331,46 @@ fn rally_cli_help_no_longer_advertises_herdr_flags() {
     );
 }
 
+/// Post-cleanup: `detect_host_runtime` MUST no longer read the legacy
+/// `HERDR_SOCKET_PATH` env var or probe any `herdr.sock` path. The renamed
+/// socket is `ptyd.sock`; the env var is `PTYD_SOCKET_PATH` (Easy Terminal
+/// app daemon renamed its socket, ptyd dropped HERDR_SOCKET_PATH). If a
+/// future refactor reintroduces the legacy names this test fires.
+#[test]
+fn detect_host_runtime_no_longer_references_herdr_socket() {
+    // Strip line-comments before scanning so a narrative comment like
+    // "(was herdr.sock, renamed to ptyd.sock)" doesn't trip the gate.
+    // Block-comment stripping is not needed — `detect_host_runtime` has none.
+    let lib_rs = read_to_string(&rally_cli_root().join("src").join("lib.rs"));
+    let fn_body_raw = extract_function_body(&lib_rs, "fn detect_host_runtime(")
+        .expect("detect_host_runtime function must exist in lib.rs");
+    let code_only: String = fn_body_raw
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(idx) => &line[..idx],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code_only.contains("HERDR_SOCKET_PATH"),
+        "detect_host_runtime MUST NOT read HERDR_SOCKET_PATH (use PTYD_SOCKET_PATH): {code_only}"
+    );
+    assert!(
+        !code_only.contains("herdr.sock"),
+        "detect_host_runtime MUST NOT probe herdr.sock paths (use ptyd.sock): {code_only}"
+    );
+    // Positive pin: the new env var + socket name are present.
+    assert!(
+        code_only.contains("PTYD_SOCKET_PATH"),
+        "detect_host_runtime must read PTYD_SOCKET_PATH: {code_only}"
+    );
+    assert!(
+        code_only.contains("ptyd.sock"),
+        "detect_host_runtime must probe ptyd.sock paths: {code_only}"
+    );
+}
+
 /// Best-effort extract a `fn <name>(...)` body — finds the function
 /// signature, walks `{` to balanced `}`. Returns `None` if the function
 /// isn't found. Good enough for an arch lint that just greps for

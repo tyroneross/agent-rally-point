@@ -5,6 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # Assessment — codex rally hook desync + missing wall-clock bound (2026-05-31)
 
+> **Historical (2026-05-31).** References to `--backend herdr` and herdr lifecycle commands describe the state of the world before Plan F removed the herdr backend. Easy Terminal's app daemon socket has since been renamed `herdr.sock` → `ptyd.sock`.
+
 Field report from dogfooding parallel agents in Easy Terminal. Surfaced while
 diagnosing orphaned, unkillable `rally hook` processes. Ties directly to **B17**
 (one-store retirement) and the **lazy-auto-enter / no-hook** design principle.

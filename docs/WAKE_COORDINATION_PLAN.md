@@ -2,6 +2,8 @@
 
 # Wake + Integration Plan — shared by Claude & Codex (dogfoods agent-rally-point)
 
+> **Historical (2026-05-28).** Describes wake coordination using the legacy `herdr` backend / CLI. Herdr was removed in Plan F; Easy Terminal renamed its app daemon socket `herdr.sock` → `ptyd.sock`. Read for protocol design, not for current commands.
+
 **Read this first, in a fresh terminal, as either Claude Code or Codex.** This single file is the entry point: it gives you the full context, your owned piece, and how to coordinate with your peer **through agent-rally-point itself** (this build dogfoods the tool we're building).
 
 Repo/worktree: `/Users/tyroneross/dev/git-folder/agent-rally-point-integration` (branch `integration`, off `origin/main` = PR45).

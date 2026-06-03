@@ -103,7 +103,7 @@ engagement segment.
 | Python watcher | `tools/agent-rally-watcher/` still watches legacy `~/.agent-rally-point/apps/<app>/changes.jsonl` | Keep as reference only until native parity; do not use as active product path | It documents useful dispatch behavior but points at the wrong canonical store. |
 | Build Loop embedded bridge | Local Build Loop still contains `scripts/rally_point/**`, `scripts/agent_rally.py`, `coordination_status.py`, and `coordination_rally.py` with legacy fallback references | Build Loop should resolve to the owning repo and shell to native `rally` for writes, or use a bridge that writes repo-local `.rally/log` | This prevents Build Loop-managed agents from becoming invisible to native-rally agents. |
 | Easy Terminal | Easy Terminal docs require ET work to coordinate from `/Users/tyroneross/dev/git-folder/easy-terminal/.rally` | Keep ET coordination in Easy Terminal's repo, even when editing Rally or ptyd as support work | The owner of the work owns the ledger. Do not centralize project facts into Agent Rally Point. |
-| Host runtime | `rally whoami` sees Easy Terminal Herdr socket and `under_herdr: true` | Treat as delivery/runtime context, not source-of-truth storage | Herdr can inject/capture sessions; it should not determine where facts are stored. |
+| Host runtime | `rally whoami` sees Easy Terminal's ptyd socket and `under_ptyd: true` | Treat as delivery/runtime context, not source-of-truth storage | ptyd can inject/capture sessions; it should not determine where facts are stored. |
 
 ## Recommendations
 
