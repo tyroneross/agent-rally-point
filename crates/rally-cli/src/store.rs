@@ -251,7 +251,7 @@ fn fact_schema() -> String {
 /// `status` is "active" if `last_seen_ts` is within the last 15 minutes,
 /// "idle" otherwise.  The 15-minute threshold is intentionally generous so
 /// agents that are doing long computes don't flicker out of the squad view.
-#[derive(Clone, Debug, Default, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 pub(crate) struct Squad {
     pub(crate) tool: String,
     pub(crate) last_seen_seq: i64,
@@ -284,7 +284,7 @@ pub(crate) fn acknowledged_tools(facts: &[Fact]) -> std::collections::BTreeSet<S
 ///
 /// Surfaced only under `rally room --readers`; omitted from the default room
 /// output to avoid bloat.
-#[derive(Clone, Debug, Default, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 pub(crate) struct ReadReceipt {
     pub(crate) tool: String,
     pub(crate) last_read_seq: i64,
@@ -293,7 +293,7 @@ pub(crate) struct ReadReceipt {
     pub(crate) status: String,
 }
 
-#[derive(Clone, Debug, Default, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 pub(crate) struct RoomSnapshot {
     pub(crate) max_seq: i64,
     /// R10: highest seq of a substantive (non-read-checkpoint) fact.
@@ -318,21 +318,22 @@ pub(crate) struct RoomSnapshot {
     /// Distinct tools that have entered or authored facts in this room.
     pub(crate) squads: Vec<Squad>,
     /// Tool asserting the `role:lead` decision, if any.
+    #[serde(default)]
     pub(crate) lead: Option<String>,
     /// Seq of the latest lead-family decision (`role:lead` or relinquish).
     /// Agents can use this as a cheap epoch to detect stale lead context.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) lead_epoch: Option<i64>,
     /// R10: per-tool read receipts projected from `FactKind::Read` checkpoints.
     /// Populated only when `include_readers` is requested (see
     /// `RoomStore::snapshot_with_readers`); empty in the default snapshot.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) readers: Vec<ReadReceipt>,
     /// Current room north-star text, projected from the latest `FactKind::Mission`
     /// fact whose scope contains `"mission"`. `None` when no mission has been set.
     /// Omitted from JSON when unset so existing B16-style round-trip tests are
     /// unaffected.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mission: Option<String>,
 }
 
@@ -2065,6 +2066,155 @@ impl RoomStore {
             }
         }
     }
+}
+
+// =============================================================================
+// Snapshot fast-path cache (B-perf): bound read-only snapshot cost under load
+// =============================================================================
+//
+// Under heavy CPU contention the `RoomStore::open()` + `snapshot()` path is
+// dominated by:
+//   (a) the LOCK_EX `mutation.lock` flock (serializes every rally invocation,
+//       reader OR writer, against any concurrent writer's open),
+//   (b) `reconcile_segments_and_db` reading every JSONL line in every segment
+//       to count distinct seqs vs. the SQLite event count, and
+//   (c) the SQLite query that deserializes the full Fact set to project a
+//       `RoomSnapshot`.
+//
+// All three are O(N) in ledger size and become the bottleneck on a busy box.
+// The before-write coordination gate is a hot path called from agent
+// write-hooks; if it cannot return in the 3s watchdog budget, the watchdog
+// fires fail-open (i.e. NO coordination check applied — the worst possible
+// outcome for a gate whose entire purpose is preventing two agents from
+// clobbering one claimed path).
+//
+// Mitigation: when the canonical ledger has not changed since the last
+// snapshot we projected, reuse that snapshot directly from a tiny on-disk
+// cache instead of reopening the database. Cache freshness is checked
+// against a fingerprint of `(facts.db mtime_ns, log/index.json mtime_ns +
+// content)`. The log-index is refreshed on every append (`refresh_log_index`
+// runs at the end of `append_fact`); a writer that mutates the room thus
+// inevitably invalidates the cache, even when it never touches the cache
+// file itself.
+//
+// The cache is *advisory* — a miss only costs the existing slow path; a
+// corrupt cache file is treated as a miss. Readers do NOT take the mutation
+// lock on the fast path: the cache is read-only and the underlying canonical
+// files are append-only, so a reader that observes a fingerprint can rely
+// on it being a consistent view of the ledger at that moment in time. The
+// fingerprint mechanism is the only correctness gate.
+
+const SNAPSHOT_CACHE_FILENAME: &str = "snapshot.cache.json";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SnapshotCacheEnvelope {
+    /// Fingerprint of the canonical inputs at the time of caching. A cache
+    /// is fresh iff this matches the current fingerprint exactly.
+    fingerprint: SnapshotCacheFingerprint,
+    /// Projected `RoomSnapshot` for the fingerprinted ledger state.
+    snapshot: RoomSnapshot,
+    /// ISO-8601 stamp for observability (not part of the freshness check).
+    cached_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct SnapshotCacheFingerprint {
+    /// `facts.db` modification time in nanoseconds since the unix epoch.
+    /// 0 when the db file is absent (a perfectly valid empty-room state).
+    facts_db_mtime_ns: i128,
+    /// Inline copy of the `log/index.json` content. Comparing the full text
+    /// is cheaper than re-parsing the JSON and gives strictly-stronger
+    /// freshness than mtime alone (the index file is rewritten on every
+    /// append even when the highest seq does not change — e.g. the index
+    /// re-stamps `updated_at`). Bounded in size by the live segment count,
+    /// not by the line count.
+    log_index_text: String,
+}
+
+fn snapshot_cache_path(rally_dir: &Path) -> PathBuf {
+    rally_dir.join(SNAPSHOT_CACHE_FILENAME)
+}
+
+fn file_mtime_ns(path: &Path) -> i128 {
+    let Ok(meta) = fs::metadata(path) else {
+        return 0;
+    };
+    let Ok(modified) = meta.modified() else {
+        return 0;
+    };
+    match modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i128,
+        Err(err) => -(err.duration().as_nanos() as i128),
+    }
+}
+
+fn current_fingerprint(rally_dir: &Path) -> SnapshotCacheFingerprint {
+    let facts_db = rally_dir.join("facts.db");
+    let log_index = rally_dir.join(LOG_DIRNAME).join(LOG_INDEX_FILENAME);
+    SnapshotCacheFingerprint {
+        facts_db_mtime_ns: file_mtime_ns(&facts_db),
+        log_index_text: fs::read_to_string(&log_index).unwrap_or_default(),
+    }
+}
+
+/// Read-only snapshot retrieval: return the cached `RoomSnapshot` when its
+/// fingerprint matches the current canonical state. `None` when the cache is
+/// absent, unparseable, or stale. No mutation lock is acquired and no SQLite
+/// connection is opened on a hit; this is the path the before-write gate
+/// takes under sub-100ms targets.
+pub(crate) fn try_load_cached_snapshot(rally_dir: &Path) -> Option<RoomSnapshot> {
+    let cache_path = snapshot_cache_path(rally_dir);
+    let text = fs::read_to_string(&cache_path).ok()?;
+    let envelope: SnapshotCacheEnvelope = serde_json::from_str(&text).ok()?;
+    let now = current_fingerprint(rally_dir);
+    if envelope.fingerprint == now {
+        Some(envelope.snapshot)
+    } else {
+        None
+    }
+}
+
+/// Persist `snapshot` under the current fingerprint. Atomic temp+rename; any
+/// IO error is swallowed (the cache is advisory — a failed write only forces
+/// the next reader through the slow path).
+pub(crate) fn write_snapshot_cache(rally_dir: &Path, snapshot: &RoomSnapshot) {
+    let envelope = SnapshotCacheEnvelope {
+        fingerprint: current_fingerprint(rally_dir),
+        snapshot: snapshot.clone(),
+        cached_at: now_string(),
+    };
+    let Ok(rendered) = serde_json::to_string(&envelope) else {
+        return;
+    };
+    let cache_path = snapshot_cache_path(rally_dir);
+    let Some(parent) = cache_path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let temp_path = cache_path.with_extension(format!("json.tmp-{}", short_id()));
+    if fs::write(&temp_path, rendered).is_err() {
+        let _ = fs::remove_file(&temp_path);
+        return;
+    }
+    if fs::rename(&temp_path, &cache_path).is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+}
+
+/// Resolve the `.rally` directory for `repo_root` and return a cached
+/// snapshot when one is available. Convenience wrapper used by hot read-only
+/// paths (the before-write gate today; status / next / room are candidates
+/// for a follow-up extension).
+pub(crate) fn try_load_cached_snapshot_for(repo_root: &Path) -> Option<RoomSnapshot> {
+    try_load_cached_snapshot(&repo_root.join(".rally"))
+}
+
+/// Convenience writer keyed by `repo_root` rather than the inner `.rally`
+/// directory. Same fail-soft semantics as [`write_snapshot_cache`].
+pub(crate) fn write_snapshot_cache_for(repo_root: &Path, snapshot: &RoomSnapshot) {
+    write_snapshot_cache(&repo_root.join(".rally"), snapshot);
 }
 
 #[cfg(test)]

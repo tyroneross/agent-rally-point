@@ -417,17 +417,18 @@ pub(crate) struct AdoptArgs {
 #[derive(Clone, Debug)]
 pub(crate) struct BackendBins {
     pub(crate) tmux_bin: String,
-    pub(crate) herdr_bin: String,
-    pub(crate) herdr_socket: Option<String>,
     pub(crate) cmux_bin: String,
 }
+
+// PROVENANCE: previously held `herdr_bin: String` and `herdr_socket: Option<String>`
+// for the legacy `Backend::Herdr` lane. Both were dropped when the herdr backend
+// was removed in Plan F (Chunk 3); the CLI surface (`--herdr-bin` / `--herdr-socket`)
+// is removed in the same cleanup pass that retired this struct's herdr fields.
 
 impl Default for BackendBins {
     fn default() -> Self {
         Self {
             tmux_bin: "tmux".to_string(),
-            herdr_bin: "herdr".to_string(),
-            herdr_socket: None,
             cmux_bin: "cmux".to_string(),
         }
     }
@@ -1201,19 +1202,15 @@ fn watch_parser() -> impl Parser<WatchArgs> {
 }
 
 fn backend_bins_parser() -> impl Parser<BackendBins> {
+    // PROVENANCE: previously also parsed `--herdr-bin <PATH>` and `--herdr-socket <PATH>`
+    // for `Backend::Herdr`. Both flags were ignored at runtime once Plan F retired the
+    // herdr lane (BackendRunner discarded the fields). They are now removed from the
+    // CLI surface entirely so `rally inject --help` no longer advertises a no-op flag.
     let tmux_bin = optional_string_arg("tmux-bin", "PATH")
         .map(|value| value.unwrap_or_else(|| "tmux".to_string()));
-    let herdr_bin = optional_string_arg("herdr-bin", "PATH")
-        .map(|value| value.unwrap_or_else(|| "herdr".to_string()));
-    let herdr_socket = optional_string_arg("herdr-socket", "PATH");
     let cmux_bin = optional_string_arg("cmux-bin", "PATH")
         .map(|value| value.unwrap_or_else(|| "cmux".to_string()));
-    construct!(BackendBins {
-        tmux_bin,
-        herdr_bin,
-        herdr_socket,
-        cmux_bin
-    })
+    construct!(BackendBins { tmux_bin, cmux_bin })
 }
 
 fn json_flag() -> impl Parser<bool> {

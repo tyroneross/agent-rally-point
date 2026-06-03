@@ -146,10 +146,18 @@ fn resolve_watchdog_timeout(args: &[String]) -> Duration {
     Duration::from_millis(ms)
 }
 
-/// Remove the watchdog-only `--timeout-ms` flag (both `--timeout-ms VALUE` and
-/// `--timeout-ms=VALUE` forms) from the argument list so it is never forwarded
-/// to a subcommand parser. The flag controls only the wall-clock budget and is
-/// meaningless to any individual command.
+/// Remove watchdog-only flags from the argument list so they never reach a
+/// subcommand parser. Three flags are watchdog-level and meaningless to any
+/// individual command:
+///   * `--timeout-ms VALUE` / `--timeout-ms=VALUE` — wall-clock budget.
+///   * `--fail-open` — explicit posture override (default already; mostly
+///     used by hook wrappers as a self-documenting marker).
+///   * `--fail-closed` — opt-in fail-closed posture for `check before-write`.
+///
+/// The bpaf subcommand parsers don't know about these flags; without
+/// stripping, the parser rejects them as "unexpected in this context" and
+/// the only reason `--fail-open` worked historically was that the timeout
+/// arm fired before the rejection could surface.
 fn strip_timeout_flag(args: Vec<String>) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
     let mut i = 0;
@@ -166,6 +174,10 @@ fn strip_timeout_flag(args: Vec<String>) -> Vec<String> {
             continue;
         }
         if arg.starts_with("--timeout-ms=") {
+            i += 1;
+            continue;
+        }
+        if arg == "--fail-open" || arg == "--fail-closed" {
             i += 1;
             continue;
         }
@@ -199,6 +211,21 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
     // `--timeout-ms` flag so it never reaches a subcommand parser (which would
     // reject it as unknown). The env var path needs no stripping.
     let timeout = resolve_watchdog_timeout(&args);
+    // Watchdog-level flag detection happens BEFORE stripping so we honor
+    // `--fail-open` / `--fail-closed` even though those tokens are removed
+    // before the subcommand parser sees them.
+    let fail_open = args.iter().any(|arg| arg == "--fail-open");
+    // Posture override for the before-write gate: opt-in fail-CLOSED on
+    // watchdog timeout. The default fail-open posture is right for read-only
+    // commands (status, next, room, locate) — a stuck advisory must never
+    // hang the host tool. But for the before-write coordination gate
+    // specifically, two agents writing the same claimed path is the failure
+    // mode the gate exists to prevent: better to delay the write than to
+    // silently let two agents clobber one another. The posture is opt-in
+    // (env var or flag) so existing call sites are unchanged, and it ONLY
+    // activates when the resolved subcommand is `check before-write` —
+    // global fail-closed would wedge agents on a stalled `rally room` poll.
+    let posture = resolve_watchdog_posture(&args, fail_open);
     let args = strip_timeout_flag(args);
 
     let wants_json = args.iter().any(|arg| arg == "--json");
@@ -207,7 +234,6 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
     // allow-everything envelope. Without it we still exit 0 (rally is an
     // advisory coordinator — hanging the agent is strictly worse than skipping
     // one advisory), but we surface a timeout note on stderr for visibility.
-    let fail_open = args.iter().any(|arg| arg == "--fail-open");
 
     let (tx, rx) = std::sync::mpsc::channel::<WatchdogResult>();
     let worker = thread::Builder::new()
@@ -249,11 +275,77 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
             ExitCode::from(exit_code)
         }
         Err(_) => {
-            // Deadline elapsed (or the worker panicked without sending). Fail
-            // open and exit immediately, abandoning the worker thread.
-            emit_timeout_fail_open(wants_json, fail_open, timeout);
-            std::process::exit(0);
+            // Deadline elapsed (or the worker panicked without sending). The
+            // posture decides whether to fail open (default) or fail closed
+            // (opt-in, before-write only — see `resolve_watchdog_posture`).
+            // Either way we exit immediately, abandoning the worker thread;
+            // the kernel reaps any fd/lock/child it held.
+            match posture {
+                WatchdogPosture::FailOpen => {
+                    emit_timeout_fail_open(wants_json, fail_open, timeout);
+                    std::process::exit(0);
+                }
+                WatchdogPosture::FailClosedBeforeWrite => {
+                    emit_timeout_fail_closed_before_write(wants_json, timeout);
+                    // Exit code mirrors `--strict` mode in the normal
+                    // before-write gate (4 = a stop finding was raised).
+                    // Wrappers translate this to "abort the write attempt".
+                    std::process::exit(4);
+                }
+            }
         }
+    }
+}
+
+/// Watchdog timeout posture. Default is `FailOpen` (fail-open is the right
+/// posture for read-only / advisory commands — never hang the host tool).
+/// `FailClosedBeforeWrite` is opt-in and applies ONLY when the resolved
+/// subcommand is `check before-write`: the coordination gate's purpose is
+/// preventing two agents from clobbering one claimed path, so a stuck
+/// snapshot read better delays the write than silently allows it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchdogPosture {
+    FailOpen,
+    FailClosedBeforeWrite,
+}
+
+/// Resolve the watchdog posture for THIS invocation.
+///
+/// Fail-closed activates when **both** conditions hold:
+///  1. The subcommand parses as `check before-write` (the only command for
+///     which fail-closed is safe — a read-only command's stuck advisory must
+///     never block the host tool).
+///  2. Opt-in is present via either `RALLY_BEFORE_WRITE_FAILCLOSED=1` env or
+///     a `--fail-closed` flag in the argument list.
+///
+/// `--fail-open` on the same call site wins: an explicit fail-open flag
+/// reasserts the default and disables fail-closed even when the env var is
+/// set, so operators can override per-call without unsetting the env var.
+fn resolve_watchdog_posture(args: &[String], fail_open: bool) -> WatchdogPosture {
+    if fail_open {
+        return WatchdogPosture::FailOpen;
+    }
+    let env_opt_in = env::var("RALLY_BEFORE_WRITE_FAILCLOSED")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let flag_opt_in = args.iter().any(|a| a == "--fail-closed");
+    if !(env_opt_in || flag_opt_in) {
+        return WatchdogPosture::FailOpen;
+    }
+    // Subcommand gate: only `check before-write` flips. Look at the first two
+    // positional tokens; both must be present and equal to `check` then
+    // `before-write` respectively. A bare `rally check` or any other phase
+    // (`before-complete`, `tier-fit`, `liveness`, `coordination`) stays
+    // fail-open. This mirrors the policy in `agents/build-orchestrator.md`
+    // (gates #1–#2 in §"Keep going until done") which always fail-open on
+    // ambiguous safety classification.
+    let mut positionals = args.iter().filter(|a| !a.starts_with('-'));
+    let first = positionals.next().map(String::as_str);
+    let second = positionals.next().map(String::as_str);
+    if first == Some("check") && second == Some("before-write") {
+        WatchdogPosture::FailClosedBeforeWrite
+    } else {
+        WatchdogPosture::FailOpen
     }
 }
 
@@ -299,6 +391,51 @@ fn emit_timeout_fail_open(wants_json: bool, fail_open: bool, timeout: Duration) 
     let _ = fail_open; // semantics identical either way; kept for clarity/logging
     eprintln!(
         "rally: hook exceeded {}ms wall-clock budget — failing open (no coordination check applied)",
+        timeout.as_millis()
+    );
+}
+
+/// Fail-CLOSED counterpart for the before-write gate. Synthesizes the same
+/// envelope shape that `check::build_check` would have emitted with a
+/// stop-severity finding, so hook wrappers can route this exactly as they
+/// route a real claimed-path/active-blocker stop. Setting `allow: false` is
+/// what flips the wrapper from "allow the write" to "abort the write
+/// attempt".
+fn emit_timeout_fail_closed_before_write(wants_json: bool, timeout: Duration) {
+    if wants_json {
+        // Same envelope shape as a real before-write check (see
+        // `check::CheckResult` + `agent_visible`). Strict-mode wrappers
+        // parse `agent_visible.present == true` as "raise to the agent and
+        // block"; the synthesized finding tells the operator why.
+        let payload = json!({
+            "ok": true,
+            "product": "rally",
+            "command": "check",
+            "data": {
+                "check": {
+                    "phase": "before-write",
+                    "mode": "strict",
+                    "allow": false,
+                    "findings": [{
+                        "code": "watchdog-timeout-fail-closed",
+                        "severity": "stop",
+                        "message": format!(
+                            "before-write check exceeded {}ms wall-clock budget; failing closed because RALLY_BEFORE_WRITE_FAILCLOSED is opt-in",
+                            timeout.as_millis()
+                        ),
+                    }],
+                    "agent_visible": {
+                        "present": true,
+                        "severity": "stop",
+                        "message": "Rally before-write check timed out; failing closed (RALLY_BEFORE_WRITE_FAILCLOSED) to prevent two agents clobbering one claimed path."
+                    }
+                }
+            }
+        });
+        println!("{payload}");
+    }
+    eprintln!(
+        "rally: before-write hook exceeded {}ms wall-clock budget — failing CLOSED (RALLY_BEFORE_WRITE_FAILCLOSED is set; blocking write to prevent silent claim collision)",
         timeout.as_millis()
     );
 }
@@ -1986,6 +2123,24 @@ fn command_check(args: CheckArgs) -> Result<Output> {
         None => "unknown".to_string(),
     };
     let path = args.path.map(normalize_path);
+
+    // B-perf fast path: when the snapshot cache is fresh AND already records
+    // our tool's presence, project the check from the cached `RoomSnapshot`
+    // without taking the room mutation lock or opening SQLite. This is the
+    // path that lets a busy agent stay under the 3s watchdog when a parallel
+    // writer is contending for `mutation.lock` on every other invocation.
+    // See `store::try_load_cached_snapshot` for the freshness fingerprint.
+    if let Ok(repo_root_path) = repo_root()
+        && tool != "unknown"
+        && let Some(cached) = crate::store::try_load_cached_snapshot_for(&repo_root_path)
+        && cached.squads.iter().any(|s| s.tool == tool)
+    {
+        let check = build_check(phase.clone(), tool.clone(), path.clone(), args.strict, &cached)?;
+        let body = envelope("check", SCHEMA_CHECK, check.data)?;
+        let text = format!("check findings={} (cached)", check.finding_count);
+        return Ok(Output::new(args.json, text, body).with_exit_code(check.exit_code));
+    }
+
     let room = RoomStore::open()?;
     // Component B: auto-register presence when a real tool identity is known.
     // Skip "unknown" (no-tool before-complete calls) — nothing meaningful to register.
@@ -1993,6 +2148,12 @@ fn command_check(args: CheckArgs) -> Result<Output> {
         ensure_presence(&room, &tool)?;
     }
     let snapshot = room.snapshot()?;
+    // B-perf: refresh the snapshot cache after every successful slow-path
+    // snapshot. The next invocation that observes the same fingerprint takes
+    // the fast path above.
+    if let Ok(repo_root_path) = repo_root() {
+        crate::store::write_snapshot_cache_for(&repo_root_path, &snapshot);
+    }
     let check = build_check(phase, tool, path, args.strict, &snapshot)?;
     let body = envelope("check", SCHEMA_CHECK, check.data)?;
     let text = format!("check findings={}", check.finding_count);
@@ -7815,7 +7976,7 @@ fn help_text() -> String {
         "  rally migrate-legacy [--json]  # one-shot replay of legacy ~/.agent-rally-point/apps/<slug>/changes.jsonl into this repo ledger",
         "  rally check before-write --tool <tool> --path <path> [--strict] [--json]",
         "  rally check before-complete --tool <tool> [--strict] [--json]",
-        "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|herdr|cmux>] [--herdr-socket <path>] [--dry-run] [--json]",
+        "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|cmux>] [--dry-run] [--json]",
         "    managed run ids auto-number active agents, e.g. claude-01 / claude_code:01",
         "  rally sessions [--json]",
         "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--require-ack] [--json]",

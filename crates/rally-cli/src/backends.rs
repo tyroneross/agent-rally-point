@@ -241,12 +241,10 @@ pub(crate) struct BackendRunner {
 
 impl BackendRunner {
     pub(crate) fn new(backend: Backend, bins: BackendBins) -> Self {
-        // herdr_bin / herdr_socket fields removed with Backend::Herdr;
-        // callers that pass them get ignored fields (BackendBins still
-        // carries them for now to keep CLI parsing stable — they're
-        // de-facto dead but a separate cleanup pass).
-        let _ = bins.herdr_bin;
-        let _ = bins.herdr_socket;
+        // PROVENANCE: the BackendBins struct previously carried `herdr_bin` and
+        // `herdr_socket`, which this constructor ignored once Backend::Herdr was
+        // removed in Plan F. Those fields and their CLI flags have now been
+        // deleted at the source; nothing to discard here anymore.
         Self {
             backend,
             tmux_bin: bins.tmux_bin,
