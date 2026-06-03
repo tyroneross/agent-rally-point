@@ -1450,7 +1450,7 @@ fn command_whoami(args: WhoamiArgs) -> Result<Output> {
         .map(|snap| build_lead_context(snap, args.tool.as_deref(), None));
     let host_runtime = detect_host_runtime();
     let text = format!(
-        "repo_root={repo_root} repo_id={repo_id} room_id={room_id} build_id={BUILD_ID} branch={} herdr_ambiguous={} lead={}",
+        "repo_root={repo_root} repo_id={repo_id} room_id={room_id} build_id={BUILD_ID} branch={} ptyd_ambiguous={} lead={}",
         branch.as_deref().unwrap_or("<none>"),
         host_runtime.ambiguous,
         lead.as_deref().unwrap_or("<none>"),
@@ -3824,14 +3824,14 @@ mod tests {
 
     #[test]
     fn host_runtime_ambiguity_detection() {
-        // SL-1: >1 resolvable herdr socket => ambiguous (agents must not guess).
-        let base = unique_root("herdr-sockets");
+        // SL-1: >1 resolvable ptyd socket => ambiguous (agents must not guess).
+        let base = unique_root("ptyd-sockets");
         let a = base.join("a");
         let b = base.join("b");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
-        let sa = a.join("herdr.sock");
-        let sb = b.join("herdr.sock");
+        let sa = a.join("ptyd.sock");
+        let sb = b.join("ptyd.sock");
         std::fs::write(&sa, b"").unwrap();
         let one = existing_unique_paths(&[
             sa.to_string_lossy().to_string(),
@@ -3845,6 +3845,96 @@ mod tests {
             sa.to_string_lossy().to_string(), // dup is ignored
         ]);
         assert_eq!(two.len(), 2, "two distinct sockets -> ambiguous (len>1)");
+    }
+
+    #[test]
+    fn detect_host_runtime_finds_easy_terminal_ptyd_socket() {
+        // SL-2: when …/EasyTerminal/ptyd.sock exists, detect_host_runtime
+        // reports under_ptyd=true with that path in sockets_found. When a
+        // second ptyd.sock exists (e.g. ~/.config/ptyd/ptyd.sock), ambiguous=true.
+        //
+        // Test runs in an isolated HOME so we don't depend on / pollute the
+        // real user filesystem. PTYD_SOCKET_PATH is cleared so only on-disk
+        // resolution drives the decision.
+        //
+        // Env mutation is process-wide and Rust 2024 marks it unsafe. We
+        // serialize HOME/PTYD/XDG mutations via a static mutex so concurrent
+        // unit tests in this binary don't race against each other or
+        // observe a half-set env.
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let base = unique_root("ptyd-detect");
+        let home = base.join("home");
+        let et_dir = home.join("Library/Application Support/EasyTerminal");
+        let cfg_dir = home.join(".config/ptyd");
+        std::fs::create_dir_all(&et_dir).unwrap();
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+
+        // Snapshot + override env. unsafe per Rust 2024 edition; we restore
+        // before the function returns even on assertion failure via a guard.
+        struct EnvGuard {
+            home: Option<String>,
+            ptyd: Option<String>,
+            xdg: Option<String>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.home {
+                        Some(v) => env::set_var("HOME", v),
+                        None => env::remove_var("HOME"),
+                    }
+                    match &self.ptyd {
+                        Some(v) => env::set_var("PTYD_SOCKET_PATH", v),
+                        None => env::remove_var("PTYD_SOCKET_PATH"),
+                    }
+                    match &self.xdg {
+                        Some(v) => env::set_var("XDG_RUNTIME_DIR", v),
+                        None => env::remove_var("XDG_RUNTIME_DIR"),
+                    }
+                }
+            }
+        }
+        let _guard = EnvGuard {
+            home: env::var("HOME").ok(),
+            ptyd: env::var("PTYD_SOCKET_PATH").ok(),
+            xdg: env::var("XDG_RUNTIME_DIR").ok(),
+        };
+        unsafe {
+            env::set_var("HOME", &home);
+            env::remove_var("PTYD_SOCKET_PATH");
+            env::remove_var("XDG_RUNTIME_DIR");
+        }
+
+        // Only the Easy Terminal socket exists.
+        let et_sock = et_dir.join("ptyd.sock");
+        std::fs::write(&et_sock, b"").unwrap();
+        let hr = detect_host_runtime();
+        assert!(
+            hr.under_ptyd,
+            "under_ptyd must be true when …/EasyTerminal/ptyd.sock exists"
+        );
+        assert!(!hr.ambiguous, "single ptyd socket -> not ambiguous");
+        assert!(
+            hr.sockets_found
+                .iter()
+                .any(|s| s == &et_sock.to_string_lossy()),
+            "sockets_found must include the Easy Terminal ptyd.sock: {:?}",
+            hr.sockets_found
+        );
+
+        // Add the CLI socket → ambiguous.
+        let cli_sock = cfg_dir.join("ptyd.sock");
+        std::fs::write(&cli_sock, b"").unwrap();
+        let hr2 = detect_host_runtime();
+        assert!(hr2.under_ptyd);
+        assert!(
+            hr2.ambiguous,
+            "two ptyd sockets on disk -> ambiguous=true (got sockets_found={:?})",
+            hr2.sockets_found
+        );
     }
 
     #[test]
@@ -7110,7 +7200,7 @@ struct WhoamiPayload {
     branch: Option<String>,
     build_id: String,
     cwd: String,
-    /// Self-location: which host runtime (herdr) this process is bound to, and
+    /// Self-location: which host runtime (ptyd) this process is bound to, and
     /// whether more than one is resolvable (ambiguous → agents must not guess).
     host_runtime: HostRuntime,
     /// Coordination context — resolves "who's lead / what's the goal" in one call.
@@ -7123,14 +7213,14 @@ struct WhoamiPayload {
     lead_context: Option<LeadContext>,
 }
 
-/// Self-location of the host runtime (Easy Terminal / herdr). `bound_socket` is
-/// the socket THIS process is pinned to (`HERDR_SOCKET_PATH`); `sockets_found`
-/// is every resolvable herdr **server** socket on disk; `ambiguous` is true when
+/// Self-location of the host runtime (Easy Terminal / ptyd). `bound_socket` is
+/// the socket THIS process is pinned to (`PTYD_SOCKET_PATH`); `sockets_found`
+/// is every resolvable ptyd socket on disk; `ambiguous` is true when
 /// more than one exists — the exact condition that made an agent guess which
-/// herdr it was on. Fail-loud on ambiguity instead of silently defaulting.
+/// ptyd it was on. Fail-loud on ambiguity instead of silently defaulting.
 #[derive(JsonSchema, Serialize)]
 struct HostRuntime {
-    under_herdr: bool,
+    under_ptyd: bool,
     bound_socket: Option<String>,
     sockets_found: Vec<String>,
     ambiguous: bool,
@@ -7148,20 +7238,23 @@ fn existing_unique_paths(candidates: &[String]) -> Vec<String> {
     found
 }
 
-/// Detect resolvable herdr **server** sockets (`herdr.sock`, not the
-/// `-client.sock`). Pure-ish (reads env + filesystem existence only).
+/// Detect resolvable ptyd sockets. Probes the Easy Terminal app-daemon socket
+/// (`…/EasyTerminal/ptyd.sock`) and the ptyd CLI socket
+/// (`~/.config/ptyd/ptyd.sock`), plus XDG_RUNTIME_DIR. Reads env + filesystem
+/// existence only.
 fn detect_host_runtime() -> HostRuntime {
-    let bound = env::var("HERDR_SOCKET_PATH").ok().filter(|s| !s.is_empty());
+    let bound = env::var("PTYD_SOCKET_PATH").ok().filter(|s| !s.is_empty());
     let home = env::var("HOME").unwrap_or_default();
     let mut candidates: Vec<String> = vec![
-        format!("{home}/Library/Application Support/EasyTerminal/herdr.sock"),
-        format!("{home}/Library/Application Support/herdr/herdr.sock"),
-        format!("{home}/.local/share/herdr/herdr.sock"),
-        format!("{home}/.config/herdr/herdr.sock"),
+        // Easy Terminal app daemon socket (was herdr.sock, renamed to ptyd.sock).
+        format!("{home}/Library/Application Support/EasyTerminal/ptyd.sock"),
+        // ptyd CLI socket.
+        format!("{home}/.config/ptyd/ptyd.sock"),
+        format!("{home}/.local/share/ptyd/ptyd.sock"),
     ];
     if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
         if !xdg.is_empty() {
-            candidates.push(format!("{xdg}/herdr.sock"));
+            candidates.push(format!("{xdg}/ptyd.sock"));
         }
     }
     if let Some(b) = &bound {
@@ -7169,7 +7262,7 @@ fn detect_host_runtime() -> HostRuntime {
     }
     let found = existing_unique_paths(&candidates);
     HostRuntime {
-        under_herdr: bound.is_some() || !found.is_empty(),
+        under_ptyd: bound.is_some() || !found.is_empty(),
         bound_socket: bound,
         ambiguous: found.len() > 1,
         sockets_found: found,
