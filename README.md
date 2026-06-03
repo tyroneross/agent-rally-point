@@ -21,7 +21,9 @@ Checkout and active-ledger migration rules live in
 Rally owns the primary product path:
 
 - `rally` is the primary CLI.
-- `.rally/facts.db` is the durable fact store, including managed sessions.
+- `.rally/log/<engagement>.jsonl` is the durable fact store, including managed
+  sessions.
+- `.rally/facts.db` is a derived sqlite cache rebuilt from the log.
 - Linked git worktrees share one room through the repo's git common dir.
 - Room state is derived from the fact store on demand.
 - `enter`, `next`, `say`, `room`, `check`, `run`, `sessions`, `inject`,
@@ -40,7 +42,9 @@ Install the primary Rally CLI from the checkout:
 git clone https://github.com/tyroneross/agent-rally-point.git
 cd agent-rally-point
 cargo install --path crates/rally-cli
+rally whoami --tool codex --json
 rally enter --tool codex --json
+rally ack --tool codex
 rally next --tool codex --json
 ```
 
@@ -49,7 +53,9 @@ rally next --tool codex --json
 The primary loop is intentionally small:
 
 ```bash
+rally whoami --tool codex --json
 rally enter --tool codex --json
+rally ack --tool codex
 rally next --tool codex --json
 rally check before-write --tool codex --path crates/foo.rs --strict --json
 rally say artifact --tool codex --subject "implementation complete" --uri crates/foo.rs --evidence "cargo test" --json
@@ -59,8 +65,8 @@ rally room --json
 The autonomous act-on-next contract is:
 
 ```text
-enter -> next -> if actionable, claim/check -> execute -> verify
-      -> say artifact/handoff/resolve/release -> next
+whoami -> enter -> ack -> next -> if actionable, claim/check -> execute
+       -> verify -> say artifact/handoff/resolve/release -> next
 ```
 
 `rally next` returns `actionable`, `requires_human`, `stop_reason`,
@@ -77,6 +83,12 @@ rally say resolve --tool codex --ref <blocker-id> --subject "resolved" --json
 rally say decision --tool codex --subject "Rally is primary" --status binding --json
 rally say handoff --tool codex --target claude_code --subject "review docs" --summary "Rally is now primary" --json
 ```
+
+Resolve handoff targets from live Rally state, not from examples or old logs.
+Use `rally whoami`, `rally lead show`, `rally next`, `rally room --json`, and
+explicit handoff targets to identify the current recipient. A targeted handoff
+is the durable action request; `rally inject` is only a wake/delivery path for a
+target already listed by `rally sessions --json`.
 
 Managed sessions need no setup step. `rally run --backend <tmux|herdr|cmux>`
 starts the addressable pane/workspace, and `rally inject` delivers work to it.

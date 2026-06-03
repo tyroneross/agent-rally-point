@@ -2344,6 +2344,16 @@ fn presence_substrate_enter_writes_presence_and_lead() {
     // --- First enter: tool "alpha" ---
     let enter_a = workspace.json(&["enter", "--json", "--tool", "alpha"]);
     assert_eq!(enter_a["schema"], "agent-rally.command.enter.v1");
+    let lead_context_a = &enter_a["data"]["lead_context"];
+    assert_eq!(lead_context_a["current_lead"], "alpha");
+    let lead_epoch = lead_context_a["lead_epoch"]
+        .as_i64()
+        .expect("enter should expose lead_epoch");
+    assert!(lead_epoch > 0, "lead_epoch should be a ledger seq");
+    assert_eq!(lead_context_a["self_role"], "lead");
+    assert_eq!(lead_context_a["self_is_lead"], true);
+    assert_eq!(lead_context_a["self_acknowledged"], false);
+    assert_eq!(lead_context_a["current_lead_acknowledged"], false);
     // room_id must be a non-null, non-empty string (Component A requirement).
     let room_id = enter_a["data"]["enter"]["room_id"].as_str().unwrap();
     assert!(!room_id.is_empty(), "room_id must be non-empty");
@@ -2362,6 +2372,13 @@ fn presence_substrate_enter_writes_presence_and_lead() {
 
     // --- Second enter: tool "beta" ---
     let enter_b = workspace.json(&["enter", "--json", "--tool", "beta"]);
+    let lead_context_b = &enter_b["data"]["lead_context"];
+    assert_eq!(lead_context_b["current_lead"], "alpha");
+    assert_eq!(lead_context_b["lead_epoch"], lead_epoch);
+    assert_eq!(lead_context_b["self_role"], "participant");
+    assert_eq!(lead_context_b["self_is_lead"], false);
+    assert_eq!(lead_context_b["self_acknowledged"], false);
+    assert_eq!(lead_context_b["current_lead_acknowledged"], false);
     let room_id_b = enter_b["data"]["enter"]["room_id"].as_str().unwrap();
     assert_eq!(room_id, room_id_b, "room_id stable across enters");
 
@@ -2410,6 +2427,29 @@ fn presence_substrate_enter_writes_presence_and_lead() {
         rows.iter().any(|r| r["fact"]["kind"] == "presence"),
         "presence facts appear in recent rows"
     );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn next_exposes_tool_scoped_lead_context() {
+    let workspace = Workspace::new("rally-next-lead-context");
+
+    let enter_a = workspace.json(&["enter", "--json", "--tool", "alpha"]);
+    let lead_epoch = enter_a["data"]["lead_context"]["lead_epoch"]
+        .as_i64()
+        .expect("enter should expose lead_epoch");
+    let ack = workspace.json(&["ack", "--json", "--tool", "alpha"]);
+    assert_eq!(ack["data"]["ack"]["acknowledged"], true);
+
+    let next_b = workspace.json(&["next", "--json", "--tool", "beta"]);
+    let lead_context = &next_b["data"]["lead_context"];
+    assert_eq!(lead_context["current_lead"], "alpha");
+    assert_eq!(lead_context["lead_epoch"], lead_epoch);
+    assert_eq!(lead_context["self_role"], "participant");
+    assert_eq!(lead_context["self_is_lead"], false);
+    assert_eq!(lead_context["self_acknowledged"], false);
+    assert_eq!(lead_context["current_lead_acknowledged"], true);
 
     workspace.cleanup();
 }
@@ -3311,11 +3351,27 @@ fn rally_whoami_repo_id_uses_manifest_not_active_engagement() {
 fn rally_whoami_with_tool_reflects_tool_in_output() {
     let workspace = Workspace::new("rally-whoami-tool");
 
+    let enter = workspace.json(&["enter", "--json", "--tool", "claude_code:01"]);
+    let lead_epoch = enter["data"]["lead_context"]["lead_epoch"]
+        .as_i64()
+        .expect("enter should expose lead_epoch");
+    let ack = workspace.json(&["ack", "--json", "--tool", "claude_code:01"]);
+    assert_eq!(ack["data"]["ack"]["acknowledged"], true);
+
     let result = workspace.json(&["whoami", "--json", "--tool", "claude_code:01"]);
     assert!(result["ok"].as_bool().unwrap_or(false));
 
-    let tool = result["data"]["whoami"]["tool"].as_str().unwrap_or("");
+    let whoami = &result["data"]["whoami"];
+    let tool = whoami["tool"].as_str().unwrap_or("");
     assert_eq!(tool, "claude_code:01", "tool must be echoed back");
+    assert_eq!(whoami["acknowledged"], true);
+    let lead_context = &whoami["lead_context"];
+    assert_eq!(lead_context["current_lead"], "claude_code:01");
+    assert_eq!(lead_context["lead_epoch"], lead_epoch);
+    assert_eq!(lead_context["self_role"], "lead");
+    assert_eq!(lead_context["self_is_lead"], true);
+    assert_eq!(lead_context["self_acknowledged"], true);
+    assert_eq!(lead_context["current_lead_acknowledged"], true);
 
     workspace.cleanup();
 }

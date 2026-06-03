@@ -319,6 +319,10 @@ pub(crate) struct RoomSnapshot {
     pub(crate) squads: Vec<Squad>,
     /// Tool asserting the `role:lead` decision, if any.
     pub(crate) lead: Option<String>,
+    /// Seq of the latest lead-family decision (`role:lead` or relinquish).
+    /// Agents can use this as a cheap epoch to detect stale lead context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) lead_epoch: Option<i64>,
     /// R10: per-tool read receipts projected from `FactKind::Read` checkpoints.
     /// Populated only when `include_readers` is requested (see
     /// `RoomStore::snapshot_with_readers`); empty in the default snapshot.
@@ -352,6 +356,7 @@ impl RoomSnapshot {
             // squads, lead, readers, and mission are room-level aggregates; not filtered by path/tool query.
             squads: self.squads,
             lead: self.lead,
+            lead_epoch: self.lead_epoch,
             readers: self.readers,
             mission: self.mission,
         }
@@ -1374,13 +1379,15 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
     // Lead is the tool from the most-recent decision with subject "role:lead".
     // Lead = the tool of the latest `role:lead` decision, UNLESS the latest
     // lead-family decision is a `role:lead:relinquished` (seat reopened → None).
-    let lead = facts
+    let latest_lead_fact = facts
         .iter()
         .filter(|f| {
             f.kind == "decision"
                 && (f.subject == "role:lead" || f.subject == "role:lead:relinquished")
         })
-        .max_by_key(|f| f.seq)
+        .max_by_key(|f| f.seq);
+    let lead_epoch = latest_lead_fact.map(|f| f.seq);
+    let lead = latest_lead_fact
         .filter(|f| f.subject == "role:lead")
         .and_then(|f| f.tool.clone());
 
@@ -1406,6 +1413,7 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
         stale_facts: Vec::new(),
         squads,
         lead,
+        lead_epoch,
         readers: Vec::new(),
         mission,
     }

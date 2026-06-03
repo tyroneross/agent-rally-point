@@ -9,6 +9,7 @@ This repo coordinates parallel coding agents via **agent-rally-point** (per-repo
 
 - **Self-locate FIRST:** `rally whoami --tool <you> --json` — host runtime, room, lead, mission, ack status. If `host_runtime.ambiguous` is true, STOP and resolve which host before acting (never guess).
 - **Enter + acknowledge:** `rally enter --tool <host-llm-role-number> --json` (e.g. `claude_code:01`), then `rally ack --tool <you>` to confirm you ingested the rules/guardrails/lead/mission.
+- **Resolve targets from live state:** Treat lead/tool ids as runtime data, not constants. Use `whoami`, `lead show`, `room`, `next`, and explicit handoff targets; do not copy ids from examples, old logs, or another repo.
 - **What to do next:** `rally next --tool <you> --json`
 - **Current state:** `rally room --json`
 - **History (durable, per-engagement):** `.rally/log/`

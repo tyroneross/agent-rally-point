@@ -740,6 +740,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         .find(|sq| sq.tool == tool)
         .map(|sq| sq.acknowledged)
         .unwrap_or(false);
+    let lead_context = build_lead_context(&snapshot, Some(&tool), role.as_deref());
     let acknowledgment = Acknowledgment {
         required: true,
         acknowledged,
@@ -774,6 +775,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
             enter: enter_payload,
             room: room_summary,
             acknowledgment,
+            lead_context,
         },
     )?;
     let text = format!("entered room tool={} attention={}", tool, attention_count,);
@@ -1113,6 +1115,7 @@ fn command_next(args: NextArgs) -> Result<Output> {
     // This call uses `append_fact` (not `append_fact_verified`) — read-checkpoints
     // are low-stakes metadata and must not trigger a segment readback loop.
     let _ = room.maybe_append_read_checkpoint(&tool, snapshot.content_max_seq);
+    let lead_context = build_lead_context(&snapshot, Some(&tool), role.as_deref());
     let body = envelope(
         "next",
         SCHEMA_NEXT,
@@ -1123,6 +1126,7 @@ fn command_next(args: NextArgs) -> Result<Output> {
             next,
             wake_intent,
             room: RoomSummary::from(&snapshot),
+            lead_context,
         },
     )?;
     let text = format!("next action={action} target={target_event_id}");
@@ -1304,6 +1308,9 @@ fn command_whoami(args: WhoamiArgs) -> Result<Output> {
         ),
         _ => None,
     };
+    let lead_context = snapshot
+        .as_ref()
+        .map(|snap| build_lead_context(snap, args.tool.as_deref(), None));
     let host_runtime = detect_host_runtime();
     let text = format!(
         "repo_root={repo_root} repo_id={repo_id} room_id={room_id} build_id={BUILD_ID} branch={} herdr_ambiguous={} lead={}",
@@ -1328,6 +1335,7 @@ fn command_whoami(args: WhoamiArgs) -> Result<Output> {
                 lead,
                 mission,
                 acknowledged,
+                lead_context,
             },
         },
     )?;
@@ -3762,8 +3770,8 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
-        let fact = inject_content_fact(&room, "claude_code:sender-1", "claude_code:target", "hi")
-            .unwrap();
+        let fact =
+            inject_content_fact(&room, "claude_code:sender-1", "claude_code:target", "hi").unwrap();
 
         assert!(
             fact.evidence
@@ -6496,6 +6504,8 @@ struct EnterData {
     room: RoomSummary,
     /// Coordination-mandate (C1): the context the agent must ingest + ack.
     acknowledgment: Acknowledgment,
+    /// Live lead/self-role metadata so agents do not rely on stale examples.
+    lead_context: LeadContext,
 }
 
 /// Coordination-mandate (C1): what `rally enter` surfaces for the agent to
@@ -6519,6 +6529,61 @@ struct AckContext {
     mission: Option<String>,
     /// Exact command to acknowledge.
     how_to_ack: String,
+}
+
+/// Tool-scoped lead context projected from live room facts.
+#[derive(Clone, JsonSchema, Serialize)]
+struct LeadContext {
+    /// Current lead tool id, if a lead seat is occupied.
+    current_lead: Option<String>,
+    /// Seq of the latest lead-family fact. This is the lead-context epoch.
+    lead_epoch: Option<i64>,
+    /// Role Rally assigns to the calling tool for this response.
+    self_role: Option<String>,
+    /// True when the calling tool is the current lead.
+    self_is_lead: bool,
+    /// Whether the calling tool has acked the current coordination context.
+    self_acknowledged: Option<bool>,
+    /// Whether the current lead has acked the coordination context.
+    current_lead_acknowledged: Option<bool>,
+}
+
+fn build_lead_context(
+    snapshot: &RoomSnapshot,
+    tool: Option<&str>,
+    requested_role: Option<&str>,
+) -> LeadContext {
+    let current_lead = snapshot.lead.clone();
+    let self_is_lead = tool
+        .zip(current_lead.as_deref())
+        .map(|(tool, lead)| tool == lead)
+        .unwrap_or(false);
+    let self_role = tool.map(|_| {
+        if self_is_lead {
+            "lead".to_string()
+        } else {
+            requested_role.unwrap_or("participant").to_string()
+        }
+    });
+    let self_acknowledged = tool.map(|tool| squad_acknowledged(snapshot, tool));
+    let current_lead_acknowledged = current_lead
+        .as_deref()
+        .map(|lead| squad_acknowledged(snapshot, lead));
+    LeadContext {
+        current_lead,
+        lead_epoch: snapshot.lead_epoch,
+        self_role,
+        self_is_lead,
+        self_acknowledged,
+        current_lead_acknowledged,
+    }
+}
+
+fn squad_acknowledged(snapshot: &RoomSnapshot, tool: &str) -> bool {
+    snapshot
+        .squads
+        .iter()
+        .any(|sq| sq.tool == tool && sq.acknowledged)
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -6624,6 +6689,9 @@ struct WhoamiPayload {
     mission: Option<String>,
     /// Whether `--tool` has recorded a coordination:ack (None if no --tool).
     acknowledged: Option<bool>,
+    /// Live lead/self-role metadata when the room is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lead_context: Option<LeadContext>,
 }
 
 /// Self-location of the host runtime (Easy Terminal / herdr). `bound_socket` is
@@ -6693,6 +6761,8 @@ struct NextData {
     next: NextResult,
     wake_intent: Option<Fact>,
     room: RoomSummary,
+    /// Live lead/self-role metadata for the acting tool.
+    lead_context: LeadContext,
 }
 
 fn scopes_from(raw_scopes: Vec<String>, resources: Vec<String>, paths: Vec<String>) -> Vec<String> {

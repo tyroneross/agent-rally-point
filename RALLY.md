@@ -14,16 +14,20 @@ to do next.
 ## The Load-Bearing Commands
 
 ```bash
+rally whoami --tool <you> --json
 rally enter --tool <you> [--tier frontier|executing|fast] --json   # --tier: first frontier agent auto-leads
+rally ack --tool <you>
 rally next --tool <you> --json
 rally check before-write --tool <you> --path <path> --strict --json
 rally say artifact --tool <you> --subject "<what changed>" --uri <path> --evidence "<verification>" --json
 rally room --json
 ```
 
-That is the core loop. `enter` shows the room, `next` gives a concrete action
-contract, `check` protects shared boundaries, `say` records durable facts, and
-`room` inspects the current projection.
+That is the core loop. `whoami` identifies the active host, room, lead, and
+mission before any action, `enter` shows the room, `ack` confirms the startup
+rules were ingested, `next` gives a concrete action contract, `check` protects
+shared boundaries, `say` records durable facts, and `room` inspects the current
+projection.
 
 ## Identify Yourself
 
@@ -42,6 +46,29 @@ named reviewer is `reviewer-01` with tool `claude_code:reviewer-01`.
 | Cursor        | `cursor`      |
 | Gemini CLI    | `gemini`      |
 | CI/automation | `ci`          |
+
+## Resolve Targets From Live State
+
+Treat every lead, reviewer, worker, and session id as runtime state. The current
+target comes from the mission, `rally whoami`, `rally lead show`, `rally next`,
+an explicit handoff target, or `rally room --json`. Do not reuse ids from
+examples, old logs, another repo, or a previous engagement.
+
+When a specific agent must act, write a targeted handoff first; that is the
+durable action request:
+
+```bash
+rally say handoff --tool <you> \
+  --target <target-tool> \
+  --subject "<action needed>" \
+  --json
+```
+
+Direct injection is only a wake/delivery path for managed sessions. Before
+injecting, verify the target exists in `rally sessions --json`. If it is not a
+managed session, do not guess a terminal pane. Keep the targeted handoff as the
+source of truth and report that direct injection is unavailable unless the exact
+running surface can be positively adopted.
 
 ## The Agent Loop
 
@@ -71,7 +98,9 @@ rally say handoff --tool claude_code \
   --json
 
 # Codex:
+rally whoami --tool codex --json
 rally enter --tool codex --json
+rally ack --tool codex
 rally next --tool codex --json
 # ... claims/checks, does the work, verifies ...
 rally say artifact --tool codex \
@@ -91,6 +120,10 @@ rally run claude --backend tmux --json
 rally inject <session|name|tool> --handoff <event-id> --json  # e.g. claude-01
 rally capture <session|name|tool> --json
 ```
+
+`rally inject` addresses managed sessions only. If `rally sessions --json` does
+not list the target, use `rally say handoff --target <target-tool>` and either
+adopt/relaunch the running surface or report that direct delivery is unavailable.
 
 Agents can still call `rally check before-write` explicitly before shared
 edits. Rally no longer installs host hooks or prompt injection glue.
@@ -165,5 +198,7 @@ facts ride the same ledger.
 git clone https://github.com/tyroneross/agent-rally-point.git
 cd agent-rally-point
 cargo install --path crates/rally-cli
+rally whoami --tool <you> --json
 rally enter --tool <you> --json
+rally ack --tool <you>
 ```

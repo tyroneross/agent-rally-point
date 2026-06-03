@@ -140,7 +140,9 @@ form proves insufficient.
 The greenfield surface should be small:
 
 ```bash
+rally whoami --tool codex   # self-locate host, room, lead, mission, ack state
 rally enter --tool codex    # agent entry state + changed attention
+rally ack --tool codex      # confirm startup rules/guardrails/lead/mission
 rally next --tool codex     # ranked next action when idle or waiting
 rally say <kind> ...        # append a typed coordination fact
 rally room --json           # inspect current projected room state
@@ -158,7 +160,9 @@ Required loop:
 
 ```text
 rally run -> managed mux session starts the agent
+self-locate -> identify host, room, lead, mission, and ack state
 enter repo/session -> receive room state
+ack -> confirm startup rules/guardrails/lead/mission
 explicit idle/wait command -> receive next useful action
 before shared change -> run boundary check
 after meaningful work -> say the durable fact
@@ -206,8 +210,8 @@ The `next` payload must make the loop explicit:
 The intended autonomous build loop is:
 
 ```text
-enter -> next -> if actionable, claim/check -> execute -> verify
-      -> say artifact/handoff/resolve/release -> next
+whoami -> enter -> ack -> next -> if actionable, claim/check -> execute
+       -> verify -> say artifact/handoff/resolve/release -> next
 ```
 
 The loop stops when `actionable` is false, `requires_human` is true, the agent
@@ -535,8 +539,8 @@ Phase 1: Product contract.
 Phase 2: Product build.
 
 - Implement `enter`, `say`, `room`, and `check`.
-- Use `facts.db` as canonical state.
-- Use an internal SQLite projection for queries.
+- Use `.rally/log/<engagement>.jsonl` as canonical state.
+- Use `facts.db` as the internal SQLite projection for queries.
 - Add journey tests for stable command contracts.
 
 Phase 3: Managed-session loop.

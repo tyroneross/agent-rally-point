@@ -87,6 +87,7 @@ fn pointer_block() -> String {
     );
     s.push_str("- **Self-locate FIRST:** `rally whoami --tool <you> --json` — host runtime, room, lead, mission, ack status. If `host_runtime.ambiguous` is true, STOP and resolve which host before acting (never guess).\n");
     s.push_str("- **Enter + acknowledge:** `rally enter --tool <host-llm-role-number> --json` (e.g. `claude_code:01`), then `rally ack --tool <you>` to confirm you ingested the rules/guardrails/lead/mission.\n");
+    s.push_str("- **Resolve targets from live state:** Treat lead/tool ids as runtime data, not constants. Use `whoami`, `lead show`, `room`, `next`, and explicit handoff targets; do not copy ids from examples, old logs, or another repo.\n");
     s.push_str("- **What to do next:** `rally next --tool <you> --json`\n");
     s.push_str("- **Current state:** `rally room --json`\n");
     s.push_str("- **History (durable, per-engagement):** `.rally/log/`\n");
@@ -98,6 +99,7 @@ fn pointer_block() -> String {
         "- **Wire protocol:** [dynamic-workflows/PROTOCOL.md](dynamic-workflows/PROTOCOL.md)\n",
     );
     s.push_str("- **Board / current lanes:** [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md)\n");
+    s.push_str("- **Handoffs & launching agents (Claude+Codex):** [docs/HANDOFFS-AND-LAUNCHING-AGENTS.md](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md)\n");
     s.push_str(POINTER_END);
     s.push('\n');
     s

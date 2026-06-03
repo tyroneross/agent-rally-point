@@ -1,5 +1,10 @@
 # Discovery Re-Port Design
 
+> Status: historical design note. This document predates the current segmented
+> ledger model; any source-of-truth statement below is governed by the current
+> architecture rule: `.rally/log/<engagement>.jsonl` is canonical and
+> `.rally/facts.db` is a derived sqlite cache. Discovery remains read-only.
+
 PR45 replaced the PR40 multi-crate channel model with one `rally` CLI and a
 repo-local `.rally/facts.db` RoomStore. The old `rally-core::channel_index`
 implementation must not be merged into this branch. The useful product behavior
@@ -24,14 +29,16 @@ resolve coordination obligations.
 PR45 state lives here:
 
 ```text
-<repo>/.rally/facts.db      canonical factstr-sqlite event store
-<repo>/.rally/cursors.json  per-tool read cursors
+<repo>/.rally/log/<engagement>.jsonl  canonical append-only fact segments
+<repo>/.rally/facts.db                derived factstr-sqlite cache
+<repo>/.rally/cursors.json            per-tool read cursors
 ```
 
 `RoomStore::open()` resolves the repo through its git common dir before opening
-`.rally/facts.db`, so linked worktrees share one room. Room projections come
-from `RoomStore::facts()` and `RoomStore::snapshot()`. Discovery should call
-that boundary or a small sibling reader, not parse factstr internals ad hoc.
+the repo-local room, so linked worktrees share one room. Room projections come
+from `RoomStore::facts()` and `RoomStore::snapshot()`, which rebuild the derived
+cache from canonical log segments when needed. Discovery should call that
+boundary or a small sibling reader, not parse storage internals ad hoc.
 
 ## Proposed Shape
 
@@ -76,8 +83,8 @@ Rules:
 
 - Opening a `RoomStore` may refresh the current repo's index entry.
 - Missing or moved repos produce warnings, not hard failures.
-- The index is not coordination truth. If it disagrees with `.rally/facts.db`,
-  the fact store wins.
+- The index is not coordination truth. If it disagrees with a repo's canonical
+  `.rally/log/` segments, the repo-local log wins.
 - Manual users can still pass a repo path later if an explicit
   `--repo <path>` flag is added.
 
@@ -86,7 +93,7 @@ Rules:
 `rally locate <event-id> --json` should:
 
 1. Search the current repo first through `RoomStore::facts()`.
-2. Search indexed `.rally/facts.db` rooms.
+2. Search indexed repo rooms through the RoomStore boundary.
 3. Optionally search legacy channels under `~/.agent-rally-point/apps/*`.
 4. Return the first exact fact id match plus all source metadata needed for a
    human or agent to act.
@@ -112,7 +119,7 @@ Output contract:
 ```
 
 If only a legacy record is found, set `source` to `legacy_channel` and include
-the legacy channel path. Do not rewrite it into `.rally/facts.db` from `locate`.
+the legacy channel path. Do not rewrite it into the current room from `locate`.
 
 ## Recent
 
@@ -157,7 +164,8 @@ separate reviewable path.
 ## Implementation Plan
 
 1. Add the room index writer behind `RoomStore::open()` or an adjacent helper.
-2. Add a read-only discovery module that opens known `.rally/facts.db` stores.
+2. Add a read-only discovery module that opens known repo rooms through
+   RoomStore.
 3. Add `locate` and `recent` parser entries and JSON schemas.
 4. Add tests with two temporary repos plus one synthetic legacy channel.
 5. Add warning coverage for stale registry entries and malformed legacy rows.
@@ -172,4 +180,4 @@ separate reviewable path.
 - A stale index entry reports a warning and does not fail the command.
 - A legacy `changes.jsonl` event can be located by id and is clearly marked as
   `legacy_channel`.
-- `recent --all` never mutates `.rally/facts.db`.
+- `recent --all` never mutates room state or canonical log segments.
