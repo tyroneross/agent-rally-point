@@ -3054,6 +3054,14 @@ mod ledger_tests {
 
         drop(store);
 
+        // Remove the WAL/SHM siblings before corrupting the main file. A leftover
+        // WAL lets SQLite recover the (about-to-be-)corrupted header from the WAL
+        // ~4% of the time under heavy parallel load — masking the corruption so
+        // the precondition + quarantine assertions flap. With the siblings gone,
+        // a wrong magic header is categorically SQLITE_NOTADB, detected at open.
+        let _ = fs::remove_file(root.join(".rally/facts.db-wal"));
+        let _ = fs::remove_file(root.join(".rally/facts.db-shm"));
+
         // Corrupt facts.db by overwriting the SQLite magic header (bytes 0-15
         // hold the ASCII string "SQLite format 3\000"). This reproduces
         // SQLITE_NOTADB / "file is not a database" — categorically detectable
