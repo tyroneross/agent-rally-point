@@ -3709,10 +3709,16 @@ pub(crate) fn shell_quote(value: &str) -> String {
         .into_owned()
 }
 
+/// Crate-wide serialization lock for tests that mutate process-global env vars
+/// (`RALLY_ENGAGEMENT`, `RALLY_ROTATE_DAYS`, `RALLY_GLOBAL_INDEX`, `HOME`,
+/// `PTYD_SOCKET_PATH`, `XDG_RUNTIME_DIR`).  Every env-mutating test must acquire
+/// this lock at the top of the test body and hold it for the full body.
+#[cfg(test)]
+pub(crate) static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_root(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -3858,12 +3864,9 @@ mod tests {
         // resolution drives the decision.
         //
         // Env mutation is process-wide and Rust 2024 marks it unsafe. We
-        // serialize HOME/PTYD/XDG mutations via a static mutex so concurrent
-        // unit tests in this binary don't race against each other or
-        // observe a half-set env.
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // serialize HOME/PTYD/XDG mutations via the crate-wide PROCESS_ENV_LOCK
+        // so all env-touching tests in this binary serialize against each other.
+        let _env_guard = crate::PROCESS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
         let base = unique_root("ptyd-detect");
         let home = base.join("home");

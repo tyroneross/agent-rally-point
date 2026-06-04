@@ -312,7 +312,8 @@ mod tests {
     /// reconstructs full history.
     #[test]
     fn rotates_old_segments_keeps_recent_replay_preserves_history() {
-        // SAFETY: env mutation, single-threaded test scope.
+        let _env = crate::PROCESS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: env mutation serialized by PROCESS_ENV_LOCK above.
         unsafe {
             env::remove_var(THRESHOLD_ENV_VAR);
             env::remove_var(crate::store::ENGAGEMENT_ENV_VAR);
@@ -377,7 +378,8 @@ mod tests {
     /// A segment with at least one fresh line stays live (no partial rotation).
     #[test]
     fn segment_with_recent_event_stays_live() {
-        // SAFETY: env mutation, single-threaded test scope.
+        let _env = crate::PROCESS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: env mutation serialized by PROCESS_ENV_LOCK above.
         unsafe {
             env::remove_var(THRESHOLD_ENV_VAR);
             env::remove_var(crate::store::ENGAGEMENT_ENV_VAR);
@@ -415,7 +417,8 @@ mod tests {
     /// `--dry-run` reports without moving.
     #[test]
     fn dry_run_reports_without_moving() {
-        // SAFETY: env mutation, single-threaded test scope.
+        let _env = crate::PROCESS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: env mutation serialized by PROCESS_ENV_LOCK above.
         unsafe {
             env::remove_var(THRESHOLD_ENV_VAR);
             env::remove_var(crate::store::ENGAGEMENT_ENV_VAR);
@@ -441,7 +444,8 @@ mod tests {
     /// Idempotent — running twice on already-rotated state is a no-op.
     #[test]
     fn rotation_is_idempotent() {
-        // SAFETY: env mutation, single-threaded test scope.
+        let _env = crate::PROCESS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: env mutation serialized by PROCESS_ENV_LOCK above.
         unsafe {
             env::remove_var(THRESHOLD_ENV_VAR);
             env::remove_var(crate::store::ENGAGEMENT_ENV_VAR);
@@ -469,7 +473,8 @@ mod tests {
     /// Threshold-source precedence: flag > env > manifest > default.
     #[test]
     fn threshold_source_priority() {
-        // SAFETY: env mutation, single-threaded test scope.
+        let _env = crate::PROCESS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: env mutation serialized by PROCESS_ENV_LOCK above.
         unsafe {
             env::remove_var(THRESHOLD_ENV_VAR);
         }
