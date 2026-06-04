@@ -121,6 +121,24 @@ Everything below radiates from that.
     every reader hits this path on open, so corruption is a non-event. Empirical test:
     `malformed_facts_db_is_rebuilt_from_segments_on_open` in `crates/rally-cli/src/store.rs`.
 
+## Store durability + scale session (2026-06-04)
+
+- **A persisted cache key MUST use a deterministic hash.** `hash_file_head` used Rust's
+  `DefaultHasher` (randomly seeded *per process*); since every `rally` CLI call is a fresh process,
+  the sidecar key never matched across processes → the O(1) fast path was silently dead in
+  production while the in-process unit test passed. **Why it bit:** `DefaultHasher` is stable
+  *within* a process, so single-process tests are blind to it. **How to apply:** never persist a
+  `DefaultHasher`/`HashMap`-seeded value to disk — use a fixed-seed hash (FNV-1a here) and pin it
+  with a golden-value test. Caught by `independent-auditor`, not by the implementer's tests.
+- **Measure the real (cross-process) path, not the in-process unit.** The reconcile O(1) win is real
+  (150µs flat) but did **not** move end-to-end command latency, because `snapshot()` loads all facts
+  (O(N)) and dominates. A flat unit benchmark ≠ a flat user-facing curve. Re-run the binary curve.
+- **Seed benchmarks with a *persisting* fact kind.** First latency run used `rally say note` — a
+  non-persisting kind — so the ledger never grew and the curve was meaningless ("final ledger lines:
+  4"). Verify the population actually grew before trusting a curve.
+- **Verify subagent test counts independently.** A coder reported "10/10 green / 190 passed"; an
+  independent re-run found a real residual flake. Re-run the gate yourself before committing.
+
 ## Top systemic fixes (ranked)
 
 1. **Verify-before-asserting-a-negative** — machine-stored `verified_by` on every closing fact +

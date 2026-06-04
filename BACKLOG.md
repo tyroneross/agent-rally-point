@@ -51,6 +51,29 @@ housekeeping rows below.
 duplicate ids **warn + record a durable audit fact** (inject channel-of-record, B10 ambiguous-path
 WARN, B11 duplicate-id risk fact) so work continues and any mistake is traceable + fixable after.
 
+## Delivered — store durability for scale (2026-06-04)
+
+Foundation for the **thousands-of-agents / many-terminals** north star. Commits `5c68dac`..`32d21be`
+on `origin/main`. Measured roadmap: [`docs/SCALE-ROADMAP.md`](docs/SCALE-ROADMAP.md).
+
+- **Corruption resilience — DONE.** Malformed/missing `facts.db` → quarantine + rebuild from the
+  canonical JSONL ledger, zero history loss (header/mid-page/extended SQLite codes + torn trailing
+  line). Resolves the 2026-06-01 easy-terminal `facts.db.corrupt` incident (was a cross-reference in
+  build-loop issue `bl-coord-store-fragmentation`).
+- **O(1) happy-path reconcile — DONE.** Fingerprint sidecar (`.rally/.reconcile-cache.json`,
+  deterministic FNV-1a) short-circuits the O(N) scan; authoritative scan+rebuild on any drift.
+  Measured flat (150µs at n=200 and n=4000).
+- **Concurrency + determinism — DONE.** Active-segment-first R9 readback; thread-aware open jitter
+  (replaces `pid%17`); parallel-test flake 25% → 0%. `SILENT_LOSS=0` at N≤128.
+
+## Open — ranked — scale (P1–P3, measured; see SCALE-ROADMAP.md)
+
+| ID | Item | Status |
+|----|------|--------|
+| **S-P1** | **Projection → indexed SQL.** `snapshot()`/`read_db_event_count` still load *all* facts → now the dominant command-latency cost (`say` 16→33ms over 251→2001 facts). Push counts to `COUNT(*)` and projections to indexed queries. Correctness-sensitive (coordination decisions) → own build-loop, TDD + audit. | open — highest leverage |
+| **S-P2** | **Rotation + compaction.** Auto size-trigger rotation AND checkpoint archive into `facts.db` so it is no longer re-replayed (`replay_archive_segments`) — bounds the hot set as history grows. | open |
+| **S-P3** | **`rallyd` single-writer daemon.** Warm SQLite + in-memory projection over a Unix socket; CLIs become thin clients. Removes per-process cold opens + flock thundering (wall ∝ N ≈ 110s at N=1000). Architectural — design forks (lifecycle/socket/fallback/auth) need a decision first. | open — N=1000+ ceiling |
+
 ## Open — ranked
 
 > **Reconciliation (2026-05-30 #2 — validated against real code + call-graph scan):** most rows below
