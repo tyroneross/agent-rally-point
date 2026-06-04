@@ -126,7 +126,12 @@ not list the target, use `rally say handoff --target <target-tool>` and either
 adopt/relaunch the running surface or report that direct delivery is unavailable.
 
 Agents can still call `rally check before-write` explicitly before shared
-edits. Rally no longer installs host hooks or prompt injection glue.
+edits. Rally's core CLI does not auto-install host hooks. An opt-in,
+version-controlled hook + installer ships in `hooks/` and `scripts/` for
+hosts (Claude Code, Codex) that benefit from automatic `SessionStart` +
+`PreToolUse` presence and deconfliction; see
+[`docs/AUTO-COORDINATION-HOOKS.md`](docs/AUTO-COORDINATION-HOOKS.md). The
+hook self-gates on missing `.rally/` so it is safe to install globally.
 
 ## Discovery & Session Management
 
