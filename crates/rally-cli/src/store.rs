@@ -1470,7 +1470,17 @@ fn is_db_locked(err: &impl std::fmt::Display) -> bool {
 /// never escape the log dir. The fallback never fails — if the clock returns
 /// something exotic, `"unknown-engagement"` is used.
 fn resolve_active_engagement(rally_dir: &Path) -> String {
-    if let Ok(value) = env::var(ENGAGEMENT_ENV_VAR) {
+    resolve_active_engagement_with_env(rally_dir, env::var(ENGAGEMENT_ENV_VAR).ok())
+}
+
+/// Engagement resolution with the `RALLY_ENGAGEMENT` value injected rather than
+/// read from the process environment. This is the real implementation; the
+/// public wrapper passes the live env var. Tests pass an explicit value so they
+/// can exercise the priority ladder WITHOUT mutating the process-global env —
+/// `std::env::set_var` is unsound under cargo's multi-threaded test runner and
+/// raced concurrent engagement resolution in other tests (e.g. backlog).
+fn resolve_active_engagement_with_env(rally_dir: &Path, env_value: Option<String>) -> String {
+    if let Some(value) = env_value {
         let cleaned = sanitise_engagement(&value);
         if !cleaned.is_empty() {
             return cleaned;
@@ -1703,8 +1713,12 @@ fn distinct_segment_seqs(live: &[PathBuf], archived: &[PathBuf]) -> Result<i64> 
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: LedgerLine = serde_json::from_str(&line)
-                .map_err(RallyError::json(format!("parse {}", path.display())))?;
+            let Ok(entry) = serde_json::from_str::<LedgerLine>(&line) else {
+                // Torn trailing line (crash during append, never fsynced).
+                // Skip rather than brick the store — mirrors live-index reader
+                // behaviour at ~store.rs:1645.
+                continue;
+            };
             seqs.insert(entry.seq);
         }
     }
@@ -1747,9 +1761,17 @@ fn read_db_event_count(facts_db_path: &Path) -> Result<i64> {
         Err(err) => return Err(err),
     };
     // TODO(perf): O(N) full load — replace with count() when factstr exposes one.
-    let query = store
-        .query(&FactQuery::all())
-        .map_err(|err| RallyError::Message(format!("query facts: {err}")))?;
+    // Mid-page corruption (SQLITE_CORRUPT / code 11) only surfaces during
+    // b-tree traversal, not at open time. Catch it here so the same
+    // quarantine+rebuild path fires for code-11 as for code-26 (header).
+    let query = match store.query(&FactQuery::all()) {
+        Ok(q) => q,
+        Err(err) if is_malformed_db_error(&err) => {
+            quarantine_corrupt_db(facts_db_path)?;
+            return Ok(0);
+        }
+        Err(err) => return Err(RallyError::Message(format!("query facts: {err}"))),
+    };
     i64::try_from(query.event_records.len())
         .map_err(|err| RallyError::Message(format!("event count overflow: {err}")))
 }
@@ -1784,8 +1806,11 @@ fn read_db_event_count(facts_db_path: &Path) -> Result<i64> {
 /// from SQLite's `sqlite3_errstr` table.
 fn is_malformed_db_error(err: &impl std::fmt::Display) -> bool {
     let msg = err.to_string();
-    msg.contains("code: 11")
-        || msg.contains("code: 26")
+    // Match "code: 11)" with closing paren to avoid false positive on "code: 110"
+    // (SQLite does not emit code 110, but the substring "code: 11" would match it).
+    // "code: 26)" is already unambiguous but gets the same treatment for consistency.
+    msg.contains("code: 11)")
+        || msg.contains("code: 26)")
         || msg.contains("disk image is malformed")
         || msg.contains("file is not a database")
         || msg.contains("corrupt")
@@ -1865,14 +1890,17 @@ fn rebuild_db_from_segments(
     for path in live.iter().chain(archived.iter()) {
         let file =
             fs::File::open(path).map_err(RallyError::io(format!("read {}", path.display())))?;
-        for (idx, line) in BufReader::new(file).lines().enumerate() {
+        for line in BufReader::new(file).lines() {
             let line = line.map_err(RallyError::io(format!("read {}", path.display())))?;
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: LedgerLine = serde_json::from_str(&line).map_err(RallyError::json(
-                format!("parse {} line {}", path.display(), idx + 1),
-            ))?;
+            let Ok(entry) = serde_json::from_str::<LedgerLine>(&line) else {
+                // Torn trailing line (crash during append, never fsynced).
+                // Skip rather than brick the store — mirrors live-index reader
+                // behaviour at ~store.rs:1645.
+                continue;
+            };
             all_entries.push(entry);
         }
     }
@@ -2490,10 +2518,12 @@ mod ledger_tests {
             &"UNIQUE constraint failed: store_metadata.key".to_string()
         ));
         // Negative control: an unrelated error that happens to contain "code: 11x".
-        // SQLite does not currently emit "code: 110" / "code: 119" so a
-        // substring conflict at the byte-pattern level is acceptable; the
-        // caller already exhausted the retry loop in `open_fact_store` and
-        // anything reaching us here is fatal at the cache layer.
+        // SQLite does not currently emit "code: 110" / "code: 119"; we now
+        // match "code: 11)" (closing paren) so this is a true negative rather
+        // than an acceptable false positive.
+        assert!(!is_malformed_db_error(
+            &"error from database: (code: 110) some other error".to_string()
+        ));
         assert!(!is_malformed_db_error(&"".to_string()));
     }
 
@@ -2941,6 +2971,11 @@ mod ledger_tests {
     }
 
     /// Engagement resolution priority: env var > persisted file > UTC date.
+    /// Exercised through `resolve_active_engagement_with_env` so the test never
+    /// mutates the process-global `RALLY_ENGAGEMENT` — `env::set_var` is unsound
+    /// under cargo's multi-threaded runner and previously raced concurrent
+    /// engagement resolution in other tests (e.g. backlog), making the suite
+    /// non-deterministic.
     #[test]
     fn engagement_resolution_priority_env_then_file_then_date() {
         let root = unique_root("engagement-resolve");
@@ -2948,31 +2983,19 @@ mod ledger_tests {
         fs::create_dir_all(&dir).unwrap();
 
         // 1. No env, no file → UTC date.
-        // Unset the env var if it's set in the test environment.
-        // (cargo test isolates env vars per process; the var may leak from
-        // outer shells if someone set it. Defensive remove.)
-        // SAFETY: env mutation is safe in single-threaded test execution.
-        unsafe {
-            env::remove_var(ENGAGEMENT_ENV_VAR);
-        }
-        let label = resolve_active_engagement(&dir);
+        let label = resolve_active_engagement_with_env(&dir, None);
         let today = utc_date_label();
         assert_eq!(label, today);
 
-        // 2. Persisted file → that label.
+        // 2. Persisted file (no env) → that label.
         persist_active_engagement(&dir, "  my-sprint  ").unwrap();
-        assert_eq!(resolve_active_engagement(&dir), "my-sprint");
+        assert_eq!(resolve_active_engagement_with_env(&dir, None), "my-sprint");
 
         // 3. Env var wins over file.
-        // SAFETY: env mutation, single-threaded test.
-        unsafe {
-            env::set_var(ENGAGEMENT_ENV_VAR, "env-engagement");
-        }
-        assert_eq!(resolve_active_engagement(&dir), "env-engagement");
-        // SAFETY: env mutation, single-threaded test.
-        unsafe {
-            env::remove_var(ENGAGEMENT_ENV_VAR);
-        }
+        assert_eq!(
+            resolve_active_engagement_with_env(&dir, Some("env-engagement".to_string())),
+            "env-engagement"
+        );
 
         // Sanitise strips path separators.
         let cleaned = sanitise_engagement("../escape/me");
@@ -4029,6 +4052,173 @@ mod ledger_tests {
             idempotent, after_re_enter,
             "cursor_for must be idempotent — no side effects on repeated reads"
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // F1 — torn trailing JSONL line must not brick the store
+    // -------------------------------------------------------------------------
+
+    /// A crash during segment append can leave a partially-written (non-JSON)
+    /// last line.  Previously `distinct_segment_seqs` and `rebuild_db_from_segments`
+    /// hard-errored on it, bricking the store.  The torn line was never durably
+    /// committed (fsync contract), so it must be tolerated and skipped.
+    #[test]
+    fn torn_trailing_segment_line_is_skipped_on_rebuild() {
+        let root = unique_root("torn-trailing");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        // Write 3 valid facts (seq 1-3).
+        let a = store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim a"))
+            .unwrap();
+        let b = store
+            .append_fact(&make_fact("e2", FactKind::Decision, "src/", "decided b"))
+            .unwrap();
+        let c = store
+            .append_fact(&make_fact("e3", FactKind::Blocker, "tests/", "blocker c"))
+            .unwrap();
+        assert_eq!((a.seq, b.seq, c.seq), (1, 2, 3));
+
+        // Grab the segment path before drop so we can mutate it.
+        let segment_path = store.active_segment_path();
+        drop(store);
+
+        // Simulate a torn write: append a partial/truncated JSON fragment that
+        // a crash would leave — not valid JSON, no terminating newline.
+        {
+            use std::io::Write;
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(&segment_path)
+                .unwrap();
+            // Deliberately incomplete — looks like the beginning of a LedgerLine
+            // that was cut off mid-write.
+            f.write_all(b"{\"seq\":4,\"occurred_at\":\"2026-01-01T00:00:00Z\",\"event_type\":\"claim\",\"payload\":{\"ev")
+                .unwrap();
+            // No trailing newline — crash happened before completion.
+        }
+
+        // Delete facts.db so reconcile is forced to call rebuild_db_from_segments.
+        let facts_db = root.join(".rally/facts.db");
+        fs::remove_file(&facts_db).ok();
+        let _ = fs::remove_file(facts_db.with_extension("db-shm"));
+        let _ = fs::remove_file(facts_db.with_extension("db-wal"));
+
+        // open_at must succeed — torn line must be skipped, not fatal.
+        let store2 = RoomStore::open_at(root.clone()).unwrap();
+        let facts = store2.facts().unwrap();
+
+        // All 3 valid facts recovered; the torn line produces no entry.
+        assert_eq!(facts.len(), 3, "all 3 valid facts recovered; torn line skipped");
+        assert_eq!(facts[0].seq, 1);
+        assert_eq!(facts[1].seq, 2);
+        assert_eq!(facts[2].seq, 3);
+
+        // The canonical segment was not quarantined (quarantine only applies to
+        // facts.db, not to JSONL segments).
+        let rally_dir = root.join(".rally");
+        let has_quarantine = fs::read_dir(&rally_dir)
+            .unwrap()
+            .any(|e| {
+                e.map(|e| e.file_name().to_string_lossy().starts_with("facts.db.corrupt."))
+                    .unwrap_or(false)
+            });
+        assert!(!has_quarantine, "no quarantine file: torn line is not treated as DB corruption");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // F2 — mid-page SQLITE_CORRUPT (code 11) triggers full recovery end-to-end
+    // -------------------------------------------------------------------------
+
+    /// The existing test `malformed_facts_db_is_rebuilt_from_segments_on_open`
+    /// corrupts only the SQLite header (→ SQLITE_NOTADB / code 26).  This test
+    /// exercises mid-page corruption (→ SQLITE_CORRUPT / code 11) by writing
+    /// enough facts to produce a multi-page DB, then corrupting bytes in page 2
+    /// (offset 4096), and forcing a real b-tree traversal via `store.facts()`.
+    #[test]
+    fn malformed_facts_db_midpage_corruption_triggers_rebuild() {
+        let root = unique_root("midpage-corrupt");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        // Write ~500 facts to ensure the DB spans multiple pages.
+        for i in 0..500u32 {
+            store
+                .append_fact(&make_fact(
+                    &format!("e{i}"),
+                    FactKind::Claim,
+                    "src/",
+                    &format!("fact {i} — padding to grow the db past one page boundary"),
+                ))
+                .unwrap();
+        }
+        let before_facts = store.facts().unwrap();
+        assert_eq!(before_facts.len(), 500);
+
+        let segments = segments_under(&root);
+        assert!(!segments.is_empty(), "segments are canonical");
+
+        drop(store);
+
+        // Corrupt page 2 (offset 4096) — well past the header so sqlite opens
+        // without noticing until it traverses the b-tree during a real query.
+        let facts_db = root.join(".rally/facts.db");
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&facts_db)
+                .unwrap();
+            let db_size = f.seek(SeekFrom::End(0)).unwrap();
+            // Only proceed if the file is actually multi-page.
+            assert!(
+                db_size > 8192,
+                "DB must be multi-page for mid-page corruption test (got {db_size} bytes)"
+            );
+            f.seek(SeekFrom::Start(4096)).unwrap();
+            // Overwrite 64 bytes in the middle of page 2 with garbage.
+            f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF].repeat(16)).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Reopen the room.  reconcile_segments_and_db detects the corrupt DB
+        // via read_db_event_count (which issues a query, forcing page traversal)
+        // and triggers quarantine + rebuild.
+        let store2 = RoomStore::open_at(root.clone()).unwrap();
+
+        // Force a full b-tree traversal so SQLite must visit the corrupted page.
+        let after_facts = store2.facts().unwrap();
+
+        // All 500 facts recovered from the canonical JSONL segments.
+        assert_eq!(after_facts.len(), 500, "all 500 facts recovered after mid-page corruption");
+        for (pre, post) in before_facts.iter().zip(after_facts.iter()) {
+            assert_eq!(pre.seq, post.seq);
+            assert_eq!(pre.event_id, post.event_id);
+        }
+
+        // A quarantine file exists (corrupt bytes preserved for forensics).
+        let rally_dir = root.join(".rally");
+        let found_quarantine = fs::read_dir(&rally_dir)
+            .unwrap()
+            .any(|e| {
+                e.map(|e| {
+                    let n = e.file_name();
+                    let s = n.to_string_lossy();
+                    s.starts_with("facts.db.corrupt.")
+                        && !s.ends_with("-db-shm")
+                        && !s.ends_with("-db-wal")
+                })
+                .unwrap_or(false)
+            });
+        assert!(found_quarantine, "corrupt bytes preserved as facts.db.corrupt.<stamp>");
+
+        // Rebuilt DB is healthy — snapshot is queryable.
+        let snap = store2.snapshot().unwrap();
+        assert_eq!(snap.max_seq, 500);
 
         fs::remove_dir_all(&root).ok();
     }
