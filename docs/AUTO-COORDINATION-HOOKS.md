@@ -11,6 +11,35 @@ agents (Claude Code, Codex, Gemini) without per-repo setup. Closes backlog
 risk documented in
 [`assessment-2026-05-31-codex-hook-desync.md`](assessment-2026-05-31-codex-hook-desync.md).
 
+## Install — portable, ships in the repo (no global config)
+
+The wiring **ships with this repo** so it works on **any user machine** without
+touching `~/.claude` or `~/.codex`:
+
+- `.claude/settings.json` — Claude Code hooks via `${CLAUDE_PROJECT_DIR}` (resolves
+  to the repo root on any machine).
+- `.codex/hooks.json` — Codex hooks via the git top-level (portable path).
+
+Just open the repo in Claude Code / Codex and **trust it on first prompt**. The
+hook self-gates on `.rally/` presence (no-op elsewhere) and fail-opens (never
+blocks an edit). This is the default and recommended path — nothing to run.
+
+**Opt-in only — user-wide install across every repo on one machine** (edits your
+global `~/.claude/settings.json`; per-machine, not portable):
+
+```bash
+scripts/install_rally_hooks.sh --global [--repoint-codex]    # install user-wide
+scripts/install_rally_hooks.sh --uninstall [--repoint-codex] # revert
+```
+
+Running the installer **without `--global` does nothing** but print this guidance —
+the portable project config is already committed.
+
+> **Other repos that adopt rally:** copy `.claude/settings.json` + `.codex/hooks.json`
+> into that repo, pointing the command at a `rally`-resolvable hook. The universal
+> zero-bundle mechanism (a `rally hook` binary subcommand so a one-line committed
+> config calls `rally hook …` with no script path) is tracked as a backlog item.
+
 ## What the hook does
 
 | Event | Action |

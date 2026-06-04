@@ -37,6 +37,7 @@ ACTION="install"
 REPOINT_CODEX=0
 DRY_RUN=0
 QUIET=0
+GLOBAL=0
 
 usage() {
   sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
@@ -47,12 +48,35 @@ while [ $# -gt 0 ]; do
     --uninstall) ACTION="uninstall"; shift ;;
     --install)   ACTION="install"; shift ;;
     --repoint-codex) REPOINT_CODEX=1; shift ;;
+    --global)    GLOBAL=1; shift ;;
     --dry-run)   DRY_RUN=1; shift ;;
     --quiet|-q)  QUIET=1; shift ;;
     --help|-h)   usage; exit 0 ;;
     *) echo "install_rally_hooks: unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+# Portable-by-default: the auto-coordination config SHIPS IN THE REPO
+# (.claude/settings.json + .codex/hooks.json, committed, using ${CLAUDE_PROJECT_DIR}).
+# Opening this repo in Claude Code / Codex auto-loads them — no global change,
+# works on any user machine. The global install is an explicit opt-in only.
+if [ "$ACTION" = "install" ] && [ "$GLOBAL" != "1" ]; then
+  cat >&2 <<'EOF'
+install_rally_hooks: nothing to do — project-level config is the portable default
+  and is already committed in this repo:
+      .claude/settings.json     (Claude Code, via ${CLAUDE_PROJECT_DIR})
+      .codex/hooks.json         (Codex, via git-toplevel)
+  Open the repo in Claude Code / Codex and trust it on first prompt. Works on any
+  machine with NO change to your global ~/.claude or ~/.codex config.
+
+  Opt-in to a USER-WIDE install across every repo on THIS machine (edits your
+  global ~/.claude/settings.json — not portable, per-machine):
+      scripts/install_rally_hooks.sh --global [--repoint-codex]
+  Uninstall the global install:
+      scripts/install_rally_hooks.sh --uninstall [--repoint-codex]
+EOF
+  exit 0
+fi
 
 say() { [ "$QUIET" = "1" ] || printf '%s\n' "$*"; }
 say_changed() { printf '%s\n' "$*"; }

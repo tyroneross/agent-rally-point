@@ -74,6 +74,23 @@ on `origin/main`. Measured roadmap: [`docs/SCALE-ROADMAP.md`](docs/SCALE-ROADMAP
 | **S-P2** | **Rotation + compaction.** Auto size-trigger rotation AND checkpoint archive into `facts.db` so it is no longer re-replayed (`replay_archive_segments`) — bounds the hot set as history grows. | open |
 | **S-P3** | **`rallyd` single-writer daemon.** Warm SQLite + in-memory projection over a Unix socket; CLIs become thin clients. Removes per-process cold opens + flock thundering (wall ∝ N ≈ 110s at N=1000). Architectural — design forks (lifecycle/socket/fallback/auth) need a decision first. | open — N=1000+ ceiling |
 
+## Delivered — automatic coordination hooks (2026-06-04, B19-(a))
+
+Rally presence + before-write deconfliction now fire automatically (no human nudge).
+**Portable by design** — the wiring ships in the repo (`.claude/settings.json` via
+`${CLAUDE_PROJECT_DIR}`, `.codex/hooks.json` via git-toplevel), so it works on any
+user machine with NO global `~/.claude`/`~/.codex` change. Advisory/non-blocking by
+default (verified Claude + Codex hook contracts); `RALLY_HOOK_STRICT=1` opt-in to
+block; `--global` installer is opt-in only. SessionStart surfaces active peers +
+open claims + deconflict guidance; PreToolUse warns on a peer-claimed path. See
+[`docs/AUTO-COORDINATION-HOOKS.md`](docs/AUTO-COORDINATION-HOOKS.md).
+
+## Open — coordination portability
+
+| ID | Item | Status |
+|----|------|--------|
+| **B19-(a)-universal** | **`rally hook` binary subcommand** so ANY rally repo needs only a one-line committed `.claude/settings.json` / `.codex/hooks.json` that calls `rally hook <phase> <host>` (rally on PATH — no bundled script, no absolute paths). Universal zero-config mechanism for repos that don't vendor `hooks/rally-coordination-hook.sh`. The old `rally hook` was removed (desync); re-add as a proper binary subcommand emitting the verified host envelope. | open |
+
 ## Open — ranked
 
 > **Reconciliation (2026-05-30 #2 — validated against real code + call-graph scan):** most rows below

@@ -43,7 +43,7 @@ jget() {
 # ----------------------------------------------------------------------
 T="install from empty settings.json"
 H="$(scratch_home)"
-HOME="$H" "$INSTALLER" --quiet >/dev/null 2>&1
+HOME="$H" "$INSTALLER" --global --quiet >/dev/null 2>&1
 rc=$?
 if [ "$rc" != "0" ]; then bad "$T" "rc=$rc"; else
   settings="$H/.claude/settings.json"
@@ -66,9 +66,9 @@ rm -rf "$H"
 # ----------------------------------------------------------------------
 T="install is idempotent (2nd run = no change)"
 H="$(scratch_home)"
-HOME="$H" "$INSTALLER" --quiet >/dev/null 2>&1
+HOME="$H" "$INSTALLER" --global --quiet >/dev/null 2>&1
 before="$(cat "$H/.claude/settings.json")"
-HOME="$H" "$INSTALLER" 2>&1 | grep -q "no change"
+HOME="$H" "$INSTALLER" --global 2>&1 | grep -q "no change"
 rc=$?
 after="$(cat "$H/.claude/settings.json")"
 if [ "$rc" = "0" ] && [ "$before" = "$after" ]; then
@@ -95,7 +95,7 @@ cat > "$H/.claude/settings.json" <<'EOF'
   }
 }
 EOF
-HOME="$H" "$INSTALLER" --quiet >/dev/null 2>&1
+HOME="$H" "$INSTALLER" --global --quiet >/dev/null 2>&1
 rc=$?
 # Both unrelated hooks must still be present.
 keep_other=$(grep -c "some_other_hook.sh" "$H/.claude/settings.json" 2>/dev/null || echo 0)
@@ -126,7 +126,7 @@ cat > "$H/.claude/settings.json" <<'EOF'
 }
 EOF
 original_normalized="$(python3 -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2))" "$H/.claude/settings.json")"
-HOME="$H" "$INSTALLER" --quiet >/dev/null 2>&1
+HOME="$H" "$INSTALLER" --global --quiet >/dev/null 2>&1
 HOME="$H" "$INSTALLER" --uninstall --quiet >/dev/null 2>&1
 final_normalized="$(python3 -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2))" "$H/.claude/settings.json")"
 if [ "$original_normalized" = "$final_normalized" ]; then
@@ -160,7 +160,7 @@ H="$(scratch_home)"
 echo '{}' > "$H/.claude/settings.json"
 before_mtime="$(stat -f %m "$H/.claude/settings.json" 2>/dev/null || stat -c %Y "$H/.claude/settings.json" 2>/dev/null)"
 sleep 1
-HOME="$H" "$INSTALLER" --dry-run --quiet >/dev/null 2>&1
+HOME="$H" "$INSTALLER" --global --dry-run --quiet >/dev/null 2>&1
 after_mtime="$(stat -f %m "$H/.claude/settings.json" 2>/dev/null || stat -c %Y "$H/.claude/settings.json" 2>/dev/null)"
 if [ "$before_mtime" = "$after_mtime" ]; then
   ok "$T"
@@ -179,7 +179,7 @@ echo "#!/bin/sh
 # old content" > "$H/.codex/rally-hook.sh"
 chmod +x "$H/.codex/rally-hook.sh"
 old_content="$(cat "$H/.codex/rally-hook.sh")"
-HOME="$H" "$INSTALLER" --repoint-codex --quiet >/dev/null 2>&1
+HOME="$H" "$INSTALLER" --global --repoint-codex --quiet >/dev/null 2>&1
 rc=$?
 shim="$H/.codex/rally-hook.sh"
 bak="$H/.codex/rally-hook.sh.bak"
@@ -203,13 +203,27 @@ mkdir -p "$H/.codex"
 printf '#!/bin/sh\n# old content\n' > "$H/.codex/rally-hook.sh"
 chmod +x "$H/.codex/rally-hook.sh"
 old_content="$(cat "$H/.codex/rally-hook.sh")"
-HOME="$H" "$INSTALLER" --repoint-codex --quiet >/dev/null 2>&1
+HOME="$H" "$INSTALLER" --global --repoint-codex --quiet >/dev/null 2>&1
 HOME="$H" "$INSTALLER" --repoint-codex --uninstall --quiet >/dev/null 2>&1
 restored="$(cat "$H/.codex/rally-hook.sh" 2>/dev/null || echo MISSING)"
 if [ "$restored" = "$old_content" ]; then
   ok "$T"
 else
   bad "$T" "restored content differs from original"
+fi
+rm -rf "$H"
+
+# ----------------------------------------------------------------------
+# Test 9: default (no --global) must NOT write global; guides to project config
+# ----------------------------------------------------------------------
+T="default (no --global) leaves global untouched + guides to project config"
+H="$(mktemp -d)"; mkdir -p "$H/.claude"; printf '{"hooks":{}}' > "$H/.claude/settings.json"
+out="$(HOME="$H" "$INSTALLER" 2>&1)"
+after="$(cat "$H/.claude/settings.json")"
+if printf '%s' "$out" | grep -q "project-level config is the portable default" && [ "$after" = '{"hooks":{}}' ]; then
+  ok "$T"
+else
+  bad "$T" "default run must not write global and must print project-level guidance"
 fi
 rm -rf "$H"
 
