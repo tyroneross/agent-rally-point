@@ -61,8 +61,10 @@ target/
 #     engagement. Derived view (regenerate via `rally retrospective`; do
 #     not hand-edit) but committed so a fresh clone sees the history.
 # Everything else under .rally/ is a derived cache (facts.db, room.db,
-# cursors.json, tmp files) that `rally` rebuilds from the ledger on first
-# open.
+# cursors.json, .reconcile-cache.json, tmp files) that `rally` rebuilds from
+# the ledger on first open. The reconcile sidecar (.reconcile-cache.json) is a
+# disposable fingerprint cache for the O(1) reconcile fast path; a
+# missing/corrupt sidecar just forces a full authoritative scan + rebuild.
 .rally/*
 !.rally/ledger.jsonl
 !.rally/manifest.json
