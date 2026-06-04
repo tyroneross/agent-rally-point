@@ -110,7 +110,7 @@ if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 # Test 5: advisory-only invariant — even with a stub rally that emits a
 # `stop`-severity envelope, default mode must NOT emit deny/block.
 # ----------------------------------------------------------------------
-T="advisory-only default: stop-severity → additionalContext, not deny"
+T="advisory-only default: stop-severity → allow+systemMessage, not deny"
 stub_bin="$tmpdir/rally_stub"
 cat > "$stub_bin" <<'EOF'
 #!/usr/bin/env bash
@@ -136,8 +136,13 @@ chmod +x "$stub_bin"
   if ! printf '%s' "$out" | grep -q "HIGH-SEVERITY"; then
     printf 'missing high-severity marker in advisory: %s\n' "$out" >&2; exit 1
   fi
-  if ! printf '%s' "$out" | grep -q "additionalContext"; then
-    printf 'missing additionalContext envelope: %s\n' "$out" >&2; exit 1
+  # Verified PreToolUse advisory contract: permissionDecision "allow"
+  # (non-blocking) + systemMessage (guaranteed-surfaced warn).
+  if ! printf '%s' "$out" | grep -q '"permissionDecision":"allow"'; then
+    printf 'missing permissionDecision:allow: %s\n' "$out" >&2; exit 1
+  fi
+  if ! printf '%s' "$out" | grep -q "systemMessage"; then
+    printf 'missing systemMessage envelope: %s\n' "$out" >&2; exit 1
   fi
   exit 0
 )
@@ -179,8 +184,8 @@ chmod +x "$warn_bin"
     if printf '%s' "$out" | grep -q '"permissionDecision":"deny"'; then
       printf 'warn must never deny: %s\n' "$out" >&2; exit 1
     fi
-    if ! printf '%s' "$out" | grep -q "additionalContext"; then
-      printf 'warn missing additionalContext: %s\n' "$out" >&2; exit 1
+    if ! printf '%s' "$out" | grep -q "systemMessage"; then
+      printf 'warn missing systemMessage: %s\n' "$out" >&2; exit 1
     fi
   done
   exit 0

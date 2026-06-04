@@ -103,7 +103,7 @@ compute_new_jq() {
     printf '%s' "$OLD_JSON" | jq \
       --arg start_cmd "$HOOK_CMD_START" \
       --arg pretool_cmd "$HOOK_CMD_PRETOOL" \
-      --arg matcher "Edit|Write|MultiEdit" \
+      --arg matcher "Edit|Write|MultiEdit|NotebookEdit" \
       '
       # Ensure hooks object
       .hooks //= {}
@@ -151,7 +151,7 @@ compute_new_python() {
   ACTION_ENV="$action" \
   START_CMD="$HOOK_CMD_START" \
   PRETOOL_CMD="$HOOK_CMD_PRETOOL" \
-  MATCHER="Edit|Write|MultiEdit" \
+  MATCHER="Edit|Write|MultiEdit|NotebookEdit" \
   OLD_JSON_ENV="$OLD_JSON" \
   python3 - <<'PY'
 import json, os, sys

@@ -178,7 +178,37 @@ if [ -z "$session" ]; then session="${RALLY_SESSION_ID:-${tool}-$(date +%s)}"; f
 # Dispatch on phase.
 rally_output=""
 if [ "$phase" = "start" ]; then
-  rally_output="$(rally_timeout enter --tool "$tool" --session-id "$session" --json 2>/dev/null || true)"
+  # Register presence (auto-enter), then surface room awareness so a NEW agent
+  # automatically knows there is an active room + who owns what, and deconflicts
+  # before editing. Stays quiet (no nag) when the agent is solo.
+  rally_timeout enter --tool "$tool" --session-id "$session" --json >/dev/null 2>&1 || true
+  if [ "$have_node" = "1" ]; then
+    room_json="$(rally_timeout room --json 2>/dev/null || true)"
+    next_json="$(rally_timeout next --tool "$tool" --json 2>/dev/null || true)"
+    rally_output="$({ printf '%s' "$room_json" | RALLY_NEXT_JSON="$next_json" RALLY_SELF_TOOL="$tool" node -e '
+const fs = require("fs");
+const tool = process.env.RALLY_SELF_TOOL || "";
+let room = {}, nxt = {};
+try { room = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch (_) {}
+try { nxt = JSON.parse(process.env.RALLY_NEXT_JSON || "{}"); } catch (_) {}
+const R = room?.data?.room || {};
+const squads = Array.isArray(R.squads) ? R.squads : [];
+const peers = [...new Set(squads.map(s => s && s.tool).filter(t => t && t !== tool && t !== "rally"))];
+const claims = (Array.isArray(R.active_claims) ? R.active_claims : [])
+  .filter(c => c && c.tool !== tool)
+  .map(c => `${(c.scope || []).join(",") || "?"} (by ${c.tool})`);
+const handoffs = Array.isArray(R.open_handoffs) ? R.open_handoffs.length : 0;
+const nextAction = nxt?.data?.next?.action;
+if (peers.length === 0 && claims.length === 0 && handoffs === 0) { process.stdout.write("{}"); process.exit(0); }
+let msg = "Active rally room here. ";
+if (peers.length) msg += `Peers: ${peers.join(", ")}. `;
+if (claims.length) msg += `Open claims: ${claims.slice(0, 8).join("; ")}. `;
+if (handoffs) msg += `${handoffs} open handoff(s). `;
+if (nextAction) msg += `Suggested next: ${nextAction}. `;
+msg += "Before editing, check `rally room` / `rally next` and deconflict — do not edit a path another agent has claimed (rally auto-checks before each write).";
+process.stdout.write(JSON.stringify({ agent_visible: { present: true, severity: "warn", message: msg } }));
+' ; } 2>/dev/null)"
+  fi
 elif [ "$phase" = "before-write" ]; then
   if [ -n "$path" ]; then
     rally_output="$(rally_timeout check before-write --tool "$tool" --path "$path" --json 2>/dev/null || true)"
@@ -314,9 +344,14 @@ if (tool === "gemini" || tool.startsWith("gemini")) {
   if (event === "SessionStart" || event === "UserPromptSubmit") {
     output({hookSpecificOutput: {hookEventName: event, additionalContext: message}});
   } else if (event === "PreToolUse") {
+    // Advisory (default): permissionDecision "allow" keeps the edit unblocked
+    // while systemMessage GUARANTEES the deconflict warning surfaces to the
+    // agent (additionalContext is not reliably injected on PreToolUse). Strict
+    // mode is the only path that emits "deny". Verified against the official
+    // Claude Code hooks contract (code.claude.com/docs/en/hooks, 2026-06).
     output(stop
       ? {hookSpecificOutput: {hookEventName: event, permissionDecision: "deny", permissionDecisionReason: message}}
-      : {hookSpecificOutput: {hookEventName: event, additionalContext: message}});
+      : {hookSpecificOutput: {hookEventName: event, permissionDecision: "allow", permissionDecisionReason: message}, systemMessage: message});
   } else if (event === "Stop") {
     output(stop ? {decision: "block", reason: message} : {systemMessage: message});
   } else {
