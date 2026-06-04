@@ -16,6 +16,9 @@ The full product boundary is [`docs/RALLY_ARCHITECTURE.md`](docs/RALLY_ARCHITECT
 Checkout and active-ledger migration rules live in
 [`docs/CANONICAL-CHECKOUT-MIGRATION.md`](docs/CANONICAL-CHECKOUT-MIGRATION.md).
 
+Automatic Claude Code / Codex hook wiring (`SessionStart` + `PreToolUse`) is
+documented in [`docs/AUTO-COORDINATION-HOOKS.md`](docs/AUTO-COORDINATION-HOOKS.md).
+
 ## Status
 
 Rally owns the primary product path:
