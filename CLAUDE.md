@@ -17,6 +17,7 @@ This repo coordinates parallel coding agents via **agent-rally-point** (per-repo
 
 ### Deeper docs
 
+- **North Star (durable vision + invariants):** [NORTH_STAR.md](NORTH_STAR.md)
 - **Guide (60-second):** [RALLY.md](RALLY.md)
 - **Doctrine (Rally Flow):** [dynamic-workflows/COORDINATION.md](dynamic-workflows/COORDINATION.md)
 - **Wire protocol:** [dynamic-workflows/PROTOCOL.md](dynamic-workflows/PROTOCOL.md)
