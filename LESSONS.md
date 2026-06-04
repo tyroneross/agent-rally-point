@@ -108,6 +108,19 @@ Everything below radiates from that.
     item twice — (a) is it still an issue, against current code; (b) is the prescribed approach still
     right, against the charter/invariants. A backlog is a hypothesis, not an instruction.
 
+13. **The canonical record must survive the cache.** *Why:* `facts.db` is a derived sqlite cache;
+    `.rally/log/<engagement>.jsonl` is the canonical record. On 2026-06-01, easy-terminal saw
+    `facts.db` corrupt and every `rally` command failed with `database disk image is malformed`; the
+    surviving cache later restarted at `sequence_number 1`, leaving orphan `facts.db.corrupt.bak`
+    files on disk. Root cause: `read_db_event_count` propagated SQLite's corruption error instead of
+    treating malformed-cache identically to missing-cache, so the existing `rebuild_db_from_segments`
+    replay path never fired. *How:* opens that touch a derived cache must (a) recognise corruption
+    sentinels (sqlite codes 11/26: `SQLITE_CORRUPT`, `SQLITE_NOTADB`), (b) quarantine the bad bytes
+    for forensics (`facts.db.corrupt.<UTC_NS>` + WAL/SHM siblings), (c) fall through to the existing
+    rebuild path. The cache-false-pass invariant in `docs/ORCHESTRATION.md §116` is now load-bearing:
+    every reader hits this path on open, so corruption is a non-event. Empirical test:
+    `malformed_facts_db_is_rebuilt_from_segments_on_open` in `crates/rally-cli/src/store.rs`.
+
 ## Top systemic fixes (ranked)
 
 1. **Verify-before-asserting-a-negative** — machine-stored `verified_by` on every closing fact +

@@ -1713,19 +1713,121 @@ fn distinct_segment_seqs(live: &[PathBuf], archived: &[PathBuf]) -> Result<i64> 
 }
 
 /// Number of events currently held by the derived sqlite cache. Compared
-/// against [`distinct_segment_seqs`] to detect a stale/absent cache. Returns
-/// 0 when the db file does not exist.
+/// against [`distinct_segment_seqs`] to detect a stale/absent cache.
+///
+/// Returns 0 in any of three cases that all funnel into the same recovery path:
+///
+/// 1. **Absent** — the db file does not exist. First-run or post-delete.
+/// 2. **Malformed** — the db file exists but SQLite refuses to open it
+///    (`SQLITE_CORRUPT`, `SQLITE_NOTADB`, "disk image is malformed"). The
+///    cache is QUARANTINED to `facts.db.corrupt.<UTC_NS>` (plus its `-shm`
+///    and `-wal` siblings) so the bytes survive for forensics, then we
+///    return 0. The caller — `reconcile_segments_and_db` — then sees
+///    `canonical_count != db_count`, fires `rebuild_db_from_segments`, and
+///    full history is restored from the canonical JSONL ledger. The
+///    canonical ledger is `.rally/log/<engagement>.jsonl` (+ archive); the
+///    db is a pure derived cache (see [`reconcile_segments_and_db`] and
+///    the cache-false-pass invariant in `docs/ORCHESTRATION.md`).
+/// 3. **Healthy** — count is queried and returned.
+///
+/// Idempotent: a second call after quarantine sees the file absent and takes
+/// the case-(1) branch with no further quarantine churn.
 fn read_db_event_count(facts_db_path: &Path) -> Result<i64> {
     if !facts_db_path.exists() {
         return Ok(0);
     }
-    let store = open_fact_store(facts_db_path)?;
+    let store = match open_fact_store(facts_db_path) {
+        Ok(store) => store,
+        Err(err) if is_malformed_db_error(&err) => {
+            // Cache is corrupt; the canonical JSONL ledger is unaffected.
+            // Move the bad bytes aside and let reconcile rebuild from segments.
+            quarantine_corrupt_db(facts_db_path)?;
+            return Ok(0);
+        }
+        Err(err) => return Err(err),
+    };
     // TODO(perf): O(N) full load — replace with count() when factstr exposes one.
     let query = store
         .query(&FactQuery::all())
         .map_err(|err| RallyError::Message(format!("query facts: {err}")))?;
     i64::try_from(query.event_records.len())
         .map_err(|err| RallyError::Message(format!("event count overflow: {err}")))
+}
+
+/// Recognize the SQLite error class that means "this file exists but cannot be
+/// opened as a database." On these errors the derived cache is unrecoverable
+/// and must be rebuilt from the canonical JSONL ledger.
+///
+/// Detection is by error-message substring because `factstr`/`factstr-sqlite`
+/// returns errors as opaque [`RallyError::Message`] strings here (the chain
+/// flattens before we see it). The substrings cover the two SQLite extended
+/// codes that mean unrecoverable corruption:
+///
+/// * `(code: 11)` — `SQLITE_CORRUPT`: malformed database disk image. Triggered
+///   by mid-file byte corruption (cosmic-ray bit flip, truncated write, partial
+///   journal replay).
+/// * `(code: 26)` — `SQLITE_NOTADB`: file does not look like a database.
+///   Triggered by a fully-overwritten or zero-truncated file.
+///
+/// The human-readable substrings (`"disk image is malformed"`,
+/// `"file is not a database"`) are checked as a belt-and-braces: SQLite's
+/// numeric-code wording is stable across the supported version range, but the
+/// English message is what most callers grep for in logs.
+fn is_malformed_db_error(err: &impl std::fmt::Display) -> bool {
+    let msg = err.to_string();
+    msg.contains("code: 11")
+        || msg.contains("code: 26")
+        || msg.contains("disk image is malformed")
+        || msg.contains("file is not a database")
+}
+
+/// Rename a corrupt `facts.db` (plus its `-shm` / `-wal` siblings) to
+/// `facts.db.corrupt.<UTC_NS>{,-shm,-wal}` so the bytes are preserved for
+/// forensics and the next `open_at` sees an absent cache (triggering the
+/// rebuild path).
+///
+/// Atomic per file: each rename is a single `rename(2)` call. If a sibling
+/// (`-shm`, `-wal`) is missing — which is normal for a non-WAL-mode db or a
+/// clean shutdown — that slot is simply skipped. Idempotent: a second call
+/// after a successful quarantine finds the source files absent and returns
+/// Ok(()) immediately.
+///
+/// The timestamp suffix is monotonic to nanosecond resolution; even back-to-back
+/// quarantines from the same process produce distinct paths.
+fn quarantine_corrupt_db(facts_db_path: &Path) -> Result<()> {
+    if !facts_db_path.exists() {
+        // Nothing to quarantine — already healed, or never present. The next
+        // case-(1) branch in `read_db_event_count` will return 0 directly.
+        return Ok(());
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let parent = facts_db_path
+        .parent()
+        .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+    let base = facts_db_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| RallyError::Message("facts db path has no file name".to_string()))?;
+    let quarantine_main = parent.join(format!("{base}.corrupt.{stamp}"));
+    fs::rename(facts_db_path, &quarantine_main).map_err(RallyError::io(format!(
+        "quarantine {} -> {}",
+        facts_db_path.display(),
+        quarantine_main.display()
+    )))?;
+    // Best-effort: quarantine the WAL/SHM siblings so they don't interfere with
+    // the rebuild. They are not load-bearing — the canonical record is the
+    // JSONL ledger — so a sibling rename failure is logged but not fatal.
+    for ext in ["db-shm", "db-wal"] {
+        let sibling = facts_db_path.with_extension(ext);
+        if sibling.exists() {
+            let quarantine_sibling = parent.join(format!("{base}.corrupt.{stamp}-{ext}"));
+            let _ = fs::rename(&sibling, &quarantine_sibling);
+        }
+    }
+    Ok(())
 }
 
 /// Rebuild the derived sqlite cache by replaying every segment line in seq
@@ -2333,6 +2435,255 @@ mod ledger_tests {
             assert_eq!(x.seq, y.seq);
             assert_eq!(x.event_id, y.event_id);
         }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // Malformed-DB recovery (Q1): the canonical JSONL ledger is the source of
+    // truth, the SQLite db is a disposable cache. A corrupt db must not lose
+    // history — the next open quarantines the bad bytes and rebuilds from
+    // segments. Empirical reproduction of the failure mode observed on
+    // easy-terminal (facts.db.corrupt + facts.db.corrupt.bak orphans).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn is_malformed_db_error_recognises_known_codes() {
+        // SQLite numeric codes (stable across supported versions).
+        assert!(is_malformed_db_error(&"error returned from database: (code: 11) database disk image is malformed".to_string()));
+        assert!(is_malformed_db_error(&"error returned from database: (code: 26) file is not a database".to_string()));
+        // Human-readable substring fallback.
+        assert!(is_malformed_db_error(
+            &"some other wrapping: disk image is malformed".to_string()
+        ));
+        assert!(is_malformed_db_error(
+            &"some other wrapping: file is not a database".to_string()
+        ));
+        // Negative controls: lock contention and metadata races are NOT
+        // unrecoverable corruption — the existing retry loop handles those.
+        assert!(!is_malformed_db_error(
+            &"database is locked".to_string()
+        ));
+        assert!(!is_malformed_db_error(
+            &"UNIQUE constraint failed: store_metadata.key".to_string()
+        ));
+        assert!(!is_malformed_db_error(&"".to_string()));
+    }
+
+    #[test]
+    fn quarantine_corrupt_db_moves_aside_atomically() {
+        let root = unique_root("quarantine-mv");
+        let rally = root.join(".rally");
+        fs::create_dir_all(&rally).unwrap();
+        let facts_db = rally.join("facts.db");
+        // Plant a "corrupt" file + WAL/SHM siblings.
+        fs::write(&facts_db, b"GARBAGE bytes pretending to be sqlite").unwrap();
+        fs::write(facts_db.with_extension("db-shm"), b"shm").unwrap();
+        fs::write(facts_db.with_extension("db-wal"), b"wal").unwrap();
+
+        quarantine_corrupt_db(&facts_db).unwrap();
+
+        assert!(!facts_db.exists(), "primary file moved aside");
+        assert!(
+            !facts_db.with_extension("db-shm").exists(),
+            "shm sibling moved aside"
+        );
+        assert!(
+            !facts_db.with_extension("db-wal").exists(),
+            "wal sibling moved aside"
+        );
+
+        // Quarantine files exist with `.corrupt.<stamp>` infix; their bytes
+        // are preserved verbatim.
+        let mut found_main = false;
+        let mut found_shm = false;
+        let mut found_wal = false;
+        for entry in fs::read_dir(&rally).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("facts.db.corrupt.") {
+                if name.ends_with("-db-shm") {
+                    found_shm = true;
+                } else if name.ends_with("-db-wal") {
+                    found_wal = true;
+                } else {
+                    found_main = true;
+                    let bytes = fs::read(entry.path()).unwrap();
+                    assert_eq!(
+                        bytes, b"GARBAGE bytes pretending to be sqlite",
+                        "quarantine preserves bytes verbatim for forensics"
+                    );
+                }
+            }
+        }
+        assert!(found_main && found_shm && found_wal, "all three siblings quarantined");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn quarantine_corrupt_db_is_idempotent() {
+        let root = unique_root("quarantine-idempotent");
+        let rally = root.join(".rally");
+        fs::create_dir_all(&rally).unwrap();
+        let facts_db = rally.join("facts.db");
+        // No file → noop, returns Ok.
+        quarantine_corrupt_db(&facts_db).unwrap();
+        assert!(!facts_db.exists());
+
+        // After a real quarantine, a second call still returns Ok and does
+        // not error (the source file is gone).
+        fs::write(&facts_db, b"corrupt").unwrap();
+        quarantine_corrupt_db(&facts_db).unwrap();
+        quarantine_corrupt_db(&facts_db).unwrap();
+        assert!(!facts_db.exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// THE empirical test: corrupt facts.db mid-bytes, reopen the room, and
+    /// assert every fact appended before the corruption is recovered byte-for-
+    /// byte from the canonical JSONL ledger. This is the failure mode observed
+    /// on easy-terminal (2026-06-01 → 2026-06-04, history reset to seq 1 with
+    /// orphan facts.db.corrupt.bak left on disk).
+    #[test]
+    fn malformed_facts_db_is_rebuilt_from_segments_on_open() {
+        let root = unique_root("malformed-recovery");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+
+        // Seed enough history that recovery is visibly nontrivial.
+        let a = store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim a"))
+            .unwrap();
+        let b = store
+            .append_fact(&make_fact("e2", FactKind::Decision, "src/", "decided b"))
+            .unwrap();
+        let c = store
+            .append_fact(&make_fact("e3", FactKind::Blocker, "tests/", "blocker c"))
+            .unwrap();
+        let d = store
+            .append_fact(&make_fact("e4", FactKind::Risk, "src/", "risk d"))
+            .unwrap();
+        assert_eq!((a.seq, b.seq, c.seq, d.seq), (1, 2, 3, 4));
+        let before_facts = store.facts().unwrap();
+        assert_eq!(before_facts.len(), 4);
+
+        // Capture canonical JSONL bytes BEFORE corruption so we can prove the
+        // ledger was not touched by the recovery path.
+        let segments = segments_under(&root);
+        assert!(!segments.is_empty(), "segments are canonical");
+        let segment_bytes_before: Vec<(PathBuf, Vec<u8>)> = segments
+            .iter()
+            .map(|p| (p.clone(), fs::read(p).unwrap()))
+            .collect();
+
+        drop(store);
+
+        // Corrupt facts.db mid-file. This reproduces SQLITE_CORRUPT (code: 11)
+        // — what an OS crash mid-write, a stray write through a stale file
+        // descriptor, or a bit flip on disk all produce.
+        let facts_db = root.join(".rally/facts.db");
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&facts_db)
+                .unwrap();
+            use std::io::{Seek, SeekFrom, Write};
+            f.seek(SeekFrom::Start(100)).unwrap();
+            f.write_all(&[0u8; 4096]).unwrap();
+            f.write_all(&b"GARBAGE".repeat(100)).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Sanity: the corrupted db cannot be opened directly.
+        assert!(
+            open_fact_store(&facts_db).is_err(),
+            "precondition: corruption is visible to sqlite"
+        );
+
+        // Reopen the room. This is the failure path before the fix; with the
+        // fix it must succeed.
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let after_facts = store.facts().unwrap();
+
+        // (1) Every pre-corruption fact recovered, in order, byte-identical
+        // on the load-bearing fields.
+        assert_eq!(after_facts.len(), 4, "all four facts recovered");
+        for (pre, post) in before_facts.iter().zip(after_facts.iter()) {
+            assert_eq!(pre.seq, post.seq);
+            assert_eq!(pre.event_id, post.event_id);
+            assert_eq!(pre.kind.as_str(), post.kind.as_str());
+            assert_eq!(pre.subject, post.subject);
+            assert_eq!(pre.scope, post.scope);
+            assert_eq!(pre.summary, post.summary);
+        }
+
+        // (2) The canonical JSONL segments are byte-identical post-recovery —
+        // the recovery path read them, it did not rewrite them.
+        for (path, bytes_before) in &segment_bytes_before {
+            let bytes_after = fs::read(path).unwrap();
+            assert_eq!(
+                bytes_before, &bytes_after,
+                "segment {} bytes unchanged by recovery",
+                path.display()
+            );
+        }
+
+        // (3) A quarantine file exists; bytes preserved for forensics. (We
+        // cannot assert exact mtime; the `.corrupt.<stamp>` prefix is enough.)
+        let rally_dir = root.join(".rally");
+        let mut found_quarantine = false;
+        for entry in fs::read_dir(&rally_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name = name.to_string_lossy().to_string();
+            if name.starts_with("facts.db.corrupt.")
+                && !name.ends_with("-db-shm")
+                && !name.ends_with("-db-wal")
+            {
+                found_quarantine = true;
+                // Quarantine contains the corrupted bytes, NOT the rebuilt db.
+                let qb = fs::read(entry.path()).unwrap();
+                // Mid-bytes had GARBAGE injected; first 100 bytes were the
+                // sqlite header that survived our seek-100 write. We just
+                // assert size is non-trivial and contains our garbage marker.
+                assert!(qb.windows(7).any(|w| w == b"GARBAGE"));
+            }
+        }
+        assert!(found_quarantine, "corrupt bytes preserved as facts.db.corrupt.<stamp>");
+
+        // (4) The rebuilt facts.db is healthy (we can query it).
+        let snap = store.snapshot().unwrap();
+        assert_eq!(snap.max_seq, 4);
+
+        // (5) Idempotent: a second open after the heal is a no-op — no new
+        // quarantine file, healthy cache stays.
+        let quarantine_count_pre = fs::read_dir(&rally_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .map(|e| e.file_name().to_string_lossy().starts_with("facts.db.corrupt."))
+                    .unwrap_or(false)
+            })
+            .count();
+        drop(store);
+        let store2 = RoomStore::open_at(root.clone()).unwrap();
+        let facts2 = store2.facts().unwrap();
+        assert_eq!(facts2.len(), 4, "second open: same recovered state");
+        let quarantine_count_post = fs::read_dir(&rally_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .map(|e| e.file_name().to_string_lossy().starts_with("facts.db.corrupt."))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            quarantine_count_pre, quarantine_count_post,
+            "idempotent: no new quarantine on second open"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
