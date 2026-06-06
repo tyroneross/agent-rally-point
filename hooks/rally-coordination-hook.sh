@@ -81,7 +81,25 @@ fi
 
 # If the binary truly is missing, fail-open immediately rather than emit shell
 # errors. We test once up front so the watchdog branches stay clean.
+#
+# Plugin-install advisory (SessionStart only, never for PreToolUse): when this
+# hook fires inside a rally repo (.rally/ present, gate above) but `rally` is
+# not on PATH, emit a one-time concise install hint. This handles the
+# plugin-only install case where skills/hooks shipped via marketplace but the
+# Rust CLI was not built. Stays charter-compliant: advisory `additionalContext`
+# only, exit 0, never blocks. Suppressed on every other phase so PreToolUse
+# does not spam the agent on every edit.
 if ! command -v "$RALLY_BIN" >/dev/null 2>&1 && [ ! -x "$RALLY_BIN" ]; then
+  if [ "${1:-idle}" = "start" ]; then
+    rally_root="$(find_rally_root 2>/dev/null || true)"
+    msg="Agent Rally Point: rally CLI not found on PATH (looked for: $RALLY_BIN). This repo uses .rally/ but the backend binary is missing. To enable coordination: \`cd ${rally_root:-<rally-repo>} && cargo install --path crates/rally-cli\` (installs to ~/.local/bin/rally). Until then, this plugin's hooks no-op and skills will report rally errors."
+    if command -v node >/dev/null 2>&1; then
+      printf '%s' "$msg" | node -e '
+let m=""; process.stdin.on("data",c=>m+=c); process.stdin.on("end",()=>{
+  process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:m}}));
+});'
+    fi
+  fi
   exit 0
 fi
 

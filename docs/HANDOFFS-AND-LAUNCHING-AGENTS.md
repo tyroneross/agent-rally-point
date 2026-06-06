@@ -34,6 +34,7 @@ rally inject claude-foo-01 --text "Read docs/HANDOFF.md and continue …"
 - `--require-ack` requires `--handoff <event-id>` or `--ref` — it does **not** work with free `--text`. For a plain steer, omit it.
 - `delivered=true ack=false` is normal for a `--text` inject (no ack channel).
 - Inject only works against a **`rally run`-managed** session. Fact-only / externally-launched agents are not injectable — hand those off via a committed doc instead.
+- Capture before the first real inject if the host can show startup prompts. Codex may stop on an update/trust prompt; clear that deliberately before injecting work so the handoff lands at the agent prompt, not in the startup menu.
 - If `rally capture` shows the prompt pasted but not acted on, wait briefly and send one bounded backend-specific Enter as troubleshooting. That is a fallback, not the normal contract.
 
 ## 3. The handoff itself — Rally is the source of truth
