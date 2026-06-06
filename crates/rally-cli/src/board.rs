@@ -13,7 +13,9 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 
+use crate::agent_state::{AgentStateEntry, project_agent_states, stale_tools};
 use crate::backlog::{BacklogItem, list_backlog_items, satisfied_ids};
+use crate::now_string;
 use crate::store::{Fact, RoomStore};
 
 // ─── Lane projection ─────────────────────────────────────────────────────────
@@ -215,6 +217,18 @@ pub(crate) struct BoardOutput {
     pub(crate) backlog: BacklogView,
     pub(crate) delta: Vec<DeltaItem>,
     pub(crate) max_seq: i64,
+    /// Liveness-aware agent-state projection — one entry per tool, derived from
+    /// the latest presence fact per tool. See `agent_state::project_agent_states`.
+    /// Additive field: a host that ignores it sees identical legacy shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) agent_states: Vec<AgentStateEntry>,
+    /// Claims whose owner is currently stale (last seen older than the liveness
+    /// threshold). Surfaced separately from `lanes` so a host can render
+    /// "auto-releasable" without losing the original claim's status. Rally
+    /// records + surfaces; the operator/lead triggers any actual release —
+    /// consistent with the charter (facilitator, not executor).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) auto_releasable_claims: Vec<LaneItem>,
 }
 
 pub(crate) fn build_board(room: &RoomStore) -> crate::error::Result<BoardOutput> {
@@ -246,11 +260,35 @@ pub(crate) fn build_board(room: &RoomStore) -> crate::error::Result<BoardOutput>
     let backlog = project_backlog_view(&backlog_items, &active_claim_scopes);
     let delta = project_delta(&facts, 20);
 
+    // Liveness-aware agent-state projection. `now_string()` is the same clock
+    // every projection in the crate reads; passing it explicitly keeps the
+    // projector pure + testable.
+    let now_ts = now_string();
+    let agent_states = project_agent_states(&facts, &now_ts);
+    let stale = stale_tools(&agent_states);
+
+    // A claim is "auto-releasable" iff (a) it is currently in-flight (not
+    // closed or landed) AND (b) its owner is in the stale set. We project from
+    // the lanes vec the work to derive the same status taxonomy.
+    let auto_releasable_claims: Vec<LaneItem> = lanes
+        .iter()
+        .filter(|l| matches!(l.status, LaneStatus::InFlight))
+        .filter(|l| {
+            l.owner
+                .as_deref()
+                .map(|o| stale.contains(o))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+
     Ok(BoardOutput {
         lanes,
         backlog,
         delta,
         max_seq,
+        agent_states,
+        auto_releasable_claims,
     })
 }
 
@@ -340,6 +378,115 @@ mod tests {
             board.lanes[0].status,
             LaneStatus::LandedUnverified
         ));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Verifies the liveness-aware projection: when a tool claimed a path 2 days
+    /// ago and has not posted anything since (stale > 15m threshold), the claim
+    /// must (a) STILL appear in `lanes` as in-flight (Rally records the truth)
+    /// AND (b) surface separately in `auto_releasable_claims[]` so a host can
+    /// render the auto-release affordance. Models the codex:consolidation-01
+    /// case the lesson fact (seq 1603) flagged. */
+    #[test]
+    fn board_surfaces_stale_owner_claim_as_auto_releasable() {
+        use crate::store::FactKind;
+        let (room, root) = test_room();
+
+        // Make a stale claim by hand-writing the created_at (the helper uses
+        // now_string()). Override via direct append.
+        let claim = Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("ev-stale"),
+            seq: 0,
+            thread_id: new_id("t"),
+            kind: FactKind::Claim,
+            tool: Some("stale-tool".to_string()),
+            role: None,
+            subject: "ancient claim that nobody released".to_string(),
+            scope: vec!["file:src/lib.rs".to_string()],
+            // 2 days ago — well past the 15-minute liveness threshold.
+            created_at: "2026-06-02T10:00:00Z".to_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&claim).unwrap();
+
+        // Add a presence fact for stale-tool that is also old — this is what
+        // makes the tool stale in the projection.
+        let stale_presence = Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("ev-pres"),
+            seq: 0,
+            thread_id: new_id("t"),
+            kind: FactKind::Presence,
+            tool: Some("stale-tool".to_string()),
+            role: None,
+            subject: "state=working | file=src/lib.rs | intent=long-gone".to_string(),
+            scope: Vec::new(),
+            created_at: "2026-06-02T10:00:00Z".to_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&stale_presence).unwrap();
+
+        let board = build_board(&room).unwrap();
+
+        // Stale claim is still in lanes (Rally records the truth — never lies).
+        assert_eq!(board.lanes.len(), 1);
+        assert!(matches!(board.lanes[0].status, LaneStatus::InFlight));
+
+        // And surfaced in auto-releasable.
+        assert_eq!(
+            board.auto_releasable_claims.len(),
+            1,
+            "stale-owner claim must surface in auto_releasable_claims; got board={:?}",
+            board.auto_releasable_claims
+        );
+        assert_eq!(board.auto_releasable_claims[0].owner.as_deref(), Some("stale-tool"));
+
+        // And agent_states[stale-tool].stale == true.
+        let stale_state = board
+            .agent_states
+            .iter()
+            .find(|s| s.tool == "stale-tool")
+            .expect("stale-tool must appear in agent_states");
+        assert!(stale_state.stale, "stale-tool must be marked stale");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A fresh agent's claim must NOT surface in auto_releasable_claims.
+    #[test]
+    fn board_does_not_mark_fresh_owner_claim_as_auto_releasable() {
+        let (room, root) = test_room();
+        append_fact(&room, FactKind::Claim, "fresh work", "fresh-tool");
+        // Add a fresh presence too, so projection has a state to work with.
+        append_fact(&room, FactKind::Presence, "state=working | file=x | intent=fresh", "fresh-tool");
+
+        let board = build_board(&room).unwrap();
+        assert_eq!(board.lanes.len(), 1);
+        assert!(
+            board.auto_releasable_claims.is_empty(),
+            "fresh agent's claim must not be flagged auto-releasable"
+        );
+        let fresh = board
+            .agent_states
+            .iter()
+            .find(|s| s.tool == "fresh-tool")
+            .expect("fresh-tool must appear");
+        assert!(!fresh.stale);
         std::fs::remove_dir_all(root).ok();
     }
 

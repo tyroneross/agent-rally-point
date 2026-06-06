@@ -275,8 +275,53 @@ pub(crate) struct SessionActionArgs {
 #[derive(Clone, Debug)]
 pub(crate) struct StatusArgs {
     pub(crate) json: bool,
-    /// Aggregate status across all known repo rooms (required flag).
-    pub(crate) global: bool,
+    pub(crate) subcommand: StatusSubcommand,
+}
+
+/// `rally status` modes.
+///
+/// - `Global`: existing multi-repo discovery aggregation (`--global` flag).
+/// - `Post`: append a typed agent-state heartbeat (`post` subcommand).
+/// - `Read`: project latest-per-tool state from the ledger (`read` subcommand).
+///
+/// `--global` is preserved as a flag (not a subcommand) so existing scripts
+/// calling `rally status --global` keep working identically.
+#[derive(Clone, Debug)]
+pub(crate) enum StatusSubcommand {
+    Global,
+    Post(StatusPostArgs),
+    Read(StatusReadArgs),
+}
+
+/// Typed status heartbeat: `rally status post --tool T --state <s> [opts]`.
+///
+/// Writes ONE `presence` fact whose `subject` carries the marker grammar
+/// `agent_state::parse_marker_string` understands. Always append-only — never
+/// overwrites a prior heartbeat. The latest-per-tool projection reads the
+/// most-recent.
+#[derive(Clone, Debug)]
+pub(crate) struct StatusPostArgs {
+    pub(crate) tool: String,
+    /// One of `idle | working | blocked | done`. Validated in `command_status_post`.
+    pub(crate) state: String,
+    /// `state=working` requires `--file`.
+    pub(crate) file: Option<String>,
+    /// `state=working` requires `--intent`.
+    pub(crate) intent: Option<String>,
+    /// `state=blocked` requires `--blocked-ref`.
+    pub(crate) blocked_ref: Option<String>,
+    /// `state=idle` may carry `--wake-after <iso>`.
+    pub(crate) wake_after: Option<String>,
+    /// `state=done` requires `--committed-sha`. The Codex seam.
+    pub(crate) committed_sha: Option<String>,
+    /// `state=done` requires `--worktree-branch`. The Codex seam.
+    pub(crate) worktree_branch: Option<String>,
+}
+
+/// Read the latest typed state per tool. `--tool` filters to one tool.
+#[derive(Clone, Debug)]
+pub(crate) struct StatusReadArgs {
+    pub(crate) tool: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -753,9 +798,65 @@ fn cli_parser() -> OptionParser<CliCommand> {
 }
 
 fn status_parser() -> impl Parser<StatusArgs> {
+    // `rally status post --tool T --state <s> [--file P] [--intent I]
+    //  [--blocked-ref ID] [--wake-after ISO] [--committed-sha SHA]
+    //  [--worktree-branch BRANCH]`
+    let post_tool = string_arg("tool", "TOOL");
+    let post_state = string_arg("state", "STATE");
+    let post_file = optional_string_arg("file", "PATH");
+    let post_intent = optional_string_arg("intent", "INTENT");
+    let post_blocked_ref = optional_string_arg("blocked-ref", "EVENT_ID");
+    let post_wake_after = optional_string_arg("wake-after", "ISO");
+    let post_committed_sha = optional_string_arg("committed-sha", "SHA");
+    let post_worktree_branch = optional_string_arg("worktree-branch", "BRANCH");
+    let post_parser = construct!(
+        post_tool,
+        post_state,
+        post_file,
+        post_intent,
+        post_blocked_ref,
+        post_wake_after,
+        post_committed_sha,
+        post_worktree_branch
+    )
+    .map(
+        |(tool, state, file, intent, blocked_ref, wake_after, committed_sha, worktree_branch)| {
+            StatusPostArgs {
+                tool,
+                state,
+                file,
+                intent,
+                blocked_ref,
+                wake_after,
+                committed_sha,
+                worktree_branch,
+            }
+        },
+    )
+    .to_options()
+    .descr("Append a typed agent-state heartbeat (idle|working|blocked|done).")
+    .command("post")
+    .map(StatusSubcommand::Post);
+
+    // `rally status read [--tool T]`
+    let read_tool = optional_string_arg("tool", "TOOL");
+    let read_parser = read_tool
+        .map(|tool| StatusReadArgs { tool })
+        .to_options()
+        .descr("Read the latest typed agent-state, projected per tool.")
+        .command("read")
+        .map(StatusSubcommand::Read);
+
+    // `rally status --global` — existing multi-repo discovery aggregation,
+    // preserved as a flag for back-compat.
+    let global_parser = long("global")
+        .switch()
+        .guard(|on| *on, "rally status requires a subcommand (post|read) or --global")
+        .map(|_| StatusSubcommand::Global);
+
     let json = json_flag();
-    let global = long("global").switch();
-    construct!(StatusArgs { json, global })
+    let subcommand = construct!([post_parser, read_parser, global_parser]);
+    construct!(json, subcommand).map(|(json, subcommand)| StatusArgs { json, subcommand })
 }
 
 fn init_parser() -> impl Parser<InitArgs> {

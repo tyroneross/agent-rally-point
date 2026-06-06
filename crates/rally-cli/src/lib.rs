@@ -45,6 +45,7 @@ macro_rules! cmd {
     };
 }
 
+mod agent_state;
 mod backends;
 mod backlog;
 mod board;
@@ -1044,6 +1045,69 @@ fn command_say(args: SayArgs) -> Result<Output> {
     // ref_standby (--ref-standby) takes precedence over --ref for wake facts.
     let ref_id = args.ref_standby.or(args.ref_id);
 
+    // Path-only release fix (C4):
+    //
+    // Before the fix, `rally say release --tool T --path P` (no `--ref`)
+    // routed through `append_state_transition_verified`, which errored with
+    // "release requires --ref". The user-reported lesson (seq 1603) was
+    // "silently no-ops" because the error came as a bare stderr line — there
+    // was no actionable next step (find the event_id manually, then retry).
+    //
+    // The natural mental model is: "I'm done with this path, release my
+    // claims on it". So when release is invoked with at least one path scope
+    // but no `--ref`, we resolve to the calling tool's currently-active
+    // claims overlapping any of those paths and release them one by one
+    // through the existing verified path. If no live claim matches, error
+    // LOUD and list the tool's open claims so the operator has the next step
+    // in hand.
+    if matches!(kind, FactKind::Release)
+        && ref_id.is_none()
+        && scope.iter().any(|s| s.starts_with("file:"))
+    {
+        // Parity with the normal say path: if any external-intake path was
+        // also passed, write the durable risk fact + return the same warning.
+        let mut warnings = Vec::<SayWarning>::new();
+        if is_external {
+            let root_display = repo_root()
+                .map(|r| r.display().to_string())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            let paths_display = external_paths.join(", ");
+            let risk_summary = format!(
+                "external-intake: path(s) [{paths_display}] resolve outside repo_root {root_display}; quarantined — not promoted into repo-local backlog. Recorded for audit."
+            );
+            let risk_fact = build_risk_fact(
+                &args.tool,
+                format!("external-intake: {paths_display}"),
+                risk_summary.clone(),
+                Vec::new(),
+                "warn",
+                Vec::new(),
+                None,
+            );
+            room.append_fact(&risk_fact)?;
+            warnings.push(SayWarning {
+                code: "external-intake".to_string(),
+                message: risk_summary,
+            });
+        }
+        return command_release_by_path(
+            &room,
+            &args.tool,
+            &scope,
+            args.thread_id,
+            args.role,
+            subject,
+            summary,
+            evidence,
+            args.target,
+            args.status,
+            args.severity,
+            args.uri,
+            args.json,
+            warnings,
+        );
+    }
+
     let fact = Fact {
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
@@ -1173,6 +1237,185 @@ fn command_say(args: SayArgs) -> Result<Output> {
         fact.seq
     );
     Ok(Output::new(args.json, text, body))
+}
+
+/// Path-only release: resolve to the calling tool's currently-active claims
+/// overlapping any path in `scope`, then emit ONE release fact per match via
+/// the existing `append_state_transition_verified` path (preserves R9-readback).
+///
+/// Loud error rules:
+/// - No live claim found for any of the paths → error listing the tool's
+///   currently-open claims (with `event_id` + `subject`) so the caller has the
+///   next actionable step. This is the fix for the "silently no-ops" lesson.
+/// - Some live claims found but matching release fails the projection assertion
+///   inside `append_state_transition_verified` → that error bubbles unchanged.
+///
+/// Returns the SAME `SayData` envelope as a single release — `say.fact` is the
+/// LAST release fact written, and `warnings[]` carries one note per release
+/// outcome so a host can read the full per-claim history.
+#[allow(clippy::too_many_arguments)]
+fn command_release_by_path(
+    room: &RoomStore,
+    tool: &str,
+    scope: &[String],
+    thread_id: Option<String>,
+    role: Option<String>,
+    subject: String,
+    summary: Option<String>,
+    evidence: Vec<String>,
+    target: Option<String>,
+    status: Option<String>,
+    severity: Option<String>,
+    uri: Option<String>,
+    json: bool,
+    mut warnings: Vec<SayWarning>,
+) -> Result<Output> {
+    let snapshot = room.snapshot()?;
+
+    // Find this tool's open claims AND any matching by path scope (regardless
+    // of owner — a lead releasing a stale-owner claim is a legitimate use).
+    // We still annotate which match was on tool-owned paths vs cross-tool so
+    // the operator sees who they released.
+    let want_paths: Vec<&str> = scope
+        .iter()
+        .filter(|s| s.starts_with("file:"))
+        .map(|s| s.as_str())
+        .collect();
+    if want_paths.is_empty() {
+        return Err(RallyError::Usage(
+            "rally say release --path requires at least one --path argument".to_string(),
+        ));
+    }
+    let matches: Vec<&Fact> = snapshot
+        .active_claims
+        .iter()
+        .filter(|c| c.tool.as_deref() == Some(tool))
+        .filter(|c| {
+            c.scope
+                .iter()
+                .any(|cs| want_paths.iter().any(|wp| wp == cs))
+        })
+        .collect();
+    if matches.is_empty() {
+        // Build the loud-error list: this tool's currently-open claims.
+        let mine: Vec<&Fact> = snapshot
+            .active_claims
+            .iter()
+            .filter(|c| c.tool.as_deref() == Some(tool))
+            .collect();
+        let listing = if mine.is_empty() {
+            format!("(none — {tool} has no open claims in this room)")
+        } else {
+            mine.iter()
+                .map(|c| {
+                    format!(
+                        "  - {} {} scope=[{}]",
+                        c.event_id,
+                        c.subject,
+                        c.scope.join(",")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        return Err(RallyError::Usage(format!(
+            "rally say release: no live claim by {tool} matches paths [{paths}]; nothing to release.\n{tool}'s open claims:\n{listing}",
+            paths = want_paths.join(", ")
+        )));
+    }
+
+    // Snapshot the matched claim metadata before mutating — we want stable
+    // event_ids + subjects to populate warnings even if a subsequent release
+    // changes the projection.
+    let match_meta: Vec<(String, String, Vec<String>)> = matches
+        .into_iter()
+        .map(|c| (c.event_id.clone(), c.subject.clone(), c.scope.clone()))
+        .collect();
+    let total = match_meta.len();
+
+    // The projection's released-scopes filter (store.rs::snapshot_from_facts)
+    // closes EVERY claim whose scope overlaps the released scope. Issuing one
+    // release fact per match would therefore re-fail the second matched
+    // claim's "is_live" check because the first release already swept it.
+    //
+    // The contract-correct shape is: ONE release fact per call, carrying the
+    // first matched claim's event_id as `ref_id` AND the union of every
+    // matched claim's scope. The verified path's readback then asserts the
+    // primary claim flipped — and the projection naturally sweeps the rest.
+    // We surface every claim that the call closed via `warnings[]` so a host
+    // sees the full audit trail.
+    let primary = match_meta
+        .first()
+        .expect("match_meta is non-empty (early-return guard above)")
+        .clone();
+    let mut union_scope: Vec<String> = Vec::new();
+    for (_id, _subj, sc) in &match_meta {
+        for s in sc {
+            if !union_scope.contains(s) {
+                union_scope.push(s.clone());
+            }
+        }
+    }
+    let fact = Fact {
+        schema: FACT_SCHEMA.to_string(),
+        event_id: new_id("fact"),
+        seq: 0,
+        thread_id: thread_id.unwrap_or_else(|| new_id("room")),
+        kind: FactKind::Release,
+        tool: Some(tool.to_string()),
+        role,
+        subject: if total == 1 {
+            subject
+        } else {
+            format!("{subject} (releases {total} matching claims)")
+        },
+        scope: union_scope,
+        created_at: now_string(),
+        summary,
+        evidence,
+        target,
+        ref_id: Some(primary.0.clone()),
+        status,
+        severity,
+        uri,
+        session: None,
+    };
+    let appended = room.append_state_transition_verified(&fact)?;
+    for (id, subj, _sc) in &match_meta {
+        warnings.push(SayWarning {
+            code: "released-by-path".to_string(),
+            message: format!(
+                "released claim {} (\"{}\") via path-only resolution; release seq={}",
+                id, subj, appended.seq
+            ),
+        });
+    }
+    let last_fact = appended;
+    let snapshot_after = room.snapshot()?;
+    let verified = SayVerified {
+        room: room.room_id().to_string(),
+        seq: last_fact.seq,
+    };
+    let body = envelope(
+        "say",
+        SCHEMA_SAY,
+        SayData {
+            say: SayPayload {
+                fact: last_fact.clone(),
+            },
+            room: RoomSummary::from(&snapshot_after),
+            warnings,
+            verified,
+        },
+    )?;
+    let text = format!(
+        "said release {} released={} room={} last_seq={}",
+        last_fact.event_id,
+        total,
+        room.room_id(),
+        last_fact.seq
+    );
+    Ok(Output::new(json, text, body))
 }
 
 fn command_room(args: RoomArgs) -> Result<Output> {
@@ -1511,16 +1754,175 @@ struct StatusEnvelope {
 }
 
 fn command_status(args: StatusArgs) -> Result<Output> {
-    if !args.global {
-        return Err(RallyError::Usage(
-            "rally status requires --global".to_string(),
-        ));
+    match args.subcommand {
+        cli::StatusSubcommand::Global => {
+            let data = discovery::status_global()?;
+            let repo_count = data.repos.len();
+            let text = format!("status repos={repo_count}");
+            let body = envelope("status", SCHEMA_STATUS, StatusEnvelope { status: data })?;
+            Ok(Output::new(args.json, text, body))
+        }
+        cli::StatusSubcommand::Post(post) => command_status_post(args.json, post),
+        cli::StatusSubcommand::Read(read) => command_status_read(args.json, read),
     }
-    let data = discovery::status_global()?;
-    let repo_count = data.repos.len();
-    let text = format!("status repos={repo_count}");
-    let body = envelope("status", SCHEMA_STATUS, StatusEnvelope { status: data })?;
-    Ok(Output::new(args.json, text, body))
+}
+
+/// Envelope for `rally status post`: result under `data["status_post"]`.
+#[derive(JsonSchema, Serialize)]
+struct StatusPostData {
+    status_post: StatusPostResult,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct StatusPostResult {
+    fact: store::Fact,
+    state: agent_state::AgentState,
+}
+
+/// Envelope for `rally status read`: result under `data["status_read"]`.
+#[derive(JsonSchema, Serialize)]
+struct StatusReadData {
+    status_read: StatusReadResult,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct StatusReadResult {
+    states: Vec<agent_state::AgentStateEntry>,
+}
+
+/// Schema marker for status_post envelopes.
+const SCHEMA_STATUS_POST: &str = "agent-rally.command.status_post.v1";
+/// Schema marker for status_read envelopes.
+const SCHEMA_STATUS_READ: &str = "agent-rally.command.status_read.v1";
+
+/// Build the canonical marker subject for a typed status post.
+///
+/// Mirrors the existing presence convention: `state=<s> | <k1>=<v1> | ...`.
+/// `committed_sha` + `worktree_branch` live in the SUMMARY for `done` so the
+/// subject stays short and the markers remain in the same fact's text.
+fn build_status_subject(state: &str, args: &cli::StatusPostArgs) -> String {
+    let mut parts: Vec<String> = vec![format!("state={state}")];
+    if let Some(file) = &args.file {
+        parts.push(format!("file={file}"));
+    }
+    if let Some(intent) = &args.intent {
+        parts.push(format!("intent={intent}"));
+    }
+    if let Some(blocked_ref) = &args.blocked_ref {
+        parts.push(format!("ref={blocked_ref}"));
+    }
+    if let Some(wake_after) = &args.wake_after {
+        parts.push(format!("wake_after={wake_after}"));
+    }
+    if let Some(sha) = &args.committed_sha {
+        parts.push(format!("committed_sha={sha}"));
+    }
+    if let Some(branch) = &args.worktree_branch {
+        parts.push(format!("worktree_branch={branch}"));
+    }
+    parts.join(" | ")
+}
+
+/// Validate state-specific required args. Returns a loud usage error rather
+/// than silently writing a malformed heartbeat — consistent with the "no
+/// fail-quiet" lesson the release-fix is also closing.
+fn validate_status_post_args(state: &str, args: &cli::StatusPostArgs) -> Result<()> {
+    match state {
+        "idle" => {
+            // wake_after optional; nothing required.
+        }
+        "working" => {
+            if args.file.is_none() || args.intent.is_none() {
+                return Err(RallyError::Usage(
+                    "rally status post --state working requires --file <path> and --intent <one-line>".to_string(),
+                ));
+            }
+        }
+        "blocked" => {
+            if args.blocked_ref.is_none() {
+                return Err(RallyError::Usage(
+                    "rally status post --state blocked requires --blocked-ref <event-id>".to_string(),
+                ));
+            }
+        }
+        "done" => {
+            if args.committed_sha.is_none() || args.worktree_branch.is_none() {
+                return Err(RallyError::Usage(
+                    "rally status post --state done requires --committed-sha <sha> and --worktree-branch <branch>".to_string(),
+                ));
+            }
+        }
+        other => {
+            return Err(RallyError::Usage(format!(
+                "rally status post --state must be one of idle|working|blocked|done; got {other:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn command_status_post(json: bool, args: cli::StatusPostArgs) -> Result<Output> {
+    validate_status_post_args(&args.state, &args)?;
+
+    let room = RoomStore::open()?;
+    // Auto-register the calling tool (matches `rally say` ergonomics).
+    ensure_presence(&room, &args.tool)?;
+
+    let subject = build_status_subject(&args.state, &args);
+    let fact = store::Fact {
+        schema: FACT_SCHEMA.to_string(),
+        event_id: new_id("fact"),
+        seq: 0,
+        thread_id: new_id("room"),
+        kind: store::FactKind::Presence,
+        tool: Some(args.tool.clone()),
+        role: None,
+        subject: subject.clone(),
+        scope: Vec::new(),
+        created_at: now_string(),
+        summary: Some(format!("build_id:{BUILD_ID}")),
+        evidence: Vec::new(),
+        target: None,
+        ref_id: None,
+        status: None,
+        severity: None,
+        uri: None,
+        session: None,
+    };
+    let appended = room.append_fact_verified(&fact)?;
+    let state = agent_state::project_presence_to_state(&appended)
+        .unwrap_or(agent_state::AgentState::Idle { wake_after: None });
+    let text = format!("status post tool={} seq={}", args.tool, appended.seq);
+    let body = envelope(
+        "status_post",
+        SCHEMA_STATUS_POST,
+        StatusPostData {
+            status_post: StatusPostResult {
+                fact: appended,
+                state,
+            },
+        },
+    )?;
+    Ok(Output::new(json, text, body))
+}
+
+fn command_status_read(json: bool, args: cli::StatusReadArgs) -> Result<Output> {
+    let room = RoomStore::open()?;
+    let facts = room.facts()?;
+    let now_ts = now_string();
+    let mut states = agent_state::project_agent_states(&facts, &now_ts);
+    if let Some(filter_tool) = args.tool.as_deref() {
+        states.retain(|s| s.tool == filter_tool);
+    }
+    let text = format!("status read tools={}", states.len());
+    let body = envelope(
+        "status_read",
+        SCHEMA_STATUS_READ,
+        StatusReadData {
+            status_read: StatusReadResult { states },
+        },
+    )?;
+    Ok(Output::new(json, text, body))
 }
 
 // =============================================================================
@@ -6979,6 +7381,317 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ─── C4: path-only release ───────────────────────────────────────────────
+    //
+    // Closes lesson seq 1603 ("rally say release silently no-ops w/o proper
+    // ref/path"). The first test proves the happy path; the second proves we
+    // error loud + actionable when no match is found.
+
+    /// Helper: write a claim by tool T on path P and return its event_id.
+    fn append_claim(room: &store::RoomStore, tool: &str, path: &str, subject: &str) -> String {
+        let fact = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Claim,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: subject.to_string(),
+            scope: vec![format!("file:{path}")],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        let appended = room.append_fact_verified(&fact).unwrap();
+        appended.event_id
+    }
+
+    #[test]
+    fn path_only_release_closes_matching_claim_and_flips_projection() {
+        let root = unique_root("path-only-release-happy");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        let claim_id = append_claim(&room, "alpha", "src/foo.rs", "fix the thing");
+
+        // Sanity: it's in active_claims before.
+        let before = room.snapshot().unwrap();
+        assert!(
+            before.active_claims.iter().any(|c| c.event_id == claim_id),
+            "claim must start active"
+        );
+
+        // command_release_by_path replicates what command_say's branch routes to.
+        let out = command_release_by_path(
+            &room,
+            "alpha",
+            &["file:src/foo.rs".to_string()],
+            None,
+            None,
+            "done with src/foo.rs".to_string(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            true,
+            Vec::new(),
+        )
+        .expect("path-only release must succeed");
+
+        // Projection must have flipped.
+        let after = room.snapshot().unwrap();
+        assert!(
+            !after.active_claims.iter().any(|c| c.event_id == claim_id),
+            "claim must no longer be active after path-only release"
+        );
+
+        // Envelope must carry a `released-by-path` warning naming the original.
+        let body: serde_json::Value =
+            out.body.clone();
+        let warnings = body["data"]["warnings"].as_array().expect("warnings array");
+        let found = warnings.iter().any(|w| {
+            w["code"] == "released-by-path"
+                && w["message"].as_str().unwrap_or("").contains(&claim_id)
+        });
+        assert!(found, "warnings must name the released claim event_id; got {warnings:?}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn path_only_release_errors_loud_when_no_claim_matches() {
+        let root = unique_root("path-only-release-loud");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // alpha owns one claim on a different path.
+        let alpha_other = append_claim(&room, "alpha", "src/bar.rs", "wrong path");
+
+        let result = command_release_by_path(
+            &room,
+            "alpha",
+            &["file:src/foo.rs".to_string()],
+            None,
+            None,
+            "no match".to_string(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            true,
+            Vec::new(),
+        );
+        let err = match result {
+            Ok(_) => panic!("path-only release with no match must error loud, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no live claim"),
+            "error must say 'no live claim'; got: {msg}"
+        );
+        assert!(
+            msg.contains(&alpha_other),
+            "error must list alpha's open claims (the actionable next step); got: {msg}"
+        );
+
+        // Claim must still be active.
+        let after = room.snapshot().unwrap();
+        assert!(
+            after.active_claims.iter().any(|c| c.event_id == alpha_other),
+            "no-match release must NOT incidentally close any other claim"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn path_only_release_handles_multi_claim_match_atomically() {
+        let root = unique_root("path-only-release-multi");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        let c1 = append_claim(&room, "alpha", "src/foo.rs", "first");
+        let c2 = append_claim(&room, "alpha", "src/foo.rs", "second");
+
+        let _ = command_release_by_path(
+            &room,
+            "alpha",
+            &["file:src/foo.rs".to_string()],
+            None,
+            None,
+            "release both".to_string(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            true,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let after = room.snapshot().unwrap();
+        assert!(!after.active_claims.iter().any(|c| c.event_id == c1));
+        assert!(!after.active_claims.iter().any(|c| c.event_id == c2));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ─── C3: status post + read roundtrip ────────────────────────────────────
+
+    #[test]
+    fn status_post_then_status_read_roundtrip() {
+        let root = unique_root("status-post-roundtrip");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        // command_status_post calls RoomStore::open() which resolves from cwd.
+        // Use the env-lock + cd dance from the existing pattern.
+        let _guard = PROCESS_ENV_LOCK.lock().unwrap();
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+
+        let post = command_status_post(
+            true,
+            cli::StatusPostArgs {
+                tool: "alpha".to_string(),
+                state: "working".to_string(),
+                file: Some("crates/rally-cli".to_string()),
+                intent: Some("agent-state".to_string()),
+                blocked_ref: None,
+                wake_after: None,
+                committed_sha: None,
+                worktree_branch: None,
+            },
+        )
+        .expect("status post must succeed");
+        let post_body: serde_json::Value =
+            post.body.clone();
+        let state_kind = post_body["data"]["status_post"]["state"]["state"]
+            .as_str()
+            .unwrap_or("");
+        assert_eq!(state_kind, "working");
+
+        let read = command_status_read(
+            true,
+            cli::StatusReadArgs {
+                tool: Some("alpha".to_string()),
+            },
+        )
+        .expect("status read must succeed");
+        let read_body: serde_json::Value =
+            read.body.clone();
+        let states = read_body["data"]["status_read"]["states"]
+            .as_array()
+            .expect("states array");
+        assert_eq!(states.len(), 1, "expected one entry for alpha");
+        assert_eq!(states[0]["tool"], "alpha");
+        assert_eq!(states[0]["state"], "working");
+        assert_eq!(states[0]["file"], "crates/rally-cli");
+        assert_eq!(states[0]["intent"], "agent-state");
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn status_post_validates_required_fields_for_each_state() {
+        // working requires --file + --intent
+        let err = validate_status_post_args(
+            "working",
+            &cli::StatusPostArgs {
+                tool: "alpha".to_string(),
+                state: "working".to_string(),
+                file: None,
+                intent: None,
+                blocked_ref: None,
+                wake_after: None,
+                committed_sha: None,
+                worktree_branch: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--file"));
+
+        // blocked requires --blocked-ref
+        let err = validate_status_post_args(
+            "blocked",
+            &cli::StatusPostArgs {
+                tool: "alpha".to_string(),
+                state: "blocked".to_string(),
+                file: None,
+                intent: None,
+                blocked_ref: None,
+                wake_after: None,
+                committed_sha: None,
+                worktree_branch: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--blocked-ref"));
+
+        // done requires both --committed-sha + --worktree-branch
+        let err = validate_status_post_args(
+            "done",
+            &cli::StatusPostArgs {
+                tool: "alpha".to_string(),
+                state: "done".to_string(),
+                file: None,
+                intent: None,
+                blocked_ref: None,
+                wake_after: None,
+                committed_sha: Some("abc".to_string()),
+                worktree_branch: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--worktree-branch"));
+
+        // unknown state errors clearly
+        let err = validate_status_post_args(
+            "napping",
+            &cli::StatusPostArgs {
+                tool: "alpha".to_string(),
+                state: "napping".to_string(),
+                file: None,
+                intent: None,
+                blocked_ref: None,
+                wake_after: None,
+                committed_sha: None,
+                worktree_branch: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("idle|working|blocked|done"));
+
+        // idle requires nothing
+        validate_status_post_args(
+            "idle",
+            &cli::StatusPostArgs {
+                tool: "alpha".to_string(),
+                state: "idle".to_string(),
+                file: None,
+                intent: None,
+                blocked_ref: None,
+                wake_after: None,
+                committed_sha: None,
+                worktree_branch: None,
+            },
+        )
+        .unwrap();
     }
 }
 
