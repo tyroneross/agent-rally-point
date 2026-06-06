@@ -28,7 +28,7 @@ Each tool has at most one current `AgentState`:
 | `idle` | — | `wake_after=<iso>` | Alive but not actively working. Optional wake hint (mirrors the `Standby` marker grammar). |
 | `working` | `file=<path>` `intent=<one-line>` | — | Actively working on a file. The natural unit for path-overlap reasoning. |
 | `blocked` | `ref=<event-id>` | — | Waiting on a fact (a blocker, a handoff, an unresolved risk). The `ref` is the actionable next step. |
-| `done` | `committed_sha=<sha>` `worktree_branch=<branch>` | — | A commit landed on a managed worktree branch. **The Codex seam.** |
+| `done` | `committed_sha=<sha>` `worktree_branch=<branch>` | — | A commit landed on a managed worktree branch. **The done producer seam.** |
 | `unknown` | — | — | Subject carried `state=<x>` for an unrecognised `x`. Surfaced so an older binary writer doesn't disappear from the board. |
 
 ## Marker grammar
@@ -85,19 +85,22 @@ rally status post --tool codex:consolidation-01 --state idle \
 rally status post --tool claude_code:bl-agentstate --state blocked \
   --blocked-ref fact_1c63_18b6003369c3da28
 
-# Codex's seam — written by Codex's committed→mergeable lane:
+# Agent-agnostic done signal. If omitted, git metadata is inferred from the
+# current checkout; explicit flags remain authoritative.
 rally status post --tool codex:bl-committed --state done \
   --committed-sha abc123def456 --worktree-branch feat/agent-state
+
+rally status post --tool claude_code:build-loop --state done
 ```
 
 Validation rules:
 
-| State | Required flags | Error if missing |
+| State | Required inputs | Error if unavailable |
 |---|---|---|
 | `idle` | — | — |
 | `working` | `--file` `--intent` | "rally status post --state working requires --file <path> and --intent <one-line>" |
 | `blocked` | `--blocked-ref` | "rally status post --state blocked requires --blocked-ref <event-id>" |
-| `done` | `--committed-sha` `--worktree-branch` | "rally status post --state done requires --committed-sha <sha> and --worktree-branch <branch>" |
+| `done` | `committed_sha` + `worktree_branch`, either explicit or inferred from git | "rally status post --state done could not auto-detect <field>; pass --<flag> explicitly" |
 
 ### `rally status read [--tool T]`
 
@@ -171,18 +174,23 @@ Loud-error rules:
 - No path-only match found → error names the tool's currently-open claims so the operator's next step is in hand.
 - Neither `--ref` nor `--path` provided → unchanged ("release requires --ref").
 
-## Codex seam
+## Done Producer Seam
 
-The `done` state is **authored by Codex** (the committed→mergeable lane in this run's parallel split). Codex's responsibility:
+The `done` state is authored by whichever agent owns the committing lane. In the original split this was Codex; the contract is now shared by Codex, Claude Code, and any other Rally participant:
 
-1. Watch the managed worktree branch for new commits authored by an agent in the room.
-2. On a new commit, emit:
+1. Finish work on a managed worktree or checkout.
+2. Emit:
    ```bash
-   rally status post --tool <codex-tool-id> --state done \
+   rally status post --tool <tool-id> --state done
+   ```
+   The CLI resolves `committed_sha` from `git rev-parse --verify HEAD` and `worktree_branch` from `git symbolic-ref --quiet --short HEAD`.
+3. If the checkout is detached, has no commit, or git is unavailable, pass explicit values:
+   ```bash
+   rally status post --tool <tool-id> --state done \
      --committed-sha <sha> --worktree-branch <branch>
    ```
 
-Claude's responsibility (this PR):
+Consumer responsibility:
 
 - Consume the fact unchanged in `project_agent_states` → `AgentState::Done { committed_sha, worktree_branch }`.
 - Surface in `rally board --json` `.board.agent_states[]`.
@@ -214,4 +222,4 @@ A future revision can promote `committed_sha` + `worktree_branch` to typed `Fact
 | `crates/rally-cli/src/board.rs` | Adds `agent_states[]` + `auto_releasable_claims[]` to `BoardOutput`. |
 | `crates/rally-cli/src/cli.rs` | `rally status post` + `rally status read` parsers; `--global` preserved. |
 | `crates/rally-cli/src/lib.rs` | `command_status_post`, `command_status_read`, `command_release_by_path`. |
-| `docs/AGENT-STATE-MODEL.md` | This file — the vocabulary contract + the Codex seam. |
+| `docs/AGENT-STATE-MODEL.md` | This file — the vocabulary contract + the done producer seam. |

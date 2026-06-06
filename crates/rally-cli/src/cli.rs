@@ -312,9 +312,9 @@ pub(crate) struct StatusPostArgs {
     pub(crate) blocked_ref: Option<String>,
     /// `state=idle` may carry `--wake-after <iso>`.
     pub(crate) wake_after: Option<String>,
-    /// `state=done` requires `--committed-sha`. The Codex seam.
+    /// `state=done` may omit this; the CLI infers git HEAD when possible.
     pub(crate) committed_sha: Option<String>,
-    /// `state=done` requires `--worktree-branch`. The Codex seam.
+    /// `state=done` may omit this; the CLI infers the current git branch when possible.
     pub(crate) worktree_branch: Option<String>,
 }
 
@@ -800,7 +800,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
 fn status_parser() -> impl Parser<StatusArgs> {
     // `rally status post --tool T --state <s> [--file P] [--intent I]
     //  [--blocked-ref ID] [--wake-after ISO] [--committed-sha SHA]
-    //  [--worktree-branch BRANCH]`
+    //  [--worktree-branch BRANCH]`. For `done`, omitted git metadata is
+    //  inferred from the current checkout when possible.
     let post_tool = string_arg("tool", "TOOL");
     let post_state = string_arg("state", "STATE");
     let post_file = optional_string_arg("file", "PATH");

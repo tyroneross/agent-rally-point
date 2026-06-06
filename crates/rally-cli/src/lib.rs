@@ -1823,6 +1823,63 @@ fn build_status_subject(state: &str, args: &cli::StatusPostArgs) -> String {
     parts.join(" | ")
 }
 
+fn missing_marker(value: &Option<String>) -> bool {
+    value.as_deref().map(str::trim).unwrap_or("").is_empty()
+}
+
+fn git_value_for_status_done(args: &[&str], field: &str, flag: &str) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|err| {
+            RallyError::Usage(format!(
+                "rally status post --state done could not auto-detect {field}: failed to run git ({err}); pass {flag} explicitly"
+            ))
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(" (git: {stderr})")
+        };
+        return Err(RallyError::Usage(format!(
+            "rally status post --state done could not auto-detect {field}; pass {flag} explicitly{detail}"
+        )));
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() || value == "HEAD" {
+        return Err(RallyError::Usage(format!(
+            "rally status post --state done could not auto-detect {field}; pass {flag} explicitly"
+        )));
+    }
+    Ok(value)
+}
+
+/// Fill omitted `done` metadata from the current git checkout. This is
+/// intentionally tool-neutral: Codex, Claude Code, or any other agent all use
+/// the same CLI contract, and explicit flags remain authoritative.
+fn auto_fill_done_git_metadata(args: &mut cli::StatusPostArgs) -> Result<()> {
+    if args.state != "done" {
+        return Ok(());
+    }
+    if missing_marker(&args.committed_sha) {
+        args.committed_sha = Some(git_value_for_status_done(
+            &["rev-parse", "--verify", "HEAD"],
+            "committed_sha",
+            "--committed-sha <sha>",
+        )?);
+    }
+    if missing_marker(&args.worktree_branch) {
+        args.worktree_branch = Some(git_value_for_status_done(
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            "worktree_branch",
+            "--worktree-branch <branch>",
+        )?);
+    }
+    Ok(())
+}
+
 /// Validate state-specific required args. Returns a loud usage error rather
 /// than silently writing a malformed heartbeat — consistent with the "no
 /// fail-quiet" lesson the release-fix is also closing.
@@ -1861,7 +1918,8 @@ fn validate_status_post_args(state: &str, args: &cli::StatusPostArgs) -> Result<
     Ok(())
 }
 
-fn command_status_post(json: bool, args: cli::StatusPostArgs) -> Result<Output> {
+fn command_status_post(json: bool, mut args: cli::StatusPostArgs) -> Result<Output> {
+    auto_fill_done_git_metadata(&mut args)?;
     validate_status_post_args(&args.state, &args)?;
 
     let room = RoomStore::open()?;
@@ -4130,6 +4188,41 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rally-lib-{label}-{nanos}"));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    fn run_git(root: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git invocation");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn init_status_git_repo(root: &Path, branch: &str) -> String {
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "rally@example.test"]);
+        run_git(root, &["config", "user.name", "Rally Test"]);
+        std::fs::write(root.join("tracked.txt"), "status done\n").unwrap();
+        run_git(root, &["add", "tracked.txt"]);
+        run_git(root, &["commit", "-m", "initial"]);
+        run_git(root, &["checkout", "-B", branch]);
+        run_git(root, &["rev-parse", "--verify", "HEAD"])
     }
 
     // Plan F functional core (Chunk 3): self_host_guard_* tests removed
@@ -7602,6 +7695,123 @@ mod tests {
         assert_eq!(states[0]["state"], "working");
         assert_eq!(states[0]["file"], "crates/rally-cli");
         assert_eq!(states[0]["intent"], "agent-state");
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn status_post_done_autofills_git_metadata_for_codex_and_claude_code() {
+        if !git_available() {
+            return;
+        }
+        let root = unique_root("status-done-autofill");
+        let branch = "feature/status-done-autofill";
+        let sha = init_status_git_repo(&root, branch);
+
+        let _guard = PROCESS_ENV_LOCK.lock().unwrap();
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+
+        for tool in ["codex:worker", "claude_code:worker"] {
+            let post = command_status_post(
+                true,
+                cli::StatusPostArgs {
+                    tool: tool.to_string(),
+                    state: "done".to_string(),
+                    file: None,
+                    intent: None,
+                    blocked_ref: None,
+                    wake_after: None,
+                    committed_sha: None,
+                    worktree_branch: None,
+                },
+            )
+            .expect("status done post must infer git metadata");
+            let body: serde_json::Value = post.body.clone();
+            let state = &body["data"]["status_post"]["state"];
+            assert_eq!(state["state"], "done");
+            assert_eq!(state["committed_sha"].as_str().unwrap(), sha);
+            assert_eq!(state["worktree_branch"].as_str().unwrap(), branch);
+            let subject = body["data"]["status_post"]["fact"]["subject"]
+                .as_str()
+                .unwrap();
+            assert!(subject.contains(&format!("committed_sha={sha}")));
+            assert!(subject.contains(&format!("worktree_branch={branch}")));
+        }
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn status_post_done_explicit_metadata_does_not_require_git_autofill() {
+        let root = unique_root("status-done-explicit");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        let _guard = PROCESS_ENV_LOCK.lock().unwrap();
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+
+        let post = command_status_post(
+            true,
+            cli::StatusPostArgs {
+                tool: "any_agent:worker".to_string(),
+                state: "done".to_string(),
+                file: None,
+                intent: None,
+                blocked_ref: None,
+                wake_after: None,
+                committed_sha: Some("explicit-sha".to_string()),
+                worktree_branch: Some("explicit-branch".to_string()),
+            },
+        )
+        .expect("explicit done metadata must not need git");
+        let body: serde_json::Value = post.body.clone();
+        let state = &body["data"]["status_post"]["state"];
+        assert_eq!(state["state"], "done");
+        assert_eq!(state["committed_sha"].as_str().unwrap(), "explicit-sha");
+        assert_eq!(
+            state["worktree_branch"].as_str().unwrap(),
+            "explicit-branch"
+        );
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn status_post_done_explicit_marker_overrides_git_for_missing_pair_only() {
+        if !git_available() {
+            return;
+        }
+        let root = unique_root("status-done-partial-explicit");
+        let branch = "feature/status-done-partial-explicit";
+        init_status_git_repo(&root, branch);
+
+        let _guard = PROCESS_ENV_LOCK.lock().unwrap();
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+
+        let post = command_status_post(
+            true,
+            cli::StatusPostArgs {
+                tool: "gemini:worker".to_string(),
+                state: "done".to_string(),
+                file: None,
+                intent: None,
+                blocked_ref: None,
+                wake_after: None,
+                committed_sha: Some("manual-sha".to_string()),
+                worktree_branch: None,
+            },
+        )
+        .expect("missing branch must infer while explicit sha wins");
+        let body: serde_json::Value = post.body.clone();
+        let state = &body["data"]["status_post"]["state"];
+        assert_eq!(state["state"], "done");
+        assert_eq!(state["committed_sha"].as_str().unwrap(), "manual-sha");
+        assert_eq!(state["worktree_branch"].as_str().unwrap(), branch);
 
         std::env::set_current_dir(prev_cwd).unwrap();
         std::fs::remove_dir_all(&root).ok();

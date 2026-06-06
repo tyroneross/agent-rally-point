@@ -20,9 +20,10 @@
 //!   `ref=<event-id>` naming the blocking fact.
 //! - [`AgentState::Done`] — last heartbeat carried `state=done`, plus
 //!   `committed_sha=<hash>` and `worktree_branch=<branch>`. This is the
-//!   **Codex seam**: Codex (or any author) detects a commit landed on a
-//!   managed worktree branch and posts the `done` heartbeat. Claude's
-//!   projection consumes the fact unchanged — no git-side reasoning here.
+//!   **done producer seam**: Codex, Claude Code, or any other Rally participant
+//!   detects or reports that a commit landed on a managed worktree branch and
+//!   posts the `done` heartbeat. The projection consumes the fact unchanged —
+//!   no git-side reasoning here.
 //!
 //! ## Marker grammar
 //! Markers live in the presence fact's `subject` and (for `done` only) the
@@ -69,8 +70,8 @@ pub(crate) enum AgentState {
     Working { file: String, intent: String },
     /// Agent is blocked on `ref` (an event_id of a blocker/handoff/etc).
     Blocked { #[serde(rename = "ref")] ref_id: String },
-    /// Agent finished a commit on a managed worktree branch. Authored by the
-    /// Codex committed→mergeable lane (Codex's seam) — consumed here unchanged.
+    /// Agent finished a commit on a managed worktree branch. Authored by any
+    /// Rally participant's committing lane and consumed here unchanged.
     Done {
         committed_sha: String,
         worktree_branch: String,
@@ -380,8 +381,8 @@ mod tests {
         }
     }
 
-    /// Codex seam test — a synthetic `done` fact authored by Codex (the
-    /// committed→mergeable lane) is consumed unchanged by Claude's projection.
+    /// Producer seam test — a synthetic `done` fact authored by Codex (one
+    /// committed→mergeable producer) is consumed unchanged by the projection.
     /// Locks the wire vocabulary: `state=done | committed_sha=<h> | worktree_branch=<b>`.
     #[test]
     fn project_agent_states_recognises_done_from_synthetic_codex_fact() {
