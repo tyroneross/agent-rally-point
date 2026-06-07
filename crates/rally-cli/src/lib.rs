@@ -2216,8 +2216,10 @@ fn watch_run_on_activity(
     }
 }
 
-/// Print a launchd plist referencing this binary + the current working dir.
-fn watch_print_launchd(args: &WatchArgs, exe: &Path, repo: &Path) {
+/// Render a launchd plist referencing this binary + the current working dir.
+/// Pure (returns the plist string) so it is unit-testable without spawning a
+/// live binary; takes only the `WatchArgs` fields it needs.
+fn render_launchd_plist(interval: u64, on_activity: Option<&str>, exe: &Path, repo: &Path) -> String {
     let label = format!(
         "com.agent-rally-point.watch.{}",
         repo.file_name().and_then(|n| n.to_str()).unwrap_or("repo")
@@ -2226,11 +2228,11 @@ fn watch_print_launchd(args: &WatchArgs, exe: &Path, repo: &Path) {
     let repo_str = repo.to_string_lossy();
     let mut program_args = vec![format!("  <string>{exe_str}</string>")];
     program_args.push("  <string>watch</string>".to_string());
-    if let Some(interval) = Some(args.interval).filter(|&i| i != 5) {
+    if let Some(interval) = Some(interval).filter(|&i| i != 5) {
         program_args.push("  <string>--interval</string>".to_string());
         program_args.push(format!("  <string>{interval}</string>"));
     }
-    if let Some(ref cmd) = args.on_activity {
+    if let Some(cmd) = on_activity {
         let escaped = cmd
             .replace('&', "&amp;")
             .replace('<', "&lt;")
@@ -2239,7 +2241,7 @@ fn watch_print_launchd(args: &WatchArgs, exe: &Path, repo: &Path) {
         program_args.push(format!("  <string>{escaped}</string>"));
     }
     let args_xml = program_args.join("\n");
-    println!(
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2263,6 +2265,14 @@ fn watch_print_launchd(args: &WatchArgs, exe: &Path, repo: &Path) {
   <string>/tmp/rally-watch-{label}.err</string>
 </dict>
 </plist>"#
+    )
+}
+
+/// Print a launchd plist referencing this binary + the current working dir.
+fn watch_print_launchd(args: &WatchArgs, exe: &Path, repo: &Path) {
+    println!(
+        "{}",
+        render_launchd_plist(args.interval, args.on_activity.as_deref(), exe, repo)
     );
 }
 
@@ -6472,46 +6482,32 @@ mod tests {
             "repo path must be non-empty for WorkingDirectory"
         );
 
-        // Verify the rendered plist text using the actual function.
-        // Redirect stdout to a file via a child `sh -c` that uses the compiled binary.
-        let out_path = std::env::temp_dir().join(format!("rally-launchd-{}.plist", short_id()));
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rally"));
-        // Run the watch --print-launchd subcommand inside the temp git root.
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "{} watch --print-launchd > {}",
-                exe.display(),
-                out_path.display()
-            ))
-            .current_dir(&root)
-            .status();
+        // Verify the rendered plist text directly via the pure renderer.
+        // No subprocess: a unit test must not depend on a live binary, and the
+        // previous spawn of the *test harness* binary always failed with
+        // "Unrecognized option: 'print-launchd'", silently skipping these asserts.
+        let plist = render_launchd_plist(5, None, &PathBuf::from("rally"), &root);
+        assert!(
+            plist.contains("watch"),
+            "plist must contain 'watch' keyword; got:\n{plist}"
+        );
+        assert!(
+            plist.contains(repo_str.as_ref()),
+            "plist must contain the repo path as WorkingDirectory; got:\n{plist}"
+        );
+        assert!(
+            plist.contains("RunAtLoad"),
+            "plist must contain RunAtLoad key; got:\n{plist}"
+        );
+        assert!(
+            plist.contains("KeepAlive"),
+            "plist must contain KeepAlive key; got:\n{plist}"
+        );
+        assert!(
+            plist.contains(&label),
+            "plist must contain the derived launchd label; got:\n{plist}"
+        );
 
-        if let Ok(st) = status {
-            if st.success() {
-                let plist = std::fs::read_to_string(&out_path).unwrap_or_default();
-                assert!(
-                    plist.contains("watch"),
-                    "plist must contain 'watch' keyword; got:\n{plist}"
-                );
-                assert!(
-                    plist.contains(root.to_string_lossy().as_ref()),
-                    "plist must contain the repo path as WorkingDirectory; got:\n{plist}"
-                );
-                assert!(
-                    plist.contains("RunAtLoad"),
-                    "plist must contain RunAtLoad key; got:\n{plist}"
-                );
-                assert!(
-                    plist.contains("KeepAlive"),
-                    "plist must contain KeepAlive key; got:\n{plist}"
-                );
-            }
-            // If the binary cannot run (e.g. different architecture in CI), the
-            // label-structure assertions above still exercise the generator logic.
-        }
-
-        std::fs::remove_file(&out_path).ok();
         std::fs::remove_dir_all(&root).ok();
     }
 
