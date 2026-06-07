@@ -1,5 +1,6 @@
 use schemars::JsonSchema;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::backlog::BacklogItem;
 use crate::store::{Fact, FactKind, RoomSnapshot};
@@ -392,10 +393,11 @@ fn next_candidates(
             .as_deref()
             .is_some_and(|target| target != tool && target != "all");
         if !authored_by_self && !routed_elsewhere {
+            let (reason, base_score) = artifact_review_priority(artifact, tool, waiting);
             candidates.push(NextCandidate::from_fact(
                 "review_artifact",
-                "unconsumed_peer_artifact_can_be_checked_while_waiting",
-                boost_score(if waiting { 80 } else { 65 }, artifact, role, paths),
+                reason,
+                boost_artifact_review_score(base_score, artifact, role, paths),
                 artifact,
             ));
         }
@@ -613,6 +615,59 @@ fn fact_is_weak(fact: &Fact) -> bool {
         .as_deref()
         .is_none_or(|summary| summary.trim().is_empty())
         && fact.evidence.is_empty()
+}
+
+fn artifact_review_priority(artifact: &Fact, tool: &str, waiting: bool) -> (&'static str, i64) {
+    let directly_targeted = artifact.target.as_deref() == Some(tool);
+    if directly_targeted && artifact_requires_ack(artifact) {
+        return ("targeted_peer_artifact_requires_ack", 110);
+    }
+    if directly_targeted {
+        return ("targeted_peer_artifact_requires_attention", 100);
+    }
+    if artifact.target.as_deref() == Some("all") && artifact_requires_ack(artifact) {
+        return ("broadcast_peer_artifact_requires_ack", 90);
+    }
+    (
+        "unconsumed_peer_artifact_can_be_checked_while_waiting",
+        if waiting { 80 } else { 65 },
+    )
+}
+
+fn artifact_requires_ack(fact: &Fact) -> bool {
+    fact.evidence
+        .iter()
+        .any(|evidence| evidence_requires_ack(evidence))
+}
+
+fn evidence_requires_ack(evidence: &str) -> bool {
+    let trimmed = evidence.trim();
+    if trimmed.eq_ignore_ascii_case("requires_ack")
+        || trimmed.eq_ignore_ascii_case("requires_ack:true")
+        || trimmed.eq_ignore_ascii_case("ack_required")
+        || trimmed.eq_ignore_ascii_case("ack_required:true")
+    {
+        return true;
+    }
+
+    serde_json::from_str::<Value>(trimmed).is_ok_and(|value| json_requires_ack(&value))
+}
+
+fn json_requires_ack(value: &Value) -> bool {
+    value
+        .get("requires_ack")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || value.get("payload").is_some_and(json_requires_ack)
+}
+
+fn boost_artifact_review_score(
+    base: i64,
+    fact: &Fact,
+    role: Option<&str>,
+    paths: &[String],
+) -> i64 {
+    boost_score(base.min(100), fact, role, paths) + base.saturating_sub(100)
 }
 
 fn boost_score(base: i64, fact: &Fact, role: Option<&str>, paths: &[String]) -> i64 {
