@@ -523,11 +523,18 @@ const SCHEMA_WORKTREE_GC: &str = "agent-rally.command.worktree-gc.v1";
 fn command_worktree_gc(args: WorktreeGcArgs) -> Result<Output> {
     let repo = repo_root()?;
 
-    // Load presence facts from the room store for liveness checks.
-    // Graceful degradation: if the room store is unavailable (e.g. no .rally/
-    // in this repo yet), supply no facts and rely on TTL-only staleness.
-    let presence_facts: Vec<worktree_gc::PresenceFact> = RoomStore::open()
-        .and_then(|r| r.facts())
+    // Open the room store once; derive both presence facts (for TTL-liveness)
+    // and active sessions (for the f2 backend-probe) from it.
+    // Graceful degradation: if the store is unavailable (no .rally/ yet),
+    // supply empty facts and no probe (merged worktrees still reap; unmerged
+    // are conservatively skipped until a probe is available).
+    let bins = BackendBins::default();
+    let room_result = RoomStore::open();
+
+    let presence_facts: Vec<worktree_gc::PresenceFact> = room_result
+        .as_ref()
+        .ok()
+        .and_then(|r| r.facts().ok())
         .map(|facts| {
             facts
                 .into_iter()
@@ -544,6 +551,29 @@ fn command_worktree_gc(args: WorktreeGcArgs) -> Result<Output> {
         })
         .unwrap_or_default();
 
+    // f2 — build a real backend-liveness probe from the session ledger.
+    // `probe_session_liveness` queries tmux/cmux for each active managed
+    // session and returns Stale when the backing session is gone.
+    // The probe closure captures an Arc of the result map so it is cheap to
+    // clone and 'static-safe for the GcConfig field.
+    let backend_liveness_probe: Option<std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>> =
+        room_result.ok().and_then(|room| {
+            active_session_facts(&room).ok().map(|active| {
+                let liveness_map = probe_session_liveness(&active, bins);
+                let arc_map = std::sync::Arc::new(liveness_map);
+                let probe: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync> =
+                    std::sync::Arc::new(move |session_id: &str| -> bool {
+                        // Returns true when the backend is DEAD (Stale), allowing the GC
+                        // to proceed; false when still Live or Unknown (conservative skip).
+                        matches!(
+                            arc_map.get(session_id).copied().unwrap_or(SessionLiveness::Unknown),
+                            SessionLiveness::Stale
+                        )
+                    });
+                probe
+            })
+        });
+
     let config = worktree_gc::GcConfig {
         repo_root: repo,
         apply: args.apply,
@@ -551,11 +581,9 @@ fn command_worktree_gc(args: WorktreeGcArgs) -> Result<Output> {
         now_ts: None, // use system clock
         presence_facts,
         git_bin: "git".to_string(),
-        // f2: The CLI path wires the existing probe_session_liveness machinery
-        // from lib.rs (which queries tmux/cmux) into the GC config when a room
-        // store is available.  For now None (TTL-only); a follow-up can thread
-        // BackendBins through WorktreeGcArgs.
-        backend_liveness_probe: None,
+        // f2: wired — queries tmux/cmux via probe_session_liveness; None only
+        // when the room store is unavailable (graceful degradation).
+        backend_liveness_probe,
     };
 
     let report = worktree_gc::run_gc(config).map_err(RallyError::Message)?;

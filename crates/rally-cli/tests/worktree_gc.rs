@@ -280,6 +280,10 @@ fn unmerged_with_stale_owner_is_bundled_then_reaped() {
 
     let facts = vec![make_presence_fact("codex", 1, "state=idle", stale_ts)];
 
+    // Backend probe: returns true (= backend is DEAD) so the f2 gate lets the
+    // reap proceed for this stale unmerged worktree.
+    let dead_probe: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(|_| true);
+
     let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
         repo_root: repo.clone(),
         apply: true,
@@ -287,7 +291,7 @@ fn unmerged_with_stale_owner_is_bundled_then_reaped() {
         now_ts: Some(now_ts.to_string()),
         presence_facts: facts,
         git_bin: "git".to_string(),
-        backend_liveness_probe: None,
+        backend_liveness_probe: Some(dead_probe),
     });
     assert!(report.is_ok(), "must not error: {:?}", report);
     let report = report.unwrap();
@@ -422,6 +426,11 @@ fn ttl_boundary_respected() {
         make_presence_fact("codex", 2, "state=idle", live_ts),
     ];
 
+    // Backend probe: returns true (dead) so the f2 gate lets the stale
+    // claude worktree reap. The live codex worktree never reaches the probe
+    // (it's skipped earlier at the live-owner check).
+    let dead_probe: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(|_| true);
+
     let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
         repo_root: repo.clone(),
         apply: true,
@@ -429,7 +438,7 @@ fn ttl_boundary_respected() {
         now_ts: Some(now_ts.to_string()),
         presence_facts: facts,
         git_bin: "git".to_string(),
-        backend_liveness_probe: None,
+        backend_liveness_probe: Some(dead_probe),
     });
     assert!(report.is_ok(), "must not error: {:?}", report);
     let report = report.unwrap();
@@ -634,6 +643,10 @@ fn bundle_failure_skips_unmerged_worktree() {
     let now_ts = "2026-06-07T12:00:00Z";
     let facts = vec![make_presence_fact("claude", 1, "state=idle", stale_ts)];
 
+    // Backend probe: returns true (dead) so f2 lets the stale worktree
+    // proceed to cleanup(), where the fake git's bundle-fail triggers f3.
+    let dead_probe: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(|_| true);
+
     let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
         repo_root: repo.clone(),
         apply: true,
@@ -641,7 +654,7 @@ fn bundle_failure_skips_unmerged_worktree() {
         now_ts: Some(now_ts.to_string()),
         presence_facts: facts,
         git_bin: fake_git.to_string_lossy().to_string(),
-        backend_liveness_probe: None,
+        backend_liveness_probe: Some(dead_probe),
     });
     assert!(report.is_ok(), "must not error: {:?}", report);
     let report = report.unwrap();

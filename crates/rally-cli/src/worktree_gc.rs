@@ -244,16 +244,32 @@ pub fn run_gc(config: GcConfig) -> Result<GcReport, String> {
         // hasn't posted a heartbeat recently is indistinguishable from a dead
         // one by TTL alone.  If the probe says the session is still live, skip.
         if !merged {
-            if let Some(ref probe) = config.backend_liveness_probe {
-                // Extract the session-id from the branch name (`rally/<id>`).
-                let session_id = entry.branch.strip_prefix("rally/").unwrap_or(&entry.branch);
-                let backend_dead = probe(session_id);
-                if !backend_dead {
+            // Reapable only by TTL staleness (not by merge): we must confirm the
+            // agent is actually gone before deleting unmerged work.
+            let session_id = entry.branch.strip_prefix("rally/").unwrap_or(&entry.branch);
+            match config.backend_liveness_probe {
+                Some(ref probe) => {
+                    if !probe(session_id) {
+                        skipped.push(GcSkipped {
+                            worktree_path: entry.path.clone(),
+                            branch: entry.branch.clone(),
+                            reason: format!(
+                                "backend probe says session {session_id} is still live — not reaped"
+                            ),
+                        });
+                        continue;
+                    }
+                    // backend confirmed dead → fall through to reap (cleanup bundles).
+                }
+                None => {
+                    // No backend probe wired: TTL staleness alone cannot tell a dead
+                    // agent from a quiet long-running one. Conservatively refuse to reap
+                    // unmerged work. (Merged worktrees are already reaped above.)
                     skipped.push(GcSkipped {
                         worktree_path: entry.path.clone(),
                         branch: entry.branch.clone(),
                         reason: format!(
-                            "backend probe says session {session_id} is still live — not reaped"
+                            "unmerged + no backend probe — refusing to reap on staleness alone (session {session_id})"
                         ),
                     });
                     continue;
