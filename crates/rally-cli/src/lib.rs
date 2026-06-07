@@ -57,6 +57,7 @@ mod dag;
 mod discovery;
 mod doctor;
 mod error;
+mod event_envelope;
 mod init;
 mod next;
 mod output;
@@ -66,6 +67,7 @@ mod ripple;
 mod rotate;
 mod route_findings;
 mod run_worktree;
+mod session_identity;
 mod source_grounding;
 mod store;
 mod tier_fit;
@@ -1697,6 +1699,19 @@ fn command_whoami(args: WhoamiArgs) -> Result<Output> {
         .as_ref()
         .map(|snap| build_lead_context(snap, args.tool.as_deref(), None));
     let host_runtime = detect_host_runtime();
+    // Derive the layered protocol session identity from runtime signals. The
+    // lease is deterministic ("live") so the session_id is stable across CLI
+    // invocations from the same endpoint until a registry-backed lease exists.
+    let protocol_session = {
+        let endpoint =
+            session_identity::derive_endpoint(&session_identity::EndpointInputs::from_env());
+        let raw_tool = args.tool.as_deref().unwrap_or("unknown");
+        let (tool_type, actor) = match raw_tool.split_once(':') {
+            Some((t, a)) if !a.is_empty() => (t, Some(a)),
+            _ => (raw_tool, None),
+        };
+        session_identity::ProtocolSessionIdentity::mint(&endpoint, tool_type, "live", actor, None)
+    };
     let text = format!(
         "repo_root={repo_root} repo_id={repo_id} room_id={room_id} build_id={BUILD_ID} branch={} ptyd_ambiguous={} lead={}",
         branch.as_deref().unwrap_or("<none>"),
@@ -1721,6 +1736,7 @@ fn command_whoami(args: WhoamiArgs) -> Result<Output> {
                 mission,
                 acknowledged,
                 lead_context,
+                session_identity: protocol_session,
             },
         },
     )?;
@@ -8251,6 +8267,10 @@ struct WhoamiPayload {
     /// Live lead/self-role metadata when the room is available.
     #[serde(skip_serializing_if = "Option::is_none")]
     lead_context: Option<LeadContext>,
+    /// Layered protocol session identity (endpoint id + session lease +
+    /// legible name), distinct from `tool`. Answers "which runtime is this?"
+    /// beyond the tool label. See [`session_identity`].
+    session_identity: session_identity::ProtocolSessionIdentity,
 }
 
 /// Self-location of the host runtime (Easy Terminal / ptyd). `bound_socket` is
