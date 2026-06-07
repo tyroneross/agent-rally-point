@@ -1155,6 +1155,27 @@ fn command_say(args: SayArgs) -> Result<Output> {
     // B18: append ONE durable risk fact for each external-intake detection so
     // the contamination event is permanently auditable.  Never blocks the write.
     let mut say_warnings: Vec<SayWarning> = Vec::new();
+
+    // Advisory protocol-envelope validation (lenient, never blocks): surfaces
+    // missing causal ids — e.g. an ACK/resolve that doesn't cite its ref_event_id.
+    // Charter: warn and record; hosts decide whether to act.
+    if let Some(pk) = protocol_event_kind(&fact.kind) {
+        if let Err(missing) = pk.validate(
+            &fact_protocol_envelope(&fact),
+            event_envelope::CompatMode::Lenient,
+        ) {
+            let ids = missing
+                .iter()
+                .map(|e| format!("{:?}", e.missing))
+                .collect::<Vec<_>>()
+                .join(", ");
+            say_warnings.push(SayWarning {
+                code: "envelope-incomplete".to_string(),
+                message: format!("{pk:?} event is missing required causal id(s): {ids}"),
+            });
+        }
+    }
+
     if is_external {
         let root_display = repo_root()
             .map(|r| r.display().to_string())
@@ -1684,6 +1705,48 @@ fn current_protocol_session(tool: Option<&str>) -> session_identity::ProtocolSes
         _ => (raw_tool, None),
     };
     session_identity::ProtocolSessionIdentity::mint(&endpoint, tool_type, "live", actor, None)
+}
+
+/// Map a ledger [`store::FactKind`] to the north-star protocol event vocabulary
+/// for advisory envelope validation. Returns `None` for kinds outside the
+/// durable coordination set (presence/read/session/etc.).
+fn protocol_event_kind(kind: &store::FactKind) -> Option<event_envelope::ProtocolEventKind> {
+    use event_envelope::ProtocolEventKind as P;
+    use store::FactKind as F;
+    Some(match kind {
+        F::Claim => P::ClaimAcquired,
+        F::ClaimExpired => P::ClaimExpired,
+        F::Release => P::ClaimReleased,
+        F::Handoff => P::HandoffRequested,
+        F::Resolve => P::HandoffAcked,
+        F::Decision => P::DecisionRecorded,
+        F::Artifact => P::ArtifactPublished,
+        _ => return None,
+    })
+}
+
+/// Project a durable [`store::Fact`] onto an [`event_envelope::EventEnvelope`],
+/// mapping the existing fields (`event_id`, `ref`, `from_session_id`) onto the
+/// protocol causal ids so the envelope can be validated.
+fn fact_protocol_envelope(fact: &store::Fact) -> event_envelope::EventEnvelope {
+    use store::FactKind as F;
+    let mut env = event_envelope::EventEnvelope {
+        from_session_id: fact.from_session_id.clone(),
+        ..Default::default()
+    };
+    // A referenced prior event is both the ref and the direct cause (for replies).
+    if fact.ref_id.is_some() {
+        env.ref_event_id = fact.ref_id.clone();
+        env.causation_id = fact.ref_id.clone();
+    }
+    match fact.kind {
+        F::Claim | F::ClaimExpired => env.claim_id = Some(fact.event_id.clone()),
+        F::Release => env.claim_id = fact.ref_id.clone().or_else(|| Some(fact.event_id.clone())),
+        F::Handoff => env.handoff_id = Some(fact.event_id.clone()),
+        F::Resolve => env.handoff_id = fact.ref_id.clone(),
+        _ => {}
+    }
+    env
 }
 
 fn command_whoami(args: WhoamiArgs) -> Result<Output> {
