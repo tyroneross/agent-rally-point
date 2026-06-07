@@ -214,6 +214,7 @@ mod tests {
 
     fn make_calibration_fact(summary: &str, event_id: &str) -> Fact {
         Fact {
+            from_session_id: None,
             schema: "agent-rally.fact.v1".to_string(),
             event_id: event_id.to_string(),
             seq: 1,

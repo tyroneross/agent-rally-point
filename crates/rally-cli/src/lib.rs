@@ -605,6 +605,7 @@ fn ensure_presence_tiered(room: &RoomStore, tool: &str, tier: Option<&str>) -> R
     // so that `command_enter` can detect when different builds are writing to
     // the same room.  Format: "build_id:<BUILD_ID>" — minimal, no schema bump.
     let presence_fact = Fact {
+        from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -630,6 +631,7 @@ fn ensure_presence_tiered(room: &RoomStore, tool: &str, tier: Option<&str>) -> R
     let lead_eligible = matches!(tier, None | Some("frontier"));
     if snapshot.lead.is_none() && lead_eligible {
         let lead_fact = Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -1116,6 +1118,12 @@ fn command_say(args: SayArgs) -> Result<Output> {
     }
 
     let fact = Fact {
+        // Stamp the authoring session lease on this durable LLM-authored write.
+        from_session_id: Some(
+            current_protocol_session(Some(&args.tool))
+                .from_session_id()
+                .to_string(),
+        ),
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -1364,6 +1372,7 @@ fn command_release_by_path(
         }
     }
     let fact = Fact {
+        from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -1662,6 +1671,21 @@ fn command_version(args: VersionArgs) -> Result<Output> {
 /// Reports: tool (if `--tool` given), repo_root (shared coord dir), repo_id
 /// (room identifier), worktree (active checkout dir), build_id (embedded
 /// RALLY_BUILD_ID), and cwd. Read-only — no facts are written.
+/// Derive this runtime's layered protocol session identity, used by `whoami`
+/// (display) and `say` (`from_session_id` stamping). Reads runtime signals via
+/// the `session_identity` boundary; the lease is deterministic ("live") so the
+/// session_id is stable across CLI invocations from the same endpoint until a
+/// registry-backed lease exists.
+fn current_protocol_session(tool: Option<&str>) -> session_identity::ProtocolSessionIdentity {
+    let endpoint = session_identity::derive_endpoint(&session_identity::EndpointInputs::from_env());
+    let raw_tool = tool.unwrap_or("unknown");
+    let (tool_type, actor) = match raw_tool.split_once(':') {
+        Some((t, a)) if !a.is_empty() => (t, Some(a)),
+        _ => (raw_tool, None),
+    };
+    session_identity::ProtocolSessionIdentity::mint(&endpoint, tool_type, "live", actor, None)
+}
+
 fn command_whoami(args: WhoamiArgs) -> Result<Output> {
     let repo_root_path = repo_root().ok();
     let repo_root = repo_root_path
@@ -1699,19 +1723,7 @@ fn command_whoami(args: WhoamiArgs) -> Result<Output> {
         .as_ref()
         .map(|snap| build_lead_context(snap, args.tool.as_deref(), None));
     let host_runtime = detect_host_runtime();
-    // Derive the layered protocol session identity from runtime signals. The
-    // lease is deterministic ("live") so the session_id is stable across CLI
-    // invocations from the same endpoint until a registry-backed lease exists.
-    let protocol_session = {
-        let endpoint =
-            session_identity::derive_endpoint(&session_identity::EndpointInputs::from_env());
-        let raw_tool = args.tool.as_deref().unwrap_or("unknown");
-        let (tool_type, actor) = match raw_tool.split_once(':') {
-            Some((t, a)) if !a.is_empty() => (t, Some(a)),
-            _ => (raw_tool, None),
-        };
-        session_identity::ProtocolSessionIdentity::mint(&endpoint, tool_type, "live", actor, None)
-    };
+    let protocol_session = current_protocol_session(args.tool.as_deref());
     let text = format!(
         "repo_root={repo_root} repo_id={repo_id} room_id={room_id} build_id={BUILD_ID} branch={} ptyd_ambiguous={} lead={}",
         branch.as_deref().unwrap_or("<none>"),
@@ -1950,6 +1962,7 @@ fn command_status_post(json: bool, mut args: cli::StatusPostArgs) -> Result<Outp
 
     let subject = build_status_subject(&args.state, &args);
     let fact = store::Fact {
+        from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -2472,6 +2485,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
             if args.enforce {
                 for claim in &held {
                     let release = Fact {
+                        from_session_id: None,
                         schema: FACT_SCHEMA.to_string(),
                         event_id: new_id("fact"),
                         seq: 0,
@@ -3718,6 +3732,7 @@ fn active_session_facts_from_facts(facts: Vec<Fact>) -> Vec<(Fact, ManagedSessio
 
 fn session_fact(session: &ManagedSession, status: &str, ref_id: Option<String>) -> Fact {
     Fact {
+        from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -3780,6 +3795,7 @@ fn make_inject_content_fact(sender_tool: &str, recipient_tool: &str, text: &str)
     let subject_text: String = text.chars().take(120).collect();
     let subject = format!("inject: {subject_text}");
     Fact {
+        from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("inject"),
         seq: 0,
@@ -3935,6 +3951,7 @@ fn wake_fact(
     status: Option<String>,
 ) -> Fact {
     Fact {
+        from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("wake"),
         seq: 0,
@@ -4026,6 +4043,7 @@ fn build_risk_fact(
     ref_id: Option<String>,
 ) -> Fact {
     Fact {
+        from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -4497,6 +4515,7 @@ mod tests {
         let room = store::RoomStore::open_at(root).unwrap();
         ensure_presence_tiered(&room, "opus-1", Some("frontier")).unwrap();
         let mk = |subject: &str, scope: Vec<String>| Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -4549,6 +4568,7 @@ mod tests {
         let room = store::RoomStore::open_at(root).unwrap();
         let old = "2020-01-01T00:00:00Z";
         let mk = |kind: FactKind, subject: &str, scope: Vec<String>| Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -4611,6 +4631,7 @@ mod tests {
         };
         assert!(!acked(&room), "squad must be unacknowledged before ack");
         let ack = Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -4647,6 +4668,7 @@ mod tests {
         ensure_presence_tiered(&room, "opus-1", Some("frontier")).unwrap();
         assert_eq!(room.snapshot().unwrap().lead.as_deref(), Some("opus-1"));
         let relinquish = Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -4833,6 +4855,7 @@ mod tests {
 
     fn resolve_fact(tool: &str, ref_id: &str, subject: &str) -> Fact {
         Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("resolve"),
             seq: 0,
@@ -5018,6 +5041,7 @@ mod tests {
 
         // Append a wake fact authored by the system ("rally"), as `rally next` does.
         let wake = Fact {
+            from_session_id: None,
             schema: crate::FACT_SCHEMA.to_string(),
             event_id: new_id("wake"),
             seq: 0,
@@ -5290,6 +5314,7 @@ mod tests {
 
             // This is the exact block copied from command_enter.
             let risk_fact = Fact {
+                from_session_id: None,
                 schema: crate::FACT_SCHEMA.to_string(),
                 event_id: new_id("fact"),
                 seq: 0,
@@ -5724,6 +5749,7 @@ mod tests {
 
         // tool-b posts a fact between the two enters.
         let peer_fact = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("peer"),
             seq: 0,
@@ -5802,6 +5828,7 @@ mod tests {
         let mut written: Vec<store::Fact> = Vec::new();
         for (subject, kind) in kinds {
             let fact = store::Fact {
+                from_session_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("b16"),
                 seq: 0,
@@ -5932,6 +5959,7 @@ mod tests {
         // Post a fact to advance max_seq.
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let fact = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("watch-once"),
             seq: 0,
@@ -5999,6 +6027,7 @@ mod tests {
         // Post a fact.
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let fact = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("watch-oact"),
             seq: 0,
@@ -6136,6 +6165,7 @@ mod tests {
         // Post a fact to create the index.
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let fact = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("watch-repo"),
             seq: 0,
@@ -6251,6 +6281,7 @@ mod tests {
         // Fabricate the external-tagged claim directly (avoids cwd dependency
         // of command_say while still exercising the snapshot projection).
         let external_claim = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b18d-claim"),
             seq: 0,
@@ -6278,6 +6309,7 @@ mod tests {
 
         // Post a normal repo-local claim too so we can verify it IS included.
         let local_claim = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b18d-local"),
             seq: 0,
@@ -6332,6 +6364,7 @@ mod tests {
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
         let ext_handoff = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b18e-hoff"),
             seq: 0,
@@ -6376,6 +6409,7 @@ mod tests {
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
         let ext_artifact = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b18f-art"),
             seq: 0,
@@ -6422,6 +6456,7 @@ mod tests {
 
         // Simulate what command_say does: write the tagged claim + the risk fact.
         let ext_claim = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b18g-claim"),
             seq: 0,
@@ -6447,6 +6482,7 @@ mod tests {
         room.append_fact(&ext_claim).unwrap();
 
         let risk_fact = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b18g-risk"),
             seq: 0,
@@ -6508,6 +6544,7 @@ mod tests {
 
         // One canonical claim (already file:-prefixed, relative).
         let canonical_claim = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("doctor-cp-c1"),
             seq: 0,
@@ -6586,6 +6623,7 @@ mod tests {
 
         // Scope stored in non-canonical form (./src/foo.rs — not yet normalized).
         let claim = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("doctor-cp-nc"),
             seq: 0,
@@ -6660,6 +6698,7 @@ mod tests {
 
         // tool-a claims "file:crates/a/src/lib.rs"
         let claim_a = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("doctor-cp-a"),
             seq: 0,
@@ -6681,6 +6720,7 @@ mod tests {
         };
         // tool-b claims "file:crates/b/src/lib.rs"
         let claim_b = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("doctor-cp-b"),
             seq: 0,
@@ -6999,6 +7039,7 @@ mod tests {
         {
             let room = store::RoomStore::open_at(root.clone()).unwrap();
             let stale_presence = store::Fact {
+                from_session_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("stale"),
                 seq: 0,
@@ -7054,6 +7095,7 @@ mod tests {
             BUILD_ID, prior_id
         );
         let risk_fact = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -7117,6 +7159,7 @@ mod tests {
         // Resolve +30m and store.
         let wake_iso = dag::resolve_wake_after("+30m").expect("+30m must resolve");
         let fact = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b1a-standby"),
             seq: 0,
@@ -7178,6 +7221,7 @@ mod tests {
 
         // Write a standby fact.
         let standby = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b1b-standby"),
             seq: 0,
@@ -7201,6 +7245,7 @@ mod tests {
 
         // Write a wake fact referencing the standby.
         let wake = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b1b-wake"),
             seq: 0,
@@ -7253,6 +7298,7 @@ mod tests {
         let run_id = "RUN-B1C";
         // Handoff at step S0.
         let handoff = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b1c-handoff"),
             seq: 0,
@@ -7277,6 +7323,7 @@ mod tests {
         // 3 child claims at steps S1, S2, S3 with parent-step:S0.
         for i in 1..=3 {
             let claim = store::Fact {
+                from_session_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id(&format!("b1c-claim-s{i}")),
                 seq: 0,
@@ -7339,6 +7386,7 @@ mod tests {
         let run_id = "RUN-B1D";
         // Claim at S1.
         let claim = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b1d-claim"),
             seq: 0,
@@ -7360,6 +7408,7 @@ mod tests {
         };
         // Standby at S1 with past wake_after.
         let standby = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b1d-standby"),
             seq: 0,
@@ -7411,6 +7460,7 @@ mod tests {
 
         // Write a standby with a past wake_after.
         let standby = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b4a-standby"),
             seq: 0,
@@ -7466,6 +7516,7 @@ mod tests {
         ensure_presence(&room, "tool-b").unwrap();
 
         let standby = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b4b-standby"),
             seq: 0,
@@ -7548,6 +7599,7 @@ mod tests {
         {
             let room = store::RoomStore::open_at(root.clone()).unwrap();
             let current_presence = store::Fact {
+                from_session_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("same"),
                 seq: 0,
@@ -7612,6 +7664,7 @@ mod tests {
     /// Helper: write a claim by tool T on path P and return its event_id.
     fn append_claim(room: &store::RoomStore, tool: &str, path: &str, subject: &str) -> String {
         let fact = store::Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -9005,6 +9058,7 @@ fn command_ack(args: AckArgs) -> Result<Output> {
     ensure_presence(&room, &args.tool)?;
     let snapshot = room.snapshot()?;
     let fact = Fact {
+        from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -9102,6 +9156,7 @@ fn command_lead(args: LeadArgs) -> Result<Output> {
             ensure_presence(&room, &r.tool)?;
             let prior = room.snapshot()?.lead;
             let fact = Fact {
+                from_session_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("fact"),
                 seq: 0,
@@ -9157,6 +9212,7 @@ fn set_lead(json: bool, t: &LeadTargetArgs, mode: &str) -> Result<Output> {
         evidence.push(format!("from:{p}"));
     }
     let fact = Fact {
+        from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -9215,6 +9271,7 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
         let may_text = args.may.as_deref().unwrap_or("");
         let must_check_text = args.must_check.as_deref().unwrap_or("");
         let fact = Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("mission"),
             seq: 0,
@@ -9265,6 +9322,7 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
         let tool_attr = args.tool.clone().unwrap_or_else(|| "unknown".to_string());
         let room = RoomStore::open()?;
         let fact = Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("mission"),
             seq: 0,

@@ -130,6 +130,7 @@ pub(crate) fn add_backlog_item(
     evidence.sort();
 
     let fact = Fact {
+        from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("backlog"),
         seq: 0,
@@ -172,6 +173,7 @@ pub(crate) fn mark_backlog_done(room: &RoomStore, tool: &str, id: &str) -> Resul
     scope.sort();
     scope.dedup();
     let fact = Fact {
+        from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("backlog"),
         seq: 0,
@@ -312,6 +314,7 @@ mod tests {
 
         // Mark dep-1 done by adding another backlog-item fact with same id + done status
         let done_fact = Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("backlog"),
             seq: 0,
@@ -349,6 +352,7 @@ mod tests {
 
         add_backlog_item(&room, "tool-a", "finished", "done task", &[], &[]).unwrap();
         let done_fact = Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("backlog"),
             seq: 0,

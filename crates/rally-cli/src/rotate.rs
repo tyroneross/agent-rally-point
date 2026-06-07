@@ -255,6 +255,7 @@ mod tests {
 
     fn make_fact(seq: i64, subject: &str) -> Fact {
         Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: format!("e{seq}"),
             seq,

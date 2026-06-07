@@ -224,6 +224,7 @@ mod tests {
 
     fn fact(id: &str, tool: &str, scope: Vec<&str>) -> Fact {
         Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: id.to_string(),
             seq: id.bytes().map(i64::from).sum::<i64>(),

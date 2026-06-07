@@ -312,6 +312,7 @@ mod tests {
 
     fn append_fact(room: &RoomStore, kind: FactKind, subject: &str, tool: &str) -> Fact {
         let fact = Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("test"),
             seq: 0,
@@ -351,6 +352,7 @@ mod tests {
         let claim = append_fact(&room, FactKind::Claim, "claim with artifact", "tool-b");
 
         let artifact = Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("artifact"),
             seq: 0,
@@ -395,6 +397,7 @@ mod tests {
         // Make a stale claim by hand-writing the created_at (the helper uses
         // now_string()). Override via direct append.
         let claim = Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("ev-stale"),
             seq: 0,
@@ -420,6 +423,7 @@ mod tests {
         // Add a presence fact for stale-tool that is also old — this is what
         // makes the tool stale in the projection.
         let stale_presence = Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("ev-pres"),
             seq: 0,

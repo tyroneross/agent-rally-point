@@ -1092,6 +1092,7 @@ mod tests {
         // Write one fact in the real repo ledger.
         let room = RoomStore::open_at(root.clone()).unwrap();
         let live_fact = crate::store::Fact {
+            from_session_id: None,
             schema: crate::FACT_SCHEMA.to_string(),
             event_id: "evt_b17_live".to_string(),
             seq: 0,

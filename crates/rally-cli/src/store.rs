@@ -226,7 +226,7 @@ impl PartialEq<&str> for FactKind {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 pub(crate) struct Fact {
     #[serde(default = "fact_schema")]
     pub(crate) schema: String,
@@ -264,6 +264,11 @@ pub(crate) struct Fact {
     pub(crate) uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session: Option<ManagedSession>,
+    /// The live session lease that authored this durable write
+    /// (see `session_identity`). Optional + serde-default so legacy
+    /// rows without it replay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) from_session_id: Option<String>,
 }
 
 impl Fact {
@@ -1098,6 +1103,7 @@ impl RoomStore {
         let mut appended = Vec::new();
         for claim in expired {
             let fact = Fact {
+                from_session_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: crate::new_id("fact"),
                 seq: 0,
@@ -1284,6 +1290,7 @@ impl RoomStore {
             return Ok(None);
         }
         let fact = Fact {
+            from_session_id: None,
             schema: crate::FACT_SCHEMA.to_string(),
             event_id: crate::new_id("read"),
             seq: 0,
@@ -2877,6 +2884,39 @@ mod ledger_tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn fact_from_session_id_round_trips_and_defaults_none() {
+        // New durable writes carry the authoring session lease.
+        let f = Fact {
+            from_session_id: Some("sess:term:host:abc#live".to_string()),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["from_session_id"], "sess:term:host:abc#live");
+        // Default facts have no lease and skip the field on the wire.
+        let bare = Fact::default();
+        assert!(bare.from_session_id.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("from_session_id")
+                .is_none(),
+            "absent from_session_id is skipped, not serialized as null"
+        );
+    }
+
+    #[test]
+    fn legacy_fact_without_from_session_id_still_replays() {
+        // A pre-protocol ledger row carries no from_session_id field.
+        let legacy = r#"{"schema":"agent-rally.fact.v1","event_id":"fact_old","kind":"decision","subject":"old","tool":"codex:01"}"#;
+        let f: Fact = serde_json::from_str(legacy).unwrap();
+        assert!(
+            f.from_session_id.is_none(),
+            "old rows replay with from_session_id=None"
+        );
+        assert_eq!(f.subject, "old");
+    }
+
     fn unique_root(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2889,6 +2929,7 @@ mod ledger_tests {
 
     fn make_fact(event_id: &str, kind: FactKind, scope: &str, summary: &str) -> Fact {
         Fact {
+            from_session_id: None,
             schema: fact_schema(),
             event_id: event_id.to_string(),
             seq: 0,
@@ -4376,6 +4417,7 @@ mod ledger_tests {
 
         // Case A: release with no ref_id at all → must fail.
         let release_no_ref = Fact {
+            from_session_id: None,
             schema: fact_schema(),
             event_id: "ev-release-no-ref".to_string(),
             seq: 0,
@@ -4406,6 +4448,7 @@ mod ledger_tests {
 
         // Case B: release with a bogus ref that is not a live claim → must fail.
         let release_bogus = Fact {
+            from_session_id: None,
             schema: fact_schema(),
             event_id: "ev-release-bogus".to_string(),
             seq: 0,

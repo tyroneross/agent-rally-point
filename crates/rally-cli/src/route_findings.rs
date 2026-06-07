@@ -117,6 +117,7 @@ pub(crate) fn route_findings(
         let (fact_kind, fact) = if let Some(owner_tool) = owner {
             // Route to owner via handoff fact
             let fact = Fact {
+                from_session_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("finding"),
                 seq: 0,
@@ -147,6 +148,7 @@ pub(crate) fn route_findings(
         } else {
             // No active claim owner — emit a risk fact tagged unowned
             let fact = Fact {
+                from_session_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("finding"),
                 seq: 0,
@@ -189,6 +191,7 @@ pub(crate) fn route_findings(
 
     // Emit a routing-summary artifact fact
     let summary_fact = Fact {
+        from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("findings-summary"),
         seq: 0,
@@ -246,6 +249,7 @@ mod tests {
 
     fn add_claim(room: &RoomStore, tool: &str, path: &str) -> Fact {
         let fact = Fact {
+            from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("claim"),
             seq: 0,
