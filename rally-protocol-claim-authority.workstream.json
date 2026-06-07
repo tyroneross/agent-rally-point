@@ -1,0 +1,78 @@
+{
+  "workstream": "rally-protocol-claim-authority",
+  "description": "Implement Rally protocol session identity, transactional claims, leases, causal event envelope, and Claude/Codex handoff dogfood. Rally facilitates; hosts execute. Target design: docs/PROTOCOL-NORTH-STAR.md. Build plan: docs/PLAN-protocol-claim-authority-dogfood.md.",
+  "tasks": [
+    {
+      "id": "session-identity",
+      "intent": "Add endpoint/session identity registry and from_session_id write context, augmenting existing detect_host_runtime/numbered_session_identity.",
+      "owns": ["crates/rally-cli/src/session_identity.rs"],
+      "validation": "cargo test -p rally-cli session_identity",
+      "output": "session registry distinguishes two Claude sessions and one Codex session; whoami reports unambiguous session_id + legible_name"
+    },
+    {
+      "id": "structured-scopes",
+      "intent": "Add structured resource scopes, access modes, canonicalization, and conflict rules.",
+      "owns": ["crates/rally-cli/src/resource_scope.rs"],
+      "validation": "cargo test -p rally-cli resource_scope",
+      "output": "canonical scope tests and conflict policy tests pass"
+    },
+    {
+      "id": "claim-leases",
+      "intent": "Add claim leases, mutable renewal, durable expiry, and rebuild from ledger.",
+      "owns": ["crates/rally-cli/src/claim_authority.rs"],
+      "depends_on": ["structured-scopes", "session-identity"],
+      "validation": "cargo test -p rally-cli claim_authority",
+      "output": "lease renewal is non-durable; expiry emits exactly one durable event"
+    },
+    {
+      "id": "event-envelope-auth",
+      "intent": "Add causal/idempotency fields and advisory authorization checks.",
+      "owns": ["crates/rally-cli/src/event_envelope.rs", "docs/schemas/rally-protocol-events.md"],
+      "validation": "cargo test -p rally-cli event_envelope",
+      "output": "old logs replay and privileged events enforce role policy"
+    },
+    {
+      "id": "integration-wiring",
+      "intent": "Wire new protocol modules into CLI/store/output without changing their internal contracts.",
+      "owns": [
+        "crates/rally-cli/src/cli.rs",
+        "crates/rally-cli/src/lib.rs",
+        "crates/rally-cli/src/store.rs",
+        "crates/rally-cli/src/output.rs"
+      ],
+      "depends_on": [
+        "session-identity",
+        "structured-scopes",
+        "claim-leases",
+        "event-envelope-auth"
+      ],
+      "validation": "cargo test --all",
+      "output": "existing commands still replay old ledgers and new protocol commands work"
+    },
+    {
+      "id": "handoff-dogfood",
+      "intent": "Prove targeted delivery, ACK, accept/reject, and resolve with Claude and Codex sessions.",
+      "owns": [
+        "scripts/protocol-dogfood-smoke.sh"
+      ],
+      "depends_on": ["integration-wiring"],
+      "validation": "git diff --check",
+      "output": "dogfood event ids show delivered is not acked and ack uses exact from_session_id/ref_event_id"
+    },
+    {
+      "id": "integration-audit",
+      "intent": "Audit scheduler boundary, state projections, docs, and validation evidence.",
+      "owns": "read-only",
+      "depends_on": [
+        "session-identity",
+        "structured-scopes",
+        "claim-leases",
+        "event-envelope-auth",
+        "integration-wiring",
+        "handoff-dogfood"
+      ],
+      "validation": "cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test --all && git diff --check",
+      "output": "closeout report with pass/fail evidence and follow-ups"
+    }
+  ]
+}

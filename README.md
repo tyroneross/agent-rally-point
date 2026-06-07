@@ -13,6 +13,12 @@ operating guide for the Rally loop.
 
 The full product boundary is [`docs/RALLY_ARCHITECTURE.md`](docs/RALLY_ARCHITECTURE.md).
 
+The long-term coordination protocol model is
+[`docs/PROTOCOL-NORTH-STAR.md`](docs/PROTOCOL-NORTH-STAR.md).
+
+The build-loop implementation and Claude/Codex dogfood plan is
+[`docs/PLAN-protocol-claim-authority-dogfood.md`](docs/PLAN-protocol-claim-authority-dogfood.md).
+
 Checkout and active-ledger migration rules live in
 [`docs/CANONICAL-CHECKOUT-MIGRATION.md`](docs/CANONICAL-CHECKOUT-MIGRATION.md).
 
