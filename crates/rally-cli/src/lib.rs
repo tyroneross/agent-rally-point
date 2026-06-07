@@ -51,6 +51,7 @@ mod backlog;
 mod board;
 mod check;
 mod check_ci;
+mod claim_authority;
 mod cli;
 mod dag;
 mod discovery;
@@ -59,6 +60,7 @@ mod error;
 mod init;
 mod next;
 mod output;
+mod resource_scope;
 mod retrospective;
 mod ripple;
 mod rotate;
@@ -957,6 +959,9 @@ fn command_say(args: SayArgs) -> Result<Output> {
     }
     for d in &args.depends {
         evidence.push(format!("depends:{d}"));
+    }
+    if kind == FactKind::Claim {
+        claim_authority::ensure_default_lease_evidence(&mut evidence);
     }
 
     // B1: encode lineage markers (run/step/parent-step) into scope.
@@ -9283,7 +9288,7 @@ fn help_text() -> String {
         "  rally board [--json]",
         "  rally route-findings --file <findings.json> [--tool <tool>] --verified [--json]",
         "  rally check-ci [--strict] [--receipt-threshold <secs>] [--json]  # read-only CI gate: exits 0 (pass) or 4 with --strict (fail)",
-        "Fact kinds: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake, standby, presence, backlog-item, mission",
+        "Fact kinds: claim, claim.expired, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake, standby, presence, backlog-item, mission",
         "  rally mission [--json]                                        # GET: current north-star + agent envelopes",
         "  rally mission --set \"<north-star>\" [--tool <t>] [--json]    # SET mission",
         "  rally mission --tool <agent> --may \"<...>\" --must-check \"<...>\" [--json]  # SET envelope",

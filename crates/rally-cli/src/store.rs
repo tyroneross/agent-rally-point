@@ -98,12 +98,17 @@ fn retry_jitter_ms() -> u64 {
     // base back-off so it perturbs rather than dominates the schedule.
     hasher.finish() % 23
 }
-use crate::{FACT_SCHEMA, normalize_paths, now_string, path_matches_scope, repo_root, short_id};
+use crate::{
+    FACT_SCHEMA, claim_authority, normalize_paths, now_string, path_matches_scope, repo_root,
+    short_id,
+};
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FactKind {
     Claim,
+    #[serde(rename = "claim.expired")]
+    ClaimExpired,
     Release,
     Blocker,
     Resolve,
@@ -168,6 +173,7 @@ impl FactKind {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "claim" => Some(Self::Claim),
+            "claim.expired" | "claim_expired" => Some(Self::ClaimExpired),
             "release" => Some(Self::Release),
             "blocker" => Some(Self::Blocker),
             "resolve" => Some(Self::Resolve),
@@ -192,6 +198,7 @@ impl FactKind {
     pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::Claim => "claim",
+            Self::ClaimExpired => "claim.expired",
             Self::Release => "release",
             Self::Blocker => "blocker",
             Self::Resolve => "resolve",
@@ -506,6 +513,7 @@ pub(crate) struct RoomStore {
     cursor_path: PathBuf,
     repo_root: PathBuf,
     facts_db_path: PathBuf,
+    claim_index_path: PathBuf,
     /// Per-engagement segment directory (R5). All segment files together form
     /// the canonical append-only record.
     log_dir: PathBuf,
@@ -641,6 +649,7 @@ impl RoomStore {
             cursor_path: dir.join("cursors.json"),
             repo_root: root,
             facts_db_path: fact_store_path,
+            claim_index_path: dir.join(claim_authority::CLAIM_INDEX_FILENAME),
             log_dir,
             archive_dir,
             active_engagement,
@@ -678,6 +687,7 @@ impl RoomStore {
             cursor_path: dir.join("cursors.json"),
             repo_root: root,
             facts_db_path: fact_store_path,
+            claim_index_path: dir.join(claim_authority::CLAIM_INDEX_FILENAME),
             log_dir,
             archive_dir,
             active_engagement,
@@ -714,6 +724,21 @@ impl RoomStore {
         reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
         let fact_store = open_fact_store(&self.facts_db_path)?;
         let mut fact = fact.clone();
+        if fact.kind == FactKind::Claim {
+            let facts = facts_from_store(&fact_store)?;
+            if let Some(conflict) = claim_authority::detect_conflict(&facts, &fact) {
+                return Err(RallyError::Usage(format!(
+                    "claim conflict: {} already owns {}; existing claim {} conflicts with requested scope {}",
+                    conflict
+                        .existing_owner
+                        .as_deref()
+                        .unwrap_or("unknown owner"),
+                    conflict.scope,
+                    conflict.existing_claim_id,
+                    conflict.scope
+                )));
+            }
+        }
         let event_type = fact.kind.as_str().to_string();
         let payload = serde_json::to_value(&fact).map_err(RallyError::json("render fact"))?;
         // The room lock serializes Rally writers; keep a short retry for
@@ -755,6 +780,14 @@ impl RoomStore {
         // rebuilds them on next open from segments.
         let _ = self.refresh_log_index();
         let _ = self.refresh_index(fact.seq);
+        if matches!(
+            fact.kind,
+            FactKind::Claim | FactKind::Release | FactKind::Resolve | FactKind::ClaimExpired
+        ) {
+            let facts = facts_from_store(&fact_store)?;
+            claim_authority::write_index_from_facts(&self.claim_index_path, &facts)
+                .map_err(|err| RallyError::Message(format!("write claim index: {err}")))?;
+        }
         Ok(fact)
     }
 
@@ -1026,20 +1059,73 @@ impl RoomStore {
     }
 
     pub(crate) fn facts(&self) -> Result<Vec<Fact>> {
-        let query = self
-            .fact_store
-            .query(&FactQuery::all())
-            .map_err(|err| RallyError::Message(format!("query facts: {err}")))?;
-        query
-            .event_records
-            .into_iter()
-            .map(|record| {
-                let seq = i64::try_from(record.sequence_number).map_err(|err| {
-                    RallyError::Message(format!("sequence number overflow: {err}"))
-                })?;
-                Fact::from_value(record.payload, seq)
-            })
-            .collect()
+        facts_from_store(&self.fact_store)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn rebuild_claim_index(&self) -> Result<()> {
+        let facts = self.facts()?;
+        claim_authority::write_index_from_facts(&self.claim_index_path, &facts)
+            .map_err(|err| RallyError::Message(format!("write claim index: {err}")))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn renew_claim_lease(
+        &self,
+        claim_id: &str,
+        lease_expires_at: String,
+    ) -> Result<Option<claim_authority::ActiveClaimRecord>> {
+        self.rebuild_claim_index()?;
+        claim_authority::renew_claim_lease(&self.claim_index_path, claim_id, lease_expires_at)
+            .map_err(|err| RallyError::Message(format!("renew claim lease: {err}")))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claim_index_path(&self) -> &Path {
+        &self.claim_index_path
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn expire_claim_leases_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<Fact>> {
+        self.rebuild_claim_index()?;
+        let facts = self.facts()?;
+        let index = claim_authority::read_index(&self.claim_index_path)
+            .map_err(|err| RallyError::Message(format!("read claim index: {err}")))?;
+        let expired = claim_authority::expired_claims(&index, &facts, now);
+        let mut appended = Vec::new();
+        for claim in expired {
+            let fact = Fact {
+                schema: FACT_SCHEMA.to_string(),
+                event_id: crate::new_id("fact"),
+                seq: 0,
+                thread_id: crate::new_id("room"),
+                kind: FactKind::ClaimExpired,
+                tool: Some("rally".to_string()),
+                role: None,
+                subject: format!("claim expired: {}", claim.claim_id),
+                scope: claim.raw_scope.clone(),
+                created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                summary: claim
+                    .lease_expires_at
+                    .as_ref()
+                    .map(|lease| format!("lease_expires_at:{lease}")),
+                evidence: vec![format!("expired_claim:{}", claim.claim_id)],
+                target: claim.owner_tool.clone(),
+                ref_id: Some(claim.claim_id.clone()),
+                status: Some("expired".to_string()),
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            appended.push(self.append_fact_verified(&fact)?);
+        }
+        if !appended.is_empty() {
+            self.rebuild_claim_index()?;
+        }
+        Ok(appended)
     }
 
     pub(crate) fn session_facts_with_context_version(&self) -> Result<(Vec<Fact>, Option<u64>)> {
@@ -1327,6 +1413,21 @@ fn filter_facts(facts: Vec<Fact>, query: &RoomQuery) -> Vec<Fact> {
         .collect()
 }
 
+fn facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
+    let query = store
+        .query(&FactQuery::all())
+        .map_err(|err| RallyError::Message(format!("query facts: {err}")))?;
+    query
+        .event_records
+        .into_iter()
+        .map(|record| {
+            let seq = i64::try_from(record.sequence_number)
+                .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
+            Fact::from_value(record.payload, seq)
+        })
+        .collect()
+}
+
 /// Pure projection of a `RoomSnapshot` from an already-loaded facts slice.
 ///
 /// This is the body formerly inlined in `RoomStore::snapshot`. Extracted so
@@ -1353,21 +1454,17 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
     // B13: receipts close handoffs (same projection as resolve).
     let resolved = facts
         .iter()
-        .filter(|f| f.kind == "resolve" || f.kind == "release" || f.kind == "receipt")
+        .filter(|f| {
+            f.kind == "resolve"
+                || f.kind == "release"
+                || f.kind == "receipt"
+                || f.kind == "claim.expired"
+        })
         .filter_map(|f| f.ref_id.clone())
-        .collect::<BTreeSet<_>>();
-    let released_scopes = facts
-        .iter()
-        .filter(|f| f.kind == "release")
-        .flat_map(|f| f.scope.clone())
         .collect::<BTreeSet<_>>();
     let active_claims = facts
         .iter()
-        .filter(|f| f.kind == "claim")
-        .filter(|f| !resolved.contains(&f.event_id))
-        .filter(|f| !f.scope.iter().any(|scope| released_scopes.contains(scope)))
-        // B18: exclude external-intake facts from repo-local backlog.
-        .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
+        .filter(|fact| claim_authority::is_active_claim_fact(fact, facts))
         .cloned()
         .collect::<Vec<_>>();
     let active_blockers = facts
@@ -2810,6 +2907,223 @@ mod ledger_tests {
             uri: None,
             session: None,
         }
+    }
+
+    fn claim_fact(event_id: &str, tool: &str, scope: &str, lease_expires_at: &str) -> Fact {
+        let mut fact = make_fact(event_id, FactKind::Claim, scope, "claim");
+        fact.tool = Some(tool.to_string());
+        if !lease_expires_at.is_empty() {
+            fact.evidence
+                .push(format!("lease_expires_at:{lease_expires_at}"));
+        }
+        fact
+    }
+
+    #[test]
+    fn claim_authority_rejects_second_exclusive_owner_on_same_scope() {
+        let root = unique_root("claim-authority-conflict");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let first = claim_fact(
+            "claim-first",
+            "tool-a",
+            "file:src/lib.rs",
+            "2099-01-01T00:00:00Z",
+        );
+        let second = claim_fact(
+            "claim-second",
+            "tool-b",
+            "file:./src/lib.rs",
+            "2099-01-01T00:00:00Z",
+        );
+
+        store.append_fact_verified(&first).unwrap();
+        let err = store.append_fact_verified(&second).unwrap_err().to_string();
+
+        assert!(
+            err.contains("claim conflict"),
+            "second owner must be rejected by claim authority; got {err}"
+        );
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.active_claims.len(), 1);
+        assert_eq!(snapshot.active_claims[0].event_id, "claim-first");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn release_scope_before_later_same_scope_claim_does_not_suppress_later_claim() {
+        let root = unique_root("claim-authority-release-order");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let old_claim = claim_fact(
+            "claim-old",
+            "tool-a",
+            "file:src/lib.rs",
+            "2099-01-01T00:00:00Z",
+        );
+        let old_claim = store.append_fact_verified(&old_claim).unwrap();
+        let mut release = make_fact(
+            "release-old",
+            FactKind::Release,
+            "file:src/lib.rs",
+            "release old claim",
+        );
+        release.ref_id = Some(old_claim.event_id);
+        store.append_state_transition_verified(&release).unwrap();
+        let later_claim = claim_fact(
+            "claim-later",
+            "tool-b",
+            "file:src/lib.rs",
+            "2099-01-01T00:00:00Z",
+        );
+
+        store.append_fact_verified(&later_claim).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let index = claim_authority::read_index(store.claim_index_path()).unwrap();
+
+        assert_eq!(snapshot.active_claims.len(), 1);
+        assert_eq!(snapshot.active_claims[0].event_id, "claim-later");
+        assert_eq!(snapshot.active_claims[0].tool.as_deref(), Some("tool-b"));
+        assert_eq!(index.claims.len(), 1);
+        assert!(index.claims.contains_key("claim-later"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn claim_authority_concurrent_exclusive_acquire_allows_one_owner() {
+        use std::sync::{Arc, Barrier};
+
+        let root = unique_root("claim-authority-concurrent");
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let root = root.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let store = RoomStore::open_at(root).unwrap();
+                let fact = claim_fact(
+                    &format!("claim-{i}"),
+                    &format!("tool-{i}"),
+                    "file:src/lib.rs",
+                    "2099-01-01T00:00:00Z",
+                );
+                barrier.wait();
+                store.append_fact_verified(&fact).map(|f| f.event_id)
+            }));
+        }
+
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        let successes = results.iter().filter(|result| result.is_ok()).count();
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let owners = store
+            .snapshot()
+            .unwrap()
+            .active_claims
+            .into_iter()
+            .filter_map(|claim| claim.tool)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(successes, 1, "exactly one append should acquire the scope");
+        assert_eq!(owners.len(), 1, "projection must show exactly one owner");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn claim_lease_renewal_updates_index_without_durable_event() {
+        let root = unique_root("claim-lease-renew");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let claim = claim_fact(
+            "claim-renew",
+            "tool-a",
+            "file:src/lib.rs",
+            "2099-01-01T00:00:00Z",
+        );
+        store.append_fact_verified(&claim).unwrap();
+        let before_count = store.facts().unwrap().len();
+
+        let renewed = store
+            .renew_claim_lease("claim-renew", "2099-01-01T00:30:00Z".to_string())
+            .unwrap()
+            .unwrap();
+        let after_count = store.facts().unwrap().len();
+        let index = claim_authority::read_index(store.claim_index_path()).unwrap();
+
+        assert_eq!(
+            before_count, after_count,
+            "lease renewal must not append durable facts"
+        );
+        assert_eq!(
+            renewed.lease_expires_at.as_deref(),
+            Some("2099-01-01T00:30:00Z")
+        );
+        assert_eq!(
+            index
+                .claims
+                .get("claim-renew")
+                .and_then(|record| record.lease_expires_at.as_deref()),
+            Some("2099-01-01T00:30:00Z")
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn claim_lease_expiry_appends_one_durable_event_and_frees_claim() {
+        let root = unique_root("claim-lease-expire");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let claim = claim_fact(
+            "claim-expiring",
+            "tool-a",
+            "file:src/lib.rs",
+            "2000-01-01T00:00:00Z",
+        );
+        store.append_fact_verified(&claim).unwrap();
+
+        let first = store.expire_claim_leases_at(chrono::Utc::now()).unwrap();
+        let second = store.expire_claim_leases_at(chrono::Utc::now()).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let expired_count = store
+            .facts()
+            .unwrap()
+            .into_iter()
+            .filter(|fact| fact.kind == FactKind::ClaimExpired)
+            .count();
+
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty(), "expiry must be durable exactly once");
+        assert_eq!(expired_count, 1);
+        assert!(
+            snapshot.active_claims.is_empty(),
+            "expired claim must leave active ownership"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn claim_authority_replays_legacy_claim_without_lease_marker() {
+        let root = unique_root("claim-authority-legacy-replay");
+        {
+            let store = RoomStore::open_at(root.clone()).unwrap();
+            let claim = claim_fact("claim-legacy", "tool-a", "file:src/lib.rs", "");
+            store.append_fact_verified(&claim).unwrap();
+        }
+
+        let reopened = RoomStore::open_at(root.clone()).unwrap();
+        reopened.rebuild_claim_index().unwrap();
+        let snapshot = reopened.snapshot().unwrap();
+        let index = claim_authority::read_index(reopened.claim_index_path()).unwrap();
+
+        assert_eq!(snapshot.active_claims.len(), 1);
+        assert_eq!(index.claims.len(), 1);
+        assert_eq!(
+            index
+                .claims
+                .get("claim-legacy")
+                .and_then(|record| record.lease_expires_at.as_deref()),
+            None,
+            "legacy claim replay remains tolerant of missing lease metadata"
+        );
+        fs::remove_dir_all(&root).ok();
     }
 
     fn segments_under(root: &Path) -> Vec<PathBuf> {
