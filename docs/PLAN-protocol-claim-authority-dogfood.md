@@ -374,7 +374,7 @@ Checkpoint:
 | Pass | Delivered is visible but not treated as ACK; Claude ACK cites exact ref | Move to operation/work result semantics. |
 | Fail: wrong Claude | ACK `from_session_id` does not match target | Fix session targeting and legible-name display. |
 | Fail: delivery counted as ACK | Message lifecycle skips ACK | Fix lifecycle projection before continuing. |
-| Fail: no ACK | Delivery succeeded but Claude did not act | Capture session, inspect prompt state, retry injection or report host issue. |
+| Fail: no ACK | No target-authored Rally evidence before timeout | Assume not received. Check session/pane state, `rally room`/`next`/`recent`, and assigned-file movement; retry once with a short doorbell; then move work to a separate worktree, hand off to another live agent, or escalate. |
 
 ## Phase 6 - Work And Operation Result Semantics
 
@@ -468,7 +468,10 @@ Use skills/rally-workflows/SKILL.md for fan-out and skills/mini-loop/SKILL.md fo
 Own the session identity, handoff lifecycle, docs, and dogfood verification lane unless Rally says otherwise.
 Before editing, claim exact files with Rally. Do not edit Codex-owned claim authority files without handoff.
 Your required proof: targeted handoff ACK uses your exact from_session_id and ref_event_id; delivered is not treated as ACK.
-If injection reaches the wrong terminal or no ACK occurs, stop and report the session registry evidence instead of continuing.
+If injection reaches the wrong terminal or no ACK occurs, stop treating the
+inject as delivery. `rally inject --handoff` now requires target-authored Rally
+evidence by default; a timeout returns `verified_received: false` plus a
+fallback plan. Follow that plan instead of waiting indefinitely.
 Post checkpoints as Rally artifacts with commands and results.
 ```
 

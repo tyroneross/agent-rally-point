@@ -135,6 +135,16 @@ pub(crate) struct InjectData {
     pub(crate) handoff: Option<String>,
     pub(crate) require_ack: bool,
     pub(crate) ack: Option<Value>,
+    /// Whether the target has posted Rally evidence for this injection.
+    /// Transport success alone does not set this true.
+    pub(crate) verified_received: bool,
+    /// Machine-readable ACK lifecycle for callers that need fallback routing.
+    /// Values: `not_required`, `planned`, `acked`, `blocked`, `timeout`.
+    pub(crate) ack_state: &'static str,
+    /// Present when an ACK was required but did not arrive. This is the
+    /// deterministic fallback tree callers should execute instead of assuming
+    /// the injected text was read.
+    pub(crate) fallback_plan: Option<Value>,
     pub(crate) wake_intent: Option<Fact>,
     pub(crate) commands: Vec<Value>,
     /// The tool that initiated the injection (from --tool; "unknown" when omitted).

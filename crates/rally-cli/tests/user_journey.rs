@@ -1167,6 +1167,9 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     ]);
     resolver.join().unwrap();
     assert_eq!(acked["data"]["inject"]["ack"]["resolved"], true);
+    assert_eq!(acked["data"]["inject"]["ack"]["received"], true);
+    assert_eq!(acked["data"]["inject"]["ack_state"], "acked");
+    assert_eq!(acked["data"]["inject"]["verified_received"], true);
     assert_eq!(
         acked["data"]["inject"]["ack"]["tool"],
         "claude_code:reviewer-01"
@@ -1308,6 +1311,14 @@ fn rally_inject_require_ack_timeout_returns_ok_with_timeout_ack() {
     // Must be ok:true (inject succeeded; only ack is pending).
     assert_eq!(output.status.code(), Some(0), "ack-timeout must exit 0");
     assert_eq!(body["ok"], true, "ack-timeout must return ok:true");
+    assert_eq!(
+        body["data"]["inject"]["ack_state"], "timeout",
+        "ack_state must surface timeout"
+    );
+    assert_eq!(
+        body["data"]["inject"]["verified_received"], false,
+        "target receipt must be false until target-authored Rally evidence appears"
+    );
 
     // delivery + content fact must be present (message was recorded before wait).
     assert_eq!(
@@ -1323,12 +1334,24 @@ fn rally_inject_require_ack_timeout_returns_ok_with_timeout_ack() {
         ack["resolved"], false,
         "ack.resolved must be false on timeout"
     );
+    assert_eq!(
+        ack["received"], false,
+        "ack.received must be false on timeout"
+    );
+    assert_eq!(
+        ack["assume_received"], false,
+        "timeout means assume the target did not receive/read the injection"
+    );
     assert_eq!(ack["timed_out"], true, "ack.timed_out must be true");
     assert!(
         ack["waited_seconds"].as_u64().unwrap_or(0) >= 1,
         "ack.waited_seconds must reflect the timeout duration"
     );
     assert!(!ack["after_seq"].is_null(), "ack.after_seq must be present");
+    assert_eq!(
+        body["data"]["inject"]["fallback_plan"]["assumption"], "not_received",
+        "timeout must return a fallback plan that treats missing ACK as not received"
+    );
 
     workspace.cleanup();
 }
@@ -1603,6 +1626,8 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
         "--json",
         "--handoff",
         handoff_id,
+        "--timeout-seconds",
+        "1",
         "--tmux-bin",
         "/usr/bin/true",
     ]);
@@ -1616,6 +1641,30 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
     assert_eq!(
         inject["data"]["inject"]["wake_intent"]["status"],
         "delivered"
+    );
+    assert_eq!(
+        inject["data"]["inject"]["require_ack"], true,
+        "--handoff injects require target ACK by default"
+    );
+    assert_eq!(
+        inject["data"]["inject"]["ack_state"], "timeout",
+        "without a target-authored Rally response, inject must time out"
+    );
+    assert_eq!(
+        inject["data"]["inject"]["verified_received"], false,
+        "no target ACK means assume the injected prompt was not received"
+    );
+    assert_eq!(
+        inject["data"]["inject"]["ack"]["received"], false,
+        "timeout ACK object must explicitly mark received=false"
+    );
+    assert_eq!(
+        inject["data"]["inject"]["fallback_plan"]["fallbacks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4,
+        "timeout must return concrete fallback choices"
     );
 
     workspace.cleanup();

@@ -15,15 +15,49 @@
       "properties": {
         "inject": {
           "type": "object",
-          "required": ["mode", "session", "require_ack", "commands"],
+          "required": [
+            "mode",
+            "session",
+            "target_kind",
+            "handoff",
+            "require_ack",
+            "ack",
+            "verified_received",
+            "ack_state",
+            "fallback_plan",
+            "wake_intent",
+            "commands",
+            "sender_tool",
+            "content_fact",
+            "delivered",
+            "delivery_state",
+            "directive_seq",
+            "directive_to"
+          ],
           "properties": {
             "mode": { "type": "string" },
-            "session": { "type": "object" },
+            "session": { "type": ["object", "null"] },
+            "target_kind": {
+              "type": "string",
+              "enum": ["managed_session", "ledger_agent"]
+            },
             "handoff": { "type": ["string", "null"] },
             "require_ack": { "type": "boolean" },
             "ack": { "type": ["object", "null"] },
+            "verified_received": { "type": "boolean" },
+            "ack_state": {
+              "type": "string",
+              "enum": ["not_required", "planned", "acked", "blocked", "timeout", "pending"]
+            },
+            "fallback_plan": { "type": ["object", "null"] },
             "wake_intent": { "type": ["object", "null"] },
-            "commands": { "type": "array" }
+            "commands": { "type": "array" },
+            "sender_tool": { "type": "string" },
+            "content_fact": { "type": ["object", "null"] },
+            "delivered": { "type": "boolean" },
+            "delivery_state": { "type": "string" },
+            "directive_seq": { "type": ["integer", "null"] },
+            "directive_to": { "type": ["string", "null"] }
           }
         }
       }

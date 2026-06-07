@@ -1179,7 +1179,7 @@ fn inject_parser() -> impl Parser<InjectArgs> {
     let text = optional_string_arg("text", "TEXT");
     let handoff = handoff_arg();
     let require_ack = long("require-ack").switch();
-    let timeout_seconds = bounded_i64_arg("timeout-seconds", "SECONDS", 60, 1, 600);
+    let timeout_seconds = bounded_i64_arg("timeout-seconds", "SECONDS", 10, 1, 600);
     let bins = backend_bins_parser();
     let tool = optional_string_arg("tool", "TOOL")
         .map(|value| value.unwrap_or_else(|| "unknown".to_string()));

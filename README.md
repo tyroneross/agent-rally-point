@@ -99,6 +99,15 @@ explicit handoff targets to identify the current recipient. A targeted handoff
 is the durable action request; `rally inject` is only a wake/delivery path for a
 target already listed by `rally sessions --json`.
 
+For `--handoff`, `rally inject` waits for target-authored Rally evidence by
+default. Text reaching a pane is not proof that the receiving agent read or
+acted on it. If the target does not post `resolve`, `receipt`, `artifact`,
+`blocker`, or `decision` for the expected handoff before the timeout, the
+inject result returns `ack_state: "timeout"`, `verified_received: false`, and a
+`fallback_plan`. Treat that as not received: check Rally state and assigned
+file movement, retry once with a short doorbell, then move the work to a
+separate worktree, hand it to another live agent, or escalate.
+
 Managed sessions need no setup step. `rally run --backend <tmux|cmux>`
 starts the addressable pane/workspace, and `rally inject` delivers work to it.
 The legacy `herdr` backend (and its `--herdr-bin` / `--herdr-socket` flags)

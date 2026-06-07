@@ -3333,6 +3333,7 @@ fn command_inject_managed(
             "--require-ack requires --handoff or --ref".to_string(),
         ));
     }
+    let effective_require_ack = require_ack || handoff.is_some();
     let timeout = timeout_seconds as u64;
 
     // Open the room once for all appends in this command.
@@ -3342,7 +3343,7 @@ fn command_inject_managed(
         None
     };
 
-    let ack_after_seq = if require_ack && !dry_run {
+    let ack_after_seq = if effective_require_ack && !dry_run {
         room.as_ref()
             .map(|r| r.snapshot().map(|s| s.max_seq))
             .transpose()?
@@ -3454,7 +3455,7 @@ fn command_inject_managed(
         dry_run,
         delivery_state,
     )?;
-    let ack = if require_ack && !dry_run {
+    let ack = if effective_require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
         // room is always Some here (require_ack && !dry_run guards this branch).
         let ack_room = room.as_ref().expect("room must be open for --require-ack");
@@ -3468,14 +3469,26 @@ fn command_inject_managed(
     } else {
         None
     };
+    let ack_state = inject_ack_state(effective_require_ack, dry_run, ack.as_ref());
+    let verified_received = inject_verified_received(ack.as_ref());
+    let fallback_plan = inject_fallback_plan(
+        effective_require_ack,
+        dry_run,
+        handoff.as_deref(),
+        &session.tool,
+        ack.as_ref(),
+    );
     let session_id_for_text = session.session_id.clone();
     let inject_payload = InjectData {
         mode: if dry_run { "dry-run" } else { "inject" },
         session: Some(session),
         target_kind: "managed_session",
         handoff,
-        require_ack,
+        require_ack: effective_require_ack,
         ack: ack.clone(),
+        verified_received,
+        ack_state,
+        fallback_plan,
         wake_intent,
         commands: command_plan_json(&commands),
         sender_tool,
@@ -3539,6 +3552,7 @@ fn command_inject_ledger(
             "--require-ack requires --handoff or --ref".to_string(),
         ));
     }
+    let effective_require_ack = require_ack || handoff.is_some();
     let timeout = timeout_seconds as u64;
 
     let room = if !dry_run {
@@ -3547,7 +3561,7 @@ fn command_inject_ledger(
         None
     };
 
-    let ack_after_seq = if require_ack && !dry_run {
+    let ack_after_seq = if effective_require_ack && !dry_run {
         room.as_ref()
             .map(|r| r.snapshot().map(|s| s.max_seq))
             .transpose()?
@@ -3593,7 +3607,7 @@ fn command_inject_ledger(
         dry_run,
         delivery_state,
     )?;
-    let ack = if require_ack && !dry_run {
+    let ack = if effective_require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
         let ack_room = room.as_ref().expect("room must be open for --require-ack");
         Some(wait_for_resolution(
@@ -3606,13 +3620,25 @@ fn command_inject_ledger(
     } else {
         None
     };
+    let ack_state = inject_ack_state(effective_require_ack, dry_run, ack.as_ref());
+    let verified_received = inject_verified_received(ack.as_ref());
+    let fallback_plan = inject_fallback_plan(
+        effective_require_ack,
+        dry_run,
+        handoff.as_deref(),
+        &agent_id,
+        ack.as_ref(),
+    );
     let inject_payload = InjectData {
         mode: if dry_run { "dry-run" } else { "inject" },
         session: None,
         target_kind: "ledger_agent",
         handoff,
-        require_ack,
+        require_ack: effective_require_ack,
         ack: ack.clone(),
+        verified_received,
+        ack_state,
+        fallback_plan,
         wake_intent,
         commands: command_plan_json(&commands),
         sender_tool,
@@ -4236,24 +4262,44 @@ fn wait_for_resolution(
 ) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     let mut last_seen_seq = after_seq;
-    let mut ignored_resolves = BTreeSet::new();
+    let mut ignored_target_responses = BTreeSet::new();
     loop {
         for fact in room.facts()? {
             last_seen_seq = last_seen_seq.max(fact.seq);
-            if fact.seq > after_seq
-                && fact.kind == "resolve"
-                && fact.ref_id.as_deref() == Some(handoff)
-            {
+            if fact.seq > after_seq && fact.ref_id.as_deref() == Some(handoff) {
+                if !matches!(
+                    fact.kind,
+                    store::FactKind::Resolve
+                        | store::FactKind::Receipt
+                        | store::FactKind::Artifact
+                        | store::FactKind::Blocker
+                        | store::FactKind::Decision
+                ) {
+                    continue;
+                }
                 if fact.tool.as_deref() == Some(expected_tool) {
+                    let blocked = fact.kind == store::FactKind::Blocker;
+                    let decision = fact.kind == store::FactKind::Decision;
+                    let resolved = matches!(
+                        fact.kind,
+                        store::FactKind::Resolve
+                            | store::FactKind::Receipt
+                            | store::FactKind::Artifact
+                    );
                     return Ok(json!({
-                        "resolved": true,
+                        "received": true,
+                        "resolved": resolved,
+                        "handoff_closed": resolved,
+                        "blocked": blocked,
+                        "decision": decision,
                         "event_id": fact.event_id,
                         "tool": fact.tool,
                         "expected_tool": expected_tool,
+                        "kind": fact.kind.as_str(),
                         "subject": fact.subject
                     }));
                 }
-                ignored_resolves.insert(fact.event_id);
+                ignored_target_responses.insert(fact.event_id);
             }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -4262,14 +4308,92 @@ fn wait_for_resolution(
         }
         thread::sleep(remaining.min(Duration::from_millis(250)));
     }
+    let fallback_plan = ack_timeout_fallback_plan(handoff, expected_tool, timeout_seconds);
     Ok(json!({
+        "received": false,
         "resolved": false,
+        "assume_received": false,
         "timed_out": true,
         "waited_seconds": timeout_seconds,
         "after_seq": after_seq,
         "expected_tool": expected_tool,
-        "ignored_resolves": ignored_resolves.len()
+        "ignored_resolves": ignored_target_responses.len(),
+        "ignored_target_responses": ignored_target_responses.len(),
+        "fallback_plan": fallback_plan
     }))
+}
+
+fn inject_ack_state(require_ack: bool, dry_run: bool, ack: Option<&Value>) -> &'static str {
+    if !require_ack {
+        return "not_required";
+    }
+    if dry_run {
+        return "planned";
+    }
+    if let Some(ack) = ack {
+        if ack.get("blocked").and_then(Value::as_bool).unwrap_or(false) {
+            return "blocked";
+        }
+        if ack
+            .get("received")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return "acked";
+        }
+        if ack
+            .get("timed_out")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return "timeout";
+        }
+    }
+    "pending"
+}
+
+fn inject_verified_received(ack: Option<&Value>) -> bool {
+    ack.and_then(|ack| ack.get("received"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn inject_fallback_plan(
+    require_ack: bool,
+    dry_run: bool,
+    handoff: Option<&str>,
+    expected_tool: &str,
+    ack: Option<&Value>,
+) -> Option<Value> {
+    if !require_ack || dry_run || inject_verified_received(ack) {
+        return None;
+    }
+    if let Some(plan) = ack.and_then(|ack| ack.get("fallback_plan")).cloned() {
+        return Some(plan);
+    }
+    handoff.map(|handoff| ack_timeout_fallback_plan(handoff, expected_tool, 0))
+}
+
+fn ack_timeout_fallback_plan(handoff: &str, expected_tool: &str, timeout_seconds: u64) -> Value {
+    json!({
+        "trigger": "ack_timeout",
+        "assumption": "not_received",
+        "handoff": handoff,
+        "expected_tool": expected_tool,
+        "timeout_seconds": timeout_seconds,
+        "checks": [
+            format!("rally room --json; confirm handoff {handoff} is still open"),
+            format!("rally next --tool {expected_tool} --json; confirm the target still sees the handoff"),
+            "rally recent --limit 50 --json; look for target-authored resolve/artifact/blocker",
+            "check whether assigned files changed or claims moved before retrying"
+        ],
+        "fallbacks": [
+            "retry once with a short doorbell only",
+            "move the work to a separate worktree if ownership is safe",
+            "handoff to another live agent when the target stays silent",
+            "escalate to the human when file ownership or risk is unclear"
+        ]
+    })
 }
 
 fn sanitize_id(value: &str) -> String {
@@ -4916,14 +5040,14 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    fn resolve_fact(tool: &str, ref_id: &str, subject: &str) -> Fact {
+    fn ref_fact(kind: FactKind, tool: &str, ref_id: &str, subject: &str) -> Fact {
         Fact {
             from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
-            event_id: new_id("resolve"),
+            event_id: new_id(kind.as_str()),
             seq: 0,
             thread_id: new_id("ack"),
-            kind: FactKind::Resolve,
+            kind,
             tool: Some(tool.to_string()),
             role: None,
             subject: subject.to_string(),
@@ -4938,6 +5062,10 @@ mod tests {
             uri: None,
             session: None,
         }
+    }
+
+    fn resolve_fact(tool: &str, ref_id: &str, subject: &str) -> Fact {
+        ref_fact(FactKind::Resolve, tool, ref_id, subject)
     }
 
     #[test]
@@ -4986,6 +5114,58 @@ mod tests {
         assert_eq!(ack["timed_out"].as_bool(), Some(true));
         assert_eq!(ack["expected_tool"].as_str(), Some(expected_tool));
         assert_eq!(ack["ignored_resolves"].as_u64(), Some(1));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn wait_for_resolution_accepts_target_artifact_as_ack() {
+        let root = unique_root("ack-target-artifact");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let handoff_id = "handoff-under-test";
+        let expected_tool = "claude_code:reviewer-01";
+
+        room.append_fact(&ref_fact(
+            FactKind::Artifact,
+            expected_tool,
+            handoff_id,
+            "target artifact",
+        ))
+        .unwrap();
+
+        let ack = wait_for_resolution(handoff_id, 0, 0, &room, expected_tool).unwrap();
+
+        assert_eq!(ack["received"].as_bool(), Some(true));
+        assert_eq!(ack["resolved"].as_bool(), Some(true));
+        assert_eq!(ack["handoff_closed"].as_bool(), Some(true));
+        assert_eq!(ack["kind"].as_str(), Some("artifact"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn wait_for_resolution_accepts_target_blocker_as_received_not_resolved() {
+        let root = unique_root("ack-target-blocker");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let handoff_id = "handoff-under-test";
+        let expected_tool = "claude_code:reviewer-01";
+
+        room.append_fact(&ref_fact(
+            FactKind::Blocker,
+            expected_tool,
+            handoff_id,
+            "target blocked",
+        ))
+        .unwrap();
+
+        let ack = wait_for_resolution(handoff_id, 0, 0, &room, expected_tool).unwrap();
+
+        assert_eq!(ack["received"].as_bool(), Some(true));
+        assert_eq!(ack["resolved"].as_bool(), Some(false));
+        assert_eq!(ack["blocked"].as_bool(), Some(true));
+        assert_eq!(ack["kind"].as_str(), Some("blocker"));
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -9521,7 +9701,8 @@ fn help_text() -> String {
         "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|cmux>] [--dry-run] [--json]",
         "    managed run ids auto-number active agents, e.g. claude-01 / claude_code:01",
         "  rally sessions [--json]",
-        "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--require-ack] [--json]",
+        "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--timeout-seconds <n>] [--json]",
+        "    --handoff waits for target-authored Rally ACK by default; no ACK means assume not received and follow fallback_plan",
         "  rally attach <session|name|tool> [--dry-run] [--json]",
         "  rally capture <session|name|tool> [--lines <n>] [--dry-run] [--json]",
         "  rally stop <session|name|tool> [--dry-run] [--json]",
