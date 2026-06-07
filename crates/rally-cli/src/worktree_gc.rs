@@ -40,6 +40,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use crate::run_worktree;
 
@@ -81,6 +82,22 @@ pub struct GcConfig {
     pub presence_facts: Vec<PresenceFact>,
     /// Git binary to use (e.g. `"git"`).
     pub git_bin: String,
+    /// f2 — Backend-liveness gate for unmerged worktrees that are stale-by-TTL
+    /// only.
+    ///
+    /// When supplied, a worktree that is reapable ONLY because its owner is
+    /// TTL-stale (i.e. unmerged) is additionally required to be confirmed
+    /// backend-dead before it is reaped.  The probe is called with the
+    /// per-agent `session_id` (branch suffix after `rally/`), and returns
+    /// `true` when the backing tmux/cmux session is confirmed gone (dead) and
+    /// `false` when the session is still live.  If the probe returns `false`
+    /// (live backend), the GC skips the worktree with a reason mentioning the
+    /// live backend.
+    ///
+    /// `None` → no backend probe is performed (TTL-only staleness is
+    /// sufficient).  This preserves backward-compatibility for callers that
+    /// do not have a tmux/cmux binary available.
+    pub backend_liveness_probe: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
 }
 
 /// One GC candidate (may or may not be reaped).
@@ -146,9 +163,13 @@ pub fn run_gc(config: GcConfig) -> Result<GcReport, String> {
     // 1. Enumerate worktrees.
     let entries = list_worktrees(repo, git_bin)?;
 
-    // 2. Resolve default branch and current worktree to protect them.
+    // 2. Resolve default branch and current worktree(s) to protect them.
+    //    f4: resolve BOTH the repo-root toplevel (via -C repo) AND the process
+    //    cwd toplevel (no -C, inherits actual cwd) so that running gc from
+    //    inside a linked worktree protects that worktree too.
     let default_branch = resolve_default_branch(repo, git_bin);
     let current_wt = resolve_current_worktree(repo, git_bin);
+    let cwd_wt = resolve_cwd_worktree(git_bin);
 
     // 3. Build liveness index from presence facts.
     let liveness = build_liveness_index(&config.presence_facts, &now_ts, config.ttl_secs);
@@ -179,15 +200,18 @@ pub fn run_gc(config: GcConfig) -> Result<GcReport, String> {
         }
 
         // Protect the current (cwd-resolved) worktree.
-        if let Some(ref cwd_wt) = current_wt {
-            if same_path(cwd_wt, &entry.path) {
-                skipped.push(GcSkipped {
-                    worktree_path: entry.path.clone(),
-                    branch: entry.branch.clone(),
-                    reason: "current worktree — never reap".to_string(),
-                });
-                continue;
-            }
+        // f4: check both the repo-root resolved path AND the actual process cwd
+        // so that running gc from inside a linked worktree protects that linked
+        // worktree as well.
+        let is_current_wt = current_wt.as_ref().map_or(false, |p| same_path(p, &entry.path))
+            || cwd_wt.as_ref().map_or(false, |p| same_path(p, &entry.path));
+        if is_current_wt {
+            skipped.push(GcSkipped {
+                worktree_path: entry.path.clone(),
+                branch: entry.branch.clone(),
+                reason: "current worktree — never reap".to_string(),
+            });
+            continue;
         }
 
         // Determine owner liveness.
@@ -214,7 +238,30 @@ pub fn run_gc(config: GcConfig) -> Result<GcReport, String> {
             continue;
         }
 
-        // Reapable: merged OR (unmerged + stale owner).
+        // f2 — backend-liveness gate: an unmerged worktree that is reapable
+        // ONLY by TTL staleness (not by merge) must also be confirmed
+        // backend-dead before we touch it.  A long-running agent that simply
+        // hasn't posted a heartbeat recently is indistinguishable from a dead
+        // one by TTL alone.  If the probe says the session is still live, skip.
+        if !merged {
+            if let Some(ref probe) = config.backend_liveness_probe {
+                // Extract the session-id from the branch name (`rally/<id>`).
+                let session_id = entry.branch.strip_prefix("rally/").unwrap_or(&entry.branch);
+                let backend_dead = probe(session_id);
+                if !backend_dead {
+                    skipped.push(GcSkipped {
+                        worktree_path: entry.path.clone(),
+                        branch: entry.branch.clone(),
+                        reason: format!(
+                            "backend probe says session {session_id} is still live — not reaped"
+                        ),
+                    });
+                    continue;
+                }
+            }
+        }
+
+        // Reapable: merged OR (unmerged + stale owner + backend-dead).
         let reason = if merged {
             "branch merged into default".to_string()
         } else {
@@ -236,6 +283,22 @@ pub fn run_gc(config: GcConfig) -> Result<GcReport, String> {
         let outcome = run_worktree::cleanup(repo, &entry.path, &entry.branch, git_bin);
         for w in &outcome.warnings {
             warnings.push(w.clone());
+        }
+        // f3 — bundle_failed guard: if cleanup() could not write the safety
+        // bundle for unmerged work, it did NOT remove the worktree.  Push to
+        // skipped (not reaped) so the caller knows the worktree is still
+        // present and surfaces the warning.
+        if outcome.bundle_failed {
+            warnings.push(format!(
+                "worktree gc: skipped {} — bundle failed, unmerged work preserved",
+                entry.path.display()
+            ));
+            skipped.push(GcSkipped {
+                worktree_path: entry.path.clone(),
+                branch: entry.branch.clone(),
+                reason: "bundle write failed — unmerged work not removed".to_string(),
+            });
+            continue;
         }
         if let Some(bundle) = outcome.bundle_path {
             bundles.push(bundle);
@@ -392,6 +455,26 @@ fn resolve_current_worktree(repo: &Path, git_bin: &str) -> Option<PathBuf> {
     None
 }
 
+/// f4 — Resolve the worktree that contains the ACTUAL PROCESS CWD.
+///
+/// `resolve_current_worktree` always resolves via `-C repo_root`, which
+/// returns the canonical checkout.  When `rally worktree gc` is invoked from
+/// inside a linked worktree, the process cwd is DIFFERENT from the canonical
+/// checkout.  This function runs `git rev-parse --show-toplevel` with NO `-C`
+/// flag so it inherits the real process cwd, returning the linked worktree
+/// path.  The result is added to the protected set in addition to `repo_root`.
+fn resolve_cwd_worktree(git_bin: &str) -> Option<PathBuf> {
+    let out = Command::new(git_bin)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if out.status.success() {
+        let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        return Some(p);
+    }
+    None
+}
+
 fn same_path(a: &Path, b: &Path) -> bool {
     // Canonicalize for symlink safety; fall back to raw comparison on error.
     let ca = a.canonicalize().unwrap_or_else(|_| a.to_path_buf());
@@ -436,16 +519,30 @@ struct LivenessIndex {
     stale_tools: BTreeSet<String>,
 }
 
+/// f1 — Normalize a tool/agent name for hyphen-vs-underscore-safe comparison.
+///
+/// `rally run` registers tools with underscores (e.g. `claude_code:01`) but
+/// `derive_owner_prefix` may extract a hyphenated prefix from the branch name
+/// (e.g. `claude-code` from `rally/claude-code-task-01`).  Normalizing BOTH
+/// sides to underscores before any comparison eliminates false-negative
+/// liveness mismatches that would incorrectly allow a live owner's worktree to
+/// be reaped.
+fn normalize_name(s: &str) -> String {
+    s.replace('-', "_")
+}
+
 fn build_liveness_index(facts: &[PresenceFact], now_ts: &str, ttl_secs: u64) -> LivenessIndex {
     let now_secs = chrono::DateTime::parse_from_rfc3339(now_ts)
         .map(|dt| dt.timestamp())
         .ok();
 
-    // Keep only the highest-seq fact per tool.
+    // Keep only the highest-seq fact per tool (keyed by normalized name so
+    // that `claude-code` and `claude_code` collapse to the same entry).
     use std::collections::BTreeMap;
     let mut latest: BTreeMap<String, &PresenceFact> = BTreeMap::new();
     for fact in facts {
-        let entry = latest.entry(fact.tool.clone()).or_insert(fact);
+        let key = normalize_name(&fact.tool);
+        let entry = latest.entry(key).or_insert(fact);
         if fact.seq > entry.seq {
             *entry = fact;
         }
@@ -454,7 +551,7 @@ fn build_liveness_index(facts: &[PresenceFact], now_ts: &str, ttl_secs: u64) -> 
     let mut live_tools = BTreeSet::new();
     let mut stale_tools = BTreeSet::new();
 
-    for (tool, fact) in &latest {
+    for (normalized_tool, fact) in &latest {
         let seen_secs = chrono::DateTime::parse_from_rfc3339(&fact.created_at)
             .map(|dt| dt.timestamp())
             .ok();
@@ -465,9 +562,9 @@ fn build_liveness_index(facts: &[PresenceFact], now_ts: &str, ttl_secs: u64) -> 
             _ => false,
         };
         if stale {
-            stale_tools.insert(tool.clone());
+            stale_tools.insert(normalized_tool.clone());
         } else {
-            live_tools.insert(tool.clone());
+            live_tools.insert(normalized_tool.clone());
         }
     }
 
@@ -514,9 +611,14 @@ fn derive_owner_prefix(branch: &str) -> String {
 
 /// Return `true` when the owner is live (NOT stale).
 ///
+/// f1: both the owner prefix and the stored tool names are normalized
+/// (hyphens → underscores) before comparison, eliminating false mismatches
+/// between e.g. `claude-code` (from the branch name) and `claude_code`
+/// (from the tool registration).
+///
 /// Matching strategy (in priority order):
-/// 1. Exact match between prefix and a tool name.
-/// 2. Tool name starts with the prefix (covers `claude_code:01`-style names).
+/// 1. Exact match between normalized prefix and a normalized tool name.
+/// 2. Tool name starts with the normalized prefix.
 /// 3. Prefix starts with the tool name (covers tool `claude` matching prefix
 ///    `claude` extracted from `rally/claude-foo-01`).
 ///
@@ -525,12 +627,14 @@ fn derive_owner_prefix(branch: &str) -> String {
 /// room data for this agent — falls back to TTL-only (treats as stale, i.e.
 /// reapable).
 fn is_owner_live(owner_prefix: &str, idx: &LivenessIndex) -> bool {
+    // Normalize the owner prefix once; the index is already normalized.
+    let norm_prefix = normalize_name(owner_prefix);
     // Explicitly stale → not live (short-circuit before checking live set).
     let name_match = |set: &BTreeSet<String>| {
         set.iter().any(|t| {
-            t == owner_prefix
-                || t.starts_with(owner_prefix)
-                || owner_prefix.starts_with(t.as_str())
+            t == &norm_prefix
+                || t.starts_with(&norm_prefix)
+                || norm_prefix.starts_with(t.as_str())
         })
     };
     if name_match(&idx.stale_tools) {

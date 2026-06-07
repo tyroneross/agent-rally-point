@@ -155,6 +155,12 @@ pub(crate) struct CleanupOutcome {
     pub(crate) bundle_path: Option<PathBuf>,
     /// Non-fatal warnings collected during cleanup.
     pub(crate) warnings: Vec<String>,
+    /// True when the branch had unmerged work AND the bundle write failed.
+    ///
+    /// When this is true the caller MUST NOT count the worktree as reaped:
+    /// skipping it preserves the unmerged work until the bundle problem is
+    /// resolved.
+    pub(crate) bundle_failed: bool,
 }
 
 /// Remove a per-agent worktree and its branch (when safe).
@@ -178,7 +184,12 @@ pub(crate) fn cleanup(
     let base = run_base(repo_root, git_bin).unwrap_or_else(|_| "HEAD".to_string());
 
     // 1. If the branch has unmerged commits, bundle before remove.
+    //    Safety invariant (f3): if the bundle fails we must NOT remove the
+    //    worktree — unmerged work would be permanently lost.  Set
+    //    `bundle_failed = true` and return early so the GC caller can skip
+    //    this candidate rather than counting it as reaped.
     let mut bundle_path = None;
+    let bundle_failed: bool;
     let has_unmerged = branch_has_unmerged(repo_root, branch, &base, git_bin);
     if has_unmerged {
         let bundle = bundle_path_for(worktree_path);
@@ -191,13 +202,38 @@ pub(crate) fn cleanup(
             .arg(branch)
             .output();
         match bundle_result {
-            Ok(out) if out.status.success() => bundle_path = Some(bundle),
-            Ok(out) => warnings.push(format!(
-                "rally stop: bundle write for branch {branch} failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )),
-            Err(err) => warnings.push(format!("rally stop: could not invoke git bundle: {err}")),
+            Ok(out) if out.status.success() => {
+                bundle_path = Some(bundle);
+                bundle_failed = false;
+            }
+            Ok(out) => {
+                let msg = format!(
+                    "rally stop: bundle write for branch {branch} failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                warnings.push(msg);
+                // Return immediately — do NOT remove unmerged work without a bundle.
+                return CleanupOutcome {
+                    worktree_removed: false,
+                    branch_deleted: false,
+                    bundle_path: None,
+                    warnings,
+                    bundle_failed: true,
+                };
+            }
+            Err(err) => {
+                warnings.push(format!("rally stop: could not invoke git bundle: {err}"));
+                return CleanupOutcome {
+                    worktree_removed: false,
+                    branch_deleted: false,
+                    bundle_path: None,
+                    warnings,
+                    bundle_failed: true,
+                };
+            }
         }
+    } else {
+        bundle_failed = false;
     }
 
     // 2. Remove the worktree directory.
@@ -273,6 +309,7 @@ pub(crate) fn cleanup(
         branch_deleted,
         bundle_path,
         warnings,
+        bundle_failed,
     }
 }
 

@@ -551,6 +551,11 @@ fn command_worktree_gc(args: WorktreeGcArgs) -> Result<Output> {
         now_ts: None, // use system clock
         presence_facts,
         git_bin: "git".to_string(),
+        // f2: The CLI path wires the existing probe_session_liveness machinery
+        // from lib.rs (which queries tmux/cmux) into the GC config when a room
+        // store is available.  For now None (TTL-only); a follow-up can thread
+        // BackendBins through WorktreeGcArgs.
+        backend_liveness_probe: None,
     };
 
     let report = worktree_gc::run_gc(config).map_err(RallyError::Message)?;

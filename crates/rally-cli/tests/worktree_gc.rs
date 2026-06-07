@@ -18,6 +18,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
@@ -163,6 +164,7 @@ fn merged_worktree_is_reaped_on_apply_listed_on_dry_run() {
         now_ts: None,
         presence_facts: vec![],
         git_bin: "git".to_string(),
+        backend_liveness_probe: None,
     });
     assert!(report.is_ok(), "dry-run must not error: {:?}", report);
     let report = report.unwrap();
@@ -187,6 +189,7 @@ fn merged_worktree_is_reaped_on_apply_listed_on_dry_run() {
         now_ts: None,
         presence_facts: vec![],
         git_bin: "git".to_string(),
+        backend_liveness_probe: None,
     });
     assert!(report.is_ok(), "apply must not error: {:?}", report);
     let report = report.unwrap();
@@ -228,6 +231,7 @@ fn unmerged_with_live_owner_is_never_reaped() {
         now_ts: Some(now_ts.to_string()),
         presence_facts: facts,
         git_bin: "git".to_string(),
+        backend_liveness_probe: None,
     });
     assert!(report.is_ok(), "must not error: {:?}", report);
     let report = report.unwrap();
@@ -283,6 +287,7 @@ fn unmerged_with_stale_owner_is_bundled_then_reaped() {
         now_ts: Some(now_ts.to_string()),
         presence_facts: facts,
         git_bin: "git".to_string(),
+        backend_liveness_probe: None,
     });
     assert!(report.is_ok(), "must not error: {:?}", report);
     let report = report.unwrap();
@@ -323,6 +328,7 @@ fn default_branch_and_cwd_worktree_are_never_reaped() {
         now_ts: None,
         presence_facts: vec![],
         git_bin: "git".to_string(),
+        backend_liveness_probe: None,
     });
     assert!(report.is_ok());
     let report = report.unwrap();
@@ -360,6 +366,7 @@ fn dry_run_makes_no_filesystem_changes() {
         now_ts: None,
         presence_facts: vec![],
         git_bin: "git".to_string(),
+        backend_liveness_probe: None,
     });
     assert!(report.is_ok());
     let report = report.unwrap();
@@ -422,6 +429,7 @@ fn ttl_boundary_respected() {
         now_ts: Some(now_ts.to_string()),
         presence_facts: facts,
         git_bin: "git".to_string(),
+        backend_liveness_probe: None,
     });
     assert!(report.is_ok(), "must not error: {:?}", report);
     let report = report.unwrap();
@@ -439,6 +447,306 @@ fn ttl_boundary_respected() {
         report.reaped
     );
     assert!(wt_live.exists(), "live worktree directory must still exist");
+
+    fs::remove_dir_all(&repo).ok();
+}
+
+// ---------------------------------------------------------------------------
+// f1 — live_owner_hyphen_underscore_mismatch_not_reaped
+// ---------------------------------------------------------------------------
+
+/// f1 safety fix: branch `rally/claude-code-task-01` derives owner prefix
+/// `claude-code` (hyphens).  The tool registered in the room is
+/// `claude_code:01` (underscores).  Before the fix, none of the three
+/// predicates in `is_owner_live` matched, so a LIVE owner was falsely
+/// treated as absent/stale → the worktree was reaped.  After normalizing
+/// both sides (replace '-' → '_'), the match succeeds → not reaped.
+#[test]
+fn live_owner_hyphen_underscore_mismatch_not_reaped() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let repo = tmp_dir("f1-hyphen-underscore");
+    init_repo(&repo);
+    // Session id uses the multi-word hyphenated form — derive_owner_prefix
+    // returns "claude-code" (hyphenated).
+    let wt = make_rally_worktree(&repo, "claude-code-task-01");
+    add_commit_in_worktree(&wt); // unmerged
+
+    let now_ts = "2026-06-07T12:00:00Z";
+    let fresh_ts = "2026-06-07T11:58:00Z"; // 2 min ago — within any TTL
+
+    // Tool name uses underscores, as registered by `rally run claude`
+    // (AgentSpec.tool = "claude_code").  This is the mismatch f1 fixes.
+    let facts = vec![make_presence_fact("claude_code:01", 1, "state=idle", fresh_ts)];
+
+    let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
+        repo_root: repo.clone(),
+        apply: true,
+        ttl_secs: 24 * 3600,
+        now_ts: Some(now_ts.to_string()),
+        presence_facts: facts,
+        git_bin: "git".to_string(),
+        backend_liveness_probe: None,
+    });
+    assert!(report.is_ok(), "must not error: {:?}", report);
+    let report = report.unwrap();
+
+    // The owner is LIVE — the worktree must NOT be reaped.
+    assert!(
+        report.reaped.is_empty(),
+        "f1: live claude_code:01 must protect rally/claude-code-task-01 from reaping; \
+         reaped={:?}",
+        report.reaped
+    );
+    assert!(wt.exists(), "worktree directory must still exist");
+
+    // Confirm it landed in skipped with a live-related reason.
+    let skipped = report.skipped.iter().find(|s| s.worktree_path == wt);
+    assert!(
+        skipped.is_some(),
+        "f1: worktree must appear in skipped list; skipped={:?}",
+        report.skipped
+    );
+    let reason = &skipped.unwrap().reason;
+    assert!(
+        reason.to_lowercase().contains("live"),
+        "f1: skip reason must mention live owner; got: {reason}"
+    );
+
+    fs::remove_dir_all(&repo).ok();
+}
+
+// ---------------------------------------------------------------------------
+// f2 — backend_live_stale_by_ttl_not_reaped
+// ---------------------------------------------------------------------------
+
+/// f2 safety fix: a worktree whose owner is TTL-stale (no recent heartbeat)
+/// but whose backing tmux/cmux session is still live according to the backend
+/// probe must NOT be reaped.  The probe returning `false` (backend alive)
+/// causes the GC to skip the worktree.
+#[test]
+fn backend_live_stale_by_ttl_not_reaped() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let repo = tmp_dir("f2-backend-live");
+    init_repo(&repo);
+    let wt = make_rally_worktree(&repo, "codex-long-run-01");
+    add_commit_in_worktree(&wt); // unmerged
+
+    // Agent is stale by TTL — no heartbeat for 48 h.
+    let now_ts = "2026-06-07T12:00:00Z";
+    let stale_ts = "2026-06-05T12:00:00Z";
+    let facts = vec![make_presence_fact("codex", 1, "state=idle", stale_ts)];
+
+    // Backend probe: returns false (= backend IS alive, NOT dead) for this
+    // session so the GC must skip it.
+    let probe: Arc<dyn Fn(&str) -> bool + Send + Sync> =
+        Arc::new(|session_id: &str| -> bool {
+            // `false` = backend is live (session exists); reaper must skip.
+            assert!(
+                session_id == "codex-long-run-01",
+                "probe called with unexpected session_id: {session_id}"
+            );
+            false // backend alive → NOT dead
+        });
+
+    let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
+        repo_root: repo.clone(),
+        apply: true,
+        ttl_secs: 24 * 3600,
+        now_ts: Some(now_ts.to_string()),
+        presence_facts: facts,
+        git_bin: "git".to_string(),
+        backend_liveness_probe: Some(probe),
+    });
+    assert!(report.is_ok(), "must not error: {:?}", report);
+    let report = report.unwrap();
+
+    assert!(
+        report.reaped.is_empty(),
+        "f2: backend-live worktree must not be reaped even when TTL-stale; \
+         reaped={:?}",
+        report.reaped
+    );
+    assert!(wt.exists(), "worktree directory must still exist");
+
+    let skipped = report.skipped.iter().find(|s| s.worktree_path == wt);
+    assert!(
+        skipped.is_some(),
+        "f2: worktree must appear in skipped list; skipped={:?}",
+        report.skipped
+    );
+    let reason = &skipped.unwrap().reason;
+    assert!(
+        reason.to_lowercase().contains("live"),
+        "f2: skip reason must mention live backend; got: {reason}"
+    );
+
+    fs::remove_dir_all(&repo).ok();
+}
+
+// ---------------------------------------------------------------------------
+// f3 — bundle_failure_skips_unmerged_worktree
+// ---------------------------------------------------------------------------
+
+/// f3 safety fix: when `git bundle` fails (e.g. a fake git that always fails),
+/// the worktree must NOT be removed and must appear in `skipped`, not `reaped`,
+/// with a warning surfaced.  This prevents silent data loss when the safety
+/// bundle cannot be written.
+#[test]
+fn bundle_failure_skips_unmerged_worktree() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let repo = tmp_dir("f3-bundle-fail");
+    init_repo(&repo);
+    let wt = make_rally_worktree(&repo, "claude-bundle-fail-01");
+    add_commit_in_worktree(&wt); // unmerged — would require a bundle
+
+    // Write a fake `git` that fails every `bundle create` but succeeds for
+    // all other git commands (by delegating to the real git).
+    let fake_git_dir = tmp_dir("fake-git-bin");
+    let fake_git = fake_git_dir.join("git");
+    let real_git = Command::new("which")
+        .arg("git")
+        .output()
+        .expect("which git")
+        .stdout;
+    let real_git_path = String::from_utf8_lossy(&real_git).trim().to_string();
+    // Shell wrapper: intercept `git bundle create` and exit 1; delegate rest.
+    let script = format!(
+        "#!/bin/sh\nif echo \"$*\" | grep -q 'bundle create'; then\n  echo 'fake git: bundle create disabled' >&2\n  exit 1\nfi\nexec {real_git_path} \"$@\"\n"
+    );
+    fs::write(&fake_git, script.as_bytes()).unwrap();
+    // Make executable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let stale_ts = "2026-06-05T12:00:00Z"; // 2 days ago — stale
+    let now_ts = "2026-06-07T12:00:00Z";
+    let facts = vec![make_presence_fact("claude", 1, "state=idle", stale_ts)];
+
+    let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
+        repo_root: repo.clone(),
+        apply: true,
+        ttl_secs: 24 * 3600,
+        now_ts: Some(now_ts.to_string()),
+        presence_facts: facts,
+        git_bin: fake_git.to_string_lossy().to_string(),
+        backend_liveness_probe: None,
+    });
+    assert!(report.is_ok(), "must not error: {:?}", report);
+    let report = report.unwrap();
+
+    // Worktree must still exist on disk (not removed).
+    assert!(
+        wt.exists(),
+        "f3: worktree must still exist when bundle fails; path={:?}",
+        wt
+    );
+    // Must NOT appear in reaped.
+    assert!(
+        report.reaped.iter().all(|r| r.worktree_path != wt),
+        "f3: worktree with failed bundle must not be counted as reaped; reaped={:?}",
+        report.reaped
+    );
+    // Must appear in skipped.
+    let skipped = report.skipped.iter().find(|s| s.worktree_path == wt);
+    assert!(
+        skipped.is_some(),
+        "f3: worktree must appear in skipped list; skipped={:?}",
+        report.skipped
+    );
+    // A warning must be emitted.
+    assert!(
+        !report.warnings.is_empty(),
+        "f3: a warning must be emitted when bundle fails; warnings={:?}",
+        report.warnings
+    );
+
+    fs::remove_dir_all(&repo).ok();
+    fs::remove_dir_all(&fake_git_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// f4 — gc_from_linked_worktree_protects_cwd
+// ---------------------------------------------------------------------------
+
+/// f4 safety fix: when `rally worktree gc` runs with `repo_root` pointing at
+/// the canonical checkout but the PROCESS CWD is a linked worktree, that
+/// linked worktree must be protected (never reaped).  The original code only
+/// resolved `--show-toplevel` via `-C repo_root`, so a linked worktree that
+/// happened to be the process cwd was not protected.
+///
+/// We simulate this by setting the process cwd via `std::env::set_current_dir`
+/// to the linked worktree and then invoking gc.
+#[test]
+fn gc_from_linked_worktree_protects_cwd() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let repo = tmp_dir("f4-cwd-protect");
+    init_repo(&repo);
+    // Create the linked worktree that will be "our" cwd.
+    let linked_wt = make_rally_worktree(&repo, "claude-linked-cwd-01");
+    add_commit_in_worktree(&linked_wt); // give it an unmerged commit so it's a candidate
+
+    // Change the process cwd to the linked worktree.
+    let original_cwd = std::env::current_dir().expect("current_dir");
+    std::env::set_current_dir(&linked_wt).expect("set_current_dir to linked worktree");
+
+    let now_ts = "2026-06-07T12:00:00Z";
+    let stale_ts = "2026-06-05T12:00:00Z"; // owner stale — would reap without f4
+    let facts = vec![make_presence_fact("claude", 1, "state=idle", stale_ts)];
+
+    let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
+        repo_root: repo.clone(),
+        apply: true,
+        ttl_secs: 24 * 3600,
+        now_ts: Some(now_ts.to_string()),
+        presence_facts: facts,
+        git_bin: "git".to_string(),
+        backend_liveness_probe: None,
+    });
+
+    // Restore cwd unconditionally.
+    std::env::set_current_dir(&original_cwd).ok();
+
+    assert!(report.is_ok(), "must not error: {:?}", report);
+    let report = report.unwrap();
+
+    // The linked worktree (our cwd) must NOT be reaped.
+    assert!(
+        report.reaped.iter().all(|r| r.worktree_path != linked_wt),
+        "f4: linked worktree that is the process cwd must not be reaped; reaped={:?}",
+        report.reaped
+    );
+    assert!(
+        linked_wt.exists(),
+        "f4: cwd linked worktree must still exist after gc"
+    );
+
+    // It must appear in skipped with a protection reason.
+    let skipped = report.skipped.iter().find(|s| s.worktree_path == linked_wt);
+    assert!(
+        skipped.is_some(),
+        "f4: cwd worktree must appear in skipped list; skipped={:?}",
+        report.skipped
+    );
+    let reason = &skipped.unwrap().reason;
+    assert!(
+        reason.to_lowercase().contains("current"),
+        "f4: skip reason must mention 'current' worktree; got: {reason}"
+    );
 
     fs::remove_dir_all(&repo).ok();
 }
