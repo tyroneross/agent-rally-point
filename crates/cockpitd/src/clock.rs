@@ -52,7 +52,7 @@ impl FakeClock {
     /// Advance the clock by the given duration.
     pub fn advance(&self, d: Duration) {
         let mut t = self.inner.lock().unwrap();
-        *t = *t + d;
+        *t += d;
     }
 
     /// Set the clock to an absolute instant.

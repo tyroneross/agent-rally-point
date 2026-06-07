@@ -470,7 +470,9 @@ mod tests {
     /// markdown groups by engagement and lists each kind's section.
     #[test]
     fn retrospective_groups_by_engagement_with_all_sections() {
-        let _env = crate::PROCESS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // SAFETY: env mutation serialized by PROCESS_ENV_LOCK above.
         unsafe {
             std::env::remove_var(crate::store::ENGAGEMENT_ENV_VAR);
@@ -538,7 +540,9 @@ mod tests {
     /// (deterministic output → action == "unchanged").
     #[test]
     fn retrospective_is_idempotent() {
-        let _env = crate::PROCESS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // SAFETY: env mutation serialized by PROCESS_ENV_LOCK above.
         unsafe {
             std::env::remove_var(crate::store::ENGAGEMENT_ENV_VAR);
@@ -568,7 +572,9 @@ mod tests {
     /// `--engagement` filter limits the output to one section.
     #[test]
     fn retrospective_filter_limits_to_one_engagement() {
-        let _env = crate::PROCESS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // SAFETY: env mutation serialized by PROCESS_ENV_LOCK above.
         unsafe {
             std::env::remove_var(crate::store::ENGAGEMENT_ENV_VAR);

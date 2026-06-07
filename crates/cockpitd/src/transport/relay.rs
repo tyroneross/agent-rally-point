@@ -65,7 +65,9 @@ struct RelayInner {
 
 impl RelayInner {
     fn new() -> Self {
-        Self { rooms: HashMap::new() }
+        Self {
+            rooms: HashMap::new(),
+        }
     }
 
     fn register(
@@ -78,10 +80,7 @@ impl RelayInner {
         self.rooms
             .entry(room_id.to_string())
             .or_default()
-            .push((
-                client_id.to_string(),
-                ClientEntry { tx, pubkey },
-            ));
+            .push((client_id.to_string(), ClientEntry { tx, pubkey }));
     }
 
     fn deregister(&mut self, room_id: &str, client_id: &str) {
@@ -93,10 +92,13 @@ impl RelayInner {
     /// Get the public key of a client in a room.
     fn get_pubkey(&self, room_id: &str, client_id: &str) -> Option<[u8; 32]> {
         self.rooms.get(room_id)?.iter().find_map(|(id, entry)| {
-            if id == client_id { Some(entry.pubkey) } else { None }
+            if id == client_id {
+                Some(entry.pubkey)
+            } else {
+                None
+            }
         })
     }
-
 }
 
 // ── ZeroKnowledgeRelay ────────────────────────────────────────────────────────
@@ -113,7 +115,9 @@ pub struct ZeroKnowledgeRelay {
 impl ZeroKnowledgeRelay {
     /// Create a new, empty relay.
     pub fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(RelayInner::new())) }
+        Self {
+            inner: Arc::new(Mutex::new(RelayInner::new())),
+        }
     }
 
     /// Join a room, returning a `RelayClient` handle.
@@ -146,7 +150,9 @@ impl ZeroKnowledgeRelay {
     /// Used by clients to find the recipient pubkey for key wrapping; the relay
     /// itself never calls this internally.
     pub fn get_peer_pubkey(&self, room_id: &str, client_id: &str) -> Option<[u8; 32]> {
-        self.inner.lock().expect("relay mutex poisoned")
+        self.inner
+            .lock()
+            .expect("relay mutex poisoned")
             .get_pubkey(room_id, client_id)
     }
 
@@ -228,9 +234,7 @@ impl Drop for RelayClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{
-        RecipientKeypair, generate_data_key, open, seal, unwrap_key, wrap_key,
-    };
+    use crate::crypto::{RecipientKeypair, generate_data_key, open, seal, unwrap_key, wrap_key};
 
     /// F5 end-to-end: two in-process clients exchange a message through the relay.
     ///
@@ -252,8 +256,7 @@ mod tests {
 
         // ── Join room ────────────────────────────────────────────────────────
         let sender_client = relay.join("room:session-42", "sender", [0u8; 32]);
-        let mut recipient_client =
-            relay.join("room:session-42", "recipient", recipient_pubkey);
+        let mut recipient_client = relay.join("room:session-42", "recipient", recipient_pubkey);
 
         // ── Session data key (never given to relay) ──────────────────────────
         let data_key = generate_data_key();
@@ -286,13 +289,11 @@ mod tests {
             .expect("send must succeed");
 
         // ── Relay has forwarded; intercept from recipient's channel ───────────
-        let received_envelope = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            recipient_client.recv(),
-        )
-        .await
-        .expect("recv must not time out")
-        .expect("envelope must arrive");
+        let received_envelope =
+            tokio::time::timeout(std::time::Duration::from_secs(1), recipient_client.recv())
+                .await
+                .expect("recv must not time out")
+                .expect("envelope must arrive");
 
         let intercepted = &received_envelope.payload;
 
@@ -323,18 +324,23 @@ mod tests {
             .expect("nonce must be 24 bytes");
         let ciphertext_recv = received[nonce_start + 24..].to_vec();
 
-        let wrapped_recv = crate::crypto::WrappedKey { bytes: wk_bytes_recv.to_vec() };
-        let recovered_key = unwrap_key(&wrapped_recv, &recipient_kp)
-            .expect("recipient must be able to unwrap key");
+        let wrapped_recv = crate::crypto::WrappedKey {
+            bytes: wk_bytes_recv.to_vec(),
+        };
+        let recovered_key =
+            unwrap_key(&wrapped_recv, &recipient_kp).expect("recipient must be able to unwrap key");
 
         let sealed_recv = crate::crypto::SealedPayload {
             nonce: nonce_recv,
             ciphertext: ciphertext_recv,
         };
-        let decrypted = open(&recovered_key, &sealed_recv)
-            .expect("recipient must decrypt successfully");
+        let decrypted =
+            open(&recovered_key, &sealed_recv).expect("recipient must decrypt successfully");
 
-        assert_eq!(decrypted, plaintext, "recipient must recover exact plaintext");
+        assert_eq!(
+            decrypted, plaintext,
+            "recipient must recover exact plaintext"
+        );
     }
 
     /// Verify that a client in one room does NOT receive messages from another room.
@@ -349,21 +355,18 @@ mod tests {
         client_a.send(b"hello alpha".to_vec()).await.unwrap();
 
         // C receives the message.
-        let env = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            client_c.recv(),
-        )
-        .await
-        .expect("C must receive")
-        .expect("envelope present");
+        let env = tokio::time::timeout(std::time::Duration::from_millis(100), client_c.recv())
+            .await
+            .expect("C must receive")
+            .expect("envelope present");
         assert_eq!(env.payload, b"hello alpha");
 
         // B (room beta) must NOT receive anything.
-        let b_result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            client_b.recv(),
-        )
-        .await;
-        assert!(b_result.is_err(), "B must not receive messages from room alpha");
+        let b_result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), client_b.recv()).await;
+        assert!(
+            b_result.is_err(),
+            "B must not receive messages from room alpha"
+        );
     }
 }

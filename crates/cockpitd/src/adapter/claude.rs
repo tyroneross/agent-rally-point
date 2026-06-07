@@ -110,8 +110,10 @@ impl Adapter for ClaudeAdapter {
     ) -> Result<()> {
         let mut cmd = Command::new(&self.config.binary);
         cmd.arg("-p")
-            .arg("--output-format").arg("stream-json")
-            .arg("--input-format").arg("stream-json")
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--input-format")
+            .arg("stream-json")
             .arg("--verbose");
 
         for flag in &self.config.extra_flags {
@@ -169,7 +171,8 @@ impl Adapter for ClaudeAdapter {
 
         let rt = tokio::runtime::Handle::try_current();
         match rt {
-            Ok(h) => h.block_on(async { stdin.write_all(&bytes).await })
+            Ok(h) => h
+                .block_on(async { stdin.write_all(&bytes).await })
                 .context("write to claude stdin"),
             Err(_) => anyhow::bail!("send() called outside tokio runtime"),
         }
@@ -241,15 +244,16 @@ async fn read_loop(
 /// - `system` with `subtype:"init"` carries `session_id`
 /// - `assistant` carries `message.content` (array of blocks)
 /// - `result` with `is_error:true` → Failed; `is_error:false` → terminal status
-pub(crate) fn map_claude_events(session_id: Uuid, event_type: &str, v: &Value) -> Vec<AdapterEvent> {
+pub(crate) fn map_claude_events(
+    session_id: Uuid,
+    event_type: &str,
+    v: &Value,
+) -> Vec<AdapterEvent> {
     let now = Utc::now();
     match event_type {
         "system" => {
             // Capture session_id from init event and emit a system status event.
-            let captured_session_id = v
-                .get("session_id")
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
+            let captured_session_id = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
             let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
             if subtype == "init" {
                 let event = Event {
@@ -310,10 +314,8 @@ pub(crate) fn map_claude_events(session_id: Uuid, event_type: &str, v: &Value) -
                                 .and_then(|i| i.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            let input = block
-                                .get("input")
-                                .cloned()
-                                .unwrap_or(serde_json::json!({}));
+                            let input =
+                                block.get("input").cloned().unwrap_or(serde_json::json!({}));
                             let content = serde_json::to_string(&input).unwrap_or_default();
                             events.push(AdapterEvent::Event(Event {
                                 session_id,
@@ -331,7 +333,10 @@ pub(crate) fn map_claude_events(session_id: Uuid, event_type: &str, v: &Value) -
                             }));
                         }
                         _ => {
-                            debug!("claude: skipping unknown content block type {:?}", block_type);
+                            debug!(
+                                "claude: skipping unknown content block type {:?}",
+                                block_type
+                            );
                         }
                     }
                 }
@@ -366,10 +371,7 @@ pub(crate) fn map_claude_events(session_id: Uuid, event_type: &str, v: &Value) -
 
         "result" => {
             // Terminal event from claude -p.
-            let is_error = v
-                .get("is_error")
-                .and_then(|e| e.as_bool())
-                .unwrap_or(false);
+            let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
             if is_error {
                 let msg = v
                     .get("result")
@@ -410,16 +412,11 @@ mod tests {
             .expect("start mock claude");
 
         let mut events = Vec::new();
-        loop {
-            match rx.recv().await {
-                Some(e) => {
-                    let done = matches!(&e, AdapterEvent::Completed | AdapterEvent::Failed(_));
-                    events.push(e);
-                    if done {
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(e) = rx.recv().await {
+            let done = matches!(&e, AdapterEvent::Completed | AdapterEvent::Failed(_));
+            events.push(e);
+            if done {
+                break;
             }
         }
         events
@@ -442,7 +439,10 @@ mod tests {
         let first = &events[0];
         match first {
             AdapterEvent::Event(e) => {
-                assert_eq!(e.kind, "status", "first event should be status (system init)");
+                assert_eq!(
+                    e.kind, "status",
+                    "first event should be status (system init)"
+                );
                 assert!(
                     e.metadata.get("claude_session_id").is_some(),
                     "system init should capture claude_session_id"
@@ -461,15 +461,15 @@ mod tests {
         }
 
         // Check that we have a message event somewhere.
-        let has_message = events.iter().any(|e| {
-            matches!(e, AdapterEvent::Event(ev) if ev.kind == "message")
-        });
+        let has_message = events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::Event(ev) if ev.kind == "message"));
         assert!(has_message, "expected at least one message event");
 
         // Check that we have a tool_call event.
-        let has_tool_call = events.iter().any(|e| {
-            matches!(e, AdapterEvent::Event(ev) if ev.kind == "tool_call")
-        });
+        let has_tool_call = events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::Event(ev) if ev.kind == "tool_call"));
         assert!(has_tool_call, "expected at least one tool_call event");
 
         // Last event should be Completed.
@@ -503,13 +503,17 @@ mod tests {
     async fn unknown_event_types_are_skipped() {
         let v = serde_json::json!({ "type": "some_future_type", "data": "x" });
         let result = map_claude_events(Uuid::new_v4(), "some_future_type", &v);
-        assert!(result.is_empty(), "unknown event type should map to empty vec");
+        assert!(
+            result.is_empty(),
+            "unknown event type should map to empty vec"
+        );
     }
 
     /// B1-4: result with is_error:true maps to Failed.
     #[tokio::test]
     async fn result_is_error_maps_to_failed() {
-        let v = serde_json::json!({ "type": "result", "is_error": true, "result": "something broke" });
+        let v =
+            serde_json::json!({ "type": "result", "is_error": true, "result": "something broke" });
         let result = map_claude_events(Uuid::new_v4(), "result", &v);
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], AdapterEvent::Failed(_)));
@@ -541,13 +545,20 @@ mod tests {
             }
         });
         let events = map_claude_events(session_id, "assistant", &v);
-        assert_eq!(events.len(), 3, "expected 3 events: 1 message + 2 tool_call");
+        assert_eq!(
+            events.len(),
+            3,
+            "expected 3 events: 1 message + 2 tool_call"
+        );
 
         // kinds in order
-        let kinds: Vec<&str> = events.iter().map(|e| match e {
-            AdapterEvent::Event(ev) => ev.kind.as_str(),
-            _ => "terminal",
-        }).collect();
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                AdapterEvent::Event(ev) => ev.kind.as_str(),
+                _ => "terminal",
+            })
+            .collect();
         assert_eq!(kinds, vec!["message", "tool_call", "tool_call"]);
 
         // tool names in metadata
@@ -587,6 +598,9 @@ mod tests {
                 break;
             }
         }
-        assert!(!events.is_empty(), "live claude should emit at least one event");
+        assert!(
+            !events.is_empty(),
+            "live claude should emit at least one event"
+        );
     }
 }

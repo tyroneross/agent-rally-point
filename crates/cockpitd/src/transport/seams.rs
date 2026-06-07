@@ -27,7 +27,9 @@ pub struct DevTokenAuth {
 
 impl DevTokenAuth {
     pub fn new(expected: impl Into<String>) -> Self {
-        Self { expected: expected.into() }
+        Self {
+            expected: expected.into(),
+        }
     }
 }
 

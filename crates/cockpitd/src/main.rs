@@ -45,7 +45,7 @@ async fn serve_cmd() -> Result<()> {
         clock::SystemClock,
         store::Store,
         supervisor::Supervisor,
-        transport::{build_state, DirectWs, Transport},
+        transport::{DirectWs, Transport, build_state},
     };
 
     let addr: SocketAddr = std::env::var("COCKPIT_ADDR")
@@ -54,8 +54,8 @@ async fn serve_cmd() -> Result<()> {
         .expect("invalid COCKPIT_ADDR");
 
     let db_path = std::env::var("COCKPIT_DB").unwrap_or_else(|_| "cockpitd.db".into());
-    let audit_db_path = std::env::var("COCKPIT_AUDIT_DB")
-        .unwrap_or_else(|_| format!("{db_path}.audit.db"));
+    let audit_db_path =
+        std::env::var("COCKPIT_AUDIT_DB").unwrap_or_else(|_| format!("{db_path}.audit.db"));
 
     // H1a: single store for sessions + events + approvals. The audit log
     // retains its own separate store (intentional isolated record).

@@ -297,7 +297,10 @@ fn inject_to_unregistered_valid_agent_id_writes_ledger_directive() {
         "exactly one Directive in the agent's ledger inbox",
     );
     let d = &directives[0];
-    assert_eq!(d.to, agent, "Directive.to is the agent-id, not a session.tool");
+    assert_eq!(
+        d.to, agent,
+        "Directive.to is the agent-id, not a session.tool"
+    );
     assert_eq!(d.from, "claude_code:test-sender");
     assert_eq!(d.text.as_deref(), Some("wake up"));
     assert!(!d.urgent);

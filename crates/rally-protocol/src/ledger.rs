@@ -255,16 +255,16 @@ impl Inbox for FileInbox {
         validate_agent_id(&directive.to)?;
         // SEC-008: bound the payload. A directive becomes keystrokes in the
         // target's pane; an unbounded `text` is an OOM/disk/PTY-flood vector.
-        if let Some(text) = directive.text.as_deref() {
-            if text.len() > MAX_DIRECTIVE_TEXT_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "directive text {} bytes exceeds MAX_DIRECTIVE_TEXT_BYTES ({MAX_DIRECTIVE_TEXT_BYTES})",
-                        text.len()
-                    ),
-                ));
-            }
+        if let Some(text) = directive.text.as_deref()
+            && text.len() > MAX_DIRECTIVE_TEXT_BYTES
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "directive text {} bytes exceeds MAX_DIRECTIVE_TEXT_BYTES ({MAX_DIRECTIVE_TEXT_BYTES})",
+                    text.len()
+                ),
+            ));
         }
         // Assign or validate seq.
         let current_max = self.current_max_seq(&directive.to)?;
@@ -350,7 +350,11 @@ struct LineRead {
 /// line incrementally and stops STORING at `cap` while still draining the rest
 /// of the physical line so the next call starts cleanly. The newline byte is
 /// consumed but never stored.
-fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>, cap: usize) -> io::Result<LineRead> {
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> io::Result<LineRead> {
     buf.clear();
     let mut had_newline = false;
     let mut truncated = false;

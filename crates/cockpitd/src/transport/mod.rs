@@ -30,15 +30,10 @@ pub mod ws;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
 
-use crate::{
-    audit::AuditLog,
-    clock::Clock,
-    model::Event,
-    supervisor::Supervisor,
-};
+use crate::{audit::AuditLog, clock::Clock, model::Event, supervisor::Supervisor};
 
 /// The serving-surface abstraction.
 ///
@@ -108,8 +103,16 @@ pub trait ErasedSupervisor {
     // ── Store passthrough (avoids separate store in AppState) ─────────────────
     fn list_sessions(&self) -> anyhow::Result<Vec<crate::model::Session>>;
     fn get_session(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::model::Session>>;
-    fn replay_from(&self, session_id: uuid::Uuid, from_seq: u64) -> anyhow::Result<Vec<crate::model::Event>>;
-    fn update_session_status(&mut self, id: uuid::Uuid, status: &crate::model::SessionStatus) -> anyhow::Result<()>;
+    fn replay_from(
+        &self,
+        session_id: uuid::Uuid,
+        from_seq: u64,
+    ) -> anyhow::Result<Vec<crate::model::Event>>;
+    fn update_session_status(
+        &mut self,
+        id: uuid::Uuid,
+        status: &crate::model::SessionStatus,
+    ) -> anyhow::Result<()>;
     fn append_event(&mut self, e: &crate::model::Event) -> anyhow::Result<u64>;
 
     // ── Approval passthrough via supervisor's store ───────────────────────────
@@ -195,11 +198,19 @@ impl<C: Clock> ErasedSupervisor for ConcreteSupervisor<C> {
         self.0.store.get_session(id)
     }
 
-    fn replay_from(&self, session_id: uuid::Uuid, from_seq: u64) -> anyhow::Result<Vec<crate::model::Event>> {
+    fn replay_from(
+        &self,
+        session_id: uuid::Uuid,
+        from_seq: u64,
+    ) -> anyhow::Result<Vec<crate::model::Event>> {
         self.0.store.replay_from(session_id, from_seq)
     }
 
-    fn update_session_status(&mut self, id: uuid::Uuid, status: &crate::model::SessionStatus) -> anyhow::Result<()> {
+    fn update_session_status(
+        &mut self,
+        id: uuid::Uuid,
+        status: &crate::model::SessionStatus,
+    ) -> anyhow::Result<()> {
         self.0.store.update_session_status(id, status)
     }
 
@@ -259,19 +270,16 @@ impl<C: Clock> ErasedAudit for ConcreteAudit<C> {
 ///
 /// The audit log retains its own separate store (intentional isolation for the
 /// append-only immutable record).
-pub fn build_state<C: Clock>(
-    supervisor: Supervisor<C>,
-    audit: AuditLog<C>,
-) -> AppState {
+pub fn build_state<C: Clock>(supervisor: Supervisor<C>, audit: AuditLog<C>) -> AppState {
     let (event_tx, _) = broadcast::channel(512);
     AppState {
         event_tx,
         supervisor: std::sync::Arc::new(tokio::sync::Mutex::new(SupervisorBox(Box::new(
             ConcreteSupervisor(supervisor),
         )))),
-        audit: std::sync::Arc::new(tokio::sync::Mutex::new(AuditBox(Box::new(
-            ConcreteAudit(audit),
-        )))),
+        audit: std::sync::Arc::new(tokio::sync::Mutex::new(AuditBox(Box::new(ConcreteAudit(
+            audit,
+        ))))),
         approval_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
     }
 }

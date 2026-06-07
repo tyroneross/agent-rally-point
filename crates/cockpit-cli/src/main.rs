@@ -15,9 +15,9 @@
 //!   --addr  ws://127.0.0.1:8787   (override: COCKPIT_ADDR)
 //!   --token <empty>                (override: COCKPIT_TOKEN)
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 // ── Reusable client primitives ────────────────────────────────────────────────
@@ -41,14 +41,12 @@ impl WsClient {
     /// Connect to `addr` (ws://…) and authenticate with `token`.
     /// Returns the client after `hello_ok` is received.
     pub async fn connect(addr: &str, token: &str) -> Result<Self> {
-        let (ws, _) = connect_async(addr)
-            .await
-            .context("connect to cockpitd")?;
+        let (ws, _) = connect_async(addr).await.context("connect to cockpitd")?;
         let (mut sink, mut stream) = ws.split();
 
         // Send hello.
         let hello = json!({"t": "hello", "token": token, "protocol": 1});
-        sink.send(Message::Text(hello.to_string().into()))
+        sink.send(Message::Text(hello.to_string()))
             .await
             .context("send hello")?;
 
@@ -75,7 +73,7 @@ impl WsClient {
     /// Send a JSON frame.
     pub async fn send_frame(&mut self, v: &Value) -> Result<()> {
         self.sink
-            .send(Message::Text(v.to_string().into()))
+            .send(Message::Text(v.to_string()))
             .await
             .context("send frame")
     }
@@ -328,11 +326,7 @@ async fn cmd_launch(addr: &str, token: &str, args: &[String]) -> Result<()> {
     }
     let agent_type = &args[0];
     let repo_path = &args[1];
-    let prompt: Option<&str> = if args.len() > 2 {
-        Some(&args[2])
-    } else {
-        None
-    };
+    let prompt: Option<&str> = if args.len() > 2 { Some(&args[2]) } else { None };
 
     let mut frame = json!({
         "t": "launch_session",

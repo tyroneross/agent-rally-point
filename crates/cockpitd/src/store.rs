@@ -15,7 +15,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::model::{Approval, Event, Session, SessionStatus};
@@ -57,22 +57,23 @@ impl Store {
     // ── sessions ─────────────────────────────────────────────────────────────
 
     pub fn create_session(&mut self, session: &Session) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO sessions
+        self.conn
+            .execute(
+                "INSERT INTO sessions
                (id, owner_id, agent_type, repo_path, status, title, created_at, last_seq)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                session.id.to_string(),
-                session.owner_id,
-                session.agent_type,
-                session.repo_path,
-                session.status.to_string(),
-                session.title,
-                session.created_at.to_rfc3339(),
-                session.last_seq as i64,
-            ],
-        )
-        .context("insert session")?;
+                params![
+                    session.id.to_string(),
+                    session.owner_id,
+                    session.agent_type,
+                    session.repo_path,
+                    session.status.to_string(),
+                    session.title,
+                    session.created_at.to_rfc3339(),
+                    session.last_seq as i64,
+                ],
+            )
+            .context("insert session")?;
         Ok(())
     }
 
@@ -82,7 +83,7 @@ impl Store {
              FROM sessions WHERE id = ?1",
         )?;
         let rows = stmt.query_map(params![id.to_string()], row_to_session)?;
-        for row in rows {
+        if let Some(row) = rows.into_iter().next() {
             return Ok(Some(row?));
         }
         Ok(None)
@@ -94,8 +95,7 @@ impl Store {
              FROM sessions ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .context("list sessions")
+        rows.collect::<Result<Vec<_>, _>>().context("list sessions")
     }
 
     /// Return sessions belonging to `owner_id` only.
@@ -115,18 +115,13 @@ impl Store {
 
     /// Fetch a session only if it belongs to `owner_id`; returns `None` if the
     /// session exists but is owned by a different owner.
-    pub fn get_session_for_owner(
-        &self,
-        id: Uuid,
-        owner_id: &str,
-    ) -> Result<Option<Session>> {
+    pub fn get_session_for_owner(&self, id: Uuid, owner_id: &str) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, owner_id, agent_type, repo_path, status, title, created_at, last_seq
              FROM sessions WHERE id = ?1 AND owner_id = ?2",
         )?;
-        let rows =
-            stmt.query_map(params![id.to_string(), owner_id], row_to_session)?;
-        for row in rows {
+        let rows = stmt.query_map(params![id.to_string(), owner_id], row_to_session)?;
+        if let Some(row) = rows.into_iter().next() {
             return Ok(Some(row?));
         }
         Ok(None)
@@ -148,39 +143,43 @@ impl Store {
     /// writes event row, bumps `sessions.last_seq`). Returns the assigned seq.
     pub fn append_event(&mut self, e: &Event) -> Result<u64> {
         // Read current last_seq
-        let last_seq: i64 = self.conn.query_row(
-            "SELECT last_seq FROM sessions WHERE id = ?1",
-            params![e.session_id.to_string()],
-            |row| row.get(0),
-        )
-        .context("read last_seq (session not found?)")?;
+        let last_seq: i64 = self
+            .conn
+            .query_row(
+                "SELECT last_seq FROM sessions WHERE id = ?1",
+                params![e.session_id.to_string()],
+                |row| row.get(0),
+            )
+            .context("read last_seq (session not found?)")?;
         let next_seq = last_seq + 1;
 
         let clean_content = sanitize(&e.content);
         let meta_str = serde_json::to_string(&e.metadata).unwrap_or_else(|_| "{}".into());
 
-        self.conn.execute(
-            "INSERT INTO events
+        self.conn
+            .execute(
+                "INSERT INTO events
                (session_id, seq, sender, kind, content, requires_user_input, created_at, metadata)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                e.session_id.to_string(),
-                next_seq,
-                e.sender,
-                e.kind,
-                clean_content,
-                e.requires_user_input as i64,
-                e.created_at.to_rfc3339(),
-                meta_str,
-            ],
-        )
-        .context("insert event")?;
+                params![
+                    e.session_id.to_string(),
+                    next_seq,
+                    e.sender,
+                    e.kind,
+                    clean_content,
+                    e.requires_user_input as i64,
+                    e.created_at.to_rfc3339(),
+                    meta_str,
+                ],
+            )
+            .context("insert event")?;
 
-        self.conn.execute(
-            "UPDATE sessions SET last_seq = ?1 WHERE id = ?2",
-            params![next_seq, e.session_id.to_string()],
-        )
-        .context("bump last_seq")?;
+        self.conn
+            .execute(
+                "UPDATE sessions SET last_seq = ?1 WHERE id = ?2",
+                params![next_seq, e.session_id.to_string()],
+            )
+            .context("bump last_seq")?;
 
         Ok(next_seq as u64)
     }
@@ -197,8 +196,7 @@ impl Store {
             params![session_id.to_string(), from_seq as i64],
             row_to_event,
         )?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .context("replay events")
+        rows.collect::<Result<Vec<_>, _>>().context("replay events")
     }
 
     // ── approvals ─────────────────────────────────────────────────────────────
@@ -236,7 +234,7 @@ impl Store {
              FROM approvals WHERE id = ?1",
         )?;
         let rows = stmt.query_map(params![id.to_string()], row_to_approval)?;
-        for row in rows {
+        if let Some(row) = rows.into_iter().next() {
             return Ok(Some(row?));
         }
         Ok(None)
@@ -340,7 +338,8 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
         created_at: created_str
             .parse::<DateTime<Utc>>()
             .unwrap_or_else(|_| Utc::now()),
-        metadata: serde_json::from_str(&meta_str).unwrap_or(serde_json::Value::Object(Default::default())),
+        metadata: serde_json::from_str(&meta_str)
+            .unwrap_or(serde_json::Value::Object(Default::default())),
     })
 }
 
@@ -414,9 +413,15 @@ mod tests {
         let sid = Uuid::new_v4();
         store.create_session(&make_session(sid)).unwrap();
 
-        let s1 = store.append_event(&make_event(sid, "message", "hello")).unwrap();
-        let s2 = store.append_event(&make_event(sid, "message", "world")).unwrap();
-        let s3 = store.append_event(&make_event(sid, "tool_call", "ls")).unwrap();
+        let s1 = store
+            .append_event(&make_event(sid, "message", "hello"))
+            .unwrap();
+        let s2 = store
+            .append_event(&make_event(sid, "message", "world"))
+            .unwrap();
+        let s3 = store
+            .append_event(&make_event(sid, "tool_call", "ls"))
+            .unwrap();
 
         assert_eq!(s1, 1);
         assert_eq!(s2, 2);
@@ -437,9 +442,15 @@ mod tests {
         let sid = Uuid::new_v4();
         store.create_session(&make_session(sid)).unwrap();
 
-        store.append_event(&make_event(sid, "message", "a")).unwrap();
-        store.append_event(&make_event(sid, "message", "b")).unwrap();
-        store.append_event(&make_event(sid, "message", "c")).unwrap();
+        store
+            .append_event(&make_event(sid, "message", "a"))
+            .unwrap();
+        store
+            .append_event(&make_event(sid, "message", "b"))
+            .unwrap();
+        store
+            .append_event(&make_event(sid, "message", "c"))
+            .unwrap();
 
         let events = store.replay_from(sid, 2).unwrap();
         assert_eq!(events.len(), 1);
@@ -455,8 +466,12 @@ mod tests {
         let sid = Uuid::new_v4();
         store.create_session(&make_session(sid)).unwrap();
 
-        store.append_event(&make_event(sid, "message", "x")).unwrap();
-        store.append_event(&make_event(sid, "message", "y")).unwrap();
+        store
+            .append_event(&make_event(sid, "message", "x"))
+            .unwrap();
+        store
+            .append_event(&make_event(sid, "message", "y"))
+            .unwrap();
 
         let session = store.get_session(sid).unwrap().unwrap();
         assert_eq!(session.last_seq, 2);
@@ -561,11 +576,19 @@ mod tests {
         store.create_session(&session_b).unwrap();
 
         let alice_sessions = store.list_sessions_for_owner("alice").unwrap();
-        assert_eq!(alice_sessions.len(), 1, "alice must see exactly her own session");
+        assert_eq!(
+            alice_sessions.len(),
+            1,
+            "alice must see exactly her own session"
+        );
         assert_eq!(alice_sessions[0].id, sid_a);
 
         let bob_sessions = store.list_sessions_for_owner("bob").unwrap();
-        assert_eq!(bob_sessions.len(), 1, "bob must see exactly his own session");
+        assert_eq!(
+            bob_sessions.len(),
+            1,
+            "bob must see exactly his own session"
+        );
         assert_eq!(bob_sessions[0].id, sid_b);
 
         // Cross-owner: alice asking for bob's session returns None.
@@ -583,8 +606,18 @@ mod tests {
         let mut store = open_store();
         let sid_a = Uuid::new_v4();
         let sid_b = Uuid::new_v4();
-        store.create_session(&Session { owner_id: "alice".into(), ..make_session(sid_a) }).unwrap();
-        store.create_session(&Session { owner_id: "bob".into(), ..make_session(sid_b) }).unwrap();
+        store
+            .create_session(&Session {
+                owner_id: "alice".into(),
+                ..make_session(sid_a)
+            })
+            .unwrap();
+        store
+            .create_session(&Session {
+                owner_id: "bob".into(),
+                ..make_session(sid_b)
+            })
+            .unwrap();
         let all = store.list_sessions().unwrap();
         assert_eq!(all.len(), 2, "unscoped list must return all sessions");
     }

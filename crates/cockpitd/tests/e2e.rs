@@ -23,7 +23,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use cockpitd::clock::Clock as _;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
@@ -45,7 +45,7 @@ async fn start_daemon() -> SocketAddr {
         clock::SystemClock,
         store::Store,
         supervisor::Supervisor,
-        transport::{build_state, DirectWs, Transport},
+        transport::{DirectWs, Transport, build_state},
     };
 
     // Find an ephemeral port.
@@ -112,7 +112,7 @@ impl TestClient {
 
     async fn send(&mut self, v: Value) {
         self.sink
-            .send(Message::Text(v.to_string().into()))
+            .send(Message::Text(v.to_string()))
             .await
             .expect("send");
     }
@@ -188,10 +188,7 @@ async fn e2e_auth_and_list() {
         .get("sessions")
         .and_then(|s| s.as_array())
         .expect("sessions array");
-    assert!(
-        sessions.is_empty(),
-        "new daemon should have no sessions"
-    );
+    assert!(sessions.is_empty(), "new daemon should have no sessions");
 }
 
 // ── E2E-2: bad token → error ──────────────────────────────────────────────────
@@ -210,10 +207,7 @@ async fn e2e_bad_token_rejected() {
         Some("error"),
         "wrong token must produce error"
     );
-    assert_eq!(
-        v.get("code").and_then(|c| c.as_str()),
-        Some("auth_failed"),
-    );
+    assert_eq!(v.get("code").and_then(|c| c.as_str()), Some("auth_failed"),);
 }
 
 // ── E2E-3: launch + open + event stream + reconnect invariant ─────────────────
@@ -393,13 +387,13 @@ async fn e2e_ping_pong() {
 
 #[tokio::test]
 async fn e2e_approve_resolves_in_store() {
+    use chrono::Utc;
     use cockpitd::{
         approval::ApprovalManager,
         clock::SystemClock,
         model::{Approval, Session, SessionStatus},
         store::Store,
     };
-    use chrono::Utc;
 
     // Direct store test (approve command flow is exercised in the ws handler).
     let mut store = Store::open_in_memory().unwrap();
@@ -461,7 +455,7 @@ async fn start_daemon_codex() -> SocketAddr {
         clock::SystemClock,
         store::Store,
         supervisor::Supervisor,
-        transport::{build_state, DirectWs, Transport},
+        transport::{DirectWs, Transport, build_state},
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -566,7 +560,8 @@ async fn e2e_codex_approval_wire_roundtrip() {
         }
     }
 
-    let approval_id_str = approval_id_str.expect("expected an approval_request event with approval_id over the wire");
+    let approval_id_str =
+        approval_id_str.expect("expected an approval_request event with approval_id over the wire");
 
     // H1b: mock now emits a valid UUID so parse must succeed.
     let approval_id: Uuid = approval_id_str
@@ -629,13 +624,13 @@ async fn e2e_codex_approval_wire_roundtrip() {
 
 #[tokio::test]
 async fn e2e_ttl_auto_deny_via_store() {
+    use chrono::{Duration, Utc};
     use cockpitd::{
         approval::ApprovalManager,
         clock::FakeClock,
         model::{Approval, Session, SessionStatus},
         store::Store,
     };
-    use chrono::{Duration, Utc};
 
     let clock = FakeClock::at_epoch();
     let mut store = Store::open_in_memory().unwrap();
@@ -722,7 +717,7 @@ async fn start_daemon_gated() -> SocketAddr {
         clock::SystemClock,
         store::Store,
         supervisor::Supervisor,
-        transport::{build_state, DirectWs, Transport},
+        transport::{DirectWs, Transport, build_state},
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -764,7 +759,7 @@ async fn start_daemon_multiblock() -> SocketAddr {
         clock::SystemClock,
         store::Store,
         supervisor::Supervisor,
-        transport::{build_state, DirectWs, Transport},
+        transport::{DirectWs, Transport, build_state},
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -852,7 +847,8 @@ async fn e2e_authz_gate_allow() {
                     let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
                     if t == "event" {
                         if let Some(evt) = v.get("event") {
-                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request") {
+                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
+                            {
                                 let aid = evt
                                     .get("metadata")
                                     .and_then(|m| m.get("approval_id"))
@@ -871,10 +867,13 @@ async fn e2e_authz_gate_allow() {
         }
     }
 
-    let approval_id_str = approval_id_str.expect("authz gate must emit approval_request for non-allowlisted write_file tool");
+    let approval_id_str = approval_id_str
+        .expect("authz gate must emit approval_request for non-allowlisted write_file tool");
 
     // Send approve{allow}.
-    let approval_id: Uuid = approval_id_str.parse().expect("approval_id must be a valid UUID");
+    let approval_id: Uuid = approval_id_str
+        .parse()
+        .expect("approval_id must be a valid UUID");
     client
         .send(json!({
             "t": "approve",
@@ -966,7 +965,8 @@ async fn e2e_authz_gate_deny() {
                     let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
                     if t == "event" {
                         if let Some(evt) = v.get("event") {
-                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request") {
+                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
+                            {
                                 let aid = evt
                                     .get("metadata")
                                     .and_then(|m| m.get("approval_id"))
@@ -985,10 +985,13 @@ async fn e2e_authz_gate_deny() {
         }
     }
 
-    let approval_id_str = approval_id_str.expect("authz gate must emit approval_request for non-allowlisted tool");
+    let approval_id_str =
+        approval_id_str.expect("authz gate must emit approval_request for non-allowlisted tool");
 
     // Send approve{deny}.
-    let approval_id: Uuid = approval_id_str.parse().expect("approval_id must be a valid UUID");
+    let approval_id: Uuid = approval_id_str
+        .parse()
+        .expect("approval_id must be a valid UUID");
     client
         .send(json!({
             "t": "approve",
@@ -1024,8 +1027,14 @@ async fn e2e_authz_gate_deny() {
         }
     }
 
-    assert!(saw_tool_blocked, "deny decision must produce tool_blocked event");
-    assert!(!saw_tool_result, "deny decision must NOT forward tool_result to the session");
+    assert!(
+        saw_tool_blocked,
+        "deny decision must produce tool_blocked event"
+    );
+    assert!(
+        !saw_tool_result,
+        "deny decision must NOT forward tool_result to the session"
+    );
 }
 
 // ── E2E-11: G2 multi-block assistant turn ────────────────────────────────────
@@ -1168,18 +1177,19 @@ async fn e2e_audit_log_wire_roundtrip() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Query audit log (no session filter — get all).
-    client
-        .send(json!({ "t": "get_audit", "limit": 50 }))
-        .await;
+    client.send(json!({ "t": "get_audit", "limit": 50 })).await;
 
     let audit_frame = client.recv_matching("audit_list").await;
     let entries = audit_frame["entries"].as_array().expect("entries array");
 
     // Must have at least the session:launch entry.
-    let has_launch = entries.iter().any(|e| {
-        e.get("action").and_then(|a| a.as_str()) == Some("session:launch")
-    });
-    assert!(has_launch, "audit_list must contain a session:launch entry after launching a session");
+    let has_launch = entries
+        .iter()
+        .any(|e| e.get("action").and_then(|a| a.as_str()) == Some("session:launch"));
+    assert!(
+        has_launch,
+        "audit_list must contain a session:launch entry after launching a session"
+    );
 
     // Filter by session_id.
     let session_id: Uuid = session_id_str.parse().expect("valid uuid");
@@ -1214,7 +1224,7 @@ async fn start_daemon_codex_gated() -> SocketAddr {
         clock::SystemClock,
         store::Store,
         supervisor::Supervisor,
-        transport::{build_state, DirectWs, Transport},
+        transport::{DirectWs, Transport, build_state},
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1301,7 +1311,8 @@ async fn e2e_codex_native_gate_allow() {
                     let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
                     if t == "event" {
                         if let Some(evt) = v.get("event") {
-                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request") {
+                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
+                            {
                                 let aid = evt
                                     .get("metadata")
                                     .and_then(|m| m.get("approval_id"))
@@ -1420,7 +1431,8 @@ async fn e2e_codex_native_gate_deny() {
                     let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
                     if t == "event" {
                         if let Some(evt) = v.get("event") {
-                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request") {
+                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
+                            {
                                 let aid = evt
                                     .get("metadata")
                                     .and_then(|m| m.get("approval_id"))
@@ -1439,8 +1451,8 @@ async fn e2e_codex_native_gate_deny() {
         }
     }
 
-    let approval_id_str = approval_id_str
-        .expect("H1b: codex-gated mock deny — must receive approval_request");
+    let approval_id_str =
+        approval_id_str.expect("H1b: codex-gated mock deny — must receive approval_request");
 
     let approval_id: Uuid = approval_id_str
         .parse()
@@ -1507,6 +1519,7 @@ async fn e2e_codex_native_gate_deny() {
 
 #[tokio::test]
 async fn e2e_sweep_auto_deny_unparks_gate() {
+    use chrono::{DateTime, Duration as ChronoDuration};
     use cockpitd::{
         adapter::claude::{ClaudeAdapter, ClaudeConfig},
         audit::AuditLog,
@@ -1516,8 +1529,10 @@ async fn e2e_sweep_auto_deny_unparks_gate() {
         supervisor::Supervisor,
         transport::{build_state, sweep::sweep_once},
     };
-    use chrono::{DateTime, Duration as ChronoDuration};
-    use std::sync::{atomic::{AtomicBool, Ordering}, Arc as StdArc};
+    use std::sync::{
+        Arc as StdArc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::Duration as StdDuration;
 
     // Epoch as base time: approval created at T=0, TTL=10s → deadline T+10.
@@ -1568,7 +1583,10 @@ async fn e2e_sweep_auto_deny_unparks_gate() {
     {
         let sup = state.supervisor.lock().await;
         let a = sup.0.get_approval(approval_id).unwrap().unwrap();
-        assert!(a.resolution.is_none(), "approval must be pending before sweep");
+        assert!(
+            a.resolution.is_none(),
+            "approval must be pending before sweep"
+        );
     }
 
     // ── Plant a gate Notify (simulating the parked run_pump task) ────────────
@@ -1608,11 +1626,7 @@ async fn e2e_sweep_auto_deny_unparks_gate() {
     );
     let resolution = {
         let sup = state.supervisor.lock().await;
-        sup.0
-            .get_approval(approval_id)
-            .unwrap()
-            .unwrap()
-            .resolution
+        sup.0.get_approval(approval_id).unwrap().unwrap().resolution
     };
     assert_eq!(
         resolution.as_deref(),

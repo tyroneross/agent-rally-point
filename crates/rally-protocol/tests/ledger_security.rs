@@ -15,15 +15,18 @@
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rally_protocol::ledger::{validate_agent_id, FileInbox, MAX_DIRECTIVE_TEXT_BYTES};
-use rally_protocol::{now_ts, Directive, DirectiveKind, Inbox, InterruptType};
+use rally_protocol::ledger::{FileInbox, MAX_DIRECTIVE_TEXT_BYTES, validate_agent_id};
+use rally_protocol::{Directive, DirectiveKind, Inbox, InterruptType, now_ts};
 
 fn scratch_root(tag: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let p = std::env::temp_dir().join(format!("rally-ledger-sec-{tag}-{}-{nanos}", std::process::id()));
+    let p = std::env::temp_dir().join(format!(
+        "rally-ledger-sec-{tag}-{}-{nanos}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
@@ -58,7 +61,12 @@ fn sec003_traversal_target_rejected_on_write() {
 
     // Nothing escaped: no etc/passwd-ish file anywhere under (or above) inbox/.
     assert!(
-        !root.join("inbox").join("..").join("..").join("etc").exists()
+        !root
+            .join("inbox")
+            .join("..")
+            .join("..")
+            .join("etc")
+            .exists()
             || !root.join("../../etc/passwd").exists(),
         "no file may have been created outside inbox/"
     );
@@ -67,7 +75,16 @@ fn sec003_traversal_target_rejected_on_write() {
 
 #[test]
 fn sec003_empty_and_dot_and_separator_ids_rejected() {
-    for bad in ["", ".", "..", ".hidden", "a/b", "a\\b", "evil/../x", "with space"] {
+    for bad in [
+        "",
+        ".",
+        "..",
+        ".hidden",
+        "a/b",
+        "a\\b",
+        "evil/../x",
+        "with space",
+    ] {
         assert!(
             validate_agent_id(bad).is_err(),
             "agent id {bad:?} must be rejected"
@@ -93,8 +110,8 @@ fn sec003_empty_and_dot_and_separator_ids_rejected() {
 #[cfg(unix)]
 #[test]
 fn sec007_inbox_and_receipt_modes_are_private() {
-    use std::os::unix::fs::PermissionsExt;
     use rally_protocol::{DeliveryStatus, Receipt};
+    use std::os::unix::fs::PermissionsExt;
 
     let root = scratch_root("modes");
     let inbox = FileInbox::open(&root).unwrap();
@@ -102,7 +119,11 @@ fn sec007_inbox_and_receipt_modes_are_private() {
     let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
 
     assert_eq!(mode(&root.join("inbox")), 0o700, "inbox/ must be 0700");
-    assert_eq!(mode(&root.join("receipts")), 0o700, "receipts/ must be 0700");
+    assert_eq!(
+        mode(&root.join("receipts")),
+        0o700,
+        "receipts/ must be 0700"
+    );
 
     inbox.append_directive(&directive("agent-a", "hi")).unwrap();
     assert_eq!(
@@ -168,7 +189,11 @@ fn sec008_oversize_text_rejected_on_write() {
 
     // A 1 MiB payload (well past the ceiling) — the explicit review case.
     let one_mb = "Y".repeat(1024 * 1024);
-    assert!(inbox.append_directive(&directive("agent-a", &one_mb)).is_err());
+    assert!(
+        inbox
+            .append_directive(&directive("agent-a", &one_mb))
+            .is_err()
+    );
 
     // At-the-ceiling payload is accepted.
     let at = "Z".repeat(MAX_DIRECTIVE_TEXT_BYTES);
@@ -183,7 +208,9 @@ fn sec008_reader_skips_overlong_line_keeps_valid() {
     let inbox = FileInbox::open(&root).unwrap();
 
     // Two legitimate directives via the writer (seq 1, 2).
-    inbox.append_directive(&directive("agent-a", "first")).unwrap();
+    inbox
+        .append_directive(&directive("agent-a", "first"))
+        .unwrap();
 
     // A hostile, over-long single line written DIRECTLY to the file (bypassing
     // the writer's cap) — the bounded reader must skip it without OOM-buffering
@@ -193,17 +220,28 @@ fn sec008_reader_skips_overlong_line_keeps_valid() {
     giant.push_str(&"A".repeat(2 * 1024 * 1024));
     giant.push_str("\"}\n");
     {
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(giant.as_bytes()).unwrap();
         f.flush().unwrap();
     }
 
-    inbox.append_directive(&directive("agent-a", "second")).unwrap();
+    inbox
+        .append_directive(&directive("agent-a", "second"))
+        .unwrap();
 
     let got = inbox.read_since("agent-a", 0).unwrap();
     let texts: Vec<&str> = got.iter().filter_map(|d| d.text.as_deref()).collect();
-    assert!(texts.contains(&"first"), "valid pre-line preserved: {texts:?}");
-    assert!(texts.contains(&"second"), "valid post-line preserved: {texts:?}");
+    assert!(
+        texts.contains(&"first"),
+        "valid pre-line preserved: {texts:?}"
+    );
+    assert!(
+        texts.contains(&"second"),
+        "valid post-line preserved: {texts:?}"
+    );
     // The giant junk line is NOT parsed into a directive.
     assert_eq!(got.len(), 2, "only the two valid directives returned");
 

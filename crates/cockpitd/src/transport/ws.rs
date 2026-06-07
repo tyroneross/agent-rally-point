@@ -15,27 +15,27 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use axum::{
+    Router,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
     routing::get,
-    Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, broadcast};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    VERSION,
     authz::{self, AuthzPolicy},
     model::{Approval, Event, SessionStatus},
     protocol::{ApproveDecision, ClientCommand, ServerEvent},
     supervisor::AdapterEvent,
     transport::AppState,
-    VERSION,
 };
 
 // H1a: `approval` has been removed from AppState. All approval operations
@@ -56,9 +56,7 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
 
     let state = Arc::new(state);
 
-    let app = Router::new()
-        .route("/", get(ws_handler))
-        .with_state(state);
+    let app = Router::new().route("/", get(ws_handler)).with_state(state);
 
     info!("cockpitd {} serving on ws://{}", VERSION, addr);
 
@@ -69,10 +67,7 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
 
 // ── WebSocket upgrade handler ─────────────────────────────────────────────────
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
@@ -104,48 +99,43 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     // ── Auth: wait for hello ──────────────────────────────────────────────────
     let authed = match stream.next().await {
-        Some(Ok(Message::Text(text))) => {
-            match serde_json::from_str::<Value>(&text) {
-                Ok(v) if v.get("t").and_then(|t| t.as_str()) == Some("hello") => {
-                    let token = v
-                        .get("token")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-                    match super::auth::validate_token(token) {
-                        Ok(()) => {
-                            let ok = ServerEvent::HelloOk {
-                                server_version: VERSION.to_string(),
-                                protocol: 1,
-                            };
-                            let _ = sink
-                                .send(Message::Text(serde_json::to_string(&ok).unwrap().into()))
-                                .await;
-                            true
-                        }
-                        Err(reason) => {
-                            let err = ServerEvent::Error {
-                                code: "auth_failed".into(),
-                                message: reason.to_string(),
-                            };
-                            let _ = sink
-                                .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
-                                .await;
-                            false
-                        }
+        Some(Ok(Message::Text(text))) => match serde_json::from_str::<Value>(&text) {
+            Ok(v) if v.get("t").and_then(|t| t.as_str()) == Some("hello") => {
+                let token = v.get("token").and_then(|t| t.as_str()).unwrap_or("");
+                match super::auth::validate_token(token) {
+                    Ok(()) => {
+                        let ok = ServerEvent::HelloOk {
+                            server_version: VERSION.to_string(),
+                            protocol: 1,
+                        };
+                        let _ = sink
+                            .send(Message::Text(serde_json::to_string(&ok).unwrap()))
+                            .await;
+                        true
+                    }
+                    Err(reason) => {
+                        let err = ServerEvent::Error {
+                            code: "auth_failed".into(),
+                            message: reason.to_string(),
+                        };
+                        let _ = sink
+                            .send(Message::Text(serde_json::to_string(&err).unwrap()))
+                            .await;
+                        false
                     }
                 }
-                _ => {
-                    let err = ServerEvent::Error {
-                        code: "bad_handshake".into(),
-                        message: "first frame must be hello".into(),
-                    };
-                    let _ = sink
-                        .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
-                        .await;
-                    false
-                }
             }
-        }
+            _ => {
+                let err = ServerEvent::Error {
+                    code: "bad_handshake".into(),
+                    message: "first frame must be hello".into(),
+                };
+                let _ = sink
+                    .send(Message::Text(serde_json::to_string(&err).unwrap()))
+                    .await;
+                false
+            }
+        },
         _ => false,
     };
 
@@ -229,12 +219,9 @@ async fn flush_pending_events(
     sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
 ) {
     for (session_id, event) in pending.drain(..) {
-        let frame = ServerEvent::Event {
-            session_id,
-            event,
-        };
+        let frame = ServerEvent::Event { session_id, event };
         let _ = sink
-            .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+            .send(Message::Text(serde_json::to_string(&frame).unwrap()))
             .await;
     }
     *flush_deadline = None;
@@ -258,7 +245,7 @@ async fn handle_command(
                 message: e.to_string(),
             };
             let _ = sink
-                .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+                .send(Message::Text(serde_json::to_string(&err).unwrap()))
                 .await;
             return;
         }
@@ -272,7 +259,7 @@ async fn handle_command(
         ClientCommand::Ping => {
             let _ = sink
                 .send(Message::Text(
-                    serde_json::to_string(&ServerEvent::Pong).unwrap().into(),
+                    serde_json::to_string(&ServerEvent::Pong).unwrap(),
                 ))
                 .await;
         }
@@ -284,7 +271,7 @@ async fn handle_command(
             };
             let frame = ServerEvent::SessionList { sessions };
             let _ = sink
-                .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                .send(Message::Text(serde_json::to_string(&frame).unwrap()))
                 .await;
         }
 
@@ -309,9 +296,8 @@ async fn handle_command(
                         message: format!("session {session_id} not found"),
                     };
                     let _ = sink
-                        .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+                        .send(Message::Text(serde_json::to_string(&err).unwrap()))
                         .await;
-                    return;
                 }
                 Some(session) => {
                     let cursor_seq = events.last().map(|e| e.seq).unwrap_or(from_seq);
@@ -322,7 +308,7 @@ async fn handle_command(
                         cursor_seq,
                     };
                     let _ = sink
-                        .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                        .send(Message::Text(serde_json::to_string(&frame).unwrap()))
                         .await;
 
                     // Subscribe to live deltas.
@@ -343,7 +329,7 @@ async fn handle_command(
                         message: e.to_string(),
                     };
                     let _ = sink
-                        .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+                        .send(Message::Text(serde_json::to_string(&err).unwrap()))
                         .await;
                 }
             }
@@ -359,7 +345,7 @@ async fn handle_command(
                         message: e.to_string(),
                     };
                     let _ = sink
-                        .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+                        .send(Message::Text(serde_json::to_string(&err).unwrap()))
                         .await;
                 }
             }
@@ -379,7 +365,9 @@ async fn handle_command(
             // Look up the session_id for audit, then resolve in one place.
             let (session_id_for_audit, resolve_result) = {
                 let mut sup = ctx.state.supervisor.lock().await;
-                let session_id = sup.0.get_approval(approval_id)
+                let session_id = sup
+                    .0
+                    .get_approval(approval_id)
                     .ok()
                     .flatten()
                     .map(|a| a.session_id);
@@ -387,38 +375,41 @@ async fn handle_command(
                 (session_id, result)
             };
 
-            if resolve_result.is_ok() {
-                // Audit the resolution.
-                {
-                    let mut audit = ctx.state.audit.lock().await;
-                    let _ = audit.0.append(
-                        "client",
-                        "approval:resolved",
-                        session_id_for_audit,
-                        serde_json::json!({
-                            "approval_id": approval_id.to_string(),
-                            "decision": decision_str,
-                        }),
-                    );
+            match resolve_result {
+                Ok(_) => {
+                    // Audit the resolution.
+                    {
+                        let mut audit = ctx.state.audit.lock().await;
+                        let _ = audit.0.append(
+                            "client",
+                            "approval:resolved",
+                            session_id_for_audit,
+                            serde_json::json!({
+                                "approval_id": approval_id.to_string(),
+                                "decision": decision_str,
+                            }),
+                        );
+                    }
+                    // Signal the per-approval gate so the waiting pump can
+                    // read the resolution and continue or block the tool.
+                    let gate = {
+                        let gates = ctx.state.approval_gates.lock().unwrap();
+                        gates.get(&approval_id).cloned()
+                    };
+                    if let Some(notify) = gate {
+                        notify.notify_one();
+                    }
                 }
-                // Signal the per-approval gate so the waiting pump can
-                // read the resolution and continue or block the tool.
-                let gate = {
-                    let gates = ctx.state.approval_gates.lock().unwrap();
-                    gates.get(&approval_id).cloned()
-                };
-                if let Some(notify) = gate {
-                    notify.notify_one();
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    let err = ServerEvent::Error {
+                        code: "approve_failed".into(),
+                        message: err_msg,
+                    };
+                    let _ = sink
+                        .send(Message::Text(serde_json::to_string(&err).unwrap()))
+                        .await;
                 }
-            } else {
-                let err_msg = resolve_result.unwrap_err().to_string();
-                let err = ServerEvent::Error {
-                    code: "approve_failed".into(),
-                    message: err_msg,
-                };
-                let _ = sink
-                    .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
-                    .await;
             }
         }
 
@@ -428,7 +419,7 @@ async fn handle_command(
                 Ok(entries) => {
                     let frame = ServerEvent::AuditList { entries };
                     let _ = sink
-                        .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                        .send(Message::Text(serde_json::to_string(&frame).unwrap()))
                         .await;
                 }
                 Err(e) => {
@@ -437,7 +428,7 @@ async fn handle_command(
                         message: e.to_string(),
                     };
                     let _ = sink
-                        .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+                        .send(Message::Text(serde_json::to_string(&err).unwrap()))
                         .await;
                 }
             }
@@ -451,7 +442,13 @@ async fn handle_command(
             let session_id = {
                 let mut sup = ctx.state.supervisor.lock().await;
                 let event_tx = ctx.state.event_tx.clone();
-                sup.0.launch_session(&agent_type, &repo_path, prompt.as_deref(), "local", event_tx)
+                sup.0.launch_session(
+                    &agent_type,
+                    &repo_path,
+                    prompt.as_deref(),
+                    "local",
+                    event_tx,
+                )
             };
 
             match session_id {
@@ -461,9 +458,8 @@ async fn handle_command(
                         message: e.to_string(),
                     };
                     let _ = sink
-                        .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+                        .send(Message::Text(serde_json::to_string(&err).unwrap()))
                         .await;
-                    return;
                 }
                 Ok(sid) => {
                     // Audit: session launched.
@@ -502,7 +498,7 @@ async fn handle_command(
                     };
                     let frame = ServerEvent::SessionList { sessions };
                     let _ = sink
-                        .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                        .send(Message::Text(serde_json::to_string(&frame).unwrap()))
                         .await;
                 }
             }
@@ -518,7 +514,7 @@ async fn handle_command(
                         message: e.to_string(),
                     };
                     let _ = sink
-                        .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+                        .send(Message::Text(serde_json::to_string(&err).unwrap()))
                         .await;
                 }
             }
@@ -717,7 +713,9 @@ async fn run_pump(
                                 seq: 0,
                                 sender: "system".into(),
                                 kind: "tool_blocked".into(),
-                                content: format!("tool '{tool_name}' blocked by authz ({denial_reason})"),
+                                content: format!(
+                                    "tool '{tool_name}' blocked by authz ({denial_reason})"
+                                ),
                                 requires_user_input: false,
                                 created_at: evt.created_at,
                                 metadata: serde_json::json!({
@@ -806,8 +804,8 @@ async fn run_pump(
 
                     // Parse the adapter-supplied ID (must be a valid UUID for
                     // the wire round-trip; mock emits a valid UUID from H1b).
-                    let approval_uuid = Uuid::parse_str(approval_id_str)
-                        .unwrap_or_else(|_| Uuid::new_v4());
+                    let approval_uuid =
+                        Uuid::parse_str(approval_id_str).unwrap_or_else(|_| Uuid::new_v4());
 
                     let pending = Approval {
                         id: approval_uuid,
@@ -963,7 +961,9 @@ async fn run_pump(
                     );
                 }
                 let mut sup = supervisor.lock().await;
-                let _ = sup.0.update_session_status(session_id, &SessionStatus::Completed);
+                let _ = sup
+                    .0
+                    .update_session_status(session_id, &SessionStatus::Completed);
                 sup.0.set_status(session_id, SessionStatus::Completed);
                 sup.0.remove_live(session_id);
                 break;
@@ -981,7 +981,9 @@ async fn run_pump(
                     );
                 }
                 let mut sup = supervisor.lock().await;
-                let _ = sup.0.update_session_status(session_id, &SessionStatus::Failed);
+                let _ = sup
+                    .0
+                    .update_session_status(session_id, &SessionStatus::Failed);
                 sup.0.set_status(session_id, SessionStatus::Failed);
                 sup.0.remove_live(session_id);
                 break;

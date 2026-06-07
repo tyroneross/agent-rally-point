@@ -30,27 +30,15 @@ use crate::model::{Approval, Event, Session, SessionStatus};
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ClientCommand {
     /// Auth handshake; must be the first frame.
-    Hello {
-        token: String,
-        protocol: u32,
-    },
+    Hello { token: String, protocol: u32 },
     /// Request current session list.
     ListSessions,
     /// Subscribe to a session and replay events from `from_seq` (exclusive).
-    OpenSession {
-        session_id: Uuid,
-        from_seq: u64,
-    },
+    OpenSession { session_id: Uuid, from_seq: u64 },
     /// Send a new prompt turn.
-    SendPrompt {
-        session_id: Uuid,
-        text: String,
-    },
+    SendPrompt { session_id: Uuid, text: String },
     /// Inject a steering message mid-run.
-    Steer {
-        session_id: Uuid,
-        text: String,
-    },
+    Steer { session_id: Uuid, text: String },
     /// Resolve a pending approval.
     Approve {
         approval_id: Uuid,
@@ -67,9 +55,7 @@ pub enum ClientCommand {
         prompt: Option<String>,
     },
     /// Stop/kill a session.
-    CloseSession {
-        session_id: Uuid,
-    },
+    CloseSession { session_id: Uuid },
     /// Keepalive.
     Ping,
     /// Retrieve audit log entries. Optionally filter by session_id and cap with limit.
@@ -104,14 +90,9 @@ pub enum ServerEvent {
         protocol: u32,
     },
     /// Protocol or command error.
-    Error {
-        code: String,
-        message: String,
-    },
+    Error { code: String, message: String },
     /// Snapshot of all sessions.
-    SessionList {
-        sessions: Vec<Session>,
-    },
+    SessionList { sessions: Vec<Session> },
     /// Sent in response to `open_session`: replays + current state.
     Snapshot {
         session_id: Uuid,
@@ -130,9 +111,7 @@ pub enum ServerEvent {
         status: SessionStatus,
     },
     /// A tool call requires user approval.
-    ApprovalRequest {
-        approval: Approval,
-    },
+    ApprovalRequest { approval: Approval },
     /// Keepalive reply.
     Pong,
     /// Response to `get_audit`: ordered list of audit entries.

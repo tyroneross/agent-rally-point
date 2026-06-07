@@ -194,12 +194,7 @@ fn rally_cli_source_contains_zero_backend_herdr_variant_uses() {
                 continue;
             }
             if line.contains("Backend::Herdr") {
-                violations.push(format!(
-                    "{}:{}: {}",
-                    file,
-                    i + 1,
-                    line.trim_end()
-                ));
+                violations.push(format!("{}:{}: {}", file, i + 1, line.trim_end()));
             }
         }
     }
@@ -217,9 +212,7 @@ fn rally_cli_backends_enum_no_longer_has_herdr_variant() {
     // catches a regression where the variant is re-introduced but its
     // call sites are split across many files (the per-line scan above
     // would still catch each, but THIS test names the enum directly).
-    let backends_rs = read_to_string(
-        &rally_cli_root().join("src").join("backends.rs"),
-    );
+    let backends_rs = read_to_string(&rally_cli_root().join("src").join("backends.rs"));
     // Extract the enum body via a small grep.
     let enum_start = backends_rs
         .find("pub(crate) enum Backend")
@@ -259,13 +252,15 @@ fn backend_bins_struct_has_no_herdr_fields() {
         .find(sig)
         .expect("BackendBins struct must exist in cli.rs");
     let after = &cli_rs[start..];
-    let open = after.find('{').expect("BackendBins struct must have a body");
+    let open = after
+        .find('{')
+        .expect("BackendBins struct must have a body");
     let body_start = start + open;
     let mut depth = 0_i32;
     let bytes = cli_rs.as_bytes();
     let mut body_end = body_start;
-    for i in body_start..bytes.len() {
-        match bytes[i] {
+    for (i, &byte) in bytes.iter().enumerate().skip(body_start) {
+        match byte {
             b'{' => depth += 1,
             b'}' => {
                 depth -= 1;

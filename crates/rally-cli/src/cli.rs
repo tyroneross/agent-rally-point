@@ -852,7 +852,10 @@ fn status_parser() -> impl Parser<StatusArgs> {
     // preserved as a flag for back-compat.
     let global_parser = long("global")
         .switch()
-        .guard(|on| *on, "rally status requires a subcommand (post|read) or --global")
+        .guard(
+            |on| *on,
+            "rally status requires a subcommand (post|read) or --global",
+        )
         .map(|_| StatusSubcommand::Global);
 
     let json = json_flag();
@@ -1199,7 +1202,18 @@ fn inject_parser() -> impl Parser<InjectArgs> {
         target
     )
     .map(
-        |(json, dry_run, text, handoff, require_ack, timeout_seconds, bins, tool, urgent, target)| {
+        |(
+            json,
+            dry_run,
+            text,
+            handoff,
+            require_ack,
+            timeout_seconds,
+            bins,
+            tool,
+            urgent,
+            target,
+        )| {
             InjectArgs {
                 json,
                 dry_run,

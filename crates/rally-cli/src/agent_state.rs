@@ -69,7 +69,10 @@ pub(crate) enum AgentState {
     /// Agent is actively working on `file` with the stated `intent`.
     Working { file: String, intent: String },
     /// Agent is blocked on `ref` (an event_id of a blocker/handoff/etc).
-    Blocked { #[serde(rename = "ref")] ref_id: String },
+    Blocked {
+        #[serde(rename = "ref")]
+        ref_id: String,
+    },
     /// Agent finished a commit on a managed worktree branch. Authored by any
     /// Rally participant's committing lane and consumed here unchanged.
     Done {
@@ -212,8 +215,8 @@ pub(crate) fn project_agent_states(facts: &[Fact], now_ts: &str) -> Vec<AgentSta
     latest
         .into_iter()
         .map(|(tool, fact)| {
-            let state = project_presence_to_state(fact)
-                .unwrap_or(AgentState::Idle { wake_after: None });
+            let state =
+                project_presence_to_state(fact).unwrap_or(AgentState::Idle { wake_after: None });
             let seen_secs = chrono::DateTime::parse_from_rfc3339(&fact.created_at)
                 .map(|dt| dt.timestamp())
                 .ok();
@@ -285,12 +288,14 @@ mod tests {
 
     #[test]
     fn parse_marker_string_handles_canonical_presence_subject() {
-        let m = parse_marker_string(
-            "state=working | file=crates/rally-cli | intent=agent-state model",
-        );
+        let m =
+            parse_marker_string("state=working | file=crates/rally-cli | intent=agent-state model");
         assert_eq!(m.get("state").map(String::as_str), Some("working"));
         assert_eq!(m.get("file").map(String::as_str), Some("crates/rally-cli"));
-        assert_eq!(m.get("intent").map(String::as_str), Some("agent-state model"));
+        assert_eq!(
+            m.get("intent").map(String::as_str),
+            Some("agent-state model")
+        );
     }
 
     #[test]
@@ -328,7 +333,13 @@ mod tests {
 
     #[test]
     fn legacy_presence_subject_with_no_state_marker_returns_none() {
-        let f = presence("claude_code", 1, "agent presence: claude_code", None, "2026-06-04T22:00:00Z");
+        let f = presence(
+            "claude_code",
+            1,
+            "agent presence: claude_code",
+            None,
+            "2026-06-04T22:00:00Z",
+        );
         assert_eq!(project_presence_to_state(&f), None);
     }
 
@@ -357,7 +368,13 @@ mod tests {
             AgentState::Idle { wake_after } => assert_eq!(wake_after, None),
             other => panic!("expected Idle, got {other:?}"),
         }
-        let f2 = presence("a", 2, "state=idle | wake_after=2026-06-04T23:00:00Z", None, "2026-06-04T22:00:00Z");
+        let f2 = presence(
+            "a",
+            2,
+            "state=idle | wake_after=2026-06-04T23:00:00Z",
+            None,
+            "2026-06-04T22:00:00Z",
+        );
         match project_presence_to_state(&f2).unwrap() {
             AgentState::Idle { wake_after } => {
                 assert_eq!(wake_after.as_deref(), Some("2026-06-04T23:00:00Z"));
@@ -459,7 +476,13 @@ mod tests {
                 None,
                 "2026-06-04T22:05:00Z",
             ),
-            presence("beta", 2, "state=working | file=y.rs | intent=tidy", None, "2026-06-04T22:01:00Z"),
+            presence(
+                "beta",
+                2,
+                "state=working | file=y.rs | intent=tidy",
+                None,
+                "2026-06-04T22:01:00Z",
+            ),
         ];
         let states = project_agent_states(&facts, "2026-06-04T22:06:00Z");
         assert_eq!(states.len(), 2);
@@ -472,7 +495,13 @@ mod tests {
     fn project_agent_states_excludes_rally_system_author() {
         let facts = vec![
             presence("rally", 1, "state=working", None, "2026-06-04T22:00:00Z"),
-            presence("real-agent", 2, "state=working | file=x | intent=y", None, "2026-06-04T22:01:00Z"),
+            presence(
+                "real-agent",
+                2,
+                "state=working | file=x | intent=y",
+                None,
+                "2026-06-04T22:01:00Z",
+            ),
         ];
         let states = project_agent_states(&facts, "2026-06-04T22:02:00Z");
         assert_eq!(states.len(), 1);
@@ -521,7 +550,10 @@ mod tests {
         let states = project_agent_states(&facts, "2026-06-04T22:10:00Z");
         let fresh = states.iter().find(|s| s.tool == "fresh").unwrap();
         let stale = states.iter().find(|s| s.tool == "stale").unwrap();
-        assert!(!fresh.stale, "10-minute lag is within the 15-minute threshold");
+        assert!(
+            !fresh.stale,
+            "10-minute lag is within the 15-minute threshold"
+        );
         assert!(stale.stale, "2-day lag must trip the threshold");
         let st = stale_tools(&states);
         assert!(st.contains("stale"));
@@ -541,7 +573,13 @@ mod tests {
 
     #[test]
     fn legacy_presence_without_state_marker_becomes_idle_default() {
-        let f = presence("legacy", 1, "agent presence: legacy", Some("build_id:abc"), "2026-06-04T22:00:00Z");
+        let f = presence(
+            "legacy",
+            1,
+            "agent presence: legacy",
+            Some("build_id:abc"),
+            "2026-06-04T22:00:00Z",
+        );
         let states = project_agent_states(&[f], "2026-06-04T22:01:00Z");
         assert_eq!(states.len(), 1);
         match &states[0].state {

@@ -19,7 +19,7 @@
 //!   `ApprovalManager::resolve`, which also sends the decision back to the
 //!   live session via `SessionCommand::Approve`.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use chrono::Duration;
 use uuid::Uuid;
 
@@ -65,7 +65,10 @@ impl<C: Clock> ApprovalManager<C> {
 
         if existing.resolution.is_some() {
             // Already resolved — treat as no-op.
-            tracing::debug!("approval {id} already resolved as {:?}, ignoring re-resolve", existing.resolution);
+            tracing::debug!(
+                "approval {id} already resolved as {:?}, ignoring re-resolve",
+                existing.resolution
+            );
             return Ok(());
         }
 
@@ -99,8 +102,7 @@ impl<C: Clock> ApprovalManager<C> {
 
         let mut count = 0;
         for approval in &pendings {
-            let deadline = approval.created_at
-                + Duration::seconds(approval.ttl_secs as i64);
+            let deadline = approval.created_at + Duration::seconds(approval.ttl_secs as i64);
             if now >= deadline {
                 self.store.resolve_approval(approval.id, "auto_denied")?;
                 count += 1;
@@ -126,8 +128,8 @@ pub(crate) trait StorePendingExt {
 
 impl StorePendingExt for Store {
     fn list_pending_approvals(&self) -> Result<Vec<Approval>> {
-        use rusqlite::params;
         use crate::model::Approval;
+        use rusqlite::params;
 
         let conn = self.raw_conn();
         let mut stmt = conn.prepare(
@@ -198,7 +200,11 @@ mod tests {
         sid
     }
 
-    fn make_approval(session_id: Uuid, ttl_secs: u64, created_at: chrono::DateTime<Utc>) -> Approval {
+    fn make_approval(
+        session_id: Uuid,
+        ttl_secs: u64,
+        created_at: chrono::DateTime<Utc>,
+    ) -> Approval {
         Approval {
             id: Uuid::new_v4(),
             session_id,

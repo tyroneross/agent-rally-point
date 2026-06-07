@@ -16,7 +16,7 @@
 //! - Timestamps come from the injected Clock so tests are deterministic.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -113,11 +113,7 @@ impl<C: Clock> AuditLog<C> {
     /// List audit entries, optionally filtered by session_id.
     ///
     /// Returns up to `limit` entries in ascending timestamp order.
-    pub fn list(
-        &self,
-        session_id: Option<Uuid>,
-        limit: Option<u64>,
-    ) -> Result<Vec<AuditEntry>> {
+    pub fn list(&self, session_id: Option<Uuid>, limit: Option<u64>) -> Result<Vec<AuditEntry>> {
         let limit_val = limit.unwrap_or(1000) as i64;
 
         match session_id {
@@ -155,9 +151,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEntry> {
         ts: row.get(1)?,
         actor: row.get(2)?,
         action: row.get(3)?,
-        session_id: sid_str
-            .as_deref()
-            .and_then(|s| Uuid::parse_str(s).ok()),
+        session_id: sid_str.as_deref().and_then(|s| Uuid::parse_str(s).ok()),
         detail: serde_json::from_str(&detail_str)
             .unwrap_or(serde_json::Value::Object(Default::default())),
     })
@@ -168,7 +162,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::{FakeClock};
+    use crate::clock::FakeClock;
     use chrono::Duration;
 
     fn open_log() -> (AuditLog<FakeClock>, FakeClock) {
@@ -218,8 +212,13 @@ mod tests {
 
         log.append("client", "cmd:approve", Some(sid1), serde_json::json!({}))
             .unwrap();
-        log.append("client", "session:launch", Some(sid2), serde_json::json!({}))
-            .unwrap();
+        log.append(
+            "client",
+            "session:launch",
+            Some(sid2),
+            serde_json::json!({}),
+        )
+        .unwrap();
         log.append(
             "client",
             "approval:resolved",
@@ -246,13 +245,8 @@ mod tests {
 
         for i in 0..10u64 {
             clock.advance(Duration::seconds(1));
-            log.append(
-                "client",
-                "cmd:ping",
-                None,
-                serde_json::json!({"i": i}),
-            )
-            .unwrap();
+            log.append("client", "cmd:ping", None, serde_json::json!({"i": i}))
+                .unwrap();
         }
 
         let entries = log.list(None, Some(3)).unwrap();

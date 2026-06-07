@@ -1161,7 +1161,9 @@ mod tests {
     fn b17_room_index_path_defaults_off_opt_in_and_killswitch() {
         // Serialize against all other env-touching tests in this binary via the
         // crate-wide lock defined in lib.rs.
-        let _guard = crate::PROCESS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         // SAFETY: single-threaded via mutex; no other threads read these vars
         // while the lock is held. Required by Rust's unsafe contract on set/remove_var.

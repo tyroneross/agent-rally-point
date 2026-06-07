@@ -55,7 +55,9 @@ impl Workspace {
 
     fn run_envs(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
-        cmd.current_dir(&self.cwd).env("HOME", &self.home).args(args);
+        cmd.current_dir(&self.cwd)
+            .env("HOME", &self.home)
+            .args(args);
         for (k, v) in envs {
             cmd.env(k, v);
         }

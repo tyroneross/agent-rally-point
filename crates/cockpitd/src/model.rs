@@ -19,6 +19,7 @@ use uuid::Uuid;
 /// unknown future statuses decode as `Unknown` rather than failing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SessionStatus {
     Active,
     AwaitingInput,
@@ -27,16 +28,11 @@ pub enum SessionStatus {
     Completed,
     Failed,
     Killed,
+    #[default]
     Disconnected,
     /// Forward-compat catch-all: an unknown status string decodes here.
     #[serde(other)]
     Unknown,
-}
-
-impl Default for SessionStatus {
-    fn default() -> Self {
-        Self::Disconnected
-    }
 }
 
 impl std::fmt::Display for SessionStatus {

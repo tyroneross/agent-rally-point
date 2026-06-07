@@ -1903,7 +1903,8 @@ fn validate_status_post_args(state: &str, args: &cli::StatusPostArgs) -> Result<
         "blocked" => {
             if args.blocked_ref.is_none() {
                 return Err(RallyError::Usage(
-                    "rally status post --state blocked requires --blocked-ref <event-id>".to_string(),
+                    "rally status post --state blocked requires --blocked-ref <event-id>"
+                        .to_string(),
                 ));
             }
         }
@@ -2600,7 +2601,13 @@ fn command_check(args: CheckArgs) -> Result<Output> {
         && let Some(cached) = crate::store::try_load_cached_snapshot_for(&repo_root_path)
         && cached.squads.iter().any(|s| s.tool == tool)
     {
-        let check = build_check(phase.clone(), tool.clone(), path.clone(), args.strict, &cached)?;
+        let check = build_check(
+            phase.clone(),
+            tool.clone(),
+            path.clone(),
+            args.strict,
+            &cached,
+        )?;
         let body = envelope("check", SCHEMA_CHECK, check.data)?;
         let text = format!("check findings={} (cached)", check.finding_count);
         return Ok(Output::new(args.json, text, body).with_exit_code(check.exit_code));
@@ -3172,12 +3179,29 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     // `InjectTarget` for the order-matters rationale (managed wins over id).
     let inject_target = resolve_inject_target(&target)?;
     match inject_target {
-        InjectTarget::Managed(session) => {
-            command_inject_managed(args.json, dry_run, urgent, sender_tool, session, args.handoff, args.text, args.require_ack, args.timeout_seconds, args.bins)
-        }
-        InjectTarget::LedgerAgent(agent_id) => {
-            command_inject_ledger(args.json, dry_run, urgent, sender_tool, agent_id, args.handoff, args.text, args.require_ack, args.timeout_seconds)
-        }
+        InjectTarget::Managed(session) => command_inject_managed(
+            args.json,
+            dry_run,
+            urgent,
+            sender_tool,
+            session,
+            args.handoff,
+            args.text,
+            args.require_ack,
+            args.timeout_seconds,
+            args.bins,
+        ),
+        InjectTarget::LedgerAgent(agent_id) => command_inject_ledger(
+            args.json,
+            dry_run,
+            urgent,
+            sender_tool,
+            agent_id,
+            args.handoff,
+            args.text,
+            args.require_ack,
+            args.timeout_seconds,
+        ),
     }
 }
 
@@ -3379,9 +3403,7 @@ fn command_inject_managed(
             inject: inject_payload,
         },
     )?;
-    let text = format!(
-        "inject session={session_id_for_text} delivered={delivered} ack={has_ack}",
-    );
+    let text = format!("inject session={session_id_for_text} delivered={delivered} ack={has_ack}",);
     Ok(Output::new(json, text, body))
 }
 
@@ -3456,18 +3478,15 @@ fn command_inject_ledger(
     // is called — this is the fix for the orchestrator brief's "second bug"
     // (double-delivery on the ledger-only path). The managed-session arm
     // above keeps its intentional dual-delivery for P2 tmux/cmux.
-    let (directive_seq, directive_to, delivery_state): (
-        Option<u64>,
-        Option<String>,
-        &'static str,
-    ) = if dry_run {
-        (None, None, "pending")
-    } else {
-        match inject_via_ledger(&repo_root()?, &agent_id, &sender_tool, &text, urgent) {
-            Ok(seq) => (Some(seq), Some(agent_id.clone()), "pending"),
-            Err(_) => (None, Some(agent_id.clone()), "failed"),
-        }
-    };
+    let (directive_seq, directive_to, delivery_state): (Option<u64>, Option<String>, &'static str) =
+        if dry_run {
+            (None, None, "pending")
+        } else {
+            match inject_via_ledger(&repo_root()?, &agent_id, &sender_tool, &text, urgent) {
+                Ok(seq) => (Some(seq), Some(agent_id.clone()), "pending"),
+                Err(_) => (None, Some(agent_id.clone()), "failed"),
+            }
+        };
 
     // No backend commands on the ledger-only path; surface an empty plan.
     let commands: Vec<Vec<String>> = Vec::new();
@@ -3524,9 +3543,8 @@ fn command_inject_ledger(
             inject: inject_payload,
         },
     )?;
-    let text = format!(
-        "inject agent={agent_for_text} delivery_state={delivery_state} ack={has_ack}",
-    );
+    let text =
+        format!("inject agent={agent_for_text} delivery_state={delivery_state} ack={has_ack}",);
     Ok(Output::new(json, text, body))
 }
 
@@ -4379,7 +4397,9 @@ mod tests {
         // Env mutation is process-wide and Rust 2024 marks it unsafe. We
         // serialize HOME/PTYD/XDG mutations via the crate-wide PROCESS_ENV_LOCK
         // so all env-touching tests in this binary serialize against each other.
-        let _env_guard = crate::PROCESS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env_guard = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         let base = unique_root("ptyd-detect");
         let home = base.join("home");
@@ -7641,14 +7661,16 @@ mod tests {
         );
 
         // Envelope must carry a `released-by-path` warning naming the original.
-        let body: serde_json::Value =
-            out.body.clone();
+        let body: serde_json::Value = out.body.clone();
         let warnings = body["data"]["warnings"].as_array().expect("warnings array");
         let found = warnings.iter().any(|w| {
             w["code"] == "released-by-path"
                 && w["message"].as_str().unwrap_or("").contains(&claim_id)
         });
-        assert!(found, "warnings must name the released claim event_id; got {warnings:?}");
+        assert!(
+            found,
+            "warnings must name the released claim event_id; got {warnings:?}"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -7695,7 +7717,10 @@ mod tests {
         // Claim must still be active.
         let after = room.snapshot().unwrap();
         assert!(
-            after.active_claims.iter().any(|c| c.event_id == alpha_other),
+            after
+                .active_claims
+                .iter()
+                .any(|c| c.event_id == alpha_other),
             "no-match release must NOT incidentally close any other claim"
         );
 
@@ -7762,8 +7787,7 @@ mod tests {
             },
         )
         .expect("status post must succeed");
-        let post_body: serde_json::Value =
-            post.body.clone();
+        let post_body: serde_json::Value = post.body.clone();
         let state_kind = post_body["data"]["status_post"]["state"]["state"]
             .as_str()
             .unwrap_or("");
@@ -7776,8 +7800,7 @@ mod tests {
             },
         )
         .expect("status read must succeed");
-        let read_body: serde_json::Value =
-            read.body.clone();
+        let read_body: serde_json::Value = read.body.clone();
         let states = read_body["data"]["status_read"]["states"]
             .as_array()
             .expect("states array");

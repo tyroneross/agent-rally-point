@@ -261,8 +261,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir()
-            .join(format!("rally-backlog-test-{id}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("rally-backlog-test-{id}-{}", std::process::id()));
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = RoomStore::open_at(root.clone()).unwrap();
         (room, root)

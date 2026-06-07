@@ -220,7 +220,7 @@ fn parse_time(raw: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{now_string, FACT_SCHEMA};
+    use crate::{FACT_SCHEMA, now_string};
 
     fn fact(id: &str, tool: &str, scope: Vec<&str>) -> Fact {
         Fact {

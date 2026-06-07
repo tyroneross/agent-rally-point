@@ -185,7 +185,9 @@ pub struct RecipientKeypair {
 impl RecipientKeypair {
     /// Generate a fresh random recipient keypair.
     pub fn generate() -> Self {
-        Self { inner: BoxKeyPair::generate() }
+        Self {
+            inner: BoxKeyPair::generate(),
+        }
     }
 
     /// Public key (32 bytes), share with the server so it can wrap keys for you.
@@ -204,7 +206,9 @@ pub fn wrap_key(data_key: &DataKey, recipient_pub: &[u8; 32]) -> Result<WrappedK
         .map_err(|_| anyhow!("invalid recipient pubkey length"))?;
     let boxed = DryocBox::seal_to_vecbox(data_key, &pub_key)
         .map_err(|e| anyhow!("key wrap failed: {e}"))?;
-    Ok(WrappedKey { bytes: boxed.to_vec() })
+    Ok(WrappedKey {
+        bytes: boxed.to_vec(),
+    })
 }
 
 /// Unwrap a `WrappedKey` using the recipient's secret keypair.

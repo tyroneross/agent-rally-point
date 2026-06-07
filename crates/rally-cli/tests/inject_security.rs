@@ -161,7 +161,8 @@ fn sec009_urgent_addition_is_not_delivered_by_any_backend() {
     // `--urgent` => urgent Addition (the only itype the CLI emits). The legacy
     // tmux/cmux synchronous inject MUST be gated off (split-enforcement guard),
     // so `delivered` is false and the state is not "delivered".
-    let outcome = sandbox.inject_with_flags(&target, "claude_code:test-sender", "URGENT do X", true);
+    let outcome =
+        sandbox.inject_with_flags(&target, "claude_code:test-sender", "URGENT do X", true);
     assert!(
         !outcome.delivered,
         "urgent Addition must NOT be delivered by the legacy backend; outcome={outcome:?}"

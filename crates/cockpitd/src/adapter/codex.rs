@@ -168,7 +168,11 @@ impl Adapter for CodexAdapter {
         }
 
         let mut cmd = std::process::Command::new(&self.config.binary);
-        cmd.arg("exec").arg("resume").arg(&codex_id).arg("--json").arg(text);
+        cmd.arg("exec")
+            .arg("resume")
+            .arg(&codex_id)
+            .arg("--json")
+            .arg(text);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -380,10 +384,7 @@ fn map_codex_event(session_id: Uuid, event_type: &str, v: &Value) -> MapResult {
         }
 
         "completed" => {
-            let exit_code = v
-                .get("exit_code")
-                .and_then(|e| e.as_i64())
-                .unwrap_or(0);
+            let exit_code = v.get("exit_code").and_then(|e| e.as_i64()).unwrap_or(0);
             if exit_code == 0 {
                 MapResult::Terminal(AdapterEvent::Completed)
             } else {
@@ -428,16 +429,11 @@ mod tests {
             .expect("start mock codex");
 
         let mut events = Vec::new();
-        loop {
-            match rx.recv().await {
-                Some(e) => {
-                    let done = matches!(&e, AdapterEvent::Completed | AdapterEvent::Failed(_));
-                    events.push(e);
-                    if done {
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(e) = rx.recv().await {
+            let done = matches!(&e, AdapterEvent::Completed | AdapterEvent::Failed(_));
+            events.push(e);
+            if done {
+                break;
             }
         }
         events
@@ -470,15 +466,15 @@ mod tests {
         }
 
         // Expect a message event.
-        let has_message = events.iter().any(|e| {
-            matches!(e, AdapterEvent::Event(ev) if ev.kind == "message")
-        });
+        let has_message = events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::Event(ev) if ev.kind == "message"));
         assert!(has_message, "expected message event");
 
         // Expect a tool_call event.
-        let has_tool_call = events.iter().any(|e| {
-            matches!(e, AdapterEvent::Event(ev) if ev.kind == "tool_call")
-        });
+        let has_tool_call = events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::Event(ev) if ev.kind == "tool_call"));
         assert!(has_tool_call, "expected tool_call event");
 
         // Last event should be Completed.
@@ -494,9 +490,9 @@ mod tests {
         let session_id = Uuid::new_v4();
         let events = run_mock_codex(session_id).await;
 
-        let approval_evt = events.iter().find(|e| {
-            matches!(e, AdapterEvent::Event(ev) if ev.kind == "approval_request")
-        });
+        let approval_evt = events
+            .iter()
+            .find(|e| matches!(e, AdapterEvent::Event(ev) if ev.kind == "approval_request"));
         assert!(approval_evt.is_some(), "expected approval_request event");
 
         if let Some(AdapterEvent::Event(e)) = approval_evt {
@@ -554,6 +550,9 @@ mod tests {
                 break;
             }
         }
-        assert!(!events.is_empty(), "live codex should emit at least one event");
+        assert!(
+            !events.is_empty(),
+            "live codex should emit at least one event"
+        );
     }
 }

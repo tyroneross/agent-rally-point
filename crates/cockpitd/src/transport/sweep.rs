@@ -54,8 +54,7 @@ pub async fn sweep_once(
             Ok(pendings) => pendings
                 .into_iter()
                 .filter(|a| {
-                    let deadline = a.created_at
-                        + chrono::Duration::seconds(a.ttl_secs as i64);
+                    let deadline = a.created_at + chrono::Duration::seconds(a.ttl_secs as i64);
                     now >= deadline
                 })
                 .map(|a| a.id)

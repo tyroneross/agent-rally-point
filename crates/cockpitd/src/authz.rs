@@ -22,6 +22,7 @@
 //!   - If `decide → Permit`, the event is broadcast normally.
 //!   - If `decide → RequireApproval`, a pending `Approval` is created and the
 //!     `approval_request` frame is broadcast; the session is gated until resolved.
+//!
 //! Full runtime enforcement wiring is TAG:ASSUMED until the next chunk adds the
 //! gating mechanism in the pump; the policy engine itself is fully real and tested.
 
@@ -169,7 +170,9 @@ mod tests {
     fn shell_like_tool_names_require_approval() {
         let policy = AuthzPolicy::with_allowlist(["bash", "shell", "exec"]);
         // Shell-like by name overrides even if on the allowlist.
-        for name in &["bash", "shell", "sh", "cmd", "exec", "run", "terminal", "zsh"] {
+        for name in &[
+            "bash", "shell", "sh", "cmd", "exec", "run", "terminal", "zsh",
+        ] {
             assert_eq!(
                 decide(name, &empty_args(), &policy),
                 Decision::RequireApproval,
@@ -243,8 +246,14 @@ mod tests {
     #[test]
     fn conservative_policy_permits_read_operations() {
         let policy = AuthzPolicy::conservative();
-        assert_eq!(decide("read_file", &empty_args(), &policy), Decision::Permit);
-        assert_eq!(decide("list_files", &empty_args(), &policy), Decision::Permit);
+        assert_eq!(
+            decide("read_file", &empty_args(), &policy),
+            Decision::Permit
+        );
+        assert_eq!(
+            decide("list_files", &empty_args(), &policy),
+            Decision::Permit
+        );
     }
 
     #[test]

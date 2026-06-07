@@ -303,8 +303,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir()
-            .join(format!("rally-board-test-{id}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("rally-board-test-{id}-{}", std::process::id()));
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = RoomStore::open_at(root.clone()).unwrap();
         (room, root)
@@ -454,7 +454,10 @@ mod tests {
             "stale-owner claim must surface in auto_releasable_claims; got board={:?}",
             board.auto_releasable_claims
         );
-        assert_eq!(board.auto_releasable_claims[0].owner.as_deref(), Some("stale-tool"));
+        assert_eq!(
+            board.auto_releasable_claims[0].owner.as_deref(),
+            Some("stale-tool")
+        );
 
         // And agent_states[stale-tool].stale == true.
         let stale_state = board
@@ -473,7 +476,12 @@ mod tests {
         let (room, root) = test_room();
         append_fact(&room, FactKind::Claim, "fresh work", "fresh-tool");
         // Add a fresh presence too, so projection has a state to work with.
-        append_fact(&room, FactKind::Presence, "state=working | file=x | intent=fresh", "fresh-tool");
+        append_fact(
+            &room,
+            FactKind::Presence,
+            "state=working | file=x | intent=fresh",
+            "fresh-tool",
+        );
 
         let board = build_board(&room).unwrap();
         assert_eq!(board.lanes.len(), 1);

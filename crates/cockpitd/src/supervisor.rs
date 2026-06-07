@@ -20,7 +20,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
@@ -258,7 +258,11 @@ impl<C: Clock> Supervisor<C> {
     ///
     /// For FakeAdapter, the channel is pre-loaded and closed immediately.
     /// Real adapters (chunk B) will use an async pump instead.
-    fn drain_events(&mut self, session_id: Uuid, mut rx: mpsc::Receiver<AdapterEvent>) -> Result<()> {
+    fn drain_events(
+        &mut self,
+        session_id: Uuid,
+        mut rx: mpsc::Receiver<AdapterEvent>,
+    ) -> Result<()> {
         // Use try_recv loop: FakeAdapter sends all events then drops sender.
         loop {
             match rx.try_recv() {
@@ -457,7 +461,9 @@ mod tests {
             AdapterEvent::Completed,
         ];
         let mut sup = open_supervisor(script);
-        let sid = sup.launch_session("codex", "/tmp/r", None, "local").unwrap();
+        let sid = sup
+            .launch_session("codex", "/tmp/r", None, "local")
+            .unwrap();
 
         let session = sup.store.get_session(sid).unwrap().unwrap();
         assert_eq!(session.last_seq, 2);
@@ -514,7 +520,7 @@ mod tests {
             stored.status
         );
         // Session removed from live map
-        assert!(sup.sessions.get(&sid).is_none());
+        assert!(!sup.sessions.contains_key(&sid));
     }
 
     // ── A3-4: disconnect when adapter channel closes without terminal event ────
@@ -524,7 +530,9 @@ mod tests {
         // Empty script → FakeAdapter drops tx immediately.
         let script = vec![];
         let mut sup = open_supervisor(script);
-        let sid = sup.launch_session("claude", "/tmp/r", None, "local").unwrap();
+        let sid = sup
+            .launch_session("claude", "/tmp/r", None, "local")
+            .unwrap();
 
         let stored = sup.store.get_session(sid).unwrap().unwrap();
         assert!(

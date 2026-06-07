@@ -1911,7 +1911,8 @@ fn write_reconcile_cache(facts_db_path: &Path, cache: &ReconcileCache) -> Result
     let Some(path) = reconcile_cache_path(facts_db_path) else {
         return Ok(());
     };
-    let rendered = serde_json::to_string(cache).map_err(RallyError::json("render reconcile cache"))?;
+    let rendered =
+        serde_json::to_string(cache).map_err(RallyError::json("render reconcile cache"))?;
     let temp_path = path.with_extension(format!("json.tmp-{}", short_id()));
     fs::write(&temp_path, rendered)
         .map_err(RallyError::io(format!("write {}", temp_path.display())))?;
@@ -2618,8 +2619,8 @@ impl RoomStore {
 
         let index_path = self.log_dir.join(LOG_INDEX_FILENAME);
         let current_fp = segments_fingerprint(&segments, &archived);
-        let current_fp_value =
-            serde_json::to_value(&current_fp).map_err(RallyError::json("render index fingerprint"))?;
+        let current_fp_value = serde_json::to_value(&current_fp)
+            .map_err(RallyError::json("render index fingerprint"))?;
         // Fast path: fingerprint unchanged → index already current.
         if let Ok(existing_text) = fs::read_to_string(&index_path)
             && let Ok(existing) = serde_json::from_str::<Value>(&existing_text)
@@ -3219,8 +3220,13 @@ mod ledger_tests {
     #[test]
     fn is_malformed_db_error_recognises_known_codes() {
         // SQLite base numeric codes (stable across supported versions).
-        assert!(is_malformed_db_error(&"error returned from database: (code: 11) database disk image is malformed".to_string()));
-        assert!(is_malformed_db_error(&"error returned from database: (code: 26) file is not a database".to_string()));
+        assert!(is_malformed_db_error(
+            &"error returned from database: (code: 11) database disk image is malformed"
+                .to_string()
+        ));
+        assert!(is_malformed_db_error(
+            &"error returned from database: (code: 26) file is not a database".to_string()
+        ));
         // Human-readable substring fallback.
         assert!(is_malformed_db_error(
             &"some other wrapping: disk image is malformed".to_string()
@@ -3242,9 +3248,7 @@ mod ledger_tests {
         ));
         // Negative controls: lock contention and metadata races are NOT
         // unrecoverable corruption — the existing retry loop handles those.
-        assert!(!is_malformed_db_error(
-            &"database is locked".to_string()
-        ));
+        assert!(!is_malformed_db_error(&"database is locked".to_string()));
         assert!(!is_malformed_db_error(
             &"UNIQUE constraint failed: store_metadata.key".to_string()
         ));
@@ -3305,7 +3309,10 @@ mod ledger_tests {
                 }
             }
         }
-        assert!(found_main && found_shm && found_wal, "all three siblings quarantined");
+        assert!(
+            found_main && found_shm && found_wal,
+            "all three siblings quarantined"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -3430,7 +3437,8 @@ mod ledger_tests {
         for (path, bytes_before) in &segment_bytes_before {
             let bytes_after = fs::read(path).unwrap();
             assert_eq!(
-                bytes_before, &bytes_after,
+                bytes_before,
+                &bytes_after,
                 "segment {} bytes unchanged by recovery",
                 path.display()
             );
@@ -3456,7 +3464,10 @@ mod ledger_tests {
                 assert!(qb.starts_with(b"GARBAGE-not-sqlite-magic"));
             }
         }
-        assert!(found_quarantine, "corrupt bytes preserved as facts.db.corrupt.<stamp>");
+        assert!(
+            found_quarantine,
+            "corrupt bytes preserved as facts.db.corrupt.<stamp>"
+        );
 
         // (4) The rebuilt facts.db is healthy (we can query it).
         let snap = store.snapshot().unwrap();
@@ -3468,7 +3479,11 @@ mod ledger_tests {
             .unwrap()
             .filter(|e| {
                 e.as_ref()
-                    .map(|e| e.file_name().to_string_lossy().starts_with("facts.db.corrupt."))
+                    .map(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("facts.db.corrupt.")
+                    })
                     .unwrap_or(false)
             })
             .count();
@@ -3480,7 +3495,11 @@ mod ledger_tests {
             .unwrap()
             .filter(|e| {
                 e.as_ref()
-                    .map(|e| e.file_name().to_string_lossy().starts_with("facts.db.corrupt."))
+                    .map(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("facts.db.corrupt.")
+                    })
                     .unwrap_or(false)
             })
             .count();
@@ -4106,7 +4125,11 @@ mod ledger_tests {
             "corrupt sidecar must be ignored → authoritative scan runs"
         );
         let store = RoomStore::open_at(root.clone()).unwrap();
-        assert_eq!(store.facts().unwrap().len(), 4, "no data loss after corrupt sidecar");
+        assert_eq!(
+            store.facts().unwrap().len(),
+            4,
+            "no data loss after corrupt sidecar"
+        );
         drop(store);
 
         // -- Delete sidecar --
@@ -4116,7 +4139,11 @@ mod ledger_tests {
             "missing sidecar must trigger authoritative scan"
         );
         let store = RoomStore::open_at(root.clone()).unwrap();
-        assert_eq!(store.facts().unwrap().len(), 4, "no data loss after missing sidecar");
+        assert_eq!(
+            store.facts().unwrap().len(),
+            4,
+            "no data loss after missing sidecar"
+        );
         // The reopen re-seeded the sidecar → next reconcile is fast.
         assert!(
             !reconcile_took_full_scan(&root),
@@ -4170,7 +4197,11 @@ mod ledger_tests {
         // from the sidecar's recorded db_fingerprint.
         {
             use std::io::{Seek, SeekFrom, Write};
-            let mut f = OpenOptions::new().read(true).write(true).open(&facts_db).unwrap();
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&facts_db)
+                .unwrap();
             f.seek(SeekFrom::Start(0)).unwrap();
             f.write_all(b"GARBAGE-not-sqlite-magic").unwrap();
             f.sync_all().unwrap();
@@ -4213,16 +4244,30 @@ mod ledger_tests {
         // path). On the rare sqlx-silent-recreation path the corrupt bytes are
         // lost, but data is still fully recovered (asserted below).
         if open_fails {
-            let quarantine_exists = root.join(".rally").read_dir().unwrap()
+            let quarantine_exists = root
+                .join(".rally")
+                .read_dir()
+                .unwrap()
                 .filter_map(|e| e.ok())
-                .any(|e| e.file_name().to_string_lossy().starts_with("facts.db.corrupt."));
-            assert!(quarantine_exists, "header corruption with a stale sidecar must still quarantine");
+                .any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("facts.db.corrupt.")
+                });
+            assert!(
+                quarantine_exists,
+                "header corruption with a stale sidecar must still quarantine"
+            );
         }
 
         // And the full room reopen recovers every fact from the canonical ledger.
         let store = RoomStore::open_at(root.clone()).unwrap();
         let after = store.facts().unwrap();
-        assert_eq!(after.len(), 4, "all facts recovered from canonical segments");
+        assert_eq!(
+            after.len(),
+            4,
+            "all facts recovered from canonical segments"
+        );
         for (i, id) in ids.iter().enumerate() {
             assert_eq!(&after[i].event_id, id, "order + identity preserved");
         }
@@ -5109,10 +5154,7 @@ mod ledger_tests {
         // a crash would leave — not valid JSON, no terminating newline.
         {
             use std::io::Write;
-            let mut f = OpenOptions::new()
-                .append(true)
-                .open(&segment_path)
-                .unwrap();
+            let mut f = OpenOptions::new().append(true).open(&segment_path).unwrap();
             // Deliberately incomplete — looks like the beginning of a LedgerLine
             // that was cut off mid-write.
             f.write_all(b"{\"seq\":4,\"occurred_at\":\"2026-01-01T00:00:00Z\",\"event_type\":\"claim\",\"payload\":{\"ev")
@@ -5131,7 +5173,11 @@ mod ledger_tests {
         let facts = store2.facts().unwrap();
 
         // All 3 valid facts recovered; the torn line produces no entry.
-        assert_eq!(facts.len(), 3, "all 3 valid facts recovered; torn line skipped");
+        assert_eq!(
+            facts.len(),
+            3,
+            "all 3 valid facts recovered; torn line skipped"
+        );
         assert_eq!(facts[0].seq, 1);
         assert_eq!(facts[1].seq, 2);
         assert_eq!(facts[2].seq, 3);
@@ -5139,13 +5185,18 @@ mod ledger_tests {
         // The canonical segment was not quarantined (quarantine only applies to
         // facts.db, not to JSONL segments).
         let rally_dir = root.join(".rally");
-        let has_quarantine = fs::read_dir(&rally_dir)
-            .unwrap()
-            .any(|e| {
-                e.map(|e| e.file_name().to_string_lossy().starts_with("facts.db.corrupt."))
-                    .unwrap_or(false)
-            });
-        assert!(!has_quarantine, "no quarantine file: torn line is not treated as DB corruption");
+        let has_quarantine = fs::read_dir(&rally_dir).unwrap().any(|e| {
+            e.map(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("facts.db.corrupt.")
+            })
+            .unwrap_or(false)
+        });
+        assert!(
+            !has_quarantine,
+            "no quarantine file: torn line is not treated as DB corruption"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -5214,7 +5265,11 @@ mod ledger_tests {
         let after_facts = store2.facts().unwrap();
 
         // All 500 facts recovered from the canonical JSONL segments.
-        assert_eq!(after_facts.len(), 500, "all 500 facts recovered after mid-page corruption");
+        assert_eq!(
+            after_facts.len(),
+            500,
+            "all 500 facts recovered after mid-page corruption"
+        );
         for (pre, post) in before_facts.iter().zip(after_facts.iter()) {
             assert_eq!(pre.seq, post.seq);
             assert_eq!(pre.event_id, post.event_id);
@@ -5222,19 +5277,20 @@ mod ledger_tests {
 
         // A quarantine file exists (corrupt bytes preserved for forensics).
         let rally_dir = root.join(".rally");
-        let found_quarantine = fs::read_dir(&rally_dir)
-            .unwrap()
-            .any(|e| {
-                e.map(|e| {
-                    let n = e.file_name();
-                    let s = n.to_string_lossy();
-                    s.starts_with("facts.db.corrupt.")
-                        && !s.ends_with("-db-shm")
-                        && !s.ends_with("-db-wal")
-                })
-                .unwrap_or(false)
-            });
-        assert!(found_quarantine, "corrupt bytes preserved as facts.db.corrupt.<stamp>");
+        let found_quarantine = fs::read_dir(&rally_dir).unwrap().any(|e| {
+            e.map(|e| {
+                let n = e.file_name();
+                let s = n.to_string_lossy();
+                s.starts_with("facts.db.corrupt.")
+                    && !s.ends_with("-db-shm")
+                    && !s.ends_with("-db-wal")
+            })
+            .unwrap_or(false)
+        });
+        assert!(
+            found_quarantine,
+            "corrupt bytes preserved as facts.db.corrupt.<stamp>"
+        );
 
         // Rebuilt DB is healthy — snapshot is queryable.
         let snap = store2.snapshot().unwrap();
