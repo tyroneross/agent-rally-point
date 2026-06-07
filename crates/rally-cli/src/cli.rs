@@ -45,6 +45,8 @@ pub(crate) enum CliCommand {
     /// C-FLEET: register an already-running agent (a tmux or cmux target)
     /// into the managed-session ledger without relaunching it.
     Adopt(AdoptArgs),
+    /// Sweep-reap leftover rally per-agent worktrees and branches.
+    WorktreeGc(WorktreeGcArgs),
 }
 
 pub(crate) enum CliParse {
@@ -497,6 +499,18 @@ pub(crate) struct WakeDueArgs {
     pub(crate) tool: Option<String>,
 }
 
+/// Arguments for `rally worktree gc`.
+#[derive(Clone, Debug)]
+pub(crate) struct WorktreeGcArgs {
+    pub(crate) json: bool,
+    /// When false (default), only lists candidates without making any changes.
+    /// When true, executes cleanup() on each reapable worktree.
+    pub(crate) apply: bool,
+    /// Staleness threshold in seconds.  A presence fact older than this treats
+    /// the owning agent as stale.  Default: 86400 (24 hours).
+    pub(crate) ttl_secs: u64,
+}
+
 /// B13: arguments for `rally check ci`.
 #[derive(Clone, Debug)]
 pub(crate) struct CheckCiArgs {
@@ -569,6 +583,8 @@ const COMMANDS: &[&str] = &[
     "ack",
     // C-FLEET: register an already-running agent into the managed-session ledger
     "adopt",
+    // Sweep-reaper: GC leftover per-agent worktrees
+    "worktree",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -762,6 +778,16 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .command("adopt")
         .map(CliCommand::Adopt);
 
+    let worktree_gc = worktree_gc_parser()
+        .to_options()
+        .descr("Sweep-reap leftover rally per-agent worktrees and branches. Default = dry-run (list candidates only). Use --apply to execute cleanup.")
+        .command("gc")
+        .map(CliCommand::WorktreeGc)
+        .to_options()
+        .descr("Worktree management: gc — sweep-reap leftover per-agent worktrees.")
+        .command("worktree")
+        .map(|c| c);
+
     construct!([
         init,
         enter,
@@ -794,7 +820,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         mission,
         lead,
         ack,
-        adopt
+        adopt,
+        worktree_gc
     ])
     .to_options()
 }
@@ -1632,4 +1659,41 @@ fn check_ci_parser() -> impl Parser<CheckCiArgs> {
             receipt_threshold_secs,
         },
     )
+}
+
+// Worktree GC parser
+fn worktree_gc_parser() -> impl Parser<WorktreeGcArgs> {
+    let json = json_flag();
+    let apply = long("apply")
+        .help("Execute cleanup on each reapable worktree. Default = dry-run (list only, no changes).")
+        .switch();
+    let ttl_secs = string_arg("ttl", "DURATION")
+        .parse(|v: String| {
+            // Accept plain seconds ("86400") or human suffixes "24h", "30m", "3600s".
+            if let Ok(n) = v.parse::<u64>() {
+                return Ok(n);
+            }
+            if let Some(h) = v.strip_suffix('h') {
+                return h.parse::<u64>().map(|n| n * 3600).map_err(|_| {
+                    RallyError::Usage(format!("invalid --ttl value {v}"))
+                });
+            }
+            if let Some(m) = v.strip_suffix('m') {
+                return m.parse::<u64>().map(|n| n * 60).map_err(|_| {
+                    RallyError::Usage(format!("invalid --ttl value {v}"))
+                });
+            }
+            if let Some(s) = v.strip_suffix('s') {
+                return s.parse::<u64>().map_err(|_| {
+                    RallyError::Usage(format!("invalid --ttl value {v}"))
+                });
+            }
+            Err(RallyError::Usage(format!("invalid --ttl value {v}")))
+        })
+        .fallback(86400u64); // 24 hours
+    construct!(json, apply, ttl_secs).map(|(json, apply, ttl_secs)| WorktreeGcArgs {
+        json,
+        apply,
+        ttl_secs,
+    })
 }

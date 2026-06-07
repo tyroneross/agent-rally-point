@@ -68,6 +68,7 @@ mod rotate;
 mod route_findings;
 mod run_worktree;
 mod session_identity;
+pub mod worktree_gc;
 mod source_grounding;
 mod store;
 mod tier_fit;
@@ -508,7 +509,121 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::Ack(args) => command_ack(args),
         // C-FLEET: adopt an already-running agent into the managed-session ledger
         CliCommand::Adopt(args) => command_adopt(args),
+        // Sweep-reaper: GC leftover per-agent worktrees
+        CliCommand::WorktreeGc(args) => command_worktree_gc(args),
     }
+}
+
+// =============================================================================
+// rally worktree gc — sweep-reaper for leftover per-agent worktrees
+// =============================================================================
+
+const SCHEMA_WORKTREE_GC: &str = "agent-rally.command.worktree-gc.v1";
+
+fn command_worktree_gc(args: WorktreeGcArgs) -> Result<Output> {
+    let repo = repo_root()?;
+
+    // Load presence facts from the room store for liveness checks.
+    // Graceful degradation: if the room store is unavailable (e.g. no .rally/
+    // in this repo yet), supply no facts and rely on TTL-only staleness.
+    let presence_facts: Vec<worktree_gc::PresenceFact> = RoomStore::open()
+        .and_then(|r| r.facts())
+        .map(|facts| {
+            facts
+                .into_iter()
+                .filter(|f| f.kind == FactKind::Presence)
+                .filter_map(|f| {
+                    f.tool.map(|tool| worktree_gc::PresenceFact {
+                        tool,
+                        seq: f.seq,
+                        subject: f.subject.clone(),
+                        created_at: f.created_at.clone(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let config = worktree_gc::GcConfig {
+        repo_root: repo,
+        apply: args.apply,
+        ttl_secs: args.ttl_secs,
+        now_ts: None, // use system clock
+        presence_facts,
+        git_bin: "git".to_string(),
+    };
+
+    let report = worktree_gc::run_gc(config).map_err(RallyError::Message)?;
+
+    let mode = if args.apply { "apply" } else { "dry-run" };
+    let text = format!(
+        "rally worktree gc ({mode}): candidates={} reaped={} skipped={} bundles={}{}",
+        report.candidates.len(),
+        report.reaped.len(),
+        report.skipped.len(),
+        report.bundles.len(),
+        if report.warnings.is_empty() {
+            String::new()
+        } else {
+            format!(" warnings={}", report.warnings.len())
+        }
+    );
+
+    // Build candidate list for JSON output.
+    let candidates_json: Vec<serde_json::Value> = report
+        .candidates
+        .iter()
+        .map(|c| {
+            json!({
+                "worktree_path": c.worktree_path.to_string_lossy(),
+                "branch": c.branch,
+                "reason": c.reason,
+            })
+        })
+        .collect();
+    let reaped_json: Vec<serde_json::Value> = report
+        .reaped
+        .iter()
+        .map(|r| {
+            json!({
+                "worktree_path": r.worktree_path.to_string_lossy(),
+                "branch": r.branch,
+                "branch_deleted": r.branch_deleted,
+            })
+        })
+        .collect();
+    let skipped_json: Vec<serde_json::Value> = report
+        .skipped
+        .iter()
+        .map(|s| {
+            json!({
+                "worktree_path": s.worktree_path.to_string_lossy(),
+                "branch": s.branch,
+                "reason": s.reason,
+            })
+        })
+        .collect();
+    let bundles_json: Vec<serde_json::Value> = report
+        .bundles
+        .iter()
+        .map(|b| json!(b.to_string_lossy()))
+        .collect();
+
+    let body = envelope_value(
+        "worktree_gc",
+        SCHEMA_WORKTREE_GC,
+        json!({
+            "worktree_gc": {
+                "mode": mode,
+                "candidates": candidates_json,
+                "reaped": reaped_json,
+                "skipped": skipped_json,
+                "bundles": bundles_json,
+                "warnings": report.warnings,
+            }
+        }),
+    )?;
+    Ok(Output::new(args.json, text, body))
 }
 
 fn command_rotate(args: RotateArgs) -> Result<Output> {
