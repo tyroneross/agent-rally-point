@@ -3335,6 +3335,7 @@ fn command_inject_managed(
         handoff.as_deref(),
         &commands,
         dry_run,
+        delivery_state,
     )?;
     let ack = if require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
@@ -3345,6 +3346,7 @@ fn command_inject_managed(
             timeout,
             ack_after_seq.unwrap_or(0),
             ack_room,
+            &session.tool,
         )?)
     } else {
         None
@@ -3477,6 +3479,7 @@ fn command_inject_ledger(
         handoff.as_deref(),
         &commands,
         dry_run,
+        delivery_state,
     )?;
     let ack = if require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
@@ -3486,6 +3489,7 @@ fn command_inject_ledger(
             timeout,
             ack_after_seq.unwrap_or(0),
             ack_room,
+            &agent_id,
         )?)
     } else {
         None
@@ -3808,9 +3812,10 @@ fn inject_wake_intent_with_room(
     handoff: Option<&str>,
     commands: &[Vec<String>],
     dry_run: bool,
+    delivery_state: &'static str,
 ) -> Result<Option<Fact>> {
-    let status = if dry_run { "planned" } else { "delivered" };
-    let subject = format!("wake intent delivered to {target_tool}");
+    let status = if dry_run { "planned" } else { delivery_state };
+    let subject = format!("wake intent {status} to {target_tool}");
     let summary = Some(match session {
         Some(s) => format!(
             "rally inject {status} for managed session {} via {}",
@@ -4112,9 +4117,11 @@ fn wait_for_resolution(
     timeout_seconds: u64,
     after_seq: i64,
     room: &RoomStore,
+    expected_tool: &str,
 ) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     let mut last_seen_seq = after_seq;
+    let mut ignored_resolves = BTreeSet::new();
     loop {
         for fact in room.facts()? {
             last_seen_seq = last_seen_seq.max(fact.seq);
@@ -4122,12 +4129,16 @@ fn wait_for_resolution(
                 && fact.kind == "resolve"
                 && fact.ref_id.as_deref() == Some(handoff)
             {
-                return Ok(json!({
-                    "resolved": true,
-                    "event_id": fact.event_id,
-                    "tool": fact.tool,
-                    "subject": fact.subject
-                }));
+                if fact.tool.as_deref() == Some(expected_tool) {
+                    return Ok(json!({
+                        "resolved": true,
+                        "event_id": fact.event_id,
+                        "tool": fact.tool,
+                        "expected_tool": expected_tool,
+                        "subject": fact.subject
+                    }));
+                }
+                ignored_resolves.insert(fact.event_id);
             }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -4140,7 +4151,9 @@ fn wait_for_resolution(
         "resolved": false,
         "timed_out": true,
         "waited_seconds": timeout_seconds,
-        "after_seq": after_seq
+        "after_seq": after_seq,
+        "expected_tool": expected_tool,
+        "ignored_resolves": ignored_resolves.len()
     }))
 }
 
@@ -4778,6 +4791,79 @@ mod tests {
             recorded.subject
         );
         assert_eq!(recorded.summary.as_deref(), Some(msg));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn resolve_fact(tool: &str, ref_id: &str, subject: &str) -> Fact {
+        Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("resolve"),
+            seq: 0,
+            thread_id: new_id("ack"),
+            kind: FactKind::Resolve,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: subject.to_string(),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: Some(ref_id.to_string()),
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        }
+    }
+
+    #[test]
+    fn wait_for_resolution_accepts_only_expected_tool() {
+        let root = unique_root("ack-tool-correlation");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let handoff_id = "handoff-under-test";
+        let expected_tool = "claude_code:reviewer-01";
+
+        room.append_fact(&resolve_fact("codex:other", handoff_id, "wrong ack"))
+            .unwrap();
+        room.append_fact(&resolve_fact(expected_tool, handoff_id, "right ack"))
+            .unwrap();
+
+        let ack = wait_for_resolution(handoff_id, 0, 0, &room, expected_tool).unwrap();
+
+        assert_eq!(ack["resolved"].as_bool(), Some(true));
+        assert_eq!(ack["tool"].as_str(), Some(expected_tool));
+        assert_eq!(ack["expected_tool"].as_str(), Some(expected_tool));
+        assert!(
+            ack["subject"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("right ack"),
+            "ack should report the expected tool's resolve, got {ack}",
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn wait_for_resolution_times_out_when_only_wrong_tool_resolves() {
+        let root = unique_root("ack-wrong-tool-timeout");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let handoff_id = "handoff-under-test";
+        let expected_tool = "claude_code:reviewer-01";
+
+        room.append_fact(&resolve_fact("codex:other", handoff_id, "wrong ack"))
+            .unwrap();
+
+        let ack = wait_for_resolution(handoff_id, 0, 0, &room, expected_tool).unwrap();
+
+        assert_eq!(ack["resolved"].as_bool(), Some(false));
+        assert_eq!(ack["timed_out"].as_bool(), Some(true));
+        assert_eq!(ack["expected_tool"].as_str(), Some(expected_tool));
+        assert_eq!(ack["ignored_resolves"].as_u64(), Some(1));
 
         std::fs::remove_dir_all(&root).ok();
     }

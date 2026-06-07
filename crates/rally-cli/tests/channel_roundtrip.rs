@@ -193,6 +193,40 @@ fn delivery_state_field_is_pending_or_delivered_never_unknown() {
     );
 }
 
+#[test]
+fn managed_session_backend_failure_marks_wake_failed_not_delivered() {
+    // Regression for stale managed targets: a vanished tmux pane makes the
+    // legacy backend command fail. The wake fact must not claim delivered.
+    let sandbox = ChannelSandbox::spawn();
+    let name = unique_name("stale");
+    let target = sandbox.add_tmux_session(&name);
+
+    let envelope = sandbox.rally_json(&[
+        "inject",
+        &target,
+        "--json",
+        "--text",
+        "wake stale target",
+        "--tool",
+        "claude_code:test-sender",
+        "--tmux-bin",
+        "/usr/bin/false",
+    ]);
+    let inject = &envelope["data"]["inject"];
+
+    assert_eq!(inject["delivered"].as_bool(), Some(false));
+    assert_eq!(inject["delivery_state"].as_str(), Some("failed"));
+    assert_eq!(inject["wake_intent"]["kind"].as_str(), Some("wake"));
+    assert_eq!(inject["wake_intent"]["status"].as_str(), Some("failed"));
+    assert!(
+        inject["wake_intent"]["subject"]
+            .as_str()
+            .unwrap_or("")
+            .contains("failed"),
+        "wake subject must surface the failed state: {inject:?}",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // feat/inject-ledger-target — ledger-only delivery to a rally-termd-registered
 // agent (no managed session). These tests prove the new `resolve_inject_target`
@@ -224,6 +258,11 @@ fn inject_to_unregistered_valid_agent_id_writes_ledger_directive() {
     assert_eq!(
         outcome.delivery_state, "pending",
         "ledger-only inject must report pending (no legacy backend to flip it); outcome={outcome:?}",
+    );
+    assert_eq!(
+        outcome.raw["wake_intent"]["status"].as_str(),
+        Some("pending"),
+        "wake fact must mirror the pending ledger-only state, not claim delivered",
     );
     assert!(
         !outcome.delivered,
