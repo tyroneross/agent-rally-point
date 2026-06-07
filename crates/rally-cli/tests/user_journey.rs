@@ -651,6 +651,60 @@ fn rally_next_finds_useful_work_while_waiting() {
 }
 
 #[test]
+fn rally_next_prioritizes_targeted_ack_artifact_over_stale_handoff() {
+    let workspace = Workspace::new("rally-next-targeted-ack-artifact");
+    let artifact = workspace.json(&[
+        "say",
+        "artifact",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--target",
+        "codex",
+        "--subject",
+        "message",
+        "--evidence",
+        r#"{"requires_ack":true,"payload":{"summary":"review branch"}}"#,
+    ]);
+    let artifact_id = artifact["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap();
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--target",
+        "codex",
+        "--subject",
+        "newer handoff",
+    ]);
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+
+    let next = workspace.json(&["next", "--json", "--tool", "codex", "--limit", "4"]);
+    assert_eq!(next["schema"], "agent-rally.command.next.v1");
+    assert_matches_schema("agent-rally.command.next.v1.json", &next);
+    assert_eq!(next["data"]["next"]["action"], "review_artifact");
+    assert_eq!(
+        next["data"]["next"]["reason"],
+        "targeted_peer_artifact_requires_ack"
+    );
+    assert_eq!(next["data"]["next"]["target_event_id"], artifact_id);
+    assert!(
+        next["data"]["next"]["alternatives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["action"] == "respond_to_handoff"
+                && item["target_event_id"] == handoff_id),
+        "newer handoff should stay visible as an alternative"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
 fn rally_artifact_ref_consumes_targeted_handoff_only_from_target_tool() {
     // intent: a target-authored artifact that references a handoff via --ref
     // should close that handoff (drop it from room.open_handoffs and next).
