@@ -117,6 +117,13 @@ fn temp_path(name: &str) -> PathBuf {
     ))
 }
 
+fn write_executable(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
 /// True when the `git` binary is on PATH; used to skip worktree-isolation
 /// tests in stripped CI environments rather than failing them spuriously.
 fn git_available() -> bool {
@@ -1257,6 +1264,128 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         0
     );
     assert!(!workspace.cwd.join(".rally/sessions.json").exists());
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_stop_tombstones_session_when_backend_stop_fails() {
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-stop-stale-target");
+
+    let run = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "stoppable",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    let session_id = run["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .unwrap();
+
+    let stop = workspace.json(&["stop", session_id, "--json", "--tmux-bin", "/usr/bin/false"]);
+    assert_eq!(stop["schema"], "agent-rally.command.session-action.v1");
+    assert_eq!(stop["data"]["stop"]["session"]["session_id"], session_id);
+
+    let sessions = workspace.json(&["sessions", "--json", "--tmux-bin", "/usr/bin/true"]);
+    assert_eq!(
+        sessions["data"]["sessions"]["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "explicit stop must tombstone the session even when backend stop fails"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn stale_managed_session_projects_reaps_and_blocks_inject() {
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-stale-session-projection");
+    let fake_tmux = workspace.cwd.join("fake-tmux-stale.sh");
+    write_executable(
+        &fake_tmux,
+        r#"#!/bin/sh
+case "$1" in
+  new-session) exit 0 ;;
+  list-panes) echo "no server running on /tmp/rally-test" >&2; exit 1 ;;
+  kill-session) echo "can't find session: $3" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+"#,
+    );
+    let fake_tmux = fake_tmux.to_string_lossy().to_string();
+
+    let run = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "stale",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        &fake_tmux,
+    ]);
+    let session_id = run["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let name = run["data"]["run"]["session"]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let sessions = workspace.json(&["sessions", "--json", "--tmux-bin", &fake_tmux]);
+    let rows = sessions["data"]["sessions"]["sessions"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["session_id"], session_id);
+    assert_eq!(rows[0]["liveness"], "stale");
+    assert_eq!(rows[0]["liveness_source"], "backend_probe");
+
+    let inject = workspace.output(&[
+        "inject",
+        &name,
+        "--json",
+        "--text",
+        "must not route to stale session",
+        "--tool",
+        "claude_code:test-sender",
+        "--tmux-bin",
+        &fake_tmux,
+    ]);
+    assert!(!inject.status.success());
+    let stderr = String::from_utf8_lossy(&inject.stderr);
+    assert!(
+        stderr.contains("stale managed session"),
+        "inject must fail loud for stale managed sessions; stderr={stderr}"
+    );
+
+    let reaped = workspace.json(&["sessions", "--reap", "--json", "--tmux-bin", &fake_tmux]);
+    assert_eq!(
+        reaped["data"]["sessions"]["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "--reap must tombstone stale sessions"
+    );
+    let reaped_again = workspace.json(&["sessions", "--reap", "--json", "--tmux-bin", &fake_tmux]);
+    assert_eq!(
+        reaped_again["data"]["sessions"]["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "--reap must be idempotent"
+    );
 
     workspace.cleanup();
 }

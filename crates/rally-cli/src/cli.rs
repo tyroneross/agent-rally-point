@@ -237,6 +237,8 @@ pub(crate) struct RunArgs {
 #[derive(Clone, Debug)]
 pub(crate) struct SessionsArgs {
     pub(crate) json: bool,
+    pub(crate) reap: bool,
+    pub(crate) bins: BackendBins,
 }
 
 #[derive(Clone, Debug)]
@@ -1170,7 +1172,11 @@ fn run_parser() -> impl Parser<RunArgs> {
 
 fn sessions_parser() -> impl Parser<SessionsArgs> {
     let json = json_flag();
-    construct!(SessionsArgs { json })
+    let reap = long("reap")
+        .help("Tombstone sessions projected as stale. Unknown sessions are left untouched.")
+        .switch();
+    let bins = backend_bins_parser();
+    construct!(SessionsArgs { json, reap, bins })
 }
 
 fn inject_parser() -> impl Parser<InjectArgs> {

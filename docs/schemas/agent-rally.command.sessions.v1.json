@@ -28,8 +28,27 @@
                   "tool",
                   "backend",
                   "cwd",
-                  "target"
-                ]
+                  "target",
+                  "liveness",
+                  "liveness_source"
+                ],
+                "properties": {
+                  "session_id": { "type": "string" },
+                  "name": { "type": "string" },
+                  "agent": { "type": "string" },
+                  "tool": { "type": "string" },
+                  "backend": { "type": "string" },
+                  "cwd": { "type": "string" },
+                  "target": { "type": "string" },
+                  "worktree_path": { "type": "string" },
+                  "branch": { "type": "string" },
+                  "liveness": {
+                    "enum": ["live", "stale", "unknown"]
+                  },
+                  "liveness_source": {
+                    "enum": ["heartbeat_ttl", "backend_probe"]
+                  }
+                }
               }
             }
           }

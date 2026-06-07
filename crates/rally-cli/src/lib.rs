@@ -3239,7 +3239,21 @@ fn ensure_unique_session_identity(
 }
 
 fn command_sessions(args: SessionsArgs) -> Result<Output> {
-    let sessions = read_session_records()?;
+    let room = RoomStore::open()?;
+    let mut sessions = read_session_views(&room, args.bins.clone())?;
+    let reaped = if args.reap {
+        let mut count = 0;
+        for (fact, view) in active_session_views(&room, args.bins.clone())? {
+            if view.liveness == SessionLiveness::Stale {
+                append_stopped_session_record(&room, &view.session, &fact)?;
+                count += 1;
+            }
+        }
+        sessions = read_session_views(&room, args.bins)?;
+        count
+    } else {
+        0
+    };
     let body = envelope(
         "sessions",
         SCHEMA_SESSIONS,
@@ -3249,7 +3263,11 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
             },
         },
     )?;
-    let text = format!("sessions {}", sessions.len());
+    let text = if args.reap {
+        format!("sessions {} reaped {reaped}", sessions.len())
+    } else {
+        format!("sessions {}", sessions.len())
+    };
     Ok(Output::new(args.json, text, body))
 }
 
@@ -3270,7 +3288,7 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     // Two-arm target resolution: managed session (legacy dual-delivery,
     // unchanged), or rally-termd-registered ledger agent (ledger-only). See
     // `InjectTarget` for the order-matters rationale (managed wins over id).
-    let inject_target = resolve_inject_target(&target)?;
+    let inject_target = resolve_inject_target(&target, &args.bins)?;
     match inject_target {
         InjectTarget::Managed(session) => command_inject_managed(
             args.json,
@@ -3688,7 +3706,7 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
     let action = args.action;
     let dry_run = args.dry_run;
     let target = args.target;
-    let session = find_session(&target)?;
+    let session = find_session(&target, &args.bins)?;
     let backend_runner = BackendRunner::new(Backend::parse(&session.backend)?, args.bins);
     let live_target = if dry_run {
         session.target.clone()
@@ -3716,7 +3734,7 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
         SessionAction::Stop => {
             let commands = backend_runner.stop_commands(&live_target);
             if !dry_run {
-                backend_runner.stop(&live_target)?;
+                let _ = backend_runner.stop(&live_target);
                 // Cleanup the per-agent worktree (when present) before
                 // marking the session stopped.  Best-effort: warnings are
                 // discarded so `rally stop` never blocks on a leftover
@@ -3754,9 +3772,83 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
     Ok(Output::new(args.json, text, body))
 }
 
-fn read_session_records() -> Result<Vec<ManagedSession>> {
-    let room = RoomStore::open()?;
-    active_session_records(&room)
+fn read_session_views(room: &RoomStore, bins: BackendBins) -> Result<Vec<SessionView>> {
+    Ok(active_session_views(room, bins)?
+        .into_iter()
+        .map(|(_, view)| view)
+        .collect())
+}
+
+fn active_session_views(room: &RoomStore, bins: BackendBins) -> Result<Vec<(Fact, SessionView)>> {
+    let facts = room.facts()?;
+    let active = active_session_facts_from_facts(facts.clone());
+    let probes = probe_session_liveness(&active, bins);
+    let states = agent_state::project_agent_states(&facts, &now_string())
+        .into_iter()
+        .map(|entry| (entry.tool, entry.stale))
+        .collect::<BTreeMap<_, _>>();
+
+    Ok(active
+        .into_iter()
+        .map(|(fact, session)| {
+            let (liveness, liveness_source) =
+                projected_session_liveness(&session, &states, &probes);
+            (
+                fact,
+                SessionView {
+                    session,
+                    liveness,
+                    liveness_source,
+                },
+            )
+        })
+        .collect())
+}
+
+fn projected_session_liveness(
+    session: &ManagedSession,
+    heartbeat_stale: &BTreeMap<String, bool>,
+    backend_probes: &BTreeMap<String, SessionLiveness>,
+) -> (SessionLiveness, &'static str) {
+    let probe = backend_probes
+        .get(&session.session_id)
+        .copied()
+        .unwrap_or(SessionLiveness::Unknown);
+    match (heartbeat_stale.get(&session.tool).copied(), probe) {
+        (Some(true), _) => (SessionLiveness::Stale, "heartbeat_ttl"),
+        (_, SessionLiveness::Stale) => (SessionLiveness::Stale, "backend_probe"),
+        (Some(false), _) => (SessionLiveness::Live, "heartbeat_ttl"),
+        (None, liveness) => (liveness, "backend_probe"),
+    }
+}
+
+fn probe_session_liveness(
+    active: &[(Fact, ManagedSession)],
+    bins: BackendBins,
+) -> BTreeMap<String, SessionLiveness> {
+    let mut by_backend: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for (_, session) in active {
+        by_backend
+            .entry(session.backend.clone())
+            .or_default()
+            .push((session.session_id.clone(), session.target.clone()));
+    }
+
+    let mut out = BTreeMap::new();
+    for (backend, sessions) in by_backend {
+        let targets = sessions
+            .iter()
+            .map(|(_, target)| target.clone())
+            .collect::<Vec<_>>();
+        let liveness = match Backend::parse(&backend) {
+            Ok(backend) => BackendRunner::new(backend, bins.clone()).liveness(&targets),
+            Err(_) => targets.iter().map(|_| SessionLiveness::Unknown).collect(),
+        };
+        for ((session_id, _), liveness) in sessions.into_iter().zip(liveness) {
+            out.insert(session_id, liveness);
+        }
+    }
+    out
 }
 
 fn remove_session_record(session_id: &str) -> Result<()> {
@@ -4154,13 +4246,22 @@ fn build_risk_fact(
     }
 }
 
-fn find_session(target: &str) -> Result<ManagedSession> {
-    read_session_records()?
+fn find_session(target: &str, bins: &BackendBins) -> Result<ManagedSession> {
+    let room = RoomStore::open()?;
+    let Some(view) = read_session_views(&room, bins.clone())?
         .into_iter()
-        .find(|session| {
-            session.session_id == target || session.name == target || session.tool == target
+        .find(|view| {
+            view.session.session_id == target
+                || view.session.name == target
+                || view.session.tool == target
         })
-        .ok_or_else(|| RallyError::NotFound(format!("unknown managed session {target}")))
+    else {
+        return Err(RallyError::NotFound(format!(
+            "unknown managed session {target}"
+        )));
+    };
+    reject_stale_session(target, &view)?;
+    Ok(view.session)
 }
 
 /// What kind of injection target a string resolves to. The two arms are the
@@ -4206,12 +4307,19 @@ enum InjectTarget {
 /// writer applies, so a malformed `target` cannot reach
 /// `inject_via_ledger`/`append_directive` here; ledger-side defenses stay
 /// active too.
-fn resolve_inject_target(target: &str) -> Result<InjectTarget> {
+fn resolve_inject_target(target: &str, bins: &BackendBins) -> Result<InjectTarget> {
     // 1. Active managed session (existing behavior; preserves dual-delivery).
-    if let Some(session) = read_session_records()?.into_iter().find(|session| {
-        session.session_id == target || session.name == target || session.tool == target
-    }) {
-        return Ok(InjectTarget::Managed(session));
+    let room = RoomStore::open()?;
+    if let Some(view) = read_session_views(&room, bins.clone())?
+        .into_iter()
+        .find(|view| {
+            view.session.session_id == target
+                || view.session.name == target
+                || view.session.tool == target
+        })
+    {
+        reject_stale_session(target, &view)?;
+        return Ok(InjectTarget::Managed(view.session));
     }
 
     // 2. Else, syntactically valid agent-id → ledger-only delivery to a
@@ -4226,6 +4334,19 @@ fn resolve_inject_target(target: &str) -> Result<InjectTarget> {
     Err(RallyError::NotFound(format!(
         "unknown managed session {target}"
     )))
+}
+
+fn reject_stale_session(target: &str, view: &SessionView) -> Result<()> {
+    if view.liveness == SessionLiveness::Stale {
+        return Err(RallyError::Command(format!(
+            "stale managed session {target}: session_id={} target={} source={}; run `rally stop {}` or `rally sessions --reap` before injecting",
+            view.session.session_id,
+            view.session.target,
+            view.liveness_source,
+            view.session.session_id
+        )));
+    }
+    Ok(())
 }
 
 fn backend_target(backend: Backend, session_id: &str) -> String {
@@ -9700,7 +9821,7 @@ fn help_text() -> String {
         "  rally check before-complete --tool <tool> [--strict] [--json]",
         "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|cmux>] [--dry-run] [--json]",
         "    managed run ids auto-number active agents, e.g. claude-01 / claude_code:01",
-        "  rally sessions [--json]",
+        "  rally sessions [--reap] [--json] [--tmux-bin <path>] [--cmux-bin <path>]",
         "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--timeout-seconds <n>] [--json]",
         "    --handoff waits for target-authored Rally ACK by default; no ACK means assume not received and follow fallback_plan",
         "  rally attach <session|name|tool> [--dry-run] [--json]",

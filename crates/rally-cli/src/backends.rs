@@ -1,8 +1,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output as ProcessOutput};
 
 use crate::cli::BackendBins;
 use crate::error::{RallyError, Result};
@@ -73,6 +74,22 @@ pub(crate) struct ManagedSession {
     pub(crate) branch: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SessionLiveness {
+    Live,
+    Stale,
+    Unknown,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct SessionView {
+    #[serde(flatten)]
+    pub(crate) session: ManagedSession,
+    pub(crate) liveness: SessionLiveness,
+    pub(crate) liveness_source: &'static str,
+}
+
 #[derive(JsonSchema, Serialize)]
 pub(crate) struct RunData {
     pub(crate) mode: &'static str,
@@ -93,7 +110,7 @@ pub(crate) struct RunEnvelope {
 
 #[derive(JsonSchema, Serialize)]
 pub(crate) struct SessionsData {
-    pub(crate) sessions: Vec<ManagedSession>,
+    pub(crate) sessions: Vec<SessionView>,
 }
 
 /// Envelope for `sessions`: result under `data.sessions`.
@@ -389,6 +406,16 @@ impl BackendRunner {
     pub(crate) fn stop(&self, target: &str) -> Result<()> {
         run_commands(&self.stop_commands(target))
     }
+
+    pub(crate) fn liveness(&self, targets: &[String]) -> Vec<SessionLiveness> {
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        match self.backend {
+            Backend::Tmux => probe_tmux_liveness(&self.tmux_bin, targets),
+            Backend::Cmux => probe_cmux_liveness(&self.cmux_bin, targets),
+        }
+    }
 }
 
 // Plan F functional core (Chunk 3): default_private_socket_client +
@@ -430,6 +457,73 @@ fn tmux_inject_commands(bin: &str, session: &str, text: &str) -> Vec<Vec<String>
         cmd![bin, "paste-buffer", "-b", buffer, "-t", session],
         cmd![bin, "send-keys", "-t", session, "Enter"],
     ]
+}
+
+fn probe_tmux_liveness(bin: &str, targets: &[String]) -> Vec<SessionLiveness> {
+    let output = Command::new(bin)
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\n#{window_id}\n#{pane_id}",
+        ])
+        .output();
+    classify_probe_output(output, targets)
+}
+
+fn probe_cmux_liveness(bin: &str, targets: &[String]) -> Vec<SessionLiveness> {
+    let output = Command::new(bin).arg("list-workspaces").output();
+    classify_probe_output(output, targets)
+}
+
+fn classify_probe_output(
+    output: std::io::Result<ProcessOutput>,
+    targets: &[String],
+) -> Vec<SessionLiveness> {
+    let Ok(output) = output else {
+        return targets.iter().map(|_| SessionLiveness::Unknown).collect();
+    };
+    if output.status.success() {
+        let live_targets = target_tokens(&String::from_utf8_lossy(&output.stdout));
+        if live_targets.is_empty() {
+            return targets.iter().map(|_| SessionLiveness::Unknown).collect();
+        }
+        return targets
+            .iter()
+            .map(|target| {
+                if live_targets.contains(target) {
+                    SessionLiveness::Live
+                } else {
+                    SessionLiveness::Stale
+                }
+            })
+            .collect();
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    let status = if stderr.contains("no server running")
+        || stderr.contains("no such file or directory")
+        || stderr.contains("can't find")
+        || stderr.contains("not found")
+    {
+        SessionLiveness::Stale
+    } else {
+        SessionLiveness::Unknown
+    };
+    targets.iter().map(|_| status).collect()
+}
+
+fn target_tokens(output: &str) -> BTreeSet<String> {
+    output
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|ch: char| {
+                ch == '"' || ch == '\'' || ch == ',' || ch == ';' || ch == '.'
+            })
+        })
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 // Plan F functional core (Chunk 3): herdr_* helpers are removed with
