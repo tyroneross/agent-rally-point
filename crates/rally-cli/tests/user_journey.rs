@@ -644,11 +644,12 @@ fn rally_next_finds_useful_work_while_waiting() {
 }
 
 #[test]
-fn rally_artifact_ref_consumes_handoff_but_not_blocker_or_claim() {
-    // intent: an artifact fact that references a handoff via --ref should
-    // close that handoff (drop it from room.open_handoffs and next).
-    // Blockers must still require resolve, and claims must still require
-    // release — artifact --ref is not a universal closer.
+fn rally_artifact_ref_consumes_targeted_handoff_only_from_target_tool() {
+    // intent: a target-authored artifact that references a handoff via --ref
+    // should close that handoff (drop it from room.open_handoffs and next).
+    // Evidence from non-target tools must not ACK/complete someone else's
+    // targeted handoff. Blockers still require resolve, and claims still
+    // require release — artifact --ref is not a universal closer.
     let workspace = Workspace::new("rally-artifact-closes-handoff");
 
     let handoff = workspace.json(&[
@@ -699,7 +700,68 @@ fn rally_artifact_ref_consumes_handoff_but_not_blocker_or_claim() {
         "handoff should be open before artifact references it"
     );
 
-    // Artifact references each fact via --ref. Only the handoff should close.
+    // Non-target commentary/evidence that references the targeted handoff does
+    // not close it.
+    workspace.json(&[
+        "say",
+        "artifact",
+        "--json",
+        "--tool",
+        "codex:monitor",
+        "--subject",
+        "transport observation",
+        "--ref",
+        handoff_id,
+        "--evidence",
+        "delivered but not acked",
+    ]);
+    let room_after_monitor_artifact = workspace.json(&["room", "--json"]);
+    assert!(
+        room_after_monitor_artifact["data"]["room"]["open_handoffs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["event_id"] == handoff_id),
+        "non-target artifact --ref must not close a targeted handoff"
+    );
+
+    // A wrong-tool resolve is rejected before it can write a bogus closeout.
+    let wrong_resolve = workspace.output(&[
+        "say",
+        "resolve",
+        "--json",
+        "--tool",
+        "codex:monitor",
+        "--ref",
+        handoff_id,
+        "--subject",
+        "wrong target resolve",
+    ]);
+    assert!(
+        !wrong_resolve.status.success(),
+        "wrong-tool resolve must fail"
+    );
+    let wrong_resolve_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&wrong_resolve.stdout),
+        String::from_utf8_lossy(&wrong_resolve.stderr)
+    );
+    assert!(
+        wrong_resolve_text.contains("targeted to claude_code"),
+        "wrong-tool resolve should explain target mismatch; got {wrong_resolve_text}"
+    );
+    let room_after_wrong_resolve = workspace.json(&["room", "--json"]);
+    assert!(
+        room_after_wrong_resolve["data"]["room"]["open_handoffs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["event_id"] == handoff_id),
+        "rejected wrong-tool resolve must not close a targeted handoff"
+    );
+
+    // Target-authored artifact references each fact via --ref. Only the
+    // handoff should close.
     workspace.json(&[
         "say",
         "artifact",

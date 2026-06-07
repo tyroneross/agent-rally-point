@@ -940,6 +940,10 @@ impl RoomStore {
                 // or an unconsumed artifact.  Artifacts are consumed by resolve
                 // (via the `consumed_refs` projection) which drops them from
                 // `unconsumed_artifacts`.
+                let open_handoff = snapshot_before
+                    .open_handoffs
+                    .iter()
+                    .find(|f| f.event_id == ref_id);
                 let is_live = snapshot_before
                     .active_blockers
                     .iter()
@@ -963,6 +967,15 @@ impl RoomStore {
                 if !is_live {
                     return Err(RallyError::Usage(format!(
                         "resolve failed: ref {ref_id} is not a live blocker, claim, handoff, risk, or unconsumed artifact (already resolved, never existed, or invalid); nothing to resolve"
+                    )));
+                }
+                if let Some(handoff) = open_handoff
+                    && !handoff_closer_matches_target(handoff, fact)
+                {
+                    let target = handoff.target.as_deref().unwrap_or("<untargeted>");
+                    let tool = fact.tool.as_deref().unwrap_or("<unknown>");
+                    return Err(RallyError::Usage(format!(
+                        "resolve failed: ref {ref_id} is targeted to {target}; tool {tool} cannot resolve it"
                     )));
                 }
             }
@@ -1435,6 +1448,35 @@ fn facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
         .collect()
 }
 
+fn handoff_closer_matches_target(handoff: &Fact, closer: &Fact) -> bool {
+    // Legacy rows predate session identity and used artifact/resolve refs as
+    // broad completion markers. Keep replay stable for those ledgers while
+    // applying target correlation to session-era durable writes.
+    if closer.from_session_id.is_none() {
+        return true;
+    }
+
+    match handoff.target.as_deref() {
+        Some("all") | None => true,
+        Some(target) => closer.tool.as_deref() == Some(target),
+    }
+}
+
+fn fact_closes_handoff(handoff: &Fact, closer: &Fact) -> bool {
+    matches!(
+        closer.kind,
+        FactKind::Resolve | FactKind::Receipt | FactKind::Artifact
+    ) && closer.seq > handoff.seq
+        && closer.ref_id.as_deref() == Some(handoff.event_id.as_str())
+        && handoff_closer_matches_target(handoff, closer)
+}
+
+fn handoff_is_closed(handoff: &Fact, facts: &[Fact]) -> bool {
+    facts
+        .iter()
+        .any(|closer| fact_closes_handoff(handoff, closer))
+}
+
 /// Pure projection of a `RoomSnapshot` from an already-loaded facts slice.
 ///
 /// This is the body formerly inlined in `RoomStore::snapshot`. Extracted so
@@ -1480,16 +1522,10 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
         .filter(|f| !resolved.contains(&f.event_id))
         .cloned()
         .collect::<Vec<_>>();
-    let artifact_consumed_handoffs = facts
-        .iter()
-        .filter(|f| f.kind == "artifact")
-        .filter_map(|f| f.ref_id.clone())
-        .collect::<BTreeSet<_>>();
     let open_handoffs = facts
         .iter()
         .filter(|f| f.kind == "handoff")
-        .filter(|f| !resolved.contains(&f.event_id))
-        .filter(|f| !artifact_consumed_handoffs.contains(&f.event_id))
+        .filter(|f| !handoff_is_closed(f, facts))
         // B18: exclude external-intake facts from repo-local backlog.
         .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
         .cloned()
