@@ -117,6 +117,7 @@ fn envelope_init() {
     fs::write(ws.cwd.join("dynamic-workflows/PROTOCOL.md"), "# Protocol").unwrap();
     fs::create_dir_all(ws.cwd.join("docs")).unwrap();
     fs::write(ws.cwd.join("docs/ORCHESTRATION.md"), "# Orch").unwrap();
+    fs::write(ws.cwd.join("docs/ANY-AGENT-ONBOARDING.md"), "# Any Agent").unwrap();
     let body = ws.json(&["init", "--json"]);
     assert_envelope_contract("init", &body);
     ws.cleanup();

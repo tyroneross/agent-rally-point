@@ -1,13 +1,15 @@
 <!-- SPDX-FileCopyrightText: 2026 Tyrone Ross, Jr | SPDX-License-Identifier: Apache-2.0 -->
-# Handoffs & Launching Agents (Claude + Codex)
+# Handoffs & Launching Managed Agents
 
-Practical guide for handing a build off to a fresh agent session and launching managed Claude/Codex agents into a Rally room. Distilled from a live run (2026-05-31 Easy Terminal redesign).
+Practical guide for handing a build off to a fresh agent session and launching
+managed agents into a Rally room. Distilled from a live run (2026-05-31 Easy
+Terminal redesign).
 
 ## TL;DR
 
 ```bash
 cd <repo>                                   # rally is repo-local — cwd must be the repo
-rally run claude --name <label>             # launch a managed Claude in tmux, auto-numbered (claude-<label>-01)
+rally run <claude|codex|opencode|gemini> --name <label>
 rally inject <session> --text "<prompt>"    # deliver and submit the first instruction
 rally capture <session> --lines 30          # snapshot what it's doing
 rally attach <session>                      # watch live  ·  rally stop <session> to halt
@@ -51,7 +53,7 @@ A good handoff doc contains: mission · what's DONE (with the **canonical branch
 
 **Pin the branch.** State the canonical branch and HEAD explicitly and have the incoming session assert it (`git branch --show-current`). Worktree-isolated workers drift onto side branches and fast-forward to catch up; a handoff that says "on main" when the work is really on a feature branch will mislead the next session.
 
-## 4. Inject prompt template (codex + claude)
+## 4. Inject prompt template
 
 ```
 You are taking over <project>. FIRST read docs/HANDOFF-<date>.md, then <plan>.
@@ -63,17 +65,25 @@ Coordinate via rally (you are <session>); post progress with `rally say`, surfac
 Commit each chunk; keep <branch> green. Start by reading the handoff doc + confirming your plan.
 ```
 
-## 5. Claude vs Codex specifics
+## 5. Runtime specifics
 
-| | Claude (`rally run claude`) | Codex (`rally run codex`) |
-|---|---|---|
-| Launch | tmux, starts at prompt, auto mode | tmux; Codex TUI / `codex exec` per backend |
-| Inject | `rally inject … --text` | same; some Codex modes are non-injectable (fact-only) → use the doc + `rally say` |
-| Permissions | fresh session may prompt to trust folder / approve tools — pre-approve or run in an already-trusted repo | Codex sandbox/approval per its config |
-| Coordination | reads CLAUDE.md + rally room on entry | reads AGENTS.md + rally room on entry |
-| Identity | `claude_code:<name>` | `codex:<name>` |
+| Runtime | First-class `rally run` | Notes |
+|---|---:|---|
+| Claude Code | yes | Reads `CLAUDE.md`; fresh sessions may prompt to trust the folder or approve tools. |
+| Codex CLI | yes | Reads `AGENTS.md`; behavior depends on Codex sandbox/approval config. |
+| OpenCode | yes | Use the same Rally core loop and handoff/inject contract. |
+| Gemini CLI | yes | Use the same Rally core loop and handoff/inject contract. |
+| Cursor agent | no | Use manual onboarding until adopted by a managed backend. |
+| Qwen/Gemma CLI | no | Use manual onboarding until adopted by a managed backend. |
+| Aider | no | Use manual onboarding until adopted by a managed backend. |
 
 Keep **CLAUDE.md** (Claude) and **AGENTS.md** (Codex) at the repo root current — each host reads its own on entry, so the handoff context should live there or be linked from there.
+
+For every non-first-class host, use
+[`ANY-AGENT-ONBOARDING.md`](ANY-AGENT-ONBOARDING.md). The short version:
+choose a stable tool id, run `whoami` / `enter` / `ack` / `next`, post targeted
+Rally facts, and do not assume `rally inject` is available unless
+`rally sessions --json` lists the session.
 
 ## 6. Monitoring
 

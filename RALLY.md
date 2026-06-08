@@ -10,6 +10,11 @@ to do next.
 > agent landing there sees how to enter and where the deeper docs live.
 > Idempotent — re-running `rally init` refreshes the pointer block between
 > stable markers without duplicating anything.
+>
+> Generic or non-first-class agents should start with
+> [`docs/ANY-AGENT-ONBOARDING.md`](docs/ANY-AGENT-ONBOARDING.md). Rally room
+> participation only requires the CLI; direct injection requires a managed
+> session.
 
 ## The Load-Bearing Commands
 
@@ -45,6 +50,10 @@ named reviewer is `reviewer-01` with tool `claude_code:reviewer-01`.
 | Pi            | `pi`          |
 | Cursor        | `cursor`      |
 | Gemini CLI    | `gemini`      |
+| OpenCode      | `opencode`    |
+| Qwen CLI      | `qwen`        |
+| Gemma CLI     | `gemma`       |
+| Aider         | `aider`       |
 | CI/automation | `ci`          |
 
 ## Resolve Targets From Live State
@@ -113,7 +122,7 @@ rally next --tool codex --json
 
 ## How Agents Wire This In
 
-Managed sessions are the reliable delivery path:
+Managed sessions are the reliable direct-delivery path:
 
 ```bash
 rally run claude --backend tmux --json
@@ -121,9 +130,16 @@ rally inject <session|name|tool> --handoff <event-id> --json  # e.g. claude-01
 rally capture <session|name|tool> --json
 ```
 
+First-class `rally run` launch targets are currently Claude, Codex, OpenCode,
+and Gemini. Other agents - Cursor, Qwen, Gemma, Aider, IDE plugins, CI workers -
+can still participate by running the core `whoami` / `enter` / `ack` / `next`
+loop with a stable tool id.
+
 `rally inject` addresses managed sessions only. If `rally sessions --json` does
 not list the target, use `rally say handoff --target <target-tool>` and either
 adopt/relaunch the running surface or report that direct delivery is unavailable.
+For the generic bootstrap contract, see
+[`docs/ANY-AGENT-ONBOARDING.md`](docs/ANY-AGENT-ONBOARDING.md).
 
 Agents can still call `rally check before-write` explicitly before shared
 edits. Rally's core CLI does not auto-install host hooks. An opt-in,

@@ -40,6 +40,7 @@ const DOC_GUIDE: &str = "RALLY.md";
 const DOC_DOCTRINE: &str = "dynamic-workflows/COORDINATION.md";
 const DOC_PROTOCOL: &str = "dynamic-workflows/PROTOCOL.md";
 const DOC_BOARD: &str = "docs/ORCHESTRATION.md";
+const DOC_ANY_AGENT_ONBOARDING: &str = "docs/ANY-AGENT-ONBOARDING.md";
 
 /// Result of `rally init` for one of the pointer-doc targets.
 #[derive(Debug, Serialize)]
@@ -71,6 +72,7 @@ pub(crate) struct ManifestDocs {
     pub(crate) doctrine: String,
     pub(crate) protocol: String,
     pub(crate) board: String,
+    pub(crate) any_agent_onboarding: String,
 }
 
 /// Build the pointer block written into `CLAUDE.md`/`AGENTS.md`. Plain
@@ -99,7 +101,8 @@ fn pointer_block() -> String {
         "- **Wire protocol:** [dynamic-workflows/PROTOCOL.md](dynamic-workflows/PROTOCOL.md)\n",
     );
     s.push_str("- **Board / current lanes:** [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md)\n");
-    s.push_str("- **Handoffs & launching agents (Claude+Codex):** [docs/HANDOFFS-AND-LAUNCHING-AGENTS.md](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md)\n");
+    s.push_str("- **Any-agent onboarding contract:** [docs/ANY-AGENT-ONBOARDING.md](docs/ANY-AGENT-ONBOARDING.md)\n");
+    s.push_str("- **Handoffs & managed agents:** [docs/HANDOFFS-AND-LAUNCHING-AGENTS.md](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md)\n");
     s.push_str(POINTER_END);
     s.push('\n');
     s
@@ -232,6 +235,7 @@ fn build_manifest(repo_root: &Path, worktree_root: &Path) -> Result<(Value, Mani
         doctrine: DOC_DOCTRINE.to_string(),
         protocol: DOC_PROTOCOL.to_string(),
         board: DOC_BOARD.to_string(),
+        any_agent_onboarding: DOC_ANY_AGENT_ONBOARDING.to_string(),
     };
 
     // Verify each doc pointer resolves now. If something has moved we want
@@ -241,6 +245,7 @@ fn build_manifest(repo_root: &Path, worktree_root: &Path) -> Result<(Value, Mani
         ("docs.doctrine", &docs.doctrine),
         ("docs.protocol", &docs.protocol),
         ("docs.board", &docs.board),
+        ("docs.any_agent_onboarding", &docs.any_agent_onboarding),
     ] {
         let resolved = worktree_root.join(rel);
         if !resolved.exists() {
@@ -266,6 +271,7 @@ fn build_manifest(repo_root: &Path, worktree_root: &Path) -> Result<(Value, Mani
             "doctrine": docs.doctrine,
             "protocol": docs.protocol,
             "board": docs.board,
+            "any_agent_onboarding": docs.any_agent_onboarding,
         },
         "ledger": format!(".rally/{LOG_DIRNAME}/"),
         "ledger_filename_legacy": format!(".rally/{LEDGER_FILENAME}"),
@@ -368,7 +374,13 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("rally-init-{label}-{nanos}"));
         fs::create_dir_all(&root).unwrap();
-        for rel in [DOC_GUIDE, DOC_DOCTRINE, DOC_PROTOCOL, DOC_BOARD] {
+        for rel in [
+            DOC_GUIDE,
+            DOC_DOCTRINE,
+            DOC_PROTOCOL,
+            DOC_BOARD,
+            DOC_ANY_AGENT_ONBOARDING,
+        ] {
             let path = root.join(rel);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).unwrap();
@@ -398,6 +410,10 @@ mod tests {
         assert_eq!(parsed["schema"], MANIFEST_SCHEMA);
         assert_eq!(parsed["docs"]["guide"], DOC_GUIDE);
         assert_eq!(parsed["docs"]["board"], DOC_BOARD);
+        assert_eq!(
+            parsed["docs"]["any_agent_onboarding"],
+            DOC_ANY_AGENT_ONBOARDING
+        );
         assert_eq!(parsed["room_cmd"], "rally room");
         assert_eq!(parsed["ledger"], format!(".rally/{LOG_DIRNAME}/"));
 
@@ -542,7 +558,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rally-init-missing-{nanos}"));
         fs::create_dir_all(&root).unwrap();
         // Create all docs *except* the doctrine one.
-        for rel in [DOC_GUIDE, DOC_PROTOCOL, DOC_BOARD] {
+        for rel in [DOC_GUIDE, DOC_PROTOCOL, DOC_BOARD, DOC_ANY_AGENT_ONBOARDING] {
             let path = root.join(rel);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).unwrap();

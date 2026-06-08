@@ -6,7 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 # Auto-Coordination Hooks
 
 Make rally presence + before-write deconfliction **automatic** for coding
-agents (Claude Code, Codex, Gemini) without per-repo setup. Closes backlog
+agents (Claude Code, Codex, Gemini) without per-repo setup. Other agents can
+still participate manually through the same Rally contract; see
+[`ANY-AGENT-ONBOARDING.md`](ANY-AGENT-ONBOARDING.md). Closes backlog
 **B19-(a)** ("Claude PreToolUse hook — land separately") and the recurrence
 risk documented in
 [`assessment-2026-05-31-codex-hook-desync.md`](assessment-2026-05-31-codex-hook-desync.md).
@@ -39,6 +41,11 @@ the portable project config is already committed.
 > into that repo, pointing the command at a `rally`-resolvable hook. The universal
 > zero-bundle mechanism (a `rally hook` binary subcommand so a one-line committed
 > config calls `rally hook …` with no script path) is tracked as a backlog item.
+>
+> **Other hosts:** Cursor, Qwen, Gemma, Aider, IDE plugins, and custom CLIs do
+> not get automatic SessionStart/PreToolUse hooks from this file today. Give
+> them the any-agent bootstrap prompt, or wrap/adopt them into a managed backend
+> before relying on direct injection.
 
 ## What the hook does
 
