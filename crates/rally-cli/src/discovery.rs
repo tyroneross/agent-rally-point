@@ -17,6 +17,10 @@ pub(crate) struct KnownRoom {
     #[serde(default = "room_index_schema")]
     pub(crate) schema: String,
     pub(crate) repo_root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_id: Option<String>,
     pub(crate) display_name: String,
     pub(crate) facts_db: PathBuf,
     pub(crate) last_seen_seq: i64,
@@ -92,6 +96,10 @@ pub(crate) struct MigrateLegacyData {
 pub(crate) struct RepoStatus {
     /// Repo root path.
     pub(crate) repo: PathBuf,
+    /// Workspace boundary this repo belongs to.
+    pub(crate) workspace_root: PathBuf,
+    /// Stable, human-readable workspace label derived from the workspace root.
+    pub(crate) workspace_id: String,
     /// Room display name (basename of repo root).
     pub(crate) room: String,
     /// Tool holding `role:lead`, if any.
@@ -106,8 +114,16 @@ pub(crate) struct RepoStatus {
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub(crate) struct GlobalStatusData {
+    pub(crate) workspace_root: Option<PathBuf>,
+    pub(crate) workspace_id: Option<String>,
     pub(crate) repos: Vec<RepoStatus>,
     pub(crate) warnings: Vec<DiscoveryWarning>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkspaceContext {
+    root: PathBuf,
+    id: String,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -133,6 +149,7 @@ pub(crate) fn refresh_room_index(
     let mut index = read_room_index_at(&path)?;
     let repo_root = absolute_path(repo_root);
     let facts_db = absolute_path(facts_db);
+    let workspace = workspace_context_for_repo(&repo_root);
     let display_name = repo_root
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -142,6 +159,8 @@ pub(crate) fn refresh_room_index(
     let mut updated = false;
     for room in &mut index.rooms {
         if room.repo_root == repo_root {
+            room.workspace_root = Some(workspace.root.clone());
+            room.workspace_id = Some(workspace.id.clone());
             room.display_name = display_name.clone();
             room.facts_db = facts_db.clone();
             room.last_seen_seq = room.last_seen_seq.max(last_seen_seq);
@@ -154,6 +173,8 @@ pub(crate) fn refresh_room_index(
         index.rooms.push(KnownRoom {
             schema: ROOM_INDEX_SCHEMA.to_string(),
             repo_root,
+            workspace_root: Some(workspace.root),
+            workspace_id: Some(workspace.id),
             display_name,
             facts_db,
             last_seen_seq,
@@ -194,6 +215,9 @@ pub(crate) fn locate(event_id: &str) -> Result<LocateData> {
 pub(crate) fn status_global() -> Result<GlobalStatusData> {
     let mut warnings = Vec::new();
     let mut repos = Vec::new();
+    let current_workspace = repo_root()
+        .ok()
+        .map(|root| workspace_context_for_repo(&root));
 
     let Some(index_path) = room_index_path() else {
         warnings.push(warning(
@@ -201,7 +225,12 @@ pub(crate) fn status_global() -> Result<GlobalStatusData> {
             "global index disabled (opt in with RALLY_GLOBAL_INDEX=1); showing this repo only",
             None,
         ));
-        return Ok(GlobalStatusData { repos, warnings });
+        return Ok(GlobalStatusData {
+            workspace_root: current_workspace.as_ref().map(|w| w.root.clone()),
+            workspace_id: current_workspace.as_ref().map(|w| w.id.clone()),
+            repos,
+            warnings,
+        });
     };
 
     let index = match read_room_index_at(&index_path) {
@@ -212,12 +241,25 @@ pub(crate) fn status_global() -> Result<GlobalStatusData> {
                 format!("failed to read room index: {err}"),
                 Some(index_path),
             ));
-            return Ok(GlobalStatusData { repos, warnings });
+            return Ok(GlobalStatusData {
+                workspace_root: current_workspace.as_ref().map(|w| w.root.clone()),
+                workspace_id: current_workspace.as_ref().map(|w| w.id.clone()),
+                repos,
+                warnings,
+            });
         }
     };
 
     let mut missing_count: usize = 0;
     for room_entry in &index.rooms {
+        let room_workspace = workspace_context_for_room(room_entry, current_workspace.as_ref());
+        if current_workspace
+            .as_ref()
+            .is_some_and(|workspace| room_workspace.root != workspace.root)
+        {
+            continue;
+        }
+
         let Some(store) = try_open_indexed_room(room_entry)? else {
             missing_count += 1;
             continue;
@@ -250,6 +292,8 @@ pub(crate) fn status_global() -> Result<GlobalStatusData> {
 
         repos.push(RepoStatus {
             repo: room_entry.repo_root.clone(),
+            workspace_root: room_workspace.root,
+            workspace_id: room_workspace.id,
             room: room_entry.display_name.clone(),
             lead: snapshot.lead.clone(),
             open_claims: snapshot.active_claims.len(),
@@ -269,7 +313,12 @@ pub(crate) fn status_global() -> Result<GlobalStatusData> {
         ));
     }
 
-    Ok(GlobalStatusData { repos, warnings })
+    Ok(GlobalStatusData {
+        workspace_root: current_workspace.as_ref().map(|w| w.root.clone()),
+        workspace_id: current_workspace.as_ref().map(|w| w.id.clone()),
+        repos,
+        warnings,
+    })
 }
 
 pub(crate) fn recent(all: bool, limit: i64) -> Result<RecentData> {
@@ -320,12 +369,18 @@ fn known_rooms_with_current(
     warnings: &mut Vec<DiscoveryWarning>,
 ) -> Result<Vec<KnownRoom>> {
     let current_room = known_room_for_current(current)?;
+    let current_workspace = workspace_context_for_room(&current_room, None);
     let mut rooms = BTreeMap::new();
     rooms.insert(current_room.repo_root.clone(), current_room);
     if let Some(path) = room_index_path() {
         match read_room_index_at(&path) {
             Ok(index) => {
                 for room in index.rooms {
+                    let room_workspace =
+                        workspace_context_for_room(&room, Some(&current_workspace));
+                    if room_workspace.root != current_workspace.root {
+                        continue;
+                    }
                     rooms.entry(room.repo_root.clone()).or_insert(room);
                 }
             }
@@ -342,9 +397,12 @@ fn known_rooms_with_current(
 fn known_room_for_current(current: &Path) -> Result<KnownRoom> {
     let _ = RoomStore::open_at(current.to_path_buf())?;
     let facts_db = current.join(".rally/facts.db");
+    let workspace = workspace_context_for_repo(current);
     Ok(KnownRoom {
         schema: ROOM_INDEX_SCHEMA.to_string(),
         repo_root: absolute_path(current),
+        workspace_root: Some(workspace.root),
+        workspace_id: Some(workspace.id),
         display_name: current
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -741,6 +799,78 @@ fn absolute_path(path: &Path) -> PathBuf {
     }
 }
 
+fn workspace_context_for_repo(repo_root: &Path) -> WorkspaceContext {
+    let root = env::var_os("RALLY_WORKSPACE_ROOT")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            repo_root
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| repo_root.to_path_buf())
+        });
+    let root = absolute_path(&root)
+        .canonicalize()
+        .unwrap_or_else(|_| absolute_path(&root));
+    WorkspaceContext {
+        id: workspace_id_from_root(&root),
+        root,
+    }
+}
+
+fn workspace_context_for_room(
+    room: &KnownRoom,
+    current_workspace: Option<&WorkspaceContext>,
+) -> WorkspaceContext {
+    if let (Some(root), Some(id)) = (&room.workspace_root, &room.workspace_id) {
+        let root = absolute_path(root)
+            .canonicalize()
+            .unwrap_or_else(|_| absolute_path(root));
+        return WorkspaceContext {
+            root,
+            id: id.clone(),
+        };
+    }
+
+    if let Some(workspace) = current_workspace {
+        let room_repo = absolute_path(&room.repo_root)
+            .canonicalize()
+            .unwrap_or_else(|_| absolute_path(&room.repo_root));
+        if room_repo.starts_with(&workspace.root) {
+            return workspace.clone();
+        }
+    }
+
+    workspace_context_for_repo(&room.repo_root)
+}
+
+fn workspace_id_from_root(root: &Path) -> String {
+    let raw = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| root.display().to_string());
+    let mut out = String::with_capacity(raw.len());
+    let mut last_dash = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "workspace".to_string()
+    } else {
+        out
+    }
+}
+
 fn warning(
     code: impl Into<String>,
     message: impl Into<String>,
@@ -784,6 +914,8 @@ mod tests {
         KnownRoom {
             schema: ROOM_INDEX_SCHEMA.to_string(),
             repo_root: PathBuf::from(repo),
+            workspace_root: None,
+            workspace_id: None,
             display_name: repo.to_string(),
             facts_db: PathBuf::from(format!("{repo}/.rally/facts.db")),
             last_seen_seq: 1,

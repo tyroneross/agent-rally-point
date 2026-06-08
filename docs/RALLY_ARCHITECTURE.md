@@ -86,14 +86,15 @@ and managed sessions in repo A are invisible to a `rally` invocation in
 repo B.
 
 The home-dir directory `~/.agent-rally-point/rooms/v1/index.json` is an
-**opt-in, pointers-only** discovery hint — it lists `(repo_root, facts_db_path,
-last_seen_seq)` so `rally locate --all` and `rally recent --all` can answer
-"what other rooms exist on this machine?" without a network call. It holds
-**zero canonical fact data**; the per-repo `.rally/log/` segments do. Deleting
-the global index loses cross-repo visibility but not a single fact.
+**opt-in, pointers-only** discovery hint — it lists `(repo_root,
+workspace_root, facts_db_path, last_seen_seq)` so `rally locate --all`,
+`rally recent --all`, and `rally status --global` can answer "what other rooms
+exist in this workspace?" without a network call. It holds **zero canonical
+fact data**; the per-repo `.rally/log/` segments do. Deleting the global index
+loses cross-repo visibility but not a single fact.
 
 ```text
-~/.agent-rally-point/rooms/v1/index.json   global discovery hint (pointers; opt-in via RALLY_GLOBAL_INDEX=1)
+~/.agent-rally-point/rooms/v1/index.json   workspace discovery hint (pointers; opt-in via RALLY_GLOBAL_INDEX=1)
 ~/dev/repo-a/.rally/log/<engagement>.jsonl repo A — canonical fact segments
 ~/dev/repo-a/.rally/facts.db               repo A — derived cache
 ~/dev/repo-b/.rally/log/<engagement>.jsonl repo B — canonical fact segments (isolated)
@@ -118,6 +119,13 @@ Per-repo coordination is **unaffected** — `.rally/log/` segments and
 `.rally/facts.db` work exactly as before. Only the cross-repo "what other
 rooms exist?" surface is gated.
 
+`rally status --global` is workspace-scoped even when the pointer index contains
+rooms from elsewhere on the machine. The workspace root is `RALLY_WORKSPACE_ROOT`
+when set; otherwise it is the current repo root's parent directory. Rooms outside
+that boundary are hidden from the status rollup. This lets a Terminal Rally
+Point viewer show all Rally activity inside one local workspace without exposing
+unrelated workspaces.
+
 ```bash
 # Default: no env var needed — the global index is already off (B17).
 rally recent --all --json                          # silent on other repos (this repo only)
@@ -125,6 +133,7 @@ rally recent --all --json                          # silent on other repos (this
 # Opt in to cross-repo discovery:
 RALLY_GLOBAL_INDEX=1 rally recent --all --json      # lists other rooms on this machine
 RALLY_GLOBAL_INDEX=1 rally locate --all --json
+RALLY_GLOBAL_INDEX=1 rally status --global --json   # lists rooms in this workspace
 
 # Force-off even when opted in (privacy-isolated / multi-tenant / CI):
 RALLY_NO_GLOBAL_INDEX=1 rally enter --tool codex --json

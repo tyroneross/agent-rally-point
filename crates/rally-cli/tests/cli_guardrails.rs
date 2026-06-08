@@ -13,6 +13,7 @@ struct Workspace {
     /// When true, passes RALLY_GLOBAL_INDEX=1 to every command (opt-in for
     /// tests that exercise cross-repo status).
     global_index: bool,
+    workspace_root: Option<PathBuf>,
 }
 
 impl Workspace {
@@ -26,6 +27,7 @@ impl Workspace {
             cwd,
             home,
             global_index: false,
+            workspace_root: None,
         }
     }
 
@@ -38,12 +40,32 @@ impl Workspace {
             cwd,
             home,
             global_index: false,
+            workspace_root: None,
+        }
+    }
+
+    /// Create a workspace under an explicit parent directory while sharing HOME.
+    fn new_with_home_in(name: &str, parent: &PathBuf, home: PathBuf) -> Self {
+        let cwd = parent.join(format!("{name}-cwd"));
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(cwd.join(".git")).unwrap();
+        Self {
+            cwd,
+            home,
+            global_index: false,
+            workspace_root: None,
         }
     }
 
     /// Enable RALLY_GLOBAL_INDEX=1 for all commands run through this workspace.
     fn with_global_index(mut self) -> Self {
         self.global_index = true;
+        self
+    }
+
+    /// Bound cross-repo status to a specific workspace root.
+    fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
+        self.workspace_root = Some(workspace_root);
         self
     }
 
@@ -64,6 +86,9 @@ impl Workspace {
         cmd.current_dir(&self.cwd).env("HOME", &self.home);
         if self.global_index {
             cmd.env("RALLY_GLOBAL_INDEX", "1");
+        }
+        if let Some(workspace_root) = &self.workspace_root {
+            cmd.env("RALLY_WORKSPACE_ROOT", workspace_root);
         }
         cmd.args(args).output().unwrap()
     }
@@ -343,6 +368,15 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
         })
         .unwrap_or_else(|| panic!("repo_b ({repo_b_canonical}) not found in status: {repos:#?}"));
 
+    assert!(
+        entry_a["workspace_root"].as_str().is_some(),
+        "repo_a status must include workspace_root: {entry_a:#?}"
+    );
+    assert!(
+        entry_a["workspace_id"].as_str().is_some(),
+        "repo_a status must include workspace_id: {entry_a:#?}"
+    );
+
     // repo_a: lead=tool_a, open_claims=2
     assert_eq!(
         entry_a["lead"], "tool_a",
@@ -392,5 +426,75 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
     // Cleanup.
     repo_a.cleanup();
     repo_b.cleanup();
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn status_global_filters_to_current_workspace_boundary() {
+    let home = temp_path("rally-status-global-filter-home");
+    let workspace_a_root = temp_path("rally-status-global-workspace-a");
+    let workspace_b_root = temp_path("rally-status-global-workspace-b");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&workspace_a_root).unwrap();
+    fs::create_dir_all(&workspace_b_root).unwrap();
+
+    let repo_a = Workspace::new_with_home_in("repo-a", &workspace_a_root, home.clone())
+        .with_global_index()
+        .with_workspace_root(workspace_a_root.clone());
+    let repo_b = Workspace::new_with_home_in("repo-b", &workspace_b_root, home.clone())
+        .with_global_index()
+        .with_workspace_root(workspace_b_root.clone());
+
+    repo_a.json(&["enter", "--tool", "tool_a", "--json"]);
+    repo_b.json(&["enter", "--tool", "tool_b", "--json"]);
+
+    let index_path = home.join(".agent-rally-point/rooms/v1/index.json");
+    let index: Value = serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+    assert_eq!(
+        index["rooms"].as_array().map(Vec::len),
+        Some(2),
+        "global pointer index should know both repos before status filtering"
+    );
+
+    let status = repo_a.json(&["status", "--global", "--json"]);
+    let repos = status["data"]["status"]["repos"]
+        .as_array()
+        .expect("data.status.repos must be an array");
+
+    let repo_a_canonical = fs::canonicalize(&repo_a.cwd)
+        .unwrap_or_else(|_| repo_a.cwd.clone())
+        .to_string_lossy()
+        .to_string();
+    let repo_b_canonical = fs::canonicalize(&repo_b.cwd)
+        .unwrap_or_else(|_| repo_b.cwd.clone())
+        .to_string_lossy()
+        .to_string();
+    let workspace_a_canonical = fs::canonicalize(&workspace_a_root)
+        .unwrap_or_else(|_| workspace_a_root.clone())
+        .to_string_lossy()
+        .to_string();
+
+    assert!(
+        repos
+            .iter()
+            .any(|r| r["repo"].as_str() == Some(repo_a_canonical.as_str())),
+        "current workspace repo should be visible: {repos:#?}"
+    );
+    assert!(
+        !repos
+            .iter()
+            .any(|r| r["repo"].as_str() == Some(repo_b_canonical.as_str())),
+        "other workspace repo must be hidden from workspace-scoped status: {repos:#?}"
+    );
+    assert_eq!(
+        status["data"]["status"]["workspace_root"].as_str(),
+        Some(workspace_a_canonical.as_str()),
+        "status should report the workspace boundary used for filtering"
+    );
+
+    repo_a.cleanup();
+    repo_b.cleanup();
+    fs::remove_dir_all(&workspace_a_root).ok();
+    fs::remove_dir_all(&workspace_b_root).ok();
     fs::remove_dir_all(&home).ok();
 }
