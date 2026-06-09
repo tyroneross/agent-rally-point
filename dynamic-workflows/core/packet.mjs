@@ -68,11 +68,15 @@ function renderRallyLoop({ task, runId, tool }) {
   const owns = ownedPaths(task.owns);
   const ownsArgs = owns.length ? owns.map((p) => `--path ${p}`).join(" ") : "";
   const deps = Array.isArray(task.depends_on) ? task.depends_on : [];
-  // one --parent-step per depends_on entry; omit entirely if none
+  // one --parent-step per depends_on entry; omit entirely if none.
+  // `rally say` accepts repeated --parent-step (each becomes one DAG edge).
   const parentSteps = deps.map((d) => `--parent-step ${d}`).join(" ");
   const claimPath = owns.length ? ` ${ownsArgs}` : "";
+  // `rally check before-write` rejects repeated --path ("argument --path cannot be
+  // used multiple times"), so emit ONE before-write line per owned path — unlike the
+  // claim line above, where --path IS repeatable.
   const checkLine = owns.length
-    ? `rally check before-write --tool ${tool} ${ownsArgs} --strict`
+    ? owns.map((p) => `rally check before-write --tool ${tool} --path ${p} --strict`).join("\n")
     : `# read-only task — no before-write check required`;
   const artifactUri = owns.length ? owns[0] : "<artifact-uri>";
   const stepMarkers = `--run ${runId} --step ${task.id}${parentSteps ? " " + parentSteps : ""}`;

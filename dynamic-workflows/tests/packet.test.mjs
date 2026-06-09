@@ -33,6 +33,25 @@ const FIXTURE = {
   ],
 };
 
+// A task that owns TWO paths and depends on TWO upstream tasks — the case that
+// f1 (repeated --path on before-write) and f2 (repeated --parent-step) regressed.
+const MULTI = {
+  workstream: "multi-owns multi-dep fixture",
+  description: "exercises per-path before-write and per-dep parent-step",
+  tasks: [
+    { id: "a", intent: "build a", owns: ["src/a.js"], validation: "true", output: "a" },
+    { id: "b", intent: "build b", owns: ["src/b.js"], validation: "true", output: "b" },
+    {
+      id: "c",
+      intent: "wire a and b together",
+      owns: ["src/c.js", "src/c.test.js"],
+      validation: "true",
+      output: "c",
+      depends_on: ["a", "b"],
+    },
+  ],
+};
+
 const RUN = "run-fixture-001";
 
 test("packet embeds the task's owns paths", () => {
@@ -51,6 +70,38 @@ test("dependent task carries a --parent-step marker", () => {
   const p = renderPacket({ task: FIXTURE.tasks[1], runId: RUN, toolPrefix: "agent" });
   assert.ok(p.includes("--parent-step t1"), "expected --parent-step for depends_on");
   assert.ok(p.includes("--step t2"), "expected its own --step marker");
+});
+
+test("f1: multi-owns task emits one before-write line per owned path", () => {
+  const c = MULTI.tasks[2];
+  const p = renderPacket({ task: c, runId: RUN, toolPrefix: "agent" });
+  // One before-write per path, each with a SINGLE --path (the CLI rejects repeated --path).
+  const checks = p.split("\n").filter((l) => l.startsWith("rally check before-write"));
+  assert.equal(checks.length, 2, `expected one before-write line per owned path; got: ${checks.join(" | ")}`);
+  assert.ok(checks.every((l) => (l.match(/--path /g) || []).length === 1), "each before-write line must carry exactly one --path");
+  assert.ok(checks.some((l) => l.includes("--path src/c.js")), "expected a before-write for src/c.js");
+  assert.ok(checks.some((l) => l.includes("--path src/c.test.js")), "expected a before-write for src/c.test.js");
+});
+
+test("f1: the claim line keeps both --path args (claim --path IS repeatable)", () => {
+  const c = MULTI.tasks[2];
+  const p = renderPacket({ task: c, runId: RUN, toolPrefix: "agent" });
+  const claimLine = p.split("\n").find((l) => l.startsWith("rally say claim"));
+  assert.ok(claimLine.includes("--path src/c.js"), "claim must own src/c.js");
+  assert.ok(claimLine.includes("--path src/c.test.js"), "claim must own src/c.test.js");
+});
+
+test("f2: multi-dep task emits one --parent-step per depends_on entry", () => {
+  const c = MULTI.tasks[2];
+  const p = renderPacket({ task: c, runId: RUN, toolPrefix: "agent" });
+  // Scope the count to the emitted command span (the claim line + its marker
+  // continuation), not the explanatory prose which also names --parent-step.
+  const lines = p.split("\n");
+  const claimIdx = lines.findIndex((l) => l.startsWith("rally say claim"));
+  const markerLine = lines[claimIdx + 1];
+  assert.ok(markerLine.includes("--parent-step a"), "expected --parent-step a on the claim markers");
+  assert.ok(markerLine.includes("--parent-step b"), "expected --parent-step b on the claim markers");
+  assert.equal((markerLine.match(/--parent-step /g) || []).length, 2, "expected exactly two --parent-step markers on the command");
 });
 
 test("packet embeds validation, output contract, and final-JSON discipline", () => {
