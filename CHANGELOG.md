@@ -7,6 +7,35 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### `rally inject` now actually submits + waits for an ACK (2026-06-09)
+
+Fixes the long-recurring "inject delivered but never ACKed" signature (L5 /
+`incident-rally-inject-not-acked`). Two independent root causes, both repaired:
+
+- **Submit semantics (tmux fallback).** The tmux inject path built FOUR separate
+  commands — `C-u`, `set-buffer`, `paste-buffer`, then a SEPARATE `send-keys
+  Enter` — and that separate Enter never submitted against Codex's bracketed-
+  paste TUI: the message landed in the input box and sat at the prompt. It now
+  ships the whole frame as ONE atomic `send-keys -t <t> -H <hex…>` write —
+  `ESC[200~ <text> ESC[201~` followed by a CR placed AFTER the close marker so
+  it submits rather than pasting as literal text (ported from ptyd `frame_line`,
+  `src/comms.rs` §4.1/§4.2, no path dependency). `C-u` stays a discrete clear.
+  cmux keeps its separate-submit sequence (no raw-byte `send`); documented inline.
+- **ACK wait never ran (watchdog pre-emption).** `inject --handoff
+  --timeout-seconds 75` returned a bare `{ok:true,product:rally}` immediately —
+  not because the `InjectData` envelope was missing (it was already built with
+  `delivery_state`/`ack_state`/`fallback_plan` and polled the ledger via
+  `wait_for_resolution`), but because the global 3s-default / 60s-max wall-clock
+  watchdog killed the process before the 75s ACK poll could run, emitting the
+  neutral fail-open payload. `inject` — the one deliberately-blocking interactive
+  verb — now sizes its watchdog from `--timeout-seconds` + headroom (ceiling
+  605s), bypassing the 60s hook cap. An explicit `--timeout-ms` /
+  `RALLY_HOOK_TIMEOUT_MS` override still wins (clamped to the hook band); all
+  other (hook-invoked) commands keep the 3s default unchanged.
+
+Follow-up (spec only): [`docs/PLAN-daemon-first-inject-routing.md`](docs/PLAN-daemon-first-inject-routing.md)
+describes the daemon-first routing this framed tmux write is the fallback for.
+
 ### Reliability & performance — store durability for scale (2026-06-04)
 
 Foundation for durable coordination at thousands of agents. Commits `5c68dac`..`32d21be`.
