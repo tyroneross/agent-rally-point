@@ -114,13 +114,16 @@ fn check_before_write(
         });
     }
     if let Some(path) = path {
-        // TTL-primary liveness: a claim whose owner has gone idle past the
-        // 15-minute threshold is "squatting" and must not hard-block a peer's
-        // write (fact_182e8 gap 1: a dead owner's claims squat forever because
-        // `rally say release` was owner-only). Such a claim downgrades from a
-        // hard `stop` to a reclaimable `warn` so the peer can proceed, and a
-        // lead can issue an authorized takeover release.
-        let stale_owners = snapshot.stale_owner_tools();
+        // TTL-primary liveness (ADVISORY tier): a claim whose owner has gone
+        // idle past the 15-minute threshold is "squatting" and must not
+        // hard-block a peer's write (fact_182e8 gap 1: a dead owner's claims
+        // squat forever because `rally say release` was owner-only). Such a
+        // claim downgrades from a hard `stop` to a reclaimable `warn` so the
+        // peer can proceed. This is advisory only — it does NOT itself release
+        // the claim; the destructive takeover release applies a stricter
+        // staleness bar (`takeover_eligible_owners`, 2h) so a busy-but-quiet
+        // agent is not reclaimed out from under (independent-auditor HIGH).
+        let stale_owners = snapshot.idle_owner_tools();
         for claim in &snapshot.active_claims {
             let is_different_tool = claim.tool.as_deref() != Some(tool);
             let exact_or_dir = claim
@@ -139,9 +142,10 @@ fn check_before_write(
                     code: "stale-owner-claim",
                     severity: "warn",
                     message: format!(
-                        "path claimed by {} whose presence is stale (>15m idle) — \
-                         claim is reclaimable; proceed, or have the lead run \
-                         `rally say release --path {} --tool <lead>` to take it over",
+                        "path claimed by {} whose presence is idle (>15m) — not a hard \
+                         block; proceed with coordination awareness. If the owner is \
+                         truly gone (idle >2h), a lead can reclaim it with \
+                         `rally say release --path {} --tool <lead>`",
                         claim.tool.as_deref().unwrap_or("unknown"),
                         path,
                     ),
@@ -256,6 +260,21 @@ fn check_before_complete(snapshot: &RoomSnapshot, tool: &str, findings: &mut Vec
             });
         }
     }
+}
+
+/// Test-only accessor so sibling modules (lib.rs unit tests) can exercise the
+/// private `check_before_write` gate and read back `(code, severity)` pairs
+/// without exposing the private `CheckFinding` type.
+#[cfg(test)]
+pub(crate) fn check_before_write_for_test(
+    snapshot: &RoomSnapshot,
+    tool: &str,
+    path: Option<&str>,
+    out: &mut Vec<(&'static str, &'static str)>,
+) {
+    let mut findings = Vec::new();
+    check_before_write(snapshot, tool, path, &mut findings);
+    out.extend(findings.into_iter().map(|f| (f.code, f.severity)));
 }
 
 #[cfg(test)]

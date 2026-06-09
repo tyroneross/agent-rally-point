@@ -306,6 +306,14 @@ pub(crate) struct Squad {
 /// Seconds of inactivity after which a squad member is marked "idle".
 const IDLE_THRESHOLD_SECS: i64 = 15 * 60;
 
+/// Seconds of TOTAL silence after which a stale owner's claim becomes eligible
+/// for a non-owner takeover release. Deliberately much larger than
+/// `IDLE_THRESHOLD_SECS`: idle (15m) is advisory-only, but a DESTRUCTIVE
+/// takeover requires proof the owner is really gone, not merely busy-and-quiet
+/// (independent-auditor HIGH, 2026-06-09). 2h ≫ any plausible work-pause,
+/// ≪ the real ~2-day dead-owner case.
+const TAKEOVER_STALE_SECS: i64 = 2 * 60 * 60;
+
 /// Coordination-mandate (C1): tools that have recorded a `coordination:ack`
 /// decision. A squad is "acknowledged" iff it appears here.
 pub(crate) fn acknowledged_tools(facts: &[Fact]) -> std::collections::BTreeSet<String> {
@@ -378,21 +386,47 @@ pub(crate) struct RoomSnapshot {
 }
 
 impl RoomSnapshot {
-    /// Tools whose latest presence is liveness-stale (squad `status == "idle"`,
-    /// i.e. `last_seen_ts` older than the 15-minute `IDLE_THRESHOLD_SECS`). This
-    /// is the TTL-primary liveness signal — the same `last_seen_ts` projection
-    /// the squad view already computes — reused rather than adding a fourth
-    /// liveness engine (lesson 2026-06-07-managed-session-liveness-ttl-primary).
+    /// ADVISORY tier — tools whose latest presence is liveness-idle (squad
+    /// `status == "idle"`, i.e. `last_seen_ts` older than the 15-minute
+    /// `IDLE_THRESHOLD_SECS`). This is the standard TTL-primary signal reused
+    /// from the squad view (lesson 2026-06-07-managed-session-liveness-ttl-primary).
     ///
-    /// A claim held by a tool in this set is "squatting": its owner went quiet
-    /// past the threshold, so peers may treat it as reclaimable (a non-blocking
-    /// WARN in `before-write`) and a lead may release it (authorized takeover).
-    /// Acknowledged-then-died owners are caught here even though
-    /// `liveness_conflicted` (which gates on `!acknowledged`) misses them.
-    pub(crate) fn stale_owner_tools(&self) -> std::collections::BTreeSet<String> {
+    /// Use this ONLY for advisory surfaces (the non-blocking `before-write`
+    /// downgrade): a 15-minute quiet window is plausible for a busy agent that
+    /// simply hasn't posted to Rally, so it must never authorize a DESTRUCTIVE
+    /// action on its behalf. For that, use [`takeover_eligible_owners`].
+    pub(crate) fn idle_owner_tools(&self) -> std::collections::BTreeSet<String> {
         self.squads
             .iter()
             .filter(|sq| sq.status == "idle")
+            .map(|sq| sq.tool.clone())
+            .collect()
+    }
+
+    /// DESTRUCTIVE tier — tools whose latest presence is older than
+    /// [`TAKEOVER_STALE_SECS`] (2 hours), the conservative bar required to
+    /// authorize a NON-OWNER takeover release of a squatting claim. The 15-min
+    /// idle threshold is deliberately NOT used here: an agent doing a long
+    /// build or local work without a Rally write for 15 minutes is alive, and
+    /// reclaiming its claim would be a coordination-integrity REGRESSION
+    /// (independent-auditor HIGH, 2026-06-09). Two hours of total silence is
+    /// well beyond any plausible single work-pause yet far under the real dead-
+    /// owner case (the squatting claude_code:01 claims were ~2 DAYS stale).
+    ///
+    /// Owners whose `last_seen_ts` fails to parse are treated as NOT eligible
+    /// (fail-closed: never reclaim on a malformed timestamp).
+    pub(crate) fn takeover_eligible_owners(&self) -> std::collections::BTreeSet<String> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.squads
+            .iter()
+            .filter(|sq| {
+                chrono::DateTime::parse_from_rfc3339(&sq.last_seen_ts)
+                    .map(|dt| now_secs - dt.timestamp() > TAKEOVER_STALE_SECS)
+                    .unwrap_or(false)
+            })
             .map(|sq| sq.tool.clone())
             .collect()
     }
@@ -1789,6 +1823,17 @@ pub(crate) fn persist_active_engagement(rally_dir: &Path, engagement: &str) -> R
     if cleaned.is_empty() {
         return Err(RallyError::Usage(format!(
             "engagement label {engagement:?} is empty after sanitising"
+        )));
+    }
+    // Reject reserved fixture labels at WRITE time too (independent-auditor LOW,
+    // 2026-06-09): the resolver already refuses to ROUTE live appends to a
+    // reserved label, but silently accepting `rally enter --engagement test`
+    // and then never honoring it is a confusing no-op. Fail loud instead.
+    if is_reserved_fixture_engagement(&cleaned) {
+        return Err(RallyError::Usage(format!(
+            "engagement label {cleaned:?} is reserved for the committed test/CI \
+             fixture segment and cannot be set for a live session; pick a \
+             different label (or omit --engagement to use the dated segment)"
         )));
     }
     fs::create_dir_all(rally_dir)
@@ -3895,8 +3940,12 @@ mod ledger_tests {
         fs::create_dir_all(&dir).unwrap();
         let today = utc_date_label();
 
-        // Reserved label via the persisted file → falls through to UTC date.
-        persist_active_engagement(&dir, "test").unwrap();
+        // A pre-existing/stale `test` active-engagement file (e.g. left by an
+        // old fixture run) must NOT route live appends to the fixture — the
+        // resolver falls through to the UTC date. Write the file directly to
+        // simulate the stale pin (persist_active_engagement now rejects writing
+        // a reserved label outright — see persist_rejects_reserved_label).
+        fs::write(dir.join(ACTIVE_ENGAGEMENT_FILENAME), "test\n").unwrap();
         assert_eq!(
             resolve_active_engagement_with_env(&dir, None),
             today,
@@ -3925,6 +3974,35 @@ mod ledger_tests {
         assert!(is_reserved_fixture_engagement("test"));
         assert!(is_reserved_fixture_engagement("Test"));
         assert!(!is_reserved_fixture_engagement("2026-06-09"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// independent-auditor LOW (2026-06-09): persisting a reserved label is
+    /// rejected loudly rather than silently accepted-then-ignored, so
+    /// `rally enter --engagement test` fails with a clear usage error instead
+    /// of appearing to work while the resolver silently uses the dated segment.
+    #[test]
+    fn persist_rejects_reserved_label() {
+        let root = unique_root("engagement-persist-reserved");
+        let dir = root.join(".rally");
+        fs::create_dir_all(&dir).unwrap();
+
+        let err = persist_active_engagement(&dir, "test").unwrap_err();
+        assert!(
+            err.to_string().contains("reserved"),
+            "persisting a reserved label must error with 'reserved'; got: {err}"
+        );
+        // Case-insensitive.
+        assert!(persist_active_engagement(&dir, "TEST").is_err());
+        // The file must not have been written.
+        assert!(
+            !dir.join(ACTIVE_ENGAGEMENT_FILENAME).exists(),
+            "a rejected reserved label must not leave an active-engagement file"
+        );
+        // A normal label still persists fine.
+        persist_active_engagement(&dir, "sprint-9").unwrap();
+        assert_eq!(resolve_active_engagement_with_env(&dir, None), "sprint-9");
 
         fs::remove_dir_all(&root).ok();
     }

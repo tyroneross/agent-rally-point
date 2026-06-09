@@ -1547,29 +1547,50 @@ fn command_release_by_path(
     // A claim matches a `--path` release when its scope covers a requested
     // path AND the caller is authorized to release it. Authorization is either:
     //   (a) the caller OWNS the claim (the original owner-self-release path), OR
-    //   (b) AUTHORIZED TAKEOVER — the claim's owner is liveness-stale (squad
-    //       idle > 15m) so a peer/lead may reclaim it. This closes fact_182e8
-    //       gap 1: a dead owner's claims could never be cleared because release
-    //       was strictly owner-only ("no live claim by <me> matches").
-    // Takeover reuses the TTL-primary stale-owner signal — no new liveness
-    // engine (lesson 2026-06-07-managed-session-liveness-ttl-primary).
-    let stale_owners = snapshot.stale_owner_tools();
-    let scope_match = |c: &&Fact| {
+    //   (b) AUTHORIZED TAKEOVER — the claim's owner is takeover-eligible-stale
+    //       (>2h total silence, NOT the 15-min advisory idle) so a peer/lead may
+    //       reclaim it. This closes fact_182e8 gap 1: a dead owner's claims
+    //       could never be cleared because release was strictly owner-only.
+    // The 2h destructive bar (vs 15m advisory) prevents reclaiming a busy-but-
+    // quiet live agent's claim (independent-auditor HIGH, 2026-06-09).
+    //
+    // Scope matching differs by arm to fix the auditor's MED asymmetry:
+    //   - SELF release keeps the pre-existing EXACT scope match (unchanged
+    //     contract; an owner releases the exact scope string it claimed).
+    //   - TAKEOVER uses `path_matches_scope` so a stale DIRECTORY claim (e.g.
+    //     `file:src`) that `before-write` flagged reclaimable for `src/foo.rs`
+    //     can actually be released via that same path — the two surfaces now
+    //     agree (lesson: a WARN that points at an unrunnable command is a bug).
+    let takeover_owners = snapshot.takeover_eligible_owners();
+    let exact_scope_match = |c: &&Fact| {
         c.scope
             .iter()
             .any(|cs| want_paths.iter().any(|wp| wp == cs))
+    };
+    let takeover_scope_match = |c: &&Fact| {
+        c.scope.iter().any(|cs| {
+            want_paths.iter().any(|wp| {
+                wp == cs
+                    || wp
+                        .strip_prefix("file:")
+                        .is_some_and(|p| crate::path_matches_scope(cs, p))
+            })
+        })
     };
     let matches: Vec<&Fact> = snapshot
         .active_claims
         .iter()
         .filter(|c| {
             let owned = c.tool.as_deref() == Some(tool);
+            if owned {
+                return exact_scope_match(c);
+            }
             let stale_takeover = c
                 .tool
                 .as_deref()
-                .map(|o| o != tool && stale_owners.contains(o))
+                .map(|o| takeover_owners.contains(o))
                 .unwrap_or(false);
-            (owned || stale_takeover) && scope_match(c)
+            stale_takeover && takeover_scope_match(c)
         })
         .collect();
     // Did at least one match come from a stale-owner takeover (not self)?
@@ -1590,7 +1611,7 @@ fn command_release_by_path(
             .active_claims
             .iter()
             .filter(|c| c.tool.as_deref() != Some(tool))
-            .filter(scope_match)
+            .filter(takeover_scope_match)
             .collect();
         let listing = if mine.is_empty() {
             format!("(none — {tool} has no open claims in this room)")
@@ -1615,9 +1636,10 @@ fn command_release_by_path(
                 .filter_map(|c| c.tool.clone())
                 .collect();
             format!(
-                "\nNote: those paths are claimed by still-live peer(s) [{}]; \
-                 a takeover release is only authorized once their presence goes \
-                 stale (>15m idle).",
+                "\nNote: those paths are claimed by peer(s) [{}] that are not \
+                 takeover-eligible; an authorized takeover release is only \
+                 permitted once an owner has been totally silent >2h (a 15m idle \
+                 window is advisory only, not enough to reclaim a claim).",
                 owners.join(", ")
             )
         };
@@ -8620,8 +8642,8 @@ mod tests {
         );
         let before = room.snapshot().unwrap();
         assert!(
-            before.stale_owner_tools().contains("dead-owner"),
-            "dead-owner must project as liveness-stale; squads={:?}",
+            before.takeover_eligible_owners().contains("dead-owner"),
+            "a 2-day-stale dead-owner must be takeover-eligible (>2h silent); squads={:?}",
             before.squads
         );
 
@@ -8679,12 +8701,12 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
-        // alpha claims now → squad is active (not stale).
+        // alpha claims now → not takeover-eligible (well under 2h).
         let live_id = append_claim(&room, "alpha", "src/foo.rs", "active work");
         let before = room.snapshot().unwrap();
         assert!(
-            !before.stale_owner_tools().contains("alpha"),
-            "freshly-claiming alpha must be live, not stale"
+            !before.takeover_eligible_owners().contains("alpha"),
+            "freshly-claiming alpha must not be takeover-eligible"
         );
 
         let result = command_release_by_path(
@@ -8709,8 +8731,8 @@ mod tests {
         );
         let msg = result.err().unwrap().to_string();
         assert!(
-            msg.contains("still-live peer"),
-            "error must explain the live-peer block; got: {msg}"
+            msg.contains("not takeover-eligible"),
+            "error must explain the not-takeover-eligible block; got: {msg}"
         );
 
         // Claim survives.
@@ -8719,6 +8741,131 @@ mod tests {
             after.active_claims.iter().any(|c| c.event_id == live_id),
             "live owner's claim must survive a rejected takeover"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// independent-auditor HIGH (2026-06-09): a BUSY-BUT-QUIET owner — idle past
+    /// the 15-minute advisory threshold but well under the 2h takeover bar —
+    /// must NOT have its claim reclaimed. before-write may WARN (advisory), but
+    /// the destructive takeover release must refuse. This is the regression the
+    /// two-tier threshold prevents (a long build with no Rally write != dead).
+    #[test]
+    fn busy_but_quiet_owner_is_warnable_but_not_takeover_eligible() {
+        let root = unique_root("busy-quiet-owner");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // Claim 30 minutes ago: past 15m idle, under 2h takeover bar.
+        let thirty_min_ago = (chrono::Utc::now() - chrono::Duration::minutes(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let live_id = append_stale_claim(
+            &room,
+            "busy-builder",
+            "src/foo.rs",
+            "long build, no rally write in 30m",
+            &thirty_min_ago,
+        );
+        let snap = room.snapshot().unwrap();
+        assert!(
+            snap.idle_owner_tools().contains("busy-builder"),
+            "30m-quiet owner IS idle (advisory)"
+        );
+        assert!(
+            !snap.takeover_eligible_owners().contains("busy-builder"),
+            "30m-quiet owner must NOT be takeover-eligible (needs >2h)"
+        );
+
+        // before-write downgrades to a reclaimable WARN (advisory), not a stop.
+        let mut findings = Vec::new();
+        crate::check::check_before_write_for_test(
+            &snap,
+            "peer",
+            Some("src/foo.rs"),
+            &mut findings,
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|(code, sev)| *code == "stale-owner-claim" && *sev == "warn"),
+            "before-write must WARN (not stop) on a 30m-idle owner; got {findings:?}"
+        );
+
+        // But the destructive takeover release REFUSES.
+        let result = command_release_by_path(
+            &room,
+            "peer",
+            &["file:src/foo.rs".to_string()],
+            None,
+            None,
+            "premature takeover".to_string(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            true,
+            Vec::new(),
+        );
+        assert!(
+            result.is_err(),
+            "takeover of a busy-but-quiet (30m) owner must be refused"
+        );
+
+        let after = room.snapshot().unwrap();
+        assert!(
+            after.active_claims.iter().any(|c| c.event_id == live_id),
+            "busy-but-quiet owner's claim must survive"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// independent-auditor MED (2026-06-09): a stale DIRECTORY claim (`file:src`)
+    /// that before-write flags reclaimable for `src/foo.rs` must ALSO be
+    /// releasable via that path — the takeover scope match uses `path_matches_scope`
+    /// so the WARN points at a command that actually works.
+    #[test]
+    fn takeover_release_matches_stale_directory_claim_by_contained_path() {
+        let root = unique_root("takeover-dir-claim");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // dead-owner holds a 2-day-stale DIRECTORY claim on `src`.
+        let dir_claim = append_stale_claim(
+            &room,
+            "dead-owner",
+            "src",
+            "directory-scope claim from a dead session",
+            "2026-06-02T10:00:00Z",
+        );
+
+        // A peer reclaims it via a contained file path.
+        let out = command_release_by_path(
+            &room,
+            "lead",
+            &["file:src/foo.rs".to_string()],
+            None,
+            None,
+            "reclaim stale dir claim via contained path".to_string(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            true,
+            Vec::new(),
+        )
+        .expect("takeover must match a stale directory claim by a contained path");
+
+        let after = room.snapshot().unwrap();
+        assert!(
+            !after.active_claims.iter().any(|c| c.event_id == dir_claim),
+            "stale directory claim must be released via the contained-path takeover"
+        );
+        let _ = out;
 
         std::fs::remove_dir_all(&root).ok();
     }
