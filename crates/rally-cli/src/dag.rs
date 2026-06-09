@@ -114,6 +114,9 @@ pub(crate) fn extract_parent_step_ids(fact: &Fact) -> Vec<String> {
     fact.scope
         .iter()
         .filter_map(|s| s.strip_prefix("parent-step:").map(str::to_string))
+        // Skip an empty id: a bare `parent-step:` marker (e.g. from an empty
+        // `--parent-step ""` value) must not produce a phantom DAG edge.
+        .filter(|id| !id.is_empty())
         .collect()
 }
 
@@ -445,6 +448,33 @@ mod tests {
             uri: None,
             session: None,
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // extract_parent_step_ids — empty-value filtering (f3)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn extract_parent_step_ids_skips_empty_marker() {
+        // A bare `parent-step:` marker (the shape an empty `--parent-step ""`
+        // value would write) must not yield an empty parent id / phantom edge.
+        let fact = make_fact(
+            "say",
+            "agent:c",
+            vec![
+                "run:r1".to_string(),
+                "step:c".to_string(),
+                "parent-step:".to_string(),
+                "parent-step:a".to_string(),
+            ],
+            None,
+        );
+        let parents = extract_parent_step_ids(&fact);
+        assert_eq!(
+            parents,
+            vec!["a".to_string()],
+            "empty parent-step marker must be filtered; got {parents:?}"
+        );
     }
 
     // -------------------------------------------------------------------------

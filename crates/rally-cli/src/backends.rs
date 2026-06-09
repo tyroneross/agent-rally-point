@@ -335,8 +335,13 @@ impl BackendRunner {
     }
 
     pub(crate) fn inject_commands(&self, target: &str, text: &str) -> Vec<Vec<String>> {
+        // Sanitize ONCE here, before backend dispatch, so EVERY backend (tmux,
+        // cmux, and any future one) receives control-stripped text and no future
+        // caller can route around the paste-breakout hardening. Downstream
+        // framers/senders must treat their input as already-sanitized.
+        let text = sanitize_inject_text(text);
         match self.backend {
-            Backend::Tmux => tmux_inject_commands(&self.tmux_bin, target, text),
+            Backend::Tmux => tmux_inject_commands(&self.tmux_bin, target, &text),
             // cmux kept as the separate-submit sequence: its `send` subcommand
             // accepts literal text only (and `send-key <name>` named keys) —
             // there is no raw-byte / hex write equivalent to tmux's
@@ -344,9 +349,11 @@ impl BackendRunner {
             // ESC[201~ + CR) cannot be expressed. `send-key enter` submits as a
             // discrete key, which works for cmux's own TUI; the framed-write
             // fix is tmux-specific (where Codex's bracketed-paste TUI lives).
+            // cmux now also receives sanitized text (intended hardening): a
+            // control byte in a cmux `send` could otherwise inject keystrokes.
             Backend::Cmux => vec![
                 cmd![&self.cmux_bin, "send-key", "--workspace", target, "ctrl+u"],
-                cmd![&self.cmux_bin, "send", "--workspace", target, text],
+                cmd![&self.cmux_bin, "send", "--workspace", target, &text],
                 cmd![&self.cmux_bin, "send-key", "--workspace", target, "enter"],
             ],
         }
@@ -485,21 +492,23 @@ fn sanitize_inject_text(text: &str) -> String {
 /// §4.1/§4.2, Apache-2.0, same author — reimplemented here so this repo stays
 /// self-contained with no path dependency on ptyd).
 ///
-/// The body is first run through [`sanitize_inject_text`] so it cannot carry
-/// its own paste-end marker or control bytes (paste-breakout hardening).
+/// PURE FRAMER — input MUST be pre-sanitized. The paste-breakout hardening
+/// ([`sanitize_inject_text`]) is applied at the single chokepoint
+/// [`BackendRunner::inject_commands`], before backend dispatch, so this framer
+/// assumes its body carries no control bytes / paste-end marker. Do NOT feed it
+/// raw, attacker-controllable text directly — route through `inject_commands`.
 ///
-/// Layout: `ESC[200~ <sanitized-body> ESC[201~` followed by a single CR placed
-/// **after** the closing bracketed-paste marker — never inside the frame, where
+/// Layout: `ESC[200~ <body> ESC[201~` followed by a single CR placed **after**
+/// the closing bracketed-paste marker — never inside the frame, where
 /// bracketed-paste semantics would paste the CR as literal text instead of
 /// submitting (§4.2). A paste-aware TUI (codex) treats the wrapped body as a
 /// paste; the trailing CR then submits the prompt. The separate-Enter sequence
 /// this replaces empirically failed against Codex's TUI: the message landed in
 /// the input box but never submitted.
 fn frame_line_bytes(text: &str) -> Vec<u8> {
-    let body = sanitize_inject_text(text);
-    let mut out = Vec::with_capacity(body.len() + PASTE_START.len() + PASTE_END.len() + 1);
+    let mut out = Vec::with_capacity(text.len() + PASTE_START.len() + PASTE_END.len() + 1);
     out.extend_from_slice(PASTE_START);
-    out.extend_from_slice(body.as_bytes());
+    out.extend_from_slice(text.as_bytes());
     out.extend_from_slice(PASTE_END);
     out.push(CR);
     out
@@ -789,8 +798,11 @@ mod tests {
         // A malicious body carrying its own ESC[201~ (+ a shell line + CR) must
         // NOT close the frame early. The ESC and CR are control bytes and are
         // stripped; only printable residue survives, safely inside the frame.
+        // Sanitization now happens at the inject_commands chokepoint (not inside
+        // frame_line_bytes), so this exercises the real pipeline order
+        // sanitize -> frame, which is exactly what inject_commands does.
         let attack = "ok\x1b[201~rm -rf /\r";
-        let got = frame_line_bytes(attack);
+        let got = frame_line_bytes(&sanitize_inject_text(attack));
         // There must be exactly ONE close marker in the output: the framer's own.
         let occurrences = got
             .windows(PASTE_END.len())

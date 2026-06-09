@@ -1193,7 +1193,12 @@ fn command_say(args: SayArgs) -> Result<Output> {
     }
     // One `parent-step:<id>` marker per value — a task with multiple `depends_on`
     // entries records one DAG edge per (parent, step). Zero values writes none.
+    // Skip empty values: an empty `--parent-step` would write a `parent-step:`
+    // marker with no id, producing a phantom DAG edge to/from "".
     for parent_step_id in &args.parent_step_ids {
+        if parent_step_id.is_empty() {
+            continue;
+        }
         lineage_scope.push(format!("parent-step:{parent_step_id}"));
     }
     // Merge lineage into scope (before external-intake check, which runs later).
