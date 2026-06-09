@@ -7,6 +7,8 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+- Hardened the fan-out path: `workstream-lint.mjs` now also rejects shell-unsafe `output` and `owns`/`id` chars; the empirical packet gate runs in CI (`rally-gate.yml` builds the release binary + runs the node suite); empty `--parent-step` values no longer write phantom DAG edges; and inject sanitization is hoisted to the `inject_commands` chokepoint so every backend (tmux + cmux) is covered.
+
 ### `packet.mjs` fan-out now generates CLI-executable rally commands (2026-06-09)
 
 Fixes four findings where the emitted fan-out packet named rally markers that the

@@ -11,7 +11,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Test
         run: cargo test
+      - name: Build release binary (arms the empirical packet gate)
+        run: cargo build --release -p rally-cli
+      - name: dynamic-workflows node tests (empirical gate ARMED)
+        working-directory: dynamic-workflows
+        run: node --test "tests/**/*.test.mjs"
       - name: Rally coordination gate
         run: cargo run -p rally-cli -- check before-complete --tool ci --json
