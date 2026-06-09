@@ -7,6 +7,33 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### `packet.mjs` fan-out now generates CLI-executable rally commands (2026-06-09)
+
+Fixes four findings where the emitted fan-out packet named rally markers that the
+real CLI rejected — escaped review because the tests asserted marker *presence*,
+not executability against the binary.
+
+- **Repeated `--path` on `before-write` (HIGH).** `renderRallyLoop` emitted one
+  `rally check before-write --tool <t> --path a --path b --strict` line, but
+  `rally check` rejects repeated `--path`. A multi-owns task failed at its
+  before-write step. Now emits one before-write line per owned path. The claim
+  line is unchanged — `rally say --path` is repeatable.
+- **Repeated `--parent-step` on `rally say` (HIGH).** A task with ≥2 `depends_on`
+  emitted one `--parent-step` per dep, but `rally say` accepted at most one, so
+  the task failed at its first command. Durable fix in the CLI:
+  `SayArgs.parent_step_id` (`Option`) → `parent_step_ids` (`Vec`), one
+  `parent-step:<id>` scope marker written per value, and `dag.rs` now extracts
+  every marker (one DAG edge per parent). Zero/one value behaves exactly as
+  before; existing ledger facts parse unchanged.
+- **Test fixture didn't exercise the multi case (MEDIUM).** Added a
+  2-path-owns/2-`depends_on` fixture and an empirical gate
+  (`packet-empirical.test.mjs`) that dry-runs the emitted claim + before-write
+  lines against the built release binary in a throwaway rally room and asserts
+  `rally dag` shows two parent edges — so flag-arity drift fails tests.
+- **Shell-unsafe descriptor fields (LOW).** `workstream-lint.mjs` now rejects
+  `"`, `$`, or backtick in `intent` (break the emitted `--subject` quoting) and
+  whitespace in any `owns` path (would split into multiple `--path` tokens).
+
 ### `rally inject` now actually submits + waits for an ACK (2026-06-09)
 
 Fixes the long-recurring "inject delivered but never ACKed" signature (L5 /
