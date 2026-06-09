@@ -197,7 +197,10 @@ fn merged_worktree_is_reaped_on_apply_listed_on_dry_run() {
         !report.reaped.is_empty(),
         "apply must have reaped at least one worktree"
     );
-    assert!(!wt.exists(), "worktree directory must be gone after --apply");
+    assert!(
+        !wt.exists(),
+        "worktree directory must be gone after --apply"
+    );
 
     fs::remove_dir_all(&repo).ok();
 }
@@ -244,10 +247,7 @@ fn unmerged_with_live_owner_is_never_reaped() {
     assert!(wt.exists(), "worktree must still exist");
 
     // Confirm the candidate was skipped and the skip reason mentions liveness.
-    let skipped = report
-        .skipped
-        .iter()
-        .find(|s| s.worktree_path == wt);
+    let skipped = report.skipped.iter().find(|s| s.worktree_path == wt);
     assert!(
         skipped.is_some(),
         "unmerged+live must appear in skipped list"
@@ -381,7 +381,10 @@ fn dry_run_makes_no_filesystem_changes() {
     );
 
     // Worktree dir must still exist.
-    assert!(wt.exists(), "dry-run must not remove the worktree directory");
+    assert!(
+        wt.exists(),
+        "dry-run must not remove the worktree directory"
+    );
 
     // Branch list must be unchanged.
     let branches_after = list_branches(&repo);
@@ -419,7 +422,7 @@ fn ttl_boundary_respected() {
     // claude: 2 hours old → stale → reaped.
     // codex:  30 minutes old → live → kept.
     let stale_ts = "2026-06-07T10:00:00Z"; // 2h ago
-    let live_ts = "2026-06-07T11:30:00Z";  // 30m ago
+    let live_ts = "2026-06-07T11:30:00Z"; // 30m ago
 
     let facts = vec![
         make_presence_fact("claude", 1, "state=idle", stale_ts),
@@ -488,7 +491,12 @@ fn live_owner_hyphen_underscore_mismatch_not_reaped() {
 
     // Tool name uses underscores, as registered by `rally run claude`
     // (AgentSpec.tool = "claude_code").  This is the mismatch f1 fixes.
-    let facts = vec![make_presence_fact("claude_code:01", 1, "state=idle", fresh_ts)];
+    let facts = vec![make_presence_fact(
+        "claude_code:01",
+        1,
+        "state=idle",
+        fresh_ts,
+    )];
 
     let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
         repo_root: repo.clone(),
@@ -553,15 +561,14 @@ fn backend_live_stale_by_ttl_not_reaped() {
 
     // Backend probe: returns false (= backend IS alive, NOT dead) for this
     // session so the GC must skip it.
-    let probe: Arc<dyn Fn(&str) -> bool + Send + Sync> =
-        Arc::new(|session_id: &str| -> bool {
-            // `false` = backend is live (session exists); reaper must skip.
-            assert!(
-                session_id == "codex-long-run-01",
-                "probe called with unexpected session_id: {session_id}"
-            );
-            false // backend alive → NOT dead
-        });
+    let probe: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(|session_id: &str| -> bool {
+        // `false` = backend is live (session exists); reaper must skip.
+        assert!(
+            session_id == "codex-long-run-01",
+            "probe called with unexpected session_id: {session_id}"
+        );
+        false // backend alive → NOT dead
+    });
 
     let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
         repo_root: repo.clone(),

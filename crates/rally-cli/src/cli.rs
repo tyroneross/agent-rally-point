@@ -1665,7 +1665,9 @@ fn check_ci_parser() -> impl Parser<CheckCiArgs> {
 fn worktree_gc_parser() -> impl Parser<WorktreeGcArgs> {
     let json = json_flag();
     let apply = long("apply")
-        .help("Execute cleanup on each reapable worktree. Default = dry-run (list only, no changes).")
+        .help(
+            "Execute cleanup on each reapable worktree. Default = dry-run (list only, no changes).",
+        )
         .switch();
     let ttl_secs = string_arg("ttl", "DURATION")
         .parse(|v: String| {
@@ -1674,19 +1676,21 @@ fn worktree_gc_parser() -> impl Parser<WorktreeGcArgs> {
                 return Ok(n);
             }
             if let Some(h) = v.strip_suffix('h') {
-                return h.parse::<u64>().map(|n| n * 3600).map_err(|_| {
-                    RallyError::Usage(format!("invalid --ttl value {v}"))
-                });
+                return h
+                    .parse::<u64>()
+                    .map(|n| n * 3600)
+                    .map_err(|_| RallyError::Usage(format!("invalid --ttl value {v}")));
             }
             if let Some(m) = v.strip_suffix('m') {
-                return m.parse::<u64>().map(|n| n * 60).map_err(|_| {
-                    RallyError::Usage(format!("invalid --ttl value {v}"))
-                });
+                return m
+                    .parse::<u64>()
+                    .map(|n| n * 60)
+                    .map_err(|_| RallyError::Usage(format!("invalid --ttl value {v}")));
             }
             if let Some(s) = v.strip_suffix('s') {
-                return s.parse::<u64>().map_err(|_| {
-                    RallyError::Usage(format!("invalid --ttl value {v}"))
-                });
+                return s
+                    .parse::<u64>()
+                    .map_err(|_| RallyError::Usage(format!("invalid --ttl value {v}")));
             }
             Err(RallyError::Usage(format!("invalid --ttl value {v}")))
         })

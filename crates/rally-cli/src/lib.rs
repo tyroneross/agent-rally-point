@@ -68,10 +68,10 @@ mod rotate;
 mod route_findings;
 mod run_worktree;
 mod session_identity;
-pub mod worktree_gc;
 mod source_grounding;
 mod store;
 mod tier_fit;
+pub mod worktree_gc;
 mod worktree_guard;
 
 use backends::*;
@@ -556,17 +556,20 @@ fn command_worktree_gc(args: WorktreeGcArgs) -> Result<Output> {
     // session and returns Stale when the backing session is gone.
     // The probe closure captures an Arc of the result map so it is cheap to
     // clone and 'static-safe for the GcConfig field.
-    let backend_liveness_probe: Option<std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>> =
+    let backend_liveness_probe: Option<worktree_gc::BackendLivenessProbe> =
         room_result.ok().and_then(|room| {
             active_session_facts(&room).ok().map(|active| {
                 let liveness_map = probe_session_liveness(&active, bins);
                 let arc_map = std::sync::Arc::new(liveness_map);
-                let probe: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync> =
+                let probe: worktree_gc::BackendLivenessProbe =
                     std::sync::Arc::new(move |session_id: &str| -> bool {
                         // Returns true when the backend is DEAD (Stale), allowing the GC
                         // to proceed; false when still Live or Unknown (conservative skip).
                         matches!(
-                            arc_map.get(session_id).copied().unwrap_or(SessionLiveness::Unknown),
+                            arc_map
+                                .get(session_id)
+                                .copied()
+                                .unwrap_or(SessionLiveness::Unknown),
                             SessionLiveness::Stale
                         )
                     });
@@ -2367,7 +2370,12 @@ fn watch_run_on_activity(
 /// Render a launchd plist referencing this binary + the current working dir.
 /// Pure (returns the plist string) so it is unit-testable without spawning a
 /// live binary; takes only the `WatchArgs` fields it needs.
-fn render_launchd_plist(interval: u64, on_activity: Option<&str>, exe: &Path, repo: &Path) -> String {
+fn render_launchd_plist(
+    interval: u64,
+    on_activity: Option<&str>,
+    exe: &Path,
+    repo: &Path,
+) -> String {
     let label = format!(
         "com.agent-rally-point.watch.{}",
         repo.file_name().and_then(|n| n.to_str()).unwrap_or("repo")

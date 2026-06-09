@@ -44,6 +44,12 @@ use std::sync::Arc;
 
 use crate::run_worktree;
 
+/// Backend-liveness probe: given a per-agent `session_id`, returns `true` when
+/// the backing tmux/cmux session is confirmed gone (dead) and `false` when it
+/// is still live. Shared between `GcConfig` and the `lib.rs` call site so the
+/// `Arc<dyn Fn(...)>` shape lives in exactly one place (clippy::type_complexity).
+pub type BackendLivenessProbe = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -97,7 +103,7 @@ pub struct GcConfig {
     /// `None` → no backend probe is performed (TTL-only staleness is
     /// sufficient).  This preserves backward-compatibility for callers that
     /// do not have a tmux/cmux binary available.
-    pub backend_liveness_probe: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    pub backend_liveness_probe: Option<BackendLivenessProbe>,
 }
 
 /// One GC candidate (may or may not be reaped).
@@ -203,8 +209,10 @@ pub fn run_gc(config: GcConfig) -> Result<GcReport, String> {
         // f4: check both the repo-root resolved path AND the actual process cwd
         // so that running gc from inside a linked worktree protects that linked
         // worktree as well.
-        let is_current_wt = current_wt.as_ref().map_or(false, |p| same_path(p, &entry.path))
-            || cwd_wt.as_ref().map_or(false, |p| same_path(p, &entry.path));
+        let is_current_wt = current_wt
+            .as_ref()
+            .is_some_and(|p| same_path(p, &entry.path))
+            || cwd_wt.as_ref().is_some_and(|p| same_path(p, &entry.path));
         if is_current_wt {
             skipped.push(GcSkipped {
                 worktree_path: entry.path.clone(),
@@ -281,7 +289,10 @@ pub fn run_gc(config: GcConfig) -> Result<GcReport, String> {
         let reason = if merged {
             "branch merged into default".to_string()
         } else {
-            format!("owner stale (>{ttl}s since last presence)", ttl = config.ttl_secs)
+            format!(
+                "owner stale (>{ttl}s since last presence)",
+                ttl = config.ttl_secs
+            )
         };
 
         candidates.push(GcCandidate {
@@ -407,10 +418,7 @@ fn parse_porcelain(output: &str) -> Vec<WorktreeEntry> {
 // ---------------------------------------------------------------------------
 
 fn is_rally_managed(branch: &str, path: &Path) -> bool {
-    branch.starts_with("rally/")
-        || path
-            .components()
-            .any(|c| c.as_os_str() == ".rally")
+    branch.starts_with("rally/") || path.components().any(|c| c.as_os_str() == ".rally")
 }
 
 // ---------------------------------------------------------------------------
@@ -648,9 +656,7 @@ fn is_owner_live(owner_prefix: &str, idx: &LivenessIndex) -> bool {
     // Explicitly stale → not live (short-circuit before checking live set).
     let name_match = |set: &BTreeSet<String>| {
         set.iter().any(|t| {
-            t == &norm_prefix
-                || t.starts_with(&norm_prefix)
-                || norm_prefix.starts_with(t.as_str())
+            t == &norm_prefix || t.starts_with(&norm_prefix) || norm_prefix.starts_with(t.as_str())
         })
     };
     if name_match(&idx.stale_tools) {
@@ -708,7 +714,10 @@ branch refs/heads/rally/codex-bar-01
     #[test]
     fn derive_owner_prefix_extracts_single_word_agent() {
         assert_eq!(derive_owner_prefix("rally/claude-protocol-01"), "claude");
-        assert_eq!(derive_owner_prefix("rally/codex-claim-authority-01"), "codex");
+        assert_eq!(
+            derive_owner_prefix("rally/codex-claim-authority-01"),
+            "codex"
+        );
         assert_eq!(derive_owner_prefix("rally/gemini-foo-01"), "gemini");
     }
 
@@ -718,10 +727,7 @@ branch refs/heads/rally/codex-bar-01
             derive_owner_prefix("rally/claude-code-protocol-01"),
             "claude-code"
         );
-        assert_eq!(
-            derive_owner_prefix("rally/opencode-task-01"),
-            "opencode"
-        );
+        assert_eq!(derive_owner_prefix("rally/opencode-task-01"), "opencode");
     }
 
     #[test]

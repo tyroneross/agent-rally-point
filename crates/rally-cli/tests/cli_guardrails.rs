@@ -3,7 +3,7 @@
 
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -45,7 +45,7 @@ impl Workspace {
     }
 
     /// Create a workspace under an explicit parent directory while sharing HOME.
-    fn new_with_home_in(name: &str, parent: &PathBuf, home: PathBuf) -> Self {
+    fn new_with_home_in(name: &str, parent: &Path, home: PathBuf) -> Self {
         let cwd = parent.join(format!("{name}-cwd"));
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
