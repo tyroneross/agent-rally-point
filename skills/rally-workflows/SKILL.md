@@ -35,6 +35,11 @@ Write a JSON workstream descriptor per `../../dynamic-workflows/PROTOCOL.md` (§
 top-level fields: `workstream` (objective), `description` (drop-in context), `tasks` (non-empty).
 Each task needs `id` (unique), `intent`, `owns`, `validation`, `output`.
 
+To go from a *vague goal* to this descriptor host-neutrally (pick the partition axis, derive
+disjoint `owns` from each task's output path, write deterministic `validation`, defer to the
+target repo's domain skill for task content), follow [`references/decomposition.md`](references/decomposition.md)
+— it ends with a copy-pasteable worked example.
+
 - `owns` — either `"read-only"` or a non-empty array of path strings. Paths across write-tasks must
   be **disjoint** (no prefix overlap). That MECE guarantee is what lets agents run in parallel.
 - `validation` — a deterministic shell command (no `Date.now()`, `Math.random()`, `new Date()`).
@@ -71,6 +76,25 @@ packet. Prompt each subagent with its `owns`, `validation`, and `output` only �
 
 No prose after that block. The orchestrating agent collects results; it does not trust them
 without re-running validation for any shared-impact change.
+
+## 2.5 · Generate packets — descriptor → ready-to-paste prompts
+
+Don't hand-write each subagent prompt. Once the descriptor lints clean, render one packet per task
+mechanically:
+
+```bash
+node dynamic-workflows/core/packet.mjs my.workstream.json --run <run_id>            # all tasks → stdout
+node dynamic-workflows/core/packet.mjs my.workstream.json --run <run_id> --task p01 # one task
+node dynamic-workflows/core/packet.mjs my.workstream.json --run <run_id> --out ./packets --tool-prefix <prefix>
+```
+
+Each packet embeds the task intent, its `owns` boundary, the per-task rally loop with
+`--run`/`--step`/`--parent-step` already filled in, the `validation` command, the output contract,
+and the one-JSON-result discipline (§2) — the mechanical version of what an orchestrator did by hand.
+The packet is **host-agnostic text**: your host's own spawn mechanism (subagent tool, a new
+terminal, or a paste to a human) consumes it. `packet.mjs` re-lints and refuses a descriptor that
+isn't clean, so it is also a second guardrail. The rally `<TOOL>` id per task is `<prefix>:<task-id>`
+(`--tool-prefix`, default `agent`).
 
 ## 3 · Tier 2 — cross-host fan-out
 
