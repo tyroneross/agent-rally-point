@@ -1,5 +1,5 @@
 {
-  "$comment": "Agent Rally Point plugin hooks — auto-loaded by Claude Code at this standard path (do NOT also declare a 'hooks' key in .claude-plugin/plugin.json; see reference_plugin_hooks_autoload.md). The hook self-gates on .rally/ presence (silent no-op if absent) and fail-opens (never blocks). Advisory by default; export RALLY_HOOK_STRICT=1 to hard-block on high-severity coordination signals. Minimal surface: SessionStart for room awareness, PreToolUse for deconflict before edits.",
+  "$comment": "Agent Rally Point plugin hooks — auto-loaded by Claude Code at this standard path (do NOT also declare a 'hooks' key in .claude-plugin/plugin.json; see reference_plugin_hooks_autoload.md). The hook self-gates on .rally/ presence (silent no-op if absent) and fail-opens (never blocks). Advisory by default; export RALLY_HOOK_STRICT=1 to hard-block on high-severity coordination signals. Cadence parity with Codex (.codex/hooks.json): SessionStart=room awareness, UserPromptSubmit=per-turn presence refresh (idle), PreToolUse=deconflict before edits (kept edit-scoped on purpose — avoids firing on every read/bash tool), Stop=after-write.",
   "hooks": {
     "SessionStart": [
       {
@@ -12,6 +12,17 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5000,
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh idle claude_code"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit|NotebookEdit",
@@ -20,6 +31,17 @@
             "type": "command",
             "timeout": 10000,
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh before-write claude_code"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5000,
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh after-write claude_code"
           }
         ]
       }

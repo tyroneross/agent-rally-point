@@ -52,7 +52,12 @@ the portable project config is already committed.
 | Event | Action |
 |------|--------|
 | `SessionStart` | Calls `rally enter` so the agent registers presence on turn 1. Surfaces a short context line from `rally room` / `rally next` (active peers, claimed paths, suggested next) so a fresh agent is rally-aware without a manual nudge. |
+| `UserPromptSubmit` | Per-turn presence refresh (hook phase `idle`). Re-surfaces active peers / open claims / suggested next from `rally next` at the start of each turn, so Claude stays rally-aware during long read/explore phases instead of only re-checking at the moment it edits. Advisory `additionalContext`; emits `{}` when the room is quiet. This is the key parity fix — Codex already touches rally continuously; Claude previously only did so right before a write. |
 | `PreToolUse(Edit\|Write\|MultiEdit)` | Extracts the target file path from the tool input envelope, calls `rally check before-write --path <p>`, and (when the path is unclaimed and the check allows) auto-claims it. On a conflict, surfaces an `additionalContext` warning to the agent. `rally check` already records the durable audit fact. |
+| `Stop` | At turn end (hook phase `after-write`), runs `rally next` and surfaces any pending coordination obligation as an advisory `systemMessage`. Parity with Codex's `Stop` hook; never blocks turn completion (strict mode is the only path that can emit `decision: block`). |
+
+
+**Why PreToolUse stays edit-scoped (deliberate).** Codex's `.codex/hooks.json` wires PreToolUse with *no matcher*, so it fires `before-write` on every tool call — consistent, but it spawns the hook + watchdog on reads/bash/etc. that have no file path and no-op. Claude keeps the `Edit|Write|MultiEdit|NotebookEdit` matcher for `before-write` and instead gets continuous awareness from the cheaper `UserPromptSubmit` (idle) refresh + `Stop` (after-write). Same coordination footprint as Codex, without per-tool overhead.
 
 **Charter — advisory-only (default).** Coordination is recorded + exposed,
 never enforced. The hook NEVER emits `permissionDecision: "deny"` or

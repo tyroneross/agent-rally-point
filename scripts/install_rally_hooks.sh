@@ -6,7 +6,7 @@
 # coordination hook into a coding host's settings.
 #
 # What it does (Claude Code):
-#   Writes/merges the SessionStart + PreToolUse(Edit|Write|MultiEdit) entries
+#   Writes/merges the SessionStart + UserPromptSubmit + PreToolUse(Edit|Write|MultiEdit) + Stop entries
 #   in ~/.claude/settings.json so the host fires
 #   hooks/rally-coordination-hook.sh automatically. The hook self-gates on
 #   missing .rally/, so it is safe to install globally.
@@ -108,7 +108,9 @@ fi
 
 # Marker commands — identify-by-substring on uninstall.
 HOOK_CMD_START="$HOOK_PATH start claude_code"
+HOOK_CMD_IDLE="$HOOK_PATH idle claude_code"
 HOOK_CMD_PRETOOL="$HOOK_PATH before-write claude_code"
+HOOK_CMD_STOP="$HOOK_PATH after-write claude_code"
 
 # --- read existing settings -----------------------------------------------
 mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
@@ -127,6 +129,8 @@ compute_new_jq() {
     printf '%s' "$OLD_JSON" | jq \
       --arg start_cmd "$HOOK_CMD_START" \
       --arg pretool_cmd "$HOOK_CMD_PRETOOL" \
+      --arg idle_cmd "$HOOK_CMD_IDLE" \
+      --arg stop_cmd "$HOOK_CMD_STOP" \
       --arg matcher "Edit|Write|MultiEdit|NotebookEdit" \
       '
       # Ensure hooks object
@@ -147,6 +151,18 @@ compute_new_jq() {
           | map(select(.hooks | length > 0))
           + [ { "matcher": $matcher, "hooks": [ { "type": "command", "command": $pretool_cmd } ] } ]
         ))
+      | .hooks.UserPromptSubmit //= []
+      | (.hooks.UserPromptSubmit |= (
+          map(.hooks //= [] | .hooks |= map(select(.command // "" | contains("rally-coordination-hook.sh idle") | not)))
+          | map(select(.hooks | length > 0))
+          + [ { "hooks": [ { "type": "command", "command": $idle_cmd } ] } ]
+        ))
+      | .hooks.Stop //= []
+      | (.hooks.Stop |= (
+          map(.hooks //= [] | .hooks |= map(select(.command // "" | contains("rally-coordination-hook.sh after-write") | not)))
+          | map(select(.hooks | length > 0))
+          + [ { "hooks": [ { "type": "command", "command": $stop_cmd } ] } ]
+        ))
       '
   else
     # uninstall: strip any rally-coordination-hook entries; drop empty arrays.
@@ -162,8 +178,20 @@ compute_new_jq() {
           | map(.hooks //= [] | .hooks |= map(select(.command // "" | contains("rally-coordination-hook.sh") | not)))
           | map(select(.hooks | length > 0))
         )
+        | .hooks.UserPromptSubmit = (
+          (.hooks.UserPromptSubmit // [])
+          | map(.hooks //= [] | .hooks |= map(select(.command // "" | contains("rally-coordination-hook.sh") | not)))
+          | map(select(.hooks | length > 0))
+        )
+        | .hooks.Stop = (
+          (.hooks.Stop // [])
+          | map(.hooks //= [] | .hooks |= map(select(.command // "" | contains("rally-coordination-hook.sh") | not)))
+          | map(select(.hooks | length > 0))
+        )
         | (if (.hooks.SessionStart | length) == 0 then del(.hooks.SessionStart) else . end)
         | (if (.hooks.PreToolUse  | length) == 0 then del(.hooks.PreToolUse)  else . end)
+        | (if (.hooks.UserPromptSubmit | length) == 0 then del(.hooks.UserPromptSubmit) else . end)
+        | (if (.hooks.Stop | length) == 0 then del(.hooks.Stop) else . end)
         | (if (.hooks | length) == 0 then del(.hooks) else . end)
       else . end
     '
@@ -175,6 +203,8 @@ compute_new_python() {
   ACTION_ENV="$action" \
   START_CMD="$HOOK_CMD_START" \
   PRETOOL_CMD="$HOOK_CMD_PRETOOL" \
+  IDLE_CMD="$HOOK_CMD_IDLE" \
+  STOP_CMD="$HOOK_CMD_STOP" \
   MATCHER="Edit|Write|MultiEdit|NotebookEdit" \
   OLD_JSON_ENV="$OLD_JSON" \
   python3 - <<'PY'
@@ -193,6 +223,8 @@ if not isinstance(data, dict):
 action = os.environ["ACTION_ENV"]
 start_cmd = os.environ["START_CMD"]
 pretool_cmd = os.environ["PRETOOL_CMD"]
+idle_cmd = os.environ["IDLE_CMD"]
+stop_cmd = os.environ["STOP_CMD"]
 matcher = os.environ["MATCHER"]
 
 MARKER = "rally-coordination-hook.sh"
@@ -224,14 +256,28 @@ if action == "install":
     pt.append({"matcher": matcher, "hooks": [{"type": "command", "command": pretool_cmd}]})
     hooks["PreToolUse"] = pt
 
+    ups = strip(hooks.get("UserPromptSubmit"), "rally-coordination-hook.sh idle")
+    ups.append({"hooks": [{"type": "command", "command": idle_cmd}]})
+    hooks["UserPromptSubmit"] = ups
+
+    st = strip(hooks.get("Stop"), "rally-coordination-hook.sh after-write")
+    st.append({"hooks": [{"type": "command", "command": stop_cmd}]})
+    hooks["Stop"] = st
+
     data["hooks"] = hooks
 else:  # uninstall
     ss = strip(hooks.get("SessionStart"), MARKER)
     pt = strip(hooks.get("PreToolUse"), MARKER)
+    ups = strip(hooks.get("UserPromptSubmit"), MARKER)
+    st = strip(hooks.get("Stop"), MARKER)
     if ss: hooks["SessionStart"] = ss
     elif "SessionStart" in hooks: del hooks["SessionStart"]
     if pt: hooks["PreToolUse"] = pt
     elif "PreToolUse" in hooks: del hooks["PreToolUse"]
+    if ups: hooks["UserPromptSubmit"] = ups
+    elif "UserPromptSubmit" in hooks: del hooks["UserPromptSubmit"]
+    if st: hooks["Stop"] = st
+    elif "Stop" in hooks: del hooks["Stop"]
     if hooks:
         data["hooks"] = hooks
     elif "hooks" in data:
@@ -331,7 +377,7 @@ fi
 
 if [ "$ACTION" = "install" ] && [ "$DRY_RUN" = "0" ] && [ "$CLAUDE_CHANGED" = "1" ]; then
   say ""
-  say "Installed. Hook will fire on Claude Code SessionStart + PreToolUse(Edit|Write|MultiEdit)."
+  say "Installed. Hook will fire on Claude Code SessionStart + UserPromptSubmit + PreToolUse(Edit|Write|MultiEdit) + Stop."
   say "Self-gates outside rally repos (.rally/ absent → exit 0)."
   say "Strict mode (off by default): export RALLY_HOOK_STRICT=1"
   say "Uninstall: $0 --uninstall"

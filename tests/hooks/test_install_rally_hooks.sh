@@ -39,7 +39,7 @@ jget() {
 }
 
 # ----------------------------------------------------------------------
-# Test 1: install from empty — creates the two entries
+# Test 1: install from empty — creates the four rally entries
 # ----------------------------------------------------------------------
 T="install from empty settings.json"
 H="$(scratch_home)"
@@ -51,11 +51,14 @@ if [ "$rc" != "0" ]; then bad "$T" "rc=$rc"; else
   else
     n_ss=$(python3 -c "import json; d=json.load(open('$settings')); print(len(d.get('hooks',{}).get('SessionStart',[])))" 2>/dev/null)
     n_pt=$(python3 -c "import json; d=json.load(open('$settings')); print(len(d.get('hooks',{}).get('PreToolUse',[])))" 2>/dev/null)
+    n_ups=$(python3 -c "import json; d=json.load(open('$settings')); print(len(d.get('hooks',{}).get('UserPromptSubmit',[])))" 2>/dev/null)
+    n_stop=$(python3 -c "import json; d=json.load(open('$settings')); print(len(d.get('hooks',{}).get('Stop',[])))" 2>/dev/null)
     has_hook=$(grep -c "rally-coordination-hook.sh" "$settings" 2>/dev/null || echo 0)
-    if [ "$n_ss" = "1" ] && [ "$n_pt" = "1" ] && [ "$has_hook" = "2" ]; then
+    # 4 rally entries: SessionStart(start) + UserPromptSubmit(idle) + PreToolUse(before-write) + Stop(after-write)
+    if [ "$n_ss" = "1" ] && [ "$n_pt" = "1" ] && [ "$n_ups" = "1" ] && [ "$n_stop" = "1" ] && [ "$has_hook" = "4" ]; then
       ok "$T"
     else
-      bad "$T" "n_ss=$n_ss n_pt=$n_pt has_hook=$has_hook"
+      bad "$T" "n_ss=$n_ss n_pt=$n_pt n_ups=$n_ups n_stop=$n_stop has_hook=$has_hook"
     fi
   fi
 fi
@@ -101,7 +104,7 @@ rc=$?
 keep_other=$(grep -c "some_other_hook.sh" "$H/.claude/settings.json" 2>/dev/null || echo 0)
 keep_audit=$(grep -c "audit_bash.sh" "$H/.claude/settings.json" 2>/dev/null || echo 0)
 add_rally=$(grep -c "rally-coordination-hook.sh" "$H/.claude/settings.json" 2>/dev/null || echo 0)
-if [ "$rc" = "0" ] && [ "$keep_other" = "1" ] && [ "$keep_audit" = "1" ] && [ "$add_rally" = "2" ]; then
+if [ "$rc" = "0" ] && [ "$keep_other" = "1" ] && [ "$keep_audit" = "1" ] && [ "$add_rally" = "4" ]; then
   ok "$T"
 else
   bad "$T" "rc=$rc keep_other=$keep_other keep_audit=$keep_audit add_rally=$add_rally"

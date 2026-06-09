@@ -193,6 +193,61 @@ chmod +x "$warn_bin"
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Test 8: idle phase (UserPromptSubmit / per-turn refresh) — advisory only
+# ----------------------------------------------------------------------
+T="idle phase: exit 0 + valid JSON + never deny/block (default)"
+(
+  cd "$REPO_ROOT"
+  out=$(RALLY_BIN="$stub_bin" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
+  if ! printf '%s' "$out" | node -e 'try { JSON.parse(require("fs").readFileSync(0,"utf8")||"{}"); process.exit(0);} catch(_){process.exit(1);} ' 2>/dev/null; then
+    printf 'idle: invalid JSON: %s\n' "$out" >&2; exit 1
+  fi
+  if printf '%s' "$out" | grep -q '"permissionDecision":"deny"'; then
+    printf 'idle must never deny: %s\n' "$out" >&2; exit 1
+  fi
+  if printf '%s' "$out" | grep -q '"decision":"block"'; then
+    printf 'idle must never block: %s\n' "$out" >&2; exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "idle must stay advisory"; fi
+
+# ----------------------------------------------------------------------
+# Test 9: after-write phase (Stop) — advisory only, never decision:block
+# ----------------------------------------------------------------------
+T="after-write phase: exit 0 + valid JSON + never block (default)"
+(
+  cd "$REPO_ROOT"
+  out=$(RALLY_BIN="$stub_bin" "$HOOK" after-write claude_code </dev/null 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
+  if ! printf '%s' "$out" | node -e 'try { JSON.parse(require("fs").readFileSync(0,"utf8")||"{}"); process.exit(0);} catch(_){process.exit(1);} ' 2>/dev/null; then
+    printf 'after-write: invalid JSON: %s\n' "$out" >&2; exit 1
+  fi
+  if printf '%s' "$out" | grep -q '"decision":"block"'; then
+    printf 'after-write must never block: %s\n' "$out" >&2; exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "Stop must stay advisory"; fi
+
+# ----------------------------------------------------------------------
+# Test 10: idle + after-write self-gate — no .rally/ → exit 0, empty stdout
+# ----------------------------------------------------------------------
+T="self-gate: idle + after-write outside .rally/ → exit 0 + empty"
+(
+  cd "$tmpdir"
+  for ph in idle after-write; do
+    o=$("$HOOK" "$ph" claude_code </dev/null 2>/dev/null); r=$?
+    if [ "$r" != "0" ] || [ -n "$o" ]; then printf 'phase=%s rc=%s out=[%s]\n' "$ph" "$r" "$o" >&2; exit 1; fi
+  done
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
 # Summary
 # ----------------------------------------------------------------------
 echo ""
