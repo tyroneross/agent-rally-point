@@ -194,6 +194,40 @@ if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 # ----------------------------------------------------------------------
 # ----------------------------------------------------------------------
+# Test 11: anti-spam dedup — idle surfaces once, then silent until changed
+# ----------------------------------------------------------------------
+T="anti-spam: idle repeats are silent ({}), a changed message surfaces again"
+# Stub emits an actionable `next` envelope; message text is controlled by $SUBJ.
+dedup_bin="$tmpdir/rally_dedup"
+cat > "$dedup_bin" <<'EOF'
+#!/usr/bin/env bash
+cat <<JSON
+{"data":{"next":{"actionable":true,"action":"continue_or_release_claim","reason":"${SUBJ:-first message}"}}}
+JSON
+EOF
+chmod +x "$dedup_bin"
+SID="test-dedup-$$"
+(
+  cd "$REPO_ROOT"
+  rm -f ".rally/.hook-seen/${SID}."*".seen" 2>/dev/null
+  # 1st call: state is new -> must surface (non-empty, has additionalContext)
+  o1=$(RALLY_BIN="$dedup_bin" RALLY_SESSION_ID="$SID" SUBJ="alpha" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  # 2nd call: identical state -> must be silent ({})
+  o2=$(RALLY_BIN="$dedup_bin" RALLY_SESSION_ID="$SID" SUBJ="alpha" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  # 3rd call: changed message -> must surface again
+  o3=$(RALLY_BIN="$dedup_bin" RALLY_SESSION_ID="$SID" SUBJ="beta" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  rm -f ".rally/.hook-seen/${SID}."*".seen" 2>/dev/null
+  if ! printf '%s' "$o1" | grep -q "additionalContext"; then printf '1st call should surface: [%s]
+' "$o1" >&2; exit 1; fi
+  if [ "$o2" != "{}" ]; then printf '2nd identical call should be silent, got: [%s]
+' "$o2" >&2; exit 1; fi
+  if ! printf '%s' "$o3" | grep -q "additionalContext"; then printf '3rd changed call should surface: [%s]
+' "$o3" >&2; exit 1; fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "dedup must suppress repeats, surface changes"; fi
+
+# ----------------------------------------------------------------------
 # Test 8: idle phase (UserPromptSubmit / per-turn refresh) — advisory only
 # ----------------------------------------------------------------------
 T="idle phase: exit 0 + valid JSON + never deny/block (default)"

@@ -293,7 +293,8 @@ if [ "$have_node" != "1" ]; then exit 0; fi
 # Default (any other value): force advisory-only.
 strict="${RALLY_HOOK_STRICT:-0}"
 
-printf '%s' "$rally_output" | RALLY_HOOK_STRICT="$strict" node -e '
+rally_root="$(find_rally_root 2>/dev/null || pwd)"
+printf '%s' "$rally_output" | RALLY_HOOK_STRICT="$strict" RALLY_HOOK_ROOT="$rally_root" RALLY_HOOK_SESSION="$session" node -e '
 const fs = require("fs");
 const raw = fs.readFileSync(0, "utf8");
 const phase = process.argv[1] || "idle";
@@ -347,6 +348,28 @@ const message = highSeverity
       ? `⚠️ HIGH-SEVERITY coordination signal (STRICT MODE — BLOCKING): ${rawMessage}`
       : `⚠️ HIGH-SEVERITY coordination signal (advisory — not blocking; rally never enforces): ${rawMessage}`)
   : rawMessage;
+
+// Anti-spam: surface-on-change, not on-poll. On the per-turn phases
+// (idle -> UserPromptSubmit, after-write -> Stop) suppress an identical
+// surface already shown this session — emit {} (a valid empty hook result)
+// so smooth turns stay quiet and only a CHANGED room nudges again. Not
+// applied to `start` (fires once/session) or `before-write` (edit-scoped +
+// conflict-specific — repetition there is intentional).
+if (phase === "idle" || phase === "after-write") {
+  try {
+    const root = process.env.RALLY_HOOK_ROOT || process.cwd();
+    const sess = (process.env.RALLY_HOOK_SESSION || "anon").replace(/[^A-Za-z0-9_.:-]/g, "_");
+    const dir = root + "/.rally/.hook-seen";
+    const file = dir + "/" + sess + "." + phase + ".seen";
+    const key = event + "|" + severity + "|" + rawMessage;
+    let h = 5381; for (let i = 0; i < key.length; i++) { h = ((h * 33) ^ key.charCodeAt(i)) >>> 0; }
+    const sig = String(h);
+    let prev = "";
+    try { prev = fs.readFileSync(file, "utf8"); } catch (_) {}
+    if (prev === sig) { output({}); process.exit(0); }
+    try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(file, sig); } catch (_) {}
+  } catch (_) { /* dedup is best-effort; never block surfacing on an FS error */ }
+}
 
 if (tool === "gemini" || tool.startsWith("gemini")) {
   if (event === "SessionStart" || event === "BeforeAgent") {
