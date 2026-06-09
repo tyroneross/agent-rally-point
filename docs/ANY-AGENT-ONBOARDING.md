@@ -44,6 +44,20 @@ Use `rally say blocker`, `rally say handoff`, `rally say decision`, and
 `rally say resolve` for durable coordination. Do not rely on chat scrollback as
 the source of truth.
 
+## Parallel / fan-out work
+
+When a job splits into independent pieces — review from N perspectives, the same
+change across many files, one task per route or dimension — do not improvise the
+split. Route it through the **rally-workflows** skill
+(`skills/rally-workflows/SKILL.md`): author a JSON *workstream descriptor* (one
+task each with `id` / `intent` / `owns` / `validation` / `output`), lint it with
+`node dynamic-workflows/core/workstream-lint.mjs <descriptor>.json` to prove the
+write boundaries are disjoint (exit 0 = safe), then generate a ready-to-paste
+prompt per task with `node dynamic-workflows/core/packet.mjs <descriptor>.json
+--run <run_id>`. `references/decomposition.md` is the host-neutral procedure for
+turning a vague goal into that descriptor. Rally records and lints the fan-out;
+your host's own spawn mechanism runs the agents.
+
 ## Tool Ids
 
 Use a stable id that names the runtime and, when needed, the lane:
