@@ -463,12 +463,32 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 /// Carriage return — the submit byte.
 const CR: u8 = 0x0D;
 
+/// Strip control bytes from inject text BEFORE it is framed, so the body can
+/// never carry its own bracketed-paste end marker (`ESC[201~`) or a raw submit
+/// CR. Mirrors ptyd's `sanitize_delivery_text` (ptyd `src/termd.rs`,
+/// Apache-2.0) — keep printable chars plus `\t`; drop every C0 control, DEL,
+/// and ESC (0x1B). This closes a paste-breakout: without it, a `--text`
+/// payload containing `ESC[201~` would close the frame early and everything
+/// after it (including a CR) would reach the shell as live keystrokes — the
+/// exact L7/SEC keystroke-injection class. Newline is also dropped here (unlike
+/// ptyd's daemon path, which keeps `\n` as paste content) because this fallback
+/// appends its OWN submit CR after the frame; a body newline could otherwise
+/// submit a partial line inside a non-paste-aware target.
+fn sanitize_inject_text(text: &str) -> String {
+    text.chars()
+        .filter(|&c| c == '\t' || (!c.is_control()))
+        .collect()
+}
+
 /// Build the framed byte string for a submit-delivery, mirroring ptyd's
 /// `frame_line(text, submit=true, paste_frame=true)` (ptyd `src/comms.rs`
 /// §4.1/§4.2, Apache-2.0, same author — reimplemented here so this repo stays
 /// self-contained with no path dependency on ptyd).
 ///
-/// Layout: `ESC[200~ <text-bytes> ESC[201~` followed by a single CR placed
+/// The body is first run through [`sanitize_inject_text`] so it cannot carry
+/// its own paste-end marker or control bytes (paste-breakout hardening).
+///
+/// Layout: `ESC[200~ <sanitized-body> ESC[201~` followed by a single CR placed
 /// **after** the closing bracketed-paste marker — never inside the frame, where
 /// bracketed-paste semantics would paste the CR as literal text instead of
 /// submitting (§4.2). A paste-aware TUI (codex) treats the wrapped body as a
@@ -476,9 +496,10 @@ const CR: u8 = 0x0D;
 /// this replaces empirically failed against Codex's TUI: the message landed in
 /// the input box but never submitted.
 fn frame_line_bytes(text: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len() + PASTE_START.len() + PASTE_END.len() + 1);
+    let body = sanitize_inject_text(text);
+    let mut out = Vec::with_capacity(body.len() + PASTE_START.len() + PASTE_END.len() + 1);
     out.extend_from_slice(PASTE_START);
-    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(body.as_bytes());
     out.extend_from_slice(PASTE_END);
     out.push(CR);
     out
@@ -698,7 +719,7 @@ mod tests {
     // and resolve_agent_pane_from_list removed with the Backend::Herdr arm.
     use super::{
         CR, PASTE_END, PASTE_START, frame_line_bytes, hex_tokens, parse_cmux_start_target,
-        shell_words, tmux_inject_commands,
+        sanitize_inject_text, shell_words, tmux_inject_commands,
     };
     use crate::check::CheckData;
     use crate::store::Fact;
@@ -752,8 +773,8 @@ mod tests {
     }
 
     #[test]
-    fn frame_line_handles_multibyte_and_control_text() {
-        // UTF-8 multibyte body bytes pass through verbatim (frame is byte-exact).
+    fn frame_line_passes_printable_multibyte_through_verbatim() {
+        // UTF-8 multibyte printable body bytes pass through verbatim.
         let got = frame_line_bytes("café✓");
         let mut want = Vec::new();
         want.extend_from_slice(PASTE_START);
@@ -761,6 +782,41 @@ mod tests {
         want.extend_from_slice(PASTE_END);
         want.push(CR);
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn frame_line_strips_embedded_paste_end_marker_breakout() {
+        // A malicious body carrying its own ESC[201~ (+ a shell line + CR) must
+        // NOT close the frame early. The ESC and CR are control bytes and are
+        // stripped; only printable residue survives, safely inside the frame.
+        let attack = "ok\x1b[201~rm -rf /\r";
+        let got = frame_line_bytes(attack);
+        // There must be exactly ONE close marker in the output: the framer's own.
+        let occurrences = got
+            .windows(PASTE_END.len())
+            .filter(|w| *w == PASTE_END)
+            .count();
+        assert_eq!(occurrences, 1, "no attacker-supplied close marker survives");
+        // Exactly ONE CR — the framer's submit byte, as the final byte.
+        assert_eq!(got.iter().filter(|&&b| b == CR).count(), 1);
+        assert_eq!(*got.last().unwrap(), CR);
+        // The single close marker is immediately before the submit CR.
+        assert_eq!(
+            &got[got.len() - 1 - PASTE_END.len()..got.len() - 1],
+            PASTE_END
+        );
+        // No ESC byte survives inside the body (all stripped except the markers').
+        // The only ESC bytes are the two framer markers (start + the surviving end).
+        assert_eq!(got.iter().filter(|&&b| b == 0x1b).count(), 2);
+    }
+
+    #[test]
+    fn sanitize_inject_text_keeps_printable_and_tab_drops_controls() {
+        assert_eq!(sanitize_inject_text("hello world"), "hello world");
+        assert_eq!(sanitize_inject_text("a\tb"), "a\tb");
+        // ESC, CR, LF, NUL, DEL all dropped.
+        assert_eq!(sanitize_inject_text("a\x1bb\rc\nd\0e\x7ff"), "abcdef");
+        assert_eq!(sanitize_inject_text("café✓"), "café✓");
     }
 
     #[test]
