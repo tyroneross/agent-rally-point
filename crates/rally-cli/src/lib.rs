@@ -127,11 +127,60 @@ const DEFAULT_WATCHDOG_TIMEOUT_MS: u64 = 3000;
 const MIN_WATCHDOG_TIMEOUT_MS: u64 = 100;
 const MAX_WATCHDOG_TIMEOUT_MS: u64 = 60_000;
 
-/// Resolve the watchdog budget from (in priority order) a `--timeout-ms VALUE`
-/// argument, the `RALLY_HOOK_TIMEOUT_MS` env var, then the default. Clamped to
-/// `[MIN, MAX]`. Out-of-range / unparseable inputs fall through to the next
-/// source rather than erroring — the watchdog must never be the thing that
-/// fails a hook.
+/// Headroom added to an `inject` command's `--timeout-seconds` ACK budget when
+/// it sets the watchdog. The inner ACK poll sleeps in 250ms ticks and does a
+/// final ledger scan + envelope build after the deadline; this margin keeps the
+/// outer watchdog from racing the inner poll's own timeout (which is the path
+/// that correctly emits `ack_state: "timeout"` + a populated `fallback_plan`).
+const INJECT_WATCHDOG_HEADROOM_MS: u64 = 5_000;
+/// Absolute ceiling for the `inject` watchdog. The CLI caps `--timeout-seconds`
+/// at 600 (`bounded_i64_arg`), so 600s + headroom is the worst case; this is a
+/// defensive bound in case that CLI cap ever changes.
+const INJECT_MAX_WATCHDOG_TIMEOUT_MS: u64 = 605_000;
+
+/// True when the resolved subcommand is `inject`. `inject` is the one
+/// deliberately-LONG interactive coordination verb: with `--handoff` /
+/// `--require-ack` it BLOCKS polling the ledger for a target-authored ACK up to
+/// `--timeout-seconds` (1–600s). The 3s-default / 60s-max hook watchdog exists
+/// to stop a write-hook wedged on stuck I/O — it must not pre-empt inject's
+/// legitimate ACK wait, which it otherwise always does (firing first and
+/// emitting the neutral fail-open envelope, which looks exactly like the
+/// "bare `{ok:true}`, no InjectData" symptom). First positional, dash-skipping,
+/// matching the `resolve_watchdog_posture` subcommand gate.
+fn first_positional_is_inject(args: &[String]) -> bool {
+    args.iter()
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        == Some("inject")
+}
+
+/// Extract the `--timeout-seconds VALUE` (or `=VALUE`) ACK budget from an
+/// inject invocation, if present and parseable.
+fn inject_timeout_seconds(args: &[String]) -> Option<u64> {
+    let positional = args
+        .iter()
+        .position(|a| a == "--timeout-seconds")
+        .and_then(|i| args.get(i + 1).and_then(|v| v.parse::<u64>().ok()));
+    let eq = args.iter().find_map(|a| {
+        a.strip_prefix("--timeout-seconds=")
+            .and_then(|v| v.parse::<u64>().ok())
+    });
+    positional.or(eq)
+}
+
+/// Resolve the watchdog budget. Priority order:
+///  1. An explicit `--timeout-ms VALUE` / `--timeout-ms=VALUE` arg, or the
+///     `RALLY_HOOK_TIMEOUT_MS` env var — operator escape hatch, clamped
+///     `[MIN, MAX]` (the hook-safe band). This wins for ALL commands including
+///     inject, so an operator can still cap a runaway inject.
+///  2. For the `inject` subcommand (and only inject), derive the budget from
+///     its `--timeout-seconds` ACK wait + headroom, bypassing the 60s hook cap.
+///     This is what lets `inject --handoff --timeout-seconds 75` actually wait
+///     75s for an ACK instead of being killed at 3s.
+///  3. Otherwise the clamped default (`DEFAULT_WATCHDOG_TIMEOUT_MS`).
+///
+/// Out-of-range / unparseable inputs fall through rather than erroring — the
+/// watchdog must never be the thing that fails a command.
 fn resolve_watchdog_timeout(args: &[String]) -> Duration {
     let from_args = args
         .iter()
@@ -144,12 +193,27 @@ fn resolve_watchdog_timeout(args: &[String]) -> Duration {
     let from_env = env::var("RALLY_HOOK_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok());
-    let ms = from_args
-        .or(from_eq)
-        .or(from_env)
-        .unwrap_or(DEFAULT_WATCHDOG_TIMEOUT_MS)
-        .clamp(MIN_WATCHDOG_TIMEOUT_MS, MAX_WATCHDOG_TIMEOUT_MS);
-    Duration::from_millis(ms)
+
+    // (1) Explicit override wins for every command, clamped to the hook band.
+    if let Some(ms) = from_args.or(from_eq).or(from_env) {
+        return Duration::from_millis(ms.clamp(MIN_WATCHDOG_TIMEOUT_MS, MAX_WATCHDOG_TIMEOUT_MS));
+    }
+
+    // (2) inject — the deliberately-blocking interactive verb — sizes its
+    // watchdog from the ACK budget so the wait is never pre-empted.
+    if first_positional_is_inject(args) {
+        // Default inject ACK budget mirrors the CLI default (10s) when the flag
+        // is absent so a bare `inject --handoff` still gets room to wait.
+        let ack_secs = inject_timeout_seconds(args).unwrap_or(10);
+        let ms = ack_secs
+            .saturating_mul(1000)
+            .saturating_add(INJECT_WATCHDOG_HEADROOM_MS)
+            .clamp(MIN_WATCHDOG_TIMEOUT_MS, INJECT_MAX_WATCHDOG_TIMEOUT_MS);
+        return Duration::from_millis(ms);
+    }
+
+    // (3) Everything else: the hook-safe default.
+    Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
 }
 
 /// Remove watchdog-only flags from the argument list so they never reach a
@@ -4723,6 +4787,98 @@ pub(crate) static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---- inject watchdog budget (Chunk 2 root-cause fix) -----------------
+
+    #[test]
+    fn inject_watchdog_budget_covers_ack_timeout_not_3s_default() {
+        // The whole bug: `inject --handoff --timeout-seconds 75` was killed at
+        // the 3s default watchdog, emitting the bare fail-open envelope before
+        // the 75s ACK wait could run. The inject watchdog must now exceed the
+        // ACK budget.
+        let d = resolve_watchdog_timeout(&argv(&[
+            "inject",
+            "reviewer-01",
+            "--handoff",
+            "evt-1",
+            "--timeout-seconds",
+            "75",
+            "--json",
+        ]));
+        assert_eq!(
+            d,
+            Duration::from_millis(75 * 1000 + INJECT_WATCHDOG_HEADROOM_MS)
+        );
+        assert!(
+            d > Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS),
+            "inject budget must exceed the 3s hook default"
+        );
+        assert!(
+            d > Duration::from_millis(MAX_WATCHDOG_TIMEOUT_MS),
+            "inject budget must be allowed to exceed the 60s hook cap"
+        );
+    }
+
+    #[test]
+    fn inject_watchdog_uses_eq_form_and_default_when_flag_absent() {
+        // `--timeout-seconds=120` form.
+        let d = resolve_watchdog_timeout(&argv(&["inject", "r", "--timeout-seconds=120"]));
+        assert_eq!(
+            d,
+            Duration::from_millis(120 * 1000 + INJECT_WATCHDOG_HEADROOM_MS)
+        );
+        // A bare `inject --handoff` (no explicit timeout) still gets room
+        // beyond the 3s default, sized off the CLI's 10s ACK default.
+        let bare = resolve_watchdog_timeout(&argv(&["inject", "r", "--handoff", "e"]));
+        assert_eq!(
+            bare,
+            Duration::from_millis(10 * 1000 + INJECT_WATCHDOG_HEADROOM_MS)
+        );
+    }
+
+    #[test]
+    fn inject_watchdog_is_clamped_to_ceiling() {
+        // Even an absurd ack budget is bounded by the defensive ceiling.
+        let d = resolve_watchdog_timeout(&argv(&["inject", "r", "--timeout-seconds", "99999"]));
+        assert_eq!(d, Duration::from_millis(INJECT_MAX_WATCHDOG_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn explicit_timeout_ms_override_wins_even_for_inject() {
+        // An operator can still cap a runaway inject; the override is clamped to
+        // the hook band so it can't itself re-introduce an unbounded hang.
+        let d = resolve_watchdog_timeout(&argv(&[
+            "inject",
+            "r",
+            "--timeout-seconds",
+            "300",
+            "--timeout-ms",
+            "4000",
+        ]));
+        assert_eq!(d, Duration::from_millis(4000));
+    }
+
+    #[test]
+    fn non_inject_commands_keep_the_3s_hook_default() {
+        // The hook-invoked read paths are unchanged — still the fast default.
+        for cmd in [["room", "--json"], ["next", "--json"], ["status", "--json"]] {
+            assert_eq!(
+                resolve_watchdog_timeout(&argv(&cmd)),
+                Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS),
+                "{cmd:?} must keep the 3s default"
+            );
+        }
+        // `inject` only matches as the FIRST positional, never as an argument
+        // value to another command.
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["say", "handoff", "--subject", "inject"])),
+            Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
+        );
+    }
 
     fn unique_root(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
