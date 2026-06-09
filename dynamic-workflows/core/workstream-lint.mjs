@@ -84,7 +84,12 @@ export function lintWorkstream(doc) {
       return;
     }
     if (!isNonEmptyString(task.id)) e(`${where}.id must be a non-empty string`);
-    else if (ids.has(task.id)) e(`${where}.id duplicates an earlier task id: ${task.id}`);
+    // packet.mjs interpolates `id` bare into `--step <id>`/`--parent-step <id>`
+    // and into output filenames. Constrain it to a safe token charset so it can
+    // never inject shell tokens or path separators into the emitted commands.
+    else if (!/^[A-Za-z0-9._-]+$/.test(task.id)) {
+      e(`${where}.id "${task.id}" must match /^[A-Za-z0-9._-]+$/ — it is interpolated bare into --step/--parent-step and packet filenames`);
+    } else if (ids.has(task.id)) e(`${where}.id duplicates an earlier task id: ${task.id}`);
     else ids.add(task.id);
 
     const label = isNonEmptyString(task.id) ? task.id : where;
@@ -98,6 +103,13 @@ export function lintWorkstream(doc) {
     }
     if (!isNonEmptyString(task.validation)) e(`task ${label}: \`validation\` must be a non-empty string (how to verify the task)`);
     if (!isNonEmptyString(task.output)) e(`task ${label}: \`output\` must be a non-empty string (expected result shape)`);
+    // packet.mjs interpolates `output` inside a double-quoted bash --subject at
+    // the `rally say artifact` line, exactly like `intent` on the claim line. The
+    // same characters break out of that quoting (or trigger shell expansion /
+    // command substitution) in the emitted rally command.
+    else if (/["$`]/.test(task.output)) {
+      e(`task ${label}: \`output\` must not contain " $ or backtick — they break the emitted bash --subject quoting`);
+    }
 
     // owns: required — either the literal "read-only" or a non-empty array of path strings
     const owns = task.owns;
@@ -108,9 +120,11 @@ export function lintWorkstream(doc) {
       for (const p of ownedPaths(owns)) {
         // packet.mjs emits owns paths bare (unquoted) as `--path <p>` on the
         // rally claim + before-write lines. Whitespace would split one path into
-        // multiple shell tokens, silently claiming the wrong boundary.
-        if (/\s/.test(p)) {
-          e(`task ${label}: \`owns\` path "${p}" must not contain whitespace — it would split into multiple --path tokens in the emitted bash`);
+        // multiple shell tokens (silently claiming the wrong boundary); a quote,
+        // `$`, or backtick would break quoting or trigger shell expansion /
+        // command substitution in those bare positions.
+        if (/[\s"$`]/.test(p)) {
+          e(`task ${label}: \`owns\` path "${p}" must not contain whitespace, " $ or backtick — it is emitted bare as a --path token in the rally claim/before-write commands`);
         }
         writeOwners.push({ id: label, path: p });
       }

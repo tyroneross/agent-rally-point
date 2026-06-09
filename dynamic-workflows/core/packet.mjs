@@ -66,6 +66,10 @@ export function toolIdFor(taskId, prefix) {
  */
 function renderRallyLoop({ task, runId, tool }) {
   const owns = ownedPaths(task.owns);
+  // CLI flag-arity asymmetry: `rally say` (the claim line below) ACCEPTS repeated
+  // --path, so we join all owned paths into ONE claim. `rally check before-write`
+  // REJECTS repeated --path, so checkLine emits one line per path instead. Same
+  // owns list, two emission shapes — keep them in sync if the CLI arity changes.
   const ownsArgs = owns.length ? owns.map((p) => `--path ${p}`).join(" ") : "";
   const deps = Array.isArray(task.depends_on) ? task.depends_on : [];
   // one --parent-step per depends_on entry; omit entirely if none.

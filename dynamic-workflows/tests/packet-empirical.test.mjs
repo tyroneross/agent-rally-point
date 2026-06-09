@@ -31,6 +31,11 @@ import { renderPacket } from "../core/packet.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // dynamic-workflows/tests -> repo root -> target/release/rally
+// NOTE: this binary must be REBUILT after any rally-cli change for this gate to
+// test current behavior — a stale binary would assert against old flag arity.
+// CI guarantees freshness: .github/workflows/rally-gate.yml runs
+// `cargo build --release -p rally-cli` before the node test suite, so the gate
+// is always ARMED (not skipped) and always tests the just-built CLI.
 const RALLY = join(here, "..", "..", "target", "release", "rally");
 
 const DESCRIPTOR = {
