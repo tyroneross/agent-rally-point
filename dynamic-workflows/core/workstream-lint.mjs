@@ -90,6 +90,12 @@ export function lintWorkstream(doc) {
     const label = isNonEmptyString(task.id) ? task.id : where;
 
     if (!isNonEmptyString(task.intent)) e(`task ${label}: \`intent\` must be a non-empty string`);
+    // packet.mjs interpolates `intent` inside a double-quoted bash --subject. A
+    // double-quote, `$`, or backtick would break out of that quoting (or trigger
+    // shell expansion / command substitution) in the emitted rally command.
+    else if (/["$`]/.test(task.intent)) {
+      e(`task ${label}: \`intent\` must not contain " $ or backtick — they break the emitted bash --subject quoting`);
+    }
     if (!isNonEmptyString(task.validation)) e(`task ${label}: \`validation\` must be a non-empty string (how to verify the task)`);
     if (!isNonEmptyString(task.output)) e(`task ${label}: \`output\` must be a non-empty string (expected result shape)`);
 
@@ -99,7 +105,15 @@ export function lintWorkstream(doc) {
     if (!ownsValid) {
       e(`task ${label}: \`owns\` must be "read-only" or a non-empty array of path strings`);
     } else {
-      for (const p of ownedPaths(owns)) writeOwners.push({ id: label, path: p });
+      for (const p of ownedPaths(owns)) {
+        // packet.mjs emits owns paths bare (unquoted) as `--path <p>` on the
+        // rally claim + before-write lines. Whitespace would split one path into
+        // multiple shell tokens, silently claiming the wrong boundary.
+        if (/\s/.test(p)) {
+          e(`task ${label}: \`owns\` path "${p}" must not contain whitespace — it would split into multiple --path tokens in the emitted bash`);
+        }
+        writeOwners.push({ id: label, path: p });
+      }
     }
 
     if (task.tier !== undefined && !TIERS.has(task.tier)) {

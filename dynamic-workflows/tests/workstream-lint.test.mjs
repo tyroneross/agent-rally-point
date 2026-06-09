@@ -54,3 +54,41 @@ test("rejects a non-object descriptor and empty tasks", () => {
   assert.ok(lintWorkstream(null).length > 0);
   assert.ok(lintWorkstream({ workstream: "w", description: "d", tasks: [] }).some((e) => /non-empty array/.test(e)));
 });
+
+// f4: the emitted bash interpolates intent inside a double-quoted --subject and
+// owns paths bare. Reject the characters that would break that quoting so a
+// descriptor can never generate shell-unsafe rally commands.
+for (const ch of ['"', "$", "`"]) {
+  test(`rejects intent containing ${JSON.stringify(ch)} (breaks emitted --subject quoting)`, () => {
+    const errors = lintWorkstream({
+      workstream: "w",
+      description: "d",
+      tasks: [{ id: "x", intent: `do ${ch} thing`, owns: ["src/x.js"], validation: "v", output: "o" }],
+    });
+    assert.ok(
+      errors.some((e) => /intent.*must not contain/.test(e)),
+      `expected an intent-quoting error for ${JSON.stringify(ch)}, got: ${errors.join("; ")}`,
+    );
+  });
+}
+
+test("rejects an owns path containing whitespace (would split into multiple --path tokens)", () => {
+  const errors = lintWorkstream({
+    workstream: "w",
+    description: "d",
+    tasks: [{ id: "x", intent: "i", owns: ["src/my file.js"], validation: "v", output: "o" }],
+  });
+  assert.ok(
+    errors.some((e) => /owns.*must not contain whitespace/.test(e)),
+    `expected an owns-whitespace error, got: ${errors.join("; ")}`,
+  );
+});
+
+test("accepts a clean intent + owns (no f4 false positives)", () => {
+  const errors = lintWorkstream({
+    workstream: "w",
+    description: "d",
+    tasks: [{ id: "x", intent: "extract the foo helper (pure)", owns: ["src/foo-bar.js"], validation: "v", output: "o" }],
+  });
+  assert.deepEqual(errors, [], `expected no errors, got: ${errors.join("; ")}`);
+});
