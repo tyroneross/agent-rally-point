@@ -337,6 +337,13 @@ impl BackendRunner {
     pub(crate) fn inject_commands(&self, target: &str, text: &str) -> Vec<Vec<String>> {
         match self.backend {
             Backend::Tmux => tmux_inject_commands(&self.tmux_bin, target, text),
+            // cmux kept as the separate-submit sequence: its `send` subcommand
+            // accepts literal text only (and `send-key <name>` named keys) —
+            // there is no raw-byte / hex write equivalent to tmux's
+            // `send-keys -H`, so the atomic bracketed-paste frame (ESC[200~ …
+            // ESC[201~ + CR) cannot be expressed. `send-key enter` submits as a
+            // discrete key, which works for cmux's own TUI; the framed-write
+            // fix is tmux-specific (where Codex's bracketed-paste TUI lives).
             Backend::Cmux => vec![
                 cmd![&self.cmux_bin, "send-key", "--workspace", target, "ctrl+u"],
                 cmd![&self.cmux_bin, "send", "--workspace", target, text],
@@ -449,14 +456,51 @@ fn tmux_start_command(
     ])
 }
 
+/// Bracketed-paste start marker: `ESC [ 200 ~`.
+const PASTE_START: &[u8] = b"\x1b[200~";
+/// Bracketed-paste end marker: `ESC [ 201 ~`.
+const PASTE_END: &[u8] = b"\x1b[201~";
+/// Carriage return — the submit byte.
+const CR: u8 = 0x0D;
+
+/// Build the framed byte string for a submit-delivery, mirroring ptyd's
+/// `frame_line(text, submit=true, paste_frame=true)` (ptyd `src/comms.rs`
+/// §4.1/§4.2, Apache-2.0, same author — reimplemented here so this repo stays
+/// self-contained with no path dependency on ptyd).
+///
+/// Layout: `ESC[200~ <text-bytes> ESC[201~` followed by a single CR placed
+/// **after** the closing bracketed-paste marker — never inside the frame, where
+/// bracketed-paste semantics would paste the CR as literal text instead of
+/// submitting (§4.2). A paste-aware TUI (codex) treats the wrapped body as a
+/// paste; the trailing CR then submits the prompt. The separate-Enter sequence
+/// this replaces empirically failed against Codex's TUI: the message landed in
+/// the input box but never submitted.
+fn frame_line_bytes(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + PASTE_START.len() + PASTE_END.len() + 1);
+    out.extend_from_slice(PASTE_START);
+    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(PASTE_END);
+    out.push(CR);
+    out
+}
+
+/// Encode raw bytes as the lowercase 2-hex-digit tokens `tmux send-keys -H`
+/// expects (one token per byte). `send-keys -H 1b 5b 32 30 30 7e …` writes the
+/// exact bytes to the pane with no key-name interpretation, so the whole frame
+/// — markers, body, and submit CR — arrives in ONE atomic tmux write rather
+/// than the prior four separate commands.
+fn hex_tokens(bytes: &[u8]) -> Vec<String> {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn tmux_inject_commands(bin: &str, session: &str, text: &str) -> Vec<Vec<String>> {
-    let buffer = format!("rally-inject-{session}");
-    vec![
-        cmd![bin, "send-keys", "-t", session, "C-u"],
-        cmd![bin, "set-buffer", "-b", &buffer, text],
-        cmd![bin, "paste-buffer", "-b", buffer, "-t", session],
-        cmd![bin, "send-keys", "-t", session, "Enter"],
-    ]
+    // C-u clears any stale input still sitting at the prompt; kept as its own
+    // prior command (it is a control-key chord, not part of the framed paste).
+    let clear = cmd![bin, "send-keys", "-t", session, "C-u"];
+    // The framed paste + submit CR delivered as a SINGLE hex send-keys write.
+    let mut framed = cmd![bin, "send-keys", "-t", session, "-H"];
+    framed.extend(hex_tokens(&frame_line_bytes(text)));
+    vec![clear, framed]
 }
 
 fn probe_tmux_liveness(bin: &str, targets: &[String]) -> Vec<SessionLiveness> {
@@ -652,7 +696,10 @@ mod tests {
     use super::{InjectData, RunData, SessionActionData, SessionsData};
     // Plan F functional core (Chunk 3): herdr_command, parse_herdr_agents_tab,
     // and resolve_agent_pane_from_list removed with the Backend::Herdr arm.
-    use super::{parse_cmux_start_target, shell_words};
+    use super::{
+        CR, PASTE_END, PASTE_START, frame_line_bytes, hex_tokens, parse_cmux_start_target,
+        shell_words, tmux_inject_commands,
+    };
     use crate::check::CheckData;
     use crate::store::Fact;
     use crate::{EnterData, Envelope, NextData, RoomData, SayData};
@@ -677,6 +724,84 @@ mod tests {
         let command = vec!["claude".to_string(), "bad\0arg".to_string()];
         let err = shell_words(&command).unwrap_err();
         assert!(err.to_string().contains("cannot be shell-quoted"));
+    }
+
+    // ---- frame_line port (ptyd src/comms.rs §4.1/§4.2) -------------------
+
+    #[test]
+    fn frame_line_wraps_body_and_appends_cr_after_close_marker() {
+        let got = frame_line_bytes("hello");
+        let mut want = Vec::new();
+        want.extend_from_slice(b"\x1b[200~hello\x1b[201~");
+        want.push(0x0d);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn frame_line_cr_is_outside_the_frame() {
+        let got = frame_line_bytes("x");
+        // Last byte is the submit CR; the byte before it is the final byte of
+        // the closing marker (`~`) — the CR is never inside the paste body.
+        assert_eq!(*got.last().unwrap(), CR);
+        assert_eq!(got[got.len() - 2], b'~');
+        // The body sits strictly between the two markers.
+        assert!(got.starts_with(PASTE_START));
+        let after_start = &got[PASTE_START.len()..];
+        assert!(after_start.starts_with(b"x"));
+        assert!(after_start[1..].starts_with(PASTE_END));
+    }
+
+    #[test]
+    fn frame_line_handles_multibyte_and_control_text() {
+        // UTF-8 multibyte body bytes pass through verbatim (frame is byte-exact).
+        let got = frame_line_bytes("café✓");
+        let mut want = Vec::new();
+        want.extend_from_slice(PASTE_START);
+        want.extend_from_slice("café✓".as_bytes());
+        want.extend_from_slice(PASTE_END);
+        want.push(CR);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn hex_tokens_encodes_each_byte_as_lowercase_two_digits() {
+        assert_eq!(
+            hex_tokens(b"\x1b[200~"),
+            vec!["1b", "5b", "32", "30", "30", "7e"]
+        );
+        assert_eq!(hex_tokens(&[0x00, 0x0d, 0xff]), vec!["00", "0d", "ff"]);
+        assert_eq!(hex_tokens(&[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn tmux_inject_clears_then_sends_one_framed_hex_write() {
+        let cmds = tmux_inject_commands("tmux", "rally-codex", "do the thing");
+        // Exactly two commands: the C-u clear, then the single framed -H write.
+        assert_eq!(cmds.len(), 2, "must be one clear + one atomic framed write");
+        assert_eq!(
+            cmds[0],
+            vec!["tmux", "send-keys", "-t", "rally-codex", "C-u"]
+        );
+        // The second command is a single send-keys -H with hex tokens for the
+        // whole frame — NOT a separate paste-buffer + Enter pair.
+        let framed = &cmds[1];
+        assert_eq!(
+            &framed[..5],
+            &["tmux", "send-keys", "-t", "rally-codex", "-H"]
+        );
+        let hex: Vec<u8> = framed[5..]
+            .iter()
+            .map(|t| u8::from_str_radix(t, 16).unwrap())
+            .collect();
+        assert_eq!(hex, frame_line_bytes("do the thing"));
+        // The decoded frame ends in CR (submit) right after the close marker.
+        assert_eq!(*hex.last().unwrap(), CR);
+        assert_eq!(hex[hex.len() - 2], b'~');
+        // No legacy paste-buffer / set-buffer / separate Enter survives.
+        for cmd in &cmds {
+            assert!(!cmd.iter().any(|a| a == "paste-buffer" || a == "set-buffer"));
+            assert!(!cmd.iter().any(|a| a == "Enter"));
+        }
     }
 
     // Plan F functional core (Chunk 3): herdr_agents_tab_*, herdr_command_*,

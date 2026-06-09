@@ -1163,13 +1163,46 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     assert_eq!(inject["schema"], "agent-rally.command.inject.v1");
     assert_matches_schema("agent-rally.command.inject.v1.json", &inject);
     assert_eq!(inject["data"]["inject"]["session"]["name"], "reviewer-01");
+    // tmux inject is now TWO commands: a C-u clear, then a SINGLE atomic
+    // bracketed-paste-framed `send-keys -H <hex…>` write whose trailing CR
+    // submits (ptyd frame_line port — replaces the old 4-command set-buffer /
+    // paste-buffer / separate-Enter sequence that never submitted in Codex).
+    let cmds = inject["data"]["inject"]["commands"].as_array().unwrap();
+    assert_eq!(cmds.len(), 2, "framed inject is clear + one atomic write");
+    let second: Vec<&str> = cmds[1]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    assert!(second.contains(&"-H"), "framed write uses hex send-keys");
+    // The decoded hex frame must end in a submit CR (0x0d) right after the
+    // bracketed-paste close marker (`~` == 0x7e).
+    let hex_start = second.iter().position(|a| *a == "-H").unwrap() + 1;
+    let frame: Vec<u8> = second[hex_start..]
+        .iter()
+        .map(|t| u8::from_str_radix(t, 16).unwrap())
+        .collect();
     assert_eq!(
-        inject["data"]["inject"]["commands"]
+        *frame.last().unwrap(),
+        0x0d,
+        "frame submits with trailing CR"
+    );
+    assert_eq!(
+        frame[frame.len() - 2],
+        0x7e,
+        "CR sits after the close marker"
+    );
+    // No legacy paste-buffer / separate Enter survives anywhere in the plan.
+    for c in cmds {
+        let toks: Vec<&str> = c
             .as_array()
             .unwrap()
-            .len(),
-        4
-    );
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert!(!toks.contains(&"paste-buffer") && !toks.contains(&"Enter"));
+    }
 
     let handoff = workspace.json(&[
         "say",
