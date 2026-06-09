@@ -3659,7 +3659,12 @@ fn rally_whoami_repo_id_uses_manifest_not_active_engagement() {
         r#"{"schema":"agent-rally.manifest.v1","repo":"agent-rally-point"}"#,
     )
     .unwrap();
-    fs::write(rally_dir.join("active-engagement"), "test\n").unwrap();
+    // Use a non-reserved engagement label: `test` is a reserved fixture
+    // engagement that live sessions intentionally redirect away from (so
+    // production facts never leak into the committed test.jsonl segment).
+    // This test's actual subject is repo_id-from-manifest, so any normal
+    // engagement label serves the scaffolding.
+    fs::write(rally_dir.join("active-engagement"), "sprint-9\n").unwrap();
 
     let result = workspace.json(&["whoami", "--json"]);
     assert!(result["ok"].as_bool().unwrap_or(false));
@@ -3668,7 +3673,7 @@ fn rally_whoami_repo_id_uses_manifest_not_active_engagement() {
         whoami["repo_id"].as_str().unwrap_or(""),
         "agent-rally-point"
     );
-    assert_eq!(whoami["room_id"].as_str().unwrap_or(""), "test");
+    assert_eq!(whoami["room_id"].as_str().unwrap_or(""), "sprint-9");
 
     workspace.cleanup();
 }

@@ -1694,12 +1694,37 @@ fn is_db_locked(err: &impl std::fmt::Display) -> bool {
 // line in **seq order** rebuilds `facts.db`. The replay is concat-and-sort —
 // segment file names don't have to match append order, only the per-line seqs.
 
+/// Engagement labels reserved for committed test/CI fixtures. A LIVE runtime
+/// session must never resolve to one of these — its facts would leak into a
+/// git-tracked fixture segment (`.rally/log/test.jsonl`), perma-dirtying the
+/// working tree and mixing real coordination history with fixture data
+/// (HIGH-risk fact_182e8, 2026-06-09). The in-process cargo test suite is
+/// unaffected: tests set the engagement via [`RoomStore::set_active_engagement_for_test`]
+/// (a `#[cfg(test)]` setter that bypasses this resolver entirely), so the
+/// reserved-label guard only ever fires for a production `rally` invocation
+/// that inherited a stale `test` label from the env or the
+/// `.rally/active-engagement` file.
+pub(crate) const RESERVED_FIXTURE_ENGAGEMENTS: &[&str] = &["test"];
+
+/// True when `label` is a reserved fixture engagement that live appends must
+/// not write into. Case-insensitive so `Test`/`TEST` are caught too.
+pub(crate) fn is_reserved_fixture_engagement(label: &str) -> bool {
+    RESERVED_FIXTURE_ENGAGEMENTS
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(label))
+}
+
 /// Resolve the engagement label used to stamp new appends.
 ///
 /// Priority:
 /// 1. `RALLY_ENGAGEMENT` env var (non-empty after trim, sanitised).
 /// 2. `.rally/active-engagement` file (one line, sanitised).
 /// 3. UTC date `YYYY-MM-DD` from the current clock.
+///
+/// A resolved label that is a [reserved fixture engagement](RESERVED_FIXTURE_ENGAGEMENTS)
+/// is REJECTED at every tier and falls through to the UTC-date fallback, so a
+/// live session can never append into the committed `test.jsonl` fixture even
+/// if its env/file says `test`.
 ///
 /// Sanitisation strips path separators and trims whitespace so a label can
 /// never escape the log dir. The fallback never fails — if the clock returns
@@ -1717,14 +1742,14 @@ fn resolve_active_engagement(rally_dir: &Path) -> String {
 fn resolve_active_engagement_with_env(rally_dir: &Path, env_value: Option<String>) -> String {
     if let Some(value) = env_value {
         let cleaned = sanitise_engagement(&value);
-        if !cleaned.is_empty() {
+        if !cleaned.is_empty() && !is_reserved_fixture_engagement(&cleaned) {
             return cleaned;
         }
     }
     let active_path = rally_dir.join(ACTIVE_ENGAGEMENT_FILENAME);
     if let Ok(text) = fs::read_to_string(&active_path) {
         let cleaned = sanitise_engagement(text.trim());
-        if !cleaned.is_empty() {
+        if !cleaned.is_empty() && !is_reserved_fixture_engagement(&cleaned) {
             return cleaned;
         }
     }
@@ -3835,6 +3860,52 @@ mod ledger_tests {
         // Sanitise strips path separators.
         let cleaned = sanitise_engagement("../escape/me");
         assert!(!cleaned.contains('/'));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A live session whose env OR `.rally/active-engagement` file says `test`
+    /// must NOT resolve to the reserved `test` fixture engagement — it falls
+    /// through to the UTC-date label so production facts never leak into the
+    /// committed `test.jsonl` segment (HIGH-risk fact_182e8). This is the
+    /// durable product fix for the test-segment leak.
+    #[test]
+    fn reserved_fixture_engagement_never_resolves_for_live_session() {
+        let root = unique_root("engagement-reserved");
+        let dir = root.join(".rally");
+        fs::create_dir_all(&dir).unwrap();
+        let today = utc_date_label();
+
+        // Reserved label via the persisted file → falls through to UTC date.
+        persist_active_engagement(&dir, "test").unwrap();
+        assert_eq!(
+            resolve_active_engagement_with_env(&dir, None),
+            today,
+            "a 'test' active-engagement file must not route live appends to the fixture"
+        );
+
+        // Reserved label via the env var → also falls through to UTC date.
+        assert_eq!(
+            resolve_active_engagement_with_env(&dir, Some("test".to_string())),
+            today,
+            "RALLY_ENGAGEMENT=test must not route live appends to the fixture"
+        );
+
+        // Case-insensitive: TEST / Test are also reserved.
+        assert_eq!(
+            resolve_active_engagement_with_env(&dir, Some("TEST".to_string())),
+            today
+        );
+
+        // A non-reserved label from env still wins normally.
+        assert_eq!(
+            resolve_active_engagement_with_env(&dir, Some("sprint-7".to_string())),
+            "sprint-7"
+        );
+
+        assert!(is_reserved_fixture_engagement("test"));
+        assert!(is_reserved_fixture_engagement("Test"));
+        assert!(!is_reserved_fixture_engagement("2026-06-09"));
 
         fs::remove_dir_all(&root).ok();
     }
