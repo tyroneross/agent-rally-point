@@ -77,6 +77,20 @@ fn later_fact_refs_claim(fact: &Fact, claim_id: &str) -> bool {
     ) && fact.ref_id.as_deref() == Some(claim_id)
 }
 
+/// A `Release` closes EVERY active claim whose scope overlaps the release
+/// scope, regardless of the claim's owner. This is intentional for the
+/// multi-claim atomic-release contract (`command_release_by_path` writes ONE
+/// release carrying the union of matched scopes and relies on this sweep).
+///
+/// Scope note (independent-auditor MED, 2026-06-09): on a NORMAL ledger this
+/// cannot over-close a foreign claim, because same-scope different-owner claims
+/// are rejected at append time (`store::append_fact` claim-conflict detection),
+/// so two live claims never share a scope. The over-close risk is latent only
+/// for an imported / hand-edited / corrupt ledger that already violates that
+/// invariant — in which case the projection faithfully reflects the (already
+/// inconsistent) ledger rather than masking it. The authorization gate that
+/// decides WHO may write a takeover release lives in `command_release_by_path`
+/// (2h stale-owner bar); this projection is downstream of that decision.
 fn later_release_overlaps_claim_scope(fact: &Fact, claim: &Fact) -> bool {
     fact.kind == FactKind::Release
         && fact.scope.iter().any(|release_scope| {
