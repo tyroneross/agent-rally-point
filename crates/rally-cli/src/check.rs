@@ -114,14 +114,43 @@ fn check_before_write(
         });
     }
     if let Some(path) = path {
+        // TTL-primary liveness: a claim whose owner has gone idle past the
+        // 15-minute threshold is "squatting" and must not hard-block a peer's
+        // write (fact_182e8 gap 1: a dead owner's claims squat forever because
+        // `rally say release` was owner-only). Such a claim downgrades from a
+        // hard `stop` to a reclaimable `warn` so the peer can proceed, and a
+        // lead can issue an authorized takeover release.
+        let stale_owners = snapshot.stale_owner_tools();
         for claim in &snapshot.active_claims {
             let is_different_tool = claim.tool.as_deref() != Some(tool);
             let exact_or_dir = claim
                 .scope
                 .iter()
                 .any(|scope| path_matches_scope(scope, path));
+            let owner_is_stale = claim
+                .tool
+                .as_deref()
+                .map(|o| stale_owners.contains(o))
+                .unwrap_or(false);
 
-            if exact_or_dir && is_different_tool {
+            if exact_or_dir && is_different_tool && owner_is_stale {
+                // Squatting claim: reclaimable, not a hard block.
+                findings.push(CheckFinding {
+                    code: "stale-owner-claim",
+                    severity: "warn",
+                    message: format!(
+                        "path claimed by {} whose presence is stale (>15m idle) — \
+                         claim is reclaimable; proceed, or have the lead run \
+                         `rally say release --path {} --tool <lead>` to take it over",
+                        claim.tool.as_deref().unwrap_or("unknown"),
+                        path,
+                    ),
+                    fact_id: Some(claim.event_id.clone()),
+                    owner: claim.tool.clone(),
+                    path: Some(path.to_string()),
+                    scope: Vec::new(),
+                });
+            } else if exact_or_dir && is_different_tool {
                 findings.push(CheckFinding {
                     code: "claimed-path",
                     severity: "stop",
@@ -226,5 +255,78 @@ fn check_before_complete(snapshot: &RoomSnapshot, tool: &str, findings: &mut Vec
                 scope: Vec::new(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Fact, RoomSnapshot, Squad};
+
+    fn claim_by(tool: &str, path: &str) -> Fact {
+        Fact {
+            tool: Some(tool.to_string()),
+            scope: vec![format!("file:{path}")],
+            event_id: format!("fact_{tool}"),
+            ..Default::default()
+        }
+    }
+
+    fn squad(tool: &str, status: &str) -> Squad {
+        Squad {
+            tool: tool.to_string(),
+            status: status.to_string(),
+            acknowledged: true,
+            ..Default::default()
+        }
+    }
+
+    /// fact_182e8 gap 1 — a peer's `before-write` against a path claimed by a
+    /// LIVE owner is a hard `stop` (unchanged behaviour).
+    #[test]
+    fn before_write_live_owner_claim_is_a_hard_stop() {
+        let snapshot = RoomSnapshot {
+            active_claims: vec![claim_by("alpha", "src/foo.rs")],
+            squads: vec![squad("alpha", "active")],
+            ..Default::default()
+        };
+        let mut findings = Vec::new();
+        check_before_write(&snapshot, "beta", Some("src/foo.rs"), &mut findings);
+        let f = findings
+            .iter()
+            .find(|f| f.fact_id.as_deref() == Some("fact_alpha"))
+            .expect("a finding about alpha's claim must exist");
+        assert_eq!(f.code, "claimed-path");
+        assert_eq!(f.severity, "stop");
+    }
+
+    /// fact_182e8 gap 1 — when the owner is liveness-stale (squad idle), the
+    /// same conflict downgrades from a hard `stop` to a reclaimable `warn` so
+    /// the peer is not blocked by a dead owner's squatting claim.
+    #[test]
+    fn before_write_stale_owner_claim_downgrades_to_reclaimable_warn() {
+        let snapshot = RoomSnapshot {
+            active_claims: vec![claim_by("dead-owner", "src/foo.rs")],
+            squads: vec![squad("dead-owner", "idle")],
+            ..Default::default()
+        };
+        let mut findings = Vec::new();
+        check_before_write(&snapshot, "beta", Some("src/foo.rs"), &mut findings);
+        let f = findings
+            .iter()
+            .find(|f| f.fact_id.as_deref() == Some("fact_dead-owner"))
+            .expect("a finding about the stale claim must exist");
+        assert_eq!(
+            f.code, "stale-owner-claim",
+            "stale-owner conflict must use the reclaimable code"
+        );
+        assert_eq!(
+            f.severity, "warn",
+            "stale-owner conflict must not hard-block the peer"
+        );
+        assert!(
+            !findings.iter().any(|f| f.code == "claimed-path"),
+            "a stale-owner conflict must NOT also emit a hard claimed-path stop"
+        );
     }
 }

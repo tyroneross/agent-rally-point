@@ -1544,22 +1544,53 @@ fn command_release_by_path(
             "rally say release --path requires at least one --path argument".to_string(),
         ));
     }
+    // A claim matches a `--path` release when its scope covers a requested
+    // path AND the caller is authorized to release it. Authorization is either:
+    //   (a) the caller OWNS the claim (the original owner-self-release path), OR
+    //   (b) AUTHORIZED TAKEOVER — the claim's owner is liveness-stale (squad
+    //       idle > 15m) so a peer/lead may reclaim it. This closes fact_182e8
+    //       gap 1: a dead owner's claims could never be cleared because release
+    //       was strictly owner-only ("no live claim by <me> matches").
+    // Takeover reuses the TTL-primary stale-owner signal — no new liveness
+    // engine (lesson 2026-06-07-managed-session-liveness-ttl-primary).
+    let stale_owners = snapshot.stale_owner_tools();
+    let scope_match = |c: &&Fact| {
+        c.scope
+            .iter()
+            .any(|cs| want_paths.iter().any(|wp| wp == cs))
+    };
     let matches: Vec<&Fact> = snapshot
         .active_claims
         .iter()
-        .filter(|c| c.tool.as_deref() == Some(tool))
         .filter(|c| {
-            c.scope
-                .iter()
-                .any(|cs| want_paths.iter().any(|wp| wp == cs))
+            let owned = c.tool.as_deref() == Some(tool);
+            let stale_takeover = c
+                .tool
+                .as_deref()
+                .map(|o| o != tool && stale_owners.contains(o))
+                .unwrap_or(false);
+            (owned || stale_takeover) && scope_match(c)
         })
         .collect();
+    // Did at least one match come from a stale-owner takeover (not self)?
+    let is_takeover = matches
+        .iter()
+        .any(|c| c.tool.as_deref() != Some(tool));
     if matches.is_empty() {
-        // Build the loud-error list: this tool's currently-open claims.
+        // Build the loud-error list: this tool's currently-open claims, plus a
+        // hint about any squatting (stale-owner) claims on the wanted paths that
+        // would be reclaimable IF the owner were stale — so the operator learns
+        // why a still-live peer's claim is not reclaimable.
         let mine: Vec<&Fact> = snapshot
             .active_claims
             .iter()
             .filter(|c| c.tool.as_deref() == Some(tool))
+            .collect();
+        let blocking_live: Vec<&Fact> = snapshot
+            .active_claims
+            .iter()
+            .filter(|c| c.tool.as_deref() != Some(tool))
+            .filter(scope_match)
             .collect();
         let listing = if mine.is_empty() {
             format!("(none — {tool} has no open claims in this room)")
@@ -1576,18 +1607,39 @@ fn command_release_by_path(
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        let live_hint = if blocking_live.is_empty() {
+            String::new()
+        } else {
+            let owners: Vec<String> = blocking_live
+                .iter()
+                .filter_map(|c| c.tool.clone())
+                .collect();
+            format!(
+                "\nNote: those paths are claimed by still-live peer(s) [{}]; \
+                 a takeover release is only authorized once their presence goes \
+                 stale (>15m idle).",
+                owners.join(", ")
+            )
+        };
         return Err(RallyError::Usage(format!(
-            "rally say release: no live claim by {tool} matches paths [{paths}]; nothing to release.\n{tool}'s open claims:\n{listing}",
+            "rally say release: no live claim by {tool} matches paths [{paths}]; nothing to release.\n{tool}'s open claims:\n{listing}{live_hint}",
             paths = want_paths.join(", ")
         )));
     }
 
     // Snapshot the matched claim metadata before mutating — we want stable
-    // event_ids + subjects to populate warnings even if a subsequent release
-    // changes the projection.
-    let match_meta: Vec<(String, String, Vec<String>)> = matches
+    // event_ids + subjects + owners to populate warnings + takeover provenance
+    // even if a subsequent release changes the projection.
+    let match_meta: Vec<(String, String, Vec<String>, Option<String>)> = matches
         .into_iter()
-        .map(|c| (c.event_id.clone(), c.subject.clone(), c.scope.clone()))
+        .map(|c| {
+            (
+                c.event_id.clone(),
+                c.subject.clone(),
+                c.scope.clone(),
+                c.tool.clone(),
+            )
+        })
         .collect();
     let total = match_meta.len();
 
@@ -1607,12 +1659,49 @@ fn command_release_by_path(
         .expect("match_meta is non-empty (early-return guard above)")
         .clone();
     let mut union_scope: Vec<String> = Vec::new();
-    for (_id, _subj, sc) in &match_meta {
+    for (_id, _subj, sc, _owner) in &match_meta {
         for s in sc {
             if !union_scope.contains(s) {
                 union_scope.push(s.clone());
             }
         }
+    }
+    // Record an authorized-takeover provenance trail when the caller reclaimed a
+    // stale peer's claim (rather than releasing their own). The annotation lands
+    // on the durable release fact itself, which is the decision record (the fix
+    // direction asked for an authorized-takeover release "keyed to a decision
+    // fact"; the release IS that fact, now self-describing as a takeover).
+    let taken_over_owners: Vec<String> = if is_takeover {
+        let mut o: Vec<String> = match_meta
+            .iter()
+            .filter_map(|(_id, _subj, _sc, owner)| owner.clone())
+            .filter(|owner| owner != tool)
+            .collect();
+        o.sort();
+        o.dedup();
+        o
+    } else {
+        Vec::new()
+    };
+    let base_subject = if total == 1 {
+        subject
+    } else {
+        format!("{subject} (releases {total} matching claims)")
+    };
+    let subject = if taken_over_owners.is_empty() {
+        base_subject
+    } else {
+        format!(
+            "{base_subject} [authorized-takeover: reclaimed stale-owner claim(s) from {}]",
+            taken_over_owners.join(", ")
+        )
+    };
+    let mut evidence = evidence;
+    if !taken_over_owners.is_empty() {
+        evidence.push(format!(
+            "authorized-takeover:stale-owner={}",
+            taken_over_owners.join(",")
+        ));
     }
     let fact = Fact {
         from_session_id: None,
@@ -1623,11 +1712,7 @@ fn command_release_by_path(
         kind: FactKind::Release,
         tool: Some(tool.to_string()),
         role,
-        subject: if total == 1 {
-            subject
-        } else {
-            format!("{subject} (releases {total} matching claims)")
-        },
+        subject,
         scope: union_scope,
         created_at: now_string(),
         summary,
@@ -1640,12 +1725,17 @@ fn command_release_by_path(
         session: None,
     };
     let appended = room.append_state_transition_verified(&fact)?;
-    for (id, subj, _sc) in &match_meta {
+    for (id, subj, _sc, _owner) in &match_meta {
+        let takeover_note = if is_takeover {
+            " (authorized takeover of stale-owner claim)"
+        } else {
+            ""
+        };
         warnings.push(SayWarning {
             code: "released-by-path".to_string(),
             message: format!(
-                "released claim {} (\"{}\") via path-only resolution; release seq={}",
-                id, subj, appended.seq
+                "released claim {} (\"{}\") via path-only resolution{}; release seq={}",
+                id, subj, takeover_note, appended.seq
             ),
         });
     }
@@ -8470,6 +8560,164 @@ mod tests {
                 .iter()
                 .any(|c| c.event_id == alpha_other),
             "no-match release must NOT incidentally close any other claim"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Append a claim whose `created_at` is backdated, making its owner's
+    /// squad project as `idle` (stale) since the squad's last_seen_ts is the
+    /// highest-seq fact's created_at and a claim is that tool's only fact.
+    fn append_stale_claim(
+        room: &store::RoomStore,
+        tool: &str,
+        path: &str,
+        subject: &str,
+        created_at: &str,
+    ) -> String {
+        let fact = store::Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Claim,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: subject.to_string(),
+            scope: vec![format!("file:{path}")],
+            created_at: created_at.to_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&fact).unwrap().event_id
+    }
+
+    /// fact_182e8 gap 1 — authorized takeover. A claim whose owner has gone
+    /// liveness-stale (>15m idle) CAN be released by a different tool (the
+    /// fix), where previously `rally say release` was strictly owner-only and a
+    /// dead owner's claim squatted forever. The release fact records the
+    /// takeover provenance (subject annotation + evidence tag).
+    #[test]
+    fn stale_owner_claim_is_reclaimable_by_authorized_takeover() {
+        let root = unique_root("stale-claim-takeover");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // dead-owner claimed src/foo.rs 2 days ago and went quiet → stale squad.
+        let stale_id = append_stale_claim(
+            &room,
+            "dead-owner",
+            "src/foo.rs",
+            "claim from a session that died",
+            "2026-06-02T10:00:00Z",
+        );
+        let before = room.snapshot().unwrap();
+        assert!(
+            before.stale_owner_tools().contains("dead-owner"),
+            "dead-owner must project as liveness-stale; squads={:?}",
+            before.squads
+        );
+
+        // A different tool (the lead/peer) reclaims it.
+        let out = command_release_by_path(
+            &room,
+            "claude_code:lead",
+            &["file:src/foo.rs".to_string()],
+            None,
+            None,
+            "reclaim squatting claim".to_string(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            true,
+            Vec::new(),
+        )
+        .expect("authorized takeover of a stale-owner claim must succeed");
+
+        // Claim is gone from active projection.
+        let after = room.snapshot().unwrap();
+        assert!(
+            !after.active_claims.iter().any(|c| c.event_id == stale_id),
+            "stale-owner claim must be released after authorized takeover"
+        );
+
+        // Release fact records takeover provenance.
+        let body: serde_json::Value = out.body.clone();
+        let released_fact = &body["data"]["say"]["fact"];
+        let subject = released_fact["subject"].as_str().unwrap_or("");
+        assert!(
+            subject.contains("authorized-takeover"),
+            "release subject must record the takeover; got: {subject}"
+        );
+        let evidence = released_fact["evidence"].as_array().cloned().unwrap_or_default();
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e.as_str().unwrap_or("").contains("dead-owner")),
+            "release evidence must name the stale owner reclaimed; got: {evidence:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A still-LIVE peer's claim is NOT reclaimable by takeover — only the
+    /// owner can release it. Guards against the takeover path widening into a
+    /// general "anyone can release anyone's live claim" hole.
+    #[test]
+    fn live_owner_claim_is_not_reclaimable_by_takeover() {
+        let root = unique_root("live-claim-no-takeover");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        // alpha claims now → squad is active (not stale).
+        let live_id = append_claim(&room, "alpha", "src/foo.rs", "active work");
+        let before = room.snapshot().unwrap();
+        assert!(
+            !before.stale_owner_tools().contains("alpha"),
+            "freshly-claiming alpha must be live, not stale"
+        );
+
+        let result = command_release_by_path(
+            &room,
+            "beta",
+            &["file:src/foo.rs".to_string()],
+            None,
+            None,
+            "attempted takeover of a live claim".to_string(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            true,
+            Vec::new(),
+        );
+        assert!(
+            result.is_err(),
+            "a different tool must NOT release a still-live owner's claim"
+        );
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("still-live peer"),
+            "error must explain the live-peer block; got: {msg}"
+        );
+
+        // Claim survives.
+        let after = room.snapshot().unwrap();
+        assert!(
+            after.active_claims.iter().any(|c| c.event_id == live_id),
+            "live owner's claim must survive a rejected takeover"
         );
 
         std::fs::remove_dir_all(&root).ok();

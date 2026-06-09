@@ -378,6 +378,25 @@ pub(crate) struct RoomSnapshot {
 }
 
 impl RoomSnapshot {
+    /// Tools whose latest presence is liveness-stale (squad `status == "idle"`,
+    /// i.e. `last_seen_ts` older than the 15-minute `IDLE_THRESHOLD_SECS`). This
+    /// is the TTL-primary liveness signal — the same `last_seen_ts` projection
+    /// the squad view already computes — reused rather than adding a fourth
+    /// liveness engine (lesson 2026-06-07-managed-session-liveness-ttl-primary).
+    ///
+    /// A claim held by a tool in this set is "squatting": its owner went quiet
+    /// past the threshold, so peers may treat it as reclaimable (a non-blocking
+    /// WARN in `before-write`) and a lead may release it (authorized takeover).
+    /// Acknowledged-then-died owners are caught here even though
+    /// `liveness_conflicted` (which gates on `!acknowledged`) misses them.
+    pub(crate) fn stale_owner_tools(&self) -> std::collections::BTreeSet<String> {
+        self.squads
+            .iter()
+            .filter(|sq| sq.status == "idle")
+            .map(|sq| sq.tool.clone())
+            .collect()
+    }
+
     pub(crate) fn filtered(self, query: &RoomQuery) -> Self {
         if query.is_empty() {
             return self;
