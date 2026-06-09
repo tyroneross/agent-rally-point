@@ -1191,7 +1191,9 @@ fn command_say(args: SayArgs) -> Result<Output> {
     if let Some(ref step_id) = args.step_id {
         lineage_scope.push(format!("step:{step_id}"));
     }
-    if let Some(ref parent_step_id) = args.parent_step_id {
+    // One `parent-step:<id>` marker per value — a task with multiple `depends_on`
+    // entries records one DAG edge per (parent, step). Zero values writes none.
+    for parent_step_id in &args.parent_step_ids {
         lineage_scope.push(format!("parent-step:{parent_step_id}"));
     }
     // Merge lineage into scope (before external-intake check, which runs later).

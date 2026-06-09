@@ -105,11 +105,16 @@ pub(crate) fn extract_step_id(fact: &Fact) -> Option<String> {
         .find_map(|s| s.strip_prefix("step:").map(str::to_string))
 }
 
-/// Extract `parent-step:<id>` from a fact's scope markers.
-pub(crate) fn extract_parent_step_id(fact: &Fact) -> Option<String> {
+/// Extract every `parent-step:<id>` marker from a fact's scope.
+///
+/// A task with multiple `depends_on` entries carries one `parent-step:<id>` marker
+/// per dependency, so this returns all of them (one DAG edge per parent). A fact
+/// with a single marker yields a one-element Vec — identical to the prior behavior.
+pub(crate) fn extract_parent_step_ids(fact: &Fact) -> Vec<String> {
     fact.scope
         .iter()
-        .find_map(|s| s.strip_prefix("parent-step:").map(str::to_string))
+        .filter_map(|s| s.strip_prefix("parent-step:").map(str::to_string))
+        .collect()
 }
 
 /// Extract `wake_after:<iso>` from a standby fact's summary.
@@ -276,8 +281,8 @@ pub(crate) fn build_dag(facts: &[Fact], run_id: &str) -> DagOutput {
 
     for (step_id, facts) in &step_facts {
         for fact in facts {
-            // parent-step edges.
-            if let Some(parent) = extract_parent_step_id(fact) {
+            // parent-step edges — one per `parent-step:<id>` marker on the fact.
+            for parent in extract_parent_step_ids(fact) {
                 let key = (parent.clone(), step_id.clone(), "parent_step".to_string());
                 if seen_edges.insert(key) {
                     edges.push(DagEdge {
@@ -556,6 +561,73 @@ mod tests {
                 node.step_id
             );
         }
+    }
+
+    #[test]
+    fn dag_build_multi_parent_step_emits_one_edge_per_parent() {
+        // A single dependent claim that depends on TWO parents carries two
+        // `parent-step:` markers — the multi-`depends_on` case from packet.mjs.
+        // Each must become its own DAG edge.
+        let run = "RUNMP";
+
+        let p1 = {
+            let mut f = make_fact(
+                "claim",
+                "tool-a",
+                vec![format!("run:{run}"), "step:P1".into()],
+                None,
+            );
+            f.event_id = "evt-p1".into();
+            f
+        };
+        let p2 = {
+            let mut f = make_fact(
+                "claim",
+                "tool-a",
+                vec![format!("run:{run}"), "step:P2".into()],
+                None,
+            );
+            f.event_id = "evt-p2".into();
+            f
+        };
+        let child = {
+            let mut f = make_fact(
+                "claim",
+                "tool-b",
+                vec![
+                    format!("run:{run}"),
+                    "step:C1".into(),
+                    "parent-step:P1".into(),
+                    "parent-step:P2".into(),
+                ],
+                None,
+            );
+            f.event_id = "evt-c1".into();
+            f
+        };
+
+        let dag = build_dag(&[p1, p2, child], run);
+
+        let parent_edges: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.kind == "parent_step")
+            .collect();
+        assert_eq!(
+            parent_edges.len(),
+            2,
+            "a 2-parent child must emit 2 parent_step edges; got: {parent_edges:?}"
+        );
+        let to_c1: BTreeSet<&str> = parent_edges
+            .iter()
+            .filter(|e| e.to_step == "C1")
+            .map(|e| e.from_step.as_str())
+            .collect();
+        assert_eq!(
+            to_c1,
+            BTreeSet::from(["P1", "P2"]),
+            "both P1 and P2 must edge into C1"
+        );
     }
 
     #[test]

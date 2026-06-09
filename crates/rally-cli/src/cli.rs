@@ -127,8 +127,11 @@ pub(crate) struct SayArgs {
     pub(crate) run_id: Option<String>,
     /// Lineage: step identifier for this specific fact. Stored as `step:<id>` in scope.
     pub(crate) step_id: Option<String>,
-    /// Lineage: parent step that caused this step. Stored as `parent-step:<id>` in scope.
-    pub(crate) parent_step_id: Option<String>,
+    /// Lineage: parent steps that caused this step (repeatable). One `parent-step:<id>`
+    /// scope marker is written per value, so a task with multiple `depends_on` entries
+    /// records one DAG edge per (parent, step). Zero or one value behaves exactly as the
+    /// prior `Option<String>` form did — backward compatible with existing ledger facts.
+    pub(crate) parent_step_ids: Vec<String>,
     // B1 standby-specific args (only meaningful when kind == standby)
     /// Standby: human-readable reason for going dormant. Encoded as `reason:<r>` in summary.
     pub(crate) reason: Option<String>,
@@ -962,7 +965,9 @@ fn say_parser() -> impl Parser<SayArgs> {
     // B1: lineage markers (all optional)
     let run_id = optional_string_arg("run", "RUN_ID");
     let step_id = optional_string_arg("step", "STEP_ID");
-    let parent_step_id = optional_string_arg("parent-step", "STEP_ID");
+    // Repeatable: one DAG edge per (parent, step). `.many()` accepts zero/one/many,
+    // so single- and zero-parent callers behave exactly as the prior optional form.
+    let parent_step_ids = many_string_arg("parent-step", "STEP_ID");
     // B1: standby/wake specific args
     let reason = optional_string_arg("reason", "REASON");
     let wake_after = optional_string_arg("wake-after", "OFFSET_OR_ISO");
@@ -988,7 +993,7 @@ fn say_parser() -> impl Parser<SayArgs> {
         depends,
         run_id,
         step_id,
-        parent_step_id,
+        parent_step_ids,
         reason,
         wake_after,
         ref_standby,
@@ -1015,7 +1020,7 @@ fn say_parser() -> impl Parser<SayArgs> {
             depends,
             run_id,
             step_id,
-            parent_step_id,
+            parent_step_ids,
             reason,
             wake_after,
             ref_standby,
@@ -1041,7 +1046,7 @@ fn say_parser() -> impl Parser<SayArgs> {
             depends,
             run_id,
             step_id,
-            parent_step_id,
+            parent_step_ids,
             reason,
             wake_after,
             ref_standby,
