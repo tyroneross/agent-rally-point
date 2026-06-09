@@ -12,22 +12,83 @@
 //! The blocking is simulated via `RALLY_TEST_BLOCK_MS`, a seam that only exists
 //! in debug builds (`cfg(debug_assertions)`); these tests run against the debug
 //! binary that `cargo test` builds, so the seam is live here.
+//!
+//! ## Hermetic rooms
+//!
+//! Every `rally` invocation here runs inside a throwaway temp room — a fresh
+//! temp dir with a bare `.git/` (so `repo_root()` resolves there) and an
+//! isolated `HOME` — mirroring the pattern in `cli_guardrails.rs`. This matters
+//! for two reasons:
+//!
+//!  1. **Cold-ledger cost.** The committed production room (`.rally/`) carries a
+//!     ~2400-fact JSONL ledger; `facts.db` is gitignored, so on a cold CI runner
+//!     `rally check` must rebuild it from JSONL on first read. That rebuild plus
+//!     process spawn can exceed a 3s watchdog budget and fire the fail-open
+//!     envelope — making the timing-sensitive `..._does_not_break_real_command`
+//!     test flap on CI (green locally where `facts.db` is already warm). An
+//!     empty temp room has nothing to rebuild, so the real envelope returns
+//!     fast and deterministically.
+//!  2. **Ledger pollution.** `rally check before-write` writes a binding-decision
+//!     audit fact. Running against the production room writes those into the
+//!     committed ledger on every local test run. A temp room keeps the
+//!     production ledger pristine.
 
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-fn rally() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rally"))
+/// A throwaway rally room: a temp cwd with a bare `.git/` plus an isolated HOME.
+/// Drop cleans up both directories.
+struct TempRoom {
+    cwd: PathBuf,
+    home: PathBuf,
+}
+
+impl TempRoom {
+    fn new(name: &str) -> Self {
+        let cwd = temp_path(&format!("watchdog-{name}-cwd"));
+        let home = temp_path(&format!("watchdog-{name}-home"));
+        fs::create_dir_all(cwd.join(".git")).expect("create temp room .git");
+        fs::create_dir_all(&home).expect("create temp home");
+        Self { cwd, home }
+    }
+
+    /// A `rally` command rooted in this hermetic room (isolated cwd + HOME).
+    fn rally(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
+        cmd.current_dir(&self.cwd).env("HOME", &self.home);
+        cmd
+    }
+}
+
+impl Drop for TempRoom {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.cwd).ok();
+        fs::remove_dir_all(&self.home).ok();
+    }
+}
+
+fn temp_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "{name}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
 }
 
 /// The command body sleeps 30s but the budget is 300ms → must return fast,
 /// exit 0, and print the neutral envelope, not hang.
 #[test]
 fn hook_that_blocks_fails_open_within_budget() {
+    let room = TempRoom::new("blocks-fails-open");
     let budget_ms: u64 = 300;
     let started = Instant::now();
 
-    let output = rally()
+    let output = room
+        .rally()
         .args([
             "check",
             "before-write",
@@ -91,8 +152,10 @@ fn hook_that_blocks_fails_open_within_budget() {
 /// `--timeout-ms` argument takes effect and is honored just like the env var.
 #[test]
 fn timeout_ms_flag_is_honored() {
+    let room = TempRoom::new("timeout-ms-honored");
     let started = Instant::now();
-    let output = rally()
+    let output = room
+        .rally()
         .args([
             "check",
             "before-write",
@@ -118,7 +181,14 @@ fn timeout_ms_flag_is_honored() {
 /// subcommand parser (which would reject it as an unknown argument).
 #[test]
 fn timeout_ms_flag_does_not_break_real_command() {
-    let output = rally()
+    let room = TempRoom::new("does-not-break-real-command");
+    // Budget is generous on purpose: this test asserts the flag *parses* and
+    // does not leak into the subcommand — not that the command is fast. The
+    // hermetic room already removes the cold-ledger cost; the 15s budget is
+    // defense-in-depth against a pathologically slow runner so a real (non
+    // fail-open) envelope is what we assert on.
+    let output = room
+        .rally()
         .args([
             "check",
             "before-write",
@@ -128,7 +198,7 @@ fn timeout_ms_flag_does_not_break_real_command() {
             "/tmp/x",
             "--json",
             "--timeout-ms",
-            "3000",
+            "15000",
         ])
         .output()
         .expect("spawn rally");
@@ -148,7 +218,9 @@ fn timeout_ms_flag_does_not_break_real_command() {
 /// real exit code, no watchdog interference.
 #[test]
 fn fast_command_is_unaffected() {
-    let output = rally()
+    let room = TempRoom::new("fast-command");
+    let output = room
+        .rally()
         .args(["version", "--json"])
         .env("RALLY_HOOK_TIMEOUT_MS", "3000")
         .output()
