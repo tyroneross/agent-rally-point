@@ -1594,9 +1594,7 @@ fn command_release_by_path(
         })
         .collect();
     // Did at least one match come from a stale-owner takeover (not self)?
-    let is_takeover = matches
-        .iter()
-        .any(|c| c.tool.as_deref() != Some(tool));
+    let is_takeover = matches.iter().any(|c| c.tool.as_deref() != Some(tool));
     if matches.is_empty() {
         // Build the loud-error list: this tool's currently-open claims, plus a
         // hint about any squatting (stale-owner) claims on the wanted paths that
@@ -2886,6 +2884,14 @@ fn command_check(args: CheckArgs) -> Result<Output> {
             check: LivenessResult,
         }
 
+        // DESTRUCTIVE-release bar (independent-auditor HIGH, 2026-06-09): the
+        // `--enforce` arm appends Release facts on another tool's behalf, so it
+        // must apply the SAME 2h takeover-eligibility gate as `say release
+        // --path`. Reporting a conflict at the 15-min idle threshold is fine
+        // (advisory); RELEASING a claim out from under a busy-but-quiet owner
+        // at 15m is the regression. An unacknowledged owner that is idle but
+        // not yet >2h silent is reported as conflicted but NOT released.
+        let takeover_owners = snapshot.takeover_eligible_owners();
         let mut conflicted: Vec<ConflictedSquad> = Vec::new();
         for (sq_tool, held_ids) in liveness_conflicted(&snapshot) {
             let held: Vec<&Fact> = snapshot
@@ -2894,7 +2900,8 @@ fn command_check(args: CheckArgs) -> Result<Output> {
                 .filter(|c| held_ids.contains(&c.event_id))
                 .collect();
             let mut released = Vec::new();
-            if args.enforce {
+            let enforce_eligible = args.enforce && takeover_owners.contains(&sq_tool);
+            if enforce_eligible {
                 for claim in &held {
                     let release = Fact {
                         from_session_id: None,
@@ -2940,9 +2947,17 @@ fn command_check(args: CheckArgs) -> Result<Output> {
                 );
                 room.append_fact(&alert)?;
             }
+            let reason = if args.enforce && !enforce_eligible {
+                // Conflict reported but NOT released: owner is unacknowledged +
+                // idle but has not been silent the >2h required for a
+                // destructive release (busy-but-quiet protection).
+                "unacknowledged + idle + holding open claims (reported; not released — owner not yet >2h silent)".to_string()
+            } else {
+                "unacknowledged + idle + holding open claims".to_string()
+            };
             conflicted.push(ConflictedSquad {
                 tool: sq_tool.clone(),
-                reason: "unacknowledged + idle + holding open claims".to_string(),
+                reason,
                 released_claims: released,
             });
         }
@@ -5359,6 +5374,64 @@ mod tests {
         assert!(
             liveness_conflicted(&room.snapshot().unwrap()).is_empty(),
             "ack must clear conflict-out eligibility"
+        );
+    }
+
+    /// independent-auditor v2 HIGH (2026-06-09): `check liveness --enforce` must
+    /// apply the SAME 2h destructive-release gate as `say release --path`. A
+    /// busy-but-quiet unacknowledged owner that is idle (>15m) but NOT yet >2h
+    /// silent is REPORTED as conflicted (advisory) but its claim must NOT be
+    /// released. This locks the composition the enforce arm now relies on:
+    /// conflicted ∧ takeover-eligible (not conflicted alone).
+    #[test]
+    fn liveness_enforce_respects_takeover_gate_for_busy_but_quiet_owner() {
+        let root = unique_root("coord-liveness-2h-gate");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root).unwrap();
+        // 30 minutes ago: idle (>15m) but well under the 2h takeover bar, and
+        // never acknowledged → conflicted but not release-eligible.
+        let thirty_min_ago = (chrono::Utc::now() - chrono::Duration::minutes(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let mk = |kind: FactKind, subject: &str, scope: Vec<String>| Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind,
+            tool: Some("busy-ghost".to_string()),
+            role: None,
+            subject: subject.to_string(),
+            scope,
+            created_at: thirty_min_ago.clone(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact(&mk(FactKind::Presence, "presence: busy-ghost", Vec::new()))
+            .unwrap();
+        room.append_fact(&mk(
+            FactKind::Claim,
+            "claim y",
+            vec!["file:y.rs".to_string()],
+        ))
+        .unwrap();
+        let snap = room.snapshot().unwrap();
+        // Conflicted (unack + idle + holding a claim) — reportable.
+        assert_eq!(
+            liveness_conflicted(&snap).len(),
+            1,
+            "30m-idle unacked claim-holder must be conflicted (reportable)"
+        );
+        // But NOT takeover-eligible — so the enforce arm must not release it.
+        assert!(
+            !snap.takeover_eligible_owners().contains("busy-ghost"),
+            "a 30m-idle owner must not be takeover-eligible (needs >2h)"
         );
     }
 
@@ -8681,7 +8754,10 @@ mod tests {
             subject.contains("authorized-takeover"),
             "release subject must record the takeover; got: {subject}"
         );
-        let evidence = released_fact["evidence"].as_array().cloned().unwrap_or_default();
+        let evidence = released_fact["evidence"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         assert!(
             evidence
                 .iter()
@@ -8778,12 +8854,7 @@ mod tests {
 
         // before-write downgrades to a reclaimable WARN (advisory), not a stop.
         let mut findings = Vec::new();
-        crate::check::check_before_write_for_test(
-            &snap,
-            "peer",
-            Some("src/foo.rs"),
-            &mut findings,
-        );
+        crate::check::check_before_write_for_test(&snap, "peer", Some("src/foo.rs"), &mut findings);
         assert!(
             findings
                 .iter()
