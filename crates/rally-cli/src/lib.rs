@@ -3097,11 +3097,55 @@ fn command_run(args: RunArgs) -> Result<Output> {
         agent,
         name,
         backend,
+        backend_raw,
         session_id,
         tool,
         bins,
         shared,
     } = args;
+
+    // Backend resolution for the ptyd pane-ownership flip:
+    //   * `--backend auto`: prefer Ptyd iff the RALLY-OWNED socket is LIVE
+    //     (connectable, not just file-exists); else keep Tmux (current default).
+    //   * `--backend ptyd`: if the socket is not live, AUTOSTART the rally
+    //     daemon (≤5s) or fail the run with a clear error.
+    // The detect_host_runtime / try_register_session_with_daemon paths
+    // (tmux-session registration) are untouched — F3.
+    let backend = if dry_run {
+        // Dry-run never touches a daemon: report the parsed backend as-is.
+        backend
+    } else if Backend::is_auto(&backend_raw) {
+        match daemon_client::rally_owned_socket() {
+            Some(sock) if daemon_client::socket_is_live(&sock) => {
+                // [F]: `auto` is now the default backend, so a plain `rally run`
+                // silently selecting ptyd (where attach is unsupported) would
+                // surprise the user. Emit ONE stderr line naming the selection
+                // and how to override. JSON stdout is untouched (this is stderr).
+                eprintln!(
+                    "rally: backend=auto selected ptyd (rally daemon live at {sock}); \
+                     pass --backend tmux to force tmux. Attach a ptyd pane via \
+                     EasyTerminal or `ptyd attach`."
+                );
+                Backend::Ptyd
+            }
+            _ => backend, // Tmux fallback — no live rally daemon.
+        }
+    } else if backend == Backend::Ptyd {
+        let sock = daemon_client::rally_owned_socket().ok_or_else(|| {
+            RallyError::Usage(
+                "--backend ptyd requires HOME to resolve the rally ptyd socket".to_string(),
+            )
+        })?;
+        if !daemon_client::socket_is_live(&sock) {
+            // Explicit ptyd → autostart the rally-owned daemon (env-gated so the
+            // hermetic test of "no socket, no binary" asserts the error path).
+            daemon_client::autostart_daemon(&sock).map_err(RallyError::Command)?;
+        }
+        Backend::Ptyd
+    } else {
+        backend
+    };
+
     let backend_name = backend.as_str().to_string();
     let repo = repo_root()?;
     let agent_spec = AgentSpec::from_name(&agent)?;
@@ -3131,6 +3175,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 branch: None,
                 daemon_registered: false,
                 daemon_pane: None,
+                daemon_socket: None,
             },
         }
     } else {
@@ -3202,17 +3247,95 @@ fn command_run(args: RunArgs) -> Result<Output> {
     }
 
     let command = agent_spec.command_line(&session.name);
-    let backend_runner = BackendRunner::new(backend, bins);
+    let mut backend_runner = BackendRunner::new(backend, bins.clone());
     // Backend launches the agent in the worktree (when provisioned) so the
     // agent's HEAD, commits and working tree are isolated from peers.
     let backend_cwd = session.cwd.clone();
     let start_commands =
         backend_runner.start_commands(&session.target, &backend_cwd, &command, &session.name)?;
 
-    let actual_target = if dry_run {
-        session.target.clone()
+    // F2 loud warning surfaced in the run envelope when a ptyd spawn succeeded
+    // but registration forced a tmux fallback (no silent orphaned panes).
+    let mut run_warning: Option<String> = None;
+
+    if dry_run {
+        // Dry-run: no launch, no daemon contact. The envelope advertises the
+        // planned target only.
+    } else if backend == Backend::Ptyd {
+        // ----- ptyd pane-ownership spawn path (design-1 + design-3 start) -----
+        // 1. ensure a rally-dedicated workspace so the pane never lands in the
+        //    user's focused tab; 2. agent.start (focus:false) → pane id;
+        //    3. register_agent binds session.tool → pane. On REGISTER FAILURE
+        //    after a successful spawn (F2): agent-stop the pane, then fall back
+        //    to a tmux launch with a loud warning — never a silent orphan.
+        match ptyd_spawn_and_register(
+            &backend_runner,
+            &room,
+            &reservation.fact,
+            &mut session,
+            &backend_cwd,
+            &command,
+        ) {
+            PtydSpawnResult::Daemon => { /* session is daemon-owned + registered */ }
+            PtydSpawnResult::FellBackToTmux { warning } => {
+                // The ptyd pane was already reaped inside the helper. Relaunch
+                // under tmux so the agent actually runs; switch the runner +
+                // recorded backend to tmux for the rest of this command.
+                run_warning = Some(warning);
+                session.backend = Backend::Tmux.as_str().to_string();
+                backend_runner = BackendRunner::new(Backend::Tmux, bins.clone());
+                let tmux_target = backend_target(Backend::Tmux, &session.session_id);
+                session.target = tmux_target.clone();
+                match backend_runner.start(&tmux_target, &backend_cwd, &command, &session.name) {
+                    Ok(target) => {
+                        session.target = target;
+                        if let Some(fact) = &reservation.fact {
+                            room.append_fact(&session_fact(
+                                &session,
+                                "active",
+                                Some(fact.event_id.clone()),
+                            ))?;
+                        }
+                    }
+                    Err(err) => {
+                        if let (Some(path), Some(branch)) =
+                            (provisioned_path.as_deref(), session.branch.as_deref())
+                        {
+                            let _ = run_worktree::cleanup(&repo, path, branch, "git");
+                        }
+                        if let Some(fact) = &reservation.fact {
+                            let _ = append_stopped_session_record(&room, &session, fact);
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            PtydSpawnResult::Failed(err) => {
+                // Spawn itself failed (no pane to reap) → clean up like any
+                // backend-start failure.
+                if let (Some(path), Some(branch)) =
+                    (provisioned_path.as_deref(), session.branch.as_deref())
+                {
+                    let _ = run_worktree::cleanup(&repo, path, branch, "git");
+                }
+                if let Some(fact) = &reservation.fact {
+                    if let Err(cleanup_err) = append_stopped_session_record(&room, &session, fact) {
+                        return Err(RallyError::Message(format!(
+                            "ptyd spawn failed: {err}; additionally failed to mark managed session stopped: {cleanup_err}"
+                        )));
+                    }
+                }
+                return Err(err);
+            }
+        }
     } else {
-        match backend_runner.start(&session.target, &backend_cwd, &command, &session.name) {
+        // ----- tmux / cmux generic backend start (unchanged) -----
+        let actual_target = match backend_runner.start(
+            &session.target,
+            &backend_cwd,
+            &command,
+            &session.name,
+        ) {
             Ok(target) => target,
             Err(err) => {
                 // Best-effort cleanup of the worktree we just provisioned, so
@@ -3231,24 +3354,22 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 }
                 return Err(err);
             }
+        };
+        if actual_target != session.target {
+            session.target = actual_target;
+            if let Some(fact) = &reservation.fact {
+                room.append_fact(&session_fact(
+                    &session,
+                    "active",
+                    Some(fact.event_id.clone()),
+                ))?;
+            }
         }
-    };
-    if actual_target != session.target {
-        session.target = actual_target;
-        if let Some(fact) = &reservation.fact {
-            room.append_fact(&session_fact(
-                &session,
-                "active",
-                Some(fact.event_id.clone()),
-            ))?;
-        }
-    }
 
-    // Daemon-first inject routing (move 2): attempt to register this session's
-    // pane with the rally-termd daemon so future injects route LEDGER-ONLY.
-    // Fail-OPEN — if no daemon is reachable (the common case until ptyd owns
-    // the pane), the session stays on the framed-tmux fallback with zero error.
-    if !dry_run {
+        // Daemon-first inject routing (move 2): attempt to register this
+        // session's tmux/cmux pane with a daemon that may already own it. This
+        // is the EXISTING path (detect_host_runtime candidate list); the ptyd
+        // spawn path above handles its own registration. Fail-OPEN.
         try_register_session_with_daemon(&room, &reservation.fact, &mut session);
     }
 
@@ -3262,6 +3383,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 commands: RunCommands {
                     start: command_plan_json(&start_commands),
                 },
+                warning: run_warning,
             },
         },
     )?;
@@ -3304,6 +3426,102 @@ fn try_register_session_with_daemon(
         }
         daemon_client::RegisterOutcome::Unavailable { .. } => {
             // Fall back silently — framed-tmux delivery carries the inject.
+        }
+    }
+}
+
+/// Result of the ptyd pane-ownership spawn path.
+enum PtydSpawnResult {
+    /// The pane was spawned AND registered: `session` is daemon-owned, its
+    /// `target`/`daemon_pane`/`daemon_registered` fields are set.
+    Daemon,
+    /// F2: the pane spawned but `agent.register` failed. The spawned pane has
+    /// already been reaped (`agent.stop`); the caller must relaunch under tmux
+    /// and surface `warning` in the run envelope.
+    FellBackToTmux { warning: String },
+    /// The spawn RPC itself failed — no pane exists to reap.
+    Failed(RallyError),
+}
+
+/// Spawn a ptyd-owned agent pane and register the session's identity with the
+/// rally daemon (design-3 start arm). On success, sets `session.target =
+/// session.daemon_pane = <pane id>` and `daemon_registered = true`, and
+/// refreshes the durable session fact so `rally sessions` shows the binding.
+///
+/// F2 (register-fail safety): if `agent.register` fails AFTER a successful
+/// `agent.start`, the just-spawned pane is reaped via `agent.stop` (no silent
+/// orphan), and the function returns `FellBackToTmux` so the caller relaunches
+/// under tmux with a loud warning.
+fn ptyd_spawn_and_register(
+    runner: &BackendRunner,
+    room: &RoomStore,
+    reservation_fact: &Option<Fact>,
+    session: &mut ManagedSession,
+    cwd: &std::path::Path,
+    command: &[String],
+) -> PtydSpawnResult {
+    // Design-1: a rally-dedicated workspace so the pane never lands in the
+    // user's focused tab. Label is stable so repeated runs reuse intent (ptyd
+    // assigns a fresh workspace id each create; that's fine — any rally
+    // workspace is off the user's focused tab).
+    let workspace_id = match runner.ptyd_ensure_workspace("rally") {
+        Ok(id) => id,
+        Err(e) => return PtydSpawnResult::Failed(e),
+    };
+
+    // agent.start (focus:false) → daemon pane id.
+    let pane_id = match runner.ptyd_start(&session.name, cwd, command, &workspace_id) {
+        Ok(id) => id,
+        Err(e) => return PtydSpawnResult::Failed(e),
+    };
+
+    // The pane id IS the session target AND the daemon pane handle.
+    session.target = pane_id.clone();
+    session.daemon_pane = Some(pane_id.clone());
+
+    // [E]: bind session.tool → pane via the SAME socket the runner spawned into,
+    // and RECORD it on the session so every later send/stop/read reaches that
+    // exact daemon — never a re-resolved (possibly different) socket. The runner
+    // already resolved the rally-owned socket (F3) at construction.
+    let socket = match runner.ptyd_socket() {
+        Some(s) => s.to_string(),
+        None => {
+            // Should not happen (ptyd_ensure_workspace already required it), but
+            // be safe: reap + fall back.
+            let _ = runner.ptyd_stop(&session.name);
+            return PtydSpawnResult::FellBackToTmux {
+                warning: "ptyd register skipped: rally socket unresolved; fell back to tmux"
+                    .to_string(),
+            };
+        }
+    };
+    session.daemon_socket = Some(socket.clone());
+    match daemon_client::register_agent(&socket, &session.tool, &pane_id) {
+        daemon_client::RegisterOutcome::Registered { pane_id: bound } => {
+            session.daemon_registered = true;
+            session.daemon_pane = Some(bound);
+            // Refresh the durable record so the binding is visible + survives.
+            let prev = reservation_fact.as_ref().map(|f| f.event_id.clone());
+            let _ = room.append_fact(&session_fact(session, "active", prev));
+            PtydSpawnResult::Daemon
+        }
+        daemon_client::RegisterOutcome::Unavailable { reason } => {
+            // F2: reap the orphaned pane BEFORE falling back. [G]: reap by the
+            // exact PANE ID we just spawned (`pane.close`), NOT by name — a name
+            // collision could otherwise reap the wrong pane. Best-effort: a
+            // failed reap is surfaced in the warning for manual cleanup.
+            let reap = runner.ptyd_close_pane(&pane_id);
+            session.daemon_pane = None;
+            session.daemon_socket = None;
+            let reap_note = match reap {
+                Ok(()) => "spawned pane reaped".to_string(),
+                Err(e) => format!("WARNING: failed to reap spawned pane ({e})"),
+            };
+            PtydSpawnResult::FellBackToTmux {
+                warning: format!(
+                    "ptyd agent.register failed ({reason}); {reap_note}; fell back to tmux launch"
+                ),
+            }
         }
     }
 }
@@ -3405,6 +3623,7 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
         branch: None,
         daemon_registered: false,
         daemon_pane: None,
+        daemon_socket: None,
     };
 
     // Append the session fact under the same context-version race guard as
@@ -3490,6 +3709,7 @@ fn reserve_numbered_session(
             branch: None,
             daemon_registered: false,
             daemon_pane: None,
+            daemon_socket: None,
         };
         let fact = session_fact(&session, "active", None);
         if let Some(fact) = room.append_session_fact_if_context(&fact, context_version)? {
@@ -3804,7 +4024,10 @@ fn command_inject_managed(
     };
 
     let backend_parsed = Backend::parse(&session.backend)?;
-    let backend_runner = BackendRunner::new(backend_parsed, bins);
+    let mut backend_runner = BackendRunner::new(backend_parsed, bins);
+    // [E]: a ptyd session pins the exact socket it was spawned+registered on, so
+    // this inject's agent.send reaches the SAME daemon (never a re-resolved one).
+    backend_runner.pin_ptyd_socket(session.daemon_socket.as_deref());
     let live_target = if dry_run {
         session.target.clone()
     } else {
@@ -3834,13 +4057,10 @@ fn command_inject_managed(
         }
     };
 
-    // Daemon-first inject routing (move 2): if this session is registered with
-    // the rally-termd daemon, the daemon OWNS the PTY-write. The CLI must NOT
-    // puppet the TUI with keystrokes — the ledger Directive already written
-    // above IS the delivery, and the daemon performs the PTY-write + posts a
-    // Receipt that `inject`'s existing ACK wait resolves on. So we SKIP the
-    // legacy synchronous backend inject entirely for a daemon-registered
-    // session. When not registered, the framed tmux write below is the
+    // Daemon-first inject routing: if this session is registered with the rally
+    // ptyd daemon, the daemon OWNS the pane and delivery is the `agent.send`
+    // RPC — NOT a tmux keystroke write (the pane is a ptyd pane; tmux cannot
+    // reach it). When not registered, the framed tmux write below is the
     // operative fallback (the 2026-06-09 atomic send-keys frame).
     let delivery_path: &'static str = if session.daemon_registered {
         "daemon"
@@ -3849,18 +4069,72 @@ fn command_inject_managed(
     };
     let daemon_routed = session.daemon_registered;
 
-    // Legacy synchronous backend delivery — preserved for backward compat
-    // with tmux/cmux backends and pre-daemon herdr smoke tests. Once
-    // rally-termd (P3) is universally deployed, this branch becomes
-    // redundant for Backend::Herdr.
+    // ----- ptyd daemon delivery arm (design-4) -----
+    // For a daemon-registered session, perform the real `agent.send` RPC here:
+    //   F1: sanitize is applied inside `ptyd_inject` before the write.
+    //   F4: the receipt's pane_id is cross-checked against session.daemon_pane;
+    //       a mismatch is a HARD `daemon_pane_mismatch` failure — NO fallback.
+    // On RPC failure the directive stays Pending and the envelope reports the
+    // failure honestly; we do NOT fall back to tmux keystrokes (the pane is a
+    // ptyd pane). On success we append a Receipt fact ref'ing the directive seq
+    // so `inject`'s ACK wait resolves on it.
+    enum PtydDelivery {
+        NotDaemon,
+        Sent { state: String },
+        Mismatch { reason: String },
+        Failed { reason: String },
+    }
+    let ptyd_delivery = if dry_run || !daemon_routed {
+        PtydDelivery::NotDaemon
+    } else if delivery_state_initial == "failed" {
+        // Ledger write failed — do not attempt the daemon send (we have no
+        // directive seq to reference and delivery is already a failure).
+        PtydDelivery::Failed {
+            reason: "ledger directive write failed".to_string(),
+        }
+    } else if urgent {
+        // Same SEC-009 split-enforcement posture as the tmux path: an urgent
+        // Addition is delivered by NO transport (the daemon would reject it).
+        PtydDelivery::Failed {
+            reason: "urgent Addition is not delivered synchronously (SEC-009)".to_string(),
+        }
+    } else {
+        let expect_pane = session.daemon_pane.clone().unwrap_or_default();
+        match backend_runner.ptyd_inject(&session.tool, &text, &expect_pane) {
+            Ok(state) => PtydDelivery::Sent { state },
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("daemon_pane_mismatch") {
+                    PtydDelivery::Mismatch { reason: msg }
+                } else {
+                    PtydDelivery::Failed { reason: msg }
+                }
+            }
+        }
+    };
+
+    // On a successful daemon send, post a Receipt fact correlating the delivery
+    // to the directive seq via EVIDENCE (not a fake handoff ref). [D]: this is a
+    // SENDER-authored delivery record, NOT an ACK — the ACK is the TARGET's own
+    // Resolve/Receipt against the handoff ref_id, which only the agent posts. We
+    // record the REAL receipt state (`submitted`/`sent`/`seen`) the daemon
+    // returned, not a fabricated "delivered".
+    if let (PtydDelivery::Sent { state }, Some(seq), Some(r)) =
+        (&ptyd_delivery, directive_seq, room.as_ref())
+    {
+        let receipt = ptyd_receipt_fact(&sender_tool, seq, &session.tool, state);
+        let _ = r.append_fact(&receipt);
+    }
+
+    // Legacy synchronous backend delivery — preserved for tmux/cmux backends.
     let delivered = if dry_run {
         false
     } else if daemon_routed {
-        // Daemon owns delivery — NO keystroke write. `delivered` (the legacy
-        // sync-delivery flag) stays false; truthful delivery state is the
-        // ledger Pending until the daemon posts its Receipt (resolved
-        // out-of-band via `rally status`, same as the LedgerAgent arm).
-        false
+        // ptyd daemon owns delivery: `delivered` (the legacy sync-delivery flag)
+        // is true ONLY when the agent.send RPC returned a Receipt. A mismatch or
+        // RPC failure leaves it false (and surfaces as a failed delivery_state
+        // below). NO tmux keystroke is ever written for a ptyd session.
+        matches!(ptyd_delivery, PtydDelivery::Sent { .. })
     } else if delivery_state_initial == "failed" {
         // Ledger write failed — do not attempt backend inject. The content
         // fact is already recorded.
@@ -3895,18 +4169,22 @@ fn command_inject_managed(
     // Plan F functional core (Chunk 3): the herdr backend is removed;
     // the only inject paths left are tmux + cmux + the ledger write.
     let ledger_failed = delivery_state_initial == "failed";
-    // A daemon-routed inject intentionally does NO keystroke write, so a false
-    // `delivered` is EXPECTED (not a legacy failure). Exclude it from the
-    // tmux/cmux-failure detection — its state stays the ledger Pending until
-    // the daemon posts a Receipt.
     let legacy_tmux_cmux_failed = !dry_run && !daemon_routed && !delivered && !ledger_failed;
-    let delivery_state: &'static str = if ledger_failed || legacy_tmux_cmux_failed {
-        "failed"
-    } else if delivered {
-        "delivered"
-    } else {
-        delivery_state_initial
-    };
+    // F4 + RPC honesty: a daemon-routed send that hit a pane mismatch or an RPC
+    // error is a REAL failure (the directive stays Pending on the ledger, but
+    // this inject did not deliver). A successful Receipt is `delivered`.
+    let daemon_delivery_failed = matches!(
+        ptyd_delivery,
+        PtydDelivery::Mismatch { .. } | PtydDelivery::Failed { .. }
+    );
+    let delivery_state: &'static str =
+        if ledger_failed || legacy_tmux_cmux_failed || daemon_delivery_failed {
+            "failed"
+        } else if delivered {
+            "delivered"
+        } else {
+            delivery_state_initial
+        };
 
     let wake_intent = inject_wake_intent_with_room(
         room.as_ref(),
@@ -3940,6 +4218,14 @@ fn command_inject_managed(
         &session.tool,
         ack.as_ref(),
     );
+    // Surface the daemon Receipt state / failure reason honestly.
+    let (daemon_receipt_state, daemon_delivery_error) = match &ptyd_delivery {
+        PtydDelivery::Sent { state } => (Some(state.clone()), None),
+        PtydDelivery::Mismatch { reason } | PtydDelivery::Failed { reason } => {
+            (None, Some(reason.clone()))
+        }
+        PtydDelivery::NotDaemon => (None, None),
+    };
     let session_id_for_text = session.session_id.clone();
     let inject_payload = InjectData {
         mode: if dry_run { "dry-run" } else { "inject" },
@@ -3963,6 +4249,8 @@ fn command_inject_managed(
         directive_seq,
         directive_to,
         delivery_path,
+        daemon_receipt_state,
+        daemon_delivery_error,
     };
     let has_ack = ack.is_some();
     let body = envelope(
@@ -4118,6 +4406,10 @@ fn command_inject_ledger(
         // A LedgerAgent target is an externally-registered ptyd pane: the
         // ledger write is already the daemon-delivered path.
         delivery_path: "ledger_only",
+        // The LedgerAgent arm does not perform a CLI-initiated agent.send (the
+        // external rally-termd owns delivery + posts its own Receipt).
+        daemon_receipt_state: None,
+        daemon_delivery_error: None,
     };
     let has_ack = ack.is_some();
     let agent_for_text = agent_id;
@@ -4155,7 +4447,10 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
     let dry_run = args.dry_run;
     let target = args.target;
     let session = find_session(&target, &args.bins)?;
-    let backend_runner = BackendRunner::new(Backend::parse(&session.backend)?, args.bins);
+    let mut backend_runner = BackendRunner::new(Backend::parse(&session.backend)?, args.bins);
+    // [E]: capture/stop/attach on a ptyd session must reach the SAME daemon the
+    // pane was spawned in — pin the socket recorded on the session.
+    backend_runner.pin_ptyd_socket(session.daemon_socket.as_deref());
     let live_target = if dry_run {
         session.target.clone()
     } else {
@@ -4448,6 +4743,74 @@ fn make_inject_content_fact(sender_tool: &str, recipient_tool: &str, text: &str)
         target: Some(recipient_tool.to_string()),
         ref_id: None,
         status: Some("pending".to_string()),
+        severity: None,
+        uri: None,
+        session: None,
+    }
+}
+
+/// Build a `Receipt` fact recording that the rally ptyd daemon delivered a
+/// directive to a daemon-owned pane (design-4). [D]: this is a SENDER-authored
+/// DELIVERY record — it is authored as `sender_tool` (the actor that initiated
+/// the `agent.send`, same actor as the tmux fallback), NOT the target. It is
+/// NOT an ACK: the ACK that closes a `--require-ack` wait is the TARGET's own
+/// Resolve/Receipt against the handoff `ref_id`, which only the agent posts
+/// (`wait_for_resolution` matches `ref_id == handoff && tool == target`). A
+/// sender-fabricated, target-attributed "delivered" claim would be a fake ACK,
+/// so we do neither: no handoff ref, and `status` reflects the REAL receipt
+/// state the daemon returned (`sent`/`seen`/`acted`), not an invented
+/// "delivered".
+///
+/// Correlation to the Directive it acknowledges is carried by EVIDENCE
+/// (`directive_seq:<n>`), so a consumer can join the Receipt to its Directive
+/// without a synthetic handoff ref_id that would never match.
+///
+/// SAME-ACTOR trust model (plan §Fallback contract): the CLI initiated the
+/// `agent.send` itself, so it may post a delivery Receipt for that send. The
+/// autonomous rally-termd path (which would post its OWN Receipt) is separate
+/// and gated; see F5 mutual-exclusion in the plan.
+///
+/// `receipt_state` is the ptyd `Receipt.state` (`sent`/`seen`/`acted`) — with
+/// the CLI's `confirm:"sent"` ceiling this is `"sent"` (submitted, bytes
+/// written). It is recorded verbatim so the fact never oversells the evidence.
+fn ptyd_receipt_fact(
+    sender_tool: &str,
+    directive_seq: u64,
+    target_tool: &str,
+    receipt_state: &str,
+) -> Fact {
+    Fact {
+        from_session_id: None,
+        schema: FACT_SCHEMA.to_string(),
+        event_id: new_id("receipt"),
+        seq: 0,
+        thread_id: format!("inject-{}", sanitize_id(target_tool)),
+        kind: FactKind::Receipt,
+        // [D]: authored as the SENDER (the actor that performed the send), not
+        // the target. A target-attributed receipt would be a sender-fabricated
+        // claim spoofing the agent.
+        tool: Some(sender_tool.to_string()),
+        role: None,
+        subject: format!("receipt: daemon delivered directive seq {directive_seq}"),
+        scope: Vec::new(),
+        created_at: now_string(),
+        summary: Some(format!(
+            "rally ptyd daemon delivered directive seq {directive_seq} to {target_tool} \
+             (state {receipt_state})"
+        )),
+        // Correlate to the Directive by evidence, not a synthetic handoff ref.
+        evidence: vec![
+            format!("directive_seq:{directive_seq}"),
+            "transport:daemon".to_string(),
+            format!("receipt_state:{receipt_state}"),
+        ],
+        target: Some(target_tool.to_string()),
+        // No ref_id: this is NOT a handoff-closing ACK. Leaving ref_id unset
+        // keeps it out of `wait_for_resolution`'s handoff match (which it could
+        // never satisfy anyway).
+        ref_id: None,
+        // [D]: status is the REAL receipt state, not a fabricated "delivered".
+        status: Some(receipt_state.to_string()),
         severity: None,
         uri: None,
         session: None,
@@ -4802,6 +5165,10 @@ fn backend_target(backend: Backend, session_id: &str) -> String {
     match backend {
         Backend::Tmux => format!("rally-{}", sanitize_id(session_id)),
         Backend::Cmux => sanitize_id(session_id),
+        // ptyd's real target is the daemon pane id, assigned at spawn time. This
+        // is only a pre-spawn placeholder for the reserved session record; the
+        // ptyd spawn path overwrites `session.target` with the pane id.
+        Backend::Ptyd => format!("rally-ptyd-{}", sanitize_id(session_id)),
     }
 }
 

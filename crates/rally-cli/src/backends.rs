@@ -87,6 +87,14 @@ pub(crate) struct ManagedSession {
     /// (acceptance criterion 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) daemon_pane: Option<String>,
+    /// [E]: the EXACT rally-owned ptyd socket the spawn path used to spawn +
+    /// register this `Backend::Ptyd` pane. Pinned on the session so every later
+    /// op (send/stop/read/liveness) reaches the SAME daemon the pane lives in —
+    /// not a possibly-different socket re-resolved at call time. `None` for
+    /// tmux/cmux sessions and for ptyd sessions recorded before this field
+    /// shipped (those fall back to `rally_owned_socket()` resolution).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) daemon_socket: Option<String>,
 }
 
 /// Serde skip helper: omit `daemon_registered` from JSON when false so existing
@@ -116,6 +124,12 @@ pub(crate) struct RunData {
     pub(crate) mode: &'static str,
     pub(crate) session: ManagedSession,
     pub(crate) commands: RunCommands,
+    /// F2: a LOUD warning when a ptyd spawn succeeded but its `agent.register`
+    /// failed, forcing a tmux fallback launch (the spawned daemon pane was
+    /// reaped first — no silent orphan). `None` on the happy path. Surfaced so
+    /// a host never silently believes it got a daemon-owned pane when it didn't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) warning: Option<String>,
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -225,6 +239,19 @@ pub(crate) struct InjectData {
     ///
     /// Consumers branch on this to know whether a keystroke write happened.
     pub(crate) delivery_path: &'static str,
+    /// ptyd pane-ownership flip: the `state` of the daemon's `agent.send`
+    /// Receipt (`sent|seen|acted`) when `delivery_path == "daemon"` and the send
+    /// succeeded; `None` for non-daemon paths or a failed/mismatched daemon
+    /// send. Lets a caller see how far the daemon delivery got without scraping
+    /// the ledger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) daemon_receipt_state: Option<String>,
+    /// ptyd pane-ownership flip: when a daemon-routed send FAILED (RPC error or
+    /// the F4 `daemon_pane_mismatch` cross-check), the honest reason. `None` on
+    /// success or non-daemon paths. The directive stays Pending on the ledger;
+    /// the CLI does NOT fall back to tmux keystrokes for a ptyd pane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) daemon_delivery_error: Option<String>,
 }
 
 /// Envelope for `inject`: result under `data.inject`.
@@ -281,13 +308,25 @@ impl serde::Serialize for SessionActionEnvelope {
 pub(crate) enum Backend {
     Tmux,
     Cmux,
+    /// ptyd pane-ownership flip: the agent runs as a pane OWNED by the
+    /// rally-dedicated ptyd daemon. Start/inject/stop/liveness all speak the
+    /// daemon's unix-socket JSON-RPC (no tmux keystrokes). Resolved by
+    /// `Backend::parse` from `"ptyd"`; `"auto"` prefers it iff the rally-owned
+    /// socket is LIVE.
+    Ptyd,
 }
 
 impl Backend {
+    /// Parse a `--backend` value. NOTE: `"auto"` here defaults to `Tmux` — the
+    /// live-socket preference for `auto` cannot be decided from the string
+    /// alone (it needs an I/O probe), so `command_run` resolves `auto → ptyd`
+    /// when the rally-owned socket is live via [`Backend::resolve_auto`]. Every
+    /// non-auto value maps deterministically.
     pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "auto" | "tmux" => Ok(Self::Tmux),
             "cmux" => Ok(Self::Cmux),
+            "ptyd" => Ok(Self::Ptyd),
             "herdr" => Err(RallyError::Usage(
                 "backend \"herdr\" is removed (Plan F): use the .rally ledger \
                  (rally inject) and the rally-termd daemon; or fall back to tmux/cmux"
@@ -297,10 +336,19 @@ impl Backend {
         }
     }
 
+    /// True when the user passed `--backend auto` (recorded so `command_run`
+    /// can apply the live-socket preference). bpaf maps both `auto` and `tmux`
+    /// to `Tmux`, so the raw string is threaded separately when the distinction
+    /// matters.
+    pub(crate) fn is_auto(raw: &str) -> bool {
+        raw == "auto"
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Tmux => "tmux",
             Self::Cmux => "cmux",
+            Self::Ptyd => "ptyd",
         }
     }
 }
@@ -309,6 +357,10 @@ pub(crate) struct BackendRunner {
     pub(crate) backend: Backend,
     tmux_bin: String,
     cmux_bin: String,
+    /// The RALLY-OWNED ptyd socket (F3), resolved once at construction. `None`
+    /// only when HOME is unset. Used exclusively by the `Backend::Ptyd` arms;
+    /// the tmux/cmux arms never touch it.
+    ptyd_socket: Option<String>,
 }
 
 impl BackendRunner {
@@ -321,7 +373,38 @@ impl BackendRunner {
             backend,
             tmux_bin: bins.tmux_bin,
             cmux_bin: bins.cmux_bin,
+            // F3: the rally-owned socket only — NEVER detect_host_runtime's
+            // wider candidate list (which includes Easy Terminal's daemon).
+            ptyd_socket: crate::daemon_client::rally_owned_socket(),
         }
+    }
+
+    /// [E]: pin the ptyd socket this runner uses to the EXACT socket recorded on
+    /// a `Backend::Ptyd` session (`ManagedSession::daemon_socket`), so send/
+    /// stop/read/liveness reach the SAME daemon the pane was spawned in. A no-op
+    /// (`None`/empty) leaves the constructor's `rally_owned_socket()` resolution.
+    pub(crate) fn pin_ptyd_socket(&mut self, socket: Option<&str>) {
+        if let Some(s) = socket {
+            if !s.is_empty() {
+                self.ptyd_socket = Some(s.to_string());
+            }
+        }
+    }
+
+    /// The socket this runner will use for ptyd ops, if resolvable. Used by the
+    /// spawn path to RECORD the pinned socket on the session ([E]).
+    pub(crate) fn ptyd_socket(&self) -> Option<&str> {
+        self.ptyd_socket.as_deref()
+    }
+
+    /// The resolved rally-owned ptyd socket, or a clear error when unresolved.
+    fn require_ptyd_socket(&self) -> Result<&str> {
+        self.ptyd_socket.as_deref().ok_or_else(|| {
+            RallyError::Command(
+                "rally ptyd socket unresolved (HOME unset); cannot reach the rally daemon"
+                    .to_string(),
+            )
+        })
     }
 
     pub(crate) fn start_commands(
@@ -340,6 +423,11 @@ impl BackendRunner {
                 command,
                 name,
             )?],
+            // ptyd spawn is a daemon RPC, not a subprocess command. The plan is
+            // surfaced for observability as a single pseudo-command; the actual
+            // spawn runs through `command_run`'s ptyd path
+            // (`daemon_client::start_agent`), which also does register + F2.
+            Backend::Ptyd => vec![ptyd_start_plan(target, cwd, command, name)],
         };
         Ok(commands)
     }
@@ -358,12 +446,60 @@ impl BackendRunner {
                 let output = run_command_output(first_command(&commands)?)?;
                 parse_cmux_start_target(&output, target)
             }
+            // `command_run` drives the ptyd spawn directly (it needs the pane
+            // id for register + F2 rollback), so this generic path is not the
+            // ptyd entry point. Reject it loudly rather than silently no-op.
+            Backend::Ptyd => Err(RallyError::Command(
+                "internal: ptyd sessions must start via command_run's ptyd path, \
+                 not BackendRunner::start"
+                    .to_string(),
+            )),
         }
+    }
+
+    /// Spawn a ptyd-owned agent pane via daemon RPC (design-3 start arm). Used
+    /// by `command_run`. Returns the daemon pane id (→ `session.target` AND
+    /// `session.daemon_pane`).
+    pub(crate) fn ptyd_start(
+        &self,
+        name: &str,
+        cwd: &Path,
+        command: &[String],
+        workspace_id: &str,
+    ) -> Result<String> {
+        let socket = self.require_ptyd_socket()?;
+        match crate::daemon_client::start_agent(socket, name, cwd, command, workspace_id) {
+            crate::daemon_client::StartOutcome::Started { pane_id } => Ok(pane_id),
+            crate::daemon_client::StartOutcome::Failed { reason } => Err(RallyError::Command(
+                format!("ptyd agent.start failed: {reason}"),
+            )),
+        }
+    }
+
+    /// Ensure the rally-dedicated ptyd workspace exists, returning its id so a
+    /// spawned pane never lands in the user's focused tab (design-1).
+    pub(crate) fn ptyd_ensure_workspace(&self, label: &str) -> Result<String> {
+        let socket = self.require_ptyd_socket()?;
+        crate::daemon_client::ensure_rally_workspace(socket, label).map_err(RallyError::Command)
+    }
+
+    /// Stop (reap) a ptyd-owned pane by daemon name (`agent.stop`).
+    pub(crate) fn ptyd_stop(&self, name: &str) -> Result<()> {
+        let socket = self.require_ptyd_socket()?;
+        crate::daemon_client::stop_agent(socket, name).map_err(RallyError::Command)
+    }
+
+    /// [G]: Reap a ptyd-owned pane by its PANE ID (`pane.close`) — used by F2
+    /// register-fail rollback, which holds the exact pane id it just spawned. By
+    /// id (not name) so a label collision can't reap the wrong pane.
+    pub(crate) fn ptyd_close_pane(&self, pane_id: &str) -> Result<()> {
+        let socket = self.require_ptyd_socket()?;
+        crate::daemon_client::close_pane_by_id(socket, pane_id).map_err(RallyError::Command)
     }
 
     pub(crate) fn live_target(&self, session: &ManagedSession) -> Result<String> {
         match self.backend {
-            Backend::Tmux | Backend::Cmux => Ok(session.target.clone()),
+            Backend::Tmux | Backend::Cmux | Backend::Ptyd => Ok(session.target.clone()),
         }
     }
 
@@ -389,11 +525,62 @@ impl BackendRunner {
                 cmd![&self.cmux_bin, "send", "--workspace", target, &text],
                 cmd![&self.cmux_bin, "send-key", "--workspace", target, "enter"],
             ],
+            // Observability-only plan line: the real ptyd inject is the
+            // `agent.send` RPC driven by command_inject_managed (with the F4
+            // pane cross-check + Receipt fact). No keystrokes are ever sent.
+            Backend::Ptyd => vec![cmd![
+                "ptyd-rpc",
+                "agent.send",
+                "--to",
+                target,
+                "--text",
+                &text,
+                // submit:true + confirm:"sent" — the real RPC appends the
+                // submitting CR and resolves on bytes-written ([A]/[B]).
+                "--submit",
+                "--confirm",
+                "sent"
+            ]],
         }
     }
 
     pub(crate) fn inject(&self, target: &str, text: &str) -> Result<()> {
         run_commands(&self.inject_commands(target, text))
+    }
+
+    /// Deliver `text` to a ptyd-owned pane bound to `identity` via `agent.send`
+    /// (design-3 inject arm). Applies [`sanitize_inject_text`] (F1) before the
+    /// RPC and cross-checks the Receipt's `pane_id` against `expect_pane` (F4):
+    /// a mismatch is a HARD failure with `daemon_pane_mismatch` — NO fallback
+    /// delivery. Returns the receipt `state` on success.
+    pub(crate) fn ptyd_inject(
+        &self,
+        identity: &str,
+        text: &str,
+        expect_pane: &str,
+    ) -> Result<String> {
+        let socket = self.require_ptyd_socket()?;
+        // F1: strip control bytes BEFORE the daemon write, same chokepoint
+        // semantics as the tmux path.
+        let sanitized = sanitize_inject_text(text);
+        match crate::daemon_client::send_agent(socket, identity, &sanitized) {
+            crate::daemon_client::SendOutcome::Sent(receipt) => {
+                // F4: the daemon must have written the pane WE bound. A receipt
+                // for a different pane means the identity→pane mapping drifted;
+                // refuse to claim delivery and do NOT fall back.
+                if receipt.pane_id != expect_pane {
+                    return Err(RallyError::Command(format!(
+                        "daemon_pane_mismatch: agent.send receipt pane {:?} != session daemon_pane {:?} \
+                         (refusing fallback delivery)",
+                        receipt.pane_id, expect_pane
+                    )));
+                }
+                Ok(receipt.state)
+            }
+            crate::daemon_client::SendOutcome::Failed { reason } => Err(RallyError::Command(
+                format!("ptyd agent.send failed: {reason}"),
+            )),
+        }
     }
 
     pub(crate) fn attach_commands(&self, target: &str) -> Vec<Vec<String>> {
@@ -405,10 +592,21 @@ impl BackendRunner {
                 "--workspace",
                 target,
             ]],
+            // A ptyd pane is attached via EasyTerminal / `ptyd attach`, not a
+            // tmux client. Surface the real command rather than fake one.
+            Backend::Ptyd => vec![cmd!["ptyd", "attach", target]],
         }
     }
 
     pub(crate) fn attach(&self, target: &str) -> Result<()> {
+        if self.backend == Backend::Ptyd {
+            // Don't pretend to attach: a ptyd pane lives inside the daemon /
+            // EasyTerminal, not a tmux client the CLI can hand the TTY to.
+            return Err(RallyError::Usage(format!(
+                "attach is unsupported for ptyd sessions; open the pane in EasyTerminal \
+                 or run `ptyd attach {target}`"
+            )));
+        }
         run_commands(&self.attach_commands(target))
     }
 
@@ -431,10 +629,25 @@ impl BackendRunner {
                 "--lines",
                 lines,
             ]],
+            // ptyd capture is the `agent.read` RPC against the pane id.
+            Backend::Ptyd => vec![cmd![
+                "ptyd-rpc",
+                "agent.read",
+                "--name",
+                target,
+                "--lines",
+                lines
+            ]],
         }
     }
 
     pub(crate) fn capture(&self, target: &str, lines: usize) -> Result<String> {
+        if self.backend == Backend::Ptyd {
+            // design-3 capture arm: the agent.read scrollback verb.
+            let socket = self.require_ptyd_socket()?;
+            return crate::daemon_client::read_agent(socket, target, lines)
+                .map_err(RallyError::Command);
+        }
         run_command_output(first_command(&self.capture_commands(target, lines))?)
     }
 
@@ -447,10 +660,17 @@ impl BackendRunner {
                 "--workspace",
                 target
             ]],
+            // ptyd stop is the `agent.stop` RPC (reaps the PTY child daemon-side).
+            Backend::Ptyd => vec![cmd!["ptyd-rpc", "agent.stop", "--name", target]],
         }
     }
 
     pub(crate) fn stop(&self, target: &str) -> Result<()> {
+        if self.backend == Backend::Ptyd {
+            // design-3 stop arm: agent.stop RPC.
+            let socket = self.require_ptyd_socket()?;
+            return crate::daemon_client::stop_agent(socket, target).map_err(RallyError::Command);
+        }
         run_commands(&self.stop_commands(target))
     }
 
@@ -461,8 +681,51 @@ impl BackendRunner {
         match self.backend {
             Backend::Tmux => probe_tmux_liveness(&self.tmux_bin, targets),
             Backend::Cmux => probe_cmux_liveness(&self.cmux_bin, targets),
+            Backend::Ptyd => self.probe_ptyd_liveness(targets),
         }
     }
+
+    /// design-3 liveness arm: probe `pane.list` and map each session target
+    /// (a daemon pane id) to Live (listed) / Stale (daemon answered, pane gone)
+    /// / Unknown (daemon unreachable — never a false Stale).
+    fn probe_ptyd_liveness(&self, targets: &[String]) -> Vec<SessionLiveness> {
+        let Some(socket) = self.ptyd_socket.as_deref() else {
+            return targets.iter().map(|_| SessionLiveness::Unknown).collect();
+        };
+        match crate::daemon_client::live_pane_ids(socket) {
+            Some(live) => {
+                let live: BTreeSet<String> = live.into_iter().collect();
+                targets
+                    .iter()
+                    .map(|t| {
+                        if live.contains(t) {
+                            SessionLiveness::Live
+                        } else {
+                            SessionLiveness::Stale
+                        }
+                    })
+                    .collect()
+            }
+            None => targets.iter().map(|_| SessionLiveness::Unknown).collect(),
+        }
+    }
+}
+
+/// Observability-only pseudo-command describing a ptyd `agent.start` for the
+/// run envelope's `commands` plan. The actual spawn is a daemon RPC.
+fn ptyd_start_plan(_target: &str, cwd: &Path, command: &[String], name: &str) -> Vec<String> {
+    let mut plan = cmd![
+        "ptyd-rpc",
+        "agent.start",
+        "--name",
+        name,
+        "--cwd",
+        cwd.display(),
+        "--no-focus",
+        "--"
+    ];
+    plan.extend(command.iter().cloned());
+    plan
 }
 
 // Plan F functional core (Chunk 3): default_private_socket_client +

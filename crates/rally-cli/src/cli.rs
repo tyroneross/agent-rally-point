@@ -228,6 +228,10 @@ pub(crate) struct RunArgs {
     pub(crate) agent: String,
     pub(crate) name: Option<String>,
     pub(crate) backend: Backend,
+    /// The raw `--backend` value as typed (`"auto"`/`"tmux"`/`"cmux"`/`"ptyd"`).
+    /// Preserved so `command_run` can apply the `auto → ptyd` live-socket
+    /// preference (bpaf maps both `auto` and `tmux` to `Backend::Tmux`).
+    pub(crate) backend_raw: String,
     pub(crate) session_id: Option<String>,
     pub(crate) tool: Option<String>,
     pub(crate) bins: BackendBins,
@@ -1174,7 +1178,11 @@ fn run_parser() -> impl Parser<RunArgs> {
     let json = json_flag();
     let dry_run = dry_run_flag();
     let name = optional_string_arg("name", "NAME");
-    let backend = backend_arg();
+    // Parse the raw string once, then derive the typed Backend from it, so the
+    // raw `"auto"` distinction survives for the live-socket preference.
+    let backend = string_arg("backend", "BACKEND")
+        .fallback("auto".to_string())
+        .parse(|raw| Backend::parse(&raw).map(|backend| (backend, raw)));
     let session_id = optional_string_arg("session-id", "SESSION_ID");
     let tool = optional_string_arg("tool", "TOOL");
     let bins = backend_bins_parser();
@@ -1188,16 +1196,19 @@ fn run_parser() -> impl Parser<RunArgs> {
         json, dry_run, name, backend, session_id, tool, bins, shared, agent
     )
     .map(
-        |(json, dry_run, name, backend, session_id, tool, bins, shared, agent)| RunArgs {
-            json,
-            dry_run,
-            agent,
-            name,
-            backend,
-            session_id,
-            tool,
-            bins,
-            shared,
+        |(json, dry_run, name, (backend, backend_raw), session_id, tool, bins, shared, agent)| {
+            RunArgs {
+                json,
+                dry_run,
+                agent,
+                name,
+                backend,
+                backend_raw,
+                session_id,
+                tool,
+                bins,
+                shared,
+            }
         },
     )
 }
@@ -1412,12 +1423,6 @@ fn bounded_i64_arg(
             }
         })
         .fallback(default)
-}
-
-fn backend_arg() -> impl Parser<Backend> {
-    string_arg("backend", "BACKEND")
-        .parse(|value| Backend::parse(&value))
-        .fallback(Backend::Tmux)
 }
 
 fn target_arg() -> impl Parser<Option<String>> {

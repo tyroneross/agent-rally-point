@@ -32,8 +32,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -42,6 +42,60 @@ use serde_json::json;
 /// local-socket call; if the daemon does not answer quickly it is treated as
 /// unavailable and the caller falls back.
 const DAEMON_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Env override for the RALLY-OWNED ptyd socket used by the spawn path (`rally
+/// run --backend ptyd`). F3: this is DELIBERATELY separate from
+/// `detect_host_runtime`'s candidate list (which includes Easy Terminal's
+/// production daemon). The spawn path must NEVER default into a user-facing
+/// daemon — rally agents own their own daemon at this socket.
+pub(crate) const RALLY_PTYD_SOCKET_ENV: &str = "RALLY_PTYD_SOCKET";
+/// Env override for the ptyd binary used to autostart the rally-owned daemon.
+pub(crate) const RALLY_PTYD_BIN_ENV: &str = "RALLY_PTYD_BIN";
+
+/// Resolve the RALLY-OWNED ptyd socket path (F3). Precedence:
+///   1. `$RALLY_PTYD_SOCKET` (explicit override — tests + ET opt-in use this).
+///   2. `~/.local/share/rally/ptyd.sock` (the rally-dedicated default).
+///
+/// This NEVER returns the Easy Terminal production socket — the rally daemon is
+/// a distinct instance with its own state dir. `detect_host_runtime`'s wider
+/// candidate scan (used for tmux-session registration) is intentionally NOT
+/// consulted here.
+pub(crate) fn rally_owned_socket() -> Option<String> {
+    if let Ok(explicit) = std::env::var(RALLY_PTYD_SOCKET_ENV) {
+        if !explicit.is_empty() {
+            return Some(explicit);
+        }
+    }
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    Some(format!("{home}/.local/share/rally/ptyd.sock"))
+}
+
+/// The rally-owned ptyd state dir (sibling of the socket default). Passed to an
+/// autostarted daemon via `PTYD_STATE_DIR` so it never shares Easy Terminal's
+/// persisted session tree.
+fn rally_owned_state_dir() -> Option<String> {
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    Some(format!("{home}/.local/share/rally/ptyd-state"))
+}
+
+/// True iff a daemon is LIVE at `socket` — connectable AND answers a cheap
+/// `pane.list` probe. `auto` backend selection requires liveness, not mere
+/// file-existence: a stale socket file from a crashed daemon must NOT win.
+pub(crate) fn socket_is_live(socket: &str) -> bool {
+    if !Path::new(socket).exists() {
+        return false;
+    }
+    round_trip(socket, "pane.list", &json!({}), DAEMON_TIMEOUT)
+        .ok()
+        .and_then(|reply| {
+            reply
+                .get("result")
+                .and_then(|r| r.get("type"))
+                .and_then(|t| t.as_str())
+                .map(|t| t == "pane_list")
+        })
+        .unwrap_or(false)
+}
 
 /// Result of an `agent.register` attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,6 +220,417 @@ fn parse_register_reply(reply: &serde_json::Value, requested_identity: &str) -> 
             reason: "register reply had neither result nor error".to_string(),
         },
     }
+}
+
+// ===========================================================================
+// Spawn path (rally run --backend ptyd) — ptyd OWNS the pane via RPC.
+// Unlike `register_agent` (fail-open), spawn/inject errors here are REAL
+// errors: a ptyd-backed `rally run` must not silently degrade to a phantom
+// session. The caller decides any fallback (F2).
+// ===========================================================================
+
+/// Outcome of an `agent.start` spawn RPC.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StartOutcome {
+    /// ptyd spawned the agent; `pane_id` is the daemon-owned handle that
+    /// becomes both `session.target` and `session.daemon_pane`.
+    Started { pane_id: String },
+    /// The daemon refused or was unreachable. `reason` is surfaced to the user.
+    Failed { reason: String },
+}
+
+/// The success branch of an `agent.start` reply (`AgentStarted { pane }`).
+#[derive(Debug, Deserialize)]
+struct AgentStartedResult {
+    pane: PaneIdOnly,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneIdOnly {
+    pane_id: String,
+}
+
+/// Spawn an agent pane OWNED by the rally ptyd daemon. F3/design-1: always
+/// `focus:false` and a dedicated `workspace_id` so the pane never lands in a
+/// user's focused tab. `command` is the agent argv (e.g. `["claude","--name",
+/// "x"]`).
+///
+/// Wire: `agent.start {name, cwd, command, focus:false, workspace_id}` → ptyd
+/// `main.rs` `"agent.start"` arm → `ResponseResult::AgentStarted { pane }`
+/// (verified against ptyd `protocol.rs:120` + `tests/agent_lifecycle.rs:201`).
+pub(crate) fn start_agent(
+    socket: &str,
+    name: &str,
+    cwd: &Path,
+    command: &[String],
+    workspace_id: &str,
+) -> StartOutcome {
+    let params = json!({
+        "name": name,
+        "cwd": cwd.display().to_string(),
+        "command": command,
+        // Design-1: rally panes NEVER steal the user's focused tab.
+        "focus": false,
+        "workspace_id": workspace_id,
+    });
+    match round_trip(socket, "agent.start", &params, DAEMON_TIMEOUT) {
+        Ok(reply) => parse_start_reply(&reply),
+        Err(e) => StartOutcome::Failed {
+            reason: format!("agent.start call failed: {e}"),
+        },
+    }
+}
+
+fn parse_start_reply(reply: &serde_json::Value) -> StartOutcome {
+    if let Some(err) = reply.get("error") {
+        return StartOutcome::Failed {
+            reason: format!("daemon refused agent.start: {}", err_message(err)),
+        };
+    }
+    match reply
+        .get("result")
+        .cloned()
+        .map(serde_json::from_value::<AgentStartedResult>)
+    {
+        Some(Ok(r)) => StartOutcome::Started {
+            pane_id: r.pane.pane_id,
+        },
+        Some(Err(e)) => StartOutcome::Failed {
+            reason: format!("malformed agent.start result: {e}"),
+        },
+        None => StartOutcome::Failed {
+            reason: "agent.start reply had neither result nor error".to_string(),
+        },
+    }
+}
+
+/// Ensure a rally-dedicated workspace exists, returning its id so spawned panes
+/// land there instead of the user's focused tab. ptyd's `agent.start` rejects an
+/// unknown `workspace_id` ("no such workspace", pane.rs:3205), so a valid one is
+/// required up front.
+///
+/// [C]: LIST-then-REUSE by label, so repeated `rally run`s do NOT pile up N
+/// workspaces (each with its own orphan root shell). We first `workspace.list`
+/// and reuse the existing rally workspace when one carries `label`; only when
+/// none exists do we `workspace.create`. Wire:
+///   * `workspace.list {}` → `WorkspaceList { workspaces:[{workspace_id,label,..}] }`
+///     (ptyd `main.rs:489` + `protocol.rs:79`, `WorkspaceInfo` `protocol.rs:424`).
+///   * `workspace.create {label}` → `WorkspaceCreated { workspace, .. }`
+///     (ptyd `main.rs:511` + `protocol.rs:88`).
+pub(crate) fn ensure_rally_workspace(socket: &str, label: &str) -> Result<String, String> {
+    // 1. Reuse an existing rally workspace if one is already labeled `label`.
+    if let Some(existing) = find_workspace_by_label(socket, label)? {
+        return Ok(existing);
+    }
+    // 2. None found → create one.
+    let reply = round_trip(
+        socket,
+        "workspace.create",
+        &json!({ "label": label }),
+        DAEMON_TIMEOUT,
+    )
+    .map_err(|e| format!("workspace.create call failed: {e}"))?;
+    if let Some(err) = reply.get("error") {
+        return Err(format!(
+            "daemon refused workspace.create: {}",
+            err_message(err)
+        ));
+    }
+    reply
+        .get("result")
+        .and_then(|r| r.get("workspace"))
+        .and_then(|w| w.get("workspace_id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "workspace.create reply missing workspace_id".to_string())
+}
+
+/// [C]: find an existing workspace whose `label` matches, returning its
+/// `workspace_id`. A `workspace.list` failure is fatal here (the caller would
+/// otherwise create a duplicate); a daemon that simply has no matching workspace
+/// returns `Ok(None)`. Wire: ptyd `main.rs:489` (`workspace_list` result type,
+/// `WorkspaceInfo{workspace_id,label}` at `protocol.rs:424-426`).
+fn find_workspace_by_label(socket: &str, label: &str) -> Result<Option<String>, String> {
+    let reply = round_trip(socket, "workspace.list", &json!({}), DAEMON_TIMEOUT)
+        .map_err(|e| format!("workspace.list call failed: {e}"))?;
+    if let Some(err) = reply.get("error") {
+        return Err(format!(
+            "daemon refused workspace.list: {}",
+            err_message(err)
+        ));
+    }
+    let Some(workspaces) = reply
+        .get("result")
+        .and_then(|r| r.get("workspaces"))
+        .and_then(|w| w.as_array())
+    else {
+        return Err("workspace.list reply missing workspaces array".to_string());
+    };
+    Ok(workspaces
+        .iter()
+        .find(|w| w.get("label").and_then(|l| l.as_str()) == Some(label))
+        .and_then(|w| w.get("workspace_id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
+}
+
+/// The parsed `Receipt` reply of an `agent.send` (ptyd `protocol.rs:160`,
+/// built by `build_receipt` at ptyd `main.rs:1148`). We read `pane_id` (F4
+/// cross-check) and `state` (ack-state mapping).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SendReceipt {
+    pub(crate) pane_id: String,
+    pub(crate) state: String,
+}
+
+/// Outcome of an `agent.send` RPC.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SendOutcome {
+    /// The daemon accepted the send and returned a Receipt.
+    Sent(SendReceipt),
+    /// The daemon refused or was unreachable.
+    Failed { reason: String },
+}
+
+/// Deliver `text` to the daemon-owned pane bound to `identity` via `agent.send`.
+/// The caller MUST pass already-sanitized text (F1: `sanitize_inject_text`
+/// applied before this call).
+///
+/// ## Why `submit:true` + `confirm:"sent"` (NOT a bare `{to,text}`)
+///
+/// ptyd treats the PRESENCE of `to` (or any of `submit`/`confirm`/
+/// `confirm_timeout_ms`/`paste_frame`) as the NON-legacy framing path
+/// (`legacy = !(...)`, ptyd `src/main.rs:670-674`). A `{to,text}` send is
+/// therefore NON-legacy, and the non-legacy arm defaults `submit` to FALSE
+/// (`src/main.rs:724-728`) — the text would be pasted into the agent's TUI
+/// input box and NEVER submitted (the L5 inject-no-submit failure the tmux
+/// framer fixes with a trailing CR). We MUST pass `submit:true` so ptyd's
+/// `frame_line` appends the carriage return that submits the line
+/// (`src/comms.rs:48-50`: `if submit { out.push(CR) }`).
+///
+/// We also pass `confirm:"sent"`. The non-legacy arm otherwise defaults
+/// `confirm` to `"seen"` with a 4000ms timeout (`src/main.rs:729-736`), and
+/// `confirm:"seen"` makes `deliver_line` BLOCK waiting for the agent to echo
+/// the text back (`src/pane.rs:1640-1688`) — up to 4s, which EXCEEDS this
+/// CLI's 3s round-trip read timeout (`DAEMON_TIMEOUT`), so a successful write
+/// is reported as a spurious "failed" and a retry would DOUBLE-paste.
+/// `confirm:"sent"` parses to `ReceiptState::Sent` (`src/comms.rs:198`);
+/// `deliver_line` then sees `want_seen == false` and returns IMMEDIATELY after
+/// the write (`src/pane.rs:1640,1646-1662`), well under 3s.
+///
+/// Wire: `agent.send {to, text, submit:true, confirm:"sent"}` → ptyd
+/// `src/main.rs:665` non-legacy arm → `ResponseResult::Receipt { to, pane_id,
+/// transport, state, evidence }` (ptyd `src/protocol.rs:160`, built by
+/// `build_receipt` at `src/main.rs:1148`). `state` is `"sent"` for this
+/// ceiling.
+pub(crate) fn send_agent(socket: &str, identity: &str, text: &str) -> SendOutcome {
+    let params = json!({
+        "to": identity,
+        "text": text,
+        // Append the submitting CR (else ptyd pastes-without-submitting; [A]/[B]).
+        "submit": true,
+        // Resolve on bytes-written, NOT echo-seen — keeps the round trip < 3s.
+        "confirm": "sent",
+    });
+    match round_trip(socket, "agent.send", &params, DAEMON_TIMEOUT) {
+        Ok(reply) => parse_send_reply(&reply),
+        Err(e) => SendOutcome::Failed {
+            reason: format!("agent.send call failed: {e}"),
+        },
+    }
+}
+
+fn parse_send_reply(reply: &serde_json::Value) -> SendOutcome {
+    if let Some(err) = reply.get("error") {
+        return SendOutcome::Failed {
+            reason: format!("daemon refused agent.send: {}", err_message(err)),
+        };
+    }
+    let Some(result) = reply.get("result") else {
+        return SendOutcome::Failed {
+            reason: "agent.send reply had neither result nor error".to_string(),
+        };
+    };
+    let pane_id = result.get("pane_id").and_then(|v| v.as_str());
+    let state = result.get("state").and_then(|v| v.as_str());
+    match (pane_id, state) {
+        (Some(pane_id), Some(state)) => SendOutcome::Sent(SendReceipt {
+            pane_id: pane_id.to_string(),
+            state: state.to_string(),
+        }),
+        _ => SendOutcome::Failed {
+            reason: format!("malformed agent.send receipt: {result}"),
+        },
+    }
+}
+
+/// Stop (reap) the daemon-owned pane named `name` via `agent.stop`. Used by
+/// `rally stop` on a ptyd session (the user addresses sessions by name). Wire:
+/// `agent.stop {name}` → `ResponseResult::Ok` (ptyd `main.rs:852` +
+/// `tests/agent_lifecycle.rs:365`).
+pub(crate) fn stop_agent(socket: &str, name: &str) -> Result<(), String> {
+    let reply = round_trip(
+        socket,
+        "agent.stop",
+        &json!({ "name": name }),
+        DAEMON_TIMEOUT,
+    )
+    .map_err(|e| format!("agent.stop call failed: {e}"))?;
+    if let Some(err) = reply.get("error") {
+        return Err(format!("daemon refused agent.stop: {}", err_message(err)));
+    }
+    Ok(())
+}
+
+/// [G]: Stop (reap) the daemon-owned pane by its PANE ID via `pane.close`. The
+/// F2 register-fail rollback holds the exact pane id it just spawned, so it
+/// reaps THAT pane — reaping by name (`agent.stop`) could hit a different pane
+/// on a label collision. Wire: `pane.close {pane_id}` → `ResponseResult::Ok`
+/// (ptyd `main.rs:567` — `close_pane(pane_id)` then `Ok{}`; `pane_not_found`
+/// error otherwise).
+pub(crate) fn close_pane_by_id(socket: &str, pane_id: &str) -> Result<(), String> {
+    let reply = round_trip(
+        socket,
+        "pane.close",
+        &json!({ "pane_id": pane_id }),
+        DAEMON_TIMEOUT,
+    )
+    .map_err(|e| format!("pane.close call failed: {e}"))?;
+    if let Some(err) = reply.get("error") {
+        return Err(format!("daemon refused pane.close: {}", err_message(err)));
+    }
+    Ok(())
+}
+
+/// Read recent reconstructed text from the daemon-owned pane named `name` via
+/// `agent.read`. Wire: `agent.read {name, source:"recent", lines}` →
+/// `ResponseResult::AgentRead { text, bytes }` (ptyd `main.rs:785` +
+/// `protocol.rs:129`).
+pub(crate) fn read_agent(socket: &str, name: &str, lines: usize) -> Result<String, String> {
+    let params = json!({ "name": name, "source": "recent", "lines": lines });
+    let reply = round_trip(socket, "agent.read", &params, DAEMON_TIMEOUT)
+        .map_err(|e| format!("agent.read call failed: {e}"))?;
+    if let Some(err) = reply.get("error") {
+        return Err(format!("daemon refused agent.read: {}", err_message(err)));
+    }
+    reply
+        .get("result")
+        .and_then(|r| r.get("text"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "agent.read reply missing text".to_string())
+}
+
+/// Liveness probe: returns the set of live pane ids the daemon reports via
+/// `pane.list`. The caller maps its session targets against this set. Wire:
+/// `pane.list {}` → `ResponseResult::PaneList { panes:[{pane_id,..}] }` (ptyd
+/// `main.rs:433` + `protocol.rs:70`). On any failure returns `None` so the
+/// caller can map to `Unknown` (never a false `Stale`).
+pub(crate) fn live_pane_ids(socket: &str) -> Option<Vec<String>> {
+    let reply = round_trip(socket, "pane.list", &json!({}), DAEMON_TIMEOUT).ok()?;
+    let panes = reply.get("result")?.get("panes")?.as_array()?;
+    Some(
+        panes
+            .iter()
+            .filter_map(|p| {
+                p.get("pane_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect(),
+    )
+}
+
+/// Autostart the rally-owned ptyd daemon for an explicit `--backend ptyd` run.
+/// Spawns `<bin> server` detached with the rally-owned socket + state dir env,
+/// then waits ≤5s for the socket to become LIVE. The binary is `$RALLY_PTYD_BIN`
+/// if set, else `ptyd` resolved on PATH (installed at `~/.local/bin/ptyd`).
+///
+/// Returns `Ok(())` once the socket answers, or an `Err` describing why it
+/// could not be started (missing binary, never bound) — the caller fails the
+/// run with that message.
+pub(crate) fn autostart_daemon(socket: &str) -> Result<(), String> {
+    let bin = ptyd_binary().ok_or_else(|| {
+        format!(
+            "rally ptyd daemon is not live at {socket} and no ptyd binary was found \
+             (set {RALLY_PTYD_BIN_ENV} or install `ptyd` on PATH at ~/.local/bin/ptyd)"
+        )
+    })?;
+    let state_dir = rally_owned_state_dir()
+        .ok_or_else(|| "cannot resolve rally ptyd state dir (HOME unset)".to_string())?;
+    if let Some(parent) = Path::new(socket).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::create_dir_all(&state_dir);
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("server")
+        .env("PTYD_SOCKET_PATH", socket)
+        .env("PTYD_STATE_DIR", &state_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // [H]: detach into a NEW session via setsid() so the daemon has no
+    // controlling terminal — a SIGHUP when the launching terminal closes will
+    // NOT reach it. Without this, closing the shell that ran `rally run` would
+    // kill the rally daemon (and every agent pane it owns). `setsid()` runs in
+    // the forked child before exec; it fails only if the child is already a
+    // session leader (it is not), so an error there is genuinely exceptional.
+    //
+    // SAFETY: `pre_exec` runs in the child after fork, before exec. `setsid` is
+    // async-signal-safe and touches no parent-process state, satisfying the
+    // post-fork restrictions. We declare `setsid` directly (it is in libc) to
+    // avoid taking a new direct crate dependency for one syscall.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        unsafe extern "C" {
+            fn setsid() -> i32;
+        }
+        cmd.pre_exec(|| {
+            if setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn()
+        .map_err(|e| format!("failed to spawn `{} server`: {e}", bin.display()))?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if socket_is_live(socket) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "rally ptyd daemon did not bind {socket} within 5s after autostart"
+    ))
+}
+
+/// Resolve the ptyd binary for autostart: `$RALLY_PTYD_BIN` (must exist) else
+/// `ptyd` found on PATH.
+fn ptyd_binary() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var(RALLY_PTYD_BIN_ENV) {
+        if !explicit.is_empty() {
+            let p = PathBuf::from(&explicit);
+            return p.exists().then_some(p);
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("ptyd"))
+        .find(|cand| cand.is_file())
+}
+
+/// Pull a human-readable message out of a JSON-RPC `error` body
+/// (`{"code","message"}`), falling back to a bare string error.
+fn err_message(err: &serde_json::Value) -> String {
+    err.get("message")
+        .and_then(|m| m.as_str())
+        .or_else(|| err.as_str())
+        .unwrap_or("unknown daemon error")
+        .to_string()
 }
 
 /// One line-delimited JSON-RPC round trip: connect, write
