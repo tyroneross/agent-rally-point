@@ -52,7 +52,7 @@ impl AgentSpec {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 pub(crate) struct ManagedSession {
     pub(crate) session_id: String,
     pub(crate) name: String,
@@ -72,6 +72,27 @@ pub(crate) struct ManagedSession {
     /// worktree was provisioned.  Set together with `worktree_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) branch: Option<String>,
+    /// Daemon-first inject routing (move 2): `true` when this session's pane was
+    /// registered with the rally-termd daemon (`agent.register`), so the daemon
+    /// owns the PTY and `inject` routes LEDGER-ONLY (the daemon performs the
+    /// PTY-write + posts a Receipt). `false`/absent → the framed tmux write is
+    /// the operative delivery (`delivery_path: "tmux_framed_fallback"`).
+    /// Defaults to `false` so every pre-existing session record stays on the
+    /// fallback path with zero behavior change.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) daemon_registered: bool,
+    /// The daemon-owned pane handle returned by `agent.register`
+    /// (`Registered.pane_id`). `None` unless `daemon_registered` is true.
+    /// Surfaced under `rally sessions` so a host can see the daemon binding
+    /// (acceptance criterion 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) daemon_pane: Option<String>,
+}
+
+/// Serde skip helper: omit `daemon_registered` from JSON when false so existing
+/// session-record shapes are byte-identical until a session is daemon-bound.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
@@ -192,6 +213,18 @@ pub(crate) struct InjectData {
     /// `session.tool` for the common case; surfaced explicitly so consumer
     /// tools don't have to thread through the session blob).
     pub(crate) directive_to: Option<String>,
+    /// **Daemon-first inject routing (move 2).** Which delivery tier carried
+    /// this inject:
+    ///   - `"daemon"` — the session is daemon-registered; ONLY the ledger
+    ///     Directive was written and the rally-termd daemon owns the PTY-write
+    ///     (NO tmux/cmux keystrokes fired). This is the north-star path.
+    ///   - `"tmux_framed_fallback"` — no daemon binding; the CLI performed the
+    ///     framed `send-keys` write (the degraded-but-correct fallback).
+    ///   - `"ledger_only"` — a `LedgerAgent` target (externally-registered
+    ///     ptyd pane with no managed session); already daemon-delivered.
+    ///
+    /// Consumers branch on this to know whether a keystroke write happened.
+    pub(crate) delivery_path: &'static str,
 }
 
 /// Envelope for `inject`: result under `data.inject`.

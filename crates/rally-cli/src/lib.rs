@@ -53,6 +53,7 @@ mod check;
 mod check_ci;
 mod claim_authority;
 mod cli;
+mod daemon_client;
 mod dag;
 mod discovery;
 mod doctor;
@@ -3128,6 +3129,8 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 target: backend_target(backend, &identity.session_id),
                 worktree_path: None,
                 branch: None,
+                daemon_registered: false,
+                daemon_pane: None,
             },
         }
     } else {
@@ -3241,6 +3244,14 @@ fn command_run(args: RunArgs) -> Result<Output> {
         }
     }
 
+    // Daemon-first inject routing (move 2): attempt to register this session's
+    // pane with the rally-termd daemon so future injects route LEDGER-ONLY.
+    // Fail-OPEN — if no daemon is reachable (the common case until ptyd owns
+    // the pane), the session stays on the framed-tmux fallback with zero error.
+    if !dry_run {
+        try_register_session_with_daemon(&room, &reservation.fact, &mut session);
+    }
+
     let body = envelope(
         "run",
         SCHEMA_RUN,
@@ -3259,6 +3270,42 @@ fn command_run(args: RunArgs) -> Result<Output> {
         session.agent, session.backend, session.session_id
     );
     Ok(Output::new(json, text, body))
+}
+
+/// Attempt to register `session`'s pane with the rally-termd daemon so future
+/// `inject`s route ledger-only (the daemon owns the PTY-write). On success,
+/// flips `session.daemon_registered = true` + records the daemon pane handle
+/// AND refreshes the durable session fact so a `rally sessions` view shows the
+/// binding (acceptance criterion 4). FAIL-OPEN: a missing/ambiguous/refused
+/// daemon is a silent no-op — the framed-tmux fallback remains operative.
+///
+/// The daemon pane handle passed to `agent.register` is the session's live
+/// backend target. For a tmux/cmux session the daemon does not yet own that
+/// pane, so the daemon returns `pane_not_found` and this stays a no-op (the
+/// documented live-flip step: ptyd must own the pane for full daemon routing).
+fn try_register_session_with_daemon(
+    room: &RoomStore,
+    reservation_fact: &Option<Fact>,
+    session: &mut ManagedSession,
+) {
+    let runtime = detect_host_runtime();
+    // Never guess which daemon to bind when multiple sockets are resolvable.
+    let Some(socket) = daemon_client::resolve_unambiguous_socket(&runtime.sockets_found) else {
+        return;
+    };
+    match daemon_client::register_agent(&socket, &session.tool, &session.target) {
+        daemon_client::RegisterOutcome::Registered { pane_id } => {
+            session.daemon_registered = true;
+            session.daemon_pane = Some(pane_id);
+            // Refresh the durable session record so the binding survives and is
+            // visible under `rally sessions`.
+            let prev = reservation_fact.as_ref().map(|f| f.event_id.clone());
+            let _ = room.append_fact(&session_fact(session, "active", prev));
+        }
+        daemon_client::RegisterOutcome::Unavailable { .. } => {
+            // Fall back silently — framed-tmux delivery carries the inject.
+        }
+    }
 }
 
 // Plan F functional core (Chunk 3): enforce_easy_terminal_self_host_guard
@@ -3356,19 +3403,25 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
         target,
         worktree_path: None,
         branch: None,
+        daemon_registered: false,
+        daemon_pane: None,
     };
 
     // Append the session fact under the same context-version race guard as
     // run uses.
     let fact = session_fact(&session, "active", None);
-    if room
-        .append_session_fact_if_context(&fact, context_version)?
-        .is_none()
-    {
+    let landed_fact = room.append_session_fact_if_context(&fact, context_version)?;
+    if landed_fact.is_none() {
         return Err(RallyError::Message(
             "adopt: concurrent session-fact write detected; retry".to_string(),
         ));
     }
+
+    // Daemon-first inject routing (move 2): same registration attempt as
+    // `rally run`. Fail-open — an adopted tmux/cmux pane the daemon doesn't own
+    // simply stays on the framed-tmux fallback.
+    let mut session = session;
+    try_register_session_with_daemon(&room, &landed_fact, &mut session);
 
     let body = envelope(
         "adopt",
@@ -3435,6 +3488,8 @@ fn reserve_numbered_session(
             target: backend_target(input.backend, &identity.session_id),
             worktree_path: None,
             branch: None,
+            daemon_registered: false,
+            daemon_pane: None,
         };
         let fact = session_fact(&session, "active", None);
         if let Some(fact) = room.append_session_fact_if_context(&fact, context_version)? {
@@ -3659,7 +3714,7 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
             dry_run,
             urgent,
             sender_tool,
-            session,
+            *session,
             args.handoff,
             args.text,
             args.require_ack,
@@ -3779,11 +3834,32 @@ fn command_inject_managed(
         }
     };
 
+    // Daemon-first inject routing (move 2): if this session is registered with
+    // the rally-termd daemon, the daemon OWNS the PTY-write. The CLI must NOT
+    // puppet the TUI with keystrokes — the ledger Directive already written
+    // above IS the delivery, and the daemon performs the PTY-write + posts a
+    // Receipt that `inject`'s existing ACK wait resolves on. So we SKIP the
+    // legacy synchronous backend inject entirely for a daemon-registered
+    // session. When not registered, the framed tmux write below is the
+    // operative fallback (the 2026-06-09 atomic send-keys frame).
+    let delivery_path: &'static str = if session.daemon_registered {
+        "daemon"
+    } else {
+        "tmux_framed_fallback"
+    };
+    let daemon_routed = session.daemon_registered;
+
     // Legacy synchronous backend delivery — preserved for backward compat
     // with tmux/cmux backends and pre-daemon herdr smoke tests. Once
     // rally-termd (P3) is universally deployed, this branch becomes
     // redundant for Backend::Herdr.
     let delivered = if dry_run {
+        false
+    } else if daemon_routed {
+        // Daemon owns delivery — NO keystroke write. `delivered` (the legacy
+        // sync-delivery flag) stays false; truthful delivery state is the
+        // ledger Pending until the daemon posts its Receipt (resolved
+        // out-of-band via `rally status`, same as the LedgerAgent arm).
         false
     } else if delivery_state_initial == "failed" {
         // Ledger write failed — do not attempt backend inject. The content
@@ -3819,7 +3895,11 @@ fn command_inject_managed(
     // Plan F functional core (Chunk 3): the herdr backend is removed;
     // the only inject paths left are tmux + cmux + the ledger write.
     let ledger_failed = delivery_state_initial == "failed";
-    let legacy_tmux_cmux_failed = !dry_run && !delivered && !ledger_failed;
+    // A daemon-routed inject intentionally does NO keystroke write, so a false
+    // `delivered` is EXPECTED (not a legacy failure). Exclude it from the
+    // tmux/cmux-failure detection — its state stays the ledger Pending until
+    // the daemon posts a Receipt.
+    let legacy_tmux_cmux_failed = !dry_run && !daemon_routed && !delivered && !ledger_failed;
     let delivery_state: &'static str = if ledger_failed || legacy_tmux_cmux_failed {
         "failed"
     } else if delivered {
@@ -3882,6 +3962,7 @@ fn command_inject_managed(
         delivery_state,
         directive_seq,
         directive_to,
+        delivery_path,
     };
     let has_ack = ack.is_some();
     let body = envelope(
@@ -4034,6 +4115,9 @@ fn command_inject_ledger(
         delivery_state,
         directive_seq,
         directive_to,
+        // A LedgerAgent target is an externally-registered ptyd pane: the
+        // ledger write is already the daemon-delivered path.
+        delivery_path: "ledger_only",
     };
     let has_ack = ack.is_some();
     let agent_for_text = agent_id;
@@ -4647,8 +4731,9 @@ fn find_session(target: &str, bins: &BackendBins) -> Result<ManagedSession> {
 enum InjectTarget {
     /// `target` matched an active managed session (by `session_id`, `name`, or
     /// `tool`). Delivery is the existing dual path: ledger write + legacy
-    /// synchronous backend inject.
-    Managed(ManagedSession),
+    /// synchronous backend inject. Boxed so this dispatch enum stays small
+    /// (the `ManagedSession` payload grew with the daemon-binding fields).
+    Managed(Box<ManagedSession>),
     /// `target` did not match a managed session but is a syntactically valid
     /// agent-id (passes `rally_protocol::ledger::validate_agent_id`). Delivery
     /// is ledger-only: the typed Directive lands in `.rally/inbox/<id>.jsonl`
@@ -4683,7 +4768,7 @@ fn resolve_inject_target(target: &str, bins: &BackendBins) -> Result<InjectTarge
         })
     {
         reject_stale_session(target, &view)?;
-        return Ok(InjectTarget::Managed(view.session));
+        return Ok(InjectTarget::Managed(Box::new(view.session)));
     }
 
     // 2. Else, syntactically valid agent-id → ledger-only delivery to a
@@ -5580,6 +5665,7 @@ mod tests {
             target: "rally-test".to_string(),
             worktree_path: None,
             branch: None,
+            ..Default::default()
         }
     }
 
@@ -6418,6 +6504,7 @@ mod tests {
             target: "cmux-target-9".to_string(), // caller-provided, NOT derived
             worktree_path: None,
             branch: None,
+            ..Default::default()
         };
         let (_facts, ctx) = room.session_facts_with_context_version().unwrap();
         let fact = session_fact(&session, "active", None);
@@ -6480,6 +6567,7 @@ mod tests {
             target: "rally-legacy".to_string(),
             worktree_path: None,
             branch: None,
+            ..Default::default()
         };
         let (_facts, ctx) = room.session_facts_with_context_version().unwrap();
         room.append_session_fact_if_context(&session_fact(&session, "active", None), ctx)
@@ -6518,6 +6606,7 @@ mod tests {
             target: "rally-claude-99".to_string(),
             worktree_path: None,
             branch: None,
+            ..Default::default()
         };
         room.append_fact(&session_fact(&session, "active", None))
             .unwrap();

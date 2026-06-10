@@ -5,11 +5,44 @@ SPDX-License-Identifier: Apache-2.0
 
 # PLAN — Daemon-first inject routing (move 2)
 
-> **Status:** SPEC ONLY — no implementation in this plan. Follow-up to the
-> 2026-06-09 inject submit-semantics fix (`backends.rs` framed-write + `lib.rs`
-> inject watchdog budget). That fix repaired the **no-daemon tmux fallback**;
-> this plan describes the **daemon-first** path it falls back *from*.
+> **Status:** CLI SIDE IMPLEMENTED (2026-06-09). The rally-CLI registration +
+> routing + labeling is shipped and CI-tested against a test-double daemon
+> (`crates/rally-cli/tests/daemon_inject_routing.rs`). The real ptyd daemon
+> side already exists (`agent.register` verb + Receipt loop; shared
+> `rally-protocol`), but the LIVE FLIP is gated — see §7. Follow-up to the
+> 2026-06-09 inject submit-semantics fix.
 > **Target line:** `main`. **Run via:** `/build-loop:run` when scheduled.
+
+## Implementation status (CLI side, 2026-06-09)
+
+| Criterion | Status |
+|---|---|
+| 1. Daemon-routed inject writes ledger-only, ZERO send-keys, `delivery_path:"daemon"` | DONE — `daemon_registered_session_injects_ledger_only_zero_send_keys` (tmux-bin spy) |
+| 2. ACK resolves on the daemon Receipt | UNCHANGED — `inject`'s ACK wait already accepts `Receipt` |
+| 3. No-daemon → framed tmux fallback, `delivery_path:"tmux_framed_fallback"` | DONE — `no_daemon_session_falls_back_to_framed_tmux` |
+| 4. `rally run`/`adopt` register with daemon; `rally sessions` shows the binding | DONE — `ManagedSession.daemon_registered`/`daemon_pane`; `try_register_session_with_daemon` |
+| 5. SEC gate on the `authorize()` capability matrix before the PTY-write swap | See §7 — CLI does not flip the swap; gate applies to the live-flip step |
+
+What shipped on the CLI: `daemon_client.rs` (fail-open `agent.register` client +
+unambiguous-socket resolution), `ManagedSession{daemon_registered,daemon_pane}`,
+`try_register_session_with_daemon` wired into `rally run` + `rally adopt`,
+`command_inject_managed` skips the legacy tmux write for a daemon-registered
+session and labels `delivery_path`, and `InjectData.delivery_path`.
+
+## 7. Remaining step — the live daemon flip
+
+The CLI is fail-open: until the rally-termd daemon actually OWNS the pane that
+`rally run` launches, `agent.register` returns `pane_not_found` and the session
+stays on the framed-tmux fallback (zero behavior change). Flipping the live
+daemon path on requires, in order:
+
+1. ptyd owns the launched pane (ptyd-managed pane, not a bare tmux/cmux pane),
+   so `agent.register(pane, identity)` resolves a real pane handle.
+2. The daemon `authorize(sender→target→verb)` capability matrix is re-reviewed
+   (criterion 5) — a capability that turns ledger input into keystrokes in
+   ANOTHER agent's pane is a major change behind a hard security gate. This was
+   reviewed for the CLI change (no new PTY-write authority added on the CLI
+   side); the live flip needs the daemon-side re-review before enabling.
 
 ---
 
