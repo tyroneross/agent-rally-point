@@ -21,8 +21,13 @@ touching `~/.claude` or `~/.codex`:
 - `.claude/settings.json` — Claude Code hooks via `${CLAUDE_PROJECT_DIR}` (resolves
   to the repo root on any machine).
 - `.codex/hooks.json` — Codex hooks via the git top-level (portable path).
+- `.cursor/hooks.json` — Cursor hooks (schema v1) via the git top-level. Cursor's
+  contract only injects an agent-visible message on `preToolUse` (`agent_message`);
+  `sessionStart`/`stop` register presence / surface next-actions with no visible
+  output. Advisory by default; `RALLY_HOOK_STRICT=1` turns a `preToolUse` collision
+  into `permission: deny`.
 
-Just open the repo in Claude Code / Codex and **trust it on first prompt**. The
+Just open the repo in Claude Code / Codex / Cursor and **trust it on first prompt**. The
 hook self-gates on `.rally/` presence (no-op elsewhere) and fail-opens (never
 blocks an edit). This is the default and recommended path — nothing to run.
 `SessionStart` shows a concise Rally-active prompt with the current off switch
@@ -44,10 +49,18 @@ the portable project config is already committed.
 > zero-bundle mechanism (a `rally hook` binary subcommand so a one-line committed
 > config calls `rally hook …` with no script path) is tracked as a backlog item.
 >
-> **Other hosts:** Cursor, Qwen, Gemma, Aider, IDE plugins, and custom CLIs do
-> not get automatic SessionStart/PreToolUse hooks from this file today. Give
-> them the any-agent bootstrap prompt, or wrap/adopt them into a managed backend
-> before relying on direct injection.
+> **Cursor:** delivered as the project hook `.cursor/hooks.json` (Cursor has no
+> plugin marketplace, so it is not a plugin install like Claude Code / Codex).
+> Cursor's hook schema cannot inject context at `sessionStart`, so the
+> session-start awareness/offer does not surface there; the safety-critical
+> `preToolUse` before-write deconfliction does (`agent_message`). The
+> `preToolUse` input envelope shape is matched against Cursor's tool input but is
+> not yet validated against a live Cursor session — treat path-specific claims as
+> best-effort until confirmed.
+>
+> **Other hosts:** Qwen, Gemma, Aider, IDE plugins, and custom CLIs do not get
+> automatic hooks from this file today. Give them the any-agent bootstrap prompt,
+> or wrap/adopt them into a managed backend before relying on direct injection.
 
 ## What the hook does
 

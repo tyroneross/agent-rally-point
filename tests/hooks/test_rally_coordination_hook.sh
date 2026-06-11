@@ -248,6 +248,35 @@ T="strict mode: RALLY_HOOK_STRICT=1 + stop-severity → permissionDecision:deny"
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 # ----------------------------------------------------------------------
+# Test 6b: Cursor host schema — before-write conflict must render Cursor's
+# {permission, agent_message} contract (advisory allow), never Claude's
+# permissionDecision/systemMessage keys. Strict mode → permission:deny.
+# ----------------------------------------------------------------------
+T="cursor schema: before-write conflict → permission:allow + agent_message (advisory)"
+(
+  cd "$REPO_ROOT"
+  out=$(RALLY_BIN="$stub_bin" "$HOOK" before-write cursor <<<'{"tool_input":{"file_path":"foo.txt"}}' 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
+  printf '%s' "$out" | grep -q '"permission":"allow"' || { printf 'missing permission:allow: %s\n' "$out" >&2; exit 1; }
+  printf '%s' "$out" | grep -q '"agent_message"' || { printf 'missing agent_message: %s\n' "$out" >&2; exit 1; }
+  if printf '%s' "$out" | grep -qE '"permissionDecision"|"systemMessage"'; then
+    printf 'cursor output leaked Claude-only keys: %s\n' "$out" >&2; exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+T="cursor schema: strict mode → permission:deny"
+(
+  cd "$REPO_ROOT"
+  out=$(RALLY_BIN="$stub_bin" RALLY_HOOK_STRICT=1 "$HOOK" before-write cursor <<<'{"tool_input":{"file_path":"foo.txt"}}' 2>/dev/null)
+  printf '%s' "$out" | grep -q '"permission":"deny"' || { printf 'expected permission:deny: %s\n' "$out" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+# ----------------------------------------------------------------------
 # Test 7: low-severity warn → additionalContext (no deny) in both modes
 # ----------------------------------------------------------------------
 T="low-severity warn: never deny (even strict)"

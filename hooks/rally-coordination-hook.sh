@@ -390,6 +390,10 @@ function nativeEvent(tool, phase) {
   if (tool === "gemini" || tool.startsWith("gemini")) {
     return {start:"SessionStart", idle:"BeforeAgent", "before-write":"BeforeTool", "after-write":"AfterAgent"}[phase] || "BeforeAgent";
   }
+  if (tool === "cursor" || tool.startsWith("cursor")) {
+    // Cursor hooks schema v1 event names (lowercase).
+    return {start:"sessionStart", idle:"beforeSubmitPrompt", "before-write":"preToolUse", "after-write":"stop"}[phase] || "beforeSubmitPrompt";
+  }
   // Claude Code + Codex use the same event names for our purposes.
   return {start:"SessionStart", idle:"UserPromptSubmit", "before-write":"PreToolUse", "after-write":"Stop"}[phase] || "UserPromptSubmit";
 }
@@ -474,6 +478,20 @@ if (tool === "gemini" || tool.startsWith("gemini")) {
     output(stop ? {decision: "deny", reason: message} : {systemMessage: message});
   } else {
     output({systemMessage: message});
+  }
+} else if (tool === "cursor" || tool.startsWith("cursor")) {
+  // Cursor hook contract (schema v1, from the Cursor "create-hook" skill Event
+  // Output Cheat Sheet): only preToolUse injects an agent-visible message
+  // (agent_message) plus a permission gate. sessionStart / stop /
+  // beforeSubmitPrompt have NO documented context-injection output, so they run
+  // their rally side-effects (enter on start, next on idle) and return an empty
+  // object. Advisory by default (permission "allow"); strict mode emits "deny".
+  if (event === "preToolUse") {
+    output(stop
+      ? {permission: "deny", agent_message: message}
+      : {permission: "allow", agent_message: message});
+  } else {
+    output({});
   }
 } else {
   if (event === "SessionStart" || event === "UserPromptSubmit") {
