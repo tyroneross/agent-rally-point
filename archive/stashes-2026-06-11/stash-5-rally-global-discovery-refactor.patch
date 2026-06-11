@@ -1,0 +1,1507 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 120dcad..bb91d59 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -390,6 +390,7 @@ dependencies = [
+  "rally-trust",
+  "serde",
+  "serde_json",
++ "toml",
+ ]
+ 
+ [[package]]
+diff --git a/RALLY.md b/RALLY.md
+index 39605dd..535d70d 100644
+--- a/RALLY.md
++++ b/RALLY.md
+@@ -104,14 +104,15 @@ rally start codex --session-id codex-123 --intent "edit CLI docs" --path docs/CL
+ Peers see live sessions in `active_peers[]` and last-known active/stopped
+ session state in `peer_states[]`.
+ 
+-If you use herdr, `rally setup install herdr` chains these together
+-automatically — open a `rally pi` pane and you're done.
++`rally setup install` with no target installs the supported session-start
++coordination hooks/wrappers for Pi, Claude, Codex, Gemini, cmux, and Herdr.
++Use `rally setup install <tool>` for a scoped install.
+ 
+ Before mutating real agent config, inspect the plan:
+ 
+ ```bash
+-rally setup install pi --dry-run --json
+-rally setup verify pi --json
++rally setup install --dry-run --json
++rally setup verify all --json
+ ```
+ 
+ Setup writes `<file>.rally.bak` backups before changing existing files.
+@@ -128,6 +129,8 @@ The `rally` CLI has ~25 other commands (`claim`, `blocker`, `task`,
+ adapter packets, etc.). They're real, but they're not the loop.
+ Reach for them when you have a specific need:
+ 
++- **`locate <event-id>` / `recent --all`** — when the event may live in a
++  different local repo channel.
+ - **`claim` / `release`** — when two agents might touch the same file
+   concurrently and you want a soft lock visible in `rally conflicts`.
+ - **`blocker` / `unblock`** — when you're stuck on something only
+@@ -148,13 +151,17 @@ Everything else is reference; reach for `docs/SCHEMA.md` and
+ ```
+ ~/.agent-rally-point/apps/<repo_id>/
+ ├── changes.jsonl         ← source of truth, append-only
++├── rally.channel.json    ← readable repo/channel metadata when available
+ ├── rally/cursors/        ← per-(tool, session) read cursors
+ └── rally/...             ← derived projections, checkpoints
+ ```
+ 
+ `<repo_id>` is derived from `git remote get-url origin` when present,
+ else the git root, else `cwd`. Worktrees and clones of the same repo
+-share the channel.
++share the channel. If a repo already has a path-derived channel with events,
++Rally keeps using that channel until an explicit migration avoids splitting the
++ledger. `rally locate <event-id> --json` and `rally recent --all --json` scan
++all local channels under this directory.
+ 
+ ## Install
+ 
+diff --git a/README.md b/README.md
+index 69687ab..d47fd11 100644
+--- a/README.md
++++ b/README.md
+@@ -66,8 +66,9 @@ rally next --tool codex --json
+ rally judge --tool codex --phase idle --json
+ rally hook before-write --tool codex --path crates/foo.rs --auto-claim --json
+ rally setup --json
+-rally setup install codex --dry-run --json
+-rally setup verify codex --json
++rally setup install --dry-run --json
++rally setup install --json
++rally setup verify all --json
+ rally setup enforcement strict --json
+ rally setup install cmux --json
+ rally preflight --tool codex --start-ping --json
+@@ -99,6 +100,8 @@ rally blockers --json
+ rally conflicts --json
+ rally diagnose --json
+ rally score --json
++rally locate <event-id> --json
++rally recent --all --limit 10 --json
+ rally thread <event-id> --json
+ rally replay --json
+ rally report --json
+@@ -118,9 +121,12 @@ the next watch command. `rally start <tool>` is the generic equivalent.
+ claims/tasks/handoffs, stale checkpoints, missing profiles, open handoffs,
+ conflicts, and trust/diagnosis findings. `rally setup` discovers local harnesses,
+ records enforcement mode (`off`, `warn`, or `strict`), installs native hooks,
+-and records adapter config changes. Install/uninstall support `--dry-run`, write
+-`.rally.bak` backups before mutating existing config files, and can be checked
+-with `rally setup verify [tool] --json`. In `strict` mode, write commands reject
++and records adapter config changes. With no target, `rally setup install`
++installs every supported session-start coordination hook/wrapper; use
++`rally setup install codex` or another target for scoped changes.
++Install/uninstall support `--dry-run`, write `.rally.bak` backups before
++mutating existing config files, and can be checked with
++`rally setup verify [tool|all] --json`. In `strict` mode, write commands reject
+ anonymous `tool`, `from_tool`, or `owner_tool` values instead of only reporting
+ them in doctor output.
+ 
+@@ -131,6 +137,10 @@ source events. `judge` returns the current allow/stop decision for a phase.
+ blockers, stale checkpoints, or claim conflicts. `rally ci gate` gives CI a
+ merge-time coordination check.
+ 
++`rally locate <event-id>` and `rally recent --all` are local discovery commands.
++Use them when a handoff or event may have been written from another repo's Rally
++channel under `~/.agent-rally-point/apps`.
++
+ `rally packet` is the bounded work-brief surface for specialized agents. It is
+ read-only, derived from the same context projection, and shapes the JSON for the
+ requesting profile role: reviewer, builder, architect, QA, or general.
+diff --git a/crates/rally-cli/Cargo.toml b/crates/rally-cli/Cargo.toml
+index d7229c9..4e7cfc6 100644
+--- a/crates/rally-cli/Cargo.toml
++++ b/crates/rally-cli/Cargo.toml
+@@ -20,6 +20,7 @@ rally-protocol = { path = "../rally-protocol" }
+ rally-trust = { path = "../rally-trust" }
+ serde.workspace = true
+ serde_json.workspace = true
++toml.workspace = true
+ 
+ [dev-dependencies]
+ base64.workspace = true
+diff --git a/crates/rally-cli/src/args.rs b/crates/rally-cli/src/args.rs
+index c75fe1c..d3cb8b2 100644
+--- a/crates/rally-cli/src/args.rs
++++ b/crates/rally-cli/src/args.rs
+@@ -6,7 +6,7 @@ mod commands;
+ pub(crate) use commands::*;
+ 
+ use crate::output::CliError;
+-use rally_core::repo::resolve_channel_dir;
++use rally_core::repo::{resolve_channel_dir, write_channel_metadata};
+ use rally_core::store::ChannelStore;
+ use std::collections::BTreeMap;
+ use std::env;
+@@ -42,6 +42,9 @@ impl CommonOptions {
+         let home = env::var_os("HOME").map(PathBuf::from);
+         let resolution = resolve_channel_dir(cwd, home.as_deref())
+             .map_err(|err| CliError::usage(command, err.to_string()))?;
++        write_channel_metadata(&resolution).map_err(|err| {
++            CliError::runtime(command, format!("failed to write channel metadata: {err}"))
++        })?;
+         Ok(ChannelStore::new(resolution.channel_dir))
+     }
+ 
+@@ -119,7 +122,8 @@ impl WriteArgs {
+                 | "--auto-claim"
+                 | "--fail-open"
+                 | "--dry-run"
+-                | "--no-default-trust-policy" => {
++                | "--no-default-trust-policy"
++                | "--all" => {
+                     if arg == "--sign" {
+                         common.sign = true;
+                     }
+@@ -132,7 +136,7 @@ impl WriteArgs {
+                             values.push(value);
+                         }
+                     }
+-                    flags.insert(arg, values);
++                    flags.entry(arg).or_default().extend(values);
+                 }
+                 "--to"
+                 | "--availability"
+diff --git a/crates/rally-cli/src/args/commands.rs b/crates/rally-cli/src/args/commands.rs
+index eef7345..fe91742 100644
+--- a/crates/rally-cli/src/args/commands.rs
++++ b/crates/rally-cli/src/args/commands.rs
+@@ -179,6 +179,19 @@ pub(crate) struct ReadCommand {
+     pub(crate) session_id: Option<String>,
+ }
+ 
++#[derive(Debug)]
++pub(crate) struct LocateCommand {
++    pub(crate) common: CommonOptions,
++    pub(crate) identifier: String,
++}
++
++#[derive(Debug)]
++pub(crate) struct RecentCommand {
++    pub(crate) common: CommonOptions,
++    pub(crate) limit: usize,
++    pub(crate) all: bool,
++}
++
+ #[derive(Debug)]
+ pub(crate) struct IdentityInitCommand {
+     pub(crate) common: CommonOptions,
+@@ -388,7 +401,7 @@ pub(crate) fn parse_setup(args: WriteArgs) -> Result<SetupCommand, CliError> {
+         _ => {
+             return Err(CliError::usage(
+                 args.command,
+-                "setup accepts: setup | setup install <pi|claude|codex|gemini|cmux|herdr> | setup uninstall <pi|claude|codex|gemini|cmux|herdr> | setup enforcement <off|warn|strict>",
++                "setup accepts: setup | setup install [all|pi|claude|codex|gemini|cmux|herdr] | setup uninstall <all|pi|claude|codex|gemini|cmux|herdr> | setup enforcement <off|warn|strict>",
+             ));
+         }
+     };
+@@ -617,6 +630,26 @@ pub(crate) fn parse_post(args: WriteArgs) -> Result<PostCommand, CliError> {
+     })
+ }
+ 
++pub(crate) fn parse_locate(args: WriteArgs) -> Result<LocateCommand, CliError> {
++    Ok(LocateCommand {
++        identifier: args.identifier()?,
++        common: args.common,
++    })
++}
++
++pub(crate) fn parse_recent(args: WriteArgs) -> Result<RecentCommand, CliError> {
++    let limit = args
++        .one("--limit")
++        .map(|value| parse_usize(args.command, "--limit", &value))
++        .transpose()?
++        .unwrap_or(20);
++    Ok(RecentCommand {
++        limit,
++        all: args.has("--all"),
++        common: args.common,
++    })
++}
++
+ pub(crate) fn parse_read(args: WriteArgs) -> Result<ReadCommand, CliError> {
+     let limit = args
+         .one("--limit")
+diff --git a/crates/rally-cli/src/dispatch.rs b/crates/rally-cli/src/dispatch.rs
+index a8124e6..ffd8a9b 100644
+--- a/crates/rally-cli/src/dispatch.rs
++++ b/crates/rally-cli/src/dispatch.rs
+@@ -4,18 +4,18 @@
+ use crate::args::{
+     WriteArgs, parse_ack, parse_artifact, parse_blocker, parse_claim, parse_decision,
+     parse_handoff, parse_herdr_inject, parse_hook, parse_identity_init, parse_judge, parse_lesson,
+-    parse_post, parse_preflight, parse_profile, parse_read, parse_release, parse_repair,
+-    parse_setup, parse_start, parse_stop, parse_subscribe, parse_sync_export, parse_sync_import,
+-    parse_task, parse_unblock, parse_watch,
++    parse_locate, parse_post, parse_preflight, parse_profile, parse_read, parse_recent,
++    parse_release, parse_repair, parse_setup, parse_start, parse_stop, parse_subscribe,
++    parse_sync_export, parse_sync_import, parse_task, parse_unblock, parse_watch,
+ };
+ use crate::output::{CliError, WriteOutput};
+ use crate::query_commands::{
+     execute_adapter_contract, execute_blockers, execute_checkpoint_rebuild,
+     execute_checkpoint_status, execute_ci_gate, execute_claims, execute_cmux_packet,
+     execute_conflicts, execute_context, execute_diagnose, execute_doctor, execute_herdr_inject,
+-    execute_herdr_packet, execute_hook, execute_inbox, execute_judge, execute_next, execute_packet,
+-    execute_repair, execute_replay, execute_report, execute_score, execute_setup, execute_start,
+-    execute_thread,
++    execute_herdr_packet, execute_hook, execute_inbox, execute_judge, execute_locate, execute_next,
++    execute_packet, execute_recent, execute_repair, execute_replay, execute_report, execute_score,
++    execute_setup, execute_start, execute_thread,
+ };
+ use crate::sync_commands::{execute_sync_export, execute_sync_import};
+ use crate::verify_commands::{VerifyOptions, verify};
+@@ -80,6 +80,8 @@ pub(crate) fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
+         Some("diagnose") => run_read("diagnose", args, parse_read, execute_diagnose),
+         Some("doctor") => run_read("doctor", args, parse_read, execute_doctor),
+         Some("next") => run_read("next", args, parse_read, execute_next),
++        Some("locate") => run_read("locate", args, parse_locate, execute_locate),
++        Some("recent") => run_read("recent", args, parse_recent, execute_recent),
+         Some("judge") => run_write("judge", args, parse_judge, execute_judge),
+         Some("hook") => run_write("hook", args, parse_hook, execute_hook),
+         Some("repair") => run_write("repair", args, parse_repair, execute_repair),
+@@ -399,6 +401,8 @@ fn usage() {
+         "       rally watch [--tool <t>] [--kind <k>] [--thread <id>] [--since-cursor --session-id <id>] [--from-start] [--max-seconds <n>]   # block + emit new events via kqueue/inotify"
+     );
+     eprintln!("       rally thread [--json] <event-id>");
++    eprintln!("       rally locate [--json] <event-id>");
++    eprintln!("       rally recent --all [--limit <n>] [--json]");
+     eprintln!("       rally identity init [--identity-dir <dir>] --tool <tool> [--json]");
+     eprintln!("       rally sync export [--json] [--since <window>] > packet.json");
+     eprintln!("       rally sync import [--json] [--trust-policy <trust.toml>] <packet.json>");
+@@ -409,7 +413,7 @@ fn usage() {
+     eprintln!("       rally repair [checkpoint|profile] [--json]");
+     eprintln!("       rally ci gate --tool ci --json");
+     eprintln!(
+-        "       rally setup [install|uninstall <tool>|enforcement <off|warn|strict>] [--json]"
++        "       rally setup [install [all|<tool>]|uninstall <all|tool>|enforcement <off|warn|strict>] [--json]"
+     );
+     eprintln!("       rally herdr inject [--json] [--force] <handoff-id>");
+     eprintln!("       rally adapter contract [--json]");
+diff --git a/crates/rally-cli/src/query_commands.rs b/crates/rally-cli/src/query_commands.rs
+index ab9f939..9b1aef9 100644
+--- a/crates/rally-cli/src/query_commands.rs
++++ b/crates/rally-cli/src/query_commands.rs
+@@ -2,12 +2,13 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ use crate::args::{
+-    CommonOptions, HerdrInjectCommand, HookCommand, JudgeCommand, ReadCommand, RepairCommand,
+-    SetupCommand, StartCommand,
++    CommonOptions, HerdrInjectCommand, HookCommand, JudgeCommand, LocateCommand, ReadCommand,
++    RecentCommand, RepairCommand, SetupCommand, StartCommand,
+ };
+ use crate::output::{CliError, WriteOutput};
+ use crate::resources::normalize_file_resource;
+ use crate::runtime::{new_id, now_rfc3339};
++use rally_core::channel_index::{IndexedEvent, locate_event, recent_events};
+ use rally_core::context::{ContextRecommendation, build_context_brief, build_work_packet};
+ use rally_core::cursors;
+ use rally_core::diagnose::{DiagnoseOptions, diagnose_records};
+@@ -592,6 +593,93 @@ pub(super) fn execute_next(command: ReadCommand) -> Result<WriteOutput, CliError
+     ))
+ }
+ 
++pub(super) fn execute_locate(command: LocateCommand) -> Result<WriteOutput, CliError> {
++    let home = home_dir("locate")?;
++    let located = locate_event(&home, &command.identifier).map_err(|err| {
++        CliError::runtime("locate", format!("failed to scan Rally channels: {err}"))
++    })?;
++    let Some(located) = located else {
++        return Err(CliError::not_found(
++            "locate",
++            format!(
++                "event {} was not found in local Rally channels",
++                command.identifier
++            ),
++        ));
++    };
++    let text = format!(
++        "{} repo={} channel={} kind={}: {}",
++        located.event.event.event_id,
++        event_repo_name(&located.event),
++        located.event.channel.channel_dir,
++        located.event.event.kind,
++        located.event.event.subject
++    );
++    Ok(WriteOutput {
++        json: command.common.json,
++        text,
++        body: json!({
++            "ok": true,
++            "command": "locate",
++            "schema": "agent-rally.command.locate.v1",
++            "channel": located.event.channel.channel_dir,
++            "data": {
++                "located": located.event,
++                "warnings": located.warnings,
++            }
++        }),
++    })
++}
++
++pub(super) fn execute_recent(command: RecentCommand) -> Result<WriteOutput, CliError> {
++    if !command.all {
++        return Err(CliError::usage(
++            "recent",
++            "recent currently requires --all to scan local Rally channels",
++        ));
++    }
++    let home = home_dir("recent")?;
++    let recent = recent_events(&home, command.limit).map_err(|err| {
++        CliError::runtime("recent", format!("failed to scan Rally channels: {err}"))
++    })?;
++    let text = if recent.events.is_empty() {
++        "No events across local Rally channels.".to_string()
++    } else {
++        recent
++            .events
++            .iter()
++            .map(|event| {
++                let time = event.event.time.as_deref().unwrap_or("unknown-time");
++                let tool = event.event.tool.as_deref().unwrap_or("unknown");
++                format!(
++                    "{} repo={} {} {} {}: {}",
++                    time,
++                    event_repo_name(event),
++                    event.event.event_id,
++                    event.event.kind,
++                    tool,
++                    event.event.subject
++                )
++            })
++            .collect::<Vec<_>>()
++            .join("\n")
++    };
++    Ok(WriteOutput {
++        json: command.common.json,
++        text,
++        body: json!({
++            "ok": true,
++            "command": "recent",
++            "schema": "agent-rally.command.recent.v1",
++            "channel": "all",
++            "data": {
++                "events": recent.events,
++                "warnings": recent.warnings,
++            }
++        }),
++    })
++}
++
+ pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliError> {
+     let store = command.common.channel_store("setup")?;
+     let mut status = setup_status(&store)?;
+@@ -624,37 +712,47 @@ pub(super) fn execute_setup(command: SetupCommand) -> Result<WriteOutput, CliErr
+             status = setup_status(&store)?;
+         }
+         "install" => {
+-            let adapter = command
+-                .target
+-                .as_deref()
+-                .ok_or_else(|| CliError::usage("setup", "setup install requires a tool id"))?;
+-            if !matches!(
+-                adapter,
+-                "pi" | "claude" | "codex" | "gemini" | "cmux" | "herdr"
+-            ) {
++            let adapter = command.target.as_deref().unwrap_or("all");
++            if adapter == "all" {
++                let install = if command.dry_run {
++                    plan_install_many(&store, SUPPORTED_INSTALL_TARGETS)?
++                } else {
++                    write_install_many(&store, SUPPORTED_INSTALL_TARGETS)?
++                };
++                installed_path = install.primary_path;
++                installed_files = install.files;
++                modified_external_config = install.modified_config;
++                backup_paths = install.backup_paths;
++            } else if !SUPPORTED_INSTALL_TARGETS.contains(&adapter) {
+                 return Err(CliError::usage(
+                     "setup",
+-                    "unknown adapter; expected pi, claude, codex, gemini, cmux, or herdr",
++                    "unknown adapter; expected all, pi, claude, codex, gemini, cmux, or herdr",
+                 ));
+-            }
+-            let install = if command.dry_run {
+-                plan_install(&store, adapter)?
+-            } else if matches!(adapter, "cmux" | "herdr") {
+-                write_adapter_install(&store, adapter)?
+             } else {
+-                write_tool_install(adapter)?
+-            };
+-            installed_path = install.primary_path;
+-            installed_files = install.files;
+-            modified_external_config = install.modified_config;
+-            backup_paths = install.backup_paths;
++                let install = if command.dry_run {
++                    plan_install(&store, adapter)?
++                } else if matches!(adapter, "cmux" | "herdr") {
++                    write_adapter_install(&store, adapter)?
++                } else {
++                    write_tool_install(adapter)?
++                };
++                installed_path = install.primary_path;
++                installed_files = install.files;
++                modified_external_config = install.modified_config;
++                backup_paths = install.backup_paths;
++            }
+         }
+         "uninstall" => {
+-            let adapter = command
+-                .target
+-                .as_deref()
+-                .ok_or_else(|| CliError::usage("setup", "setup uninstall requires a tool id"))?;
+-            let uninstall = if command.dry_run {
++            let adapter = command.target.as_deref().ok_or_else(|| {
++                CliError::usage("setup", "setup uninstall requires a tool id or all")
++            })?;
++            let uninstall = if adapter == "all" {
++                if command.dry_run {
++                    plan_uninstall_many(SUPPORTED_INSTALL_TARGETS)?
++                } else {
++                    uninstall_many(SUPPORTED_INSTALL_TARGETS)?
++                }
++            } else if command.dry_run {
+                 plan_uninstall(adapter)?
+             } else {
+                 uninstall_tool_or_adapter(adapter)?
+@@ -1545,6 +1643,8 @@ struct AdapterInstall {
+     backup_paths: Vec<String>,
+ }
+ 
++const SUPPORTED_INSTALL_TARGETS: &[&str] = &["pi", "claude", "codex", "gemini", "cmux", "herdr"];
++
+ fn plan_install(store: &ChannelStore, tool: &str) -> Result<AdapterInstall, CliError> {
+     let files = install_paths(store, tool)?;
+     Ok(AdapterInstall {
+@@ -1555,6 +1655,55 @@ fn plan_install(store: &ChannelStore, tool: &str) -> Result<AdapterInstall, CliE
+     })
+ }
+ 
++fn plan_install_many(store: &ChannelStore, tools: &[&str]) -> Result<AdapterInstall, CliError> {
++    Ok(combine_installs(
++        tools
++            .iter()
++            .map(|tool| plan_install(store, tool))
++            .collect::<Result<Vec<_>, _>>()?,
++    ))
++}
++
++fn write_install_many(store: &ChannelStore, tools: &[&str]) -> Result<AdapterInstall, CliError> {
++    let mut installs = Vec::new();
++    for tool in tools {
++        let install = if matches!(*tool, "cmux" | "herdr") {
++            write_adapter_install(store, tool)?
++        } else {
++            write_tool_install(tool)?
++        };
++        installs.push(install);
++    }
++    Ok(combine_installs(installs))
++}
++
++fn combine_installs(installs: Vec<AdapterInstall>) -> AdapterInstall {
++    let mut files = Vec::new();
++    let mut backup_paths = Vec::new();
++    let mut primary_path = None;
++    for install in installs {
++        if primary_path.is_none() {
++            primary_path = install.primary_path;
++        }
++        extend_unique(&mut files, install.files);
++        extend_unique(&mut backup_paths, install.backup_paths);
++    }
++    AdapterInstall {
++        primary_path,
++        files,
++        modified_config: None,
++        backup_paths,
++    }
++}
++
++fn extend_unique(target: &mut Vec<String>, values: Vec<String>) {
++    for value in values {
++        if !target.contains(&value) {
++            target.push(value);
++        }
++    }
++}
++
+ fn plan_uninstall(tool: &str) -> Result<AdapterInstall, CliError> {
+     let files = install_paths(&ChannelStore::new("."), tool)?
+         .into_iter()
+@@ -1568,6 +1717,24 @@ fn plan_uninstall(tool: &str) -> Result<AdapterInstall, CliError> {
+     })
+ }
+ 
++fn plan_uninstall_many(tools: &[&str]) -> Result<AdapterInstall, CliError> {
++    Ok(combine_installs(
++        tools
++            .iter()
++            .map(|tool| plan_uninstall(tool))
++            .collect::<Result<Vec<_>, _>>()?,
++    ))
++}
++
++fn uninstall_many(tools: &[&str]) -> Result<AdapterInstall, CliError> {
++    Ok(combine_installs(
++        tools
++            .iter()
++            .map(|tool| uninstall_tool_or_adapter(tool))
++            .collect::<Result<Vec<_>, _>>()?,
++    ))
++}
++
+ fn install_paths(store: &ChannelStore, tool: &str) -> Result<Vec<String>, CliError> {
+     Ok(match tool {
+         "pi" => vec![
+@@ -1652,8 +1819,8 @@ fn modified_config_for(tool: &str, files: &[String]) -> Option<String> {
+ 
+ fn verify_setup(target: Option<&str>) -> Result<Vec<Value>, CliError> {
+     let tools = match target {
++        Some("all") | None => SUPPORTED_INSTALL_TARGETS.to_vec(),
+         Some(tool) => vec![tool],
+-        None => vec!["pi", "claude", "codex", "gemini", "cmux", "herdr"],
+     };
+     tools
+         .into_iter()
+@@ -1838,12 +2005,7 @@ fn install_codex_hooks() -> Result<AdapterInstall, CliError> {
+     write_json_pretty(&hooks, &value)?;
+     let config = dir.join("config.toml");
+     backup_paths.extend(backup_file(&config)?);
+-    upsert_marked_block(
+-        &config,
+-        "# BEGIN rally codex hooks",
+-        "# END rally codex hooks",
+-        "# BEGIN rally codex hooks\n[features]\nhooks = true\n# END rally codex hooks\n",
+-    )?;
++    set_codex_features_hooks(&config, true)?;
+     Ok(AdapterInstall {
+         primary_path: Some(hooks.display().to_string()),
+         files: vec![
+@@ -1856,6 +2018,121 @@ fn install_codex_hooks() -> Result<AdapterInstall, CliError> {
+     })
+ }
+ 
++/// Set `features.hooks = true` in Codex config without writing a duplicate
++/// `[features]` table. Also repairs the older Rally marker block if present.
++fn set_codex_features_hooks(path: &Path, enabled: bool) -> Result<(), CliError> {
++    if let Some(parent) = path.parent() {
++        fs::create_dir_all(parent).map_err(|err| {
++            CliError::runtime(
++                "setup",
++                format!("failed to create {}: {err}", parent.display()),
++            )
++        })?;
++    }
++    let existing = fs::read_to_string(path).unwrap_or_default();
++    let cleaned = remove_marked_block(
++        &existing,
++        "# BEGIN rally codex hooks",
++        "# END rally codex hooks",
++    );
++    validate_toml_config(path, &cleaned)?;
++    let next = set_toml_bool_in_table(&cleaned, "features", "hooks", enabled);
++    validate_toml_config(path, &next)?;
++    fs::write(path, next).map_err(|err| {
++        CliError::runtime(
++            "setup",
++            format!("failed to write {}: {err}", path.display()),
++        )
++    })
++}
++
++fn validate_toml_config(path: &Path, text: &str) -> Result<(), CliError> {
++    if text.trim().is_empty() {
++        return Ok(());
++    }
++    toml::from_str::<toml::Value>(text).map_err(|err| {
++        CliError::runtime(
++            "setup",
++            format!("failed to parse Codex config {}: {err}", path.display()),
++        )
++    })?;
++    Ok(())
++}
++
++fn set_toml_bool_in_table(text: &str, table: &str, key: &str, enabled: bool) -> String {
++    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
++    let had_trailing_newline = text.ends_with('\n');
++    let Some((start, end)) = toml_table_bounds(&lines, table) else {
++        if !enabled {
++            return text.to_string();
++        }
++        let mut next = text.to_string();
++        if !next.is_empty() && !next.ends_with('\n') {
++            next.push('\n');
++        }
++        if !next.is_empty() {
++            next.push('\n');
++        }
++        next.push_str(&format!("[{table}]\n{key} = true\n"));
++        return next;
++    };
++    let key_index = lines[start + 1..end]
++        .iter()
++        .position(|line| toml_key_name(line) == Some(key))
++        .map(|index| start + 1 + index);
++    if enabled {
++        match key_index {
++            Some(index) => {
++                let indent = lines[index]
++                    .chars()
++                    .take_while(|character| character.is_whitespace())
++                    .collect::<String>();
++                lines[index] = format!("{indent}{key} = true");
++            }
++            None => lines.insert(start + 1, format!("{key} = true")),
++        }
++    } else if let Some(index) = key_index {
++        lines.remove(index);
++    }
++    let mut next = lines.join("\n");
++    if had_trailing_newline && !next.is_empty() {
++        next.push('\n');
++    }
++    next
++}
++
++fn toml_table_bounds(lines: &[String], table: &str) -> Option<(usize, usize)> {
++    let header = format!("[{table}]");
++    let start = lines
++        .iter()
++        .position(|line| toml_header(line).as_deref() == Some(header.as_str()))?;
++    let end = lines
++        .iter()
++        .enumerate()
++        .skip(start + 1)
++        .find(|(_, line)| toml_header(line).is_some())
++        .map(|(index, _)| index)
++        .unwrap_or(lines.len());
++    Some((start, end))
++}
++
++fn toml_header(line: &str) -> Option<String> {
++    let trimmed = line.split('#').next().unwrap_or("").trim();
++    if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.starts_with("[[") {
++        return Some(trimmed.to_string());
++    }
++    None
++}
++
++fn toml_key_name(line: &str) -> Option<&str> {
++    let trimmed = line.trim_start();
++    if trimmed.is_empty() || trimmed.starts_with('#') {
++        return None;
++    }
++    let (key, _) = trimmed.split_once('=')?;
++    Some(key.trim().trim_matches('"'))
++}
++
+ fn install_gemini_hooks() -> Result<AdapterInstall, CliError> {
+     let dir = home_dot(".gemini")?;
+     fs::create_dir_all(&dir)
+@@ -1967,17 +2244,7 @@ fn uninstall_tool_or_adapter(tool: &str) -> Result<AdapterInstall, CliError> {
+         let config = dir.join("config.toml");
+         if config.exists() {
+             backup_paths.extend(backup_file(&config)?);
+-            let existing = fs::read_to_string(&config).map_err(|err| {
+-                CliError::runtime("setup", format!("failed to read Codex config: {err}"))
+-            })?;
+-            let next = remove_marked_block(
+-                &existing,
+-                "# BEGIN rally codex hooks",
+-                "# END rally codex hooks",
+-            );
+-            fs::write(&config, next).map_err(|err| {
+-                CliError::runtime("setup", format!("failed to write Codex config: {err}"))
+-            })?;
++            set_codex_features_hooks(&config, false)?;
+         }
+     } else if tool == "gemini" {
+         let dir = home_dot(".gemini")?;
+@@ -2192,25 +2459,6 @@ fn remove_rally_native_hooks(value: &mut Value) {
+     }
+ }
+ 
+-fn upsert_marked_block(path: &Path, begin: &str, end: &str, block: &str) -> Result<(), CliError> {
+-    if let Some(parent) = path.parent() {
+-        fs::create_dir_all(parent).map_err(|err| {
+-            CliError::runtime(
+-                "setup",
+-                format!("failed to create {}: {err}", parent.display()),
+-            )
+-        })?;
+-    }
+-    let existing = fs::read_to_string(path).unwrap_or_default();
+-    let next = replace_marked_block(&existing, begin, end, block);
+-    fs::write(path, next).map_err(|err| {
+-        CliError::runtime(
+-            "setup",
+-            format!("failed to write {}: {err}", path.display()),
+-        )
+-    })
+-}
+-
+ fn native_hook_script(default_tool: &str) -> String {
+     r#"#!/usr/bin/env bash
+ set -euo pipefail
+@@ -3079,6 +3327,21 @@ fn query_output(
+     }
+ }
+ 
++fn home_dir(command: &'static str) -> Result<PathBuf, CliError> {
++    env::var_os("HOME")
++        .map(PathBuf::from)
++        .ok_or_else(|| CliError::usage(command, "HOME is required to scan Rally channels"))
++}
++
++fn event_repo_name(event: &IndexedEvent) -> String {
++    event
++        .channel
++        .metadata
++        .as_ref()
++        .map(|metadata| metadata.display_name.clone())
++        .unwrap_or_else(|| event.channel.repo_id.clone())
++}
++
+ pub(super) fn query_records(
+     command: &ReadCommand,
+ ) -> Result<(ChannelStore, Vec<Value>, f64), CliError> {
+diff --git a/crates/rally-cli/src/watch.rs b/crates/rally-cli/src/watch.rs
+index 97b7669..2973ba2 100644
+--- a/crates/rally-cli/src/watch.rs
++++ b/crates/rally-cli/src/watch.rs
+@@ -4,7 +4,7 @@
+ //! `rally watch` — block on changes.jsonl, emit new matching events as JSON lines.
+ //!
+ //! Uses the `notify` crate for kqueue/inotify/ReadDirectoryChangesW wakeups so
+-//! idle = zero CPU and latency is ~ms. A slow safety-net poll catches any
++//! idle = near-zero CPU and latency is ~ms. A safety-net poll catches any
+ //! coalesced/missed events.
+ //!
+ //! Production fan-out (multi-consumer, sinks, configured filter rules) lives
+@@ -22,11 +22,14 @@ use std::fs::File;
+ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+ use std::path::Path;
+ use std::sync::mpsc;
++use std::thread;
+ use std::time::{Duration, Instant};
+ 
+ /// Maximum interval between forced re-reads even when no FS event arrived.
+-/// Belt-and-suspenders for cases where notify coalesces or drops an event.
+-const SAFETY_POLL: Duration = Duration::from_secs(5);
++/// Keeps the CLI tailer responsive when notify coalesces or drops an event.
++const SAFETY_POLL: Duration = Duration::from_millis(500);
++const SETTLE_POLL: Duration = Duration::from_millis(20);
++const SETTLE_WINDOW: Duration = Duration::from_millis(300);
+ 
+ pub(crate) fn execute_watch(command: WatchCommand) -> Result<(), CliError> {
+     let store = command.common.channel_store("watch")?;
+@@ -82,11 +85,26 @@ pub(crate) fn execute_watch(command: WatchCommand) -> Result<(), CliError> {
+                 break;
+             }
+             let wait = (deadline - now).min(SAFETY_POLL);
+-            let _ = recv_relevant_event(&rx, wait, &changes_path);
++            let woke = recv_relevant_event(&rx, wait, &changes_path);
++            drain_after_wake(
++                woke,
++                &changes_path,
++                &mut offset,
++                &mut max_seq,
++                &command,
++                &mut out,
++            );
+         } else {
+-            let _ = recv_relevant_event(&rx, SAFETY_POLL, &changes_path);
++            let woke = recv_relevant_event(&rx, SAFETY_POLL, &changes_path);
++            drain_after_wake(
++                woke,
++                &changes_path,
++                &mut offset,
++                &mut max_seq,
++                &command,
++                &mut out,
++            );
+         }
+-        drain(&changes_path, &mut offset, &mut max_seq, &command, &mut out);
+         if command.since_cursor && !command.peek {
+             advance_cursor(&store, &command, max_seq);
+         }
+@@ -96,6 +114,25 @@ pub(crate) fn execute_watch(command: WatchCommand) -> Result<(), CliError> {
+     Ok(())
+ }
+ 
++fn drain_after_wake(
++    woke: bool,
++    changes_path: &Path,
++    offset: &mut u64,
++    max_seq: &mut u64,
++    command: &WatchCommand,
++    out: &mut impl Write,
++) {
++    let mut drained = drain(changes_path, offset, max_seq, command, out);
++    if !woke || drained > 0 {
++        return;
++    }
++    let deadline = Instant::now() + SETTLE_WINDOW;
++    while drained == 0 && Instant::now() < deadline {
++        thread::sleep(SETTLE_POLL);
++        drained = drain(changes_path, offset, max_seq, command, out);
++    }
++}
++
+ /// Block up to `timeout` for an FS event affecting `changes_path` (or any
+ /// event in its parent dir). Returns whether a relevant event arrived; on
+ /// timeout, returns false and the caller falls back to a safety re-read.
+@@ -104,10 +141,17 @@ fn recv_relevant_event(
+     timeout: Duration,
+     changes_path: &Path,
+ ) -> bool {
+-    match rx.recv_timeout(timeout) {
+-        Ok(Ok(event)) => event_touches_log(&event, changes_path),
+-        Ok(Err(_)) => false,
+-        Err(_) => false,
++    let deadline = Instant::now() + timeout;
++    loop {
++        let now = Instant::now();
++        if now >= deadline {
++            return false;
++        }
++        match rx.recv_timeout(deadline - now) {
++            Ok(Ok(event)) if event_touches_log(&event, changes_path) => return true,
++            Ok(_) => continue,
++            Err(_) => return false,
++        }
+     }
+ }
+ 
+@@ -121,11 +165,12 @@ fn event_touches_log(event: &notify::Event, changes_path: &Path) -> bool {
+     if !kind_ok {
+         return false;
+     }
+-    event
+-        .paths
+-        .iter()
+-        .any(|p| p == changes_path || p.ends_with("changes.jsonl"))
+-        || matches!(event.kind, EventKind::Modify(ModifyKind::Any))
++    let watch_dir = changes_path.parent();
++    event.paths.iter().any(|p| {
++        p == changes_path
++            || p.ends_with("changes.jsonl")
++            || watch_dir.is_some_and(|dir| p == dir || p.parent() == Some(dir))
++    }) || matches!(event.kind, EventKind::Modify(ModifyKind::Any))
+ }
+ 
+ fn drain(
+@@ -134,8 +179,9 @@ fn drain(
+     max_seq: &mut u64,
+     command: &WatchCommand,
+     out: &mut impl Write,
+-) {
++) -> usize {
+     let (records, new_offset) = read_new(changes_path, *offset);
++    let read_count = records.len();
+     *offset = new_offset;
+     for record in records {
+         let seq = record.get("local_seq").and_then(Value::as_u64).unwrap_or(0);
+@@ -147,6 +193,7 @@ fn drain(
+             out.flush().ok();
+         }
+     }
++    read_count
+ }
+ 
+ fn matches(record: &Value, command: &WatchCommand) -> bool {
+diff --git a/crates/rally-cli/tests/user_journeys.rs b/crates/rally-cli/tests/user_journeys.rs
+index b030a3a..d360d35 100644
+--- a/crates/rally-cli/tests/user_journeys.rs
++++ b/crates/rally-cli/tests/user_journeys.rs
+@@ -24,6 +24,13 @@ impl RallyWorkspace {
+         Self { cwd, home }
+     }
+ 
++    fn new_with_home(name: &str, home: PathBuf) -> Self {
++        let cwd = temp_path(&format!("{name}-cwd"));
++        fs::create_dir_all(&cwd).unwrap();
++        fs::create_dir_all(&home).unwrap();
++        Self { cwd, home }
++    }
++
+     fn run(&self, args: &[&str]) -> std::process::Output {
+         Command::new(env!("CARGO_BIN_EXE_rally"))
+             .current_dir(&self.cwd)
+@@ -127,6 +134,50 @@ fn agent_starts_from_preflight_and_clears_a_required_handoff() {
+     assert_eq!(inbox["data"]["pending"].as_array().unwrap().len(), 0);
+ }
+ 
++#[test]
++fn global_discovery_locates_events_written_from_another_repo() {
++    let home = temp_path("journey-global-home");
++    let writer = RallyWorkspace::new_with_home("journey-global-writer", home.clone());
++    let reader = RallyWorkspace::new_with_home("journey-global-reader", home.clone());
++
++    let handoff = writer.json(&[
++        "handoff",
++        "--json",
++        "--to",
++        "claude_code",
++        "--from-tool",
++        "codex",
++        "--subject",
++        "cross repo rally handoff",
++        "--files",
++        "docs/RALLY.md",
++    ]);
++    let handoff_id = handoff["event_id"].as_str().unwrap();
++
++    let located = reader.json(&["locate", "--json", handoff_id]);
++    assert_eq!(located["data"]["located"]["event"]["event_id"], handoff_id);
++    assert_eq!(
++        located["data"]["located"]["event"]["to_tool"],
++        "claude_code"
++    );
++    assert!(
++        located["data"]["located"]["channel"]["metadata"]["display_name"]
++            .as_str()
++            .unwrap()
++            .contains("journey-global-writer-cwd")
++    );
++
++    let recent = reader.json(&["recent", "--all", "--json", "--limit", "5"]);
++    let events = recent["data"]["events"].as_array().unwrap();
++    assert!(events.iter().any(|event| {
++        event["event"]["event_id"] == handoff_id
++            && event["channel"]["channel_dir"] == handoff["channel"]
++    }));
++
++    writer.cleanup();
++    reader.cleanup();
++}
++
+ #[test]
+ fn agents_detect_and_resolve_overlapping_file_claims() {
+     let workspace = RallyWorkspace::new("journey-file-claims");
+diff --git a/crates/rally-cli/tests/verify.rs b/crates/rally-cli/tests/verify.rs
+index 63ade1f..343de96 100644
+--- a/crates/rally-cli/tests/verify.rs
++++ b/crates/rally-cli/tests/verify.rs
+@@ -152,6 +152,9 @@ fn write_commands_append_typed_handoff_and_ack_events() {
+         "review schema",
+         "--files",
+         "docs/SCHEMA.md",
++        "--files",
++        "crates/rally-core/src/lib.rs",
++        "docs/SIGNED_EVENTS.md",
+     ]));
+ 
+     let handoff_id = handoff["event_id"].as_str().unwrap();
+@@ -169,6 +172,14 @@ fn write_commands_append_typed_handoff_and_ack_events() {
+         handoff["event"]["payload"]["ref_files"][0],
+         "docs/SCHEMA.md"
+     );
++    assert_eq!(
++        handoff["event"]["payload"]["ref_files"][1],
++        "crates/rally-core/src/lib.rs"
++    );
++    assert_eq!(
++        handoff["event"]["payload"]["ref_files"][2],
++        "docs/SIGNED_EVENTS.md"
++    );
+ 
+     let ack = json_stdout(workspace.run(&[
+         "ack",
+@@ -547,6 +558,110 @@ fn setup_install_and_uninstall_agent_wrapper() {
+     workspace.cleanup();
+ }
+ 
++#[test]
++fn setup_install_without_target_wires_session_start_coordination() {
++    let workspace = RallyWorkspace::new("rally-cli-install-all");
++    let codex_config = workspace.home.join(".codex/config.toml");
++    fs::create_dir_all(codex_config.parent().unwrap()).unwrap();
++    fs::write(
++        &codex_config,
++        "[features]\nmemories = true\n\n[profiles.default]\nmodel = \"gpt-5\"\n",
++    )
++    .unwrap();
++
++    let install = json_stdout(workspace.run(&["setup", "install", "--json"]));
++    let installed_files = install["data"]["setup"]["installed_files"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .filter_map(|value| value.as_str())
++        .collect::<Vec<_>>();
++    assert!(
++        installed_files
++            .iter()
++            .any(|path| path.ends_with(".pi/agent/extensions/rally-judgment.ts"))
++    );
++    assert!(
++        installed_files
++            .iter()
++            .any(|path| path.ends_with(".claude/hooks/rally-hook.sh"))
++    );
++    assert!(
++        installed_files
++            .iter()
++            .any(|path| path.ends_with(".codex/hooks.json"))
++    );
++    assert!(
++        installed_files
++            .iter()
++            .any(|path| path.ends_with(".gemini/settings.json"))
++    );
++    assert!(
++        installed_files
++            .iter()
++            .any(|path| path.ends_with(".config/cmux/rally-agent-wrapper.sh"))
++    );
++    assert!(
++        installed_files
++            .iter()
++            .any(|path| path.ends_with(".config/herdr/config.toml"))
++    );
++
++    let claude_settings = fs::read_to_string(workspace.home.join(".claude/settings.json")).unwrap();
++    assert!(claude_settings.contains("SessionStart"));
++    assert!(claude_settings.contains("start claude"));
++
++    let codex_hooks = fs::read_to_string(workspace.home.join(".codex/hooks.json")).unwrap();
++    assert!(codex_hooks.contains("SessionStart"));
++    assert!(codex_hooks.contains("start codex"));
++    let codex_config_text = fs::read_to_string(&codex_config).unwrap();
++    assert_eq!(codex_config_text.matches("[features]").count(), 1);
++    let codex_config_value: toml::Value = toml::from_str(&codex_config_text).unwrap();
++    assert_eq!(
++        codex_config_value["features"]["memories"].as_bool(),
++        Some(true)
++    );
++    assert_eq!(
++        codex_config_value["features"]["hooks"].as_bool(),
++        Some(true)
++    );
++
++    let gemini_settings = fs::read_to_string(workspace.home.join(".gemini/settings.json")).unwrap();
++    assert!(gemini_settings.contains("SessionStart"));
++    assert!(gemini_settings.contains("start gemini"));
++
++    let pi_extension = fs::read_to_string(
++        workspace
++            .home
++            .join(".pi/agent/extensions/rally-judgment.ts"),
++    )
++    .unwrap();
++    assert!(pi_extension.contains("session_start"));
++    assert!(pi_extension.contains("\"start\", \"pi\""));
++
++    let cmux_wrapper =
++        fs::read_to_string(workspace.home.join(".config/cmux/rally-agent-wrapper.sh")).unwrap();
++    assert!(cmux_wrapper.contains("rally start \"$tool\""));
++
++    let herdr_wrapper = fs::read_to_string(
++        workspace
++            .home
++            .join(".config/herdr/integrations/rally-agent-start.sh"),
++    )
++    .unwrap();
++    assert!(herdr_wrapper.contains("rally start \"$tool\""));
++
++    let verify_all = json_stdout(workspace.run(&["setup", "verify", "all", "--json"]));
++    assert!(
++        verify_all["data"]["setup"]["verification"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .all(|entry| entry["installed"] == true)
++    );
++    workspace.cleanup();
++}
++
+ #[test]
+ fn repair_profile_and_ci_gate() {
+     let workspace = RallyWorkspace::new("rally-cli-repair-ci");
+diff --git a/crates/rally-core/src/lib.rs b/crates/rally-core/src/lib.rs
+index 898425a..dd51ec5 100644
+--- a/crates/rally-core/src/lib.rs
++++ b/crates/rally-core/src/lib.rs
+@@ -8,6 +8,7 @@
+ //! MCP tools, ACP/A2A bridges, and future sync code should call this crate
+ //! instead of reinterpreting `changes.jsonl` independently.
+ 
++pub mod channel_index;
+ pub mod context;
+ pub mod cursors;
+ pub mod diagnose;
+diff --git a/crates/rally-core/src/repo.rs b/crates/rally-core/src/repo.rs
+index a20b3c1..befc152 100644
+--- a/crates/rally-core/src/repo.rs
++++ b/crates/rally-core/src/repo.rs
+@@ -1,10 +1,15 @@
+ // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+ // SPDX-License-Identifier: Apache-2.0
+ 
++use chrono::{DateTime, SecondsFormat, Utc};
+ use rally_protocol::sha256_hash;
++use serde::{Deserialize, Serialize};
+ use std::fmt;
+ use std::fs;
+ use std::path::{Path, PathBuf};
++use std::time::SystemTime;
++
++pub const CHANNEL_METADATA: &str = "rally.channel.json";
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct ChannelResolution {
+@@ -12,15 +17,38 @@ pub struct ChannelResolution {
+     pub repo_id: String,
+     pub repo_root: PathBuf,
+     pub source: RepoIdSource,
++    pub display_name: String,
+ }
+ 
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
+ pub enum RepoIdSource {
+     GitRemote,
+     GitRoot,
+     WorkingDirectory,
+ }
+ 
++impl RepoIdSource {
++    pub fn as_str(self) -> &'static str {
++        match self {
++            Self::GitRemote => "git_remote",
++            Self::GitRoot => "git_root",
++            Self::WorkingDirectory => "working_directory",
++        }
++    }
++}
++
++#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
++pub struct ChannelMetadata {
++    pub schema: String,
++    pub repo_id: String,
++    pub display_name: String,
++    pub repo_root: String,
++    pub repo_id_source: RepoIdSource,
++    pub channel_dir: String,
++    pub last_resolved_at: String,
++}
++
+ #[derive(Debug)]
+ pub enum RepoError {
+     MissingHome,
+@@ -51,27 +79,97 @@ pub fn resolve_channel_dir(
+     let cwd = cwd.as_ref();
+     let home = home.ok_or(RepoError::MissingHome)?;
+     let repo_root = find_repo_root(cwd).unwrap_or_else(|| canonical_or_original(cwd));
+-    let (source, identity) = git_remote_identity(&repo_root)
++    let fallback = fallback_identity(cwd, &repo_root);
++    let preferred = git_remote_identity(&repo_root)
+         .map(|remote| (RepoIdSource::GitRemote, remote))
+-        .unwrap_or_else(|| {
+-            if has_git_dir(&repo_root) {
+-                (RepoIdSource::GitRoot, repo_root.display().to_string())
+-            } else {
+-                (
+-                    RepoIdSource::WorkingDirectory,
+-                    canonical_or_original(cwd).display().to_string(),
+-                )
+-            }
+-        });
++        .unwrap_or_else(|| fallback.clone());
++    let (source, identity) = select_existing_channel(home, &preferred, &fallback);
+     let repo_id = repo_id("repo", &identity);
++    let channel_dir = channel_dir_for(home, &repo_id);
++    let display_name = display_name_for(&repo_root, &identity);
+     Ok(ChannelResolution {
+-        channel_dir: home.join(".agent-rally-point/apps").join(&repo_id),
++        channel_dir,
+         repo_id,
+         repo_root,
+         source,
++        display_name,
+     })
+ }
+ 
++fn fallback_identity(cwd: &Path, repo_root: &Path) -> (RepoIdSource, String) {
++    if has_git_dir(repo_root) {
++        (RepoIdSource::GitRoot, repo_root.display().to_string())
++    } else {
++        (
++            RepoIdSource::WorkingDirectory,
++            canonical_or_original(cwd).display().to_string(),
++        )
++    }
++}
++
++fn select_existing_channel(
++    home: &Path,
++    preferred: &(RepoIdSource, String),
++    fallback: &(RepoIdSource, String),
++) -> (RepoIdSource, String) {
++    if preferred.0 != RepoIdSource::GitRemote || preferred.1 == fallback.1 {
++        return preferred.clone();
++    }
++    let preferred_id = repo_id("repo", &preferred.1);
++    let fallback_id = repo_id("repo", &fallback.1);
++    let preferred_channel = channel_dir_for(home, &preferred_id);
++    let fallback_channel = channel_dir_for(home, &fallback_id);
++    if channel_has_events(&fallback_channel) && !channel_has_events(&preferred_channel) {
++        return fallback.clone();
++    }
++    preferred.clone()
++}
++
++fn channel_dir_for(home: &Path, repo_id: &str) -> PathBuf {
++    home.join(".agent-rally-point/apps").join(repo_id)
++}
++
++fn channel_has_events(channel_dir: &Path) -> bool {
++    fs::metadata(channel_dir.join("changes.jsonl"))
++        .map(|metadata| metadata.len() > 0)
++        .unwrap_or(false)
++}
++
++impl ChannelResolution {
++    pub fn metadata(&self) -> ChannelMetadata {
++        ChannelMetadata {
++            schema: "agent-rally.channel.v1".to_string(),
++            repo_id: self.repo_id.clone(),
++            display_name: self.display_name.clone(),
++            repo_root: self.repo_root.display().to_string(),
++            repo_id_source: self.source,
++            channel_dir: self.channel_dir.display().to_string(),
++            last_resolved_at: DateTime::<Utc>::from(SystemTime::now())
++                .to_rfc3339_opts(SecondsFormat::Millis, true),
++        }
++    }
++}
++
++pub fn write_channel_metadata(resolution: &ChannelResolution) -> Result<(), RepoError> {
++    let metadata = resolution.metadata();
++    if let Ok(existing) = read_channel_metadata(&resolution.channel_dir) {
++        if same_channel_identity(&existing, &metadata) {
++            return Ok(());
++        }
++    }
++    fs::create_dir_all(&resolution.channel_dir)?;
++    let metadata = serde_json::to_string_pretty(&metadata).map_err(std::io::Error::other)?;
++    fs::write(resolution.channel_dir.join(CHANNEL_METADATA), metadata)?;
++    Ok(())
++}
++
++pub fn read_channel_metadata(channel_dir: impl AsRef<Path>) -> Result<ChannelMetadata, RepoError> {
++    let value = fs::read_to_string(channel_dir.as_ref().join(CHANNEL_METADATA))?;
++    serde_json::from_str(&value)
++        .map_err(std::io::Error::other)
++        .map_err(RepoError::Io)
++}
++
+ fn find_repo_root(cwd: &Path) -> Option<PathBuf> {
+     let mut current = Some(cwd);
+     while let Some(path) = current {
+@@ -131,6 +229,38 @@ fn repo_id(prefix: &str, value: &str) -> String {
+     format!("{prefix}_{}", &hash["sha256:".len().."sha256:".len() + 16])
+ }
+ 
++fn display_name_for(repo_root: &Path, identity: &str) -> String {
++    repo_root
++        .file_name()
++        .and_then(|name| name.to_str())
++        .filter(|name| !name.is_empty())
++        .map(str::to_string)
++        .or_else(|| remote_repo_name(identity))
++        .unwrap_or_else(|| "unknown-repo".to_string())
++}
++
++fn same_channel_identity(left: &ChannelMetadata, right: &ChannelMetadata) -> bool {
++    left.schema == right.schema
++        && left.repo_id == right.repo_id
++        && left.display_name == right.display_name
++        && left.repo_root == right.repo_root
++        && left.repo_id_source == right.repo_id_source
++        && left.channel_dir == right.channel_dir
++}
++
++fn remote_repo_name(value: &str) -> Option<String> {
++    let value = value.trim().trim_end_matches('/');
++    let path = value
++        .rsplit_once(':')
++        .map(|(_, path)| path)
++        .unwrap_or(value)
++        .trim_end_matches(".git");
++    path.rsplit('/')
++        .next()
++        .filter(|name| !name.is_empty())
++        .map(str::to_string)
++}
++
+ fn canonical_or_original(path: &Path) -> PathBuf {
+     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+ }
+@@ -167,10 +297,35 @@ mod tests {
+         fs::remove_dir_all(repo).unwrap();
+ 
+         assert_eq!(resolved.source, RepoIdSource::GitRemote);
++        assert!(resolved.display_name.starts_with("rally-repo-git"));
+         assert!(resolved.channel_dir.starts_with(home));
+         assert!(resolved.repo_id.starts_with("repo_"));
+     }
+ 
++    #[test]
++    fn existing_path_channel_wins_until_remote_channel_has_events() {
++        let repo = temp_dir("rally-repo-compat");
++        fs::create_dir_all(repo.join(".git")).unwrap();
++        fs::write(
++            repo.join(".git/config"),
++            "[remote \"origin\"]\n  url = https://github.com/tyroneross/example.git\n",
++        )
++        .unwrap();
++        let home = temp_dir("rally-repo-compat-home");
++        let legacy_identity = repo.canonicalize().unwrap().display().to_string();
++        let legacy_id = repo_id("repo", &legacy_identity);
++        let legacy_channel = channel_dir_for(&home, &legacy_id);
++        fs::create_dir_all(&legacy_channel).unwrap();
++        fs::write(legacy_channel.join("changes.jsonl"), "{}\n").unwrap();
++
++        let resolved = resolve_channel_dir(&repo, Some(&home)).unwrap();
++        fs::remove_dir_all(repo).unwrap();
++        fs::remove_dir_all(home).unwrap();
++
++        assert_eq!(resolved.source, RepoIdSource::GitRoot);
++        assert_eq!(resolved.repo_id, legacy_id);
++    }
++
+     #[test]
+     fn working_directory_falls_back_without_git() {
+         let cwd = temp_dir("rally-repo-path");
+@@ -181,6 +336,25 @@ mod tests {
+         fs::remove_dir_all(cwd).unwrap();
+ 
+         assert_eq!(resolved.source, RepoIdSource::WorkingDirectory);
++        assert!(resolved.display_name.starts_with("rally-repo-path"));
+         assert!(resolved.channel_dir.starts_with(home));
+     }
++
++    #[test]
++    fn writes_readable_channel_metadata() {
++        let cwd = temp_dir("rally-repo-meta");
++        fs::create_dir_all(cwd.join(".git")).unwrap();
++        let home = temp_dir("rally-repo-meta-home");
++
++        let resolved = resolve_channel_dir(&cwd, Some(&home)).unwrap();
++        write_channel_metadata(&resolved).unwrap();
++        let metadata = read_channel_metadata(&resolved.channel_dir).unwrap();
++        fs::remove_dir_all(cwd).unwrap();
++        fs::remove_dir_all(home).unwrap();
++
++        assert_eq!(metadata.schema, "agent-rally.channel.v1");
++        assert_eq!(metadata.repo_id, resolved.repo_id);
++        assert!(metadata.display_name.starts_with("rally-repo-meta"));
++        assert_eq!(metadata.repo_id_source, RepoIdSource::GitRoot);
++    }
+ }
+diff --git a/docs/CLI.md b/docs/CLI.md
+index eb2f4b8..bee0088 100644
+--- a/docs/CLI.md
++++ b/docs/CLI.md
+@@ -27,6 +27,8 @@ workflow against product-manager, backend, frontend, and general-coder roles.
+ | Resolve a blocker | `rally unblock --tool <tool> <blocker-id> --resolution "<fix>" --json` |
+ | Get the full context brief | `rally context --tool <tool> --json` |
+ | Get a compact role-shaped work packet | `rally packet --tool <tool> --json` |
++| Find an event across local Rally repo channels | `rally locate <event-id> --json` |
++| See latest events across local Rally repo channels | `rally recent --all --limit 10 --json` |
+ | Check channel health | `rally doctor --tool <tool> --json` |
+ | Run a CI coordination gate | `rally ci gate --tool ci --json` |
+ | Export or import sync packets | `rally sync export --json` / `rally sync import --json <packet.json>` |
+@@ -318,6 +320,8 @@ rally blockers --json
+ rally conflicts --json
+ rally diagnose --tool codex --json
+ rally score --json
++rally locate <event-id> --json
++rally recent --all --limit 10 --json
+ rally thread <event-id> --json
+ rally replay --json
+ rally report --json
+@@ -326,6 +330,13 @@ rally report --json
+ Use `claims`, `blockers`, and `conflicts` before broad edits. Use `thread`,
+ `replay`, and `report` when debugging history.
+ 
++Use `locate` when you have an event id but do not know which local repo channel
++contains it. Use `recent --all` when the work may have happened in another repo;
++it scans `~/.agent-rally-point/apps/*/changes.jsonl`, sorts by event time, and
++includes channel metadata when that repo has written it. Repos with an existing
++path-derived channel keep using that channel until an explicit migration moves
++the ledger to a remote-derived id.
++
+ ## Setup And Health
+ 
+ ### `rally doctor`
+@@ -342,13 +353,18 @@ Discovers harnesses and manages local hook/adapter setup.
+ 
+ ```bash
+ rally setup --json
+-rally setup install codex --dry-run --json
++rally setup install --dry-run --json
++rally setup install --json
+ rally setup install codex --json
+-rally setup verify codex --json
++rally setup verify all --json
+ rally setup uninstall codex --json
++rally setup uninstall all --json
+ rally setup enforcement strict --json
+ ```
+ 
++With no target, `setup install` installs all supported session-start
++coordination hooks: Pi extension, Claude/Codex/Gemini native hooks, and
++cmux/Herdr startup wrappers. Use a target such as `codex` for a scoped install.
+ Install commands create `.rally.bak` backups before mutating existing config
+ files. Use `--dry-run` before changing a real host config.
+ 
+diff --git a/docs/CONTEXT_BRIEF_SCHEMA.md b/docs/CONTEXT_BRIEF_SCHEMA.md
+index 432a2a4..6b19096 100644
+--- a/docs/CONTEXT_BRIEF_SCHEMA.md
++++ b/docs/CONTEXT_BRIEF_SCHEMA.md
+@@ -290,8 +290,10 @@ Adapter rules:
+ `rally setup --json` discovers known harnesses and returns their availability
+ plus canonical startup commands. `rally setup enforcement <off|warn|strict>`
+ records how strongly anonymous coordination should be treated. `rally setup
+-install <cmux|herdr>` writes adapter notes under the channel directory and
+-installs edge hooks in the harness config directory:
++install` without a target installs every supported session-start coordination
++hook/wrapper. `rally setup install <tool>` scopes setup to one tool. For
++adapters, `rally setup install <cmux|herdr>` writes adapter notes under the
++channel directory and installs edge hooks in the harness config directory:
+ 
+ - cmux: `~/.config/cmux/rally-agent-wrapper.sh` plus a `rally-agent` command in
+   `~/.config/cmux/cmux.json`.
+@@ -301,8 +303,8 @@ installs edge hooks in the harness config directory:
+ Tests may override those locations with `RALLY_CMUX_CONFIG_DIR` and
+ `RALLY_HERDR_CONFIG_DIR`.
+ 
+-`rally setup install <pi|claude|codex|gemini>` uses each tool's native hook
+-surface rather than PATH shadowing:
++For direct agent hosts, `rally setup install <pi|claude|codex|gemini>` uses
++each tool's native hook surface rather than PATH shadowing:
+ 
+ - Pi: `~/.pi/agent/extensions/rally-judgment.ts` via Pi's extension API.
+ - Claude: `~/.claude/settings.json` hook entries plus
+@@ -318,7 +320,7 @@ Safety rules for setup mutation:
+ 
+ - `--dry-run` returns planned files/config without writing.
+ - Existing files are copied to `<file>.rally.bak` before mutation/removal.
+-- `rally setup verify [tool] --json` checks expected files and markers.
++- `rally setup verify [tool|all] --json` checks expected files and markers.
+ - Install/uninstall are intended to be idempotent: generated hook entries are not
+   duplicated on repeat installs.
+ 
