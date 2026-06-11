@@ -4,7 +4,10 @@
   "plugins": [
     {
       "name": "agent-rally-point",
-      "source": "./"
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex"
+      }
     }
   ]
 }
