@@ -23,7 +23,11 @@ dest="$repo_root/plugins/codex/.codex-plugin"
 rm -rf "$dest"
 mkdir -p "$dest"
 # Copy plugin.json + skills/ (everything Codex needs to run the plugin).
-cp -R "$src/." "$dest/"
+# -L DEREFERENCES symlinks: the root .codex-plugin/skills/* are symlinks into
+# the repo's main skills/ (DRY), but the artifact must be SELF-CONTAINED — Codex
+# copies the subdir wholesale on install, so relative symlinks would dangle and
+# ship empty skills. Follow them to materialize real files.
+cp -RL "$src/." "$dest/"
 # Strip macOS cruft so it never ships in the artifact.
 find "$dest" -name '.DS_Store' -delete 2>/dev/null || true
 
