@@ -6,6 +6,15 @@
 
 The only shipped coordination command is `rally`.
 
+## Install as a Claude Code plugin
+
+```bash
+claude plugin marketplace add tyroneross/agent-rally-point
+claude plugin install agent-rally-point@agent-rally-point
+```
+
+Hooks (SessionStart auto-coordination + PreToolUse write-boundary checks) and skills (`agent-rally-point`, `rally-workflows`, `mini-loop`) activate automatically on install. The `rally` CLI binary is auto-provisioned on first session.
+
 ## Start Here
 
 New agent or human dropping in? Read [`RALLY.md`](RALLY.md). It is the short

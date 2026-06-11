@@ -365,6 +365,119 @@ T="self-gate: idle + after-write outside .rally/ → exit 0 + empty"
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
+# ----------------------------------------------------------------------
+# Test 12: git repo + no .rally/ + start → offer emitted once; second start
+#          is silent (sentinel suppresses).
+# ----------------------------------------------------------------------
+T="no-.rally git repo: start emits offer once, second start is silent"
+(
+  # Create a real git repo with no .rally/.
+  offer_repo="$tmpdir/offer-repo"
+  mkdir -p "$offer_repo"
+  cd "$offer_repo"
+  git init -q
+  git commit --allow-empty -q -m "init" 2>/dev/null
+  # Remove any pre-existing sentinel from a prior run.
+  _gc="$(git rev-parse --git-common-dir 2>/dev/null)"
+  rm -f "${_gc}/rally-offer-shown" 2>/dev/null
+
+  out1=$("$HOOK" start claude_code </dev/null 2>/dev/null)
+  rc1=$?
+  # First call: must contain additionalContext with "rally init".
+  if [ "$rc1" != "0" ]; then printf 'rc1=%s\n' "$rc1" >&2; exit 1; fi
+  if ! printf '%s' "$out1" | grep -q "rally init"; then
+    printf 'first start missing offer: [%s]\n' "$out1" >&2; exit 1
+  fi
+  if ! printf '%s' "$out1" | grep -q "additionalContext"; then
+    printf 'first start missing additionalContext: [%s]\n' "$out1" >&2; exit 1
+  fi
+
+  out2=$("$HOOK" start claude_code </dev/null 2>/dev/null)
+  rc2=$?
+  # Second call: sentinel exists → silent (empty or {}).
+  if [ "$rc2" != "0" ]; then printf 'rc2=%s\n' "$rc2" >&2; exit 1; fi
+  if printf '%s' "$out2" | grep -q "rally init"; then
+    printf 'second start should be silent, got: [%s]\n' "$out2" >&2; exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "offer must appear once then be suppressed by sentinel"; fi
+
+# ----------------------------------------------------------------------
+# Test 13: NON-git dir + no .rally/ + start → silent exit 0, no offer.
+# ----------------------------------------------------------------------
+T="non-git dir: start phase → silent exit 0, no offer"
+(
+  non_git="$tmpdir/non-git-dir"
+  mkdir -p "$non_git"
+  cd "$non_git"
+  out=$("$HOOK" start claude_code </dev/null 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
+  if [ -n "$out" ]; then
+    printf 'expected empty output in non-git dir, got: [%s]\n' "$out" >&2; exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "non-git dir must stay silent"; fi
+
+# ----------------------------------------------------------------------
+# Test 14: RALLY_HOOKS=off + git repo + no .rally/ + start → no offer.
+# ----------------------------------------------------------------------
+T="RALLY_HOOKS=off + no-.rally git repo: no offer on start"
+(
+  optout_repo="$tmpdir/optout-repo"
+  mkdir -p "$optout_repo"
+  cd "$optout_repo"
+  git init -q
+  git commit --allow-empty -q -m "init" 2>/dev/null
+
+  out=$(RALLY_HOOKS=off "$HOOK" start claude_code </dev/null 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
+  if printf '%s' "$out" | grep -q "rally init"; then
+    printf 'RALLY_HOOKS=off should suppress offer, got: [%s]\n' "$out" >&2; exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "RALLY_HOOKS=off must suppress offer"; fi
+
+# ----------------------------------------------------------------------
+# Test 15: Regression — .rally/ PRESENT → existing start behavior preserved.
+#          The test mirrors Test 2d (quiet room, prompt="once") and asserts
+#          the room-awareness message is still emitted correctly.
+# ----------------------------------------------------------------------
+T="regression: .rally/ present → start still emits room-awareness (no regressions)"
+reg_bin="$tmpdir/rally_regression"
+cat > "$reg_bin" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "hooks" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"data":{"hooks":{"enabled":true,"prompt":"once"}}}'
+elif [ "$1" = "enter" ]; then
+  :
+elif [ "$1" = "room" ]; then
+  printf '%s\n' '{"data":{"room":{"squads":[],"active_claims":[],"open_handoffs":[]}}}'
+elif [ "$1" = "next" ]; then
+  printf '%s\n' '{"data":{"next":{"actionable":false}}}'
+else
+  printf '%s\n' '{}'
+fi
+EOF
+chmod +x "$reg_bin"
+(
+  reg_repo="$tmpdir/reg-repo"
+  mkdir -p "$reg_repo/.rally"
+  cd "$reg_repo"
+  out=$(RALLY_BIN="$reg_bin" "$HOOK" start claude_code </dev/null 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
+  if ! printf '%s' "$out" | grep -q "Agent Rally Point is active in this repo"; then
+    printf 'regression: missing room-awareness message: [%s]\n' "$out" >&2; exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "existing .rally/ start path must be unchanged"; fi
+
 # Summary
 # ----------------------------------------------------------------------
 echo ""

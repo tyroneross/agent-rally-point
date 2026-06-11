@@ -59,7 +59,53 @@ find_rally_root() {
 }
 
 if ! find_rally_root >/dev/null 2>&1; then
-  # Not a rally repo — silent no-op so this script is safe to install globally.
+  # Not a rally repo. For the start phase only, offer one-time setup advice if
+  # we're inside a git work tree. All other phases: silent no-op.
+  if [ "${1:-idle}" = "start" ]; then
+    # Wire ensure-rally-binary on start even in no-.rally repos (best-effort).
+    ensure_bin="$(dirname "$0")/ensure-rally-binary.sh"
+    [ -x "$ensure_bin" ] && "$ensure_bin" "${CLAUDE_PLUGIN_ROOT:-}" >/dev/null 2>&1 || true
+
+    # Check opt-outs first (env vars; can't call `rally hooks status` without .rally/).
+    _no_offer=0
+    case "$(printf '%s' "${RALLY_HOOKS:-}" | tr '[:upper:]' '[:lower:]')" in
+      0|off|false|no|disabled) _no_offer=1 ;;
+    esac
+    if [ "$_no_offer" = "0" ]; then
+      case "$(printf '%s' "${RALLY_HOOK_PROMPT:-once}" | tr '[:upper:]' '[:lower:]')" in
+        off) _no_offer=1 ;;
+      esac
+    fi
+    # Also respect ~/.config/rally/config.json hooks.prompt == "off" if node available.
+    if [ "$_no_offer" = "0" ] && command -v node >/dev/null 2>&1; then
+      _cfg_prompt="$(node -e '
+const fs = require("fs");
+const p = (process.env.HOME || "") + "/.config/rally/config.json";
+try { const c = JSON.parse(fs.readFileSync(p,"utf8")); process.stdout.write(String(c?.hooks?.prompt || "")); } catch (_) {}
+' 2>/dev/null || true)"
+      if [ "$_cfg_prompt" = "off" ]; then _no_offer=1; fi
+    fi
+
+    if [ "$_no_offer" = "0" ]; then
+      # Only offer once per repo using a sentinel file in the git common dir.
+      _git_common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+      if [ -n "$_git_common_dir" ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        _sentinel="${_git_common_dir}/rally-offer-shown"
+        if [ ! -f "$_sentinel" ]; then
+          # Create sentinel best-effort, then emit the offer.
+          mkdir -p "$(dirname "$_sentinel")" 2>/dev/null || true
+          printf '1' > "$_sentinel" 2>/dev/null || true
+          if command -v node >/dev/null 2>&1; then
+            _offer_msg="Agent Rally Point is installed but this repo isn't coordinated yet. Run \`rally init\` to enable automatic multi-agent coordination (presence, before-write deconfliction, handoffs). One-time prompt — silence with \`RALLY_HOOKS=off\`."
+            node -e '
+const msg = process.argv[1] || "";
+process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:msg}}));
+' "$_offer_msg" 2>/dev/null || true
+          fi
+        fi
+      fi
+    fi
+  fi
   exit 0
 fi
 
@@ -225,6 +271,10 @@ if [ -z "$session" ]; then session="${RALLY_SESSION_ID:-${tool}-$(date +%s)}"; f
 # Dispatch on phase.
 rally_output=""
 if [ "$phase" = "start" ]; then
+  # Wire ensure-rally-binary on start in the .rally-present path (best-effort).
+  ensure_bin="$(dirname "$0")/ensure-rally-binary.sh"
+  [ -x "$ensure_bin" ] && "$ensure_bin" "${CLAUDE_PLUGIN_ROOT:-}" >/dev/null 2>&1 || true
+
   # Register presence (auto-enter), then surface room awareness so a NEW agent
   # automatically knows there is an active room + who owns what, and deconflicts
   # before editing. Stays quiet (no nag) when the agent is solo.
