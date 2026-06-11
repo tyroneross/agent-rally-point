@@ -161,14 +161,29 @@ _try_download() {
   if ! command -v curl >/dev/null 2>&1; then return 1; fi
   if [ -z "$HOST_TRIPLE" ]; then return 1; fi
 
-  # Resolve latest tag via the GitHub Releases API (no auth needed for public repo)
-  local api_url="https://api.github.com/repos/tyroneross/agent-rally-point/releases/latest"
-  local release_json
-  release_json="$(curl -fsSL --max-time 10 "$api_url" 2>/dev/null)" || return 1
-
-  # Extract tag_name (portable; no jq)
-  local tag
-  tag="$(printf '%s' "$release_json" | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+  # Resolve the release tag. PREFER the installed plugin's own version: it needs
+  # no network call (the GitHub API is unauthenticated-rate-limited to 60/hr and
+  # fails on shared IPs / CI), AND it downloads the binary that MATCHES the
+  # installed plugin rather than a possibly-newer "latest". Fall back to the
+  # releases/latest API only when no manifest version can be read.
+  local tag=""
+  local manifest=""
+  local m
+  for m in "$PLUGIN_ROOT/.claude-plugin/plugin.json" "$PLUGIN_ROOT/.codex-plugin/plugin.json"; do
+    if [ -f "$m" ]; then manifest="$m"; break; fi
+  done
+  if [ -n "$manifest" ]; then
+    local ver
+    ver="$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$manifest" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)"[[:space:]]*$/\1/')"
+    [ -n "$ver" ] && tag="v$ver"
+  fi
+  if [ -z "$tag" ]; then
+    # Fallback: GitHub Releases API (no auth; subject to rate limits).
+    local api_url="https://api.github.com/repos/tyroneross/agent-rally-point/releases/latest"
+    local release_json
+    release_json="$(curl -fsSL --max-time 10 "$api_url" 2>/dev/null || true)"
+    tag="$(printf '%s' "$release_json" | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+  fi
   [ -z "$tag" ] && return 1
 
   local asset_name="rally-${HOST_TRIPLE}"
