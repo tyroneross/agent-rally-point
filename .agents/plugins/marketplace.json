@@ -1,0 +1,10 @@
+{
+  "name": "agent-rally-point",
+  "version": "0.1.1",
+  "plugins": [
+    {
+      "name": "agent-rally-point",
+      "source": "./"
+    }
+  ]
+}
