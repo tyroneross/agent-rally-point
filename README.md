@@ -16,6 +16,9 @@ The full product boundary is [`docs/RALLY_ARCHITECTURE.md`](docs/RALLY_ARCHITECT
 The long-term coordination protocol model is
 [`docs/PROTOCOL-NORTH-STAR.md`](docs/PROTOCOL-NORTH-STAR.md).
 
+Command read/write behavior is summarized in
+[`docs/COMMAND-SEMANTICS.md`](docs/COMMAND-SEMANTICS.md).
+
 The build-loop implementation and Claude/Codex dogfood plan is
 [`docs/PLAN-protocol-claim-authority-dogfood.md`](docs/PLAN-protocol-claim-authority-dogfood.md).
 
@@ -108,8 +111,10 @@ inject result returns `ack_state: "timeout"`, `verified_received: false`, and a
 file movement, retry once with a short doorbell, then move the work to a
 separate worktree, hand it to another live agent, or escalate.
 
-Managed sessions need no setup step. `rally run --backend <tmux|cmux>`
+Managed sessions need no setup step. `rally run --backend <auto|tmux|cmux|ptyd>`
 starts the addressable pane/workspace, and `rally inject` delivers work to it.
+The default `auto` path uses a rally-owned ptyd daemon when its socket is live,
+otherwise it falls back to tmux.
 The legacy `herdr` backend (and its `--herdr-bin` / `--herdr-socket` flags)
 were removed in Plan F: rally writes to the `.rally` ledger and the
 `rally-termd` daemon subscribes, replacing the previous "rally calls the

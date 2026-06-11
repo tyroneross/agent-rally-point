@@ -59,6 +59,89 @@ T="fail-open: missing rally binary → exit 0"
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 # ----------------------------------------------------------------------
+# Test 2b: session opt-out — RALLY_HOOKS=off exits before rally work
+# ----------------------------------------------------------------------
+T="session opt-out: RALLY_HOOKS=off → exit 0 + empty stdout"
+(
+  cd "$REPO_ROOT"
+  out=$(RALLY_HOOKS=off RALLY_BIN="/no/such/rally/binary/exists" "$HOOK" start claude_code </dev/null 2>/dev/null)
+  rc=$?
+  if [ "$rc" = "0" ] && [ -z "$out" ]; then
+    exit 0
+  else
+    printf 'rc=%s out=[%s]' "$rc" "$out" >&2
+    exit 1
+  fi
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+# ----------------------------------------------------------------------
+# Test 2c: config opt-out — hooks status disabled stops before enter/room
+# ----------------------------------------------------------------------
+T="config opt-out: hooks status disabled → no room writes"
+disabled_bin="$tmpdir/rally_disabled"
+disabled_marker="$tmpdir/disabled-unexpected"
+cat > "$disabled_bin" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "hooks" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"data":{"hooks":{"enabled":false,"prompt":"off"}}}'
+  exit 0
+fi
+printf 'unexpected:%s\n' "$*" >> "${MARKER:?}"
+exit 0
+EOF
+chmod +x "$disabled_bin"
+(
+  repo="$tmpdir/disabled-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+  out=$(MARKER="$disabled_marker" RALLY_BIN="$disabled_bin" "$HOOK" start claude_code </dev/null 2>/dev/null)
+  rc=$?
+  if [ "$rc" = "0" ] && [ -z "$out" ] && [ ! -e "$disabled_marker" ]; then
+    exit 0
+  else
+    printf 'rc=%s out=[%s] marker=[%s]' "$rc" "$out" "$(cat "$disabled_marker" 2>/dev/null)" >&2
+    exit 1
+  fi
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+# ----------------------------------------------------------------------
+# Test 2d: quiet room still surfaces the Rally active prompt on start
+# ----------------------------------------------------------------------
+T="SessionStart prompt: quiet rally repo still tells user Rally is active"
+prompt_bin="$tmpdir/rally_prompt"
+cat > "$prompt_bin" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "hooks" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"data":{"hooks":{"enabled":true,"prompt":"once"}}}'
+elif [ "$1" = "enter" ]; then
+  :
+elif [ "$1" = "room" ]; then
+  printf '%s\n' '{"data":{"room":{"squads":[],"active_claims":[],"open_handoffs":[]}}}'
+elif [ "$1" = "next" ]; then
+  printf '%s\n' '{"data":{"next":{"actionable":false}}}'
+else
+  printf '%s\n' '{}'
+fi
+EOF
+chmod +x "$prompt_bin"
+(
+  repo="$tmpdir/prompt-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+  out=$(RALLY_BIN="$prompt_bin" "$HOOK" start claude_code </dev/null 2>/dev/null)
+  rc=$?
+  if [ "$rc" = "0" ] && printf '%s' "$out" | grep -q "Agent Rally Point is active in this repo"; then
+    exit 0
+  else
+    printf 'rc=%s out=[%s]' "$rc" "$out" >&2
+    exit 1
+  fi
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+# ----------------------------------------------------------------------
 # Test 3: fail-open — rally binary that hangs → killed by watchdog,
 # overall exit still 0
 # ----------------------------------------------------------------------

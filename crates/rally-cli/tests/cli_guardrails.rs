@@ -138,6 +138,72 @@ fn subcommand_help_handles_positionals_without_panicking() {
 }
 
 #[test]
+fn top_level_help_and_docs_advertise_ptyd_backend() {
+    let workspace = Workspace::new("rally-help-ptyd-backend");
+
+    let output = workspace.output(&["--help"]);
+    assert!(
+        output.status.success(),
+        "rally --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        help.contains("--backend <auto|tmux|cmux|ptyd>"),
+        "top-level help must list every supported run backend; help:\n{help}"
+    );
+
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("rally-cli crate should live under <repo>/crates/rally-cli");
+    let readme = fs::read_to_string(repo.join("README.md")).expect("README.md");
+    assert!(
+        readme.contains("rally run --backend <auto|tmux|cmux|ptyd>"),
+        "README must document ptyd and auto as supported run backends"
+    );
+    let rally = fs::read_to_string(repo.join("RALLY.md")).expect("RALLY.md");
+    assert!(
+        rally.contains("Run backends are `auto`, `tmux`, `cmux`, and `ptyd`."),
+        "RALLY.md must document the supported run backends"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn hooks_command_toggles_repo_config_and_prompt_mode() {
+    let workspace = Workspace::new("rally-hooks-config");
+
+    let initial = workspace.json(&["hooks", "status", "--json"]);
+    assert_eq!(initial["data"]["hooks"]["enabled"], true);
+    assert_eq!(initial["data"]["hooks"]["prompt"], "once");
+
+    let off = workspace.json(&["hooks", "off", "--scope", "repo", "--json"]);
+    assert_eq!(off["data"]["hooks"]["scope"], "repo");
+    assert_eq!(off["data"]["hooks"]["enabled"], false);
+
+    let prompt = workspace.json(&["hooks", "prompt", "--off", "--json"]);
+    assert_eq!(prompt["data"]["hooks"]["scope"], "repo");
+    assert_eq!(prompt["data"]["hooks"]["prompt"], "off");
+
+    let after = workspace.json(&["hooks", "status", "--json"]);
+    assert_eq!(after["data"]["hooks"]["enabled"], false);
+    assert_eq!(after["data"]["hooks"]["enabled_source"], "repo");
+    assert_eq!(after["data"]["hooks"]["prompt"], "off");
+    assert_eq!(after["data"]["hooks"]["prompt_source"], "repo");
+
+    let config = fs::read_to_string(workspace.cwd.join(".rally/config.json")).unwrap();
+    assert!(
+        config.contains("\"enabled\": false") && config.contains("\"prompt\": \"off\""),
+        "repo hook config did not persist expected fields:\n{config}"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
 fn bounded_numeric_flags_reject_out_of_range_values() {
     let workspace = Workspace::new("rally-bounded-numeric-flags");
 

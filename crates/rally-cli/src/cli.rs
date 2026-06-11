@@ -8,6 +8,7 @@ use crate::store::FactKind;
 #[allow(clippy::large_enum_variant)] // short-lived dispatch enum; boxing adds indirection for no runtime benefit
 pub(crate) enum CliCommand {
     Init(InitArgs),
+    Hooks(HooksArgs),
     Enter(EnterArgs),
     Say(SayArgs),
     Room(RoomArgs),
@@ -57,6 +58,44 @@ pub(crate) enum CliParse {
 #[derive(Clone, Debug)]
 pub(crate) struct InitArgs {
     pub(crate) json: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HooksScopeArg {
+    Repo,
+    User,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HooksPromptModeArg {
+    Once,
+    Always,
+    Off,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HooksSetArgs {
+    pub(crate) scope: HooksScopeArg,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HooksPromptArgs {
+    pub(crate) scope: HooksScopeArg,
+    pub(crate) mode: HooksPromptModeArg,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum HooksSubcommand {
+    Status,
+    On(HooksSetArgs),
+    Off(HooksSetArgs),
+    Prompt(HooksPromptArgs),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HooksArgs {
+    pub(crate) json: bool,
+    pub(crate) subcommand: HooksSubcommand,
 }
 
 #[derive(Clone, Debug)]
@@ -551,6 +590,7 @@ pub(crate) struct MissionArgs {
 
 const COMMANDS: &[&str] = &[
     "init",
+    "hooks",
     "enter",
     "say",
     "room",
@@ -633,6 +673,11 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("init")
         .map(CliCommand::Init);
+    let hooks = hooks_parser()
+        .to_options()
+        .descr("Inspect or toggle automatic Rally hook participation for this repo or user.")
+        .command("hooks")
+        .map(CliCommand::Hooks);
     let enter = enter_parser()
         .to_options()
         .command("enter")
@@ -797,6 +842,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
 
     construct!([
         init,
+        hooks,
         enter,
         say,
         room,
@@ -902,6 +948,31 @@ fn status_parser() -> impl Parser<StatusArgs> {
 fn init_parser() -> impl Parser<InitArgs> {
     let json = json_flag();
     construct!(InitArgs { json })
+}
+
+fn hooks_parser() -> impl Parser<HooksArgs> {
+    let status = bpaf::pure(HooksSubcommand::Status)
+        .to_options()
+        .descr("Show effective hook policy after env, repo, user, and default resolution.")
+        .command("status");
+    let on = hooks_scope_parser()
+        .map(|scope| HooksSubcommand::On(HooksSetArgs { scope }))
+        .to_options()
+        .descr("Enable automatic Rally hooks for the selected scope.")
+        .command("on");
+    let off = hooks_scope_parser()
+        .map(|scope| HooksSubcommand::Off(HooksSetArgs { scope }))
+        .to_options()
+        .descr("Disable automatic Rally hooks for the selected scope.")
+        .command("off");
+    let prompt = construct!(hooks_scope_parser(), hooks_prompt_mode_parser())
+        .map(|(scope, mode)| HooksSubcommand::Prompt(HooksPromptArgs { scope, mode }))
+        .to_options()
+        .descr("Set startup prompt mode: --once, --always, or --off.")
+        .command("prompt");
+    let json = json_flag();
+    let subcommand = construct!([status, on, off, prompt]);
+    construct!(json, subcommand).map(|(json, subcommand)| HooksArgs { json, subcommand })
 }
 
 fn rotate_parser() -> impl Parser<RotateArgs> {
@@ -1461,6 +1532,41 @@ fn parse_i64_arg(name: &str, value: String) -> Result<i64> {
 fn version_parser() -> impl Parser<VersionArgs> {
     let json = json_flag();
     construct!(VersionArgs { json })
+}
+
+fn hooks_scope_parser() -> impl Parser<HooksScopeArg> {
+    optional_string_arg("scope", "repo|user")
+        .map(|scope| scope.unwrap_or_else(|| "repo".to_string()))
+        .parse(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "repo" => Ok(HooksScopeArg::Repo),
+            "user" => Ok(HooksScopeArg::User),
+            _ => Err(RallyError::Usage(format!(
+                "--scope must be repo or user, got {value:?}"
+            ))),
+        })
+}
+
+fn hooks_prompt_mode_parser() -> impl Parser<HooksPromptModeArg> {
+    let once = long("once").switch();
+    let always = long("always").switch();
+    let off = long("off").switch();
+    construct!(once, always, off).parse(|(once, always, off)| {
+        let selected = [once, always, off]
+            .into_iter()
+            .filter(|value| *value)
+            .count();
+        match (selected, once, always, off) {
+            (1, true, false, false) => Ok(HooksPromptModeArg::Once),
+            (1, false, true, false) => Ok(HooksPromptModeArg::Always),
+            (1, false, false, true) => Ok(HooksPromptModeArg::Off),
+            (0, _, _, _) => Err(RallyError::Usage(
+                "rally hooks prompt requires one of --once, --always, or --off".to_string(),
+            )),
+            _ => Err(RallyError::Usage(
+                "rally hooks prompt accepts only one of --once, --always, or --off".to_string(),
+            )),
+        }
+    })
 }
 
 fn whoami_parser() -> impl Parser<WhoamiArgs> {

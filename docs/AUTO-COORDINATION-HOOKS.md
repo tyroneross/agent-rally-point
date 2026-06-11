@@ -25,6 +25,8 @@ touching `~/.claude` or `~/.codex`:
 Just open the repo in Claude Code / Codex and **trust it on first prompt**. The
 hook self-gates on `.rally/` presence (no-op elsewhere) and fail-opens (never
 blocks an edit). This is the default and recommended path — nothing to run.
+`SessionStart` shows a concise Rally-active prompt with the current off switch
+so users know the repo is coordinated before work starts.
 
 **Opt-in only — user-wide install across every repo on one machine** (edits your
 global `~/.claude/settings.json`; per-machine, not portable):
@@ -51,7 +53,7 @@ the portable project config is already committed.
 
 | Event | Action |
 |------|--------|
-| `SessionStart` | Calls `rally enter` so the agent registers presence on turn 1. Surfaces a short context line from `rally room` / `rally next` (active peers, claimed paths, suggested next) so a fresh agent is rally-aware without a manual nudge. |
+| `SessionStart` | Resolves `rally hooks status`, calls `rally enter` when hooks are enabled, and surfaces a short context line from `rally room` / `rally next` (active peers, claimed paths, suggested next). Even in a quiet room, the default prompt tells the user Rally is active and shows the session/repo off commands. |
 | `UserPromptSubmit` | Per-turn presence refresh (hook phase `idle`). Re-surfaces active peers / open claims / suggested next from `rally next` at the start of each turn, so Claude stays rally-aware during long read/explore phases instead of only re-checking at the moment it edits. Advisory `additionalContext`; emits `{}` when the room is quiet. This is the key parity fix — Codex already touches rally continuously; Claude previously only did so right before a write. |
 | `PreToolUse(Edit\|Write\|MultiEdit)` | Extracts the target file path from the tool input envelope, calls `rally check before-write --path <p>`, and (when the path is unclaimed and the check allows) auto-claims it. On a conflict, surfaces an `additionalContext` warning to the agent. `rally check` already records the durable audit fact. |
 | `Stop` | At turn end (hook phase `after-write`), runs `rally next` and surfaces any pending coordination obligation as an advisory `systemMessage`. Parity with Codex's `Stop` hook; never blocks turn completion (strict mode is the only path that can emit `decision: block`). |
@@ -67,6 +69,33 @@ never enforced. The hook NEVER emits `permissionDecision: "deny"` or
 deny/block on high-severity collisions. Off by default. Documented as an
 explicit deviation from the never-block charter for orchestration paths that
 want hard gates.
+
+## Hook Policy And Opt-Out
+
+Hooks are default-on for repos with `.rally/`, then resolved in this order:
+
+1. Session env: `RALLY_HOOKS=off|on` and `RALLY_HOOK_PROMPT=once|always|off`.
+2. Repo config: `.rally/config.json`.
+3. User config: `~/.config/rally/config.json`.
+4. Built-in default: hooks enabled, prompt once.
+
+Commands:
+
+```bash
+rally hooks status --json
+rally hooks off --scope repo
+rally hooks on --scope repo
+rally hooks off --scope user
+rally hooks prompt --once --scope repo
+rally hooks prompt --always --scope repo
+rally hooks prompt --off --scope repo
+```
+
+One-session opt-out:
+
+```bash
+RALLY_HOOKS=off
+```
 
 ## What ships
 
@@ -183,11 +212,10 @@ for orchestration paths where the operator wants hard gates. Use sparingly.
 
 ## Disabling per session
 
-- Permanent: `scripts/install_rally_hooks.sh --uninstall`.
-- One session: `unset` the hook entry from `~/.claude/settings.json` for that
-  session, or override `RALLY_BIN` to point at `/bin/true` (which exits 0
-  immediately and produces no envelope — the translator emits `{}`, a valid
-  empty hook output).
+- Repo: `rally hooks off --scope repo`.
+- User: `rally hooks off --scope user`.
+- One session: set `RALLY_HOOKS=off`.
+- Legacy global uninstall: `scripts/install_rally_hooks.sh --uninstall`.
 
 ## Why a hook (vs. lazy auto-enter)?
 

@@ -125,10 +125,13 @@ rally next --tool codex --json
 Managed sessions are the reliable direct-delivery path:
 
 ```bash
-rally run claude --backend tmux --json
+rally run claude --backend auto --json
 rally inject <session|name|tool> --handoff <event-id> --json  # e.g. claude-01
 rally capture <session|name|tool> --json
 ```
+
+Run backends are `auto`, `tmux`, `cmux`, and `ptyd`. `auto` selects the
+rally-owned ptyd path only when that daemon socket is live, otherwise tmux.
 
 First-class `rally run` launch targets are currently Claude, Codex, OpenCode,
 and Gemini. Other agents - Cursor, Qwen, Gemma, Aider, IDE plugins, CI workers -

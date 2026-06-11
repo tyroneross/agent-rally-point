@@ -22,6 +22,7 @@ pub(crate) const BUILD_ID: &str = env!("RALLY_BUILD_ID");
 
 const SCHEMA_STATUS: &str = "agent-rally.command.status.v1";
 const SCHEMA_INIT: &str = "agent-rally.command.init.v1";
+const SCHEMA_HOOKS: &str = "agent-rally.command.hooks.v1";
 const SCHEMA_RETROSPECTIVE: &str = "agent-rally.command.retrospective.v1";
 const SCHEMA_ROTATE: &str = "agent-rally.command.rotate.v1";
 const SCHEMA_ENTER: &str = "agent-rally.command.enter.v1";
@@ -59,6 +60,7 @@ mod discovery;
 mod doctor;
 mod error;
 mod event_envelope;
+mod hooks_config;
 mod init;
 mod next;
 mod output;
@@ -539,6 +541,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
 
     match command {
         CliCommand::Init(args) => command_init(args),
+        CliCommand::Hooks(args) => command_hooks(args),
         CliCommand::Enter(args) => command_enter(args),
         CliCommand::Say(args) => command_say(args),
         CliCommand::Room(args) => command_room(args),
@@ -789,6 +792,69 @@ fn command_init(args: InitArgs) -> Result<Output> {
     let inner = serde_json::to_value(&outcome).map_err(RallyError::json("init outcome"))?;
     let body = envelope_value("init", SCHEMA_INIT, json!({ "init": inner }))?;
     Ok(Output::new(args.json, text, body))
+}
+
+fn command_hooks(args: HooksArgs) -> Result<Output> {
+    let repo = repo_root()?;
+    let (text, payload) = match args.subcommand {
+        HooksSubcommand::Status => {
+            let status = hooks_config::resolve(&repo)?;
+            let text = format!(
+                "hooks: enabled={} prompt={} (enabled_source={} prompt_source={})",
+                status.enabled, status.prompt, status.enabled_source, status.prompt_source
+            );
+            let payload =
+                serde_json::to_value(&status).map_err(RallyError::json("render hooks status"))?;
+            (text, payload)
+        }
+        HooksSubcommand::On(set) => {
+            let outcome = hooks_config::set_enabled(&repo, hooks_scope(set.scope), true)?;
+            let text = format!("hooks on --scope {} ({})", outcome.scope, outcome.path);
+            let payload =
+                serde_json::to_value(&outcome).map_err(RallyError::json("render hooks on"))?;
+            (text, payload)
+        }
+        HooksSubcommand::Off(set) => {
+            let outcome = hooks_config::set_enabled(&repo, hooks_scope(set.scope), false)?;
+            let text = format!("hooks off --scope {} ({})", outcome.scope, outcome.path);
+            let payload =
+                serde_json::to_value(&outcome).map_err(RallyError::json("render hooks off"))?;
+            (text, payload)
+        }
+        HooksSubcommand::Prompt(prompt) => {
+            let outcome = hooks_config::set_prompt(
+                &repo,
+                hooks_scope(prompt.scope),
+                hooks_prompt_mode(prompt.mode),
+            )?;
+            let text = format!(
+                "hooks prompt={} --scope {} ({})",
+                outcome.prompt.as_deref().unwrap_or("unknown"),
+                outcome.scope,
+                outcome.path
+            );
+            let payload =
+                serde_json::to_value(&outcome).map_err(RallyError::json("render hooks prompt"))?;
+            (text, payload)
+        }
+    };
+    let body = envelope_value("hooks", SCHEMA_HOOKS, json!({ "hooks": payload }))?;
+    Ok(Output::new(args.json, text, body))
+}
+
+fn hooks_scope(scope: HooksScopeArg) -> hooks_config::ConfigScope {
+    match scope {
+        HooksScopeArg::Repo => hooks_config::ConfigScope::Repo,
+        HooksScopeArg::User => hooks_config::ConfigScope::User,
+    }
+}
+
+fn hooks_prompt_mode(mode: HooksPromptModeArg) -> hooks_config::PromptMode {
+    match mode {
+        HooksPromptModeArg::Once => hooks_config::PromptMode::Once,
+        HooksPromptModeArg::Always => hooks_config::PromptMode::Always,
+        HooksPromptModeArg::Off => hooks_config::PromptMode::Off,
+    }
 }
 
 /// Ensure `tool` is registered in the current room engagement.
@@ -11045,6 +11111,9 @@ fn help_text() -> String {
         "",
         "Usage:",
         "  rally init [--json]",
+        "  rally hooks status [--json]",
+        "  rally hooks on|off [--scope <repo|user>] [--json]",
+        "  rally hooks prompt (--once|--always|--off) [--scope <repo|user>] [--json]",
         "  rally retrospective [--engagement <label>] [--out <path>] [--json]",
         "  rally rotate [--days <n>] [--dry-run] [--json]",
         "  rally enter --tool <tool> [--engagement <label>] [--path <path>] [--role <role>] [--json]",
@@ -11056,7 +11125,7 @@ fn help_text() -> String {
         "  rally migrate-legacy [--json]  # one-shot replay of legacy ~/.agent-rally-point/apps/<slug>/changes.jsonl into this repo ledger",
         "  rally check before-write --tool <tool> --path <path> [--strict] [--json]",
         "  rally check before-complete --tool <tool> [--strict] [--json]",
-        "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <tmux|cmux>] [--dry-run] [--json]",
+        "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <auto|tmux|cmux|ptyd>] [--dry-run] [--json]",
         "    managed run ids auto-number active agents, e.g. claude-01 / claude_code:01",
         "  rally sessions [--reap] [--json] [--tmux-bin <path>] [--cmux-bin <path>]",
         "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--timeout-seconds <n>] [--json]",

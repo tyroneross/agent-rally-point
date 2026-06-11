@@ -36,6 +36,8 @@
 #   RALLY_HOOK_TIMEOUT_MS  — wall-clock budget for each rally call (default 5000).
 #   RALLY_BIN              — rally binary path (default ./target/debug/rally or $PATH).
 #   RALLY_SESSION_ID       — override session id (default <tool>-<epoch>).
+#   RALLY_HOOKS            — "off" disables this hook for the current session.
+#   RALLY_HOOK_PROMPT      — startup prompt mode: once, always, or off.
 #   RALLY_HOOK_STRICT      — "1" to enable deny/block on high-severity signals.
 #
 # Exit code: 0 always (fail-open). Output goes on stdout per host hook contract.
@@ -60,6 +62,10 @@ if ! find_rally_root >/dev/null 2>&1; then
   # Not a rally repo — silent no-op so this script is safe to install globally.
   exit 0
 fi
+
+case "$(printf '%s' "${RALLY_HOOKS:-}" | tr '[:upper:]' '[:lower:]')" in
+  0|off|false|no|disabled) exit 0 ;;
+esac
 
 # --- Defense-in-depth wall-clock guard ------------------------------------
 # The `rally` binary self-bounds via an internal watchdog (default 3s), but a
@@ -167,6 +173,29 @@ if command -v node >/dev/null 2>&1; then have_node=1; fi
 phase="${1:-idle}"
 tool="${2:-claude_code}"
 
+hook_prompt_mode="${RALLY_HOOK_PROMPT:-once}"
+if [ "$have_node" = "1" ]; then
+  hooks_status="$(rally_timeout hooks status --json 2>/dev/null || true)"
+  hooks_meta="$({ printf '%s' "$hooks_status" | node -e '
+const fs = require("fs");
+try {
+  const parsed = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
+  const hooks = parsed?.data?.hooks || {};
+  const enabled = hooks.enabled === false ? "0" : "1";
+  const prompt = ["once", "always", "off"].includes(hooks.prompt) ? hooks.prompt : "once";
+  process.stdout.write(enabled + "\n" + prompt);
+} catch (_) {
+  process.stdout.write("1\nonce");
+}
+' ; } 2>/dev/null)"
+  hook_enabled="$(printf '%s\n' "$hooks_meta" | sed -n '1p')"
+  hook_prompt_mode="$(printf '%s\n' "$hooks_meta" | sed -n '2p')"
+  if [ "$hook_enabled" = "0" ]; then
+    exit 0
+  fi
+fi
+export RALLY_HOOK_PROMPT_MODE="$hook_prompt_mode"
+
 # Read stdin envelope if present; do not block if empty.
 input=""
 if [ ! -t 0 ]; then
@@ -217,8 +246,14 @@ const claims = (Array.isArray(R.active_claims) ? R.active_claims : [])
   .map(c => `${(c.scope || []).join(",") || "?"} (by ${c.tool})`);
 const handoffs = Array.isArray(R.open_handoffs) ? R.open_handoffs.length : 0;
 const nextAction = nxt?.data?.next?.action;
-if (peers.length === 0 && claims.length === 0 && handoffs === 0) { process.stdout.write("{}"); process.exit(0); }
-let msg = "Active rally room here. ";
+const promptMode = process.env.RALLY_HOOK_PROMPT_MODE || "once";
+const showPrompt = promptMode !== "off";
+if (!showPrompt && peers.length === 0 && claims.length === 0 && handoffs === 0) { process.stdout.write("{}"); process.exit(0); }
+let msg = "";
+if (showPrompt) {
+  msg += "Agent Rally Point is active in this repo. Agents will enter the room, check coordination before edits, and surface handoffs. Turn off this session: `RALLY_HOOKS=off`; repo: `rally hooks off --scope repo`; status: `rally hooks status`. ";
+}
+if (peers.length || claims.length || handoffs || nextAction) msg += "Active room state: ";
 if (peers.length) msg += `Peers: ${peers.join(", ")}. `;
 if (claims.length) msg += `Open claims: ${claims.slice(0, 8).join("; ")}. `;
 if (handoffs) msg += `${handoffs} open handoff(s). `;
@@ -325,6 +360,15 @@ if ((!visible || !visible.present) && next?.actionable) {
     present: true,
     severity: next?.requires_human ? "stop" : "warn",
     message: `Rally has actionable coordination work: ${next.action}. Subject: ${subject}.`
+  };
+}
+
+const promptMode = process.env.RALLY_HOOK_PROMPT_MODE || "once";
+if ((!visible || !visible.present) && promptMode === "always" && phase === "idle") {
+  visible = {
+    present: true,
+    severity: "info",
+    message: "Agent Rally Point is active in this repo. Agents will enter the room, check coordination before edits, and surface handoffs. Turn off this session: `RALLY_HOOKS=off`; repo: `rally hooks off --scope repo`; status: `rally hooks status`."
   };
 }
 

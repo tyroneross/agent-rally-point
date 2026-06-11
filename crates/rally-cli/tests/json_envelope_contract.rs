@@ -123,6 +123,18 @@ fn envelope_init() {
     ws.cleanup();
 }
 
+/// `hooks status` — reads effective auto-coordination hook policy.
+#[test]
+fn envelope_hooks() {
+    let ws = Workspace::new("hooks");
+    let body = ws.json(&["hooks", "status", "--json"]);
+    assert_envelope_contract("hooks", &body);
+    assert_eq!(body["schema"], "agent-rally.command.hooks.v1");
+    assert_eq!(body["data"]["hooks"]["enabled"], true);
+    assert_eq!(body["data"]["hooks"]["prompt"], "once");
+    ws.cleanup();
+}
+
 /// `enter` — registers agent presence; requires --tool.
 #[test]
 fn envelope_enter() {
