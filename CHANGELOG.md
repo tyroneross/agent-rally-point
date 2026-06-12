@@ -7,6 +7,30 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## 0.1.2 — Binary auto-provision hardening (2026-06-11)
+
+Hardening of `hooks/ensure-rally-binary.sh` across five rounds of dual-vendor
+adversarial review (Fable + Codex), all verified under stock macOS `/bin/bash`
+3.2:
+
+- **Verified downloads.** A downloaded binary is SHA256-verified against the
+  release's `<asset>.sha256` before it is made executable; the download path is
+  fail-closed (a mismatch OR an unverifiable download is rejected, never run —
+  cargo-from-source is the fallback). Releases now publish per-asset `.sha256` +
+  a sigstore build-provenance attestation (`gh attestation verify`).
+- **Never blocks the session.** All network + compiler work runs in one
+  backgrounded, fd-detached worker; local liveness probes are time-bounded
+  (perl/setsid shim) so even a hung or crashing on-disk binary can't stall the
+  hook. A signal-killed `version` probe is treated as failure on every
+  acceptance path (PATH, `~/.local/bin`, shipped, cached, downloaded).
+- **Concurrency.** A single atomic pid lock (noclobber + verify-after-write,
+  parent writes the worker's real pid — `$BASHPID`-independent for bash 3.2);
+  the `building` short-circuit is gated on worker-pid liveness so a crashed
+  worker no longer wedges provisioning.
+- **Charter robustness.** Unset `HOME`, a corrupt state file, and a missing
+  script dir no longer abort under `set -euo pipefail` — exit 0 always. A
+  checksum mismatch records a durable trace to `download-rejections.log`.
+
 ## 0.1.1 — Plugin auto-launch + hooks policy (2026-06-11)
 
 - **Auto-launch on install.** `.claude-plugin/marketplace.json` makes the repo a self-hosting single-plugin marketplace, so `claude plugin marketplace add tyroneross/agent-rally-point` + `claude plugin install` work; hooks and skills activate on install.
