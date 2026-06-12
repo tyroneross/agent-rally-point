@@ -158,15 +158,21 @@ T="fail-open: no cargo + no network + no prebuilt → exit 0 + unavailable"
     printf 'hook must exit 0, got rc=%s\n' "$rc" >&2; exit 1
   fi
 
-  # Provision state must be written
+  # Provisioning is now BACKGROUNDED (f3 — the hook never blocks on network or a
+  # compiler), so the terminal "unavailable" state arrives asynchronously after
+  # the synchronous "provisioning" stamp. Poll for the terminal state.
   state_file="$XDG_CACHE_HOME/rally/provision.json"
+  result=""
+  for _ in $(seq 1 40); do
+    [ -f "$state_file" ] && result="$(grep -o '"result":"[^"]*"' "$state_file" | cut -d'"' -f4 || true)"
+    [ "$result" = "unavailable" ] && break
+    sleep 0.25
+  done
   if [ ! -f "$state_file" ]; then
     printf 'provision.json not written\n' >&2; exit 1
   fi
-
-  result="$(grep -o '"result":"[^"]*"' "$state_file" | cut -d'"' -f4 || true)"
   if [ "$result" != "unavailable" ]; then
-    printf 'expected result=unavailable, got: %s\n' "$result" >&2; exit 1
+    printf 'expected terminal result=unavailable, got: %s\n' "$result" >&2; exit 1
   fi
   exit 0
 )
@@ -323,6 +329,70 @@ T="idempotency: second run with cached ok state exits 0 quickly, no lock"
   exit 0
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+# ---------------------------------------------------------------------------
+# Test 7: f2 integrity — a downloaded binary is verified against the published
+# SHA256 BEFORE chmod/exec. Match installs (method=downloaded); a mismatch is
+# rejected and never installed (falls through to unavailable).
+# ---------------------------------------------------------------------------
+if command -v shasum >/dev/null 2>&1; then
+  _FAKE_BODY='#!/usr/bin/env bash
+case "${1:-}" in version) printf "rally 0.0.0-test\n"; exit 0;; *) exit 2;; esac'
+  _GOOD_HASH="$(printf '%s' "$_FAKE_BODY" | shasum -a 256 | awk '{print $1}')"
+  _write_curl_stub() {  # $1=dir  $2=served_hash
+    cat > "$1/curl" <<STUB
+#!/usr/bin/env bash
+out=""; url=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in -o) out="\$2"; shift 2;; http*) url="\$1"; shift;; *) shift;; esac
+done
+case "\$url" in
+  *.sha256) printf '%s  rally\n' "$2";;
+  *.tar.gz) exit 1;;
+  *) printf '%s' '$_FAKE_BODY' > "\$out";;
+esac
+exit 0
+STUB
+    chmod +x "$1/curl"
+  }
+  _poll_method() {  # $1=state_file ; echoes terminal method
+    local m=""
+    for _ in $(seq 1 40); do
+      [ -f "$1" ] && m="$(grep -o '"method":"[^"]*"' "$1" | cut -d'"' -f4 || true)"
+      case "$m" in downloaded|downloaded-unverified|none|source) break;; esac
+      sleep 0.25
+    done
+    printf '%s' "$m"
+  }
+
+  T="f2 checksum match -> verified + installed (method=downloaded)"
+  (
+    sb="$TMPDIR_ROOT/ck-ok"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin/.claude-plugin"
+    printf '{"name":"x","version":"0.0.0-test"}\n' > "$sb/plugin/.claude-plugin/plugin.json"
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
+    [ "$m" = "downloaded" ] || { printf 'expected downloaded, got: %s\n' "$m" >&2; exit 1; }
+    [ -x "$sb/home/.local/bin/rally" ] || { printf 'binary not installed\n' >&2; exit 1; }
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+  T="f2 checksum MISMATCH -> rejected (tampered binary never installed)"
+  (
+    sb="$TMPDIR_ROOT/ck-bad"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin/.claude-plugin"
+    printf '{"name":"x","version":"0.0.0-test"}\n' > "$sb/plugin/.claude-plugin/plugin.json"
+    _write_curl_stub "$sb/tools" "deadbeef00000000000000000000000000000000000000000000000000000000"
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
+    [ "$m" = "none" ] || { printf 'expected none (rejected), got: %s\n' "$m" >&2; exit 1; }
+    [ ! -x "$sb/home/.local/bin/rally" ] || { printf 'TAMPERED binary was installed!\n' >&2; exit 1; }
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+else
+  ok "f2 checksum tests (skipped — shasum unavailable)"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

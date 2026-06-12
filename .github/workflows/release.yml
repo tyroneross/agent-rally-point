@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 # SPDX-License-Identifier: Apache-2.0
 #
-# Release workflow: builds the rally CLI for all 4 supported target triples
-# on every version tag (v*) and uploads the binaries as GitHub Release assets.
-# Triggered by: push to tags matching v* OR workflow_dispatch.
+# Release workflow: builds the rally CLI for all 4 supported target triples on
+# every version tag (v*), publishes each binary + a SHA256 sidecar, and signs a
+# build-provenance attestation. ensure-rally-binary.sh verifies the SHA256
+# before executing a downloaded binary (integrity); the attestation is the
+# anti-tamper layer against release-asset substitution, verifiable out-of-band
+# with `gh attestation verify rally-<triple> --repo tyroneross/agent-rally-point`.
 
 name: Release
 
@@ -12,9 +15,15 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build + attach assets to (e.g. v0.1.2). Required for manual runs."
+        required: true
 
 permissions:
-  contents: write
+  contents: write       # upload release assets
+  id-token: write       # provenance attestation (sigstore OIDC)
+  attestations: write   # write the attestation
 
 jobs:
   build:
@@ -42,11 +51,9 @@ jobs:
             target: x86_64-unknown-linux-gnu
             cross: false
 
-          # Linux aarch64 — cross-compiled on x86_64 ubuntu via the
-          # `cross` crate (wraps Docker + pre-built cross images). This is
-          # the simplest reliable approach that avoids custom QEMU setup:
-          # `cross build` is a drop-in replacement for `cargo build` and
-          # handles the sysroot and linker transparently.
+          # Linux aarch64 — cross-compiled on x86_64 ubuntu via the `cross`
+          # crate (wraps Docker + pre-built cross images): a drop-in for
+          # `cargo build` that handles the sysroot/linker with no QEMU setup.
           - triple: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             target: aarch64-unknown-linux-gnu
@@ -73,11 +80,29 @@ jobs:
         if: ${{ matrix.cross }}
         run: cross build --release -p rally-cli --target ${{ matrix.target }}
 
-      - name: Rename binary to rally-<triple>
+      - name: Stage binary + SHA256 sidecar
         run: |
           cp target/${{ matrix.target }}/release/rally rally-${{ matrix.triple }}
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 rally-${{ matrix.triple }} > rally-${{ matrix.triple }}.sha256
+          else
+            sha256sum rally-${{ matrix.triple }} > rally-${{ matrix.triple }}.sha256
+          fi
+          cat rally-${{ matrix.triple }}.sha256
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: rally-${{ matrix.triple }}
 
       - name: Upload to GitHub Release
+        # Only attach assets for an actual tag (push-tag, or a workflow_dispatch
+        # that names an existing tag). Prevents the upload step from erroring on
+        # a tagless manual run after four full builds.
+        if: ${{ startsWith(github.ref, 'refs/tags/') || github.event.inputs.tag != '' }}
         uses: softprops/action-gh-release@v2
         with:
-          files: rally-${{ matrix.triple }}
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            rally-${{ matrix.triple }}
+            rally-${{ matrix.triple }}.sha256
