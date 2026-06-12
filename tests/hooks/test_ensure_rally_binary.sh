@@ -121,7 +121,7 @@ T="fast-path: rally already on PATH → exit 0 + method=present + no lock"
   fi
 
   # No build lock dir should have been created
-  lock_dir="$XDG_CACHE_HOME/rally/.build.lock"
+  lock_dir="$XDG_CACHE_HOME/rally/.provision.lock"
   if [ -d "$lock_dir" ]; then
     printf 'unexpected lock dir created\n' >&2; exit 1
   fi
@@ -322,7 +322,7 @@ T="idempotency: second run with cached ok state exits 0 quickly, no lock"
   if [ "$rc" != "0" ]; then printf 'second run rc=%s\n' "$rc" >&2; exit 1; fi
 
   # No lock dir
-  lock_dir="$XDG_CACHE_HOME/rally/.build.lock"
+  lock_dir="$XDG_CACHE_HOME/rally/.provision.lock"
   if [ -d "$lock_dir" ]; then
     printf 'unexpected lock dir on second run\n' >&2; exit 1
   fi
@@ -359,7 +359,7 @@ STUB
     local m=""
     for _ in $(seq 1 40); do
       [ -f "$1" ] && m="$(grep -o '"method":"[^"]*"' "$1" | cut -d'"' -f4 || true)"
-      case "$m" in downloaded|downloaded-unverified|none|source) break;; esac
+      case "$m" in downloaded|download-rejected|none|source) break;; esac
       sleep 0.25
     done
     printf '%s' "$m"
@@ -385,7 +385,7 @@ STUB
     _write_curl_stub "$sb/tools" "deadbeef00000000000000000000000000000000000000000000000000000000"
     HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
     m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
-    [ "$m" = "none" ] || { printf 'expected none (rejected), got: %s\n' "$m" >&2; exit 1; }
+    [ "$m" = "download-rejected" ] || { printf 'expected download-rejected, got: %s\n' "$m" >&2; exit 1; }
     [ ! -x "$sb/home/.local/bin/rally" ] || { printf 'TAMPERED binary was installed!\n' >&2; exit 1; }
     exit 0
   )
@@ -393,6 +393,40 @@ STUB
 else
   ok "f2 checksum tests (skipped — shasum unavailable)"
 fi
+
+# ---------------------------------------------------------------------------
+# Test: f10 lock race — a FRESH empty lock (the create/write window, or a crash
+# mid-write) is treated as live and NOT stolen; provisioning backs off.
+# ---------------------------------------------------------------------------
+T="f10 lock race: fresh empty lock not reclaimed (no double-provision)"
+(
+  sb="$TMPDIR_ROOT/lock-young"; mkdir -p "$sb/home/.cache/rally" "$sb/tools" "$sb/plugin"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$sb/tools/curl"; chmod +x "$sb/tools/curl"
+  : > "$sb/home/.cache/rally/.provision.lock"   # fresh, empty lock
+  HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" = 0 ] || { printf 'rc=%s\n' "$rc" >&2; exit 1; }
+  lk="$sb/home/.cache/rally/.provision.lock"
+  [ -f "$lk" ] && [ ! -s "$lk" ] || { printf 'fresh empty lock was stolen/overwritten\n' >&2; exit 1; }
+  [ ! -f "$sb/home/.cache/rally/provision.json" ] || { printf 'provisioned despite a young lock\n' >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+# ---------------------------------------------------------------------------
+# Test: f11 charter — a corrupted state file (ts with no digits) must not crash
+# the hook under set -euo pipefail; it still exits 0.
+# ---------------------------------------------------------------------------
+T="f11 corrupt-state: malformed ts -> hook still exits 0"
+(
+  sb="$TMPDIR_ROOT/corrupt"; mkdir -p "$sb/home/.cache/rally" "$sb/plugin"
+  printf '{"ts":,"method":"x","result":"ok","binary":"","hint":""}\n' > "$sb/home/.cache/rally/provision.json"
+  HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="/usr/bin:/bin" "$HOOK" "$sb/plugin"
+  rc=$?
+  [ "$rc" = 0 ] || { printf 'corrupt state must exit 0, got rc=%s\n' "$rc" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 # ---------------------------------------------------------------------------
 # Summary

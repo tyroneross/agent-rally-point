@@ -4,31 +4,46 @@
 #
 # ensure-rally-binary.sh — Auto-provision the rally CLI on first SessionStart.
 #
-# CHARTER (fail-open, never-block): this script ALWAYS exits 0. Slow work
-# (cargo build) is backgrounded with a lockfile so concurrent sessions do not
-# double-build. Idempotency via a state file in XDG_CACHE_HOME.
+# CHARTER (fail-open, never-block): this script ALWAYS exits 0 and never blocks
+# the hook. ALL network + compiler work (download, cargo build) runs in ONE
+# backgrounded, locked worker; local liveness probes are time-bounded. Even a
+# hung on-disk binary cannot stall the hook. Idempotency + handoff via a state
+# file in XDG_CACHE_HOME and a single pid lock.
 #
-# Usage:
-#   ensure-rally-binary.sh [plugin_root]
+# Usage: ensure-rally-binary.sh [plugin_root]
+#   plugin_root resolved: $1 → $CLAUDE_PLUGIN_ROOT → dirname($0)/..
 #
-#   plugin_root — optional. Resolved in order:
-#     1. $1 (arg)
-#     2. $CLAUDE_PLUGIN_ROOT
-#     3. dirname($0)/..   (script lives at plugin_root/hooks/ensure-rally-binary.sh)
+# Provision order (first success wins): reachable on PATH/known-loc → shipped
+# prebuilt in plugin → download from GitHub Releases (checksum-verified) →
+# cargo build (backgrounded) → unavailable.
 #
-# Resolution order (stops at first success):
-#   1. rally already reachable (command -v / known paths)        → "present"
-#   2. Prebuilt binary shipped inside plugin at bin/<triple>/rally → "shipped-binary"
-#   3. Download prebuilt from GitHub Releases                     → "downloaded"
-#   4. cargo install from source (backgrounded)                   → "building"
-#   5. Nothing worked                                             → "unavailable"
+# SECURITY (download path): a downloaded binary is SHA256-verified against the
+# release's published <asset>.sha256 BEFORE it is made executable. The download
+# path is FAIL-CLOSED: a mismatch OR an unverifiable download (no checksum, no
+# sum tool) is rejected and never executed — cargo (verified source) is the
+# fallback. Scope: the same-repo .sha256 defends transit/CDN corruption +
+# partial downloads. It does NOT defend GitHub-account compromise (an attacker
+# who can swap the binary can swap its checksum). The release also publishes a
+# sigstore build-provenance attestation (release.yml) which DOES defend
+# substitution, but it is verified OUT OF BAND by a human/CI via
+# `gh attestation verify rally-<triple> --repo tyroneross/agent-rally-point` —
+# NOT client-side here, because a fail-open hook cannot reliably distinguish a
+# real tamper from a network/auth error without turning every offline start
+# into a hard failure.
 #
 # State file: ${XDG_CACHE_HOME:-$HOME/.cache}/rally/provision.json
-#   Fields: ts (epoch), method, result ("ok"|"building"|"unavailable"), binary, hint
-#
+#   {ts, method, result("ok"|"building"|"unavailable"), binary, hint}
 # Exit code: 0 always.
 
 set -euo pipefail
+
+# A usable HOME (or XDG_CACHE_HOME) is required for every install target and the
+# state/lock dir. Without one there is nothing safe to do — exit 0 (charter)
+# before any $HOME expansion can trip `set -u`.
+if [ -z "${HOME:-}" ] && [ -z "${XDG_CACHE_HOME:-}" ]; then
+  exit 0
+fi
+: "${HOME:=$XDG_CACHE_HOME}"   # last-resort so $HOME/.local stays well-formed
 
 # ---------------------------------------------------------------------------
 # 0. Resolve plugin root
@@ -38,138 +53,138 @@ if [ -n "${1:-}" ]; then
 elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
   PLUGIN_ROOT="$CLAUDE_PLUGIN_ROOT"
 else
-  # Script lives at $plugin_root/hooks/ensure-rally-binary.sh
   _script_dir="$(cd "$(dirname "$0")" && pwd -P)"
   PLUGIN_ROOT="$(dirname "$_script_dir")"
 fi
 
 # ---------------------------------------------------------------------------
-# 1. Detect host triple
+# 1. Host triple
 # ---------------------------------------------------------------------------
 _uname_s="$(uname -s 2>/dev/null || echo unknown)"
 _uname_m="$(uname -m 2>/dev/null || echo unknown)"
-
 HOST_TRIPLE=""
 case "${_uname_s}:${_uname_m}" in
-  Darwin:arm64)                  HOST_TRIPLE="aarch64-apple-darwin"    ;;
-  Darwin:x86_64)                 HOST_TRIPLE="x86_64-apple-darwin"     ;;
-  Linux:x86_64)                  HOST_TRIPLE="x86_64-unknown-linux-gnu";;
-  Linux:aarch64|Linux:arm64)     HOST_TRIPLE="aarch64-unknown-linux-gnu";;
-  *)                             HOST_TRIPLE=""                         ;;
+  Darwin:arm64)               HOST_TRIPLE="aarch64-apple-darwin"     ;;
+  Darwin:x86_64)              HOST_TRIPLE="x86_64-apple-darwin"      ;;
+  Linux:x86_64)               HOST_TRIPLE="x86_64-unknown-linux-gnu" ;;
+  Linux:aarch64|Linux:arm64)  HOST_TRIPLE="aarch64-unknown-linux-gnu";;
+  *)                          HOST_TRIPLE=""                          ;;
 esac
 
 # ---------------------------------------------------------------------------
-# 2. Cache / state file helpers
+# 2. Paths + helpers
 # ---------------------------------------------------------------------------
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/rally"
 STATE_FILE="$CACHE_DIR/provision.json"
+LOCK_FILE="$CACHE_DIR/.provision.lock"
 LOCAL_BIN="$HOME/.local/bin"
 LOCAL_RALLY="$LOCAL_BIN/rally"
+GH_REPO="tyroneross/agent-rally-point"
 
-# Write provision.json (best-effort; never fatal)
 _write_state() {
-  local method="$1" result="$2" binary="${3:-}" hint="${4:-}"
-  local ts
+  local method="$1" result="$2" binary="${3:-}" hint="${4:-}" ts
   ts="$(date +%s 2>/dev/null || echo 0)"
   mkdir -p "$CACHE_DIR" 2>/dev/null || true
   printf '{"ts":%s,"method":"%s","result":"%s","binary":"%s","hint":"%s"}\n' \
     "$ts" "$method" "$result" "$binary" "$hint" > "$STATE_FILE" 2>/dev/null || true
 }
 
-# ---------------------------------------------------------------------------
-# 3. Fast-exit if a recent successful provision is cached or binary is live
-# ---------------------------------------------------------------------------
-_binary_works() {
-  local b="$1"
-  [ -x "$b" ] && "$b" version >/dev/null 2>&1
+# Run a command under a wall-clock cap. macOS ships no timeout(1); fall back to
+# gtimeout, then a portable bash background-kill shim. Robust under set -e
+# (every failing command is `|| ...`-guarded).
+_timed() {
+  local secs="$1"; shift
+  local rc=0
+  if command -v timeout >/dev/null 2>&1; then timeout -k 1 "${secs}s" "$@" || rc=$?; return "$rc"; fi
+  if command -v gtimeout >/dev/null 2>&1; then gtimeout -k 1 "${secs}s" "$@" || rc=$?; return "$rc"; fi
+  "$@" & local p=$!
+  ( sleep "$secs" && kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 & local k=$!
+  wait "$p" 2>/dev/null || rc=$?
+  kill -KILL "$k" 2>/dev/null || true
+  wait "$k" 2>/dev/null || true
+  return "$rc"
 }
 
+# Liveness probe is TIME-BOUNDED so a hung on-disk binary can never stall the
+# hook (the hook's whole point is to not block).
+_binary_works() {
+  local b="$1"
+  [ -x "$b" ] && _timed 3 "$b" version >/dev/null 2>&1
+}
+
+_file_age_secs() {
+  local f="$1" mt now
+  mt="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)"
+  now="$(date +%s 2>/dev/null || echo 0)"
+  echo $(( now - mt ))
+}
+
+# True iff the lock exists AND names a live pid (a provision is in progress).
+_lock_pid_alive() {
+  [ -f "$LOCK_FILE" ] || return 1
+  local lp; lp="$(cat "$LOCK_FILE" 2>/dev/null || echo '')"
+  [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# 3. Fast synchronous exits (cheap; no network, no compiler)
+# ---------------------------------------------------------------------------
 _check_existing() {
-  # Already on PATH?
   if command -v rally >/dev/null 2>&1; then
-    local found
-    found="$(command -v rally)"
-    _write_state "present" "ok" "$found" ""
-    return 0
+    _write_state "present" "ok" "$(command -v rally)" ""; return 0
   fi
-  # Well-known install location
   if _binary_works "$LOCAL_RALLY"; then
-    _write_state "present" "ok" "$LOCAL_RALLY" ""
-    return 0
-  fi
-  # Shipped prebuilt in plugin (for present-detection before copying)
-  if [ -n "$HOST_TRIPLE" ] && _binary_works "$PLUGIN_ROOT/bin/$HOST_TRIPLE/rally"; then
-    # Not yet installed, do not record "present" — fall through to step 2
-    return 1
+    _write_state "present" "ok" "$LOCAL_RALLY" ""; return 0
   fi
   return 1
 }
 
-# Check cached state first (avoids re-probing every session)
 if [ -f "$STATE_FILE" ]; then
-  # Read result and ts from cached state (portable; no jq required)
   _cached_result="$(grep -o '"result":"[^"]*"' "$STATE_FILE" 2>/dev/null | cut -d'"' -f4 || true)"
   _cached_bin="$(grep -o '"binary":"[^"]*"' "$STATE_FILE" 2>/dev/null | cut -d'"' -f4 || true)"
   _cached_ts="$(grep -o '"ts":[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d: -f2 || echo 0)"
+  case "${_cached_ts:-}" in ''|*[!0-9]*) _cached_ts=0 ;; esac   # corrupt-state guard
   _now_ts="$(date +%s 2>/dev/null || echo 0)"
+  case "${_now_ts:-}" in ''|*[!0-9]*) _now_ts=0 ;; esac
   _age=$(( _now_ts - _cached_ts ))
 
   if [ "$_cached_result" = "ok" ] && [ "$_age" -lt 86400 ]; then
-    # Validate the recorded binary is still there
-    if [ -n "$_cached_bin" ] && _binary_works "$_cached_bin"; then
-      exit 0
-    fi
-    if command -v rally >/dev/null 2>&1; then
-      exit 0
-    fi
-    # Binary moved — fall through to re-provision
+    if [ -n "$_cached_bin" ] && _binary_works "$_cached_bin"; then exit 0; fi
+    if command -v rally >/dev/null 2>&1; then exit 0; fi
+    # binary moved — fall through to re-provision
   fi
 
-  if [ "$_cached_result" = "building" ] && [ "$_age" -lt 1800 ]; then
-    # A build is in progress (backgrounded in a previous session within 30 min).
+  # A provision is only "in progress" if its worker is actually alive — tie the
+  # building/provisioning short-circuit to lock-pid liveness, not age, so a
+  # crashed worker does not wedge provisioning for 30 minutes.
+  if { [ "$_cached_result" = "building" ] || [ "$_cached_result" = "provisioning" ]; } && _lock_pid_alive; then
     exit 0
   fi
 fi
 
-# Quick PATH / known-location check before heavier work
-if _check_existing; then
-  exit 0
-fi
+if _check_existing; then exit 0; fi
 
 # ---------------------------------------------------------------------------
-# 4. Step 2: copy shipped prebuilt from plugin bin/<triple>/rally
+# 4. Shipped prebuilt copy (local, fast — stays synchronous)
 # ---------------------------------------------------------------------------
 if [ -n "$HOST_TRIPLE" ]; then
   _shipped="$PLUGIN_ROOT/bin/$HOST_TRIPLE/rally"
   if [ -f "$_shipped" ]; then
     mkdir -p "$LOCAL_BIN" 2>/dev/null || true
-    if cp "$_shipped" "$LOCAL_RALLY" 2>/dev/null && chmod +x "$LOCAL_RALLY" 2>/dev/null; then
-      if _binary_works "$LOCAL_RALLY"; then
-        _write_state "shipped-binary" "ok" "$LOCAL_RALLY" ""
-        exit 0
-      fi
+    if cp "$_shipped" "$LOCAL_RALLY" 2>/dev/null && chmod +x "$LOCAL_RALLY" 2>/dev/null && _binary_works "$LOCAL_RALLY"; then
+      _write_state "shipped-binary" "ok" "$LOCAL_RALLY" ""
+      exit 0
     fi
-    # Copy succeeded but binary didn't verify — clean up and fall through
     rm -f "$LOCAL_RALLY" 2>/dev/null || true
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Heavy provisioning (download or cargo build) — BACKGROUNDED under one lock.
-#
-# The fast synchronous checks above already handled "binary present" and the
-# local shipped-prebuilt copy. If we reach here we genuinely need the network or
-# a compiler, so it MUST run off the hook's critical path: a SessionStart hook
-# has a small budget (Cursor's is ~5s) and a cargo build is minutes — running
-# either synchronously gets the hook killed every session and never caches the
-# result. We kick the work into the background and let the binary be ready for
-# the next session.
+# 5. Heavy provisioning — download (checksum-verified) or cargo, BACKGROUNDED.
 # ---------------------------------------------------------------------------
-GH_REPO="tyroneross/agent-rally-point"
 
-# Resolve the release tag from the installed plugin version (no API call; this
-# also pins the download to the binary that MATCHES the installed plugin),
-# falling back to releases/latest only when no manifest version is readable.
+# Tag from the installed plugin version (no API call; pins to the matching
+# binary), API fallback only when no manifest version is readable.
 _resolve_tag() {
   local manifest="" m ver
   for m in "$PLUGIN_ROOT/.claude-plugin/plugin.json" "$PLUGIN_ROOT/.codex-plugin/plugin.json"; do
@@ -185,15 +200,8 @@ _resolve_tag() {
   printf '%s' "$j" | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4
 }
 
-# f2 — integrity: verify a downloaded file against the release's published
-# <asset>.sha256 BEFORE making it executable/installing.
-#   return 0 = verified · 1 = MISMATCH (reject, never exec) · 2 = no checksum
-#   published for this release (caller falls back to the execute-check, the
-#   prior behavior). NOTE: a same-repo .sha256 defends transit/CDN corruption
-#   and partial downloads; it does NOT defend GitHub-account compromise (an
-#   attacker who can swap the binary can swap the checksum). Build-provenance
-#   attestation (release.yml `attest-build-provenance`, verifiable out-of-band
-#   via `gh attestation verify`) is the anti-tamper layer for that threat.
+# Verify a downloaded FILE against <asset>.sha256.
+#   0 verified · 1 mismatch · 2 unverifiable (no checksum published, or no sum tool)
 _verify_sha256() {
   local file="$1" tag="$2" asset="$3"
   command -v curl >/dev/null 2>&1 || return 2
@@ -210,48 +218,33 @@ _verify_sha256() {
   return 1
 }
 
-# Install a downloaded candidate: integrity-verify (f2) BEFORE exec, then a
-# liveness check, then atomically place it.
-_install_candidate() {
-  local cand="$1" tag="$2" asset="$3"
-  _verify_sha256 "$cand" "$tag" "$asset"
-  local vrc=$?
-  [ "$vrc" = "1" ] && return 1   # checksum MISMATCH → reject, do not chmod/exec
-  chmod +x "$cand" 2>/dev/null || true
-  "$cand" version >/dev/null 2>&1 || return 1
-  mkdir -p "$LOCAL_BIN" 2>/dev/null || true
-  mv "$cand" "$LOCAL_RALLY" 2>/dev/null || return 1
-  if [ "$vrc" = "2" ]; then
-    _write_state "downloaded-unverified" "ok" "$LOCAL_RALLY" "no SHA256 published for $tag; relied on execute-check"
-  else
-    _write_state "downloaded" "ok" "$LOCAL_RALLY" ""
-  fi
-  return 0
-}
-
 _do_download() {
   command -v curl >/dev/null 2>&1 || return 1
   [ -n "$HOST_TRIPLE" ] || return 1
   local tag; tag="$(_resolve_tag)"; [ -n "$tag" ] || return 1
   local asset="rally-${HOST_TRIPLE}"
-  local base="https://github.com/$GH_REPO/releases/download/${tag}/${asset}"
+  local url="https://github.com/$GH_REPO/releases/download/${tag}/${asset}"
   local tmp; tmp="$(mktemp 2>/dev/null || echo "/tmp/rally-dl-$$")"
-  if curl -fsSL --max-time 120 -o "$tmp" "$base" 2>/dev/null; then
-    _install_candidate "$tmp" "$tag" "$asset" && return 0
+  if ! curl -fsSL --max-time 120 -o "$tmp" "$url" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true; return 1
   fi
-  rm -f "$tmp" 2>/dev/null || true
-  # .tar.gz fallback (checksum keyed to the tarball asset)
-  local tgz ex b
-  tgz="$(mktemp 2>/dev/null || echo "/tmp/rally-tgz-$$")"
-  ex="$(mktemp -d 2>/dev/null || echo "/tmp/rally-ex-$$")"
-  if curl -fsSL --max-time 120 -o "$tgz" "${base}.tar.gz" 2>/dev/null && tar -xzf "$tgz" -C "$ex" 2>/dev/null; then
-    b="$(find "$ex" -name rally -type f 2>/dev/null | head -1)"
-    if [ -n "$b" ] && _install_candidate "$b" "$tag" "${asset}.tar.gz"; then
-      rm -f "$tgz" 2>/dev/null || true; rm -rf "$ex" 2>/dev/null || true; return 0
-    fi
+  # FAIL-CLOSED: verify BEFORE chmod/exec. Reject mismatch AND unverifiable.
+  _verify_sha256 "$tmp" "$tag" "$asset"
+  local vrc=$?
+  if [ "$vrc" != "0" ]; then
+    local why
+    if [ "$vrc" = "1" ]; then why="sha256 MISMATCH for $asset@$tag — download rejected (possible tamper/corruption)";
+    else why="no verifiable sha256 for $asset@$tag — download rejected (fail-closed)"; fi
+    rm -f "$tmp" 2>/dev/null || true
+    _write_state "download-rejected" "unavailable" "" "$why"
+    return 1
   fi
-  rm -f "$tgz" 2>/dev/null || true; rm -rf "$ex" 2>/dev/null || true
-  return 1
+  chmod +x "$tmp" 2>/dev/null || true
+  if ! _timed 5 "$tmp" version >/dev/null 2>&1; then rm -f "$tmp" 2>/dev/null || true; return 1; fi
+  mkdir -p "$LOCAL_BIN" 2>/dev/null || true
+  mv "$tmp" "$LOCAL_RALLY" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+  _write_state "downloaded" "ok" "$LOCAL_RALLY" ""
+  return 0
 }
 
 _do_cargo() {
@@ -265,8 +258,7 @@ _do_cargo() {
   return 1
 }
 
-# Nothing to do if neither path can work — record unavailable synchronously
-# (cheap) rather than backgrounding a guaranteed no-op.
+# Nothing to do if neither path can possibly work — record synchronously.
 if ! command -v curl >/dev/null 2>&1 && ! command -v cargo >/dev/null 2>&1; then
   _path_hint=""
   if [ -d "$HOME/.local/bin" ]; then
@@ -279,34 +271,41 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v cargo >/dev/null 2>&1; then
   exit 0
 fi
 
-# f3 + f4 — one lock for all heavy provisioning; the live pid is written into
-# the lock BEFORE the background worker is spawned, so there is never a window
-# where the lock dir exists without a live pid. That window is exactly what let
-# a concurrent session misclassify a fresh live lock as stale and delete it
-# (double-build) — the marketed parallel-agents scenario.
+# Acquire a single pid lock for the worker. The lock FILE is created atomically
+# (noclobber → O_EXCL) and immediately holds a live pid, so there is no pidless
+# window a concurrent session could reclaim. A young EMPTY lock (the sub-syscall
+# create/write gap, or a crash mid-write) is treated as live (mtime grace) so it
+# is never stolen; an old empty or dead-pid lock is reclaimed.
+#   returns 0 = acquired (we own it, our pid is in the file), 1 = held/busy
+_acquire_lock() {
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  if ( set -C; printf '%s\n' "$$" > "$LOCK_FILE" ) 2>/dev/null; then return 0; fi
+  local lp; lp="$(cat "$LOCK_FILE" 2>/dev/null || echo '')"
+  if [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null; then return 1; fi
+  if [ -z "$lp" ] && [ "$(_file_age_secs "$LOCK_FILE")" -lt 10 ]; then return 1; fi
+  rm -f "$LOCK_FILE" 2>/dev/null || true
+  ( set -C; printf '%s\n' "$$" > "$LOCK_FILE" ) 2>/dev/null && return 0
+  return 1
+}
+
 _provision_bg() {
-  mkdir -p "$CACHE_DIR" 2>/dev/null || true   # the lock mkdir below needs the parent dir
-  local lock="$CACHE_DIR/.provision.lock"
-  if ! mkdir "$lock" 2>/dev/null; then
-    local lp
-    lp="$(cat "$lock/pid" 2>/dev/null || echo '')"
-    if [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null; then
-      return 0   # provisioning already in progress in another session
-    fi
-    rm -rf "$lock" 2>/dev/null || true
-    mkdir "$lock" 2>/dev/null || return 0
-  fi
-  printf '%s' "$$" > "$lock/pid" 2>/dev/null || true   # placeholder live pid (f4)
+  _acquire_lock || return 0   # another session is provisioning
   mkdir -p "$LOCAL_BIN" 2>/dev/null || true
   _write_state "provisioning" "building" "" "Provisioning rally in background; binary will be at $LOCAL_RALLY when ready."
   (
-    if _do_download || _do_cargo; then :; else
-      _write_state "none" "unavailable" "" "no verifiable prebuilt download and no cargo build available"
+    if _do_download; then :
+    elif _do_cargo; then :
+    else
+      # Preserve a specific download rejection hint; otherwise stamp generic.
+      case "$(grep -o '"method":"[^"]*"' "$STATE_FILE" 2>/dev/null | cut -d'"' -f4 || true)" in
+        download-rejected) : ;;
+        *) _write_state "none" "unavailable" "" "no verifiable prebuilt download and no cargo build available" ;;
+      esac
     fi
-    rm -rf "$lock" 2>/dev/null || true
+    rm -f "$LOCK_FILE" 2>/dev/null || true
   ) &
   local bg=$!
-  printf '%s' "$bg" > "$lock/pid" 2>/dev/null || true  # real worker pid (f4)
+  printf '%s\n' "$bg" > "$LOCK_FILE" 2>/dev/null || true   # hand the lock to the worker pid
   disown "$bg" 2>/dev/null || true
 }
 
