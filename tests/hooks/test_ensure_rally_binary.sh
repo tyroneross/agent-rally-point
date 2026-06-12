@@ -429,6 +429,22 @@ T="f11 corrupt-state: malformed ts -> hook still exits 0"
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 # ---------------------------------------------------------------------------
+# Test: f1 never-block — a caller that CAPTURES the hook's stdout must not block
+# for the background worker's lifetime (worker fds are detached).
+# ---------------------------------------------------------------------------
+T="f1 never-block: stdout-capturing caller returns fast despite a slow worker"
+(
+  sb="$TMPDIR_ROOT/fdblock"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
+  printf '#!/usr/bin/env bash\nsleep 6\nexit 1\n' > "$sb/tools/curl"; chmod +x "$sb/tools/curl"
+  t0=$(date +%s)
+  out=$(HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin")
+  t1=$(date +%s)
+  [ $((t1-t0)) -lt 3 ] || { printf 'caller blocked %ss on the worker\n' "$((t1-t0))" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "worker must detach inherited fds"; fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
