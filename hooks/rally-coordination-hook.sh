@@ -126,6 +126,13 @@ _rally_budget_s=$(( (_rally_budget_ms + 999) / 1000 ))
 if [ -z "${RALLY_BIN:-}" ]; then
   if [ -x "./target/debug/rally" ]; then
     RALLY_BIN="./target/debug/rally"
+  elif command -v rally >/dev/null 2>&1; then
+    RALLY_BIN="rally"
+  elif [ -x "$HOME/.local/bin/rally" ]; then
+    # Where ensure-rally-binary.sh provisions the CLI. ~/.local/bin is NOT on
+    # the default non-login hook PATH, so without this branch a freshly
+    # auto-provisioned binary stays invisible and the hook no-ops forever.
+    RALLY_BIN="$HOME/.local/bin/rally"
   else
     RALLY_BIN="rally"
   fi

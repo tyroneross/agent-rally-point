@@ -507,6 +507,38 @@ chmod +x "$reg_bin"
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "existing .rally/ start path must be unchanged"; fi
 
+# ----------------------------------------------------------------------
+# Test 16: provision→consume integration — a binary at ~/.local/bin/rally
+# (where ensure-rally-binary.sh installs it) must be resolved even when
+# ~/.local/bin is NOT on the hook PATH. Regression guard for the dormant-
+# provision defect (independent-auditor f1): without the explicit fallback,
+# a freshly auto-provisioned binary is invisible and the hook no-ops forever.
+# ----------------------------------------------------------------------
+T="provisioned ~/.local/bin/rally resolved off-PATH (provision->consume integration)"
+if command -v node >/dev/null 2>&1; then
+  node_dir="$(dirname "$(command -v node)")"
+  (
+    sbhome="$tmpdir/t16home"; mkdir -p "$sbhome/.local/bin"
+    printf '#!/usr/bin/env bash\nprintf "{}"\nexit 0\n' > "$sbhome/.local/bin/rally"
+    chmod +x "$sbhome/.local/bin/rally"
+    repo="$tmpdir/t16repo"; mkdir -p "$repo/.rally"
+    cd "$repo"
+    # PATH has node but NOT rally and NOT ~/.local/bin
+    out=$(HOME="$sbhome" XDG_CACHE_HOME="$sbhome/.cache" PATH="$node_dir:/usr/bin:/bin" \
+      "$HOOK" start claude_code </dev/null 2>/dev/null)
+    if printf '%s' "$out" | grep -q "not found on PATH"; then
+      printf 'binary not resolved — got not-found advisory: %s\n' "$out" >&2; exit 1
+    fi
+    if ! printf '%s' "$out" | grep -q "active in this repo"; then
+      printf 'expected room-awareness (binary resolved+used): %s\n' "$out" >&2; exit 1
+    fi
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "~/.local/bin/rally must be resolvable off-PATH"; fi
+else
+  ok "$T (skipped — node unavailable in test env)"
+fi
+
 # Summary
 # ----------------------------------------------------------------------
 echo ""
