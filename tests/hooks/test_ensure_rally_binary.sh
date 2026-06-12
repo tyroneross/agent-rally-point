@@ -445,6 +445,49 @@ T="f1 never-block: stdout-capturing caller returns fast despite a slow worker"
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "worker must detach inherited fds"; fi
 
 # ---------------------------------------------------------------------------
+# Test: f3 handoff — after the hook returns, the lock names a LIVE pid (the
+# worker), on every bash. Run under /bin/bash explicitly so the macOS 3.2 path
+# (no $BASHPID) is exercised; the suite otherwise runs under a newer bash and
+# would miss a 3.2-only regression.
+# ---------------------------------------------------------------------------
+T="f3 handoff: lock names a live pid after return (forced /bin/bash 3.2 path)"
+if [ -x /bin/bash ]; then
+  (
+    sb="$TMPDIR_ROOT/handoff"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
+    printf '#!/bin/bash\nsleep 8\nexit 1\n' > "$sb/tools/curl"; chmod +x "$sb/tools/curl"
+    env -i HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" /bin/bash "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    lk="$sb/home/.cache/rally/.provision.lock"; c="$(cat "$lk" 2>/dev/null || echo)"
+    live=1; { [ -n "$c" ] && kill -0 "$c" 2>/dev/null; } || live=0
+    pkill -f "$sb/tools/curl" 2>/dev/null || true
+    [ "$live" = 1 ] || { printf 'lock did not name a live pid: [%s]\n' "$c" >&2; exit 1; }
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "worker pid handoff broken (bash 3.2)"; fi
+else
+  ok "$T (skipped — /bin/bash unavailable)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test: f2 liveness — a binary that crashes by SIGNAL on `version` must be
+# REJECTED, never stamped 'present' (the timer must not map signal-death to 0).
+# ---------------------------------------------------------------------------
+T="f2 liveness: SIGSEGV-on-version binary is rejected, not stamped present"
+if [ -x /bin/bash ]; then
+  (
+    sb="$TMPDIR_ROOT/sigcrash"; mkdir -p "$sb/home/.local/bin" "$sb/tools" "$sb/plugin"
+    printf '#!/bin/bash\ncase "${1:-}" in version) kill -SEGV $$;; *) exit 2;; esac\n' > "$sb/home/.local/bin/rally"; chmod +x "$sb/home/.local/bin/rally"
+    printf '#!/bin/bash\nexit 1\n' > "$sb/tools/curl"; chmod +x "$sb/tools/curl"   # no real network
+    env -i HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" /bin/bash "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    m="$(grep -o '"method":"[^"]*"' "$sb/home/.cache/rally/provision.json" 2>/dev/null | cut -d'"' -f4 || true)"
+    [ "$m" != "present" ] || { printf 'crashing binary stamped present\n' >&2; exit 1; }
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "signal-death must fail liveness"; fi
+else
+  ok "$T (skipped — /bin/bash unavailable)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

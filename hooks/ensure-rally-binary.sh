@@ -111,7 +111,10 @@ _timed() {
       $SIG{ALRM} = sub { kill "-KILL", $pid; waitpid($pid, 0); exit 124; };
       alarm $t;
       waitpid($pid, 0);
-      exit($? >> 8);
+      # Report signal-death as failure (128+N), not the misleading exit 0 that
+      # ($? >> 8) yields when the low byte holds a signal — so a binary that
+      # SIGSEGVs during `version` is rejected, not stamped healthy.
+      exit( ($? & 127) ? (128 + ($? & 127)) : ($? >> 8) );
     ' "$secs" "$@"
     return $?
   fi
@@ -334,12 +337,13 @@ _provision_bg() {
   _acquire_lock || return 0   # another session is provisioning
   mkdir -p "$LOCAL_BIN" 2>/dev/null || true
   _write_state "provisioning" "building" "" "Provisioning rally in background; binary will be at $LOCAL_RALLY when ready."
-  # Worker: (a) takes ownership of the lock with its OWN pid as its first action
-  # so the lock always names a live pid across the handoff; (b) runs with all
-  # inherited fds detached (`>/dev/null 2>&1 </dev/null`) so a caller that
-  # captures the hook's stdout never blocks on the worker's lifetime.
+  # Worker runs with all inherited fds detached (`>/dev/null 2>&1 </dev/null`) so
+  # a caller that captures the hook's stdout never blocks on the worker's
+  # lifetime. On bash 4+ the worker also stamps its own pid first (belt-and-
+  # suspenders, closing the parent-killed-before-stamp window); on bash 3.2
+  # BASHPID is unset, so this is a no-op and the parent stamp below is the path.
   (
-    printf '%s\n' "${BASHPID:-$$}" > "$LOCK_FILE" 2>/dev/null || true
+    [ -n "${BASHPID:-}" ] && printf '%s\n' "$BASHPID" > "$LOCK_FILE" 2>/dev/null || true
     if _do_download; then :
     elif _do_cargo; then :
     else
@@ -352,15 +356,12 @@ _provision_bg() {
   ) >/dev/null 2>&1 </dev/null &
   local bg=$!
   disown "$bg" 2>/dev/null || true
-  # Bounded wait until the worker owns the lock (its pid replaced ours) or has
-  # finished (lock gone) — so we never return while the lock still names our
-  # about-to-exit pid. ~1ms in practice; capped ~1s.
-  local i=0 c
-  while [ "$i" -lt 100 ]; do
-    c="$(cat "$LOCK_FILE" 2>/dev/null || echo MISSING)"
-    [ "$c" != "$$" ] && break
-    i=$((i + 1)); sleep 0.01 2>/dev/null || true
-  done
+  # Hand the lock to the worker's REAL pid — known via $! on EVERY bash version
+  # (unlike $BASHPID, which is bash-4.0+). Guard with kill -0 so a fast worker
+  # that already finished + removed the lock is not resurrected with a stale pid.
+  if kill -0 "$bg" 2>/dev/null; then
+    printf '%s\n' "$bg" > "$LOCK_FILE" 2>/dev/null || true
+  fi
 }
 
 _provision_bg
