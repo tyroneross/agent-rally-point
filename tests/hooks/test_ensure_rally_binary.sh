@@ -31,7 +31,7 @@ bad()  { FAIL=$((FAIL+1)); FAILS+=("$1"); printf 'FAIL %s\n' "$1"; [ -n "${2:-}"
 
 # Create a shared top-level temp dir; individual tests get subdirs.
 TMPDIR_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR_ROOT"' EXIT
+trap 'pkill -f "$TMPDIR_ROOT" 2>/dev/null || true; rm -rf "$TMPDIR_ROOT" 2>/dev/null || { sleep 1; pkill -f "$TMPDIR_ROOT" 2>/dev/null || true; rm -rf "$TMPDIR_ROOT" 2>/dev/null || true; }' EXIT
 
 # ---------------------------------------------------------------------------
 # Helper: make a fake rally binary that mirrors the REAL CLI's contract — it
@@ -483,6 +483,26 @@ if [ -x /bin/bash ]; then
     exit 0
   )
   if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "signal-death must fail liveness"; fi
+else
+  ok "$T (skipped — /bin/bash unavailable)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test: f2b liveness — a crashing rally ON PATH (the `command -v` fast-path) must
+# also be rejected, not stamped present (the signal gate must cover PATH too).
+# ---------------------------------------------------------------------------
+T="f2b liveness: SIGSEGV rally on PATH is rejected (command -v fast-path)"
+if [ -x /bin/bash ]; then
+  (
+    sb="$TMPDIR_ROOT/sigcrash-path"; mkdir -p "$sb/home" "$sb/bin" "$sb/plugin"
+    printf '#!/bin/bash\ncase "${1:-}" in version) kill -SEGV $$;; *) exit 2;; esac\n' > "$sb/bin/rally"; chmod +x "$sb/bin/rally"
+    printf '#!/bin/bash\nexit 1\n' > "$sb/bin/curl"; chmod +x "$sb/bin/curl"
+    env -i HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/bin:/usr/bin:/bin" /bin/bash "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    m="$(grep -o '"method":"[^"]*"' "$sb/home/.cache/rally/provision.json" 2>/dev/null | cut -d'"' -f4 || true)"
+    [ "$m" != "present" ] || { printf 'crashing PATH binary stamped present\n' >&2; exit 1; }
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "PATH fast-path must also gate on liveness"; fi
 else
   ok "$T (skipped — /bin/bash unavailable)"
 fi

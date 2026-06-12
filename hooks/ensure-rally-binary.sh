@@ -160,8 +160,11 @@ _lock_pid_alive() {
 # 3. Fast synchronous exits (cheap; no network, no compiler)
 # ---------------------------------------------------------------------------
 _check_existing() {
-  if command -v rally >/dev/null 2>&1; then
-    _write_state "present" "ok" "$(command -v rally)" ""; return 0
+  # `rally` on PATH counts as present ONLY if it actually runs — a binary that
+  # crashes (signal) or hangs on `version` must NOT be stamped healthy.
+  local p
+  if p="$(command -v rally 2>/dev/null)" && _binary_works "$p"; then
+    _write_state "present" "ok" "$p" ""; return 0
   fi
   if _binary_works "$LOCAL_RALLY"; then
     _write_state "present" "ok" "$LOCAL_RALLY" ""; return 0
@@ -180,8 +183,10 @@ if [ -f "$STATE_FILE" ]; then
 
   if [ "$_cached_result" = "ok" ] && [ "$_age" -lt 86400 ]; then
     if [ -n "$_cached_bin" ] && _binary_works "$_cached_bin"; then exit 0; fi
-    if command -v rally >/dev/null 2>&1; then exit 0; fi
-    # binary moved — fall through to re-provision
+    # A rally on PATH satisfies the cached-ok fast-exit only if it still runs.
+    _path_rally="$(command -v rally 2>/dev/null || true)"
+    if [ -n "$_path_rally" ] && _binary_works "$_path_rally"; then exit 0; fi
+    # binary moved/broke — fall through to re-provision
   fi
 
   # A provision is only "in progress" if its worker is actually alive — tie the
