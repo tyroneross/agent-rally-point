@@ -508,6 +508,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test: flock path — when flock(1) is present (Linux), provisioning goes through
+# the flock branch. Real flock semantics (worker holds the lock, OS auto-release)
+# are exercised on Linux/CI; here a stub drives the branch logic on macOS.
+# ---------------------------------------------------------------------------
+T="flock acquire: with flock present + acquirable, the hook provisions"
+(
+  sb="$TMPDIR_ROOT/flock-ok"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
+  printf '#!/bin/bash\nexit 0\n' > "$sb/tools/flock"; chmod +x "$sb/tools/flock"   # acquires
+  printf '#!/bin/bash\nexit 1\n' > "$sb/tools/curl"; chmod +x "$sb/tools/curl"     # no network
+  env -i HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+  rc=$?; [ "$rc" = 0 ] || { printf 'rc=%s\n' "$rc" >&2; exit 1; }
+  [ -f "$sb/home/.cache/rally/provision.json" ] || { printf 'flock path did not provision\n' >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "flock acquire branch"; fi
+
+T="flock busy: with flock held by a peer, the hook backs off (no provisioning)"
+(
+  sb="$TMPDIR_ROOT/flock-busy"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
+  printf '#!/bin/bash\nexit 1\n' > "$sb/tools/flock"; chmod +x "$sb/tools/flock"   # busy (can't acquire)
+  printf '#!/bin/bash\nexit 1\n' > "$sb/tools/curl"; chmod +x "$sb/tools/curl"
+  env -i HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+  rc=$?; [ "$rc" = 0 ] || { printf 'rc=%s\n' "$rc" >&2; exit 1; }
+  [ ! -f "$sb/home/.cache/rally/provision.json" ] || { printf 'backed-off run still provisioned\n' >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "flock busy backoff"; fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

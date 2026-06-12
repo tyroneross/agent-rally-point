@@ -338,8 +338,34 @@ _acquire_lock() {
   return 1
 }
 
+# Preferred lock: a held flock gives TRUE mutual exclusion with zero TOCTOU (it
+# closes the portable path's narrow reclaim race entirely). The WORKER inherits
+# the locked fd 9 and holds it for its lifetime — auto-released by the OS on exit
+# OR crash, so it can never wedge. flock(1) is Linux-standard and absent on stock
+# macOS; there `_flock_acquire` returns 2 and `_provision_bg` uses the portable
+# path below. A FIXED fd (9) keeps this parseable on bash 3.2 (which lacks
+# `{var}`-fd syntax); the whole branch parses-but-never-runs where flock is gone.
+#   returns: 0 = acquired (we hold fd 9; hand it to the worker), 1 = busy, 2 = unavailable
+_flock_acquire() {
+  command -v flock >/dev/null 2>&1 || return 2
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  exec 9>"${LOCK_FILE}.flock" 2>/dev/null || return 2
+  if flock -n 9 2>/dev/null; then return 0; fi
+  exec 9>&- 2>/dev/null || true
+  return 1
+}
+_flock_release() { exec 9>&- 2>/dev/null || true; }
+
 _provision_bg() {
-  _acquire_lock || return 0   # another session is provisioning
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  local via_flock=0 frc=0
+  _flock_acquire || frc=$?                        # capture rc without tripping set -e
+  if [ "$frc" = 1 ]; then return 0; fi           # a live worker holds the flock → in progress
+  if [ "$frc" = 0 ]; then
+    via_flock=1
+  else
+    _acquire_lock || return 0                     # no flock → portable lock (another session has it)
+  fi
   mkdir -p "$LOCAL_BIN" 2>/dev/null || true
   _write_state "provisioning" "building" "" "Provisioning rally in background; binary will be at $LOCAL_RALLY when ready."
   # Worker runs with all inherited fds detached (`>/dev/null 2>&1 </dev/null`) so
@@ -361,11 +387,17 @@ _provision_bg() {
   ) >/dev/null 2>&1 </dev/null &
   local bg=$!
   disown "$bg" 2>/dev/null || true
-  # Hand the lock to the worker's REAL pid — known via $! on EVERY bash version
-  # (unlike $BASHPID, which is bash-4.0+). Guard with kill -0 so a fast worker
-  # that already finished + removed the lock is not resurrected with a stale pid.
-  if kill -0 "$bg" 2>/dev/null; then
-    printf '%s\n' "$bg" > "$LOCK_FILE" 2>/dev/null || true
+  if [ "$via_flock" = 1 ]; then
+    # The worker subshell inherited fd 9 (the held flock); the hook drops its own
+    # copy so the lock is held by — and only by — the worker, until it exits.
+    _flock_release
+  else
+    # Portable path: hand the lock to the worker's REAL pid — known via $! on
+    # EVERY bash version (unlike $BASHPID, bash-4.0+). Guard with kill -0 so a
+    # fast worker that already finished + removed the lock is not resurrected.
+    if kill -0 "$bg" 2>/dev/null; then
+      printf '%s\n' "$bg" > "$LOCK_FILE" 2>/dev/null || true
+    fi
   fi
 }
 
