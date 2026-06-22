@@ -192,6 +192,8 @@ pub(crate) struct RoomArgs {
     pub(crate) since: Option<i64>,
     /// R10: project per-tool read receipts from ledger read-checkpoint facts.
     pub(crate) readers: bool,
+    /// Re-include recency-decayed (archived) facts in the room snapshot.
+    pub(crate) include_archived: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +216,8 @@ pub(crate) struct RecentArgs {
     pub(crate) json: bool,
     pub(crate) all: bool,
     pub(crate) limit: i64,
+    /// Re-include recency-decayed (archived) facts in the recent listing.
+    pub(crate) include_archived: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1140,6 +1144,9 @@ fn room_parser() -> impl Parser<RoomArgs> {
     let readers = long("readers")
         .help("R10: project per-tool read receipts from ledger read-checkpoint facts")
         .switch();
+    let include_archived = long("include-archived")
+        .help("re-include recency-decayed (archived) facts in the snapshot")
+        .switch();
     construct!(RoomArgs {
         json,
         tool,
@@ -1148,7 +1155,8 @@ fn room_parser() -> impl Parser<RoomArgs> {
         event_id,
         thread_id,
         since,
-        readers
+        readers,
+        include_archived
     })
 }
 
@@ -1177,7 +1185,15 @@ fn recent_parser() -> impl Parser<RecentArgs> {
     let json = json_flag();
     let all = long("all").switch();
     let limit = bounded_i64_arg("limit", "N", 20, 1, 500);
-    construct!(RecentArgs { json, all, limit })
+    let include_archived = long("include-archived")
+        .help("re-include recency-decayed (archived) facts in the recent listing")
+        .switch();
+    construct!(RecentArgs {
+        json,
+        all,
+        limit,
+        include_archived
+    })
 }
 
 fn migrate_legacy_parser() -> impl Parser<MigrateLegacyArgs> {

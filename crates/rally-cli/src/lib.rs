@@ -56,6 +56,7 @@ mod claim_authority;
 mod cli;
 mod daemon_client;
 mod dag;
+mod decay;
 mod discovery;
 mod doctor;
 mod error;
@@ -1247,7 +1248,21 @@ fn command_say(args: SayArgs) -> Result<Output> {
         evidence.push(format!("depends:{d}"));
     }
     if kind == FactKind::Claim {
-        claim_authority::ensure_default_lease_evidence(&mut evidence);
+        // Size-scale the lease window to the claimed work: a single-file claim
+        // gets the SMALL window (default 30m), a multi-file/coarse claim the
+        // LARGE window (default 2h). Resolved from the coordination policy.
+        let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+        let resource_scopes: Vec<crate::resource_scope::ResourceScope> = scope
+            .iter()
+            .filter_map(|s| crate::resource_scope::ResourceScope::parse_claim_scope(s))
+            .collect();
+        let size = crate::decay::classify_work_size(&resource_scopes, scope.len());
+        let lease_secs = crate::decay::reclaim_timeout_secs(
+            size,
+            coord.reclaim_small_minutes,
+            coord.reclaim_large_minutes,
+        );
+        claim_authority::ensure_lease_evidence(&mut evidence, lease_secs);
     }
 
     // B1: encode lineage markers (run/step/parent-step) into scope.
@@ -1618,8 +1633,14 @@ fn command_release_by_path(
     //       (>2h total silence, NOT the 15-min advisory idle) so a peer/lead may
     //       reclaim it. This closes fact_182e8 gap 1: a dead owner's claims
     //       could never be cleared because release was strictly owner-only.
-    // The 2h destructive bar (vs 15m advisory) prevents reclaiming a busy-but-
-    // quiet live agent's claim (independent-auditor HIGH, 2026-06-09).
+    // The destructive bar (vs 15m advisory) prevents reclaiming a busy-but-
+    // quiet live agent's claim (independent-auditor HIGH, 2026-06-09). That bar
+    // is now SIZE-SCALED per claim: a single-file claim becomes reclaimable
+    // after the SMALL timeout (default 30m), a multi-file / directory / repo /
+    // task claim only after the LARGE timeout (default 2h, == the historical
+    // flat `TAKEOVER_STALE_SECS`, so coarse claims keep their prior grace).
+    // Eligibility stays fail-closed: an owner with an unknown/unparseable
+    // last-seen is never reclaimable (`claim_reclaim_eligible`).
     //
     // Scope matching differs by arm to fix the auditor's MED asymmetry:
     //   - SELF release keeps the pre-existing EXACT scope match (unchanged
@@ -1628,7 +1649,7 @@ fn command_release_by_path(
     //     `file:src`) that `before-write` flagged reclaimable for `src/foo.rs`
     //     can actually be released via that same path — the two surfaces now
     //     agree (lesson: a WARN that points at an unrunnable command is a bug).
-    let takeover_owners = snapshot.takeover_eligible_owners();
+    let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
     let exact_scope_match = |c: &&Fact| {
         c.scope
             .iter()
@@ -1644,6 +1665,8 @@ fn command_release_by_path(
             })
         })
     };
+    // Capture the size class of each reclaimed claim for the provenance trail.
+    let mut reclaim_sizes: Vec<crate::decay::WorkSize> = Vec::new();
     let matches: Vec<&Fact> = snapshot
         .active_claims
         .iter()
@@ -1652,12 +1675,14 @@ fn command_release_by_path(
             if owned {
                 return exact_scope_match(c);
             }
-            let stale_takeover = c
-                .tool
-                .as_deref()
-                .map(|o| takeover_owners.contains(o))
-                .unwrap_or(false);
-            stale_takeover && takeover_scope_match(c)
+            if !takeover_scope_match(c) {
+                return false;
+            }
+            let (eligible, size) = snapshot.claim_reclaim_eligible(c, &coord);
+            if eligible {
+                reclaim_sizes.push(size);
+            }
+            eligible
         })
         .collect();
     // Did at least one match come from a stale-owner takeover (not self)?
@@ -1789,6 +1814,21 @@ fn command_release_by_path(
             "authorized-takeover:stale-owner={}",
             taken_over_owners.join(",")
         ));
+        // Record WHY the reclaim was authorized: stale-by-timeout, with the
+        // size class(es) that set each claim's timeout. Auditable provenance.
+        let sizes: Vec<&str> = reclaim_sizes
+            .iter()
+            .map(|s| match s {
+                crate::decay::WorkSize::Small => "small",
+                crate::decay::WorkSize::Large => "large",
+            })
+            .collect();
+        if !sizes.is_empty() {
+            evidence.push(format!(
+                "reclaim-reason:stale-by-timeout;work-size={}",
+                sizes.join(",")
+            ));
+        }
     }
     let fact = Fact {
         from_session_id: None,
@@ -1861,9 +1901,11 @@ fn command_room(args: RoomArgs) -> Result<Output> {
     // R10: use snapshot_with_readers when --readers is passed so that
     // ReadReceipt projection happens; otherwise use the cheaper default path.
     let snapshot = if query.readers {
-        room.snapshot_with_readers()?.filtered(&query)
+        room.snapshot_with_readers_archived(query.include_archived)?
+            .filtered(&query)
     } else {
-        room.snapshot()?.filtered(&query)
+        room.snapshot_with_archived(query.include_archived)?
+            .filtered(&query)
     };
     // R10: extract readers from snapshot (populated by snapshot_with_readers).
     let readers = snapshot.readers.clone();
@@ -1970,7 +2012,7 @@ struct RecentEnvelope {
 }
 
 fn command_recent(args: RecentArgs) -> Result<Output> {
-    let data = discovery::recent(args.all, args.limit)?;
+    let data = discovery::recent(args.all, args.limit, args.include_archived)?;
     let count = data.rows.len();
     let body = envelope("recent", SCHEMA_RECENT, RecentEnvelope { recent: data })?;
     let text = format!("recent rows={count}");

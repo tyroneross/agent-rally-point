@@ -7,7 +7,6 @@ use std::fs;
 use std::path::Path;
 
 pub(crate) const CLAIM_INDEX_FILENAME: &str = "claim-index.json";
-const DEFAULT_CLAIM_LEASE_SECS: i64 = 30 * 60;
 const LEASE_EVIDENCE_PREFIX: &str = "lease_expires_at:";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -31,7 +30,11 @@ pub(crate) struct ClaimConflict {
     pub(crate) scope: String,
 }
 
-pub(crate) fn ensure_default_lease_evidence(evidence: &mut Vec<String>) {
+/// Stamp a `lease_expires_at:` evidence marker with an EXPLICIT lease window
+/// (seconds). Used so a claim's lease window can be SIZE-SCALED (a single-file
+/// claim gets the small window, a coarse claim the large one) — see
+/// `decay::reclaim_timeout_secs`. No-op when a lease marker already exists.
+pub(crate) fn ensure_lease_evidence(evidence: &mut Vec<String>, lease_secs: i64) {
     if evidence
         .iter()
         .any(|item| item.starts_with(LEASE_EVIDENCE_PREFIX))
@@ -40,12 +43,15 @@ pub(crate) fn ensure_default_lease_evidence(evidence: &mut Vec<String>) {
     }
     evidence.push(format!(
         "{LEASE_EVIDENCE_PREFIX}{}",
-        default_lease_expires_at(Utc::now())
+        lease_marker_at(Utc::now(), lease_secs)
     ));
 }
 
-pub(crate) fn default_lease_expires_at(now: DateTime<Utc>) -> String {
-    (now + Duration::seconds(DEFAULT_CLAIM_LEASE_SECS)).to_rfc3339_opts(SecondsFormat::Secs, true)
+/// The `lease_expires_at` timestamp string for `now + lease_secs`.
+/// (Distinct from `lease_expires_at(&Fact)` below, which READS a lease marker
+/// off an existing claim.)
+pub(crate) fn lease_marker_at(now: DateTime<Utc>, lease_secs: i64) -> String {
+    (now + Duration::seconds(lease_secs)).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 pub(crate) fn active_claim_records(facts: &[Fact]) -> Vec<ActiveClaimRecord> {
@@ -316,7 +322,10 @@ mod tests {
             Utc::now().timestamp_nanos_opt().unwrap()
         ));
         let mut claim = fact("claim-a", "tool-a", vec!["file:src/lib.rs"]);
-        ensure_default_lease_evidence(&mut claim.evidence);
+        ensure_lease_evidence(
+            &mut claim.evidence,
+            crate::decay::DEFAULT_RECLAIM_SMALL_MINUTES * 60,
+        );
         write_index_from_facts(&temp, &[claim]).unwrap();
         let before_len = read_index(&temp).unwrap().claims.len();
         let renewed = renew_claim_lease(&temp, "claim-a", "2099-01-01T00:00:00Z".to_string())

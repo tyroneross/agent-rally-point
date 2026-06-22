@@ -321,7 +321,7 @@ pub(crate) fn status_global() -> Result<GlobalStatusData> {
     })
 }
 
-pub(crate) fn recent(all: bool, limit: i64) -> Result<RecentData> {
+pub(crate) fn recent(all: bool, limit: i64, include_archived: bool) -> Result<RecentData> {
     let current = repo_root()?;
     let mut warnings = Vec::new();
     let mut rows = Vec::new();
@@ -332,7 +332,7 @@ pub(crate) fn recent(all: bool, limit: i64) -> Result<RecentData> {
     };
     let mut missing_count: usize = 0;
     for room in rooms {
-        let (room_rows, was_missing) = recent_in_room(&room, &mut warnings)?;
+        let (room_rows, was_missing) = recent_in_room(&room, include_archived, &mut warnings)?;
         rows.extend(room_rows);
         if was_missing {
             missing_count += 1;
@@ -440,15 +440,38 @@ fn locate_in_room(
 
 fn recent_in_room(
     room: &KnownRoom,
+    include_archived: bool,
     warnings: &mut Vec<DiscoveryWarning>,
 ) -> Result<(Vec<RecentRow>, bool)> {
     let Some(store) = try_open_indexed_room(room)? else {
         return Ok((Vec::new(), true));
     };
     let _ = warnings; // retained for future per-room warnings that are not room_missing
+    // Recency-decay archive floor: drop facts that have decayed below the floor
+    // unless --include-archived was requested. Ordering itself is already
+    // recency-correct via the created_at-DESC comparator in `recent()`.
+    let coord = crate::hooks_config::resolve_coordination(&room.repo_root).unwrap_or_default();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let half_life_secs = coord.half_life_secs();
+    let floor = coord.archive_floor_weight;
     let rows = store
         .facts()?
         .into_iter()
+        .filter(|fact| {
+            if include_archived {
+                return true;
+            }
+            // Fail-open: a fact with an unparseable created_at is kept (treated
+            // as fresh) — decay never hides a message on a malformed timestamp.
+            let weight = match chrono::DateTime::parse_from_rfc3339(&fact.created_at) {
+                Ok(dt) => crate::decay::recency_weight(now_secs - dt.timestamp(), half_life_secs),
+                Err(_) => 1.0,
+            };
+            !crate::decay::is_archivable(weight, floor)
+        })
         .map(|fact| RecentRow {
             source: "room".to_string(),
             repo_root: Some(room.repo_root.clone()),

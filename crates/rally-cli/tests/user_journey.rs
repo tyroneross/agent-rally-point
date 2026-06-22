@@ -2873,15 +2873,19 @@ fn rally_migrate_legacy_replays_and_is_idempotent() {
         "no facts should be skipped on first run"
     );
 
-    // Verify the fact appears in recent.
-    let recent = workspace.json(&["recent", "--json"]);
+    // Verify the fact appears in recent. The migrated legacy fact carries an
+    // OLD `created_at` (its original timestamp), so recency-decay archives it
+    // out of the default `recent` view once it is past the archive floor
+    // (~14d at the default 48h half-life). It is still losslessly retrievable
+    // via `recent --include-archived` — the documented retrieval path.
+    let recent = workspace.json(&["recent", "--include-archived", "--json"]);
     assert!(
         recent["data"]["recent"]["rows"]
             .as_array()
             .unwrap()
             .iter()
             .any(|row| row["fact"]["event_id"].as_str() == Some("evt_migrate_test_001")),
-        "migrated fact must appear in recent after first run"
+        "migrated fact must appear in recent --include-archived after first run"
     );
 
     // Unrelated fact must NOT appear (different slug).

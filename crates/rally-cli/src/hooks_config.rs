@@ -263,3 +263,222 @@ fn parse_enabled_override(value: &str) -> Option<bool> {
         _ => None,
     }
 }
+
+// --------------------------------------------------------------------------
+// Coordination policy (recency decay + size-scaled reclaim) tunables
+//
+// Resolved from the SAME `.rally/config.json` files as hooks, under a
+// `"coordination"` object, with the same default → user → repo → env
+// precedence. Defaults come from `crate::decay` so the constants live in
+// exactly one place.
+// --------------------------------------------------------------------------
+
+/// Effective coordination policy after resolving config + env overrides.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CoordinationConfig {
+    /// Recency-decay half-life, in hours.
+    pub(crate) half_life_hours: f64,
+    /// Archive floor — messages whose weight drops below this are archived.
+    pub(crate) archive_floor_weight: f64,
+    /// Reclaim timeout for a SMALL (single-file) claim, in minutes.
+    pub(crate) reclaim_small_minutes: i64,
+    /// Reclaim timeout for a LARGE (multi-file / coarse) claim, in minutes.
+    pub(crate) reclaim_large_minutes: i64,
+}
+
+impl Default for CoordinationConfig {
+    fn default() -> Self {
+        Self {
+            half_life_hours: crate::decay::DEFAULT_HALF_LIFE_HOURS,
+            archive_floor_weight: crate::decay::DEFAULT_ARCHIVE_FLOOR,
+            reclaim_small_minutes: crate::decay::DEFAULT_RECLAIM_SMALL_MINUTES,
+            reclaim_large_minutes: crate::decay::DEFAULT_RECLAIM_LARGE_MINUTES,
+        }
+    }
+}
+
+impl CoordinationConfig {
+    /// Half-life expressed in seconds (the unit `decay::recency_weight` wants).
+    pub(crate) fn half_life_secs(&self) -> i64 {
+        (self.half_life_hours * 3600.0).round() as i64
+    }
+}
+
+fn coordination_from_value(value: &Value, into: &mut CoordinationConfig) {
+    let Some(coord) = value.get("coordination").and_then(Value::as_object) else {
+        return;
+    };
+    if let Some(v) = coord.get("half_life_hours").and_then(Value::as_f64) {
+        if v > 0.0 {
+            into.half_life_hours = v;
+        }
+    }
+    if let Some(v) = coord.get("archive_floor_weight").and_then(Value::as_f64) {
+        if v > 0.0 && v < 1.0 {
+            into.archive_floor_weight = v;
+        }
+    }
+    if let Some(v) = coord.get("reclaim_small_minutes").and_then(Value::as_i64) {
+        if v > 0 {
+            into.reclaim_small_minutes = v;
+        }
+    }
+    if let Some(v) = coord.get("reclaim_large_minutes").and_then(Value::as_i64) {
+        if v > 0 {
+            into.reclaim_large_minutes = v;
+        }
+    }
+}
+
+fn coord_env_f64(name: &str, slot: &mut f64, guard: impl Fn(f64) -> bool) {
+    if let Some(v) = env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+    {
+        if guard(v) {
+            *slot = v;
+        }
+    }
+}
+
+fn coord_env_i64(name: &str, slot: &mut i64) {
+    if let Some(v) = env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+    {
+        if v > 0 {
+            *slot = v;
+        }
+    }
+}
+
+/// Resolve the effective coordination policy: default → user → repo → env.
+pub(crate) fn resolve_coordination(repo_root: &Path) -> Result<CoordinationConfig> {
+    let mut cfg = CoordinationConfig::default();
+    if let Some(user_path) = user_config_path() {
+        let v = read_config_value(&user_path)?;
+        coordination_from_value(&v, &mut cfg);
+    }
+    let repo_value = read_config_value(&repo_config_path(repo_root))?;
+    coordination_from_value(&repo_value, &mut cfg);
+
+    // Env overrides (highest precedence) — match the RALLY_* naming convention.
+    coord_env_f64("RALLY_HALF_LIFE_HOURS", &mut cfg.half_life_hours, |v| {
+        v > 0.0
+    });
+    coord_env_f64("RALLY_ARCHIVE_FLOOR", &mut cfg.archive_floor_weight, |v| {
+        v > 0.0 && v < 1.0
+    });
+    coord_env_i64(
+        "RALLY_RECLAIM_SMALL_MINUTES",
+        &mut cfg.reclaim_small_minutes,
+    );
+    coord_env_i64(
+        "RALLY_RECLAIM_LARGE_MINUTES",
+        &mut cfg.reclaim_large_minutes,
+    );
+
+    Ok(cfg)
+}
+
+#[cfg(test)]
+mod coordination_tests {
+    use super::*;
+    use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    // env var mutation is process-global; serialize these tests.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn defaults_when_no_config() {
+        let _g = env_lock().lock().unwrap();
+        for k in [
+            "RALLY_HALF_LIFE_HOURS",
+            "RALLY_ARCHIVE_FLOOR",
+            "RALLY_RECLAIM_SMALL_MINUTES",
+            "RALLY_RECLAIM_LARGE_MINUTES",
+        ] {
+            unsafe { env::remove_var(k) };
+        }
+        let dir = std::env::temp_dir().join(format!("rally-coord-def-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let cfg = resolve_coordination(&dir).unwrap();
+        assert_eq!(cfg, CoordinationConfig::default());
+        assert_eq!(cfg.half_life_hours, 48.0);
+        assert_eq!(cfg.archive_floor_weight, 0.05);
+        assert_eq!(cfg.reclaim_small_minutes, 30);
+        assert_eq!(cfg.reclaim_large_minutes, 120);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_config_overrides_default() {
+        let _g = env_lock().lock().unwrap();
+        for k in [
+            "RALLY_HALF_LIFE_HOURS",
+            "RALLY_ARCHIVE_FLOOR",
+            "RALLY_RECLAIM_SMALL_MINUTES",
+            "RALLY_RECLAIM_LARGE_MINUTES",
+        ] {
+            unsafe { env::remove_var(k) };
+        }
+        let dir = std::env::temp_dir().join(format!("rally-coord-repo-{}", std::process::id()));
+        let _ = fs::create_dir_all(dir.join(".rally"));
+        fs::write(
+            dir.join(".rally").join("config.json"),
+            r#"{"coordination":{"half_life_hours":24,"archive_floor_weight":0.1,"reclaim_small_minutes":10,"reclaim_large_minutes":60}}"#,
+        )
+        .unwrap();
+        let cfg = resolve_coordination(&dir).unwrap();
+        assert_eq!(cfg.half_life_hours, 24.0);
+        assert_eq!(cfg.archive_floor_weight, 0.1);
+        assert_eq!(cfg.reclaim_small_minutes, 10);
+        assert_eq!(cfg.reclaim_large_minutes, 60);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_overrides_repo() {
+        let _g = env_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("rally-coord-env-{}", std::process::id()));
+        let _ = fs::create_dir_all(dir.join(".rally"));
+        fs::write(
+            dir.join(".rally").join("config.json"),
+            r#"{"coordination":{"half_life_hours":24}}"#,
+        )
+        .unwrap();
+        unsafe { env::set_var("RALLY_HALF_LIFE_HOURS", "72") };
+        let cfg = resolve_coordination(&dir).unwrap();
+        assert_eq!(cfg.half_life_hours, 72.0, "env beats repo");
+        unsafe { env::remove_var("RALLY_HALF_LIFE_HOURS") };
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_values_ignored() {
+        let _g = env_lock().lock().unwrap();
+        for k in [
+            "RALLY_HALF_LIFE_HOURS",
+            "RALLY_ARCHIVE_FLOOR",
+            "RALLY_RECLAIM_SMALL_MINUTES",
+            "RALLY_RECLAIM_LARGE_MINUTES",
+        ] {
+            unsafe { env::remove_var(k) };
+        }
+        let dir = std::env::temp_dir().join(format!("rally-coord-bad-{}", std::process::id()));
+        let _ = fs::create_dir_all(dir.join(".rally"));
+        // negative half-life + out-of-range floor must be ignored → defaults kept.
+        fs::write(
+            dir.join(".rally").join("config.json"),
+            r#"{"coordination":{"half_life_hours":-5,"archive_floor_weight":2.0}}"#,
+        )
+        .unwrap();
+        let cfg = resolve_coordination(&dir).unwrap();
+        assert_eq!(cfg, CoordinationConfig::default());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
