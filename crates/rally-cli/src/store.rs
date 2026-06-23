@@ -431,6 +431,54 @@ impl RoomSnapshot {
             .collect()
     }
 
+    /// PER-CLAIM destructive reclaim eligibility, with the timeout SCALED by the
+    /// size of the work the claim covers (`decay::classify_work_size`):
+    /// a single-file claim becomes reclaimable after the SMALL timeout
+    /// (default 30m); a multi-file / directory / repo / task claim only after
+    /// the LARGE timeout (default 2h, == the historical `TAKEOVER_STALE_SECS`).
+    ///
+    /// Fail-closed: an owner whose `last_seen_ts` is unknown or unparseable is
+    /// NEVER reclaimable (matches `takeover_eligible_owners`). The owner's age
+    /// is taken from the squad projection (last authored/presence fact).
+    /// Returns `(eligible, work_size)` so the caller can record the size in the
+    /// reclaim provenance.
+    pub(crate) fn claim_reclaim_eligible(
+        &self,
+        claim: &Fact,
+        coord: &crate::hooks_config::CoordinationConfig,
+    ) -> (bool, crate::decay::WorkSize) {
+        let resource_scopes: Vec<crate::resource_scope::ResourceScope> = claim
+            .scope
+            .iter()
+            .filter_map(|s| crate::resource_scope::ResourceScope::parse_claim_scope(s))
+            .collect();
+        let size = crate::decay::classify_work_size(&resource_scopes, claim.scope.len());
+        let timeout = crate::decay::reclaim_timeout_secs(
+            size,
+            coord.reclaim_small_minutes,
+            coord.reclaim_large_minutes,
+        );
+        let Some(owner) = claim.tool.as_deref() else {
+            return (false, size);
+        };
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // Owner age from the squad projection; fail-closed on missing/bad ts.
+        let eligible = self
+            .squads
+            .iter()
+            .find(|sq| sq.tool == owner)
+            .and_then(|sq| {
+                chrono::DateTime::parse_from_rfc3339(&sq.last_seen_ts)
+                    .ok()
+                    .map(|dt| now_secs - dt.timestamp() > timeout)
+            })
+            .unwrap_or(false);
+        (eligible, size)
+    }
+
     pub(crate) fn filtered(self, query: &RoomQuery) -> Self {
         if query.is_empty() {
             return self;
@@ -471,6 +519,10 @@ pub(crate) struct RoomQuery {
     /// Not serialized into the query output (internal routing only).
     #[serde(skip)]
     pub(crate) readers: bool,
+    /// When true, re-include recency-decayed (archived) facts in the snapshot.
+    /// Internal routing only — not serialized, not part of `is_empty`.
+    #[serde(skip)]
+    pub(crate) include_archived: bool,
 }
 
 impl RoomQuery {
@@ -483,6 +535,7 @@ impl RoomQuery {
             thread_id: args.thread_id,
             since: args.since,
             readers: args.readers,
+            include_archived: args.include_archived,
         }
     }
 
@@ -773,6 +826,27 @@ impl RoomStore {
             .join(format!("{}.jsonl", self.active_engagement))
     }
 
+    /// Parse the `authorized-takeover:stale-owner=<a>,<b>` evidence marker that
+    /// `command_release_by_path` writes onto a takeover Release, returning the
+    /// list of stale owners the release claims to reclaim. `None` when the
+    /// marker is absent (an ordinary self-release, no takeover guard needed).
+    fn takeover_owners_marker(evidence: &[String]) -> Option<Vec<String>> {
+        const PREFIX: &str = "authorized-takeover:stale-owner=";
+        for item in evidence {
+            if let Some(rest) = item.strip_prefix(PREFIX) {
+                let owners: Vec<String> = rest
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !owners.is_empty() {
+                    return Some(owners);
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn append_fact(&self, fact: &Fact) -> Result<Fact> {
         let room_dir = self
             .facts_db_path
@@ -782,6 +856,44 @@ impl RoomStore {
         reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
         let fact_store = open_fact_store(&self.facts_db_path)?;
         let mut fact = fact.clone();
+        // SEC-001 close: a takeover Release authorizes reclaiming a stale peer's
+        // claim. Eligibility was judged on an UNLOCKED snapshot in
+        // `command_release_by_path`; an owner could revive in the gap before we
+        // hold the lock. Re-assert eligibility HERE, under the held mutation
+        // lock, against freshly-read facts — if a named stale-owner is no longer
+        // reclaim-eligible (it posted activity and became live), refuse the
+        // takeover rather than reclaim a now-live owner's claim (the
+        // independent-auditor-HIGH 2026-06-09 regression class).
+        if fact.kind == FactKind::Release {
+            if let Some(stale_owners) = Self::takeover_owners_marker(&fact.evidence) {
+                let coord =
+                    crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+                let facts = facts_from_store(&fact_store)?;
+                let fresh = snapshot_from_facts_with_policy(&facts, &coord, false);
+                for owner in &stale_owners {
+                    let still_eligible = fresh
+                        .active_claims
+                        .iter()
+                        .filter(|c| c.tool.as_deref() == Some(owner.as_str()))
+                        .any(|c| fresh.claim_reclaim_eligible(c, &coord).0);
+                    // No remaining eligible claim for this owner means either it
+                    // was already reclaimed (fine) or it revived (refuse). We
+                    // only refuse when the owner still HOLDS active claims that
+                    // are NO LONGER eligible — i.e. it came back to life.
+                    let still_owns = fresh
+                        .active_claims
+                        .iter()
+                        .any(|c| c.tool.as_deref() == Some(owner.as_str()));
+                    if still_owns && !still_eligible {
+                        return Err(RallyError::Usage(format!(
+                            "takeover refused: owner {owner} is no longer stale \
+                             (revived under the mutation lock); not reclaiming a \
+                             now-live owner's claim"
+                        )));
+                    }
+                }
+            }
+        }
         if fact.kind == FactKind::Claim {
             let facts = facts_from_store(&fact_store)?;
             if let Some(conflict) = claim_authority::detect_conflict(&facts, &fact) {
@@ -1228,9 +1340,26 @@ impl RoomStore {
         Ok((facts, context_version))
     }
 
+    /// Repo root this store is rooted at (parent of `.rally`). Used to resolve
+    /// the coordination policy (`resolve_coordination`).
+    pub(crate) fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
     pub(crate) fn snapshot(&self) -> Result<RoomSnapshot> {
+        self.snapshot_with_archived(false)
+    }
+
+    /// Snapshot honoring an explicit `include_archived` flag (the
+    /// `rally room --include-archived` path re-includes decayed facts).
+    pub(crate) fn snapshot_with_archived(&self, include_archived: bool) -> Result<RoomSnapshot> {
         let facts = self.facts()?;
-        Ok(snapshot_from_facts(&facts))
+        let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+        Ok(snapshot_from_facts_with_policy(
+            &facts,
+            &coord,
+            include_archived,
+        ))
     }
 
     /// Return the current read cursor for `tool`.
@@ -1471,9 +1600,14 @@ impl RoomStore {
     ///
     /// Loads facts ONCE and passes the same slice to both `snapshot_from_facts`
     /// and `project_read_receipts_from_facts` — one DB round-trip instead of two.
-    pub(crate) fn snapshot_with_readers(&self) -> Result<RoomSnapshot> {
+    /// Snapshot with per-tool read receipts, honoring an `include_archived` flag.
+    pub(crate) fn snapshot_with_readers_archived(
+        &self,
+        include_archived: bool,
+    ) -> Result<RoomSnapshot> {
         let facts = self.facts()?;
-        let mut snapshot = snapshot_from_facts(&facts);
+        let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+        let mut snapshot = snapshot_from_facts_with_policy(&facts, &coord, include_archived);
         snapshot.readers = self.project_read_receipts_from_facts(&facts, snapshot.max_seq)?;
         Ok(snapshot)
     }
@@ -1535,7 +1669,55 @@ fn handoff_is_closed(handoff: &Fact, facts: &[Fact]) -> bool {
 /// This is the body formerly inlined in `RoomStore::snapshot`. Extracted so
 /// that both `snapshot()` and `snapshot_with_readers()` can call it without
 /// loading facts twice (fix #2 — one DB round-trip instead of two).
-fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
+/// Recency weight for a fact, from its `created_at` and the policy half-life.
+/// A fact whose `created_at` fails to parse is treated as fresh (weight 1.0):
+/// decay must never hide a message just because its timestamp is malformed.
+fn fact_recency_weight(fact: &Fact, now_secs: i64, half_life_secs: i64) -> f64 {
+    match chrono::DateTime::parse_from_rfc3339(&fact.created_at) {
+        Ok(dt) => crate::decay::recency_weight(now_secs - dt.timestamp(), half_life_secs),
+        Err(_) => 1.0,
+    }
+}
+
+/// Sort a bucket newest-first by recency weight (DESC), tie-broken by seq (DESC)
+/// so the existing insertion-order behavior is preserved for equal-age facts.
+fn sort_by_recency(facts: &mut [Fact], now_secs: i64, half_life_secs: i64) {
+    facts.sort_by(|a, b| {
+        let wa = fact_recency_weight(a, now_secs, half_life_secs);
+        let wb = fact_recency_weight(b, now_secs, half_life_secs);
+        wb.partial_cmp(&wa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.seq.cmp(&a.seq))
+    });
+}
+
+/// Build a room snapshot, applying recency-decay ordering and archive-floor
+/// partitioning per the coordination policy.
+///
+/// * Listing buckets (decisions / risks / artifacts) are ordered by recency
+///   weight so fresher messages surface first.
+/// * Facts whose weight has fallen below the archive floor are moved OUT of the
+///   active buckets and into `stale_facts` (lossless — the raw segments stay on
+///   disk and are re-included when `include_archived` is true / via
+///   `--include-archived`).
+fn snapshot_from_facts_with_policy(
+    facts: &[Fact],
+    coord: &crate::hooks_config::CoordinationConfig,
+    include_archived: bool,
+) -> RoomSnapshot {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let half_life_secs = coord.half_life_secs();
+    let floor = coord.archive_floor_weight;
+    let is_archived = |fact: &Fact| -> bool {
+        !include_archived
+            && crate::decay::is_archivable(
+                fact_recency_weight(fact, now_secs, half_life_secs),
+                floor,
+            )
+    };
     let max_seq = facts.iter().map(|f| f.seq).max().unwrap_or(0);
     // R10: `content_max_seq` is the highest seq of a non-read-checkpoint
     // fact. Used by command_next to derive the read position to record
@@ -1583,30 +1765,59 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
         .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
         .cloned()
         .collect::<Vec<_>>();
-    let current_decisions = facts
+    // Recency-decay buckets: order by weight (fresh first), drop facts that
+    // have decayed below the archive floor into `stale_facts`.
+    let mut stale_facts: Vec<Fact> = Vec::new();
+    let mut current_decisions = facts
         .iter()
         .filter(|f| f.kind == "decision")
-        .rev()
-        .take(20)
+        .filter(|f| {
+            if is_archived(f) {
+                stale_facts.push((*f).clone());
+                false
+            } else {
+                true
+            }
+        })
         .cloned()
         .collect::<Vec<_>>();
-    let current_risks = facts
+    sort_by_recency(&mut current_decisions, now_secs, half_life_secs);
+    current_decisions.truncate(20);
+
+    let mut current_risks = facts
         .iter()
         .filter(|f| f.kind == "risk")
         .filter(|f| !resolved.contains(&f.event_id))
-        .rev()
-        .take(20)
+        .filter(|f| {
+            if is_archived(f) {
+                stale_facts.push((*f).clone());
+                false
+            } else {
+                true
+            }
+        })
         .cloned()
         .collect::<Vec<_>>();
-    let recent_artifacts = facts
+    sort_by_recency(&mut current_risks, now_secs, half_life_secs);
+    current_risks.truncate(20);
+
+    let mut recent_artifacts = facts
         .iter()
         .filter(|f| f.kind == "artifact")
         // B18: exclude external-intake facts from repo-local backlog.
         .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
-        .rev()
-        .take(20)
+        .filter(|f| {
+            if is_archived(f) {
+                stale_facts.push((*f).clone());
+                false
+            } else {
+                true
+            }
+        })
         .cloned()
         .collect::<Vec<_>>();
+    sort_by_recency(&mut recent_artifacts, now_secs, half_life_secs);
+    recent_artifacts.truncate(20);
     let consumed_refs = facts
         .iter()
         .filter(|f| f.kind == "handoff" || f.kind == "resolve")
@@ -1635,10 +1846,7 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
             }
         }
     }
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    // `now_secs` already computed at the top of this function.
     let acked = acknowledged_tools(facts);
     let squads = tool_last
         .into_iter()
@@ -1698,7 +1906,7 @@ fn snapshot_from_facts(facts: &[Fact]) -> RoomSnapshot {
         current_risks,
         recent_artifacts,
         unconsumed_artifacts,
-        stale_facts: Vec::new(),
+        stale_facts,
         squads,
         lead,
         lead_epoch,
@@ -5581,5 +5789,380 @@ mod ledger_tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod decay_reclaim_tests {
+    use super::*;
+    use crate::decay::WorkSize;
+    use crate::hooks_config::CoordinationConfig;
+    use crate::resource_scope::{AccessMode, ResourceScope, ResourceType};
+
+    fn iso_ago(secs: i64) -> String {
+        let now = chrono::Utc::now();
+        (now - chrono::Duration::seconds(secs.max(0)))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    fn aged_fact(event_id: &str, kind: FactKind, age_secs: i64) -> Fact {
+        Fact {
+            from_session_id: None,
+            schema: fact_schema(),
+            event_id: event_id.to_string(),
+            seq: 0,
+            thread_id: format!("t-{event_id}"),
+            kind,
+            tool: Some("tester".to_string()),
+            role: None,
+            subject: format!("s-{event_id}"),
+            scope: Vec::new(),
+            created_at: iso_ago(age_secs),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        }
+    }
+
+    fn squad(tool: &str, last_seen_age_secs: i64) -> Squad {
+        Squad {
+            tool: tool.to_string(),
+            last_seen_seq: 1,
+            last_seen_ts: iso_ago(last_seen_age_secs),
+            status: "idle".to_string(),
+            acknowledged: false,
+        }
+    }
+
+    fn claim_with(tool: &str, scopes: &[&str], owner_age_secs: i64) -> (Fact, RoomSnapshot) {
+        let mut claim = aged_fact("claim-1", FactKind::Claim, 0);
+        claim.tool = Some(tool.to_string());
+        claim.scope = scopes.iter().map(|s| s.to_string()).collect();
+        let snapshot = RoomSnapshot {
+            squads: vec![squad(tool, owner_age_secs)],
+            ..Default::default()
+        };
+        (claim, snapshot)
+    }
+
+    // --- INTEGRATION: snapshot decay sort + archive partition ---
+    #[test]
+    fn snapshot_orders_by_recency_and_partitions_stale() {
+        let coord = CoordinationConfig::default(); // 48h half-life, 0.05 floor
+        // fresh decision (0d), mid (3d, weight ~0.42 > floor), stale (20d, < floor)
+        let mut fresh = aged_fact("d-fresh", FactKind::Decision, 0);
+        fresh.seq = 1;
+        let mut mid = aged_fact("d-mid", FactKind::Decision, 3 * 24 * 3600);
+        mid.seq = 2;
+        let mut stale = aged_fact("d-stale", FactKind::Decision, 20 * 24 * 3600);
+        stale.seq = 3;
+        let facts = vec![mid.clone(), stale.clone(), fresh.clone()];
+
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        // Fresh sorts above mid; stale is archived out of the active bucket.
+        let ids: Vec<&str> = snap
+            .current_decisions
+            .iter()
+            .map(|f| f.event_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["d-fresh", "d-mid"], "fresh first, stale excluded");
+        assert!(
+            snap.stale_facts.iter().any(|f| f.event_id == "d-stale"),
+            "20d decision moved to stale_facts"
+        );
+
+        // include_archived re-includes the stale fact in the active bucket.
+        let snap_all = snapshot_from_facts_with_policy(&facts, &coord, true);
+        assert!(
+            snap_all
+                .current_decisions
+                .iter()
+                .any(|f| f.event_id == "d-stale"),
+            "include_archived keeps decayed facts"
+        );
+        assert!(
+            snap_all.stale_facts.is_empty(),
+            "nothing archived when included"
+        );
+    }
+
+    #[test]
+    fn malformed_created_at_is_kept_not_archived() {
+        let coord = CoordinationConfig::default();
+        let mut bad = aged_fact("d-bad", FactKind::Decision, 0);
+        bad.created_at = "not-a-timestamp".to_string();
+        bad.seq = 1;
+        let snap = snapshot_from_facts_with_policy(&[bad], &coord, false);
+        assert_eq!(
+            snap.current_decisions.len(),
+            1,
+            "fail-open: malformed ts kept"
+        );
+        assert!(snap.stale_facts.is_empty());
+    }
+
+    // --- claim_reclaim_eligible: size-scaled, just-under/just-over, fail-closed ---
+    #[test]
+    fn single_file_claim_reclaims_after_small_timeout() {
+        let coord = CoordinationConfig::default(); // small 30m, large 2h
+        // owner silent 31m → eligible (single file = small = 30m)
+        let (claim, snap) = claim_with("ghost", &["file:src/a.rs"], 31 * 60);
+        let (eligible, size) = snap.claim_reclaim_eligible(&claim, &coord);
+        assert!(eligible, "single-file claim reclaimable at 31m");
+        assert_eq!(size, WorkSize::Small);
+
+        // owner silent 29m → NOT eligible
+        let (claim2, snap2) = claim_with("ghost", &["file:src/a.rs"], 29 * 60);
+        let (eligible2, _) = snap2.claim_reclaim_eligible(&claim2, &coord);
+        assert!(!eligible2, "single-file claim NOT reclaimable at 29m");
+    }
+
+    #[test]
+    fn multi_file_claim_only_reclaims_after_large_timeout() {
+        let coord = CoordinationConfig::default();
+        // multi-file, owner silent 31m → NOT eligible (large = 2h)
+        let (claim, snap) = claim_with("ghost", &["file:src/a.rs", "file:src/b.rs"], 31 * 60);
+        let (eligible, size) = snap.claim_reclaim_eligible(&claim, &coord);
+        assert!(!eligible, "multi-file claim NOT reclaimable at 31m");
+        assert_eq!(size, WorkSize::Large);
+
+        // owner silent 121m → eligible
+        let (claim2, snap2) = claim_with("ghost", &["file:src/a.rs", "file:src/b.rs"], 121 * 60);
+        let (eligible2, _) = snap2.claim_reclaim_eligible(&claim2, &coord);
+        assert!(eligible2, "multi-file claim reclaimable at 121m");
+    }
+
+    #[test]
+    fn dir_scope_claim_uses_large_timeout() {
+        let coord = CoordinationConfig::default();
+        let (claim, snap) = claim_with("ghost", &["dir:src"], 31 * 60);
+        let (eligible, size) = snap.claim_reclaim_eligible(&claim, &coord);
+        assert_eq!(size, WorkSize::Large, "dir scope is coarse");
+        assert!(!eligible, "dir claim not reclaimable at 31m");
+    }
+
+    #[test]
+    fn malformed_owner_last_seen_is_never_reclaimable() {
+        let coord = CoordinationConfig::default();
+        let mut claim = aged_fact("claim-1", FactKind::Claim, 0);
+        claim.tool = Some("ghost".to_string());
+        claim.scope = vec!["file:src/a.rs".to_string()];
+        let mut sq = squad("ghost", 0);
+        sq.last_seen_ts = "garbage".to_string(); // unparseable
+        let snap = RoomSnapshot {
+            squads: vec![sq],
+            ..Default::default()
+        };
+        let (eligible, _) = snap.claim_reclaim_eligible(&claim, &coord);
+        assert!(!eligible, "fail-closed: malformed last_seen never reclaims");
+    }
+
+    #[test]
+    fn unknown_owner_is_never_reclaimable() {
+        let coord = CoordinationConfig::default();
+        let mut claim = aged_fact("claim-1", FactKind::Claim, 0);
+        claim.tool = Some("ghost".to_string());
+        claim.scope = vec!["file:src/a.rs".to_string()];
+        // squad list does NOT contain "ghost"
+        let snap = RoomSnapshot {
+            squads: vec![squad("someone-else", 999999)],
+            ..Default::default()
+        };
+        let (eligible, _) = snap.claim_reclaim_eligible(&claim, &coord);
+        assert!(!eligible, "fail-closed: no squad entry for owner");
+    }
+
+    #[test]
+    fn config_tunables_change_timeout() {
+        // custom small=10m: owner silent 11m on a single file → eligible
+        let coord = CoordinationConfig {
+            reclaim_small_minutes: 10,
+            ..CoordinationConfig::default()
+        };
+        let (claim, snap) = claim_with("ghost", &["file:src/a.rs"], 11 * 60);
+        let (eligible, _) = snap.claim_reclaim_eligible(&claim, &coord);
+        assert!(eligible, "custom 10m small timeout honored");
+        // at 9m, not yet
+        let (claim2, snap2) = claim_with("ghost", &["file:src/a.rs"], 9 * 60);
+        let (eligible2, _) = snap2.claim_reclaim_eligible(&claim2, &coord);
+        assert!(!eligible2);
+    }
+
+    #[test]
+    fn classify_helper_matches_parse() {
+        // sanity: a parsed file scope classifies Small.
+        let rs = ResourceScope {
+            resource_type: ResourceType::File,
+            identifier: "src/a.rs".to_string(),
+            access: AccessMode::Exclusive,
+        };
+        assert_eq!(crate::decay::classify_work_size(&[rs], 1), WorkSize::Small);
+    }
+}
+
+#[cfg(test)]
+mod sec001_takeover_guard_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let r = std::env::temp_dir().join(format!("rally-sec001-{label}-{nanos}"));
+        fs::create_dir_all(&r).unwrap();
+        r
+    }
+
+    fn iso_ago(secs: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::seconds(secs.max(0)))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    fn fact_at(event_id: &str, kind: FactKind, tool: &str, scope: &str, created_at: &str) -> Fact {
+        Fact {
+            from_session_id: None,
+            schema: fact_schema(),
+            event_id: event_id.to_string(),
+            seq: 0,
+            thread_id: format!("t-{event_id}"),
+            kind,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("s-{event_id}"),
+            scope: vec![scope.to_string()],
+            created_at: created_at.to_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        }
+    }
+
+    #[test]
+    fn marker_parser_extracts_owners() {
+        let ev = vec![
+            "produces:x".to_string(),
+            "authorized-takeover:stale-owner=ghost,other".to_string(),
+        ];
+        assert_eq!(
+            RoomStore::takeover_owners_marker(&ev),
+            Some(vec!["ghost".to_string(), "other".to_string()])
+        );
+        assert_eq!(RoomStore::takeover_owners_marker(&["x".to_string()]), None);
+    }
+
+    #[test]
+    fn takeover_refused_when_owner_revived_under_lock() {
+        let r = root("revived");
+        let store = RoomStore::open_at(r.clone()).unwrap();
+        // Stale owner "ghost" claimed a single file long ago (>30m => small,
+        // reclaim-eligible at snapshot time).
+        let claim = fact_at(
+            "claim-g",
+            FactKind::Claim,
+            "ghost",
+            "file:src/a.rs",
+            &iso_ago(40 * 60),
+        );
+        store.append_fact(&claim).unwrap();
+        // ghost REVIVES: posts a fresh fact (now its squad last_seen is ~now).
+        let revive = fact_at(
+            "revive-g",
+            FactKind::Presence,
+            "ghost",
+            "presence",
+            &iso_ago(1),
+        );
+        store.append_fact(&revive).unwrap();
+        // A peer attempts a takeover release marked for ghost. The in-lock guard
+        // must REFUSE because ghost is no longer stale.
+        let mut release = fact_at(
+            "rel-1",
+            FactKind::Release,
+            "peer",
+            "file:src/a.rs",
+            &iso_ago(0),
+        );
+        release.ref_id = Some("claim-g".to_string());
+        release.evidence = vec!["authorized-takeover:stale-owner=ghost".to_string()];
+        let err = store.append_fact(&release).unwrap_err().to_string();
+        assert!(
+            err.contains("takeover refused") && err.contains("revived"),
+            "revived owner's claim must not be reclaimed; got: {err}"
+        );
+        // ghost still owns its claim.
+        let snap = store.snapshot().unwrap();
+        assert!(snap.active_claims.iter().any(|c| c.event_id == "claim-g"));
+        fs::remove_dir_all(&r).ok();
+    }
+
+    #[test]
+    fn takeover_allowed_when_owner_still_stale() {
+        let r = root("still-stale");
+        let store = RoomStore::open_at(r.clone()).unwrap();
+        // ghost claimed a single file 40m ago and has NOT revived -> eligible.
+        let claim = fact_at(
+            "claim-g",
+            FactKind::Claim,
+            "ghost",
+            "file:src/a.rs",
+            &iso_ago(40 * 60),
+        );
+        store.append_fact(&claim).unwrap();
+        let mut release = fact_at(
+            "rel-1",
+            FactKind::Release,
+            "peer",
+            "file:src/a.rs",
+            &iso_ago(0),
+        );
+        release.ref_id = Some("claim-g".to_string());
+        release.evidence = vec!["authorized-takeover:stale-owner=ghost".to_string()];
+        // Guard passes (owner still stale); release succeeds.
+        store.append_fact(&release).unwrap();
+        let snap = store.snapshot().unwrap();
+        assert!(
+            !snap.active_claims.iter().any(|c| c.event_id == "claim-g"),
+            "stale owner's claim is reclaimed when it is genuinely stale"
+        );
+        fs::remove_dir_all(&r).ok();
+    }
+
+    #[test]
+    fn ordinary_self_release_has_no_takeover_guard() {
+        let r = root("self-release");
+        let store = RoomStore::open_at(r.clone()).unwrap();
+        let claim = fact_at(
+            "claim-s",
+            FactKind::Claim,
+            "me",
+            "file:src/a.rs",
+            &iso_ago(5),
+        );
+        store.append_fact(&claim).unwrap();
+        // No takeover marker -> guard is skipped; a normal release works.
+        let mut release = fact_at(
+            "rel-s",
+            FactKind::Release,
+            "me",
+            "file:src/a.rs",
+            &iso_ago(0),
+        );
+        release.ref_id = Some("claim-s".to_string());
+        store.append_fact(&release).unwrap();
+        let snap = store.snapshot().unwrap();
+        assert!(!snap.active_claims.iter().any(|c| c.event_id == "claim-s"));
+        fs::remove_dir_all(&r).ok();
     }
 }

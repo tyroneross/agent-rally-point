@@ -7,6 +7,48 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Added — Coordination recency decay + size-scaled lead/ownership auto-reclaim
+
+A single shared coordination policy now governs two behaviors. All tunables live
+under a `"coordination"` object in `.rally/config.json` (default → user → repo →
+env precedence, mirroring `hooks`). The math is the single source of truth in the
+new `crates/rally-cli/src/decay.rs`.
+
+- **Time-based recency decay.** Every coordination message (fact) gets a
+  continuously-computed weight from its age, `weight = 0.5 ^ (age_hours /
+  half_life)` (exponential half-life, default 48h). `rally room` orders the
+  decision / risk / artifact buckets fresh-first by weight; `rally recent` and
+  `rally next` inherit recency ordering. A message whose weight falls below the
+  archive floor (default `0.05`, ≈14d) is moved OUT of the active view into
+  `stale_facts` (losslessly — the raw segments stay on disk). Re-include
+  decayed messages with `rally room --include-archived` / `rally recent
+  --include-archived`. Active state (claims, blockers, open handoffs) is never
+  decayed — only historical message buckets. Tunables: `half_life_hours`,
+  `archive_floor_weight` (env `RALLY_HALF_LIFE_HOURS`, `RALLY_ARCHIVE_FLOOR`).
+- **Size-scaled lead/ownership auto-reclaim.** A stale owner's claim becomes
+  reclaimable on a timeout that SCALES with the claimed work: a single-file
+  claim after the small timeout (default 30m), a multi-file / directory / repo /
+  task claim after the large timeout (default 2h — equal to the prior flat
+  `TAKEOVER_STALE_SECS`, so coarse claims keep their existing grace window).
+  Size is derived from the claim's existing `ResourceType` breadth + scope
+  count (no new claim metadata). The size-scaled window also sets the claim's
+  `lease_expires_at` evidence at claim time. The destructive reclaim path
+  (`command_release_by_path`) records the reason + size class in the release
+  fact's provenance (`reclaim-reason:stale-by-timeout;work-size=…`). Tunables:
+  `reclaim_small_minutes`, `reclaim_large_minutes` (env
+  `RALLY_RECLAIM_SMALL_MINUTES`, `RALLY_RECLAIM_LARGE_MINUTES`).
+- **Preserved invariants.** Reclaim stays race-safe (the `.rally/mutation.lock`
+  flock is untouched) and FAIL-CLOSED: an owner whose `last_seen_ts` is missing
+  or unparseable is never reclaimable. Recency decay fails OPEN: a message with
+  an unparseable `created_at` is treated as fresh and never hidden.
+- **Behavior change to note.** A single-file claim that previously had the flat
+  2h takeover grace is now reclaimable after 30m by default — an intentional
+  tightening of narrow claims (multi-file / coarse claims are unchanged).
+
+Verified: `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`
+(workspace green; new unit + integration coverage for the reference decay ages,
+the archive-floor boundary, and the small/large reclaim timing incl. fail-closed).
+
 ## 0.1.2 — Binary auto-provision hardening (2026-06-11)
 
 Hardening of `hooks/ensure-rally-binary.sh` across five rounds of dual-vendor
