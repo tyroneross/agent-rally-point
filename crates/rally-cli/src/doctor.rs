@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! `rally doctor` — read-only diagnostics for path hygiene and room registry.
+//! `rally doctor` — diagnostics and remediation for path hygiene, room registry, and stale state.
 //!
-//! Two independent modes:
+//! Three independent modes:
 //!   --canonical-paths  scan active claims for non-canonical scopes and suffix collisions
 //!   --prune-rooms      classify registry entries as live/stale; remove stale ones with --apply
+//!   --reap-stale       reap over-TTL in-room claims and stale lead leases (dry-run; commit with --apply)
 
 use schemars::JsonSchema;
 use serde::Serialize;

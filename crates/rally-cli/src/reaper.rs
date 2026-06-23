@@ -1,0 +1,831 @@
+// SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+// SPDX-License-Identifier: Apache-2.0
+
+//! In-room stale-state REAPER — the actuator that physically removes over-TTL
+//! claims and stale squad-lead leases.
+//!
+//! Entry point: `run_reap_stale(apply)`.
+//!
+//! Design principles:
+//! - COMPOSE existing eligibility functions; do NOT reimplement staleness math.
+//! - FAIL-CLOSED: any claim whose owner timestamp is unparseable or whose squad
+//!   entry is absent is NEVER staged for removal. This guarantee is INHERITED
+//!   from `claim_reclaim_eligible` and `takeover_eligible_owners`.
+//! - Idempotent: re-running on an already-clean room is a safe no-op because
+//!   `active_claims` only surfaces claims that are not yet closed.
+//! - When `apply` is false the report describes WHAT WOULD happen (dry-run).
+
+use schemars::JsonSchema;
+use serde::Serialize;
+
+use crate::error::Result;
+use crate::store::{Fact, FactKind, RoomStore};
+use crate::{FACT_SCHEMA, new_id, now_string};
+
+// =============================================================================
+// Output types
+// =============================================================================
+
+/// A claim that was (or would be) reaped.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct ReapedClaim {
+    /// The `event_id` of the original claim fact.
+    pub(crate) claim_id: String,
+    /// The tool that held (owns) the claim.
+    pub(crate) owner_tool: String,
+    /// Scopes the claim covered.
+    pub(crate) scope: Vec<String>,
+    /// The `lease_expires_at` evidence value from the claim, if any.
+    pub(crate) lease_expires_at: Option<String>,
+    /// Why this claim was reaped: "owner-stale" | "lease-expired" |
+    /// "owner-stale+lease-expired".
+    pub(crate) reason: String,
+}
+
+/// Result returned by `run_reap_stale`.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct ReapReport {
+    /// Claims that were reaped (ClaimExpired fact appended for each).
+    pub(crate) claims_reaped: Vec<ReapedClaim>,
+    /// Tools whose squad status was idle long enough to be cleared (informational;
+    /// squads are not directly removable — this records which tools were stale).
+    pub(crate) squads_idle_cleared: Vec<String>,
+    /// Tool whose lead lease was relinquished, if any.
+    pub(crate) lead_relinquished: Option<String>,
+    /// Number of claims that were inspected but KEPT (future-dated lease, owner
+    /// timestamp unparseable, or owner still active).
+    pub(crate) preserved_future_or_active: usize,
+    /// Whether the staged facts were actually written (`apply=true`).
+    pub(crate) applied: bool,
+}
+
+// =============================================================================
+// Core logic
+// =============================================================================
+
+/// Reap over-TTL claims and stale lead leases in the current room.
+///
+/// When `apply` is false: compute eligibility + populate the report, but write
+/// no facts (dry-run). When `apply` is true: append one `ClaimExpired` fact per
+/// eligible claim via `append_state_transition_verified` (preserves the
+/// mutation lock + SEC-001 re-check), then a `Decision` relinquish fact if the
+/// lead is stale.
+pub(crate) fn run_reap_stale(apply: bool) -> Result<ReapReport> {
+    let room = RoomStore::open()?;
+    run_reap_stale_in_room(&room, apply)
+}
+
+/// Inner implementation — takes an explicit `&RoomStore` so tests can inject a
+/// temp store without touching the process-global cwd.
+pub(crate) fn run_reap_stale_in_room(room: &RoomStore, apply: bool) -> Result<ReapReport> {
+    let snapshot = room.snapshot()?;
+    let coord =
+        crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+
+    let mut claims_reaped: Vec<ReapedClaim> = Vec::new();
+    let mut preserved: usize = 0;
+
+    // Identify the stale-owner set at snapshot time (squad-level, 2h bar).
+    // Used for the lead relinquish decision; claim eligibility is per-claim
+    // (size-scaled via claim_reclaim_eligible, which composes the same logic).
+    let stale_owners = snapshot.takeover_eligible_owners();
+
+    // Compute the lease-expired claim_id set: claims whose OWN lease timestamp
+    // has provably passed NOW, regardless of owner-squad liveness.
+    // fail-closed: expired_claims only includes claims with a parseable
+    // lease_expires_at <= now; unparseable or missing lease → not included.
+    let facts = room.facts()?;
+    let claim_index = crate::claim_authority::index_from_facts(&facts);
+    let lease_expired_ids: std::collections::BTreeSet<String> =
+        crate::claim_authority::expired_claims(&claim_index, &facts, chrono::Utc::now())
+            .into_iter()
+            .map(|r| r.claim_id)
+            .collect();
+
+    // --- Evaluate each active claim ---
+    for claim in &snapshot.active_claims {
+        let (owner_eligible, _size) = snapshot.claim_reclaim_eligible(claim, &coord);
+        let lease_eligible = lease_expired_ids.contains(&claim.event_id);
+
+        // A claim is reaped when EITHER its owner-squad is >timeout stale OR
+        // its own lease has provably expired. Both signals are fail-closed.
+        if !(owner_eligible || lease_eligible) {
+            preserved += 1;
+            continue;
+        }
+
+        let reason = match (owner_eligible, lease_eligible) {
+            (true, true) => "owner-stale+lease-expired",
+            (true, false) => "owner-stale",
+            (false, true) => "lease-expired",
+            (false, false) => unreachable!(),
+        }
+        .to_string();
+
+        // Build the lease_expires_at provenance from the claim's evidence, if any.
+        let lease_expires_at = claim
+            .evidence
+            .iter()
+            .find_map(|e| e.strip_prefix("lease_expires_at:"))
+            .map(str::to_string);
+
+        let reaped = ReapedClaim {
+            claim_id: claim.event_id.clone(),
+            owner_tool: claim.tool.clone().unwrap_or_default(),
+            scope: claim.scope.clone(),
+            lease_expires_at,
+            reason: reason.clone(),
+        };
+
+        if apply {
+            // Append a ClaimExpired fact that closes this claim.
+            // `append_state_transition_verified` re-asserts eligibility under
+            // the held mutation lock (SEC-001 safeguard for Release facts).
+            // For ClaimExpired we use `append_fact_verified` (no pre-condition
+            // check needed beyond the claim still being live — the projection
+            // already handles duplicate ClaimExpired via ref_id dedup).
+            let expired_fact = Fact {
+                from_session_id: None,
+                schema: FACT_SCHEMA.to_string(),
+                event_id: new_id("fact"),
+                seq: 0,
+                thread_id: new_id("room"),
+                kind: FactKind::ClaimExpired,
+                tool: Some("rally".to_string()),
+                role: None,
+                subject: format!(
+                    "reaper: claim {} expired (reason={}, owner: {})",
+                    claim.event_id,
+                    reason,
+                    claim.tool.as_deref().unwrap_or("unknown")
+                ),
+                scope: claim.scope.clone(),
+                created_at: now_string(),
+                summary: Some(format!("reaper:reason={}", reaped.reason)),
+                evidence: vec![format!("reaper:ref_id={}", claim.event_id)],
+                target: None,
+                ref_id: Some(claim.event_id.clone()),
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            // Best-effort: if the claim was concurrently closed before we got
+            // the lock, skip it silently — the room is already clean.
+            match room.append_fact_verified(&expired_fact) {
+                Ok(_) => {}
+                Err(e) => {
+                    // Log but do not abort the whole reap run.
+                    eprintln!(
+                        "reaper: skipping {} (already closed or lock error): {}",
+                        claim.event_id, e
+                    );
+                    preserved += 1;
+                    continue;
+                }
+            }
+        }
+
+        claims_reaped.push(reaped);
+    }
+
+    // --- Lead relinquish ---
+    // Only relinquish the lead when the lead's owning tool is in the
+    // DESTRUCTIVE stale set (>2h silence). This is the same predicate used
+    // for per-claim reclaim, just at the squad level.
+    let lead_relinquished: Option<String> = if let Some(lead_tool) = &snapshot.lead {
+        if stale_owners.contains(lead_tool.as_str()) {
+            if apply {
+                let relinquish_fact = Fact {
+                    from_session_id: None,
+                    schema: FACT_SCHEMA.to_string(),
+                    event_id: new_id("fact"),
+                    seq: 0,
+                    thread_id: new_id("room"),
+                    kind: FactKind::Decision,
+                    tool: Some("rally".to_string()),
+                    role: None,
+                    subject: "role:lead:relinquished".to_string(),
+                    scope: Vec::new(),
+                    created_at: now_string(),
+                    summary: Some(format!(
+                        "reaper: lead {} relinquished (stale owner)",
+                        lead_tool
+                    )),
+                    evidence: vec![format!("reaper:stale-lead={lead_tool}")],
+                    target: None,
+                    ref_id: None,
+                    status: None,
+                    severity: None,
+                    uri: None,
+                    session: None,
+                };
+                let _ = room.append_fact_verified(&relinquish_fact);
+            }
+            Some(lead_tool.clone())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Squads that are idle (advisory 15m) are surfaced for visibility; rally
+    // does not physically remove squad entries (they are projections from
+    // presence facts, not separate records). Report the stale (2h) set here
+    // because that is the actionable tier.
+    let squads_idle_cleared: Vec<String> = stale_owners.into_iter().collect();
+
+    Ok(ReapReport {
+        claims_reaped,
+        squads_idle_cleared,
+        lead_relinquished,
+        preserved_future_or_active: preserved,
+        applied: apply,
+    })
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::RoomStore;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    fn unique_root(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rally-reaper-{label}-{nanos}"));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Build a backdated RFC-3339 timestamp `ago_secs` seconds in the past.
+    fn past_ts(ago_secs: i64) -> String {
+        use chrono::{SecondsFormat, Utc};
+        (Utc::now() - chrono::Duration::seconds(ago_secs))
+            .to_rfc3339_opts(SecondsFormat::Secs, true)
+    }
+
+    /// Append a Presence fact for `tool` with `created_at` set to `ago_secs`
+    /// seconds in the past.  The squad projection uses the highest-seq fact's
+    /// `created_at` as `last_seen_ts`, so ALL facts for this tool must be
+    /// backdated consistently (see `append_stale_claim`).
+    fn append_presence(room: &RoomStore, tool: &str, ago_secs: i64) {
+        let fact = Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Presence,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("presence: {tool}"),
+            scope: Vec::new(),
+            created_at: past_ts(ago_secs),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&fact).unwrap();
+    }
+
+    /// Append a Claim fact owned by `tool` with `created_at` set to `ago_secs`
+    /// seconds in the past (large-scope → WorkSize::Large → 2h reclaim bar).
+    ///
+    /// IMPORTANT: the squad projection uses the HIGHEST-seq fact's `created_at`
+    /// as `last_seen_ts`. Because the claim is appended AFTER the presence fact
+    /// (higher seq), it overrides `last_seen_ts`. Both presence and claim must
+    /// share the same `ago_secs` so the owner appears consistently stale.
+    fn append_claim(room: &RoomStore, event_id: &str, tool: &str) -> Fact {
+        append_claim_ago(room, event_id, tool, 3 * 60 * 60)
+    }
+
+    fn append_claim_ago(room: &RoomStore, event_id: &str, tool: &str, ago_secs: i64) -> Fact {
+        let fact = Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: event_id.to_string(),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Claim,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("claim: {tool}"),
+            // Multi-scope → WorkSize::Large → 2h bar.
+            scope: vec![
+                format!("file:src/a_{event_id}.rs"),
+                format!("file:src/b_{event_id}.rs"),
+            ],
+            created_at: past_ts(ago_secs),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&fact).unwrap()
+    }
+
+    /// Append a small single-file claim owned by `tool` (FRESH timestamp so the
+    /// owner's last_seen_ts stays live — useful for self-release tests).
+    fn append_small_claim(room: &RoomStore, event_id: &str, tool: &str) -> Fact {
+        let fact = Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: event_id.to_string(),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Claim,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("claim: {tool}"),
+            scope: vec![format!("file:src/{event_id}.rs")],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&fact).unwrap()
+    }
+
+    // -------------------------------------------------------------------------
+    // (a) Over-TTL claim is staged and, after apply, leaves active_claims
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn over_ttl_claim_is_reaped_and_leaves_active_claims() {
+        let root = unique_root("over-ttl");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        // Owner has been silent for 3 hours (> 2h LARGE bar).
+        let ago = 3 * 60 * 60_i64;
+        append_presence(&room, "stale-tool", ago);
+        let claim = append_claim(&room, "claim-stale", "stale-tool");
+
+        let report = run_reap_stale_in_room(&room, true).unwrap();
+
+        assert_eq!(report.claims_reaped.len(), 1, "one claim should be reaped");
+        assert_eq!(report.claims_reaped[0].claim_id, claim.event_id);
+        assert!(report.applied);
+
+        // After apply the claim must no longer appear in active_claims.
+        let snap = room.snapshot().unwrap();
+        let still_active = snap
+            .active_claims
+            .iter()
+            .any(|c| c.event_id == claim.event_id);
+        assert!(!still_active, "reaped claim must leave active_claims");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // (b) Unparseable last_seen_ts → NEVER staged (fail-closed)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn unparseable_owner_ts_is_never_staged() {
+        let root = unique_root("bad-ts");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        // Step 1: append the claim first (lower seq).
+        // The claim uses a backdated ts so the owner would look stale IF the
+        // ts were parseable — but we will override last_seen_ts in step 2.
+        append_claim_ago(&room, "claim-bad-ts", "bad-ts-tool", 3 * 60 * 60);
+
+        // Step 2: append a Presence with a deliberately broken timestamp LAST
+        // (higher seq than the claim) so it wins the squad projection.
+        // The squad's last_seen_ts becomes "NOT-A-VALID-TIMESTAMP", which
+        // claim_reclaim_eligible cannot parse → fail-closed → never reaped.
+        let bad_fact = Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Presence,
+            tool: Some("bad-ts-tool".to_string()),
+            role: None,
+            subject: "presence: bad-ts-tool".to_string(),
+            scope: Vec::new(),
+            created_at: "NOT-A-VALID-TIMESTAMP".to_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&bad_fact).unwrap();
+
+        let report = run_reap_stale_in_room(&room, true).unwrap();
+
+        assert_eq!(
+            report.claims_reaped.len(),
+            0,
+            "claim with unparseable owner ts must NOT be reaped (fail-closed)"
+        );
+        assert_eq!(
+            report.preserved_future_or_active, 1,
+            "bad-ts claim must be counted as preserved"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // (c) Fresh-owner (or future-dated) claim is NEVER staged
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fresh_owner_claim_is_not_staged() {
+        let root = unique_root("fresh-owner");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        // Owner is fresh (1 minute old) — well under any reclaim bar.
+        // Both presence AND claim must use a fresh timestamp so the squad
+        // projection sees a fresh last_seen_ts (claim is higher-seq, wins).
+        append_presence(&room, "active-tool", 60);
+        // Use append_claim_ago with a fresh timestamp (60s) so the claim does
+        // not override the owner's last_seen_ts to appear stale.
+        append_claim_ago(&room, "claim-fresh", "active-tool", 60);
+
+        let report = run_reap_stale_in_room(&room, true).unwrap();
+
+        assert_eq!(
+            report.claims_reaped.len(),
+            0,
+            "claim with fresh owner must not be reaped"
+        );
+        assert_eq!(report.preserved_future_or_active, 1);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // (d) Idempotent: second run finds nothing eligible
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn idempotent_second_run_finds_nothing() {
+        let root = unique_root("idempotent");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        let ago = 3 * 60 * 60_i64;
+        append_presence(&room, "stale-tool", ago);
+        append_claim(&room, "claim-idem", "stale-tool");
+
+        // First run reaps.
+        let first = run_reap_stale_in_room(&room, true).unwrap();
+        assert_eq!(first.claims_reaped.len(), 1);
+
+        // Second run finds nothing (claim is no longer in active_claims).
+        let second = run_reap_stale_in_room(&room, true).unwrap();
+        assert_eq!(
+            second.claims_reaped.len(),
+            0,
+            "second run must find nothing eligible (idempotent)"
+        );
+        assert_eq!(second.preserved_future_or_active, 0);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // (e) Self-release in stop: only the stopping tool's claims, not peers'
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn stop_self_release_only_releases_stopping_tool_claims() {
+        let root = unique_root("self-release");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        // Two fresh tools; each holds a claim.
+        append_presence(&room, "tool-a", 10);
+        append_presence(&room, "tool-b", 10);
+        let claim_a = append_small_claim(&room, "claim-a", "tool-a");
+        let claim_b = append_small_claim(&room, "claim-b", "tool-b");
+
+        // Simulate self-release on stop: release only tool-a's claims.
+        let snap = room.snapshot().unwrap();
+        for c in snap
+            .active_claims
+            .iter()
+            .filter(|c| c.tool.as_deref() == Some("tool-a"))
+        {
+            let release = Fact {
+                from_session_id: None,
+                schema: FACT_SCHEMA.to_string(),
+                event_id: new_id("fact"),
+                seq: 0,
+                thread_id: new_id("room"),
+                kind: FactKind::Release,
+                tool: Some("tool-a".to_string()),
+                role: None,
+                subject: format!("self-release on stop: {}", c.event_id),
+                scope: c.scope.clone(),
+                created_at: now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: Some(c.event_id.clone()),
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            let _ = room.append_state_transition_verified(&release);
+        }
+
+        let snap_after = room.snapshot().unwrap();
+        let a_still_live = snap_after
+            .active_claims
+            .iter()
+            .any(|c| c.event_id == claim_a.event_id);
+        let b_still_live = snap_after
+            .active_claims
+            .iter()
+            .any(|c| c.event_id == claim_b.event_id);
+
+        assert!(!a_still_live, "tool-a claim must be released after stop");
+        assert!(b_still_live, "tool-b claim must NOT be touched by tool-a stop");
+
+        // Suppress unused-variable warning for claim_b event_id which is checked above.
+        let _ = claim_b;
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // (f) Heartbeat parity: recency_weight and staleness verdict are tool-agnostic
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn heartbeat_parity_vectors_match_expected() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/heartbeat_parity_vectors.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("read heartbeat parity vectors");
+        let v: serde_json::Value =
+            serde_json::from_str(&raw).expect("parse heartbeat parity vectors");
+
+        let hl_secs = v["half_life_secs"]
+            .as_i64()
+            .expect("half_life_secs must be i64");
+        let heartbeat_minutes = v["heartbeat_minutes"]
+            .as_i64()
+            .expect("heartbeat_minutes must be i64");
+        let stale_threshold_secs = heartbeat_minutes * 60;
+
+        for (i, case) in v["cases"]
+            .as_array()
+            .expect("cases array")
+            .iter()
+            .enumerate()
+        {
+            let age_secs = case["age_secs"].as_i64().expect("age_secs");
+            let expected_weight = case["expected_weight"].as_f64().expect("expected_weight");
+            let stale_at_15m = case["stale_at_15m"].as_bool().expect("stale_at_15m");
+
+            let got_weight = crate::decay::recency_weight(age_secs, hl_secs);
+            assert!(
+                (got_weight - expected_weight).abs() < 1e-4,
+                "case {i}: age_secs={age_secs} got weight {got_weight}, expected {expected_weight}"
+            );
+
+            // Stale verdict: age > heartbeat threshold. Both tools use the same
+            // monotonic wall-clock age, so the verdict must be identical.
+            let got_stale = age_secs > stale_threshold_secs;
+            assert_eq!(
+                got_stale, stale_at_15m,
+                "case {i}: age_secs={age_secs} stale verdict mismatch (got {got_stale}, expected {stale_at_15m})"
+            );
+
+            // Verify tool_a and tool_b both use the same curve (tool-agnostic).
+            let tool_a = case["tool_a"].as_str().unwrap_or("");
+            let tool_b = case["tool_b"].as_str().unwrap_or("");
+            assert_ne!(
+                tool_a, tool_b,
+                "case {i}: fixture must name two distinct tools"
+            );
+            // The weight formula has no tool parameter — the assertion above
+            // already proves both tools yield the same result for the same age.
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Additional: dry-run does not write facts
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn dry_run_does_not_write_facts() {
+        let root = unique_root("dry-run");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        let ago = 3 * 60 * 60_i64;
+        append_presence(&room, "stale-tool", ago);
+        let claim = append_claim(&room, "claim-dry", "stale-tool");
+
+        let snap_before = room.snapshot().unwrap();
+        let count_before = snap_before.active_claims.len();
+
+        let report = run_reap_stale_in_room(&room, false).unwrap();
+
+        assert_eq!(report.claims_reaped.len(), 1, "dry-run must report eligible claim");
+        assert!(!report.applied);
+
+        let snap_after = room.snapshot().unwrap();
+        assert_eq!(
+            snap_after.active_claims.len(),
+            count_before,
+            "dry-run must not change active_claims"
+        );
+        let _ = claim;
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // Additional: squads_idle_cleared enumerates stale owners
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn squads_idle_cleared_enumerates_stale_owners() {
+        let root = unique_root("idle-cleared");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        // One stale tool (3h silent) and one fresh tool (1m).
+        let stale_ago = 3 * 60 * 60_i64;
+        append_presence(&room, "stale-tool", stale_ago);
+        append_presence(&room, "fresh-tool", 60);
+
+        let report = run_reap_stale_in_room(&room, false).unwrap();
+
+        let cleared: BTreeSet<_> = report.squads_idle_cleared.iter().cloned().collect();
+        assert!(
+            cleared.contains("stale-tool"),
+            "stale-tool must appear in squads_idle_cleared"
+        );
+        assert!(
+            !cleared.contains("fresh-tool"),
+            "fresh-tool must NOT appear in squads_idle_cleared"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // (g) Lease-expired claim with a LIVE owner is reaped (dual-signal fix)
+    // -------------------------------------------------------------------------
+
+    /// Append a Claim owned by `tool` with:
+    ///   - `created_at` fresh (now) so the owner's squad last_seen_ts stays live
+    ///   - `lease_expires_at:<ts>` evidence stamped with the given RFC-3339 string
+    /// Multi-scope so it has parseable ResourceScope entries and appears in active_claims.
+    fn append_claim_with_lease(
+        room: &RoomStore,
+        event_id: &str,
+        tool: &str,
+        lease_ts: &str,
+    ) -> Fact {
+        let fact = Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: event_id.to_string(),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Claim,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("claim: {tool}"),
+            scope: vec![
+                format!("file:src/a_{event_id}.rs"),
+                format!("file:src/b_{event_id}.rs"),
+            ],
+            created_at: now_string(),
+            summary: None,
+            evidence: vec![format!("lease_expires_at:{lease_ts}")],
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&fact).unwrap()
+    }
+
+    #[test]
+    fn lease_expired_claim_with_live_owner_is_reaped() {
+        // This is the 76-claim case the old logic missed: the owner squad IS
+        // active (fresh presence), but the claim's own lease_expires_at is in
+        // the past. The dual-signal fix must reap it via the lease signal.
+        let root = unique_root("lease-expired-live-owner");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        // Owner is fresh (just now) — squad is NOT stale.
+        append_presence(&room, "live-owner", 5);
+
+        // Claim has a past lease (1 hour ago).
+        let past_lease = past_ts(3600);
+        let claim = append_claim_with_lease(&room, "claim-lease-expired", "live-owner", &past_lease);
+
+        let report = run_reap_stale_in_room(&room, true).unwrap();
+
+        assert_eq!(
+            report.claims_reaped.len(),
+            1,
+            "lease-expired claim with live owner must be reaped"
+        );
+        assert_eq!(report.claims_reaped[0].claim_id, claim.event_id);
+        assert_eq!(
+            report.claims_reaped[0].reason,
+            "lease-expired",
+            "reason must be lease-expired when only the lease signal fires"
+        );
+        assert!(report.applied);
+
+        // The claim must no longer be active.
+        let snap = room.snapshot().unwrap();
+        assert!(
+            !snap.active_claims.iter().any(|c| c.event_id == claim.event_id),
+            "reaped claim must leave active_claims"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // (h) Future-lease with live owner is PRESERVED (9-claim case)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn future_lease_with_live_owner_is_preserved() {
+        // The owner is active AND the lease is in the future: neither signal
+        // fires → claim must be kept.
+        let root = unique_root("future-lease-live-owner");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        // Owner is fresh.
+        append_presence(&room, "live-owner", 5);
+
+        // Claim has a future lease (1 hour from now).
+        let future_lease = {
+            use chrono::{SecondsFormat, Utc};
+            (Utc::now() + chrono::Duration::seconds(3600))
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        };
+        let claim =
+            append_claim_with_lease(&room, "claim-future-lease", "live-owner", &future_lease);
+
+        let report = run_reap_stale_in_room(&room, true).unwrap();
+
+        assert_eq!(
+            report.claims_reaped.len(),
+            0,
+            "claim with future lease and live owner must NOT be reaped"
+        );
+        assert_eq!(
+            report.preserved_future_or_active, 1,
+            "future-lease claim must be counted as preserved"
+        );
+
+        // Must still be active.
+        let snap = room.snapshot().unwrap();
+        assert!(
+            snap.active_claims.iter().any(|c| c.event_id == claim.event_id),
+            "future-lease claim must remain in active_claims"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+}

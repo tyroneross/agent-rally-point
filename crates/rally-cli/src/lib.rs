@@ -65,6 +65,7 @@ mod hooks_config;
 mod init;
 mod next;
 mod output;
+mod reaper;
 mod resource_scope;
 mod retrospective;
 mod ripple;
@@ -2079,8 +2080,19 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
         let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
         return Ok(Output::new(args.json, text, body));
     }
+    if args.reap_stale {
+        let data = reaper::run_reap_stale(args.apply)?;
+        let text = format!(
+            "doctor reap-stale: claims_reaped={} lead_relinquished={} applied={}",
+            data.claims_reaped.len(),
+            data.lead_relinquished.is_some(),
+            data.applied,
+        );
+        let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
+        return Ok(Output::new(args.json, text, body));
+    }
     Err(RallyError::Usage(
-        "rally doctor requires --canonical-paths or --prune-rooms".to_string(),
+        "rally doctor requires --canonical-paths, --prune-rooms, or --reap-stale".to_string(),
     ))
 }
 
@@ -4595,6 +4607,50 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                 {
                     let repo = repo_root().unwrap_or_else(|_| PathBuf::from("."));
                     let _ = run_worktree::cleanup(&repo, path, branch, "git");
+                }
+                // LEVER 3: self-release all active claims owned by the stopping
+                // tool before removing the session record. Self-release is
+                // authoritative (bypasses the 2h reclaim bar — the owner is
+                // declaring itself done), keeps SEC-001 dormant (no stale-owner
+                // marker on the release fact), and is best-effort (never blocks
+                // the stop path).
+                if let Ok(room) = RoomStore::open() {
+                    if let Ok(snap) = room.snapshot() {
+                        let stopping_tool = &session.tool;
+                        for claim in snap
+                            .active_claims
+                            .iter()
+                            .filter(|c| c.tool.as_deref() == Some(stopping_tool.as_str()))
+                        {
+                            let release = Fact {
+                                from_session_id: None,
+                                schema: FACT_SCHEMA.to_string(),
+                                event_id: new_id("fact"),
+                                seq: 0,
+                                thread_id: new_id("room"),
+                                kind: FactKind::Release,
+                                tool: Some(stopping_tool.clone()),
+                                role: None,
+                                subject: format!(
+                                    "self-release on stop: {}",
+                                    claim.event_id
+                                ),
+                                scope: claim.scope.clone(),
+                                created_at: now_string(),
+                                summary: None,
+                                // No authorized-takeover marker — this is a
+                                // self-release; SEC-001 stays dormant.
+                                evidence: Vec::new(),
+                                target: None,
+                                ref_id: Some(claim.event_id.clone()),
+                                status: None,
+                                severity: None,
+                                uri: None,
+                                session: None,
+                            };
+                            let _ = room.append_state_transition_verified(&release);
+                        }
+                    }
                 }
                 remove_session_record(&session.session_id)?;
             }

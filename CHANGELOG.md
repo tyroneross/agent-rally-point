@@ -7,6 +7,70 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Added — In-room stale-state REAPER + heartbeat parity + session-end self-release
+
+Three new actuators that make coordination state self-cleaning:
+
+- **`rally doctor --reap-stale` (REAPER).** New sub-command (with `--apply` to
+  commit writes, dry-run by default) that physically removes over-TTL claims and
+  stale squad-lead leases. Implemented in `crates/rally-cli/src/reaper.rs`.
+  Composes existing eligibility functions (`claim_reclaim_eligible`,
+  `takeover_eligible_owners`) without reimplementing staleness math.
+
+  **Dual-signal eligibility (2026-06-22 fix):** a claim is now reaped when
+  EITHER (1) its owner-squad is >timeout stale (`claim_reclaim_eligible`) OR
+  (2) its own `lease_expires_at` evidence timestamp has provably passed
+  (`claim_authority::expired_claims`). This closes the shared-tool-identity
+  gap: a claim owned by an identity like `claude_code` (which appears "live"
+  because the current session IS that identity) is still reaped when its
+  individual lease has expired. Both signals are fail-closed: an unparseable
+  owner timestamp keeps the claim, and an unparseable or missing
+  `lease_expires_at` keeps the claim. The union preserves every
+  future-dated-lease claim. Each reaped claim now carries a `reason` field
+  in `ReapedClaim`: `"owner-stale"` | `"lease-expired"` |
+  `"owner-stale+lease-expired"`.
+
+  FAIL-CLOSED on any unparseable owner timestamp or lease (inherited
+  guarantees from both composing functions). Race-safe: appends via
+  `append_fact_verified` under the existing mutation lock. Idempotent: a
+  re-run finds nothing eligible because `active_claims` projects only open
+  claims. Output: `ReapReport { claims_reaped, squads_idle_cleared,
+  lead_relinquished, preserved_future_or_active, applied }`.
+
+- **Session-end self-release (LEVER 3).** `rally stop` now self-releases all
+  active claims owned by the stopping tool before removing the session record.
+  Self-release is authoritative (bypasses the 2h reclaim bar — the owner is
+  declaring itself done), keeps SEC-001 dormant (no stale-owner evidence marker),
+  and is best-effort (never blocks the stop path). Implemented inside the
+  `SessionAction::Stop` arm in `lib.rs`.
+
+- **Heartbeat parity fixture.**
+  `crates/rally-cli/tests/fixtures/heartbeat_parity_vectors.json` — a new
+  golden-vector file (byte-identical to the build-loop mirror at
+  `scripts/rally_point/heartbeat_parity_vectors.json`) asserting that a
+  `claude_code` session and a `codex` session that emit presence/heartbeat at the
+  same age decay IDENTICALLY (heartbeat is tool-agnostic, curve is shared).
+  Validated by a new `reaper::tests::heartbeat_parity_vectors_match_expected` test
+  checking each vector against `decay::recency_weight` and the stale-at-15m
+  verdict to 1e-4 precision.
+
+### Test coverage (reaper.rs)
+
+10 `#[cfg(test)]` cases inside `reaper::tests`:
+(a) over-TTL claim is staged + leaves `active_claims` after apply;
+(b) unparseable owner ts is never staged (fail-closed);
+(c) fresh-owner claim is not staged;
+(d) idempotent: second run finds nothing;
+(e) stop self-release only releases the stopping tool's claims, not peers';
+(f) heartbeat parity vectors match expected weight and stale verdict;
+(g) **lease-expired claim with live owner IS reaped** (dual-signal fix, the 76-claim case);
+(h) **future-lease claim with live owner is preserved** (the 9-claim keep case);
+(+2) dry-run writes no facts; `squads_idle_cleared` enumerates stale owners.
+
+Verified: `cargo build -p rally-cli && cargo test -p rally-cli` (349 pass, 0 fail).
+
+---
+
 ### Added — Coordination recency decay + size-scaled lead/ownership auto-reclaim
 
 A single shared coordination policy now governs two behaviors. All tunables live

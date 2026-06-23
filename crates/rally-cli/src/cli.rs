@@ -244,7 +244,10 @@ pub(crate) struct DoctorArgs {
     pub(crate) canonical_paths: bool,
     /// Classify rooms registry entries as live/stale; with --apply, rewrite the index.
     pub(crate) prune_rooms: bool,
+    /// Reap over-TTL in-room presence/claims/leads (dry-run by default; commit with --apply).
+    pub(crate) reap_stale: bool,
     /// Apply the prune (rewrite index); only meaningful with --prune-rooms.
+    /// Also activates writes for --reap-stale.
     pub(crate) apply: bool,
 }
 
@@ -1209,13 +1212,17 @@ fn doctor_parser() -> impl Parser<DoctorArgs> {
     let prune_rooms = long("prune-rooms")
         .help("Classify rooms registry entries as live/stale (dry-run by default)")
         .switch();
+    let reap_stale = long("reap-stale")
+        .help("Reap over-TTL in-room presence/claims/leads (dry-run by default; commit with --apply)")
+        .switch();
     let apply = long("apply")
-        .help("Apply the prune: rewrite the registry index, keeping only live entries")
+        .help("Apply the prune: rewrite the registry index, keeping only live entries; also commits --reap-stale writes")
         .switch();
     construct!(DoctorArgs {
         json,
         canonical_paths,
         prune_rooms,
+        reap_stale,
         apply
     })
 }
