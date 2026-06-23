@@ -7,6 +7,43 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Added — Zombie-tmux prevention: three layers over one liveness model
+
+Stops accreted zombie `rally-*` tmux sessions at the source instead of relying on a
+clock. Root cause: rally `exec`s the agent, so a session auto-closes when its agent
+EXITS — but agents that never exit (a disabled autonomy poller, idle detached panes)
+leave the session forever, and tmux has no native idle/lifetime timeout. All three
+layers REUSE the single `liveness::is_live` 4-signal model + adaptive window; none
+adds a fixed idle clock.
+
+- **Layer 1 — completion-scoped self-exit.** New `rally self-exit-check --tool
+  <self> [--persistent] [--required-streak N]`: a task-scoped session that holds no
+  active claims AND for which `rally next` is non-actionable for a SUSTAINED streak
+  (default 2, persisted in the session's own `RALLY_SELFEXIT_STREAK` tmux env so it
+  dies with the session) self-kills its own tmux session → `exec` auto-closes it.
+  `--persistent` opts a deliberately-long-lived session out of the implicit "work
+  done" path; `rally stop` remains the explicit path. Decision:
+  `liveness::completion_self_exit_eligible`.
+- **Layer 2 — event-driven liveness-lease safety net.** `rally enter` now
+  opportunistically sweeps detached `rally-*` orphan tmux sessions (in addition to
+  `rally sessions --reap`), via one shared actuator (`sweep_orphan_tmux`).
+  Best-effort + fail-open: runs after presence, never blocks enter, never raises,
+  never reaps a live / parent-alive session. No daemon/cron.
+- **Layer 3 — parent-lifecycle binding.** `tmux_start_command` stamps
+  `RALLY_PARENT_PID=<launcher pid>` into the new session's env in the same atomic
+  `tmux new-session -e` call. The reaper reads it back, probes `kill -0 <pid>` (no
+  new crate dependency), and feeds the result to the single shared
+  `liveness::reapable(liveness, parent_alive)` authority.
+- **One reaper-eligibility authority** `liveness::reapable` (mirrored Rust↔Python;
+  `liveness_vectors.json` gains `reapable_cases` + `self_exit_cases`). Fail-safe:
+  Live/Unknown are NEVER reaped; parent-dead reaps only a session ALSO `Stale` by
+  liveness; missing parent info degrades to the window criterion alone (prior
+  orphan behavior, unchanged); `kill -0` non-ESRCH failures read ALIVE.
+- Tests: `liveness.rs` parity + dedicated `reapable`/`self_exit` cases;
+  `backends.rs` Layer-3 classifier cases (dead-parent reaped, live-parent kept,
+  code-progressing-with-dead-parent kept, missing-info window fallback, `kill -0`
+  self/dead probe).
+
 ### Added — Adaptive, multi-signal session liveness (squad-projection decay + tmux orphan reaper)
 
 Replaces fixed staleness cutoffs for the squad/presence projection with liveness

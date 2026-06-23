@@ -48,6 +48,8 @@ pub(crate) enum CliCommand {
     Adopt(AdoptArgs),
     /// Sweep-reap leftover rally per-agent worktrees and branches.
     WorktreeGc(WorktreeGcArgs),
+    /// Layer 1: completion-scoped self-exit re-check for a task-scoped session.
+    SelfExitCheck(SelfExitCheckArgs),
 }
 
 pub(crate) enum CliParse {
@@ -472,6 +474,25 @@ pub(crate) struct AckArgs {
     pub(crate) tool: String,
 }
 
+/// Layer 1 — `rally self-exit-check --tool <self> [--persistent]
+/// [--required-streak N]`. ONE stateless completion re-check: if this tool's
+/// owned rally work is resolved AND `rally next` is non-actionable for a
+/// SUSTAINED streak (persisted in the session's own tmux env, so it dies with
+/// the session), self-kill the agent's `rally-*` tmux session so `exec`
+/// auto-closes it. `--persistent` opts a deliberately-long-lived session out of
+/// the implicit "work done" exit entirely.
+#[derive(Clone, Debug)]
+pub(crate) struct SelfExitCheckArgs {
+    pub(crate) json: bool,
+    pub(crate) tool: String,
+    /// Opt-out: a deliberately-persistent session never self-exits on the
+    /// implicit completion path.
+    pub(crate) persistent: bool,
+    /// Consecutive non-actionable re-checks required before exit. Defaults to
+    /// `liveness::DEFAULT_SELF_EXIT_STREAK` when omitted.
+    pub(crate) required_streak: Option<i64>,
+}
+
 /// `rally board [--json]`
 #[derive(Clone, Debug)]
 pub(crate) struct BoardArgs {
@@ -639,6 +660,8 @@ const COMMANDS: &[&str] = &[
     "adopt",
     // Sweep-reaper: GC leftover per-agent worktrees
     "worktree",
+    // Layer 1: completion-scoped self-exit re-check
+    "self-exit-check",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -847,6 +870,12 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .command("worktree")
         .map(|c| c);
 
+    let self_exit_check = self_exit_check_parser()
+        .to_options()
+        .descr("Layer 1 completion-scoped self-exit: one re-check that self-kills the calling task-scoped tmux session when its owned work is resolved AND `rally next` is non-actionable for a sustained streak. --persistent opts out.")
+        .command("self-exit-check")
+        .map(CliCommand::SelfExitCheck);
+
     construct!([
         init,
         hooks,
@@ -881,7 +910,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         lead,
         ack,
         adopt,
-        worktree_gc
+        worktree_gc,
+        self_exit_check
     ])
     .to_options()
 }
@@ -1646,6 +1676,23 @@ fn ack_parser() -> impl Parser<AckArgs> {
     let json = json_flag();
     let tool = string_arg("tool", "TOOL");
     construct!(AckArgs { json, tool })
+}
+
+/// Layer 1 parser: `rally self-exit-check --tool <self> [--persistent]
+/// [--required-streak N]`.
+fn self_exit_check_parser() -> impl Parser<SelfExitCheckArgs> {
+    let json = json_flag();
+    let tool = string_arg("tool", "TOOL");
+    let persistent = long("persistent")
+        .help("Opt out: a deliberately-persistent session never self-exits on the implicit completion path.")
+        .switch();
+    let required_streak = optional_i64_arg("required-streak", "N");
+    construct!(SelfExitCheckArgs {
+        json,
+        tool,
+        persistent,
+        required_streak
+    })
 }
 
 /// C-FLEET: parser for `rally adopt <name> [--tmux …|--cmux …] [--tool …]

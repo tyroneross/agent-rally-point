@@ -48,7 +48,9 @@ pub(crate) struct AttentionItem {
 pub(crate) struct NextResult {
     mode: &'static str,
     pub(crate) action: &'static str,
-    actionable: bool,
+    /// Layer 1 self-exit reads this: `true` when `next` surfaced real work to
+    /// do, `false` when the agent should wait / proceed-solo (no addressed work).
+    pub(crate) actionable: bool,
     reason: &'static str,
     score: i64,
     confidence: f64,

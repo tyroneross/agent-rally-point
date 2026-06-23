@@ -755,6 +755,16 @@ fn tmux_start_command(
         "140",
         "-y",
         "50",
+        // Layer 3 parent-lifecycle binding: stamp the launching parent's PID into
+        // the new session's environment so the orphan reaper can later ask "is the
+        // parent still alive?". `-e KEY=VALUE` sets a session-scoped env var on the
+        // created session in the SAME atomic new-session call (no follow-up
+        // command, no race). Read back via `tmux show-environment -t <session>`.
+        // FAIL-SAFE: if the var is ever absent/unparseable, the reaper falls back
+        // to the liveness-window criterion alone and NEVER reaps on the parent
+        // criterion (see liveness::reapable, parent_alive=None).
+        "-e",
+        format!("RALLY_PARENT_PID={}", std::process::id()),
         shell_command,
     ])
 }
@@ -848,6 +858,66 @@ pub(crate) struct OrphanTmux {
     pub(crate) session_name: String,
     /// Age in seconds since the session's last activity.
     pub(crate) idle_secs: i64,
+    /// Layer 3: why this session was staged for reaping — `"stale"` (liveness
+    /// window alone; no parent info) or `"stale+parent-dead"` (both criteria).
+    /// Never `"parent-dead"` alone: the control NEVER reaps on the parent
+    /// criterion without the session also being stale by liveness.
+    pub(crate) reason: String,
+}
+
+/// Look up the `RALLY_PARENT_PID` env var Layer 3 stamped onto a session at
+/// launch, then resolve `parent_alive`:
+/// * `Some(true)`  — the PID exists / is alive.
+/// * `Some(false)` — the PID is parseable but no such process exists.
+/// * `None`        — no var, unparseable var, or the env lookup failed
+///   (pre-binding session / non-rally launch) → parent criterion UNAVAILABLE.
+///
+/// `now`-free + side-effecting (reads tmux + signals the PID), so the orphan
+/// classifier takes this as an injected closure for deterministic tests.
+pub(crate) fn session_parent_alive(tmux_bin: &str, session_name: &str) -> Option<bool> {
+    let out = Command::new(tmux_bin)
+        .args(["show-environment", "-t", session_name, "RALLY_PARENT_PID"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    // tmux prints `RALLY_PARENT_PID=<value>`; an unset var prints `-RALLY_PARENT_PID`.
+    let value = raw
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("RALLY_PARENT_PID="))?;
+    let pid: i32 = value.trim().parse().ok()?;
+    if pid <= 0 {
+        return None;
+    }
+    Some(pid_is_alive(pid))
+}
+
+/// POSIX liveness probe via the `kill(1)` builtin with signal 0 — no new crate
+/// dependency (this repo keeps a ZERO-extra-dependency contract; see Cargo.toml).
+/// `kill -0 <pid>` exits 0 iff the process exists and is signalable; non-zero
+/// when it is gone (ESRCH) OR when it exists but we lack permission (EPERM).
+///
+/// The two non-zero cases are disambiguated by stderr: a "no such process"
+/// message means DEAD; a permission error means the process EXISTS (alive,
+/// fail-safe). When the `kill` invocation itself fails to spawn, we report
+/// `true` (alive) — never reap on an ambiguous/failed probe.
+fn pid_is_alive(pid: i32) -> bool {
+    let out = Command::new("kill").args(["-0", &pid.to_string()]).output();
+    match out {
+        // exit 0: process exists + is signalable → alive.
+        Ok(o) if o.status.success() => true,
+        // Non-zero: DEAD only when stderr says ESRCH ("no such process");
+        // any other failure (EPERM "operation not permitted", etc.) means the
+        // process EXISTS → alive (fail-safe: never treat live-but-unsignalable
+        // as dead).
+        Ok(o) => !String::from_utf8_lossy(&o.stderr)
+            .to_lowercase()
+            .contains("no such process"),
+        // Could not even run `kill` → cannot prove death → alive (fail-safe).
+        Err(_) => true,
+    }
 }
 
 /// PURE parse + classify of `tmux list-sessions -F
@@ -857,18 +927,32 @@ pub(crate) struct OrphanTmux {
 /// * the name starts with `rally-` (the agent-session naming convention),
 /// * it is DETACHED (`session_attached == 0` — an attached session is a human
 ///   actively looking at it; never kill it),
-/// * its last activity is older than `idle_window_secs` (the adaptive window;
-///   the orphan path has no per-session declared cadence, so the caller passes
-///   the default-cadence window).
+/// * [`liveness::reapable`] returns true for its liveness verdict + parent state.
 ///
-/// `now_epoch` is injected for deterministic tests. tmux `session_activity` is
-/// epoch seconds. A line we cannot parse is SKIPPED (fail-safe — never kill on a
-/// malformed line).
+/// Liveness is computed from the single observable orphan signal — tmux
+/// `session_activity` age, mapped onto the `code_progress` slot of the 4-signal
+/// model (forward terminal activity is the orphan-level proxy for code progress).
+/// The other three signals are absent for an UNMANAGED orphan, so `is_live`
+/// yields `Live` (fresh) or — once that one signal is stale — `Unknown`. To
+/// preserve the established "stale orphan past its window IS reaped" behavior,
+/// the orphan path treats a single stale activity signal as `Stale` (provably
+/// idle past the window) rather than `Unknown`; this is sound because tmux
+/// `session_activity` is always observed for a real session (never absent).
+///
+/// `parent_alive_fn` is injected (closure over `session_name`) so tests can
+/// supply parent state without a live process table; production passes
+/// [`session_parent_alive`]. The final keep/reap decision is
+/// [`liveness::reapable`] — the single shared authority.
+///
+/// `now_epoch` is injected for deterministic tests. A line we cannot parse is
+/// SKIPPED (fail-safe — never kill on a malformed line).
 pub(crate) fn classify_orphan_tmux(
     list_output: &str,
     now_epoch: i64,
     idle_window_secs: i64,
+    mut parent_alive_fn: impl FnMut(&str) -> Option<bool>,
 ) -> Vec<OrphanTmux> {
+    use crate::liveness::{Liveness, LivenessSignals, is_live, reapable};
     let mut out = Vec::new();
     for line in list_output.lines() {
         let line = line.trim();
@@ -894,12 +978,41 @@ pub(crate) fn classify_orphan_tmux(
             continue;
         };
         let idle = now_epoch - activity;
-        if idle > idle_window_secs {
-            out.push(OrphanTmux {
-                session_name: name.to_string(),
-                idle_secs: idle,
-            });
+
+        // Map the single observable signal (terminal activity age) onto the
+        // 4-signal model. is_live → Live when fresh; for a stale single signal
+        // the orphan path promotes Unknown → Stale because a real session ALWAYS
+        // has an observed activity timestamp (never genuinely absent), so the
+        // idle reading is trustworthy enough to be "provably stale".
+        let signals = LivenessSignals {
+            code_progress_age: Some(idle),
+            ..Default::default()
+        };
+        let verdict = match is_live(&signals, idle_window_secs) {
+            Liveness::Live => Liveness::Live,
+            // Single observed signal stale → treat as provably Stale for the
+            // reaper (see doc comment); never Unknown for a real session.
+            _ => Liveness::Stale,
+        };
+
+        let parent_alive = parent_alive_fn(name);
+        if !reapable(verdict, parent_alive) {
+            continue;
         }
+
+        let reason = match parent_alive {
+            Some(false) => "stale+parent-dead",
+            // Some(true) cannot reach here (reapable would have returned false);
+            // None and any other path is the liveness-window criterion alone.
+            _ => "stale",
+        }
+        .to_string();
+
+        out.push(OrphanTmux {
+            session_name: name.to_string(),
+            idle_secs: idle,
+            reason,
+        });
     }
     out
 }
@@ -925,6 +1038,10 @@ pub(crate) fn detect_orphan_tmux(
             &String::from_utf8_lossy(&o.stdout),
             now_epoch,
             idle_window_secs,
+            // Layer 3: resolve each candidate's launching-parent liveness from
+            // the RALLY_PARENT_PID env var stamped at launch. Absent/unparseable
+            // → None → reaper falls back to the liveness-window criterion alone.
+            |name| session_parent_alive(tmux_bin, name),
         ),
         // no server / tmux missing / error → no orphans to report (fail-open).
         _ => Vec::new(),
@@ -962,6 +1079,45 @@ pub(crate) fn own_rally_tmux_session(tmux_bin: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Read an integer session-scoped tmux env var (`tmux show-environment -t
+/// <session> <key>`). Returns `None` when not inside a value, unset, or
+/// unparseable. Used by the Layer 1 self-exit re-check to persist the
+/// consecutive-empty streak in the session's OWN env (dies with the session).
+pub(crate) fn get_session_env_i64(tmux_bin: &str, session: &str, key: &str) -> Option<i64> {
+    let out = Command::new(tmux_bin)
+        .args(["show-environment", "-t", session, key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let prefix = format!("{key}=");
+    raw.lines()
+        .find_map(|l| l.trim().strip_prefix(&prefix).map(str::to_string))
+        .and_then(|v| v.trim().parse::<i64>().ok())
+}
+
+/// Set a session-scoped tmux env var. Best-effort; returns success.
+pub(crate) fn set_session_env_i64(
+    tmux_bin: &str,
+    session: &str,
+    key: &str,
+    value: i64,
+) -> bool {
+    Command::new(tmux_bin)
+        .args([
+            "set-environment",
+            "-t",
+            session,
+            key,
+            &value.to_string(),
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn probe_cmux_liveness(bin: &str, targets: &[String]) -> Vec<SessionLiveness> {
@@ -1147,7 +1303,8 @@ mod tests {
     // and resolve_agent_pane_from_list removed with the Backend::Herdr arm.
     use super::{
         CR, PASTE_END, PASTE_START, classify_orphan_tmux, frame_line_bytes, hex_tokens,
-        parse_cmux_start_target, sanitize_inject_text, shell_words, tmux_inject_commands,
+        parse_cmux_start_target, pid_is_alive, sanitize_inject_text, shell_words,
+        tmux_inject_commands,
     };
     use crate::check::CheckData;
     use crate::store::Fact;
@@ -1321,41 +1478,50 @@ mod tests {
         format!("{name}|{attached}|{activity}")
     }
 
+    /// Default parent closure for the pre-Layer-3 behavior tests: no parent info
+    /// recorded → `None` → reaper falls back to the liveness-window criterion
+    /// alone (proves the fail-safe degradation preserves prior behavior).
+    fn no_parent(_: &str) -> Option<bool> {
+        None
+    }
+
     #[test]
     fn detached_stale_rally_session_is_orphan() {
         // detached, last activity 40 min ago (2400s > 1860).
         let out = line("rally-claude-foo", 0, NOW - 2400);
-        let orphans = classify_orphan_tmux(&out, NOW, WIN);
+        let orphans = classify_orphan_tmux(&out, NOW, WIN, no_parent);
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].session_name, "rally-claude-foo");
         assert_eq!(orphans[0].idle_secs, 2400);
+        // No parent info → window criterion alone → reason "stale".
+        assert_eq!(orphans[0].reason, "stale");
     }
 
     #[test]
     fn attached_session_is_never_orphan() {
         // attached=1: a human is looking at it — never kill, even if stale.
         let out = line("rally-codex-bar", 1, NOW - 99999);
-        assert!(classify_orphan_tmux(&out, NOW, WIN).is_empty());
+        assert!(classify_orphan_tmux(&out, NOW, WIN, no_parent).is_empty());
     }
 
     #[test]
     fn fresh_detached_rally_session_is_not_orphan() {
         // detached but active 5 min ago (300s < 1860).
         let out = line("rally-claude-baz", 0, NOW - 300);
-        assert!(classify_orphan_tmux(&out, NOW, WIN).is_empty());
+        assert!(classify_orphan_tmux(&out, NOW, WIN, no_parent).is_empty());
     }
 
     #[test]
     fn non_rally_session_is_ignored() {
         // a user's own "work" tmux session, detached and ancient, is NOT touched.
         let out = line("work", 0, NOW - 99999);
-        assert!(classify_orphan_tmux(&out, NOW, WIN).is_empty());
+        assert!(classify_orphan_tmux(&out, NOW, WIN, no_parent).is_empty());
     }
 
     #[test]
     fn malformed_lines_are_skipped() {
         let out = "garbage\nrally-x|notanumber|123\nrally-y|0|alsobad\n\n";
-        assert!(classify_orphan_tmux(out, NOW, WIN).is_empty());
+        assert!(classify_orphan_tmux(out, NOW, WIN, no_parent).is_empty());
     }
 
     #[test]
@@ -1367,8 +1533,67 @@ mod tests {
             line("work", 0, NOW - 99999),          // non-rally — keep
         ]
         .join("\n");
-        let orphans = classify_orphan_tmux(&out, NOW, WIN);
+        let orphans = classify_orphan_tmux(&out, NOW, WIN, no_parent);
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].session_name, "rally-claude-1");
+    }
+
+    // ---- Layer 3: parent-lifecycle binding (acceptance scenario 3) ----
+
+    #[test]
+    fn stale_session_with_dead_parent_is_reaped_with_reason() {
+        // Stale by window AND parent provably dead → reaped, reason names both.
+        let out = line("rally-claude-orphan", 0, NOW - 5000);
+        let orphans = classify_orphan_tmux(&out, NOW, WIN, |_| Some(false));
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].reason, "stale+parent-dead");
+    }
+
+    #[test]
+    fn stale_session_with_live_parent_is_kept() {
+        // Stale by window BUT parent still alive → conservative keep (a live
+        // parent may re-drive the child; we never reap under a live parent).
+        let out = line("rally-claude-childofparent", 0, NOW - 5000);
+        assert!(
+            classify_orphan_tmux(&out, NOW, WIN, |_| Some(true)).is_empty(),
+            "stale session under a LIVE parent must be kept"
+        );
+    }
+
+    #[test]
+    fn code_progressing_session_with_dead_parent_is_kept() {
+        // FAIL-SAFE: parent is dead, but the session is making forward progress
+        // (fresh activity within the window → Live). Independently-live sessions
+        // are NEVER reaped on the parent criterion alone.
+        let out = line("rally-claude-busy", 0, NOW - 60);
+        assert!(
+            classify_orphan_tmux(&out, NOW, WIN, |_| Some(false)).is_empty(),
+            "a code-progressing (live) session must survive even with a dead parent"
+        );
+    }
+
+    #[test]
+    fn missing_parent_info_falls_back_to_window_not_reaped_when_fresh() {
+        // No parent info AND fresh → kept (window criterion: not stale).
+        let fresh = line("rally-claude-freshnoparent", 0, NOW - 60);
+        assert!(classify_orphan_tmux(&fresh, NOW, WIN, no_parent).is_empty());
+        // No parent info AND stale → reaped on the window criterion ALONE
+        // (never reaped on the parent criterion, which is unavailable).
+        let stale = line("rally-claude-stalenoparent", 0, NOW - 5000);
+        let orphans = classify_orphan_tmux(&stale, NOW, WIN, no_parent);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].reason, "stale");
+    }
+
+    #[test]
+    fn pid_is_alive_reports_self_alive_and_unused_pid_dead() {
+        // Our own PID is alive.
+        let me = std::process::id() as i32;
+        assert!(pid_is_alive(me), "current process must read alive");
+        // PID 999999999 is (almost certainly) not a live process → dead.
+        assert!(
+            !pid_is_alive(999_999_999),
+            "an unused high PID must read dead (ESRCH)"
+        );
     }
 }

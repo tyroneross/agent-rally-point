@@ -146,6 +146,96 @@ pub(crate) fn is_live_default(
     is_live(signals, window)
 }
 
+/// Reaper eligibility — the SINGLE authority for "may this session be killed?".
+///
+/// Composes the 4-signal [`is_live`] verdict with an OPTIONAL parent-liveness
+/// signal (Layer 3 parent-lifecycle binding). This is the one decision both the
+/// orphan-tmux sweep (Layer 2) and the parent-binding reaper (Layer 3) call, so
+/// the "never reap a live session" invariant lives in exactly one place.
+///
+/// `parent_alive`:
+/// * `Some(true)`  — the launching parent PID is provably still alive.
+/// * `Some(false)` — the launching parent PID is provably dead/gone.
+/// * `None`        — no parsable parent info recorded (pre-binding session,
+///   unparseable metadata, or a session never launched via rally). The parent
+///   criterion is UNAVAILABLE; we fall back to the liveness-window criterion
+///   ALONE and NEVER reap on the parent criterion.
+///
+/// Truth table (the EXACT contract the golden fixture asserts):
+/// | liveness | parent_alive | reapable | why                                   |
+/// |----------|--------------|----------|---------------------------------------|
+/// | Live     | *            | false    | any of 4 signals fresh → never reap   |
+/// | Unknown  | *            | false    | fail-closed: untrustworthy signals    |
+/// | Stale    | Some(true)   | false    | stale by signals BUT parent alive → keep (conservative) |
+/// | Stale    | Some(false)  | true     | stale AND parent dead → Layer-3 target |
+/// | Stale    | None         | true     | stale; no parent info → window criterion alone (fail-safe) |
+///
+/// The two `Stale → true` rows are why a plain stale orphan (no parent record)
+/// is still reaped exactly as before: `None` degrades to the pre-existing
+/// liveness-window behavior. The control NEVER reaps a session solely because
+/// its parent is gone — a parent-dead session that is still independently Live
+/// or Unknown is kept.
+pub(crate) fn reapable(liveness: Liveness, parent_alive: Option<bool>) -> bool {
+    match liveness {
+        // Independently live (any signal fresh) — never reap, regardless of parent.
+        Liveness::Live => false,
+        // Fail-closed: we cannot prove death — never reap.
+        Liveness::Unknown => false,
+        // Provably stale by all observed signals.
+        Liveness::Stale => match parent_alive {
+            // Parent alive → keep (conservative: a live parent may re-drive it).
+            Some(true) => false,
+            // Parent provably dead → reap (the exact orphan failure mode).
+            Some(false) => true,
+            // No parent info → window/liveness criterion alone reaps it.
+            None => true,
+        },
+    }
+}
+
+/// Completion-scoped self-exit eligibility (Layer 1 — prevent at source).
+///
+/// A task-scoped agent should exit at natural completion so the `exec`'d tmux
+/// session auto-closes (no detached orphan to reap later). It exits ONLY when
+/// BOTH hold for a SUSTAINED re-check, and never when opted out:
+///
+/// * `work_resolved` — the agent's owned rally work is all resolved/closed.
+/// * `next_empty_streak >= required_streak` — `rally next --tool <self>`
+///   returned empty for at least `required_streak` CONSECUTIVE re-checks. The
+///   streak (not a single empty read) is what guarantees we never exit mid-task
+///   during a brief lull between claims.
+///
+/// `persistent_optout` short-circuits to `false`: a deliberately-persistent
+/// session (declared at launch) never self-exits on the implicit "work done"
+/// path. The explicit `rally stop` self-kill remains the opt-out-independent
+/// completion path.
+///
+/// Pure + time-free: the caller owns the re-check loop and passes the observed
+/// streak, so the decision is deterministically testable.
+pub(crate) fn completion_self_exit_eligible(
+    work_resolved: bool,
+    next_empty_streak: i64,
+    required_streak: i64,
+    persistent_optout: bool,
+) -> bool {
+    if persistent_optout {
+        return false;
+    }
+    if !work_resolved {
+        return false;
+    }
+    // A required streak <= 0 would let a single transient empty read trigger
+    // exit; clamp to at least 1 so "sustained" always means >=1 confirmation.
+    let needed = required_streak.max(1);
+    next_empty_streak >= needed
+}
+
+/// Default number of CONSECUTIVE empty `rally next` re-checks required before a
+/// task-scoped session self-exits (Layer 1). Two confirmations: enough to ride
+/// out a one-cycle lull between a resolved claim and the next dispatch, cheap
+/// enough that a genuinely-done agent exits promptly.
+pub(crate) const DEFAULT_SELF_EXIT_STREAK: i64 = 2;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +302,86 @@ mod tests {
                 case["name"]
             );
         }
+
+        // reapable_cases: the shared reaper-eligibility truth table.
+        fn liveness_from_str(s: &str) -> Liveness {
+            match s {
+                "live" => Liveness::Live,
+                "stale" => Liveness::Stale,
+                "unknown" => Liveness::Unknown,
+                other => panic!("bad liveness {other}"),
+            }
+        }
+        fn opt_bool(v: &Value) -> Option<bool> {
+            if v.is_null() {
+                None
+            } else {
+                Some(v.as_bool().expect("parent_alive must be bool or null"))
+            }
+        }
+        for case in v["reapable_cases"].as_array().unwrap() {
+            let liveness = liveness_from_str(case["liveness"].as_str().unwrap());
+            let parent_alive = opt_bool(&case["parent_alive"]);
+            let expected = case["expected"].as_bool().unwrap();
+            let got = reapable(liveness, parent_alive);
+            assert_eq!(
+                got, expected,
+                "reapable case {}: got {got} expected {expected}",
+                case["name"]
+            );
+        }
+
+        // self_exit_cases: the shared completion self-exit truth table.
+        for case in v["self_exit_cases"].as_array().unwrap() {
+            let got = completion_self_exit_eligible(
+                case["work_resolved"].as_bool().unwrap(),
+                case["next_empty_streak"].as_i64().unwrap(),
+                case["required_streak"].as_i64().unwrap(),
+                case["persistent_optout"].as_bool().unwrap(),
+            );
+            let expected = case["expected"].as_bool().unwrap();
+            assert_eq!(
+                got, expected,
+                "self_exit case {}: got {got} expected {expected}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn reapable_never_reaps_live_or_unknown() {
+        for parent in [Some(true), Some(false), None] {
+            assert!(!reapable(Liveness::Live, parent), "live must never be reaped");
+            assert!(
+                !reapable(Liveness::Unknown, parent),
+                "unknown must never be reaped (fail-closed)"
+            );
+        }
+    }
+
+    #[test]
+    fn reapable_stale_parent_dead_is_reaped_but_alive_is_kept() {
+        assert!(reapable(Liveness::Stale, Some(false)), "stale + dead parent → reap");
+        assert!(!reapable(Liveness::Stale, Some(true)), "stale + live parent → keep");
+        assert!(
+            reapable(Liveness::Stale, None),
+            "stale + no parent info → window criterion alone reaps"
+        );
+    }
+
+    #[test]
+    fn self_exit_requires_resolved_work_and_sustained_empty() {
+        // Resolved + sustained empty → exit.
+        assert!(completion_self_exit_eligible(true, 2, 2, false));
+        // Mid-task (unresolved) never exits no matter how empty next is.
+        assert!(!completion_self_exit_eligible(false, 100, 2, false));
+        // Resolved but streak not yet met → stay.
+        assert!(!completion_self_exit_eligible(true, 1, 2, false));
+        // Opted-out persistent session never self-exits.
+        assert!(!completion_self_exit_eligible(true, 100, 2, true));
+        // required_streak <= 0 clamps to 1.
+        assert!(completion_self_exit_eligible(true, 1, 0, false));
+        assert!(!completion_self_exit_eligible(true, 0, 0, false));
     }
 
     #[test]

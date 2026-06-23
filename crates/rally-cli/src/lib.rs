@@ -582,7 +582,119 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::Adopt(args) => command_adopt(args),
         // Sweep-reaper: GC leftover per-agent worktrees
         CliCommand::WorktreeGc(args) => command_worktree_gc(args),
+        // Layer 1: completion-scoped self-exit re-check
+        CliCommand::SelfExitCheck(args) => command_self_exit_check(args),
     }
+}
+
+// =============================================================================
+// Layer 1 — rally self-exit-check (completion-scoped self-exit)
+// =============================================================================
+
+const SCHEMA_SELF_EXIT_CHECK: &str = "agent-rally.command.self-exit-check.v1";
+
+/// tmux session env key holding the consecutive-non-actionable streak. Stored in
+/// the session's OWN env so it dies with the session (no new filesystem surface).
+const SELF_EXIT_STREAK_KEY: &str = "RALLY_SELFEXIT_STREAK";
+
+/// Layer 1: one stateless completion re-check. Decides — via the shared
+/// [`liveness::completion_self_exit_eligible`] authority — whether THIS
+/// task-scoped session should exit now, and if so self-kills its own `rally-*`
+/// tmux session so the `exec`'d agent process is torn down and the session
+/// auto-closes. Returns a JSON envelope describing the decision either way.
+///
+/// `work_resolved` = this tool holds NO active rally claims.
+/// `next_actionable` = `rally next` surfaced real addressed work.
+/// An "empty" cycle is `work_resolved && !next_actionable`; the streak of
+/// consecutive empty cycles is persisted in the session's tmux env and only a
+/// SUSTAINED streak triggers exit — so a brief lull between claims never exits
+/// mid-task.
+fn command_self_exit_check(args: cli::SelfExitCheckArgs) -> Result<Output> {
+    let tool = args.tool.clone();
+    let required_streak = args
+        .required_streak
+        .unwrap_or(crate::liveness::DEFAULT_SELF_EXIT_STREAK);
+    let tmux_bin = BackendBins::default().tmux_bin;
+
+    let room = RoomStore::open()?;
+    ensure_presence(&room, &tool)?;
+    let snapshot = room.snapshot()?;
+
+    // work_resolved: no active claim is owned by this tool.
+    let owned_active = snapshot
+        .active_claims
+        .iter()
+        .filter(|c| c.tool.as_deref() == Some(tool.as_str()))
+        .count();
+    let work_resolved = owned_active == 0;
+
+    // next_actionable: does rally next surface addressed work?
+    let backlog_items = list_backlog_items(&room).unwrap_or_default();
+    let next = build_next(&snapshot, &tool, None, &[], 1, backlog_items);
+    let next_actionable = next.actionable;
+
+    // This cycle is "empty" only when work is resolved AND next is non-actionable.
+    let empty_cycle = work_resolved && !next_actionable;
+
+    // Resolve our own tmux session (if any) to persist the streak + self-kill.
+    let own_session = backends::own_rally_tmux_session(&tmux_bin);
+
+    // Update the consecutive-empty streak in the session's own env. When not
+    // inside a rally tmux session we still compute the decision (observability /
+    // tests) but cannot persist a streak — treat the streak as this single cycle.
+    let prior_streak = own_session
+        .as_deref()
+        .and_then(|s| backends::get_session_env_i64(&tmux_bin, s, SELF_EXIT_STREAK_KEY))
+        .unwrap_or(0);
+    let new_streak = if empty_cycle { prior_streak + 1 } else { 0 };
+    if let Some(ref s) = own_session {
+        backends::set_session_env_i64(&tmux_bin, s, SELF_EXIT_STREAK_KEY, new_streak);
+    }
+
+    let eligible = crate::liveness::completion_self_exit_eligible(
+        work_resolved,
+        new_streak,
+        required_streak,
+        args.persistent,
+    );
+
+    let mut exited = false;
+    if eligible {
+        if let Some(ref s) = own_session {
+            // Self-kill: tear down our own tmux session so `exec` auto-closes it.
+            exited = backends::kill_tmux_session(&tmux_bin, s);
+        }
+    }
+
+    let session_name = own_session.clone().unwrap_or_default();
+    let text = if exited {
+        format!("self-exit-check: EXITING {session_name} (work resolved, streak {new_streak}/{required_streak})")
+    } else if args.persistent {
+        format!("self-exit-check: staying (persistent opt-out) streak={new_streak}")
+    } else {
+        format!(
+            "self-exit-check: staying (work_resolved={work_resolved} next_actionable={next_actionable} streak={new_streak}/{required_streak})"
+        )
+    };
+    let body = envelope_value(
+        "self-exit-check",
+        SCHEMA_SELF_EXIT_CHECK,
+        json!({
+            "self_exit_check": {
+                "tool": tool,
+                "work_resolved": work_resolved,
+                "next_actionable": next_actionable,
+                "empty_cycle": empty_cycle,
+                "streak": new_streak,
+                "required_streak": required_streak,
+                "persistent_optout": args.persistent,
+                "eligible": eligible,
+                "exited": exited,
+                "session": session_name,
+            }
+        }),
+    )?;
+    Ok(Output::new(args.json, text, body))
 }
 
 // =============================================================================
@@ -984,6 +1096,14 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // at once. The blocks still use `snapshot_before` (pre-presence) for their
     // dedup checks, so behavior is unchanged when none of them fire.
     ensure_presence_tiered(&room, &tool, args.tier.as_deref())?;
+
+    // Layer 2 — event-driven liveness-lease safety net: when a new agent joins,
+    // opportunistically sweep detached `rally-*` orphan tmux sessions that the
+    // shared `liveness::reapable` authority stages (stale by adaptive window, or
+    // stale + parent-dead via Layer 3). Best-effort + fail-open: never blocks the
+    // enter path, never reaps a live / parent-alive session. Runs AFTER presence
+    // so the entering agent's own managed session is in the guard set.
+    opportunistic_orphan_sweep_on_enter(&room);
 
     // B11: warn (non-blocking) when the entering tool is already active in the
     // current engagement.  A second terminal reusing the same id is ambiguous;
@@ -4032,19 +4152,14 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
             .map(|v| v.session.target.clone())
             .collect();
         let tmux_bin = args.bins.tmux_bin.clone();
-        for orphan in backends::detect_orphan_tmux(&tmux_bin, now_epoch, window) {
-            // Never touch a tmux session that a managed record points at — that
-            // path already has its own (heartbeat/probe-driven) reap above.
-            if managed_targets.contains(&orphan.session_name) {
-                continue;
-            }
-            if backends::kill_tmux_session(&tmux_bin, &orphan.session_name) {
-                let _ =
-                    append_orphan_tmux_tombstone(&room, &orphan.session_name, orphan.idle_secs);
-                orphans_reaped.push(orphan.session_name);
-                count += 1;
-            }
-        }
+        orphans_reaped = sweep_orphan_tmux(
+            &room,
+            &tmux_bin,
+            now_epoch,
+            window,
+            &managed_targets,
+        );
+        count += orphans_reaped.len();
 
         sessions = read_session_views(&room, args.bins)?;
         count
@@ -4083,6 +4198,7 @@ fn append_orphan_tmux_tombstone(
     room: &RoomStore,
     session_name: &str,
     idle_secs: i64,
+    reason: &str,
 ) -> Result<()> {
     let fact = Fact {
         from_session_id: None,
@@ -4096,10 +4212,11 @@ fn append_orphan_tmux_tombstone(
         subject: format!("reaper: orphan tmux {session_name} killed"),
         scope: Vec::new(),
         created_at: now_string(),
-        summary: Some(format!("orphan-tmux idle_secs={idle_secs}")),
+        summary: Some(format!("orphan-tmux idle_secs={idle_secs} reason={reason}")),
         evidence: vec![
             format!("reaper:orphan-tmux={session_name}"),
             format!("reaper:idle_secs={idle_secs}"),
+            format!("reaper:reason={reason}"),
         ],
         target: None,
         ref_id: None,
@@ -4110,6 +4227,72 @@ fn append_orphan_tmux_tombstone(
     };
     room.append_fact(&fact)?;
     Ok(())
+}
+
+/// Shared orphan-tmux sweep — the SINGLE actuator both the explicit
+/// `rally sessions --reap` path and the opportunistic Layer-2 enter sweep call.
+/// Detects detached `rally-*` tmux sessions the [`liveness::reapable`] authority
+/// stages (stale-by-window, or stale + parent-dead via Layer 3), skips any that
+/// a managed-session record points at, kills + tombstones each, and returns the
+/// reaped session names.
+///
+/// BEST-EFFORT by contract: a failed kill/tombstone is skipped silently; the
+/// function never returns an error and never blocks its caller (Layer 2 wires it
+/// into the hot `enter` path, which must not stall on a tmux hiccup).
+fn sweep_orphan_tmux(
+    room: &RoomStore,
+    tmux_bin: &str,
+    now_epoch: i64,
+    window: i64,
+    managed_targets: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let mut reaped: Vec<String> = Vec::new();
+    for orphan in backends::detect_orphan_tmux(tmux_bin, now_epoch, window) {
+        // Never touch a tmux session a managed record points at — that path has
+        // its own (heartbeat/probe-driven) reap.
+        if managed_targets.contains(&orphan.session_name) {
+            continue;
+        }
+        if backends::kill_tmux_session(tmux_bin, &orphan.session_name) {
+            let _ = append_orphan_tmux_tombstone(
+                room,
+                &orphan.session_name,
+                orphan.idle_secs,
+                &orphan.reason,
+            );
+            reaped.push(orphan.session_name);
+        }
+    }
+    reaped
+}
+
+/// Layer 2 — opportunistic, best-effort orphan-tmux sweep fired when a new agent
+/// joins (`rally enter`). Resolves the adaptive default-cadence window + the
+/// managed-target guard set, then delegates to [`sweep_orphan_tmux`]. FAIL-OPEN
+/// and time-bounded: any error resolving config/sessions is swallowed and the
+/// enter path proceeds untouched. Never blocks enter; never reaps a live or
+/// parent-alive session (that policy lives in [`liveness::reapable`]).
+fn opportunistic_orphan_sweep_on_enter(room: &RoomStore) {
+    // Best-effort: resolve the adaptive window; default on any failure.
+    let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    let window = crate::liveness::adaptive_window_secs(
+        coord.default_cadence_secs,
+        coord.default_cadence_secs,
+        coord.miss_multiplier,
+        coord.grace_secs,
+    );
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Guard set: never reap a tmux session a managed record points at.
+    let managed_targets: std::collections::BTreeSet<String> = active_session_records(room)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.target)
+        .collect();
+    let tmux_bin = BackendBins::default().tmux_bin;
+    let _ = sweep_orphan_tmux(room, &tmux_bin, now_epoch, window, &managed_targets);
 }
 
 fn command_inject(args: InjectArgs) -> Result<Output> {
