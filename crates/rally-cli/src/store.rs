@@ -1753,6 +1753,117 @@ fn sort_by_recency(facts: &mut [Fact], now_secs: i64, half_life_secs: i64) {
     });
 }
 
+/// Age in seconds of a fact (now - created_at), fail-open to 0 (treated as
+/// fresh) when the timestamp is unparseable — never invent staleness from a bad
+/// stamp on the squad-visibility path.
+fn fact_age_secs(fact: &Fact, now_secs: i64) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(&fact.created_at)
+        .map(|dt| now_secs - dt.timestamp())
+        .unwrap_or(0)
+}
+
+/// For each tool, the age (seconds) of the NEWEST fact of one of `kinds` that
+/// names the tool either as author (`fact.tool`) or as recipient/subject
+/// (`fact.target` / a `to:<tool>` in evidence). Pure over `facts`. Absent tools
+/// simply don't appear in the map (caller reads `None` → signal absent).
+fn newest_fact_age_per_tool(
+    facts: &[Fact],
+    now_secs: i64,
+    kinds: &[&str],
+) -> BTreeMap<String, i64> {
+    let mut out: BTreeMap<String, i64> = BTreeMap::new();
+    let mut note = |tool: &str, age: i64, out: &mut BTreeMap<String, i64>| {
+        out.entry(tool.to_string())
+            .and_modify(|e| *e = (*e).min(age))
+            .or_insert(age);
+    };
+    for f in facts.iter().filter(|f| kinds.contains(&f.kind.as_str())) {
+        let age = fact_age_secs(f, now_secs);
+        if let Some(t) = &f.tool {
+            if t != "rally" {
+                note(t, age, &mut out);
+            }
+        }
+        if let Some(t) = &f.target {
+            note(t, age, &mut out);
+        }
+        // Recipient encoded as `to:<tool>` in evidence (inject content facts).
+        for ev in &f.evidence {
+            if let Some(t) = ev.strip_prefix("to:") {
+                note(t, age, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Code-progress signal: for each tool, the age of its newest presence/session
+/// fact IFF that fact's `branch_head_sha:` stamp DIFFERS from the prior such
+/// fact's stamp (the worktree HEAD moved → forward code progress). When fewer
+/// than two stamped facts exist, or the sha is unchanged, the tool is ABSENT
+/// from the map (caller reads `None` → signal absent → fail-open). Pure over
+/// `facts`; no git I/O (the presence writer stamps the sha).
+fn code_progress_age_per_tool(facts: &[Fact], now_secs: i64) -> BTreeMap<String, i64> {
+    // Gather, per tool, the (seq, age, sha) of every stamped presence/session fact.
+    let mut by_tool: BTreeMap<String, Vec<(i64, i64, String)>> = BTreeMap::new();
+    for f in facts
+        .iter()
+        .filter(|f| f.kind == "presence" || f.kind == "session")
+    {
+        let Some(tool) = f.tool.as_deref() else {
+            continue;
+        };
+        if tool == "rally" {
+            continue;
+        }
+        let Some(sha) = f.evidence.iter().find_map(|e| {
+            e.strip_prefix("branch_head_sha:")
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "unknown")
+        }) else {
+            continue;
+        };
+        by_tool
+            .entry(tool.to_string())
+            .or_default()
+            .push((f.seq, fact_age_secs(f, now_secs), sha.to_string()));
+    }
+    let mut out: BTreeMap<String, i64> = BTreeMap::new();
+    for (tool, mut entries) in by_tool {
+        if entries.len() < 2 {
+            continue; // need two observations to prove movement
+        }
+        entries.sort_by_key(|(seq, _, _)| *seq);
+        let newest = &entries[entries.len() - 1];
+        let prev = &entries[entries.len() - 2];
+        if newest.2 != prev.2 {
+            // HEAD moved between the two latest observations → progress at the
+            // age of the newest observation.
+            out.insert(tool, newest.1);
+        }
+    }
+    out
+}
+
+/// The planned heartbeat cadence (seconds) a tool has declared, if any. Sourced
+/// (first present wins) from a `planned_heartbeat_secs:<n>` evidence stamp on the
+/// tool's newest presence/session fact. `None` → caller uses the default
+/// cadence. Pure over `facts`; never panics on a bad value.
+fn planned_cadence_for_tool(facts: &[Fact], tool: &str) -> Option<i64> {
+    facts
+        .iter()
+        .filter(|f| f.tool.as_deref() == Some(tool))
+        .filter(|f| f.kind == "presence" || f.kind == "session")
+        .max_by_key(|f| f.seq)
+        .and_then(|f| {
+            f.evidence.iter().find_map(|e| {
+                e.strip_prefix("planned_heartbeat_secs:")
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .filter(|n| *n > 0)
+            })
+        })
+}
+
 /// Build a room snapshot, applying recency-decay ordering and archive-floor
 /// partitioning per the coordination policy.
 ///
@@ -1762,6 +1873,10 @@ fn sort_by_recency(facts: &mut [Fact], now_secs: i64, half_life_secs: i64) {
 ///   active buckets and into `stale_facts` (lossless — the raw segments stay on
 ///   disk and are re-included when `include_archived` is true / via
 ///   `--include-archived`).
+/// * Squad entries decay by ADAPTIVE multi-signal liveness
+///   (`crate::liveness`): a squad whose four signals are ALL provably stale is
+///   DROPPED from the default snapshot (restored under `include_archived`).
+///   Fail-OPEN: a Live or Unknown verdict keeps the squad visible.
 fn snapshot_from_facts_with_policy(
     facts: &[Fact],
     coord: &crate::hooks_config::CoordinationConfig,
@@ -1910,27 +2025,97 @@ fn snapshot_from_facts_with_policy(
     }
     // `now_secs` already computed at the top of this function.
     let acked = acknowledged_tools(facts);
+    // Adaptive-liveness signal sources (all PURE over `facts`):
+    //   (a) heartbeat   = age of the tool's highest-seq fact (computed below).
+    //   (b) inject/ack  = age of the newest delivery record naming the tool: a
+    //                     `receipt` or `wake` it authored (ack), or a `handoff` /
+    //                     `wake` whose `target` is the tool (inject TO it).
+    //   (c) code progress = age of the tool's newest presence/session fact WHEN
+    //                     its `branch_head_sha:` evidence differs from the prior
+    //                     such fact (HEAD moved). Pure over facts — the presence
+    //                     writer stamps the sha; the snapshot stays I/O-free.
+    //                     Absent (no two stamped facts) → None → fail-open.
+    //   (d) plan/mission = age of the tool's newest live claim, or of the latest
+    //                     mission/handoff it authored (declared active work).
+    let inject_ages = newest_fact_age_per_tool(facts, now_secs, &["receipt", "wake", "handoff"]);
+    let progress_ages = code_progress_age_per_tool(facts, now_secs);
+    // Plan signal: newest live-claim OR mission/handoff age per owning tool.
+    let mut plan_ages: BTreeMap<String, i64> = BTreeMap::new();
+    for claim in &active_claims {
+        if let Some(t) = &claim.tool {
+            let age = fact_age_secs(claim, now_secs);
+            plan_ages
+                .entry(t.clone())
+                .and_modify(|e| *e = (*e).min(age))
+                .or_insert(age);
+        }
+    }
+    for f in facts.iter().filter(|f| f.kind == "mission" || f.kind == "handoff") {
+        if let Some(t) = &f.tool {
+            let age = fact_age_secs(f, now_secs);
+            plan_ages
+                .entry(t.clone())
+                .and_modify(|e| *e = (*e).min(age))
+                .or_insert(age);
+        }
+    }
+
+    let cadence = coord.default_cadence_secs;
+    let mult = coord.miss_multiplier;
+    let grace = coord.grace_secs;
     let squads = tool_last
         .into_iter()
-        .map(|(tool, (seq, ts))| {
+        .filter_map(|(tool, (seq, ts))| {
             // Parse ISO-8601 ts to epoch secs for idle check; fall back to
             // treating the tool as active if parsing fails.
             let seen_secs = chrono::DateTime::parse_from_rfc3339(&ts)
                 .map(|dt| dt.timestamp())
                 .unwrap_or(now_secs);
-            let status = if now_secs - seen_secs <= IDLE_THRESHOLD_SECS {
+            let heartbeat_age = now_secs - seen_secs;
+            // The 15-min idle label is preserved for the existing surfaces that
+            // read `Squad.status`; it is independent of the drop decision.
+            let status = if heartbeat_age <= IDLE_THRESHOLD_SECS {
                 "active".to_string()
             } else {
                 "idle".to_string()
             };
             let acknowledged = acked.contains(&tool);
-            Squad {
+
+            // --- Adaptive multi-signal liveness (the squad-decay gap) ---
+            let planned_interval = planned_cadence_for_tool(facts, &tool)
+                .unwrap_or(cadence);
+            let window = crate::liveness::adaptive_window_secs(
+                planned_interval,
+                cadence,
+                mult,
+                grace,
+            );
+            let signals = crate::liveness::LivenessSignals {
+                heartbeat_age: Some(heartbeat_age),
+                inject_age: inject_ages.get(&tool).copied(),
+                code_progress_age: progress_ages.get(&tool).copied(),
+                plan_age: plan_ages.get(&tool).copied(),
+            };
+            let verdict = crate::liveness::is_live(&signals, window);
+
+            // FAIL-OPEN: Live and Unknown are KEPT (Unknown = cannot prove dead).
+            // Only a provably-Stale squad (all signals present & past window) is
+            // DROPPED from the default snapshot; `include_archived` restores it.
+            // This direction is opposite the reaper's fail-CLOSED removal path on
+            // purpose: hiding a still-alive peer is the dangerous direction here.
+            let dropped = matches!(verdict, crate::liveness::Liveness::Stale)
+                && !include_archived;
+            if dropped {
+                return None;
+            }
+
+            Some(Squad {
                 tool,
                 last_seen_seq: seq,
                 last_seen_ts: ts,
                 status,
                 acknowledged,
-            }
+            })
         })
         .collect::<Vec<_>>();
 
@@ -6328,5 +6513,193 @@ mod sec001_takeover_guard_tests {
             "lease-expired ClaimExpired must close the claim despite owner activity"
         );
         fs::remove_dir_all(&r).ok();
+    }
+}
+
+#[cfg(test)]
+mod squad_decay_tests {
+    //! The squad-projection GAP fix: an all-signals-stale squad DROPS from the
+    //! default snapshot (restored under include_archived); any fresh signal or
+    //! any unparseable/absent signal (fail-open) keeps it visible.
+    use super::*;
+    use crate::hooks_config::CoordinationConfig;
+
+    fn iso_ago(secs: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::seconds(secs.max(0)))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    fn fact(kind: FactKind, tool: &str, age_secs: i64) -> Fact {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static N: AtomicI64 = AtomicI64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        Fact {
+            from_session_id: None,
+            schema: fact_schema(),
+            event_id: format!("evt-{n}"),
+            seq: 0,
+            thread_id: format!("room-{n}"),
+            kind,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("{tool}"),
+            scope: Vec::new(),
+            created_at: iso_ago(age_secs),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        }
+    }
+
+    /// A presence fact stamped with a branch sha (for the code-progress signal).
+    fn presence_sha(tool: &str, age_secs: i64, sha: &str) -> Fact {
+        let mut f = fact(FactKind::Presence, tool, age_secs);
+        f.evidence = vec![format!("branch_head_sha:{sha}")];
+        f
+    }
+
+    /// Assign monotonic seqs the way the real ledger does (replay order).
+    fn seqd(mut facts: Vec<Fact>) -> Vec<Fact> {
+        for (i, f) in facts.iter_mut().enumerate() {
+            f.seq = (i + 1) as i64;
+        }
+        facts
+    }
+
+    fn has_squad(snap: &RoomSnapshot, tool: &str) -> bool {
+        snap.squads.iter().any(|s| s.tool == tool)
+    }
+
+    #[test]
+    fn five_min_cadence_all_stale_squad_dropped_and_restored() {
+        // Default cadence (5m) → window 31m. Make ALL FOUR signals present and
+        // past the window so the verdict is provably Stale → DROP.
+        //   (a) heartbeat: stale presence facts (35m+, the newest).
+        //   (b) inject: a handoff TO the tool, stale (40m).
+        //   (c) code progress: two presence facts with DIFFERENT shas, both old
+        //       (the newer is 35m → progress age 35m, stale).
+        //   (d) plan: a claim owned by the tool, stale (60m).
+        let coord = CoordinationConfig::default();
+        let mut handoff = fact(FactKind::Handoff, "sender", 40 * 60);
+        handoff.target = Some("stale-tool".to_string());
+        let mut claim = fact(FactKind::Claim, "stale-tool", 60 * 60);
+        claim.scope = vec!["file:src/x.rs".to_string()];
+        let facts = seqd(vec![
+            presence_sha("stale-tool", 90 * 60, "aaaa"), // older sha
+            handoff,
+            claim,
+            presence_sha("stale-tool", 35 * 60, "bbbb"), // newer sha → moved, but 35m old
+        ]);
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        assert!(
+            !has_squad(&snap, "stale-tool"),
+            "all-signals-stale 5-min-cadence squad must be DROPPED from default view"
+        );
+        let snap_all = snapshot_from_facts_with_policy(&facts, &coord, true);
+        assert!(
+            has_squad(&snap_all, "stale-tool"),
+            "dropped squad must return under include_archived"
+        );
+    }
+
+    #[test]
+    fn five_hour_cadence_idle_2h_stays_visible() {
+        // Declared 5-hour cadence via planned_heartbeat_secs stamp → window 30h.
+        // A 2-hour-old presence is well within window → Live → visible.
+        let coord = CoordinationConfig::default();
+        let mut presence = fact(FactKind::Presence, "slow-tool", 2 * 60 * 60);
+        presence.evidence = vec!["planned_heartbeat_secs:18000".to_string()];
+        let facts = seqd(vec![presence]);
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        assert!(
+            has_squad(&snap, "slow-tool"),
+            "5-hour-cadence tool idle 2h must stay LIVE/visible"
+        );
+    }
+
+    #[test]
+    fn fresh_code_progress_keeps_stale_heartbeat_alive() {
+        // Heartbeat is the newest fact at 35m (stale on a 5m cadence) BUT the two
+        // newest presence shas DIFFER and the newer is fresh (30s) → code progress
+        // fresh → Live → visible. (Here the newest presence both IS the heartbeat
+        // and proves progress; use a fresh newer presence.)
+        let coord = CoordinationConfig::default();
+        let facts = seqd(vec![
+            presence_sha("worker", 50 * 60, "old1"),
+            presence_sha("worker", 30, "new2"), // fresh + moved
+        ]);
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        assert!(
+            has_squad(&snap, "worker"),
+            "fresh code-progress must keep the squad visible"
+        );
+    }
+
+    #[test]
+    fn fresh_inject_keeps_squad_alive() {
+        // Stale heartbeat presence, but a FRESH handoff targeting the tool (inject).
+        let coord = CoordinationConfig::default();
+        let mut handoff = fact(FactKind::Handoff, "sender", 60); // fresh inject
+        handoff.target = Some("recv".to_string());
+        let facts = seqd(vec![fact(FactKind::Presence, "recv", 40 * 60), handoff]);
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        assert!(has_squad(&snap, "recv"), "fresh inject keeps squad visible");
+    }
+
+    #[test]
+    fn fresh_plan_claim_keeps_squad_alive() {
+        // Stale heartbeat presence, but a FRESH live claim (declared active work).
+        let coord = CoordinationConfig::default();
+        let mut claim = fact(FactKind::Claim, "builder", 30);
+        claim.scope = vec!["file:src/y.rs".to_string()];
+        // presence older than claim so heartbeat (highest-seq = claim) is fresh;
+        // to isolate the plan signal, give a stale presence as the highest-seq.
+        let facts = seqd(vec![claim, fact(FactKind::Presence, "builder", 40 * 60)]);
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        assert!(
+            has_squad(&snap, "builder"),
+            "fresh plan/claim keeps squad visible"
+        );
+    }
+
+    #[test]
+    fn stale_heartbeat_only_is_unknown_failopen_visible() {
+        // Only a stale presence; inject/code/plan signals never observed → Unknown
+        // → fail-open keeps it VISIBLE.
+        let coord = CoordinationConfig::default();
+        let facts = seqd(vec![fact(FactKind::Presence, "quiet", 40 * 60)]);
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        assert!(
+            has_squad(&snap, "quiet"),
+            "stale-heartbeat-only (other signals absent) must FAIL-OPEN to visible"
+        );
+    }
+
+    #[test]
+    fn unparseable_timestamp_fails_open_visible() {
+        // A presence with a garbage created_at: fact_age_secs returns 0 (fresh) on
+        // the visibility path → heartbeat fresh → visible. Never invent staleness.
+        let coord = CoordinationConfig::default();
+        let mut bad = fact(FactKind::Presence, "badts", 0);
+        bad.created_at = "NOT-A-TIMESTAMP".to_string();
+        let facts = seqd(vec![bad]);
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        assert!(
+            has_squad(&snap, "badts"),
+            "unparseable presence ts must FAIL-OPEN to visible"
+        );
+    }
+
+    #[test]
+    fn fresh_tool_stays_visible() {
+        let coord = CoordinationConfig::default();
+        let facts = seqd(vec![fact(FactKind::Presence, "live", 30)]);
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        assert!(has_squad(&snap, "live"));
     }
 }

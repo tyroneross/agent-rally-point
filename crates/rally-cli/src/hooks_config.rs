@@ -284,6 +284,13 @@ pub(crate) struct CoordinationConfig {
     pub(crate) reclaim_small_minutes: i64,
     /// Reclaim timeout for a LARGE (multi-file / coarse) claim, in minutes.
     pub(crate) reclaim_large_minutes: i64,
+    /// Adaptive-liveness: assumed planned heartbeat cadence (seconds) for a
+    /// session that has not declared one.
+    pub(crate) default_cadence_secs: i64,
+    /// Adaptive-liveness: missed-beats multiplier (window = cadence*mult+grace).
+    pub(crate) miss_multiplier: i64,
+    /// Adaptive-liveness: extra grace (seconds) on top of the missed-beats window.
+    pub(crate) grace_secs: i64,
 }
 
 impl Default for CoordinationConfig {
@@ -293,6 +300,9 @@ impl Default for CoordinationConfig {
             archive_floor_weight: crate::decay::DEFAULT_ARCHIVE_FLOOR,
             reclaim_small_minutes: crate::decay::DEFAULT_RECLAIM_SMALL_MINUTES,
             reclaim_large_minutes: crate::decay::DEFAULT_RECLAIM_LARGE_MINUTES,
+            default_cadence_secs: crate::liveness::DEFAULT_CADENCE_SECS,
+            miss_multiplier: crate::liveness::MISS_MULTIPLIER,
+            grace_secs: crate::liveness::GRACE_SECS,
         }
     }
 }
@@ -326,6 +336,21 @@ fn coordination_from_value(value: &Value, into: &mut CoordinationConfig) {
     if let Some(v) = coord.get("reclaim_large_minutes").and_then(Value::as_i64) {
         if v > 0 {
             into.reclaim_large_minutes = v;
+        }
+    }
+    if let Some(v) = coord.get("default_cadence_secs").and_then(Value::as_i64) {
+        if v > 0 {
+            into.default_cadence_secs = v;
+        }
+    }
+    if let Some(v) = coord.get("miss_multiplier").and_then(Value::as_i64) {
+        if v > 0 {
+            into.miss_multiplier = v;
+        }
+    }
+    if let Some(v) = coord.get("grace_secs").and_then(Value::as_i64) {
+        if v >= 0 {
+            into.grace_secs = v;
         }
     }
 }
@@ -377,6 +402,11 @@ pub(crate) fn resolve_coordination(repo_root: &Path) -> Result<CoordinationConfi
         "RALLY_RECLAIM_LARGE_MINUTES",
         &mut cfg.reclaim_large_minutes,
     );
+    coord_env_i64("RALLY_DEFAULT_CADENCE_SECS", &mut cfg.default_cadence_secs);
+    coord_env_i64("RALLY_MISS_MULTIPLIER", &mut cfg.miss_multiplier);
+    // grace may be 0; coord_env_i64 only accepts >0, which is fine — a 0 grace
+    // override is a no-op (the missed-beats window already dominates).
+    coord_env_i64("RALLY_GRACE_SECS", &mut cfg.grace_secs);
 
     Ok(cfg)
 }
@@ -406,12 +436,52 @@ mod coordination_tests {
         }
         let dir = std::env::temp_dir().join(format!("rally-coord-def-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
+        for k in [
+            "RALLY_DEFAULT_CADENCE_SECS",
+            "RALLY_MISS_MULTIPLIER",
+            "RALLY_GRACE_SECS",
+        ] {
+            unsafe { env::remove_var(k) };
+        }
         let cfg = resolve_coordination(&dir).unwrap();
         assert_eq!(cfg, CoordinationConfig::default());
         assert_eq!(cfg.half_life_hours, 48.0);
         assert_eq!(cfg.archive_floor_weight, 0.05);
         assert_eq!(cfg.reclaim_small_minutes, 30);
         assert_eq!(cfg.reclaim_large_minutes, 120);
+        // Adaptive-liveness defaults flow from the liveness module.
+        assert_eq!(cfg.default_cadence_secs, 300);
+        assert_eq!(cfg.miss_multiplier, 6);
+        assert_eq!(cfg.grace_secs, 60);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn liveness_tunables_resolve_from_repo_and_env() {
+        let _g = env_lock().lock().unwrap();
+        for k in [
+            "RALLY_DEFAULT_CADENCE_SECS",
+            "RALLY_MISS_MULTIPLIER",
+            "RALLY_GRACE_SECS",
+        ] {
+            unsafe { env::remove_var(k) };
+        }
+        let dir = std::env::temp_dir().join(format!("rally-coord-live-{}", std::process::id()));
+        let _ = fs::create_dir_all(dir.join(".rally"));
+        fs::write(
+            dir.join(".rally").join("config.json"),
+            r#"{"coordination":{"default_cadence_secs":600,"miss_multiplier":4,"grace_secs":0}}"#,
+        )
+        .unwrap();
+        let cfg = resolve_coordination(&dir).unwrap();
+        assert_eq!(cfg.default_cadence_secs, 600);
+        assert_eq!(cfg.miss_multiplier, 4);
+        assert_eq!(cfg.grace_secs, 0);
+        // env beats repo
+        unsafe { env::set_var("RALLY_DEFAULT_CADENCE_SECS", "900") };
+        let cfg2 = resolve_coordination(&dir).unwrap();
+        assert_eq!(cfg2.default_cadence_secs, 900, "env beats repo");
+        unsafe { env::remove_var("RALLY_DEFAULT_CADENCE_SECS") };
         let _ = fs::remove_dir_all(&dir);
     }
 

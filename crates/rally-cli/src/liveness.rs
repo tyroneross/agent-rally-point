@@ -130,6 +130,9 @@ pub(crate) fn is_live(signals: &LivenessSignals, window: i64) -> Liveness {
 /// Convenience: compute the window from a planned interval and decide liveness
 /// in one call, using the pinned default constants. Callers that have resolved
 /// tunables from config use [`adaptive_window_secs`] + [`is_live`] directly.
+/// Used by the orphan-tmux reaper path (which has no `CoordinationConfig` in
+/// hand) and by external integration tests.
+#[allow(dead_code)]
 pub(crate) fn is_live_default(
     signals: &LivenessSignals,
     planned_interval_secs: i64,
