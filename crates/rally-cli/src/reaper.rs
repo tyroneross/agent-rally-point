@@ -162,7 +162,20 @@ pub(crate) fn run_reap_stale_in_room(room: &RoomStore, apply: bool) -> Result<Re
                 scope: claim.scope.clone(),
                 created_at: now_string(),
                 summary: Some(format!("reaper:reason={}", reaped.reason)),
-                evidence: vec![format!("reaper:ref_id={}", claim.event_id)],
+                // Stamp the reap reason onto evidence so the under-lock re-check
+                // in `store::append_fact` (SEC-001 owner-revival guard) can
+                // distinguish a racy OWNER-STALE close (must re-validate) from a
+                // monotonic LEASE-EXPIRED close (exempt — a past lease cannot
+                // un-expire). The owner-tool is stamped too so the guard knows
+                // whose liveness to re-check without re-parsing the subject.
+                evidence: vec![
+                    format!("reaper:ref_id={}", claim.event_id),
+                    format!("reaper:reason={}", reaped.reason),
+                    format!(
+                        "reaper:owner={}",
+                        claim.tool.as_deref().unwrap_or("unknown")
+                    ),
+                ],
                 target: None,
                 ref_id: Some(claim.event_id.clone()),
                 status: None,
@@ -580,6 +593,103 @@ mod tests {
 
         // Suppress unused-variable warning for claim_b event_id which is checked above.
         let _ = claim_b;
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Append a small single-file claim owned by `tool` and authored by the
+    /// live session `from_session`. FRESH timestamp so the owner stays live.
+    fn append_session_claim(
+        room: &RoomStore,
+        event_id: &str,
+        tool: &str,
+        from_session: &str,
+    ) -> Fact {
+        let fact = Fact {
+            from_session_id: Some(from_session.to_string()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: event_id.to_string(),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Claim,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("claim: {tool}"),
+            scope: vec![format!("file:src/{event_id}.rs")],
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&fact).unwrap()
+    }
+
+    #[test]
+    fn stop_self_release_is_session_scoped_for_same_tool() {
+        // Two co-resident sessions of the SAME tool each hold a claim. Stopping
+        // session A must release only A's claim; B's claim (a live sibling) must
+        // survive. The fix matches on the claim's `from_session_id`, not just
+        // the tool, so a shared tool no longer over-releases.
+        let root = unique_root("session-scoped-release");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        append_presence(&room, "claude_code", 10);
+        let claim_a = append_session_claim(&room, "claim-sa", "claude_code", "sess-A");
+        let claim_b = append_session_claim(&room, "claim-sb", "claude_code", "sess-B");
+
+        // Simulate the stop self-release for session A using the SAME filter the
+        // production stop path uses (session-then-tool fallback).
+        let stopping_tool = "claude_code";
+        let stopping_session = "sess-A";
+        let snap = room.snapshot().unwrap();
+        for c in snap.active_claims.iter().filter(|c| {
+            c.from_session_id.as_deref() == Some(stopping_session)
+                || (c.from_session_id.is_none() && c.tool.as_deref() == Some(stopping_tool))
+        }) {
+            let release = Fact {
+                from_session_id: None,
+                schema: FACT_SCHEMA.to_string(),
+                event_id: new_id("fact"),
+                seq: 0,
+                thread_id: new_id("room"),
+                kind: FactKind::Release,
+                tool: Some(stopping_tool.to_string()),
+                role: None,
+                subject: format!("self-release on stop: {}", c.event_id),
+                scope: c.scope.clone(),
+                created_at: now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: Some(c.event_id.clone()),
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            let _ = room.append_state_transition_verified(&release);
+        }
+
+        let snap_after = room.snapshot().unwrap();
+        let a_live = snap_after
+            .active_claims
+            .iter()
+            .any(|c| c.event_id == claim_a.event_id);
+        let b_live = snap_after
+            .active_claims
+            .iter()
+            .any(|c| c.event_id == claim_b.event_id);
+
+        assert!(!a_live, "stopping session A must release A's own claim");
+        assert!(
+            b_live,
+            "a live sibling session (B) of the SAME tool must NOT be released"
+        );
 
         fs::remove_dir_all(&root).ok();
     }

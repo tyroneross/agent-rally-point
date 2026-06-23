@@ -847,6 +847,18 @@ impl RoomStore {
         None
     }
 
+    /// Read a single-value `reaper:<key>=<value>` evidence marker. The reaper
+    /// stamps `reaper:reason=<owner-stale|lease-expired|owner-stale+lease-expired>`
+    /// and `reaper:owner=<tool>` onto every ClaimExpired it appends; the
+    /// under-lock revival guard reads them to decide whether to re-validate.
+    fn reaper_marker<'a>(evidence: &'a [String], key: &str) -> Option<&'a str> {
+        let prefix = format!("reaper:{key}=");
+        evidence
+            .iter()
+            .find_map(|item| item.strip_prefix(prefix.as_str()))
+            .map(str::trim)
+    }
+
     pub(crate) fn append_fact(&self, fact: &Fact) -> Result<Fact> {
         let room_dir = self
             .facts_db_path
@@ -889,6 +901,56 @@ impl RoomStore {
                             "takeover refused: owner {owner} is no longer stale \
                              (revived under the mutation lock); not reclaiming a \
                              now-live owner's claim"
+                        )));
+                    }
+                }
+            }
+        }
+        // SEC-001 close (ClaimExpired): the reaper computes owner-eligibility on
+        // an UNLOCKED snapshot (reaper.rs top), then appends ClaimExpired here,
+        // later. A peer owner that REVIVES (posts fresh activity) in the
+        // snapshot→append gap could still have its claim closed — the racy
+        // OWNER-STALE signal. Mirror the Release guard: under the held mutation
+        // lock, re-snapshot fresh facts and re-assert the closure is still
+        // justified. A LEASE-EXPIRED close is exempt — a past lease cannot
+        // un-expire (monotonic), so we only re-validate OWNER-STALE-only
+        // closures. The reaper stamps `reaper:reason=` + `reaper:owner=` so this
+        // guard can distinguish without re-parsing the subject.
+        if fact.kind == FactKind::ClaimExpired {
+            let reason = Self::reaper_marker(&fact.evidence, "reason");
+            // Only a PURE owner-stale close is racy. A close that also carries
+            // the lease-expired signal ("lease-expired" or
+            // "owner-stale+lease-expired") is monotonic-safe and exempt.
+            if reason == Some("owner-stale") {
+                if let Some(owner) = Self::reaper_marker(&fact.evidence, "owner") {
+                    let coord = crate::hooks_config::resolve_coordination(&self.repo_root)
+                        .unwrap_or_default();
+                    let facts = facts_from_store(&fact_store)?;
+                    let fresh = snapshot_from_facts_with_policy(&facts, &coord, false);
+                    // The specific claim this ClaimExpired closes (by ref).
+                    let ref_id = fact.ref_id.as_deref();
+                    let still_owns = fresh
+                        .active_claims
+                        .iter()
+                        .any(|c| c.tool.as_deref() == Some(owner) && Some(c.event_id.as_str()) == ref_id);
+                    let still_eligible = fresh
+                        .active_claims
+                        .iter()
+                        .filter(|c| {
+                            c.tool.as_deref() == Some(owner)
+                                && Some(c.event_id.as_str()) == ref_id
+                        })
+                        .any(|c| fresh.claim_reclaim_eligible(c, &coord).0);
+                    // The claim still HOLDS but is NO LONGER reap-eligible means
+                    // the owner came back to life in the gap → refuse the reap.
+                    // If the claim is already gone (already closed) we let the
+                    // append proceed; the projection dedups via ref_id.
+                    if still_owns && !still_eligible {
+                        return Err(RallyError::Usage(format!(
+                            "reap refused: owner {owner} revived under the mutation \
+                             lock (owner-stale ClaimExpired for claim {} no longer \
+                             eligible); not closing a now-live owner's claim",
+                            ref_id.unwrap_or("<unknown>")
                         )));
                     }
                 }
@@ -6163,6 +6225,108 @@ mod sec001_takeover_guard_tests {
         store.append_fact(&release).unwrap();
         let snap = store.snapshot().unwrap();
         assert!(!snap.active_claims.iter().any(|c| c.event_id == "claim-s"));
+        fs::remove_dir_all(&r).ok();
+    }
+
+    /// Build a reaper-style ClaimExpired fact closing `claim_id` for `owner`
+    /// with the given reap reason, mirroring what `reaper.rs` stamps.
+    fn reaper_claim_expired(claim_id: &str, owner: &str, reason: &str) -> Fact {
+        let mut f = fact_at(
+            "exp-1",
+            FactKind::ClaimExpired,
+            "rally",
+            "file:src/a.rs",
+            &iso_ago(0),
+        );
+        f.ref_id = Some(claim_id.to_string());
+        f.summary = Some(format!("reaper:reason={reason}"));
+        f.evidence = vec![
+            format!("reaper:ref_id={claim_id}"),
+            format!("reaper:reason={reason}"),
+            format!("reaper:owner={owner}"),
+        ];
+        f
+    }
+
+    #[test]
+    fn reaper_owner_stale_close_refused_if_owner_revived_under_lock() {
+        // Parallel to `takeover_refused_when_owner_revived_under_lock`, but for
+        // the reaper's ClaimExpired path: an OWNER-STALE close computed on an
+        // unlocked snapshot must be REFUSED if the owner revives before the
+        // append acquires the mutation lock.
+        let r = root("reaper-revived");
+        let store = RoomStore::open_at(r.clone()).unwrap();
+        // ghost claimed a single file 40m ago (small => 30m bar => stale).
+        let claim = fact_at(
+            "claim-g",
+            FactKind::Claim,
+            "ghost",
+            "file:src/a.rs",
+            &iso_ago(40 * 60),
+        );
+        store.append_fact(&claim).unwrap();
+        // ghost REVIVES: fresh presence => squad last_seen ~now => not stale.
+        let revive = fact_at(
+            "revive-g",
+            FactKind::Presence,
+            "ghost",
+            "presence",
+            &iso_ago(1),
+        );
+        store.append_fact(&revive).unwrap();
+        // The reaper attempts an owner-stale ClaimExpired for ghost's claim.
+        // The under-lock guard must refuse it.
+        let expired = reaper_claim_expired("claim-g", "ghost", "owner-stale");
+        let err = store.append_fact(&expired).unwrap_err().to_string();
+        assert!(
+            err.contains("reap refused") && err.contains("revived"),
+            "revived owner's claim must not be reaped via ClaimExpired; got: {err}"
+        );
+        // ghost still owns its claim (the skip is observable as a kept claim).
+        let snap = store.snapshot().unwrap();
+        assert!(
+            snap.active_claims.iter().any(|c| c.event_id == "claim-g"),
+            "owner-stale ClaimExpired must NOT close a revived owner's claim"
+        );
+        fs::remove_dir_all(&r).ok();
+    }
+
+    #[test]
+    fn reaper_lease_expired_close_survives_owner_activity() {
+        // A LEASE-EXPIRED close is monotonic-safe: a past lease cannot un-expire,
+        // so the under-lock guard must NOT refuse it even when the owner is fully
+        // active (fresh presence). This is the dual-signal case the owner-stale
+        // re-check must leave alone.
+        let r = root("reaper-lease-survives");
+        let store = RoomStore::open_at(r.clone()).unwrap();
+        // live-owner claims a single file just now AND is fresh (active squad).
+        let claim = fact_at(
+            "claim-l",
+            FactKind::Claim,
+            "live-owner",
+            "file:src/a.rs",
+            &iso_ago(5),
+        );
+        store.append_fact(&claim).unwrap();
+        let presence = fact_at(
+            "pres-l",
+            FactKind::Presence,
+            "live-owner",
+            "presence",
+            &iso_ago(1),
+        );
+        store.append_fact(&presence).unwrap();
+        // The reaper closes the claim on the LEASE-EXPIRED signal. Even though
+        // the owner is active, the guard exempts lease-expired closures.
+        let expired = reaper_claim_expired("claim-l", "live-owner", "lease-expired");
+        store
+            .append_fact(&expired)
+            .expect("lease-expired ClaimExpired must not be refused for an active owner");
+        let snap = store.snapshot().unwrap();
+        assert!(
+            !snap.active_claims.iter().any(|c| c.event_id == "claim-l"),
+            "lease-expired ClaimExpired must close the claim despite owner activity"
+        );
         fs::remove_dir_all(&r).ok();
     }
 }

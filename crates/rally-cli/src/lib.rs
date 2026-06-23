@@ -4608,20 +4608,31 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                     let repo = repo_root().unwrap_or_else(|_| PathBuf::from("."));
                     let _ = run_worktree::cleanup(&repo, path, branch, "git");
                 }
-                // LEVER 3: self-release all active claims owned by the stopping
-                // tool before removing the session record. Self-release is
+                // LEVER 3: self-release the STOPPING SESSION's active claims
+                // before removing the session record. Self-release is
                 // authoritative (bypasses the 2h reclaim bar — the owner is
                 // declaring itself done), keeps SEC-001 dormant (no stale-owner
                 // marker on the release fact), and is best-effort (never blocks
                 // the stop path).
+                //
+                // Goal F4: release THAT SESSION's claims, not every claim that
+                // happens to share the stopping tool. Two co-resident sessions
+                // of the SAME tool (e.g. two claude_code sessions) must not
+                // release each other's mid-work claims. Match on the claim's
+                // `from_session_id` (the live session lease that authored the
+                // claim). Fall back to tool-match ONLY for legacy claims that
+                // carry no `from_session_id` (the dominant one-session-per-tool
+                // case stays correct), and never touch a live sibling session's
+                // claims.
                 if let Ok(room) = RoomStore::open() {
                     if let Ok(snap) = room.snapshot() {
                         let stopping_tool = &session.tool;
-                        for claim in snap
-                            .active_claims
-                            .iter()
-                            .filter(|c| c.tool.as_deref() == Some(stopping_tool.as_str()))
-                        {
+                        let stopping_session = session.session_id.as_str();
+                        for claim in snap.active_claims.iter().filter(|c| {
+                            c.from_session_id.as_deref() == Some(stopping_session)
+                                || (c.from_session_id.is_none()
+                                    && c.tool.as_deref() == Some(stopping_tool.as_str()))
+                        }) {
                             let release = Fact {
                                 from_session_id: None,
                                 schema: FACT_SCHEMA.to_string(),
