@@ -841,6 +841,129 @@ fn probe_tmux_liveness(bin: &str, targets: &[String]) -> Vec<SessionLiveness> {
     classify_probe_output(output, targets)
 }
 
+/// A detached, all-stale agent tmux session that the orphan reaper would kill.
+#[derive(Clone, Debug, Eq, PartialEq, JsonSchema, Serialize)]
+pub(crate) struct OrphanTmux {
+    /// tmux session name (matches the `rally-*` convention).
+    pub(crate) session_name: String,
+    /// Age in seconds since the session's last activity.
+    pub(crate) idle_secs: i64,
+}
+
+/// PURE parse + classify of `tmux list-sessions -F
+/// '#{session_name}|#{session_attached}|#{session_activity}'` output.
+///
+/// A session is an orphan candidate iff ALL hold:
+/// * the name starts with `rally-` (the agent-session naming convention),
+/// * it is DETACHED (`session_attached == 0` — an attached session is a human
+///   actively looking at it; never kill it),
+/// * its last activity is older than `idle_window_secs` (the adaptive window;
+///   the orphan path has no per-session declared cadence, so the caller passes
+///   the default-cadence window).
+///
+/// `now_epoch` is injected for deterministic tests. tmux `session_activity` is
+/// epoch seconds. A line we cannot parse is SKIPPED (fail-safe — never kill on a
+/// malformed line).
+pub(crate) fn classify_orphan_tmux(
+    list_output: &str,
+    now_epoch: i64,
+    idle_window_secs: i64,
+) -> Vec<OrphanTmux> {
+    let mut out = Vec::new();
+    for line in list_output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('|').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let name = parts[0].trim();
+        if !name.starts_with("rally-") {
+            continue;
+        }
+        // attached flag: tmux prints "1" when attached, "0" when detached.
+        let Ok(attached) = parts[1].trim().parse::<i64>() else {
+            continue;
+        };
+        if attached != 0 {
+            continue; // a human is attached — never kill
+        }
+        let Ok(activity) = parts[2].trim().parse::<i64>() else {
+            continue;
+        };
+        let idle = now_epoch - activity;
+        if idle > idle_window_secs {
+            out.push(OrphanTmux {
+                session_name: name.to_string(),
+                idle_secs: idle,
+            });
+        }
+    }
+    out
+}
+
+/// Detect detached, all-stale `rally-*` orphan tmux sessions. Shells out to tmux
+/// once; returns `[]` when tmux is absent / no server / the call fails (fail-open
+/// — never invent orphans). `idle_window_secs` is the adaptive default-cadence
+/// window. The actual kill is performed by the caller via `BackendRunner::stop`.
+pub(crate) fn detect_orphan_tmux(
+    tmux_bin: &str,
+    now_epoch: i64,
+    idle_window_secs: i64,
+) -> Vec<OrphanTmux> {
+    let output = Command::new(tmux_bin)
+        .args([
+            "list-sessions",
+            "-F",
+            "#{session_name}|#{session_attached}|#{session_activity}",
+        ])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => classify_orphan_tmux(
+            &String::from_utf8_lossy(&o.stdout),
+            now_epoch,
+            idle_window_secs,
+        ),
+        // no server / tmux missing / error → no orphans to report (fail-open).
+        _ => Vec::new(),
+    }
+}
+
+/// Kill a tmux session by name (orphan reap / self-kill). Best-effort: returns
+/// whether the kill command reported success. Never panics.
+pub(crate) fn kill_tmux_session(tmux_bin: &str, session_name: &str) -> bool {
+    Command::new(tmux_bin)
+        .args(["kill-session", "-t", session_name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// The tmux session name that THIS process is running inside, if any
+/// (`$TMUX_PANE` → `tmux display-message`), restricted to `rally-*`. Used by
+/// `rally stop` to self-kill its own agent tmux session at session end. Returns
+/// `None` when not inside tmux or not a `rally-*` session.
+pub(crate) fn own_rally_tmux_session(tmux_bin: &str) -> Option<String> {
+    if std::env::var_os("TMUX").is_none() {
+        return None;
+    }
+    let out = Command::new(tmux_bin)
+        .args(["display-message", "-p", "#{session_name}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.starts_with("rally-") {
+        Some(name)
+    } else {
+        None
+    }
+}
+
 fn probe_cmux_liveness(bin: &str, targets: &[String]) -> Vec<SessionLiveness> {
     let output = Command::new(bin).arg("list-workspaces").output();
     classify_probe_output(output, targets)
@@ -1023,8 +1146,8 @@ mod tests {
     // Plan F functional core (Chunk 3): herdr_command, parse_herdr_agents_tab,
     // and resolve_agent_pane_from_list removed with the Backend::Herdr arm.
     use super::{
-        CR, PASTE_END, PASTE_START, frame_line_bytes, hex_tokens, parse_cmux_start_target,
-        sanitize_inject_text, shell_words, tmux_inject_commands,
+        CR, PASTE_END, PASTE_START, classify_orphan_tmux, frame_line_bytes, hex_tokens,
+        parse_cmux_start_target, sanitize_inject_text, shell_words, tmux_inject_commands,
     };
     use crate::check::CheckData;
     use crate::store::Fact;
@@ -1187,5 +1310,65 @@ mod tests {
             serde_json::to_value(schema_for!(Envelope<SessionActionData>)).unwrap(),
         ];
         assert!(schemas.iter().all(|schema| schema.is_object()));
+    }
+
+    // ---- orphan-tmux classifier (R4) ----
+    // Default-cadence adaptive window: 300*6+60 = 1860s (31m). Use now=1_000_000.
+    const NOW: i64 = 1_000_000;
+    const WIN: i64 = 1860;
+
+    fn line(name: &str, attached: i64, activity: i64) -> String {
+        format!("{name}|{attached}|{activity}")
+    }
+
+    #[test]
+    fn detached_stale_rally_session_is_orphan() {
+        // detached, last activity 40 min ago (2400s > 1860).
+        let out = line("rally-claude-foo", 0, NOW - 2400);
+        let orphans = classify_orphan_tmux(&out, NOW, WIN);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].session_name, "rally-claude-foo");
+        assert_eq!(orphans[0].idle_secs, 2400);
+    }
+
+    #[test]
+    fn attached_session_is_never_orphan() {
+        // attached=1: a human is looking at it — never kill, even if stale.
+        let out = line("rally-codex-bar", 1, NOW - 99999);
+        assert!(classify_orphan_tmux(&out, NOW, WIN).is_empty());
+    }
+
+    #[test]
+    fn fresh_detached_rally_session_is_not_orphan() {
+        // detached but active 5 min ago (300s < 1860).
+        let out = line("rally-claude-baz", 0, NOW - 300);
+        assert!(classify_orphan_tmux(&out, NOW, WIN).is_empty());
+    }
+
+    #[test]
+    fn non_rally_session_is_ignored() {
+        // a user's own "work" tmux session, detached and ancient, is NOT touched.
+        let out = line("work", 0, NOW - 99999);
+        assert!(classify_orphan_tmux(&out, NOW, WIN).is_empty());
+    }
+
+    #[test]
+    fn malformed_lines_are_skipped() {
+        let out = "garbage\nrally-x|notanumber|123\nrally-y|0|alsobad\n\n";
+        assert!(classify_orphan_tmux(out, NOW, WIN).is_empty());
+    }
+
+    #[test]
+    fn mixed_list_picks_only_stale_detached_rally() {
+        let out = [
+            line("rally-claude-1", 0, NOW - 5000), // orphan
+            line("rally-codex-2", 1, NOW - 5000),  // attached — keep
+            line("rally-claude-3", 0, NOW - 60),   // fresh — keep
+            line("work", 0, NOW - 99999),          // non-rally — keep
+        ]
+        .join("\n");
+        let orphans = classify_orphan_tmux(&out, NOW, WIN);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].session_name, "rally-claude-1");
     }
 }

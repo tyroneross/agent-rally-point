@@ -4001,6 +4001,7 @@ fn ensure_unique_session_identity(
 fn command_sessions(args: SessionsArgs) -> Result<Output> {
     let room = RoomStore::open()?;
     let mut sessions = read_session_views(&room, args.bins.clone())?;
+    let mut orphans_reaped: Vec<String> = Vec::new();
     let reaped = if args.reap {
         let mut count = 0;
         for (fact, view) in active_session_views(&room, args.bins.clone())? {
@@ -4009,6 +4010,42 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
                 count += 1;
             }
         }
+
+        // Orphan-tmux reaper: detached `rally-*` tmux sessions whose last
+        // activity is past the adaptive default-cadence window and which are NOT
+        // tracked as managed sessions are killed + tombstoned. Closes the gap
+        // where `rally sessions --reap` saw 0 of the real detached orphans.
+        let coord =
+            crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+        let window = crate::liveness::adaptive_window_secs(
+            coord.default_cadence_secs,
+            coord.default_cadence_secs,
+            coord.miss_multiplier,
+            coord.grace_secs,
+        );
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let managed_targets: std::collections::BTreeSet<String> = sessions
+            .iter()
+            .map(|v| v.session.target.clone())
+            .collect();
+        let tmux_bin = args.bins.tmux_bin.clone();
+        for orphan in backends::detect_orphan_tmux(&tmux_bin, now_epoch, window) {
+            // Never touch a tmux session that a managed record points at — that
+            // path already has its own (heartbeat/probe-driven) reap above.
+            if managed_targets.contains(&orphan.session_name) {
+                continue;
+            }
+            if backends::kill_tmux_session(&tmux_bin, &orphan.session_name) {
+                let _ =
+                    append_orphan_tmux_tombstone(&room, &orphan.session_name, orphan.idle_secs);
+                orphans_reaped.push(orphan.session_name);
+                count += 1;
+            }
+        }
+
         sessions = read_session_views(&room, args.bins)?;
         count
     } else {
@@ -4024,11 +4061,55 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
         },
     )?;
     let text = if args.reap {
-        format!("sessions {} reaped {reaped}", sessions.len())
+        if orphans_reaped.is_empty() {
+            format!("sessions {} reaped {reaped}", sessions.len())
+        } else {
+            format!(
+                "sessions {} reaped {reaped} (orphan-tmux: {})",
+                sessions.len(),
+                orphans_reaped.join(", ")
+            )
+        }
     } else {
         format!("sessions {}", sessions.len())
     };
     Ok(Output::new(args.json, text, body))
+}
+
+/// Append a durable tombstone fact for a reaped orphan tmux session so peers see
+/// it was killed (visibility; the squad/session projection is unaffected because
+/// an orphan was never a managed-session record).
+fn append_orphan_tmux_tombstone(
+    room: &RoomStore,
+    session_name: &str,
+    idle_secs: i64,
+) -> Result<()> {
+    let fact = Fact {
+        from_session_id: None,
+        schema: FACT_SCHEMA.to_string(),
+        event_id: new_id("fact"),
+        seq: 0,
+        thread_id: new_id("room"),
+        kind: FactKind::Decision,
+        tool: Some("rally".to_string()),
+        role: None,
+        subject: format!("reaper: orphan tmux {session_name} killed"),
+        scope: Vec::new(),
+        created_at: now_string(),
+        summary: Some(format!("orphan-tmux idle_secs={idle_secs}")),
+        evidence: vec![
+            format!("reaper:orphan-tmux={session_name}"),
+            format!("reaper:idle_secs={idle_secs}"),
+        ],
+        target: None,
+        ref_id: None,
+        status: None,
+        severity: None,
+        uri: None,
+        session: None,
+    };
+    room.append_fact(&fact)?;
+    Ok(())
 }
 
 fn command_inject(args: InjectArgs) -> Result<Output> {
@@ -4568,6 +4649,9 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
     let dry_run = args.dry_run;
     let target = args.target;
     let session = find_session(&target, &args.bins)?;
+    // Capture the tmux bin before `args.bins` is moved into the runner — the
+    // session-end self-kill (below) needs it.
+    let tmux_bin_for_self_kill = args.bins.tmux_bin.clone();
     let mut backend_runner = BackendRunner::new(Backend::parse(&session.backend)?, args.bins);
     // [E]: capture/stop/attach on a ptyd session must reach the SAME daemon the
     // pane was spawned in — pin the socket recorded on the session.
@@ -4665,6 +4749,17 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                     }
                 }
                 remove_session_record(&session.session_id)?;
+
+                // Session-end self-kill (contain at source): if THIS process is
+                // itself running inside a `rally-*` tmux session that is NOT the
+                // managed target we just stopped, kill it too so it can never
+                // become a detached orphan the reaper has to clean up later.
+                // Best-effort; never blocks the stop path.
+                if let Some(own) = backends::own_rally_tmux_session(&tmux_bin_for_self_kill) {
+                    if own != live_target {
+                        let _ = backends::kill_tmux_session(&tmux_bin_for_self_kill, &own);
+                    }
+                }
             }
             (commands, None)
         }
