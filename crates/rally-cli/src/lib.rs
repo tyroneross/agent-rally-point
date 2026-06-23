@@ -63,6 +63,7 @@ mod error;
 mod event_envelope;
 mod hooks_config;
 mod init;
+mod liveness;
 mod next;
 mod output;
 mod reaper;
