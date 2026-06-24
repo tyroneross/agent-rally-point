@@ -295,6 +295,13 @@ pub(crate) struct RunArgs {
 pub(crate) struct SessionsArgs {
     pub(crate) json: bool,
     pub(crate) reap: bool,
+    /// When `true`, also scan OS processes for known orphan agent patterns
+    /// (codex mcp-server, node .../bin/codex mcp-server, post-turn zombies)
+    /// and stage them for removal. Dry-run unless `apply` is also set.
+    pub(crate) reap_processes: bool,
+    /// When `true` (requires `--reap-processes`), actually kill staged processes
+    /// (TERM then KILL). Without this flag the process reaper is dry-run only.
+    pub(crate) apply: bool,
     pub(crate) bins: BackendBins,
 }
 
@@ -1342,8 +1349,26 @@ fn sessions_parser() -> impl Parser<SessionsArgs> {
     let reap = long("reap")
         .help("Tombstone sessions projected as stale. Unknown sessions are left untouched.")
         .switch();
+    let reap_processes = long("reap-processes")
+        .help(
+            "Also reap orphan agent OS processes (codex mcp-server, node codex mcp-server, \
+             post-turn-zombie). Dry-run unless --apply.",
+        )
+        .switch();
+    let apply = long("apply")
+        .help(
+            "Actually kill staged processes (TERM then KILL). \
+             Default = dry-run, list only. Only meaningful with --reap-processes.",
+        )
+        .switch();
     let bins = backend_bins_parser();
-    construct!(SessionsArgs { json, reap, bins })
+    construct!(SessionsArgs {
+        json,
+        reap,
+        reap_processes,
+        apply,
+        bins
+    })
 }
 
 fn inject_parser() -> impl Parser<InjectArgs> {

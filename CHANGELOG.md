@@ -7,6 +7,38 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Added — Orphan agent OS-process reaper (`rally sessions --reap-processes [--apply]`)
+
+Closes the gap left by the tmux and worktree reapers: nothing previously killed orphan
+OS processes (codex mcp-server, node .../bin/codex mcp-server, SkyComputerUseClient
+post-turn zombies). This session manually killed 27 such processes aged 10-18 days.
+
+- **New flag `--reap-processes`** on `rally sessions`: scans `ps -axo pid=,etime=,command=`
+  for three candidate patterns and stages matches for removal. Dry-run by default —
+  candidates are listed but nothing is killed.
+- **New flag `--apply`** (requires `--reap-processes`): executes TERM then KILL on
+  each staged process. Returns a count of killed PIDs in the text output.
+- **Reuses the existing liveness model** (`liveness::{is_live, reapable, adaptive_window_secs}`)
+  exactly as the orphan-tmux path does: single observable signal (process age from `etime`)
+  mapped onto `code_progress_age`; `Unknown` promoted to `Stale` because a real process
+  always has an observed age; `reapable(verdict, parent_alive)` is the single kill gate.
+- **macOS BSD `etime` parsing** (`parse_etime_secs`): pure helper handles `mm:ss`,
+  `hh:mm:ss`, and `dd-hh:mm:ss` (BSD `ps` has no `etimes`/`etime_secs` keyword).
+  Malformed fields return `None` → the line is SKIPPED (fail-safe).
+- **Fail-safe floor**: non-zombie candidates younger than 600 s (10 min) are never staged.
+- **Post-turn zombie bypass**: `SkyComputerUseClient` processes with `turn-ended` in their
+  command are staged at ANY age (the process is definitionally dead at turn end), bypassing
+  the floor and liveness check.
+- **Parent-liveness check**: for non-zombie candidates, the reaper resolves the process's
+  parent PID via `ps -o ppid= -p <pid>` and calls `pid_is_alive(ppid)`. ppid == 1
+  (reparented to launchd) or a dead ppid is `Some(false)` → staged as `"stale+parent-dead"`.
+  Unresolvable ppid → `None` → falls back to window criterion alone (prior behavior).
+- **No new crate dependencies**: uses `std::process::Command` for `ps` and `kill` exactly
+  as the existing tmux path does. Zero additions to Cargo.toml.
+- **Pure classifier** `classify_orphan_processes` is injected-`now` and injected-`parent_fn`
+  for deterministic unit tests — 16 new tests covering parse_etime, staging, preservation,
+  zombie bypass, idempotency, and codex-mcp-server parent-alive/dead/fresh scenarios.
+
 ### Added — Zombie-tmux prevention: three layers over one liveness model
 
 Stops accreted zombie `rally-*` tmux sessions at the source instead of relying on a

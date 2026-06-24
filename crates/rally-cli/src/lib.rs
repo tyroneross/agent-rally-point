@@ -4161,11 +4161,52 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
         );
         count += orphans_reaped.len();
 
-        sessions = read_session_views(&room, args.bins)?;
+        sessions = read_session_views(&room, args.bins.clone())?;
         count
     } else {
         0
     };
+
+    // Orphan OS-process reaper (--reap-processes [--apply]).
+    // Independent of --reap; can be combined or used alone.
+    // Detect once; apply or dry-run from the same candidate list.
+    let (processes_staged_count, processes_reaped_pids): (usize, Vec<i32>) =
+        if args.reap_processes {
+            let coord =
+                crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+            let window = crate::liveness::adaptive_window_secs(
+                coord.default_cadence_secs,
+                coord.default_cadence_secs,
+                coord.miss_multiplier,
+                coord.grace_secs,
+            );
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            const PROCESS_FLOOR_SECS: i64 = 600;
+            let staged =
+                backends::detect_orphan_processes(now_epoch, window, PROCESS_FLOOR_SECS);
+            let staged_count = staged.len();
+            let killed: Vec<i32> = if args.apply {
+                staged
+                    .iter()
+                    .filter(|p| backends::kill_process(p.pid))
+                    .map(|p| p.pid)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (staged_count, killed)
+        } else {
+            (0, Vec::new())
+        };
+
+    // Rebuild session list if any process kills happened.
+    if !processes_reaped_pids.is_empty() {
+        sessions = read_session_views(&room, args.bins)?;
+    }
+
     let body = envelope(
         "sessions",
         SCHEMA_SESSIONS,
@@ -4175,7 +4216,9 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
             },
         },
     )?;
-    let text = if args.reap {
+
+    // Build text line.
+    let mut text = if args.reap {
         if orphans_reaped.is_empty() {
             format!("sessions {} reaped {reaped}", sessions.len())
         } else {
@@ -4188,6 +4231,31 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
     } else {
         format!("sessions {}", sessions.len())
     };
+    if args.reap_processes {
+        if args.apply {
+            if processes_reaped_pids.is_empty() {
+                text.push_str(" | processes: none killed");
+            } else {
+                let pids: Vec<String> =
+                    processes_reaped_pids.iter().map(|p| p.to_string()).collect();
+                text.push_str(&format!(
+                    " | processes killed: {} (pids: {})",
+                    processes_reaped_pids.len(),
+                    pids.join(", ")
+                ));
+            }
+        } else {
+            // dry-run: list staged count without killing anything.
+            if processes_staged_count == 0 {
+                text.push_str(" | processes: 0 staged");
+            } else {
+                text.push_str(&format!(
+                    " | processes staged: {processes_staged_count} (dry-run; use --apply to kill)"
+                ));
+            }
+        }
+    }
+
     Ok(Output::new(args.json, text, body))
 }
 

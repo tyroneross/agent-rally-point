@@ -1058,6 +1058,285 @@ pub(crate) fn kill_tmux_session(tmux_bin: &str, session_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ── Orphan OS-process reaper ────────────────────────────────────────────────
+//
+// Mirrors the orphan-tmux path exactly:
+//   • `parse_etime_secs`          — pure BSD `etime` format parser
+//   • `OrphanProcess`             — candidate struct (pub(crate), derive matches OrphanTmux)
+//   • `classify_orphan_processes` — PURE parse+classify with injected now/window/parent-fn
+//   • `detect_orphan_processes`   — side-effecting: shells out to `ps`, calls pure classifier
+//   • `kill_process`              — best-effort TERM → KILL
+//
+// Candidate command patterns (substring match):
+//   1. "codex" AND "mcp-server"               — codex mcp-server process
+//   2. "node" AND "bin/codex" AND "mcp-server" — node .../bin/codex mcp-server
+//   3. "SkyComputerUseClient" AND "turn-ended" — post-turn zombie (killable at any age)
+//
+// Fail-safe: a line that cannot be parsed is SKIPPED; a process younger than
+// `floor_secs` (non-zombie) is SKIPPED; `detect_orphan_processes` returns `vec![]`
+// on any `ps` failure (fail-open, never invent orphans).
+
+/// Parse a macOS BSD `etime` field ([[dd-]hh:]mm:ss) to seconds.
+/// Returns `None` for any malformed input (fail-safe — caller skips the line).
+pub(crate) fn parse_etime_secs(etime: &str) -> Option<i64> {
+    let s = etime.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Split on '-' first to extract optional day component: "dd-hh:mm:ss"
+    let (day_secs, rest) = if let Some(dash) = s.find('-') {
+        let days: i64 = s[..dash].parse().ok()?;
+        if days < 0 {
+            return None;
+        }
+        (days * 86_400, &s[dash + 1..])
+    } else {
+        (0, s)
+    };
+    // Remaining: either mm:ss or hh:mm:ss
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (h, m, sec) = match parts.as_slice() {
+        [mm, ss] => {
+            let m: i64 = mm.parse().ok()?;
+            let s: i64 = ss.parse().ok()?;
+            (0i64, m, s)
+        }
+        [hh, mm, ss] => {
+            let h: i64 = hh.parse().ok()?;
+            let m: i64 = mm.parse().ok()?;
+            let s: i64 = ss.parse().ok()?;
+            (h, m, s)
+        }
+        _ => return None,
+    };
+    if m < 0 || m > 59 || sec < 0 || sec > 59 || h < 0 {
+        return None;
+    }
+    Some(day_secs + h * 3_600 + m * 60 + sec)
+}
+
+/// An orphan agent OS process staged for reaping.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct OrphanProcess {
+    /// OS process ID.
+    pub(crate) pid: i32,
+    /// Full command string from `ps`.
+    pub(crate) command: String,
+    /// Process age in seconds, parsed from `etime`.
+    pub(crate) age_secs: i64,
+    /// Why this process was staged: `"post-turn-zombie"`, `"stale+parent-dead"`,
+    /// or `"stale"`.
+    pub(crate) reason: String,
+}
+
+/// Returns `true` when the command matches a known candidate agent process.
+/// The three candidate patterns are described in the module comment above.
+fn is_candidate_command(cmd: &str) -> bool {
+    // Pattern 1: "codex" + "mcp-server" (covers the bare `codex mcp-server` binary)
+    (cmd.contains("codex") && cmd.contains("mcp-server"))
+    // Pattern 2: "node" + "bin/codex" + "mcp-server" (node-based codex runner)
+    || (cmd.contains("node") && cmd.contains("bin/codex") && cmd.contains("mcp-server"))
+    // Pattern 3: "SkyComputerUseClient" + "turn-ended" (post-turn zombie)
+    || (cmd.contains("SkyComputerUseClient") && cmd.contains("turn-ended"))
+}
+
+/// Returns `true` when the command is a post-turn zombie (bypasses age floor).
+fn is_post_turn_zombie(cmd: &str) -> bool {
+    cmd.contains("SkyComputerUseClient") && cmd.contains("turn-ended")
+}
+
+/// PURE parse + classify of `ps -axo pid=,etime=,command=` output.
+///
+/// Each line is: `<pid> <etime> <command...>` (separated by whitespace).
+///
+/// Candidate processes are identified by `is_candidate_command`.
+/// Post-turn zombies (`SkyComputerUseClient`+`turn-ended`) are staged at ANY age.
+/// Other candidates must be older than `floor_secs` AND classified reapable by
+/// the liveness model.
+///
+/// `now_epoch_secs` is unused for `ps -axo` output that carries `etime` (elapsed
+/// time already), but is accepted for API symmetry with the tmux classifier.
+/// `parent_alive_fn(pid) -> Option<bool>` is injected so tests need no real process
+/// table.
+///
+/// A line that cannot be parsed is SKIPPED (fail-safe). Returns `vec![]` when
+/// no candidates are found.
+pub(crate) fn classify_orphan_processes(
+    ps_output: &str,
+    _now_epoch_secs: i64,
+    window_secs: i64,
+    floor_secs: i64,
+    mut parent_alive_fn: impl FnMut(i32) -> Option<bool>,
+) -> Vec<OrphanProcess> {
+    use crate::liveness::{Liveness, LivenessSignals, is_live, reapable};
+    let mut out = Vec::new();
+    for line in ps_output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // `ps -axo pid=,etime=,command=` — first field is pid, second is etime,
+        // rest is the full command. Use split_whitespace to collect tokens so
+        // that leading padding (ps right-aligns numeric columns) and multiple
+        // spaces between fields do not produce empty/misaligned tokens.
+        // We collect the first two tokens (pid, etime) then reconstruct the
+        // command by finding the third non-whitespace run in the original line.
+        let mut ws_iter = line.split_whitespace();
+        let pid_str = match ws_iter.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let etime_str = match ws_iter.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        // Reconstruct the command: everything after pid+etime in the trimmed
+        // line. Skip past two whitespace-separated tokens from the start.
+        let command = {
+            // Find the byte offset of the third whitespace run's end in `line`.
+            let mut skipped = 0u8;
+            let mut in_ws = true; // start as if we just finished leading ws
+            let mut cmd_start = line.len();
+            for (i, c) in line.char_indices() {
+                if c.is_whitespace() {
+                    in_ws = true;
+                } else {
+                    if in_ws {
+                        // Entering a new non-whitespace run.
+                        skipped += 1;
+                        if skipped == 3 {
+                            cmd_start = i;
+                            break;
+                        }
+                    }
+                    in_ws = false;
+                }
+            }
+            if cmd_start == line.len() {
+                continue; // no command field found
+            }
+            line[cmd_start..].trim()
+        };
+        let pid: i32 = match pid_str.parse() {
+            Ok(n) if n > 0 => n,
+            _ => continue,
+        };
+        if !is_candidate_command(command) {
+            continue;
+        }
+        let age_secs = match parse_etime_secs(etime_str) {
+            Some(a) => a,
+            None => continue, // skip malformed etime (fail-safe)
+        };
+        if is_post_turn_zombie(command) {
+            // Post-turn zombies are staged at ANY age, bypassing floor + liveness.
+            out.push(OrphanProcess {
+                pid,
+                command: command.to_string(),
+                age_secs,
+                reason: "post-turn-zombie".to_string(),
+            });
+            continue;
+        }
+        // Non-zombie: must be older than floor.
+        if age_secs < floor_secs {
+            continue;
+        }
+        // Map age onto the single observable signal (code_progress proxy, same as
+        // the tmux path). Stale single-signal → promote to Stale (the signal is
+        // always observed — the process exists — so Unknown degrades to Stale).
+        let signals = LivenessSignals {
+            code_progress_age: Some(age_secs),
+            ..Default::default()
+        };
+        let verdict = match is_live(&signals, window_secs) {
+            Liveness::Live => Liveness::Live,
+            _ => Liveness::Stale,
+        };
+        let parent_alive = parent_alive_fn(pid);
+        if !reapable(verdict, parent_alive) {
+            continue;
+        }
+        let reason = match parent_alive {
+            Some(false) => "stale+parent-dead",
+            _ => "stale",
+        }
+        .to_string();
+        out.push(OrphanProcess {
+            pid,
+            command: command.to_string(),
+            age_secs,
+            reason,
+        });
+    }
+    out
+}
+
+/// Resolve the parent PID of a process via `ps -o ppid= -p <pid>`, then check
+/// whether that parent is alive.
+/// * Returns `Some(false)` when ppid is 1 (reparented to launchd = orphan) or dead.
+/// * Returns `Some(true)` when parent is alive.
+/// * Returns `None` when the ppid cannot be resolved.
+fn process_parent_alive(pid: i32) -> Option<bool> {
+    let out = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let ppid: i32 = raw.trim().parse().ok()?;
+    if ppid <= 1 {
+        // ppid 1 = reparented to launchd; treat as orphan (dead parent).
+        return Some(false);
+    }
+    Some(pid_is_alive(ppid))
+}
+
+/// Detect orphan agent OS processes. Shells out to `ps -axo pid=,etime=,command=`
+/// once; on any failure returns `vec![]` (fail-open — never invent orphans).
+/// `window_secs` and `floor_secs` are forwarded to the pure classifier.
+pub(crate) fn detect_orphan_processes(
+    _now_epoch_secs: i64,
+    window_secs: i64,
+    floor_secs: i64,
+) -> Vec<OrphanProcess> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,etime=,command="])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => classify_orphan_processes(
+            &String::from_utf8_lossy(&o.stdout),
+            _now_epoch_secs,
+            window_secs,
+            floor_secs,
+            process_parent_alive,
+        ),
+        _ => Vec::new(),
+    }
+}
+
+/// Best-effort TERM → KILL a process by PID. Returns `true` when the process is
+/// gone after the attempt. Uses `kill(1)` via `Command::new("kill")` — no new
+/// crate dependency.
+pub(crate) fn kill_process(pid: i32) -> bool {
+    let pid_s = pid.to_string();
+    // TERM first.
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid_s])
+        .output();
+    // Brief check: if already gone, done.
+    if !pid_is_alive(pid) {
+        return true;
+    }
+    // KILL as escalation.
+    let _ = Command::new("kill")
+        .args(["-KILL", &pid_s])
+        .output();
+    !pid_is_alive(pid)
+}
+
 /// The tmux session name that THIS process is running inside, if any
 /// (`$TMUX_PANE` → `tmux display-message`), restricted to `rally-*`. Used by
 /// `rally stop` to self-kill its own agent tmux session at session end. Returns
@@ -1302,9 +1581,9 @@ mod tests {
     // Plan F functional core (Chunk 3): herdr_command, parse_herdr_agents_tab,
     // and resolve_agent_pane_from_list removed with the Backend::Herdr arm.
     use super::{
-        CR, PASTE_END, PASTE_START, classify_orphan_tmux, frame_line_bytes, hex_tokens,
-        parse_cmux_start_target, pid_is_alive, sanitize_inject_text, shell_words,
-        tmux_inject_commands,
+        CR, PASTE_END, PASTE_START, classify_orphan_processes, classify_orphan_tmux,
+        frame_line_bytes, hex_tokens, parse_cmux_start_target, parse_etime_secs, pid_is_alive,
+        sanitize_inject_text, shell_words, tmux_inject_commands,
     };
     use crate::check::CheckData;
     use crate::store::Fact;
@@ -1595,5 +1874,238 @@ mod tests {
             !pid_is_alive(999_999_999),
             "an unused high PID must read dead (ESRCH)"
         );
+    }
+
+    // ── parse_etime_secs (pure, no process table) ───────────────────────────
+
+    #[test]
+    fn parse_etime_secs_mm_ss() {
+        assert_eq!(parse_etime_secs("05:30"), Some(330));
+        assert_eq!(parse_etime_secs("00:00"), Some(0));
+        assert_eq!(parse_etime_secs("59:59"), Some(3599));
+    }
+
+    #[test]
+    fn parse_etime_secs_hh_mm_ss() {
+        assert_eq!(parse_etime_secs("01:02:03"), Some(3723));
+        assert_eq!(parse_etime_secs("00:00:00"), Some(0));
+    }
+
+    #[test]
+    fn parse_etime_secs_dd_hh_mm_ss() {
+        // 2-03:04:05 = 2*86400 + 3*3600 + 4*60 + 5
+        assert_eq!(
+            parse_etime_secs("2-03:04:05"),
+            Some(2 * 86_400 + 3 * 3_600 + 4 * 60 + 5)
+        );
+        assert_eq!(parse_etime_secs("10-00:00:00"), Some(10 * 86_400));
+    }
+
+    #[test]
+    fn parse_etime_secs_garbage_returns_none() {
+        assert_eq!(parse_etime_secs(""), None);
+        assert_eq!(parse_etime_secs("notavalue"), None);
+        assert_eq!(parse_etime_secs("--"), None);
+        assert_eq!(parse_etime_secs("1:2:3:4"), None);
+    }
+
+    // ── classify_orphan_processes (pure, injected parent closure) ───────────
+
+    // Adaptive window same as tmux tests: 300*6+60 = 1860s.
+    const PROC_WIN: i64 = 1860;
+    const PROC_FLOOR: i64 = 600;
+    // now_epoch unused by the ps path (etime is already elapsed), pass 0.
+    const PROC_NOW: i64 = 0;
+
+    fn ps_line(pid: i32, etime: &str, cmd: &str) -> String {
+        format!("{pid}  {etime}  {cmd}")
+    }
+
+    fn no_proc_parent(_: i32) -> Option<bool> {
+        None
+    }
+
+    #[test]
+    fn orphan_process_stale_parent_dead_is_staged() {
+        // codex mcp-server, older than floor AND window, parent dead → staged.
+        let age_etime = "40:00"; // 2400s > 1860 window, > 600 floor
+        let line = ps_line(12345, age_etime, "/usr/local/bin/codex mcp-server");
+        let orphans = classify_orphan_processes(
+            &line,
+            PROC_NOW,
+            PROC_WIN,
+            PROC_FLOOR,
+            |_| Some(false), // parent dead
+        );
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].pid, 12345);
+        assert!(
+            orphans[0].reason.contains("parent-dead"),
+            "expected reason containing 'parent-dead', got: {}",
+            orphans[0].reason
+        );
+    }
+
+    #[test]
+    fn orphan_process_stale_parent_alive_is_kept() {
+        // stale by window BUT parent alive → conservative keep.
+        let line = ps_line(22222, "40:00", "/usr/local/bin/codex mcp-server");
+        let orphans = classify_orphan_processes(
+            &line,
+            PROC_NOW,
+            PROC_WIN,
+            PROC_FLOOR,
+            |_| Some(true), // parent alive
+        );
+        assert!(
+            orphans.is_empty(),
+            "stale+parent-alive must be kept; got: {orphans:?}"
+        );
+    }
+
+    #[test]
+    fn orphan_process_stale_no_parent_info_is_staged_with_stale_reason() {
+        // Stale, no parent info → falls back to window criterion alone.
+        let line = ps_line(33333, "40:00", "/usr/local/bin/codex mcp-server");
+        let orphans =
+            classify_orphan_processes(&line, PROC_NOW, PROC_WIN, PROC_FLOOR, no_proc_parent);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].reason, "stale");
+    }
+
+    #[test]
+    fn post_turn_zombie_staged_regardless_of_age() {
+        // SkyComputerUseClient with turn-ended → staged even if age is 0.
+        let zero_age = ps_line(44444, "00:00", "/path/SkyComputerUseClient --turn-ended");
+        let staged = classify_orphan_processes(
+            &zero_age,
+            PROC_NOW,
+            PROC_WIN,
+            PROC_FLOOR,
+            |_| Some(true), // even with live parent
+        );
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].reason, "post-turn-zombie");
+
+        // Verify it also works with an ancient age.
+        let old_age = ps_line(44445, "18-00:00:00", "/path/SkyComputerUseClient --turn-ended");
+        let staged2 = classify_orphan_processes(
+            &old_age,
+            PROC_NOW,
+            PROC_WIN,
+            PROC_FLOOR,
+            no_proc_parent,
+        );
+        assert_eq!(staged2.len(), 1);
+        assert_eq!(staged2[0].reason, "post-turn-zombie");
+    }
+
+    #[test]
+    fn young_process_below_floor_is_preserved() {
+        // age 5 min (300s) < floor 600s → not staged (fail-safe).
+        let line = ps_line(55555, "05:00", "/usr/local/bin/codex mcp-server");
+        let orphans =
+            classify_orphan_processes(&line, PROC_NOW, PROC_WIN, PROC_FLOOR, no_proc_parent);
+        assert!(
+            orphans.is_empty(),
+            "process younger than floor must be preserved"
+        );
+    }
+
+    #[test]
+    fn fresh_process_within_window_is_preserved() {
+        // age 10 min (600s == floor but within window 1860s) → not stale → kept.
+        // Use age exactly at floor (600s) — still within window (1860s) → Live.
+        let line = ps_line(66666, "10:00", "/usr/local/bin/codex mcp-server");
+        let orphans =
+            classify_orphan_processes(&line, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| Some(false));
+        assert!(
+            orphans.is_empty(),
+            "process within window must be preserved even with dead parent"
+        );
+    }
+
+    #[test]
+    fn malformed_ps_lines_are_skipped() {
+        // Various malformed lines — none should produce orphans.
+        let bad = "garbage\n   \n12345  notanetime  /usr/bin/codex mcp-server\n";
+        let orphans =
+            classify_orphan_processes(bad, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| Some(false));
+        assert!(orphans.is_empty(), "malformed lines must be skipped");
+    }
+
+    #[test]
+    fn non_candidate_commands_are_ignored() {
+        // `bash`, `python3`, regular user processes — not touched.
+        let lines = [
+            ps_line(1, "40:00", "bash"),
+            ps_line(2, "40:00", "/usr/bin/python3 script.py"),
+            ps_line(3, "40:00", "node /some/other/app.js"),
+        ]
+        .join("\n");
+        let orphans = classify_orphan_processes(&lines, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| {
+            Some(false)
+        });
+        assert!(orphans.is_empty(), "non-candidate commands must be ignored");
+    }
+
+    #[test]
+    fn classify_orphan_processes_is_idempotent() {
+        // Running classify twice on the same input produces identical output.
+        let line = ps_line(77777, "40:00", "/usr/local/bin/codex mcp-server");
+        let run1 = classify_orphan_processes(&line, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| {
+            Some(false)
+        });
+        let run2 = classify_orphan_processes(&line, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| {
+            Some(false)
+        });
+        assert_eq!(run1.len(), run2.len());
+        for (a, b) in run1.iter().zip(run2.iter()) {
+            assert_eq!(a.pid, b.pid);
+            assert_eq!(a.reason, b.reason);
+            assert_eq!(a.age_secs, b.age_secs);
+        }
+    }
+
+    #[test]
+    fn codex_mcp_server_parent_dead_staged_reason_parent_dead() {
+        let line = ps_line(88881, "40:00", "node /home/user/.nvm/versions/node/v20/bin/codex mcp-server");
+        let orphans = classify_orphan_processes(
+            &line,
+            PROC_NOW,
+            PROC_WIN,
+            PROC_FLOOR,
+            |_| Some(false),
+        );
+        assert_eq!(orphans.len(), 1);
+        assert!(orphans[0].reason.contains("parent-dead"));
+    }
+
+    #[test]
+    fn codex_mcp_server_parent_alive_stale_by_window_is_kept() {
+        // stale by window but parent alive → conservative keep.
+        let line = ps_line(88882, "40:00", "node /home/user/.nvm/versions/node/v20/bin/codex mcp-server");
+        let orphans = classify_orphan_processes(
+            &line,
+            PROC_NOW,
+            PROC_WIN,
+            PROC_FLOOR,
+            |_| Some(true),
+        );
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn codex_mcp_server_parent_alive_fresh_is_preserved() {
+        // fresh (within window) + parent alive → definitely kept.
+        let line = ps_line(88883, "10:00", "node /home/user/.nvm/versions/node/v20/bin/codex mcp-server");
+        let orphans = classify_orphan_processes(
+            &line,
+            PROC_NOW,
+            PROC_WIN,
+            PROC_FLOOR,
+            |_| Some(true),
+        );
+        assert!(orphans.is_empty());
     }
 }
