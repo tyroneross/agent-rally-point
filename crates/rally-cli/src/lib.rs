@@ -6293,7 +6293,9 @@ mod tests {
     fn liveness_enforce_respects_takeover_gate_for_busy_but_quiet_owner() {
         let root = unique_root("coord-liveness-2h-gate");
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        let room = store::RoomStore::open_at(root).unwrap();
+        // Inject default engagement (None): env-independent so a concurrent
+        // RALLY_ENGAGEMENT toggle can't flip the resolved room (parallel-flake).
+        let room = store::RoomStore::open_at_with_engagement(root, None).unwrap();
         // 30 minutes ago: idle (>15m) but well under the 2h takeover bar, and
         // never acknowledged → conflicted but not release-eligible.
         let thirty_min_ago = (chrono::Utc::now() - chrono::Duration::minutes(30))
@@ -9740,7 +9742,10 @@ mod tests {
     fn busy_but_quiet_owner_is_warnable_but_not_takeover_eligible() {
         let root = unique_root("busy-quiet-owner");
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        // Inject the default engagement (None) so a concurrent test toggling the
+        // process-global RALLY_ENGAGEMENT cannot flip which room subdir this
+        // store resolves — the cause of this test's parallel-suite flakiness.
+        let room = store::RoomStore::open_at_with_engagement(root.clone(), None).unwrap();
 
         // Claim 30 minutes ago: past 15m idle, under 2h takeover bar.
         let thirty_min_ago = (chrono::Utc::now() - chrono::Duration::minutes(30))

@@ -739,6 +739,21 @@ impl RoomStore {
     /// Replay, migration, and seed are all idempotent — running them twice
     /// on the same inputs yields identical state.
     pub(crate) fn open_at(root: PathBuf) -> Result<Self> {
+        // Production path: resolve the engagement from the process-global
+        // `RALLY_ENGAGEMENT` env (sound for a single CLI process).
+        Self::open_at_with_engagement(root, std::env::var(ENGAGEMENT_ENV_VAR).ok())
+    }
+
+    /// Open a room with the engagement label INJECTED rather than read from the
+    /// process-global `RALLY_ENGAGEMENT` env. `engagement: None` resolves the
+    /// default deterministically (active-engagement file, else the UTC date) —
+    /// no env read. Tests use this so a concurrent test toggling `RALLY_ENGAGEMENT`
+    /// cannot flip which room subdir this store resolves under parallel runs
+    /// (`env::set_var` is process-global and unsound across threads — Rust 2024).
+    pub(crate) fn open_at_with_engagement(
+        root: PathBuf,
+        engagement: Option<String>,
+    ) -> Result<Self> {
         let dir = root.join(".rally");
         fs::create_dir_all(&dir).map_err(RallyError::io("create .rally"))?;
         let _guard = acquire_room_mutation_lock(&dir)?;
@@ -754,7 +769,7 @@ impl RoomStore {
         reconcile_segments_and_db(&log_dir, &archive_dir, &fact_store_path)?;
 
         let fact_store = open_fact_store(&fact_store_path)?;
-        let active_engagement = resolve_active_engagement(&dir);
+        let active_engagement = resolve_active_engagement_with_env(&dir, engagement);
         let store = Self {
             fact_store,
             cursor_path: dir.join("cursors.json"),
