@@ -7,6 +7,14 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## v0.1.3 - 2026-06-25
+
+Coordination engine: recency decay + size-scaled auto-reclaim, in-room stale-state
+reaper, codex⇄claude heartbeat parity, adaptive multi-signal liveness + squad-projection
+decay, 3-layer tmux zombie prevention, and the orphan agent OS-process reaper. This is
+the first release carrying the full liveness/reaper coordination layer; build-loop bundles
+this binary (replacing its Python coordination mirror).
+
 ### Added — Orphan agent OS-process reaper (`rally sessions --reap-processes [--apply]`)
 
 Closes the gap left by the tmux and worktree reapers: nothing previously killed orphan
