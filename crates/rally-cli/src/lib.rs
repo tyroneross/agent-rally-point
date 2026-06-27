@@ -1809,16 +1809,18 @@ fn command_release_by_path(
             eligible
         })
         .collect();
-    // Did at least one match come from a stale-owner takeover? Keyed by SESSION
-    // identity, not tool label: a claim is a takeover when its owning session
-    // differs from the CALLER's session — so a same-tool peer in a DIFFERENT
-    // session is correctly a takeover, and the caller releasing its own
-    // (same-session) claim is not. Legacy tool-only claims resolve to the
-    // deterministic legacy session, preserving the prior same-tool=self behavior.
-    let caller_session = current_protocol_session(Some(tool)).session_id;
+    // Did at least one match come from a stale-owner takeover? A claim is a
+    // takeover when it is NOT the caller's own (see claim_is_caller_self):
+    // keyed by SESSION identity when the caller's endpoint is stable (so a
+    // same-tool peer in a DIFFERENT session is correctly a takeover), and by the
+    // legacy tool label when the endpoint is the unstable pid-fallback (so an
+    // agent's own self-release is never misclassified). Legacy tool-only claims
+    // resolve to the deterministic legacy session, preserving prior behavior.
+    let (caller_identity, caller_stable) = caller_identity_and_stability(tool);
+    let caller_session = caller_identity.session_id.clone();
     let is_takeover = matches
         .iter()
-        .any(|c| store::identity_for_fact(c).session_id != caller_session);
+        .any(|c| !claim_is_caller_self(c, &caller_identity, caller_stable, tool));
     // PRIVILEGED GATE: a cross-session takeover release is destructive and must
     // be attributable to a principal. (Eligibility — the >2h/size-scaled stale
     // bar — was already enforced above via claim_reclaim_eligible; this adds the
@@ -1928,10 +1930,20 @@ fn command_release_by_path(
     // on the durable release fact itself, which is the decision record (the fix
     // direction asked for an authorized-takeover release "keyed to a decision
     // fact"; the release IS that fact, now self-describing as a takeover).
+    // A matched claim is "taken over" (not the caller's own) under the SAME
+    // stability-aware self-check used for is_takeover: by session when the
+    // caller endpoint is stable, by tool label when it is the pid-fallback.
+    let meta_is_self = |owner: &Option<String>, sess: &str| -> bool {
+        if caller_stable {
+            sess == caller_session
+        } else {
+            owner.as_deref() == Some(tool)
+        }
+    };
     let taken_over_owners: Vec<String> = if is_takeover {
         let mut o: Vec<String> = match_meta
             .iter()
-            .filter(|(_id, _subj, _sc, _owner, sess)| *sess != caller_session)
+            .filter(|(_id, _subj, _sc, owner, sess)| !meta_is_self(owner, sess))
             .filter_map(|(_id, _subj, _sc, owner, _sess)| owner.clone())
             .collect();
         o.sort();
@@ -1945,8 +1957,8 @@ fn command_release_by_path(
     let taken_over_sessions: Vec<String> = if is_takeover {
         let mut s: Vec<String> = match_meta
             .iter()
+            .filter(|(_id, _subj, _sc, owner, sess)| !meta_is_self(owner, sess))
             .map(|(_id, _subj, _sc, _owner, sess)| sess.clone())
-            .filter(|sess| *sess != caller_session)
             .collect();
         s.sort();
         s.dedup();
@@ -2349,6 +2361,47 @@ fn current_principal_id() -> Option<String> {
     let nonempty =
         |v: std::result::Result<String, std::env::VarError>| v.ok().filter(|s| !s.trim().is_empty());
     nonempty(env::var("RALLY_PRINCIPAL_ID")).or_else(|| nonempty(env::var("GITHUB_ACTOR")))
+}
+
+/// The caller's live session identity, plus whether its endpoint is STABLE
+/// across CLI invocations. An endpoint resolved from a tty / terminal / tmux
+/// pane / managed / cloud signal is stable, so the deterministic session_id is
+/// the same across two `rally` calls from the same place → session equality is a
+/// reliable self-check. A bare-process (`proc:host:pid`) endpoint is NOT stable:
+/// each CLI call is a new pid → a new session_id, so two calls by the SAME agent
+/// would falsely look like different sessions. In that degraded case we fall
+/// back to the legacy `tool`-label self-check (the pre-identity contract), which
+/// is exactly correct there: without a stable endpoint token, the tool label is
+/// the best available self signal and two genuinely-concurrent processes already
+/// differ by pid in the endpoint.
+fn caller_identity_and_stability(tool: &str) -> (session_identity::ProtocolSessionIdentity, bool) {
+    let endpoint =
+        session_identity::derive_endpoint(&session_identity::EndpointInputs::from_env());
+    let stable = !matches!(
+        endpoint.source,
+        session_identity::EndpointSource::Process
+            | session_identity::EndpointSource::HostOnly
+            | session_identity::EndpointSource::Legacy
+    );
+    (current_protocol_session(Some(tool)), stable)
+}
+
+/// Decide whether `claim` is owned by the CALLER (a self-action) vs a peer (a
+/// cross-session takeover). Uses session-identity equality when the caller's
+/// endpoint is stable; otherwise degrades to the legacy tool-label match so an
+/// agent in a non-tty/non-tmux/non-cloud context is never wrongly blocked from
+/// releasing its OWN claim (independent-auditor f1 / security SEC-002 close).
+fn claim_is_caller_self(
+    claim: &store::Fact,
+    caller: &session_identity::ProtocolSessionIdentity,
+    caller_stable: bool,
+    caller_tool: &str,
+) -> bool {
+    if caller_stable {
+        store::identity_for_fact(claim).session_id == caller.session_id
+    } else {
+        claim.tool.as_deref() == Some(caller_tool)
+    }
 }
 
 /// PRIVILEGED-ACTION GATE for a CROSS-SESSION coordination change (taking over a
@@ -9976,6 +10029,51 @@ mod tests {
     }
 
     #[test]
+    fn claim_self_check_degrades_to_tool_label_on_unstable_endpoint() {
+        // f1 / SEC-002 close: when the caller endpoint is the unstable pid
+        // fallback (caller_stable=false), the self-check degrades to the tool
+        // label so an agent's own claim — stamped in a PRIOR process with a
+        // different pid (→ different session_id) — is still recognized as self
+        // and NOT misclassified as a cross-session takeover.
+        let prior_proc_claim = store::Fact {
+            tool: Some("claude_code:01".to_string()),
+            // stamped by an earlier process: same tool, DIFFERENT pid endpoint.
+            from_session_id: Some("sess:proc:host:11111#live:claude_code".to_string()),
+            ..Default::default()
+        };
+        // The current caller's identity is a DIFFERENT pid session for the same tool.
+        let caller = session_identity::ProtocolSessionIdentity::from_session_key(
+            "sess:proc:host:22222#live:claude_code",
+            Some("claude_code:01"),
+            None,
+        );
+        // Unstable endpoint → tool-label self-check → recognized as SELF.
+        assert!(
+            claim_is_caller_self(&prior_proc_claim, &caller, false, "claude_code:01"),
+            "own claim from a prior pid must be self when endpoint is unstable"
+        );
+        // A genuinely-different tool is NOT self, even on the unstable path.
+        assert!(
+            !claim_is_caller_self(&prior_proc_claim, &caller, false, "codex:02"),
+            "a different tool is never self"
+        );
+        // Stable endpoint → strict session equality. The prior-pid claim's
+        // session differs from the caller's → correctly NOT self (a real
+        // cross-session action on a stable endpoint).
+        assert!(
+            !claim_is_caller_self(&prior_proc_claim, &caller, true, "claude_code:01"),
+            "on a stable endpoint, a different session is a takeover"
+        );
+        // Same session on a stable endpoint → self.
+        let same = store::Fact {
+            tool: Some("claude_code:01".to_string()),
+            from_session_id: Some("sess:proc:host:22222#live:claude_code".to_string()),
+            ..Default::default()
+        };
+        assert!(claim_is_caller_self(&same, &caller, true, "claude_code:01"));
+    }
+
+    #[test]
     fn require_principal_passes_with_a_principal_and_fails_without() {
         assert!(require_principal("x", Some("tyrone")).is_ok());
         assert!(require_principal("x", Some("  ")).is_err(), "blank is not a principal");
@@ -11717,11 +11815,18 @@ fn command_lead(args: LeadArgs) -> Result<Output> {
 /// self-eligible: claiming an empty seat is not a takeover. The caller's session
 /// is resolved from the live endpoint; the lead's from `lead_session_id`.
 fn lead_change_is_self(snapshot: &store::RoomSnapshot, caller_tool: &str) -> bool {
-    let Some(lead_session) = snapshot.lead_session_id.as_deref() else {
+    if snapshot.lead_session_id.is_none() {
         return true; // empty seat — not a takeover
-    };
-    let caller = current_protocol_session(Some(caller_tool));
-    caller.session_id == lead_session
+    }
+    let (caller, caller_stable) = caller_identity_and_stability(caller_tool);
+    if caller_stable {
+        snapshot.lead_session_id.as_deref() == Some(caller.session_id.as_str())
+    } else {
+        // Unstable pid-fallback endpoint: the session_id is not stable across CLI
+        // calls, so degrade to the tool-label self-check (prior contract) — the
+        // current lead's display label vs the caller's tool.
+        snapshot.lead.as_deref() == Some(caller_tool)
+    }
 }
 
 /// True when the current lead seat is held by a STALE/REAPABLE session — a

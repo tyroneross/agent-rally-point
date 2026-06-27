@@ -34,12 +34,15 @@
 //! [`ProtocolSessionIdentity::is_legacy`] so callers can distinguish a real
 //! live lease from a back-filled one.
 //!
-//! ## Staged delivery
-//! `#![allow(dead_code)]`: this is the Phase-1 module of a staged build. Its
-//! public surface is consumed by `whoami`/`say` in the later `integration-wiring`
-//! task; until then the items are unused by the crate proper (they are exercised
-//! by this module's own tests). The allow is removed when integration lands.
-#![allow(dead_code)]
+//! ## Wired into the authority layer
+//! As of the identity-wiring integration, this module's surface is AUTHORITY-
+//! bearing: `mint` / `derive_endpoint` / `from_session_key` / `identity_for_fact`
+//! (via `store`) / `legible_tool_label` drive the live claim-conflict, lead-seat,
+//! presence-liveness and privileged-gate paths. The blanket `#![allow(dead_code)]`
+//! that marked the staged Phase-1 module as "unused" has been removed so the
+//! compiler's unused-helper warning net protects these now security-critical
+//! items. A handful of still-unused convenience helpers carry a local `#[allow(
+//! dead_code)]` instead, so a genuinely-dead AUTHZ helper would still be flagged.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -299,6 +302,9 @@ impl ProtocolSessionIdentity {
     }
 
     /// True when this identity was back-filled from a legacy `tool`-only event.
+    /// Exercised by this module's + store's tests; the live projection reads the
+    /// `legacy` field directly.
+    #[allow(dead_code)]
     pub(crate) fn is_legacy(&self) -> bool {
         self.legacy
     }
@@ -325,12 +331,16 @@ impl ProtocolSessionIdentity {
 
     /// Two identities are the **same live runtime** iff their session leases match.
     /// Same endpoint + different lease = same place, different session (a restart).
+    /// Convenience predicate exercised by tests; the gates compare `session_id`
+    /// directly. Kept for callers/tests reasoning about runtime equality.
+    #[allow(dead_code)]
     pub(crate) fn same_runtime(&self, other: &Self) -> bool {
         self.session_id == other.session_id
     }
 
     /// Two identities share an **endpoint lineage** (same physical place across
-    /// restarts) even when they are distinct sessions.
+    /// restarts) even when they are distinct sessions. Exercised by tests.
+    #[allow(dead_code)]
     pub(crate) fn same_endpoint(&self, other: &Self) -> bool {
         self.endpoint_id == other.endpoint_id
     }
