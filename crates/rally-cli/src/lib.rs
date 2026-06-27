@@ -5176,6 +5176,33 @@ fn active_session_facts_from_facts(facts: Vec<Fact>) -> Vec<(Fact, ManagedSessio
     active.into_values().collect()
 }
 
+/// Find a `session`-kind fact (active OR tombstoned/stopped) whose session
+/// matches `target` by `session_id`, `name`, or `tool`. Returns the most-recent
+/// match (facts are scanned in ascending `seq`, so the last write wins).
+///
+/// This is the discriminator that lets [`resolve_inject_target`] distinguish two
+/// cases that otherwise look identical to the ledger arm:
+///   - "named a managed session that is gone / renumbered / reaped" → fail loud;
+///   - "named a genuine ledger agent that was NEVER a managed session"
+///     (e.g. an `agent.register`-bound id with no session record) → ledger-only
+///     delivery is correct.
+///
+/// A genuine ledger agent has no `session` fact, so this returns `None` for it
+/// and the existing ledger path is preserved.
+fn prior_managed_session(room: &RoomStore, target: &str) -> Result<Option<ManagedSession>> {
+    let mut facts = room.facts()?;
+    facts.sort_by_key(|fact| fact.seq);
+    let mut found = None;
+    for fact in facts.into_iter().filter(|fact| fact.kind == "session") {
+        if let Some(session) = fact.session {
+            if session.session_id == target || session.name == target || session.tool == target {
+                found = Some(session);
+            }
+        }
+    }
+    Ok(found)
+}
+
 fn session_fact(session: &ManagedSession, status: &str, ref_id: Option<String>) -> Fact {
     Fact {
         from_session_id: None,
@@ -5654,6 +5681,22 @@ fn resolve_inject_target(target: &str, bins: &BackendBins) -> Result<InjectTarge
     {
         reject_stale_session(target, &view)?;
         return Ok(InjectTarget::Managed(Box::new(view.session)));
+    }
+
+    // 1b. The target is not an ACTIVE managed session — but if it was EVER one
+    //     (gone / renumbered / reaped), FAIL LOUDLY. Silently degrading to a
+    //     ledger-only write (step 2) would send the message somewhere the
+    //     sender never intended: a caller who named a session expects pane
+    //     delivery, not a fact in the void. Observed live (2026-06-27): an
+    //     inject to a renumbered session (`codex-01` after it became `codex-03`)
+    //     returned `delivery_path: ledger_only` with NO error. `reject_stale_
+    //     session` only covers a session whose view is still present-but-Stale;
+    //     a fully gone/reaped session has no view, so it must be caught here.
+    if let Some(prior) = prior_managed_session(&room, target)? {
+        return Err(RallyError::Command(format!(
+            "managed session {target} is no longer active (it was a {} session via {}; now gone/renumbered/reaped). It will NOT receive a pane inject. Re-target the current session — run `rally sessions` to find it.",
+            prior.agent, prior.backend
+        )));
     }
 
     // 2. Else, syntactically valid agent-id → ledger-only delivery to a

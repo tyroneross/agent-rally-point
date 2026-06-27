@@ -1478,6 +1478,77 @@ esac
 }
 
 #[test]
+fn gone_managed_session_blocks_inject_instead_of_silent_ledger_fallback() {
+    // Regression for the live-caught silent-degradation bug (2026-06-27): an
+    // inject naming a managed session that is gone/renumbered/reaped must FAIL
+    // LOUDLY, not silently degrade to a ledger-only write. The session name is a
+    // syntactically valid agent-id, so without the `prior_managed_session` gate
+    // it would resolve to `LedgerAgent` and the message would vanish into an
+    // inbox the sender never intended.
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-gone-session-inject");
+    let fake_tmux = workspace.cwd.join("fake-tmux-gone.sh");
+    write_executable(
+        &fake_tmux,
+        r#"#!/bin/sh
+case "$1" in
+  new-session) exit 0 ;;
+  list-panes) echo "no server running on /tmp/rally-test" >&2; exit 1 ;;
+  kill-session) echo "can't find session: $3" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+"#,
+    );
+    let fake_tmux = fake_tmux.to_string_lossy().to_string();
+
+    let run = workspace.json(&[
+        "run", "claude", "--json", "--name", "ghost", "--backend", "tmux", "--tmux-bin",
+        &fake_tmux,
+    ]);
+    let name = run["data"]["run"]["session"]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Reap tombstones the stale session — it is now fully gone from active
+    // session state (the historical `session` facts remain in the ledger).
+    let reaped = workspace.json(&["sessions", "--reap", "--json", "--tmux-bin", &fake_tmux]);
+    assert_eq!(
+        reaped["data"]["sessions"]["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "--reap must tombstone the stale session before the inject"
+    );
+
+    let inject = workspace.output(&[
+        "inject",
+        &name,
+        "--json",
+        "--text",
+        "must not vanish into a ledger inbox",
+        "--tool",
+        "claude_code:test-sender",
+        "--tmux-bin",
+        &fake_tmux,
+    ]);
+    assert!(
+        !inject.status.success(),
+        "inject to a gone managed session must fail; stdout={} stderr={}",
+        String::from_utf8_lossy(&inject.stdout),
+        String::from_utf8_lossy(&inject.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&inject.stderr);
+    assert!(
+        stderr.contains("no longer active"),
+        "inject must fail loud for a gone/renumbered managed session (not silent ledger fallback); stderr={stderr}"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
 fn rally_inject_require_ack_timeout_returns_ok_with_timeout_ack() {
     // Verifies that when --require-ack times out (no resolver writes a resolve
     // fact), the command exits 0 with ok:true and a structured timeout ack,
