@@ -2281,7 +2281,30 @@ fn current_protocol_session(tool: Option<&str>) -> session_identity::ProtocolSes
         Some((t, a)) if !a.is_empty() => (t, Some(a)),
         _ => (raw_tool, None),
     };
-    session_identity::ProtocolSessionIdentity::mint(&endpoint, tool_type, "live", actor, None)
+    let principal = current_principal_id();
+    // Tool-distinct deterministic lease so two host tools sharing one endpoint
+    // mint distinct sessions (see store::stamp_authoring_identity). mint()
+    // sanitizes the token.
+    let lease = format!("live:{tool_type}");
+    session_identity::ProtocolSessionIdentity::mint(
+        &endpoint,
+        tool_type,
+        &lease,
+        actor,
+        principal.as_deref(),
+    )
+}
+
+/// Resolve the human/service/agent PRINCIPAL behind this session, for the
+/// privileged-action gate. PRIVACY CONTRACT: sourced ONLY from an EXPLICIT
+/// `RALLY_PRINCIPAL_ID`, or a cloud identity (`GITHUB_ACTOR`) — NEVER silently
+/// from the `tool` label or `$USER`, which would attach an identity the operator
+/// did not opt into. `None` when neither is set (a session simply has no
+/// recorded principal; self-actions never require one).
+fn current_principal_id() -> Option<String> {
+    let nonempty =
+        |v: std::result::Result<String, std::env::VarError>| v.ok().filter(|s| !s.trim().is_empty());
+    nonempty(env::var("RALLY_PRINCIPAL_ID")).or_else(|| nonempty(env::var("GITHUB_ACTOR")))
 }
 
 /// Map a ledger [`store::FactKind`] to the north-star protocol event vocabulary
@@ -9907,15 +9930,19 @@ mod tests {
         // store resolves — the cause of this test's parallel-suite flakiness.
         let room = store::RoomStore::open_at_with_engagement(root.clone(), None).unwrap();
 
-        // Claim 30 minutes ago: past 15m idle, under 2h takeover bar.
-        let thirty_min_ago = (chrono::Utc::now() - chrono::Duration::minutes(30))
+        // Claim 20 minutes ago: PAST the 15m advisory-idle threshold, but clearly
+        // UNDER the single-file small reclaim bar (30m) — and far under the 2h
+        // coarse bar. 20m (not exactly 30m) avoids a boundary race where a
+        // claim aged EXACTLY at the small-timeout flips eligible on sub-second
+        // wall-clock drift between append and the eligibility read.
+        let twenty_min_ago = (chrono::Utc::now() - chrono::Duration::minutes(20))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let live_id = append_stale_claim(
             &room,
             "busy-builder",
             "src/foo.rs",
-            "long build, no rally write in 30m",
-            &thirty_min_ago,
+            "long build, no rally write in 20m",
+            &twenty_min_ago,
         );
         let snap = room.snapshot().unwrap();
         assert!(

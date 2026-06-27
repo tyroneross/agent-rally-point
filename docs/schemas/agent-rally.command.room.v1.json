@@ -21,8 +21,32 @@
           "type": "object",
           "required": ["active_claims", "active_blockers", "open_handoffs", "current_decisions", "current_risks", "recent_artifacts", "unconsumed_artifacts", "stale_facts", "squads", "lead"],
           "properties": {
-            "squads": { "type": "array" },
-            "lead": { "type": ["string", "null"] }
+            "squads": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["tool", "last_seen_seq", "last_seen_ts", "status", "acknowledged"],
+                "properties": {
+                  "tool": { "type": "string", "description": "Display role label (NOT the authority key)." },
+                  "last_seen_seq": { "type": "integer" },
+                  "last_seen_ts": { "type": "string" },
+                  "status": { "type": "string", "enum": ["active", "idle"] },
+                  "acknowledged": { "type": "boolean" },
+                  "session_id": { "type": "string", "description": "Authority key: the live session lease this row represents. Additive." },
+                  "endpoint_id": { "type": "string", "description": "Addressable place behind the session. Additive." },
+                  "principal_id": { "type": "string", "description": "Principal behind the session, when recorded. Additive." },
+                  "legacy": { "type": "boolean", "description": "True when synthesized from a legacy tool-only event. Additive." },
+                  "legible_name": { "type": "string", "description": "Operator-facing name. Additive." },
+                  "liveness_window_secs": { "type": "integer", "description": "Adaptive staleness window applied. Additive." },
+                  "liveness": { "type": "string", "enum": ["live", "stale", "unknown"], "description": "Multi-signal adaptive verdict. Additive." },
+                  "reapable": { "type": "boolean", "description": "True when a stale lease a peer/lead may reclaim. Additive." }
+                }
+              }
+            },
+            "lead": { "type": ["string", "null"], "description": "Display label of the lead seat holder (NOT the authority key)." },
+            "lead_session_id": { "type": ["string", "null"], "description": "Authority: session lease holding the lead seat. Additive." },
+            "lead_endpoint_id": { "type": ["string", "null"], "description": "Addressable place behind the lead session. Additive." },
+            "lead_principal_id": { "type": ["string", "null"], "description": "Principal behind the lead session, when recorded. Additive." }
           }
         }
       }

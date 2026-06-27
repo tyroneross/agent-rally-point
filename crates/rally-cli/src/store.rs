@@ -294,6 +294,55 @@ fn fact_schema() -> String {
     FACT_SCHEMA.to_string()
 }
 
+/// Stamp the AUTHORING session identity (`from_session_id` + `principal_id`) on a
+/// fact about to be written, IFF it is not already stamped. This is the single
+/// write-boundary that guarantees every durable coordination write (presence,
+/// ack, lead, status, release-by-path, reaper, …) carries identity — call sites
+/// that already stamp (the LLM-authored `say` path) are left untouched.
+///
+/// The identity is derived from the fact's own `tool` label plus the live
+/// endpoint (env) and the principal env contract. A fact with no `tool` (the
+/// reserved `rally` system author is the only such case in practice) is left
+/// unstamped — system-authored facts have no session lease.
+///
+/// PRIVACY: the principal is sourced ONLY from `RALLY_PRINCIPAL_ID` / cloud
+/// identity (mirroring `current_principal_id` in lib), never from `tool`/`$USER`.
+fn stamp_authoring_identity(fact: &mut Fact) {
+    if fact.from_session_id.is_some() {
+        return; // already stamped by the call site (e.g. the `say` path)
+    }
+    let Some(tool) = fact.tool.as_deref() else {
+        return; // system-authored (rally) facts carry no session lease
+    };
+    let endpoint =
+        crate::session_identity::derive_endpoint(&crate::session_identity::EndpointInputs::from_env());
+    let (tool_type, actor) = match tool.split_once(':') {
+        Some((t, a)) if !a.is_empty() => (t, Some(a)),
+        _ => (tool, None),
+    };
+    let nonempty =
+        |v: std::result::Result<String, std::env::VarError>| v.ok().filter(|s| !s.trim().is_empty());
+    let principal =
+        nonempty(env::var("RALLY_PRINCIPAL_ID")).or_else(|| nonempty(env::var("GITHUB_ACTOR")));
+    // Lease token is tool-distinct ("live:<tool_type>") so two different host
+    // tools sharing one endpoint (e.g. a claude and a codex on the same machine,
+    // or the synthetic same-process test endpoint) mint DISTINCT sessions rather
+    // than colliding on `sess:<endpoint>#live`. Deterministic + stable across CLI
+    // invocations from the same endpoint+tool until a registry-backed lease.
+    let lease = format!("live:{tool_type}"); // mint() sanitizes the token
+    let identity = crate::session_identity::ProtocolSessionIdentity::mint(
+        &endpoint,
+        tool_type,
+        &lease,
+        actor,
+        principal.as_deref(),
+    );
+    fact.from_session_id = Some(identity.from_session_id().to_string());
+    if fact.principal_id.is_none() {
+        fact.principal_id = identity.principal_id;
+    }
+}
+
 /// Project a durable [`Fact`] onto the layered session identity that AUTHORED it.
 ///
 /// This is the single read-side bridge from the ledger to the coordination
@@ -975,6 +1024,12 @@ impl RoomStore {
         reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
         let fact_store = open_fact_store(&self.facts_db_path)?;
         let mut fact = fact.clone();
+        // Single write-boundary identity stamp: every durable coordination write
+        // carries its authoring session lease (+ principal) unless the call site
+        // already stamped it (the LLM-authored `say` path). This covers the
+        // presence/ack/lead/status/release/reaper facts that previously wrote
+        // with from_session_id: None.
+        stamp_authoring_identity(&mut fact);
         // SEC-001 close: a takeover Release authorizes reclaiming a stale peer's
         // claim. Eligibility was judged on an UNLOCKED snapshot in
         // `command_release_by_path`; an owner could revive in the gap before we
@@ -6805,6 +6860,65 @@ mod squad_decay_tests {
             .expect("stale lease holder must STAY VISIBLE in the default view");
         assert_eq!(sq.liveness, "stale", "verdict surfaced on the row");
         assert!(sq.reapable, "a provably-stale lease holder is reapable");
+    }
+
+    #[test]
+    fn room_json_contract_squads_carry_identity_and_lead_label_is_tool() {
+        // JSON contract (Chunk 4): room.squads[] include session_id / endpoint_id;
+        // lead stays the TOOL label while lead_session_id carries the authority.
+        let coord = CoordinationConfig::default();
+        let mut presence = fact(FactKind::Presence, "claude_code:01", 60);
+        presence.from_session_id = Some("sess:term:ws:AAAA#live".to_string());
+        let mut lead = fact(FactKind::Decision, "claude_code:01", 50);
+        lead.subject = "role:lead".to_string();
+        lead.from_session_id = Some("sess:term:ws:AAAA#live".to_string());
+        let facts = seqd(vec![presence, lead]);
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        let v = serde_json::to_value(&snap).unwrap();
+
+        // lead is the DISPLAY tool label; authority is lead_session_id.
+        assert_eq!(v["lead"], "claude_code:01");
+        assert_eq!(v["lead_session_id"], "sess:term:ws:AAAA#live");
+
+        let squad = &v["squads"][0];
+        assert_eq!(squad["tool"], "claude_code:01", "tool label preserved");
+        assert_eq!(squad["session_id"], "sess:term:ws:AAAA#live");
+        assert_eq!(squad["endpoint_id"], "term:ws:AAAA");
+        assert!(squad["liveness"].is_string());
+        assert!(squad["reapable"].is_boolean());
+        // principal_id is skipped on the wire when absent (legacy-row parity).
+        assert!(squad.get("principal_id").is_none());
+    }
+
+    #[test]
+    fn stamp_authoring_identity_fills_unset_session_from_tool_and_endpoint() {
+        // The central write-boundary stamp fills from_session_id for a tool-only
+        // fact, and leaves an already-stamped fact untouched.
+        let mut unstamped = Fact {
+            tool: Some("codex:02".to_string()),
+            ..Default::default()
+        };
+        stamp_authoring_identity(&mut unstamped);
+        let key = unstamped.from_session_id.clone().expect("stamped");
+        assert!(key.starts_with("sess:"), "got {key}");
+        // identity_for_fact round-trips the stamped key to a non-legacy identity.
+        let id = identity_for_fact(&unstamped);
+        assert!(!id.is_legacy());
+        assert_eq!(id.tool_type, "codex");
+
+        // Already-stamped fact is left as-is.
+        let mut stamped = Fact {
+            tool: Some("codex:02".to_string()),
+            from_session_id: Some("sess:custom#x".to_string()),
+            ..Default::default()
+        };
+        stamp_authoring_identity(&mut stamped);
+        assert_eq!(stamped.from_session_id.as_deref(), Some("sess:custom#x"));
+
+        // A tool-less (system rally) fact is never stamped.
+        let mut systemic = Fact::default();
+        stamp_authoring_identity(&mut systemic);
+        assert!(systemic.from_session_id.is_none());
     }
 
     #[test]
