@@ -12,7 +12,25 @@ const LEASE_EVIDENCE_PREFIX: &str = "lease_expires_at:";
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ActiveClaimRecord {
     pub(crate) claim_id: String,
+    /// Human-readable role label — DISPLAY ONLY. Conflict authority is keyed by
+    /// `owner_session_id` (below), not by this. Kept so existing JSON readers
+    /// and the takeover-provenance trail still see who owns a claim.
     pub(crate) owner_tool: Option<String>,
+    /// AUTHORITY KEY: the live session lease that owns this claim. Two claims
+    /// from the SAME `owner_tool` but DIFFERENT sessions are different owners
+    /// (the two-same-tool-live-sessions case). A legacy tool-only claim maps to
+    /// a deterministic `legacy:<tool>` session so historical same-tool claims
+    /// stay same-owner. Additive + serde-default so a pre-identity claim-index
+    /// on disk deserializes unchanged.
+    #[serde(default)]
+    pub(crate) owner_session_id: String,
+    /// The addressable place behind the owning session (endpoint lineage).
+    #[serde(default)]
+    pub(crate) owner_endpoint_id: String,
+    /// The principal behind the owning session, when recorded. Used by the
+    /// privileged-action gate; never inferred from `owner_tool`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owner_principal_id: Option<String>,
     pub(crate) raw_scope: Vec<String>,
     pub(crate) resource_scopes: Vec<ResourceScope>,
     pub(crate) lease_expires_at: Option<String>,
@@ -116,9 +134,16 @@ pub(crate) fn active_claim_record_from_fact(fact: &Fact) -> Option<ActiveClaimRe
     if resource_scopes.is_empty() {
         return None;
     }
+    // Derive the owning IDENTITY (authority) from the fact. A session-keyed claim
+    // resolves to its live lease; a legacy tool-only claim to a deterministic
+    // legacy:<tool> session so historical same-tool claims stay same-owner.
+    let identity = crate::store::identity_for_fact(fact);
     Some(ActiveClaimRecord {
         claim_id: fact.event_id.clone(),
         owner_tool: fact.tool.clone(),
+        owner_session_id: identity.session_id.clone(),
+        owner_endpoint_id: identity.endpoint_id.clone(),
+        owner_principal_id: identity.principal_id.clone(),
         raw_scope: fact.scope.clone(),
         resource_scopes,
         lease_expires_at: lease_expires_at(fact),
@@ -131,7 +156,12 @@ pub(crate) fn detect_conflict(facts: &[Fact], incoming: &Fact) -> Option<ClaimCo
     }
     let incoming = active_claim_record_from_fact(incoming)?;
     for existing in active_claim_records(facts) {
-        if existing.owner_tool == incoming.owner_tool {
+        // Same OWNER = same live session (authority key), NOT same tool label.
+        // This fixes two same-tool live sessions (e.g. two `claude_code:01`
+        // terminals) colliding: they now correctly conflict on a shared file.
+        // Legacy tool-only claims map to a stable legacy:<tool> session, so a
+        // tool's own historical re-claims stay idempotent exactly as before.
+        if existing.owner_session_id == incoming.owner_session_id {
             continue;
         }
         for new_scope in &incoming.resource_scopes {
@@ -267,6 +297,16 @@ mod tests {
         }
     }
 
+    /// Like `fact`, but stamps a live `from_session_id` so the claim resolves to
+    /// a real (non-legacy) owning session — used to model two distinct live
+    /// sessions that may share a `tool` label.
+    fn fact_with_session(id: &str, tool: &str, session: &str, scope: Vec<&str>) -> Fact {
+        Fact {
+            from_session_id: Some(session.to_string()),
+            ..fact(id, tool, scope)
+        }
+    }
+
     #[test]
     fn claim_authority_rejects_conflicting_exclusive_owner() {
         let existing = fact("claim-a", "tool-a", vec!["file:src/lib.rs"]);
@@ -274,6 +314,65 @@ mod tests {
         let conflict = detect_conflict(&[existing], &incoming).unwrap();
         assert_eq!(conflict.existing_claim_id, "claim-a");
         assert_eq!(conflict.scope, "file:src/lib.rs");
+    }
+
+    #[test]
+    fn two_same_tool_different_session_claims_conflict_on_same_file() {
+        // The core fix: two live `claude_code:01` sessions (same tool label,
+        // different session lease) claiming the SAME file now COLLIDE, where the
+        // old owner_tool-keyed check silently let the second through.
+        let existing = fact_with_session(
+            "claim-a",
+            "claude_code:01",
+            "sess:term:ws:AAAA#live",
+            vec!["file:src/lib.rs"],
+        );
+        let incoming = fact_with_session(
+            "claim-b",
+            "claude_code:01",
+            "sess:term:ws:BBBB#live",
+            vec!["file:./src/lib.rs"],
+        );
+        let conflict = detect_conflict(&[existing], &incoming).expect("must conflict");
+        assert_eq!(conflict.existing_claim_id, "claim-a");
+        assert_eq!(conflict.scope, "file:src/lib.rs");
+    }
+
+    #[test]
+    fn same_session_reclaim_is_idempotent_even_when_tool_label_matches() {
+        // The SAME live session re-claiming its own file is a no-op (idempotent),
+        // keyed on session_id, not tool.
+        let existing = fact_with_session(
+            "claim-a",
+            "claude_code:01",
+            "sess:term:ws:AAAA#live",
+            vec!["file:src/lib.rs"],
+        );
+        let incoming = fact_with_session(
+            "claim-b",
+            "claude_code:01",
+            "sess:term:ws:AAAA#live",
+            vec!["file:./src/lib.rs"],
+        );
+        assert!(
+            detect_conflict(&[existing], &incoming).is_none(),
+            "same session_id → idempotent, no conflict"
+        );
+    }
+
+    #[test]
+    fn legacy_tool_only_claims_preserve_same_owner_idempotency() {
+        // Back-compat: two legacy tool-only claims from the same tool map to the
+        // same legacy:<tool> session → still same-owner → no conflict.
+        let existing = fact("claim-a", "codex:01", vec!["file:src/lib.rs"]);
+        let incoming = fact("claim-b", "codex:01", vec!["file:./src/lib.rs"]);
+        assert!(
+            detect_conflict(&[existing], &incoming).is_none(),
+            "legacy same-tool claims stay same-owner (deterministic legacy session)"
+        );
+        // And a legacy claim from a DIFFERENT tool still conflicts.
+        let other = fact("claim-c", "claude_code", vec!["file:src/lib.rs"]);
+        assert!(detect_conflict(&[fact("claim-a", "codex:01", vec!["file:src/lib.rs"])], &other).is_some());
     }
 
     #[test]
