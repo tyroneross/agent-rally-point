@@ -303,6 +303,18 @@ impl ProtocolSessionIdentity {
         self.legacy
     }
 
+    /// Reconstruct the human-readable `tool` LABEL (`tool_type[:actor]`) that the
+    /// squad/display surfaces have always shown. This is the inverse of the
+    /// `tool` → (tool_type, actor) split, so a squad row keyed by session still
+    /// renders the same `Squad.tool` value existing readers expect. NOT an
+    /// authority key — that is `session_id`.
+    pub(crate) fn legible_tool_label(&self) -> String {
+        match self.actor_id.as_deref().filter(|a| !a.is_empty()) {
+            Some(actor) => format!("{}:{}", self.tool_type, actor),
+            None => self.tool_type.clone(),
+        }
+    }
+
     /// `from_session_id` value to stamp on a durable write originating here.
     /// Named for the protocol field it yields (not a constructor); the &self
     /// getter convention is intentional.

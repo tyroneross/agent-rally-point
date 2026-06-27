@@ -334,6 +334,10 @@ pub(crate) fn identity_for_fact(fact: &Fact) -> crate::session_identity::Protoco
 /// agents that are doing long computes don't flicker out of the squad view.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 pub(crate) struct Squad {
+    /// Human-readable role label — DISPLAY ONLY. A squad row is now keyed by
+    /// `session_id` (the live lease), so two same-tool sessions appear as TWO
+    /// squad rows that share this label. Kept first + unconditional for every
+    /// existing reader (`sq.tool`).
     pub(crate) tool: String,
     pub(crate) last_seen_seq: i64,
     pub(crate) last_seen_ts: String,
@@ -342,6 +346,38 @@ pub(crate) struct Squad {
     /// Coordination-mandate (C1): has this squad recorded a `coordination:ack`
     /// fact? Acknowledged squads have ingested the rules/guardrails/lead/mission.
     pub(crate) acknowledged: bool,
+    /// AUTHORITY KEY: the live session lease this squad row represents. Two
+    /// same-`tool` sessions are two distinct rows with distinct session_ids.
+    /// Additive + serde-default so a pre-identity snapshot deserializes.
+    #[serde(default)]
+    pub(crate) session_id: String,
+    /// The addressable place (endpoint lineage) behind the session.
+    #[serde(default)]
+    pub(crate) endpoint_id: String,
+    /// The principal behind the session, when recorded; never inferred from tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal_id: Option<String>,
+    /// True when this row was synthesized from a legacy tool-only event (no live
+    /// session lease) rather than a real session.
+    #[serde(default)]
+    pub(crate) legacy: bool,
+    /// Operator-facing legible name ("Claude auditor in term:ws:AAAA").
+    #[serde(default)]
+    pub(crate) legible_name: String,
+    /// The adaptive staleness window (seconds) applied to this session — the
+    /// cadence-scaled budget the liveness verdict was computed against.
+    #[serde(default)]
+    pub(crate) liveness_window_secs: i64,
+    /// Multi-signal adaptive liveness verdict: "live" | "stale" | "unknown".
+    /// Unlike the 15-minute `status`, this is the authority-grade signal and
+    /// drives `reapable`.
+    #[serde(default)]
+    pub(crate) liveness: String,
+    /// True when this session is a stale lease that a peer/lead may reclaim. A
+    /// 4-day-dead owner is shown (NOT hidden) with reapable=true so an operator
+    /// reads "stale and reclaimable" rather than the row silently vanishing.
+    #[serde(default)]
+    pub(crate) reapable: bool,
 }
 
 /// Seconds of inactivity after which a squad member is marked "idle".
@@ -406,9 +442,21 @@ pub(crate) struct RoomSnapshot {
     pub(crate) stale_facts: Vec<Fact>,
     /// Distinct tools that have entered or authored facts in this room.
     pub(crate) squads: Vec<Squad>,
-    /// Tool asserting the `role:lead` decision, if any.
+    /// Tool asserting the `role:lead` decision, if any. DISPLAY label — the
+    /// authority identity of the lead is `lead_session_id` (below).
     #[serde(default)]
     pub(crate) lead: Option<String>,
+    /// AUTHORITY: the session lease that holds the lead seat. Derived from the
+    /// latest `role:lead` decision fact via `identity_for_fact`. Distinguishes
+    /// two same-tool sessions and is what the privileged lead-op gate checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lead_session_id: Option<String>,
+    /// The addressable place behind the lead session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lead_endpoint_id: Option<String>,
+    /// The principal behind the lead session, when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lead_principal_id: Option<String>,
     /// Seq of the latest lead-family decision (`role:lead` or relinquish).
     /// Agents can use this as a cheap epoch to detect stale lead context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -539,6 +587,9 @@ impl RoomSnapshot {
             // squads, lead, readers, and mission are room-level aggregates; not filtered by path/tool query.
             squads: self.squads,
             lead: self.lead,
+            lead_session_id: self.lead_session_id,
+            lead_endpoint_id: self.lead_endpoint_id,
+            lead_principal_id: self.lead_principal_id,
             lead_epoch: self.lead_epoch,
             readers: self.readers,
             mission: self.mission,
@@ -2064,37 +2115,41 @@ fn snapshot_from_facts_with_policy(
         .cloned()
         .collect::<Vec<_>>();
 
-    // --- Presence projection ---
-    // Collect the highest-seq fact per tool (any kind counts; presence is
-    // the primary signal but a claim or artifact also proves presence).
-    // "rally" is the reserved system author (used by wake_fact); it is not
-    // a participating agent and must not appear in squads[].
-    let mut tool_last: BTreeMap<String, (i64, String)> = BTreeMap::new();
+    // --- Presence projection (keyed by SESSION identity, not tool label) ---
+    // Collect the highest-seq fact per SESSION (any kind counts; presence is the
+    // primary signal but a claim or artifact also proves presence). A role/lease
+    // is held by an identity, so two same-tool live sessions are two rows.
+    // "rally" is the reserved system author (used by wake_fact); it is not a
+    // participating agent and must not appear in squads[].
+    //
+    // The session key is derived via `identity_for_fact`: a session-keyed fact
+    // resolves to its live lease; a legacy tool-only fact to a deterministic
+    // `legacy:<tool>` session, so a pre-identity ledger projects EXACTLY as
+    // before (one row per tool).
+    use crate::session_identity::ProtocolSessionIdentity;
+    let mut session_last: BTreeMap<String, (i64, String, ProtocolSessionIdentity)> = BTreeMap::new();
     for fact in facts {
-        if let Some(tool) = &fact.tool {
-            if tool == "rally" {
-                continue;
-            }
-            let entry = tool_last.entry(tool.clone()).or_insert((0, String::new()));
-            if fact.seq > entry.0 {
-                *entry = (fact.seq, fact.created_at.clone());
-            }
+        let Some(tool) = &fact.tool else { continue };
+        if tool == "rally" {
+            continue;
+        }
+        let identity = identity_for_fact(fact);
+        let key = identity.session_id.clone();
+        let entry = session_last
+            .entry(key)
+            .or_insert((0, String::new(), identity.clone()));
+        if fact.seq > entry.0 {
+            *entry = (fact.seq, fact.created_at.clone(), identity);
         }
     }
     // `now_secs` already computed at the top of this function.
     let acked = acknowledged_tools(facts);
-    // Adaptive-liveness signal sources (all PURE over `facts`):
-    //   (a) heartbeat   = age of the tool's highest-seq fact (computed below).
-    //   (b) inject/ack  = age of the newest delivery record naming the tool: a
-    //                     `receipt` or `wake` it authored (ack), or a `handoff` /
-    //                     `wake` whose `target` is the tool (inject TO it).
-    //   (c) code progress = age of the tool's newest presence/session fact WHEN
-    //                     its `branch_head_sha:` evidence differs from the prior
-    //                     such fact (HEAD moved). Pure over facts — the presence
-    //                     writer stamps the sha; the snapshot stays I/O-free.
-    //                     Absent (no two stamped facts) → None → fail-open.
-    //   (d) plan/mission = age of the tool's newest live claim, or of the latest
-    //                     mission/handoff it authored (declared active work).
+    // Adaptive-liveness signal sources (all PURE over `facts`). The (b) inject,
+    // (c) progress and (d) plan signals are TOOL-addressed in the ledger
+    // (handoffs/claims name a tool, not a session), so they are computed per
+    // tool and looked up by the session's tool label. The (a) heartbeat signal
+    // is per-SESSION (each session's own newest fact age), which is what
+    // distinguishes two same-tool sessions' liveness.
     let inject_ages = newest_fact_age_per_tool(facts, now_secs, &["receipt", "wake", "handoff"]);
     let progress_ages = code_progress_age_per_tool(facts, now_secs);
     // Plan signal: newest live-claim OR mission/handoff age per owning tool.
@@ -2121,17 +2176,18 @@ fn snapshot_from_facts_with_policy(
     let cadence = coord.default_cadence_secs;
     let mult = coord.miss_multiplier;
     let grace = coord.grace_secs;
-    let squads = tool_last
+    let squads = session_last
         .into_iter()
-        .filter_map(|(tool, (seq, ts))| {
+        .map(|(session_id, (seq, ts, identity))| {
+            let tool = identity.legible_tool_label();
             // Parse ISO-8601 ts to epoch secs for idle check; fall back to
-            // treating the tool as active if parsing fails.
+            // treating the session as active if parsing fails.
             let seen_secs = chrono::DateTime::parse_from_rfc3339(&ts)
                 .map(|dt| dt.timestamp())
                 .unwrap_or(now_secs);
             let heartbeat_age = now_secs - seen_secs;
             // The 15-min idle label is preserved for the existing surfaces that
-            // read `Squad.status`; it is independent of the drop decision.
+            // read `Squad.status`; it is independent of the liveness verdict.
             let status = if heartbeat_age <= IDLE_THRESHOLD_SECS {
                 "active".to_string()
             } else {
@@ -2139,15 +2195,11 @@ fn snapshot_from_facts_with_policy(
             };
             let acknowledged = acked.contains(&tool);
 
-            // --- Adaptive multi-signal liveness (the squad-decay gap) ---
-            let planned_interval = planned_cadence_for_tool(facts, &tool)
-                .unwrap_or(cadence);
-            let window = crate::liveness::adaptive_window_secs(
-                planned_interval,
-                cadence,
-                mult,
-                grace,
-            );
+            // --- Adaptive multi-signal liveness (the squad lease verdict) ---
+            // tool-addressed signals are looked up by the session's tool label.
+            let planned_interval = planned_cadence_for_tool(facts, &tool).unwrap_or(cadence);
+            let window =
+                crate::liveness::adaptive_window_secs(planned_interval, cadence, mult, grace);
             let signals = crate::liveness::LivenessSignals {
                 heartbeat_age: Some(heartbeat_age),
                 inject_age: inject_ages.get(&tool).copied(),
@@ -2155,31 +2207,42 @@ fn snapshot_from_facts_with_policy(
                 plan_age: plan_ages.get(&tool).copied(),
             };
             let verdict = crate::liveness::is_live(&signals, window);
-
-            // FAIL-OPEN: Live and Unknown are KEPT (Unknown = cannot prove dead).
-            // Only a provably-Stale squad (all signals present & past window) is
-            // DROPPED from the default snapshot; `include_archived` restores it.
-            // This direction is opposite the reaper's fail-CLOSED removal path on
-            // purpose: hiding a still-alive peer is the dangerous direction here.
-            let dropped = matches!(verdict, crate::liveness::Liveness::Stale)
-                && !include_archived;
-            if dropped {
-                return None;
+            let liveness = match verdict {
+                crate::liveness::Liveness::Live => "live",
+                crate::liveness::Liveness::Stale => "stale",
+                crate::liveness::Liveness::Unknown => "unknown",
             }
+            .to_string();
+            // SHOW stale lease holders (do NOT hide them): a 4-day-dead owner of
+            // a claim/lead must be visible as stale+reapable so an operator reads
+            // "reclaimable", not a silently-vanished row. `reapable` composes the
+            // verdict with the snapshot-layer's `None` parent signal (the same
+            // fail-safe the reaper uses when no parent record exists): Live and
+            // Unknown are never reapable; provably-Stale is.
+            let reapable = crate::liveness::reapable(verdict, None);
 
-            Some(Squad {
+            Squad {
                 tool,
                 last_seen_seq: seq,
                 last_seen_ts: ts,
                 status,
                 acknowledged,
-            })
+                session_id,
+                endpoint_id: identity.endpoint_id,
+                principal_id: identity.principal_id,
+                legacy: identity.legacy,
+                legible_name: identity.legible_name,
+                liveness_window_secs: window,
+                liveness,
+                reapable,
+            }
         })
         .collect::<Vec<_>>();
 
-    // Lead is the tool from the most-recent decision with subject "role:lead".
-    // Lead = the tool of the latest `role:lead` decision, UNLESS the latest
-    // lead-family decision is a `role:lead:relinquished` (seat reopened → None).
+    // Lead is the SESSION from the most-recent decision with subject "role:lead",
+    // UNLESS the latest lead-family decision is a `role:lead:relinquished` (seat
+    // reopened → None). The `lead` display label is kept; the authority identity
+    // (`lead_session_id` etc.) is derived from the same fact.
     let latest_lead_fact = facts
         .iter()
         .filter(|f| {
@@ -2188,9 +2251,12 @@ fn snapshot_from_facts_with_policy(
         })
         .max_by_key(|f| f.seq);
     let lead_epoch = latest_lead_fact.map(|f| f.seq);
-    let lead = latest_lead_fact
-        .filter(|f| f.subject == "role:lead")
-        .and_then(|f| f.tool.clone());
+    let active_lead_fact = latest_lead_fact.filter(|f| f.subject == "role:lead");
+    let lead = active_lead_fact.and_then(|f| f.tool.clone());
+    let lead_identity = active_lead_fact.map(identity_for_fact);
+    let lead_session_id = lead_identity.as_ref().map(|i| i.session_id.clone());
+    let lead_endpoint_id = lead_identity.as_ref().map(|i| i.endpoint_id.clone());
+    let lead_principal_id = lead_identity.as_ref().and_then(|i| i.principal_id.clone());
 
     // Mission: latest-by-seq Mission fact whose scope contains "mission".
     // "mission" scope distinguishes north-star facts from envelope facts.
@@ -2214,6 +2280,9 @@ fn snapshot_from_facts_with_policy(
         stale_facts,
         squads,
         lead,
+        lead_session_id,
+        lead_endpoint_id,
+        lead_principal_id,
         lead_epoch,
         readers: Vec::new(),
         mission,
@@ -6208,6 +6277,7 @@ mod decay_reclaim_tests {
             last_seen_ts: iso_ago(last_seen_age_secs),
             status: "idle".to_string(),
             acknowledged: false,
+            ..Default::default()
         }
     }
 
@@ -6703,14 +6773,19 @@ mod squad_decay_tests {
     }
 
     #[test]
-    fn five_min_cadence_all_stale_squad_dropped_and_restored() {
+    fn five_min_cadence_all_stale_squad_shown_as_stale_and_reapable() {
         // Default cadence (5m) → window 31m. Make ALL FOUR signals present and
-        // past the window so the verdict is provably Stale → DROP.
+        // past the window so the verdict is provably Stale.
         //   (a) heartbeat: stale presence facts (35m+, the newest).
         //   (b) inject: a handoff TO the tool, stale (40m).
         //   (c) code progress: two presence facts with DIFFERENT shas, both old
         //       (the newer is 35m → progress age 35m, stale).
         //   (d) plan: a claim owned by the tool, stale (60m).
+        //
+        // NEW CONTRACT (identity-wiring): a stale lease holder is SHOWN (not
+        // dropped) with liveness="stale" + reapable=true, so an operator reads
+        // "stale and reclaimable" instead of the row silently vanishing. A
+        // 4-day-dead claim/lead owner must be visible to be reclaimed.
         let coord = CoordinationConfig::default();
         let mut handoff = fact(FactKind::Handoff, "sender", 40 * 60);
         handoff.target = Some("stale-tool".to_string());
@@ -6723,15 +6798,98 @@ mod squad_decay_tests {
             presence_sha("stale-tool", 35 * 60, "bbbb"), // newer sha → moved, but 35m old
         ]);
         let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
-        assert!(
-            !has_squad(&snap, "stale-tool"),
-            "all-signals-stale 5-min-cadence squad must be DROPPED from default view"
-        );
-        let snap_all = snapshot_from_facts_with_policy(&facts, &coord, true);
-        assert!(
-            has_squad(&snap_all, "stale-tool"),
-            "dropped squad must return under include_archived"
-        );
+        let sq = snap
+            .squads
+            .iter()
+            .find(|s| s.tool == "stale-tool")
+            .expect("stale lease holder must STAY VISIBLE in the default view");
+        assert_eq!(sq.liveness, "stale", "verdict surfaced on the row");
+        assert!(sq.reapable, "a provably-stale lease holder is reapable");
+    }
+
+    #[test]
+    fn two_same_tool_sessions_project_as_two_distinct_squad_rows() {
+        // Two live `claude_code:01` sessions on different endpoints (e.g. two
+        // terminals) must each get their OWN squad row, keyed by session_id,
+        // sharing the `tool` display label. The old tool-keyed projection
+        // collapsed them into one.
+        let coord = CoordinationConfig::default();
+        let mut a = fact(FactKind::Presence, "claude_code:01", 60);
+        a.from_session_id = Some("sess:term:ws:AAAA#live".to_string());
+        let mut b = fact(FactKind::Presence, "claude_code:01", 60);
+        b.from_session_id = Some("sess:term:ws:BBBB#live".to_string());
+        let facts = seqd(vec![a, b]);
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        let rows: Vec<&Squad> = snap
+            .squads
+            .iter()
+            .filter(|s| s.tool == "claude_code:01")
+            .collect();
+        assert_eq!(rows.len(), 2, "two sessions → two rows");
+        let mut sessions: Vec<&str> = rows.iter().map(|s| s.session_id.as_str()).collect();
+        sessions.sort();
+        assert_eq!(sessions, vec!["sess:term:ws:AAAA#live", "sess:term:ws:BBBB#live"]);
+        assert!(rows.iter().all(|s| !s.legacy), "live sessions are not legacy");
+    }
+
+    #[test]
+    fn legacy_tool_only_ledger_still_projects_one_row_per_tool() {
+        // Back-compat: a pre-identity ledger (no from_session_id) projects EXACTLY
+        // as before — one row per tool — because every legacy fact maps to the
+        // same deterministic legacy:<tool> session.
+        let coord = CoordinationConfig::default();
+        let facts = seqd(vec![
+            fact(FactKind::Presence, "codex:01", 60),
+            fact(FactKind::Claim, "codex:01", 90),
+        ]);
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        let rows: Vec<&Squad> = snap.squads.iter().filter(|s| s.tool == "codex:01").collect();
+        assert_eq!(rows.len(), 1, "legacy tool-only facts collapse to one row");
+        assert!(rows[0].legacy, "row is flagged legacy");
+        assert!(rows[0].session_id.starts_with("sess:legacy:"));
+    }
+
+    #[test]
+    fn stale_session_lease_is_reapable_while_a_live_sibling_session_is_not() {
+        // Two sessions of the same tool: one idle past the adaptive window (all
+        // signals stale → reapable), one fresh (live → not reapable). Liveness is
+        // decided PER SESSION via its own heartbeat, so a dead lease is reapable
+        // even though a same-tool sibling is alive.
+        let coord = CoordinationConfig::default(); // 5m cadence → 31m window
+        // Stale session: old facts only. To make the verdict provably STALE (not
+        // Unknown), all four signals must be present & past the window. The
+        // inject/progress/plan signals are tool-addressed, so we add a stale
+        // handoff TO the tool and a stale claim BY the tool; progress comes from
+        // the two differing-sha presences.
+        let mut s_old = presence_sha("claude_code:01", 90 * 60, "aaaa");
+        s_old.from_session_id = Some("sess:term:ws:OLD#live".to_string());
+        let mut s_old2 = presence_sha("claude_code:01", 40 * 60, "bbbb");
+        s_old2.from_session_id = Some("sess:term:ws:OLD#live".to_string());
+        let mut handoff = fact(FactKind::Handoff, "sender", 50 * 60);
+        handoff.target = Some("claude_code:01".to_string());
+        let mut claim = fact(FactKind::Claim, "claude_code:01", 60 * 60);
+        claim.scope = vec!["file:src/x.rs".to_string()];
+        claim.from_session_id = Some("sess:term:ws:OLD#live".to_string());
+        // Fresh session: a recent presence (its own heartbeat is fresh → Live,
+        // regardless of the shared stale tool-addressed signals).
+        let mut s_new = fact(FactKind::Presence, "claude_code:01", 30);
+        s_new.from_session_id = Some("sess:term:ws:NEW#live".to_string());
+        let facts = seqd(vec![s_old, s_old2, handoff, claim, s_new]);
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        let old = snap
+            .squads
+            .iter()
+            .find(|s| s.session_id == "sess:term:ws:OLD#live")
+            .expect("stale session still visible");
+        let new = snap
+            .squads
+            .iter()
+            .find(|s| s.session_id == "sess:term:ws:NEW#live")
+            .expect("live session visible");
+        assert!(old.reapable, "the stale lease is reapable");
+        assert_eq!(old.liveness, "stale");
+        assert!(!new.reapable, "the live sibling session is never reapable");
+        assert_eq!(new.liveness, "live");
     }
 
     #[test]
