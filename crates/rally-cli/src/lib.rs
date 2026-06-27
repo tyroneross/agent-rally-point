@@ -1809,8 +1809,27 @@ fn command_release_by_path(
             eligible
         })
         .collect();
-    // Did at least one match come from a stale-owner takeover (not self)?
-    let is_takeover = matches.iter().any(|c| c.tool.as_deref() != Some(tool));
+    // Did at least one match come from a stale-owner takeover? Keyed by SESSION
+    // identity, not tool label: a claim is a takeover when its owning session
+    // differs from the CALLER's session — so a same-tool peer in a DIFFERENT
+    // session is correctly a takeover, and the caller releasing its own
+    // (same-session) claim is not. Legacy tool-only claims resolve to the
+    // deterministic legacy session, preserving the prior same-tool=self behavior.
+    let caller_session = current_protocol_session(Some(tool)).session_id;
+    let is_takeover = matches
+        .iter()
+        .any(|c| store::identity_for_fact(c).session_id != caller_session);
+    // PRIVILEGED GATE: a cross-session takeover release is destructive and must
+    // be attributable to a principal. (Eligibility — the >2h/size-scaled stale
+    // bar — was already enforced above via claim_reclaim_eligible; this adds the
+    // attribution requirement.) A self-release never trips this.
+    if is_takeover {
+        let caller_principal = current_principal_id();
+        require_principal(
+            "claim takeover release (cross-session)",
+            caller_principal.as_deref(),
+        )?;
+    }
     if matches.is_empty() {
         // Build the loud-error list: this tool's currently-open claims, plus a
         // hint about any squatting (stale-owner) claims on the wanted paths that
@@ -1864,9 +1883,10 @@ fn command_release_by_path(
     }
 
     // Snapshot the matched claim metadata before mutating — we want stable
-    // event_ids + subjects + owners to populate warnings + takeover provenance
-    // even if a subsequent release changes the projection.
-    let match_meta: Vec<(String, String, Vec<String>, Option<String>)> = matches
+    // event_ids + subjects + owners (tool label for display + session id for the
+    // takeover recheck) to populate warnings + takeover provenance even if a
+    // subsequent release changes the projection.
+    let match_meta: Vec<(String, String, Vec<String>, Option<String>, String)> = matches
         .into_iter()
         .map(|c| {
             (
@@ -1874,6 +1894,7 @@ fn command_release_by_path(
                 c.subject.clone(),
                 c.scope.clone(),
                 c.tool.clone(),
+                store::identity_for_fact(c).session_id,
             )
         })
         .collect();
@@ -1895,7 +1916,7 @@ fn command_release_by_path(
         .expect("match_meta is non-empty (early-return guard above)")
         .clone();
     let mut union_scope: Vec<String> = Vec::new();
-    for (_id, _subj, sc, _owner) in &match_meta {
+    for (_id, _subj, sc, _owner, _sess) in &match_meta {
         for s in sc {
             if !union_scope.contains(s) {
                 union_scope.push(s.clone());
@@ -1910,12 +1931,26 @@ fn command_release_by_path(
     let taken_over_owners: Vec<String> = if is_takeover {
         let mut o: Vec<String> = match_meta
             .iter()
-            .filter_map(|(_id, _subj, _sc, owner)| owner.clone())
-            .filter(|owner| owner != tool)
+            .filter(|(_id, _subj, _sc, _owner, sess)| *sess != caller_session)
+            .filter_map(|(_id, _subj, _sc, owner, _sess)| owner.clone())
             .collect();
         o.sort();
         o.dedup();
         o
+    } else {
+        Vec::new()
+    };
+    // Session-keyed owners for the under-lock takeover recheck (authority key).
+    // The tool-keyed list above stays for the human-readable subject annotation.
+    let taken_over_sessions: Vec<String> = if is_takeover {
+        let mut s: Vec<String> = match_meta
+            .iter()
+            .map(|(_id, _subj, _sc, _owner, sess)| sess.clone())
+            .filter(|sess| *sess != caller_session)
+            .collect();
+        s.sort();
+        s.dedup();
+        s
     } else {
         Vec::new()
     };
@@ -1938,6 +1973,15 @@ fn command_release_by_path(
             "authorized-takeover:stale-owner={}",
             taken_over_owners.join(",")
         ));
+        // Session-keyed marker — the AUTHORITY key the under-lock recheck uses to
+        // re-assert eligibility (so a same-tool-different-session revival is
+        // detected). Tool marker above stays for human-readable provenance.
+        if !taken_over_sessions.is_empty() {
+            evidence.push(format!(
+                "authorized-takeover:stale-session={}",
+                taken_over_sessions.join(",")
+            ));
+        }
         // Record WHY the reclaim was authorized: stale-by-timeout, with the
         // size class(es) that set each claim's timeout. Auditable provenance.
         let sizes: Vec<&str> = reclaim_sizes
@@ -1977,7 +2021,7 @@ fn command_release_by_path(
         session: None,
     };
     let appended = room.append_state_transition_verified(&fact)?;
-    for (id, subj, _sc, _owner) in &match_meta {
+    for (id, subj, _sc, _owner, _sess) in &match_meta {
         let takeover_note = if is_takeover {
             " (authorized takeover of stale-owner claim)"
         } else {
@@ -2305,6 +2349,27 @@ fn current_principal_id() -> Option<String> {
     let nonempty =
         |v: std::result::Result<String, std::env::VarError>| v.ok().filter(|s| !s.trim().is_empty());
     nonempty(env::var("RALLY_PRINCIPAL_ID")).or_else(|| nonempty(env::var("GITHUB_ACTOR")))
+}
+
+/// PRIVILEGED-ACTION GATE for a CROSS-SESSION coordination change (taking over a
+/// peer's lead seat or releasing a peer's claim). A self-action (the caller IS
+/// the current owner's session) never reaches here — the caller passes that
+/// check before calling. Requires the CALLER to carry a recorded `principal_id`:
+/// a destructive cross-session action must be attributable to a real principal,
+/// not performed anonymously by any process that happens to set a tool label.
+///
+/// Returns Ok(()) when a principal is present, else a usage error naming the
+/// action and how to authorize it. Pure over its inputs (caller resolves the
+/// live principal); deterministically testable.
+fn require_principal(action: &str, caller_principal: Option<&str>) -> Result<()> {
+    match caller_principal.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(_) => Ok(()),
+        None => Err(RallyError::Usage(format!(
+            "{action} is a privileged cross-session action and requires a principal: \
+             set RALLY_PRINCIPAL_ID (or run under a cloud identity that exports GITHUB_ACTOR). \
+             A self-action (same session as the current owner) needs no principal."
+        ))),
+    }
 }
 
 /// Map a ledger [`store::FactKind`] to the north-star protocol event vocabulary
@@ -6076,6 +6141,51 @@ mod tests {
         root
     }
 
+    /// Serializes any test that mutates the process-global `RALLY_PRINCIPAL_ID`,
+    /// since `set_var` is process-wide and unsound under the multi-threaded test
+    /// runner without serialization (same pattern as hooks_config::env_lock).
+    fn principal_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// RAII guard: set `RALLY_PRINCIPAL_ID` for the duration of a privileged-action
+    /// test (so the cross-session gate is satisfiable), restoring the prior value
+    /// on drop. Holds the env lock for its lifetime so concurrent principal tests
+    /// don't interleave.
+    struct PrincipalGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prior: Option<String>,
+    }
+    impl PrincipalGuard {
+        fn set(value: &str) -> Self {
+            let lock = principal_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+            let prior = std::env::var("RALLY_PRINCIPAL_ID").ok();
+            unsafe { std::env::set_var("RALLY_PRINCIPAL_ID", value) };
+            Self { _lock: lock, prior }
+        }
+    }
+    impl PrincipalGuard {
+        /// Guard with NO principal set (cleared) — for the not-authorized path.
+        fn cleared() -> Self {
+            let lock = principal_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+            let prior = std::env::var("RALLY_PRINCIPAL_ID").ok();
+            unsafe { std::env::remove_var("RALLY_PRINCIPAL_ID") };
+            // Also clear GITHUB_ACTOR for the duration so the fallback can't sneak
+            // a principal in under a CI runner.
+            unsafe { std::env::remove_var("GITHUB_ACTOR") };
+            Self { _lock: lock, prior }
+        }
+    }
+    impl Drop for PrincipalGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var("RALLY_PRINCIPAL_ID", v) },
+                None => unsafe { std::env::remove_var("RALLY_PRINCIPAL_ID") },
+            }
+        }
+    }
+
     fn git_available() -> bool {
         std::process::Command::new("git")
             .arg("--version")
@@ -9796,6 +9906,8 @@ mod tests {
     /// takeover provenance (subject annotation + evidence tag).
     #[test]
     fn stale_owner_claim_is_reclaimable_by_authorized_takeover() {
+        // A cross-session takeover release is principal-gated (Chunk 5).
+        let _principal = PrincipalGuard::set("tyrone");
         let root = unique_root("stale-claim-takeover");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
@@ -9860,6 +9972,136 @@ mod tests {
             "release evidence must name the stale owner reclaimed; got: {evidence:?}"
         );
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn require_principal_passes_with_a_principal_and_fails_without() {
+        assert!(require_principal("x", Some("tyrone")).is_ok());
+        assert!(require_principal("x", Some("  ")).is_err(), "blank is not a principal");
+        let err = require_principal("lead takeover", None).unwrap_err().to_string();
+        assert!(err.contains("privileged"), "got {err}");
+        assert!(err.contains("RALLY_PRINCIPAL_ID"), "names how to authorize");
+    }
+
+    #[test]
+    fn cross_session_takeover_release_is_refused_without_a_principal() {
+        // Same scenario as the authorized-takeover test, but with NO principal:
+        // the cross-session takeover must be REFUSED at the gate.
+        let _principal = PrincipalGuard::cleared();
+        let root = unique_root("takeover-no-principal");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let stale_id = append_stale_claim(
+            &room,
+            "dead-owner",
+            "src/foo.rs",
+            "claim from a dead session",
+            "2026-06-02T10:00:00Z",
+        );
+        let result = command_release_by_path(
+            &room,
+            "claude_code:peer",
+            &["file:src/foo.rs".to_string()],
+            None,
+            None,
+            "reclaim without a principal".to_string(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            true,
+            Vec::new(),
+        );
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("cross-session takeover without a principal must be refused"),
+        };
+        assert!(err.contains("principal"), "error must name the principal gate; got {err}");
+        // The claim survives the refused takeover.
+        let after = room.snapshot().unwrap();
+        assert!(after.active_claims.iter().any(|c| c.event_id == stale_id));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn self_release_needs_no_principal() {
+        // The owner releasing its OWN claim is not a takeover → no principal
+        // required, even with the principal env cleared. The claim is stamped by
+        // the central write-boundary with the SAME live session the caller
+        // resolves, so caller_session == owner_session → self-release.
+        let _principal = PrincipalGuard::cleared();
+        let root = unique_root("self-release-no-principal");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        // Fresh claim (now) by "claude_code:self" — append_fact stamps it with
+        // this process's live session for that tool.
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let claim_id = append_stale_claim(&room, "claude_code:self", "src/own.rs", "my claim", &now);
+        let result = command_release_by_path(
+            &room,
+            "claude_code:self",
+            &["file:src/own.rs".to_string()],
+            None,
+            None,
+            "release my own claim".to_string(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            true,
+            Vec::new(),
+        );
+        assert!(result.is_ok(), "self-release must NOT require a principal");
+        let after = room.snapshot().unwrap();
+        assert!(
+            !after.active_claims.iter().any(|c| c.event_id == claim_id),
+            "self-released claim is gone"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn lead_gate_self_vs_cross_session_and_reapability() {
+        // Build a real room with a lead seat held by THIS process's session for
+        // "claude_code:lead" (stamped by the central write boundary).
+        let _principal = PrincipalGuard::cleared();
+        let root = unique_root("lead-gate");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        ensure_presence(&room, "claude_code:lead").unwrap(); // first-enter → lead
+        let snap = room.snapshot().unwrap();
+        assert_eq!(snap.lead.as_deref(), Some("claude_code:lead"));
+        assert!(snap.lead_session_id.is_some(), "lead authority session recorded");
+
+        // The lead's own session resolves as SELF (no takeover).
+        assert!(
+            lead_change_is_self(&snap, "claude_code:lead"),
+            "the seat holder's own session is a self-action"
+        );
+        // A DIFFERENT tool (→ different session on the same endpoint) is NOT self.
+        assert!(
+            !lead_change_is_self(&snap, "codex:peer"),
+            "a different session is a cross-session change"
+        );
+        // The lead seat is freshly held → LIVE → not reapable.
+        assert!(
+            !current_lead_is_reapable(&snap),
+            "a freshly-entered lead seat is live, not reapable"
+        );
+
+        // An empty seat (no lead) is self-eligible (claiming, not taking over).
+        let empty = store::RoomSnapshot {
+            lead: None,
+            lead_session_id: None,
+            ..Default::default()
+        };
+        assert!(lead_change_is_self(&empty, "anyone"));
+        assert!(!current_lead_is_reapable(&empty));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -10001,6 +10243,8 @@ mod tests {
     /// so the WARN points at a command that actually works.
     #[test]
     fn takeover_release_matches_stale_directory_claim_by_contained_path() {
+        // A cross-session takeover release is principal-gated (Chunk 5).
+        let _principal = PrincipalGuard::set("tyrone");
         let root = unique_root("takeover-dir-claim");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
@@ -11402,7 +11646,25 @@ fn command_lead(args: LeadArgs) -> Result<Output> {
         LeadSubcommand::Relinquish(r) => {
             let room = RoomStore::open()?;
             ensure_presence(&room, &r.tool)?;
-            let prior = room.snapshot()?.lead;
+            let snapshot = room.snapshot()?;
+            let prior = snapshot.lead.clone();
+            // Self-relinquish (you give up your OWN seat) needs no principal.
+            // Relinquishing a DIFFERENT session's seat is a cross-session action
+            // gated like a takeover: principal required AND the seat stale/reapable.
+            if !lead_change_is_self(&snapshot, &r.tool) {
+                let caller_principal = current_principal_id();
+                require_principal(
+                    "lead relinquish (cross-session)",
+                    caller_principal.as_deref(),
+                )?;
+                if !current_lead_is_reapable(&snapshot) {
+                    return Err(RallyError::Usage(format!(
+                        "cross-session relinquish refused: the current lead ({}) is a LIVE \
+                         session. Only its own session may relinquish it, or it must go stale.",
+                        prior.as_deref().unwrap_or("<none>")
+                    )));
+                }
+            }
             let fact = Fact {
                 from_session_id: None,
                 principal_id: None,
@@ -11449,13 +11711,59 @@ fn command_lead(args: LeadArgs) -> Result<Output> {
     }
 }
 
+/// Decide whether a lead-seat change by `caller_tool` is a SELF-action (the
+/// caller already holds the seat in the same session) or a CROSS-SESSION change.
+/// Returns `true` when self. A reopened seat (no current lead) is treated as
+/// self-eligible: claiming an empty seat is not a takeover. The caller's session
+/// is resolved from the live endpoint; the lead's from `lead_session_id`.
+fn lead_change_is_self(snapshot: &store::RoomSnapshot, caller_tool: &str) -> bool {
+    let Some(lead_session) = snapshot.lead_session_id.as_deref() else {
+        return true; // empty seat — not a takeover
+    };
+    let caller = current_protocol_session(Some(caller_tool));
+    caller.session_id == lead_session
+}
+
+/// True when the current lead seat is held by a STALE/REAPABLE session — a
+/// dead-lead seat a peer may legitimately reclaim. Read off the lead's squad row.
+fn current_lead_is_reapable(snapshot: &store::RoomSnapshot) -> bool {
+    let Some(lead_session) = snapshot.lead_session_id.as_deref() else {
+        return false;
+    };
+    snapshot
+        .squads
+        .iter()
+        .find(|sq| sq.session_id == lead_session)
+        .map(|sq| sq.reapable)
+        .unwrap_or(false)
+}
+
 /// Append a `role:lead` decision transferring the title to `t.to`. The latest
 /// such decision wins in the projection, so this just records the transfer
-/// (charter: records/exposes, never enforces).
+/// (charter: records/exposes, never enforces) — EXCEPT a cross-session takeover
+/// of a LIVE lead seat, which is gated: it requires the caller to carry a
+/// principal AND the current lead to be stale/reapable. A self-handoff (caller
+/// holds the seat) or claiming a reopened seat proceeds without a principal.
 fn set_lead(json: bool, t: &LeadTargetArgs, mode: &str) -> Result<Output> {
     let room = RoomStore::open()?;
     ensure_presence(&room, &t.tool)?;
-    let prior = room.snapshot()?.lead;
+    let snapshot = room.snapshot()?;
+    // Gate a cross-session takeover. user-designated assignment is an operator
+    // override and is exempt (the human IS the authority).
+    if !t.user_designated && !lead_change_is_self(&snapshot, &t.tool) {
+        let caller_principal = current_principal_id();
+        require_principal("lead takeover (cross-session)", caller_principal.as_deref())?;
+        if !current_lead_is_reapable(&snapshot) {
+            return Err(RallyError::Usage(format!(
+                "lead takeover refused: the current lead ({}) is a LIVE session, not stale/reapable. \
+                 A live lead must hand off itself (rally lead handoff from its own session), \
+                 relinquish, or go stale before a peer may take the seat. \
+                 An operator may force it with --user-designated.",
+                snapshot.lead.as_deref().unwrap_or("<none>")
+            )));
+        }
+    }
+    let prior = snapshot.lead.clone();
     let mut evidence = vec![format!("assigned:{mode}")];
     if let Some(p) = &prior {
         evidence.push(format!("from:{p}"));

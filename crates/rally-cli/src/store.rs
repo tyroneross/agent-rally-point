@@ -987,16 +987,27 @@ impl RoomStore {
     /// list of stale owners the release claims to reclaim. `None` when the
     /// marker is absent (an ordinary self-release, no takeover guard needed).
     fn takeover_owners_marker(evidence: &[String]) -> Option<Vec<String>> {
-        const PREFIX: &str = "authorized-takeover:stale-owner=";
+        Self::csv_marker(evidence, "authorized-takeover:stale-owner=")
+    }
+
+    /// Parse the SESSION-keyed takeover marker (`authorized-takeover:stale-session
+    /// =<s1>,<s2>`). This is the AUTHORITY key the under-lock recheck prefers, so
+    /// a same-tool-different-session revival is detected. Absent on a legacy
+    /// release that only wrote the tool marker (back-compat → recheck falls back).
+    fn takeover_sessions_marker(evidence: &[String]) -> Option<Vec<String>> {
+        Self::csv_marker(evidence, "authorized-takeover:stale-session=")
+    }
+
+    fn csv_marker(evidence: &[String], prefix: &str) -> Option<Vec<String>> {
         for item in evidence {
-            if let Some(rest) = item.strip_prefix(PREFIX) {
-                let owners: Vec<String> = rest
+            if let Some(rest) = item.strip_prefix(prefix) {
+                let vals: Vec<String> = rest
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
-                if !owners.is_empty() {
-                    return Some(owners);
+                if !vals.is_empty() {
+                    return Some(vals);
                 }
             }
         }
@@ -1039,16 +1050,33 @@ impl RoomStore {
         // takeover rather than reclaim a now-live owner's claim (the
         // independent-auditor-HIGH 2026-06-09 regression class).
         if fact.kind == FactKind::Release {
-            if let Some(stale_owners) = Self::takeover_owners_marker(&fact.evidence) {
+            // Prefer the SESSION-keyed marker (authority): a same-tool peer that
+            // revived in a DIFFERENT session is then correctly detected. Fall back
+            // to the tool marker for a legacy release that only wrote tool labels.
+            let by_session = Self::takeover_sessions_marker(&fact.evidence);
+            let stale_keys = by_session
+                .clone()
+                .or_else(|| Self::takeover_owners_marker(&fact.evidence));
+            if let Some(stale_keys) = stale_keys {
+                let key_is_session = by_session.is_some();
                 let coord =
                     crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
                 let facts = facts_from_store(&fact_store)?;
                 let fresh = snapshot_from_facts_with_policy(&facts, &coord, false);
-                for owner in &stale_owners {
+                // Match a claim to a marker key by SESSION id (authority) when the
+                // session marker is present, else by the legacy tool label.
+                let claim_matches = |c: &Fact, key: &str| -> bool {
+                    if key_is_session {
+                        identity_for_fact(c).session_id == key
+                    } else {
+                        c.tool.as_deref() == Some(key)
+                    }
+                };
+                for key in &stale_keys {
                     let still_eligible = fresh
                         .active_claims
                         .iter()
-                        .filter(|c| c.tool.as_deref() == Some(owner.as_str()))
+                        .filter(|c| claim_matches(c, key))
                         .any(|c| fresh.claim_reclaim_eligible(c, &coord).0);
                     // No remaining eligible claim for this owner means either it
                     // was already reclaimed (fine) or it revived (refuse). We
@@ -1057,10 +1085,10 @@ impl RoomStore {
                     let still_owns = fresh
                         .active_claims
                         .iter()
-                        .any(|c| c.tool.as_deref() == Some(owner.as_str()));
+                        .any(|c| claim_matches(c, key));
                     if still_owns && !still_eligible {
                         return Err(RallyError::Usage(format!(
-                            "takeover refused: owner {owner} is no longer stale \
+                            "takeover refused: owner {key} is no longer stale \
                              (revived under the mutation lock); not reclaiming a \
                              now-live owner's claim"
                         )));
