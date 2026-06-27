@@ -269,6 +269,14 @@ pub(crate) struct Fact {
     /// rows without it replay unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) from_session_id: Option<String>,
+    /// The human/service/agent PRINCIPAL behind the authoring session, mirroring
+    /// `from_session_id` for the privileged-action gate (`require_principal`).
+    /// Sourced ONLY from an explicit `RALLY_PRINCIPAL_ID` or a cloud identity
+    /// (`GITHUB_ACTOR`) — NEVER silently from `tool` or `$USER`. Optional +
+    /// serde-default + skip-if-none so legacy rows replay unchanged and a fact
+    /// with no known principal serializes without the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal_id: Option<String>,
 }
 
 impl Fact {
@@ -284,6 +292,39 @@ impl Fact {
 
 fn fact_schema() -> String {
     FACT_SCHEMA.to_string()
+}
+
+/// Project a durable [`Fact`] onto the layered session identity that AUTHORED it.
+///
+/// This is the single read-side bridge from the ledger to the coordination
+/// AUTHORITY layer: a role/claim/lead is a lease over an *identity*, and that
+/// identity must be recoverable from a replayed fact long after the live
+/// `mint` is gone.
+///
+/// * When the fact carries a `from_session_id` (a real recorded session lease),
+///   that string IS the authority session key — reconstruct the endpoint from
+///   it via [`ProtocolSessionIdentity::from_session_key`], pairing in the
+///   still-present display `tool` and recorded `principal_id`.
+/// * When it does NOT (every pre-protocol / legacy `tool`-only row), fall back
+///   to [`ProtocolSessionIdentity::from_legacy_tool`] so historical behavior is
+///   preserved exactly — a legacy fact resolves to a deterministic
+///   `legacy:<tool>` session, and two such facts from the same tool collapse to
+///   the same session (the pre-identity contract).
+///
+/// Pure: no env, no clock, no I/O.
+pub(crate) fn identity_for_fact(fact: &Fact) -> crate::session_identity::ProtocolSessionIdentity {
+    match fact.from_session_id.as_deref() {
+        Some(key) if !key.is_empty() => {
+            crate::session_identity::ProtocolSessionIdentity::from_session_key(
+                key,
+                fact.tool.as_deref(),
+                fact.principal_id.as_deref(),
+            )
+        }
+        _ => crate::session_identity::ProtocolSessionIdentity::from_legacy_tool(
+            fact.tool.as_deref().unwrap_or("unknown"),
+        ),
+    }
 }
 
 /// A tool that has entered the room, derived from presence + authored facts.
@@ -1359,6 +1400,7 @@ impl RoomStore {
         for claim in expired {
             let fact = Fact {
                 from_session_id: None,
+                principal_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: crate::new_id("fact"),
                 seq: 0,
@@ -1563,6 +1605,7 @@ impl RoomStore {
         }
         let fact = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: crate::FACT_SCHEMA.to_string(),
             event_id: crate::new_id("read"),
             seq: 0,
@@ -3509,7 +3552,70 @@ mod ledger_tests {
             f.from_session_id.is_none(),
             "old rows replay with from_session_id=None"
         );
+        assert!(
+            f.principal_id.is_none(),
+            "old rows carry no principal_id (additive field)"
+        );
         assert_eq!(f.subject, "old");
+    }
+
+    #[test]
+    fn fact_principal_id_round_trips_and_is_skipped_when_absent() {
+        let f = Fact {
+            principal_id: Some("tyrone".to_string()),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["principal_id"], "tyrone");
+        // Absent principal is skipped on the wire (legacy-row parity).
+        assert!(
+            serde_json::to_value(Fact::default())
+                .unwrap()
+                .get("principal_id")
+                .is_none(),
+            "absent principal_id is skipped, not serialized as null"
+        );
+    }
+
+    #[test]
+    fn identity_for_fact_uses_session_key_when_present_else_legacy_tool() {
+        // (a) A fact carrying a real session lease → identity recovered from the
+        // key, NOT legacy, principal paired in.
+        let live = Fact {
+            from_session_id: Some("sess:term:ws:abc#live".to_string()),
+            principal_id: Some("tyrone".to_string()),
+            tool: Some("claude_code:auditor".to_string()),
+            ..Default::default()
+        };
+        let id = identity_for_fact(&live);
+        assert!(!id.is_legacy(), "a session-keyed fact is not legacy");
+        assert_eq!(id.endpoint_id, "term:ws:abc");
+        assert_eq!(id.tool_type, "claude_code");
+        assert_eq!(id.principal_id.as_deref(), Some("tyrone"));
+
+        // (b) A legacy tool-only fact → deterministic legacy session; two such
+        // facts from the same tool collapse to the SAME session (back-compat).
+        let legacy_a = Fact {
+            tool: Some("codex:01".to_string()),
+            ..Default::default()
+        };
+        let legacy_b = Fact {
+            tool: Some("codex:01".to_string()),
+            ..Default::default()
+        };
+        let ia = identity_for_fact(&legacy_a);
+        let ib = identity_for_fact(&legacy_b);
+        assert!(ia.is_legacy());
+        assert_eq!(ia.session_id, ib.session_id, "same tool → same legacy session");
+        assert!(ia.endpoint_id.starts_with("legacy:"));
+
+        // (c) An empty session key is treated as absent → legacy fallback.
+        let empty_key = Fact {
+            from_session_id: Some(String::new()),
+            tool: Some("codex".to_string()),
+            ..Default::default()
+        };
+        assert!(identity_for_fact(&empty_key).is_legacy());
     }
 
     fn unique_root(label: &str) -> PathBuf {
@@ -3525,6 +3631,7 @@ mod ledger_tests {
     fn make_fact(event_id: &str, kind: FactKind, scope: &str, summary: &str) -> Fact {
         Fact {
             from_session_id: None,
+            principal_id: None,
             schema: fact_schema(),
             event_id: event_id.to_string(),
             seq: 0,
@@ -5092,6 +5199,7 @@ mod ledger_tests {
         // Case A: release with no ref_id at all → must fail.
         let release_no_ref = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: fact_schema(),
             event_id: "ev-release-no-ref".to_string(),
             seq: 0,
@@ -5123,6 +5231,7 @@ mod ledger_tests {
         // Case B: release with a bogus ref that is not a live claim → must fail.
         let release_bogus = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: fact_schema(),
             event_id: "ev-release-bogus".to_string(),
             seq: 0,
@@ -6070,6 +6179,7 @@ mod decay_reclaim_tests {
     fn aged_fact(event_id: &str, kind: FactKind, age_secs: i64) -> Fact {
         Fact {
             from_session_id: None,
+            principal_id: None,
             schema: fact_schema(),
             event_id: event_id.to_string(),
             seq: 0,
@@ -6290,6 +6400,7 @@ mod sec001_takeover_guard_tests {
     fn fact_at(event_id: &str, kind: FactKind, tool: &str, scope: &str, created_at: &str) -> Fact {
         Fact {
             from_session_id: None,
+            principal_id: None,
             schema: fact_schema(),
             event_id: event_id.to_string(),
             seq: 0,
@@ -6550,6 +6661,7 @@ mod squad_decay_tests {
         let n = N.fetch_add(1, Ordering::Relaxed);
         Fact {
             from_session_id: None,
+            principal_id: None,
             schema: fact_schema(),
             event_id: format!("evt-{n}"),
             seq: 0,

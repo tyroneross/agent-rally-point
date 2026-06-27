@@ -146,6 +146,7 @@ pub(crate) fn run_reap_stale_in_room(room: &RoomStore, apply: bool) -> Result<Re
             // already handles duplicate ClaimExpired via ref_id dedup).
             let expired_fact = Fact {
                 from_session_id: None,
+                principal_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("fact"),
                 seq: 0,
@@ -211,6 +212,7 @@ pub(crate) fn run_reap_stale_in_room(room: &RoomStore, apply: bool) -> Result<Re
             if apply {
                 let relinquish_fact = Fact {
                     from_session_id: None,
+                    principal_id: None,
                     schema: FACT_SCHEMA.to_string(),
                     event_id: new_id("fact"),
                     seq: 0,
@@ -298,6 +300,7 @@ mod tests {
     fn append_presence(room: &RoomStore, tool: &str, ago_secs: i64) {
         let fact = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -334,6 +337,7 @@ mod tests {
     fn append_claim_ago(room: &RoomStore, event_id: &str, tool: &str, ago_secs: i64) -> Fact {
         let fact = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: event_id.to_string(),
             seq: 0,
@@ -365,6 +369,7 @@ mod tests {
     fn append_small_claim(room: &RoomStore, event_id: &str, tool: &str) -> Fact {
         let fact = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: event_id.to_string(),
             seq: 0,
@@ -438,6 +443,7 @@ mod tests {
         // claim_reclaim_eligible cannot parse → fail-closed → never reaped.
         let bad_fact = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -556,6 +562,7 @@ mod tests {
         {
             let release = Fact {
                 from_session_id: None,
+                principal_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("fact"),
                 seq: 0,
@@ -607,6 +614,7 @@ mod tests {
     ) -> Fact {
         let fact = Fact {
             from_session_id: Some(from_session.to_string()),
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: event_id.to_string(),
             seq: 0,
@@ -653,6 +661,7 @@ mod tests {
         }) {
             let release = Fact {
                 from_session_id: None,
+                principal_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("fact"),
                 seq: 0,
@@ -829,6 +838,7 @@ mod tests {
     ) -> Fact {
         let fact = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: event_id.to_string(),
             seq: 0,

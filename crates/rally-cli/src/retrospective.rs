@@ -446,6 +446,7 @@ mod tests {
     fn make_fact(event_id: &str, kind: FactKind, scope: &str, summary: &str) -> Fact {
         Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: event_id.to_string(),
             seq: 0,

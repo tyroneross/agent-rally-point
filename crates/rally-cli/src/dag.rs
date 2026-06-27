@@ -429,6 +429,7 @@ mod tests {
     fn make_fact(kind: &str, tool: &str, scope: Vec<String>, summary: Option<&str>) -> Fact {
         Fact {
             from_session_id: None,
+            principal_id: None,
             schema: "agent-rally.fact.v1".to_string(),
             event_id: format!("evt-{kind}-{}", crate::short_id()),
             seq: 0,

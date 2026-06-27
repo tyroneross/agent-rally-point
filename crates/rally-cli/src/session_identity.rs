@@ -322,6 +322,63 @@ impl ProtocolSessionIdentity {
     pub(crate) fn same_endpoint(&self, other: &Self) -> bool {
         self.endpoint_id == other.endpoint_id
     }
+
+    /// Reconstruct a session identity from a STORED `from_session_id` string —
+    /// the authority key a durable write carried. This is the read-side inverse
+    /// of [`from_session_id`](Self::from_session_id): the live `mint` path is
+    /// gone by the time we replay a fact, so we recover the addressable place
+    /// (`endpoint_id`) from the stored key and pair it with the still-present
+    /// display `tool` and any recorded `principal_id`.
+    ///
+    /// `session_key` is a `sess:<endpoint_id>#<lease>` (live) or
+    /// `sess:<endpoint_id>` (legacy mint) value. The endpoint is the segment
+    /// between the `sess:` prefix and the first `#`; the lease (after `#`) is
+    /// not needed to address the place. A `session_key` missing the `sess:`
+    /// prefix is tolerated (taken verbatim as the endpoint) so a hand-written /
+    /// imported key never panics — the field is authority data, not a contract.
+    ///
+    /// Pure: no env, no clock. The `legacy` flag is false here (this came from a
+    /// real recorded session key); a fact with NO `from_session_id` routes
+    /// through [`from_legacy_tool`](Self::from_legacy_tool) instead.
+    pub(crate) fn from_session_key(
+        session_key: &str,
+        tool: Option<&str>,
+        principal_id: Option<&str>,
+    ) -> Self {
+        let body = session_key.strip_prefix("sess:").unwrap_or(session_key);
+        let endpoint_id = body.split('#').next().unwrap_or(body).to_string();
+        let raw_tool = tool.map(str::trim).filter(|s| !s.is_empty());
+        let (tool_type, actor) = match raw_tool {
+            Some(t) => match t.split_once(':') {
+                Some((tt, a)) if !a.is_empty() => (tt.to_string(), Some(a.to_string())),
+                _ => (t.to_string(), None),
+            },
+            None => ("unknown".to_string(), None),
+        };
+        let tool_type = sanitize_segment(&tool_type);
+        let actor_id = actor
+            .as_deref()
+            .map(sanitize_segment)
+            .filter(|s| !s.is_empty());
+        let endpoint = EndpointResolution {
+            endpoint_id: endpoint_id.clone(),
+            source: EndpointSource::Process,
+            ambiguous: false,
+        };
+        let legible_name = legible_name(&tool_type, actor_id.as_deref(), &endpoint);
+        Self {
+            session_id: session_key.to_string(),
+            endpoint_id,
+            tool_type,
+            actor_id,
+            principal_id: principal_id
+                .map(str::to_string)
+                .filter(|s| !s.is_empty()),
+            legible_name,
+            legacy: false,
+            ambiguous: false,
+        }
+    }
 }
 
 /// Build the operator-facing legible name. The stable machine id handles
@@ -565,6 +622,44 @@ mod tests {
         );
         assert_ne!(a.session_id, live.session_id);
         assert_ne!(a.endpoint_id, live.endpoint_id);
+    }
+
+    #[test]
+    fn from_session_key_recovers_endpoint_and_carries_display_and_principal() {
+        // A live mint round-trips: mint → from_session_id() → from_session_key
+        // recovers the SAME endpoint lineage (same_endpoint), pairing in the
+        // display tool + principal that the stored fact still carries.
+        let minted = ProtocolSessionIdentity::mint(
+            &derive_endpoint(&proc_inputs("ws.local", 42, "1700")),
+            "claude_code",
+            "live",
+            Some("auditor"),
+            None,
+        );
+        let key = minted.from_session_id().to_string();
+        let recovered =
+            ProtocolSessionIdentity::from_session_key(&key, Some("claude_code:auditor"), Some("tyrone"));
+        assert_eq!(recovered.session_id, key, "session key is preserved verbatim");
+        assert!(
+            recovered.same_endpoint(&minted),
+            "endpoint lineage recovered from the stored session key"
+        );
+        assert_eq!(recovered.tool_type, "claude_code");
+        assert_eq!(recovered.actor_id.as_deref(), Some("auditor"));
+        assert_eq!(recovered.principal_id.as_deref(), Some("tyrone"));
+        assert!(!recovered.legacy, "a real session key is not legacy");
+    }
+
+    #[test]
+    fn from_session_key_tolerates_missing_prefix_and_no_lease() {
+        // No `sess:` prefix and no `#lease` — the whole thing is the endpoint.
+        let r = ProtocolSessionIdentity::from_session_key("term:host:abc", None, None);
+        assert_eq!(r.endpoint_id, "term:host:abc");
+        assert_eq!(r.tool_type, "unknown");
+        assert_eq!(r.principal_id, None);
+        // A `sess:` key without a lease still strips to the endpoint.
+        let r2 = ProtocolSessionIdentity::from_session_key("sess:legacy:codex", None, None);
+        assert_eq!(r2.endpoint_id, "legacy:codex");
     }
 
     #[test]

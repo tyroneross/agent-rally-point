@@ -1003,6 +1003,7 @@ fn ensure_presence_tiered(room: &RoomStore, tool: &str, tier: Option<&str>) -> R
     // the same room.  Format: "build_id:<BUILD_ID>" — minimal, no schema bump.
     let presence_fact = Fact {
         from_session_id: None,
+        principal_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -1029,6 +1030,7 @@ fn ensure_presence_tiered(room: &RoomStore, tool: &str, tier: Option<&str>) -> R
     if snapshot.lead.is_none() && lead_eligible {
         let lead_fact = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -1543,13 +1545,13 @@ fn command_say(args: SayArgs) -> Result<Output> {
         );
     }
 
+    // Resolve the authoring session ONCE so the durable write carries both the
+    // session lease (authority key) and the principal (privileged-action gate).
+    let authoring_session = current_protocol_session(Some(&args.tool));
     let fact = Fact {
         // Stamp the authoring session lease on this durable LLM-authored write.
-        from_session_id: Some(
-            current_protocol_session(Some(&args.tool))
-                .from_session_id()
-                .to_string(),
-        ),
+        from_session_id: Some(authoring_session.from_session_id().to_string()),
+        principal_id: authoring_session.principal_id.clone(),
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -1954,6 +1956,7 @@ fn command_release_by_path(
     }
     let fact = Fact {
         from_session_id: None,
+        principal_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -2600,6 +2603,7 @@ fn command_status_post(json: bool, mut args: cli::StatusPostArgs) -> Result<Outp
     let subject = build_status_subject(&args.state, &args);
     let fact = store::Fact {
         from_session_id: None,
+        principal_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -3147,6 +3151,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
                 for claim in &held {
                     let release = Fact {
                         from_session_id: None,
+                        principal_id: None,
                         schema: FACT_SCHEMA.to_string(),
                         event_id: new_id("fact"),
                         seq: 0,
@@ -4270,6 +4275,7 @@ fn append_orphan_tmux_tombstone(
 ) -> Result<()> {
     let fact = Fact {
         from_session_id: None,
+        principal_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -4971,6 +4977,7 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                         }) {
                             let release = Fact {
                                 from_session_id: None,
+                                principal_id: None,
                                 schema: FACT_SCHEMA.to_string(),
                                 event_id: new_id("fact"),
                                 seq: 0,
@@ -5206,6 +5213,7 @@ fn prior_managed_session(room: &RoomStore, target: &str) -> Result<Option<Manage
 fn session_fact(session: &ManagedSession, status: &str, ref_id: Option<String>) -> Fact {
     Fact {
         from_session_id: None,
+        principal_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -5269,6 +5277,7 @@ fn make_inject_content_fact(sender_tool: &str, recipient_tool: &str, text: &str)
     let subject = format!("inject: {subject_text}");
     Fact {
         from_session_id: None,
+        principal_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("inject"),
         seq: 0,
@@ -5330,6 +5339,7 @@ fn ptyd_receipt_fact(
 ) -> Fact {
     Fact {
         from_session_id: None,
+        principal_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("receipt"),
         seq: 0,
@@ -5493,6 +5503,7 @@ fn wake_fact(
 ) -> Fact {
     Fact {
         from_session_id: None,
+        principal_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("wake"),
         seq: 0,
@@ -5585,6 +5596,7 @@ fn build_risk_fact(
 ) -> Fact {
     Fact {
         from_session_id: None,
+        principal_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -6297,6 +6309,7 @@ mod tests {
         ensure_presence_tiered(&room, "opus-1", Some("frontier")).unwrap();
         let mk = |subject: &str, scope: Vec<String>| Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -6350,6 +6363,7 @@ mod tests {
         let old = "2020-01-01T00:00:00Z";
         let mk = |kind: FactKind, subject: &str, scope: Vec<String>| Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -6413,6 +6427,7 @@ mod tests {
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let mk = |kind: FactKind, subject: &str, scope: Vec<String>| Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -6473,6 +6488,7 @@ mod tests {
         assert!(!acked(&room), "squad must be unacknowledged before ack");
         let ack = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -6510,6 +6526,7 @@ mod tests {
         assert_eq!(room.snapshot().unwrap().lead.as_deref(), Some("opus-1"));
         let relinquish = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -6698,6 +6715,7 @@ mod tests {
     fn ref_fact(kind: FactKind, tool: &str, ref_id: &str, subject: &str) -> Fact {
         Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id(kind.as_str()),
             seq: 0,
@@ -6940,6 +6958,7 @@ mod tests {
         // Append a wake fact authored by the system ("rally"), as `rally next` does.
         let wake = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: crate::FACT_SCHEMA.to_string(),
             event_id: new_id("wake"),
             seq: 0,
@@ -7213,6 +7232,7 @@ mod tests {
             // This is the exact block copied from command_enter.
             let risk_fact = Fact {
                 from_session_id: None,
+                principal_id: None,
                 schema: crate::FACT_SCHEMA.to_string(),
                 event_id: new_id("fact"),
                 seq: 0,
@@ -7651,6 +7671,7 @@ mod tests {
         // tool-b posts a fact between the two enters.
         let peer_fact = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("peer"),
             seq: 0,
@@ -7730,6 +7751,7 @@ mod tests {
         for (subject, kind) in kinds {
             let fact = store::Fact {
                 from_session_id: None,
+                principal_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("b16"),
                 seq: 0,
@@ -7861,6 +7883,7 @@ mod tests {
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let fact = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("watch-once"),
             seq: 0,
@@ -7929,6 +7952,7 @@ mod tests {
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let fact = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("watch-oact"),
             seq: 0,
@@ -8053,6 +8077,7 @@ mod tests {
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let fact = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("watch-repo"),
             seq: 0,
@@ -8169,6 +8194,7 @@ mod tests {
         // of command_say while still exercising the snapshot projection).
         let external_claim = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b18d-claim"),
             seq: 0,
@@ -8197,6 +8223,7 @@ mod tests {
         // Post a normal repo-local claim too so we can verify it IS included.
         let local_claim = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b18d-local"),
             seq: 0,
@@ -8252,6 +8279,7 @@ mod tests {
 
         let ext_handoff = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b18e-hoff"),
             seq: 0,
@@ -8297,6 +8325,7 @@ mod tests {
 
         let ext_artifact = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b18f-art"),
             seq: 0,
@@ -8344,6 +8373,7 @@ mod tests {
         // Simulate what command_say does: write the tagged claim + the risk fact.
         let ext_claim = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b18g-claim"),
             seq: 0,
@@ -8370,6 +8400,7 @@ mod tests {
 
         let risk_fact = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b18g-risk"),
             seq: 0,
@@ -8432,6 +8463,7 @@ mod tests {
         // One canonical claim (already file:-prefixed, relative).
         let canonical_claim = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("doctor-cp-c1"),
             seq: 0,
@@ -8511,6 +8543,7 @@ mod tests {
         // Scope stored in non-canonical form (./src/foo.rs — not yet normalized).
         let claim = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("doctor-cp-nc"),
             seq: 0,
@@ -8586,6 +8619,7 @@ mod tests {
         // tool-a claims "file:crates/a/src/lib.rs"
         let claim_a = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("doctor-cp-a"),
             seq: 0,
@@ -8608,6 +8642,7 @@ mod tests {
         // tool-b claims "file:crates/b/src/lib.rs"
         let claim_b = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("doctor-cp-b"),
             seq: 0,
@@ -8927,6 +8962,7 @@ mod tests {
             let room = store::RoomStore::open_at(root.clone()).unwrap();
             let stale_presence = store::Fact {
                 from_session_id: None,
+                principal_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("stale"),
                 seq: 0,
@@ -8983,6 +9019,7 @@ mod tests {
         );
         let risk_fact = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -9047,6 +9084,7 @@ mod tests {
         let wake_iso = dag::resolve_wake_after("+30m").expect("+30m must resolve");
         let fact = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b1a-standby"),
             seq: 0,
@@ -9109,6 +9147,7 @@ mod tests {
         // Write a standby fact.
         let standby = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b1b-standby"),
             seq: 0,
@@ -9133,6 +9172,7 @@ mod tests {
         // Write a wake fact referencing the standby.
         let wake = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b1b-wake"),
             seq: 0,
@@ -9186,6 +9226,7 @@ mod tests {
         // Handoff at step S0.
         let handoff = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b1c-handoff"),
             seq: 0,
@@ -9211,6 +9252,7 @@ mod tests {
         for i in 1..=3 {
             let claim = store::Fact {
                 from_session_id: None,
+                principal_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id(&format!("b1c-claim-s{i}")),
                 seq: 0,
@@ -9274,6 +9316,7 @@ mod tests {
         // Claim at S1.
         let claim = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b1d-claim"),
             seq: 0,
@@ -9296,6 +9339,7 @@ mod tests {
         // Standby at S1 with past wake_after.
         let standby = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b1d-standby"),
             seq: 0,
@@ -9348,6 +9392,7 @@ mod tests {
         // Write a standby with a past wake_after.
         let standby = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b4a-standby"),
             seq: 0,
@@ -9404,6 +9449,7 @@ mod tests {
 
         let standby = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("b4b-standby"),
             seq: 0,
@@ -9487,6 +9533,7 @@ mod tests {
             let room = store::RoomStore::open_at(root.clone()).unwrap();
             let current_presence = store::Fact {
                 from_session_id: None,
+                principal_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("same"),
                 seq: 0,
@@ -9552,6 +9599,7 @@ mod tests {
     fn append_claim(room: &store::RoomStore, tool: &str, path: &str, subject: &str) -> String {
         let fact = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -9695,6 +9743,7 @@ mod tests {
     ) -> String {
         let fact = store::Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -11230,6 +11279,7 @@ fn command_ack(args: AckArgs) -> Result<Output> {
     let snapshot = room.snapshot()?;
     let fact = Fact {
         from_session_id: None,
+        principal_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -11328,6 +11378,7 @@ fn command_lead(args: LeadArgs) -> Result<Output> {
             let prior = room.snapshot()?.lead;
             let fact = Fact {
                 from_session_id: None,
+                principal_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("fact"),
                 seq: 0,
@@ -11384,6 +11435,7 @@ fn set_lead(json: bool, t: &LeadTargetArgs, mode: &str) -> Result<Output> {
     }
     let fact = Fact {
         from_session_id: None,
+        principal_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -11443,6 +11495,7 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
         let must_check_text = args.must_check.as_deref().unwrap_or("");
         let fact = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("mission"),
             seq: 0,
@@ -11494,6 +11547,7 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
         let room = RoomStore::open()?;
         let fact = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("mission"),
             seq: 0,

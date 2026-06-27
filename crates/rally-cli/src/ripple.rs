@@ -140,6 +140,7 @@ pub(crate) fn build_ripple_alerts(
 
         let fact = Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("ripple"),
             seq: 0,
@@ -258,6 +259,7 @@ let x = beta(1, 2);
         // Build a minimal snapshot with one peer claim owning other/mod.rs
         let peer_claim = StoreFact {
             from_session_id: None,
+            principal_id: None,
             schema: "agent-rally.fact.v1".to_string(),
             event_id: "claim-peer-001".to_string(),
             seq: 1,
@@ -337,6 +339,7 @@ let x = beta(1, 2);
 
         let peer_claim = StoreFact {
             from_session_id: None,
+            principal_id: None,
             schema: "agent-rally.fact.v1".to_string(),
             event_id: "claim-peer-002".to_string(),
             seq: 2,

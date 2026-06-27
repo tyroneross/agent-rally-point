@@ -264,6 +264,7 @@ mod tests {
     ) -> Fact {
         Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: format!("ev-{tool}-{seq}"),
             seq,
@@ -513,6 +514,7 @@ mod tests {
     fn project_agent_states_ignores_non_presence_kinds() {
         let facts = vec![Fact {
             from_session_id: None,
+            principal_id: None,
             schema: FACT_SCHEMA.to_string(),
             event_id: "ev-c-1".into(),
             seq: 1,
