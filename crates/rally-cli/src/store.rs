@@ -944,16 +944,14 @@ impl RoomStore {
                     let fresh = snapshot_from_facts_with_policy(&facts, &coord, false);
                     // The specific claim this ClaimExpired closes (by ref).
                     let ref_id = fact.ref_id.as_deref();
-                    let still_owns = fresh
-                        .active_claims
-                        .iter()
-                        .any(|c| c.tool.as_deref() == Some(owner) && Some(c.event_id.as_str()) == ref_id);
+                    let still_owns = fresh.active_claims.iter().any(|c| {
+                        c.tool.as_deref() == Some(owner) && Some(c.event_id.as_str()) == ref_id
+                    });
                     let still_eligible = fresh
                         .active_claims
                         .iter()
                         .filter(|c| {
-                            c.tool.as_deref() == Some(owner)
-                                && Some(c.event_id.as_str()) == ref_id
+                            c.tool.as_deref() == Some(owner) && Some(c.event_id.as_str()) == ref_id
                         })
                         .any(|c| fresh.claim_reclaim_eligible(c, &coord).0);
                     // The claim still HOLDS but is NO LONGER reap-eligible means
@@ -986,6 +984,9 @@ impl RoomStore {
                 )));
             }
         }
+        let logical_seq =
+            next_canonical_seq(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
+        fact.seq = logical_seq;
         let event_type = fact.kind.as_str().to_string();
         let payload = serde_json::to_value(&fact).map_err(RallyError::json("render fact"))?;
         // The room lock serializes Rally writers; keep a short retry for
@@ -1004,7 +1005,7 @@ impl RoomStore {
                 }
             }
         };
-        fact.seq = i64::try_from(result.last_sequence_number)
+        let _store_seq = i64::try_from(result.last_sequence_number)
             .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
         append_segment_line(
             &self.active_segment_path(),
@@ -1021,7 +1022,7 @@ impl RoomStore {
         // grew by exactly one event; carry the pre-append counts forward +1 and
         // re-fingerprint (cheap, O(#files)). Best-effort: a miss just means the
         // next op does one authoritative scan and re-seeds the sidecar.
-        self.refresh_reconcile_cache_after_append();
+        self.refresh_reconcile_cache_after_append(fact.seq);
         // Both index refreshes are best-effort caches; swallow failures so a
         // racing parallel writer never poisons the append path. Replay
         // rebuilds them on next open from segments.
@@ -1051,7 +1052,7 @@ impl RoomStore {
     /// self-corrected by a fingerprint mismatch on the next open, which triggers
     /// the authoritative full scan. No data loss is possible — the canonical
     /// JSONL segments are not affected by sidecar drift.
-    fn refresh_reconcile_cache_after_append(&self) {
+    fn refresh_reconcile_cache_after_append(&self, appended_seq: i64) {
         let (Ok(segments), Ok(archived)) = (
             read_segment_files(&self.log_dir),
             replay_archive_segments(&self.archive_dir),
@@ -1066,12 +1067,17 @@ impl RoomStore {
         let new_db_fp = fingerprint_db(&self.facts_db_path);
         match read_reconcile_cache(&self.facts_db_path) {
             // The pre-append sidecar was consistent → just advance counts by one.
-            Some(prev) if prev.canonical_count == prev.db_count => {
+            Some(prev)
+                if prev.canonical_count == prev.db_count
+                    && prev.canonical_max_seq == prev.db_max_seq =>
+            {
                 let cache = ReconcileCache {
                     segments_fingerprint: new_seg_fp,
                     db_fingerprint: new_db_fp,
                     canonical_count: prev.canonical_count + 1,
+                    canonical_max_seq: prev.canonical_max_seq.max(appended_seq),
                     db_count: prev.db_count + 1,
+                    db_max_seq: prev.db_max_seq.max(appended_seq),
                 };
                 let _ = write_reconcile_cache(&self.facts_db_path, &cache);
             }
@@ -1287,6 +1293,9 @@ impl RoomStore {
         reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
         let fact_store = open_fact_store(&self.facts_db_path)?;
         let mut fact = fact.clone();
+        let logical_seq =
+            next_canonical_seq(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
+        fact.seq = logical_seq;
         let payload =
             serde_json::to_value(&fact).map_err(RallyError::json("render session fact"))?;
         let result = fact_store.append_if(
@@ -1296,7 +1305,7 @@ impl RoomStore {
         );
         match result {
             Ok(result) => {
-                fact.seq = i64::try_from(result.last_sequence_number).map_err(|err| {
+                let _store_seq = i64::try_from(result.last_sequence_number).map_err(|err| {
                     RallyError::Message(format!("sequence number overflow: {err}"))
                 })?;
                 append_segment_line(
@@ -1309,6 +1318,7 @@ impl RoomStore {
                         engagement: Some(self.active_engagement.clone()),
                     },
                 )?;
+                self.refresh_reconcile_cache_after_append(fact.seq);
                 let _ = self.refresh_log_index();
                 let _ = self.refresh_index(fact.seq);
                 Ok(Some(fact))
@@ -1787,7 +1797,7 @@ fn newest_fact_age_per_tool(
     kinds: &[&str],
 ) -> BTreeMap<String, i64> {
     let mut out: BTreeMap<String, i64> = BTreeMap::new();
-    let mut note = |tool: &str, age: i64, out: &mut BTreeMap<String, i64>| {
+    let note = |tool: &str, age: i64, out: &mut BTreeMap<String, i64>| {
         out.entry(tool.to_string())
             .and_modify(|e| *e = (*e).min(age))
             .or_insert(age);
@@ -1838,10 +1848,11 @@ fn code_progress_age_per_tool(facts: &[Fact], now_secs: i64) -> BTreeMap<String,
         }) else {
             continue;
         };
-        by_tool
-            .entry(tool.to_string())
-            .or_default()
-            .push((f.seq, fact_age_secs(f, now_secs), sha.to_string()));
+        by_tool.entry(tool.to_string()).or_default().push((
+            f.seq,
+            fact_age_secs(f, now_secs),
+            sha.to_string(),
+        ));
     }
     let mut out: BTreeMap<String, i64> = BTreeMap::new();
     for (tool, mut entries) in by_tool {
@@ -2065,7 +2076,10 @@ fn snapshot_from_facts_with_policy(
                 .or_insert(age);
         }
     }
-    for f in facts.iter().filter(|f| f.kind == "mission" || f.kind == "handoff") {
+    for f in facts
+        .iter()
+        .filter(|f| f.kind == "mission" || f.kind == "handoff")
+    {
         if let Some(t) = &f.tool {
             let age = fact_age_secs(f, now_secs);
             plan_ages
@@ -2097,14 +2111,9 @@ fn snapshot_from_facts_with_policy(
             let acknowledged = acked.contains(&tool);
 
             // --- Adaptive multi-signal liveness (the squad-decay gap) ---
-            let planned_interval = planned_cadence_for_tool(facts, &tool)
-                .unwrap_or(cadence);
-            let window = crate::liveness::adaptive_window_secs(
-                planned_interval,
-                cadence,
-                mult,
-                grace,
-            );
+            let planned_interval = planned_cadence_for_tool(facts, &tool).unwrap_or(cadence);
+            let window =
+                crate::liveness::adaptive_window_secs(planned_interval, cadence, mult, grace);
             let signals = crate::liveness::LivenessSignals {
                 heartbeat_age: Some(heartbeat_age),
                 inject_age: inject_ages.get(&tool).copied(),
@@ -2118,8 +2127,7 @@ fn snapshot_from_facts_with_policy(
             // DROPPED from the default snapshot; `include_archived` restores it.
             // This direction is opposite the reaper's fail-CLOSED removal path on
             // purpose: hiding a still-alive peer is the dangerous direction here.
-            let dropped = matches!(verdict, crate::liveness::Liveness::Stale)
-                && !include_archived;
+            let dropped = matches!(verdict, crate::liveness::Liveness::Stale) && !include_archived;
             if dropped {
                 return None;
             }
@@ -2387,7 +2395,17 @@ struct ReconcileCache {
     /// we last trusted it → we must NOT take the fast path.
     db_fingerprint: Option<FileFingerprint>,
     canonical_count: i64,
+    #[serde(default)]
+    canonical_max_seq: i64,
     db_count: i64,
+    #[serde(default)]
+    db_max_seq: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SeqStats {
+    count: i64,
+    max_seq: i64,
 }
 
 // Test hook: counts how many times the AUTHORITATIVE O(N) reconcile path ran
@@ -2568,6 +2586,8 @@ fn reconcile_segments_and_db(
     if let Some(cache) = read_reconcile_cache(facts_db_path)
         && cache.segments_fingerprint == seg_fp
         && cache.canonical_count == cache.db_count
+        && cache.canonical_max_seq == cache.db_max_seq
+        && (cache.canonical_count == 0 || cache.canonical_max_seq >= cache.canonical_count)
         // facts.db must be present AND byte-identical (same len + mtime) to when
         // we last verified the count. A corrupt-in-place db has a fresh mtime,
         // so this guard fails and we fall through to corruption detection.
@@ -2581,19 +2601,18 @@ fn reconcile_segments_and_db(
     note_full_reconcile_scan();
 
     // The canonical record is the *set of distinct seqs* across replay sources.
-    // The cache is fresh iff it holds exactly that many events — replay
-    // reassigns factstr seqs 1..N, so `db_event_count == distinct_replay_seqs`
-    // exactly when in sync. Comparing distinct-seq COUNT (not max seq, not raw
-    // line count) is what makes this correct under (a) seq gaps from rotation
-    // and (b) the same seq appearing in two files (archive + live).
-    let canonical_count = distinct_segment_seqs(&segments, &archived)?;
-    // NOTE: read_db_event_count both COUNTS and DETECTS+QUARANTINES corruption.
+    // The cache is fresh iff it holds the same number of events AND the same
+    // highest logical seq. Count alone misses sparse histories: canonical
+    // seqs {1,2,4} have count 3, but a derived db with logical max 3 would make
+    // the next append reuse seq 4.
+    let canonical_stats = segment_seq_stats(&segments, &archived)?;
+    // NOTE: read_db_event_stats both COUNTS and DETECTS+QUARANTINES corruption.
     // It must run on the authoritative path — the fast path above only returns
     // early when the db fingerprint is unchanged (no rewrite/corruption since
     // the last successful count), so corruption can never bypass this call.
-    let db_count = read_db_event_count(facts_db_path)?;
+    let db_stats = read_db_event_stats(facts_db_path)?;
 
-    if canonical_count == 0 && db_count == 0 {
+    if canonical_stats.count == 0 && db_stats.count == 0 {
         // Nothing to cache (no db, no segments). Drop any stale sidecar.
         if let Some(p) = reconcile_cache_path(facts_db_path) {
             let _ = fs::remove_file(p);
@@ -2601,7 +2620,7 @@ fn reconcile_segments_and_db(
         return Ok(());
     }
 
-    if canonical_count == 0 && db_count > 0 {
+    if canonical_stats.count == 0 && db_stats.count > 0 {
         // No segments yet but the db has events: first-run upgrade from a
         // pre-segment install. Seed a segment so the canonical record exists.
         seed_segment_from_db(log_dir, facts_db_path)?;
@@ -2612,10 +2631,11 @@ fn reconcile_segments_and_db(
         return Ok(());
     }
 
-    if canonical_count != db_count {
-        // Segment set and cache disagree on event count → cache is stale (or
-        // absent). Rebuild it from the canonical segments. Replay is a pure
-        // function of the deduped segment set, so this is idempotent.
+    if canonical_stats != db_stats {
+        // Segment set and cache disagree on event count or logical high-water
+        // mark → cache is stale (or absent). Rebuild it from the canonical
+        // segments. Replay is a pure function of the deduped segment set, so
+        // this is idempotent.
         rebuild_db_from_segments(&segments, &archived, facts_db_path)?;
         // Refresh the sidecar against the freshly-rebuilt db so the next op is
         // O(1). Re-fingerprint the db (it was just recreated) and recount it.
@@ -2623,18 +2643,20 @@ fn reconcile_segments_and_db(
             log_dir,
             archive_dir,
             facts_db_path,
-            canonical_count,
+            canonical_stats,
         );
         return Ok(());
     }
 
-    // canonical_count == db_count > 0 → cache is fresh; leave the db untouched
+    // canonical_stats == db_stats > 0 → cache is fresh; leave the db untouched
     // and refresh the sidecar so subsequent ops take the O(1) fast path.
     let cache = ReconcileCache {
         segments_fingerprint: seg_fp,
         db_fingerprint: fingerprint_db(facts_db_path),
-        canonical_count,
-        db_count,
+        canonical_count: canonical_stats.count,
+        canonical_max_seq: canonical_stats.max_seq,
+        db_count: db_stats.count,
+        db_max_seq: db_stats.max_seq,
     };
     let _ = write_reconcile_cache(facts_db_path, &cache);
     Ok(())
@@ -2647,7 +2669,7 @@ fn refresh_reconcile_cache_after_full_scan(
     log_dir: &Path,
     archive_dir: &Path,
     facts_db_path: &Path,
-    canonical_count: i64,
+    canonical_stats: SeqStats,
 ) {
     // Re-read segment files: a rebuild does not change them, but re-fingerprint
     // for correctness (cheap, O(#files)).
@@ -2660,8 +2682,10 @@ fn refresh_reconcile_cache_after_full_scan(
     let cache = ReconcileCache {
         segments_fingerprint: segments_fingerprint(&segments, &archived),
         db_fingerprint: fingerprint_db(facts_db_path),
-        canonical_count,
-        db_count: canonical_count,
+        canonical_count: canonical_stats.count,
+        canonical_max_seq: canonical_stats.max_seq,
+        db_count: canonical_stats.count,
+        db_max_seq: canonical_stats.max_seq,
     };
     let _ = write_reconcile_cache(facts_db_path, &cache);
 }
@@ -2794,11 +2818,11 @@ fn replay_archive_segments(archive_dir: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-/// Number of *distinct* sequence numbers across the replay sources. This is
-/// the canonical event count: the same seq appearing in two files (e.g. a
-/// rotated segment and a stray copy) counts once, and gaps in the seq range
-/// don't inflate it. Used to decide whether the derived cache is in sync.
-fn distinct_segment_seqs(live: &[PathBuf], archived: &[PathBuf]) -> Result<i64> {
+/// Sequence stats across replay sources. `count` is the number of distinct
+/// sequence numbers; `max_seq` is the canonical high-water mark. Both are
+/// required: sparse histories can have `count < max_seq`, and append must never
+/// reuse an existing canonical sequence.
+fn segment_seq_stats(live: &[PathBuf], archived: &[PathBuf]) -> Result<SeqStats> {
     let mut seqs: BTreeSet<i64> = BTreeSet::new();
     for path in live.iter().chain(archived.iter()) {
         let file =
@@ -2817,12 +2841,29 @@ fn distinct_segment_seqs(live: &[PathBuf], archived: &[PathBuf]) -> Result<i64> 
             seqs.insert(entry.seq);
         }
     }
-    i64::try_from(seqs.len())
-        .map_err(|err| RallyError::Message(format!("distinct seq count overflow: {err}")))
+    let count = i64::try_from(seqs.len())
+        .map_err(|err| RallyError::Message(format!("distinct seq count overflow: {err}")))?;
+    Ok(SeqStats {
+        count,
+        max_seq: seqs.iter().next_back().copied().unwrap_or(0),
+    })
 }
 
-/// Number of events currently held by the derived sqlite cache. Compared
-/// against [`distinct_segment_seqs`] to detect a stale/absent cache.
+fn next_canonical_seq(log_dir: &Path, archive_dir: &Path, facts_db_path: &Path) -> Result<i64> {
+    if let Some(cache) = read_reconcile_cache(facts_db_path)
+        && cache.canonical_count == cache.db_count
+        && cache.canonical_max_seq == cache.db_max_seq
+        && cache.canonical_max_seq >= 0
+    {
+        return Ok(cache.canonical_max_seq + 1);
+    }
+    let segments = read_segment_files(log_dir)?;
+    let archived = replay_archive_segments(archive_dir)?;
+    Ok(segment_seq_stats(&segments, &archived)?.max_seq + 1)
+}
+
+/// Events currently held by the derived sqlite cache. Compared against
+/// [`segment_seq_stats`] to detect a stale/absent cache.
 ///
 /// Returns 0 in any of three cases that all funnel into the same recovery path:
 ///
@@ -2841,9 +2882,9 @@ fn distinct_segment_seqs(live: &[PathBuf], archived: &[PathBuf]) -> Result<i64> 
 ///
 /// Idempotent: a second call after quarantine sees the file absent and takes
 /// the case-(1) branch with no further quarantine churn.
-fn read_db_event_count(facts_db_path: &Path) -> Result<i64> {
+fn read_db_event_stats(facts_db_path: &Path) -> Result<SeqStats> {
     if !facts_db_path.exists() {
-        return Ok(0);
+        return Ok(SeqStats::default());
     }
     let store = match open_fact_store(facts_db_path) {
         Ok(store) => store,
@@ -2851,7 +2892,7 @@ fn read_db_event_count(facts_db_path: &Path) -> Result<i64> {
             // Cache is corrupt; the canonical JSONL ledger is unaffected.
             // Move the bad bytes aside and let reconcile rebuild from segments.
             quarantine_corrupt_db(facts_db_path)?;
-            return Ok(0);
+            return Ok(SeqStats::default());
         }
         Err(err) => return Err(err),
     };
@@ -2863,12 +2904,20 @@ fn read_db_event_count(facts_db_path: &Path) -> Result<i64> {
         Ok(q) => q,
         Err(err) if is_malformed_db_error(&err) => {
             quarantine_corrupt_db(facts_db_path)?;
-            return Ok(0);
+            return Ok(SeqStats::default());
         }
         Err(err) => return Err(RallyError::Message(format!("query facts: {err}"))),
     };
-    i64::try_from(query.event_records.len())
-        .map_err(|err| RallyError::Message(format!("event count overflow: {err}")))
+    let mut max_seq = 0_i64;
+    for record in &query.event_records {
+        let seq = i64::try_from(record.sequence_number)
+            .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
+        let fact = Fact::from_value(record.payload.clone(), seq)?;
+        max_seq = max_seq.max(fact.seq);
+    }
+    let count = i64::try_from(query.event_records.len())
+        .map_err(|err| RallyError::Message(format!("event count overflow: {err}")))?;
+    Ok(SeqStats { count, max_seq })
 }
 
 /// Recognize the SQLite error class that means "this file exists but cannot be
@@ -3026,11 +3075,12 @@ fn rebuild_db_from_segments(
 
     let store = open_fact_store(facts_db_path)?;
     for entry in &all_entries {
+        let mut payload = entry.payload.clone();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("seq".to_string(), json!(entry.seq));
+        }
         store
-            .append(vec![NewEvent::new(
-                entry.event_type.clone(),
-                entry.payload.clone(),
-            )])
+            .append(vec![NewEvent::new(entry.event_type.clone(), payload)])
             .map_err(|err| RallyError::Message(format!("replay segments: {err}")))?;
     }
     Ok(())
@@ -4624,6 +4674,75 @@ mod ledger_tests {
         assert_eq!(facts.len(), 3, "all 3 non-contiguous events replayed");
         let ids: Vec<&str> = facts.iter().map(|f| f.event_id.as_str()).collect();
         assert_eq!(ids, ["e2", "e5", "e9"], "order preserved by stored seq");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Sparse canonical ledgers must not be treated as fresh just because the
+    /// distinct event count matches the derived db count. If canonical seqs are
+    /// {1,2,4}, a db whose logical max is 3 would make the next append reuse
+    /// seq 4 and corrupt replay. Reconcile must rebuild on max-seq drift, and
+    /// append must allocate from the canonical high-water mark.
+    #[test]
+    fn reconcile_rebuilds_when_sparse_canonical_max_exceeds_db_max() {
+        let root = unique_root("reconcile-sparse-max-drift");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        for seq in 1..=3 {
+            store
+                .append_fact(&make_fact(
+                    &format!("dense-e{seq}"),
+                    FactKind::Decision,
+                    "src/",
+                    "dense db seed",
+                ))
+                .unwrap();
+        }
+        assert_eq!(store.snapshot().unwrap().max_seq, 3);
+        drop(store);
+
+        fs::remove_dir_all(root.join(".rally").join(LOG_DIRNAME)).unwrap();
+        let sparse = [
+            ledger_line(1, "decision", "sparse-e1", "alpha"),
+            ledger_line(2, "decision", "sparse-e2", "alpha"),
+            ledger_line(4, "decision", "sparse-e4", "alpha"),
+        ];
+        let refs: Vec<&str> = sparse.iter().map(String::as_str).collect();
+        write_segment(&root, "log", "alpha.jsonl", &refs);
+
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let facts = store.facts().unwrap();
+        let seqs: Vec<i64> = facts.iter().map(|f| f.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 2, 4],
+            "rebuild must preserve canonical segment seqs in fact payloads"
+        );
+        assert_eq!(
+            store.snapshot().unwrap().max_seq,
+            4,
+            "snapshot must report canonical high-water mark after rebuild"
+        );
+
+        let appended = store
+            .append_fact(&make_fact(
+                "after-sparse",
+                FactKind::Artifact,
+                "src/",
+                "append after sparse ledger",
+            ))
+            .unwrap();
+        assert_eq!(
+            appended.seq, 5,
+            "append must allocate from canonical max seq, not db event count"
+        );
+
+        let live = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
+        let archived = replay_archive_segments(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
+        assert_eq!(
+            segment_seq_stats(&live, &archived).unwrap().max_seq,
+            5,
+            "canonical ledger high-water mark advances without reusing seq 4"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
