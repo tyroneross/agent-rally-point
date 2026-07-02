@@ -99,3 +99,9 @@ uv.lock
 cockpitd.db
 cockpitd.db-shm
 cockpitd.db-wal
+
+# Runtime coordination state + backups + local bundles (never commit; see 2026-07-02 takeover)
+.rally.bak-*/
+archive/bundles/
+agent-rally-point.worktrees/
+RALLY-VERSION-MISMATCH-ASSESSMENT-*.md
