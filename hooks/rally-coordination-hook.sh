@@ -297,12 +297,36 @@ try { room = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch (_) {}
 try { nxt = JSON.parse(process.env.RALLY_NEXT_JSON || "{}"); } catch (_) {}
 const R = room?.data?.room || {};
 const squads = Array.isArray(R.squads) ? R.squads : [];
-const peers = [...new Set(squads.map(s => s && s.tool).filter(t => t && t !== tool && t !== "rally"))];
+const activeTools = new Set(
+  squads
+    .filter(s => s && s.status === "active" && s.tool && s.tool !== "rally")
+    .map(s => s.tool)
+);
+const peers = [...activeTools].filter(t => t !== tool);
+const nowMs = Date.now();
+function leaseExpired(fact) {
+  const evidence = Array.isArray(fact?.evidence) ? fact.evidence : [];
+  const lease = evidence
+    .map(String)
+    .find(e => e.startsWith("lease_expires_at:"))
+    ?.slice("lease_expires_at:".length);
+  if (!lease) return false;
+  const parsed = Date.parse(lease);
+  return Number.isFinite(parsed) && parsed <= nowMs;
+}
+function factIsRecent(fact, maxAgeMs) {
+  const parsed = Date.parse(fact?.created_at || "");
+  return Number.isFinite(parsed) && (nowMs - parsed) <= maxAgeMs;
+}
 const claims = (Array.isArray(R.active_claims) ? R.active_claims : [])
-  .filter(c => c && c.tool !== tool)
+  .filter(c => c && c.tool !== tool && activeTools.has(c.tool) && !leaseExpired(c))
   .map(c => `${(c.scope || []).join(",") || "?"} (by ${c.tool})`);
-const handoffs = Array.isArray(R.open_handoffs) ? R.open_handoffs.length : 0;
-const nextAction = nxt?.data?.next?.action;
+const activeHandoffs = (Array.isArray(R.open_handoffs) ? R.open_handoffs : [])
+  .filter(h => h && (h.target === tool || h.target === "all" || !h.target))
+  .filter(h => factIsRecent(h, 24 * 60 * 60 * 1000) || activeTools.has(h.tool));
+const handoffs = activeHandoffs.length;
+const nextData = nxt?.data?.next || {};
+const nextAction = nextData.actionable ? nextData.action : "";
 const promptMode = process.env.RALLY_HOOK_PROMPT_MODE || "once";
 const showPrompt = promptMode !== "off";
 if (!showPrompt && peers.length === 0 && claims.length === 0 && handoffs === 0) { process.stdout.write("{}"); process.exit(0); }
@@ -311,11 +335,11 @@ if (showPrompt) {
   msg += "Agent Rally Point is active in this repo. Agents will enter the room, check coordination before edits, and surface handoffs. Turn off this session: `RALLY_HOOKS=off`; repo: `rally hooks off --scope repo`; status: `rally hooks status`. ";
 }
 if (peers.length || claims.length || handoffs || nextAction) msg += "Active room state: ";
-if (peers.length) msg += `Peers: ${peers.join(", ")}. `;
+if (peers.length) msg += `Active peers: ${peers.slice(0, 8).join(", ")}${peers.length > 8 ? ` (+${peers.length - 8} more)` : ""}. `;
 if (claims.length) msg += `Open claims: ${claims.slice(0, 8).join("; ")}. `;
 if (handoffs) msg += `${handoffs} open handoff(s). `;
 if (nextAction) msg += `Suggested next: ${nextAction}. `;
-msg += "Before editing, check `rally room` / `rally next` and deconflict — do not edit a path another agent has claimed (rally auto-checks before each write).";
+msg += "Stale peers, expired claims, and non-actionable waits are omitted from this prompt; use `rally room` for full history. Before editing, check `rally room` / `rally next` and deconflict — do not edit a path another active agent has claimed (rally auto-checks before each write).";
 process.stdout.write(JSON.stringify({ agent_visible: { present: true, severity: "warn", message: msg } }));
 ' ; } 2>/dev/null)"
   fi

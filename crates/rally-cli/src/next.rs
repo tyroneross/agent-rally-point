@@ -1,10 +1,13 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 use crate::backlog::BacklogItem;
 use crate::store::{Fact, FactKind, RoomSnapshot};
-use crate::{normalize_path, path_matches_scope, shell_quote};
+use crate::{FACT_SCHEMA, normalize_path, path_matches_scope, shell_quote};
+
+const STALE_WAIT_SECS: i64 = 24 * 60 * 60;
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub(crate) struct EntryData {
@@ -98,6 +101,9 @@ pub(crate) struct SuggestedBacklogItem {
     pub(crate) intent: String,
     pub(crate) owns: Vec<String>,
     pub(crate) depends_on: Vec<String>,
+    pub(crate) status: String,
+    pub(crate) target: Option<String>,
+    pub(crate) expected_by: Option<String>,
     pub(crate) event_id: String,
 }
 
@@ -256,22 +262,6 @@ pub(crate) fn build_next(
 ) -> NextResult {
     let waiting_on = waiting_on_facts(snapshot, tool);
     let waiting = !waiting_on.is_empty();
-    let mut candidates = next_candidates(snapshot, tool, role, paths, waiting, &waiting_on);
-    candidates.sort_by(compare_next_candidates);
-
-    let top = candidates
-        .first()
-        .cloned()
-        .unwrap_or_else(default_next_candidate);
-    let alternatives = candidates
-        .iter()
-        .skip(1)
-        .take(limit.saturating_sub(1))
-        .map(NextCandidate::to_data)
-        .collect::<Vec<_>>();
-    let mode = next_mode(waiting, top.action);
-    let contract = action_contract(&top, tool);
-    let top_data = top.to_data();
 
     // #7: filter backlog items to those ready for pickup:
     //   - status is not "done"
@@ -290,8 +280,9 @@ pub(crate) fn build_next(
         .iter()
         .flat_map(|c| c.scope.clone())
         .collect();
-    let suggested_backlog_items: Vec<SuggestedBacklogItem> = backlog_items
-        .into_iter()
+    let ready_backlog_items: Vec<BacklogItem> = backlog_items
+        .iter()
+        .cloned()
         .filter(|item| item.status != "done")
         .filter(|item| {
             // All deps satisfied
@@ -308,11 +299,42 @@ pub(crate) fn build_next(
                 !claimed_scopes.contains(&normalized) && !claimed_scopes.contains(path)
             })
         })
+        .collect();
+    let mut candidates = next_candidates(
+        snapshot,
+        tool,
+        role,
+        paths,
+        waiting,
+        &waiting_on,
+        &backlog_items,
+    );
+    candidates.sort_by(compare_next_candidates);
+
+    let top = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(default_next_candidate);
+    let alternatives = candidates
+        .iter()
+        .skip(1)
+        .take(limit.saturating_sub(1))
+        .map(NextCandidate::to_data)
+        .collect::<Vec<_>>();
+    let mode = next_mode(waiting, top.action);
+    let contract = action_contract(&top, tool);
+    let top_data = top.to_data();
+
+    let suggested_backlog_items: Vec<SuggestedBacklogItem> = ready_backlog_items
+        .into_iter()
         .map(|item| SuggestedBacklogItem {
             id: item.id,
             intent: item.intent,
             owns: item.owns,
             depends_on: item.depends_on,
+            status: item.status,
+            target: item.target,
+            expected_by: item.expected_by,
             event_id: item.event_id,
         })
         .collect();
@@ -339,11 +361,13 @@ pub(crate) fn build_next(
 }
 
 fn waiting_on_facts(snapshot: &RoomSnapshot, tool: &str) -> Vec<Fact> {
+    let stale_targets = snapshot.takeover_eligible_owners();
     snapshot
         .open_handoffs
         .iter()
         .chain(snapshot.active_blockers.iter())
         .filter(|fact| waiting_on_peer(fact, tool))
+        .filter(|fact| !stale_wait_obligation(fact, &stale_targets))
         .cloned()
         .collect()
 }
@@ -355,6 +379,7 @@ fn next_candidates(
     paths: &[String],
     waiting: bool,
     waiting_on: &[Fact],
+    backlog_items: &[BacklogItem],
 ) -> Vec<NextCandidate> {
     let mut candidates = Vec::new();
 
@@ -414,12 +439,67 @@ fn next_candidates(
             ));
         }
     }
+    for item in backlog_items {
+        if item.target.as_deref() == Some(tool) && backlog_item_requires_status_update(item) {
+            let fact = backlog_item_as_fact(item);
+            candidates.push(NextCandidate::from_fact(
+                "update_plan_status",
+                "targeted_backlog_plan_needs_status",
+                95,
+                &fact,
+            ));
+        }
+    }
 
     if candidates.is_empty() {
         candidates.push(idle_next_candidate(waiting, waiting_on));
     }
 
     candidates
+}
+
+fn backlog_item_requires_status_update(item: &BacklogItem) -> bool {
+    matches!(item.status.as_str(), "open" | "planned" | "blocked")
+}
+
+fn backlog_item_as_fact(item: &BacklogItem) -> Fact {
+    let mut scope = vec!["backlog-item".to_string()];
+    scope.extend(item.owns.iter().map(|path| format!("owns:{path}")));
+    scope.sort();
+    scope.dedup();
+
+    let mut evidence: Vec<String> = item
+        .depends_on
+        .iter()
+        .map(|dep| format!("dep:{dep}"))
+        .collect();
+    if let Some(expected_by) = &item.expected_by {
+        evidence.push(format!("expected_by:{expected_by}"));
+    }
+    evidence.sort();
+    evidence.dedup();
+
+    Fact {
+        from_session_id: None,
+        schema: FACT_SCHEMA.to_string(),
+        event_id: item.event_id.clone(),
+        seq: item.seq,
+        thread_id: format!("backlog-{}", item.id.chars().take(32).collect::<String>()),
+        kind: FactKind::BacklogItem,
+        tool: item.tool.clone(),
+        role: None,
+        subject: item.intent.clone(),
+        scope,
+        created_at: item.created_at.clone(),
+        summary: Some(format!("id:{}", item.id)),
+        evidence,
+        target: item.target.clone(),
+        ref_id: None,
+        status: Some(item.status.clone()),
+        severity: None,
+        uri: None,
+        session: None,
+    }
 }
 
 fn idle_next_candidate(waiting: bool, waiting_on: &[Fact]) -> NextCandidate {
@@ -479,7 +559,11 @@ fn action_contract(candidate: &NextCandidate, tool: &str) -> ActionContract {
     let suggested_claims = candidate
         .fact
         .as_ref()
-        .filter(|_| actionable && candidate.action != "continue_or_release_claim")
+        .filter(|_| {
+            actionable
+                && candidate.action != "continue_or_release_claim"
+                && candidate.action != "update_plan_status"
+        })
         .map(|fact| suggested_claims(tool, fact))
         .unwrap_or_default();
     let suggested_commands = if actionable {
@@ -519,6 +603,17 @@ fn suggested_commands(tool: &str, candidate: &NextCandidate) -> Vec<String> {
     let Some(fact) = candidate.fact.as_ref() else {
         return Vec::new();
     };
+    if candidate.action == "update_plan_status" {
+        return backlog_id(fact)
+            .map(|id| {
+                vec![format!(
+                    "rally backlog update --tool {} --id {} --status in_progress --expected-by \"<next checkpoint>\" --json",
+                    shell_quote(tool),
+                    shell_quote(&id),
+                )]
+            })
+            .unwrap_or_default();
+    }
     let mut commands = executable_scopes(fact)
         .into_iter()
         .map(|scope| {
@@ -562,18 +657,29 @@ fn suggested_commands(tool: &str, candidate: &NextCandidate) -> Vec<String> {
     commands
 }
 
+fn backlog_id(fact: &Fact) -> Option<String> {
+    fact.summary
+        .as_deref()
+        .and_then(|summary| summary.strip_prefix("id:"))
+        .and_then(|rest| rest.split('\n').next())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 fn completion_contract(action: &str, actionable: bool) -> CompletionContract {
     let record_kind = match action {
         "respond_to_handoff" | "resolve_owned_blocker" => "resolve",
         "continue_or_release_claim" => "artifact_or_release",
         "review_artifact" => "resolve",
         "clarify_handoff" => "handoff",
+        "update_plan_status" => "backlog_update",
         _ => "none",
     };
     CompletionContract {
         record_kind,
-        evidence_required: actionable,
-        release_claims: actionable,
+        evidence_required: actionable && action != "update_plan_status",
+        release_claims: actionable && action != "update_plan_status",
         rerun_next: actionable,
     }
 }
@@ -610,6 +716,22 @@ fn waiting_on_peer(fact: &Fact, tool: &str) -> bool {
             .target
             .as_deref()
             .is_some_and(|target| target != tool && target != "all")
+}
+
+fn stale_wait_obligation(fact: &Fact, stale_targets: &BTreeSet<String>) -> bool {
+    fact.target
+        .as_deref()
+        .is_some_and(|target| stale_targets.contains(target))
+        || fact_age_secs(fact).is_some_and(|age| age > STALE_WAIT_SECS)
+}
+
+fn fact_age_secs(fact: &Fact) -> Option<i64> {
+    let seen = chrono::DateTime::parse_from_rfc3339(&fact.created_at).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some(now - seen.timestamp())
 }
 
 fn fact_is_weak(fact: &Fact) -> bool {
@@ -754,5 +876,125 @@ fn entry_item(reason: &'static str, fact: &Fact) -> EntryItem {
         tool: fact.tool.clone(),
         target: fact.target.clone(),
         evidence: fact.evidence.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Squad;
+
+    fn handoff(id: &str, target: &str, created_at: &str) -> Fact {
+        Fact {
+            from_session_id: None,
+            schema: crate::FACT_SCHEMA.to_string(),
+            event_id: id.to_string(),
+            seq: 1,
+            thread_id: "thread-test".to_string(),
+            kind: FactKind::Handoff,
+            tool: Some("codex".to_string()),
+            role: None,
+            subject: "handoff".to_string(),
+            scope: Vec::new(),
+            created_at: created_at.to_string(),
+            summary: Some("handoff summary".to_string()),
+            evidence: Vec::new(),
+            target: Some(target.to_string()),
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        }
+    }
+
+    fn squad(tool: &str, last_seen_ts: &str, status: &str) -> Squad {
+        Squad {
+            tool: tool.to_string(),
+            last_seen_seq: 1,
+            last_seen_ts: last_seen_ts.to_string(),
+            status: status.to_string(),
+            acknowledged: true,
+        }
+    }
+
+    #[test]
+    fn stale_outgoing_handoff_does_not_force_wait() {
+        let mut snapshot = RoomSnapshot::default();
+        snapshot.open_handoffs.push(handoff(
+            "old-handoff",
+            "claude_code:l4",
+            "2000-01-01T00:00:00Z",
+        ));
+        snapshot
+            .squads
+            .push(squad("claude_code:l4", "2000-01-01T00:00:00Z", "idle"));
+
+        let result = build_next(&snapshot, "codex", None, &[], 10, Vec::new());
+
+        assert_eq!(result.action, "proceed_solo");
+        assert!(
+            result.waiting_on.is_empty(),
+            "stale outgoing handoff must not remain a wait obligation"
+        );
+    }
+
+    #[test]
+    fn current_outgoing_handoff_can_still_wait() {
+        let mut snapshot = RoomSnapshot::default();
+        snapshot.open_handoffs.push(handoff(
+            "fresh-handoff",
+            "claude_code:review",
+            "2999-01-01T00:00:00Z",
+        ));
+        snapshot.squads.push(squad(
+            "claude_code:review",
+            "2999-01-01T00:00:00Z",
+            "active",
+        ));
+
+        let result = build_next(&snapshot, "codex", None, &[], 10, Vec::new());
+
+        assert_eq!(result.action, "wait");
+        assert_eq!(result.waiting_on.len(), 1);
+    }
+
+    #[test]
+    fn targeted_planned_backlog_item_requires_status_update() {
+        let snapshot = RoomSnapshot::default();
+        let item = BacklogItem {
+            id: "plan-1".to_string(),
+            intent: "publish the ARP lane plan".to_string(),
+            owns: vec!["docs/ORCHESTRATION.md".to_string()],
+            depends_on: Vec::new(),
+            status: "planned".to_string(),
+            target: Some("codex".to_string()),
+            expected_by: Some("noon".to_string()),
+            tool: Some("claude_code".to_string()),
+            created_at: "2026-07-02T12:00:00Z".to_string(),
+            event_id: "backlog-plan-1".to_string(),
+            seq: 42,
+        };
+
+        let result = build_next(&snapshot, "codex", None, &[], 10, vec![item]);
+
+        assert_eq!(result.action, "update_plan_status");
+        assert!(result.actionable);
+        assert_eq!(result.target_event_id.as_deref(), Some("backlog-plan-1"));
+        assert!(
+            result
+                .suggested_commands
+                .iter()
+                .any(|command| command.contains("rally backlog update --tool codex"))
+        );
+        assert!(result.suggested_claims.is_empty());
+        assert!(
+            result
+                .suggested_commands
+                .iter()
+                .all(|command| !command.contains("before-write"))
+        );
+        assert_eq!(result.completion.record_kind, "backlog_update");
+        assert!(!result.completion.release_claims);
     }
 }

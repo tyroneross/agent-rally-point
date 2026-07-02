@@ -67,12 +67,12 @@ the portable project config is already committed.
 | Event | Action |
 |------|--------|
 | `SessionStart` | Resolves `rally hooks status`, calls `rally enter` when hooks are enabled, and surfaces a short context line from `rally room` / `rally next` (active peers, claimed paths, suggested next). Even in a quiet room, the default prompt tells the user Rally is active and shows the session/repo off commands. |
-| `UserPromptSubmit` | Per-turn presence refresh (hook phase `idle`). Re-surfaces active peers / open claims / suggested next from `rally next` at the start of each turn, so Claude stays rally-aware during long read/explore phases instead of only re-checking at the moment it edits. Advisory `additionalContext`; emits `{}` when the room is quiet. This is the key parity fix — Codex already touches rally continuously; Claude previously only did so right before a write. |
+| `UserPromptSubmit` | Per-turn presence refresh (hook phase `idle`). Re-surfaces active peers / open claims / suggested next from `rally next` at the start of each turn, so agents stay rally-aware during long read/explore phases instead of only re-checking at the moment they edit. Advisory `additionalContext`; emits `{}` when the room is quiet. This is the cadence parity fix for Claude and Codex. |
 | `PreToolUse(Edit\|Write\|MultiEdit)` | Extracts the target file path from the tool input envelope, calls `rally check before-write --path <p>`, and (when the path is unclaimed and the check allows) auto-claims it. On a conflict, surfaces an `additionalContext` warning to the agent. `rally check` already records the durable audit fact. |
 | `Stop` | At turn end (hook phase `after-write`), runs `rally next` and surfaces any pending coordination obligation as an advisory `systemMessage`. Parity with Codex's `Stop` hook; never blocks turn completion (strict mode is the only path that can emit `decision: block`). |
 
 
-**Why PreToolUse stays edit-scoped (deliberate).** Codex's `.codex/hooks.json` wires PreToolUse with *no matcher*, so it fires `before-write` on every tool call — consistent, but it spawns the hook + watchdog on reads/bash/etc. that have no file path and no-op. Claude keeps the `Edit|Write|MultiEdit|NotebookEdit` matcher for `before-write` and instead gets continuous awareness from the cheaper `UserPromptSubmit` (idle) refresh + `Stop` (after-write). Same coordination footprint as Codex, without per-tool overhead.
+**Why PreToolUse stays edit-scoped for Claude (deliberate).** Codex's `.codex/hooks.json` wires PreToolUse with *no matcher*, so it fires `before-write` on every tool call — consistent, but it spawns the hook + watchdog on reads/bash/etc. that have no file path and no-op. Claude keeps the `Edit|Write|MultiEdit|NotebookEdit` matcher for `before-write`; both hosts get continuous awareness from the cheaper `UserPromptSubmit` (idle) refresh plus `Stop` (after-write).
 
 **Charter — advisory-only (default).** Coordination is recorded + exposed,
 never enforced. The hook NEVER emits `permissionDecision: "deny"` or
@@ -117,21 +117,21 @@ RALLY_HOOKS=off
 | `hooks/rally-coordination-hook.sh` | Single source of truth. Host-neutral; argv-dispatched by `<phase> <tool>`. Self-gates on missing `.rally/` (silent no-op). Defense-in-depth wall-clock watchdog with process-group-kill on overrun so a hung `rally` can never stall a host session. |
 | `scripts/install_rally_hooks.sh` | Idempotent installer that wires the hook into `~/.claude/settings.json`. Supports `--uninstall`, `--dry-run`, `--repoint-codex`. Pure shell (no Rust changes); resolves the repo path to an absolute string at install time. |
 | `tests/hooks/test_rally_coordination_hook.sh` | Self-gate, fail-open (missing + hung binary), advisory-only invariant, strict-mode, warn-never-denies. |
-| `tests/hooks/test_install_rally_hooks.sh` | Install-from-empty, idempotency, preserves unrelated hooks, uninstall round-trip, `--dry-run`, codex repoint round-trip. Uses scratch HOME — never touches the user's real settings. |
+| `tests/hooks/test_install_rally_hooks.sh` | Project hook cadence regression, install-from-empty, idempotency, preserves unrelated hooks, uninstall round-trip, `--dry-run`, codex repoint round-trip. Uses scratch HOME for global installer cases — never touches the user's real settings. |
 
 ## Install / uninstall
 
 ```bash
-# Install for Claude Code (writes ~/.claude/settings.json)
-scripts/install_rally_hooks.sh
+# Install for Claude Code user-wide (writes ~/.claude/settings.json)
+scripts/install_rally_hooks.sh --global
 
 # Also repoint ~/.codex/rally-hook.sh at the in-repo versioned script (opt-in)
 # This is the durable fix for "loose-file desync" — closes the recurrence risk
 # called out in docs/assessment-2026-05-31-codex-hook-desync.md.
-scripts/install_rally_hooks.sh --repoint-codex
+scripts/install_rally_hooks.sh --global --repoint-codex
 
 # Show what would change without writing
-scripts/install_rally_hooks.sh --dry-run
+scripts/install_rally_hooks.sh --global --dry-run
 
 # Remove (leaves unrelated hooks alone)
 scripts/install_rally_hooks.sh --uninstall
@@ -162,13 +162,33 @@ Merged into `~/.claude/settings.json` (preserves any existing entries):
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<repo>/hooks/rally-coordination-hook.sh idle claude_code"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit",
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
           {
             "type": "command",
             "command": "<repo>/hooks/rally-coordination-hook.sh before-write claude_code"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<repo>/hooks/rally-coordination-hook.sh after-write claude_code"
           }
         ]
       }
@@ -235,10 +255,10 @@ for orchestration paths where the operator wants hard gates. Use sparingly.
 The lazy-auto-enter direction (every `rally check before-write` call auto-
 registers presence with no bespoke hook) remains the long-term goal — see
 `assessment-2026-05-31-codex-hook-desync.md` § "Lazy auto-enter (no hook)".
-Until that lands as the agent's default reflex, the hook closes the gap for
-**Claude Code today**: agents do not reliably self-invoke skill or CLI
-patterns mid-task (memory: `feedback_subagent_skill_reactivity`), so the
-host's PreToolUse mechanism is the deterministic surface.
+Until that lands as the agent's default reflex, host hooks close the gap for
+**Claude Code and Codex today**: agents do not reliably self-invoke skill or CLI
+patterns mid-task (memory: `feedback_subagent_skill_reactivity`), so the host
+hook mechanism is the deterministic surface.
 
 ## Recurrence risk closure
 

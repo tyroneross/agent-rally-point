@@ -81,7 +81,9 @@ pub mod worktree_gc;
 mod worktree_guard;
 
 use backends::*;
-use backlog::{BacklogItem, add_backlog_item, list_backlog_items, mark_backlog_done};
+use backlog::{
+    BacklogItem, add_backlog_item, list_backlog_items, mark_backlog_done, update_backlog_item,
+};
 use board::{BoardOutput, build_board};
 use check::build_check;
 use check_ci::build_check_ci;
@@ -10946,6 +10948,9 @@ fn command_backlog(args: BacklogArgs) -> Result<Output> {
                 &add_args.intent,
                 &add_args.owns,
                 &add_args.depends_on,
+                add_args.status.as_deref(),
+                add_args.target.as_deref(),
+                add_args.expected_by.as_deref(),
             )?;
             let items = list_backlog_items(&room).unwrap_or_default();
             let text = format!(
@@ -10982,6 +10987,41 @@ fn command_backlog(args: BacklogArgs) -> Result<Output> {
                         action: "list".to_string(),
                         items,
                         added: None,
+                    },
+                },
+            )?;
+            Ok(Output::new(args.json, text, body))
+        }
+        BacklogSubcommand::Update(update_args) => {
+            ensure_presence(&room, &update_args.tool)?;
+            let owns = (!update_args.owns.is_empty()).then_some(update_args.owns.as_slice());
+            let depends_on =
+                (!update_args.depends_on.is_empty()).then_some(update_args.depends_on.as_slice());
+            let fact = update_backlog_item(
+                &room,
+                &update_args.tool,
+                &update_args.id,
+                update_args.intent.as_deref(),
+                owns,
+                depends_on,
+                update_args.status.as_deref(),
+                update_args.target.as_deref(),
+                update_args.expected_by.as_deref(),
+            )?;
+            let items: Vec<_> = list_backlog_items(&room)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|i| i.status != "done")
+                .collect();
+            let text = format!("backlog update id={} seq={}", update_args.id, fact.seq);
+            let body = envelope(
+                "backlog",
+                SCHEMA_BACKLOG,
+                BacklogData {
+                    backlog: BacklogPayload {
+                        action: "update".to_string(),
+                        items,
+                        added: Some(fact),
                     },
                 },
             )?;
@@ -11645,8 +11685,10 @@ fn help_text() -> String {
         "              [--once] [--duration-hours <h>] [--json] [--print-launchd] [--print-systemd]",
         "  rally version [--json]  # print build-id (version + git hash); exits 0",
         "  rally whoami [--tool <id>] [--json]  # repo_root, repo_id, worktree, build_id, cwd; exits 0",
-        "  rally backlog add --tool <tool> --id <id> --intent <text> [--owns <path>] [--depends-on <id>] [--json]",
+        "  rally backlog add --tool <tool> --id <id> --intent <text> [--target <tool>] [--status <open|planned|in_progress|blocked|done>] [--expected-by <when>] [--owns <path>] [--depends-on <id>] [--json]",
+        "  rally backlog update --tool <tool> --id <id> [--status <open|planned|in_progress|blocked|done>] [--expected-by <when>] [--target <tool>] [--intent <text>] [--json]",
         "  rally backlog list [--json]",
+        "  rally backlog done --tool <tool> --id <id> [--json]",
         "  rally board [--json]",
         "  rally route-findings --file <findings.json> [--tool <tool>] --verified [--json]",
         "  rally check-ci [--strict] [--receipt-threshold <secs>] [--json]  # read-only CI gate: exits 0 (pass) or 4 with --strict (fail)",

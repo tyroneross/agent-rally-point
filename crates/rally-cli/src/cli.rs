@@ -429,6 +429,7 @@ pub(crate) struct BacklogArgs {
 pub(crate) enum BacklogSubcommand {
     Add(BacklogAddArgs),
     List,
+    Update(BacklogUpdateArgs),
     Done(BacklogDoneArgs),
 }
 
@@ -439,6 +440,21 @@ pub(crate) struct BacklogAddArgs {
     pub(crate) intent: String,
     pub(crate) owns: Vec<String>,
     pub(crate) depends_on: Vec<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) target: Option<String>,
+    pub(crate) expected_by: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BacklogUpdateArgs {
+    pub(crate) tool: String,
+    pub(crate) id: String,
+    pub(crate) intent: Option<String>,
+    pub(crate) owns: Vec<String>,
+    pub(crate) depends_on: Vec<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) target: Option<String>,
+    pub(crate) expected_by: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1250,7 +1266,9 @@ fn doctor_parser() -> impl Parser<DoctorArgs> {
         .help("Classify rooms registry entries as live/stale (dry-run by default)")
         .switch();
     let reap_stale = long("reap-stale")
-        .help("Reap over-TTL in-room presence/claims/leads (dry-run by default; commit with --apply)")
+        .help(
+            "Reap over-TTL in-room presence/claims/leads (dry-run by default; commit with --apply)",
+        )
         .switch();
     let apply = long("apply")
         .help("Apply the prune: rewrite the registry index, keeping only live entries; also commits --reap-stale writes")
@@ -1656,24 +1674,77 @@ fn whoami_parser() -> impl Parser<WhoamiArgs> {
 // ─── Work surface parsers (appended) ─────────────────────────────────────────
 
 fn backlog_parser() -> impl Parser<BacklogArgs> {
-    // `rally backlog add --tool .. --id .. --intent .. [--owns ..] [--depends-on ..]`
+    // `rally backlog add --tool .. --id .. --intent .. [--target ..] [--expected-by ..] [--status ..] [--owns ..] [--depends-on ..]`
     let tool = string_arg("tool", "TOOL");
     let id = string_arg("id", "ID");
     let intent = string_arg("intent", "INTENT");
     let owns = many_string_arg("owns", "PATH");
     let depends_on = many_string_arg("depends-on", "ID");
-    let add_parser = construct!(tool, id, intent, owns, depends_on)
-        .map(|(tool, id, intent, owns, depends_on)| BacklogAddArgs {
+    let status = optional_string_arg("status", "STATUS");
+    let target = optional_string_arg("target", "TOOL");
+    let expected_by = optional_string_arg("expected-by", "WHEN");
+    let add_parser = construct!(
+        tool,
+        id,
+        intent,
+        owns,
+        depends_on,
+        status,
+        target,
+        expected_by
+    )
+    .map(
+        |(tool, id, intent, owns, depends_on, status, target, expected_by)| BacklogAddArgs {
             tool,
             id,
             intent,
             owns,
             depends_on,
-        })
-        .to_options()
-        .descr("Add a new backlog item to the room ledger.")
-        .command("add")
-        .map(BacklogSubcommand::Add);
+            status,
+            target,
+            expected_by,
+        },
+    )
+    .to_options()
+    .descr("Add a new backlog item to the room ledger.")
+    .command("add")
+    .map(BacklogSubcommand::Add);
+
+    // `rally backlog update --tool .. --id .. [--status ..] [--expected-by ..] ...`
+    let update_tool = string_arg("tool", "TOOL");
+    let update_id = string_arg("id", "ID");
+    let update_intent = optional_string_arg("intent", "INTENT");
+    let update_owns = many_string_arg("owns", "PATH");
+    let update_depends_on = many_string_arg("depends-on", "ID");
+    let update_status = optional_string_arg("status", "STATUS");
+    let update_target = optional_string_arg("target", "TOOL");
+    let update_expected_by = optional_string_arg("expected-by", "WHEN");
+    let update_parser = construct!(
+        update_tool,
+        update_id,
+        update_intent,
+        update_owns,
+        update_depends_on,
+        update_status,
+        update_target,
+        update_expected_by
+    )
+    .map(
+        |(tool, id, intent, owns, depends_on, status, target, expected_by)| BacklogUpdateArgs {
+            tool,
+            id,
+            intent,
+            owns,
+            depends_on,
+            status,
+            target,
+            expected_by,
+        },
+    )
+    .to_options()
+    .descr("Update a backlog item's plan/status while preserving omitted fields.")
+    .command("update")
+    .map(BacklogSubcommand::Update);
 
     // `rally backlog list [--json]`
     let list_parser = bpaf::pure(())
@@ -1693,7 +1764,7 @@ fn backlog_parser() -> impl Parser<BacklogArgs> {
         .map(BacklogSubcommand::Done);
 
     let json = json_flag();
-    let subcommand = construct!([add_parser, list_parser, done_parser]);
+    let subcommand = construct!([add_parser, list_parser, update_parser, done_parser]);
     construct!(json, subcommand).map(|(json, subcommand)| BacklogArgs { json, subcommand })
 }
 

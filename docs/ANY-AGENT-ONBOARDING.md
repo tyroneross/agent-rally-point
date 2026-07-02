@@ -144,6 +144,34 @@ backend, or future custom backend registers them as a managed session. For
 manual sessions, use targeted `handoff` facts and paste the bootstrap prompt
 below into the agent's chat/input surface.
 
+## Injectable Or Heartbeat Requirement
+
+Every active agent must be observable through one of two paths:
+
+- **Injectable:** a managed or adopted session appears in `rally sessions --json`
+  and can receive `rally inject`, `rally capture`, and `rally stop`.
+- **Heartbeat:** a manual or generic session that is not injectable must keep a
+  Rally cadence. Run `rally next --tool <stable-tool-id> --json` before work,
+  before edits, before the final response, and after any long gap. For idle
+  monitoring, run `rally watch --tool <stable-tool-id> --once --json` from a
+  scheduler or `rally watch --tool <stable-tool-id> --interval 5
+  --max-interval 300 --json` as an attached watcher.
+
+Not communicating is a coordination failure. If a session cannot be injected
+and cannot maintain a heartbeat, post a `blocker` or stand down instead of
+continuing invisible work.
+
+Use the backlog as the plan/status bus when work has an owner or timeline:
+
+```bash
+rally backlog add --tool <you> --id <id> --intent "<work>" --target <owner-tool> --status planned --expected-by "<when>" --json
+rally backlog update --tool <owner-tool> --id <id> --status in_progress --expected-by "<next checkpoint>" --json
+```
+
+`rally next --tool <owner-tool> --json` surfaces targeted `open`, `planned`,
+or `blocked` backlog items as `update_plan_status` obligations until the owner
+updates them. A plan that is only in chat is not durable coordination.
+
 ## Bootstrap Prompt
 
 Use this when starting a generic agent that does not automatically read

@@ -192,11 +192,18 @@ rally lead assign  --tool <you> --to <tool> [--user-designated] --json   # set l
 rally lead relinquish --tool <lead> --json                      # drop the title (reopens the seat)
 # Lead auto-assigns to the first FRONTIER agent to enter (rally enter --tier frontier).
 
-# Claimable backlog:
-rally backlog add  --tool <you> --id <id> --intent "<what>" [--owns <path>] [--depends-on <id>] --json
+# Claimable backlog + plan/status bus:
+rally backlog add --tool <you> --id <id> --intent "<what>" [--target <owner>] [--status planned] [--expected-by "<when>"] [--owns <path>] [--depends-on <id>] --json
+rally backlog update --tool <you> --id <id> [--status in_progress|blocked] [--expected-by "<next checkpoint>"] --json
 rally backlog list --json                                       # OPEN items only
 rally backlog done --tool <you> --id <id> --json                # close an item (drops out of list)
 ```
+
+When a backlog item has `--target <tool>` and status `open`, `planned`, or
+`blocked`, `rally next --tool <tool> --json` returns `update_plan_status` until
+that tool posts a status update. This is the lightweight Rally bus for plan,
+owner, ETA, and status; do not rely on chat paste as the only coordination
+surface.
 
 ## Where State Lives
 

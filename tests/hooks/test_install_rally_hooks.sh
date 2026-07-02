@@ -39,6 +39,51 @@ jget() {
 }
 
 # ----------------------------------------------------------------------
+# Test 0: committed project hooks expose the full rally cadence
+# ----------------------------------------------------------------------
+T="project hook configs include start/idle/before-write/after-write cadence"
+if python3 - "$REPO_ROOT/.codex/hooks.json" "$REPO_ROOT/.claude/settings.json" <<'PY'
+import json
+import sys
+
+codex_path, claude_path = sys.argv[1:3]
+
+def load(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+def commands(data, event):
+    out = []
+    for group in data.get("hooks", {}).get(event, []):
+        for hook in group.get("hooks", []):
+            cmd = hook.get("command")
+            if cmd:
+                out.append(cmd)
+    return out
+
+def require(data, path, event, phase, tool):
+    needle = f"{phase} {tool}"
+    if not any("rally-coordination-hook.sh" in cmd and needle in cmd for cmd in commands(data, event)):
+        raise AssertionError(f"{path}: missing {event} hook with {needle}")
+
+codex = load(codex_path)
+claude = load(claude_path)
+for event, phase in [
+    ("SessionStart", "start"),
+    ("UserPromptSubmit", "idle"),
+    ("PreToolUse", "before-write"),
+    ("Stop", "after-write"),
+]:
+    require(codex, codex_path, event, phase, "codex")
+    require(claude, claude_path, event, phase, "claude_code")
+PY
+then
+  ok "$T"
+else
+  bad "$T" "committed .codex/.claude project hooks are missing cadence parity"
+fi
+
+# ----------------------------------------------------------------------
 # Test 1: install from empty — creates the four rally entries
 # ----------------------------------------------------------------------
 T="install from empty settings.json"

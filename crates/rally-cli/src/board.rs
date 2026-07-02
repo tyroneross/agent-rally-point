@@ -506,7 +506,18 @@ mod tests {
     fn board_backlog_includes_open_and_dep_blocked() {
         let (room, root) = test_room();
 
-        add_backlog_item(&room, "tool-a", "dep-task", "prerequisite", &[], &[]).unwrap();
+        add_backlog_item(
+            &room,
+            "tool-a",
+            "dep-task",
+            "prerequisite",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         add_backlog_item(
             &room,
             "tool-a",
@@ -514,6 +525,9 @@ mod tests {
             "depends on dep",
             &[],
             &["dep-task".to_string()],
+            None,
+            None,
+            None,
         )
         .unwrap();
 

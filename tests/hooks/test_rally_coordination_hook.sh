@@ -30,7 +30,12 @@ bad()  { FAIL=$((FAIL+1)); FAILS+=("$1"); printf 'FAIL %s\n' "$1"; [ -n "${2:-}"
 # Test 1: self-gate — no .rally/ → exit 0, no output
 # ----------------------------------------------------------------------
 T="self-gate: no .rally/ → exit 0 + empty stdout"
-tmpdir="$(mktemp -d)"
+# Some machines can have a `.rally/` marker in the default mktemp parent
+# (for example under /private/var/.../T), which makes every child look like a
+# Rally repo when the hook walks upward. Use /tmp by default because this test
+# needs a parent that is not already coordinated.
+scratch_parent="${RALLY_TEST_TMPDIR:-/tmp}"
+tmpdir="$(mktemp -d "${scratch_parent%/}/rally-hook-test.XXXXXX")"
 trap 'rm -rf "$tmpdir"' EXIT
 (
   cd "$tmpdir"
@@ -140,6 +145,47 @@ chmod +x "$prompt_bin"
   fi
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+# ----------------------------------------------------------------------
+# Test 2e: noisy room projection is trimmed to actionable current state
+# ----------------------------------------------------------------------
+T="SessionStart prompt omits stale peers, expired claims, and non-actionable waits"
+noise_bin="$tmpdir/rally_noise"
+cat > "$noise_bin" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "hooks" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"data":{"hooks":{"enabled":true,"prompt":"once"}}}'
+elif [ "$1" = "enter" ]; then
+  :
+elif [ "$1" = "room" ]; then
+  cat <<'JSON'
+{"data":{"room":{"squads":[{"tool":"claude_code","status":"active","last_seen_ts":"2999-01-01T00:00:00Z"},{"tool":"stale-peer","status":"idle","last_seen_ts":"2000-01-01T00:00:00Z"}],"active_claims":[{"tool":"claude_code","scope":["file:active.rs"],"evidence":["lease_expires_at:2999-01-01T00:00:00Z"]},{"tool":"claude_code","scope":["file:expired.rs"],"evidence":["lease_expires_at:2000-01-01T00:00:00Z"]},{"tool":"stale-peer","scope":["file:idle.rs"],"evidence":["lease_expires_at:2999-01-01T00:00:00Z"]}],"open_handoffs":[{"tool":"stale-peer","target":"codex","created_at":"2000-01-01T00:00:00Z"}]}}}
+JSON
+elif [ "$1" = "next" ]; then
+  printf '%s\n' '{"data":{"next":{"actionable":false,"action":"wait"}}}'
+else
+  printf '%s\n' '{}'
+fi
+EOF
+chmod +x "$noise_bin"
+(
+  repo="$tmpdir/noise-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+  out=$(RALLY_BIN="$noise_bin" "$HOOK" start codex </dev/null 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
+  printf '%s' "$out" | grep -q "Active peers: claude_code" || { printf 'missing active peer: %s\n' "$out" >&2; exit 1; }
+  printf '%s' "$out" | grep -q "file:active.rs" || { printf 'missing active claim: %s\n' "$out" >&2; exit 1; }
+  for bad_text in "stale-peer" "file:expired.rs" "file:idle.rs" "Suggested next: wait"; do
+    if printf '%s' "$out" | grep -q "$bad_text"; then
+      printf 'stale/non-actionable text leaked (%s): %s\n' "$bad_text" "$out" >&2
+      exit 1
+    fi
+  done
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "startup prompt must stay concise and current"; fi
 
 # ----------------------------------------------------------------------
 # Test 3: fail-open — rally binary that hangs → killed by watchdog,

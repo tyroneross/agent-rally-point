@@ -1017,6 +1017,112 @@ fn rally_next_waits_only_when_no_useful_work_exists() {
 }
 
 #[test]
+fn rally_backlog_plan_status_is_actionable_for_target() {
+    let workspace = Workspace::new("rally-backlog-plan-status");
+
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--path",
+        "docs/ORCHESTRATION.md",
+        "--subject",
+        "peer owns implementation surface",
+    ]);
+
+    let added = workspace.json(&[
+        "backlog",
+        "add",
+        "--tool",
+        "claude_code",
+        "--id",
+        "arp-plan",
+        "--intent",
+        "publish the ARP lane plan and timeline",
+        "--target",
+        "codex",
+        "--status",
+        "planned",
+        "--expected-by",
+        "noon",
+        "--owns",
+        "docs/ORCHESTRATION.md",
+        "--json",
+    ]);
+    assert_eq!(added["data"]["backlog"]["items"][0]["target"], "codex");
+    assert_eq!(added["data"]["backlog"]["items"][0]["expected_by"], "noon");
+    assert_eq!(added["data"]["backlog"]["items"][0]["status"], "planned");
+
+    let next = workspace.json(&["next", "--json", "--tool", "codex", "--limit", "3"]);
+    assert_matches_schema("agent-rally.command.next.v1.json", &next);
+    assert_eq!(next["data"]["next"]["action"], "update_plan_status");
+    assert_eq!(
+        next["data"]["next"]["reason"],
+        "targeted_backlog_plan_needs_status"
+    );
+    assert_eq!(next["data"]["next"]["fact"]["kind"], "backlog_item");
+    assert!(
+        next["data"]["next"]["suggested_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command
+                .as_str()
+                .unwrap()
+                .contains("rally backlog update --tool codex --id arp-plan"))
+    );
+    assert!(
+        next["data"]["next"]["suggested_claims"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        next["data"]["next"]["suggested_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|command| !command.as_str().unwrap().contains("before-write"))
+    );
+
+    let updated = workspace.json(&[
+        "backlog",
+        "update",
+        "--tool",
+        "codex",
+        "--id",
+        "arp-plan",
+        "--status",
+        "in_progress",
+        "--expected-by",
+        "next checkpoint",
+        "--json",
+    ]);
+    assert_eq!(
+        updated["data"]["backlog"]["items"][0]["status"],
+        "in_progress"
+    );
+    assert_eq!(
+        updated["data"]["backlog"]["items"][0]["target"], "codex",
+        "status updates must preserve the assigned owner"
+    );
+    assert_eq!(
+        updated["data"]["backlog"]["items"][0]["expected_by"],
+        "next checkpoint"
+    );
+
+    let after_update = workspace.json(&["next", "--json", "--tool", "codex", "--limit", "3"]);
+    assert_ne!(
+        after_update["data"]["next"]["action"], "update_plan_status",
+        "in_progress status should clear the immediate status-update obligation"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
 fn rally_entry_and_handoff_split_response_and_work_buckets() {
     let workspace = Workspace::new("rally-entry-buckets");
     workspace.json(&[
@@ -1502,7 +1608,14 @@ esac
     let fake_tmux = fake_tmux.to_string_lossy().to_string();
 
     let run = workspace.json(&[
-        "run", "claude", "--json", "--name", "ghost", "--backend", "tmux", "--tmux-bin",
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "ghost",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
         &fake_tmux,
     ]);
     let name = run["data"]["run"]["session"]["name"]

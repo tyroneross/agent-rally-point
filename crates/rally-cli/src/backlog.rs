@@ -11,8 +11,10 @@
 //! - `subject` : the intent (free-form description)
 //! - `scope`   : `owns:<path>` entries (one per owned path) + `backlog-item` sentinel
 //! - `summary` : `id:<id>` prefix, then the rest is free text
-//! - `evidence`: `dep:<dep-id>` entries (one per dependency item id)
-//! - `status`  : "open" | "assigned" | "done"
+//! - `evidence`: `dep:<dep-id>` entries (one per dependency item id) and
+//!   `expected_by:<time-or-checkpoint>` for live status planning
+//! - `target`  : assigned owner expected to keep status current
+//! - `status`  : "open" | "planned" | "in_progress" | "blocked" | "done"
 //!
 //! No schema bump is required because all encoding lives in existing fields.
 
@@ -33,6 +35,10 @@ pub(crate) struct BacklogItem {
     pub(crate) owns: Vec<String>,
     pub(crate) depends_on: Vec<String>,
     pub(crate) status: String,
+    pub(crate) target: Option<String>,
+    pub(crate) expected_by: Option<String>,
+    pub(crate) tool: Option<String>,
+    pub(crate) created_at: String,
     /// `event_id` of the underlying ledger fact — callers use it to resolve.
     pub(crate) event_id: String,
     pub(crate) seq: i64,
@@ -74,6 +80,16 @@ fn extract_depends_on(fact: &Fact) -> Vec<String> {
         .collect()
 }
 
+fn extract_expected_by(fact: &Fact) -> Option<String> {
+    fact.evidence
+        .iter()
+        .filter_map(|s| s.strip_prefix("expected_by:"))
+        .last()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 fn extract_status(fact: &Fact) -> String {
     fact.status.clone().unwrap_or_else(|| "open".to_string())
 }
@@ -93,6 +109,10 @@ pub(crate) fn fact_to_backlog_item(fact: &Fact) -> Option<BacklogItem> {
         owns: extract_owns(fact),
         depends_on: extract_depends_on(fact),
         status: extract_status(fact),
+        target: fact.target.clone(),
+        expected_by: extract_expected_by(fact),
+        tool: fact.tool.clone(),
+        created_at: fact.created_at.clone(),
         event_id: fact.event_id.clone(),
         seq: fact.seq,
     })
@@ -100,16 +120,7 @@ pub(crate) fn fact_to_backlog_item(fact: &Fact) -> Option<BacklogItem> {
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
-/// Add a backlog item to the room ledger. Returns the stored `Fact`.
-pub(crate) fn add_backlog_item(
-    room: &RoomStore,
-    tool: &str,
-    id: &str,
-    intent: &str,
-    owns: &[String],
-    depends_on: &[String],
-) -> Result<Fact> {
-    // Validate id: must not be empty and must not contain ':' or '\n'
+fn validate_id(id: &str) -> Result<()> {
     if id.trim().is_empty() {
         return Err(RallyError::Usage("--id must not be empty".to_string()));
     }
@@ -118,7 +129,19 @@ pub(crate) fn add_backlog_item(
             "--id must not contain ':' or newlines".to_string(),
         ));
     }
+    Ok(())
+}
 
+fn build_backlog_fact(
+    tool: &str,
+    id: &str,
+    intent: &str,
+    owns: &[String],
+    depends_on: &[String],
+    status: &str,
+    target: Option<&str>,
+    expected_by: Option<&str>,
+) -> Fact {
     let mut scope = vec!["backlog-item".to_string()];
     for path in owns {
         scope.push(format!("owns:{path}"));
@@ -127,9 +150,13 @@ pub(crate) fn add_backlog_item(
     scope.dedup();
 
     let mut evidence: Vec<String> = depends_on.iter().map(|dep| format!("dep:{dep}")).collect();
+    if let Some(expected_by) = expected_by.map(str::trim).filter(|value| !value.is_empty()) {
+        evidence.push(format!("expected_by:{expected_by}"));
+    }
     evidence.sort();
+    evidence.dedup();
 
-    let fact = Fact {
+    Fact {
         from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("backlog"),
@@ -143,13 +170,80 @@ pub(crate) fn add_backlog_item(
         created_at: now_string(),
         summary: Some(format!("id:{id}")),
         evidence,
-        target: None,
+        target: target.map(str::to_string),
         ref_id: None,
-        status: Some("open".to_string()),
+        status: Some(status.to_string()),
         severity: None,
         uri: None,
         session: None,
-    };
+    }
+}
+
+/// Add a backlog item to the room ledger. Returns the stored `Fact`.
+pub(crate) fn add_backlog_item(
+    room: &RoomStore,
+    tool: &str,
+    id: &str,
+    intent: &str,
+    owns: &[String],
+    depends_on: &[String],
+    status: Option<&str>,
+    target: Option<&str>,
+    expected_by: Option<&str>,
+) -> Result<Fact> {
+    validate_id(id)?;
+    let status = status.unwrap_or("open");
+    let fact = build_backlog_fact(
+        tool,
+        id,
+        intent,
+        owns,
+        depends_on,
+        status,
+        target,
+        expected_by,
+    );
+    room.append_fact_verified(&fact)
+}
+
+/// Update an existing backlog item by appending a same-id fact. Omitted fields
+/// inherit from the latest item so update facts remain self-contained.
+pub(crate) fn update_backlog_item(
+    room: &RoomStore,
+    tool: &str,
+    id: &str,
+    intent: Option<&str>,
+    owns: Option<&[String]>,
+    depends_on: Option<&[String]>,
+    status: Option<&str>,
+    target: Option<&str>,
+    expected_by: Option<&str>,
+) -> Result<Fact> {
+    validate_id(id)?;
+    let existing = list_backlog_items(room)?
+        .into_iter()
+        .find(|i| i.id == id)
+        .ok_or_else(|| RallyError::Usage(format!("no backlog item with id '{id}'")))?;
+
+    let intent = intent.unwrap_or(&existing.intent);
+    let owns = owns.unwrap_or(&existing.owns);
+    let depends_on = depends_on.unwrap_or(&existing.depends_on);
+    let status = status.unwrap_or(&existing.status);
+    let inherited_target = existing.target.as_deref();
+    let target = target.or(inherited_target);
+    let inherited_expected_by = existing.expected_by.as_deref();
+    let expected_by = expected_by.or(inherited_expected_by);
+
+    let fact = build_backlog_fact(
+        tool,
+        id,
+        intent,
+        owns,
+        depends_on,
+        status,
+        target,
+        expected_by,
+    );
     room.append_fact_verified(&fact)
 }
 
@@ -166,33 +260,16 @@ pub(crate) fn mark_backlog_done(room: &RoomStore, tool: &str, id: &str) -> Resul
             "backlog item '{id}' is already done"
         )));
     }
-    let mut scope = vec!["backlog-item".to_string()];
-    for path in &existing.owns {
-        scope.push(format!("owns:{path}"));
-    }
-    scope.sort();
-    scope.dedup();
-    let fact = Fact {
-        from_session_id: None,
-        schema: FACT_SCHEMA.to_string(),
-        event_id: new_id("backlog"),
-        seq: 0,
-        thread_id: format!("backlog-{}", id.chars().take(32).collect::<String>()),
-        kind: FactKind::BacklogItem,
-        tool: Some(tool.to_string()),
-        role: None,
-        subject: existing.intent.clone(),
-        scope,
-        created_at: now_string(),
-        summary: Some(format!("id:{id}")),
-        evidence: Vec::new(),
-        target: None,
-        ref_id: None,
-        status: Some("done".to_string()),
-        severity: None,
-        uri: None,
-        session: None,
-    };
+    let fact = build_backlog_fact(
+        tool,
+        id,
+        &existing.intent,
+        &existing.owns,
+        &existing.depends_on,
+        "done",
+        existing.target.as_deref(),
+        existing.expected_by.as_deref(),
+    );
     room.append_fact_verified(&fact)
 }
 
@@ -238,7 +315,18 @@ mod tests {
     #[test]
     fn backlog_done_marks_item_done() {
         let (room, _root) = test_room();
-        add_backlog_item(&room, "t", "X-1", "do the thing", &[], &[]).unwrap();
+        add_backlog_item(
+            &room,
+            "t",
+            "X-1",
+            "do the thing",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(list_backlog_items(&room).unwrap()[0].status, "open");
         mark_backlog_done(&room, "t", "X-1").unwrap();
         let item = list_backlog_items(&room)
@@ -281,6 +369,9 @@ mod tests {
             "implement the widget",
             &["crates/widget/src/lib.rs".to_string()],
             &[],
+            Some("planned"),
+            Some("codex"),
+            Some("2026-07-02T12:00:00Z"),
         )
         .unwrap();
         assert_eq!(fact.kind, FactKind::BacklogItem);
@@ -292,7 +383,9 @@ mod tests {
         assert_eq!(item.intent, "implement the widget");
         assert_eq!(item.owns, vec!["crates/widget/src/lib.rs"]);
         assert!(item.depends_on.is_empty());
-        assert_eq!(item.status, "open");
+        assert_eq!(item.status, "planned");
+        assert_eq!(item.target.as_deref(), Some("codex"));
+        assert_eq!(item.expected_by.as_deref(), Some("2026-07-02T12:00:00Z"));
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -301,7 +394,18 @@ mod tests {
     fn backlog_list_open_excludes_done_items() {
         let (room, root) = test_room();
 
-        add_backlog_item(&room, "tool-a", "dep-1", "dep task", &[], &[]).unwrap();
+        add_backlog_item(
+            &room,
+            "tool-a",
+            "dep-1",
+            "dep task",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         add_backlog_item(
             &room,
             "tool-a",
@@ -309,6 +413,9 @@ mod tests {
             "dependant task",
             &[],
             &["dep-1".to_string()],
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -347,10 +454,65 @@ mod tests {
     }
 
     #[test]
+    fn backlog_update_preserves_omitted_plan_fields() {
+        let (room, root) = test_room();
+
+        add_backlog_item(
+            &room,
+            "claude_code",
+            "plan-1",
+            "publish a live plan",
+            &["docs/ORCHESTRATION.md".to_string()],
+            &["dep-1".to_string()],
+            Some("planned"),
+            Some("codex"),
+            Some("noon"),
+        )
+        .unwrap();
+        update_backlog_item(
+            &room,
+            "codex",
+            "plan-1",
+            None,
+            None,
+            None,
+            Some("in_progress"),
+            None,
+            Some("next checkpoint"),
+        )
+        .unwrap();
+
+        let item = list_backlog_items(&room)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == "plan-1")
+            .unwrap();
+        assert_eq!(item.intent, "publish a live plan");
+        assert_eq!(item.owns, vec!["docs/ORCHESTRATION.md"]);
+        assert_eq!(item.depends_on, vec!["dep-1"]);
+        assert_eq!(item.target.as_deref(), Some("codex"));
+        assert_eq!(item.status, "in_progress");
+        assert_eq!(item.expected_by.as_deref(), Some("next checkpoint"));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn backlog_satisfied_ids_includes_done() {
         let (room, root) = test_room();
 
-        add_backlog_item(&room, "tool-a", "finished", "done task", &[], &[]).unwrap();
+        add_backlog_item(
+            &room,
+            "tool-a",
+            "finished",
+            "done task",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let done_fact = Fact {
             from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
