@@ -7,6 +7,24 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## v0.1.4 - 2026-07-02
+
+Ledger-integrity release. **Ends the duplicate-seq ledger-corruption class**: the
+seq allocator now allocates from the canonical segment high-water mark (max+1)
+under the room flock, instead of the derived `facts.db` row count — a count that
+undercounts whenever the ledger has a seq gap and thus deterministically collided
+with the live tail after any rebuild. Adds defense-in-depth: a last-line dup gate
+(loud `seq allocation conflict` error instead of a silent duplicate that bricks
+replay) and a fingerprinted fast path (the O(1) sidecar shortcut is taken only when
+its segment fingerprint still matches on disk, so a stale cache can never hand out a
+stale max regardless of caller order). Also: the **plan/status commitment bus** —
+`rally backlog add/update` gain `--target`/`--status`/`--expected-by`, and `rally
+next` surfaces targeted plan items as an actionable `update_plan_status` obligation
+so peers forecast ETAs and plan/ETA requests cannot sit unconsumed; a stale-wait fix
+(handoffs >24h or to takeover-eligible owners no longer force a wait); Codex⇄Claude
+SessionStart cadence parity and advisory-prompt noise-trim; and gitignore hygiene for
+runtime backups and local bundles.
+
 ## v0.1.3 - 2026-06-25
 
 Coordination engine: recency decay + size-scaled auto-reclaim, in-room stale-state
