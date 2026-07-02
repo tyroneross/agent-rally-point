@@ -987,6 +987,18 @@ impl RoomStore {
         let logical_seq =
             next_canonical_seq(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
         fact.seq = logical_seq;
+        // Defense-in-depth dup gate (2026-07-02): the allocated seq must exceed
+        // the active segment's on-disk tail. A stale cache or an old count-based
+        // allocator could hand out an already-used seq; fail LOUD here rather
+        // than write a duplicate that bricks replay for every reader.
+        if let Some(tail) = last_seq_in_segment(&self.active_segment_path())?
+            && fact.seq <= tail
+        {
+            return Err(RallyError::Message(format!(
+                "seq allocation conflict: allocated {} <= active segment tail {} — refusing to write a duplicate. Delete .rally/.reconcile-cache.json and retry.",
+                fact.seq, tail
+            )));
+        }
         let event_type = fact.kind.as_str().to_string();
         let payload = serde_json::to_value(&fact).map_err(RallyError::json("render fact"))?;
         // The room lock serializes Rally writers; keep a short retry for
@@ -1296,6 +1308,15 @@ impl RoomStore {
         let logical_seq =
             next_canonical_seq(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
         fact.seq = logical_seq;
+        // Defense-in-depth dup gate (2026-07-02) — see append_fact.
+        if let Some(tail) = last_seq_in_segment(&self.active_segment_path())?
+            && fact.seq <= tail
+        {
+            return Err(RallyError::Message(format!(
+                "seq allocation conflict: allocated {} <= active segment tail {} — refusing to write a duplicate. Delete .rally/.reconcile-cache.json and retry.",
+                fact.seq, tail
+            )));
+        }
         let payload =
             serde_json::to_value(&fact).map_err(RallyError::json("render session fact"))?;
         let result = fact_store.append_if(
@@ -2850,16 +2871,46 @@ fn segment_seq_stats(live: &[PathBuf], archived: &[PathBuf]) -> Result<SeqStats>
 }
 
 fn next_canonical_seq(log_dir: &Path, archive_dir: &Path, facts_db_path: &Path) -> Result<i64> {
+    let segments = read_segment_files(log_dir)?;
+    let archived = replay_archive_segments(archive_dir)?;
+    // Fast path ONLY when the sidecar's counts AND its segment fingerprint still
+    // match the on-disk segments — so the O(1) shortcut can never hand out a
+    // stale max regardless of caller order (defense-in-depth, 2026-07-02). The
+    // fingerprint compare is O(#files) stat, cheap; the fallback already reads
+    // these segments.
     if let Some(cache) = read_reconcile_cache(facts_db_path)
         && cache.canonical_count == cache.db_count
         && cache.canonical_max_seq == cache.db_max_seq
         && cache.canonical_max_seq >= 0
+        && cache.segments_fingerprint == segments_fingerprint(&segments, &archived)
     {
         return Ok(cache.canonical_max_seq + 1);
     }
-    let segments = read_segment_files(log_dir)?;
-    let archived = replay_archive_segments(archive_dir)?;
     Ok(segment_seq_stats(&segments, &archived)?.max_seq + 1)
+}
+
+/// Highest `seq` currently written to a segment file (its on-disk tail), or
+/// `None` when the segment is absent/empty. Used as a defense-in-depth dup gate:
+/// an allocated seq must always exceed the active segment's tail, else we would
+/// write a duplicate that bricks segment replay. Reads the (per-engagement,
+/// typically small) active segment; scans from the end for the last non-empty
+/// line.
+fn last_seq_in_segment(segment_path: &Path) -> Result<Option<i64>> {
+    if !segment_path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(segment_path)
+        .map_err(RallyError::io(format!("read {}", segment_path.display())))?;
+    for line in content.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: LedgerLine =
+            serde_json::from_str(line).map_err(RallyError::json("parse last segment line"))?;
+        return Ok(Some(entry.seq));
+    }
+    Ok(None)
 }
 
 /// Events currently held by the derived sqlite cache. Compared against
@@ -4552,6 +4603,86 @@ mod ledger_tests {
             engagement: Some(engagement.to_string()),
         };
         serde_json::to_string(&entry).unwrap()
+    }
+
+    #[test]
+    fn last_seq_in_segment_reads_tail_or_none() {
+        let root = unique_root("last-seq-tail");
+        // Absent segment → None.
+        let missing = root.join(".rally").join(LOG_DIRNAME).join("missing.jsonl");
+        assert_eq!(last_seq_in_segment(&missing).unwrap(), None);
+        // Segment with seqs [1,2,5] → Some(5) (the on-disk tail).
+        let lines = [
+            ledger_line(1, "decision", "e1", "alpha"),
+            ledger_line(2, "decision", "e2", "alpha"),
+            ledger_line(5, "decision", "e5", "alpha"),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_segment(&root, "log", "alpha.jsonl", &refs);
+        let seg = root.join(".rally").join(LOG_DIRNAME).join("alpha.jsonl");
+        assert_eq!(last_seq_in_segment(&seg).unwrap(), Some(5));
+    }
+
+    /// A higher seq written out-of-band (a peer / old binary) changes the
+    /// active segment's fingerprint. The next allocation MUST scan
+    /// authoritatively past that tail (GAP B fingerprint check) rather than
+    /// trust a stale sidecar — and never emit a duplicate (GAP A dup gate is
+    /// the last-resort backstop). Regression for the 2026-07-02 corruption.
+    #[test]
+    fn out_of_band_higher_seq_forces_authoritative_allocation() {
+        let root = unique_root("oob-higher-seq");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        for i in 1..=3 {
+            store
+                .append_fact(&make_fact(
+                    &format!("seed{i}"),
+                    FactKind::Decision,
+                    "src/",
+                    "seed",
+                ))
+                .unwrap();
+        }
+        assert_eq!(store.snapshot().unwrap().max_seq, 3);
+        // Out-of-band write of a HIGHER seq straight to the active segment.
+        append_segment_line(
+            &store.active_segment_path(),
+            &LedgerLine {
+                seq: 7,
+                occurred_at: now_string(),
+                event_type: "decision".to_string(),
+                payload: json!({
+                    "schema": fact_schema(),
+                    "event_id": "oob7",
+                    "seq": 7,
+                    "kind": "decision",
+                    "subject": "oob",
+                    "scope": ["src/"],
+                }),
+                engagement: Some("default".to_string()),
+            },
+        )
+        .unwrap();
+        // Must allocate ABOVE the out-of-band tail (8), never a stale 4.
+        let appended = store
+            .append_fact(&make_fact(
+                "after-oob",
+                FactKind::Artifact,
+                "src/",
+                "after",
+            ))
+            .unwrap();
+        assert_eq!(
+            appended.seq, 8,
+            "fingerprint mismatch must force an authoritative scan past the out-of-band tail"
+        );
+        let live = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
+        let archived =
+            replay_archive_segments(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
+        assert_eq!(
+            segment_seq_stats(&live, &archived).unwrap().max_seq,
+            8,
+            "ledger stays duplicate-free after out-of-band + normal append"
+        );
     }
 
     /// Inode of `.rally/facts.db`. A destructive rebuild deletes + recreates
