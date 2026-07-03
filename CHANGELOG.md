@@ -7,6 +7,24 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## v0.1.5 - 2026-07-03
+
+Hardening + Apple-Silicon-optimized release. **`rally backlog add/update` now
+validate `--status`**: an unknown value (e.g. `wip`) fails loud with the valid
+set instead of being stored silently and then dropping off the `rally next`
+plan/status obligation radar. **Release binaries are ~32% smaller** — a tuned
+`[profile.release]` (fat LTO + `codegen-units = 1` + `strip`) replaces the cargo
+defaults; the arm64 macOS binary drops 7.1 MB → 4.8 MB, and startup benefits on
+the hot hook path (`before-write`/`before-complete` run every commit). **The
+Intel `x86_64-apple-darwin` binary now cross-compiles on the arm64 `macos-14`
+runner** instead of the retiring native `macos-13` runner, which was starving in
+the GitHub queue (a v0.1.4 build waited ~5h and never scheduled) — the Intel
+target no longer depends on Intel-runner availability. CI hygiene: `release.yml`
+pins its checkout to the dispatched tag so a re-published release matches its tag
+commit, and all workflow actions move off the deprecated Node 20
+(`checkout@v7`, `setup-node@v6`, `attest-build-provenance@v4`,
+`action-gh-release@v3`).
+
 ## v0.1.4 - 2026-07-02
 
 Ledger-integrity release. **Ends the duplicate-seq ledger-corruption class**: the
