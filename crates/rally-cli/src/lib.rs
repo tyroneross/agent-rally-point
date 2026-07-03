@@ -5,11 +5,16 @@ use chrono::{SecondsFormat, Utc};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -117,6 +122,68 @@ const SCHEMA_DAG: &str = "agent-rally.command.dag.v1";
 const SCHEMA_WAKE_DUE: &str = "agent-rally.command.wake-due.v1";
 // Rank-11: room north-star + per-agent autonomy envelope
 const SCHEMA_MISSION: &str = "agent-rally.command.mission.v1";
+
+thread_local! {
+    static WATCHDOG_COMMIT_SIGNAL: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    static WATCHDOG_COMMIT_ARM_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct WatchdogCommitSignalGuard;
+
+impl Drop for WatchdogCommitSignalGuard {
+    fn drop(&mut self) {
+        WATCHDOG_COMMIT_SIGNAL.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+fn install_watchdog_commit_signal(signal: Arc<AtomicBool>) -> WatchdogCommitSignalGuard {
+    WATCHDOG_COMMIT_SIGNAL.with(|slot| {
+        *slot.borrow_mut() = Some(signal);
+    });
+    WatchdogCommitSignalGuard
+}
+
+struct WatchdogCommitArmGuard;
+
+impl Drop for WatchdogCommitArmGuard {
+    fn drop(&mut self) {
+        WATCHDOG_COMMIT_ARM_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
+
+fn arm_watchdog_command_commit() -> WatchdogCommitArmGuard {
+    WATCHDOG_COMMIT_ARM_DEPTH.with(|depth| {
+        depth.set(depth.get().saturating_add(1));
+    });
+    WatchdogCommitArmGuard
+}
+
+fn with_watchdog_command_commit<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = arm_watchdog_command_commit();
+    f()
+}
+
+pub(crate) fn mark_watchdog_command_commit() {
+    let armed = WATCHDOG_COMMIT_ARM_DEPTH.with(|depth| depth.get() > 0);
+    if !armed {
+        return;
+    }
+    WATCHDOG_COMMIT_SIGNAL.with(|slot| {
+        if let Some(signal) = slot.borrow().as_ref() {
+            signal.store(true, Ordering::SeqCst);
+        }
+    });
+    #[cfg(debug_assertions)]
+    if let Ok(ms) = env::var("RALLY_TEST_BLOCK_AFTER_COMMIT_MS") {
+        if let Ok(ms) = ms.trim().parse::<u64>() {
+            thread::sleep(Duration::from_millis(ms));
+        }
+    }
+}
 
 /// Default hard wall-clock budget for a single `rally` invocation, in
 /// milliseconds. Any command that has not returned within this budget is
@@ -315,9 +382,12 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
     // one advisory), but we surface a timeout note on stderr for visibility.
 
     let (tx, rx) = std::sync::mpsc::channel::<WatchdogResult>();
+    let commit_signal = Arc::new(AtomicBool::new(false));
+    let worker_commit_signal = Arc::clone(&commit_signal);
     let worker = thread::Builder::new()
         .name("rally-command".to_string())
         .spawn(move || {
+            let _commit_signal_guard = install_watchdog_commit_signal(worker_commit_signal);
             let result = match run_inner_with(&args) {
                 Ok(output) => {
                     let exit_code = output.exit_code;
@@ -360,15 +430,23 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
             // Either way we exit immediately, abandoning the worker thread;
             // the kernel reaps any fd/lock/child it held.
             match posture {
-                WatchdogPosture::FailOpen => {
+                WatchdogPosture::Open => {
                     emit_timeout_fail_open(wants_json, fail_open, timeout);
                     std::process::exit(0);
                 }
-                WatchdogPosture::FailClosedBeforeWrite => {
+                WatchdogPosture::ClosedBeforeWrite => {
                     emit_timeout_fail_closed_before_write(wants_json, timeout);
                     // Exit code mirrors `--strict` mode in the normal
                     // before-write gate (4 = a stop finding was raised).
                     // Wrappers translate this to "abort the write attempt".
+                    std::process::exit(4);
+                }
+                WatchdogPosture::ClosedMutation => {
+                    if commit_signal.load(Ordering::SeqCst) {
+                        emit_timeout_committed_mutation(wants_json, timeout);
+                        std::process::exit(0);
+                    }
+                    emit_timeout_fail_closed_mutation(wants_json, timeout);
                     std::process::exit(4);
                 }
             }
@@ -376,16 +454,17 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
     }
 }
 
-/// Watchdog timeout posture. Default is `FailOpen` (fail-open is the right
+/// Watchdog timeout posture. Default is `Open` (fail-open is the right
 /// posture for read-only / advisory commands — never hang the host tool).
-/// `FailClosedBeforeWrite` is opt-in and applies ONLY when the resolved
+/// `ClosedBeforeWrite` is opt-in and applies ONLY when the resolved
 /// subcommand is `check before-write`: the coordination gate's purpose is
 /// preventing two agents from clobbering one claimed path, so a stuck
 /// snapshot read better delays the write than silently allows it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WatchdogPosture {
-    FailOpen,
-    FailClosedBeforeWrite,
+    Open,
+    ClosedBeforeWrite,
+    ClosedMutation,
 }
 
 /// Resolve the watchdog posture for THIS invocation.
@@ -402,15 +481,13 @@ enum WatchdogPosture {
 /// set, so operators can override per-call without unsetting the env var.
 fn resolve_watchdog_posture(args: &[String], fail_open: bool) -> WatchdogPosture {
     if fail_open {
-        return WatchdogPosture::FailOpen;
+        return WatchdogPosture::Open;
     }
+    let stripped = strip_timeout_flag(args.to_vec());
     let env_opt_in = env::var("RALLY_BEFORE_WRITE_FAILCLOSED")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
         .unwrap_or(false);
     let flag_opt_in = args.iter().any(|a| a == "--fail-closed");
-    if !(env_opt_in || flag_opt_in) {
-        return WatchdogPosture::FailOpen;
-    }
     // Subcommand gate: only `check before-write` flips. Look at the first two
     // positional tokens; both must be present and equal to `check` then
     // `before-write` respectively. A bare `rally check` or any other phase
@@ -418,13 +495,54 @@ fn resolve_watchdog_posture(args: &[String], fail_open: bool) -> WatchdogPosture
     // fail-open. This mirrors the policy in `agents/build-orchestrator.md`
     // (gates #1–#2 in §"Keep going until done") which always fail-open on
     // ambiguous safety classification.
-    let mut positionals = args.iter().filter(|a| !a.starts_with('-'));
+    let mut positionals = stripped.iter().filter(|a| !a.starts_with('-'));
     let first = positionals.next().map(String::as_str);
     let second = positionals.next().map(String::as_str);
-    if first == Some("check") && second == Some("before-write") {
-        WatchdogPosture::FailClosedBeforeWrite
+    if (env_opt_in || flag_opt_in) && first == Some("check") && second == Some("before-write") {
+        WatchdogPosture::ClosedBeforeWrite
+    } else if is_fail_closed_mutation_invocation(&stripped) {
+        WatchdogPosture::ClosedMutation
     } else {
-        WatchdogPosture::FailOpen
+        WatchdogPosture::Open
+    }
+}
+
+fn has_arg(args: &[String], needle: &str) -> bool {
+    args.iter().any(|arg| arg == needle)
+}
+
+fn has_any_arg(args: &[String], needles: &[&str]) -> bool {
+    needles.iter().any(|needle| has_arg(args, needle))
+}
+
+fn first_positionals(args: &[String]) -> (Option<&str>, Option<&str>) {
+    let mut positionals = args.iter().filter(|arg| !arg.starts_with('-'));
+    (
+        positionals.next().map(String::as_str),
+        positionals.next().map(String::as_str),
+    )
+}
+
+fn is_fail_closed_mutation_invocation(args: &[String]) -> bool {
+    let (first, second) = first_positionals(args);
+    match first {
+        Some("say" | "enter" | "ack" | "adopt" | "route-findings" | "migrate-legacy") => true,
+        Some("inject" | "run") => !has_arg(args, "--dry-run"),
+        Some("stop") => !has_arg(args, "--dry-run"),
+        Some("rotate") => !has_arg(args, "--dry-run"),
+        Some("hooks") => matches!(second, Some("on" | "off" | "prompt")),
+        Some("init") => true,
+        Some("status") => second == Some("post"),
+        Some("backlog") => matches!(second, Some("add" | "update" | "done")),
+        Some("lead") => matches!(second, Some("handoff" | "assign" | "relinquish")),
+        Some("mission") => has_any_arg(args, &["--set", "--may", "--must-check"]),
+        Some("sessions") => {
+            has_arg(args, "--reap")
+                || (has_arg(args, "--reap-processes") && has_arg(args, "--apply"))
+        }
+        Some("check") => second == Some("liveness") && has_arg(args, "--enforce"),
+        Some("doctor" | "worktree-gc") => has_arg(args, "--apply"),
+        _ => false,
     }
 }
 
@@ -517,6 +635,62 @@ fn emit_timeout_fail_closed_before_write(wants_json: bool, timeout: Duration) {
         "rally: before-write hook exceeded {}ms wall-clock budget — failing CLOSED (RALLY_BEFORE_WRITE_FAILCLOSED is set; blocking write to prevent silent claim collision)",
         timeout.as_millis()
     );
+}
+
+fn emit_timeout_fail_closed_mutation(wants_json: bool, timeout: Duration) {
+    let message = format!(
+        "mutating command exceeded {}ms wall-clock budget before its primary durable append committed; failing closed so the caller does not treat a dropped write as success",
+        timeout.as_millis()
+    );
+    if wants_json {
+        let payload = json!({
+            "ok": false,
+            "product": "rally",
+            "command": "watchdog",
+            "error": {
+                "code": "watchdog-timeout-uncommitted-mutation",
+                "message": message,
+            },
+            "data": {
+                "watchdog": {
+                    "committed": false,
+                    "allow": false,
+                    "timeout_ms": timeout.as_millis(),
+                    "agent_visible": {
+                        "present": true,
+                        "severity": "stop",
+                        "message": "Rally mutation timed out before the durable append committed; retry after contention clears."
+                    }
+                }
+            }
+        });
+        println!("{payload}");
+    }
+    eprintln!("rally: {message}");
+}
+
+fn emit_timeout_committed_mutation(wants_json: bool, timeout: Duration) {
+    let message = format!(
+        "mutating command exceeded {}ms wall-clock budget after its primary durable append committed; projection/output was abandoned",
+        timeout.as_millis()
+    );
+    if wants_json {
+        let payload = json!({
+            "ok": true,
+            "product": "rally",
+            "command": "watchdog",
+            "data": {
+                "watchdog": {
+                    "committed": true,
+                    "projection_complete": false,
+                    "timeout_ms": timeout.as_millis(),
+                    "message": message,
+                }
+            }
+        });
+        println!("{payload}");
+    }
+    eprintln!("rally: {message}");
 }
 
 fn run_inner_with(args: &[String]) -> Result<Output> {
@@ -1101,7 +1275,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // attributed risk facts before this point — the re-order fixes all four
     // at once. The blocks still use `snapshot_before` (pre-presence) for their
     // dedup checks, so behavior is unchanged when none of them fire.
-    ensure_presence_tiered(&room, &tool, args.tier.as_deref())?;
+    with_watchdog_command_commit(|| ensure_presence_tiered(&room, &tool, args.tier.as_deref()))?;
 
     // Layer 2 — event-driven liveness-lease safety net: when a new agent joins,
     // opportunistically sweep detached `rally-*` orphan tmux sessions that the
@@ -1579,10 +1753,10 @@ fn command_say(args: SayArgs) -> Result<Output> {
     // stricter verified path that also asserts the projection flipped.
     // All other mutating facts go through append_fact_verified (segment readback
     // only — no projection assertion needed).
-    let fact = match kind {
-        FactKind::Release | FactKind::Resolve => room.append_state_transition_verified(&fact)?,
-        _ => room.append_fact_verified(&fact)?,
-    };
+    let fact = with_watchdog_command_commit(|| match kind {
+        FactKind::Release | FactKind::Resolve => room.append_state_transition_verified(&fact),
+        _ => room.append_fact_verified(&fact),
+    })?;
 
     // B18: append ONE durable risk fact for each external-intake detection so
     // the contamination event is permanently auditable.  Never blocks the write.
@@ -1979,7 +2153,7 @@ fn command_release_by_path(
         uri,
         session: None,
     };
-    let appended = room.append_state_transition_verified(&fact)?;
+    let appended = with_watchdog_command_commit(|| room.append_state_transition_verified(&fact))?;
     for (id, subj, _sc, _owner) in &match_meta {
         let takeover_note = if is_takeover {
             " (authorized takeover of stale-owner claim)"
@@ -2803,7 +2977,7 @@ fn command_status_post(json: bool, mut args: cli::StatusPostArgs) -> Result<Outp
         uri: None,
         session: None,
     };
-    let appended = room.append_fact_verified(&fact)?;
+    let appended = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
     let state = agent_state::project_presence_to_state(&appended)
         .unwrap_or(agent_state::AgentState::Idle { wake_after: None });
     let text = format!("status post tool={} seq={}", args.tool, appended.seq);
@@ -3328,6 +3502,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
             let mut released = Vec::new();
             let enforce_eligible = args.enforce && takeover_owners.contains(&sq_tool);
             if enforce_eligible {
+                let _commit_guard = arm_watchdog_command_commit();
                 for claim in &held {
                     let release = Fact {
                         from_session_id: None,
@@ -4054,7 +4229,9 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
     // Append the session fact under the same context-version race guard as
     // run uses.
     let fact = session_fact(&session, "active", None);
-    let landed_fact = room.append_session_fact_if_context(&fact, context_version)?;
+    let landed_fact = with_watchdog_command_commit(|| {
+        room.append_session_fact_if_context(&fact, context_version)
+    })?;
     if landed_fact.is_none() {
         return Err(RallyError::Message(
             "adopt: concurrent session-fact write detected; retry".to_string(),
@@ -4137,7 +4314,9 @@ fn reserve_numbered_session(
             daemon_socket: None,
         };
         let fact = session_fact(&session, "active", None);
-        if let Some(fact) = room.append_session_fact_if_context(&fact, context_version)? {
+        if let Some(fact) = with_watchdog_command_commit(|| {
+            room.append_session_fact_if_context(&fact, context_version)
+        })? {
             return Ok(ReservedSession {
                 fact: Some(fact),
                 session,
@@ -4310,7 +4489,9 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
         let mut count = 0;
         for (fact, view) in active_session_views(&room, args.bins.clone())? {
             if view.liveness == SessionLiveness::Stale {
-                append_stopped_session_record(&room, &view.session, &fact)?;
+                with_watchdog_command_commit(|| {
+                    append_stopped_session_record(&room, &view.session, &fact)
+                })?;
                 count += 1;
             }
         }
@@ -5131,6 +5312,7 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
         SessionAction::Stop => {
             let commands = backend_runner.stop_commands(&live_target);
             if !dry_run {
+                let _commit_guard = arm_watchdog_command_commit();
                 let _ = backend_runner.stop(&live_target);
                 // Cleanup the per-agent worktree (when present) before
                 // marking the session stopped.  Best-effort: warnings are
@@ -5579,7 +5761,7 @@ fn inject_content_fact(
     text: &str,
 ) -> Result<Fact> {
     let fact = make_inject_content_fact(sender_tool, recipient_tool, text);
-    room.append_fact_verified(&fact)
+    with_watchdog_command_commit(|| room.append_fact_verified(&fact))
 }
 
 /// Return the content fact without appending (dry-run path).
@@ -6368,6 +6550,53 @@ mod tests {
             resolve_watchdog_timeout(&argv(&["say", "handoff", "--subject", "inject"])),
             Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
         );
+    }
+
+    #[test]
+    fn watchdog_posture_classifies_mutations_without_fail_closed_opt_in() {
+        for cmd in [
+            argv(&["say", "handoff", "--subject", "x"]),
+            argv(&["enter", "--tool", "codex"]),
+            argv(&["ack", "--tool", "codex"]),
+            argv(&[
+                "route-findings",
+                "findings.json",
+                "--tool",
+                "scanner",
+                "--verified",
+            ]),
+            argv(&["status", "post", "--tool", "codex", "--state", "idle"]),
+            argv(&[
+                "backlog", "add", "--tool", "codex", "--id", "b1", "--intent", "x",
+            ]),
+            argv(&["lead", "assign", "--tool", "lead"]),
+            argv(&["mission", "--set", "north star"]),
+            argv(&["check", "liveness", "--enforce"]),
+        ] {
+            assert_eq!(
+                resolve_watchdog_posture(&cmd, false),
+                WatchdogPosture::ClosedMutation,
+                "{cmd:?} must fail closed as a mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn watchdog_posture_keeps_read_only_commands_fail_open() {
+        for cmd in [
+            argv(&["room", "--json"]),
+            argv(&["next", "--tool", "codex", "--json"]),
+            argv(&["lead", "show", "--json"]),
+            argv(&["check", "before-write", "--tool", "codex", "--json"]),
+            argv(&["check", "coordination", "--strict", "--json"]),
+            argv(&["sessions", "--json"]),
+        ] {
+            assert_eq!(
+                resolve_watchdog_posture(&cmd, false),
+                WatchdogPosture::Open,
+                "{cmd:?} must remain fail open"
+            );
+        }
     }
 
     fn unique_root(label: &str) -> PathBuf {
@@ -11309,17 +11538,19 @@ fn command_backlog(args: BacklogArgs) -> Result<Output> {
     match args.subcommand {
         BacklogSubcommand::Add(add_args) => {
             ensure_presence(&room, &add_args.tool)?;
-            let fact = add_backlog_item(
-                &room,
-                &add_args.tool,
-                &add_args.id,
-                &add_args.intent,
-                &add_args.owns,
-                &add_args.depends_on,
-                add_args.status.as_deref(),
-                add_args.target.as_deref(),
-                add_args.expected_by.as_deref(),
-            )?;
+            let fact = with_watchdog_command_commit(|| {
+                add_backlog_item(
+                    &room,
+                    &add_args.tool,
+                    &add_args.id,
+                    &add_args.intent,
+                    &add_args.owns,
+                    &add_args.depends_on,
+                    add_args.status.as_deref(),
+                    add_args.target.as_deref(),
+                    add_args.expected_by.as_deref(),
+                )
+            })?;
             let items = list_backlog_items(&room).unwrap_or_default();
             let text = format!(
                 "backlog add id={} intent={:?} seq={}",
@@ -11365,17 +11596,19 @@ fn command_backlog(args: BacklogArgs) -> Result<Output> {
             let owns = (!update_args.owns.is_empty()).then_some(update_args.owns.as_slice());
             let depends_on =
                 (!update_args.depends_on.is_empty()).then_some(update_args.depends_on.as_slice());
-            let fact = update_backlog_item(
-                &room,
-                &update_args.tool,
-                &update_args.id,
-                update_args.intent.as_deref(),
-                owns,
-                depends_on,
-                update_args.status.as_deref(),
-                update_args.target.as_deref(),
-                update_args.expected_by.as_deref(),
-            )?;
+            let fact = with_watchdog_command_commit(|| {
+                update_backlog_item(
+                    &room,
+                    &update_args.tool,
+                    &update_args.id,
+                    update_args.intent.as_deref(),
+                    owns,
+                    depends_on,
+                    update_args.status.as_deref(),
+                    update_args.target.as_deref(),
+                    update_args.expected_by.as_deref(),
+                )
+            })?;
             let items: Vec<_> = list_backlog_items(&room)
                 .unwrap_or_default()
                 .into_iter()
@@ -11397,7 +11630,9 @@ fn command_backlog(args: BacklogArgs) -> Result<Output> {
         }
         BacklogSubcommand::Done(done_args) => {
             ensure_presence(&room, &done_args.tool)?;
-            let fact = mark_backlog_done(&room, &done_args.tool, &done_args.id)?;
+            let fact = with_watchdog_command_commit(|| {
+                mark_backlog_done(&room, &done_args.tool, &done_args.id)
+            })?;
             let items: Vec<_> = list_backlog_items(&room)
                 .unwrap_or_default()
                 .into_iter()
@@ -11459,7 +11694,9 @@ fn command_route_findings(args: RouteFindingsArgs) -> Result<Output> {
 
     let room = RoomStore::open()?;
     ensure_presence(&room, &args.tool)?;
-    let routing = route_findings(&room, &args.tool, findings, args.verified)?;
+    let routing = with_watchdog_command_commit(|| {
+        route_findings(&room, &args.tool, findings, args.verified)
+    })?;
 
     let text = format!(
         "route-findings total={} routed={} unowned={}",
@@ -11660,7 +11897,7 @@ fn command_ack(args: AckArgs) -> Result<Output> {
         uri: None,
         session: None,
     };
-    let fact = room.append_fact_verified(&fact)?;
+    let fact = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
     let text = format!("ack recorded for {} (seq {})", args.tool, fact.seq);
     let body = envelope(
         "ack",
@@ -11755,7 +11992,7 @@ fn command_lead(args: LeadArgs) -> Result<Output> {
                 uri: None,
                 session: None,
             };
-            let fact = room.append_fact_verified(&fact)?;
+            let fact = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
             let text = format!(
                 "lead relinquished by {} (was {})",
                 r.tool,
@@ -11811,7 +12048,7 @@ fn set_lead(json: bool, t: &LeadTargetArgs, mode: &str) -> Result<Output> {
         uri: None,
         session: None,
     };
-    let fact = room.append_fact_verified(&fact)?;
+    let fact = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
     let text = format!(
         "lead {} -> {} (via {mode})",
         prior.as_deref().unwrap_or("<none>"),
@@ -11880,7 +12117,7 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
             uri: None,
             session: None,
         };
-        let appended = room.append_fact_verified(&fact)?;
+        let appended = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
         let text = format!("mission envelope set agent={agent} seq={}", appended.seq);
         let body = envelope(
             "mission",
@@ -11921,7 +12158,7 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
             uri: None,
             session: None,
         };
-        let appended = room.append_fact_verified(&fact)?;
+        let appended = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
         let text = format!("mission set seq={}", appended.seq);
         let body = envelope(
             "mission",

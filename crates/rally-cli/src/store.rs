@@ -770,9 +770,8 @@ impl RoomStore {
         // R1 → R5 migration (idempotent, see [`migrate_monolith_to_segments`]).
         migrate_monolith_to_segments(&legacy_ledger_path, &log_dir, &archive_dir)?;
 
-        reconcile_segments_and_db(&log_dir, &archive_dir, &fact_store_path)?;
-
-        let fact_store = open_fact_store(&fact_store_path)?;
+        let fact_store = open_fact_store_lenient(&fact_store_path)?;
+        seed_segments_from_db_if_absent(&log_dir, &archive_dir, &fact_store_path)?;
         let active_engagement = resolve_active_engagement_with_env(&dir, engagement);
         let store = Self {
             fact_store,
@@ -809,8 +808,8 @@ impl RoomStore {
         }
         let _guard = acquire_room_mutation_lock(&dir)?;
         migrate_monolith_to_segments(&legacy_ledger_path, &log_dir, &archive_dir)?;
-        reconcile_segments_and_db(&log_dir, &archive_dir, &fact_store_path)?;
-        let fact_store = open_fact_store(&fact_store_path)?;
+        let fact_store = open_fact_store_lenient(&fact_store_path)?;
+        seed_segments_from_db_if_absent(&log_dir, &archive_dir, &fact_store_path)?;
         let active_engagement = resolve_active_engagement(&dir);
         let store = Self {
             fact_store,
@@ -884,8 +883,7 @@ impl RoomStore {
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
-        reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
-        let fact_store = open_fact_store(&self.facts_db_path)?;
+        let fact_store = open_fact_store_lenient(&self.facts_db_path)?;
         let mut fact = fact.clone();
         // SEC-001 close: a takeover Release authorizes reclaiming a stale peer's
         // claim. Eligibility was judged on an UNLOCKED snapshot in
@@ -899,7 +897,7 @@ impl RoomStore {
             if let Some(stale_owners) = Self::takeover_owners_marker(&fact.evidence) {
                 let coord =
                     crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
-                let facts = facts_from_store(&fact_store)?;
+                let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
                 let fresh = snapshot_from_facts_with_policy(&facts, &coord, false);
                 for owner in &stale_owners {
                     let still_eligible = fresh
@@ -944,7 +942,7 @@ impl RoomStore {
                 if let Some(owner) = Self::reaper_marker(&fact.evidence, "owner") {
                     let coord = crate::hooks_config::resolve_coordination(&self.repo_root)
                         .unwrap_or_default();
-                    let facts = facts_from_store(&fact_store)?;
+                    let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
                     let fresh = snapshot_from_facts_with_policy(&facts, &coord, false);
                     // The specific claim this ClaimExpired closes (by ref).
                     let ref_id = fact.ref_id.as_deref();
@@ -974,7 +972,7 @@ impl RoomStore {
             }
         }
         if fact.kind == FactKind::Claim {
-            let facts = facts_from_store(&fact_store)?;
+            let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
             if let Some(conflict) = claim_authority::detect_conflict(&facts, &fact) {
                 return Err(RallyError::Usage(format!(
                     "claim conflict: {} already owns {}; existing claim {} conflicts with requested scope {}",
@@ -1033,6 +1031,7 @@ impl RoomStore {
                 engagement: Some(self.active_engagement.clone()),
             },
         )?;
+        crate::mark_watchdog_command_commit();
         // Refresh the reconcile sidecar while the flock is still held so the
         // NEXT op stays on the O(1) fast path. The db and active segment each
         // grew by exactly one event; carry the pre-append counts forward +1 and
@@ -1048,7 +1047,7 @@ impl RoomStore {
             fact.kind,
             FactKind::Claim | FactKind::Release | FactKind::Resolve | FactKind::ClaimExpired
         ) {
-            let facts = facts_from_store(&fact_store)?;
+            let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
             claim_authority::write_index_from_facts(&self.claim_index_path, &facts)
                 .map_err(|err| RallyError::Message(format!("write claim index: {err}")))?;
         }
@@ -1057,9 +1056,9 @@ impl RoomStore {
 
     /// After a successful single-event append, advance the reconcile sidecar in
     /// place: counts += 1, re-fingerprint the (now-grown) active segment + the
-    /// (now-grown) facts.db. Reads the pre-append sidecar that `reconcile`
-    /// established at the top of `append_fact`; if it's missing/inconsistent,
-    /// drops the sidecar so the next op re-scans authoritatively. Never errors.
+    /// (now-grown) facts.db. Reads the pre-append sidecar established by open
+    /// or a previous reconcile; if it's missing/inconsistent, drops the sidecar
+    /// so the next op re-scans authoritatively. Never errors.
     ///
     /// Non-Unix note: on non-Unix platforms the mutation lock is a no-op
     /// (see store.rs `acquire_room_mutation_lock` #[cfg(not(unix))]). A concurrent
@@ -1307,7 +1306,7 @@ impl RoomStore {
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
         reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
-        let fact_store = open_fact_store(&self.facts_db_path)?;
+        let fact_store = open_fact_store_lenient(&self.facts_db_path)?;
         let mut fact = fact.clone();
         let logical_seq =
             next_canonical_seq(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
@@ -1343,6 +1342,7 @@ impl RoomStore {
                         engagement: Some(self.active_engagement.clone()),
                     },
                 )?;
+                crate::mark_watchdog_command_commit();
                 self.refresh_reconcile_cache_after_append(fact.seq);
                 let _ = self.refresh_log_index();
                 let _ = self.refresh_index(fact.seq);
@@ -1354,7 +1354,14 @@ impl RoomStore {
     }
 
     pub(crate) fn facts(&self) -> Result<Vec<Fact>> {
-        facts_from_store(&self.fact_store)
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
+        let fact_store = open_fact_store_lenient(&self.facts_db_path)?;
+        facts_from_store(&fact_store)
     }
 
     #[allow(dead_code)]
@@ -1745,6 +1752,36 @@ fn facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
             Fact::from_value(record.payload, seq)
         })
         .collect()
+}
+
+fn facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> {
+    let live = read_segment_files(log_dir)?;
+    let archived = replay_archive_segments(archive_dir)?;
+    let mut entries: Vec<LedgerLine> = Vec::new();
+    for path in live.iter().chain(archived.iter()) {
+        let file =
+            fs::File::open(path).map_err(RallyError::io(format!("read {}", path.display())))?;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(RallyError::io(format!("read {}", path.display())))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(entry) = serde_json::from_str::<LedgerLine>(&line) else {
+                continue;
+            };
+            entries.push(entry);
+        }
+    }
+    entries.sort_by_key(|entry| entry.seq);
+    let mut facts = Vec::with_capacity(entries.len());
+    let mut seen = BTreeSet::<i64>::new();
+    for entry in entries {
+        if !seen.insert(entry.seq) {
+            continue;
+        }
+        facts.push(Fact::from_value(entry.payload, entry.seq)?);
+    }
+    Ok(facts)
 }
 
 fn handoff_closer_matches_target(handoff: &Fact, closer: &Fact) -> bool {
@@ -2230,6 +2267,17 @@ fn open_fact_store(path: &Path) -> Result<SqliteStore> {
     }
 }
 
+fn open_fact_store_lenient(path: &Path) -> Result<SqliteStore> {
+    match open_fact_store(path) {
+        Ok(store) => Ok(store),
+        Err(err) if is_malformed_db_error(&err) => {
+            quarantine_corrupt_db(path)?;
+            open_fact_store(path)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn is_bootstrap_metadata_race(err: &impl std::fmt::Display) -> bool {
     err.to_string()
         .contains("UNIQUE constraint failed: store_metadata.key")
@@ -2575,9 +2623,41 @@ fn write_reconcile_cache(facts_db_path: &Path, cache: &ReconcileCache) -> Result
     }
 }
 
+fn seed_segments_from_db_if_absent(
+    log_dir: &Path,
+    archive_dir: &Path,
+    facts_db_path: &Path,
+) -> Result<()> {
+    let segments = read_segment_files(log_dir)?;
+    let archived = replay_archive_segments(archive_dir)?;
+    if !segments.is_empty() || !archived.is_empty() {
+        return Ok(());
+    }
+
+    let db_stats = read_db_event_stats(facts_db_path)?;
+    if db_stats.count > 0 {
+        seed_segment_from_db(log_dir, facts_db_path)?;
+        refresh_reconcile_cache_after_full_scan(log_dir, archive_dir, facts_db_path, db_stats);
+        return Ok(());
+    }
+
+    let cache = ReconcileCache {
+        segments_fingerprint: segments_fingerprint(&segments, &archived),
+        db_fingerprint: fingerprint_db(facts_db_path),
+        canonical_count: 0,
+        canonical_max_seq: 0,
+        db_count: 0,
+        db_max_seq: 0,
+    };
+    let _ = write_reconcile_cache(facts_db_path, &cache);
+    Ok(())
+}
+
 /// Reconcile the canonical segment set with the derived sqlite cache.
 ///
-/// Called on every `RoomStore::open_at` / `open_existing_at` / `append_fact`.
+/// Called by read projections and targeted repair paths. Hot opens/appends use
+/// cheaper cache-open plus canonical segment readback; they do not run this
+/// full reconcile on every invocation.
 /// The contract is:
 ///
 /// * Segments ahead of db (incl. db absent) → rebuild db by replaying segments.
