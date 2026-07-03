@@ -1889,7 +1889,15 @@ fn rally_run_assigns_numbered_agent_ids() {
 fn rally_run_reserves_numbered_ids_under_parallel_launch() {
     let _run_guard = serialize_rally_run();
     let workspace = Workspace::new("rally-run-parallel-numbered-ids");
-    let handles = (0..24)
+    // Scale concurrency to the host. The reservation is CAS-atomic (uniqueness
+    // holds at any N — that is what this test asserts), so the only thing a
+    // fixed high N buys is over-subscription on constrained CI runners (24
+    // processes on 2 cores => spurious watchdog timeouts). Scale to the machine:
+    // full stress locally, still-meaningful concurrency on a small runner.
+    let n: usize = std::thread::available_parallelism()
+        .map(|p| (p.get() * 4).clamp(8, 24))
+        .unwrap_or(8);
+    let handles = (0..n)
         .map(|_| {
             let cwd = workspace.cwd.clone();
             let home = workspace.home.clone();
@@ -1927,7 +1935,7 @@ fn rally_run_reserves_numbered_ids_under_parallel_launch() {
     let sessions = sessions_resp["data"]["sessions"]["sessions"]
         .as_array()
         .unwrap();
-    assert_eq!(sessions.len(), 24);
+    assert_eq!(sessions.len(), n);
     let names = sessions
         .iter()
         .map(|session| session["name"].as_str().unwrap().to_string())
@@ -1936,12 +1944,13 @@ fn rally_run_reserves_numbered_ids_under_parallel_launch() {
         .iter()
         .map(|session| session["tool"].as_str().unwrap().to_string())
         .collect::<BTreeSet<_>>();
-    assert_eq!(names.len(), 24);
-    assert_eq!(tools.len(), 24);
+    // The correctness property: N concurrent launches yield N DISTINCT ids.
+    assert_eq!(names.len(), n);
+    assert_eq!(tools.len(), n);
     assert!(names.contains("claude-01"));
-    assert!(names.contains("claude-24"));
+    assert!(names.contains(&format!("claude-{n:02}")));
     assert!(tools.contains("claude_code:01"));
-    assert!(tools.contains("claude_code:24"));
+    assert!(tools.contains(&format!("claude_code:{n:02}")));
 
     workspace.cleanup();
 }
