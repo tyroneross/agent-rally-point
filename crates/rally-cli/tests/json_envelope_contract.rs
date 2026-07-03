@@ -405,6 +405,16 @@ fn envelope_whoami() {
     ws.cleanup();
 }
 
+/// `owners --dirty` — read-only; returns empty dirty ownership on fake-git rooms.
+#[test]
+fn envelope_owners_dirty() {
+    let ws = Workspace::new("owners");
+    let body = ws.json(&["owners", "--dirty", "--json"]);
+    assert_envelope_contract("owners", &body);
+    assert_eq!(body["schema"], "agent-rally.command.owners.v1");
+    ws.cleanup();
+}
+
 /// `mission` GET — read-only; works on empty room.
 #[test]
 fn envelope_mission_get() {

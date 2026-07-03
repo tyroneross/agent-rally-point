@@ -13,6 +13,8 @@ const LEASE_EVIDENCE_PREFIX: &str = "lease_expires_at:";
 pub(crate) struct ActiveClaimRecord {
     pub(crate) claim_id: String,
     pub(crate) owner_tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) from_session_id: Option<String>,
     pub(crate) raw_scope: Vec<String>,
     pub(crate) resource_scopes: Vec<ResourceScope>,
     pub(crate) lease_expires_at: Option<String>,
@@ -119,6 +121,7 @@ pub(crate) fn active_claim_record_from_fact(fact: &Fact) -> Option<ActiveClaimRe
     Some(ActiveClaimRecord {
         claim_id: fact.event_id.clone(),
         owner_tool: fact.tool.clone(),
+        from_session_id: fact.from_session_id.clone(),
         raw_scope: fact.scope.clone(),
         resource_scopes,
         lease_expires_at: lease_expires_at(fact),
@@ -280,6 +283,19 @@ mod tests {
         let existing = fact("claim-a", "tool-a", vec!["file:src/lib.rs"]);
         let incoming = fact("claim-b", "tool-a", vec!["file:./src/lib.rs"]);
         assert!(detect_conflict(&[existing], &incoming).is_none());
+    }
+
+    #[test]
+    fn active_claim_record_preserves_authoring_session_id() {
+        let mut claim = fact("claim-a", "tool-a", vec!["file:src/lib.rs"]);
+        claim.from_session_id = Some("sess:term:host:abc#live".to_string());
+
+        let record = active_claim_record_from_fact(&claim).unwrap();
+
+        assert_eq!(
+            record.from_session_id.as_deref(),
+            Some("sess:term:host:abc#live")
+        );
     }
 
     #[test]

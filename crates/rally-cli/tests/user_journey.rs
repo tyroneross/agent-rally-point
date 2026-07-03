@@ -3905,6 +3905,76 @@ fn rally_whoami_with_tool_reflects_tool_in_output() {
     workspace.cleanup();
 }
 
+#[test]
+fn rally_owners_dirty_maps_dirty_path_to_claim_session() {
+    if !git_available() {
+        return;
+    }
+    let workspace = real_repo_workspace("rally-owners-dirty");
+    let src_dir = workspace.cwd.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(src_dir.join("lib.rs"), "pub fn value() -> i32 { 1 }\n").unwrap();
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(&workspace.cwd)
+        .args(["add", "src/lib.rs"])
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let commit = Command::new("git")
+        .arg("-C")
+        .arg(&workspace.cwd)
+        .args(["commit", "-q", "-m", "add lib"])
+        .output()
+        .unwrap();
+    assert!(
+        commit.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+
+    let claim = workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "codex:worker-01",
+        "--subject",
+        "work on lib",
+        "--path",
+        "src/lib.rs",
+    ]);
+    let claim_id = claim["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_session_id = claim["data"]["say"]["fact"]["from_session_id"]
+        .as_str()
+        .expect("claim must be stamped with authoring session id")
+        .to_string();
+
+    fs::write(src_dir.join("lib.rs"), "pub fn value() -> i32 { 2 }\n").unwrap();
+
+    let owners = workspace.json(&["owners", "--dirty", "--json"]);
+    assert_eq!(owners["schema"], "agent-rally.command.owners.v1");
+    let dirty = owners["data"]["owners"]["dirty"].as_array().unwrap();
+    let row = dirty
+        .iter()
+        .find(|row| row["path"] == "src/lib.rs" && row["claim_id"] == claim_id)
+        .unwrap_or_else(|| panic!("dirty owner row missing; body={owners:#}"));
+    assert_eq!(row["owner_tool"], "codex:worker-01");
+    assert_eq!(row["from_session_id"], from_session_id);
+    assert_eq!(row["owner_status"], "active");
+    assert_eq!(row["lease_expired"], false);
+    assert_eq!(row["is_owner_live"], true);
+
+    workspace.cleanup();
+}
+
 // =============================================================================
 // Rank-11: rally mission — room north-star + per-agent autonomy envelope
 // =============================================================================

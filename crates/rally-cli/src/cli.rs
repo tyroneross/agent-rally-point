@@ -39,6 +39,8 @@ pub(crate) enum CliCommand {
     WakeDue(WakeDueArgs),
     /// B-whoami: identity report — repo_root, repo_id, worktree, build_id, cwd.
     Whoami(WhoamiArgs),
+    /// Dirty checkout ownership projection.
+    Owners(OwnersArgs),
     /// Rank-11: room north-star + per-agent autonomy envelope.
     Mission(MissionArgs),
     Lead(LeadArgs),
@@ -237,6 +239,15 @@ pub(crate) struct WhoamiArgs {
     pub(crate) json: bool,
     /// Optional tool/role label to echo back in the output.
     pub(crate) tool: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OwnersArgs {
+    pub(crate) json: bool,
+    /// Project current git dirty paths against active claims.
+    pub(crate) dirty: bool,
+    /// Backend binaries used to probe managed-session liveness.
+    pub(crate) bins: BackendBins,
 }
 
 #[derive(Clone, Debug)]
@@ -673,6 +684,8 @@ const COMMANDS: &[&str] = &[
     "wake-due",
     // B-whoami: identity report
     "whoami",
+    // Dirty checkout ownership projection.
+    "owners",
     // Rank-11: room north-star + per-agent autonomy envelope
     "mission",
     // Lead-agent title surface (L-2)
@@ -841,6 +854,12 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .command("whoami")
         .map(CliCommand::Whoami);
 
+    let owners = owners_parser()
+        .to_options()
+        .descr("Read-only ownership projection: map dirty git paths to active claim owners and session liveness.")
+        .command("owners")
+        .map(CliCommand::Owners);
+
     // Work surface commands (appended — do not reorder above)
     let backlog = backlog_parser()
         .to_options()
@@ -929,6 +948,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
         dag,
         wake_due,
         whoami,
+        owners,
         mission,
         lead,
         ack,
@@ -1387,6 +1407,15 @@ fn sessions_parser() -> impl Parser<SessionsArgs> {
         apply,
         bins
     })
+}
+
+fn owners_parser() -> impl Parser<OwnersArgs> {
+    let json = json_flag();
+    let dirty = long("dirty")
+        .help("Map current git dirty paths to active claims and owner/session liveness")
+        .switch();
+    let bins = backend_bins_parser();
+    construct!(OwnersArgs { json, dirty, bins })
 }
 
 fn inject_parser() -> impl Parser<InjectArgs> {

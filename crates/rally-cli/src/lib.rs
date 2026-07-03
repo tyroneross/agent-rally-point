@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -103,6 +103,7 @@ const SCHEMA_MIGRATE_LEGACY: &str = "agent-rally.command.migrate-legacy.v1";
 const SCHEMA_DOCTOR: &str = "agent-rally.command.doctor.v1";
 const SCHEMA_VERSION: &str = "agent-rally.command.version.v1";
 const SCHEMA_WHOAMI: &str = "agent-rally.command.whoami.v1";
+const SCHEMA_OWNERS: &str = "agent-rally.command.owners.v1";
 // Work surface schemas
 const SCHEMA_BACKLOG: &str = "agent-rally.command.backlog.v1";
 const SCHEMA_LEAD: &str = "agent-rally.command.lead.v1";
@@ -576,6 +577,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::WakeDue(args) => command_wake_due(args),
         // B-whoami: identity report
         CliCommand::Whoami(args) => command_whoami(args),
+        CliCommand::Owners(args) => command_owners(args),
         // Rank-11: room north-star + per-agent autonomy envelope
         CliCommand::Mission(args) => command_mission(args),
         CliCommand::Lead(args) => command_lead(args),
@@ -2394,6 +2396,184 @@ fn command_whoami(args: WhoamiArgs) -> Result<Output> {
         },
     )?;
     Ok(Output::new(args.json, text, body))
+}
+
+fn command_owners(args: OwnersArgs) -> Result<Output> {
+    if !args.dirty {
+        return Err(RallyError::Usage(
+            "rally owners currently requires --dirty".to_string(),
+        ));
+    }
+    let root = repo_root()?;
+    let room = RoomStore::open()?;
+    let snapshot = room.snapshot()?;
+    let session_views = read_session_views(&room, args.bins)?;
+    let dirty_paths = dirty_git_paths(&root);
+    let dirty = build_dirty_owners(&snapshot, &session_views, &dirty_paths);
+    let claimed_paths: BTreeSet<String> = dirty.iter().map(|owner| owner.path.clone()).collect();
+    let unclaimed_dirty_paths = dirty_paths
+        .iter()
+        .filter(|path| !claimed_paths.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let dirty_len = dirty.len();
+    let unclaimed_len = unclaimed_dirty_paths.len();
+    let body = envelope(
+        "owners",
+        SCHEMA_OWNERS,
+        OwnersData {
+            owners: OwnersPayload {
+                mode: "dirty",
+                dirty_paths,
+                dirty,
+                unclaimed_dirty_paths,
+            },
+        },
+    )?;
+    let text = format!("owners dirty={dirty_len} unclaimed={unclaimed_len}");
+    Ok(Output::new(args.json, text, body))
+}
+
+fn dirty_git_paths(root: &Path) -> Vec<String> {
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_git_porcelain_z(&output.stdout)
+}
+
+fn parse_git_porcelain_z(stdout: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut entries = stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty());
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let x = entry[0] as char;
+        let y = entry[1] as char;
+        let path = String::from_utf8_lossy(&entry[3..])
+            .replace('\\', "/")
+            .trim()
+            .to_string();
+        if !path.is_empty() && !paths.contains(&path) {
+            paths.push(path);
+        }
+        if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
+            let _ = entries.next();
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn build_dirty_owners(
+    snapshot: &RoomSnapshot,
+    session_views: &[SessionView],
+    dirty_paths: &[String],
+) -> Vec<DirtyOwner> {
+    let mut rows = Vec::new();
+    for path in dirty_paths {
+        for claim in &snapshot.active_claims {
+            if !claim
+                .scope
+                .iter()
+                .any(|scope| path_matches_scope(scope, path))
+            {
+                continue;
+            }
+            let Some(record) = claim_authority::active_claim_record_from_fact(claim) else {
+                continue;
+            };
+            let owner_status = record.owner_tool.as_deref().and_then(|owner| {
+                snapshot
+                    .squads
+                    .iter()
+                    .find(|squad| squad.tool == owner)
+                    .map(|squad| squad.status.clone())
+            });
+            let (session_liveness, liveness_source) =
+                claim_session_liveness(&record, session_views);
+            let lease_expired = record
+                .lease_expires_at
+                .as_deref()
+                .is_some_and(lease_is_expired);
+            let is_owner_live =
+                owner_live_decision(owner_status.as_deref(), session_liveness, lease_expired);
+            rows.push(DirtyOwner {
+                path: path.clone(),
+                claim_id: record.claim_id,
+                owner_tool: record.owner_tool,
+                from_session_id: record.from_session_id,
+                owner_status,
+                lease_expires_at: record.lease_expires_at,
+                lease_expired,
+                session_liveness,
+                liveness_source,
+                is_owner_live,
+                scope: claim.scope.clone(),
+                subject: claim.subject.clone(),
+            });
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.claim_id.cmp(&b.claim_id))
+    });
+    rows
+}
+
+fn claim_session_liveness(
+    claim: &claim_authority::ActiveClaimRecord,
+    session_views: &[SessionView],
+) -> (Option<SessionLiveness>, Option<&'static str>) {
+    let by_session = claim.from_session_id.as_deref().and_then(|session_id| {
+        session_views
+            .iter()
+            .find(|view| view.session.session_id == session_id)
+    });
+    let by_tool = claim.owner_tool.as_deref().and_then(|owner| {
+        session_views
+            .iter()
+            .find(|view| view.session.tool == owner && view.liveness == SessionLiveness::Live)
+            .or_else(|| session_views.iter().find(|view| view.session.tool == owner))
+    });
+    by_session
+        .or(by_tool)
+        .map(|view| (Some(view.liveness), Some(view.liveness_source)))
+        .unwrap_or((None, None))
+}
+
+fn lease_is_expired(raw: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc) <= Utc::now())
+        .unwrap_or(false)
+}
+
+fn owner_live_decision(
+    owner_status: Option<&str>,
+    session_liveness: Option<SessionLiveness>,
+    lease_expired: bool,
+) -> Option<bool> {
+    if owner_status == Some("active") || session_liveness == Some(SessionLiveness::Live) {
+        return Some(true);
+    }
+    if session_liveness == Some(SessionLiveness::Stale)
+        || (lease_expired && owner_status == Some("idle"))
+    {
+        return Some(false);
+    }
+    None
 }
 
 fn resolve_repo_id(repo_root: Option<&Path>) -> String {
@@ -10719,6 +10899,37 @@ struct WhoamiData {
 }
 
 #[derive(JsonSchema, Serialize)]
+struct OwnersData {
+    owners: OwnersPayload,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct OwnersPayload {
+    mode: &'static str,
+    dirty_paths: Vec<String>,
+    dirty: Vec<DirtyOwner>,
+    unclaimed_dirty_paths: Vec<String>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct DirtyOwner {
+    path: String,
+    claim_id: String,
+    owner_tool: Option<String>,
+    from_session_id: Option<String>,
+    owner_status: Option<String>,
+    lease_expires_at: Option<String>,
+    lease_expired: bool,
+    session_liveness: Option<SessionLiveness>,
+    liveness_source: Option<&'static str>,
+    /// `true` = active heartbeat or live backend; `false` = stale backend or
+    /// expired lease with idle owner; `null` = Rally lacks enough evidence.
+    is_owner_live: Option<bool>,
+    scope: Vec<String>,
+    subject: String,
+}
+
+#[derive(JsonSchema, Serialize)]
 struct NextData {
     tool: String,
     role: Option<String>,
@@ -11842,6 +12053,7 @@ fn help_text() -> String {
         "              [--once] [--duration-hours <h>] [--json] [--print-launchd] [--print-systemd]",
         "  rally version [--json]  # print build-id (version + git hash); exits 0",
         "  rally whoami [--tool <id>] [--json]  # repo_root, repo_id, worktree, build_id, cwd; exits 0",
+        "  rally owners --dirty [--json] [--tmux-bin <path>] [--cmux-bin <path>]  # map dirty git paths to claim owners + session liveness",
         "  rally backlog add --tool <tool> --id <id> --intent <text> [--target <tool>] [--status <open|planned|in_progress|blocked|done>] [--expected-by <when>] [--owns <path>] [--depends-on <id>] [--json]",
         "  rally backlog update --tool <tool> --id <id> [--status <open|planned|in_progress|blocked|done>] [--expected-by <when>] [--target <tool>] [--intent <text>] [--json]",
         "  rally backlog list [--json]",
