@@ -132,6 +132,23 @@ fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The closed set of valid backlog statuses (matches the module-doc contract and
+/// `rally next`'s actionable-status filter). Kept as the single source of truth
+/// so an unrecognized `--status` (e.g. `wip`) fails loud instead of being stored
+/// and silently dropping off the plan/status obligation radar.
+const VALID_STATUSES: [&str; 5] = ["open", "planned", "in_progress", "blocked", "done"];
+
+fn validate_status(status: &str) -> Result<()> {
+    if VALID_STATUSES.contains(&status) {
+        Ok(())
+    } else {
+        Err(RallyError::Usage(format!(
+            "--status must be one of {}; got {status:?}",
+            VALID_STATUSES.join("|")
+        )))
+    }
+}
+
 fn build_backlog_fact(
     tool: &str,
     id: &str,
@@ -192,6 +209,9 @@ pub(crate) fn add_backlog_item(
     expected_by: Option<&str>,
 ) -> Result<Fact> {
     validate_id(id)?;
+    if let Some(status) = status {
+        validate_status(status)?;
+    }
     let status = status.unwrap_or("open");
     let fact = build_backlog_fact(
         tool,
@@ -220,6 +240,9 @@ pub(crate) fn update_backlog_item(
     expected_by: Option<&str>,
 ) -> Result<Fact> {
     validate_id(id)?;
+    if let Some(status) = status {
+        validate_status(status)?;
+    }
     let existing = list_backlog_items(room)?
         .into_iter()
         .find(|i| i.id == id)
@@ -387,6 +410,69 @@ mod tests {
         assert_eq!(item.target.as_deref(), Some("codex"));
         assert_eq!(item.expected_by.as_deref(), Some("2026-07-02T12:00:00Z"));
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn backlog_add_rejects_invalid_status() {
+        let (room, root) = test_room();
+        let err = add_backlog_item(
+            &room, "t", "task-1", "do it", &[], &[], Some("wip"), None, None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RallyError::Usage(msg) if msg.contains("--status must be one of")),
+            "invalid --status must fail loud, not be stored"
+        );
+        assert!(
+            list_backlog_items(&room).unwrap().is_empty(),
+            "no fact is appended when status is invalid"
+        );
+        // Every valid status is accepted.
+        for status in VALID_STATUSES {
+            add_backlog_item(
+                &room,
+                "t",
+                &format!("ok-{status}"),
+                "do it",
+                &[],
+                &[],
+                Some(status),
+                None,
+                None,
+            )
+            .unwrap_or_else(|_| panic!("valid status {status:?} must be accepted"));
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn backlog_update_rejects_invalid_status() {
+        let (room, root) = test_room();
+        add_backlog_item(&room, "t", "task-1", "do it", &[], &[], None, None, None).unwrap();
+        let err = update_backlog_item(
+            &room,
+            "t",
+            "task-1",
+            None,
+            None,
+            None,
+            Some("wip"),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RallyError::Usage(msg) if msg.contains("--status must be one of")),
+            "invalid --status on update must fail loud"
+        );
+        // The item keeps its prior status; no bad fact was appended.
+        let item = list_backlog_items(&room)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == "task-1")
+            .unwrap();
+        assert_eq!(item.status, "open");
         std::fs::remove_dir_all(root).ok();
     }
 
