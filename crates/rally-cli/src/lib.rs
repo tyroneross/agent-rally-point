@@ -4828,13 +4828,24 @@ fn command_inject_ledger(
     };
     let ack_state = inject_ack_state(effective_require_ack, dry_run, ack.as_ref());
     let verified_received = inject_verified_received(ack.as_ref());
+    // Sender observability: prefer an ack-timeout plan when --require-ack is set;
+    // otherwise (plain inject on the ledger_only path) still surface the async
+    // delivery contract so `ok:true` + `delivered:false` is not misread as a live
+    // delivery. Skipped on dry-run and on a failed ledger write.
     let fallback_plan = inject_fallback_plan(
         effective_require_ack,
         dry_run,
         handoff.as_deref(),
         &agent_id,
         ack.as_ref(),
-    );
+    )
+    .or_else(|| {
+        if dry_run || delivery_state != "pending" {
+            None
+        } else {
+            Some(ledger_async_fallback_plan(&agent_id))
+        }
+    });
     let inject_payload = InjectData {
         mode: if dry_run { "dry-run" } else { "inject" },
         session: None,
@@ -5878,6 +5889,36 @@ fn inject_fallback_plan(
     handoff.map(|handoff| ack_timeout_fallback_plan(handoff, expected_tool, 0))
 }
 
+/// Sender-observability plan for the `ledger_only` inject path (any tool id;
+/// agent-neutral). The ledger arm never runs a synchronous backend, so
+/// `delivered` is always `false` and `delivery_state` is `pending`. Without a
+/// populated `fallback_plan` a caller can misread `ok:true` as a live delivery.
+/// This makes the async contract explicit: the message is durably queued and is
+/// consumed when the target next runs `rally next`/`enter`; for guaranteed live
+/// delivery the target must be a managed session (`rally run` / `rally adopt`).
+fn ledger_async_fallback_plan(agent_id: &str) -> Value {
+    json!({
+        "trigger": "ledger_only_delivery",
+        "assumption": "queued_not_live_delivered",
+        "target": agent_id,
+        "meaning": format!(
+            "message was durably queued to the ledger for {agent_id}, NOT delivered to a live session; delivered=false / delivery_state=pending is expected on this path"
+        ),
+        "delivered_when": format!(
+            "{agent_id} picks it up on its next `rally next`/`rally enter` (or its registered rally-termd pane delivers it)"
+        ),
+        "checks": [
+            format!("rally next --tool {agent_id} --json; confirm the target surfaces this handoff"),
+            "rally room --json; confirm the target squad is active (not stale/absent)"
+        ],
+        "for_live_delivery": [
+            format!("launch the target as a managed session: `rally run <agent>` (mints an injectable pane for {agent_id})"),
+            format!("or adopt an already-running pane: `rally adopt {agent_id} --tmux <target>`"),
+            "for anything time-sensitive, ALSO post a durable `rally say handoff` (dual-channel)"
+        ]
+    })
+}
+
 fn ack_timeout_fallback_plan(handoff: &str, expected_tool: &str, timeout_seconds: u64) -> Value {
     json!({
         "trigger": "ack_timeout",
@@ -5974,6 +6015,37 @@ mod tests {
             d > Duration::from_millis(MAX_WATCHDOG_TIMEOUT_MS),
             "inject budget must be allowed to exceed the 60s hook cap"
         );
+    }
+
+    // ---- ledger_only sender-observability (RCA2 P0-corrected) -------------
+
+    #[test]
+    fn ledger_async_fallback_plan_is_agent_neutral_and_actionable() {
+        // The fix for "ok:true + delivered:false is misreadable as delivered":
+        // the ledger_only path must always carry a fallback_plan explaining the
+        // async contract + how to get live delivery. Agent-neutral: identical
+        // shape for any tool id (codex:*, claude_code:*, gemini:*).
+        for id in ["codex:42", "claude_code:4f6d8c1a", "gemini:build-01"] {
+            let plan = ledger_async_fallback_plan(id);
+            assert_eq!(plan["trigger"], "ledger_only_delivery");
+            assert_eq!(plan["assumption"], "queued_not_live_delivered");
+            assert_eq!(plan["target"], id, "plan must name the target id");
+            assert!(
+                plan["delivered_when"].as_str().unwrap().contains(id),
+                "must tell the sender when {id} actually receives it"
+            );
+            let live = plan["for_live_delivery"].as_array().unwrap();
+            assert!(
+                live.iter()
+                    .any(|s| s.as_str().unwrap().contains("rally run")),
+                "must offer `rally run` as the live-delivery remediation"
+            );
+            assert!(
+                live.iter()
+                    .any(|s| s.as_str().unwrap().contains("rally adopt")),
+                "must offer `rally adopt` as the live-delivery remediation"
+            );
+        }
     }
 
     #[test]
