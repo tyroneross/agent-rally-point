@@ -39,9 +39,15 @@ jobs:
             target: aarch64-apple-darwin
             cross: false
 
-          # macOS x86_64 (Intel) — macos-13 is the last Intel macOS runner
+          # macOS x86_64 (Intel) — cross-compiled on the arm64 macos-14 runner.
+          # GitHub is retiring the native Intel `macos-13` runner; it starves in
+          # the queue (a v0.1.4 run waited ~5h and never got one). Rust + the
+          # universal Xcode toolchain on Apple Silicon emit a valid x86_64 Mach-O
+          # via `cargo build --target x86_64-apple-darwin`, so no Intel runner is
+          # needed. `cross: false` — this is a native Rust cross-target, not the
+          # `cross` crate (which is Linux-container based).
           - triple: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
             target: x86_64-apple-darwin
             cross: false
 
