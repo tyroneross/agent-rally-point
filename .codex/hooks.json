@@ -1,5 +1,4 @@
 {
-  "_comment": "Project-level rally auto-coordination hooks for Codex. Ships WITH the repo (works on any user machine, no ~/.codex global change). The command resolves the repo root via git so the path is portable. The hook self-gates on .rally/ presence and fail-opens. Advisory by default; RALLY_HOOK_STRICT=1 to hard-block. Codex prompts to trust on first use. Cadence parity with Claude: SessionStart=enter, UserPromptSubmit=per-turn presence refresh (idle), PreToolUse=before-write, Stop=after-write. See docs/AUTO-COORDINATION-HOOKS.md.",
   "hooks": {
     "SessionStart": [
       { "hooks": [ { "type": "command", "timeout": 5000, "command": "bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" start codex" } ] }
