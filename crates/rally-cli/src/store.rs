@@ -39,6 +39,10 @@ pub(crate) const LOG_INDEX_FILENAME: &str = "index.json";
 /// Same line format as live segments; replay walks here too.
 pub(crate) const ARCHIVE_DIRNAME: &str = "archive";
 
+/// Forensic holding area for canonical JSONL records that replay can safely
+/// skip while keeping the room readable.
+const QUARANTINE_DIRNAME: &str = "quarantine";
+
 /// Filename used by the R5 migration to preserve the R1 monolith verbatim.
 pub(crate) const ARCHIVED_MONOLITH_FILENAME: &str = "ledger-pre-segment.jsonl";
 
@@ -2506,17 +2510,21 @@ fn fingerprint_db(path: &Path) -> Option<FileFingerprint> {
 /// hasher for any value persisted to disk.
 fn hash_file_head(path: &Path) -> u64 {
     use std::io::Read;
-    // FNV-1a 64-bit (deterministic across processes — DefaultHasher is per-process
-    // seeded and MUST NOT be used for a value persisted to the sidecar cache).
-    let mut h: u64 = 0xcbf29ce484222325;
     if let Ok(mut f) = fs::File::open(path) {
         let mut buf = [0u8; 4096];
         if let Ok(n) = f.read(&mut buf) {
-            for &b in &buf[..n] {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x100000001b3);
-            }
+            return hash_bytes_fnv1a(&buf[..n]);
         }
+    }
+    hash_bytes_fnv1a(&[])
+}
+
+/// FNV-1a 64-bit for persisted filenames/fingerprints. See [`hash_file_head`].
+fn hash_bytes_fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
     }
     h
 }
@@ -3063,8 +3071,9 @@ fn quarantine_corrupt_db(facts_db_path: &Path) -> Result<()> {
 /// Rebuild the derived sqlite cache by replaying every segment line in seq
 /// order (live segments first, then archive — the union — sorted by seq).
 /// Dedup by `sequence_number` (re-running migration twice can otherwise
-/// duplicate). Hard error on conflict (two different payloads at the same
-/// seq is corruption, not noise).
+/// duplicate). If two different payloads share a seq, keep the first-valid line,
+/// write the conflicting later line to `.rally/quarantine/`, and continue. One
+/// bad duplicate line must not brick every read path.
 ///
 /// Replay is a **pure function of the deduped event set**: each surviving
 /// line is appended in seq order and factstr assigns fresh monotonic seqs
@@ -3101,20 +3110,17 @@ fn rebuild_db_from_segments(
     }
     all_entries.sort_by_key(|e| e.seq);
 
-    // Dedup by seq in-place (keep first occurrence); hard-error if two seqs
-    // disagree on payload.  Operates on the same Vec to avoid a second allocation.
+    // Dedup by seq in-place (keep first occurrence); quarantine conflicting
+    // later lines so replay can project the rest of the room.
     let mut write = 0usize;
     for read in 0..all_entries.len() {
         if write > 0 && all_entries[write - 1].seq == all_entries[read].seq {
             if all_entries[write - 1].payload != all_entries[read].payload
                 || all_entries[write - 1].event_type != all_entries[read].event_type
             {
-                return Err(RallyError::Message(format!(
-                    "segment replay conflict at seq {}: two distinct events recorded with the same sequence number",
-                    all_entries[read].seq
-                )));
+                quarantine_duplicate_segment_entry(facts_db_path, &all_entries[read])?;
             }
-            // duplicate — skip
+            // duplicate/conflict — skip
         } else {
             if read != write {
                 all_entries.swap(read, write);
@@ -3134,6 +3140,33 @@ fn rebuild_db_from_segments(
             .append(vec![NewEvent::new(entry.event_type.clone(), payload)])
             .map_err(|err| RallyError::Message(format!("replay segments: {err}")))?;
     }
+    Ok(())
+}
+
+fn quarantine_duplicate_segment_entry(facts_db_path: &Path, entry: &LedgerLine) -> Result<()> {
+    let parent = facts_db_path
+        .parent()
+        .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+    let quarantine_dir = parent.join(QUARANTINE_DIRNAME);
+    fs::create_dir_all(&quarantine_dir).map_err(RallyError::io(format!(
+        "create {}",
+        quarantine_dir.display()
+    )))?;
+    let line =
+        serde_json::to_string(entry).map_err(RallyError::json("render duplicate segment"))?;
+    let hash = hash_bytes_fnv1a(line.as_bytes());
+    let path = quarantine_dir.join(format!("duplicate-seq-{}-{hash:016x}.jsonl", entry.seq));
+    if path.exists() {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .map_err(RallyError::io(format!("create {}", path.display())))?;
+    writeln!(file, "{line}").map_err(RallyError::io(format!("write {}", path.display())))?;
+    file.sync_all()
+        .map_err(RallyError::io(format!("sync {}", path.display())))?;
     Ok(())
 }
 
@@ -4799,6 +4832,82 @@ mod ledger_tests {
         assert_eq!(facts.len(), 3, "all 3 non-contiguous events replayed");
         let ids: Vec<&str> = facts.iter().map(|f| f.event_id.as_str()).collect();
         assert_eq!(ids, ["e2", "e5", "e9"], "order preserved by stored seq");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A duplicate sequence number with a different event used to hard-fail
+    /// replay, which made every `room` / `recent` / `next` read unusable until
+    /// manual segment surgery. L2 graceful degradation keeps the first-valid
+    /// record, quarantines the conflicting later line, and projects the rest.
+    #[test]
+    fn duplicate_seq_conflict_is_quarantined_and_room_stays_readable() {
+        let root = unique_root("reconcile-dup-seq-quarantine");
+
+        let lines = [
+            ledger_line(1, "decision", "e1", "alpha"),
+            ledger_line(2, "decision", "e2-first", "alpha"),
+            ledger_line(2, "blocker", "e2-duplicate", "alpha"),
+            ledger_line(3, "artifact", "e3", "alpha"),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_segment(&root, "log", "alpha.jsonl", &refs);
+
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let facts = store.facts().unwrap();
+        let ids: Vec<&str> = facts.iter().map(|f| f.event_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["e1", "e2-first", "e3"],
+            "duplicate seq must not brick replay; first-valid record is kept"
+        );
+        assert_eq!(
+            store.snapshot().unwrap().max_seq,
+            3,
+            "snapshot still reports the canonical high-water mark"
+        );
+
+        let quarantine_dir = root.join(".rally").join(QUARANTINE_DIRNAME);
+        let quarantined: Vec<PathBuf> = fs::read_dir(&quarantine_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "conflicting duplicate line is preserved once for forensics"
+        );
+        let quarantined_body = fs::read_to_string(&quarantined[0]).unwrap();
+        assert!(
+            quarantined_body.contains("e2-duplicate"),
+            "quarantine file must contain the skipped duplicate event"
+        );
+
+        let appended = store
+            .append_fact(&make_fact(
+                "after-duplicate",
+                FactKind::Decision,
+                "src/",
+                "append after duplicate quarantine",
+            ))
+            .unwrap();
+        assert_eq!(
+            appended.seq, 4,
+            "append must allocate above the surviving canonical max"
+        );
+
+        drop(store);
+        let facts_db = root.join(".rally/facts.db");
+        fs::remove_file(&facts_db).ok();
+        let _ = fs::remove_file(facts_db.with_extension("db-shm"));
+        let _ = fs::remove_file(facts_db.with_extension("db-wal"));
+        let store2 = RoomStore::open_at(root.clone()).unwrap();
+        assert_eq!(store2.facts().unwrap().len(), 4);
+        let quarantine_count_after_rebuild = fs::read_dir(&quarantine_dir).unwrap().count();
+        assert_eq!(
+            quarantine_count_after_rebuild, 1,
+            "deterministic quarantine filenames prevent repeated rebuild churn"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
