@@ -1,6 +1,6 @@
 {
   "name": "agent-rally-point",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Agent Rally Point coordination skills (agent-rally-point, rally-workflows, mini-loop) for Codex. Repo-local coordination via the rally CLI: claims, write-boundary checks, handoffs, dynamic-workflow task packets.",
   "author": {
     "name": "Tyrone Ross",
@@ -24,6 +24,8 @@
     "longDescription": "Agent Rally Point gives Codex a repo-local coordination surface for Rally claims, checks, artifacts, handoffs, and dynamic workflow task packets. Three skills: agent-rally-point (per-session loop), rally-workflows (fan-out + dynamic-workflows protocol), mini-loop (per-task assess/plan/execute/judge quality gate).",
     "developerName": "Ross Labs",
     "category": "Coding",
+    "composerIcon": "./assets/app-icon-rally-point-v5.png",
+    "logo": "./assets/app-icon-rally-point-v5.png",
     "capabilities": [
       "Read",
       "Write"

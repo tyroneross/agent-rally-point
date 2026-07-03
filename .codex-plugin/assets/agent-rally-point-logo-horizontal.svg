@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: 2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com> -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="220" viewBox="0 0 920 220" role="img" aria-labelledby="title desc">
+  <title id="title">Agent Rally Point logo</title>
+  <desc id="desc">Horizontal logo lockup with the Agent Rally Point icon mark and wordmark.</desc>
+  <defs>
+    <filter id="markShadow" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#020617" flood-opacity="0.18"/>
+    </filter>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#00C8FF"/>
+      <stop offset="0.5" stop-color="#F59E0B"/>
+      <stop offset="1" stop-color="#64E96B"/>
+    </linearGradient>
+  </defs>
+
+  <image href="app-icon-rally-point-v5.png" x="30" y="34" width="152" height="152" preserveAspectRatio="xMidYMid meet" filter="url(#markShadow)"/>
+
+  <g transform="translate(218 57)">
+    <text x="0" y="52"
+          font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif"
+          font-size="52"
+          font-weight="760"
+          letter-spacing="0"
+          fill="#111827">Agent Rally Point</text>
+
+    <g transform="translate(2 80)">
+      <path d="M0 0H500" stroke="url(#accent)" stroke-width="4" stroke-linecap="round"/>
+      <circle cx="0" cy="0" r="7" fill="#00C8FF"/>
+      <circle cx="250" cy="0" r="9" fill="#F59E0B"/>
+      <circle cx="500" cy="0" r="7" fill="#64E96B"/>
+    </g>
+
+    <text x="0" y="124"
+          font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif"
+          font-size="20"
+          font-weight="560"
+          letter-spacing="0"
+          fill="#526170">Coordinate complex agent work</text>
+  </g>
+</svg>

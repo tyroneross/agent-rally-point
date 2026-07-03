@@ -9,13 +9,48 @@ Use `rally` as the live source of coordination truth.
 
 ## Session Start
 
-From inside the repo, identify your stable tool id (`codex`, `claude_code`,
-`pi`, `cursor`, `gemini`, `ci`, etc.) and enter the room:
+From inside the repo, enter with a Rally id that identifies the working
+agent/session, not just the host family. The host family is metadata
+(`codex`, `claude_code`, `cursor`, etc.); the agent id is a unique string or
+number for this terminal/session/worker. Every concurrently working agent gets
+its own id. `--session-id` is not a substitute because Rally routes handoffs,
+claims, cursors, and presence by `--tool`.
 
 ```bash
-rally enter --tool <tool> --json
-rally next --tool <tool> --json
+HOST="${RALLY_HOST_FAMILY:-codex}"  # use claude_code, cursor, gemini, etc. as needed
+if [ -z "${RALLY_AGENT_ID:-}" ]; then
+  RALLY_AGENT_ID="$(uuidgen 2>/dev/null || printf 'agent-%s' "$$")"
+  RALLY_AGENT_ID="$(printf '%s' "$RALLY_AGENT_ID" | tr '[:upper:]' '[:lower:]')"
+  export RALLY_AGENT_ID
+fi
+TOOL="${RALLY_TOOL_ID:-$HOST:$RALLY_AGENT_ID}"
+rally enter --tool "$TOOL" --json
+rally next --tool "$TOOL" --json
 ```
+
+If `rally enter` warns `duplicate-active-squad-id`, stop using that tool id in
+this terminal and re-enter with a distinct `RALLY_AGENT_ID` / `--tool`. If you
+spawn another agent or worker that will post Rally facts, give it a separate
+agent id; do not let it reuse the parent terminal's id.
+
+## Live Agent Status
+
+Every working agent must keep its status current so peers can tell who is
+working, what they are working on, whether they are idle/blocked/done, and when
+they will check in again. Automatic hooks post status for start, before-write,
+idle, and stop phases; manual agents should use the same host-neutral commands.
+
+```bash
+rally status post --tool "$TOOL" --state working --file <path> --intent "<one-line>"
+rally status post --tool "$TOOL" --state idle --wake-after <iso-8601>
+rally status post --tool "$TOOL" --state blocked --blocked-ref <event-id>
+rally status post --tool "$TOOL" --state done
+rally status read --json
+```
+
+Treat `rally status read --json` as the current roster before coordinating or
+joining shared work. Ignore `stale:true` entries for live ownership decisions
+unless you are explicitly cleaning up abandoned work.
 
 Read `next` before broad repo exploration:
 
@@ -35,13 +70,13 @@ If `actionable` is false, do not invent work from Rally state. If
    likely to overlap with another agent:
 
 ```bash
-rally say claim --tool <tool> --subject "edit shared file" --path <path> --json
+rally say claim --tool "$TOOL" --subject "edit shared file" --path <path> --json
 ```
 
 2. **Check before writing**:
 
 ```bash
-rally check before-write --tool <tool> --path <path> --strict --json
+rally check before-write --tool "$TOOL" --path <path> --strict --json
 ```
 
 If the check returns blocking findings, stop and resolve them before editing.
@@ -49,23 +84,23 @@ If the check returns blocking findings, stop and resolve them before editing.
 3. **Record meaningful outputs**:
 
 ```bash
-rally say artifact --tool <tool> --subject "implemented change" --uri <path> --evidence "<verification>" --json
+rally say artifact --tool "$TOOL" --subject "implemented change" --uri <path> --evidence "<verification>" --json
 ```
 
 4. **Record coordination facts**:
 
 ```bash
-rally say handoff --tool <tool> --target <other-tool> --subject "review this" --summary "<context>" --json
-rally say blocker --tool <tool> --subject "need decision" --severity high --json
-rally say resolve --tool <tool> --ref <blocker-id> --subject "resolved" --json
-rally say decision --tool <tool> --subject "binding decision" --status binding --json
-rally say release --tool <tool> --ref <claim-id> --subject "done" --json
+rally say handoff --tool "$TOOL" --target <other-tool> --subject "review this" --summary "<context>" --json
+rally say blocker --tool "$TOOL" --subject "need decision" --severity high --json
+rally say resolve --tool "$TOOL" --ref <blocker-id> --subject "resolved" --json
+rally say decision --tool "$TOOL" --subject "binding decision" --status binding --json
+rally say release --tool "$TOOL" --ref <claim-id> --subject "done" --json
 ```
 
 5. **Loop back**:
 
 ```bash
-rally next --tool <tool> --json
+rally next --tool "$TOOL" --json
 ```
 
 Continue only while the next action is actionable, safe, and inside the user's
@@ -81,7 +116,7 @@ rally inject <session|name|tool> --handoff <event-id> --json
 rally capture <session|name|tool> --json
 ```
 
-Rally does not keep agents awake by itself. Treat `rally next --tool <tool>
+Rally does not keep agents awake by itself. Treat `rally next --tool "$TOOL"
 --json` as the wake-intent check and `rally inject ... --handoff <event-id>` as
 the focused delivery path for managed sessions. Host adapters decide whether to
 use native wake, prompt injection, pane notification, resume-only context, or CI
@@ -134,8 +169,8 @@ Before ending a session:
 
 ```bash
 rally room --json
-rally next --tool <tool> --json
-rally say release --tool <tool> --ref <claim-id> --subject "done" --json
+rally next --tool "$TOOL" --json
+rally say release --tool "$TOOL" --ref <claim-id> --subject "done" --json
 ```
 
 If something remains for another agent, leave a `handoff` with enough context

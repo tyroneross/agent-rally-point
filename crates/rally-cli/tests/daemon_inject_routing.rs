@@ -22,6 +22,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,10 +30,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 const RALLY_BIN: &str = env!("CARGO_BIN_EXE_rally");
+static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique(prefix: &str) -> String {
+    let counter = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(
-        "{prefix}-{}-{}",
+        "{prefix}-{}-{}-{counter}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

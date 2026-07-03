@@ -31,10 +31,10 @@ bad()  { FAIL=$((FAIL+1)); FAILS+=("$1"); printf 'FAIL %s\n' "$1"; [ -n "${2:-}"
 # ----------------------------------------------------------------------
 T="self-gate: no .rally/ → exit 0 + empty stdout"
 # Some machines can have a `.rally/` marker in the default mktemp parent
-# (for example under /private/var/.../T), which makes every child look like a
-# Rally repo when the hook walks upward. Use /tmp by default because this test
-# needs a parent that is not already coordinated.
-scratch_parent="${RALLY_TEST_TMPDIR:-/tmp}"
+# (for example under /private/tmp), which makes every child look like a Rally
+# repo when the hook walks upward. Use /var/tmp by default because these tests
+# need a parent that is not already coordinated.
+scratch_parent="${RALLY_TEST_TMPDIR:-/var/tmp}"
 tmpdir="$(mktemp -d "${scratch_parent%/}/rally-hook-test.XXXXXX")"
 trap 'rm -rf "$tmpdir"' EXIT
 (
@@ -79,6 +79,130 @@ T="session opt-out: RALLY_HOOKS=off → exit 0 + empty stdout"
   fi
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+# ----------------------------------------------------------------------
+# Test 2c: identity — hooks must not reuse a bare host id as the routed tool.
+# ----------------------------------------------------------------------
+T="identity: bare host tool is scoped by session id before enter/next"
+identity_bin="$tmpdir/rally_identity"
+identity_calls="$tmpdir/rally_identity.calls"
+cat > "$identity_bin" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${CALLS:?}"
+if [ "$1" = "hooks" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"data":{"hooks":{"enabled":true,"prompt":"off"}}}'
+elif [ "$1" = "room" ]; then
+  printf '%s\n' '{"data":{"room":{"squads":[],"active_claims":[],"open_handoffs":[]}}}'
+elif [ "$1" = "next" ]; then
+  printf '%s\n' '{"data":{"next":{"actionable":false}}}'
+else
+  printf '%s\n' '{}'
+fi
+EOF
+chmod +x "$identity_bin"
+(
+  repo="$tmpdir/identity-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+  CALLS="$identity_calls" RALLY_SESSION_ID="Term A/One" RALLY_BIN="$identity_bin" "$HOOK" start claude_code </dev/null >/dev/null 2>&1
+  if ! grep -q -- 'enter --tool claude_code:term-a-one --session-id Term A/One' "$identity_calls"; then
+    printf 'enter did not use session-scoped tool id:\n%s\n' "$(cat "$identity_calls" 2>/dev/null)" >&2
+    exit 1
+  fi
+  if ! grep -q -- 'next --tool claude_code:term-a-one' "$identity_calls"; then
+    printf 'next did not use same session-scoped tool id:\n%s\n' "$(cat "$identity_calls" 2>/dev/null)" >&2
+    exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "session id must affect routed tool, not only --session-id"; fi
+
+T="identity: RALLY_AGENT_ID supplies routed ids across host families"
+agent_id_calls="$tmpdir/rally_identity_agent_id.calls"
+(
+  repo="$tmpdir/identity-agent-id-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+  : > "$agent_id_calls"
+  for host in codex claude_code; do
+    CALLS="$agent_id_calls" RALLY_SESSION_ID="Terminal 99" RALLY_AGENT_ID="Agent 42" RALLY_BIN="$identity_bin" "$HOOK" start "$host" </dev/null >/dev/null 2>&1
+    if ! grep -q -- "enter --tool ${host}:agent-42 --session-id Terminal 99" "$agent_id_calls"; then
+      printf 'enter did not use host+RALLY_AGENT_ID as routed id for %s:\n%s\n' "$host" "$(cat "$agent_id_calls" 2>/dev/null)" >&2
+      exit 1
+    fi
+    if ! grep -q -- "next --tool ${host}:agent-42" "$agent_id_calls"; then
+      printf 'next did not use host+RALLY_AGENT_ID as routed id for %s:\n%s\n' "$host" "$(cat "$agent_id_calls" 2>/dev/null)" >&2
+      exit 1
+    fi
+  done
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "agent id must route handoffs/claims/presence across hosts"; fi
+
+T="status heartbeat: start publishes idle with next check-in"
+status_start_calls="$tmpdir/rally_status_start.calls"
+(
+  repo="$tmpdir/status-start-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+  CALLS="$status_start_calls" RALLY_SESSION_ID="Terminal 99" RALLY_AGENT_ID="Agent 42" RALLY_CHECKIN_SECS=600 RALLY_BIN="$identity_bin" "$HOOK" start codex </dev/null >/dev/null 2>&1
+  if ! grep -q -- 'status post --tool codex:agent-42 --state idle --wake-after' "$status_start_calls"; then
+    printf 'start did not publish idle status with wake-after:\n%s\n' "$(cat "$status_start_calls" 2>/dev/null)" >&2
+    exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "agents must publish state + next check-in"; fi
+
+T="status heartbeat: no node still publishes idle and exits 0"
+status_no_node_calls="$tmpdir/rally_status_no_node.calls"
+(
+  repo="$tmpdir/status-no-node-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+  CALLS="$status_no_node_calls" PATH="/usr/bin:/bin" RALLY_SESSION_ID="Terminal 99" RALLY_AGENT_ID="Agent 42" RALLY_BIN="$identity_bin" "$HOOK" start codex </dev/null >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" != "0" ]; then
+    printf 'hook exited nonzero without node: rc=%s\n' "$rc" >&2
+    exit 1
+  fi
+  if ! grep -q -- 'status post --tool codex:agent-42 --state idle --json' "$status_no_node_calls"; then
+    printf 'no-node start did not publish idle status without wake-after:\n%s\n' "$(cat "$status_no_node_calls" 2>/dev/null)" >&2
+    exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "status helper must stay fail-open without node"; fi
+
+T="status heartbeat: before-write publishes working file and intent"
+status_work_calls="$tmpdir/rally_status_work.calls"
+(
+  repo="$tmpdir/status-work-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+  CALLS="$status_work_calls" RALLY_SESSION_ID="Terminal 99" RALLY_AGENT_ID="Agent 42" RALLY_BIN="$identity_bin" "$HOOK" before-write codex <<<'{"tool_input":{"file_path":"src/lib.rs"}}' >/dev/null 2>&1
+  if ! grep -q -- 'status post --tool codex:agent-42 --state working --file src/lib.rs --intent editing src/lib.rs' "$status_work_calls"; then
+    printf 'before-write did not publish working status:\n%s\n' "$(cat "$status_work_calls" 2>/dev/null)" >&2
+    exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "agents must publish what they are working on"; fi
+
+T="identity: explicit full tool id is preserved"
+explicit_calls="$tmpdir/rally_identity_explicit.calls"
+(
+  repo="$tmpdir/identity-explicit-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+  CALLS="$explicit_calls" RALLY_SESSION_ID="Term B/Two" RALLY_BIN="$identity_bin" "$HOOK" start claude_code:observer </dev/null >/dev/null 2>&1
+  if grep -q -- 'claude_code:observer:term-b-two' "$explicit_calls"; then
+    printf 'explicit tool id was double-suffixed:\n%s\n' "$(cat "$explicit_calls" 2>/dev/null)" >&2
+    exit 1
+  fi
+  grep -q -- 'enter --tool claude_code:observer --session-id Term B/Two' "$explicit_calls"
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "explicit tool ids must not be rewritten"; fi
 
 # ----------------------------------------------------------------------
 # Test 2c: config opt-out — hooks status disabled stops before enter/room
@@ -186,6 +310,72 @@ chmod +x "$noise_bin"
   exit 0
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "startup prompt must stay concise and current"; fi
+
+# ----------------------------------------------------------------------
+# Test 2f: agent status is surfaced from the typed status projection.
+# ----------------------------------------------------------------------
+T="SessionStart prompt includes agent status, work, and next check-in"
+status_prompt_bin="$tmpdir/rally_status_prompt"
+cat > "$status_prompt_bin" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "hooks" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"data":{"hooks":{"enabled":true,"prompt":"once"}}}'
+elif [ "$1" = "enter" ]; then
+  :
+elif [ "$1" = "status" ] && [ "$2" = "post" ]; then
+  printf '%s\n' '{}'
+elif [ "$1" = "status" ] && [ "$2" = "read" ]; then
+  cat <<'JSON'
+{"data":{"status_read":{"states":[{"tool":"codex:observer","state":"idle","wake_after":"2999-01-01T00:10:00Z","last_seen_seq":1,"last_seen_ts":"2999-01-01T00:00:00Z","stale":false},{"tool":"claude_code:lead","state":"working","file":"crates/rally-cli","intent":"engine dispatch","last_seen_seq":2,"last_seen_ts":"2999-01-01T00:00:00Z","stale":false},{"tool":"gemini:qa","state":"idle","wake_after":"2999-01-01T00:05:00Z","last_seen_seq":3,"last_seen_ts":"2999-01-01T00:00:00Z","stale":false},{"tool":"codex:blocked","state":"blocked","ref":"fact_blocker","last_seen_seq":4,"last_seen_ts":"2999-01-01T00:00:00Z","stale":false},{"tool":"stale-peer","state":"working","file":"old.rs","intent":"old work","last_seen_seq":5,"last_seen_ts":"2000-01-01T00:00:00Z","stale":true}]}}}
+JSON
+elif [ "$1" = "room" ]; then
+  printf '%s\n' '{"data":{"room":{"squads":[],"active_claims":[],"open_handoffs":[]}}}'
+elif [ "$1" = "next" ]; then
+  printf '%s\n' '{"data":{"next":{"actionable":false}}}'
+else
+  printf '%s\n' '{}'
+fi
+EOF
+chmod +x "$status_prompt_bin"
+(
+  repo="$tmpdir/status-prompt-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+  out=$(RALLY_BIN="$status_prompt_bin" RALLY_SESSION_ID="Status Terminal" RALLY_AGENT_ID="observer" "$HOOK" start codex </dev/null 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
+  printf '%s' "$out" | grep -q "Agent status:" || { printf 'missing status header: %s\n' "$out" >&2; exit 1; }
+  printf '%s' "$out" | grep -q "claude_code:lead: working on crates/rally-cli (engine dispatch)" || { printf 'missing working peer: %s\n' "$out" >&2; exit 1; }
+  printf '%s' "$out" | grep -q "gemini:qa: idle, next check-in 2999-01-01T00:05:00Z" || { printf 'missing idle wake-after: %s\n' "$out" >&2; exit 1; }
+  printf '%s' "$out" | grep -q "codex:blocked: blocked on fact_blocker" || { printf 'missing blocked ref: %s\n' "$out" >&2; exit 1; }
+  if printf '%s' "$out" | grep -q "stale-peer"; then
+    printf 'stale status leaked: %s\n' "$out" >&2
+    exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "start must tell agents who is working, blocked, idle, and due next"; fi
+
+T="UserPromptSubmit prompt includes peer status changes"
+(
+  repo="$tmpdir/status-idle-repo"
+  mkdir -p "$repo/.rally/.hook-seen"
+  cd "$repo"
+  rm -f .rally/.hook-seen/status-peer-session.*.seen 2>/dev/null
+  out=$(RALLY_BIN="$status_prompt_bin" RALLY_SESSION_ID="status-peer-session" RALLY_AGENT_ID="observer" "$HOOK" idle codex </dev/null 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
+  printf '%s' "$out" | grep -q "UserPromptSubmit" || { printf 'missing UserPromptSubmit envelope: %s\n' "$out" >&2; exit 1; }
+  printf '%s' "$out" | grep -q "Agent status:" || { printf 'missing status header: %s\n' "$out" >&2; exit 1; }
+  printf '%s' "$out" | grep -q "claude_code:lead: working on crates/rally-cli (engine dispatch)" || { printf 'missing working peer: %s\n' "$out" >&2; exit 1; }
+  printf '%s' "$out" | grep -q "gemini:qa: idle, next check-in 2999-01-01T00:05:00Z" || { printf 'missing peer next check-in: %s\n' "$out" >&2; exit 1; }
+  if printf '%s' "$out" | grep -q "codex:observer: idle"; then
+    printf 'per-turn prompt should omit self-only status noise: %s\n' "$out" >&2
+    exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "per-turn awareness must include peer status"; fi
 
 # ----------------------------------------------------------------------
 # Test 3: fail-open — rally binary that hangs → killed by watchdog,
@@ -318,6 +508,28 @@ T="cursor schema: strict mode → permission:deny"
   cd "$REPO_ROOT"
   out=$(RALLY_BIN="$stub_bin" RALLY_HOOK_STRICT=1 "$HOOK" before-write cursor <<<'{"tool_input":{"file_path":"foo.txt"}}' 2>/dev/null)
   printf '%s' "$out" | grep -q '"permission":"deny"' || { printf 'expected permission:deny: %s\n' "$out" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+# ----------------------------------------------------------------------
+# Test 6c: Codex host schema — Codex rejects Claude's permissionDecision
+# field on PreToolUse. A before-write conflict must fail open and surface a
+# visible systemMessage instead, in default and strict modes.
+# ----------------------------------------------------------------------
+T="codex schema: before-write conflict → systemMessage, no permissionDecision"
+(
+  cd "$REPO_ROOT"
+  out_default=$(RALLY_BIN="$stub_bin" "$HOOK" before-write codex <<<'{"tool_input":{"file_path":"foo.txt"}}' 2>/dev/null)
+  out_strict=$(RALLY_BIN="$stub_bin" RALLY_HOOK_STRICT=1 "$HOOK" before-write codex <<<'{"tool_input":{"file_path":"foo.txt"}}' 2>/dev/null)
+  for out in "$out_default" "$out_strict"; do
+    if ! printf '%s' "$out" | grep -q "systemMessage"; then
+      printf 'codex missing systemMessage: %s\n' "$out" >&2; exit 1
+    fi
+    if printf '%s' "$out" | grep -qE '"permissionDecision"|"permission":"deny"|"decision":"block"'; then
+      printf 'codex output leaked unsupported/blocking keys: %s\n' "$out" >&2; exit 1
+    fi
+  done
   exit 0
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi

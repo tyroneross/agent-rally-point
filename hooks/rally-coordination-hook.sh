@@ -19,7 +19,8 @@
 # Usage (called by a coding host's hook system):
 #   rally-coordination-hook.sh <phase> <tool>
 #     phase ∈ { start | before-write | after-write | idle }
-#     tool  ∈ free-form id (e.g. claude_code, codex, gemini, claude_code:01)
+#     tool  ∈ host family or full Rally id (e.g. claude_code, codex, gemini,
+#             claude_code:agent-01)
 #   STDIN: the host's hook input envelope (JSON). Optional.
 #
 # Behavior:
@@ -35,7 +36,14 @@
 # Env:
 #   RALLY_HOOK_TIMEOUT_MS  — wall-clock budget for each rally call (default 5000).
 #   RALLY_BIN              — rally binary path (default ./target/debug/rally or $PATH).
-#   RALLY_SESSION_ID       — override session id (default <tool>-<epoch>).
+#   RALLY_SESSION_ID       — override terminal/session id.
+#   RALLY_AGENT_ID         — unique agent instance id for this terminal/worker.
+#                            Used as <host>:<agent-id> when the hook is called
+#                            with a bare host family such as codex/claude_code.
+#   RALLY_TOOL_ID          — override the full effective Rally id. Back-compat;
+#                            prefer RALLY_AGENT_ID when the hook argv still
+#                            names the host family.
+#   RALLY_CHECKIN_SECS     — next status check-in window (default 300 seconds).
 #   RALLY_HOOKS            — "off" disables this hook for the current session.
 #   RALLY_HOOK_PROMPT      — startup prompt mode: once, always, or off.
 #   RALLY_HOOK_STRICT      — "1" to enable deny/block on high-severity signals.
@@ -223,6 +231,40 @@ fi
 have_node=0
 if command -v node >/dev/null 2>&1; then have_node=1; fi
 
+_rally_id_segment() {
+  # Keep ids readable and safe for JSON, filenames, and shell display.
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g' \
+    | cut -c1-40
+}
+
+_rally_checkin_iso() {
+  # Use Node because BSD date and GNU date disagree on relative offsets.
+  if [ "$have_node" = "1" ]; then
+    node -e '
+const raw = Number(process.env.RALLY_CHECKIN_SECS || "300");
+const secs = Number.isFinite(raw) && raw > 0 ? raw : 300;
+process.stdout.write(new Date(Date.now() + secs * 1000).toISOString().replace(/\.\d{3}Z$/, "Z"));
+' 2>/dev/null || true
+  fi
+  return 0
+}
+
+_rally_status_idle() {
+  wake_after="$(_rally_checkin_iso)"
+  if [ -n "$wake_after" ]; then
+    rally_timeout status post --tool "$tool" --state idle --wake-after "$wake_after" --json >/dev/null 2>&1 || true
+  else
+    rally_timeout status post --tool "$tool" --state idle --json >/dev/null 2>&1 || true
+  fi
+}
+
+_rally_status_working() {
+  [ -z "${path:-}" ] && return 0
+  rally_timeout status post --tool "$tool" --state working --file "$path" --intent "editing $path" --json >/dev/null 2>&1 || true
+}
+
 phase="${1:-idle}"
 tool="${2:-claude_code}"
 
@@ -273,7 +315,39 @@ let data=""; process.stdin.on("data", c => data += c); process.stdin.on("end", (
   path="$({ printf '%s' "$meta" | node -e 'const fs=require("fs"); try { const v=JSON.parse(fs.readFileSync(0,"utf8")||"{}"); process.stdout.write(v.path||""); } catch (_) {}' ; } 2>/dev/null)"
   session="$({ printf '%s' "$meta" | node -e 'const fs=require("fs"); try { const v=JSON.parse(fs.readFileSync(0,"utf8")||"{}"); process.stdout.write(v.session||""); } catch (_) {}' ; } 2>/dev/null)"
 fi
-if [ -z "$session" ]; then session="${RALLY_SESSION_ID:-${tool}-$(date +%s)}"; fi
+if [ -z "$session" ]; then
+  if [ -n "${RALLY_SESSION_ID:-}" ]; then
+    session="$RALLY_SESSION_ID"
+  elif [ -n "${TERM_SESSION_ID:-}" ]; then
+    session="term-${TERM_SESSION_ID}"
+  elif [ -n "${TMUX_PANE:-}" ]; then
+    session="tmux-${TMUX_PANE}"
+  elif [ -n "${TTY:-}" ]; then
+    session="tty-${TTY}"
+  elif [ -n "${PPID:-}" ]; then
+    session="ppid-${PPID}"
+  else
+    session="${tool}-$(date +%s)"
+  fi
+fi
+
+# Rally routes handoffs, claims, presence, and read cursors by `--tool`, not by
+# `--session-id`. The routed id must identify the working agent/terminal, not
+# just the host family. Keep full explicit ids untouched (`codex:agent-01`),
+# but expand bare host ids to <host>:<agent-id>.
+if [ -n "${RALLY_TOOL_ID:-}" ]; then
+  tool="$RALLY_TOOL_ID"
+elif [[ "$tool" != *:* ]]; then
+  tool_base="$(_rally_id_segment "$tool")"
+  agent_id="${RALLY_AGENT_ID:-$session}"
+  tool_suffix="$(_rally_id_segment "$agent_id")"
+  [ -z "$tool_suffix" ] && tool_suffix="session"
+  if [[ "$tool_suffix" == "$tool_base"-* ]]; then
+    tool_suffix="${tool_suffix#"$tool_base"-}"
+  fi
+  [ -z "$tool_suffix" ] && tool_suffix="session"
+  tool="${tool}:${tool_suffix}"
+fi
 
 # Dispatch on phase.
 rally_output=""
@@ -286,15 +360,18 @@ if [ "$phase" = "start" ]; then
   # automatically knows there is an active room + who owns what, and deconflicts
   # before editing. Stays quiet (no nag) when the agent is solo.
   rally_timeout enter --tool "$tool" --session-id "$session" --json >/dev/null 2>&1 || true
+  _rally_status_idle
   if [ "$have_node" = "1" ]; then
     room_json="$(rally_timeout room --json 2>/dev/null || true)"
     next_json="$(rally_timeout next --tool "$tool" --json 2>/dev/null || true)"
-    rally_output="$({ printf '%s' "$room_json" | RALLY_NEXT_JSON="$next_json" RALLY_SELF_TOOL="$tool" node -e '
+    status_json="$(rally_timeout status read --json 2>/dev/null || true)"
+    rally_output="$({ printf '%s' "$room_json" | RALLY_NEXT_JSON="$next_json" RALLY_STATUS_JSON="$status_json" RALLY_SELF_TOOL="$tool" node -e '
 const fs = require("fs");
 const tool = process.env.RALLY_SELF_TOOL || "";
-let room = {}, nxt = {};
+let room = {}, nxt = {}, status = {};
 try { room = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch (_) {}
 try { nxt = JSON.parse(process.env.RALLY_NEXT_JSON || "{}"); } catch (_) {}
+try { status = JSON.parse(process.env.RALLY_STATUS_JSON || "{}"); } catch (_) {}
 const R = room?.data?.room || {};
 const squads = Array.isArray(R.squads) ? R.squads : [];
 const activeTools = new Set(
@@ -327,15 +404,29 @@ const activeHandoffs = (Array.isArray(R.open_handoffs) ? R.open_handoffs : [])
 const handoffs = activeHandoffs.length;
 const nextData = nxt?.data?.next || {};
 const nextAction = nextData.actionable ? nextData.action : "";
+const states = Array.isArray(status?.data?.status_read?.states) ? status.data.status_read.states : [];
+function stateSummary(s) {
+  if (!s || !s.tool || s.tool === "rally" || s.stale) return null;
+  if (s.state === "working") return `${s.tool}: working on ${s.file || "?"}${s.intent ? ` (${s.intent})` : ""}`;
+  if (s.state === "idle") return `${s.tool}: idle${s.wake_after ? `, next check-in ${s.wake_after}` : ""}`;
+  if (s.state === "blocked") {
+    const ref = s.ref || s.ref_id || "";
+    return `${s.tool}: blocked${ref ? ` on ${ref}` : ""}`;
+  }
+  if (s.state === "done") return `${s.tool}: done${s.worktree_branch ? ` on ${s.worktree_branch}` : ""}`;
+  return `${s.tool}: ${s.state || "unknown"}`;
+}
+const statusLines = states.map(stateSummary).filter(Boolean);
 const promptMode = process.env.RALLY_HOOK_PROMPT_MODE || "once";
 const showPrompt = promptMode !== "off";
-if (!showPrompt && peers.length === 0 && claims.length === 0 && handoffs === 0) { process.stdout.write("{}"); process.exit(0); }
+if (!showPrompt && peers.length === 0 && claims.length === 0 && handoffs === 0 && statusLines.length === 0) { process.stdout.write("{}"); process.exit(0); }
 let msg = "";
 if (showPrompt) {
   msg += "Agent Rally Point is active in this repo. Agents will enter the room, check coordination before edits, and surface handoffs. Turn off this session: `RALLY_HOOKS=off`; repo: `rally hooks off --scope repo`; status: `rally hooks status`. ";
 }
-if (peers.length || claims.length || handoffs || nextAction) msg += "Active room state: ";
+if (peers.length || claims.length || handoffs || nextAction || statusLines.length) msg += "Active room state: ";
 if (peers.length) msg += `Active peers: ${peers.slice(0, 8).join(", ")}${peers.length > 8 ? ` (+${peers.length - 8} more)` : ""}. `;
+if (statusLines.length) msg += `Agent status: ${statusLines.slice(0, 8).join("; ")}${statusLines.length > 8 ? ` (+${statusLines.length - 8} more)` : ""}. `;
 if (claims.length) msg += `Open claims: ${claims.slice(0, 8).join("; ")}. `;
 if (handoffs) msg += `${handoffs} open handoff(s). `;
 if (nextAction) msg += `Suggested next: ${nextAction}. `;
@@ -344,6 +435,7 @@ process.stdout.write(JSON.stringify({ agent_visible: { present: true, severity: 
 ' ; } 2>/dev/null)"
   fi
 elif [ "$phase" = "before-write" ]; then
+  _rally_status_working
   if [ -n "$path" ]; then
     rally_output="$(rally_timeout check before-write --tool "$tool" --path "$path" --json 2>/dev/null || true)"
   else
@@ -398,6 +490,11 @@ try {
     fi
   fi
 else
+  status_json=""
+  if [ "$phase" = "after-write" ] || [ "$phase" = "idle" ]; then
+    _rally_status_idle
+    status_json="$(rally_timeout status read --json 2>/dev/null || true)"
+  fi
   rally_output="$(rally_timeout next --tool "$tool" --json 2>/dev/null || true)"
 fi
 
@@ -410,7 +507,7 @@ if [ "$have_node" != "1" ]; then exit 0; fi
 strict="${RALLY_HOOK_STRICT:-0}"
 
 rally_root="$(find_rally_root 2>/dev/null || pwd)"
-printf '%s' "$rally_output" | RALLY_HOOK_STRICT="$strict" RALLY_HOOK_ROOT="$rally_root" RALLY_HOOK_SESSION="$session" node -e '
+printf '%s' "$rally_output" | RALLY_HOOK_STRICT="$strict" RALLY_HOOK_ROOT="$rally_root" RALLY_HOOK_SESSION="$session" RALLY_STATUS_JSON="${status_json:-}" node -e '
 const fs = require("fs");
 const raw = fs.readFileSync(0, "utf8");
 const phase = process.argv[1] || "idle";
@@ -425,7 +522,8 @@ function nativeEvent(tool, phase) {
     // Cursor hooks schema v1 event names (lowercase).
     return {start:"sessionStart", idle:"beforeSubmitPrompt", "before-write":"preToolUse", "after-write":"stop"}[phase] || "beforeSubmitPrompt";
   }
-  // Claude Code + Codex use the same event names for our purposes.
+  // Claude Code + Codex use the same event names, but not the same output
+  // contract for PreToolUse.
   return {start:"SessionStart", idle:"UserPromptSubmit", "before-write":"PreToolUse", "after-write":"Stop"}[phase] || "UserPromptSubmit";
 }
 function output(value) { process.stdout.write(JSON.stringify(value)); }
@@ -439,12 +537,42 @@ const check = parsed?.data?.check || {};
 const next = parsed?.data?.next || {};
 let visible = hook?.agent_visible || judgment?.agent_visible || check?.agent_visible || parsed?.agent_visible || next?.agent_visible || {};
 
+function statusSummaryLines(selfTool) {
+  let status = {};
+  try { status = JSON.parse(process.env.RALLY_STATUS_JSON || "{}"); } catch (_) {}
+  const states = Array.isArray(status?.data?.status_read?.states) ? status.data.status_read.states : [];
+  return states.map((s) => {
+    if (!s || !s.tool || s.tool === "rally" || s.stale || s.tool === selfTool) return null;
+    if (s.state === "working") return `${s.tool}: working on ${s.file || "?"}${s.intent ? ` (${s.intent})` : ""}`;
+    if (s.state === "idle") return `${s.tool}: idle${s.wake_after ? `, next check-in ${s.wake_after}` : ""}`;
+    if (s.state === "blocked") {
+      const ref = s.ref || s.ref_id || "";
+      return `${s.tool}: blocked${ref ? ` on ${ref}` : ""}`;
+    }
+    if (s.state === "done") return `${s.tool}: done${s.worktree_branch ? ` on ${s.worktree_branch}` : ""}`;
+    return `${s.tool}: ${s.state || "unknown"}`;
+  }).filter(Boolean);
+}
+
+const peerStatusLines = phase === "start" ? [] : statusSummaryLines(tool);
+
 if ((!visible || !visible.present) && next?.actionable) {
   const subject = next?.fact?.subject || next?.reason || "see rally next";
   visible = {
     present: true,
     severity: next?.requires_human ? "stop" : "warn",
     message: `Rally has actionable coordination work: ${next.action}. Subject: ${subject}.`
+  };
+}
+
+if (visible?.present && peerStatusLines.length) {
+  const suffix = `Agent status: ${peerStatusLines.slice(0, 8).join("; ")}${peerStatusLines.length > 8 ? ` (+${peerStatusLines.length - 8} more)` : ""}.`;
+  visible = {...visible, message: `${visible.message || ""} ${suffix}`.trim()};
+} else if ((!visible || !visible.present) && peerStatusLines.length) {
+  visible = {
+    present: true,
+    severity: "info",
+    message: `Agent status: ${peerStatusLines.slice(0, 8).join("; ")}${peerStatusLines.length > 8 ? ` (+${peerStatusLines.length - 8} more)` : ""}.`
   };
 }
 
@@ -523,6 +651,19 @@ if (tool === "gemini" || tool.startsWith("gemini")) {
       : {permission: "allow", agent_message: message});
   } else {
     output({});
+  }
+} else if (tool === "codex" || tool.startsWith("codex:")) {
+  if (event === "SessionStart" || event === "UserPromptSubmit") {
+    output({hookSpecificOutput: {hookEventName: event, additionalContext: message}});
+  } else if (event === "PreToolUse") {
+    // Codex v0.142.5 rejects Claude PreToolUse permissionDecision fields
+    // ("unsupported permissionDecision:allow"). Keep Codex fail-open and
+    // visible; Claude remains the only host that receives permissionDecision.
+    output({systemMessage: message});
+  } else if (event === "Stop") {
+    output({systemMessage: message});
+  } else {
+    output({systemMessage: message});
   }
 } else {
   if (event === "SessionStart" || event === "UserPromptSubmit") {

@@ -66,13 +66,30 @@ the portable project config is already committed.
 
 | Event | Action |
 |------|--------|
-| `SessionStart` | Resolves `rally hooks status`, calls `rally enter` when hooks are enabled, and surfaces a short context line from `rally room` / `rally next` (active peers, claimed paths, suggested next). Even in a quiet room, the default prompt tells the user Rally is active and shows the session/repo off commands. |
-| `UserPromptSubmit` | Per-turn presence refresh (hook phase `idle`). Re-surfaces active peers / open claims / suggested next from `rally next` at the start of each turn, so agents stay rally-aware during long read/explore phases instead of only re-checking at the moment they edit. Advisory `additionalContext`; emits `{}` when the room is quiet. This is the cadence parity fix for Claude and Codex. |
-| `PreToolUse(Edit\|Write\|MultiEdit)` | Extracts the target file path from the tool input envelope, calls `rally check before-write --path <p>`, and (when the path is unclaimed and the check allows) auto-claims it. On a conflict, surfaces an `additionalContext` warning to the agent. `rally check` already records the durable audit fact. |
-| `Stop` | At turn end (hook phase `after-write`), runs `rally next` and surfaces any pending coordination obligation as an advisory `systemMessage`. Parity with Codex's `Stop` hook; never blocks turn completion (strict mode is the only path that can emit `decision: block`). |
+| `SessionStart` | Resolves `rally hooks status`, calls `rally enter` when hooks are enabled, posts `state=idle` with a next check-in, and surfaces a short context line from `rally room` / `rally next` / `rally status read` (active peers, claimed paths, suggested next, agent status). Even in a quiet room, the default prompt tells the user Rally is active and shows the session/repo off commands. |
+| `UserPromptSubmit` | Per-turn presence refresh (hook phase `idle`). Posts `state=idle`, then re-surfaces actionable `rally next` work plus peer status from `rally status read` when another live agent is working/idle/blocked/done. Advisory `additionalContext`; emits `{}` when the room is quiet or unchanged. This is the cadence parity fix for Claude and Codex. |
+| `PreToolUse(Edit\|Write\|MultiEdit)` | Extracts the target file path from the tool input envelope, posts `state=working` with file + intent, calls `rally check before-write --path <p>`, and (when the path is unclaimed and the check allows) auto-claims it. On a conflict, surfaces a host-valid warning to the agent: Claude receives `permissionDecision` plus `systemMessage`; Codex receives `systemMessage` only because it rejects Claude's `permissionDecision` field. `rally check` already records the durable audit fact. |
+| `Stop` | At turn end (hook phase `after-write`), posts `state=idle` with a next check-in, runs `rally next`, and surfaces any pending coordination obligation or peer status change as an advisory `systemMessage`. Parity with Codex's `Stop` hook; never blocks turn completion (strict mode is the only path that can emit `decision: block`). |
 
 
 **Why PreToolUse stays edit-scoped for Claude (deliberate).** Codex's `.codex/hooks.json` wires PreToolUse with *no matcher*, so it fires `before-write` on every tool call — consistent, but it spawns the hook + watchdog on reads/bash/etc. that have no file path and no-op. Claude keeps the `Edit|Write|MultiEdit|NotebookEdit` matcher for `before-write`; both hosts get continuous awareness from the cheaper `UserPromptSubmit` (idle) refresh plus `Stop` (after-write).
+
+**Identity model.** The hook argv names the host family (`codex`,
+`claude_code`, `cursor`, etc.). The routed Rally id must identify the working
+agent/session, so bare host ids are expanded to `<host-family>:<agent-id>`.
+Set `RALLY_AGENT_ID` to a unique string or number for this terminal/session or
+worker; otherwise the hook derives a stable id from host session metadata.
+Every concurrently working agent that posts Rally facts needs its own id.
+`--session-id` is recorded as metadata only and does not route
+handoffs/claims/presence.
+
+**Status model.** The hook uses Rally's typed agent-state surface rather than a
+host-specific side channel. Each working agent posts `rally status post` as it
+moves between `idle`, `working`, `blocked`, and `done`; peers read the roster
+with `rally status read --json`. Startup prompts include the live roster, and
+per-turn prompts surface peer status changes so agents know who is working,
+what file/intent they have, whether they are blocked or done, and when idle
+agents expect to check in again.
 
 **Charter — advisory-only (default).** Coordination is recorded + exposed,
 never enforced. The hook NEVER emits `permissionDecision: "deny"` or
@@ -235,9 +252,11 @@ silently. The hook MUST NEVER stall a host session. Specifically:
 export RALLY_HOOK_STRICT=1
 ```
 
-When set, the hook may emit `permissionDecision: "deny"` (PreToolUse) or
+When set, the hook may emit `permissionDecision: "deny"` (Claude PreToolUse) or
 `decision: "block"` (Stop) on **high-severity** signals only (`severity==stop`
-or `allow==false`). Low-severity warnings always remain advisory.
+or `allow==false`). Codex PreToolUse remains fail-open with `systemMessage`
+because Codex rejects the Claude `permissionDecision` field. Low-severity
+warnings always remain advisory.
 
 This contradicts the never-block charter (`rally mission` — *"records and
 exposes only; never enforces"*) and is documented as a deliberate escape hatch
