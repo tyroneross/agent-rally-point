@@ -1685,6 +1685,17 @@ mod tests {
         );
         std::fs::write(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Warm-up: drain the Linux write->exec ETXTBSY window ONCE. After a clean
+        // exec of this never-rewritten file, no writer ever holds it again, so
+        // later send/capture execs can't hit "Text file busy".
+        for _ in 0..80 {
+            match std::process::Command::new(&path).arg("noop").output() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                _ => break,
+            }
+        }
         path.to_string_lossy().into_owned()
     }
 
@@ -1698,13 +1709,33 @@ mod tests {
         )
     }
 
+    /// Run `inject_and_verify`, retrying on Linux `ETXTBSY` ("Text file busy").
+    /// A concurrent test's `fork()` can momentarily hold our just-written stub
+    /// script open across `exec`, which is transient — retry drains it. Any
+    /// other error (e.g. the intended send-failure) is returned as-is.
+    fn iv_retry(r: &BackendRunner, text: &str) -> std::result::Result<bool, String> {
+        for _ in 0..80 {
+            match r.inject_and_verify("sess", text) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let s = e.to_string();
+                    if s.contains("Text file busy") || s.contains("os error 26") {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                        continue;
+                    }
+                    return Err(s);
+                }
+            }
+        }
+        Err("ETXTBSY did not clear after retries".to_string())
+    }
+
     #[test]
     fn inject_and_verify_confirms_when_payload_lands_on_pane() {
         let bin = stub_tmux("pos", "user@host:~$ rally-verify-token-ABC123 hello", 0);
         let r = tmux_runner(&bin);
         assert_eq!(
-            r.inject_and_verify("sess", "rally-verify-token-ABC123 hello")
-                .unwrap(),
+            iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
             true,
             "capture-pane shows the payload needle => verified delivery"
         );
@@ -1715,8 +1746,7 @@ mod tests {
         let bin = stub_tmux("neg", "nothing relevant on screen here", 0);
         let r = tmux_runner(&bin);
         assert_eq!(
-            r.inject_and_verify("sess", "rally-verify-token-ABC123 hello")
-                .unwrap(),
+            iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
             false,
             "send-keys ok but payload never appears => sent-but-unverified, not a false 'delivered'"
         );
@@ -1727,8 +1757,7 @@ mod tests {
         let bin = stub_tmux("fail", "irrelevant", 1);
         let r = tmux_runner(&bin);
         assert!(
-            r.inject_and_verify("sess", "rally-verify-token-ABC123 hello")
-                .is_err(),
+            iv_retry(&r, "rally-verify-token-ABC123 hello").is_err(),
             "a failed send-keys must surface as Err, not a claimed delivery"
         );
     }
@@ -1741,8 +1770,7 @@ mod tests {
         let bin = stub_tmux("empty", "", 0);
         let r = tmux_runner(&bin);
         assert_eq!(
-            r.inject_and_verify("sess", "rally-verify-token-ABC123 hello")
-                .unwrap(),
+            iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
             true,
             "empty/unavailable capture is unverifiable, not a failed landing"
         );
