@@ -68,6 +68,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # Build the SOURCE of the named tag (manual dispatch) so a re-published
+          # release matches its tag, not whatever main HEAD happens to be. The
+          # workflow DEFINITION still comes from the dispatch ref (main), so CI
+          # fixes like the macos-14 Intel cross-compile apply to old tags too.
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -97,7 +103,7 @@ jobs:
           cat rally-${{ matrix.triple }}.sha256
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: rally-${{ matrix.triple }}
 
@@ -106,7 +112,7 @@ jobs:
         # that names an existing tag). Prevents the upload step from erroring on
         # a tagless manual run after four full builds.
         if: ${{ startsWith(github.ref, 'refs/tags/') || github.event.inputs.tag != '' }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
