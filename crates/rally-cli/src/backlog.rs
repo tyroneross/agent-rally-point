@@ -417,7 +417,15 @@ mod tests {
     fn backlog_add_rejects_invalid_status() {
         let (room, root) = test_room();
         let err = add_backlog_item(
-            &room, "t", "task-1", "do it", &[], &[], Some("wip"), None, None,
+            &room,
+            "t",
+            "task-1",
+            "do it",
+            &[],
+            &[],
+            Some("wip"),
+            None,
+            None,
         )
         .unwrap_err();
         assert!(

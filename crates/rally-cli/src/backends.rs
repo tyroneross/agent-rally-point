@@ -1387,17 +1387,13 @@ pub(crate) fn detect_orphan_processes(
 pub(crate) fn kill_process(pid: i32) -> bool {
     let pid_s = pid.to_string();
     // TERM first.
-    let _ = Command::new("kill")
-        .args(["-TERM", &pid_s])
-        .output();
+    let _ = Command::new("kill").args(["-TERM", &pid_s]).output();
     // Brief check: if already gone, done.
     if !pid_is_alive(pid) {
         return true;
     }
     // KILL as escalation.
-    let _ = Command::new("kill")
-        .args(["-KILL", &pid_s])
-        .output();
+    let _ = Command::new("kill").args(["-KILL", &pid_s]).output();
     !pid_is_alive(pid)
 }
 
@@ -1444,20 +1440,9 @@ pub(crate) fn get_session_env_i64(tmux_bin: &str, session: &str, key: &str) -> O
 }
 
 /// Set a session-scoped tmux env var. Best-effort; returns success.
-pub(crate) fn set_session_env_i64(
-    tmux_bin: &str,
-    session: &str,
-    key: &str,
-    value: i64,
-) -> bool {
+pub(crate) fn set_session_env_i64(tmux_bin: &str, session: &str, key: &str, value: i64) -> bool {
     Command::new(tmux_bin)
-        .args([
-            "set-environment",
-            "-t",
-            session,
-            key,
-            &value.to_string(),
-        ])
+        .args(["set-environment", "-t", session, key, &value.to_string()])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -1644,12 +1629,12 @@ mod tests {
     use super::{InjectData, RunData, SessionActionData, SessionsData};
     // Plan F functional core (Chunk 3): herdr_command, parse_herdr_agents_tab,
     // and resolve_agent_pane_from_list removed with the Backend::Herdr arm.
+    use super::{Backend, BackendRunner, verify_needle};
     use super::{
         CR, PASTE_END, PASTE_START, classify_orphan_processes, classify_orphan_tmux,
         frame_line_bytes, hex_tokens, parse_cmux_start_target, parse_etime_secs, pid_is_alive,
         sanitize_inject_text, shell_words, tmux_inject_commands,
     };
-    use super::{Backend, BackendRunner, verify_needle};
     use crate::check::CheckData;
     use crate::cli::BackendBins;
     use crate::store::Fact;
@@ -1666,8 +1651,16 @@ mod tests {
             "longest control-free token, >= MIN chars"
         );
         assert_eq!(verify_needle("hi"), None, "too short to verify reliably");
-        assert_eq!(verify_needle("a b c d"), None, "no token reaches MIN length");
-        assert_eq!(verify_needle("   \t  "), None, "whitespace-only has no needle");
+        assert_eq!(
+            verify_needle("a b c d"),
+            None,
+            "no token reaches MIN length"
+        );
+        assert_eq!(
+            verify_needle("   \t  "),
+            None,
+            "whitespace-only has no needle"
+        );
         assert_eq!(verify_needle(""), None, "empty payload has no needle");
     }
 
@@ -1675,11 +1668,8 @@ mod tests {
     /// `capture_out` for `capture-pane` (agent-neutral — no tool id involved).
     fn stub_tmux(tag: &str, capture_out: &str, send_rc: u8) -> String {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!(
-            "rally-p1a-{}-{}.sh",
-            tag,
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("rally-p1a-{}-{}.sh", tag, std::process::id()));
         let body = format!(
             "#!/bin/sh\nfor a in \"$@\"; do\n  [ \"$a\" = \"capture-pane\" ] && {{ printf '%s\\n' '{capture_out}'; exit 0; }}\n  [ \"$a\" = \"send-keys\" ] && exit {send_rc}\ndone\nexit 0\n"
         );
@@ -2174,14 +2164,13 @@ mod tests {
         assert_eq!(staged[0].reason, "post-turn-zombie");
 
         // Verify it also works with an ancient age.
-        let old_age = ps_line(44445, "18-00:00:00", "/path/SkyComputerUseClient --turn-ended");
-        let staged2 = classify_orphan_processes(
-            &old_age,
-            PROC_NOW,
-            PROC_WIN,
-            PROC_FLOOR,
-            no_proc_parent,
+        let old_age = ps_line(
+            44445,
+            "18-00:00:00",
+            "/path/SkyComputerUseClient --turn-ended",
         );
+        let staged2 =
+            classify_orphan_processes(&old_age, PROC_NOW, PROC_WIN, PROC_FLOOR, no_proc_parent);
         assert_eq!(staged2.len(), 1);
         assert_eq!(staged2[0].reason, "post-turn-zombie");
     }
@@ -2229,9 +2218,8 @@ mod tests {
             ps_line(3, "40:00", "node /some/other/app.js"),
         ]
         .join("\n");
-        let orphans = classify_orphan_processes(&lines, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| {
-            Some(false)
-        });
+        let orphans =
+            classify_orphan_processes(&lines, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| Some(false));
         assert!(orphans.is_empty(), "non-candidate commands must be ignored");
     }
 
@@ -2239,12 +2227,10 @@ mod tests {
     fn classify_orphan_processes_is_idempotent() {
         // Running classify twice on the same input produces identical output.
         let line = ps_line(77777, "40:00", "/usr/local/bin/codex mcp-server");
-        let run1 = classify_orphan_processes(&line, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| {
-            Some(false)
-        });
-        let run2 = classify_orphan_processes(&line, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| {
-            Some(false)
-        });
+        let run1 =
+            classify_orphan_processes(&line, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| Some(false));
+        let run2 =
+            classify_orphan_processes(&line, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| Some(false));
         assert_eq!(run1.len(), run2.len());
         for (a, b) in run1.iter().zip(run2.iter()) {
             assert_eq!(a.pid, b.pid);
@@ -2255,14 +2241,13 @@ mod tests {
 
     #[test]
     fn codex_mcp_server_parent_dead_staged_reason_parent_dead() {
-        let line = ps_line(88881, "40:00", "node /home/user/.nvm/versions/node/v20/bin/codex mcp-server");
-        let orphans = classify_orphan_processes(
-            &line,
-            PROC_NOW,
-            PROC_WIN,
-            PROC_FLOOR,
-            |_| Some(false),
+        let line = ps_line(
+            88881,
+            "40:00",
+            "node /home/user/.nvm/versions/node/v20/bin/codex mcp-server",
         );
+        let orphans =
+            classify_orphan_processes(&line, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| Some(false));
         assert_eq!(orphans.len(), 1);
         assert!(orphans[0].reason.contains("parent-dead"));
     }
@@ -2270,28 +2255,26 @@ mod tests {
     #[test]
     fn codex_mcp_server_parent_alive_stale_by_window_is_kept() {
         // stale by window but parent alive → conservative keep.
-        let line = ps_line(88882, "40:00", "node /home/user/.nvm/versions/node/v20/bin/codex mcp-server");
-        let orphans = classify_orphan_processes(
-            &line,
-            PROC_NOW,
-            PROC_WIN,
-            PROC_FLOOR,
-            |_| Some(true),
+        let line = ps_line(
+            88882,
+            "40:00",
+            "node /home/user/.nvm/versions/node/v20/bin/codex mcp-server",
         );
+        let orphans =
+            classify_orphan_processes(&line, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| Some(true));
         assert!(orphans.is_empty());
     }
 
     #[test]
     fn codex_mcp_server_parent_alive_fresh_is_preserved() {
         // fresh (within window) + parent alive → definitely kept.
-        let line = ps_line(88883, "10:00", "node /home/user/.nvm/versions/node/v20/bin/codex mcp-server");
-        let orphans = classify_orphan_processes(
-            &line,
-            PROC_NOW,
-            PROC_WIN,
-            PROC_FLOOR,
-            |_| Some(true),
+        let line = ps_line(
+            88883,
+            "10:00",
+            "node /home/user/.nvm/versions/node/v20/bin/codex mcp-server",
         );
+        let orphans =
+            classify_orphan_processes(&line, PROC_NOW, PROC_WIN, PROC_FLOOR, |_| Some(true));
         assert!(orphans.is_empty());
     }
 }

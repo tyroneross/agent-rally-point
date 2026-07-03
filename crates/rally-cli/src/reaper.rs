@@ -79,8 +79,7 @@ pub(crate) fn run_reap_stale(apply: bool) -> Result<ReapReport> {
 /// temp store without touching the process-global cwd.
 pub(crate) fn run_reap_stale_in_room(room: &RoomStore, apply: bool) -> Result<ReapReport> {
     let snapshot = room.snapshot()?;
-    let coord =
-        crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
 
     let mut claims_reaped: Vec<ReapedClaim> = Vec::new();
     let mut preserved: usize = 0;
@@ -589,7 +588,10 @@ mod tests {
             .any(|c| c.event_id == claim_b.event_id);
 
         assert!(!a_still_live, "tool-a claim must be released after stop");
-        assert!(b_still_live, "tool-b claim must NOT be touched by tool-a stop");
+        assert!(
+            b_still_live,
+            "tool-b claim must NOT be touched by tool-a stop"
+        );
 
         // Suppress unused-variable warning for claim_b event_id which is checked above.
         let _ = claim_b;
@@ -770,7 +772,11 @@ mod tests {
 
         let report = run_reap_stale_in_room(&room, false).unwrap();
 
-        assert_eq!(report.claims_reaped.len(), 1, "dry-run must report eligible claim");
+        assert_eq!(
+            report.claims_reaped.len(),
+            1,
+            "dry-run must report eligible claim"
+        );
         assert!(!report.applied);
 
         let snap_after = room.snapshot().unwrap();
@@ -867,7 +873,8 @@ mod tests {
 
         // Claim has a past lease (1 hour ago).
         let past_lease = past_ts(3600);
-        let claim = append_claim_with_lease(&room, "claim-lease-expired", "live-owner", &past_lease);
+        let claim =
+            append_claim_with_lease(&room, "claim-lease-expired", "live-owner", &past_lease);
 
         let report = run_reap_stale_in_room(&room, true).unwrap();
 
@@ -878,8 +885,7 @@ mod tests {
         );
         assert_eq!(report.claims_reaped[0].claim_id, claim.event_id);
         assert_eq!(
-            report.claims_reaped[0].reason,
-            "lease-expired",
+            report.claims_reaped[0].reason, "lease-expired",
             "reason must be lease-expired when only the lease signal fires"
         );
         assert!(report.applied);
@@ -887,7 +893,10 @@ mod tests {
         // The claim must no longer be active.
         let snap = room.snapshot().unwrap();
         assert!(
-            !snap.active_claims.iter().any(|c| c.event_id == claim.event_id),
+            !snap
+                .active_claims
+                .iter()
+                .any(|c| c.event_id == claim.event_id),
             "reaped claim must leave active_claims"
         );
 
@@ -932,7 +941,9 @@ mod tests {
         // Must still be active.
         let snap = room.snapshot().unwrap();
         assert!(
-            snap.active_claims.iter().any(|c| c.event_id == claim.event_id),
+            snap.active_claims
+                .iter()
+                .any(|c| c.event_id == claim.event_id),
             "future-lease claim must remain in active_claims"
         );
 

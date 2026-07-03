@@ -670,7 +670,9 @@ fn command_self_exit_check(args: cli::SelfExitCheckArgs) -> Result<Output> {
 
     let session_name = own_session.clone().unwrap_or_default();
     let text = if exited {
-        format!("self-exit-check: EXITING {session_name} (work resolved, streak {new_streak}/{required_streak})")
+        format!(
+            "self-exit-check: EXITING {session_name} (work resolved, streak {new_streak}/{required_streak})"
+        )
     } else if args.persistent {
         format!("self-exit-check: staying (persistent opt-out) streak={new_streak}")
     } else {
@@ -4137,8 +4139,7 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
         // activity is past the adaptive default-cadence window and which are NOT
         // tracked as managed sessions are killed + tombstoned. Closes the gap
         // where `rally sessions --reap` saw 0 of the real detached orphans.
-        let coord =
-            crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+        let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
         let window = crate::liveness::adaptive_window_secs(
             coord.default_cadence_secs,
             coord.default_cadence_secs,
@@ -4149,18 +4150,10 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let managed_targets: std::collections::BTreeSet<String> = sessions
-            .iter()
-            .map(|v| v.session.target.clone())
-            .collect();
+        let managed_targets: std::collections::BTreeSet<String> =
+            sessions.iter().map(|v| v.session.target.clone()).collect();
         let tmux_bin = args.bins.tmux_bin.clone();
-        orphans_reaped = sweep_orphan_tmux(
-            &room,
-            &tmux_bin,
-            now_epoch,
-            window,
-            &managed_targets,
-        );
+        orphans_reaped = sweep_orphan_tmux(&room, &tmux_bin, now_epoch, window, &managed_targets);
         count += orphans_reaped.len();
 
         sessions = read_session_views(&room, args.bins.clone())?;
@@ -4172,37 +4165,35 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
     // Orphan OS-process reaper (--reap-processes [--apply]).
     // Independent of --reap; can be combined or used alone.
     // Detect once; apply or dry-run from the same candidate list.
-    let (processes_staged_count, processes_reaped_pids): (usize, Vec<i32>) =
-        if args.reap_processes {
-            let coord =
-                crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
-            let window = crate::liveness::adaptive_window_secs(
-                coord.default_cadence_secs,
-                coord.default_cadence_secs,
-                coord.miss_multiplier,
-                coord.grace_secs,
-            );
-            let now_epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            const PROCESS_FLOOR_SECS: i64 = 600;
-            let staged =
-                backends::detect_orphan_processes(now_epoch, window, PROCESS_FLOOR_SECS);
-            let staged_count = staged.len();
-            let killed: Vec<i32> = if args.apply {
-                staged
-                    .iter()
-                    .filter(|p| backends::kill_process(p.pid))
-                    .map(|p| p.pid)
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            (staged_count, killed)
+    let (processes_staged_count, processes_reaped_pids): (usize, Vec<i32>) = if args.reap_processes
+    {
+        let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+        let window = crate::liveness::adaptive_window_secs(
+            coord.default_cadence_secs,
+            coord.default_cadence_secs,
+            coord.miss_multiplier,
+            coord.grace_secs,
+        );
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        const PROCESS_FLOOR_SECS: i64 = 600;
+        let staged = backends::detect_orphan_processes(now_epoch, window, PROCESS_FLOOR_SECS);
+        let staged_count = staged.len();
+        let killed: Vec<i32> = if args.apply {
+            staged
+                .iter()
+                .filter(|p| backends::kill_process(p.pid))
+                .map(|p| p.pid)
+                .collect()
         } else {
-            (0, Vec::new())
+            Vec::new()
         };
+        (staged_count, killed)
+    } else {
+        (0, Vec::new())
+    };
 
     // Rebuild session list if any process kills happened.
     if !processes_reaped_pids.is_empty() {
@@ -4238,8 +4229,10 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
             if processes_reaped_pids.is_empty() {
                 text.push_str(" | processes: none killed");
             } else {
-                let pids: Vec<String> =
-                    processes_reaped_pids.iter().map(|p| p.to_string()).collect();
+                let pids: Vec<String> = processes_reaped_pids
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect();
                 text.push_str(&format!(
                     " | processes killed: {} (pids: {})",
                     processes_reaped_pids.len(),
@@ -5003,10 +4996,7 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                                 kind: FactKind::Release,
                                 tool: Some(stopping_tool.clone()),
                                 role: None,
-                                subject: format!(
-                                    "self-release on stop: {}",
-                                    claim.event_id
-                                ),
+                                subject: format!("self-release on stop: {}", claim.event_id),
                                 scope: claim.scope.clone(),
                                 created_at: now_string(),
                                 summary: None,

@@ -4664,20 +4664,14 @@ mod ledger_tests {
         .unwrap();
         // Must allocate ABOVE the out-of-band tail (8), never a stale 4.
         let appended = store
-            .append_fact(&make_fact(
-                "after-oob",
-                FactKind::Artifact,
-                "src/",
-                "after",
-            ))
+            .append_fact(&make_fact("after-oob", FactKind::Artifact, "src/", "after"))
             .unwrap();
         assert_eq!(
             appended.seq, 8,
             "fingerprint mismatch must force an authoritative scan past the out-of-band tail"
         );
         let live = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
-        let archived =
-            replay_archive_segments(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
+        let archived = replay_archive_segments(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
         assert_eq!(
             segment_seq_stats(&live, &archived).unwrap().max_seq,
             8,

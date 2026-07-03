@@ -112,9 +112,7 @@ pub(crate) fn adaptive_window_secs(
 /// * else (no fresh signal AND at least one `None`) → [`Liveness::Unknown`].
 pub(crate) fn is_live(signals: &LivenessSignals, window: i64) -> Liveness {
     let arr = signals.as_array();
-    let any_fresh = arr
-        .iter()
-        .any(|s| matches!(s, Some(age) if *age <= window));
+    let any_fresh = arr.iter().any(|s| matches!(s, Some(age) if *age <= window));
     if any_fresh {
         return Liveness::Live;
     }
@@ -133,10 +131,7 @@ pub(crate) fn is_live(signals: &LivenessSignals, window: i64) -> Liveness {
 /// Used by the orphan-tmux reaper path (which has no `CoordinationConfig` in
 /// hand) and by external integration tests.
 #[allow(dead_code)]
-pub(crate) fn is_live_default(
-    signals: &LivenessSignals,
-    planned_interval_secs: i64,
-) -> Liveness {
+pub(crate) fn is_live_default(signals: &LivenessSignals, planned_interval_secs: i64) -> Liveness {
     let window = adaptive_window_secs(
         planned_interval_secs,
         DEFAULT_CADENCE_SECS,
@@ -264,7 +259,10 @@ mod tests {
         let default_cadence = v["default_cadence_secs"].as_i64().unwrap();
         let mult = v["miss_multiplier"].as_i64().unwrap();
         let grace = v["grace_secs"].as_i64().unwrap();
-        assert_eq!(default_cadence, DEFAULT_CADENCE_SECS, "fixture cadence drift");
+        assert_eq!(
+            default_cadence, DEFAULT_CADENCE_SECS,
+            "fixture cadence drift"
+        );
         assert_eq!(mult, MISS_MULTIPLIER, "fixture multiplier drift");
         assert_eq!(grace, GRACE_SECS, "fixture grace drift");
 
@@ -351,7 +349,10 @@ mod tests {
     #[test]
     fn reapable_never_reaps_live_or_unknown() {
         for parent in [Some(true), Some(false), None] {
-            assert!(!reapable(Liveness::Live, parent), "live must never be reaped");
+            assert!(
+                !reapable(Liveness::Live, parent),
+                "live must never be reaped"
+            );
             assert!(
                 !reapable(Liveness::Unknown, parent),
                 "unknown must never be reaped (fail-closed)"
@@ -361,8 +362,14 @@ mod tests {
 
     #[test]
     fn reapable_stale_parent_dead_is_reaped_but_alive_is_kept() {
-        assert!(reapable(Liveness::Stale, Some(false)), "stale + dead parent → reap");
-        assert!(!reapable(Liveness::Stale, Some(true)), "stale + live parent → keep");
+        assert!(
+            reapable(Liveness::Stale, Some(false)),
+            "stale + dead parent → reap"
+        );
+        assert!(
+            !reapable(Liveness::Stale, Some(true)),
+            "stale + live parent → keep"
+        );
         assert!(
             reapable(Liveness::Stale, None),
             "stale + no parent info → window criterion alone reaps"
