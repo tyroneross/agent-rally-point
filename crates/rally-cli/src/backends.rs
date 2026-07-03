@@ -363,6 +363,29 @@ pub(crate) struct BackendRunner {
     ptyd_socket: Option<String>,
 }
 
+/// Legacy tmux/cmux landing-verify tuning (P1a). A few short retries tolerate
+/// app render latency without wedging the inject path.
+const LEGACY_VERIFY_ATTEMPTS: usize = 3;
+const LEGACY_VERIFY_BACKOFF_MS: u64 = 120;
+const LEGACY_VERIFY_CAPTURE_LINES: usize = 40;
+/// Shortest payload token worth searching for in the pane after inject. Below
+/// this, false-positive substring matches (and unverifiable short payloads) make
+/// screen confirmation unreliable, so we skip verification rather than downgrade.
+const LEGACY_VERIFY_MIN_NEEDLE: usize = 6;
+
+/// Pick a stable needle to confirm on the pane after a legacy inject: the
+/// longest whitespace-delimited, control-free token in the sanitized payload,
+/// of length >= [`LEGACY_VERIFY_MIN_NEEDLE`]. Returns `None` when no such token
+/// exists (payload too short / all-whitespace), signalling "cannot verify".
+fn verify_needle(sanitized: &str) -> Option<String> {
+    sanitized
+        .split_whitespace()
+        .filter(|tok| !tok.chars().any(|c| c.is_control()))
+        .max_by_key(|tok| tok.chars().count())
+        .filter(|tok| tok.chars().count() >= LEGACY_VERIFY_MIN_NEEDLE)
+        .map(str::to_string)
+}
+
 impl BackendRunner {
     pub(crate) fn new(backend: Backend, bins: BackendBins) -> Self {
         // PROVENANCE: the BackendBins struct previously carried `herdr_bin` and
@@ -546,6 +569,47 @@ impl BackendRunner {
 
     pub(crate) fn inject(&self, target: &str, text: &str) -> Result<()> {
         run_commands(&self.inject_commands(target, text))
+    }
+
+    /// tmux/cmux legacy inject WITH best-effort landing verification (P1a).
+    /// A bare `send-keys` exit 0 only proves the keystrokes were queued, not
+    /// that the pane's app consumed them — so `delivered=true` on that alone is
+    /// fire-and-forget. Here we send, then capture the pane and confirm a stable
+    /// payload needle actually appeared, catching the "live pane but app not
+    /// consuming" false positive. Agent-neutral (no tool-id coupling); the
+    /// daemon/ptyd path keeps its own Receipt+F4 verification and does not use
+    /// this method.
+    ///   `Ok(true)`  = sent AND payload confirmed on the pane (verified delivery)
+    ///   `Ok(false)` = sent (send-keys succeeded) but landing NOT confirmed
+    ///   `Err(_)`    = the send itself failed
+    pub(crate) fn inject_and_verify(&self, target: &str, text: &str) -> Result<bool> {
+        self.inject(target, text)?;
+        // A short/whitespace-only payload has no stable needle to search for;
+        // a successful send is the best signal available — do not downgrade it.
+        let needle = match verify_needle(&sanitize_inject_text(text)) {
+            Some(n) => n,
+            None => return Ok(true),
+        };
+        // Only downgrade to "unverified" when we actually observed pane content
+        // that lacked the payload. If every capture came back empty or errored
+        // (no capture backend, `/usr/bin/true` stub, permission), we simply
+        // cannot verify — and must NOT turn a successful send into a false
+        // negative. `saw_pane_content` gates that distinction.
+        let mut saw_pane_content = false;
+        for attempt in 0..LEGACY_VERIFY_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(LEGACY_VERIFY_BACKOFF_MS));
+            }
+            if let Ok(screen) = self.capture(target, LEGACY_VERIFY_CAPTURE_LINES) {
+                if screen.contains(&needle) {
+                    return Ok(true);
+                }
+                if !screen.trim().is_empty() {
+                    saw_pane_content = true;
+                }
+            }
+        }
+        Ok(!saw_pane_content)
     }
 
     /// Deliver `text` to a ptyd-owned pane bound to `identity` via `agent.send`
@@ -1585,10 +1649,104 @@ mod tests {
         frame_line_bytes, hex_tokens, parse_cmux_start_target, parse_etime_secs, pid_is_alive,
         sanitize_inject_text, shell_words, tmux_inject_commands,
     };
+    use super::{Backend, BackendRunner, verify_needle};
     use crate::check::CheckData;
+    use crate::cli::BackendBins;
     use crate::store::Fact;
     use crate::{EnterData, Envelope, NextData, RoomData, SayData};
     use schemars::schema_for;
+
+    // ---- P1a: legacy tmux/cmux inject landing-verify -----------------------
+
+    #[test]
+    fn verify_needle_picks_longest_stable_token_or_none() {
+        assert_eq!(
+            verify_needle("rally-verify-token-ABC123 hello"),
+            Some("rally-verify-token-ABC123".to_string()),
+            "longest control-free token, >= MIN chars"
+        );
+        assert_eq!(verify_needle("hi"), None, "too short to verify reliably");
+        assert_eq!(verify_needle("a b c d"), None, "no token reaches MIN length");
+        assert_eq!(verify_needle("   \t  "), None, "whitespace-only has no needle");
+        assert_eq!(verify_needle(""), None, "empty payload has no needle");
+    }
+
+    /// Write an executable stub `tmux` that exits 0 for `send-keys` and prints
+    /// `capture_out` for `capture-pane` (agent-neutral — no tool id involved).
+    fn stub_tmux(tag: &str, capture_out: &str, send_rc: u8) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "rally-p1a-{}-{}.sh",
+            tag,
+            std::process::id()
+        ));
+        let body = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  [ \"$a\" = \"capture-pane\" ] && {{ printf '%s\\n' '{capture_out}'; exit 0; }}\n  [ \"$a\" = \"send-keys\" ] && exit {send_rc}\ndone\nexit 0\n"
+        );
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn tmux_runner(bin: &str) -> BackendRunner {
+        BackendRunner::new(
+            Backend::Tmux,
+            BackendBins {
+                tmux_bin: bin.to_string(),
+                cmux_bin: "cmux".to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn inject_and_verify_confirms_when_payload_lands_on_pane() {
+        let bin = stub_tmux("pos", "user@host:~$ rally-verify-token-ABC123 hello", 0);
+        let r = tmux_runner(&bin);
+        assert_eq!(
+            r.inject_and_verify("sess", "rally-verify-token-ABC123 hello")
+                .unwrap(),
+            true,
+            "capture-pane shows the payload needle => verified delivery"
+        );
+    }
+
+    #[test]
+    fn inject_and_verify_reports_unverified_when_payload_absent() {
+        let bin = stub_tmux("neg", "nothing relevant on screen here", 0);
+        let r = tmux_runner(&bin);
+        assert_eq!(
+            r.inject_and_verify("sess", "rally-verify-token-ABC123 hello")
+                .unwrap(),
+            false,
+            "send-keys ok but payload never appears => sent-but-unverified, not a false 'delivered'"
+        );
+    }
+
+    #[test]
+    fn inject_and_verify_errors_when_send_fails() {
+        let bin = stub_tmux("fail", "irrelevant", 1);
+        let r = tmux_runner(&bin);
+        assert!(
+            r.inject_and_verify("sess", "rally-verify-token-ABC123 hello")
+                .is_err(),
+            "a failed send-keys must surface as Err, not a claimed delivery"
+        );
+    }
+
+    #[test]
+    fn inject_and_verify_does_not_downgrade_when_capture_is_empty() {
+        // `/usr/bin/true`-style stub: send-keys ok, capture-pane returns nothing.
+        // We cannot verify, so we must NOT turn a successful send into a false
+        // negative — preserves the established `--tmux-bin /usr/bin/true` idiom.
+        let bin = stub_tmux("empty", "", 0);
+        let r = tmux_runner(&bin);
+        assert_eq!(
+            r.inject_and_verify("sess", "rally-verify-token-ABC123 hello")
+                .unwrap(),
+            true,
+            "empty/unavailable capture is unverifiable, not a failed landing"
+        );
+    }
 
     #[test]
     fn cmux_start_target_uses_workspace_ref_from_status_output() {

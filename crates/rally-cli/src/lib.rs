@@ -4582,6 +4582,11 @@ fn command_inject_managed(
     }
 
     // Legacy synchronous backend delivery — preserved for tmux/cmux backends.
+    // P1a: the tmux/cmux path now confirms landing (capture-verify) before
+    // claiming `delivered`. A send that succeeded but whose landing could not be
+    // confirmed is recorded as `legacy_sent_unverified` — an honest middle state,
+    // NOT "failed" (it was sent) and NOT "delivered" (unconfirmed).
+    let mut legacy_sent_unverified = false;
     let delivered = if dry_run {
         false
     } else if daemon_routed {
@@ -4605,8 +4610,12 @@ fn command_inject_managed(
         // Addition is delivered by NO backend.
         false
     } else {
-        match backend_runner.inject(&live_target, &text) {
-            Ok(()) => true,
+        match backend_runner.inject_and_verify(&live_target, &text) {
+            Ok(true) => true,
+            Ok(false) => {
+                legacy_sent_unverified = true;
+                false
+            }
             Err(_) => false,
         }
     };
@@ -4624,7 +4633,8 @@ fn command_inject_managed(
     // Plan F functional core (Chunk 3): the herdr backend is removed;
     // the only inject paths left are tmux + cmux + the ledger write.
     let ledger_failed = delivery_state_initial == "failed";
-    let legacy_tmux_cmux_failed = !dry_run && !daemon_routed && !delivered && !ledger_failed;
+    let legacy_tmux_cmux_failed =
+        !dry_run && !daemon_routed && !delivered && !ledger_failed && !legacy_sent_unverified;
     // F4 + RPC honesty: a daemon-routed send that hit a pane mismatch or an RPC
     // error is a REAL failure (the directive stays Pending on the ledger, but
     // this inject did not deliver). A successful Receipt is `delivered`.
@@ -4637,6 +4647,8 @@ fn command_inject_managed(
             "failed"
         } else if delivered {
             "delivered"
+        } else if legacy_sent_unverified {
+            "sent_unverified"
         } else {
             delivery_state_initial
         };
