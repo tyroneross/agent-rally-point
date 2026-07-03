@@ -38,3 +38,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # F4/F5 crypto
 dryoc = "0.8"
 rand = "0.8"
+
+# Release profile — tuned for the shipped binaries (arm64 macOS is the primary
+# target). Defaults leave codegen-units=16 and no LTO, so the release binary is
+# under-optimized. `rally` runs on every commit (before-write/before-complete
+# hooks), so smaller + faster startup is directly user-visible.
+[profile.release]
+lto = true          # fat cross-crate LTO: inlining across crates, smaller code
+codegen-units = 1   # one unit → maximal optimization (no parallel-split inlining loss)
+strip = true        # drop symbols from the shipped binary
+# opt-level stays 3 (release default); panic stays unwind (abort would change
+# runtime behavior and break unwind-dependent tests).
