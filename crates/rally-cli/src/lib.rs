@@ -5105,10 +5105,17 @@ fn projected_session_liveness(
         .copied()
         .unwrap_or(SessionLiveness::Unknown);
     match (heartbeat_stale.get(&session.tool).copied(), probe) {
-        (Some(true), _) => (SessionLiveness::Stale, "heartbeat_ttl"),
+        // P1c fix: a DEFINITIVE backend probe is authoritative over the presence
+        // heartbeat TTL. A pane that is really alive is NOT stale just because
+        // its heartbeat lapsed (>15 min without a rally command) — this is the
+        // false-stale that rejected inject to busy/quiet-but-live agents. A pane
+        // that is really gone IS stale regardless of a fresh heartbeat. Only when
+        // the probe is Unknown (no backend result) do we fall back to the TTL.
+        (_, SessionLiveness::Live) => (SessionLiveness::Live, "backend_probe"),
         (_, SessionLiveness::Stale) => (SessionLiveness::Stale, "backend_probe"),
-        (Some(false), _) => (SessionLiveness::Live, "heartbeat_ttl"),
-        (None, liveness) => (liveness, "backend_probe"),
+        (Some(true), SessionLiveness::Unknown) => (SessionLiveness::Stale, "heartbeat_ttl"),
+        (Some(false), SessionLiveness::Unknown) => (SessionLiveness::Live, "heartbeat_ttl"),
+        (None, SessionLiveness::Unknown) => (SessionLiveness::Unknown, "backend_probe"),
     }
 }
 
@@ -5996,6 +6003,82 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---- P1c: session liveness — real pane probe beats presence TTL -------
+
+    fn liveness_session(session_id: &str, tool: &str) -> ManagedSession {
+        ManagedSession {
+            session_id: session_id.to_string(),
+            name: session_id.to_string(),
+            agent: "codex".to_string(),
+            tool: tool.to_string(),
+            backend: "tmux".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            target: format!("rally-{session_id}"),
+            worktree_path: None,
+            branch: None,
+            daemon_registered: false,
+            daemon_pane: None,
+            daemon_socket: None,
+        }
+    }
+
+    #[test]
+    fn live_backend_probe_overrides_stale_heartbeat_ttl() {
+        // The P1c bug: a busy/quiet-but-ALIVE agent whose presence heartbeat
+        // lapsed (>15min) was marked Stale, which rejected inject to it. A real
+        // "pane is live" probe must win over the TTL. Agent-neutral.
+        for tool in ["codex:01", "claude_code:4f6d8c1a", "gemini:build-01"] {
+            let s = liveness_session("sid", tool);
+            let heartbeat_stale = BTreeMap::from([(tool.to_string(), true)]);
+            let probes = BTreeMap::from([("sid".to_string(), SessionLiveness::Live)]);
+            assert_eq!(
+                projected_session_liveness(&s, &heartbeat_stale, &probes),
+                (SessionLiveness::Live, "backend_probe"),
+                "live pane must NOT be stale just because the heartbeat lapsed ({tool})"
+            );
+        }
+    }
+
+    #[test]
+    fn dead_backend_probe_is_stale_even_with_fresh_heartbeat() {
+        let s = liveness_session("sid", "codex:01");
+        let heartbeat_stale = BTreeMap::from([("codex:01".to_string(), false)]);
+        let probes = BTreeMap::from([("sid".to_string(), SessionLiveness::Stale)]);
+        assert_eq!(
+            projected_session_liveness(&s, &heartbeat_stale, &probes),
+            (SessionLiveness::Stale, "backend_probe"),
+            "a really-gone pane is stale regardless of a fresh heartbeat"
+        );
+    }
+
+    #[test]
+    fn heartbeat_ttl_is_the_fallback_only_when_probe_is_unknown() {
+        let s = liveness_session("sid", "codex:01");
+        // stale TTL + no probe → Stale via TTL fallback.
+        assert_eq!(
+            projected_session_liveness(
+                &s,
+                &BTreeMap::from([("codex:01".to_string(), true)]),
+                &BTreeMap::new(),
+            ),
+            (SessionLiveness::Stale, "heartbeat_ttl"),
+        );
+        // fresh TTL + no probe → Live via TTL fallback.
+        assert_eq!(
+            projected_session_liveness(
+                &s,
+                &BTreeMap::from([("codex:01".to_string(), false)]),
+                &BTreeMap::new(),
+            ),
+            (SessionLiveness::Live, "heartbeat_ttl"),
+        );
+        // no TTL info + no probe → Unknown.
+        assert_eq!(
+            projected_session_liveness(&s, &BTreeMap::new(), &BTreeMap::new()),
+            (SessionLiveness::Unknown, "backend_probe"),
+        );
     }
 
     // ---- inject watchdog budget (Chunk 2 root-cause fix) -----------------
