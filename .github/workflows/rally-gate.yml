@@ -10,10 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Pin the EXACT stable (not moving `@stable`) so local and CI rustfmt agree
+      # — a moving toolchain drifts rustfmt versions and makes the fmt gate flaky.
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      - name: Format check
+        run: cargo fmt --all --check
       - name: Test
         run: cargo test
       - name: Build release binary (arms the empirical packet gate)

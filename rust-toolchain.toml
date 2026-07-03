@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # PR45 dependencies (icu_*, time) require Rust >= 1.86/1.88; the machine default
-# toolchain may be older (e.g. 1.85). Pinning to stable makes `cargo build`
-# resolve a compatible compiler regardless of the global default, so local builds
-# and CI agree without relying on `rustc --version` of the host.
+# toolchain may be older (e.g. 1.85). Pin an EXACT stable (not moving `stable`)
+# so local builds and CI resolve the same compiler AND the same rustfmt — a
+# moving channel drifts the rustfmt version and makes the `cargo fmt --check` CI
+# gate flaky. Bump this deliberately (and the CI action pin) to adopt a newer
+# stable. CI mirrors this via `dtolnay/rust-toolchain@1.95.0` in rally-gate.yml.
 [toolchain]
-channel = "stable"
+channel = "1.95.0"
 components = ["rustfmt", "clippy"]
