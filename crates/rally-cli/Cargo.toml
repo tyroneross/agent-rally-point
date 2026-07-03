@@ -7,6 +7,9 @@ version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Repo-local coordination CLI for multi-agent Rally Point rooms."
+repository.workspace = true
+publish = false
 
 [[bin]]
 name = "rally"
@@ -27,4 +30,4 @@ thiserror.workspace = true
 # typed Directives; rally-termd subscribes and posts Receipts. ZERO further
 # dependencies (the H4 architectural lint asserts rally-cli does not depend
 # on `ptyd` either directly or transitively).
-rally-protocol = { path = "../rally-protocol" }
+rally-protocol = { version = "0.1.0", path = "../rally-protocol" }

@@ -2,7 +2,7 @@
 
 # Cargo Quality Gate Recommendations - 2026-07-03
 
-Status as of `f1f0769` (`ci(fmt): pin Rust 1.95.0 + add cargo fmt --check gate`).
+Baseline status as of `f1f0769` (`ci(fmt): pin Rust 1.95.0 + add cargo fmt --check gate`). Current working-tree progress from the follow-up hygiene lane is recorded below.
 
 ## Recommendation
 
@@ -14,9 +14,9 @@ Recommended gate ladder:
 2. Fix current clippy findings, then add `cargo clippy --workspace --all-targets -- -D warnings` to CI.
 3. Resolve dependency-audit findings before adding a hard `cargo audit` gate.
 4. Add a project-owned `deny.toml`, then add `cargo deny check`.
-5. Decide package intent for `rally-cli`: binary-only release with `publish = false`, or crates.io-ready package with metadata and a versioned internal dependency on `rally-protocol`.
+5. Treat `rally-cli` as binary-only for now with `publish = false`; keep registry package verification on `rally-protocol` until `rally-protocol` is actually published.
 
-## Current Evidence
+## Baseline Evidence
 
 Verified locally on 2026-07-03:
 
@@ -24,10 +24,25 @@ Verified locally on 2026-07-03:
 |---|---:|---|
 | `cargo fmt --check --all` | Pass | Closed by `9bbead3` plus CI gate in `f1f0769`. |
 | `git diff --check` | Pass | No whitespace errors in the current checkout. |
-| `cargo clippy --workspace --all-targets -- -D warnings` | Fail | 13 `rally-cli` clippy diagnostics remain. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Fail | Current `rally-cli` clippy diagnostics remain; Claude counted 15 emitted error lines in its verification pass. |
 | `cargo audit` | Fail | `RUSTSEC-2023-0071` via `rsa 0.9.10`; warning on `anyhow 1.0.102`. |
 | `cargo deny check` | Not gateable yet | No `deny.toml`; default config rejects common licenses and creates unusable noise. |
 | `cargo package -p rally-cli --allow-dirty` | Fail | `rally-protocol` path dependency has no version requirement; manifest metadata also incomplete. |
+
+## Current Working-Tree Progress
+
+Follow-up hygiene work after the baseline closed the unblocked items:
+
+| Check | Current working-tree result | Notes |
+|---|---:|---|
+| `cargo fmt --check --all` | Pass | No formatter drift after the hygiene edits. |
+| `git diff --check` | Pass | No whitespace errors. |
+| `cargo test --workspace` | Pass | Workspace unit, integration, and doc tests passed locally. |
+| `cargo audit` | Pass | `anyhow` is updated to `1.0.103`; `.cargo/audit.toml` narrowly ignores `RUSTSEC-2023-0071` because `cargo tree -i rsa --workspace --target all` has no reverse dependency and Rally uses SQLite-only `factstr-sqlite`/`sqlx` features. |
+| `cargo deny check --hide-inclusion-graph` | Pass with duplicate-version warnings | Advisories, licenses, and sources are gateable with the project-owned `deny.toml`; duplicate versions remain warnings. |
+| `cargo package -p rally-protocol --allow-dirty` | Pass | `rally-protocol` has package metadata and verifies. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Pass | Remaining `crates/rally-cli/src/backends.rs` diagnostics were resolved after Rally downgraded the stale Claude claim to a warning. |
+| `cargo package -p rally-cli --allow-dirty` | Not a short-term gate | `rally-cli` is now `publish = false`; registry verification cannot pass until `rally-protocol` is published or the publish model changes. |
 
 ## What Claude Already Closed
 
@@ -90,6 +105,8 @@ Recommendation:
 - If `rally-cli` is only shipped as GitHub release binaries, set `publish = false` and keep package checks focused on `rally-protocol`.
 - If `rally-cli` should be crates.io installable, add package metadata and make the dependency versioned, for example `rally-protocol = { version = "0.1.0", path = "../rally-protocol" }`, then verify publish order.
 
+Decision taken in this hygiene lane: `rally-cli` is binary-release only for now (`publish = false`), while `rally-protocol` remains packageable. A verified `cargo package -p rally-cli` gate should wait until `rally-protocol` is published or the publish model changes.
+
 ### P2 - Manifest Metadata Is Incomplete
 
 `cargo package --list` and `cargo package` warn that `rally-cli` has no description, documentation, homepage, or repository. `rally-protocol` packages successfully but warns that documentation/homepage/repository are missing.
@@ -100,7 +117,7 @@ Recommendation:
 - Add `description` to `rally-cli` if it remains packageable.
 - Use `publish = false` for internal-only crates such as cockpit packages if they are not meant for registry publication.
 
-## CI Target State
+## CI Target State After Findings Are Resolved
 
 Short-term CI target:
 

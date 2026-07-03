@@ -6801,7 +6801,7 @@ mod squad_decay_tests {
             kind,
             tool: Some(tool.to_string()),
             role: None,
-            subject: format!("{tool}"),
+            subject: tool.to_string(),
             scope: Vec::new(),
             created_at: iso_ago(age_secs),
             summary: None,

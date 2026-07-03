@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+
+[advisories]
+ignore = [
+    # `rsa` is present only through sqlx's optional MySQL package in Cargo.lock.
+    # `cargo tree -i rsa --workspace --target all` prints no reverse dependency;
+    # Rally uses factstr-sqlite/sqlx with SQLite features only.
+    "RUSTSEC-2023-0071",
+]
+
+[database]
+fetch = true
+stale = false

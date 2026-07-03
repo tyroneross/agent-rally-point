@@ -14,6 +14,7 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.85"
+repository = "https://github.com/tyroneross/agent-rally-point"
 
 [workspace.dependencies]
 bpaf = "0.9.26"

@@ -84,7 +84,7 @@ fn extract_expected_by(fact: &Fact) -> Option<String> {
     fact.evidence
         .iter()
         .filter_map(|s| s.strip_prefix("expected_by:"))
-        .last()
+        .next_back()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -149,6 +149,9 @@ fn validate_status(status: &str) -> Result<()> {
     }
 }
 
+// These helpers mirror CLI/user-facing backlog fields. Keeping the call shape
+// explicit is clearer than hiding optional fields behind a builder at call sites.
+#[allow(clippy::too_many_arguments)]
 fn build_backlog_fact(
     tool: &str,
     id: &str,
@@ -197,6 +200,7 @@ fn build_backlog_fact(
 }
 
 /// Add a backlog item to the room ledger. Returns the stored `Fact`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn add_backlog_item(
     room: &RoomStore,
     tool: &str,
@@ -228,6 +232,7 @@ pub(crate) fn add_backlog_item(
 
 /// Update an existing backlog item by appending a same-id fact. Omitted fields
 /// inherit from the latest item so update facts remain self-contained.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn update_backlog_item(
     room: &RoomStore,
     tool: &str,

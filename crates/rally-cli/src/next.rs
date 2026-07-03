@@ -282,7 +282,6 @@ pub(crate) fn build_next(
         .collect();
     let ready_backlog_items: Vec<BacklogItem> = backlog_items
         .iter()
-        .cloned()
         .filter(|item| item.status != "done")
         .filter(|item| {
             // All deps satisfied
@@ -299,6 +298,7 @@ pub(crate) fn build_next(
                 !claimed_scopes.contains(&normalized) && !claimed_scopes.contains(path)
             })
         })
+        .cloned()
         .collect();
     let mut candidates = next_candidates(
         snapshot,

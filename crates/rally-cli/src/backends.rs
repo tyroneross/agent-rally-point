@@ -1173,7 +1173,7 @@ pub(crate) fn parse_etime_secs(etime: &str) -> Option<i64> {
         }
         _ => return None,
     };
-    if m < 0 || m > 59 || sec < 0 || sec > 59 || h < 0 {
+    if !(0..=59).contains(&m) || !(0..=59).contains(&sec) || h < 0 {
         return None;
     }
     Some(day_secs + h * 3_600 + m * 60 + sec)
@@ -1402,9 +1402,7 @@ pub(crate) fn kill_process(pid: i32) -> bool {
 /// `rally stop` to self-kill its own agent tmux session at session end. Returns
 /// `None` when not inside tmux or not a `rally-*` session.
 pub(crate) fn own_rally_tmux_session(tmux_bin: &str) -> Option<String> {
-    if std::env::var_os("TMUX").is_none() {
-        return None;
-    }
+    std::env::var_os("TMUX")?;
     let out = Command::new(tmux_bin)
         .args(["display-message", "-p", "#{session_name}"])
         .output()
@@ -1724,9 +1722,8 @@ mod tests {
     fn inject_and_verify_confirms_when_payload_lands_on_pane() {
         let bin = stub_tmux("pos", "user@host:~$ rally-verify-token-ABC123 hello", 0);
         let r = tmux_runner(&bin);
-        assert_eq!(
+        assert!(
             iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
-            true,
             "capture-pane shows the payload needle => verified delivery"
         );
     }
@@ -1735,9 +1732,8 @@ mod tests {
     fn inject_and_verify_reports_unverified_when_payload_absent() {
         let bin = stub_tmux("neg", "nothing relevant on screen here", 0);
         let r = tmux_runner(&bin);
-        assert_eq!(
-            iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
-            false,
+        assert!(
+            !iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
             "send-keys ok but payload never appears => sent-but-unverified, not a false 'delivered'"
         );
     }
@@ -1759,9 +1755,8 @@ mod tests {
         // negative — preserves the established `--tmux-bin /usr/bin/true` idiom.
         let bin = stub_tmux("empty", "", 0);
         let r = tmux_runner(&bin);
-        assert_eq!(
+        assert!(
             iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
-            true,
             "empty/unavailable capture is unverifiable, not a failed landing"
         );
     }

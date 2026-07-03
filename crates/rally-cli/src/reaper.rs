@@ -826,7 +826,7 @@ mod tests {
     /// Append a Claim owned by `tool` with:
     ///   - `created_at` fresh (now) so the owner's squad last_seen_ts stays live
     ///   - `lease_expires_at:<ts>` evidence stamped with the given RFC-3339 string
-    /// Multi-scope so it has parseable ResourceScope entries and appears in active_claims.
+    ///     Multi-scope so it has parseable ResourceScope entries and appears in active_claims.
     fn append_claim_with_lease(
         room: &RoomStore,
         event_id: &str,
