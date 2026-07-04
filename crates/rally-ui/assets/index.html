@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rally-ui</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #fafafa;
+    color: #1a1a1a;
+    font-size: 14px;
+  }
+  .layout { display: flex; min-height: 100vh; align-items: stretch; }
+
+  /* ---- left rail ---- */
+  .rail {
+    width: 220px;
+    flex: 0 0 220px;
+    background: #fff;
+    border-right: 1px solid #e5e5e5;
+    display: flex;
+    flex-direction: column;
+  }
+  .add-form { padding: 12px; display: flex; flex-direction: column; gap: 6px; }
+  .add-form input[type="text"] {
+    font-size: 12px; padding: 6px 8px; border: 1px solid #e5e5e5; border-radius: 6px; width: 100%;
+  }
+  .add-form select { font-size: 12px; padding: 5px 6px; border: 1px solid #e5e5e5; border-radius: 6px; }
+  .add-form-row { display: flex; gap: 6px; }
+  .add-form button {
+    font-size: 12px; padding: 6px 10px; border: 1px solid #1a1a1a; border-radius: 6px;
+    background: #1a1a1a; color: #fff; cursor: pointer;
+  }
+  .add-error { font-size: 12px; color: #dc2626; padding: 0 2px; }
+
+  .section-label {
+    font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+    color: #8a8a8a; margin: 16px 0 8px;
+  }
+  .rooms-list-wrap { padding: 0 12px 12px; overflow-y: auto; }
+  .rooms-list {
+    list-style: none; margin: 0; padding: 0;
+    border: 1px solid #e5e5e5; border-radius: 8px; overflow: hidden;
+  }
+  .room-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 8px 10px; font-size: 13px; font-weight: 500; color: #4a4a4a;
+    border-bottom: 1px solid #e5e5e5; border-left: 2px solid transparent; cursor: pointer;
+  }
+  .room-row:last-child { border-bottom: none; }
+  .room-row:hover { background: #fafafa; }
+  .room-row.selected { color: #1a1a1a; border-left-color: #1a1a1a; }
+  .room-row .room-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .room-row .room-meta { font-size: 11px; color: #8a8a8a; font-weight: 400; flex-shrink: 0; }
+  .empty-state { font-size: 12px; color: #8a8a8a; padding: 8px 2px; }
+
+  /* ---- main ---- */
+  .main { flex: 1; padding: 24px; min-width: 0; }
+  .main-toolbar { display: flex; align-items: center; gap: 16px; margin-bottom: 16px; }
+  .auto-refresh-label { font-size: 12px; color: #4a4a4a; display: flex; align-items: center; gap: 4px; }
+  .text-btn {
+    font-size: 12px; color: #1a1a1a; background: none; border: none; cursor: pointer;
+    padding: 0; text-decoration: underline;
+  }
+  .remove-link { font-size: 11px; color: #6b7280; background: none; border: none; cursor: pointer; padding: 0; text-decoration: underline; }
+
+  .room-header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .room-header h1 { font-size: 16px; font-weight: 600; margin: 0; }
+  .health { font-size: 11px; display: flex; align-items: center; gap: 4px; color: #4a4a4a; }
+  .health-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; }
+  .health-ok { background: #15803d; }
+  .health-degraded { background: #b45309; }
+  .health-stale { background: #9ca3af; }
+  .health-error { background: #dc2626; }
+  .health-reason { font-size: 11px; color: #b45309; }
+  .room-path { font-size: 11px; color: #8a8a8a; margin-top: 2px; }
+
+  .card { background: #fff; border: 1px solid #e5e5e5; border-radius: 8px; overflow: hidden; }
+
+  table.agents-table { width: 100%; border-collapse: collapse; }
+  table.agents-table th {
+    text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.05em; color: #8a8a8a; padding: 8px 12px; border-bottom: 1px solid #e5e5e5;
+  }
+  table.agents-table td { padding: 8px 12px; font-size: 13px; border-bottom: 1px solid #e5e5e5; }
+  table.agents-table tr:last-child td { border-bottom: none; }
+  .state-working { color: #15803d; }
+  .state-idle { color: #6b7280; }
+  .state-blocked { color: #dc2626; }
+  .state-done { color: #9ca3af; }
+  .state-stale { color: #9ca3af; font-style: italic; }
+  .stale-toggle { font-size: 12px; color: #6b7280; background: none; border: none; padding: 8px 12px; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; display: block; }
+  .stale-toggle:hover { color: #1a1a1a; }
+  .meta-cell { font-size: 11px; color: #8a8a8a; }
+
+  ul.handoffs-list, ul.rooms-list { list-style: none; margin: 0; padding: 0; }
+  ul.handoffs-list li {
+    padding: 8px 12px; border-bottom: 1px solid #e5e5e5;
+  }
+  ul.handoffs-list li:last-child { border-bottom: none; }
+  .handoff-subject { font-size: 13px; font-weight: 500; }
+  .handoff-meta { font-size: 11px; color: #8a8a8a; margin-top: 2px; }
+
+  .events-feed { max-height: 320px; overflow-y: auto; }
+  .event-row { padding: 6px 12px; border-bottom: 1px solid #e5e5e5; font-size: 12px; display: flex; gap: 8px; }
+  .event-row:last-child { border-bottom: none; }
+  .event-kind { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #8a8a8a; flex-shrink: 0; }
+  .event-body { color: #1a1a1a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  section.room-section { margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="rail">
+    <div class="add-form">
+      <input id="add-path" type="text" placeholder="Add repo or top-level folder…">
+      <div class="add-form-row">
+        <select id="add-kind">
+          <option value="repo">repo</option>
+          <option value="root">scan folder</option>
+        </select>
+        <button id="add-btn" type="button">Add</button>
+      </div>
+      <div id="add-error" class="add-error" hidden></div>
+    </div>
+    <div class="section-label" style="margin-left:12px;">Rooms</div>
+    <div class="rooms-list-wrap">
+      <ul id="rooms-list" class="rooms-list"></ul>
+      <div id="rooms-empty" class="empty-state" hidden>Add a repo or folder to begin.</div>
+    </div>
+  </aside>
+  <main class="main">
+    <div class="main-toolbar">
+      <label class="auto-refresh-label">
+        <input type="checkbox" id="auto-refresh-toggle" checked>
+        Auto-refresh
+      </label>
+      <button id="refresh-btn" class="text-btn" type="button">Refresh</button>
+    </div>
+    <div id="room-detail"></div>
+  </main>
+</div>
+<script>
+(function () {
+  "use strict";
+
+  var API = { rooms: "/api/rooms", room: function (id) { return "/api/room/" + encodeURIComponent(id); } };
+  var REFRESH_MS = 5000;
+
+  var state = { rooms: [], selectedId: null, timer: null, showStale: false };
+
+  function h(tag, opts, children) {
+    var el = document.createElement(tag);
+    opts = opts || {};
+    if (opts.className) el.className = opts.className;
+    if (opts.text !== undefined) el.textContent = opts.text;
+    if (opts.title !== undefined) el.title = opts.title;
+    if (opts.attrs) for (var k in opts.attrs) el.setAttribute(k, opts.attrs[k]);
+    (children || []).forEach(function (c) { if (c) el.appendChild(c); });
+    return el;
+  }
+
+  function truncateMiddle(str, max) {
+    max = max || 28;
+    if (!str || str.length <= max) return str || "";
+    var head = Math.ceil((max - 1) / 2);
+    var tail = Math.floor((max - 1) / 2);
+    return str.slice(0, head) + "…" + str.slice(str.length - tail);
+  }
+
+  function timeAgo(iso) {
+    if (!iso) return "—";
+    var t = Date.parse(iso);
+    if (isNaN(t)) return iso;
+    var deltaSec = Math.round((Date.now() - t) / 1000);
+    if (deltaSec < 0) deltaSec = 0;
+    if (deltaSec < 60) return deltaSec + "s ago";
+    var m = Math.round(deltaSec / 60);
+    if (m < 60) return m + "m ago";
+    var hr = Math.round(m / 60);
+    if (hr < 24) return hr + "h ago";
+    var d = Math.round(hr / 24);
+    return d + "d ago";
+  }
+
+  function clockTime(iso) {
+    if (!iso) return "";
+    var t = Date.parse(iso);
+    if (isNaN(t)) {
+      // Best-effort: some ledger lines use a non-RFC3339 "YYYY-MM-DD HH:MM:SS..." shape.
+      var m = String(iso).match(/(\d{2}:\d{2}:\d{2})/);
+      return m ? m[1] : iso;
+    }
+    var d = new Date(t);
+    return [d.getHours(), d.getMinutes(), d.getSeconds()]
+      .map(function (n) { return String(n).padStart(2, "0"); })
+      .join(":");
+  }
+
+  function stateClass(agent) {
+    if (agent.stale) return "state-stale";
+    return "state-" + (agent.state || "idle");
+  }
+
+  function stateLabel(agent) {
+    var base = agent.state || "unknown";
+    return agent.stale ? base + " (stale)" : base;
+  }
+
+  function healthLabel(h) {
+    return h.charAt(0).toUpperCase() + h.slice(1);
+  }
+
+  // ---- rooms rail ----
+
+  function renderRoomsList() {
+    var list = document.getElementById("rooms-list");
+    var empty = document.getElementById("rooms-empty");
+    list.innerHTML = "";
+    if (state.rooms.length === 0) {
+      empty.hidden = false;
+      return;
+    }
+    empty.hidden = true;
+    state.rooms.forEach(function (room) {
+      var total = room.agent_counts.working + room.agent_counts.idle +
+        room.agent_counts.blocked + room.agent_counts.done + room.agent_counts.stale;
+      var row = h("li", {
+        className: "room-row" + (room.id === state.selectedId ? " selected" : ""),
+        attrs: { "data-id": room.id, title: room.path },
+      }, [
+        h("span", { className: "room-name", text: room.name }),
+        h("span", { className: "room-meta", text: total + " agent" + (total === 1 ? "" : "s") }),
+      ]);
+      row.addEventListener("click", function () {
+        state.selectedId = room.id;
+        renderRoomsList();
+        loadRoomDetail(room.id);
+      });
+      list.appendChild(row);
+    });
+  }
+
+  // ---- room detail ----
+
+  // Live agents first (working > blocked > idle > done), stale collapsed behind
+  // a count toggle — 70 stale archive rows must never bury 2 live ones.
+  var STATE_RANK = { working: 0, blocked: 1, idle: 2, done: 3 };
+
+  function agentRow(a) {
+    return h("tr", {}, [
+      h("td", { text: truncateMiddle(a.tool, 30), title: a.tool }),
+      h("td", { className: stateClass(a), text: stateLabel(a) }),
+      h("td", { className: "meta-cell", text: timeAgo(a.last_seen_ts), title: a.last_seen_ts || "" }),
+      h("td", { className: "meta-cell", text: a.wake_after ? timeAgo(a.wake_after) : "—" }),
+    ]);
+  }
+
+  function renderAgentsTable(agents) {
+    if (agents.length === 0) {
+      return h("div", { className: "card" }, [h("div", { className: "empty-state", text: "No agents seen in this room." })]);
+    }
+    var live = agents.filter(function (a) { return !a.stale; });
+    var stale = agents.filter(function (a) { return a.stale; });
+    live.sort(function (x, y) {
+      var r = (STATE_RANK[x.state] ?? 9) - (STATE_RANK[y.state] ?? 9);
+      return r !== 0 ? r : String(y.last_seen_ts || "").localeCompare(String(x.last_seen_ts || ""));
+    });
+    stale.sort(function (x, y) {
+      return String(y.last_seen_ts || "").localeCompare(String(x.last_seen_ts || ""));
+    });
+    var thead = h("thead", {}, [
+      h("tr", {}, [
+        h("th", { text: "Tool" }), h("th", { text: "State" }), h("th", { text: "Last seen" }), h("th", { text: "Wake" }),
+      ]),
+    ]);
+    var tbody = h("tbody");
+    live.forEach(function (a) { tbody.appendChild(agentRow(a)); });
+    if (state.showStale) {
+      stale.forEach(function (a) { tbody.appendChild(agentRow(a)); });
+    }
+    var card = h("div", { className: "card" });
+    if (live.length === 0 && !state.showStale) {
+      card.appendChild(h("div", { className: "empty-state", text: "No live agents right now." }));
+    } else {
+      card.appendChild(h("table", { className: "agents-table" }, [thead, tbody]));
+    }
+    if (stale.length > 0) {
+      var toggle = h("button", {
+        className: "stale-toggle",
+        text: state.showStale
+          ? "Hide " + stale.length + " stale agent" + (stale.length === 1 ? "" : "s")
+          : "Show " + stale.length + " stale agent" + (stale.length === 1 ? "" : "s"),
+      });
+      toggle.addEventListener("click", function () {
+        state.showStale = !state.showStale;
+        if (state.selectedId) loadRoomDetail(state.selectedId);
+      });
+      card.appendChild(toggle);
+    }
+    return card;
+  }
+
+  function renderHandoffs(handoffs) {
+    if (handoffs.length === 0) {
+      return h("div", { className: "card" }, [h("div", { className: "empty-state", text: "None." })]);
+    }
+    var ul = h("ul", { className: "handoffs-list" });
+    handoffs.forEach(function (ho) {
+      var meta = truncateMiddle(ho.from_session_id, 24) + " → " + (ho.target || "—") + " · " + timeAgo(ho.created_at);
+      ul.appendChild(h("li", {}, [
+        h("div", { className: "handoff-subject", text: ho.subject || "(no subject)" }),
+        h("div", { className: "handoff-meta", text: meta }),
+      ]));
+    });
+    return h("div", { className: "card" }, [ul]);
+  }
+
+  function renderEvents(events) {
+    if (events.length === 0) {
+      return h("div", { className: "card" }, [h("div", { className: "empty-state", text: "None." })]);
+    }
+    var feed = h("div", { className: "events-feed" });
+    events.forEach(function (ev) {
+      var body = ev.tool ? (ev.tool + (ev.subject ? " → " + ev.subject : "")) : (ev.subject || "");
+      feed.appendChild(h("div", { className: "event-row" }, [
+        h("span", { className: "event-kind", text: clockTime(ev.created_at) + " " + ev.kind }),
+        h("span", { className: "event-body", text: body, title: body }),
+      ]));
+    });
+    return h("div", { className: "card" }, [feed]);
+  }
+
+  function renderRoomDetail(snapshot) {
+    var container = document.getElementById("room-detail");
+    container.innerHTML = "";
+
+    var healthRow = h("div", { className: "health" }, [
+      h("span", { className: "health-dot health-" + snapshot.health }),
+      h("span", { text: healthLabel(snapshot.health) }),
+    ]);
+    var header = h("div", { className: "room-header" }, [
+      h("h1", { text: snapshot.name }),
+      healthRow,
+    ]);
+    var removeBtn = h("button", { className: "remove-link", text: "Remove", attrs: { type: "button" } });
+    removeBtn.addEventListener("click", function () { removeRoom(snapshot.id); });
+    header.appendChild(removeBtn);
+
+    container.appendChild(header);
+    container.appendChild(h("div", { className: "room-path", text: snapshot.path }));
+    if (snapshot.health_reason) {
+      container.appendChild(h("div", { className: "health-reason", text: snapshot.health_reason }));
+    }
+
+    container.appendChild(h("div", { className: "section-label", text: "Agents" }));
+    container.appendChild(renderAgentsTable(snapshot.agents));
+
+    container.appendChild(h("div", { className: "section-label", text: "Open handoffs" }));
+    container.appendChild(renderHandoffs(snapshot.handoffs));
+
+    container.appendChild(h("div", { className: "section-label", text: "Recent events" }));
+    container.appendChild(renderEvents(snapshot.events));
+  }
+
+  // ---- data loading ----
+
+  function loadRooms() {
+    return fetch(API.rooms).then(function (r) { return r.json(); }).then(function (rooms) {
+      state.rooms = rooms;
+      if (!state.selectedId && rooms.length > 0) state.selectedId = rooms[0].id;
+      if (state.selectedId && !rooms.some(function (r) { return r.id === state.selectedId; })) {
+        state.selectedId = rooms.length > 0 ? rooms[0].id : null;
+      }
+      renderRoomsList();
+      if (state.selectedId) {
+        return loadRoomDetail(state.selectedId);
+      }
+      document.getElementById("room-detail").innerHTML = "";
+    });
+  }
+
+  function loadRoomDetail(id) {
+    return fetch(API.room(id)).then(function (r) { return r.json(); }).then(function (snapshot) {
+      if (state.selectedId === id) renderRoomDetail(snapshot);
+    });
+  }
+
+  function addRoom() {
+    var pathInput = document.getElementById("add-path");
+    var kindSelect = document.getElementById("add-kind");
+    var errorBox = document.getElementById("add-error");
+    errorBox.hidden = true;
+    var path = pathInput.value.trim();
+    if (!path) return;
+    fetch(API.rooms, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: path, kind: kindSelect.value }),
+    }).then(function (r) {
+      return r.json().then(function (body) { return { ok: r.ok, body: body }; });
+    }).then(function (res) {
+      if (!res.ok) {
+        errorBox.textContent = res.body.error || "failed to add path";
+        errorBox.hidden = false;
+        return;
+      }
+      pathInput.value = "";
+      return loadRooms();
+    }).catch(function (err) {
+      errorBox.textContent = String(err);
+      errorBox.hidden = false;
+    });
+  }
+
+  function removeRoom(id) {
+    if (!window.confirm("Remove this room from rally-ui? (does not touch the repo itself)")) return;
+    fetch(API.room(id).replace("/api/room/", "/api/rooms/"), { method: "DELETE" }).then(function () {
+      if (state.selectedId === id) state.selectedId = null;
+      return loadRooms();
+    });
+  }
+
+  // ---- wiring ----
+
+  document.getElementById("add-btn").addEventListener("click", addRoom);
+  document.getElementById("add-path").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") addRoom();
+  });
+  document.getElementById("refresh-btn").addEventListener("click", loadRooms);
+
+  var toggle = document.getElementById("auto-refresh-toggle");
+  function scheduleRefresh() {
+    if (state.timer) clearInterval(state.timer);
+    state.timer = setInterval(function () {
+      if (toggle.checked) loadRooms();
+    }, REFRESH_MS);
+  }
+  toggle.addEventListener("change", scheduleRefresh);
+
+  scheduleRefresh();
+  loadRooms();
+})();
+</script>
+</body>
+</html>

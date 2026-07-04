@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "rally-ui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Localhost dashboard showing all agents across multiple rally rooms with live state, for troubleshooting rally coordination."
+
+[[bin]]
+name = "rally-ui"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+anyhow.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+tokio.workspace = true
+axum.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
