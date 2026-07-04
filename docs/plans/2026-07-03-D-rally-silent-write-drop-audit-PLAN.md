@@ -86,3 +86,6 @@ Land in order, each with a test:
 
 - No change to fail-OPEN posture for read-only/advisory commands (must never hang the host tool).
 - No rewrite of the R5 segmented-ledger model. Write-durability + timeout-posture + contention fix only, not a storage redesign.
+
+---
+**Addendum 2026-07-03 (auditor f3):** §6's "CI green on the ubuntu rally-gate run" is superseded — 4b0cfeb retired that workflow in favour of the local `.githooks/pre-push` gate (fmt scoped to pushed .rs, clippy -D warnings, workspace tests, audit/deny on dep change, pinned 1.95.0). Verification target is now the pre-push gate passing on the pushing machine. release.yml (macos-14 artifact) unchanged.

@@ -248,6 +248,9 @@ async fn run_rally(room_path: &Path, rally_bin: &str, args: &[&str]) -> Result<V
     let output = tokio::process::Command::new(rally_bin)
         .args(args)
         .current_dir(room_path)
+        // Reap the child if the outer per-room timeout drops this future —
+        // otherwise an abandoned rally process lingers until its own watchdog.
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("failed to spawn `{rally_bin}`: {e}"))?;

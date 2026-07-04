@@ -31,7 +31,32 @@ pub fn router(state: AppState) -> Router {
         .route("/api/rooms", get(list_rooms).post(add_room))
         .route("/api/rooms/:id", axum::routing::delete(remove_room))
         .route("/api/room/:id", get(room_detail))
+        .layer(axum::middleware::from_fn(reject_non_local_host))
         .with_state(state)
+}
+
+/// DNS-rebinding guard: the server is localhost-only by intent, but a
+/// rebinding page (attacker domain re-resolving to 127.0.0.1) is same-origin
+/// in the browser and would bypass CORS preflight. Reject any request whose
+/// Host header isn't a localhost form; port is not validated (the OS already
+/// scopes the bind, and proxies rewriting the port are out of scope).
+async fn reject_non_local_host(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let host_ok = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| {
+            let name = h.rsplit_once(':').map_or(h, |(n, _)| n);
+            matches!(name, "127.0.0.1" | "localhost" | "[::1]")
+        })
+        .unwrap_or(false);
+    if !host_ok {
+        return (StatusCode::FORBIDDEN, "forbidden: non-local Host header").into_response();
+    }
+    next.run(req).await
 }
 
 async fn index() -> Html<&'static str> {

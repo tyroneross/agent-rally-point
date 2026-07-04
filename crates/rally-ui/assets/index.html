@@ -152,7 +152,7 @@
   var API = { rooms: "/api/rooms", room: function (id) { return "/api/room/" + encodeURIComponent(id); } };
   var REFRESH_MS = 5000;
 
-  var state = { rooms: [], selectedId: null, timer: null, showStale: false };
+  var state = { rooms: [], selectedId: null, timer: null, showStale: false, seqSeen: {} };
 
   function h(tag, opts, children) {
     var el = document.createElement(tag);
@@ -356,6 +356,29 @@
     container.appendChild(h("div", { className: "room-path", text: snapshot.path }));
     if (snapshot.health_reason) {
       container.appendChild(h("div", { className: "health-reason", text: snapshot.health_reason }));
+    }
+
+    // Seq freshness — the PLAN-D failure telemetry: a room whose ledger seq
+    // stops advancing while agents report working is the write-drop signature.
+    if (snapshot.max_seq != null) {
+      var prev = state.seqSeen[snapshot.id];
+      var seqText = "seq " + snapshot.max_seq + " · " +
+        (snapshot.claims != null ? snapshot.claims + " active claim" + (snapshot.claims === 1 ? "" : "s") : "");
+      if (prev != null) {
+        if (snapshot.max_seq > prev.seq) {
+          state.seqSeen[snapshot.id] = { seq: snapshot.max_seq, at: Date.now() };
+        }
+        var frozenMs = Date.now() - state.seqSeen[snapshot.id].at;
+        var liveCount = snapshot.agents.filter(function (a) { return !a.stale && a.state === "working"; }).length;
+        if (snapshot.max_seq === state.seqSeen[snapshot.id].seq && frozenMs > 120000 && liveCount > 0) {
+          seqText += " · seq frozen " + Math.round(frozenMs / 60000) + "m with " + liveCount + " working agent" + (liveCount === 1 ? "" : "s") + " — possible write drop";
+        } else {
+          seqText += " · advancing";
+        }
+      } else {
+        state.seqSeen[snapshot.id] = { seq: snapshot.max_seq, at: Date.now() };
+      }
+      container.appendChild(h("div", { className: "room-path", text: seqText }));
     }
 
     container.appendChild(h("div", { className: "section-label", text: "Agents" }));
