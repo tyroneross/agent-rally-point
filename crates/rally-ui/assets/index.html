@@ -197,9 +197,18 @@
       return m ? m[1] : iso;
     }
     var d = new Date(t);
-    return [d.getHours(), d.getMinutes(), d.getSeconds()]
+    var hms = [d.getHours(), d.getMinutes(), d.getSeconds()]
       .map(function (n) { return String(n).padStart(2, "0"); })
       .join(":");
+    // A bare clock time on a day-old fact reads as "just now" and misleads
+    // troubleshooting (durable ledger facts live forever) — prefix the age
+    // whenever the event is not from today.
+    var now = new Date();
+    if (d.toDateString() !== now.toDateString()) {
+      var days = Math.max(1, Math.round((now - d) / 86400000));
+      return days + "d ago " + hms;
+    }
+    return hms;
   }
 
   function stateClass(agent) {
