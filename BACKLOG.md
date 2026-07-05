@@ -19,6 +19,58 @@ fail-loud, read-back-verified) and *liveness-aware*, then enforce the two guaran
 model rests on — one-owner-per-path and one-store-per-repo — so agents coordinate without a human
 referee.
 
+## New observations — 2026-07-04 (cross-repo defect report, rosslabs-agent-harness)
+
+Filed from live coordination failures during the harness P-A.1/Phase-8 sessions (Claude session
+59009f33 + a Codex peer). Rally-room risk fact posted: `fact_b833_18bf4bac327b1518` (seq 3991).
+
+**Root cause established by direct diagnosis: the consumer repo's `.rally/facts.db` is corrupt.**
+`PRAGMA integrity_check` on `rosslabs-agent-harness/.rally/facts.db` (1.9 MB) returns btree
+`error code 11` plus hundreds of double-referenced pages ("2nd reference to page N"). Total store
+size there: **697 MB** (log segments only 1.7 MB / 2,745 lines across 8 segments — the bulk is
+elsewhere in the store dir).
+
+Symptoms as experienced by the two agents (same binary `0.1.5+5e90f0b`):
+
+- **Claude:** every mutating command (`enter`, `say`) failed closed with
+  `watchdog-timeout-uncommitted-mutation` (>3000ms before durable append committed) — ~6 attempts
+  across a full session, zero landed; reads (`room`, `next`) intermittently failed open ("hook
+  exceeded 3000ms"). No corruption message ever surfaced.
+- **Codex:** `sessions`/`next`/`room`/`enter`/`say`/`check before-write` all failed with
+  `database disk image is malformed`; `whoami` worked.
+- **Differential:** the same binary in THIS repo's healthy store posts fine (the risk fact above,
+  ledger-verified). And the plain-file inbox path
+  (`.rally/inbox/<tool>.jsonl` appends via build-loop's `inbox.py`) kept working against the
+  corrupt store the whole time — it was the only reliable channel.
+
+Backlog candidates from this (fit the "trustworthy, fail-loud" through-line):
+
+- **R-obs1 — fail-loud corruption surfacing:** the mutation watchdog masked corruption as a generic
+  timeout for one agent while the other saw the real SQLite error. On any store error path, run/report
+  `integrity_check` and name corruption explicitly; a timeout wrapper should never be the only
+  diagnostic.
+- **R-obs2 — corrupt-store quarantine + rebuild:** detect malformed `facts.db`, quarantine it
+  (rename aside), and rebuild projections from the append-only jsonl ledger (which stayed healthy).
+  The ledger-as-source-of-truth design makes this recoverable; today nothing attempts it.
+- **R-obs3 — concurrent-writer hardening:** the corrupt store served two live agents plus
+  high-frequency hook invocations from bench/build runs (see `chore(rally): ledger segment churn
+  from build/gate runs`, `5e90f0b`). Suspect WAL/locking under concurrent writers; needs a repro
+  harness. Related artifacts in-store: `facts.db-wal`, `facts.db-shm`, `mutation.lock`.
+- **R-obs4 — store bloat:** 697 MB `.rally/` in a consumer repo (harness). Inventory what grows
+  (worktrees? snapshot caches?) and add retention/GC.
+- **R-obs5 — hook auto-init scope:** harness `run` child workspaces (temp/practice dirs) each grew
+  their own `.rally/` store via hooks (e.g. `harness-practice/docsynth-app/.rally`, 8 files incl. a
+  fresh `facts.db`). Hooks probably shouldn't initialize stores in throwaway workdirs.
+
+**Version deltas at time of observation (2026-07-04 ~19:00 PT):**
+
+| Surface | Version | Note |
+|---|---|---|
+| Binary Claude ran (`~/.local/bin/rally`) | `0.1.5+5e90f0b` | matches repo commit `5e90f0b` |
+| Binary Codex ran (`rally whoami`) | `0.1.5+5e90f0b` | same binary — no agent-to-agent delta |
+| This repo local `main` | `adb661f` (1 ahead of binary) | delta commit is rally-ui display only (`fix(rally-ui): prefix event timestamps with day-age`) — **no write-path code between binary and main**, so the failures are not the stale-binary class |
+| CC plugin cache (`agent-rally-point`) | `0.1.3` | plugin/hook surface trails the 0.1.5 CLI; see `RALLY-VERSION-MISMATCH-ASSESSMENT-2026-07-01.md` for the class |
+
 ## Delivered — coordination program (2026-05-30)
 
 Shipped this session (see `docs/PROGRAM-rally-coordination-spec.md`). Triaged into tiers; **Tier 1
