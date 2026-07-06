@@ -1360,8 +1360,7 @@ impl RoomStore {
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
         reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
-        let fact_store = open_fact_store_lenient(&self.facts_db_path)?;
-        facts_from_store(&fact_store)
+        facts_from_db_with_query_recovery(&self.log_dir, &self.archive_dir, &self.facts_db_path)
     }
 
     #[allow(dead_code)]
@@ -1752,6 +1751,27 @@ fn facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
             Fact::from_value(record.payload, seq)
         })
         .collect()
+}
+
+fn facts_from_db_with_query_recovery(
+    log_dir: &Path,
+    archive_dir: &Path,
+    facts_db_path: &Path,
+) -> Result<Vec<Fact>> {
+    let fact_store = open_fact_store_lenient(facts_db_path)?;
+    match facts_from_store(&fact_store) {
+        Ok(facts) => Ok(facts),
+        Err(err) if is_malformed_db_error(&err) => {
+            quarantine_corrupt_db(facts_db_path)?;
+            if let Some(path) = reconcile_cache_path(facts_db_path) {
+                let _ = fs::remove_file(path);
+            }
+            reconcile_segments_and_db(log_dir, archive_dir, facts_db_path)?;
+            let recovered_store = open_fact_store_lenient(facts_db_path)?;
+            facts_from_store(&recovered_store)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> {
@@ -3210,16 +3230,23 @@ fn rebuild_db_from_segments(
     }
     all_entries.truncate(write);
 
-    let store = open_fact_store(facts_db_path)?;
-    for entry in &all_entries {
-        let mut payload = entry.payload.clone();
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("seq".to_string(), json!(entry.seq));
-        }
-        store
-            .append(vec![NewEvent::new(entry.event_type.clone(), payload)])
-            .map_err(|err| RallyError::Message(format!("replay segments: {err}")))?;
+    let replay_events = all_entries
+        .iter()
+        .map(|entry| {
+            let mut payload = entry.payload.clone();
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("seq".to_string(), json!(entry.seq));
+            }
+            NewEvent::new(entry.event_type.clone(), payload)
+        })
+        .collect::<Vec<_>>();
+    if replay_events.is_empty() {
+        return Ok(());
     }
+    let store = open_fact_store(facts_db_path)?;
+    store
+        .append(replay_events)
+        .map_err(|err| RallyError::Message(format!("replay segments: {err}")))?;
     Ok(())
 }
 
@@ -3983,6 +4010,11 @@ mod ledger_tests {
 
     fn archive_under(root: &Path) -> Vec<PathBuf> {
         read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap_or_default()
+    }
+
+    fn remove_fact_store_journals(facts_db: &Path) {
+        let _ = fs::remove_file(facts_db.with_extension("db-shm"));
+        let _ = fs::remove_file(facts_db.with_extension("db-wal"));
     }
 
     /// R1-era guarantee, ported to R5: the segments under `.rally/log/` are
@@ -5337,8 +5369,7 @@ mod ledger_tests {
         // test is designed to prove. (WAL files are safe to delete between a
         // store close and a store open because the WAL is just a pending-write
         // journal; all committed data is already in facts.db after checkpoint.)
-        let _ = fs::remove_file(facts_db.with_extension("db-wal"));
-        let _ = fs::remove_file(facts_db.with_extension("db-shm"));
+        remove_fact_store_journals(&facts_db);
 
         // Corrupt the db header in place (→ SQLITE_NOTADB). This rewrites the
         // file, changing its mtime and head_hash, so its fingerprint diverges
@@ -5419,6 +5450,108 @@ mod ledger_tests {
         for (i, id) in ids.iter().enumerate() {
             assert_eq!(&after[i].event_id, id, "order + identity preserved");
         }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn facts_query_corruption_with_matching_sidecar_quarantines_and_rebuilds() {
+        let root = unique_root("query-corrupt-sidecar-match");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..800u32 {
+            let fact = store
+                .append_fact(&make_fact(
+                    &format!("e{i}"),
+                    FactKind::Claim,
+                    "src/",
+                    &format!("fact {i} padding to force many sqlite pages"),
+                ))
+                .unwrap();
+            ids.push(fact.event_id);
+        }
+        assert_eq!(store.facts().unwrap().len(), 800);
+        drop(store);
+
+        let facts_db = root.join(".rally/facts.db");
+        remove_fact_store_journals(&facts_db);
+
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&facts_db)
+                .unwrap();
+            let db_size = f.seek(SeekFrom::End(0)).unwrap();
+            assert!(
+                db_size > 16384,
+                "DB must be multi-page for query-corruption test (got {db_size} bytes)"
+            );
+            f.seek(SeekFrom::Start(4096)).unwrap();
+            f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF].repeat(16)).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let corrupt_store =
+            open_fact_store(&facts_db).expect("mid-file corruption should still open");
+        let query_err = corrupt_store
+            .query(&FactQuery::all())
+            .expect_err("corrupt b-tree must fail during full fact query");
+        assert!(
+            is_malformed_db_error(&query_err),
+            "precondition: query error must be treated as malformed DB; got {query_err}"
+        );
+        drop(corrupt_store);
+
+        let segments = segments_under(&root);
+        let archived = archive_under(&root);
+        let canonical_stats = segment_seq_stats(&segments, &archived).unwrap();
+        let adversarial_cache = ReconcileCache {
+            segments_fingerprint: segments_fingerprint(&segments, &archived),
+            db_fingerprint: fingerprint_db(&facts_db),
+            canonical_count: canonical_stats.count,
+            canonical_max_seq: canonical_stats.max_seq,
+            db_count: canonical_stats.count,
+            db_max_seq: canonical_stats.max_seq,
+        };
+        write_reconcile_cache(&facts_db, &adversarial_cache).unwrap();
+        assert!(
+            !reconcile_took_full_scan(&root),
+            "matching sidecar reproduces the fast-path false-pass precondition"
+        );
+
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let after = store.facts().unwrap();
+        assert_eq!(after.len(), 800);
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(&after[i].event_id, id, "event identity must survive replay");
+        }
+
+        let quarantine_exists = root
+            .join(".rally")
+            .read_dir()
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("facts.db.corrupt.")
+            });
+        assert!(
+            quarantine_exists,
+            "query-time corruption must preserve corrupt bytes in quarantine"
+        );
+        let rebuilt_query = open_fact_store(&facts_db)
+            .unwrap()
+            .query(&FactQuery::all())
+            .unwrap();
+        assert_eq!(
+            rebuilt_query.event_records.len(),
+            800,
+            "rebuilt projection must be queryable and complete"
+        );
+
         fs::remove_dir_all(&root).ok();
     }
 
@@ -6387,6 +6520,9 @@ mod ledger_tests {
         // Corrupt page 2 (offset 4096) — well past the header so sqlite opens
         // without noticing until it traverses the b-tree during a real query.
         let facts_db = root.join(".rally/facts.db");
+        // Remove WAL/SHM siblings before corrupting page 2. A valid WAL can
+        // let SQLite mask the damaged main file and skip the quarantine path.
+        remove_fact_store_journals(&facts_db);
         {
             use std::io::{Seek, SeekFrom, Write};
             let mut f = OpenOptions::new()
