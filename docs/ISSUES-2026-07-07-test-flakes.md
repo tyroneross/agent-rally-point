@@ -7,11 +7,14 @@
 
 ## Evidence
 
-`cargo test --workspace` (the exact command `.githooks/pre-push` runs) looped on
-`main` @ 09a4482: **3 of 4 runs failed (~75%)**, across **three distinct flake
-signatures**. (A 4th, `rally_run_reserves_numbered_ids_under_parallel_launch`,
-blocked the v0.1.6 tag push on a prior day.) Each run is non-deterministic —
-same binary, same commit, different result.
+`cargo test --workspace` (the exact command `.githooks/pre-push` runs) looped
+**10×** on `main` @ 09a4482: **3 of 10 runs failed (~30%)**, across **three
+distinct flake signatures**. The failures come in **streaks**, not uniformly —
+runs 1, 3, 4 failed; runs 5–10 were all green — so a small sample badly
+over- or under-estimates the rate (an earlier 4-run sample read ~75%). (A 4th
+signature, `rally_run_reserves_numbered_ids_under_parallel_launch`, blocked the
+v0.1.6 tag push on a prior day.) Each run is non-deterministic — same binary,
+same commit, different result.
 
 | Signature | Tests | Seen |
 |---|---|---|
@@ -52,7 +55,8 @@ Cargo runs tests multi-threaded within each test binary. Several tests mutate
 - **Releases require gate retries.** v0.1.6 needed multiple push/tag attempts
   because each `git push` re-runs `cargo test --workspace` and hits a different
   flake. This is operational drag and erodes trust in the gate.
-- Any CI that runs the full suite has a ~75%-per-run chance of a spurious red.
+- Any CI that runs the full suite has a ~30%-per-run chance of a spurious red
+  (streaky — several clean runs can precede a cluster failure).
 
 ## Fix directions (for the dedicated fix, not done here)
 
