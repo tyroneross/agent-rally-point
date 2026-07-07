@@ -7,6 +7,15 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## v0.1.6 - 2026-07-07
+
+Trustworthy room signal + read-surface ergonomics. Fable+Codex audited before release.
+
+- **System-health facts no longer drown out real risks.** System-generated telemetry (`external-intake`, `unmanaged-agent`, `duplicate-active-squad-id`, `binary-drift`) now projects into a dedicated `system_health` bucket, deduped by subject, instead of `current_risks`. `rally room` shows only human coordination risks by default; telemetry stays auditable and resolvable in its own lane, and the count surfaces as `system_health=N`.
+- **New read verbs:** `rally risks`, `rally decisions`, `rally artifacts`, `rally claims` — thin, discoverable projections of the room snapshot (`--json` gives `data.<verb>.rows`), so agents no longer hand-parse `rally room --json`.
+- **Idempotency guards** for `duplicate-active-squad-id` and `binary-drift` (matching the existing `unmanaged-agent` guard): re-entering a room no longer appends duplicate telemetry facts.
+- Resolve + enter-path guards updated to read `system_health`, so telemetry stays resolvable and non-duplicating.
+
 ## v0.1.5 - 2026-07-03
 
 Hardening + Apple-Silicon-optimized release. **`rally backlog add/update` now

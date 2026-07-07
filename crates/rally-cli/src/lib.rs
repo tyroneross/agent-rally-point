@@ -7001,10 +7001,14 @@ mod tests {
     /// conflicted ∧ takeover-eligible (not conflicted alone).
     #[test]
     fn liveness_enforce_respects_takeover_gate_for_busy_but_quiet_owner() {
+        // Hold PROCESS_ENV_LOCK: this path transitively reads the process-global
+        // RALLY_ENGAGEMENT, which env-mutating tests remove/set; the reader must
+        // serialize against them (set/remove_var is unsound vs concurrent reads).
+        let _env = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = unique_root("coord-liveness-2h-gate");
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        // Inject default engagement (None): env-independent so a concurrent
-        // RALLY_ENGAGEMENT toggle can't flip the resolved room (parallel-flake).
         let room = store::RoomStore::open_at_with_engagement(root, None).unwrap();
         // 30 minutes ago: idle (>15m) but well under the 2h takeover bar, and
         // never acknowledged → conflicted but not release-eligible.
@@ -10518,11 +10522,16 @@ mod tests {
     /// two-tier threshold prevents (a long build with no Rally write != dead).
     #[test]
     fn busy_but_quiet_owner_is_warnable_but_not_takeover_eligible() {
+        // Serialize against env-mutating tests (retrospective/discovery
+        // remove/set RALLY_ENGAGEMENT). This path transitively reads the
+        // process-global env; Rust's set/remove_var is unsound vs a concurrent
+        // read even under a writer-only mutex, so the reader must hold the same
+        // PROCESS_ENV_LOCK — the true fix for this test's parallel-suite flake.
+        let _env = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = unique_root("busy-quiet-owner");
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        // Inject the default engagement (None) so a concurrent test toggling the
-        // process-global RALLY_ENGAGEMENT cannot flip which room subdir this
-        // store resolves — the cause of this test's parallel-suite flakiness.
         let room = store::RoomStore::open_at_with_engagement(root.clone(), None).unwrap();
 
         // Claim 30 minutes ago: past 15m idle, under 2h takeover bar.
