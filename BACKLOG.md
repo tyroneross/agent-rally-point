@@ -19,6 +19,19 @@ fail-loud, read-back-verified) and *liveness-aware*, then enforce the two guaran
 model rests on — one-owner-per-path and one-store-per-repo — so agents coordinate without a human
 referee.
 
+## New observations — 2026-07-06 (hook/CLI defect report, agent-builder-studio)
+
+Filed from a live `claude_code:1ad7c71b` multi-agent session (Fable peer + codex agents). Full
+report: [`docs/ISSUES-2026-07-06-hooks.md`](docs/ISSUES-2026-07-06-hooks.md). Six issues, one
+correctness-class: **P1** — bare host-family `--tool` (`claude_code` vs `claude_code:<uuid>`) is
+accepted silently and mints `unmanaged-agent`/`duplicate-active-squad-id` risk facts, violating the
+operator-set unique-id model. **P2** — `external-intake` + stale codex-peer risk facts flood
+`current_risks` (~90% noise in the observed room; 1 real risk of 10). **P3** — no per-kind read
+verbs (`rally risks|decisions|artifacts` all "unknown command"), `whoami` returns all-null fields,
+`sessions --json` double-nests. Through-line match: directly serves the "make every rally CLI result
+*trustworthy* and *liveness-aware*" goal — a room whose risk view is 90% telemetry is not
+trustworthy coordination truth.
+
 ## New observations — 2026-07-04 (cross-repo defect report, rosslabs-agent-harness)
 
 Filed from live coordination failures during the harness P-A.1/Phase-8 sessions (Claude session

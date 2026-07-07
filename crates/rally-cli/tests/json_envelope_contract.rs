@@ -345,6 +345,47 @@ fn envelope_board() {
     ws.cleanup();
 }
 
+/// Per-kind read verbs — read-only; work on an empty room and satisfy the
+/// envelope contract (`data.<verb>` non-null) with the facts under `.rows`.
+#[test]
+fn envelope_risks() {
+    let ws = Workspace::new("risks");
+    let body = ws.json(&["risks", "--json"]);
+    assert_envelope_contract("risks", &body);
+    assert!(
+        body["data"]["risks"]["rows"].is_array(),
+        "data.risks.rows must be an array (no double-nest)"
+    );
+    ws.cleanup();
+}
+
+#[test]
+fn envelope_decisions() {
+    let ws = Workspace::new("decisions");
+    let body = ws.json(&["decisions", "--json"]);
+    assert_envelope_contract("decisions", &body);
+    assert!(body["data"]["decisions"]["rows"].is_array());
+    ws.cleanup();
+}
+
+#[test]
+fn envelope_artifacts() {
+    let ws = Workspace::new("artifacts");
+    let body = ws.json(&["artifacts", "--json"]);
+    assert_envelope_contract("artifacts", &body);
+    assert!(body["data"]["artifacts"]["rows"].is_array());
+    ws.cleanup();
+}
+
+#[test]
+fn envelope_claims() {
+    let ws = Workspace::new("claims");
+    let body = ws.json(&["claims", "--json"]);
+    assert_envelope_contract("claims", &body);
+    assert!(body["data"]["claims"]["rows"].is_array());
+    ws.cleanup();
+}
+
 /// `route-findings` — requires --file and --verified; use a minimal findings file.
 #[test]
 fn envelope_route_findings() {

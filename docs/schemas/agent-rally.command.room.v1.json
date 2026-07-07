@@ -22,7 +22,11 @@
           "required": ["active_claims", "active_blockers", "open_handoffs", "current_decisions", "current_risks", "recent_artifacts", "unconsumed_artifacts", "stale_facts", "squads", "lead"],
           "properties": {
             "squads": { "type": "array" },
-            "lead": { "type": ["string", "null"] }
+            "lead": { "type": ["string", "null"] },
+            "system_health": {
+              "type": "array",
+              "description": "System-generated health/telemetry facts (external-intake, unmanaged-agent, duplicate-active-squad-id, binary-drift), split out of current_risks. Omitted when empty."
+            }
           }
         }
       }

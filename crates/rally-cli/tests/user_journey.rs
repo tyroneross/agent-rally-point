@@ -4387,7 +4387,9 @@ fn rally_enter_emits_unmanaged_agent_for_presence_only_tool() {
     );
 
     let room = workspace.json(&["room", "--json"]);
-    let risks = room["data"]["room"]["current_risks"]
+    // DI-1: unmanaged-agent telemetry projects into `system_health`, not
+    // `current_risks` (which now shows only human coordination risks).
+    let risks = room["data"]["room"]["system_health"]
         .as_array()
         .cloned()
         .unwrap_or_default();

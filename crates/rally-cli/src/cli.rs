@@ -30,6 +30,11 @@ pub(crate) enum CliCommand {
     // Work surface commands (appended — do not reorder above)
     Backlog(BacklogArgs),
     Board(BoardArgs),
+    /// Read-only per-kind projections of the room snapshot.
+    Risks(KindReadArgs),
+    Decisions(KindReadArgs),
+    Artifacts(KindReadArgs),
+    Claims(KindReadArgs),
     RouteFindings(RouteFindingsArgs),
     /// B13: CI gate — read-only health check of the room state.
     CheckCi(CheckCiArgs),
@@ -630,6 +635,13 @@ pub(crate) struct CheckCiArgs {
     pub(crate) receipt_threshold_secs: u64,
 }
 
+/// Args for the read-only per-kind room projections
+/// (`risks`/`decisions`/`artifacts`/`claims`). Read-only: `--json` only.
+#[derive(Clone, Debug)]
+pub(crate) struct KindReadArgs {
+    pub(crate) json: bool,
+}
+
 /// Rank-11: `rally mission` args.
 ///
 /// Three modes (mutually exclusive by flag presence):
@@ -676,6 +688,11 @@ const COMMANDS: &[&str] = &[
     // Work surface commands (appended — do not reorder above)
     "backlog",
     "board",
+    // Read-only per-kind room projections (risks/decisions/artifacts/claims)
+    "risks",
+    "decisions",
+    "artifacts",
+    "claims",
     "route-findings",
     // B13: CI gate
     "check-ci",
@@ -871,6 +888,26 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .descr("Read-only board: lanes (in-flight/landed/closed), backlog, and delta.")
         .command("board")
         .map(CliCommand::Board);
+    let risks = kind_read_parser()
+        .to_options()
+        .descr("Read-only: active coordination risks (room.current_risks).")
+        .command("risks")
+        .map(CliCommand::Risks);
+    let decisions = kind_read_parser()
+        .to_options()
+        .descr("Read-only: current decisions (room.current_decisions).")
+        .command("decisions")
+        .map(CliCommand::Decisions);
+    let artifacts = kind_read_parser()
+        .to_options()
+        .descr("Read-only: recent artifacts (room.recent_artifacts).")
+        .command("artifacts")
+        .map(CliCommand::Artifacts);
+    let claims = kind_read_parser()
+        .to_options()
+        .descr("Read-only: active claims (room.active_claims).")
+        .command("claims")
+        .map(CliCommand::Claims);
     let route_findings = route_findings_parser()
         .to_options()
         .descr("Route findings from a JSON file to active claim owners; unowned → risk facts.")
@@ -943,6 +980,10 @@ fn cli_parser() -> OptionParser<CliCommand> {
         version,
         backlog,
         board,
+        risks,
+        decisions,
+        artifacts,
+        claims,
         route_findings,
         check_ci,
         dag,
@@ -1900,6 +1941,11 @@ fn lead_parser() -> impl Parser<LeadArgs> {
 fn board_parser() -> impl Parser<BoardArgs> {
     let json = json_flag();
     construct!(BoardArgs { json })
+}
+
+fn kind_read_parser() -> impl Parser<KindReadArgs> {
+    let json = json_flag();
+    construct!(KindReadArgs { json })
 }
 
 fn route_findings_parser() -> impl Parser<RouteFindingsArgs> {

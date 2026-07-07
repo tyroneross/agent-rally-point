@@ -114,6 +114,11 @@ const SCHEMA_BACKLOG: &str = "agent-rally.command.backlog.v1";
 const SCHEMA_LEAD: &str = "agent-rally.command.lead.v1";
 const SCHEMA_ACK: &str = "agent-rally.command.ack.v1";
 const SCHEMA_BOARD: &str = "agent-rally.command.board.v1";
+// Read-only per-kind room projections
+const SCHEMA_RISKS: &str = "agent-rally.command.risks.v1";
+const SCHEMA_DECISIONS: &str = "agent-rally.command.decisions.v1";
+const SCHEMA_ARTIFACTS: &str = "agent-rally.command.artifacts.v1";
+const SCHEMA_CLAIMS: &str = "agent-rally.command.claims.v1";
 const SCHEMA_ROUTE_FINDINGS: &str = "agent-rally.command.route-findings.v1";
 // B13
 const SCHEMA_CHECK_CI: &str = "agent-rally.command.check-ci.v1";
@@ -743,6 +748,10 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         // Work surface commands (appended — do not reorder above)
         CliCommand::Backlog(args) => command_backlog(args),
         CliCommand::Board(args) => command_board(args),
+        CliCommand::Risks(args) => command_kind_read(args, KindRead::Risks),
+        CliCommand::Decisions(args) => command_kind_read(args, KindRead::Decisions),
+        CliCommand::Artifacts(args) => command_kind_read(args, KindRead::Artifacts),
+        CliCommand::Claims(args) => command_kind_read(args, KindRead::Claims),
         CliCommand::RouteFindings(args) => command_route_findings(args),
         // B13
         CliCommand::CheckCi(args) => command_check_ci(args),
@@ -1304,19 +1313,28 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         // Append ONE durable risk fact so the duplicate is auditable/traceable
         // in current_risks, recent, and the retrospective digest.
         // enter still returns ok:true — this is warn-not-block.
-        let risk_fact = build_risk_fact(
-            &tool,
-            format!("duplicate-active-squad-id: {tool}"),
-            format!(
-                "another active session is already using squad id {tool} (last seen {}); not blocked — re-enter with a distinct id if this is a second terminal. Recorded for audit.",
-                squad.last_seen_ts
-            ),
-            Vec::new(),
-            "warn",
-            Vec::new(),
-            None,
-        );
-        room.append_fact(&risk_fact)?;
+        // Idempotency guard (matches the unmanaged-agent arm below): re-entering
+        // the same duplicate id must not append a second identical fact, or the
+        // room accumulates one row per re-enter and crowds out real risks.
+        let already_recorded = snapshot_before
+            .system_health
+            .iter()
+            .any(|f| f.subject == format!("duplicate-active-squad-id: {tool}"));
+        if !already_recorded {
+            let risk_fact = build_risk_fact(
+                &tool,
+                format!("duplicate-active-squad-id: {tool}"),
+                format!(
+                    "another active session is already using squad id {tool} (last seen {}); not blocked — re-enter with a distinct id if this is a second terminal. Recorded for audit.",
+                    squad.last_seen_ts
+                ),
+                Vec::new(),
+                "warn",
+                Vec::new(),
+                None,
+            );
+            room.append_fact(&risk_fact)?;
+        }
     }
 
     // C-FLEET / "all fleet workers must be rally-managed": when a tool enters
@@ -1333,7 +1351,10 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
             .iter()
             .any(|s| s.tool == tool || s.session_id == tool || s.name == tool);
         if !has_managed {
-            let already_recorded = snapshot_before.current_risks.iter().any(|f| {
+            // DI-1: telemetry facts project into `system_health`, so the
+            // idempotency guard must scan there (not current_risks) or it would
+            // never see the prior fact and re-append on every enter.
+            let already_recorded = snapshot_before.system_health.iter().any(|f| {
                 f.subject == format!("unmanaged-agent: {tool}")
                     && f.tool.as_deref() == Some(tool.as_str())
             });
@@ -1382,16 +1403,25 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
                     code: "binary-drift".to_string(),
                     message: drift_msg.clone(),
                 });
-                let risk_fact = build_risk_fact(
-                    &tool,
-                    format!("binary-drift: {} vs {}", BUILD_ID, prior_id),
-                    drift_msg,
-                    Vec::new(),
-                    "warn",
-                    Vec::new(),
-                    None,
-                );
-                room.append_fact(&risk_fact)?;
+                // Idempotency guard: don't append a duplicate drift fact for the
+                // same (this-build vs prior-build) pair on every re-enter.
+                let drift_subject = format!("binary-drift: {} vs {}", BUILD_ID, prior_id);
+                let already_recorded = snapshot_before
+                    .system_health
+                    .iter()
+                    .any(|f| f.subject == drift_subject);
+                if !already_recorded {
+                    let risk_fact = build_risk_fact(
+                        &tool,
+                        drift_subject,
+                        drift_msg,
+                        Vec::new(),
+                        "warn",
+                        Vec::new(),
+                        None,
+                    );
+                    room.append_fact(&risk_fact)?;
+                }
             }
         }
     }
@@ -2224,13 +2254,14 @@ fn command_room(args: RoomArgs) -> Result<Output> {
         },
     )?;
     let text = format!(
-        "room claims={} blockers={} handoffs={} decisions={} risks={} artifacts={}",
+        "room claims={} blockers={} handoffs={} decisions={} risks={} artifacts={} system_health={}",
         snapshot.active_claims.len(),
         snapshot.active_blockers.len(),
         snapshot.open_handoffs.len(),
         snapshot.current_decisions.len(),
         snapshot.current_risks.len(),
-        snapshot.recent_artifacts.len()
+        snapshot.recent_artifacts.len(),
+        snapshot.system_health.len()
     );
     Ok(Output::new(json_output, text, body))
 }
@@ -7810,15 +7841,17 @@ mod tests {
         let reader = store::RoomStore::open_at(root.clone()).unwrap();
         let snapshot = reader.snapshot().unwrap();
 
+        // DI-1: system-generated telemetry (duplicate-active-squad-id) now
+        // projects into `system_health`, not `current_risks`.
         let risk_facts: Vec<_> = snapshot
-            .current_risks
+            .system_health
             .iter()
             .filter(|f| f.subject.contains("duplicate-active-squad-id"))
             .collect();
         assert_eq!(
             risk_facts.len(),
             1,
-            "exactly one risk fact for duplicate-active-squad-id must be in current_risks; got: {:?}",
+            "exactly one risk fact for duplicate-active-squad-id must be in system_health; got: {:?}",
             risk_facts.iter().map(|f| &f.subject).collect::<Vec<_>>()
         );
         let rf = risk_facts[0];
@@ -7935,8 +7968,9 @@ mod tests {
         {
             let reader = store::RoomStore::open_at(root.clone()).unwrap();
             let snapshot = reader.snapshot().unwrap();
+            // DI-1: unmanaged-agent telemetry projects into `system_health`.
             let risk_facts: Vec<_> = snapshot
-                .current_risks
+                .system_health
                 .iter()
                 .filter(|f| f.subject == format!("unmanaged-agent: {stray_tool}"))
                 .collect();
@@ -7953,7 +7987,9 @@ mod tests {
         {
             let room = store::RoomStore::open_at(root.clone()).unwrap();
             let snapshot_before = room.snapshot().unwrap();
-            let already_recorded = snapshot_before.current_risks.iter().any(|f| {
+            // DI-1: the idempotency guard scans `system_health` (where telemetry
+            // now lives), matching the production guard.
+            let already_recorded = snapshot_before.system_health.iter().any(|f| {
                 f.subject == format!("unmanaged-agent: {stray_tool}")
                     && f.tool.as_deref() == Some(stray_tool)
             });
@@ -7965,13 +8001,74 @@ mod tests {
             let reader = store::RoomStore::open_at(root.clone()).unwrap();
             let snapshot = reader.snapshot().unwrap();
             let risk_facts: Vec<_> = snapshot
-                .current_risks
+                .system_health
                 .iter()
                 .filter(|f| f.subject == format!("unmanaged-agent: {stray_tool}"))
                 .collect();
             assert_eq!(risk_facts.len(), 1, "idempotent — still exactly one");
         }
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// DI-1: system-generated telemetry (subject-prefixed) projects into
+    /// `system_health` — deduped by subject — while human coordination risks
+    /// remain in `current_risks`. Keeps the risk view trustworthy.
+    #[test]
+    fn di1_telemetry_splits_from_current_risks_and_dedups() {
+        let root = unique_root("di1-split");
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        // A human coordination risk — must stay in current_risks.
+        room.append_fact(&build_risk_fact(
+            "alice",
+            "deploy blocked: staging DB down".to_string(),
+            "staging db is unreachable".to_string(),
+            Vec::new(),
+            "warn",
+            Vec::new(),
+            None,
+        ))
+        .unwrap();
+        // Two identical telemetry facts (simulate pre-guard accumulation).
+        for _ in 0..2 {
+            room.append_fact(&build_risk_fact(
+                "claude_code",
+                "unmanaged-agent: claude_code:x".to_string(),
+                "no managed session".to_string(),
+                Vec::new(),
+                "warn",
+                Vec::new(),
+                None,
+            ))
+            .unwrap();
+        }
+
+        let snap = store::RoomStore::open_at(root.clone())
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(
+            snap.current_risks.len(),
+            1,
+            "only the human risk belongs in current_risks; got: {:?}",
+            snap.current_risks
+                .iter()
+                .map(|f| &f.subject)
+                .collect::<Vec<_>>()
+        );
+        assert!(snap.current_risks[0].subject.starts_with("deploy blocked"));
+        assert_eq!(
+            snap.system_health
+                .iter()
+                .filter(|f| f.subject.starts_with("unmanaged-agent:"))
+                .count(),
+            1,
+            "telemetry must be deduped to one row in system_health; got: {:?}",
+            snap.system_health
+                .iter()
+                .map(|f| &f.subject)
+                .collect::<Vec<_>>()
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -8961,16 +9058,17 @@ mod tests {
 
         let snapshot = room.snapshot().unwrap();
 
-        // The risk fact must appear in current_risks.
-        let risk_in_current = snapshot
-            .current_risks
+        // DI-1: external-intake telemetry projects into `system_health`, not
+        // `current_risks` (keeps the coordination-risk view clean).
+        let risk_in_health = snapshot
+            .system_health
             .iter()
             .any(|f| f.subject.starts_with("external-intake:"));
         assert!(
-            risk_in_current,
-            "external-intake risk fact must appear in current_risks; got: {:?}",
+            risk_in_health,
+            "external-intake risk fact must appear in system_health; got: {:?}",
             snapshot
-                .current_risks
+                .system_health
                 .iter()
                 .map(|f| &f.subject)
                 .collect::<Vec<_>>()
@@ -9577,15 +9675,16 @@ mod tests {
         let reader = store::RoomStore::open_at(root.clone()).unwrap();
         let snapshot = reader.snapshot().unwrap();
 
+        // DI-1: binary-drift telemetry projects into `system_health`.
         let drift_risks: Vec<_> = snapshot
-            .current_risks
+            .system_health
             .iter()
             .filter(|f| f.subject.contains("binary-drift"))
             .collect();
         assert_eq!(
             drift_risks.len(),
             1,
-            "exactly one binary-drift risk fact must appear in current_risks"
+            "exactly one binary-drift risk fact must appear in system_health"
         );
         assert_eq!(
             drift_risks[0].severity.as_deref(),
@@ -11675,6 +11774,38 @@ fn command_board(args: BoardArgs) -> Result<Output> {
         board.delta.len()
     );
     let body = envelope("board", SCHEMA_BOARD, BoardData { board })?;
+    Ok(Output::new(args.json, text, body))
+}
+
+/// Which per-kind room projection a `command_kind_read` call serves.
+enum KindRead {
+    Risks,
+    Decisions,
+    Artifacts,
+    Claims,
+}
+
+/// Read-only per-kind projection of the room snapshot: `rally risks`,
+/// `rally decisions`, `rally artifacts`, `rally claims`. Each returns the
+/// corresponding `RoomSnapshot` bucket under `data.<verb>.rows` — a thin,
+/// discoverable view over the same facts `rally room --json` exposes, so
+/// agents no longer have to hand-parse `data.room.current_risks` etc.
+fn command_kind_read(args: KindReadArgs, kind: KindRead) -> Result<Output> {
+    let room = RoomStore::open()?;
+    let snapshot = room.snapshot_with_archived(false)?;
+    let (name, schema, rows) = match kind {
+        KindRead::Risks => ("risks", SCHEMA_RISKS, snapshot.current_risks),
+        KindRead::Decisions => ("decisions", SCHEMA_DECISIONS, snapshot.current_decisions),
+        KindRead::Artifacts => ("artifacts", SCHEMA_ARTIFACTS, snapshot.recent_artifacts),
+        KindRead::Claims => ("claims", SCHEMA_CLAIMS, snapshot.active_claims),
+    };
+    let text = format!("{name} {}", rows.len());
+    let rows_val = serde_json::to_value(&rows).map_err(RallyError::json("serialize facts"))?;
+    let mut inner = serde_json::Map::new();
+    inner.insert("rows".to_string(), rows_val);
+    let mut data = serde_json::Map::new();
+    data.insert(name.to_string(), Value::Object(inner));
+    let body = envelope_value(name, schema, Value::Object(data))?;
     Ok(Output::new(args.json, text, body))
 }
 

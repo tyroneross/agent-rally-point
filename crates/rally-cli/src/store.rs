@@ -364,6 +364,13 @@ pub(crate) struct RoomSnapshot {
     pub(crate) open_handoffs: Vec<Fact>,
     pub(crate) current_decisions: Vec<Fact>,
     pub(crate) current_risks: Vec<Fact>,
+    /// System-generated health/telemetry facts (`external-intake`,
+    /// `unmanaged-agent`, `duplicate-active-squad-id`, `binary-drift`) split out
+    /// of `current_risks` so the risk view shows only human coordination risks.
+    /// Deduped by subject (freshest kept). Auditable here; omitted from JSON when
+    /// empty so existing round-trip tests are unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) system_health: Vec<Fact>,
     pub(crate) recent_artifacts: Vec<Fact>,
     pub(crate) unconsumed_artifacts: Vec<Fact>,
     pub(crate) stale_facts: Vec<Fact>,
@@ -499,7 +506,9 @@ impl RoomSnapshot {
             recent_artifacts: filter_facts(self.recent_artifacts, query),
             unconsumed_artifacts: filter_facts(self.unconsumed_artifacts, query),
             stale_facts: filter_facts(self.stale_facts, query),
-            // squads, lead, readers, and mission are room-level aggregates; not filtered by path/tool query.
+            // system_health, squads, lead, readers, and mission are room-level
+            // aggregates; not filtered by path/tool query.
+            system_health: self.system_health,
             squads: self.squads,
             lead: self.lead,
             lead_epoch: self.lead_epoch,
@@ -1223,6 +1232,12 @@ impl RoomStore {
                         .current_risks
                         .iter()
                         .any(|f| f.event_id == ref_id)
+                    // DI-1: system-health telemetry (risk-kind, split out of
+                    // current_risks) must remain resolvable by ref.
+                    || snapshot_before
+                        .system_health
+                        .iter()
+                        .any(|f| f.event_id == ref_id)
                     || snapshot_before
                         .unconsumed_artifacts
                         .iter()
@@ -1277,6 +1292,10 @@ impl RoomStore {
                         .any(|f| f.event_id == ref_id)
                     || snapshot_after
                         .current_risks
+                        .iter()
+                        .any(|f| f.event_id == ref_id)
+                    || snapshot_after
+                        .system_health
                         .iter()
                         .any(|f| f.event_id == ref_id)
                     || snapshot_after
@@ -2069,22 +2088,56 @@ fn snapshot_from_facts_with_policy(
     sort_by_recency(&mut current_decisions, now_secs, half_life_secs);
     current_decisions.truncate(20);
 
-    let mut current_risks = facts
-        .iter()
-        .filter(|f| f.kind == "risk")
-        .filter(|f| !resolved.contains(&f.event_id))
-        .filter(|f| {
-            if is_archived(f) {
-                stale_facts.push((*f).clone());
-                false
-            } else {
-                true
-            }
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    // DI-1: split kind=risk facts into human coordination risks (current_risks)
+    // vs system-generated health/telemetry (system_health), keyed on a known
+    // machine subject prefix. Keeps the risk view trustworthy; telemetry stays
+    // auditable in its own bucket. `SYSTEM_HEALTH_SUBJECT_PREFIXES` is the single
+    // source of truth for the telemetry class.
+    const SYSTEM_HEALTH_SUBJECT_PREFIXES: &[&str] = &[
+        "external-intake:",
+        "unmanaged-agent:",
+        "duplicate-active-squad-id:",
+        "binary-drift:",
+    ];
+    fn is_system_health_subject(subject: &str) -> bool {
+        SYSTEM_HEALTH_SUBJECT_PREFIXES
+            .iter()
+            .any(|p| subject.starts_with(p))
+    }
+
+    let mut current_risks: Vec<Fact> = Vec::new();
+    let mut system_health_all: Vec<Fact> = Vec::new();
+    for f in facts.iter().filter(|f| f.kind == "risk") {
+        if resolved.contains(&f.event_id) {
+            continue;
+        }
+        if is_archived(f) {
+            stale_facts.push(f.clone());
+            continue;
+        }
+        if is_system_health_subject(&f.subject) {
+            system_health_all.push(f.clone());
+        } else {
+            current_risks.push(f.clone());
+        }
+    }
     sort_by_recency(&mut current_risks, now_secs, half_life_secs);
     current_risks.truncate(20);
+    // Dedup telemetry by subject (freshest kept) so historical un-guarded
+    // accumulation (pre-DI-4 binary-drift / duplicate-squad rows) collapses to
+    // one row per distinct signal.
+    sort_by_recency(&mut system_health_all, now_secs, half_life_secs);
+    let mut seen_subjects: BTreeSet<String> = BTreeSet::new();
+    let mut system_health: Vec<Fact> = Vec::new();
+    for f in system_health_all {
+        if seen_subjects.insert(f.subject.clone()) {
+            system_health.push(f);
+        }
+    }
+    // NOT truncated: the bucket is already deduped by subject (bounded by the
+    // small, machine-generated system vocabulary), and the enter-path
+    // idempotency guards read this projection — a truncation could drop a prior
+    // subject and defeat the guard, re-appending duplicates to the ledger.
 
     let mut recent_artifacts = facts
         .iter()
@@ -2256,6 +2309,7 @@ fn snapshot_from_facts_with_policy(
         open_handoffs,
         current_decisions,
         current_risks,
+        system_health,
         recent_artifacts,
         unconsumed_artifacts,
         stale_facts,
@@ -3824,6 +3878,46 @@ mod ledger_tests {
         let snapshot = store.snapshot().unwrap();
         assert_eq!(snapshot.active_claims.len(), 1);
         assert_eq!(snapshot.active_claims[0].event_id, "claim-first");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// DI-1 regression: a system-health telemetry fact (split out of
+    /// current_risks) must still be resolvable by ref. Pre-fix, the Resolve
+    /// pre-check in `append_state_transition_verified` scanned only
+    /// `current_risks` and hard-failed with "not a live risk".
+    #[test]
+    fn di1_system_health_fact_is_resolvable_by_ref() {
+        let root = unique_root("di1-resolve");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        // make_fact hardcodes subject; set the system-health prefix explicitly.
+        let mut risk_fact = make_fact("sys-drift", FactKind::Risk, "tests/", "drift telemetry");
+        risk_fact.subject = "binary-drift: build-A vs build-B".to_string();
+        let risk = store.append_fact(&risk_fact).unwrap();
+        let snap = store.snapshot().unwrap();
+        assert!(
+            snap.system_health
+                .iter()
+                .any(|f| f.event_id == risk.event_id),
+            "telemetry must project into system_health"
+        );
+        let mut resolve = make_fact(
+            "resolve-drift",
+            FactKind::Resolve,
+            "tests/",
+            "drift resolved",
+        );
+        resolve.ref_id = Some(risk.event_id.clone());
+        store
+            .append_state_transition_verified(&resolve)
+            .expect("a system_health fact must be resolvable by ref");
+        let after = store.snapshot().unwrap();
+        assert!(
+            !after
+                .system_health
+                .iter()
+                .any(|f| f.event_id == risk.event_id),
+            "resolved telemetry must leave system_health"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
