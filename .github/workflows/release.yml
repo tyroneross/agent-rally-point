@@ -80,6 +80,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Belt-and-suspenders: the toolchain action's `targets:` did not reliably
+      # install the non-native std on the macos-14 (arm64) image, so the Intel
+      # cross-target build failed with E0463 "can't find crate for core". Add the
+      # target explicitly with the same rustup that `cargo build` uses. No-op when
+      # the target is already present (native builds).
+      - name: Ensure target std is installed
+        if: ${{ !matrix.cross }}
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install cross (aarch64-linux only)
         if: ${{ matrix.cross }}
         run: cargo install cross --locked
