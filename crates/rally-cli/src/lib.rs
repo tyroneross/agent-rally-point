@@ -10534,15 +10534,22 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at_with_engagement(root.clone(), None).unwrap();
 
-        // Claim 30 minutes ago: past 15m idle, under 2h takeover bar.
-        let thirty_min_ago = (chrono::Utc::now() - chrono::Duration::minutes(30))
+        // Claim 22 minutes ago: comfortably past the 15m idle threshold, yet well
+        // under the 30m single-file DESTRUCTIVE-reclaim bar (DEFAULT_RECLAIM_SMALL_MINUTES)
+        // AND the 2h takeover bar. The prior value (exactly 30m) landed ON the
+        // single-file reclaim boundary — `command_release_by_path` checks
+        // `age > reclaim_timeout`, so second-truncation + slow execution under
+        // full-suite load flipped the takeover-refusal ~7% of runs. This is the
+        // real root cause of this test's flake (docs/ISSUES-2026-07-07-test-flakes.md),
+        // not env/CWD races.
+        let stale_ts = (chrono::Utc::now() - chrono::Duration::minutes(22))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let live_id = append_stale_claim(
             &room,
             "busy-builder",
             "src/foo.rs",
-            "long build, no rally write in 30m",
-            &thirty_min_ago,
+            "long build, no rally write in 22m",
+            &stale_ts,
         );
         let snap = room.snapshot().unwrap();
         assert!(
@@ -10679,15 +10686,41 @@ mod tests {
 
     // ─── C3: status post + read roundtrip ────────────────────────────────────
 
+    /// RAII guard for tests that must run in a specific process CWD.
+    /// Serializes on `PROCESS_ENV_LOCK` (poison-tolerant) and ALWAYS restores the
+    /// previous CWD on drop — including on an assertion panic — so a failing test
+    /// cannot leave a dangling/deleted CWD (or a poisoned lock) that cascades into
+    /// every later test in the binary. Fixes the `--workspace` flake cluster
+    /// documented in docs/ISSUES-2026-07-07-test-flakes.md (Signature A).
+    struct CwdEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<std::path::PathBuf>,
+    }
+    impl CwdEnvGuard {
+        fn enter(dir: &std::path::Path) -> Self {
+            let lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            // Capture defensively: if a prior test left CWD dangling, current_dir()
+            // errors — tolerate it (None) rather than panic and extend the cascade.
+            let prev = std::env::current_dir().ok();
+            std::env::set_current_dir(dir).expect("set_current_dir to test root");
+            CwdEnvGuard { _lock: lock, prev }
+        }
+    }
+    impl Drop for CwdEnvGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = &self.prev {
+                let _ = std::env::set_current_dir(prev);
+            }
+        }
+    }
+
     #[test]
     fn status_post_then_status_read_roundtrip() {
         let root = unique_root("status-post-roundtrip");
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        // command_status_post calls RoomStore::open() which resolves from cwd.
-        // Use the env-lock + cd dance from the existing pattern.
-        let _guard = PROCESS_ENV_LOCK.lock().unwrap();
-        let prev_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&root).unwrap();
+        // command_status_post calls RoomStore::open() which resolves from cwd,
+        // so run in `root`. CwdEnvGuard serializes + restores CWD panic-safely.
+        let _cwd = CwdEnvGuard::enter(&root);
 
         let post = command_status_post(
             true,
@@ -10726,7 +10759,6 @@ mod tests {
         assert_eq!(states[0]["file"], "crates/rally-cli");
         assert_eq!(states[0]["intent"], "agent-state");
 
-        std::env::set_current_dir(prev_cwd).unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -10739,9 +10771,7 @@ mod tests {
         let branch = "feature/status-done-autofill";
         let sha = init_status_git_repo(&root, branch);
 
-        let _guard = PROCESS_ENV_LOCK.lock().unwrap();
-        let prev_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&root).unwrap();
+        let _cwd = CwdEnvGuard::enter(&root);
 
         for tool in ["codex:worker", "claude_code:worker"] {
             let post = command_status_post(
@@ -10770,7 +10800,6 @@ mod tests {
             assert!(subject.contains(&format!("worktree_branch={branch}")));
         }
 
-        std::env::set_current_dir(prev_cwd).unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -10779,9 +10808,7 @@ mod tests {
         let root = unique_root("status-done-explicit");
         std::fs::create_dir_all(root.join(".git")).unwrap();
 
-        let _guard = PROCESS_ENV_LOCK.lock().unwrap();
-        let prev_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&root).unwrap();
+        let _cwd = CwdEnvGuard::enter(&root);
 
         let post = command_status_post(
             true,
@@ -10806,7 +10833,6 @@ mod tests {
             "explicit-branch"
         );
 
-        std::env::set_current_dir(prev_cwd).unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -10819,9 +10845,7 @@ mod tests {
         let branch = "feature/status-done-partial-explicit";
         init_status_git_repo(&root, branch);
 
-        let _guard = PROCESS_ENV_LOCK.lock().unwrap();
-        let prev_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&root).unwrap();
+        let _cwd = CwdEnvGuard::enter(&root);
 
         let post = command_status_post(
             true,
@@ -10843,7 +10867,6 @@ mod tests {
         assert_eq!(state["committed_sha"].as_str().unwrap(), "manual-sha");
         assert_eq!(state["worktree_branch"].as_str().unwrap(), branch);
 
-        std::env::set_current_dir(prev_cwd).unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
 

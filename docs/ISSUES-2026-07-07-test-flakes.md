@@ -2,8 +2,44 @@
 
 # Test-Suite Flakiness under `cargo test --workspace` — 2026-07-07
 
-**Status: CONFIRMED, still an issue on `main` (09a4482).** The `v0.1.6`
-`PROCESS_ENV_LOCK` fix reduced but did NOT eliminate it.
+**Status: shared-state flakes FIXED; resource-contention flakes remain.**
+
+## Resolution (2026-07-07)
+
+The two **deterministic shared-state** root causes are fixed and validated (0
+failures across 15 `--workspace` runs each):
+
+- **Signature A cascade** — the `status_post_*` tests did process-global
+  `set_current_dir` with a restore skipped on panic + a non-poison-tolerant
+  lock, so one failure left a deleted CWD + poisoned lock and dragged the whole
+  cluster (incl. `busy_but_quiet`) down. **Fix:** a panic-safe RAII `CwdEnvGuard`
+  (poison-tolerant lock + `Drop`-restores-CWD). Also unified `hooks_config`'s
+  private `env_lock()` into the crate-wide `PROCESS_ENV_LOCK` and added a
+  `ConfigEnvGuard` that removes coordination env vars on panic (real
+  `set_var`-unsoundness hardening).
+- **`busy_but_quiet` boundary bug** — the captured panic
+  (`lib.rs "takeover must be refused"`) traced to a **boundary value**, not an
+  env/CWD race: the test stamped a *single-file* claim at **exactly 30 min**,
+  which equals `DEFAULT_RECLAIM_SMALL_MINUTES`. `command_release_by_path` checks
+  `age > reclaim_timeout`; with second-truncated timestamps + slow execution
+  under load, `age` lands at 1801 vs 1800 ~7% of runs → reclaimable → takeover
+  succeeds. **Fix:** stamp at **22 min** (past 15m idle, safely under the 30m
+  single-file reclaim bar) → deterministic.
+
+**Remaining (resource contention, NOT shared-state):**
+`parallel_say_invocations_never_drop_or_duplicate_facts`,
+`rally_run_reserves_numbered_ids_under_parallel_launch`, `envelope_owners_dirty`.
+These spawn many concurrent subprocesses/threads; under full-suite CPU
+saturation a subprocess is starved and times out. They live in **separate test
+binaries** (separate processes), so a Rust mutex cannot coordinate them — the
+real fix is structural: **cargo-nextest** (per-test resource groups + better
+scheduling) or a reduced global `--test-threads`. Observed post-fix rate ~1/15,
+down from ~3/10 with 5-test clusters.
+
+## Original report (pre-fix)
+
+**Was: CONFIRMED on `main` (09a4482).** The `v0.1.6` `PROCESS_ENV_LOCK` fix
+reduced but did NOT eliminate it.
 
 ## Evidence
 

@@ -415,17 +415,51 @@ pub(crate) fn resolve_coordination(repo_root: &Path) -> Result<CoordinationConfi
 mod coordination_tests {
     use super::*;
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     // env var mutation is process-global; serialize these tests.
+    // Unified with the crate-wide PROCESS_ENV_LOCK (was a private OnceLock<Mutex>).
+    // A separate mutex let this module's set_var/remove_var run concurrently with
+    // env reads in other tests (busy_but_quiet, status_post, retrospective) — and
+    // Rust's set/remove_var corrupts the WHOLE environ during a concurrent read,
+    // not just the one key. One lock = all env mutators/readers serialize.
+    // See docs/ISSUES-2026-07-07-test-flakes.md.
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        &crate::PROCESS_ENV_LOCK
+    }
+
+    /// Config env vars that `resolve_coordination` reads. Tests set these; if a
+    /// test panics between set and cleanup, the value LEAKS into later tests —
+    /// e.g. a leaked `RALLY_RECLAIM_*` shrinks the takeover window and flips
+    /// `busy_but_quiet_owner_is_warnable_but_not_takeover_eligible`. See
+    /// docs/ISSUES-2026-07-07-test-flakes.md.
+    const CONFIG_ENV_VARS: &[&str] = &[
+        "RALLY_HALF_LIFE_HOURS",
+        "RALLY_ARCHIVE_FLOOR",
+        "RALLY_RECLAIM_SMALL_MINUTES",
+        "RALLY_RECLAIM_LARGE_MINUTES",
+        "RALLY_DEFAULT_CADENCE_SECS",
+        "RALLY_MISS_MULTIPLIER",
+        "RALLY_GRACE_SECS",
+    ];
+
+    /// RAII: removes every config env var on drop — including on an assertion
+    /// panic — so a test can never leak coordination config into a later test.
+    /// Declared AFTER the env-lock guard so it drops (cleans up) while the lock
+    /// is still held. Pairs with the crate-wide `PROCESS_ENV_LOCK`.
+    struct ConfigEnvGuard;
+    impl Drop for ConfigEnvGuard {
+        fn drop(&mut self) {
+            for k in CONFIG_ENV_VARS {
+                unsafe { std::env::remove_var(k) };
+            }
+        }
     }
 
     #[test]
     fn defaults_when_no_config() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _cfg_env = ConfigEnvGuard;
         for k in [
             "RALLY_HALF_LIFE_HOURS",
             "RALLY_ARCHIVE_FLOOR",
@@ -458,7 +492,8 @@ mod coordination_tests {
 
     #[test]
     fn liveness_tunables_resolve_from_repo_and_env() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _cfg_env = ConfigEnvGuard;
         for k in [
             "RALLY_DEFAULT_CADENCE_SECS",
             "RALLY_MISS_MULTIPLIER",
@@ -487,7 +522,8 @@ mod coordination_tests {
 
     #[test]
     fn repo_config_overrides_default() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _cfg_env = ConfigEnvGuard;
         for k in [
             "RALLY_HALF_LIFE_HOURS",
             "RALLY_ARCHIVE_FLOOR",
@@ -513,7 +549,8 @@ mod coordination_tests {
 
     #[test]
     fn env_overrides_repo() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _cfg_env = ConfigEnvGuard;
         let dir = std::env::temp_dir().join(format!("rally-coord-env-{}", std::process::id()));
         let _ = fs::create_dir_all(dir.join(".rally"));
         fs::write(
@@ -530,7 +567,8 @@ mod coordination_tests {
 
     #[test]
     fn malformed_values_ignored() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _cfg_env = ConfigEnvGuard;
         for k in [
             "RALLY_HALF_LIFE_HOURS",
             "RALLY_ARCHIVE_FLOOR",
