@@ -43,7 +43,16 @@ fi
 # clippy + test cover the compiled tree (a compile-break SHOULD block a push;
 # use RALLY_SKIP_PREPUSH=1 for the rare intentional case).
 echo "pre-push: clippy (-D warnings)…" >&2; $CARGO clippy --workspace --all-targets -- -D warnings
-echo "pre-push: tests…"             >&2; $CARGO test --workspace
+if command -v cargo-nextest >/dev/null 2>&1; then
+  echo "pre-push: tests (cargo nextest)…" >&2
+  $CARGO nextest run --workspace
+  echo "pre-push: doctests…" >&2
+  $CARGO test --workspace --doc
+else
+  echo "pre-push: cargo-nextest not installed; using serialized cargo test fallback" >&2
+  echo "pre-push: install faster gate with: cargo install cargo-nextest --locked" >&2
+  $CARGO test --workspace -- --test-threads=1
+fi
 
 # Supply-chain gates: only when dependencies actually changed (fast common path),
 # and only if the tools are installed (fail-soft — a missing optional tool must

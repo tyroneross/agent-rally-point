@@ -2,7 +2,25 @@
 
 # Test-Suite Flakiness under `cargo test --workspace` — 2026-07-07
 
-**Status: shared-state flakes FIXED; resource-contention flakes remain.**
+**Status: shared-state flakes FIXED; resource-contention flakes mitigated in the
+local gate with `cargo-nextest`.**
+
+## Follow-up mitigation (2026-07-07)
+
+The local pre-push gate now prefers `cargo nextest run --workspace` plus a
+separate `cargo test --workspace --doc` doctest pass. If `cargo-nextest` is not
+installed, it falls back to `cargo test --workspace -- --test-threads=1` so the
+gate remains conservative instead of failing open.
+
+`.config/nextest.toml` marks the three remaining resource-heavy signatures with
+`threads-required = "num-test-threads"`:
+
+- `parallel_say_invocations_never_drop_or_duplicate_facts`
+- `rally_run_reserves_numbered_ids_under_parallel_launch`
+- `envelope_owners_dirty`
+
+That reserves the full nextest worker pool for each known heavy test, avoiding
+cross-test CPU starvation without adding retries or weakening assertions.
 
 ## Resolution (2026-07-07)
 

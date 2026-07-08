@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+
+# The full workspace has a small class of resource-contention flakes under
+# saturated parallel runs. These tests spawn many subprocesses or inspect live
+# git/owner state, so reserve the whole nextest worker pool for each one instead
+# of hiding failures behind retries.
+[[profile.default.overrides]]
+filter = 'test(parallel_say_invocations_never_drop_or_duplicate_facts)'
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+filter = 'test(rally_run_reserves_numbered_ids_under_parallel_launch)'
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+filter = 'test(envelope_owners_dirty)'
+threads-required = "num-test-threads"
