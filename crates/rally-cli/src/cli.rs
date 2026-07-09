@@ -208,6 +208,9 @@ pub(crate) struct RoomArgs {
 #[derive(Clone, Debug)]
 pub(crate) struct NextArgs {
     pub(crate) json: bool,
+    /// Observation-only mode: rank work without presence, wake, checkpoint,
+    /// or other coordination-fact mutations. Derived caches may still rebuild.
+    pub(crate) audit: bool,
     pub(crate) tool: String,
     pub(crate) role: Option<String>,
     pub(crate) paths: Vec<String>,
@@ -1279,12 +1282,16 @@ fn room_parser() -> impl Parser<RoomArgs> {
 
 fn next_parser() -> impl Parser<NextArgs> {
     let json = json_flag();
+    let audit = long("audit")
+        .help("observation-only: rank work without writing presence, wake, or read facts")
+        .switch();
     let tool = string_arg("tool", "TOOL");
     let role = optional_string_arg("role", "ROLE");
     let paths = many_string_arg("path", "PATH");
     let limit = bounded_i64_arg("limit", "N", 5, 1, 20);
     construct!(NextArgs {
         json,
+        audit,
         tool,
         role,
         paths,

@@ -175,38 +175,37 @@ fn upsert_pointer_in_doc(repo_root: &Path, filename: &str) -> Result<PointerOutc
     // Try to find existing markers and rewrite between them.
     if let (Some(start_idx), Some(end_idx)) =
         (existing.find(POINTER_START), existing.find(POINTER_END))
+        && start_idx < end_idx
     {
-        if start_idx < end_idx {
-            // Replace [start_idx .. end_idx + len(end_marker)] with the new block.
-            let mut new_doc = String::with_capacity(existing.len() + block.len());
-            new_doc.push_str(&existing[..start_idx]);
-            // pointer_block() already ends with the end marker + newline; the
-            // existing tail picks up after the end marker.
-            new_doc.push_str(block.trim_end_matches('\n'));
-            let after_end = end_idx + POINTER_END.len();
-            // Skip exactly one trailing newline if present so we don't keep
-            // accumulating blank lines on re-run.
-            let tail = if existing[after_end..].starts_with('\n') {
-                &existing[after_end + 1..]
-            } else {
-                &existing[after_end..]
-            };
-            // Re-add the newline that pointer_block() owns at its tail.
-            new_doc.push('\n');
-            new_doc.push_str(tail);
+        // Replace [start_idx .. end_idx + len(end_marker)] with the new block.
+        let mut new_doc = String::with_capacity(existing.len() + block.len());
+        new_doc.push_str(&existing[..start_idx]);
+        // pointer_block() already ends with the end marker + newline; the
+        // existing tail picks up after the end marker.
+        new_doc.push_str(block.trim_end_matches('\n'));
+        let after_end = end_idx + POINTER_END.len();
+        // Skip exactly one trailing newline if present so we don't keep
+        // accumulating blank lines on re-run.
+        let tail = if existing[after_end..].starts_with('\n') {
+            &existing[after_end + 1..]
+        } else {
+            &existing[after_end..]
+        };
+        // Re-add the newline that pointer_block() owns at its tail.
+        new_doc.push('\n');
+        new_doc.push_str(tail);
 
-            if new_doc == existing {
-                return Ok(PointerOutcome {
-                    path: filename.to_string(),
-                    action: "unchanged",
-                });
-            }
-            atomic_write(&target, &new_doc)?;
+        if new_doc == existing {
             return Ok(PointerOutcome {
                 path: filename.to_string(),
-                action: "updated",
+                action: "unchanged",
             });
         }
+        atomic_write(&target, &new_doc)?;
+        return Ok(PointerOutcome {
+            path: filename.to_string(),
+            action: "updated",
+        });
     }
 
     // No markers (or malformed order) → append block with one separating blank line.

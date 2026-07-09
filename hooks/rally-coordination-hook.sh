@@ -363,7 +363,7 @@ if [ "$phase" = "start" ]; then
   _rally_status_idle
   if [ "$have_node" = "1" ]; then
     room_json="$(rally_timeout room --json 2>/dev/null || true)"
-    next_json="$(rally_timeout next --tool "$tool" --json 2>/dev/null || true)"
+    next_json="$(rally_timeout next --tool "$tool" --audit --json 2>/dev/null || true)"
     status_json="$(rally_timeout status read --json 2>/dev/null || true)"
     rally_output="$({ printf '%s' "$room_json" | RALLY_NEXT_JSON="$next_json" RALLY_STATUS_JSON="$status_json" RALLY_SELF_TOOL="$tool" node -e '
 const fs = require("fs");
@@ -495,7 +495,7 @@ else
     _rally_status_idle
     status_json="$(rally_timeout status read --json 2>/dev/null || true)"
   fi
-  rally_output="$(rally_timeout next --tool "$tool" --json 2>/dev/null || true)"
+  rally_output="$(rally_timeout next --tool "$tool" --audit --json 2>/dev/null || true)"
 fi
 
 # Render the host-specific output envelope from rally's JSON output.

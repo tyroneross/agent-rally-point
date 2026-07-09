@@ -384,7 +384,7 @@ fn next_candidates(
     let mut candidates = Vec::new();
 
     for handoff in &snapshot.open_handoffs {
-        if assigned_to_tool(handoff, tool) {
+        if assigned_to_tool(handoff, tool) && !stale_targeted_handoff(handoff, tool) {
             candidates.push(NextCandidate::from_fact(
                 "respond_to_handoff",
                 "open_handoff_targeted_to_this_tool",
@@ -686,13 +686,13 @@ fn completion_contract(action: &str, actionable: bool) -> CompletionContract {
 
 fn executable_scopes(fact: &Fact) -> Vec<String> {
     let mut scopes = fact.scope.clone();
-    if scopes.is_empty() {
-        if let Some(uri) = &fact.uri {
-            if uri.starts_with("file:") {
-                scopes.push(uri.clone());
-            } else if !uri.contains("://") {
-                scopes.push(normalize_path(uri.clone()));
-            }
+    if scopes.is_empty()
+        && let Some(uri) = &fact.uri
+    {
+        if uri.starts_with("file:") {
+            scopes.push(uri.clone());
+        } else if !uri.contains("://") {
+            scopes.push(normalize_path(uri.clone()));
         }
     }
     scopes.sort();
@@ -722,7 +722,15 @@ fn stale_wait_obligation(fact: &Fact, stale_targets: &BTreeSet<String>) -> bool 
     fact.target
         .as_deref()
         .is_some_and(|target| stale_targets.contains(target))
-        || fact_age_secs(fact).is_some_and(|age| age > STALE_WAIT_SECS)
+        || fact_age_secs(fact).is_some_and(stale_wait_age)
+}
+
+fn stale_targeted_handoff(fact: &Fact, tool: &str) -> bool {
+    fact.target.as_deref() == Some(tool) && fact_age_secs(fact).is_some_and(stale_wait_age)
+}
+
+fn stale_wait_age(age_secs: i64) -> bool {
+    age_secs > STALE_WAIT_SECS
 }
 
 fn fact_age_secs(fact: &Fact) -> Option<i64> {
@@ -957,6 +965,32 @@ mod tests {
 
         assert_eq!(result.action, "wait");
         assert_eq!(result.waiting_on.len(), 1);
+    }
+
+    #[test]
+    fn stale_targeted_handoff_is_not_actionable() {
+        let mut snapshot = RoomSnapshot::default();
+        snapshot.open_handoffs.push(handoff(
+            "old-targeted-handoff",
+            "codex",
+            "2000-01-01T00:00:00Z",
+        ));
+
+        let result = build_next(&snapshot, "codex", None, &[], 10, Vec::new());
+        assert_eq!(result.action, "proceed_solo");
+        assert!(!result.actionable);
+    }
+
+    #[test]
+    fn targeted_handoff_ttl_is_strict_and_bad_timestamps_fail_open() {
+        assert!(!stale_wait_age(STALE_WAIT_SECS));
+        assert!(stale_wait_age(STALE_WAIT_SECS + 1));
+
+        let malformed = handoff("bad-time", "codex", "not-a-timestamp");
+        assert!(
+            !stale_targeted_handoff(&malformed, "codex"),
+            "malformed timestamps must remain actionable"
+        );
     }
 
     #[test]

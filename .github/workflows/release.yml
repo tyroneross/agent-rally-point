@@ -26,8 +26,26 @@ permissions:
   attestations: write   # write the attestation
 
 jobs:
+  # Gates the whole build matrix on release-version parity: the canonical CLI
+  # version (crates/rally-cli/Cargo.toml) must agree with every plugin
+  # manifest AND the bundled Codex artifact must not be stale. A
+  # version-drifted or stale-artifact state must never reach a published
+  # release — fail fast here, before spending the 4-triple build matrix.
+  parity:
+    name: Release parity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Release parity (scripts/check-release-parity.sh)
+        run: ./scripts/check-release-parity.sh
+
   build:
     name: Build ${{ matrix.triple }}
+    needs: parity
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

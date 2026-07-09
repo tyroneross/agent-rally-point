@@ -28,6 +28,7 @@
 //!   That class of bug is caught by the live round-trip in P2 / P3.
 
 use std::fs;
+use std::process::{Child, Command};
 
 use rally_protocol::ledger::FileInbox;
 use rally_protocol::{
@@ -280,6 +281,151 @@ fn read_since_surfaces_corrupt_mid_line() {
 
     let err = inbox.read_since("a", 0).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn append_rejects_completed_corrupt_directive_line() {
+    let (root, _g) = scratch_root("append-corrupt");
+    let inbox = FileInbox::open(&root).unwrap();
+    inbox
+        .append_directive(&test_directive("a", "first"))
+        .unwrap();
+
+    let path = inbox.directives_path("a");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"not-json\n");
+    fs::write(&path, bytes).unwrap();
+
+    let err = inbox
+        .append_directive(&test_directive("a", "second"))
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn append_repairs_torn_tail_before_allocating_next_sequence() {
+    let (root, _g) = scratch_root("append-torn-tail");
+    let inbox = FileInbox::open(&root).unwrap();
+    inbox
+        .append_directive(&test_directive("a", "first"))
+        .unwrap();
+
+    let path = inbox.directives_path("a");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.extend_from_slice(br#"{"seq":2,"to":"a""#);
+    fs::write(&path, bytes).unwrap();
+
+    assert_eq!(
+        inbox
+            .append_directive(&test_directive("a", "second"))
+            .unwrap(),
+        2
+    );
+    let directives = inbox.read_since("a", 0).unwrap();
+    assert_eq!(
+        directives.iter().map(|d| d.seq).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+fn test_directive(target: &str, text: &str) -> Directive {
+    Directive {
+        seq: 0,
+        to: target.to_string(),
+        from: "contract-test".to_string(),
+        kind: DirectiveKind::Deliver,
+        itype: InterruptType::Addition,
+        text: Some(text.to_string()),
+        urgent: false,
+        ts: 0.0,
+    }
+}
+
+fn spawn_ledger_child(root: &std::path::Path, mode: &str, index: usize) -> Child {
+    Command::new(std::env::current_exe().expect("current test executable"))
+        .args(["--exact", "ledger_append_child", "--nocapture"])
+        .env("RALLY_LEDGER_CHILD_ROOT", root)
+        .env("RALLY_LEDGER_CHILD_MODE", mode)
+        .env("RALLY_LEDGER_CHILD_INDEX", index.to_string())
+        .env("RALLY_TEST_BLOCK_DIRECTIVE_AFTER_SEQ_MS", "75")
+        .spawn()
+        .expect("spawn ledger child")
+}
+
+#[test]
+fn ledger_append_child() {
+    let Ok(root) = std::env::var("RALLY_LEDGER_CHILD_ROOT") else {
+        return;
+    };
+    let mode = std::env::var("RALLY_LEDGER_CHILD_MODE").expect("child mode");
+    let index = std::env::var("RALLY_LEDGER_CHILD_INDEX")
+        .expect("child index")
+        .parse::<u64>()
+        .expect("numeric child index");
+    let inbox = FileInbox::open(root).expect("open child inbox");
+    match mode.as_str() {
+        "directive" => {
+            inbox
+                .append_directive(&test_directive("shared-agent", &format!("child-{index}")))
+                .expect("append child directive");
+        }
+        "receipt" => {
+            inbox
+                .append_receipt(&Receipt {
+                    ref_seq: index + 1,
+                    to: "shared-agent".to_string(),
+                    status: DeliveryStatus::Delivered,
+                    by: format!("child-{index}"),
+                    evidence: None,
+                    error: None,
+                    ts: index as f64,
+                })
+                .expect("append child receipt");
+        }
+        other => panic!("unknown child mode: {other}"),
+    }
+}
+
+#[test]
+fn concurrent_append_assigns_unique_sequences_across_processes() {
+    let (root, _g) = scratch_root("concurrent-directives");
+    FileInbox::open(&root).unwrap();
+    let children: Vec<_> = (0..8)
+        .map(|index| spawn_ledger_child(&root, "directive", index))
+        .collect();
+    for child in children {
+        let output = child.wait_with_output().expect("wait for ledger child");
+        assert!(
+            output.status.success(),
+            "child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let inbox = FileInbox::open(&root).unwrap();
+    let directives = inbox.read_since("shared-agent", 0).unwrap();
+    assert_eq!(directives.len(), 8);
+    assert_eq!(
+        directives.iter().map(|d| d.seq).collect::<Vec<_>>(),
+        (1..=8).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn concurrent_receipt_appends_remain_parseable_across_processes() {
+    let (root, _g) = scratch_root("concurrent-receipts");
+    FileInbox::open(&root).unwrap();
+    let children: Vec<_> = (0..8)
+        .map(|index| spawn_ledger_child(&root, "receipt", index))
+        .collect();
+    for child in children {
+        assert!(child.wait_with_output().unwrap().status.success());
+    }
+
+    let inbox = FileInbox::open(&root).unwrap();
+    let receipts = inbox.read_receipts_since("shared-agent", 0).unwrap();
+    assert_eq!(receipts.len(), 8);
 }
 
 #[test]

@@ -418,10 +418,10 @@ impl BackendRunner {
     /// stop/read/liveness reach the SAME daemon the pane was spawned in. A no-op
     /// (`None`/empty) leaves the constructor's `rally_owned_socket()` resolution.
     pub(crate) fn pin_ptyd_socket(&mut self, socket: Option<&str>) {
-        if let Some(s) = socket {
-            if !s.is_empty() {
-                self.ptyd_socket = Some(s.to_string());
-            }
+        if let Some(s) = socket
+            && !s.is_empty()
+        {
+            self.ptyd_socket = Some(s.to_string());
         }
     }
 

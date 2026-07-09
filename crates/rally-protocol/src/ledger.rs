@@ -9,14 +9,13 @@
 //! the same stream, and the daemon can pull-by-seq cheaply without
 //! deserialising every Receipt the agent has ever posted.
 //!
-//! ## Atomicity
-//! Each line is serialised to a `String` in memory, the trailing `\n` is
-//! appended, then `write_all` is called on a single `OpenOptions::append`
-//! handle. POSIX `O_APPEND` guarantees the entire `write_all` is atomic
-//! against concurrent writers up to PIPE_BUF (usually 4096 bytes). The
-//! canonical Directive/Receipt JSON is well under 4096 bytes; documents
-//! exceeding that are silently allowed but lose multi-writer atomicity
-//! (they STILL parse correctly under single-writer access).
+//! ## Atomicity and durability
+//! Each target has a stable advisory lock file. Directive sequence allocation
+//! and append happen while holding that lock, so independent CLI processes
+//! cannot allocate the same sequence. Receipt appends use the same transaction
+//! shape so large writes cannot interleave. Successful appends call
+//! [`File::sync_data`], and creation of a new data file also syncs its parent
+//! directory on Unix before success is reported.
 //!
 //! ## Read tolerance
 //! [`FileInbox::read_since`] and [`FileInbox::read_receipts_since`]
@@ -31,11 +30,13 @@
 //! seq (e.g. the daemon replaying a snapshot) can pass `seq > 0` and we
 //! validate it is strictly greater than the current max.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 
@@ -69,6 +70,11 @@ const MAX_LINE_BYTES: usize = MAX_DIRECTIVE_TEXT_BYTES + 8 * 1024;
 
 /// Maximum length of a sanitized agent-id filename stem (SEC-003).
 const MAX_AGENT_ID_LEN: usize = 128;
+
+/// Keep ledger lock waits below the CLI's default watchdog while allowing a
+/// short, active writer to finish its fsync transaction.
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// Validate an agent-id for use as a ledger filename stem (SEC-003).
 ///
@@ -145,7 +151,7 @@ fn ensure_private_dir(path: &Path) -> io::Result<()> {
 /// `O_APPEND` atomicity contract (mode only affects the create case).
 fn private_append_open(path: &Path) -> io::Result<File> {
     let mut opts = OpenOptions::new();
-    opts.create(true).append(true);
+    opts.create(true).append(true).write(true);
     #[cfg(unix)]
     {
         opts.mode(PRIVATE_FILE_MODE);
@@ -156,6 +162,61 @@ fn private_append_open(path: &Path) -> io::Result<File> {
         set_private_mode(path, PRIVATE_FILE_MODE)?;
     }
     Ok(f)
+}
+
+/// Open a stable per-target lock file without ever deleting or replacing it.
+fn private_lock_open(path: &Path) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        opts.mode(PRIVATE_FILE_MODE);
+    }
+    let f = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        set_private_mode(path, PRIVATE_FILE_MODE)?;
+    }
+    Ok(f)
+}
+
+fn lock_exclusive_bounded(file: &File, path: &Path) -> io::Result<()> {
+    let deadline = Instant::now() + LOCK_WAIT_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(LOCK_RETRY_DELAY);
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "timed out after {}ms waiting for ledger lock {}",
+                        LOCK_WAIT_TIMEOUT.as_millis(),
+                        path.display()
+                    ),
+                ));
+            }
+            Err(TryLockError::Error(err)) => return Err(err),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("ledger path has no parent: {}", path.display()),
+        )
+    })?;
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// File-backed Inbox rooted at a directory.
@@ -215,6 +276,18 @@ impl FileInbox {
             .join(format!("{}.jsonl", sanitize(agent)))
     }
 
+    fn directives_lock_path(&self, agent: &str) -> PathBuf {
+        self.root
+            .join("inbox")
+            .join(format!("{}.lock", sanitize(agent)))
+    }
+
+    fn receipts_lock_path(&self, agent: &str) -> PathBuf {
+        self.root
+            .join("receipts")
+            .join(format!("{}.lock", sanitize(agent)))
+    }
+
     /// The highest `seq` currently in the agent's inbox (0 if missing).
     ///
     /// Currently scans the full inbox file on every `append_directive` call.
@@ -222,30 +295,99 @@ impl FileInbox {
     /// file-event wake at the consumer (not writer throughput). Known
     /// follow-up: cache last seq in memory or maintain a `<agent>.seq`
     /// sidecar when measured write throughput becomes a bottleneck.
-    fn current_max_seq(&self, agent: &str) -> io::Result<u64> {
+    fn directive_scan(&self, agent: &str) -> io::Result<DirectiveScan> {
         let path = self.directives_path(agent);
-        if !path.exists() {
-            return Ok(0);
-        }
-        let f = File::open(&path)?;
-        let reader = BufReader::new(f);
+        let f = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(DirectiveScan::default());
+            }
+            Err(e) => return Err(e),
+        };
+        let mut reader = BufReader::new(f);
+        let mut buf = Vec::new();
         let mut max = 0u64;
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
+        let mut offset = 0u64;
+        loop {
+            let line_start = offset;
+            let lr = read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES)?;
+            if lr.eof {
+                return Ok(DirectiveScan {
+                    max_seq: max,
+                    repair: TailRepair::None,
+                });
+            }
+            offset = offset.checked_add(lr.consumed).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "ledger byte offset overflow")
+            })?;
+
+            if lr.truncated {
+                if lr.had_newline {
+                    return Err(corrupt_line_error(&path, "line exceeds maximum size"));
+                }
+                return Ok(DirectiveScan {
+                    max_seq: max,
+                    repair: TailRepair::Truncate(line_start),
+                });
+            }
+
+            let content = &buf[..lr.stored];
+            if content.iter().all(|b| b.is_ascii_whitespace()) {
+                if !lr.had_newline {
+                    return Ok(DirectiveScan {
+                        max_seq: max,
+                        repair: TailRepair::Truncate(line_start),
+                    });
+                }
                 continue;
             }
-            // Tolerant parse: a directive whose seq we can't read is treated
-            // as max=0 for this line (it WILL be re-parsed below; if it
-            // really is garbage, read_since will surface it).
-            if let Ok(d) = serde_json::from_str::<Directive>(&line)
-                && d.seq > max
-            {
-                max = d.seq;
+
+            match std::str::from_utf8(content)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                .and_then(|line| {
+                    serde_json::from_str::<Directive>(line)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                }) {
+                Ok(directive) => {
+                    max = max.max(directive.seq);
+                    if !lr.had_newline {
+                        return Ok(DirectiveScan {
+                            max_seq: max,
+                            repair: TailRepair::AddNewline,
+                        });
+                    }
+                }
+                Err(_err) if !lr.had_newline => {
+                    return Ok(DirectiveScan {
+                        max_seq: max,
+                        repair: TailRepair::Truncate(line_start),
+                    });
+                }
+                Err(err) => return Err(corrupt_line_error(&path, &err.to_string())),
             }
         }
-        Ok(max)
     }
+}
+
+#[derive(Debug, Default)]
+struct DirectiveScan {
+    max_seq: u64,
+    repair: TailRepair,
+}
+
+#[derive(Debug, Default)]
+enum TailRepair {
+    #[default]
+    None,
+    Truncate(u64),
+    AddNewline,
+}
+
+fn corrupt_line_error(path: &Path, reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("corrupt jsonl line in {}: {reason}", path.display()),
+    )
 }
 
 impl Inbox for FileInbox {
@@ -266,10 +408,29 @@ impl Inbox for FileInbox {
                 ),
             ));
         }
-        // Assign or validate seq.
-        let current_max = self.current_max_seq(&directive.to)?;
+        let lock_path = self.directives_lock_path(&directive.to);
+        let lock = private_lock_open(&lock_path)?;
+        lock_exclusive_bounded(&lock, &lock_path)?;
+
+        // Allocate and append under one cross-process transaction.
+        let scan = self.directive_scan(&directive.to)?;
+        #[cfg(debug_assertions)]
+        if let Ok(ms) = std::env::var("RALLY_TEST_BLOCK_DIRECTIVE_AFTER_SEQ_MS")
+            && let Ok(ms) = ms.trim().parse::<u64>()
+        {
+            thread::sleep(Duration::from_millis(ms));
+        }
+        let current_max = scan.max_seq;
+        // TODO(EventV2/SEC-007): a caller-supplied `directive.seq > current_max`
+        // is accepted verbatim below with no upper clamp, so a forward seq
+        // jump (accidental or adversarial) can leave a permanent gap in the
+        // sequence space. Not reachable today (`inject` hardcodes seq:0) and
+        // deliberately deferred — strict producer-side seq semantics are an
+        // EventV2 concern, not a ledger.rs one.
         let assigned_seq = if directive.seq == 0 || directive.seq <= current_max {
-            current_max + 1
+            current_max.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "directive sequence overflow")
+            })?
         } else {
             directive.seq
         };
@@ -290,13 +451,36 @@ impl Inbox for FileInbox {
         let mut line = serde_json::to_string(&to_write)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         line.push('\n');
+        // SEC-001: the raw-`text` cap above bounds the LOGICAL payload, but
+        // JSON-escaping (control chars, unicode) can expand the SERIALIZED
+        // frame past `MAX_LINE_BYTES` even when `text` itself is under
+        // `MAX_DIRECTIVE_TEXT_BYTES`. The reader hard-caps at
+        // `MAX_LINE_BYTES` (and `directive_scan` errors on an over-cap
+        // newline-terminated frame), so writing one here would wedge the
+        // inbox for every future append. Enforce write/read symmetry: never
+        // ack a frame the reader cannot read back.
+        if line.len() > MAX_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "serialized directive frame {} bytes exceeds MAX_LINE_BYTES ({MAX_LINE_BYTES})",
+                    line.len()
+                ),
+            ));
+        }
 
+        let created = !path.exists();
         let mut f = private_append_open(&path)?;
+        match scan.repair {
+            TailRepair::None => {}
+            TailRepair::Truncate(offset) => f.set_len(offset)?,
+            TailRepair::AddNewline => f.write_all(b"\n")?,
+        }
         f.write_all(line.as_bytes())?;
-        // Explicit flush. Reads via `read_since` open a fresh handle so
-        // this is belt-and-braces; the POSIX append is already durable to
-        // the page cache.
-        f.flush()?;
+        f.sync_data()?;
+        if created {
+            sync_parent(&path)?;
+        }
         Ok(assigned_seq)
     }
 
@@ -317,10 +501,30 @@ impl Inbox for FileInbox {
         let mut line = serde_json::to_string(receipt)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         line.push('\n');
+        // SEC-001: same write/read symmetry guard as `append_directive` — a
+        // Receipt has no raw-payload cap on `evidence`/`error`, so this is
+        // the ONLY bound on the serialized frame. Reject rather than write
+        // an unreadable-back frame that would wedge the receipts stream.
+        if line.len() > MAX_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "serialized receipt frame {} bytes exceeds MAX_LINE_BYTES ({MAX_LINE_BYTES})",
+                    line.len()
+                ),
+            ));
+        }
 
+        let lock_path = self.receipts_lock_path(&receipt.to);
+        let lock = private_lock_open(&lock_path)?;
+        lock_exclusive_bounded(&lock, &lock_path)?;
+        let created = !path.exists();
         let mut f = private_append_open(&path)?;
         f.write_all(line.as_bytes())?;
-        f.flush()?;
+        f.sync_data()?;
+        if created {
+            sync_parent(&path)?;
+        }
         Ok(())
     }
 
@@ -340,6 +544,9 @@ struct LineRead {
     truncated: bool,
     /// EOF reached with NOTHING read this call.
     eof: bool,
+    /// Total bytes consumed from the underlying stream, including newline and
+    /// any truncated bytes that were drained rather than stored.
+    consumed: u64,
 }
 
 /// Read one NDJSON line into `buf`, storing at most `cap` bytes (SEC-008).
@@ -359,6 +566,7 @@ fn read_line_capped<R: BufRead>(
     let mut had_newline = false;
     let mut truncated = false;
     let mut any = false;
+    let mut consumed_total = 0u64;
     loop {
         let chunk = loop {
             match reader.fill_buf() {
@@ -373,6 +581,7 @@ fn read_line_capped<R: BufRead>(
                 had_newline,
                 truncated,
                 eof: !any,
+                consumed: consumed_total,
             });
         }
         any = true;
@@ -388,6 +597,9 @@ fn read_line_capped<R: BufRead>(
         }
         let consumed = nl.map(|i| i + 1).unwrap_or(chunk.len());
         reader.consume(consumed);
+        consumed_total = consumed_total.checked_add(consumed as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "ledger line length overflow")
+        })?;
         if nl.is_some() {
             had_newline = true;
             return Ok(LineRead {
@@ -395,6 +607,7 @@ fn read_line_capped<R: BufRead>(
                 had_newline,
                 truncated,
                 eof: false,
+                consumed: consumed_total,
             });
         }
     }

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use chrono::DateTime;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -194,6 +194,12 @@ fn validate_schema(schema: &Value, value: &Value, path: &str) {
             "schema type mismatch at {path}: {value}"
         );
     }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        assert!(
+            allowed.iter().any(|candidate| candidate == value),
+            "schema enum mismatch at {path}: {value}; allowed={allowed:?}"
+        );
+    }
     if let Some(required) = schema.get("required").and_then(Value::as_array) {
         let object = value
             .as_object()
@@ -220,6 +226,125 @@ fn validate_schema(schema: &Value, value: &Value, path: &str) {
             validate_schema(item_schema, child, &format!("{path}[{index}]"));
         }
     }
+}
+
+#[test]
+fn schema_validator_rejects_invalid_enum() {
+    let schema = json!({"enum": ["live", "stale"]});
+    let invalid = json!("unknown");
+    let rejected = std::panic::catch_unwind(|| validate_schema(&schema, &invalid, "$.state"));
+    assert!(
+        rejected.is_err(),
+        "custom schema validator must enforce enum"
+    );
+}
+
+#[test]
+fn published_fact_schema_covers_runtime_fact_kinds() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/schemas/agent-rally.fact.v1.json");
+    let schema: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    let published: std::collections::BTreeSet<_> = schema["properties"]["kind"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+
+    // f1 (2026-07-09): this list used to hand-type every wire string,
+    // including `"backlog-item"` — but `FactKind::BacklogItem` actually
+    // serializes to `backlog_item` (`#[serde(rename_all = "snake_case")]`
+    // with no per-variant rename on that one variant), and the schema had
+    // copied the same wrong string. The oracle passed while encoding the
+    // exact drift it exists to catch.
+    //
+    // `rally-cli` has no `[lib]` target (binary-only crate — see
+    // `Cargo.toml`), so this integration test cannot call
+    // `serde_json::to_value(&FactKind::BacklogItem)` directly the way a
+    // `store.rs` unit test could. Instead we derive that one entry from a
+    // REAL round-trip through the compiled binary: post a `backlog-item`
+    // fact (the CLI's human-facing `FactKind::parse()` vocabulary, which is
+    // intentionally hyphenated for readability and is untouched by this
+    // fix) and read back the actual on-disk `kind` string the binary's own
+    // serde impl produced — not what we assume it is.
+    let workspace = Workspace::new("fact-kind-oracle-roundtrip");
+    let posted = workspace.json(&[
+        "say",
+        "backlog-item",
+        "--json",
+        "--tool",
+        "claude_code:oracle-test",
+        "--subject",
+        "oracle round-trip fixture",
+    ]);
+    let backlog_item_wire_kind = posted["data"]["say"]["fact"]["kind"]
+        .as_str()
+        .expect("`rally say backlog-item` must return a fact with a string kind")
+        .to_string();
+    assert!(
+        published.contains(backlog_item_wire_kind.as_str()),
+        "the ACTUAL runtime wire kind {backlog_item_wire_kind:?} (observed via a real \
+         `rally say backlog-item` round-trip) is missing from the published schema enum \
+         {published:?} — this is exactly the class of drift this test exists to catch"
+    );
+    workspace.cleanup();
+
+    // The remaining kinds are either stable (never renamed away from their
+    // `#[serde(rename_all = "snake_case")]` default) or `rally`-internal
+    // (presence/session/wake/read/receipt/standby/mission/unknown/
+    // claim.expired are RALLY-RECORDS-ONLY — emitted by internal flows, not
+    // postable one-to-one via `say`) — kept as a literal list, now with the
+    // one drift-prone entry sourced from the runtime round-trip above.
+    let runtime: std::collections::BTreeSet<&str> = [
+        "claim",
+        "claim.expired",
+        "release",
+        "blocker",
+        "resolve",
+        "decision",
+        "artifact",
+        "handoff",
+        "risk",
+        "lesson",
+        "session",
+        "wake",
+        "presence",
+        "read",
+        backlog_item_wire_kind.as_str(),
+        "receipt",
+        "standby",
+        "mission",
+        "unknown",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(published, runtime);
+}
+
+#[test]
+fn sessions_v1_accepts_pre_injectability_payload() {
+    let legacy = json!({
+        "ok": true,
+        "product": "rally",
+        "command": "sessions",
+        "schema": "agent-rally.command.sessions.v1",
+        "data": {
+            "sessions": {
+                "sessions": [{
+                    "session_id": "legacy-session",
+                    "name": "legacy",
+                    "agent": "claude",
+                    "tool": "claude_code:legacy",
+                    "backend": "tmux",
+                    "cwd": "/tmp/repo",
+                    "target": "rally-legacy",
+                    "liveness": "live",
+                    "liveness_source": "backend_probe"
+                }]
+            }
+        }
+    });
+    assert_matches_schema("agent-rally.command.sessions.v1.json", &legacy);
 }
 
 fn type_matches(type_schema: &Value, value: &Value) -> bool {
@@ -2008,6 +2133,23 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
     assert_eq!(next["data"]["wake_intent"]["ref"], handoff_id);
     assert_eq!(next["data"]["wake_intent"]["status"], "pending");
     let next_wake_id = next["data"]["wake_intent"]["event_id"].as_str().unwrap();
+    let repeated_next = workspace.json(&["next", "--json", "--tool", "codex"]);
+    assert_eq!(
+        repeated_next["data"]["wake_intent"]["event_id"], next_wake_id,
+        "an identical pending next wake must be reused"
+    );
+    let recent = workspace.json(&["recent", "--all", "--json", "--limit", "100"]);
+    let matching_wakes = recent["data"]["recent"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| {
+            row["fact"]["kind"] == "wake"
+                && row["fact"]["target"] == "codex"
+                && row["fact"]["ref"] == handoff_id
+        })
+        .count();
+    assert_eq!(matching_wakes, 1, "repeated next must not grow wake facts");
     let located_next_wake = workspace.json(&["locate", next_wake_id, "--json"]);
     assert_eq!(
         located_next_wake["data"]["locate"]["located"]["source"],
@@ -2077,6 +2219,102 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
     );
 
     workspace.cleanup();
+}
+
+#[test]
+fn rally_next_audit_is_observation_only() {
+    let workspace = Workspace::new("rally-next-audit");
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "claude_code",
+        "--target",
+        "codex",
+        "--subject",
+        "audit this handoff",
+    ]);
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+    let before = workspace.json(&["room", "--json"]);
+    let before_seq = before["data"]["room"]["max_seq"].as_i64().unwrap();
+
+    let next = workspace.json(&["next", "--audit", "--json", "--tool", "codex"]);
+    assert_eq!(next["data"]["next"]["action"], "respond_to_handoff");
+    assert_eq!(next["data"]["next"]["target_event_id"], handoff_id);
+    assert!(next["data"]["wake_intent"].is_null());
+
+    let after = workspace.json(&["room", "--json"]);
+    assert_eq!(
+        after["data"]["room"]["max_seq"].as_i64().unwrap(),
+        before_seq,
+        "--audit must not append presence, wake, or read facts"
+    );
+    workspace.cleanup();
+}
+
+/// f5 (2026-07-09): the test above only asserted `--audit`'s output against
+/// LITERAL expected values — it never proved audit picks the SAME thing a
+/// real `next` call would have acted on. This seeds two workspaces with
+/// IDENTICAL fixture state, runs plain `next` against one and
+/// `next --audit` against the other, and asserts the two agree pairwise on
+/// `action` + `target_event_id` (not just that each individually looks
+/// plausible). Two workspaces (rather than sequential calls on one) keep
+/// "identical state" honest — a prior non-audit `next` call would itself
+/// mutate the room (read-checkpoint / wake-intent facts) before the audit
+/// call ran, which is exactly the side effect audit exists to avoid.
+#[test]
+fn rally_next_audit_matches_default_next_action() {
+    fn seed(name: &str) -> (Workspace, String) {
+        let workspace = Workspace::new(name);
+        let handoff = workspace.json(&[
+            "say",
+            "handoff",
+            "--json",
+            "--tool",
+            "claude_code",
+            "--target",
+            "codex",
+            "--subject",
+            "audit-vs-default parity handoff",
+        ]);
+        let handoff_id = handoff["data"]["say"]["fact"]["event_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (workspace, handoff_id)
+    }
+
+    // `event_id`s carry a per-process nonce/timestamp component, so they
+    // are never literally identical across two independently-seeded
+    // workspaces — the point of comparison is STRUCTURAL identity of state
+    // (one handoff addressed to "codex", nothing else), verified below by
+    // asserting each workspace's `next` call resolves to ITS OWN seeded
+    // handoff, then comparing `action` pairwise.
+    let (default_ws, default_handoff_id) = seed("rally-next-audit-parity-default");
+    let (audit_ws, audit_handoff_id) = seed("rally-next-audit-parity-audit");
+
+    let default_next = default_ws.json(&["next", "--json", "--tool", "codex"]);
+    let audit_next = audit_ws.json(&["next", "--audit", "--json", "--tool", "codex"]);
+
+    assert_eq!(
+        default_next["data"]["next"]["action"], audit_next["data"]["next"]["action"],
+        "default `next` and `next --audit` must agree on `action` for identical state"
+    );
+    // Sanity: each call resolved to ITS OWN seeded handoff (proves the
+    // action agreement above isn't coincidental — both independently
+    // targeted the fact the fixture actually created).
+    assert_eq!(
+        default_next["data"]["next"]["target_event_id"], default_handoff_id,
+        "default `next` must resolve to the seeded handoff"
+    );
+    assert_eq!(
+        audit_next["data"]["next"]["target_event_id"], audit_handoff_id,
+        "`next --audit` must resolve to the seeded handoff"
+    );
+
+    default_ws.cleanup();
+    audit_ws.cleanup();
 }
 
 /// B17: verify that `locate` and `recent` use only the rooms registry (per-repo

@@ -84,18 +84,18 @@ pub(crate) fn build_check_ci(
 
     for claim in &snapshot.active_claims {
         for evidence_item in &claim.evidence {
-            if let Some(dep) = evidence_item.strip_prefix("depends:") {
-                if !all_produced.contains(&dep.to_lowercase()) {
-                    offenders.push(CiOffender {
-                        code: "dep-not-met",
-                        fact_id: claim.event_id.clone(),
-                        message: format!(
-                            "claim '{}' depends on '{}' but no fact produces it",
-                            claim.subject, dep
-                        ),
-                        dep: Some(dep.to_string()),
-                    });
-                }
+            if let Some(dep) = evidence_item.strip_prefix("depends:")
+                && !all_produced.contains(&dep.to_lowercase())
+            {
+                offenders.push(CiOffender {
+                    code: "dep-not-met",
+                    fact_id: claim.event_id.clone(),
+                    message: format!(
+                        "claim '{}' depends on '{}' but no fact produces it",
+                        claim.subject, dep
+                    ),
+                    dep: Some(dep.to_string()),
+                });
             }
         }
     }

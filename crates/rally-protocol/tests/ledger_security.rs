@@ -228,9 +228,27 @@ fn sec008_reader_skips_overlong_line_keeps_valid() {
         f.flush().unwrap();
     }
 
-    inbox
-        .append_directive(&directive("agent-a", "second"))
-        .unwrap();
+    // Sequence allocation is deliberately stricter than replay: a writer must
+    // not silently allocate across a completed corrupt frame. Preserve the
+    // reader's bounded-skip contract by placing the post-corruption fixture
+    // directly, then assert the writer refuses the same file.
+    let mut second = directive("agent-a", "second");
+    second.seq = 2;
+    let second_line = format!("{}\n", serde_json::to_string(&second).unwrap());
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(second_line.as_bytes()).unwrap();
+        f.sync_data().unwrap();
+    }
+    assert!(
+        inbox
+            .append_directive(&directive("agent-a", "third"))
+            .is_err(),
+        "allocator must reject a completed corrupt frame"
+    );
 
     let got = inbox.read_since("agent-a", 0).unwrap();
     let texts: Vec<&str> = got.iter().filter_map(|d| d.text.as_deref()).collect();
@@ -244,6 +262,118 @@ fn sec008_reader_skips_overlong_line_keeps_valid() {
     );
     // The giant junk line is NOT parsed into a directive.
     assert_eq!(got.len(), 2, "only the two valid directives returned");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// SEC-001 — serialized-frame budget (write/read symmetry)
+// ---------------------------------------------------------------------------
+//
+// The write path (SEC-008 above) only caps the RAW `Directive.text` /
+// `Receipt.evidence` payload. But the reader hard-caps the SERIALIZED NDJSON
+// frame at `MAX_LINE_BYTES`, and `directive_scan` HARD-ERRORS on an over-cap
+// newline-terminated frame it finds in the file — so if the writer ever
+// acked a frame whose serialized form exceeds `MAX_LINE_BYTES`, every future
+// append to that target would wedge. JSON control-character escaping (e.g.
+// a raw NUL byte escapes to the 6-byte sequence `\u0000`) can blow the
+// past the raw-text ceiling while `text` itself stays comfortably under it.
+
+#[test]
+fn sec001_oversize_serialized_directive_rejected_and_no_wedge() {
+    let root = scratch_root("frame-budget-directive");
+    let inbox = FileInbox::open(&root).unwrap();
+
+    // Raw `text` is well under MAX_DIRECTIVE_TEXT_BYTES (64 KiB), but each
+    // NUL byte JSON-escapes to `\u0000` (6 bytes), so the SERIALIZED frame
+    // blows past MAX_LINE_BYTES (72 KiB) even though the raw-text write-side
+    // check (SEC-008) never fires.
+    let raw_text: String = std::iter::repeat_n('\u{0}', 13_000).collect();
+    assert!(
+        raw_text.len() < MAX_DIRECTIVE_TEXT_BYTES,
+        "fixture must stay under the raw-text ceiling to exercise the SEPARATE frame check"
+    );
+
+    let path = inbox.directives_path("agent-a");
+    assert!(
+        !path.exists(),
+        "no inbox file should exist before the first append"
+    );
+
+    let err = inbox
+        .append_directive(&directive("agent-a", &raw_text))
+        .expect_err("oversize SERIALIZED frame must be rejected even though raw text is under cap");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    // No partial/over-cap frame was written — the file was never even
+    // created, so there is nothing for a future reader to choke on.
+    assert!(
+        !path.exists(),
+        "a rejected frame must leave NO partial/over-cap frame in the inbox file"
+    );
+
+    // Write/read symmetry did NOT wedge the inbox: a normal follow-up append
+    // to the SAME target still succeeds (proves no wedge).
+    let seq = inbox
+        .append_directive(&directive("agent-a", "normal follow-up"))
+        .expect("a subsequent normal append to the same target must still succeed");
+    assert_eq!(
+        seq, 1,
+        "sequence allocation is unaffected by the rejected frame"
+    );
+
+    // Durable-write invariant: anything that WAS acked is readable back.
+    let got = inbox.read_since("agent-a", 0).unwrap();
+    assert_eq!(got.len(), 1, "only the accepted directive is on disk");
+    assert_eq!(got[0].text.as_deref(), Some("normal follow-up"));
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sec001_oversize_serialized_receipt_rejected() {
+    use rally_protocol::{DeliveryStatus, Receipt};
+
+    let root = scratch_root("frame-budget-receipt");
+    let inbox = FileInbox::open(&root).unwrap();
+
+    let big_evidence: String = std::iter::repeat_n('\u{0}', 13_000).collect();
+    let path = inbox.receipts_path("agent-a");
+    assert!(!path.exists());
+
+    let err = inbox
+        .append_receipt(&Receipt {
+            ref_seq: 1,
+            to: "agent-a".to_string(),
+            status: DeliveryStatus::Delivered,
+            by: "rally-termd".to_string(),
+            evidence: Some(big_evidence),
+            error: None,
+            ts: now_ts(),
+        })
+        .expect_err("oversize serialized Receipt frame must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        !path.exists(),
+        "a rejected receipt frame must leave NO trace in the receipts file"
+    );
+
+    // No wedge: a normal follow-up receipt to the same target still succeeds
+    // and is readable back (durable-write invariant).
+    inbox
+        .append_receipt(&Receipt {
+            ref_seq: 1,
+            to: "agent-a".to_string(),
+            status: DeliveryStatus::Delivered,
+            by: "rally-termd".to_string(),
+            evidence: Some("ok".to_string()),
+            error: None,
+            ts: now_ts(),
+        })
+        .expect("a subsequent normal receipt append must still succeed");
+    let got = inbox.read_receipts_since("agent-a", 0).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].evidence.as_deref(), Some("ok"));
 
     std::fs::remove_dir_all(&root).ok();
 }

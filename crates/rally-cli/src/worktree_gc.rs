@@ -194,15 +194,15 @@ pub fn run_gc(config: GcConfig) -> Result<GcReport, String> {
         }
 
         // Protect the default branch's worktree.
-        if let Some(ref def) = default_branch {
-            if entry.branch == *def || entry.branch == format!("refs/heads/{def}") {
-                skipped.push(GcSkipped {
-                    worktree_path: entry.path.clone(),
-                    branch: entry.branch.clone(),
-                    reason: "default branch — never reap".to_string(),
-                });
-                continue;
-            }
+        if let Some(ref def) = default_branch
+            && (entry.branch == *def || entry.branch == format!("refs/heads/{def}"))
+        {
+            skipped.push(GcSkipped {
+                worktree_path: entry.path.clone(),
+                branch: entry.branch.clone(),
+                reason: "default branch — never reap".to_string(),
+            });
+            continue;
         }
 
         // Protect the current (cwd-resolved) worktree.
@@ -433,12 +433,11 @@ fn resolve_default_branch(repo: &Path, git_bin: &str) -> Option<String> {
         .arg(repo)
         .args(["symbolic-ref", "--short", "HEAD"])
         .output()
+        && out.status.success()
     {
-        if out.status.success() {
-            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !name.is_empty() {
-                return Some(name);
-            }
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
         }
     }
     // Fallback: check main then master.

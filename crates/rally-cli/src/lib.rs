@@ -183,10 +183,10 @@ pub(crate) fn mark_watchdog_command_commit() {
         }
     });
     #[cfg(debug_assertions)]
-    if let Ok(ms) = env::var("RALLY_TEST_BLOCK_AFTER_COMMIT_MS") {
-        if let Ok(ms) = ms.trim().parse::<u64>() {
-            thread::sleep(Duration::from_millis(ms));
-        }
+    if let Ok(ms) = env::var("RALLY_TEST_BLOCK_AFTER_COMMIT_MS")
+        && let Ok(ms) = ms.trim().parse::<u64>()
+    {
+        thread::sleep(Duration::from_millis(ms));
     }
 }
 
@@ -704,10 +704,10 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
     // release builds (`debug_assertions` is false in `--release`), so the
     // installed binary can never be made to hang by setting this var.
     #[cfg(debug_assertions)]
-    if let Ok(ms) = env::var("RALLY_TEST_BLOCK_MS") {
-        if let Ok(ms) = ms.trim().parse::<u64>() {
-            thread::sleep(Duration::from_millis(ms));
-        }
+    if let Ok(ms) = env::var("RALLY_TEST_BLOCK_MS")
+        && let Ok(ms) = ms.trim().parse::<u64>()
+    {
+        thread::sleep(Duration::from_millis(ms));
     }
     if args.is_empty()
         || matches!(
@@ -846,11 +846,9 @@ fn command_self_exit_check(args: cli::SelfExitCheckArgs) -> Result<Output> {
     );
 
     let mut exited = false;
-    if eligible {
-        if let Some(ref s) = own_session {
-            // Self-kill: tear down our own tmux session so `exec` auto-closes it.
-            exited = backends::kill_tmux_session(&tmux_bin, s);
-        }
+    if eligible && let Some(ref s) = own_session {
+        // Self-kill: tear down our own tmux session so `exec` auto-closes it.
+        exited = backends::kill_tmux_session(&tmux_bin, s);
     }
 
     let session_name = own_session.clone().unwrap_or_default();
@@ -1393,35 +1391,35 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
             .and_then(|s| s.strip_prefix("build_id:"))
             .map(str::to_string);
 
-        if let Some(ref prior_id) = last_presence_build_id {
-            if prior_id != BUILD_ID {
-                let drift_msg = format!(
-                    "this rally build {} differs from the build {} that last wrote to this room — a stale binary on PATH can silently drop writes; verify which rally is on PATH",
-                    BUILD_ID, prior_id
+        if let Some(ref prior_id) = last_presence_build_id
+            && prior_id != BUILD_ID
+        {
+            let drift_msg = format!(
+                "this rally build {} differs from the build {} that last wrote to this room — a stale binary on PATH can silently drop writes; verify which rally is on PATH",
+                BUILD_ID, prior_id
+            );
+            warnings.push(EnterWarning {
+                code: "binary-drift".to_string(),
+                message: drift_msg.clone(),
+            });
+            // Idempotency guard: don't append a duplicate drift fact for the
+            // same (this-build vs prior-build) pair on every re-enter.
+            let drift_subject = format!("binary-drift: {} vs {}", BUILD_ID, prior_id);
+            let already_recorded = snapshot_before
+                .system_health
+                .iter()
+                .any(|f| f.subject == drift_subject);
+            if !already_recorded {
+                let risk_fact = build_risk_fact(
+                    &tool,
+                    drift_subject,
+                    drift_msg,
+                    Vec::new(),
+                    "warn",
+                    Vec::new(),
+                    None,
                 );
-                warnings.push(EnterWarning {
-                    code: "binary-drift".to_string(),
-                    message: drift_msg.clone(),
-                });
-                // Idempotency guard: don't append a duplicate drift fact for the
-                // same (this-build vs prior-build) pair on every re-enter.
-                let drift_subject = format!("binary-drift: {} vs {}", BUILD_ID, prior_id);
-                let already_recorded = snapshot_before
-                    .system_health
-                    .iter()
-                    .any(|f| f.subject == drift_subject);
-                if !already_recorded {
-                    let risk_fact = build_risk_fact(
-                        &tool,
-                        drift_subject,
-                        drift_msg,
-                        Vec::new(),
-                        "warn",
-                        Vec::new(),
-                        None,
-                    );
-                    room.append_fact(&risk_fact)?;
-                }
+                room.append_fact(&risk_fact)?;
             }
         }
     }
@@ -1621,20 +1619,18 @@ fn command_say(args: SayArgs) -> Result<Output> {
     // #6 source-grounding: at claim, snapshot content hashes of all claimed file
     // paths and store them as `claimhash:<rel>=<hash>` in evidence.
     let repo_root_for_grounding = repo_root().ok();
-    if kind == FactKind::Claim {
-        if let Some(ref root) = repo_root_for_grounding {
-            // Collect file: scope entries only (exclude external-intake).
-            let file_scopes: Vec<String> = scope
-                .iter()
-                .filter(|s| {
-                    s.starts_with("file:") && !scope.contains(&"external-intake".to_string())
-                })
-                .cloned()
-                .collect();
-            if !file_scopes.is_empty() {
-                let hashes = source_grounding::claim_hashes(root, &file_scopes);
-                evidence.extend(hashes);
-            }
+    if kind == FactKind::Claim
+        && let Some(ref root) = repo_root_for_grounding
+    {
+        // Collect file: scope entries only (exclude external-intake).
+        let file_scopes: Vec<String> = scope
+            .iter()
+            .filter(|s| s.starts_with("file:") && !scope.contains(&"external-intake".to_string()))
+            .cloned()
+            .collect();
+        if !file_scopes.is_empty() {
+            let hashes = source_grounding::claim_hashes(root, &file_scopes);
+            evidence.extend(hashes);
         }
     }
 
@@ -1795,21 +1791,21 @@ fn command_say(args: SayArgs) -> Result<Output> {
     // Advisory protocol-envelope validation (lenient, never blocks): surfaces
     // missing causal ids — e.g. an ACK/resolve that doesn't cite its ref_event_id.
     // Charter: warn and record; hosts decide whether to act.
-    if let Some(pk) = protocol_event_kind(&fact.kind) {
-        if let Err(missing) = pk.validate(
+    if let Some(pk) = protocol_event_kind(&fact.kind)
+        && let Err(missing) = pk.validate(
             &fact_protocol_envelope(&fact),
             event_envelope::CompatMode::Lenient,
-        ) {
-            let ids = missing
-                .iter()
-                .map(|e| format!("{:?}", e.missing))
-                .collect::<Vec<_>>()
-                .join(", ");
-            say_warnings.push(SayWarning {
-                code: "envelope-incomplete".to_string(),
-                message: format!("{pk:?} event is missing required causal id(s): {ids}"),
-            });
-        }
+        )
+    {
+        let ids = missing
+            .iter()
+            .map(|e| format!("{:?}", e.missing))
+            .collect::<Vec<_>>()
+            .join(", ");
+        say_warnings.push(SayWarning {
+            code: "envelope-incomplete".to_string(),
+            message: format!("{pk:?} event is missing required causal id(s): {ids}"),
+        });
     }
 
     if is_external {
@@ -1838,48 +1834,44 @@ fn command_say(args: SayArgs) -> Result<Output> {
 
     // #6 source-grounding (artifact): re-hash claimed files; flag ungrounded ones.
     // #8 ripple: detect changed pub signatures affecting peer claims.
-    if kind == FactKind::Artifact {
-        if let Some(ref root) = repo_root_for_grounding {
-            let original_hashes = source_grounding::parse_claim_hashes(&grounding_claim_evidence);
-            if !original_hashes.is_empty() {
-                let unchanged = source_grounding::ungrounded_paths(root, &original_hashes);
-                if !unchanged.is_empty() {
-                    // Append grounded:false marker risk facts — one per unchanged file.
-                    for path in &unchanged {
-                        let risk_summary = format!(
-                            "ungrounded-artifact: {path} unchanged since claim — no evidence of work; artifact may be a dropped-work indicator. Recorded for audit."
-                        );
-                        let risk_fact = build_risk_fact(
-                            &args.tool,
-                            format!("ungrounded-artifact: {path} unchanged since claim"),
-                            risk_summary,
-                            vec!["grounded:false".to_string()],
-                            "warn",
-                            vec![format!("artifact_ref:{}", fact.event_id)],
-                            Some(fact.event_id.clone()),
-                        );
-                        let _ = room.append_fact(&risk_fact);
-                    }
-                }
-
-                // #8 ripple: for files that CHANGED, detect pub sig changes
-                // affecting peer claims. Best-effort; never blocks.
-                let changed_files: Vec<String> = original_hashes
-                    .keys()
-                    .filter(|p| !unchanged.contains(p))
-                    .cloned()
-                    .collect();
-                if !changed_files.is_empty() {
-                    let snap_for_ripple = room.snapshot().unwrap_or_default();
-                    let ripple_facts = ripple::build_ripple_alerts(
-                        &changed_files,
-                        root,
-                        &args.tool,
-                        &snap_for_ripple,
+    if kind == FactKind::Artifact
+        && let Some(ref root) = repo_root_for_grounding
+    {
+        let original_hashes = source_grounding::parse_claim_hashes(&grounding_claim_evidence);
+        if !original_hashes.is_empty() {
+            let unchanged = source_grounding::ungrounded_paths(root, &original_hashes);
+            if !unchanged.is_empty() {
+                // Append grounded:false marker risk facts — one per unchanged file.
+                for path in &unchanged {
+                    let risk_summary = format!(
+                        "ungrounded-artifact: {path} unchanged since claim — no evidence of work; artifact may be a dropped-work indicator. Recorded for audit."
                     );
-                    for rf in ripple_facts {
-                        let _ = room.append_fact(&rf);
-                    }
+                    let risk_fact = build_risk_fact(
+                        &args.tool,
+                        format!("ungrounded-artifact: {path} unchanged since claim"),
+                        risk_summary,
+                        vec!["grounded:false".to_string()],
+                        "warn",
+                        vec![format!("artifact_ref:{}", fact.event_id)],
+                        Some(fact.event_id.clone()),
+                    );
+                    let _ = room.append_fact(&risk_fact);
+                }
+            }
+
+            // #8 ripple: for files that CHANGED, detect pub sig changes
+            // affecting peer claims. Best-effort; never blocks.
+            let changed_files: Vec<String> = original_hashes
+                .keys()
+                .filter(|p| !unchanged.contains(p))
+                .cloned()
+                .collect();
+            if !changed_files.is_empty() {
+                let snap_for_ripple = room.snapshot().unwrap_or_default();
+                let ripple_facts =
+                    ripple::build_ripple_alerts(&changed_files, root, &args.tool, &snap_for_ripple);
+                for rf in ripple_facts {
+                    let _ = room.append_fact(&rf);
                 }
             }
         }
@@ -2244,7 +2236,8 @@ fn command_room(args: RoomArgs) -> Result<Output> {
     // Rank-11: surface mission at the top level so agents see it without parsing snapshot.
     let mission = snapshot.mission.clone();
     let session_views = read_session_views(&room, BackendBins::default()).unwrap_or_default();
-    let agent_injectability = build_agent_injectability(&snapshot, &session_views);
+    let agent_injectability =
+        build_agent_injectability(&snapshot, &session_views, query.tool.as_deref());
     let body = envelope(
         "room",
         SCHEMA_ROOM,
@@ -2270,13 +2263,18 @@ fn command_room(args: RoomArgs) -> Result<Output> {
 }
 
 fn command_next(args: NextArgs) -> Result<Output> {
+    let audit = args.audit;
     let tool = args.tool;
     let role = args.role;
     let paths = normalize_paths(args.paths);
     let limit = args.limit as usize;
     let room = RoomStore::open()?;
-    // Component B: auto-register presence for the calling tool.
-    ensure_presence(&room, &tool)?;
+    // Default `next` remains a writeful coordination action. `--audit` is the
+    // explicit coordination-fact observation contract used by hooks and
+    // reviewers; opening the derived cache may still repair/rebuild it.
+    if !audit {
+        ensure_presence(&room, &tool)?;
+    }
     let snapshot = room.snapshot()?;
     // #7: always read the backlog store and surface ready items in next output.
     let backlog_items = list_backlog_items(&room).unwrap_or_default();
@@ -2293,7 +2291,11 @@ fn command_next(args: NextArgs) -> Result<Output> {
         .target_event_id
         .clone()
         .unwrap_or_else(|| "none".to_string());
-    let wake_intent = append_next_wake_intent(&room, &tool, &paths, &next)?;
+    let wake_intent = if audit {
+        None
+    } else {
+        append_next_wake_intent(&room, &snapshot, &tool, &paths, &next)?
+    };
     let snapshot = if wake_intent.is_some() {
         room.snapshot()?
     } else {
@@ -2308,7 +2310,9 @@ fn command_next(args: NextArgs) -> Result<Output> {
     // at seq 6 is excluded) → last_checkpoint = 5 → no new checkpoint written.
     // This call uses `append_fact` (not `append_fact_verified`) — read-checkpoints
     // are low-stakes metadata and must not trigger a segment readback loop.
-    let _ = room.maybe_append_read_checkpoint(&tool, snapshot.content_max_seq);
+    if !audit {
+        let _ = room.maybe_append_read_checkpoint(&tool, snapshot.content_max_seq);
+    }
     let lead_context = build_lead_context(&snapshot, Some(&tool), role.as_deref());
     let body = envelope(
         "next",
@@ -3338,13 +3342,13 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
 
     loop {
         // Check deadline.
-        if let Some(dl) = deadline {
-            if std::time::Instant::now() >= dl {
-                if args.json {
-                    println!(r#"{{"event":"stopped","ts":"{}"}}"#, now_string());
-                }
-                break;
+        if let Some(dl) = deadline
+            && std::time::Instant::now() >= dl
+        {
+            if args.json {
+                println!(r#"{{"event":"stopped","ts":"{}"}}"#, now_string());
             }
+            break;
         }
 
         thread::sleep(Duration::from_secs(current_interval));
@@ -3865,14 +3869,13 @@ fn command_run(args: RunArgs) -> Result<Output> {
                     // silently falling back to the shared checkout. Mark the
                     // reservation stopped so the room doesn't leak an active
                     // record for a session that never launched.
-                    if let Some(fact) = &reservation.fact {
-                        if let Err(cleanup_err) =
+                    if let Some(fact) = &reservation.fact
+                        && let Err(cleanup_err) =
                             append_stopped_session_record(&room, &session, fact)
-                        {
-                            return Err(RallyError::Message(format!(
-                                "worktree provisioning failed: {err}; additionally failed to mark managed session stopped: {cleanup_err}"
-                            )));
-                        }
+                    {
+                        return Err(RallyError::Message(format!(
+                            "worktree provisioning failed: {err}; additionally failed to mark managed session stopped: {cleanup_err}"
+                        )));
                     }
                     return Err(err);
                 }
@@ -3952,12 +3955,12 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 {
                     let _ = run_worktree::cleanup(&repo, path, branch, "git");
                 }
-                if let Some(fact) = &reservation.fact {
-                    if let Err(cleanup_err) = append_stopped_session_record(&room, &session, fact) {
-                        return Err(RallyError::Message(format!(
-                            "ptyd spawn failed: {err}; additionally failed to mark managed session stopped: {cleanup_err}"
-                        )));
-                    }
+                if let Some(fact) = &reservation.fact
+                    && let Err(cleanup_err) = append_stopped_session_record(&room, &session, fact)
+                {
+                    return Err(RallyError::Message(format!(
+                        "ptyd spawn failed: {err}; additionally failed to mark managed session stopped: {cleanup_err}"
+                    )));
                 }
                 return Err(err);
             }
@@ -3979,12 +3982,12 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 {
                     let _ = run_worktree::cleanup(&repo, path, branch, "git");
                 }
-                if let Some(fact) = &reservation.fact {
-                    if let Err(cleanup_err) = append_stopped_session_record(&room, &session, fact) {
-                        return Err(RallyError::Message(format!(
-                            "backend start failed: {err}; additionally failed to mark managed session stopped: {cleanup_err}"
-                        )));
-                    }
+                if let Some(fact) = &reservation.fact
+                    && let Err(cleanup_err) = append_stopped_session_record(&room, &session, fact)
+                {
+                    return Err(RallyError::Message(format!(
+                        "backend start failed: {err}; additionally failed to mark managed session stopped: {cleanup_err}"
+                    )));
                 }
                 return Err(err);
             }
@@ -4457,12 +4460,12 @@ fn note_used_identity_number(base_key: &str, value: &str, used: &mut BTreeSet<u6
 }
 
 fn note_used_bare_identity_number(value: &str, used: &mut BTreeSet<u64>) {
-    if value.len() >= 2 && value.chars().all(|ch| ch.is_ascii_digit()) {
-        if let Ok(number) = value.parse::<u64>() {
-            if number != 0 {
-                used.insert(number);
-            }
-        }
+    if value.len() >= 2
+        && value.chars().all(|ch| ch.is_ascii_digit())
+        && let Ok(number) = value.parse::<u64>()
+        && number != 0
+    {
+        used.insert(number);
     }
 }
 
@@ -5374,40 +5377,40 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                 // carry no `from_session_id` (the dominant one-session-per-tool
                 // case stays correct), and never touch a live sibling session's
                 // claims.
-                if let Ok(room) = RoomStore::open() {
-                    if let Ok(snap) = room.snapshot() {
-                        let stopping_tool = &session.tool;
-                        let stopping_session = session.session_id.as_str();
-                        for claim in snap.active_claims.iter().filter(|c| {
-                            c.from_session_id.as_deref() == Some(stopping_session)
-                                || (c.from_session_id.is_none()
-                                    && c.tool.as_deref() == Some(stopping_tool.as_str()))
-                        }) {
-                            let release = Fact {
-                                from_session_id: None,
-                                schema: FACT_SCHEMA.to_string(),
-                                event_id: new_id("fact"),
-                                seq: 0,
-                                thread_id: new_id("room"),
-                                kind: FactKind::Release,
-                                tool: Some(stopping_tool.clone()),
-                                role: None,
-                                subject: format!("self-release on stop: {}", claim.event_id),
-                                scope: claim.scope.clone(),
-                                created_at: now_string(),
-                                summary: None,
-                                // No authorized-takeover marker — this is a
-                                // self-release; SEC-001 stays dormant.
-                                evidence: Vec::new(),
-                                target: None,
-                                ref_id: Some(claim.event_id.clone()),
-                                status: None,
-                                severity: None,
-                                uri: None,
-                                session: None,
-                            };
-                            let _ = room.append_state_transition_verified(&release);
-                        }
+                if let Ok(room) = RoomStore::open()
+                    && let Ok(snap) = room.snapshot()
+                {
+                    let stopping_tool = &session.tool;
+                    let stopping_session = session.session_id.as_str();
+                    for claim in snap.active_claims.iter().filter(|c| {
+                        c.from_session_id.as_deref() == Some(stopping_session)
+                            || (c.from_session_id.is_none()
+                                && c.tool.as_deref() == Some(stopping_tool.as_str()))
+                    }) {
+                        let release = Fact {
+                            from_session_id: None,
+                            schema: FACT_SCHEMA.to_string(),
+                            event_id: new_id("fact"),
+                            seq: 0,
+                            thread_id: new_id("room"),
+                            kind: FactKind::Release,
+                            tool: Some(stopping_tool.clone()),
+                            role: None,
+                            subject: format!("self-release on stop: {}", claim.event_id),
+                            scope: claim.scope.clone(),
+                            created_at: now_string(),
+                            summary: None,
+                            // No authorized-takeover marker — this is a
+                            // self-release; SEC-001 stays dormant.
+                            evidence: Vec::new(),
+                            target: None,
+                            ref_id: Some(claim.event_id.clone()),
+                            status: None,
+                            severity: None,
+                            uri: None,
+                            session: None,
+                        };
+                        let _ = room.append_state_transition_verified(&release);
                     }
                 }
                 remove_session_record(&session.session_id)?;
@@ -5417,10 +5420,10 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                 // managed target we just stopped, kill it too so it can never
                 // become a detached orphan the reaper has to clean up later.
                 // Best-effort; never blocks the stop path.
-                if let Some(own) = backends::own_rally_tmux_session(&tmux_bin_for_self_kill) {
-                    if own != live_target {
-                        let _ = backends::kill_tmux_session(&tmux_bin_for_self_kill, &own);
-                    }
+                if let Some(own) = backends::own_rally_tmux_session(&tmux_bin_for_self_kill)
+                    && own != live_target
+                {
+                    let _ = backends::kill_tmux_session(&tmux_bin_for_self_kill, &own);
                 }
             }
             (commands, None)
@@ -5509,14 +5512,47 @@ fn managed_session_injectability(
 fn build_agent_injectability(
     snapshot: &RoomSnapshot,
     session_views: &[SessionView],
+    requested_tool: Option<&str>,
 ) -> Vec<AgentInjectability> {
-    snapshot
-        .squads
+    let mut tools = BTreeSet::new();
+    if let Some(tool) = requested_tool {
+        tools.insert(tool.to_string());
+    }
+    if let Some(lead) = snapshot.lead.as_ref() {
+        tools.insert(lead.clone());
+    }
+    for squad in &snapshot.squads {
+        if squad.status == "active" {
+            tools.insert(squad.tool.clone());
+        }
+    }
+    for view in session_views {
+        if view.liveness != SessionLiveness::Stale {
+            tools.insert(view.session.tool.clone());
+        }
+    }
+    for fact in snapshot
+        .active_claims
         .iter()
-        .map(|squad| {
-            if let Some(view) = best_session_view_for_tool(session_views, &squad.tool) {
+        .chain(snapshot.active_blockers.iter())
+        .chain(snapshot.open_handoffs.iter())
+    {
+        if let Some(tool) = fact.tool.as_ref() {
+            tools.insert(tool.clone());
+        }
+        if let Some(target) = fact.target.as_ref()
+            && target != "all"
+        {
+            tools.insert(target.clone());
+        }
+    }
+
+    tools
+        .into_iter()
+        .map(|tool| {
+            if let Some(view) = best_session_view_for_tool(session_views, &tool) {
                 return AgentInjectability {
-                    tool: squad.tool.clone(),
+                    tool,
                     injectable: view.injectable,
                     status: view.inject_status.clone(),
                     via: Some(view.inject_via.clone()),
@@ -5531,7 +5567,7 @@ fn build_agent_injectability(
             }
 
             AgentInjectability {
-                tool: squad.tool.clone(),
+                tool: tool.clone(),
                 injectable: false,
                 status: "presence_only_unmanaged".to_string(),
                 via: None,
@@ -5539,7 +5575,7 @@ fn build_agent_injectability(
                 target: None,
                 reason: Some(format!(
                     "no active managed session for {}; `rally inject` can only queue a ledger wake, not deliver to a live pane. Use `rally run <agent>` or `rally adopt {} --tmux <target>` / `--cmux <target>` for live injection.",
-                    squad.tool, squad.tool
+                    tool, tool
                 )),
             }
         })
@@ -5691,10 +5727,10 @@ fn prior_managed_session(room: &RoomStore, target: &str) -> Result<Option<Manage
     facts.sort_by_key(|fact| fact.seq);
     let mut found = None;
     for fact in facts.into_iter().filter(|fact| fact.kind == "session") {
-        if let Some(session) = fact.session {
-            if session.session_id == target || session.name == target || session.tool == target {
-                found = Some(session);
-            }
+        if let Some(session) = fact.session
+            && (session.session_id == target || session.name == target || session.tool == target)
+        {
+            found = Some(session);
         }
     }
     Ok(found)
@@ -5729,6 +5765,7 @@ fn session_fact(session: &ManagedSession, status: &str, ref_id: Option<String>) 
 
 fn append_next_wake_intent(
     room: &RoomStore,
+    snapshot: &RoomSnapshot,
     tool: &str,
     paths: &[String],
     next: &NextResult,
@@ -5737,6 +5774,13 @@ fn append_next_wake_intent(
         return Ok(None);
     }
     let subject = format!("wake intent for {tool}: {}", next.action);
+    if let Some(existing) = snapshot.pending_wakes.iter().find(|wake| {
+        wake.target.as_deref() == Some(tool)
+            && wake.subject == subject
+            && wake.ref_id == next.target_event_id
+    }) {
+        return Ok(Some(existing.clone()));
+    }
     let summary = format!(
         "rally next found actionable work for {tool}: {}",
         next.action
@@ -5874,7 +5918,11 @@ fn inject_content_fact(
     text: &str,
 ) -> Result<Fact> {
     let fact = make_inject_content_fact(sender_tool, recipient_tool, text);
-    with_watchdog_command_commit(|| room.append_fact_verified(&fact))
+    // This coordination fact is supporting evidence, not the inject command's
+    // primary commit point. The watchdog is armed only around the durable
+    // Directive append so it cannot report `committed: true` before delivery
+    // intent exists in the target inbox.
+    room.append_fact_verified(&fact)
 }
 
 /// Return the content fact without appending (dry-run path).
@@ -5974,9 +6022,16 @@ fn inject_via_ledger(
         ts: now_ts(),
     };
 
-    inbox
-        .append_directive(&directive)
-        .map_err(RallyError::io("append directive"))
+    with_watchdog_command_commit(|| {
+        let seq = inbox
+            .append_directive(&directive)
+            .map_err(RallyError::io("append directive"))?;
+        // FileInbox reports success only after the record and any new-file
+        // directory entry are synced. Marking before this point would let the
+        // outer watchdog claim a mutation that was not yet durable.
+        mark_watchdog_command_commit();
+        Ok(seq)
+    })
 }
 
 fn wake_fact(
@@ -6059,10 +6114,11 @@ fn is_managed_style_tool(tool: &str) -> bool {
         if suffix == "lead" {
             return false;
         }
-        if let Some(rest) = suffix.strip_prefix('l') {
-            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-                return false;
-            }
+        if let Some(rest) = suffix.strip_prefix('l')
+            && !rest.is_empty()
+            && rest.chars().all(|c| c.is_ascii_digit())
+        {
+            return false;
         }
     }
     // Default: every other identifier is a fleet worker. No digit
@@ -6487,6 +6543,53 @@ mod tests {
             daemon_pane: None,
             daemon_socket: None,
         }
+    }
+
+    #[test]
+    fn room_injectability_is_scoped_to_requested_current_or_recent_agents() {
+        let mut snapshot = RoomSnapshot {
+            lead: Some("lead-tool".to_string()),
+            squads: vec![
+                store::Squad {
+                    tool: "recent-tool".to_string(),
+                    status: "active".to_string(),
+                    ..store::Squad::default()
+                },
+                store::Squad {
+                    tool: "historical-tool".to_string(),
+                    status: "idle".to_string(),
+                    ..store::Squad::default()
+                },
+            ],
+            ..RoomSnapshot::default()
+        };
+        snapshot.active_claims.push(Fact {
+            tool: Some("claim-owner".to_string()),
+            ..Fact::default()
+        });
+        let session = liveness_session("live-session", "managed-tool");
+        let session_views = vec![SessionView {
+            session,
+            liveness: SessionLiveness::Live,
+            liveness_source: "backend_probe",
+            injectable: true,
+            inject_status: "live_managed_session".to_string(),
+            inject_via: "tmux".to_string(),
+        }];
+
+        let rows = build_agent_injectability(&snapshot, &session_views, None);
+        let tools: BTreeSet<_> = rows.iter().map(|row| row.tool.as_str()).collect();
+        assert_eq!(
+            tools,
+            BTreeSet::from(["claim-owner", "lead-tool", "managed-tool", "recent-tool"])
+        );
+
+        let requested =
+            build_agent_injectability(&snapshot, &session_views, Some("historical-tool"));
+        assert!(
+            requested.iter().any(|row| row.tool == "historical-tool"),
+            "an explicit --tool query must include the requested historical agent"
+        );
     }
 
     #[test]
@@ -11337,10 +11440,10 @@ fn detect_host_runtime() -> HostRuntime {
         format!("{home}/.config/ptyd/ptyd.sock"),
         format!("{home}/.local/share/ptyd/ptyd.sock"),
     ];
-    if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
-        if !xdg.is_empty() {
-            candidates.push(format!("{xdg}/ptyd.sock"));
-        }
+    if let Ok(xdg) = env::var("XDG_RUNTIME_DIR")
+        && !xdg.is_empty()
+    {
+        candidates.push(format!("{xdg}/ptyd.sock"));
     }
     if let Some(b) = &bound {
         candidates.push(b.clone());

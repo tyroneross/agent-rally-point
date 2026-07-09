@@ -318,40 +318,41 @@ fn coordination_from_value(value: &Value, into: &mut CoordinationConfig) {
     let Some(coord) = value.get("coordination").and_then(Value::as_object) else {
         return;
     };
-    if let Some(v) = coord.get("half_life_hours").and_then(Value::as_f64) {
-        if v > 0.0 {
-            into.half_life_hours = v;
-        }
+    if let Some(v) = coord.get("half_life_hours").and_then(Value::as_f64)
+        && v > 0.0
+    {
+        into.half_life_hours = v;
     }
-    if let Some(v) = coord.get("archive_floor_weight").and_then(Value::as_f64) {
-        if v > 0.0 && v < 1.0 {
-            into.archive_floor_weight = v;
-        }
+    if let Some(v) = coord.get("archive_floor_weight").and_then(Value::as_f64)
+        && v > 0.0
+        && v < 1.0
+    {
+        into.archive_floor_weight = v;
     }
-    if let Some(v) = coord.get("reclaim_small_minutes").and_then(Value::as_i64) {
-        if v > 0 {
-            into.reclaim_small_minutes = v;
-        }
+    if let Some(v) = coord.get("reclaim_small_minutes").and_then(Value::as_i64)
+        && v > 0
+    {
+        into.reclaim_small_minutes = v;
     }
-    if let Some(v) = coord.get("reclaim_large_minutes").and_then(Value::as_i64) {
-        if v > 0 {
-            into.reclaim_large_minutes = v;
-        }
+    if let Some(v) = coord.get("reclaim_large_minutes").and_then(Value::as_i64)
+        && v > 0
+    {
+        into.reclaim_large_minutes = v;
     }
-    if let Some(v) = coord.get("default_cadence_secs").and_then(Value::as_i64) {
-        if v > 0 {
-            into.default_cadence_secs = v;
-        }
+    if let Some(v) = coord.get("default_cadence_secs").and_then(Value::as_i64)
+        && v > 0
+    {
+        into.default_cadence_secs = v;
     }
-    if let Some(v) = coord.get("miss_multiplier").and_then(Value::as_i64) {
-        if v > 0 {
-            into.miss_multiplier = v;
-        }
+    if let Some(v) = coord.get("miss_multiplier").and_then(Value::as_i64)
+        && v > 0
+    {
+        into.miss_multiplier = v;
     }
-    if let Some(v) = coord.get("grace_secs").and_then(Value::as_i64) {
-        if v >= 0 {
-            into.grace_secs = v;
-        }
+    if let Some(v) = coord.get("grace_secs").and_then(Value::as_i64)
+        && v >= 0
+    {
+        into.grace_secs = v;
     }
 }
 
@@ -359,10 +360,9 @@ fn coord_env_f64(name: &str, slot: &mut f64, guard: impl Fn(f64) -> bool) {
     if let Some(v) = env::var(name)
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok())
+        && guard(v)
     {
-        if guard(v) {
-            *slot = v;
-        }
+        *slot = v;
     }
 }
 
@@ -370,10 +370,9 @@ fn coord_env_i64(name: &str, slot: &mut i64) {
     if let Some(v) = env::var(name)
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
+        && v > 0
     {
-        if v > 0 {
-            *slot = v;
-        }
+        *slot = v;
     }
 }
 

@@ -370,14 +370,14 @@ impl Sandbox {
         let mut facts = Vec::new();
         if let Ok(entries) = fs::read_dir(&log_dir) {
             for entry in entries.flatten() {
-                if entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    if let Ok(body) = fs::read_to_string(entry.path()) {
-                        for line in body.lines().filter(|l| !l.trim().is_empty()) {
-                            if let Ok(v) = serde_json::from_str::<Value>(line) {
-                                // Unwrap the LedgerLine envelope to the fact.
-                                let fact = v.get("payload").cloned().unwrap_or(v);
-                                facts.push(fact);
-                            }
+                if entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl")
+                    && let Ok(body) = fs::read_to_string(entry.path())
+                {
+                    for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                        if let Ok(v) = serde_json::from_str::<Value>(line) {
+                            // Unwrap the LedgerLine envelope to the fact.
+                            let fact = v.get("payload").cloned().unwrap_or(v);
+                            facts.push(fact);
                         }
                     }
                 }
@@ -1114,16 +1114,16 @@ fn real_ptyd_inject_actually_submits_and_is_received() {
     let mut received = false;
     for _ in 0..30 {
         let cap = rally(&["capture", &target, "--json", "--lines", "50"]);
-        if cap.status.success() {
-            if let Ok(v) = serde_json::from_slice::<Value>(&cap.stdout) {
-                scrollback = v["data"]["capture"]["output"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                if scrollback.contains(&format!("GOT:{token}")) {
-                    received = true;
-                    break;
-                }
+        if cap.status.success()
+            && let Ok(v) = serde_json::from_slice::<Value>(&cap.stdout)
+        {
+            scrollback = v["data"]["capture"]["output"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            if scrollback.contains(&format!("GOT:{token}")) {
+                received = true;
+                break;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));

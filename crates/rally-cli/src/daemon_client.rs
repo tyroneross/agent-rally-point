@@ -61,10 +61,10 @@ pub(crate) const RALLY_PTYD_BIN_ENV: &str = "RALLY_PTYD_BIN";
 /// candidate scan (used for tmux-session registration) is intentionally NOT
 /// consulted here.
 pub(crate) fn rally_owned_socket() -> Option<String> {
-    if let Ok(explicit) = std::env::var(RALLY_PTYD_SOCKET_ENV) {
-        if !explicit.is_empty() {
-            return Some(explicit);
-        }
+    if let Ok(explicit) = std::env::var(RALLY_PTYD_SOCKET_ENV)
+        && !explicit.is_empty()
+    {
+        return Some(explicit);
     }
     let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
     Some(format!("{home}/.local/share/rally/ptyd.sock"))
@@ -202,14 +202,14 @@ fn parse_register_reply(reply: &serde_json::Value, requested_identity: &str) -> 
             // Older daemons may omit the echo entirely; absent is trusted (we
             // rely on the pane handle alone), but a present-and-mismatched echo
             // is rejected.
-            if let Some(bound) = r.identity.as_deref() {
-                if bound != requested_identity {
-                    return RegisterOutcome::Unavailable {
-                        reason: format!(
-                            "daemon bound identity {bound:?} but {requested_identity:?} was requested"
-                        ),
-                    };
-                }
+            if let Some(bound) = r.identity.as_deref()
+                && bound != requested_identity
+            {
+                return RegisterOutcome::Unavailable {
+                    reason: format!(
+                        "daemon bound identity {bound:?} but {requested_identity:?} was requested"
+                    ),
+                };
             }
             RegisterOutcome::Registered { pane_id: r.pane_id }
         }
@@ -611,11 +611,11 @@ pub(crate) fn autostart_daemon(socket: &str) -> Result<(), String> {
 /// Resolve the ptyd binary for autostart: `$RALLY_PTYD_BIN` (must exist) else
 /// `ptyd` found on PATH.
 fn ptyd_binary() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var(RALLY_PTYD_BIN_ENV) {
-        if !explicit.is_empty() {
-            let p = PathBuf::from(&explicit);
-            return p.exists().then_some(p);
-        }
+    if let Ok(explicit) = std::env::var(RALLY_PTYD_BIN_ENV)
+        && !explicit.is_empty()
+    {
+        let p = PathBuf::from(&explicit);
+        return p.exists().then_some(p);
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)

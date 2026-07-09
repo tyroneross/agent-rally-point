@@ -12,11 +12,17 @@
 # artifact is reproducible, not hand-maintained. Re-run after editing any
 # `.codex-plugin/` skill or manifest. `.agents/plugins/marketplace.json` points
 # its plugin source at `./plugins/codex`.
+#
+# SEC-003: `dest` is overridable via RALLY_CODEX_DEST so
+# scripts/check-release-parity.sh can invoke THIS script into a scratch dir
+# to verify freshness — single-sourcing the copy semantics (`-L`,
+# `.DS_Store` strip) instead of re-implementing them and risking drift
+# between the two scripts. Default is UNCHANGED for every normal caller.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 src="$repo_root/.codex-plugin"
-dest="$repo_root/plugins/codex/.codex-plugin"
+dest="${RALLY_CODEX_DEST:-$repo_root/plugins/codex/.codex-plugin}"
 
 [ -d "$src" ] || { echo "error: $src not found" >&2; exit 1; }
 

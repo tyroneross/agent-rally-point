@@ -87,10 +87,10 @@ fn is_shell_like(tool: &str, args: &serde_json::Value) -> bool {
     }
 
     // Heuristic: if args contains a "cmd" or "command" key it's likely shell
-    if let Some(obj) = args.as_object() {
-        if obj.contains_key("cmd") || obj.contains_key("command") {
-            return true;
-        }
+    if let Some(obj) = args.as_object()
+        && (obj.contains_key("cmd") || obj.contains_key("command"))
+    {
+        return true;
     }
 
     false

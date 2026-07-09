@@ -1,11 +1,26 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+#
 # Local pre-push gate — replaces the ubuntu GitHub Actions rally-gate.
-# Runs the same checks on the REAL runtime (this mac), under the pinned
-# toolchain, so local == gate with zero cloud cost and no Linux/macOS mismatch.
+#
+# Validates the EXACT objects being pushed, not the current (possibly dirty,
+# possibly ahead-of/behind-the-push) working tree: for every distinct
+# non-deletion `local_sha` git is about to push (computed by
+# scripts/prepush-ref-updates.sh from the ref-update tuples git supplies on
+# stdin), this hook checks out a clean DETACHED worktree at that exact SHA
+# and runs the shared quality gate (scripts/run-quality-gate.sh) inside it.
+# Detached worktrees are always torn down via a trap — success, gate
+# failure, or interrupt — so a blocked push never leaves stray worktrees.
+#
 # Blocks the push on failure. Emergency override: RALLY_SKIP_PREPUSH=1 git push
 #
-# Installed via `git config core.hooksPath .githooks` (versioned, survives clone,
-# fires for agent pushes too). Keep in lockstep with rust-toolchain.toml.
+# Installed via `git config core.hooksPath .githooks` (versioned, survives
+# clone, fires for agent pushes too). The actual gate steps (fmt/clippy/
+# tests/doctests/audit) live in scripts/run-quality-gate.sh — ONE definition
+# shared with CI (.github/workflows/ci.yml) so local and CI can never
+# silently diverge. Keep the toolchain pin (RALLY_QG_TOOLCHAIN /
+# rust-toolchain.toml) in lockstep across both.
 set -e
 
 if [ "${RALLY_SKIP_PREPUSH:-}" = "1" ]; then
@@ -16,62 +31,53 @@ fi
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
-# Pin to the same toolchain CI used, if available; else fall back to default.
-TC="1.95.0"
-if command -v rustup >/dev/null 2>&1 && rustup toolchain list 2>/dev/null | grep -q "^$TC"; then
-  CARGO="rustup run $TC cargo"
-else
-  CARGO="cargo"
-  echo "pre-push: toolchain $TC not found via rustup; using default cargo (fmt may differ)" >&2
+# git supplies one "<local_ref> <local_sha> <remote_ref> <remote_sha>" tuple
+# per line on stdin (see `git help githooks`, PRE-PUSH). Capture it once to a
+# scratch file: scripts/prepush-ref-updates.sh needs to read it, and stdin
+# can only be consumed once.
+stdin_capture=$(mktemp "${TMPDIR:-/tmp}/rally-prepush-stdin.XXXXXX")
+cat > "$stdin_capture"
+
+sha_file=$(mktemp "${TMPDIR:-/tmp}/rally-prepush-shas.XXXXXX")
+"$repo_root/scripts/prepush-ref-updates.sh" < "$stdin_capture" > "$sha_file"
+rm -f "$stdin_capture"
+
+if [ ! -s "$sha_file" ]; then
+  echo "pre-push: no non-deletion refs to validate (pure deletion push, or empty ref-update list) — nothing to gate" >&2
+  rm -f "$sha_file"
+  exit 0
 fi
 
-# fmt: scope to the .rs files actually being pushed. In a SHARED multi-agent
-# checkout, a whole-tree `cargo fmt --check` would fail on another agent's
-# uncommitted/untracked drift and block YOUR unrelated push. Checking only the
-# pushed range keeps enforcement honest without that cross-agent coupling.
-range="@{upstream}..HEAD"
-git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1 || range="HEAD"
-changed_rs=$(git diff --name-only "$range" -- '*.rs' 2>/dev/null | { grep -E '\.rs$' || true; })
-if [ -n "$changed_rs" ]; then
-  echo "pre-push: format check (pushed .rs files)…" >&2
-  # shellcheck disable=SC2086
-  printf '%s\n' "$changed_rs" | while IFS= read -r f; do [ -f "$f" ] && rustfmt --edition 2024 --check "$f"; done
-else
-  echo "pre-push: no .rs changes in push range — fmt check skipped" >&2
-fi
-
-# clippy + test cover the compiled tree (a compile-break SHOULD block a push;
-# use RALLY_SKIP_PREPUSH=1 for the rare intentional case).
-echo "pre-push: clippy (-D warnings)…" >&2; $CARGO clippy --workspace --all-targets -- -D warnings
-if command -v cargo-nextest >/dev/null 2>&1; then
-  echo "pre-push: tests (cargo nextest)…" >&2
-  $CARGO nextest run --workspace
-  echo "pre-push: doctests…" >&2
-  $CARGO test --workspace --doc
-else
-  echo "pre-push: cargo-nextest not installed; using serialized cargo test fallback" >&2
-  echo "pre-push: install faster gate with: cargo install cargo-nextest --locked" >&2
-  $CARGO test --workspace -- --test-threads=1
-fi
-
-# Supply-chain gates: only when dependencies actually changed (fast common path),
-# and only if the tools are installed (fail-soft — a missing optional tool must
-# not block a legitimate code push; note it instead).
-dep_changed=0
-if ! git diff --quiet "@{upstream}"..HEAD -- Cargo.lock Cargo.toml '**/Cargo.toml' deny.toml .cargo/audit.toml 2>/dev/null; then
-  dep_changed=1
-fi
-if [ "$dep_changed" = "1" ]; then
-  if command -v cargo-audit >/dev/null 2>&1; then
-    echo "pre-push: deps changed — cargo audit…" >&2; cargo audit
-  else
-    echo "pre-push: deps changed but cargo-audit not installed — SKIPPED (install: cargo install cargo-audit)" >&2
+worktree_base=$(mktemp -d "${TMPDIR:-/tmp}/rally-prepush-wt.XXXXXX")
+cleanup() {
+  # Runs on EVERY exit path (normal completion, a gate failure under `set -e`,
+  # or an interrupt) — the single place worktrees get torn down, so a failed
+  # push never leaves one behind.
+  if [ -d "$worktree_base" ]; then
+    for d in "$worktree_base"/*; do
+      [ -d "$d" ] || continue
+      git worktree remove --force "$d" >/dev/null 2>&1 || rm -rf "$d"
+    done
+    rm -rf "$worktree_base"
   fi
-  if command -v cargo-deny >/dev/null 2>&1; then
-    echo "pre-push: deps changed — cargo deny…" >&2; cargo deny check --hide-inclusion-graph
-  else
-    echo "pre-push: deps changed but cargo-deny not installed — SKIPPED (install: cargo install cargo-deny)" >&2
-  fi
-fi
+  git worktree prune >/dev/null 2>&1 || true
+  rm -f "$sha_file"
+}
+trap cleanup EXIT INT TERM
+
+while IFS= read -r sha; do
+  [ -n "$sha" ] || continue
+  wt="$worktree_base/$sha"
+  echo "pre-push: $sha — creating clean detached worktree…" >&2
+  git worktree add --detach "$wt" "$sha" >/dev/null
+  echo "pre-push: $sha — running quality gate (scripts/run-quality-gate.sh)…" >&2
+  ( cd "$wt" && ./scripts/run-quality-gate.sh )
+  echo "pre-push: $sha — running release parity (scripts/check-release-parity.sh)…" >&2
+  # f2: parity uses RALLY_CODEX_DEST (SEC-003) to regenerate the Codex
+  # artifact into a scratch dir, so this never mutates the detached
+  # worktree it runs in.
+  ( cd "$wt" && ./scripts/check-release-parity.sh )
+  echo "pre-push: $sha ✅ gate + parity passed" >&2
+done < "$sha_file"
 
 echo "pre-push: all gates green ✅" >&2

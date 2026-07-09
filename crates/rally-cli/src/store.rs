@@ -139,6 +139,13 @@ pub(crate) enum FactKind {
     /// Backlog item — encodes `{id, intent, owns[], depends_on[], status}` in
     /// existing fields (summary/scope/evidence) using the additive-marker pattern.
     /// Never surfaced in active_claims / open_handoffs / next candidates.
+    ///
+    /// Wire/on-disk kind is `backlog_item` (the `rename_all = "snake_case"`
+    /// default — no per-variant rename here). The `backlog-item` alias exists
+    /// only so a producer coded against the earlier (buggy) published schema
+    /// still deserializes correctly instead of falling to `#[serde(other)]
+    /// Unknown` (f1, 2026-07-09).
+    #[serde(alias = "backlog-item")]
     BacklogItem,
     /// B13: handoff receipt — durable record that a handoff was acted on by the
     /// recipient.  `ref_id` points to the originating handoff `event_id`.
@@ -362,6 +369,10 @@ pub(crate) struct RoomSnapshot {
     pub(crate) active_claims: Vec<Fact>,
     pub(crate) active_blockers: Vec<Fact>,
     pub(crate) open_handoffs: Vec<Fact>,
+    /// Pending wake intents used to coalesce repeated `next` polls. Internal
+    /// projection only; the public room schema remains unchanged.
+    #[serde(skip)]
+    pub(crate) pending_wakes: Vec<Fact>,
     pub(crate) current_decisions: Vec<Fact>,
     pub(crate) current_risks: Vec<Fact>,
     /// System-generated health/telemetry facts (`external-intake`,
@@ -501,6 +512,7 @@ impl RoomSnapshot {
             active_claims: filter_facts(self.active_claims, query),
             active_blockers: filter_facts(self.active_blockers, query),
             open_handoffs: filter_facts(self.open_handoffs, query),
+            pending_wakes: self.pending_wakes,
             current_decisions: filter_facts(self.current_decisions, query),
             current_risks: filter_facts(self.current_risks, query),
             recent_artifacts: filter_facts(self.recent_artifacts, query),
@@ -569,10 +581,10 @@ impl RoomQuery {
                 return false;
             }
         }
-        if let Some(role) = &self.role {
-            if fact.role.as_deref() != Some(role.as_str()) {
-                return false;
-            }
+        if let Some(role) = &self.role
+            && fact.role.as_deref() != Some(role.as_str())
+        {
+            return false;
         }
         if !self.paths.is_empty()
             && !self.paths.iter().any(|path| {
@@ -589,15 +601,15 @@ impl RoomQuery {
                 return false;
             }
         }
-        if let Some(thread_id) = &self.thread_id {
-            if fact.thread_id != *thread_id {
-                return false;
-            }
+        if let Some(thread_id) = &self.thread_id
+            && fact.thread_id != *thread_id
+        {
+            return false;
         }
-        if let Some(since) = self.since {
-            if fact.seq <= since {
-                return false;
-            }
+        if let Some(since) = self.since
+            && fact.seq <= since
+        {
+            return false;
         }
         true
     }
@@ -902,33 +914,33 @@ impl RoomStore {
         // reclaim-eligible (it posted activity and became live), refuse the
         // takeover rather than reclaim a now-live owner's claim (the
         // independent-auditor-HIGH 2026-06-09 regression class).
-        if fact.kind == FactKind::Release {
-            if let Some(stale_owners) = Self::takeover_owners_marker(&fact.evidence) {
-                let coord =
-                    crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
-                let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
-                let fresh = snapshot_from_facts_with_policy(&facts, &coord, false);
-                for owner in &stale_owners {
-                    let still_eligible = fresh
-                        .active_claims
-                        .iter()
-                        .filter(|c| c.tool.as_deref() == Some(owner.as_str()))
-                        .any(|c| fresh.claim_reclaim_eligible(c, &coord).0);
-                    // No remaining eligible claim for this owner means either it
-                    // was already reclaimed (fine) or it revived (refuse). We
-                    // only refuse when the owner still HOLDS active claims that
-                    // are NO LONGER eligible — i.e. it came back to life.
-                    let still_owns = fresh
-                        .active_claims
-                        .iter()
-                        .any(|c| c.tool.as_deref() == Some(owner.as_str()));
-                    if still_owns && !still_eligible {
-                        return Err(RallyError::Usage(format!(
-                            "takeover refused: owner {owner} is no longer stale \
+        if fact.kind == FactKind::Release
+            && let Some(stale_owners) = Self::takeover_owners_marker(&fact.evidence)
+        {
+            let coord =
+                crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+            let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+            let fresh = snapshot_from_facts_with_policy(&facts, &coord, false);
+            for owner in &stale_owners {
+                let still_eligible = fresh
+                    .active_claims
+                    .iter()
+                    .filter(|c| c.tool.as_deref() == Some(owner.as_str()))
+                    .any(|c| fresh.claim_reclaim_eligible(c, &coord).0);
+                // No remaining eligible claim for this owner means either it
+                // was already reclaimed (fine) or it revived (refuse). We
+                // only refuse when the owner still HOLDS active claims that
+                // are NO LONGER eligible — i.e. it came back to life.
+                let still_owns = fresh
+                    .active_claims
+                    .iter()
+                    .any(|c| c.tool.as_deref() == Some(owner.as_str()));
+                if still_owns && !still_eligible {
+                    return Err(RallyError::Usage(format!(
+                        "takeover refused: owner {owner} is no longer stale \
                              (revived under the mutation lock); not reclaiming a \
                              now-live owner's claim"
-                        )));
-                    }
+                    )));
                 }
             }
         }
@@ -947,36 +959,36 @@ impl RoomStore {
             // Only a PURE owner-stale close is racy. A close that also carries
             // the lease-expired signal ("lease-expired" or
             // "owner-stale+lease-expired") is monotonic-safe and exempt.
-            if reason == Some("owner-stale") {
-                if let Some(owner) = Self::reaper_marker(&fact.evidence, "owner") {
-                    let coord = crate::hooks_config::resolve_coordination(&self.repo_root)
-                        .unwrap_or_default();
-                    let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
-                    let fresh = snapshot_from_facts_with_policy(&facts, &coord, false);
-                    // The specific claim this ClaimExpired closes (by ref).
-                    let ref_id = fact.ref_id.as_deref();
-                    let still_owns = fresh.active_claims.iter().any(|c| {
+            if reason == Some("owner-stale")
+                && let Some(owner) = Self::reaper_marker(&fact.evidence, "owner")
+            {
+                let coord =
+                    crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+                let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+                let fresh = snapshot_from_facts_with_policy(&facts, &coord, false);
+                // The specific claim this ClaimExpired closes (by ref).
+                let ref_id = fact.ref_id.as_deref();
+                let still_owns = fresh.active_claims.iter().any(|c| {
+                    c.tool.as_deref() == Some(owner) && Some(c.event_id.as_str()) == ref_id
+                });
+                let still_eligible = fresh
+                    .active_claims
+                    .iter()
+                    .filter(|c| {
                         c.tool.as_deref() == Some(owner) && Some(c.event_id.as_str()) == ref_id
-                    });
-                    let still_eligible = fresh
-                        .active_claims
-                        .iter()
-                        .filter(|c| {
-                            c.tool.as_deref() == Some(owner) && Some(c.event_id.as_str()) == ref_id
-                        })
-                        .any(|c| fresh.claim_reclaim_eligible(c, &coord).0);
-                    // The claim still HOLDS but is NO LONGER reap-eligible means
-                    // the owner came back to life in the gap → refuse the reap.
-                    // If the claim is already gone (already closed) we let the
-                    // append proceed; the projection dedups via ref_id.
-                    if still_owns && !still_eligible {
-                        return Err(RallyError::Usage(format!(
-                            "reap refused: owner {owner} revived under the mutation \
+                    })
+                    .any(|c| fresh.claim_reclaim_eligible(c, &coord).0);
+                // The claim still HOLDS but is NO LONGER reap-eligible means
+                // the owner came back to life in the gap → refuse the reap.
+                // If the claim is already gone (already closed) we let the
+                // append proceed; the projection dedups via ref_id.
+                if still_owns && !still_eligible {
+                    return Err(RallyError::Usage(format!(
+                        "reap refused: owner {owner} revived under the mutation \
                              lock (owner-stale ClaimExpired for claim {} no longer \
                              eligible); not closing a now-live owner's claim",
-                            ref_id.unwrap_or("<unknown>")
-                        )));
-                    }
+                        ref_id.unwrap_or("<unknown>")
+                    )));
                 }
             }
         }
@@ -1798,18 +1810,7 @@ fn facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> 
     let archived = replay_archive_segments(archive_dir)?;
     let mut entries: Vec<LedgerLine> = Vec::new();
     for path in live.iter().chain(archived.iter()) {
-        let file =
-            fs::File::open(path).map_err(RallyError::io(format!("read {}", path.display())))?;
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(RallyError::io(format!("read {}", path.display())))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(entry) = serde_json::from_str::<LedgerLine>(&line) else {
-                continue;
-            };
-            entries.push(entry);
-        }
+        entries.extend(read_segment_entries(path)?);
     }
     entries.sort_by_key(|entry| entry.seq);
     let mut facts = Vec::with_capacity(entries.len());
@@ -1905,10 +1906,10 @@ fn newest_fact_age_per_tool(
     };
     for f in facts.iter().filter(|f| kinds.contains(&f.kind.as_str())) {
         let age = fact_age_secs(f, now_secs);
-        if let Some(t) = &f.tool {
-            if t != "rally" {
-                note(t, age, &mut out);
-            }
+        if let Some(t) = &f.tool
+            && t != "rally"
+        {
+            note(t, age, &mut out);
         }
         if let Some(t) = &f.target {
             note(t, age, &mut out);
@@ -2067,6 +2068,13 @@ fn snapshot_from_facts_with_policy(
         .filter(|f| !handoff_is_closed(f, facts))
         // B18: exclude external-intake facts from repo-local backlog.
         .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let pending_wakes = facts
+        .iter()
+        .filter(|fact| fact.kind == "wake")
+        .filter(|fact| fact.status.as_deref() == Some("pending"))
+        .filter(|fact| !resolved.contains(&fact.event_id))
         .cloned()
         .collect::<Vec<_>>();
     // Recency-decay buckets: order by weight (fresh first), drop facts that
@@ -2307,6 +2315,7 @@ fn snapshot_from_facts_with_policy(
         active_claims,
         active_blockers,
         open_handoffs,
+        pending_wakes,
         current_decisions,
         current_risks,
         system_health,
@@ -2899,6 +2908,74 @@ fn read_segment_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Read one canonical JSONL segment with a single framing policy used by every
+/// replay, allocation, readback, and index path.
+///
+/// A malformed final fragment without `\n` is a torn append and is ignored.
+/// Any malformed newline-terminated record is completed corruption and fails
+/// loudly with path and line evidence. A valid final record is accepted even
+/// when it lacks a newline.
+fn read_segment_entries(path: &Path) -> Result<Vec<LedgerLine>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        // f4: callers list segment files via `read_segment_files` and then
+        // open each one in a SEPARATE step (exists()-then-open at some call
+        // sites, no check at all at others) — a concurrent archival/rotation
+        // can remove a listed segment in between. That is not corruption; it
+        // is a benign race with rotation. Treat it as an empty segment
+        // rather than propagating, so callers fall through to whatever else
+        // they scan instead of hard-failing. Every PARSE error below stays
+        // loud — this only widens tolerance for the file's ABSENCE.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            let ctx = format!("read canonical segment {}", path.display());
+            return Err(RallyError::io(ctx)(err));
+        }
+    };
+    let mut reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    let mut bytes = Vec::new();
+    let mut line_number = 0usize;
+
+    loop {
+        bytes.clear();
+        let read = reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(RallyError::io(format!(
+                "read canonical segment {}",
+                path.display()
+            )))?;
+        if read == 0 {
+            break;
+        }
+        line_number += 1;
+        let had_newline = bytes.last() == Some(&b'\n');
+        if had_newline {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+        }
+        if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+
+        match serde_json::from_slice::<LedgerLine>(&bytes) {
+            Ok(entry) => entries.push(entry),
+            Err(_) if !had_newline => break,
+            Err(err) => {
+                return Err(RallyError::Message(format!(
+                    "completed canonical segment corruption in {} at line {}: {}",
+                    path.display(),
+                    line_number,
+                    err
+                )));
+            }
+        }
+    }
+    Ok(entries)
+}
+
 /// R9-readback: scan segment files for the presence of a specific `event_id`
 /// in any `LedgerLine.payload.event_id` field.  Returns `true` if found.
 ///
@@ -2910,21 +2987,7 @@ fn segment_event_id_present<'a>(
     event_id: &str,
 ) -> Result<bool> {
     for path in paths {
-        let file = match fs::File::open(path) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        for line in BufReader::new(file).lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(entry) = serde_json::from_str::<LedgerLine>(&line) else {
-                continue;
-            };
+        for entry in read_segment_entries(path)? {
             // The payload is a serialized Fact.  Extract event_id without a
             // full Fact deserialization to keep this path allocation-light.
             if entry.payload.get("event_id").and_then(|v| v.as_str()) == Some(event_id) {
@@ -2947,19 +3010,10 @@ fn segment_event_id_present<'a>(
 /// the caller falls through to the authoritative full live+archive scan. A
 /// `true` here is a genuine presence (we matched the exact `event_id`).
 fn segment_event_id_present_tail_first(path: &Path, event_id: &str) -> Result<bool> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        // Absent/unreadable active segment → defer to the full scan.
-        Err(_) => return Ok(false),
-    };
-    for line in text.lines().rev() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<LedgerLine>(line) else {
-            // Torn trailing line — skip, mirrors the full-scan reader.
-            continue;
-        };
+    if !path.exists() {
+        return Ok(false);
+    }
+    for entry in read_segment_entries(path)?.into_iter().rev() {
         if entry.payload.get("event_id").and_then(|v| v.as_str()) == Some(event_id) {
             return Ok(true);
         }
@@ -3008,19 +3062,7 @@ fn replay_archive_segments(archive_dir: &Path) -> Result<Vec<PathBuf>> {
 fn segment_seq_stats(live: &[PathBuf], archived: &[PathBuf]) -> Result<SeqStats> {
     let mut seqs: BTreeSet<i64> = BTreeSet::new();
     for path in live.iter().chain(archived.iter()) {
-        let file =
-            fs::File::open(path).map_err(RallyError::io(format!("read {}", path.display())))?;
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(RallyError::io(format!("read {}", path.display())))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(entry) = serde_json::from_str::<LedgerLine>(&line) else {
-                // Torn trailing line (crash during append, never fsynced).
-                // Skip rather than brick the store — mirrors live-index reader
-                // behaviour at ~store.rs:1645.
-                continue;
-            };
+        for entry in read_segment_entries(path)? {
             seqs.insert(entry.seq);
         }
     }
@@ -3061,18 +3103,9 @@ fn last_seq_in_segment(segment_path: &Path) -> Result<Option<i64>> {
     if !segment_path.exists() {
         return Ok(None);
     }
-    let content = fs::read_to_string(segment_path)
-        .map_err(RallyError::io(format!("read {}", segment_path.display())))?;
-    for line in content.lines().rev() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let entry: LedgerLine =
-            serde_json::from_str(line).map_err(RallyError::json("parse last segment line"))?;
-        return Ok(Some(entry.seq));
-    }
-    Ok(None)
+    Ok(read_segment_entries(segment_path)?
+        .last()
+        .map(|entry| entry.seq))
 }
 
 /// Events currently held by the derived sqlite cache. Compared against
@@ -3240,27 +3273,9 @@ fn rebuild_db_from_segments(
     archived: &[PathBuf],
     facts_db_path: &Path,
 ) -> Result<()> {
-    let _ = fs::remove_file(facts_db_path);
-    let _ = fs::remove_file(facts_db_path.with_extension("db-shm"));
-    let _ = fs::remove_file(facts_db_path.with_extension("db-wal"));
-
     let mut all_entries: Vec<LedgerLine> = Vec::new();
     for path in live.iter().chain(archived.iter()) {
-        let file =
-            fs::File::open(path).map_err(RallyError::io(format!("read {}", path.display())))?;
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(RallyError::io(format!("read {}", path.display())))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(entry) = serde_json::from_str::<LedgerLine>(&line) else {
-                // Torn trailing line (crash during append, never fsynced).
-                // Skip rather than brick the store — mirrors live-index reader
-                // behaviour at ~store.rs:1645.
-                continue;
-            };
-            all_entries.push(entry);
-        }
+        all_entries.extend(read_segment_entries(path)?);
     }
     all_entries.sort_by_key(|e| e.seq);
 
@@ -3294,6 +3309,12 @@ fn rebuild_db_from_segments(
             NewEvent::new(entry.event_type.clone(), payload)
         })
         .collect::<Vec<_>>();
+    // Canonical parsing and deduplication completed successfully. Only now is
+    // it safe to replace the derived cache; completed segment corruption must
+    // never destroy a still-readable facts.db before surfacing the error.
+    let _ = fs::remove_file(facts_db_path);
+    let _ = fs::remove_file(facts_db_path.with_extension("db-shm"));
+    let _ = fs::remove_file(facts_db_path.with_extension("db-wal"));
     if replay_events.is_empty() {
         return Ok(());
     }
@@ -3533,21 +3554,12 @@ impl RoomStore {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            let file =
-                fs::File::open(path).map_err(RallyError::io(format!("read {}", path.display())))?;
             let mut first_seq = i64::MAX;
             let mut last_seq = 0i64;
             let mut count = 0i64;
             let mut first_ts: Option<String> = None;
             let mut last_ts: Option<String> = None;
-            for line in BufReader::new(file).lines() {
-                let line = line.map_err(RallyError::io(format!("read {}", path.display())))?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let Ok(entry) = serde_json::from_str::<LedgerLine>(&line) else {
-                    continue;
-                };
+            for entry in read_segment_entries(path)? {
                 count += 1;
                 if entry.seq < first_seq {
                     first_seq = entry.seq;
@@ -3805,6 +3817,39 @@ mod ledger_tests {
             "old rows replay with from_session_id=None"
         );
         assert_eq!(f.subject, "old");
+    }
+
+    /// f4 (2026-07-09): callers list segment files via `read_segment_files`
+    /// then open each one separately — a concurrent archival/rotation can
+    /// remove a listed segment in between (TOCTOU). That is a benign race
+    /// with rotation, not corruption: the segment's entries simply moved to
+    /// the archive. `read_segment_entries` must treat a missing file as an
+    /// empty segment rather than propagating an error.
+    #[test]
+    fn f4_read_segment_entries_treats_missing_file_as_empty_not_error() {
+        let root = unique_root("read-segment-entries-notfound");
+        let missing = root.join("does-not-exist.jsonl");
+        let entries = read_segment_entries(&missing).unwrap();
+        assert!(
+            entries.is_empty(),
+            "a missing segment file must read as empty, not error"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// f4 regression guard: widening tolerance for the file's ABSENCE must
+    /// NOT widen tolerance for actual corruption of a line that IS present.
+    #[test]
+    fn f4_read_segment_entries_still_errors_loudly_on_parse_corruption() {
+        let root = unique_root("read-segment-entries-corrupt");
+        let path = root.join("corrupt.jsonl");
+        fs::write(&path, b"{not json}\n").unwrap();
+        let err = read_segment_entries(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("corruption"),
+            "a completed malformed line must still fail loudly: {err}"
+        );
+        fs::remove_dir_all(&root).ok();
     }
 
     fn unique_root(label: &str) -> PathBuf {
@@ -6576,6 +6621,93 @@ mod ledger_tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn completed_segment_corruption_fails_all_canonical_readers() {
+        let root = unique_root("completed-segment-corruption");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let fact = store
+            .append_fact(&make_fact(
+                "e1",
+                FactKind::Decision,
+                "src/",
+                "valid before corruption",
+            ))
+            .unwrap();
+        let segment = store.active_segment_path();
+        let facts_db = store.facts_db_path.clone();
+        let db_len_before = fs::metadata(&facts_db).unwrap().len();
+
+        {
+            let mut file = OpenOptions::new().append(true).open(&segment).unwrap();
+            file.write_all(b"completed-corruption\n").unwrap();
+            file.sync_data().unwrap();
+        }
+
+        let live = read_segment_files(&store.log_dir).unwrap();
+        let archived = replay_archive_segments(&store.archive_dir).unwrap();
+        let assert_completed = |err: RallyError| {
+            let message = err.to_string();
+            assert!(message.contains("completed canonical segment corruption"));
+            assert!(message.contains(&segment.display().to_string()));
+            assert!(message.contains("line 2"));
+        };
+
+        assert_completed(read_segment_entries(&segment).unwrap_err());
+        assert_completed(facts_from_segments(&store.log_dir, &store.archive_dir).unwrap_err());
+        assert_completed(segment_seq_stats(&live, &archived).unwrap_err());
+        assert_completed(last_seq_in_segment(&segment).unwrap_err());
+        assert_completed(segment_event_id_present(live.iter(), &fact.event_id).unwrap_err());
+        assert_completed(
+            segment_event_id_present_tail_first(&segment, &fact.event_id).unwrap_err(),
+        );
+        assert_completed(store.refresh_log_index().unwrap_err());
+        assert_completed(rebuild_db_from_segments(&live, &archived, &facts_db).unwrap_err());
+
+        assert!(facts_db.exists(), "failed rebuild must preserve facts.db");
+        assert_eq!(
+            fs::metadata(&facts_db).unwrap().len(),
+            db_len_before,
+            "failed canonical parse must not replace the derived cache"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pending_wake_projection_excludes_terminal_and_resolved_wakes() {
+        let mut pending = make_fact("wake-pending", FactKind::Wake, "", "pending");
+        pending.status = Some("pending".to_string());
+        pending.target = Some("codex".to_string());
+
+        let mut delivered = make_fact("wake-delivered", FactKind::Wake, "", "delivered");
+        delivered.status = Some("delivered".to_string());
+        delivered.target = Some("codex".to_string());
+
+        let mut resolved_wake = make_fact("wake-resolved", FactKind::Wake, "", "pending");
+        resolved_wake.status = Some("pending".to_string());
+        resolved_wake.target = Some("codex".to_string());
+        let mut resolution = make_fact("resolve-wake", FactKind::Resolve, "", "resolved");
+        resolution.ref_id = Some(resolved_wake.event_id.clone());
+
+        for (seq, fact) in [
+            &mut pending,
+            &mut delivered,
+            &mut resolved_wake,
+            &mut resolution,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fact.seq = (seq + 1) as i64;
+        }
+        let snapshot = snapshot_from_facts_with_policy(
+            &[pending, delivered, resolved_wake, resolution],
+            &crate::hooks_config::CoordinationConfig::default(),
+            false,
+        );
+        assert_eq!(snapshot.pending_wakes.len(), 1);
+        assert_eq!(snapshot.pending_wakes[0].event_id, "wake-pending");
     }
 
     // -------------------------------------------------------------------------

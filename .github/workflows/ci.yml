@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI: runs the SAME quality gate as local pre-push (scripts/run-quality-gate.sh
+# — one shared definition, see .githooks/pre-push) plus the release-version
+# parity check (scripts/check-release-parity.sh), on every pull request and on
+# push to main/codex/**/bl/**.
+#
+# For the pull_request trigger we check out the PR HEAD SHA EXPLICITLY
+# (github.event.pull_request.head.sha) rather than relying on the default
+# pull_request ref, and then assert `git rev-parse HEAD` equals that SHA.
+# GitHub's default pull_request checkout resolves to a synthetic merge-ref
+# commit, which is NOT the PR head — a gate that silently validates that
+# merge ref instead of the actual reviewed commit is validating the wrong
+# tree. Failing loudly here closes that gap rather than trusting it silently.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'codex/**'
+      - 'bl/**'
+
+# SEC-005: default GITHUB_TOKEN permissions are broad (write) unless a repo-
+# or org-level default narrows them; scope explicitly rather than inherit.
+# This workflow only checks out code and runs local scripts — it needs
+# nothing beyond read access. (release.yml already scopes its own
+# permissions per-job for the elevated actions it actually performs.)
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gate:
+    name: Quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (PR head SHA, explicit)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Checkout
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/checkout@v7
+
+      - name: Assert checked-out HEAD matches the PR head SHA
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          expected="${{ github.event.pull_request.head.sha }}"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::CI checked out $actual but the PR head SHA is $expected — refusing to validate the wrong commit." >&2
+            exit 1
+          fi
+          echo "CI validating PR head SHA $actual (confirmed)"
+
+      # Pin the EXACT stable (not moving `@stable`) so local (rust-toolchain.toml)
+      # and CI rustfmt/clippy agree — a moving toolchain drifts rustfmt output and
+      # makes the fmt gate flaky. Keep this pin in lockstep with rust-toolchain.toml
+      # and scripts/run-quality-gate.sh's RALLY_QG_TOOLCHAIN default.
+      - name: Install Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
+
+      # SEC-002: run-quality-gate.sh's dep-changed cargo-audit/cargo-deny
+      # steps are fail-soft (print "not installed — SKIPPED" and continue)
+      # so a change to a Cargo.lock-affecting dependency never actually gets
+      # scanned in CI without these installed. Local pre-push stays
+      # fail-soft by design (no forced install there); CI is where the
+      # supply-chain gate must actually run.
+      - name: Install cargo-audit + cargo-deny
+        run: cargo install cargo-audit cargo-deny --locked
+
+      - name: Quality gate (scripts/run-quality-gate.sh — same gate as local pre-push)
+        run: ./scripts/run-quality-gate.sh
+
+      - name: Release parity (scripts/check-release-parity.sh)
+        run: ./scripts/check-release-parity.sh

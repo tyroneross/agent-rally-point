@@ -29,6 +29,7 @@ Definitions:
 | `rally enter` | yes | yes | no | no | Records presence, lead context, build-id drift, duplicate tool risks, and read cursor advancement. |
 | `rally ack` | yes | yes | no | no | Records that the tool ingested current rules, guardrails, lead, and mission. |
 | `rally next` | yes | yes | no | no | Projects actionable work and records wake/read state for the calling tool. |
+| `rally next --audit` | no | no | no | no | Projects the same actionable work without presence, wake, or read-checkpoint facts; derived caches may still rebuild. |
 | `rally room` | no | yes | no | yes | Projects current room state from the ledger; use for ownership/blocker inspection. |
 | `rally check before-write` | no | yes | no | yes | Evaluates claim/decision/risk state; hooks may pair it with a separate claim write. |
 | `rally say <kind>` | yes | yes | no | no | Appends durable coordination facts: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, standby, wake, backlog-item, mission. |

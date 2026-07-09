@@ -30,10 +30,7 @@
                   "cwd",
                   "target",
                   "liveness",
-                  "liveness_source",
-                  "injectable",
-                  "inject_status",
-                  "inject_via"
+                  "liveness_source"
                 ],
                 "properties": {
                   "session_id": { "type": "string" },

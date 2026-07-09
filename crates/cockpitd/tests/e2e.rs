@@ -161,14 +161,13 @@ impl TestClient {
 fn extract_approval_id_from_snapshot(snapshot: &Value) -> Option<String> {
     let events = snapshot.get("events")?.as_array()?;
     for evt in events {
-        if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request") {
-            if let Some(aid) = evt
+        if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
+            && let Some(aid) = evt
                 .get("metadata")
                 .and_then(|m| m.get("approval_id"))
                 .and_then(|a| a.as_str())
-            {
-                return Some(aid.to_string());
-            }
+        {
+            return Some(aid.to_string());
         }
     }
     None
@@ -539,20 +538,19 @@ async fn e2e_codex_approval_wire_roundtrip() {
             Ok(v) => {
                 let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
                 // Live event delta.
-                if t == "event" {
-                    if let Some(evt) = v.get("event") {
-                        if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request") {
-                            // Pull approval_id from metadata.
-                            let aid = evt
-                                .get("metadata")
-                                .and_then(|m| m.get("approval_id"))
-                                .and_then(|a| a.as_str())
-                                .map(|s| s.to_string());
-                            if aid.is_some() {
-                                approval_id_str = aid;
-                                break;
-                            }
-                        }
+                if t == "event"
+                    && let Some(evt) = v.get("event")
+                    && evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
+                {
+                    // Pull approval_id from metadata.
+                    let aid = evt
+                        .get("metadata")
+                        .and_then(|m| m.get("approval_id"))
+                        .and_then(|a| a.as_str())
+                        .map(|s| s.to_string());
+                    if aid.is_some() {
+                        approval_id_str = aid;
+                        break;
                     }
                 }
             }
@@ -845,20 +843,18 @@ async fn e2e_authz_gate_allow() {
             match timeout(Duration::from_secs(2), client.recv()).await {
                 Ok(v) => {
                     let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
-                    if t == "event" {
-                        if let Some(evt) = v.get("event") {
-                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
-                            {
-                                let aid = evt
-                                    .get("metadata")
-                                    .and_then(|m| m.get("approval_id"))
-                                    .and_then(|a| a.as_str())
-                                    .map(|s| s.to_string());
-                                if aid.is_some() {
-                                    approval_id_str = aid;
-                                    break;
-                                }
-                            }
+                    if t == "event"
+                        && let Some(evt) = v.get("event")
+                        && evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
+                    {
+                        let aid = evt
+                            .get("metadata")
+                            .and_then(|m| m.get("approval_id"))
+                            .and_then(|a| a.as_str())
+                            .map(|s| s.to_string());
+                        if aid.is_some() {
+                            approval_id_str = aid;
+                            break;
                         }
                     }
                 }
@@ -891,13 +887,13 @@ async fn e2e_authz_gate_allow() {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                 let v: Value = serde_json::from_str(&text).unwrap_or_default();
                 let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
-                if t == "event" {
-                    if let Some(evt) = v.get("event") {
-                        let kind = evt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                        if kind == "tool_call" {
-                            saw_tool_call_or_terminal = true;
-                            break;
-                        }
+                if t == "event"
+                    && let Some(evt) = v.get("event")
+                {
+                    let kind = evt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                    if kind == "tool_call" {
+                        saw_tool_call_or_terminal = true;
+                        break;
                     }
                 }
                 if t == "session_status" {
@@ -963,20 +959,18 @@ async fn e2e_authz_gate_deny() {
             match timeout(Duration::from_secs(5), client.recv()).await {
                 Ok(v) => {
                     let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
-                    if t == "event" {
-                        if let Some(evt) = v.get("event") {
-                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
-                            {
-                                let aid = evt
-                                    .get("metadata")
-                                    .and_then(|m| m.get("approval_id"))
-                                    .and_then(|a| a.as_str())
-                                    .map(|s| s.to_string());
-                                if aid.is_some() {
-                                    approval_id_str = aid;
-                                    break;
-                                }
-                            }
+                    if t == "event"
+                        && let Some(evt) = v.get("event")
+                        && evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
+                    {
+                        let aid = evt
+                            .get("metadata")
+                            .and_then(|m| m.get("approval_id"))
+                            .and_then(|a| a.as_str())
+                            .map(|s| s.to_string());
+                        if aid.is_some() {
+                            approval_id_str = aid;
+                            break;
                         }
                     }
                 }
@@ -1009,15 +1003,15 @@ async fn e2e_authz_gate_deny() {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                 let v: Value = serde_json::from_str(&text).unwrap_or_default();
                 let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
-                if t == "event" {
-                    if let Some(evt) = v.get("event") {
-                        let kind = evt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                        if kind == "tool_blocked" {
-                            saw_tool_blocked = true;
-                        }
-                        if kind == "tool_result" {
-                            saw_tool_result = true;
-                        }
+                if t == "event"
+                    && let Some(evt) = v.get("event")
+                {
+                    let kind = evt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                    if kind == "tool_blocked" {
+                        saw_tool_blocked = true;
+                    }
+                    if kind == "tool_result" {
+                        saw_tool_result = true;
                     }
                 }
             }
@@ -1098,10 +1092,10 @@ async fn e2e_multiblock_turn_yields_three_events() {
         match timeout(Duration::from_millis(100), client.recv()).await {
             Ok(v) => {
                 let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
-                if t == "event" {
-                    if let Some(e) = v.get("event") {
-                        all_events.push(e.clone());
-                    }
+                if t == "event"
+                    && let Some(e) = v.get("event")
+                {
+                    all_events.push(e.clone());
                 }
             }
             Err(_) => continue,
@@ -1309,20 +1303,18 @@ async fn e2e_codex_native_gate_allow() {
             match timeout(Duration::from_secs(5), client.recv()).await {
                 Ok(v) => {
                     let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
-                    if t == "event" {
-                        if let Some(evt) = v.get("event") {
-                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
-                            {
-                                let aid = evt
-                                    .get("metadata")
-                                    .and_then(|m| m.get("approval_id"))
-                                    .and_then(|a| a.as_str())
-                                    .map(|s| s.to_string());
-                                if aid.is_some() {
-                                    approval_id_str = aid;
-                                    break;
-                                }
-                            }
+                    if t == "event"
+                        && let Some(evt) = v.get("event")
+                        && evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
+                    {
+                        let aid = evt
+                            .get("metadata")
+                            .and_then(|m| m.get("approval_id"))
+                            .and_then(|a| a.as_str())
+                            .map(|s| s.to_string());
+                        if aid.is_some() {
+                            approval_id_str = aid;
+                            break;
                         }
                     }
                 }
@@ -1429,20 +1421,18 @@ async fn e2e_codex_native_gate_deny() {
             match timeout(Duration::from_secs(5), client.recv()).await {
                 Ok(v) => {
                     let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
-                    if t == "event" {
-                        if let Some(evt) = v.get("event") {
-                            if evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
-                            {
-                                let aid = evt
-                                    .get("metadata")
-                                    .and_then(|m| m.get("approval_id"))
-                                    .and_then(|a| a.as_str())
-                                    .map(|s| s.to_string());
-                                if aid.is_some() {
-                                    approval_id_str = aid;
-                                    break;
-                                }
-                            }
+                    if t == "event"
+                        && let Some(evt) = v.get("event")
+                        && evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
+                    {
+                        let aid = evt
+                            .get("metadata")
+                            .and_then(|m| m.get("approval_id"))
+                            .and_then(|a| a.as_str())
+                            .map(|s| s.to_string());
+                        if aid.is_some() {
+                            approval_id_str = aid;
+                            break;
                         }
                     }
                 }
@@ -1474,15 +1464,15 @@ async fn e2e_codex_native_gate_deny() {
         match timeout(Duration::from_secs(3), client.recv()).await {
             Ok(v) => {
                 let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
-                if t == "event" {
-                    if let Some(evt) = v.get("event") {
-                        let kind = evt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                        if kind == "tool_blocked" {
-                            saw_tool_blocked = true;
-                        }
-                        if kind == "tool_result" {
-                            saw_tool_result = true;
-                        }
+                if t == "event"
+                    && let Some(evt) = v.get("event")
+                {
+                    let kind = evt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                    if kind == "tool_blocked" {
+                        saw_tool_blocked = true;
+                    }
+                    if kind == "tool_result" {
+                        saw_tool_result = true;
                     }
                 }
                 if t == "session_status" {

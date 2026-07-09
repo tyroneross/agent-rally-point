@@ -9,6 +9,8 @@
 //! success only with an explicit committed signal so callers do not retry and
 //! duplicate the fact.
 
+use rally_protocol::Inbox;
+use rally_protocol::ledger::FileInbox;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -178,4 +180,42 @@ fn committed_mutation_timeout_reports_committed_and_survives_replay_once() {
         1,
         "committed timeout must replay exactly one durable handoff"
     );
+}
+
+#[test]
+fn inject_timeout_marks_committed_only_after_directive_is_durable() {
+    let room = TempRoom::new("inject-committed");
+    // Initialize the room before the timed invocation so only the inject path
+    // participates in the watchdog assertion.
+    let _ = room.room_json();
+
+    let output = room
+        .rally()
+        .args([
+            "inject",
+            "watchdog-target",
+            "--tool",
+            "codex",
+            "--text",
+            "durable directive",
+            "--json",
+            "--timeout-ms",
+            "300",
+        ])
+        .env("RALLY_TEST_BLOCK_AFTER_COMMIT_MS", "5000")
+        .output()
+        .expect("spawn timed inject");
+
+    assert_eq!(output.status.code(), Some(0));
+    let payload = stdout_json(&output);
+    assert_eq!(payload["command"], "watchdog");
+    assert_eq!(payload["data"]["watchdog"]["committed"], true);
+
+    let inbox = FileInbox::open(room.cwd.join(".rally")).expect("open directive ledger");
+    let directives = inbox
+        .read_since("watchdog-target", 0)
+        .expect("replay durable directive");
+    assert_eq!(directives.len(), 1);
+    assert_eq!(directives[0].seq, 1);
+    assert_eq!(directives[0].text.as_deref(), Some("durable directive"));
 }

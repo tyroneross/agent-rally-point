@@ -34,7 +34,14 @@
         "lesson",
         "session",
         "wake",
-        "presence"
+        "presence",
+        "claim.expired",
+        "read",
+        "backlog_item",
+        "receipt",
+        "standby",
+        "mission",
+        "unknown"
       ]
     },
     "subject": { "type": "string" },

@@ -296,18 +296,17 @@ pub(crate) fn build_dag(facts: &[Fact], run_id: &str) -> DagOutput {
                 }
             }
             // ref edges (within the same run).
-            if let Some(ref_id) = &fact.ref_id {
-                if let Some(ref_step) = event_to_step.get(ref_id) {
-                    if ref_step != step_id {
-                        let key = (ref_step.clone(), step_id.clone(), "ref".to_string());
-                        if seen_edges.insert(key) {
-                            edges.push(DagEdge {
-                                from_step: ref_step.clone(),
-                                to_step: step_id.clone(),
-                                kind: "ref".to_string(),
-                            });
-                        }
-                    }
+            if let Some(ref_id) = &fact.ref_id
+                && let Some(ref_step) = event_to_step.get(ref_id)
+                && ref_step != step_id
+            {
+                let key = (ref_step.clone(), step_id.clone(), "ref".to_string());
+                if seen_edges.insert(key) {
+                    edges.push(DagEdge {
+                        from_step: ref_step.clone(),
+                        to_step: step_id.clone(),
+                        kind: "ref".to_string(),
+                    });
                 }
             }
         }

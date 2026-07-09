@@ -174,10 +174,10 @@ fn parse_calibration_for_role(role: &str, fact: &crate::store::Fact) -> Option<S
     let needle = format!("role:{role}=cheapest:");
 
     // Check summary.
-    if let Some(summary) = &fact.summary {
-        if let Some(tier) = extract_tier_from_text(summary, &needle) {
-            return Some(tier);
-        }
+    if let Some(summary) = &fact.summary
+        && let Some(tier) = extract_tier_from_text(summary, &needle)
+    {
+        return Some(tier);
     }
 
     // Check evidence entries.
