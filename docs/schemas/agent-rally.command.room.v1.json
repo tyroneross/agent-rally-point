@@ -17,6 +17,23 @@
           "type": "object",
           "required": ["paths"]
         },
+        "agent_injectability": {
+          "type": "array",
+          "description": "Per-visible-agent live-injection readiness. Presence-only agents are not live-injectable; managed live/unknown sessions are.",
+          "items": {
+            "type": "object",
+            "required": ["tool", "injectable", "status"],
+            "properties": {
+              "tool": { "type": "string" },
+              "injectable": { "type": "boolean" },
+              "status": { "type": "string" },
+              "via": { "type": "string" },
+              "session_id": { "type": "string" },
+              "target": { "type": "string" },
+              "reason": { "type": "string" }
+            }
+          }
+        },
         "room": {
           "type": "object",
           "required": ["active_claims", "active_blockers", "open_handoffs", "current_decisions", "current_risks", "recent_artifacts", "unconsumed_artifacts", "stale_facts", "squads", "lead"],

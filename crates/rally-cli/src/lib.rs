@@ -2243,6 +2243,8 @@ fn command_room(args: RoomArgs) -> Result<Output> {
     let readers = snapshot.readers.clone();
     // Rank-11: surface mission at the top level so agents see it without parsing snapshot.
     let mission = snapshot.mission.clone();
+    let session_views = read_session_views(&room, BackendBins::default()).unwrap_or_default();
+    let agent_injectability = build_agent_injectability(&snapshot, &session_views);
     let body = envelope(
         "room",
         SCHEMA_ROOM,
@@ -2251,6 +2253,7 @@ fn command_room(args: RoomArgs) -> Result<Output> {
             room: snapshot.clone(),
             readers,
             mission,
+            agent_injectability,
         },
     )?;
     let text = format!(
@@ -5466,16 +5469,95 @@ fn active_session_views(room: &RoomStore, bins: BackendBins) -> Result<Vec<(Fact
         .map(|(fact, session)| {
             let (liveness, liveness_source) =
                 projected_session_liveness(&session, &states, &probes);
+            let (injectable, inject_status, inject_via) =
+                managed_session_injectability(&session, liveness);
             (
                 fact,
                 SessionView {
                     session,
                     liveness,
                     liveness_source,
+                    injectable,
+                    inject_status,
+                    inject_via,
                 },
             )
         })
         .collect())
+}
+
+fn managed_session_injectability(
+    session: &ManagedSession,
+    liveness: SessionLiveness,
+) -> (bool, String, String) {
+    let inject_via = if session.daemon_registered {
+        "daemon".to_string()
+    } else {
+        session.backend.clone()
+    };
+    match liveness {
+        SessionLiveness::Live => (true, "live_managed_session".to_string(), inject_via),
+        SessionLiveness::Unknown => (
+            true,
+            "managed_session_liveness_unknown".to_string(),
+            inject_via,
+        ),
+        SessionLiveness::Stale => (false, "stale_managed_session".to_string(), inject_via),
+    }
+}
+
+fn build_agent_injectability(
+    snapshot: &RoomSnapshot,
+    session_views: &[SessionView],
+) -> Vec<AgentInjectability> {
+    snapshot
+        .squads
+        .iter()
+        .map(|squad| {
+            if let Some(view) = best_session_view_for_tool(session_views, &squad.tool) {
+                return AgentInjectability {
+                    tool: squad.tool.clone(),
+                    injectable: view.injectable,
+                    status: view.inject_status.clone(),
+                    via: Some(view.inject_via.clone()),
+                    session_id: Some(view.session.session_id.clone()),
+                    target: Some(view.session.target.clone()),
+                    reason: if view.injectable {
+                        Some("target has an active managed-session record; use `rally inject` with this tool/name/session".to_string())
+                    } else {
+                        Some("managed session is stale; run `rally sessions --reap`, relaunch with `rally run`, or adopt a live pane before injecting".to_string())
+                    },
+                };
+            }
+
+            AgentInjectability {
+                tool: squad.tool.clone(),
+                injectable: false,
+                status: "presence_only_unmanaged".to_string(),
+                via: None,
+                session_id: None,
+                target: None,
+                reason: Some(format!(
+                    "no active managed session for {}; `rally inject` can only queue a ledger wake, not deliver to a live pane. Use `rally run <agent>` or `rally adopt {} --tmux <target>` / `--cmux <target>` for live injection.",
+                    squad.tool, squad.tool
+                )),
+            }
+        })
+        .collect()
+}
+
+fn best_session_view_for_tool<'a>(
+    session_views: &'a [SessionView],
+    tool: &str,
+) -> Option<&'a SessionView> {
+    session_views
+        .iter()
+        .filter(|view| view.session.tool == tool)
+        .min_by_key(|view| match view.liveness {
+            SessionLiveness::Live => 0,
+            SessionLiveness::Unknown => 1,
+            SessionLiveness::Stale => 2,
+        })
 }
 
 fn projected_session_liveness(
@@ -11148,6 +11230,26 @@ struct RoomData {
     /// Omitted from JSON when no mission has been set.
     #[serde(skip_serializing_if = "Option::is_none")]
     mission: Option<String>,
+    /// Per-visible-agent live-injection readiness. This complements
+    /// `room.squads[]`: squads show participation, while this tells callers
+    /// whether `rally inject` can reach a pane or will only queue a ledger wake.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    agent_injectability: Vec<AgentInjectability>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct AgentInjectability {
+    tool: String,
+    injectable: bool,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    via: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 /// Payload for `version`, nested under `data.version`.

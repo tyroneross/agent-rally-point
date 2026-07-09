@@ -2885,6 +2885,17 @@ fn presence_substrate_enter_writes_presence_and_lead() {
         squads_a.iter().any(|s| s["tool"] == "alpha"),
         "squads must contain alpha after enter"
     );
+    let alpha_injectability = room_a["data"]["agent_injectability"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["tool"] == "alpha")
+        .expect("alpha injectability row");
+    assert_eq!(alpha_injectability["injectable"], false);
+    assert_eq!(
+        alpha_injectability["status"], "presence_only_unmanaged",
+        "enter-only agents must not look live-injectable"
+    );
     assert_eq!(
         room_a["data"]["room"]["lead"], "alpha",
         "first entrant is lead"
@@ -4474,6 +4485,25 @@ fn rally_adopt_flips_stray_to_managed_with_cmux() {
         targets.iter().any(|target| target == "workspace:42"),
         "adopted workspace:42 must show in sessions; got: {targets:?}"
     );
+    let adopted_session = sessions["data"]["sessions"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["target"] == "workspace:42")
+        .expect("adopted session row");
+    assert_eq!(adopted_session["injectable"], true);
+    assert_eq!(adopted_session["inject_via"], "cmux");
+
+    let room = workspace.json(&["room", "--json"]);
+    let row = room["data"]["agent_injectability"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["tool"] == "claude_code:42")
+        .expect("claude_code:42 injectability row");
+    assert_eq!(row["injectable"], true);
+    assert_eq!(row["via"], "cmux");
+    assert_eq!(row["target"], "workspace:42");
 
     workspace.cleanup();
 }

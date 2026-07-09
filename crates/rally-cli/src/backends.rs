@@ -117,6 +117,14 @@ pub(crate) struct SessionView {
     pub(crate) session: ManagedSession,
     pub(crate) liveness: SessionLiveness,
     pub(crate) liveness_source: &'static str,
+    /// Whether `rally inject <target>` has a live managed-session transport to
+    /// attempt. `false` means callers should not expect pane delivery.
+    pub(crate) injectable: bool,
+    /// Human/machine-readable summary of why the session is or is not
+    /// injectable.
+    pub(crate) inject_status: String,
+    /// Transport family `rally inject` will use for this managed session.
+    pub(crate) inject_via: String,
 }
 
 #[derive(JsonSchema, Serialize)]

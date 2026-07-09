@@ -30,7 +30,10 @@
                   "cwd",
                   "target",
                   "liveness",
-                  "liveness_source"
+                  "liveness_source",
+                  "injectable",
+                  "inject_status",
+                  "inject_via"
                 ],
                 "properties": {
                   "session_id": { "type": "string" },
@@ -47,6 +50,18 @@
                   },
                   "liveness_source": {
                     "enum": ["heartbeat_ttl", "backend_probe"]
+                  },
+                  "injectable": {
+                    "type": "boolean",
+                    "description": "True when rally inject can attempt a live managed-session transport for this session."
+                  },
+                  "inject_status": {
+                    "type": "string",
+                    "description": "Machine-readable injection readiness reason."
+                  },
+                  "inject_via": {
+                    "type": "string",
+                    "description": "Transport family used by rally inject for this managed session, for example tmux, cmux, or daemon."
                   }
                 }
               }
