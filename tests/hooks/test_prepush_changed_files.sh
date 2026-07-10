@@ -226,6 +226,33 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# (b2) git injects repo-scoping vars (GIT_DIR/GIT_WORK_TREE/…) into a hook's
+# environment; the gate MUST run with them cleared, or every `git` subprocess
+# inside the gate (cargo tests that shell out to git) resolves against the
+# OUTER repo instead of the detached worktree. Regression guard: export
+# GIT_DIR/GIT_WORK_TREE pointing at the fixture (whose HEAD is SHA_HEAD) while
+# pushing the NON-HEAD SHA_BASE. The gate stub records `git rev-parse HEAD`:
+# a hook that leaked GIT_DIR records SHA_HEAD; a correct hook (env cleared)
+# records SHA_BASE. Surfaced on this gate's first real push — 3 rally-cli
+# git-touching tests failed ONLY under the hook env.
+# ---------------------------------------------------------------------------
+T="e2e: hook clears git hook env (GIT_DIR) so the gate runs hermetically"
+: > "$MARKER"
+out=$( cd "$FIXTURE" && printf '%s\n' "refs/heads/main $SHA_BASE refs/heads/main $ZERO" \
+    | env -u RALLY_SKIP_PREPUSH \
+        GIT_DIR="$FIXTURE/.git" GIT_WORK_TREE="$FIXTURE" \
+        RALLY_TEST_MARKER="$MARKER" RALLY_TEST_GATE_EXIT=0 \
+        RALLY_TEST_PARITY_MARKER="$PARITY_MARKER" RALLY_TEST_PARITY_EXIT=0 \
+        sh .githooks/pre-push origin fake-remote-url ) 2>&1
+rc=$?
+recorded="$(cat "$MARKER" 2>/dev/null)"
+if [ "$rc" = "0" ] && [ "$recorded" = "$SHA_BASE" ] && [ "$recorded" != "$SHA_HEAD" ]; then
+  ok "$T"
+else
+  bad "$T" "rc=$rc recorded=[$recorded] (expect $SHA_BASE; recording SHA_HEAD=$SHA_HEAD means GIT_DIR leaked into the gate)"; note "$out"
+fi
+
+# ---------------------------------------------------------------------------
 # (c) a deletion tuple validates nothing / exits 0
 # ---------------------------------------------------------------------------
 T="e2e: deletion tuple validates nothing and exits 0"

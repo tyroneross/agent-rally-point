@@ -65,18 +65,31 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# git injects repo-scoping vars (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, …)
+# into a hook's environment. Those leak into EVERY `git` subprocess the gate
+# spawns: cargo tests that shell out to git (e.g. `git worktree add`,
+# `git commit` in temp fixtures) would resolve against the REAL repo instead
+# of their own isolated fixtures, and run-quality-gate.sh's own
+# `git rev-parse --show-toplevel` could resolve the wrong tree. Strip the
+# repo-scoping vars for the gate subshells so the gate runs hermetically
+# against the detached worktree it cd'd into. Identity/config vars
+# (GIT_AUTHOR_*, GIT_COMMITTER_*, GIT_CONFIG_*) are deliberately left intact.
+git_scope_vars='GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_COMMON_DIR GIT_QUARANTINE_PATH GIT_INTERNAL_GITDIR_HOOK_PATH GIT_REFLOG_ACTION'
+
 while IFS= read -r sha; do
   [ -n "$sha" ] || continue
   wt="$worktree_base/$sha"
   echo "pre-push: $sha — creating clean detached worktree…" >&2
   git worktree add --detach "$wt" "$sha" >/dev/null
   echo "pre-push: $sha — running quality gate (scripts/run-quality-gate.sh)…" >&2
-  ( cd "$wt" && ./scripts/run-quality-gate.sh )
+  # shellcheck disable=SC2086 # intentional word-split: unset each var name
+  ( cd "$wt" && unset $git_scope_vars && ./scripts/run-quality-gate.sh )
   echo "pre-push: $sha — running release parity (scripts/check-release-parity.sh)…" >&2
   # f2: parity uses RALLY_CODEX_DEST (SEC-003) to regenerate the Codex
   # artifact into a scratch dir, so this never mutates the detached
   # worktree it runs in.
-  ( cd "$wt" && ./scripts/check-release-parity.sh )
+  # shellcheck disable=SC2086
+  ( cd "$wt" && unset $git_scope_vars && ./scripts/check-release-parity.sh )
   echo "pre-push: $sha ✅ gate + parity passed" >&2
 done < "$sha_file"
 
