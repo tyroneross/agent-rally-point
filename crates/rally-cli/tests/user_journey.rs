@@ -1394,6 +1394,15 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     assert_eq!(inject["schema"], "agent-rally.command.inject.v1");
     assert_matches_schema("agent-rally.command.inject.v1.json", &inject);
     assert_eq!(inject["data"]["inject"]["session"]["name"], "reviewer-01");
+    // The pre-wait injectability diagnosis is a ledger_agent-path field:
+    // managed sessions reaching the inject arm are Live/Unknown by
+    // construction, so the key must be ABSENT (serde skip), not null.
+    assert!(
+        inject["data"]["inject"]
+            .get("target_injectability")
+            .is_none(),
+        "target_injectability must be omitted on the managed_session path",
+    );
     // tmux inject is now TWO commands: a C-u clear, then a SINGLE atomic
     // bracketed-paste-framed `send-keys -H <hex…>` write whose trailing CR
     // submits (ptyd frame_line port — replaces the old 4-command set-buffer /

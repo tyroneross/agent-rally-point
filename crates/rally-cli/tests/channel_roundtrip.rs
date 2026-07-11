@@ -287,6 +287,19 @@ fn inject_to_unregistered_valid_agent_id_writes_ledger_directive() {
         outcome.raw["session"].is_null(),
         "session must be null when there is no ManagedSession backing the target",
     );
+    // RCA 2026-07-09 follow-up: the ledger arm surfaces the pre-wait
+    // injectability diagnosis at t=0 so callers don't reconstruct it
+    // post-timeout from scattered fields.
+    assert_eq!(
+        outcome.raw["target_injectability"]["injectable"].as_bool(),
+        Some(false),
+        "ledger-agent target must report injectable=false (no live pane rally can see)",
+    );
+    assert_eq!(
+        outcome.raw["target_injectability"]["status"].as_str(),
+        Some("presence_only_unmanaged"),
+        "status must reuse the room agent_injectability vocabulary",
+    );
 
     // Reader-side proof: the Directive is on disk under the agent's inbox,
     // not under any session.tool name.
@@ -334,6 +347,59 @@ fn inject_ledger_only_does_not_double_deliver_via_backend() {
         commands.is_empty(),
         "ledger-only inject must have an empty commands plan (no backend to \
          build keystrokes for); got {commands:?}",
+    );
+}
+
+/// RCA 2026-07-09: `inject --require-ack` against a presence-only agent used
+/// to block the full timeout and report the cause only via scattered
+/// post-hoc fields. The WARN-and-wait fix keeps the wait (a polling agent or
+/// rally-termd-registered pane can still resolve — an async producer exists)
+/// but surfaces the diagnosis at t=0 in `target_injectability` and stamps
+/// `pre_diagnosis` into the timeout fallback plan. This test drives the full
+/// timeout path: 1s wait, no resolver → `ack_state: timeout` with the cause
+/// pre-diagnosed, NOT an error and NOT a short-circuit.
+#[test]
+fn inject_ledger_ack_timeout_carries_pre_wait_injectability_diagnosis() {
+    let sandbox = ChannelSandbox::spawn();
+    let agent = "presence-only-agent";
+
+    let envelope = sandbox.rally_json(&[
+        "inject",
+        agent,
+        "--json",
+        "--handoff",
+        "handoff-rca-followup",
+        "--require-ack",
+        "--timeout-seconds",
+        "1",
+        "--tool",
+        "claude_code:test-sender",
+    ]);
+    let inject = envelope
+        .pointer("/data/inject")
+        .unwrap_or_else(|| panic!("envelope has no /data/inject: {envelope}"));
+
+    // The wait ran and timed out — it was NOT short-circuited into an error
+    // or a fabricated ack.
+    assert_eq!(
+        inject["ack_state"].as_str(),
+        Some("timeout"),
+        "no resolver exists, so the (kept) wait must time out; inject={inject}",
+    );
+    // The t=0 diagnosis is in the envelope...
+    assert_eq!(
+        inject["target_injectability"]["status"].as_str(),
+        Some("presence_only_unmanaged"),
+        "pre-wait diagnosis must be surfaced on the ack-timeout path; inject={inject}",
+    );
+    // ...and the timeout fallback plan carries the pre-diagnosed CAUSE, not
+    // just the symptom.
+    let pre_diagnosis = inject["fallback_plan"]["pre_diagnosis"]
+        .as_str()
+        .unwrap_or_else(|| panic!("fallback_plan must carry pre_diagnosis: {inject}"));
+    assert!(
+        pre_diagnosis.contains("presence-only"),
+        "pre_diagnosis must name the t=0 cause; got {pre_diagnosis}",
     );
 }
 
