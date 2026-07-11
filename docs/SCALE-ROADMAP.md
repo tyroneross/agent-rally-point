@@ -37,10 +37,20 @@ a flock `mutation.lock` serializes writers.
   all rows in Rust. Correctness-sensitive (drives coordination decisions) → own build-loop, TDD + audit.
 - **P2 — Rotation + compaction.** Auto size-trigger rotation of the active segment, AND checkpoint rotated
   archive into `facts.db` so it is no longer re-replayed — bounds the hot set as total history grows.
-- **P3 — `rallyd` single-writer daemon** (the N=1000+ ceiling-raiser). Unix-socket daemon owns one warm
-  SQLite connection + in-memory projection; CLIs become thin clients. Eliminates per-process cold opens
-  and flock thundering. Architectural — design forks (lifecycle, socket location, daemon-down fallback,
-  auth) need an explicit decision before build. `cockpitd` is a structural template.
+- **P3 — `rallyd` single-writer daemon** ✅ SHIPPED (2026-07-11). A per-repo Unix-socket daemon owns one
+  warm SQLite pool + in-memory projection; `rally` commands become thin clients (`rally daemon
+  start|stop|status|serve`) that route over the socket when a daemon is live and **fail open** to today's
+  direct path when not (no-daemon behavior byte-identical). A kernel SH/EX flock handover on
+  `.rally/rallyd.owner.lock` guarantees exactly one writer (the daemon holds `LOCK_EX` for its lifetime;
+  direct clients hold `LOCK_SH` for their process lifetime), so multi-process `facts.db` access — the
+  measured root cause of the concurrency flake (issue #50: `SQLITE_IOERR_SHORT_READ` 17–33% + one
+  `SQLITE_CORRUPT` under 8-way bootstrap contention) — is **structurally dissolved** whenever a daemon
+  serves. Design forks resolved: explicit lifecycle (no auto-spawn), per-repo `.rally/rallyd.sock` (0600,
+  `$TMPDIR` fallback past the `sun_path` limit) discovered via a `.addr` pointer, and same-user 0600
+  socket auth. Acceptance: 30-round docker hammers (rust:1.95) of both #50 tests go **0/30 with the
+  daemon serving**. The N=1000 flock-thundering ceiling on the *no-daemon* path remains (a daemon-served
+  fleet raises it); the architecture does not preclude splitting the single dispatcher for read
+  parallelism later.
 
 Benchmarks: `scripts/scale_reliability_test.sh` (concurrency + `SILENT_LOSS`); latency-vs-ledger curve
 seeds with `rally say artifact` (a persisting kind — `say note` is non-persisting and must not be used

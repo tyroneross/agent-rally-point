@@ -212,8 +212,10 @@ surface.
 .rally/ledger.jsonl             legacy monolith — migrated into log/ on first open (R1)
 .rally/archive/                 rotated old segments, still replayable (R7)
 .rally/manifest.json            self-describing pointers (R4; committed)
-.rally/facts.db                 derived sqlite cache — rebuilt by replay (gitignored)
+.rally/facts.db                 derived sqlite cache — rebuilt by replay (gitignored; owned by rallyd when the daemon runs)
 .rally/cursors.json             per-tool read cursors
+.rally/rallyd.sock              rallyd's Unix socket when the daemon runs (gitignored)
+.rally/rallyd.owner.lock        kernel file lock guarding the daemon/direct-writer handover (gitignored)
 ```
 
 Linked git worktrees resolve this room from the shared git common dir, so the
@@ -222,6 +224,33 @@ main checkout and its worktrees coordinate through one `.rally/` store. The
 committed, durable across clone/machine. `facts.db` is a pure cache that
 `rally` rebuilds from the ledger on first open. Managed session lifecycle
 facts ride the same ledger.
+
+## Single-Writer Daemon (rallyd, optional)
+
+`rallyd` is a per-repo daemon that owns `.rally/facts.db` so exactly one process
+ever touches it. When it runs, every `rally` command routes its store reads and
+writes over a Unix socket (`.rally/rallyd.sock`) instead of opening the SQLite
+cache directly. This removes the multi-process contention that made many
+concurrent CLIs flaky under load — the cache is opened once, by one writer.
+
+It is **opt-in and fail-open.** With no daemon running, every command behaves
+exactly as before (each process opens the cache directly). Start it when a repo
+has many concurrent agents; skip it otherwise.
+
+```bash
+rally daemon start    # spawn the daemon (detached; returns once it is serving)
+rally daemon status   # is it live? pid, socket, wire version
+rally daemon stop     # graceful shutdown (SIGTERM); the cache stays intact
+rally daemon serve    # run in the foreground (what `start` launches)
+```
+
+The daemon records, serves, and derives only — it never decides, schedules, or
+runs work (charter: facilitator, never executor). The JSONL ledger under
+`.rally/log/` stays canonical; `facts.db` stays a disposable cache the daemon
+rebuilds from the ledger. A client never writes the cache directly while the
+daemon holds it, and the daemon never starts while a direct writer is mid-write —
+a kernel file lock (`.rally/rallyd.owner.lock`) enforces the handover, so there
+is never more than one writer.
 
 ## Install
 
