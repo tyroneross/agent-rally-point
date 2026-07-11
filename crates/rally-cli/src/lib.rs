@@ -5109,6 +5109,11 @@ fn command_inject_managed(
         delivery_path,
         daemon_receipt_state,
         daemon_delivery_error,
+        // Managed sessions reaching this arm are Live/Unknown by construction
+        // (stale/gone targets are rejected in `resolve_inject_target`), and
+        // their delivery truth is synchronous (`delivered`/`delivery_state`) —
+        // there is no pre-wait diagnosis to surface.
+        target_injectability: None,
     };
     let has_ack = ack.is_some();
     let body = envelope(
@@ -5216,6 +5221,30 @@ fn command_inject_ledger(
         dry_run,
         delivery_state,
     )?;
+    // RCA 2026-07-09 follow-up: a LedgerAgent target by definition has no
+    // ACTIVE managed session (`resolve_inject_target` arm 2), so pane delivery
+    // — and any synchronous ACK it would produce — depends on an external
+    // rally-termd registration Rally cannot observe from here. Diagnose that
+    // BEFORE the wait (stderr for humans, `target_injectability` in the
+    // envelope for tools) instead of leaving callers to reconstruct it
+    // post-timeout from scattered fields (`target_kind` + `delivered` +
+    // `delivery_state` + `fallback_plan`). ADVISORY ONLY — the wait below is
+    // deliberately NOT short-circuited: a rally-termd-registered pane still
+    // delivers (and posts a Receipt that `wait_for_resolution` accepts), and a
+    // presence-only agent can post a Resolve when it next polls `rally next`.
+    let target_injectability = TargetInjectability {
+        injectable: false,
+        status: "presence_only_unmanaged".to_string(),
+        via: None,
+        reason: Some(format!(
+            "no active managed session for {agent_id}; delivery is ledger-queued (a rally-termd-registered pane may still deliver). For guaranteed live injection: `rally run <agent>` or `rally adopt {agent_id} --tmux <target>`."
+        )),
+    };
+    if effective_require_ack && !dry_run {
+        eprintln!(
+            "rally: inject target {agent_id} is not synchronously injectable (presence-only; no active managed session). Waiting up to {timeout}s for an async ACK anyway — a polling agent or a rally-termd-registered pane can still resolve. Size any outer timeout accordingly."
+        );
+    }
     let ack = if effective_require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
         let ack_room = room.as_ref().expect("room must be open for --require-ack");
@@ -5248,6 +5277,19 @@ fn command_inject_ledger(
         } else {
             Some(ledger_async_fallback_plan(&agent_id))
         }
+    })
+    // Stamp the pre-wait diagnosis into whichever fallback plan fired, so a
+    // timeout report carries the cause known at t=0, not just the symptom.
+    .map(|mut plan| {
+        if let Some(obj) = plan.as_object_mut() {
+            obj.insert(
+                "pre_diagnosis".to_string(),
+                json!(
+                    "target was presence-only at inject time (no active managed session); a synchronous pane ACK had no guaranteed producer"
+                ),
+            );
+        }
+        plan
     });
     let inject_payload = InjectData {
         mode: if dry_run { "dry-run" } else { "inject" },
@@ -5279,6 +5321,7 @@ fn command_inject_ledger(
         // external rally-termd owns delivery + posts its own Receipt).
         daemon_receipt_state: None,
         daemon_delivery_error: None,
+        target_injectability: Some(target_injectability),
     };
     let has_ack = ack.is_some();
     let agent_for_text = agent_id;

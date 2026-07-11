@@ -46,6 +46,31 @@ Rally now surfaces injection readiness directly:
 This makes the pre-inject check deterministic: if the row is not injectable,
 callers should not expect synchronous pane delivery or a quick ACK.
 
+## Fix, part 2 — inject consumes the signal (WARN-and-wait)
+
+The part-1 fields were display-only: a caller who did not voluntarily
+pre-check `room --json` hit the identical full-timeout hang. `rally inject`
+now consumes its own signal on the `ledger_agent` arm:
+
+- **At wait start (t=0):** a stderr warning names the condition
+  ("presence-only; no active managed session — waiting anyway") and the
+  envelope carries a `target_injectability` object (same status vocabulary as
+  `agent_injectability[]`).
+- **On timeout:** the `fallback_plan` is stamped with `pre_diagnosis`, so the
+  report carries the cause known at t=0, not just the symptom.
+- **The wait is deliberately NOT short-circuited.** "Not injectable" means no
+  *synchronous* ACK producer — a rally-termd-registered pane still delivers
+  (and posts a Receipt that `wait_for_resolution` accepts), and a
+  presence-only agent can post a Resolve when it next polls `rally next`.
+  Fast-fail would discard those winnable ACKs and break ledger-only handoffs
+  to polling agents; fast-return would assert a falsehood ("no producer").
+  Advisory surfacing + the kept wait preserves the WARN-not-block posture
+  (NORTH_STAR invariants 3–4).
+
+The managed arm needs no diagnosis: stale/gone sessions are rejected loudly at
+`resolve_inject_target`, so sessions reaching that arm are Live/Unknown and
+their delivery truth is already synchronous (`delivered`/`delivery_state`).
+
 ## Operator Guidance
 
 Before urgent or ACK-required injection:

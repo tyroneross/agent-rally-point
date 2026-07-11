@@ -179,6 +179,26 @@ pub(crate) struct AdoptEnvelope {
     pub(crate) adopt: AdoptData,
 }
 
+/// Pre-wait injectability diagnosis for an inject target (RCA 2026-07-09
+/// follow-up). Resolved ONCE at inject time — using the same status vocabulary
+/// as `rally room --json`'s `agent_injectability[]` — so a caller learns at
+/// t=0, not after the ACK timeout, whether a synchronous pane ACK has a live
+/// producer. ADVISORY ONLY: the ACK wait always runs regardless, because a
+/// rally-termd-registered pane still delivers (and posts a Receipt) without a
+/// `ManagedSession` record, and a presence-only agent can post a Resolve when
+/// it next polls `rally next`.
+#[derive(JsonSchema, Serialize)]
+pub(crate) struct TargetInjectability {
+    pub(crate) injectable: bool,
+    /// Same status vocabulary as `agent_injectability[]`
+    /// (e.g. `presence_only_unmanaged`).
+    pub(crate) status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) via: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+}
+
 #[derive(JsonSchema, Serialize)]
 pub(crate) struct InjectData {
     pub(crate) mode: &'static str,
@@ -263,6 +283,15 @@ pub(crate) struct InjectData {
     /// the CLI does NOT fall back to tmux keystrokes for a ptyd pane.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) daemon_delivery_error: Option<String>,
+    /// Pre-wait injectability diagnosis (see [`TargetInjectability`]).
+    /// Populated on the `ledger_agent` path, where delivery is asynchronous
+    /// and the caller would otherwise learn the target had no live pane only
+    /// after the ACK timeout. Omitted on the `managed_session` path: sessions
+    /// reaching that arm are Live/Unknown by construction (stale/gone targets
+    /// are rejected in `resolve_inject_target`) and their delivery truth is
+    /// already synchronous (`delivered`/`delivery_state`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) target_injectability: Option<TargetInjectability>,
 }
 
 /// Envelope for `inject`: result under `data.inject`.

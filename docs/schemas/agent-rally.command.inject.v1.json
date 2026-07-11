@@ -57,7 +57,18 @@
             "delivered": { "type": "boolean" },
             "delivery_state": { "type": "string" },
             "directive_seq": { "type": ["integer", "null"] },
-            "directive_to": { "type": ["string", "null"] }
+            "directive_to": { "type": ["string", "null"] },
+            "target_injectability": {
+              "description": "Pre-wait injectability diagnosis, resolved at inject time (RCA 2026-07-09). Present on the ledger_agent path; omitted for managed sessions. Advisory only - the ACK wait is never short-circuited.",
+              "type": "object",
+              "required": ["injectable", "status"],
+              "properties": {
+                "injectable": { "type": "boolean" },
+                "status": { "type": "string" },
+                "via": { "type": "string" },
+                "reason": { "type": "string" }
+              }
+            }
           }
         }
       }
