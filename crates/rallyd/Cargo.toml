@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "rallyd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Per-repo single-writer daemon that owns .rally/ facts.db (BACKLOG S-P3). Thin bin over rally_cli::rallyd_core::serve."
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "rallyd"
+path = "src/main.rs"
+
+# ADR-03 / Q-criteria: the thin bin depends on rally-cli ONLY (no tokio/axum;
+# the daemon core lives in rally-cli::rallyd_core). Keep this list at one entry.
+[dependencies]
+rally-cli = { path = "../rally-cli" }

@@ -52,6 +52,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod ledger;
+pub mod store_wire;
 
 // ---------------------------------------------------------------------------
 // Directive — rally writes; daemon (or self-acking agent) reads.

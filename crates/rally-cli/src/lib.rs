@@ -71,6 +71,7 @@ mod init;
 mod liveness;
 mod next;
 mod output;
+pub mod rallyd_core;
 mod reaper;
 mod resource_scope;
 mod retrospective;

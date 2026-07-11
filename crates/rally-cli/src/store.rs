@@ -62,13 +62,27 @@ const ROOM_MUTATION_LOCK_FILENAME: &str = "mutation.lock";
 
 #[cfg(unix)]
 mod unix_lock {
+    /// Shared (read) advisory lock — many holders coexist. Used by direct
+    /// facts.db openers on the ownership lock (ADR-01, L1).
+    pub(crate) const LOCK_SH: i32 = 1;
     pub(crate) const LOCK_EX: i32 = 2;
+    /// Non-blocking modifier: `flock` returns `EWOULDBLOCK` instead of blocking
+    /// when the lock is contended. OR'd with `LOCK_SH` for the router's
+    /// non-blocking SH try (ADR-01).
+    pub(crate) const LOCK_NB: i32 = 4;
     pub(crate) const LOCK_UN: i32 = 8;
 
     unsafe extern "C" {
         pub(crate) fn flock(fd: i32, operation: i32) -> i32;
     }
 }
+
+/// Ownership lock coordinating the daemon (LOCK_EX for its serving lifetime)
+/// against direct facts.db openers (LOCK_SH for their process lifetime) —
+/// ADR-01 / L1. DISTINCT from [`ROOM_MUTATION_LOCK_FILENAME`]: the mutation
+/// lock serialises appends within the direct path; the owner lock decides
+/// whether ANY process may open facts.db directly at all.
+pub(crate) const RALLYD_OWNER_LOCK_FILENAME: &str = "rallyd.owner.lock";
 
 use crate::backends::ManagedSession;
 use crate::cli::RoomArgs;
@@ -644,8 +658,92 @@ impl From<&RoomSnapshot> for RoomSummary {
     }
 }
 
-pub(crate) struct RoomStore {
+/// The per-repo room store as seen by all 214 call sites — a two-variant
+/// dispatcher (L2/ADR-01). `Direct` is today's in-process facts.db store;
+/// `Routed` speaks to a live daemon over the wire. The four `open*`
+/// constructors are the ROUTING SEAM: they probe for a live daemon and return
+/// the appropriate variant.
+///
+/// **Chunk A:** the router ALWAYS returns `Direct` and every `Routed` dispatch
+/// arm is a stub (a retryable error, or `unreachable!` for the borrow-returning
+/// local accessors, since `Routed` is never constructed here). Chunk C replaces
+/// both the router probe (in the `open*` bodies) and the `Routed` arms.
+///
+/// ## Method classification (the frozen contract's core — Work item 1)
+///
+/// Every `pub(crate)` instance method is `routed` (touches `facts.db` via a
+/// factstr pool → served by the daemon) or `local` (pure accessor / a
+/// `cursors.json` file op → answered by the routed client itself, no wire hop,
+/// NOT part of the #50 surface). ROUTED methods each have a `store_wire::StoreOp`
+/// variant; LOCAL methods do NOT.
+///
+/// ```text
+/// ROUTED (→ StoreOp variant, served by the daemon):
+///   append_fact                          → AppendFact
+///   append_fact_verified                 → AppendFactVerified
+///   append_state_transition_verified     → AppendStateTransitionVerified
+///   append_session_fact_if_context       → AppendSessionFactIfContext
+///   facts                                → Facts
+///   rebuild_claim_index                  → RebuildClaimIndex
+///   renew_claim_lease                    → RenewClaimLease
+///   expire_claim_leases_at               → ExpireClaimLeasesAt
+///   session_facts_with_context_version   → SessionFactsWithContextVersion
+///   snapshot / snapshot_with_archived    → SnapshotWithArchived
+///   snapshot_with_readers_archived       → SnapshotWithReadersArchived
+///   last_checkpoint_seq                  → LastCheckpointSeq
+///   maybe_append_read_checkpoint         → MaybeAppendReadCheckpoint
+///   project_read_receipts                → ProjectReadReceipts
+///
+/// LOCAL (answered on the routed client's own state — NO StoreOp variant):
+///   active_engagement, room_id           (return &self.active_engagement)
+///   active_segment_path                  (derived from log_dir + engagement)
+///   repo_root                            (return &self.repo_root)
+///   claim_index_path        [cfg(test)]  (return &self.claim_index_path)
+///   set_active_engagement_for_test [test]
+///   cursor_for, set_cursor               (cursors.json file ops — not #50)
+/// ```
+///
+/// NOTE (classification correction, flagged to B/C): the plan text listed
+/// `room_id` as `routed`, but its body is `&self.active_engagement` — a pure
+/// local accessor. It is classified LOCAL here on the evidence of the code.
+// The `Direct` variant is large (holds a factstr pool + several PathBufs) and
+// is the OVERWHELMINGLY common, hot-path case (every direct CLI op). Boxing it
+// to satisfy `large_enum_variant` would add a pointless heap allocation on the
+// hot path the release profile is tuned to keep fast, to save memory only in
+// the rare, short-lived `Routed` case. Allow the lint deliberately.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum RoomStore {
+    /// Today's in-process store: opens facts.db under an owner SH lock.
+    Direct(DirectRoomStore),
+    /// Daemon-routed store (Chunk C). Never constructed in Chunk A (the router
+    /// is hard-wired to `Direct`); Chunk C's router probe constructs it.
+    #[allow(dead_code)]
+    Routed(RoutedRoomStore),
+}
+
+/// Placeholder for the daemon-routed store. Chunk C replaces this with the real
+/// client in `store_client.rs` (a `round_trip` mirror of `daemon_client.rs`),
+/// which holds NO facts.db handle (G3) and answers LOCAL methods from its own
+/// fields. Never constructed in Chunk A — the router is hard-wired to `Direct`
+/// and every `Routed` dispatch arm is a stub.
+#[allow(dead_code)]
+pub(crate) struct RoutedRoomStore {
+    _private: (),
+}
+
+/// Today's in-process room store (was `RoomStore` before the router split).
+/// The `Direct` variant of [`RoomStore`]. In direct-CLI mode `warm_fact_store`
+/// is always `None`, so every hot interior open goes through
+/// [`DirectRoomStore::fact_store_handle`]'s cold branch = today's per-op open,
+/// byte-identical to main (G1). Chunk B installs a warm pool for daemon mode.
+pub(crate) struct DirectRoomStore {
     fact_store: SqliteStore,
+    /// Daemon-mode warm facts.db pool (L11/R1/G10). `Some` ⇒ the hot interior
+    /// opens reuse this ONE pool instead of churning a pool per op (which
+    /// factstr-sqlite 0.5.2's un-closed-on-Drop background checkpoint would race
+    /// in-process, re-creating #50 inside the daemon). `None` in direct-CLI mode
+    /// ⇒ per-op opens, byte-identical to main. Installed by Chunk B at startup.
+    warm_fact_store: Option<SqliteStore>,
     cursor_path: PathBuf,
     repo_root: PathBuf,
     facts_db_path: PathBuf,
@@ -658,8 +756,30 @@ pub(crate) struct RoomStore {
     archive_dir: PathBuf,
     /// Engagement label stamped into every segment append. Resolved once at
     /// open via [`resolve_active_engagement`] (env var → on-disk file → UTC
-    /// date). Empty string is never produced.
+    /// date). Empty string is never produced. Rebindable per-request in daemon
+    /// mode via [`DirectRoomStore::set_engagement_scope`] (L9/R4).
     active_engagement: String,
+}
+
+/// Handle returned by [`DirectRoomStore::fact_store_handle`]: either the warm
+/// daemon pool (borrowed, reused across ops) or a freshly-opened per-op pool
+/// (owned — today's direct-mode behavior). Derefs to `SqliteStore` so call
+/// sites use it exactly as they used the old `let fact_store = open_…()?;`.
+enum FactStoreHandle<'a> {
+    /// Borrowed warm pool (daemon mode, `warm_fact_store` is `Some`).
+    Warm(&'a SqliteStore),
+    /// Freshly-opened pool (direct mode, `warm_fact_store` is `None`).
+    Fresh(SqliteStore),
+}
+
+impl std::ops::Deref for FactStoreHandle<'_> {
+    type Target = SqliteStore;
+    fn deref(&self) -> &SqliteStore {
+        match self {
+            FactStoreHandle::Warm(store) => store,
+            FactStoreHandle::Fresh(store) => store,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -704,6 +824,113 @@ impl Drop for RoomMutationLock {
     }
 }
 
+/// RAII guard for the ownership lock (`.rally/rallyd.owner.lock`), ADR-01/L1.
+/// Holds a `flock` (SH for direct openers, EX for the daemon) for as long as
+/// the guard lives; the kernel also releases it on any process death (crash
+/// safety — the reason a marker/pid file was rejected). The DIRECT router holds
+/// its SH guard in a process-global for the process lifetime (G7): dropping it
+/// early would reopen the factstr background-close race window.
+///
+/// Reuses the same hand-declared `extern "C"` flock pattern as
+/// [`RoomMutationLock`] (no `nix` crate). Constructed by Chunk C's router (SH)
+/// and Chunk B's daemon startup (EX); dormant in Chunk A.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) struct OwnerGuard {
+    file: fs::File,
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub(crate) struct OwnerGuard;
+
+#[cfg(unix)]
+impl Drop for OwnerGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { unix_lock::flock(self.file.as_raw_fd(), unix_lock::LOCK_UN) };
+    }
+}
+
+/// Open (creating if absent) the ownership lock file at `rally_dir`.
+#[cfg(unix)]
+fn open_owner_lock_file(rally_dir: &Path) -> Result<fs::File> {
+    fs::create_dir_all(rally_dir)
+        .map_err(RallyError::io(format!("create {}", rally_dir.display())))?;
+    let path = rally_dir.join(RALLYD_OWNER_LOCK_FILENAME);
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(RallyError::io(format!("open {}", path.display())))
+}
+
+/// Try to acquire the ownership lock SHARED, non-blocking (ADR-01 direct-open
+/// branch). `Ok(Some(guard))` ⇒ provably no daemon holds EX ⇒ the caller may
+/// open facts.db directly (and MUST hold the guard for its process lifetime,
+/// G7). `Ok(None)` ⇒ a daemon holds EX (the SH try would block) ⇒ the caller
+/// must route, never open directly. `Err` ⇒ a real I/O failure on the lock
+/// file. Dormant in Chunk A; Chunk C's router calls it.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) fn acquire_owner_shared_nb(rally_dir: &Path) -> Result<Option<OwnerGuard>> {
+    let file = open_owner_lock_file(rally_dir)?;
+    let rc = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_SH | unix_lock::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(OwnerGuard { file }));
+    }
+    let err = io::Error::last_os_error();
+    // EWOULDBLOCK/EAGAIN ⇒ the EX daemon holds it — "refused", not an error.
+    if err.kind() == io::ErrorKind::WouldBlock {
+        return Ok(None);
+    }
+    Err(RallyError::Io {
+        context: format!(
+            "lock-sh {}",
+            rally_dir.join(RALLYD_OWNER_LOCK_FILENAME).display()
+        ),
+        source: err,
+    })
+}
+
+/// Acquire the ownership lock EXCLUSIVE, BLOCKING (ADR-01 daemon startup). Held
+/// for the daemon's entire serving lifetime; blocks until every in-flight
+/// direct SH holder has exited (the "waiting for direct writers to drain"
+/// window B logs). Dormant in Chunk A; Chunk B's `serve` calls it.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) fn acquire_owner_exclusive_blocking(rally_dir: &Path) -> Result<OwnerGuard> {
+    let file = open_owner_lock_file(rally_dir)?;
+    let rc = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX) };
+    if rc != 0 {
+        return Err(RallyError::Io {
+            context: format!(
+                "lock-ex {}",
+                rally_dir.join(RALLYD_OWNER_LOCK_FILENAME).display()
+            ),
+            source: io::Error::last_os_error(),
+        });
+    }
+    Ok(OwnerGuard { file })
+}
+
+/// Non-unix no-op mirror: no flock, so the owner lock is a no-op and the direct
+/// path is always taken (mirrors [`acquire_room_mutation_lock`]'s
+/// `#[cfg(not(unix))]` stub). rallyd is a unix-only daemon; on non-unix the CLI
+/// behaves exactly as today (no daemon, direct only).
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub(crate) fn acquire_owner_shared_nb(_rally_dir: &Path) -> Result<Option<OwnerGuard>> {
+    Ok(Some(OwnerGuard))
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub(crate) fn acquire_owner_exclusive_blocking(_rally_dir: &Path) -> Result<OwnerGuard> {
+    Ok(OwnerGuard)
+}
+
 /// One line of a segment file.
 ///
 /// Compact on purpose: one event, its assigned `seq` (factstr's monotonic
@@ -738,9 +965,263 @@ struct SegmentIndexEntry {
     last_ts: Option<String>,
 }
 
+/// The routing seam (L2/ADR-01). These are the ONLY entry points the 214 call
+/// sites use; the old public names (`open`, `open_at`, `open_at_with_engagement`,
+/// `open_existing_at`) survive here as the router constructors so every caller
+/// compiles unchanged.
+///
+/// **Chunk A:** the router ALWAYS returns `Direct` — no socket probe, no owner
+/// lock. Chunk C replaces these bodies with the ADR-01 choreography (probe →
+/// SH try → bounded-block corridor) and the `Routed` dispatch arms below.
 impl RoomStore {
+    /// Router entry (was `RoomStore::open`). Resolves the repo root, then routes.
     pub(crate) fn open() -> Result<Self> {
         Self::open_at(repo_root()?)
+    }
+
+    /// Router entry (was `RoomStore::open_at`). Chunk A: always `Direct`.
+    pub(crate) fn open_at(root: PathBuf) -> Result<Self> {
+        Ok(RoomStore::Direct(DirectRoomStore::open_direct_at(root)?))
+    }
+
+    /// Router entry (was `RoomStore::open_at_with_engagement`). Chunk A: `Direct`.
+    // Only reached from tests in Chunk A (production opens via `open`/`open_at`);
+    // part of the frozen router surface B/C build against.
+    #[allow(dead_code)]
+    pub(crate) fn open_at_with_engagement(
+        root: PathBuf,
+        engagement: Option<String>,
+    ) -> Result<Self> {
+        Ok(RoomStore::Direct(
+            DirectRoomStore::open_direct_at_with_engagement(root, engagement)?,
+        ))
+    }
+
+    /// Router entry (was `RoomStore::open_existing_at`). Chunk A: `Direct`.
+    pub(crate) fn open_existing_at(root: PathBuf) -> Result<Option<Self>> {
+        Ok(DirectRoomStore::open_direct_existing_at(root)?.map(RoomStore::Direct))
+    }
+
+    // ----- dispatch: ROUTED methods (Chunk A Routed arm = retryable error) ----
+
+    pub(crate) fn append_fact(&self, fact: &Fact) -> Result<Fact> {
+        match self {
+            RoomStore::Direct(d) => d.append_fact(fact),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<Fact> {
+        match self {
+            RoomStore::Direct(d) => d.append_fact_verified(fact),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<Fact> {
+        match self {
+            RoomStore::Direct(d) => d.append_state_transition_verified(fact),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    pub(crate) fn append_session_fact_if_context(
+        &self,
+        fact: &Fact,
+        expected_context_version: Option<u64>,
+    ) -> Result<Option<Fact>> {
+        match self {
+            RoomStore::Direct(d) => {
+                d.append_session_fact_if_context(fact, expected_context_version)
+            }
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    pub(crate) fn facts(&self) -> Result<Vec<Fact>> {
+        match self {
+            RoomStore::Direct(d) => d.facts(),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn rebuild_claim_index(&self) -> Result<()> {
+        match self {
+            RoomStore::Direct(d) => d.rebuild_claim_index(),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn renew_claim_lease(
+        &self,
+        claim_id: &str,
+        lease_expires_at: String,
+    ) -> Result<Option<claim_authority::ActiveClaimRecord>> {
+        match self {
+            RoomStore::Direct(d) => d.renew_claim_lease(claim_id, lease_expires_at),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn expire_claim_leases_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<Fact>> {
+        match self {
+            RoomStore::Direct(d) => d.expire_claim_leases_at(now),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    pub(crate) fn session_facts_with_context_version(&self) -> Result<(Vec<Fact>, Option<u64>)> {
+        match self {
+            RoomStore::Direct(d) => d.session_facts_with_context_version(),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<RoomSnapshot> {
+        match self {
+            RoomStore::Direct(d) => d.snapshot(),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    pub(crate) fn snapshot_with_archived(&self, include_archived: bool) -> Result<RoomSnapshot> {
+        match self {
+            RoomStore::Direct(d) => d.snapshot_with_archived(include_archived),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    pub(crate) fn snapshot_with_readers_archived(
+        &self,
+        include_archived: bool,
+    ) -> Result<RoomSnapshot> {
+        match self {
+            RoomStore::Direct(d) => d.snapshot_with_readers_archived(include_archived),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    // Reached only from tests in Chunk A (production callers invoke the
+    // DirectRoomStore method internally); frozen router surface for B/C.
+    #[allow(dead_code)]
+    pub(crate) fn last_checkpoint_seq(&self, tool: &str) -> Result<i64> {
+        match self {
+            RoomStore::Direct(d) => d.last_checkpoint_seq(tool),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    pub(crate) fn maybe_append_read_checkpoint(
+        &self,
+        tool: &str,
+        read_seq: i64,
+    ) -> Result<Option<Fact>> {
+        match self {
+            RoomStore::Direct(d) => d.maybe_append_read_checkpoint(tool, read_seq),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn project_read_receipts(&self, max_seq: i64) -> Result<Vec<ReadReceipt>> {
+        match self {
+            RoomStore::Direct(d) => d.project_read_receipts(max_seq),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    // ----- dispatch: LOCAL methods -------------------------------------------
+    // Classified LOCAL: answered on the routed client's own state (no wire hop).
+    // In Chunk A `Routed` is never constructed; Chunk C fills these arms to read
+    // from `RoutedRoomStore`'s local fields. The borrow-returning accessors
+    // `unreachable!` here because their signatures cannot carry an error.
+
+    pub(crate) fn cursor_for(&self, tool: &str) -> Result<i64> {
+        match self {
+            RoomStore::Direct(d) => d.cursor_for(tool),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    pub(crate) fn set_cursor(&self, tool: &str, seq: i64) -> Result<()> {
+        match self {
+            RoomStore::Direct(d) => d.set_cursor(tool, seq),
+            RoomStore::Routed(_) => Err(routed_not_enabled()),
+        }
+    }
+
+    pub(crate) fn active_engagement(&self) -> &str {
+        match self {
+            RoomStore::Direct(d) => d.active_engagement(),
+            RoomStore::Routed(_) => unreachable!("routed store is never constructed in Chunk A"),
+        }
+    }
+
+    pub(crate) fn room_id(&self) -> &str {
+        match self {
+            RoomStore::Direct(d) => d.room_id(),
+            RoomStore::Routed(_) => unreachable!("routed store is never constructed in Chunk A"),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn active_segment_path(&self) -> PathBuf {
+        match self {
+            RoomStore::Direct(d) => d.active_segment_path(),
+            RoomStore::Routed(_) => unreachable!("routed store is never constructed in Chunk A"),
+        }
+    }
+
+    pub(crate) fn repo_root(&self) -> &Path {
+        match self {
+            RoomStore::Direct(d) => d.repo_root(),
+            RoomStore::Routed(_) => unreachable!("routed store is never constructed in Chunk A"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claim_index_path(&self) -> &Path {
+        match self {
+            RoomStore::Direct(d) => d.claim_index_path(),
+            RoomStore::Routed(_) => unreachable!("routed store is never constructed in Chunk A"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_active_engagement_for_test(&mut self, engagement: &str) {
+        match self {
+            RoomStore::Direct(d) => d.set_active_engagement_for_test(engagement),
+            RoomStore::Routed(_) => unreachable!("routed store is never constructed in Chunk A"),
+        }
+    }
+}
+
+/// Error returned by a `Routed` dispatch arm in Chunk A (and by a dead-socket
+/// mid-command failure once Chunk C lands, R6): a RETRYABLE `RallyError::Command`
+/// (exit 1). The caller re-runs the whole command, which re-enters the router.
+/// NEVER falls back to a direct facts.db open mid-command (that would skip the
+/// SH choreography and void the G2 chokepoint premise).
+fn routed_not_enabled() -> RallyError {
+    RallyError::Command(
+        "daemon routing is not enabled in this build (Chunk A); no routed store path exists yet — \
+         run `rally daemon status` to check the daemon"
+            .to_string(),
+    )
+}
+
+impl DirectRoomStore {
+    /// Direct (no-daemon) constructor. The router entry point is
+    /// [`RoomStore::open`]; this opens the in-process store unconditionally.
+    /// Chunk B's daemon startup uses [`DirectRoomStore::open_direct_at`].
+    #[allow(dead_code)]
+    pub(crate) fn open_direct() -> Result<Self> {
+        Self::open_direct_at(repo_root()?)
     }
 
     /// Open the per-repo room, applying the **canonical segments / derived
@@ -763,10 +1244,10 @@ impl RoomStore {
     ///
     /// Replay, migration, and seed are all idempotent — running them twice
     /// on the same inputs yields identical state.
-    pub(crate) fn open_at(root: PathBuf) -> Result<Self> {
+    pub(crate) fn open_direct_at(root: PathBuf) -> Result<Self> {
         // Production path: resolve the engagement from the process-global
         // `RALLY_ENGAGEMENT` env (sound for a single CLI process).
-        Self::open_at_with_engagement(root, std::env::var(ENGAGEMENT_ENV_VAR).ok())
+        Self::open_direct_at_with_engagement(root, std::env::var(ENGAGEMENT_ENV_VAR).ok())
     }
 
     /// Open a room with the engagement label INJECTED rather than read from the
@@ -775,7 +1256,7 @@ impl RoomStore {
     /// no env read. Tests use this so a concurrent test toggling `RALLY_ENGAGEMENT`
     /// cannot flip which room subdir this store resolves under parallel runs
     /// (`env::set_var` is process-global and unsound across threads — Rust 2024).
-    pub(crate) fn open_at_with_engagement(
+    pub(crate) fn open_direct_at_with_engagement(
         root: PathBuf,
         engagement: Option<String>,
     ) -> Result<Self> {
@@ -796,6 +1277,9 @@ impl RoomStore {
         let active_engagement = resolve_active_engagement_with_env(&dir, engagement);
         let store = Self {
             fact_store,
+            // Direct-CLI mode: no warm pool ⇒ per-op opens, byte-identical to
+            // main (G1). Chunk B installs a warm pool for daemon mode.
+            warm_fact_store: None,
             cursor_path: dir.join("cursors.json"),
             repo_root: root,
             facts_db_path: fact_store_path,
@@ -809,7 +1293,7 @@ impl RoomStore {
         Ok(store)
     }
 
-    pub(crate) fn open_existing_at(root: PathBuf) -> Result<Option<Self>> {
+    pub(crate) fn open_direct_existing_at(root: PathBuf) -> Result<Option<Self>> {
         let dir = root.join(".rally");
         let fact_store_path = dir.join("facts.db");
         let log_dir = dir.join(LOG_DIRNAME);
@@ -834,6 +1318,8 @@ impl RoomStore {
         let active_engagement = resolve_active_engagement(&dir);
         let store = Self {
             fact_store,
+            // Direct-CLI mode: no warm pool ⇒ per-op opens (G1).
+            warm_fact_store: None,
             cursor_path: dir.join("cursors.json"),
             repo_root: root,
             facts_db_path: fact_store_path,
@@ -844,6 +1330,51 @@ impl RoomStore {
         };
         let _ = store.refresh_log_index();
         Ok(Some(store))
+    }
+
+    /// The facts.db pool to use for a hot interior op (L11/R1/G10).
+    ///
+    /// * Daemon mode (`warm_fact_store` is `Some`): returns the ONE warm pool,
+    ///   borrowed and reused across ops — no per-op churn (the churn is what
+    ///   factstr-sqlite 0.5.2's un-closed-on-Drop background checkpoint races
+    ///   in-process, re-creating #50 inside the daemon).
+    /// * Direct mode (`warm_fact_store` is `None`): opens a FRESH pool exactly
+    ///   as the call site did before this facade — byte-identical to main (G1).
+    ///   `lenient` selects the cold-open strategy so each site preserves its
+    ///   prior `open_fact_store` (strict) vs `open_fact_store_lenient` choice.
+    ///
+    /// The returned [`FactStoreHandle`] derefs to `SqliteStore`, so call sites
+    /// use it exactly as the old owned `let fact_store = open_…()?;` value.
+    fn fact_store_handle(&self, lenient: bool) -> Result<FactStoreHandle<'_>> {
+        if let Some(warm) = &self.warm_fact_store {
+            return Ok(FactStoreHandle::Warm(warm));
+        }
+        let fresh = if lenient {
+            open_fact_store_lenient(&self.facts_db_path)?
+        } else {
+            open_fact_store(&self.facts_db_path)?
+        };
+        Ok(FactStoreHandle::Fresh(fresh))
+    }
+
+    /// Rebind the active engagement (and its derived active-segment path) for
+    /// subsequent ops (L9/R4). Used ONLY by the daemon dispatcher, which applies
+    /// each wire request's engagement before dispatching; direct CLIs fix the
+    /// engagement at construction and never call this (byte-identical to main).
+    ///
+    /// The client already resolved its label, so `engagement: Some(label)` is
+    /// used directly (through the same sanitising/reserved-fixture ladder as
+    /// construction); `None` resolves the room default WITHOUT consulting the
+    /// daemon's own process env (L9). `active_segment_path()` is recomputed from
+    /// `active_engagement` on each call, so no cached path needs updating.
+    #[allow(dead_code)]
+    pub(crate) fn set_engagement_scope(&mut self, engagement: Option<String>) {
+        let rally_dir = self
+            .facts_db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.repo_root.join(".rally"));
+        self.active_engagement = resolve_active_engagement_with_env(&rally_dir, engagement);
     }
 
     /// Override the active engagement for this RoomStore instance. Used by
@@ -904,7 +1435,9 @@ impl RoomStore {
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
-        let fact_store = open_fact_store_lenient(&self.facts_db_path)?;
+        // Warm-pool facade (L11/R1/G10): reuse the daemon's pool if installed,
+        // else open fresh lenient — byte-identical to main in direct mode (G1).
+        let fact_store = self.fact_store_handle(true)?;
         let mut fact = fact.clone();
         // SEC-001 close: a takeover Release authorizes reclaiming a stale peer's
         // claim. Eligibility was judged on an UNLOCKED snapshot in
@@ -1337,7 +1870,9 @@ impl RoomStore {
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
         reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
-        let fact_store = open_fact_store_lenient(&self.facts_db_path)?;
+        // Warm-pool facade (L11/R1/G10): warm reuse in daemon mode, per-op
+        // lenient open in direct mode (byte-identical to main — G1).
+        let fact_store = self.fact_store_handle(true)?;
         let mut fact = fact.clone();
         let logical_seq =
             next_canonical_seq(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
@@ -1391,6 +1926,18 @@ impl RoomStore {
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
         reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
+        // Warm-pool facade for the READ path (snapshot's underlying read, L11/R1):
+        // in daemon mode read through the ONE warm pool; on a corrupt-db error
+        // fall through to the cold recovery path (quarantine + reconcile + reopen),
+        // same as direct mode. In direct mode (`warm_fact_store` is None) this
+        // block is skipped entirely ⇒ byte-identical to main (G1).
+        if let Some(warm) = &self.warm_fact_store {
+            match facts_from_store(warm) {
+                Ok(facts) => return Ok(facts),
+                Err(err) if is_malformed_db_error(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
         facts_from_db_with_query_recovery(&self.log_dir, &self.archive_dir, &self.facts_db_path)
     }
 
@@ -1468,7 +2015,9 @@ impl RoomStore {
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
         reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
-        let fact_store = open_fact_store(&self.facts_db_path)?;
+        // Warm-pool facade (L11/R1/G10): warm reuse in daemon mode, per-op
+        // strict open in direct mode (byte-identical to main — G1).
+        let fact_store = self.fact_store_handle(false)?;
         let query = fact_store
             .query(&FactQuery::for_event_types(["session"]))
             .map_err(|err| RallyError::Message(format!("query session facts: {err}")))?;
@@ -3520,7 +4069,7 @@ fn extract_date_prefix(occurred_at: &str) -> Option<String> {
     Some(head.to_string())
 }
 
-impl RoomStore {
+impl DirectRoomStore {
     /// Refresh `.rally/log/index.json` from the current segment set.
     /// Best-effort — failure does not block reads or appends.
     ///
@@ -5948,7 +6497,9 @@ mod ledger_tests {
     #[test]
     fn r9_case5_concurrent_peer_append_does_not_false_pass_exact_event_id() {
         let root = unique_root("r9-case5-concurrency");
-        let store = RoomStore::open_at(root.clone()).unwrap();
+        // Chunk A router is hard-wired to Direct; this test reaches into the
+        // direct store's private fields, so bind the DirectRoomStore directly.
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
 
         // Write fact-A (our mutation).
         let fact_a = make_fact("ev-r9-5a", FactKind::Claim, "src/", "our fact");
@@ -6652,7 +7203,9 @@ mod ledger_tests {
     #[test]
     fn completed_segment_corruption_fails_all_canonical_readers() {
         let root = unique_root("completed-segment-corruption");
-        let store = RoomStore::open_at(root.clone()).unwrap();
+        // Direct-store internals under test; bind the DirectRoomStore directly
+        // (Chunk A router always returns Direct).
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let fact = store
             .append_fact(&make_fact(
                 "e1",
@@ -7139,10 +7692,13 @@ mod sec001_takeover_guard_tests {
             "authorized-takeover:stale-owner=ghost,other".to_string(),
         ];
         assert_eq!(
-            RoomStore::takeover_owners_marker(&ev),
+            DirectRoomStore::takeover_owners_marker(&ev),
             Some(vec!["ghost".to_string(), "other".to_string()])
         );
-        assert_eq!(RoomStore::takeover_owners_marker(&["x".to_string()]), None);
+        assert_eq!(
+            DirectRoomStore::takeover_owners_marker(&["x".to_string()]),
+            None
+        );
     }
 
     #[test]

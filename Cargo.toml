@@ -5,6 +5,7 @@
 members = [
     "crates/rally-cli",
     "crates/rally-protocol",
+    "crates/rallyd",
     "crates/cockpitd",
     "crates/cockpit-cli",
     "crates/rally-ui",
