@@ -86,8 +86,13 @@ fn hook_stays_fail_open_when_internal_mutations_time_out_uncommitted() {
     room.seed();
 
     for phase in ["start", "idle"] {
-        let out = Command::new("sh")
-            .arg(hook_script())
+        // Invoke the script DIRECTLY, exactly like production does (the
+        // installer writes `$HOOK_PATH start claude_code` into settings.json,
+        // so the kernel honors the `#!/usr/bin/env bash` shebang). Wrapping in
+        // `sh` overrides the shebang — and on Ubuntu `sh` is dash, which
+        // rejects the script's `set -o pipefail` with exit 2, failing this
+        // test for a reason production can never hit (issue #48, layer 3).
+        let out = Command::new(hook_script())
             .args([phase, "hook-contract-tool"])
             .current_dir(&room.cwd)
             .env("HOME", &room.home)
