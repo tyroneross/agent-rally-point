@@ -131,6 +131,7 @@ mod imp {
 
     use std::fs::{OpenOptions, Permissions};
     use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
@@ -163,8 +164,21 @@ mod imp {
     const SUN_PATH_MAX: usize = 103;
 
     /// Accept-loop poll interval: how often the nonblocking accept loop wakes to
-    /// re-check the shutdown flag + idle window.
+    /// re-check the shutdown flag + idle window. This bounds shutdown latency
+    /// ONLY — accept throughput is bounded by the drain-all-pending inner loop
+    /// (each wake accepts every queued connection down to `WouldBlock`), not by
+    /// this interval.
     const ACCEPT_POLL: Duration = Duration::from_millis(100);
+
+    /// Explicit listen backlog. `UnixListener::bind` calls `listen(2)` with a
+    /// smallish platform default (128 on Linux, capped further by an older
+    /// `SOMAXCONN`); under a burst of concurrent client connects the kernel
+    /// queue can fill between accept-loop wakes and REFUSE connects
+    /// (ECONNREFUSED), which the client's fresh-connection-per-op path
+    /// misclassifies as R6's retryable "daemon stopped mid-request". A large
+    /// backlog lets the queue hold a full burst until the next drain wake. 1024
+    /// == a common `SOMAXCONN`; the kernel silently clamps to its own max.
+    const LISTEN_BACKLOG: i32 = 1024;
 
     /// Per-connection read/write timeout. Bounds a stalled client so a reader
     /// thread cannot wedge indefinitely (each connection carries one request).
@@ -192,6 +206,12 @@ mod imp {
     // Linux and linked by default.
     unsafe extern "C" {
         fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+        // `listen(2)` — re-called after `UnixListener::bind` to RAISE the accept
+        // backlog above the platform default. Both Linux and BSD honor a second
+        // `listen()` on an already-listening socket to update the backlog.
+        // Exported by libc on macOS and Linux, linked by default (same posture
+        // as the `flock`/`signal` hand-declared externs — no `libc`/`nix` dep).
+        fn listen(fd: i32, backlog: i32) -> i32;
     }
 
     /// Async-signal-safe handler: only touch a lock-free atomic (SIGTERM/SIGINT).
@@ -278,6 +298,20 @@ mod imp {
         }
         let listener = UnixListener::bind(socket_path)
             .map_err(|e| ServeError::new(format!("bind {}: {e}", socket_path.display())))?;
+        // Raise the accept backlog above the platform default so a burst of
+        // concurrent connects queues in the kernel instead of being refused
+        // between accept-loop wakes (see LISTEN_BACKLOG). `bind` already
+        // socket()+bind()+listen()ed at the default; this second listen(2)
+        // updates the backlog. Best-effort: a failure here leaves the default
+        // backlog in place (still functional, just the pre-fix throughput).
+        // SAFETY: `listener` owns the fd for the duration of this call.
+        let rc = unsafe { listen(listener.as_raw_fd(), LISTEN_BACKLOG) };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            log(&format!(
+                "listen(backlog={LISTEN_BACKLOG}) failed: {e}; keeping default backlog"
+            ));
+        }
         std::fs::set_permissions(socket_path, Permissions::from_mode(0o600))
             .map_err(|e| ServeError::new(format!("chmod {}: {e}", socket_path.display())))?;
         Ok(listener)
@@ -680,7 +714,15 @@ mod imp {
         });
 
         // Nonblocking accept loop: poll the shutdown flag + idle window ~every
-        // ACCEPT_POLL; spawn one reader thread per connection.
+        // ACCEPT_POLL; on each wake DRAIN ALL pending connections (accept until
+        // WouldBlock), spawning one reader thread per connection, THEN sleep.
+        // Draining all-per-wake — not one-per-wake — is what makes the accept
+        // side keep up with a burst: the kernel backlog holds connections that
+        // arrive between wakes and this inner loop empties it fully each time,
+        // so clients no longer see ECONNREFUSED (which the fresh-connect client
+        // path misreads as R6's "daemon stopped mid-request; retry"). The
+        // dispatcher stays single-threaded (total order preserved); we widen
+        // ONLY accept concurrency (reader threads feeding the one mpsc).
         let _ = listener.set_nonblocking(true);
         loop {
             if SHUTDOWN.load(Ordering::SeqCst) {
@@ -694,19 +736,24 @@ mod imp {
                     break;
                 }
             }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let jt = job_tx.clone();
-                    thread::spawn(move || handle_conn(stream, jt));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(ACCEPT_POLL);
-                }
-                Err(e) => {
-                    log(&format!("accept error: {e}"));
-                    thread::sleep(ACCEPT_POLL);
+            // Drain every queued connection before going back to the poll sleep.
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let jt = job_tx.clone();
+                        thread::spawn(move || handle_conn(stream, jt));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Backlog drained; return to the shutdown/idle poll.
+                        break;
+                    }
+                    Err(e) => {
+                        log(&format!("accept error: {e}"));
+                        break;
+                    }
                 }
             }
+            thread::sleep(ACCEPT_POLL);
         }
 
         // Lifecycle: drop the accept-loop sender so the dispatcher drains its

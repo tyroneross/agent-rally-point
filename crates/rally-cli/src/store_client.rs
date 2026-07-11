@@ -28,10 +28,10 @@
 //! back to a direct facts.db open mid-command on this path; the whole command
 //! is re-run by the caller, which re-enters the router fresh.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -80,6 +80,58 @@ pub(crate) const CORRIDOR_BOUND: Duration = Duration::from_secs(30);
 /// connection refused) rather than blocking for the full per-attempt timeout.
 const CORRIDOR_RETRY_SLEEP: Duration = Duration::from_millis(200);
 
+/// Connect attempts (including the first) before surfacing a transient connect
+/// failure. The rallyd daemon is a single-dispatcher, nonblocking-accept
+/// server: under a burst of concurrent connects its kernel backlog can momentarily
+/// fill and REFUSE a connect (ECONNREFUSED) even though the daemon is very much
+/// alive — it answers a ping microseconds later once its accept loop drains.
+/// Because every op opens a FRESH connection (no persistent socket), a single
+/// transient refusal would otherwise surface as R6's retryable "daemon stopped
+/// mid-request". Retrying the CONNECT (not the whole request) a few times with a
+/// short jittered backoff absorbs the burst; a genuinely dead daemon still fails
+/// all attempts and yields the retryable error.
+const CONNECT_ATTEMPTS: u32 = 5;
+
+/// Jitter floor for the connect backoff (ms). Actual sleep is
+/// `CONNECT_BACKOFF_MIN_MS + (0..CONNECT_BACKOFF_SPREAD_MS)`, keeping retriers
+/// from converging on the same wake instant and re-colliding on the backlog.
+const CONNECT_BACKOFF_MIN_MS: u64 = 20;
+/// Jitter spread (ms) added on top of the floor, giving a 20–50ms window.
+const CONNECT_BACKOFF_SPREAD_MS: u64 = 31;
+
+/// Connect to `socket`, retrying a TRANSIENT connect failure (backlog-full
+/// refusal, a socket file that momentarily vanished during a daemon restart, or
+/// a nonblocking `WouldBlock`) up to [`CONNECT_ATTEMPTS`] times with a short
+/// jittered backoff. A non-transient error (or the last attempt) is returned
+/// verbatim so the caller's existing dead-socket policy still fires for a truly
+/// dead daemon. This wraps ONLY the connect — per-op read/write timeouts
+/// (`PROBE_TIMEOUT`/`OP_TIMEOUT`) are applied by the caller after connecting and
+/// are unchanged.
+fn connect_with_retry(socket: &Path) -> std::io::Result<UnixStream> {
+    let mut attempt: u32 = 0;
+    loop {
+        match UnixStream::connect(socket) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                attempt += 1;
+                let transient = matches!(
+                    e.kind(),
+                    ErrorKind::ConnectionRefused | ErrorKind::NotFound | ErrorKind::WouldBlock
+                );
+                if !transient || attempt >= CONNECT_ATTEMPTS {
+                    return Err(e);
+                }
+                let jitter = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| u64::from(d.subsec_nanos()))
+                    .unwrap_or(0)
+                    % CONNECT_BACKOFF_SPREAD_MS;
+                std::thread::sleep(Duration::from_millis(CONNECT_BACKOFF_MIN_MS + jitter));
+            }
+        }
+    }
+}
+
 /// Daemon identity from a successful `Ping` (ADR-02) — used both by the
 /// router's liveness probe and by `rally daemon status`.
 #[derive(Clone, Debug)]
@@ -121,7 +173,7 @@ fn round_trip(
     req: &StoreRequest,
     timeout: Duration,
 ) -> std::io::Result<StoreResponse> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = connect_with_retry(socket)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let mut line = serde_json::to_string(req).map_err(|e| std::io::Error::other(e.to_string()))?;

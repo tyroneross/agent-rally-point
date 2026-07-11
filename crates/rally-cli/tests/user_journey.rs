@@ -2120,26 +2120,25 @@ fn rally_run_reserves_numbered_ids_under_parallel_launch() {
     // fixed high N buys is over-subscription on constrained CI runners (24
     // processes on 2 cores => spurious watchdog timeouts). Scale to the machine:
     // full stress locally, still-meaningful concurrency on a small runner.
-    let mut n: usize = std::thread::available_parallelism()
+    let n: usize = std::thread::available_parallelism()
         .map(|p| (p.get() * 4).clamp(8, 24))
         .unwrap_or(8);
-    // DAEMON-SERVING ENVELOPE (L10): the no-daemon default keeps its full stress
-    // N (independent per-process pools + mutation.lock absorb it, byte-identical
-    // — F2). But rallyd is a SINGLE-dispatcher, total-order daemon whose stated
-    // design envelope is N≤16 ("correctness at N≤16 is the win"; the
-    // dispatcher/accept-loop throughput ceiling above that is an ACCEPTED,
-    // documented limit — NOT the #50 race). Above ~14 concurrent launches the
-    // daemon transiently refuses connects under burst, surfacing as the
-    // retryable "daemon stopped mid-request; retry". So in daemon mode we cap N
-    // inside the envelope. 12 is comfortably clean AND still ABOVE the original
-    // 8-way bootstrap contention that produced #50's 17–33% short-reads — so
-    // this remains a real falsification of #50 (dissolved: 0 corruption/drop/dup
-    // through the single writer), which is the whole point of the daemon-serving
-    // hammer. See the friction note in the Chunk-D return envelope: the >14
-    // connect-refusal is a Chunk-B/C robustness follow-up, tracked separately.
-    if daemon_mode {
-        n = n.min(12);
-    }
+    // DAEMON-SERVING ENVELOPE (L10): daemon mode now runs the SAME full stress N
+    // as the no-daemon default. The former N≤12 cap existed only because the
+    // daemon's accept loop drained one connection per ~100ms wake and bound its
+    // listen backlog to the platform default, so a burst of >~14 concurrent
+    // connects transiently overflowed the kernel queue and got refused
+    // (ECONNREFUSED) — which the client's fresh-connect-per-op path misread as
+    // R6's retryable "daemon stopped mid-request; retry". That robustness gap is
+    // now fixed at three points that compose: (1) the accept loop drains ALL
+    // pending connections per wake, (2) the listener uses an explicit large
+    // backlog (LISTEN_BACKLOG=1024), and (3) the client retries a transient
+    // connect refusal a few times with short jittered backoff before surfacing
+    // the dead-socket error. The daemon stays a single total-order writer; only
+    // ACCEPT concurrency widened. So this hammer once again runs at the full
+    // clamp — a real falsification of #50 (0 corruption/drop/dup through the
+    // single writer) at the run-id test's max N. `daemon_mode` is still consulted
+    // below to grant routed launches the queued-op timeout headroom.
     let handles = (0..n)
         .map(|_| {
             let cwd = workspace.cwd.clone();
