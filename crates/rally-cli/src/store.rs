@@ -1439,6 +1439,10 @@ impl DirectRoomStore {
         if let Some(warm) = &self.warm_fact_store {
             return Ok(FactStoreHandle::Warm(warm));
         }
+        // COLD branch: direct-mode per-op open (byte-identical to main — G1).
+        // The G10 proof counts these for a watched db path (test-only; a no-op
+        // in non-test builds, so the direct path is unchanged).
+        note_cold_open(&self.facts_db_path);
         let fresh = if lenient {
             open_fact_store_lenient(&self.facts_db_path)?
         } else {
@@ -2041,6 +2045,14 @@ impl DirectRoomStore {
                 Err(err) => return Err(err),
             }
         }
+        // BOUNDED RECOVERY PATH (f1/G10): the corrupt-db fallback opens a fresh
+        // pool directly (not via `fact_store_handle`), so it is intentionally
+        // NOT routed through the warm handle and is NOT counted by the G10
+        // cold-open probe. It fires only on a malformed-db error, never on a
+        // healthy serving daemon; it is shared with the direct path, so
+        // rerouting it through the warm handle would risk G1 byte-identity.
+        // G10's hot-path claim (append/query/snapshot) is what the counter
+        // proves; recovery churn here is out of that scope.
         facts_from_db_with_query_recovery(&self.log_dir, &self.archive_dir, &self.facts_db_path)
     }
 
@@ -3267,6 +3279,72 @@ fn full_reconcile_scan_count() -> u64 {
 #[inline]
 fn note_full_reconcile_scan() {}
 
+// ---- G10 cold-open probe (test-only, mirrors note_full_reconcile_scan) ----
+//
+// Counts [`DirectRoomStore::fact_store_handle`] COLD-branch opens (a fresh
+// per-op pool — the churn G10's warm pool exists to avoid) for a WATCHED
+// db-path prefix ONLY. Scoping to a watched prefix keeps the daemon warm-pool
+// proof deterministic under cargo's parallel test model: unrelated direct-mode
+// tests each run on their own temp room, so their cold opens don't match the
+// smoke test's watched repo_root and can't contaminate the count. The daemon
+// store has `warm_fact_store = Some`, so its hot ops (append/query/snapshot)
+// NEVER reach the cold branch — the smoke test watches its own repo_root and
+// asserts the count stays 0 across two appends + a snapshot (G10: one warm
+// pool, no per-op churn). Compiled out entirely in non-test builds (no-op),
+// so the direct path stays byte-identical to main (G1).
+#[cfg(test)]
+mod cold_open_probe {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COLD_OPENS: AtomicU64 = AtomicU64::new(0);
+    static WATCH_PREFIX: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    pub(super) fn note(path: &Path) {
+        if let Ok(guard) = WATCH_PREFIX.lock()
+            && let Some(prefix) = guard.as_deref()
+            && path.starts_with(prefix)
+        {
+            COLD_OPENS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn watch(prefix: &Path) {
+        *WATCH_PREFIX.lock().unwrap() = Some(prefix.to_path_buf());
+        COLD_OPENS.store(0, Ordering::Relaxed);
+    }
+
+    pub(super) fn count() -> u64 {
+        COLD_OPENS.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn note_cold_open(path: &Path) {
+    cold_open_probe::note(path);
+}
+
+#[cfg(not(test))]
+#[inline]
+fn note_cold_open(_path: &Path) {}
+
+/// Test-only: start counting `fact_store_handle` cold-branch opens whose db
+/// path is under `prefix` (the daemon's repo_root), resetting the count to 0.
+/// Used by `rallyd_core`'s smoke test to prove the daemon's hot path reuses the
+/// ONE warm pool (G10) instead of churning a per-op pool.
+#[cfg(test)]
+pub(crate) fn watch_cold_opens_under(prefix: &Path) {
+    cold_open_probe::watch(prefix);
+}
+
+/// Test-only: current watched cold-open count (see [`watch_cold_opens_under`]).
+#[cfg(test)]
+pub(crate) fn cold_open_count() -> u64 {
+    cold_open_probe::count()
+}
+
 /// Fingerprint a single file as `(name, byte_len, mtime_ns)` with NO content
 /// hash. Used for append-only JSONL segments, where any change moves `len`.
 /// Returns `None` if the file is absent or its metadata can't be read — callers
@@ -3810,6 +3888,14 @@ fn read_db_event_stats(facts_db_path: &Path) -> Result<SeqStats> {
     if !facts_db_path.exists() {
         return Ok(SeqStats::default());
     }
+    // BOUNDED RECOVERY/RECONCILE PATH (f1/G10): opens a fresh pool directly (not
+    // via `fact_store_handle`), so it is intentionally NOT routed through the
+    // warm handle and is NOT counted by the G10 cold-open probe. It runs on the
+    // authoritative reconcile path (fast-path miss) and to quarantine a corrupt
+    // cache — a rare, self-bounded event, not the healthy per-op hot path.
+    // Rerouting through the warm handle would risk G1 byte-identity (this path
+    // is shared with the direct path). G10's counter proves the hot path
+    // (append/query/snapshot) reuses the ONE warm pool; this is out of scope.
     let store = match open_fact_store(facts_db_path) {
         Ok(store) => store,
         Err(err) if is_malformed_db_error(&err) => {

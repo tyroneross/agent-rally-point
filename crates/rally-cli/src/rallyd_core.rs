@@ -51,6 +51,16 @@
 //! (default off) exits after N idle seconds — test hygiene against orphaned
 //! daemons.
 //!
+//! ## R8 — segment-staleness refresh
+//!
+//! R8 (keeping the served view current as segments change) needs no separate
+//! dispatcher-side gate: while serving, the daemon is the SOLE segment writer
+//! (single writer, EX-held), and every store op already runs the per-op
+//! reconcile fingerprint fast path (`store.rs`'s `reconcile_segments_and_db` —
+//! the cheap len+mtime check at `store.rs:3453-3468`) before touching facts.db,
+//! so a stale segment set is detected and reconciled inline on the next op. The
+//! per-op reconcile therefore SUBSUMES a standalone R8 staleness gate here.
+//!
 //! ## Charter purity (G5)
 //!
 //! No `Command::new`, no external-process/agent spawn, no scheduling, no LLM or
@@ -136,8 +146,8 @@ mod imp {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-    use std::sync::mpsc::{self, Sender};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, RecvTimeoutError, Sender};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -184,6 +194,19 @@ mod imp {
     /// thread cannot wedge indefinitely (each connection carries one request).
     const CONN_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// SEC-003: hard cap on concurrent per-connection reader threads. Each
+    /// accepted connection spawns one short-lived reader thread that funnels its
+    /// single request to the ONE dispatcher and waits (bounded by
+    /// [`CONN_TIMEOUT`]) for the reply. Without a cap, a wedged dispatcher (a
+    /// store op that never returns) would let reader threads accumulate until
+    /// `thread::spawn` itself fails/panics and kills the accept loop. The cap is
+    /// deliberately GENEROUS — far above F4's ~24-connection burst — so it never
+    /// rejects a legitimate burst; it only sheds load in a genuine
+    /// thread-exhaustion / wedge scenario, answering over-cap connections with a
+    /// retryable transport error. This bounds ACCEPT-side resources only; the
+    /// dispatcher stays single-threaded (total order preserved).
+    const MAX_READER_THREADS: usize = 512;
+
     /// Log the "waiting for direct writers to drain" line only if the EX acquire
     /// did not complete near-immediately (flock has no fairness guarantee).
     const OWNER_WAIT_LOG_THRESHOLD: Duration = Duration::from_millis(50);
@@ -212,6 +235,11 @@ mod imp {
         // Exported by libc on macOS and Linux, linked by default (same posture
         // as the `flock`/`signal` hand-declared externs — no `libc`/`nix` dep).
         fn listen(fd: i32, backlog: i32) -> i32;
+        // `getuid(2)` — the caller's real uid, used to name + verify the private
+        // per-user `$TMPDIR` socket subdir (SEC-002). Same hand-declared posture
+        // as `signal`/`listen`/`flock` — no `libc`/`nix` dep. Cannot fail
+        // (POSIX: getuid is always successful).
+        fn getuid() -> u32;
     }
 
     /// Async-signal-safe handler: only touch a lock-free atomic (SIGTERM/SIGINT).
@@ -271,19 +299,81 @@ mod imp {
     }
 
     /// Resolve the bind path per L7: `.rally/rallyd.sock`, or a
-    /// `$TMPDIR/rallyd-<hash>.sock` fallback when the absolute path would exceed
-    /// the platform `sun_path` limit.
+    /// `$TMPDIR/rallyd-<uid>/rallyd-<hash>.sock` fallback when the absolute path
+    /// would exceed the platform `sun_path` limit.
+    ///
+    /// SEC-002: the fallback binds inside a PER-USER subdir (`rallyd-<uid>/`)
+    /// rather than directly in world-writable `$TMPDIR`. `$TMPDIR` (often
+    /// `/tmp`, mode 1777) lets any local user pre-create a predictable socket
+    /// NAME and squat it (a DoS on the daemon's bind). Nesting under a
+    /// uid-owned, 0700 subdir (created + ownership-verified by
+    /// [`secure_tmp_socket_dir`] before bind) removes the cross-user squat
+    /// surface. The `.sock.addr` pointer remains the SOLE discovery path (L7),
+    /// so this new nesting is invisible to clients.
     fn resolve_socket_path(repo_root: &Path, rally_dir: &Path) -> PathBuf {
         let primary = rally_dir.join(SOCK_FILENAME);
         if primary.as_os_str().len() <= SUN_PATH_MAX {
             return primary;
         }
+        // SAFETY: `getuid` is a POSIX call that cannot fail and touches no
+        // shared state.
+        let uid = unsafe { getuid() };
         let tmp = std::env::var_os("TMPDIR")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
         let digest = short_hash(&canonical_repo_root(repo_root));
-        tmp.join(format!("rallyd-{}.sock", &digest[..12]))
+        tmp.join(format!("rallyd-{uid}"))
+            .join(format!("rallyd-{}.sock", &digest[..12]))
+    }
+
+    /// SEC-002: create + verify the per-user `$TMPDIR/rallyd-<uid>/` socket
+    /// subdir BEFORE binding inside it. Creates it mode 0700 (idempotent — an
+    /// existing dir is accepted, then re-checked), then `lstat`-verifies (does
+    /// NOT follow symlinks) that the path is a real DIRECTORY (not a symlink an
+    /// attacker planted to redirect the bind) owned by the current uid. A
+    /// mismatch is a hard error — the daemon refuses to bind into a dir it
+    /// cannot prove is private to this user. Finally re-asserts 0700 so a
+    /// pre-existing dir we own but with looser bits is tightened.
+    fn secure_tmp_socket_dir(dir: &Path) -> Result<(), ServeError> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(ServeError::new(format!(
+                    "create private socket dir {}: {e}",
+                    dir.display()
+                )));
+            }
+        }
+        // lstat (symlink_metadata): a symlink here has file_type().is_symlink()
+        // and is NOT is_dir(), so a planted symlink is rejected outright.
+        let meta = std::fs::symlink_metadata(dir).map_err(|e| {
+            ServeError::new(format!("stat private socket dir {}: {e}", dir.display()))
+        })?;
+        if !meta.file_type().is_dir() {
+            return Err(ServeError::new(format!(
+                "private socket dir {} is not a directory (symlink/squat?); refusing to bind",
+                dir.display()
+            )));
+        }
+        let uid = unsafe { getuid() };
+        if meta.uid() != uid {
+            return Err(ServeError::new(format!(
+                "private socket dir {} is owned by uid {}, not {} (squat?); refusing to bind",
+                dir.display(),
+                meta.uid(),
+                uid
+            )));
+        }
+        // We own it and it's a real dir: tighten perms to 0700 in case it
+        // pre-existed with looser bits.
+        std::fs::set_permissions(dir, Permissions::from_mode(0o700)).map_err(|e| {
+            ServeError::new(format!("chmod private socket dir {}: {e}", dir.display()))
+        })?;
+        Ok(())
     }
 
     fn bind_socket(socket_path: &Path) -> Result<UnixListener, ServeError> {
@@ -365,6 +455,17 @@ mod imp {
         stream.flush()
     }
 
+    /// SEC-003: answer an over-cap / un-spawnable connection immediately with a
+    /// retryable transport error, then close. The client's fresh-connection-per-
+    /// op path maps this to R6's "retry", so a momentary reader-thread saturation
+    /// sheds load gracefully instead of the accept loop dying on a `spawn` panic.
+    fn respond_busy(stream: &UnixStream) {
+        let _ = stream.set_read_timeout(Some(CONN_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(CONN_TIMEOUT));
+        let resp = StoreResponse::Err(StoreError::transport("daemon busy; retry"));
+        let _ = write_response(stream, &resp);
+    }
+
     /// Per-connection reader thread: read one request line, route it through the
     /// dispatcher, write one reply line, close. Any framing/parse failure yields
     /// a structured error reply (never a panic — falsifier B).
@@ -391,11 +492,23 @@ mod imp {
                                     "daemon dispatcher stopped; retry",
                                 ))
                             } else {
-                                reply_rx.recv().unwrap_or_else(|_| {
-                                    StoreResponse::Err(StoreError::transport(
-                                        "daemon dispatcher dropped the reply; retry",
-                                    ))
-                                })
+                                // SEC-003: bound the wait on the dispatcher reply
+                                // with CONN_TIMEOUT. A wedged store op would
+                                // otherwise park this reader thread FOREVER;
+                                // timing out lets the reader shed (close the
+                                // connection, free the thread) with a retryable
+                                // error instead of accumulating parked threads.
+                                match reply_rx.recv_timeout(CONN_TIMEOUT) {
+                                    Ok(resp) => resp,
+                                    Err(RecvTimeoutError::Timeout) => StoreResponse::Err(
+                                        StoreError::transport("daemon store op timed out; retry"),
+                                    ),
+                                    Err(RecvTimeoutError::Disconnected) => {
+                                        StoreResponse::Err(StoreError::transport(
+                                            "daemon dispatcher dropped the reply; retry",
+                                        ))
+                                    }
+                                }
                             }
                         }
                     }
@@ -655,6 +768,15 @@ mod imp {
         // (R3), so bounded-block corridor clients have a socket during a cold
         // start.
         let socket_path = resolve_socket_path(&repo_root, &rally_dir);
+        // SEC-002: when the socket falls back OUTSIDE `.rally/` (the `$TMPDIR`
+        // over-long-path case), its parent is the per-user `rallyd-<uid>/`
+        // subdir — harden + ownership-verify it before binding. The primary
+        // `.rally/` path (parent == rally_dir) is repo-local and unaffected.
+        if socket_path.parent() != Some(rally_dir.as_path())
+            && let Some(parent) = socket_path.parent()
+        {
+            secure_tmp_socket_dir(parent)?;
+        }
         let addr_path = rally_dir.join(ADDR_FILENAME);
         let pid_path = rally_dir.join(PID_FILENAME);
         let listener = bind_socket(&socket_path)?;
@@ -724,6 +846,12 @@ mod imp {
         // dispatcher stays single-threaded (total order preserved); we widen
         // ONLY accept concurrency (reader threads feeding the one mpsc).
         let _ = listener.set_nonblocking(true);
+        // SEC-003: live count of concurrent per-connection reader threads, so a
+        // wedged dispatcher can't let them accumulate until `spawn` panics and
+        // takes the accept loop with it. Scoped to THIS serve (an Arc, not a
+        // process-global) so concurrent in-process daemons (tests) don't share a
+        // counter.
+        let reader_threads = Arc::new(AtomicUsize::new(0));
         loop {
             if SHUTDOWN.load(Ordering::SeqCst) {
                 log("shutdown signal received; draining");
@@ -740,8 +868,37 @@ mod imp {
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // Reserve a reader-thread slot. Over the GENEROUS cap
+                        // (well above any legitimate burst) ⇒ shed this
+                        // connection with a retryable transport error and move on
+                        // rather than spawning unboundedly.
+                        let reserved = reader_threads.fetch_add(1, Ordering::SeqCst);
+                        if reserved >= MAX_READER_THREADS {
+                            reader_threads.fetch_sub(1, Ordering::SeqCst);
+                            respond_busy(&stream);
+                            continue;
+                        }
                         let jt = job_tx.clone();
-                        thread::spawn(move || handle_conn(stream, jt));
+                        let rt = reader_threads.clone();
+                        // Keep a fallback handle so a `spawn` FAILURE can still
+                        // answer with a structured error instead of panicking.
+                        let busy_fallback = stream.try_clone().ok();
+                        match thread::Builder::new().spawn(move || {
+                            handle_conn(stream, jt);
+                            rt.fetch_sub(1, Ordering::SeqCst);
+                        }) {
+                            Ok(_handle) => {}
+                            Err(e) => {
+                                // Release the reserved slot; the thread never ran.
+                                reader_threads.fetch_sub(1, Ordering::SeqCst);
+                                log(&format!(
+                                    "reader thread spawn failed: {e}; shedding connection"
+                                ));
+                                if let Some(s) = busy_fallback {
+                                    respond_busy(&s);
+                                }
+                            }
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         // Backlog drained; return to the shutdown/idle poll.
@@ -835,10 +992,12 @@ mod imp {
         // Smoke test (Chunk B integration checkpoint): start the daemon on a temp
         // room, ping it, do two CONSECUTIVE appends + a snapshot round trip over a
         // raw socket, assert single-store total order, then shut down and confirm
-        // the socket/.addr/pid are removed. Also the warm-pool proof stand-in:
-        // consecutive appends are served through the ONE dispatcher-owned store
-        // (see the G10 friction note in serve_unix — the strict cold-branch
-        // counter needs the A-amendment installer).
+        // the socket/.addr/pid are removed. Also the STRICT warm-pool proof
+        // (G10, f1): the A-amendment warm-pool installer landed (serve_unix calls
+        // `install_warm_fact_store` after `open_direct_at`), so this test now
+        // asserts the `fact_store_handle` cold-open counter stays ZERO across the
+        // two appends + snapshot — proving the hot path reuses the ONE warm pool
+        // with no per-op churn, not merely that the appends succeed.
         #[test]
         fn smoke_serve_ping_append_snapshot_and_shutdown() {
             let repo_root = unique_repo_root("smoke");
@@ -882,6 +1041,17 @@ mod imp {
                 other => panic!("unexpected facts reply: {other:?}"),
             }
 
+            // G10 warm-pool proof (f1): start counting `fact_store_handle`
+            // cold-branch opens under THIS daemon's repo_root. The daemon store
+            // holds a warm pool, so its append/query/snapshot ops must NEVER
+            // reach the cold branch; a nonzero count would mean per-op pool
+            // churn (the #50 regression the warm pool prevents). Scoped to this
+            // repo_root so parallel unrelated direct-mode tests can't contaminate
+            // it. (The daemon's own `open_direct_at`/`install_warm_fact_store`
+            // open the pool DIRECTLY, not via `fact_store_handle`, so they don't
+            // count either — only hot-path cold opens would.)
+            crate::store::watch_cold_opens_under(&repo_root);
+
             // Two consecutive engagement-scoped appends through the ONE store.
             let append = |subject: &str| {
                 let fact = serde_json::json!({
@@ -920,6 +1090,16 @@ mod imp {
                 StoreResponse::Ok(StoreOk::Snapshot { .. }) => {}
                 other => panic!("unexpected snapshot reply: {other:?}"),
             }
+
+            // G10 proof (f1): the two appends + snapshot were served entirely
+            // through the ONE warm pool — the hot path never cold-opened a fresh
+            // facts.db pool. (Recovery/reconcile paths that open directly are not
+            // routed through `fact_store_handle` and so are not counted.)
+            assert_eq!(
+                crate::store::cold_open_count(),
+                0,
+                "daemon hot path cold-opened the facts.db pool — G10 warm-pool churn regression"
+            );
 
             // A malformed request line yields a structured error, not a crash.
             {

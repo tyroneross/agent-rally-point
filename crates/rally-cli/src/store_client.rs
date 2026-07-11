@@ -28,7 +28,7 @@
 //! back to a direct facts.db open mid-command on this path; the whole command
 //! is re-run by the caller, which re-enters the router fresh.
 
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,7 +38,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use rally_protocol::store_wire::{
-    StoreError, StoreErrorKind, StoreOk, StoreOp, StoreRequest, StoreResponse, WIRE_VERSION,
+    MAX_LINE_BYTES, StoreError, StoreErrorKind, StoreOk, StoreOp, StoreRequest, StoreResponse,
+    WIRE_VERSION,
 };
 
 use crate::claim_authority::{self, ActiveClaimRecord};
@@ -107,7 +108,15 @@ const CONNECT_BACKOFF_SPREAD_MS: u64 = 31;
 /// dead daemon. This wraps ONLY the connect — per-op read/write timeouts
 /// (`PROBE_TIMEOUT`/`OP_TIMEOUT`) are applied by the caller after connecting and
 /// are unchanged.
-fn connect_with_retry(socket: &Path) -> std::io::Result<UnixStream> {
+///
+/// `probe` selects the transient set for [`ErrorKind::NotFound`] (f4): on the
+/// PROBE path a missing socket means "no daemon here (yet / at all)" and must
+/// resolve PROMPTLY to fail-open (direct mode) rather than burning all
+/// [`CONNECT_ATTEMPTS`] backoffs on a socket that isn't there — so NotFound is
+/// treated as non-transient (returned at once). On the DISPATCH path (`false`)
+/// NotFound stays transient: a socket file can momentarily vanish while a daemon
+/// restarts mid-command, and a short retry absorbs that race.
+fn connect_with_retry(socket: &Path, probe: bool) -> std::io::Result<UnixStream> {
     let mut attempt: u32 = 0;
     loop {
         match UnixStream::connect(socket) {
@@ -116,8 +125,8 @@ fn connect_with_retry(socket: &Path) -> std::io::Result<UnixStream> {
                 attempt += 1;
                 let transient = matches!(
                     e.kind(),
-                    ErrorKind::ConnectionRefused | ErrorKind::NotFound | ErrorKind::WouldBlock
-                );
+                    ErrorKind::ConnectionRefused | ErrorKind::WouldBlock
+                ) || (!probe && e.kind() == ErrorKind::NotFound);
                 if !transient || attempt >= CONNECT_ATTEMPTS {
                     return Err(e);
                 }
@@ -172,17 +181,31 @@ fn round_trip(
     socket: &Path,
     req: &StoreRequest,
     timeout: Duration,
+    probe: bool,
 ) -> std::io::Result<StoreResponse> {
-    let mut stream = connect_with_retry(socket)?;
+    let mut stream = connect_with_retry(socket, probe)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let mut line = serde_json::to_string(req).map_err(|e| std::io::Error::other(e.to_string()))?;
     line.push('\n');
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
-    let mut reader = BufReader::new(stream);
+    // Cap the reply read at MAX_LINE_BYTES + 1 (SEC-006): the daemon caps
+    // REQUESTS at MAX_LINE_BYTES (`rallyd_core::read_request_line`), but the
+    // client reply read was uncapped — a wedged/hostile peer streaming an
+    // unbounded line would grow this buffer without limit. Reading one extra
+    // byte lets an exactly-at-limit reply through while an over-cap reply is
+    // detected and mapped to the R6 dead-socket transport error (an io::Error
+    // here; `dispatch`/`probe_identity` already treat any transport failure as
+    // the retryable dead-socket case), mirroring the daemon's own request cap.
+    let mut reader = BufReader::new(stream).take(MAX_LINE_BYTES as u64 + 1);
     let mut resp = String::new();
     reader.read_line(&mut resp)?;
+    if resp.len() > MAX_LINE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "daemon reply exceeds {MAX_LINE_BYTES} bytes; run `rally daemon status`"
+        )));
+    }
     if resp.trim().is_empty() {
         return Err(std::io::Error::other("empty daemon reply"));
     }
@@ -206,7 +229,7 @@ pub(crate) fn probe_identity(rally_dir: &Path, expected_repo_root: &str) -> Opti
         return None;
     }
     let req = StoreRequest::new(None, StoreOp::Ping);
-    let reply = round_trip(&socket, &req, PROBE_TIMEOUT).ok()?;
+    let reply = round_trip(&socket, &req, PROBE_TIMEOUT, true).ok()?;
     match reply {
         StoreResponse::Ok(StoreOk::Pong {
             repo_root,
@@ -324,7 +347,7 @@ impl RoutedRoomStore {
     /// not just appends.
     fn dispatch(&self, op: StoreOp) -> Result<StoreOk> {
         let req = StoreRequest::new(Some(self.active_engagement.clone()), op);
-        match round_trip(&self.socket, &req, OP_TIMEOUT) {
+        match round_trip(&self.socket, &req, OP_TIMEOUT, false) {
             Ok(StoreResponse::Ok(ok)) => Ok(ok),
             Ok(StoreResponse::Err(err)) => Err(store_error_to_rally_error(err)),
             Err(_io_err) => Err(dead_socket_error()),

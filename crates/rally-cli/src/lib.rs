@@ -1093,9 +1093,19 @@ fn command_daemon_start(json: bool, args: cli::DaemonStartArgs) -> Result<Output
 
     let exe = env::current_exe().map_err(RallyError::io("resolve current_exe"))?;
     let log_path = rally_dir.join("rallyd.log");
-    let log_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    // SEC-005: create the daemon log 0600 — it can capture request/error text
+    // and must not be world/group-readable. Matches `write_private_file` in
+    // `rallyd_core.rs`. Unix-only API (`OpenOptionsExt::mode`); a fresh create
+    // is the only moment the mode bits are honored, and a pre-existing log keeps
+    // its bits (append never re-chmods), so this hardens the common cold-start.
+    let mut log_opts = fs::OpenOptions::new();
+    log_opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        log_opts.mode(0o600);
+    }
+    let log_file = log_opts
         .open(&log_path)
         .map_err(RallyError::io(format!("open {}", log_path.display())))?;
     let log_file_err = log_file
@@ -1177,17 +1187,87 @@ fn command_daemon_stop(json: bool) -> Result<Output> {
         ));
     };
 
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        return Err(RallyError::Command(
+            "rallyd is a unix-only daemon".to_string(),
+        ));
+    }
+
+    let signal_pid = {
+        // SEC-001 (a): pid 0 is NEVER a real daemon pid. `kill(0, SIGTERM)`
+        // signals the CALLER's entire process group — catastrophic. Treat a
+        // pid-0 pid file as stale: remove it and report not running, never
+        // signal.
+        if pid == 0 {
+            let _ = fs::remove_file(rally_dir.join("rallyd.pid"));
+            let body = daemon_envelope_body(
+                "stop",
+                false,
+                None,
+                None,
+                None,
+                canonical,
+                Some("stale pid file (pid 0) removed — not running".to_string()),
+            )?;
+            return Ok(Output::new(
+                json,
+                "rally daemon stop: not running (stale pid file removed)".to_string(),
+                body,
+            ));
+        }
+
+        // SEC-001 (b): corroborate that `pid` names a REAL daemon before
+        // signaling. Only two things prove a live daemon: a live ping, or a
+        // held EX ownership lock.
+        if let Some(identity) = store_client::probe_identity(&rally_dir, &canonical) {
+            // A ping answered: the daemon is provably real. Signal the pid the
+            // daemon REPORTS (authoritative — also covers a pid file that lags a
+            // restart), not the possibly-stale on-disk pid.
+            identity.pid
+        } else {
+            // No ping. If we can take the SH ownership lock, there is no EX
+            // holder ⇒ the daemon is provably DEAD and the pid file is stale.
+            // Remove it and report not running — never SIGTERM an uncorroborated
+            // pid (it may have been recycled to an unrelated process).
+            match store::acquire_owner_shared_nb(&rally_dir) {
+                Ok(Some(_guard)) => {
+                    // Probe-only SH: drop immediately (do not install this
+                    // process as the room's direct-mode guard — G7).
+                    let _ = fs::remove_file(rally_dir.join("rallyd.pid"));
+                    let body = daemon_envelope_body(
+                        "stop",
+                        false,
+                        None,
+                        None,
+                        None,
+                        canonical,
+                        Some(
+                            "no live daemon (SH lock free) — removed stale pid file, not running"
+                                .to_string(),
+                        ),
+                    )?;
+                    return Ok(Output::new(
+                        json,
+                        "rally daemon stop: not running (removed stale pid file)".to_string(),
+                        body,
+                    ));
+                }
+                // SH refused (EX held) or a lock error: an EX holder exists — a
+                // real daemon that is mid-cold-start or wedged and not yet
+                // answering pings. The held EX lock corroborates it, so signal
+                // the pid on record.
+                _ => pid,
+            }
+        }
+    };
+
     #[cfg(unix)]
     {
         // ESRCH (no such process) just means it already exited; either way we
         // confirm the lock release below rather than trusting the return code.
-        let _ = unsafe { daemon_signal::kill(pid as i32, daemon_signal::SIGTERM) };
-    }
-    #[cfg(not(unix))]
-    {
-        return Err(RallyError::Command(
-            "rallyd is a unix-only daemon".to_string(),
-        ));
+        let _ = unsafe { daemon_signal::kill(signal_pid as i32, daemon_signal::SIGTERM) };
     }
 
     let deadline = Instant::now() + DAEMON_STOP_RELEASE_BOUND;
@@ -1205,17 +1285,17 @@ fn command_daemon_stop(json: bool) -> Result<Output> {
     };
 
     let note = if released {
-        format!("SIGTERM sent to pid {pid}; ownership lock released")
+        format!("SIGTERM sent to pid {signal_pid}; ownership lock released")
     } else {
         format!(
-            "SIGTERM sent to pid {pid}; ownership lock NOT released within {}s — daemon may be wedged, check `rally daemon status`",
+            "SIGTERM sent to pid {signal_pid}; ownership lock NOT released within {}s — daemon may be wedged, check `rally daemon status`",
             DAEMON_STOP_RELEASE_BOUND.as_secs()
         )
     };
     let body = daemon_envelope_body(
         "stop",
         false,
-        Some(pid),
+        Some(signal_pid),
         None,
         None,
         canonical,
