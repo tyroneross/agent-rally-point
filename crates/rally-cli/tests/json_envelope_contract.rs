@@ -300,6 +300,30 @@ fn envelope_status() {
     ws.cleanup();
 }
 
+/// `daemon status` — read-only ping probe; on a fresh room with no daemon it
+/// reports `live:false` but MUST still honor the standard envelope (checklist
+/// Item 4 / scope-auditor advisory: the new `daemon` verb is invisible to this
+/// file's hand-enumerated list unless added here).
+#[test]
+fn envelope_daemon_status() {
+    let ws = Workspace::new("daemon-status");
+    let body = ws.json(&["daemon", "status", "--json"]);
+    assert_envelope_contract("daemon", &body);
+    assert_eq!(body["schema"], "agent-rally.command.daemon.v1");
+    // data.daemon carries the operator surface fields.
+    let d = &body["data"]["daemon"];
+    assert!(d.is_object(), "data.daemon must be an object; got {body:#}");
+    assert_eq!(
+        d["subcommand"], "status",
+        "data.daemon.subcommand must name the verb"
+    );
+    assert!(
+        d["live"].is_boolean(),
+        "data.daemon.live must be a bool; got {body:#}"
+    );
+    ws.cleanup();
+}
+
 /// `migrate-legacy` — no required args; idempotent read-then-write.
 #[test]
 fn envelope_migrate_legacy() {

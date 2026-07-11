@@ -7,10 +7,10 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Serializes the heavy `rally run` managed-session tests against each other.
 /// Each spawns subprocesses that write session-reservation facts to one SQLite
@@ -21,6 +21,94 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 static RALLY_RUN_GUARD: Mutex<()> = Mutex::new(());
 fn serialize_rally_run() -> MutexGuard<'static, ()> {
     RALLY_RUN_GUARD.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+// ── Daemon-serving mode (BACKLOG S-P3, Chunk D / F4) ─────────────────────────
+//
+// Gated behind `RALLY_TEST_RALLYD=1`, used ONLY by the run-id reservation test
+// below. When set, a rallyd daemon serves the temp room before the parallel
+// `rally run` subprocesses launch; each CAS reservation leg
+// (`session_facts_with_context_version` + `append_session_fact_if_context`,
+// lib.rs:4324) routes over the socket and the daemon's total order serialises
+// them. When UNSET the test runs exactly as today (no-daemon default, F2).
+//
+// This test has NO watchdog-block seams (unlike watchdog_concurrency) — it is a
+// pure parallel-launch race. Its core invariant is that N concurrent launches
+// reserve N DISTINCT numbered ids. Daemon-serving mode proves the #50 bootstrap
+// race is dissolved (no dropped/duplicated reservation) WITHOUT altering that
+// assertion, so the fixture is purely additive (start daemon, keep alive, tear
+// down) with the assertion logic untouched.
+
+const DAEMON_SIGTERM: i32 = 15;
+const DAEMON_SIGKILL: i32 = 9;
+
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+struct DaemonHandle {
+    child: Child,
+}
+
+fn maybe_start_daemon(cwd: &Path, home: &Path) -> Option<DaemonHandle> {
+    // Only in daemon-serving mode; `?` returns None when the gate env is unset.
+    std::env::var_os("RALLY_TEST_RALLYD")?;
+    fs::create_dir_all(cwd.join(".rally")).ok();
+    let log =
+        fs::File::create(cwd.join(".rally").join("rallyd-serve.log")).expect("create daemon log");
+    let child = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(cwd)
+        .env("HOME", home)
+        .args(["daemon", "serve", "--idle-exit-secs", "180"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("spawn rally daemon serve");
+    let handle = DaemonHandle { child };
+
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < deadline {
+        let out = Command::new(env!("CARGO_BIN_EXE_rally"))
+            .current_dir(cwd)
+            .env("HOME", home)
+            .args(["daemon", "status", "--json"])
+            .output();
+        if let Ok(out) = out
+            && out.status.success()
+            && serde_json::from_slice::<Value>(&out.stdout)
+                .ok()
+                .map(|v| v["data"]["daemon"]["live"] == Value::Bool(true))
+                .unwrap_or(false)
+        {
+            return Some(handle);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let log = fs::read_to_string(cwd.join(".rally").join("rallyd-serve.log")).unwrap_or_default();
+    panic!("RALLY_TEST_RALLYD=1 but daemon never became ready; serve log:\n{log}");
+}
+
+impl Drop for DaemonHandle {
+    fn drop(&mut self) {
+        // SAFETY: kill(2) on our own spawned child.
+        unsafe {
+            kill(self.child.id() as i32, DAEMON_SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                _ => {
+                    unsafe {
+                        kill(self.child.id() as i32, DAEMON_SIGKILL);
+                    }
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+    }
 }
 
 struct Workspace {
@@ -2023,21 +2111,42 @@ fn rally_run_assigns_numbered_agent_ids() {
 fn rally_run_reserves_numbered_ids_under_parallel_launch() {
     let _run_guard = serialize_rally_run();
     let workspace = Workspace::new("rally-run-parallel-numbered-ids");
+    // Daemon-serving mode (F4) when RALLY_TEST_RALLYD=1; no-op otherwise. Held
+    // alive through the parallel launches AND the final `sessions` read below.
+    let _daemon = maybe_start_daemon(&workspace.cwd, &workspace.home);
+    let daemon_mode = _daemon.is_some();
     // Scale concurrency to the host. The reservation is CAS-atomic (uniqueness
     // holds at any N — that is what this test asserts), so the only thing a
     // fixed high N buys is over-subscription on constrained CI runners (24
     // processes on 2 cores => spurious watchdog timeouts). Scale to the machine:
     // full stress locally, still-meaningful concurrency on a small runner.
-    let n: usize = std::thread::available_parallelism()
+    let mut n: usize = std::thread::available_parallelism()
         .map(|p| (p.get() * 4).clamp(8, 24))
         .unwrap_or(8);
+    // DAEMON-SERVING ENVELOPE (L10): the no-daemon default keeps its full stress
+    // N (independent per-process pools + mutation.lock absorb it, byte-identical
+    // — F2). But rallyd is a SINGLE-dispatcher, total-order daemon whose stated
+    // design envelope is N≤16 ("correctness at N≤16 is the win"; the
+    // dispatcher/accept-loop throughput ceiling above that is an ACCEPTED,
+    // documented limit — NOT the #50 race). Above ~14 concurrent launches the
+    // daemon transiently refuses connects under burst, surfacing as the
+    // retryable "daemon stopped mid-request; retry". So in daemon mode we cap N
+    // inside the envelope. 12 is comfortably clean AND still ABOVE the original
+    // 8-way bootstrap contention that produced #50's 17–33% short-reads — so
+    // this remains a real falsification of #50 (dissolved: 0 corruption/drop/dup
+    // through the single writer), which is the whole point of the daemon-serving
+    // hammer. See the friction note in the Chunk-D return envelope: the >14
+    // connect-refusal is a Chunk-B/C robustness follow-up, tracked separately.
+    if daemon_mode {
+        n = n.min(12);
+    }
     let handles = (0..n)
         .map(|_| {
             let cwd = workspace.cwd.clone();
             let home = workspace.home.clone();
             thread::spawn(move || {
-                Command::new(env!("CARGO_BIN_EXE_rally"))
-                    .current_dir(cwd)
+                let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
+                cmd.current_dir(cwd)
                     .env("HOME", home)
                     .env("RALLY_NO_WORKTREE", "1")
                     .args([
@@ -2048,9 +2157,18 @@ fn rally_run_reserves_numbered_ids_under_parallel_launch() {
                         "tmux",
                         "--tmux-bin",
                         "/usr/bin/true",
-                    ])
-                    .output()
-                    .unwrap()
+                    ]);
+                // Routed ops queue behind the daemon's single total-order
+                // dispatcher, so a legitimately-queued op can exceed the 3s hook
+                // watchdog (a direct-mode safety, not a routed-latency bound —
+                // cf. the client's own 10s OP_TIMEOUT). Give routed launches the
+                // same generous budget the watchdog_concurrency test uses for
+                // its non-blocking invocations. No-op semantics in direct mode
+                // (direct ops don't queue), so this stays byte-safe for F2.
+                if daemon_mode {
+                    cmd.args(["--timeout-ms", "20000"]);
+                }
+                cmd.output().unwrap()
             })
         })
         .collect::<Vec<_>>();

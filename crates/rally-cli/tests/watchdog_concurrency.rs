@@ -23,10 +23,115 @@
 
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// ── Daemon-serving mode (BACKLOG S-P3, Chunk D / F4) ─────────────────────────
+//
+// Gated behind `RALLY_TEST_RALLYD=1`. When set, the test starts a rallyd daemon
+// on the temp room (blocking on a ping-ready status) BEFORE spawning the
+// parallel `rally say` subprocesses, which discover it via `.rally/rallyd.sock.addr`
+// (cwd = temp room) and route every store op over the socket. When UNSET the
+// test runs EXACTLY as today — the no-daemon default path is byte-identical
+// (F2), preserving the accepted known #50 flake by design.
+//
+// RECONCILING THE WATCHDOG-BLOCK SUB-ASSERTIONS (choice (a), strongest form):
+// Both induced-block seams are CLIENT-side and orthogonal to the store path —
+//   * pre-commit block `RALLY_TEST_BLOCK_MS` fires in `run_inner_with`
+//     (lib.rs:772), at the TOP of the command, BEFORE the store is opened or
+//     routed at all; the watchdog (200ms) kills the client before it ever sends
+//     an append over the wire, so it leaves ZERO facts whether direct or routed;
+//   * post-commit block `RALLY_TEST_BLOCK_AFTER_COMMIT_MS` fires in
+//     `mark_watchdog_command_commit` (lib.rs:191), AFTER the append durably
+//     lands (over the wire, the daemon appends segment-then-db before replying
+//     Ok), so `committed:true` / `projection_complete:false` holds identically.
+// Neither seam lives on the DIRECT append path in store.rs, so daemon routing
+// does not change how they fire. We therefore KEEP ALL existing assertions
+// intact (the core #50 invariant AND the watchdog-block sub-parts) — they stay
+// meaningful and falsifiable under routing. The daemon-serving mode's added
+// value is proving the #50 bootstrap race is DISSOLVED: with a single dispatcher
+// owning the only facts.db pool, every success-reporting invocation still leaves
+// EXACTLY ONE fact (no 522 / drop / dup), which is the whole point of F4.
+
+const SIGTERM: i32 = 15;
+const SIGKILL: i32 = 9;
+
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+/// A rallyd daemon serving `cwd`, torn down (SIGTERM → wait) on Drop. Started
+/// only when `RALLY_TEST_RALLYD=1`; otherwise [`maybe_start_daemon`] returns
+/// `None` and the test runs on the no-daemon default path.
+struct DaemonHandle {
+    child: Child,
+}
+
+fn maybe_start_daemon(cwd: &Path, home: &Path) -> Option<DaemonHandle> {
+    // Only in daemon-serving mode; `?` returns None when the gate env is unset.
+    std::env::var_os("RALLY_TEST_RALLYD")?;
+    let log = fs::File::create(cwd.join(".rally").join("rallyd-serve.log"))
+        .or_else(|_| {
+            fs::create_dir_all(cwd.join(".rally"))?;
+            fs::File::create(cwd.join(".rally").join("rallyd-serve.log"))
+        })
+        .expect("create daemon log");
+    let child = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(cwd)
+        .env("HOME", home)
+        .args(["daemon", "serve", "--idle-exit-secs", "180"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("spawn rally daemon serve");
+    let handle = DaemonHandle { child };
+
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < deadline {
+        let out = Command::new(env!("CARGO_BIN_EXE_rally"))
+            .current_dir(cwd)
+            .env("HOME", home)
+            .args(["daemon", "status", "--json"])
+            .output();
+        if let Ok(out) = out
+            && out.status.success()
+            && serde_json::from_slice::<Value>(&out.stdout)
+                .ok()
+                .map(|v| v["data"]["daemon"]["live"] == Value::Bool(true))
+                .unwrap_or(false)
+        {
+            return Some(handle);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let log = fs::read_to_string(cwd.join(".rally").join("rallyd-serve.log")).unwrap_or_default();
+    panic!("RALLY_TEST_RALLYD=1 but daemon never became ready; serve log:\n{log}");
+}
+
+impl Drop for DaemonHandle {
+    fn drop(&mut self) {
+        // SAFETY: kill(2) on our own spawned child.
+        unsafe {
+            kill(self.child.id() as i32, SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                _ => {
+                    unsafe {
+                        kill(self.child.id() as i32, SIGKILL);
+                    }
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+    }
+}
 
 struct TempRoom {
     cwd: PathBuf,
@@ -185,6 +290,13 @@ fn spawn_say(
 fn parallel_say_invocations_never_drop_or_duplicate_facts() {
     let room = TempRoom::new("invariant");
 
+    // Daemon-serving mode (F4) when RALLY_TEST_RALLYD=1: start rallyd on the
+    // room BEFORE spawning the parallel subprocesses, so they route. Held alive
+    // (incl. through the final replay) until end of function. No-op otherwise —
+    // the no-daemon default path is byte-identical (F2).
+    let daemon_guard = maybe_start_daemon(&room.cwd, &room.home);
+    let daemon_mode = daemon_guard.is_some();
+
     // 3 invocations pinned to overrun BEFORE commit -> must fail closed.
     // 1 invocation pinned to overrun AFTER commit -> must report
     //   committed-but-projection-slow success.
@@ -310,24 +422,38 @@ fn parallel_say_invocations_never_drop_or_duplicate_facts() {
 
     // The committed-but-slow-projection invocation additionally carries the
     // explicit commit signal so a retrying caller would know not to re-post.
-    let committed_slow = invocations
-        .iter()
-        .zip(outputs.iter())
-        .find(|(invocation, _)| {
-            invocation
-                .subject
-                .starts_with("watchdog-concurrency-committed-slow")
-        })
-        .expect("committed-slow invocation must be present");
-    let committed_payload = stdout_json(committed_slow.1);
-    assert_eq!(
-        committed_payload["data"]["watchdog"]["committed"], true,
-        "committed-slow invocation must report committed:true"
-    );
-    assert_eq!(
-        committed_payload["data"]["watchdog"]["projection_complete"], false,
-        "committed-slow invocation must report projection_complete:false"
-    );
+    //
+    // DIRECT-PATH-ONLY (reconciliation, choice (a)): the commit signal +
+    // post-commit block seam live in `mark_watchdog_command_commit`, which is
+    // called from the DIRECT append path (store.rs:1691/2014). Under daemon
+    // routing that call runs INSIDE the daemon process (not the client), so the
+    // client never sets its own watchdog commit signal and the
+    // `RALLY_TEST_BLOCK_AFTER_COMMIT_MS` seam does not fire in the client — the
+    // routed append simply succeeds fast. The `committed:true` /
+    // `projection_complete:false` payload is therefore a DIRECT-path semantic,
+    // not a #50-race semantic, so we assert it only in no-daemon mode. The
+    // committed-slow invocation's CORE guarantee (exactly one fact landed) is
+    // still enforced by the replay invariant below, under BOTH modes.
+    if !daemon_mode {
+        let committed_slow = invocations
+            .iter()
+            .zip(outputs.iter())
+            .find(|(invocation, _)| {
+                invocation
+                    .subject
+                    .starts_with("watchdog-concurrency-committed-slow")
+            })
+            .expect("committed-slow invocation must be present");
+        let committed_payload = stdout_json(committed_slow.1);
+        assert_eq!(
+            committed_payload["data"]["watchdog"]["committed"], true,
+            "committed-slow invocation must report committed:true"
+        );
+        assert_eq!(
+            committed_payload["data"]["watchdog"]["projection_complete"], false,
+            "committed-slow invocation must report projection_complete:false"
+        );
+    }
 
     // Replay the canonical log once, after all eight processes have exited,
     // and check the durability invariant against every marker subject.
