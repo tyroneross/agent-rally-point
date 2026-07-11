@@ -6,9 +6,12 @@
 //! bin only parses args into a [`ServeConfig`] and calls
 //! [`rally_cli::rallyd_core::serve`].
 //!
-//! Chunk A ships a MINIMAL arg surface so `cargo build -p rallyd` passes and
-//! the frozen `serve` seam is exercised. Chunk B fills the real parser
-//! (`--idle-exit-secs`, `--foreground`, `--repo-root`).
+//! Chunk B arg surface: `--repo-root <path>` (or a single positional path),
+//! `--idle-exit-secs <n>`, and `--foreground`. All parse into the FROZEN
+//! [`ServeConfig`]; the daemon core (`rally_cli::rallyd_core::serve`) owns every
+//! behavior. `rally daemon serve` (Chunk C) is the same entry via a different
+//! front door — this bin exists so fixtures can spawn a dedicated `rallyd`
+//! process (ADR-03).
 
 use rally_cli::rallyd_core::{ServeConfig, serve};
 use std::path::PathBuf;
@@ -38,6 +41,11 @@ fn main() {
                      USAGE:\n    rallyd [--repo-root <path>] [--idle-exit-secs <n>] [--foreground]"
                 );
                 return;
+            }
+            other if !other.starts_with('-') && repo_root.is_none() => {
+                // A single positional path is the repo root (plan: "positional
+                // or --repo-root").
+                repo_root = Some(PathBuf::from(other));
             }
             other => {
                 eprintln!("rallyd: unknown argument {other:?}");

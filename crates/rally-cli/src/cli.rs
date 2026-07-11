@@ -57,6 +57,9 @@ pub(crate) enum CliCommand {
     WorktreeGc(WorktreeGcArgs),
     /// Layer 1: completion-scoped self-exit re-check for a task-scoped session.
     SelfExitCheck(SelfExitCheckArgs),
+    /// BACKLOG S-P3: `rally daemon serve|start|stop|status` — the rallyd
+    /// store daemon lifecycle.
+    Daemon(DaemonArgs),
 }
 
 pub(crate) enum CliParse {
@@ -665,6 +668,46 @@ pub(crate) struct MissionArgs {
     pub(crate) must_check: Option<String>,
 }
 
+/// BACKLOG S-P3: `rally daemon serve|start|stop|status` — the per-repo
+/// rallyd store daemon lifecycle (ADR-03).
+#[derive(Clone, Debug)]
+pub(crate) struct DaemonArgs {
+    pub(crate) json: bool,
+    pub(crate) subcommand: DaemonSubcommand,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum DaemonSubcommand {
+    Serve(DaemonServeArgs),
+    Start(DaemonStartArgs),
+    Stop,
+    Status,
+}
+
+/// `rally daemon serve` — run the daemon in THIS process, blocking until
+/// SIGTERM/SIGINT (or `--idle-exit-secs` elapses idle). Bypasses the global
+/// hook-safety watchdog entirely (D1 — see `lib.rs`'s
+/// `first_two_positionals_are_daemon_serve`).
+#[derive(Clone, Debug)]
+pub(crate) struct DaemonServeArgs {
+    /// Exit after this many idle seconds (test hygiene against orphaned
+    /// daemons). Default: serve until signalled.
+    pub(crate) idle_exit_secs: Option<u64>,
+    /// Set internally by `rally daemon start`'s spawned child. Informational
+    /// only — `rallyd_core::serve` itself ignores `ServeConfig::foreground`
+    /// (the parent handles log redirection per the frozen contract); a direct
+    /// `rally daemon serve` invocation omits this flag.
+    pub(crate) detached: bool,
+}
+
+/// `rally daemon start` — spawn a detached `rally daemon serve` child (log →
+/// `.rally/rallyd.log`, pid → `.rally/rallyd.pid`) and return only after the
+/// socket is bound and a `Ping` round-trips (R3).
+#[derive(Clone, Debug)]
+pub(crate) struct DaemonStartArgs {
+    pub(crate) idle_exit_secs: Option<u64>,
+}
+
 const COMMANDS: &[&str] = &[
     "init",
     "hooks",
@@ -718,6 +761,8 @@ const COMMANDS: &[&str] = &[
     "worktree",
     // Layer 1: completion-scoped self-exit re-check
     "self-exit-check",
+    // BACKLOG S-P3: rallyd store daemon lifecycle
+    "daemon",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -958,6 +1003,13 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .command("self-exit-check")
         .map(CliCommand::SelfExitCheck);
 
+    // BACKLOG S-P3: rallyd store daemon lifecycle
+    let daemon = daemon_parser()
+        .to_options()
+        .descr("Manage the per-repo rallyd store daemon: serve (foreground) | start (detached) | stop | status.")
+        .command("daemon")
+        .map(CliCommand::Daemon);
+
     construct!([
         init,
         hooks,
@@ -998,7 +1050,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         ack,
         adopt,
         worktree_gc,
-        self_exit_check
+        self_exit_check,
+        daemon
     ])
     .to_options()
 }
@@ -2064,4 +2117,58 @@ fn worktree_gc_parser() -> impl Parser<WorktreeGcArgs> {
         apply,
         ttl_secs,
     })
+}
+
+fn parse_u64_arg(name: &str, value: String) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|_| RallyError::Usage(format!("invalid --{name} value {value}")))
+}
+
+fn optional_u64_arg(name: &'static str, metavar: &'static str) -> impl Parser<Option<u64>> {
+    string_arg(name, metavar)
+        .parse(move |value| parse_u64_arg(name, value))
+        .optional()
+}
+
+/// BACKLOG S-P3: `rally daemon serve|start|stop|status` — mirrors
+/// `status_parser`'s json+subcommand shape.
+fn daemon_parser() -> impl Parser<DaemonArgs> {
+    let serve_idle = optional_u64_arg("idle-exit-secs", "N");
+    let serve_detached = long("detached")
+        .help("Internal: set by `rally daemon start`'s spawned child. Omit for a direct foreground invocation.")
+        .switch();
+    let serve = construct!(serve_idle, serve_detached)
+        .map(|(idle_exit_secs, detached)| DaemonServeArgs {
+            idle_exit_secs,
+            detached,
+        })
+        .to_options()
+        .descr("Run rallyd in the foreground for this repo. Blocks until SIGTERM/SIGINT (or --idle-exit-secs elapses idle). Bypasses the hook-safety watchdog entirely.")
+        .command("serve")
+        .map(DaemonSubcommand::Serve);
+
+    let start_idle = optional_u64_arg("idle-exit-secs", "N");
+    let start = start_idle
+        .map(|idle_exit_secs| DaemonStartArgs { idle_exit_secs })
+        .to_options()
+        .descr("Spawn a detached rallyd for this repo (log -> .rally/rallyd.log, pid -> .rally/rallyd.pid). Returns only after the socket is bound and a ping round-trips.")
+        .command("start")
+        .map(DaemonSubcommand::Start);
+
+    let stop = bpaf::pure(DaemonSubcommand::Stop)
+        .to_options()
+        .descr(
+            "SIGTERM the running rallyd for this repo and confirm it released the ownership lock.",
+        )
+        .command("stop");
+
+    let status = bpaf::pure(DaemonSubcommand::Status)
+        .to_options()
+        .descr("Report whether a live rallyd is serving this repo (pid, socket, wire version).")
+        .command("status");
+
+    let json = json_flag();
+    let subcommand = construct!([serve, start, stop, status]);
+    construct!(json, subcommand).map(|(json, subcommand)| DaemonArgs { json, subcommand })
 }

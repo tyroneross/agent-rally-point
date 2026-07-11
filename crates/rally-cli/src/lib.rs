@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -82,6 +82,7 @@ mod run_worktree;
 mod session_identity;
 mod source_grounding;
 mod store;
+mod store_client;
 mod tier_fit;
 pub mod worktree_gc;
 mod worktree_guard;
@@ -98,6 +99,7 @@ use dag::{DagOutput, WakeDueEntry, build_dag, project_wake_due, resolve_wake_aft
 use error::{RallyError, Result};
 use next::{AttentionItem, EntryData, NextResult, build_attention, build_entry, build_next};
 use output::{CliError, Output, RenderedOutput};
+use rallyd_core::ServeConfig;
 use route_findings::{Finding, RoutingSummary, route_findings};
 use store::{Fact, FactKind, ReadReceipt, RoomQuery, RoomSnapshot, RoomStore, RoomSummary};
 // Envelope wrapper types from backends module.
@@ -128,6 +130,8 @@ const SCHEMA_DAG: &str = "agent-rally.command.dag.v1";
 const SCHEMA_WAKE_DUE: &str = "agent-rally.command.wake-due.v1";
 // Rank-11: room north-star + per-agent autonomy envelope
 const SCHEMA_MISSION: &str = "agent-rally.command.mission.v1";
+// BACKLOG S-P3, Chunk C: `rally daemon serve|start|stop|status`
+const SCHEMA_DAEMON: &str = "agent-rally.command.daemon.v1";
 
 thread_local! {
     static WATCHDOG_COMMIT_SIGNAL: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
@@ -220,6 +224,16 @@ const INJECT_WATCHDOG_HEADROOM_MS: u64 = 5_000;
 /// defensive bound in case that CLI cap ever changes.
 const INJECT_MAX_WATCHDOG_TIMEOUT_MS: u64 = 605_000;
 
+/// Elevated watchdog budget for `rally daemon start` (D1, BACKLOG S-P3). Sized
+/// with margin above the store router's 30s bounded-block corridor
+/// (`store_client::CORRIDOR_BOUND`) so `start`'s own wait-for-ready poll —
+/// which blocks on the SAME cold-reconcile window the corridor exists to
+/// tolerate (R3) — is never pre-empted by the hook-safety watchdog. Below
+/// `MAX_WATCHDOG_TIMEOUT_MS` is irrelevant here: like the `inject` budget,
+/// this is returned directly rather than clamped through the generic
+/// override path.
+const DAEMON_START_WATCHDOG_TIMEOUT_MS: u64 = 45_000;
+
 /// True when the resolved subcommand is `inject`. `inject` is the one
 /// deliberately-LONG interactive coordination verb: with `--handoff` /
 /// `--require-ack` it BLOCKS polling the ledger for a target-authored ACK up to
@@ -234,6 +248,35 @@ fn first_positional_is_inject(args: &[String]) -> bool {
         .find(|a| !a.starts_with('-'))
         .map(String::as_str)
         == Some("inject")
+}
+
+/// D1 (Chunk C, BACKLOG S-P3): true iff the leading two positionals are
+/// `daemon serve`. `rallyd_core::serve` blocks for the daemon's ENTIRE
+/// serving lifetime (until SIGTERM/SIGINT or `--idle-exit-secs`) — it is not
+/// a bounded hook command at all, unlike `inject`'s bounded-but-long ACK
+/// wait. The hook-safety watchdog's fail-open path calls
+/// `std::process::exit(0)` on timeout, which would kill the daemon process
+/// itself (in what looks like ordinary success) and silently take
+/// `.rally/rallyd.sock` down with it. `run_with_watchdog` detects this shape
+/// and bypasses the race entirely — mirroring [`first_positional_is_inject`]'s
+/// detect-then-special-case shape, but routing to the NO-DEADLINE inline path
+/// rather than sizing a (necessarily finite) timeout.
+fn first_two_positionals_are_daemon_serve(args: &[String]) -> bool {
+    matches!(first_positionals(args), (Some("daemon"), Some("serve")))
+}
+
+/// True iff the leading two positionals are `daemon start`. R3: `start`
+/// blocks until `.rally/rallyd.sock.addr` exists AND a `Ping` round-trips,
+/// which during a cold reconcile (segment replay on a large room) can take
+/// seconds-to-tens-of-seconds — the store router's own bounded-block
+/// corridor (`store_client::CORRIDOR_BOUND`, Chunk C) waits up to 30s in
+/// 3s-per-attempt re-probes before failing loud. `daemon start`'s watchdog
+/// must not pre-empt that corridor, so it gets an elevated, fixed budget with
+/// margin above it (see `DAEMON_START_WATCHDOG_TIMEOUT_MS`). `daemon
+/// stop`/`daemon status` are quick one-shot probes and stay on the default
+/// hook-safe budget.
+fn first_two_positionals_are_daemon_start(args: &[String]) -> bool {
+    matches!(first_positionals(args), (Some("daemon"), Some("start")))
 }
 
 /// Extract the `--timeout-seconds VALUE` (or `=VALUE`) ACK budget from an
@@ -292,6 +335,15 @@ fn resolve_watchdog_timeout(args: &[String]) -> Duration {
             .saturating_add(INJECT_WATCHDOG_HEADROOM_MS)
             .clamp(MIN_WATCHDOG_TIMEOUT_MS, INJECT_MAX_WATCHDOG_TIMEOUT_MS);
         return Duration::from_millis(ms);
+    }
+
+    // (2b) `daemon start` (D1) — elevated fixed budget so it isn't pre-empted
+    // by a cold-reconcile wait-for-ready poll sized against the store
+    // router's 30s corridor (R3). `daemon serve` never reaches here at all —
+    // it is intercepted before this function is even called (see
+    // `run_with_watchdog`'s D1 bypass).
+    if first_two_positionals_are_daemon_start(args) {
+        return Duration::from_millis(DAEMON_START_WATCHDOG_TIMEOUT_MS);
     }
 
     // (3) Everything else: the hook-safe default.
@@ -359,6 +411,18 @@ pub fn main() -> ExitCode {
 /// process is the only correct release, and it is what a fresh `rally`
 /// invocation would do anyway.)
 fn run_with_watchdog(args: Vec<String>) -> ExitCode {
+    // D1 (Chunk C, BACKLOG S-P3): `rally daemon serve` bypasses the watchdog
+    // race entirely — see `first_two_positionals_are_daemon_serve`'s doc
+    // comment. Route straight to the no-deadline inline path (the same path
+    // `run_with_watchdog` itself falls back to when thread spawning fails)
+    // rather than sizing a timeout, since `serve()` legitimately blocks for
+    // the daemon's entire lifetime. Strip watchdog-only flags first so a
+    // stray `--timeout-ms`/`--fail-open` on the invocation can't reach the
+    // `daemon` subcommand parser (which doesn't know about them).
+    if first_two_positionals_are_daemon_serve(&args) {
+        return run_inline(strip_timeout_flag(args));
+    }
+
     // Resolve the budget from the *raw* args, then strip the watchdog-only
     // `--timeout-ms` flag so it never reaches a subcommand parser (which would
     // reject it as unknown). The env var path needs no stripping.
@@ -772,6 +836,8 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::WorktreeGc(args) => command_worktree_gc(args),
         // Layer 1: completion-scoped self-exit re-check
         CliCommand::SelfExitCheck(args) => command_self_exit_check(args),
+        // BACKLOG S-P3, Chunk C: rallyd store daemon lifecycle
+        CliCommand::Daemon(args) => command_daemon(args),
     }
 }
 
@@ -883,6 +949,324 @@ fn command_self_exit_check(args: cli::SelfExitCheckArgs) -> Result<Output> {
         }),
     )?;
     Ok(Output::new(args.json, text, body))
+}
+
+// =============================================================================
+// BACKLOG S-P3, Chunk C — rally daemon serve|start|stop|status
+// =============================================================================
+
+/// Hand-declared `kill(2)`, mirroring `rallyd_core.rs`'s own `extern "C" fn
+/// signal` and `store.rs`'s `extern "C" fn flock` pattern — no `libc`/`nix`
+/// dependency (zero new deps). Exported by libc on macOS and Linux and linked
+/// by default. Used only by `rally daemon stop` to SIGTERM the pid on record.
+#[cfg(unix)]
+mod daemon_signal {
+    unsafe extern "C" {
+        pub(super) fn kill(pid: i32, sig: i32) -> i32;
+    }
+    pub(super) const SIGTERM: i32 = 15;
+}
+
+/// `rally daemon start`'s own wait-for-ready poll bound. Elevated above (with
+/// margin over) the store router's [`store_client::CORRIDOR_BOUND`] (30s):
+/// both wait on the SAME cold-reconcile window (R3), so `start`'s poll must
+/// not give up before the corridor would. The watchdog carve-out
+/// (`lib.rs`'s `DAEMON_START_WATCHDOG_TIMEOUT_MS`, 45s) has its own separate
+/// margin above THIS bound.
+const DAEMON_START_READY_BOUND: Duration = Duration::from_secs(35);
+const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+/// How long `rally daemon stop` waits for the SH ownership lock to become
+/// non-blocking-acquirable after sending SIGTERM — the kernel-enforced proof
+/// that the daemon's EX hold has actually released (ADR-01/G7), not a guess.
+const DAEMON_STOP_RELEASE_BOUND: Duration = Duration::from_secs(10);
+const DAEMON_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(JsonSchema, Serialize)]
+struct DaemonData {
+    daemon: DaemonPayload,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct DaemonPayload {
+    subcommand: String,
+    live: bool,
+    pid: Option<u32>,
+    socket: Option<String>,
+    wire_version: Option<u32>,
+    repo_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn daemon_envelope_body(
+    subcommand: &str,
+    live: bool,
+    pid: Option<u32>,
+    socket: Option<String>,
+    wire_version: Option<u32>,
+    repo_root: String,
+    note: Option<String>,
+) -> Result<Value> {
+    envelope(
+        "daemon",
+        SCHEMA_DAEMON,
+        DaemonData {
+            daemon: DaemonPayload {
+                subcommand: subcommand.to_string(),
+                live,
+                pid,
+                socket,
+                wire_version,
+                repo_root,
+                note,
+            },
+        },
+    )
+}
+
+fn command_daemon(args: cli::DaemonArgs) -> Result<Output> {
+    match args.subcommand {
+        cli::DaemonSubcommand::Serve(serve_args) => command_daemon_serve(args.json, serve_args),
+        cli::DaemonSubcommand::Start(start_args) => command_daemon_start(args.json, start_args),
+        cli::DaemonSubcommand::Stop => command_daemon_stop(args.json),
+        cli::DaemonSubcommand::Status => command_daemon_status(args.json),
+    }
+}
+
+/// `rally daemon serve` — runs `rallyd_core::serve` in THIS process. Blocks
+/// until SIGTERM/SIGINT (or `--idle-exit-secs` elapses idle); D1's watchdog
+/// carve-out (`run_with_watchdog`) ensures this call is never raced against
+/// the hook-safety timeout.
+fn command_daemon_serve(json: bool, args: cli::DaemonServeArgs) -> Result<Output> {
+    let root = repo_root()?;
+    let canonical = store::canonical_repo_root_string(&root);
+    let config = ServeConfig {
+        repo_root: root,
+        idle_exit_secs: args.idle_exit_secs,
+        foreground: !args.detached,
+    };
+    rallyd_core::serve(config).map_err(|err| RallyError::Command(err.message().to_string()))?;
+    let body = daemon_envelope_body(
+        "serve",
+        false,
+        None,
+        None,
+        None,
+        canonical,
+        Some("daemon shut down cleanly".to_string()),
+    )?;
+    Ok(Output::new(
+        json,
+        "rally daemon serve: shut down cleanly".to_string(),
+        body,
+    ))
+}
+
+/// `rally daemon start` — spawn a detached `rally daemon serve --detached`
+/// child (log → `.rally/rallyd.log`) and block until it becomes ready:
+/// `.rally/rallyd.sock.addr` exists AND a `Ping` round-trips (R3). Idempotent:
+/// a daemon already live for this repo is reported as success, not an error.
+fn command_daemon_start(json: bool, args: cli::DaemonStartArgs) -> Result<Output> {
+    let root = repo_root()?;
+    let rally_dir = root.join(".rally");
+    fs::create_dir_all(&rally_dir).map_err(RallyError::io("create .rally"))?;
+    let canonical = store::canonical_repo_root_string(&root);
+
+    if let Some(identity) = store_client::probe_identity(&rally_dir, &canonical) {
+        let body = daemon_envelope_body(
+            "start",
+            true,
+            Some(identity.pid),
+            Some(identity.socket.display().to_string()),
+            Some(identity.wire_version),
+            canonical,
+            Some("already running".to_string()),
+        )?;
+        return Ok(Output::new(
+            json,
+            format!("rally daemon start: already running (pid {})", identity.pid),
+            body,
+        ));
+    }
+
+    let exe = env::current_exe().map_err(RallyError::io("resolve current_exe"))?;
+    let log_path = rally_dir.join("rallyd.log");
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(RallyError::io(format!("open {}", log_path.display())))?;
+    let log_file_err = log_file
+        .try_clone()
+        .map_err(RallyError::io("clone log fd"))?;
+
+    let mut cmd = Command::new(&exe);
+    cmd.arg("daemon").arg("serve").arg("--detached");
+    if let Some(secs) = args.idle_exit_secs {
+        cmd.arg("--idle-exit-secs").arg(secs.to_string());
+    }
+    cmd.current_dir(&root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err));
+    let child = cmd
+        .spawn()
+        .map_err(RallyError::io("spawn rally daemon serve"))?;
+    let spawned_pid = child.id();
+    // Deliberately no `.wait()` — the child is meant to OUTLIVE this process
+    // (detached posture, ADR-03/L6). If this `rally daemon start` process
+    // exits first, the kernel reparents the child; it keeps serving.
+
+    let deadline = Instant::now() + DAEMON_START_READY_BOUND;
+    loop {
+        if let Some(identity) = store_client::probe_identity(&rally_dir, &canonical) {
+            let body = daemon_envelope_body(
+                "start",
+                true,
+                Some(identity.pid),
+                Some(identity.socket.display().to_string()),
+                Some(identity.wire_version),
+                canonical,
+                None,
+            )?;
+            return Ok(Output::new(
+                json,
+                format!("rally daemon start: ready (pid {})", identity.pid),
+                body,
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(RallyError::Command(format!(
+                "rally daemon start: spawned pid {spawned_pid} but it never became ready within {}s; check {}",
+                DAEMON_START_READY_BOUND.as_secs(),
+                log_path.display()
+            )));
+        }
+        thread::sleep(DAEMON_START_POLL_INTERVAL);
+    }
+}
+
+/// `rally daemon stop` — SIGTERM the pid on record, then confirm the
+/// ownership lock actually released (SH becomes non-blocking-acquirable —
+/// kernel-enforced proof, not a guess). Idempotent: no pid file is reported
+/// as "not running", not an error.
+fn command_daemon_stop(json: bool) -> Result<Output> {
+    let root = repo_root()?;
+    let rally_dir = root.join(".rally");
+    let canonical = store::canonical_repo_root_string(&root);
+    let pid = fs::read_to_string(rally_dir.join("rallyd.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+
+    let Some(pid) = pid else {
+        let body = daemon_envelope_body(
+            "stop",
+            false,
+            None,
+            None,
+            None,
+            canonical,
+            Some("no pid file — not running".to_string()),
+        )?;
+        return Ok(Output::new(
+            json,
+            "rally daemon stop: not running".to_string(),
+            body,
+        ));
+    };
+
+    #[cfg(unix)]
+    {
+        // ESRCH (no such process) just means it already exited; either way we
+        // confirm the lock release below rather than trusting the return code.
+        let _ = unsafe { daemon_signal::kill(pid as i32, daemon_signal::SIGTERM) };
+    }
+    #[cfg(not(unix))]
+    {
+        return Err(RallyError::Command(
+            "rallyd is a unix-only daemon".to_string(),
+        ));
+    }
+
+    let deadline = Instant::now() + DAEMON_STOP_RELEASE_BOUND;
+    let released = loop {
+        if let Ok(Some(_guard)) = store::acquire_owner_shared_nb(&rally_dir) {
+            // Probe-only: drop immediately. This process isn't opening a
+            // direct store here, so it must not install itself as this
+            // room's process-global direct-mode guard (G7).
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(DAEMON_STOP_POLL_INTERVAL);
+    };
+
+    let note = if released {
+        format!("SIGTERM sent to pid {pid}; ownership lock released")
+    } else {
+        format!(
+            "SIGTERM sent to pid {pid}; ownership lock NOT released within {}s — daemon may be wedged, check `rally daemon status`",
+            DAEMON_STOP_RELEASE_BOUND.as_secs()
+        )
+    };
+    let body = daemon_envelope_body(
+        "stop",
+        false,
+        Some(pid),
+        None,
+        None,
+        canonical,
+        Some(note.clone()),
+    )?;
+    Ok(Output::new(
+        json,
+        format!("rally daemon stop: {note}"),
+        body,
+    ))
+}
+
+/// `rally daemon status` — read-only: ping-probes for a live daemon and
+/// reports pid/socket/wire_version; falls back to the pid file (stale/crashed
+/// hint) when no daemon answers. `--json` emits the standard envelope
+/// (checklist Item 4 — scope-auditor advisory).
+fn command_daemon_status(json: bool) -> Result<Output> {
+    let root = repo_root()?;
+    let rally_dir = root.join(".rally");
+    let canonical = store::canonical_repo_root_string(&root);
+    let identity = store_client::probe_identity(&rally_dir, &canonical);
+    let pid_file = fs::read_to_string(rally_dir.join("rallyd.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+
+    let (live, pid, socket, wire_version, note) = match identity {
+        Some(id) => (
+            true,
+            Some(id.pid),
+            Some(id.socket.display().to_string()),
+            Some(id.wire_version),
+            None,
+        ),
+        None if pid_file.is_some() => (
+            false,
+            pid_file,
+            None,
+            None,
+            Some("pid file present but daemon did not answer a ping (stale/crashed)".to_string()),
+        ),
+        None => (false, None, None, None, Some("not running".to_string())),
+    };
+
+    let text = format!(
+        "rally daemon status: live={live} pid={} socket={}",
+        pid.map(|p| p.to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        socket.clone().unwrap_or_else(|| "<none>".to_string())
+    );
+    let body = daemon_envelope_body("status", live, pid, socket, wire_version, canonical, note)?;
+    Ok(Output::new(json, text, body))
 }
 
 // =============================================================================
