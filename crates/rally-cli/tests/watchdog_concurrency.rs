@@ -254,6 +254,17 @@ fn parallel_say_invocations_never_drop_or_duplicate_facts() {
         .collect();
 
     for (invocation, output) in invocations.iter().zip(outputs.iter()) {
+        // Name the guilty invocation BEFORE parsing: a bare `stdout_json`
+        // panic on empty/garbled output cannot tell WHICH of the 8 processes
+        // (or which expectation group) misbehaved, nor its exit code and
+        // stderr — the three facts a flake diagnosis needs.
+        assert!(
+            !output.stdout.is_empty(),
+            "subject {} produced EMPTY stdout; exit={:?} stderr={}",
+            invocation.subject,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
         let payload = stdout_json(output);
         match invocation.expectation {
             Expectation::UncommittedTimeout => {
