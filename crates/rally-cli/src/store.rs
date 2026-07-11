@@ -4151,9 +4151,33 @@ mod ledger_tests {
         read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap_or_default()
     }
 
+    /// Wait for a just-dropped store's sqlite pool to actually CLOSE, then
+    /// remove any leftover journal siblings.
+    ///
+    /// `SqliteStore`'s `Drop` joins its delivery thread, but the sqlx pool's
+    /// sqlite worker threads close their connections ASYNCHRONOUSLY after
+    /// drop. Until that close completes, a worker holds open fds to both
+    /// `facts.db` and its `-wal` — and the final close CHECKPOINTS the WAL
+    /// back over the main file, silently undoing any corruption/surgery a
+    /// test performed in the window. Observed as issue #48: deterministic
+    /// failure on Linux CI (the async close reliably lands after the test's
+    /// corruption write), racy pass on macOS.
+    ///
+    /// sqlite removes `-wal`/`-shm` itself on the last connection close, so
+    /// their disappearance IS the quiesce signal. Bounded: after ~5s fall
+    /// through and delete stragglers — with no WAL left on disk there is no
+    /// checkpoint-from-WAL hazard for the caller's subsequent surgery.
     fn remove_fact_store_journals(facts_db: &Path) {
-        let _ = fs::remove_file(facts_db.with_extension("db-shm"));
-        let _ = fs::remove_file(facts_db.with_extension("db-wal"));
+        let wal = facts_db.with_extension("db-wal");
+        let shm = facts_db.with_extension("db-shm");
+        for _ in 0..100 {
+            if !wal.exists() && !shm.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let _ = fs::remove_file(shm);
+        let _ = fs::remove_file(wal);
     }
 
     /// R1-era guarantee, ported to R5: the segments under `.rally/log/` are
@@ -4396,13 +4420,15 @@ mod ledger_tests {
 
         drop(store);
 
-        // Remove the WAL/SHM siblings before corrupting the main file. A leftover
-        // WAL lets SQLite recover the (about-to-be-)corrupted header from the WAL
-        // ~4% of the time under heavy parallel load — masking the corruption so
-        // the precondition + quarantine assertions flap. With the siblings gone,
-        // a wrong magic header is categorically SQLITE_NOTADB, detected at open.
-        let _ = fs::remove_file(root.join(".rally/facts.db-wal"));
-        let _ = fs::remove_file(root.join(".rally/facts.db-shm"));
+        // Quiesce the dropped store's pool + remove the WAL/SHM siblings before
+        // corrupting the main file. A leftover WAL lets SQLite recover the
+        // (about-to-be-)corrupted header from the WAL — masking the corruption
+        // so the precondition + quarantine assertions flap. Deleting the WAL by
+        // path is NOT enough: the async pool close still holds an open fd to it
+        // and checkpoints it back over the main file (issue #48 — deterministic
+        // on Linux). `remove_fact_store_journals` waits for sqlite's own
+        // last-close cleanup first.
+        remove_fact_store_journals(&root.join(".rally/facts.db"));
 
         // Corrupt facts.db by overwriting the SQLite magic header (bytes 0-15
         // hold the ASCII string "SQLite format 3\000"). This reproduces
