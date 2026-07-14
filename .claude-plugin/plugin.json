@@ -1,6 +1,5 @@
 {
   "name": "agent-rally-point",
-  "version": "0.1.6",
   "description": "Agent Rally Point — repo-local coordination surface for parallel coding agents (Claude Code, Codex, Gemini). Records claims, checks write boundaries, routes handoffs, and exposes room state via the rally CLI. Skills: agent-rally-point (per-session loop), rally-workflows (fan-out + dynamic-workflows protocol), mini-loop (per-task quality gate). Advisory-only hooks auto-fire on SessionStart + PreToolUse to surface room awareness and deconflict before edits — never blocks. Backend: rally CLI (cargo install --path crates/rally-cli).",
   "author": {
     "name": "Tyrone Ross",
