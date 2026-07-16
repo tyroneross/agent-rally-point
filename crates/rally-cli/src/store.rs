@@ -1288,6 +1288,13 @@ impl RoomStore {
         }
     }
 
+    /// The `.rally` state directory backing this room — the parent of `facts.db`
+    /// and the location where quarantined `facts.db.corrupt.*` snapshots land.
+    /// Used by `rally doctor --sweep-corrupt` to locate disposable debris.
+    pub(crate) fn rally_dir(&self) -> PathBuf {
+        self.repo_root().join(".rally")
+    }
+
     #[cfg(test)]
     pub(crate) fn claim_index_path(&self) -> &Path {
         match self {

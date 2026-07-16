@@ -838,6 +838,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::SelfExitCheck(args) => command_self_exit_check(args),
         // BACKLOG S-P3, Chunk C: rallyd store daemon lifecycle
         CliCommand::Daemon(args) => command_daemon(args),
+        CliCommand::ClaimsRefresh(args) => command_claims_refresh(args),
     }
 }
 
@@ -2895,9 +2896,165 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
         let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
         return Ok(Output::new(args.json, text, body));
     }
+    if args.sweep_corrupt {
+        let data = doctor::run_sweep_corrupt(args.keep, args.max_age_days, args.apply)?;
+        let text = format!(
+            "doctor sweep-corrupt: swept={} kept={} bytes_reclaimable={} applied={}",
+            data.swept.len(),
+            data.kept.len(),
+            data.bytes_reclaimable,
+            data.applied,
+        );
+        let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
+        return Ok(Output::new(args.json, text, body));
+    }
     Err(RallyError::Usage(
-        "rally doctor requires --canonical-paths, --prune-rooms, or --reap-stale".to_string(),
+        "rally doctor requires --canonical-paths, --prune-rooms, --reap-stale, or --sweep-corrupt"
+            .to_string(),
     ))
+}
+
+// claims-refresh -------------------------------------------------------------
+
+const SCHEMA_CLAIMS_REFRESH: &str = "agent-rally.command.claims-refresh.v1";
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct ClaimsRefreshEnvelope {
+    claims_refresh: ClaimsRefreshReport,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct ClaimConflictEntry {
+    /// The manifest path that could not be claimed.
+    path: String,
+    /// The live peer that already holds a conflicting claim.
+    owner: String,
+    /// The full conflict message from the store.
+    detail: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct ClaimsRefreshReport {
+    lane: String,
+    tool: String,
+    manifest: String,
+    /// Files successfully claimed or renewed (own-claim renewal and
+    /// stale/expired-claim reclaim both land here — they never conflict).
+    claimed: Vec<String>,
+    /// Files blocked by a live peer's conflicting claim; the rest of the
+    /// manifest still processed (graceful degradation).
+    conflicts: Vec<ClaimConflictEntry>,
+    /// Total claimable paths parsed from the manifest.
+    total: usize,
+}
+
+/// Parse a newline-delimited manifest: trim each line, drop blank lines and
+/// `#`-prefixed comments.
+fn parse_claims_manifest(contents: &str) -> Vec<String> {
+    contents
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Build a single-file claim `SayArgs` tagged with a `lane:<name>` evidence
+/// marker. Reuses the full `command_say` claim path (lease sizing, source
+/// grounding, presence, conflict detection).
+fn claim_say_args(tool: &str, lane: &str, path: &str, json: bool) -> SayArgs {
+    SayArgs {
+        json,
+        kind: FactKind::Claim,
+        tool: tool.to_string(),
+        subject: None,
+        thread_id: None,
+        role: None,
+        summary: Some(format!("claims-refresh: lane {lane}")),
+        scopes: Vec::new(),
+        resources: Vec::new(),
+        paths: vec![path.to_string()],
+        evidence: vec![format!("lane:{lane}")],
+        target: None,
+        ref_id: None,
+        status: None,
+        severity: None,
+        uri: None,
+        produces: Vec::new(),
+        depends: Vec::new(),
+        run_id: None,
+        step_id: None,
+        parent_step_ids: Vec::new(),
+        reason: None,
+        wake_after: None,
+        ref_standby: None,
+    }
+}
+
+fn command_claims_refresh(args: ClaimsRefreshArgs) -> Result<Output> {
+    let contents = std::fs::read_to_string(&args.manifest)
+        .map_err(|e| RallyError::Usage(format!("cannot read manifest {}: {e}", args.manifest)))?;
+    let files = parse_claims_manifest(&contents);
+    if files.is_empty() {
+        return Err(RallyError::Usage(format!(
+            "manifest {} has no claimable paths (blank/comment-only)",
+            args.manifest
+        )));
+    }
+
+    let mut claimed: Vec<String> = Vec::new();
+    let mut conflicts: Vec<ClaimConflictEntry> = Vec::new();
+
+    for path in &files {
+        let say = claim_say_args(&args.tool, &args.lane, path, args.json);
+        match command_say(say) {
+            Ok(_) => claimed.push(path.clone()),
+            // A live peer holds a conflicting claim — record and keep going so
+            // one conflict never blocks the rest of the manifest.
+            Err(RallyError::Usage(msg)) if msg.contains("claim conflict") => {
+                let owner = msg
+                    .split("claim conflict:")
+                    .nth(1)
+                    .and_then(|s| s.split("already owns").next())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "unknown".to_string());
+                conflicts.push(ClaimConflictEntry {
+                    path: path.clone(),
+                    owner,
+                    detail: msg,
+                });
+            }
+            // Genuine failure (IO, corruption, verification) — surface loudly.
+            Err(e) => return Err(e),
+        }
+    }
+
+    let total = files.len();
+    let report = ClaimsRefreshReport {
+        lane: args.lane.clone(),
+        tool: args.tool.clone(),
+        manifest: args.manifest.clone(),
+        claimed,
+        conflicts,
+        total,
+    };
+    let text = format!(
+        "claims-refresh lane={} tool={}: claimed={}/{} conflicts={}",
+        report.lane,
+        report.tool,
+        report.claimed.len(),
+        total,
+        report.conflicts.len(),
+    );
+    let body = envelope(
+        "claims-refresh",
+        SCHEMA_CLAIMS_REFRESH,
+        ClaimsRefreshEnvelope {
+            claims_refresh: report,
+        },
+    )?;
+    Ok(Output::new(args.json, text, body))
 }
 
 // B13 -----------------------------------------------------------------------

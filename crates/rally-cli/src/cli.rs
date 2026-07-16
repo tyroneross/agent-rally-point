@@ -60,6 +60,11 @@ pub(crate) enum CliCommand {
     /// BACKLOG S-P3: `rally daemon serve|start|stop|status` — the rallyd
     /// store daemon lifecycle.
     Daemon(DaemonArgs),
+    /// One-shot lane-claim refresh: claim/renew a lane's full file manifest in
+    /// a single call (replaces the 8+ manual `rally say claim` ritual per
+    /// multi-lane run). Renews own claims, reclaims stale/expired ones, reports
+    /// live peer conflicts without blocking the rest of the manifest.
+    ClaimsRefresh(ClaimsRefreshArgs),
 }
 
 pub(crate) enum CliParse {
@@ -273,6 +278,29 @@ pub(crate) struct DoctorArgs {
     /// Apply the prune (rewrite index); only meaningful with --prune-rooms.
     /// Also activates writes for --reap-stale.
     pub(crate) apply: bool,
+    /// Sweep quarantined `facts.db.corrupt.*` snapshots from the store dir
+    /// (dry-run by default; remove with --apply). facts.db is a disposable
+    /// derived cache — the canonical record is the JSONL ledger — so these
+    /// snapshots are pure debris once triaged.
+    pub(crate) sweep_corrupt: bool,
+    /// Retention for --sweep-corrupt: keep the newest N corrupt snapshots for
+    /// forensics; older ones are swept. Default 1.
+    pub(crate) keep: Option<i64>,
+    /// Retention for --sweep-corrupt: also keep any snapshot newer than N days
+    /// regardless of --keep. Default 7.
+    pub(crate) max_age_days: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClaimsRefreshArgs {
+    pub(crate) json: bool,
+    /// The tool identity making the claims (e.g. `claude_code`).
+    pub(crate) tool: String,
+    /// Lane label recorded as a `lane:<name>` evidence marker on each claim.
+    pub(crate) lane: String,
+    /// Path to a newline-delimited manifest of files to claim/renew.
+    /// Blank lines and `#`-prefixed comment lines are ignored.
+    pub(crate) manifest: String,
 }
 
 #[derive(Clone, Debug)]
@@ -763,6 +791,8 @@ const COMMANDS: &[&str] = &[
     "self-exit-check",
     // BACKLOG S-P3: rallyd store daemon lifecycle
     "daemon",
+    // One-shot lane-claim refresh (retro §11 / enforce-candidate #3)
+    "claims-refresh",
 ];
 
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
@@ -883,9 +913,14 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .map(CliCommand::MigrateLegacy);
     let doctor = doctor_parser()
         .to_options()
-        .descr("Read-only diagnostics: path hygiene (--canonical-paths) and room registry pruning (--prune-rooms).")
+        .descr("Diagnostics + remediation: path hygiene (--canonical-paths), room registry pruning (--prune-rooms), stale-claim/lease reaping (--reap-stale), corrupt-snapshot sweeping (--sweep-corrupt). Read-only unless --apply.")
         .command("doctor")
         .map(CliCommand::Doctor);
+    let claims_refresh = claims_refresh_parser()
+        .to_options()
+        .descr("One-shot lane-claim refresh: claim/renew a lane's full file manifest in a single call. Renews own claims, reclaims stale ones, reports live peer conflicts without blocking the rest.")
+        .command("claims-refresh")
+        .map(CliCommand::ClaimsRefresh);
     let version = version_parser()
         .to_options()
         .descr("Print the rally build-id (version + git hash). Exits 0.")
@@ -1051,7 +1086,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         adopt,
         worktree_gc,
         self_exit_check,
-        daemon
+        daemon,
+        claims_refresh
     ])
     .to_options()
 }
@@ -1392,14 +1428,35 @@ fn doctor_parser() -> impl Parser<DoctorArgs> {
         )
         .switch();
     let apply = long("apply")
-        .help("Apply the prune: rewrite the registry index, keeping only live entries; also commits --reap-stale writes")
+        .help("Apply the prune: rewrite the registry index, keeping only live entries; also commits --reap-stale writes; also removes swept --sweep-corrupt snapshots")
         .switch();
+    let sweep_corrupt = long("sweep-corrupt")
+        .help("Sweep quarantined facts.db.corrupt.* snapshots (dry-run by default; remove with --apply)")
+        .switch();
+    let keep = optional_i64_arg("keep", "N");
+    let max_age_days = optional_i64_arg("max-age-days", "N");
     construct!(DoctorArgs {
         json,
         canonical_paths,
         prune_rooms,
         reap_stale,
-        apply
+        apply,
+        sweep_corrupt,
+        keep,
+        max_age_days
+    })
+}
+
+fn claims_refresh_parser() -> impl Parser<ClaimsRefreshArgs> {
+    let json = json_flag();
+    let tool = string_arg("tool", "TOOL");
+    let lane = string_arg("lane", "LANE");
+    let manifest = string_arg("manifest", "PATH");
+    construct!(ClaimsRefreshArgs {
+        json,
+        tool,
+        lane,
+        manifest
     })
 }
 
