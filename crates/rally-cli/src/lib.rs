@@ -2908,10 +2908,64 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
         let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
         return Ok(Output::new(args.json, text, body));
     }
+    if args.compact_log {
+        let data = doctor::run_compact_log(args.log_file)?;
+        let text = render_compact_log_text(&data);
+        let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
+        return Ok(Output::new(args.json, text, body));
+    }
     Err(RallyError::Usage(
-        "rally doctor requires --canonical-paths, --prune-rooms, --reap-stale, or --sweep-corrupt"
+        "rally doctor requires --canonical-paths, --prune-rooms, --reap-stale, --sweep-corrupt, or --compact-log"
             .to_string(),
     ))
+}
+
+/// Human rendering for `doctor --compact-log`: header with compaction stats,
+/// then one line per entry — heartbeat runs as `presence xN [tool(n) ...]`.
+fn render_compact_log_text(data: &doctor::CompactLogReport) -> String {
+    let mut out = format!(
+        "doctor compact-log: {} lines={} presence={} runs={} saved={} unparseable={}",
+        data.log_file.display(),
+        data.total_lines,
+        data.presence_lines,
+        data.presence_runs,
+        data.lines_saved,
+        data.unparseable_lines,
+    );
+    for entry in &data.entries {
+        match entry {
+            doctor::CompactLogEntry::PresenceRun(run) => {
+                let tools: Vec<String> = run
+                    .tools
+                    .iter()
+                    .map(|(tool, n)| format!("{tool}({n})"))
+                    .collect();
+                out.push_str(&format!(
+                    "\nseq {}..{}  {}..{}  presence x{}  [{}]",
+                    run.first_seq,
+                    run.last_seq,
+                    run.first_at,
+                    run.last_at,
+                    run.count,
+                    tools.join(" "),
+                ));
+            }
+            doctor::CompactLogEntry::Event(ev) => {
+                out.push_str(&format!(
+                    "\nseq {}  {}  {}  {}  {}",
+                    ev.seq,
+                    ev.occurred_at,
+                    ev.event_type,
+                    ev.tool.as_deref().unwrap_or("-"),
+                    ev.subject.as_deref().unwrap_or(""),
+                ));
+            }
+        }
+    }
+    for w in &data.warnings {
+        out.push_str(&format!("\nwarning {}: {}", w.code, w.message));
+    }
+    out
 }
 
 // claims-refresh -------------------------------------------------------------

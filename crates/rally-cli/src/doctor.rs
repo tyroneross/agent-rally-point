@@ -3,11 +3,12 @@
 
 //! `rally doctor` — diagnostics and remediation for path hygiene, room registry, and stale state.
 //!
-//! Four independent modes:
+//! Five independent modes:
 //!   --canonical-paths  scan active claims for non-canonical scopes and suffix collisions
 //!   --prune-rooms      classify registry entries as live/stale; remove stale ones with --apply
 //!   --reap-stale       reap over-TTL in-room claims and stale lead leases (dry-run; commit with --apply)
 //!   --sweep-corrupt    sweep disposable facts.db.corrupt.* snapshots (dry-run; remove with --apply)
+//!   --compact-log      render a diagnostic log with presence/heartbeat runs collapsed into counts
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -333,6 +334,193 @@ pub(crate) fn run_sweep_corrupt(
 }
 
 // =============================================================================
+// compact-log logic
+// =============================================================================
+
+/// A run of 2+ consecutive presence/heartbeat log lines, collapsed into one
+/// summarized entry instead of repeating each heartbeat.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct PresenceRun {
+    pub(crate) first_seq: i64,
+    pub(crate) last_seq: i64,
+    pub(crate) first_at: String,
+    pub(crate) last_at: String,
+    /// Total heartbeat lines absorbed into this run.
+    pub(crate) count: usize,
+    /// Heartbeat count per tool within the run (sorted by tool id).
+    pub(crate) tools: std::collections::BTreeMap<String, usize>,
+}
+
+/// A log line passed through individually (non-presence, or a lone heartbeat
+/// with no neighbor to collapse into).
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct CompactLogEvent {
+    pub(crate) seq: i64,
+    pub(crate) occurred_at: String,
+    pub(crate) event_type: String,
+    pub(crate) tool: Option<String>,
+    pub(crate) subject: Option<String>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[serde(tag = "entry", rename_all = "snake_case")]
+pub(crate) enum CompactLogEntry {
+    PresenceRun(PresenceRun),
+    Event(CompactLogEvent),
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct CompactLogReport {
+    /// The segment file that was read.
+    pub(crate) log_file: PathBuf,
+    pub(crate) total_lines: usize,
+    /// Lines whose event_type is presence (all of them, collapsed or not).
+    pub(crate) presence_lines: usize,
+    /// Number of collapsed runs (each absorbing 2+ presence lines).
+    pub(crate) presence_runs: usize,
+    /// Lines removed from the rendering by collapsing (absorbed − run summaries).
+    pub(crate) lines_saved: usize,
+    pub(crate) unparseable_lines: usize,
+    pub(crate) entries: Vec<CompactLogEntry>,
+    pub(crate) warnings: Vec<DiscoveryWarning>,
+}
+
+/// Event types that count as heartbeat traffic. Presence facts are the
+/// liveness heartbeat (see liveness.rs: "Heartbeat / presence last_seen").
+fn is_heartbeat(event_type: &str) -> bool {
+    event_type == "presence"
+}
+
+/// Flush a pending run of consecutive presence lines into `entries`.
+/// A single buffered heartbeat passes through as a normal event — only
+/// repetition collapses.
+fn flush_presence_run(pending: &mut Vec<CompactLogEvent>, entries: &mut Vec<CompactLogEntry>) {
+    match pending.len() {
+        0 => {}
+        1 => entries.push(CompactLogEntry::Event(pending.remove(0))),
+        _ => {
+            let mut tools = std::collections::BTreeMap::new();
+            for ev in pending.iter() {
+                *tools
+                    .entry(ev.tool.clone().unwrap_or_else(|| "unknown".to_string()))
+                    .or_insert(0) += 1;
+            }
+            let first = &pending[0];
+            let last = &pending[pending.len() - 1];
+            entries.push(CompactLogEntry::PresenceRun(PresenceRun {
+                first_seq: first.seq,
+                last_seq: last.seq,
+                first_at: first.occurred_at.clone(),
+                last_at: last.occurred_at.clone(),
+                count: pending.len(),
+                tools,
+            }));
+            pending.clear();
+        }
+    }
+}
+
+/// Pure core: compact one segment's jsonl contents. Consecutive presence
+/// (heartbeat) lines collapse into a [`PresenceRun`]; everything else passes
+/// through in order. Unparseable lines are counted, never fatal.
+pub(crate) fn compact_log_content(path: &Path, contents: &str) -> CompactLogReport {
+    let mut entries: Vec<CompactLogEntry> = Vec::new();
+    let mut pending: Vec<CompactLogEvent> = Vec::new();
+    let mut total_lines = 0usize;
+    let mut presence_lines = 0usize;
+    let mut unparseable_lines = 0usize;
+
+    for line in contents.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        total_lines += 1;
+        let parsed: Option<serde_json::Value> = serde_json::from_str(line).ok();
+        let Some(v) = parsed else {
+            unparseable_lines += 1;
+            continue;
+        };
+        let Some(event_type) = v.get("event_type").and_then(|e| e.as_str()) else {
+            unparseable_lines += 1;
+            continue;
+        };
+        let payload = v.get("payload");
+        let ev = CompactLogEvent {
+            seq: v.get("seq").and_then(|s| s.as_i64()).unwrap_or(0),
+            occurred_at: v
+                .get("occurred_at")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            event_type: event_type.to_string(),
+            tool: payload
+                .and_then(|p| p.get("tool"))
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+            subject: payload
+                .and_then(|p| p.get("subject"))
+                .and_then(|s| s.as_str())
+                .map(str::to_string),
+        };
+        if is_heartbeat(event_type) {
+            presence_lines += 1;
+            pending.push(ev);
+        } else {
+            flush_presence_run(&mut pending, &mut entries);
+            entries.push(CompactLogEntry::Event(ev));
+        }
+    }
+    flush_presence_run(&mut pending, &mut entries);
+
+    let presence_runs = entries
+        .iter()
+        .filter(|e| matches!(e, CompactLogEntry::PresenceRun(_)))
+        .count();
+    let absorbed: usize = entries
+        .iter()
+        .filter_map(|e| match e {
+            CompactLogEntry::PresenceRun(r) => Some(r.count),
+            CompactLogEntry::Event(_) => None,
+        })
+        .sum();
+    let lines_saved = absorbed.saturating_sub(presence_runs);
+
+    CompactLogReport {
+        log_file: path.to_path_buf(),
+        total_lines,
+        presence_lines,
+        presence_runs,
+        lines_saved,
+        unparseable_lines,
+        entries,
+        warnings: Vec::new(),
+    }
+}
+
+/// `rally doctor --compact-log [--log-file PATH]`: read a diagnostic log
+/// segment (default: the current room's active segment) and return it with
+/// heartbeat runs collapsed. Read-only — the segment file is never modified.
+pub(crate) fn run_compact_log(log_file: Option<String>) -> Result<CompactLogReport> {
+    let path = match log_file {
+        Some(p) => PathBuf::from(p),
+        None => RoomStore::open()?.active_segment_path(),
+    };
+    match fs::read_to_string(&path) {
+        Ok(contents) => Ok(compact_log_content(&path, &contents)),
+        Err(e) => {
+            let mut report = compact_log_content(&path, "");
+            report.warnings.push(DiscoveryWarning {
+                code: "compact_log_read_failed".to_string(),
+                message: format!("cannot read {}: {e}", path.display()),
+                path: Some(path),
+                count: None,
+            });
+            Ok(report)
+        }
+    }
+}
+
+// =============================================================================
 // prune-rooms logic
 // =============================================================================
 
@@ -394,6 +582,128 @@ pub(crate) fn run_prune_rooms(apply: bool) -> Result<PruneRoomsReport> {
         applied: apply,
         warnings: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod compact_log_tests {
+    use super::*;
+
+    /// Build one segment jsonl line in the LedgerLine shape.
+    fn line(seq: i64, event_type: &str, tool: &str, subject: &str) -> String {
+        serde_json::json!({
+            "seq": seq,
+            "occurred_at": format!("2026-07-03T19:{:02}:00Z", seq % 60),
+            "event_type": event_type,
+            "payload": {"tool": tool, "subject": subject},
+            "engagement": "test"
+        })
+        .to_string()
+    }
+
+    /// Repeated heartbeats collapse into summarized runs; interleaved
+    /// non-presence lines pass through and split the runs.
+    #[test]
+    fn presence_runs_collapse_into_counts() {
+        let contents = [
+            line(1, "presence", "codex:a", "agent presence: codex:a"),
+            line(2, "presence", "codex:a", "agent presence: codex:a"),
+            line(
+                3,
+                "presence",
+                "claude_code:b",
+                "agent presence: claude_code:b",
+            ),
+            line(4, "read", "codex:a", "room read"),
+            line(5, "presence", "codex:a", "agent presence: codex:a"),
+            line(6, "presence", "codex:a", "agent presence: codex:a"),
+        ]
+        .join("\n");
+        let r = compact_log_content(Path::new("test.jsonl"), &contents);
+
+        assert_eq!(r.total_lines, 6);
+        assert_eq!(r.presence_lines, 5);
+        assert_eq!(r.presence_runs, 2);
+        assert_eq!(r.unparseable_lines, 0);
+        // 5 presence lines render as 2 run entries → 3 lines saved.
+        assert_eq!(r.lines_saved, 3);
+        assert_eq!(r.entries.len(), 3, "run + read + run");
+
+        let CompactLogEntry::PresenceRun(first) = &r.entries[0] else {
+            panic!("entry 0 must be a presence run");
+        };
+        assert_eq!((first.first_seq, first.last_seq, first.count), (1, 3, 3));
+        assert_eq!(first.tools.get("codex:a"), Some(&2));
+        assert_eq!(first.tools.get("claude_code:b"), Some(&1));
+
+        let CompactLogEntry::Event(read) = &r.entries[1] else {
+            panic!("entry 1 must be the read event");
+        };
+        assert_eq!(read.event_type, "read");
+        assert_eq!(read.seq, 4);
+
+        let CompactLogEntry::PresenceRun(second) = &r.entries[2] else {
+            panic!("entry 2 must be a presence run");
+        };
+        assert_eq!((second.first_seq, second.last_seq, second.count), (5, 6, 2));
+    }
+
+    /// A lone heartbeat between other events is NOT a flood — it passes
+    /// through as a normal event, uncollapsed.
+    #[test]
+    fn single_presence_line_passes_through() {
+        let contents = [
+            line(1, "read", "codex:a", "room read"),
+            line(2, "presence", "codex:a", "agent presence: codex:a"),
+            line(3, "claim", "codex:a", "edit file"),
+        ]
+        .join("\n");
+        let r = compact_log_content(Path::new("test.jsonl"), &contents);
+        assert_eq!(r.presence_runs, 0);
+        assert_eq!(r.lines_saved, 0);
+        assert_eq!(r.entries.len(), 3);
+        let CompactLogEntry::Event(mid) = &r.entries[1] else {
+            panic!("lone presence stays an event");
+        };
+        assert_eq!(mid.event_type, "presence");
+    }
+
+    /// Garbage lines are counted and skipped; blank lines are ignored; the
+    /// rest of the log still compacts.
+    #[test]
+    fn unparseable_and_blank_lines_are_tolerated() {
+        let contents = format!(
+            "{}\nnot-json at all\n\n{{\"no_event_type\":true}}\n{}\n{}\n",
+            line(1, "wake", "codex:a", "wake"),
+            line(2, "presence", "codex:a", "hb"),
+            line(3, "presence", "codex:a", "hb"),
+        );
+        let r = compact_log_content(Path::new("test.jsonl"), &contents);
+        assert_eq!(r.total_lines, 5, "blank line not counted");
+        assert_eq!(r.unparseable_lines, 2);
+        assert_eq!(r.presence_runs, 1);
+        assert_eq!(r.entries.len(), 2, "wake event + one run");
+    }
+
+    /// A log that ends mid-heartbeat-run still flushes the trailing run.
+    #[test]
+    fn trailing_run_is_flushed() {
+        let contents = [
+            line(1, "presence", "codex:a", "hb"),
+            line(2, "presence", "codex:a", "hb"),
+        ]
+        .join("\n");
+        let r = compact_log_content(Path::new("test.jsonl"), &contents);
+        assert_eq!(r.presence_runs, 1);
+        assert_eq!(r.entries.len(), 1);
+    }
+
+    /// Empty contents → empty report, never errors.
+    #[test]
+    fn empty_log_is_empty_report() {
+        let r = compact_log_content(Path::new("test.jsonl"), "");
+        assert_eq!(r.total_lines, 0);
+        assert!(r.entries.is_empty());
+    }
 }
 
 #[cfg(test)]

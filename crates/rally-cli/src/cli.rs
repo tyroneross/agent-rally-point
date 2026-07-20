@@ -289,6 +289,11 @@ pub(crate) struct DoctorArgs {
     /// Retention for --sweep-corrupt: also keep any snapshot newer than N days
     /// regardless of --keep. Default 7.
     pub(crate) max_age_days: Option<i64>,
+    /// Render a diagnostic log segment with consecutive presence/heartbeat
+    /// lines collapsed into summarized counts (read-only).
+    pub(crate) compact_log: bool,
+    /// Segment file for --compact-log (default: the current room's active segment).
+    pub(crate) log_file: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1435,6 +1440,10 @@ fn doctor_parser() -> impl Parser<DoctorArgs> {
         .switch();
     let keep = optional_i64_arg("keep", "N");
     let max_age_days = optional_i64_arg("max-age-days", "N");
+    let compact_log = long("compact-log")
+        .help("Render a diagnostic log with presence/heartbeat runs collapsed into counts (read-only)")
+        .switch();
+    let log_file = optional_string_arg("log-file", "PATH");
     construct!(DoctorArgs {
         json,
         canonical_paths,
@@ -1443,7 +1452,9 @@ fn doctor_parser() -> impl Parser<DoctorArgs> {
         apply,
         sweep_corrupt,
         keep,
-        max_age_days
+        max_age_days,
+        compact_log,
+        log_file
     })
 }
 

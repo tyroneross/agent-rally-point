@@ -342,6 +342,37 @@ fn envelope_doctor() {
     ws.cleanup();
 }
 
+/// `doctor --compact-log` — read-only; heartbeat runs collapse into counts.
+#[test]
+fn envelope_doctor_compact_log() {
+    let ws = Workspace::new("doctor-compact");
+    let log = ws.cwd.join("segment.jsonl");
+    let mk = |seq: i64, event_type: &str| {
+        format!(
+            "{{\"seq\":{seq},\"occurred_at\":\"2026-07-03T19:30:00Z\",\"event_type\":\"{event_type}\",\"payload\":{{\"tool\":\"codex:a\",\"subject\":\"s\"}}}}"
+        )
+    };
+    fs::write(
+        &log,
+        [mk(1, "presence"), mk(2, "presence"), mk(3, "read")].join("\n"),
+    )
+    .unwrap();
+    let body = ws.json(&[
+        "doctor",
+        "--json",
+        "--compact-log",
+        "--log-file",
+        log.to_str().unwrap(),
+    ]);
+    assert_envelope_contract("doctor", &body);
+    let doctor = &body["data"]["doctor"];
+    assert_eq!(doctor["total_lines"], 3);
+    assert_eq!(doctor["presence_lines"], 2);
+    assert_eq!(doctor["presence_runs"], 1);
+    assert_eq!(doctor["entries"].as_array().unwrap().len(), 2);
+    ws.cleanup();
+}
+
 /// `version` — no required args; always succeeds.
 #[test]
 fn envelope_version() {
