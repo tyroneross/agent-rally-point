@@ -24,3 +24,11 @@ This repo coordinates parallel coding agents via **agent-rally-point** (per-repo
 - **Any-agent onboarding contract:** [docs/ANY-AGENT-ONBOARDING.md](docs/ANY-AGENT-ONBOARDING.md)
 - **Handoffs & managed agents:** [docs/HANDOFFS-AND-LAUNCHING-AGENTS.md](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md)
 <!-- rally:end -->
+
+## Status heartbeats (working agreement)
+
+During any operation expected to exceed ~10 minutes (long implementations, renders, big test runs, orchestration waits), post a brief status to the room every ~10 minutes:
+
+    rally say artifact --tool <you> --subject "STATUS: <task> — <progress marker>" --json
+
+Silence longer than ~15 minutes while working is a coordination bug: peers and the director cannot tell "working" from "hung". Always post a final status when the operation completes or blocks.
