@@ -358,8 +358,15 @@ pub(crate) struct CompactLogEvent {
     pub(crate) seq: i64,
     pub(crate) occurred_at: String,
     pub(crate) event_type: String,
+    /// Convenience extraction of `payload.tool` for rendering.
     pub(crate) tool: Option<String>,
+    /// Convenience extraction of `payload.subject` for rendering.
     pub(crate) subject: Option<String>,
+    /// The full fact payload, passed through unchanged — summary, target,
+    /// evidence, scope, ref, and any future fields survive compaction.
+    /// Only presence lines absorbed into a [`PresenceRun`] are summarized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) payload: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -437,10 +444,14 @@ pub(crate) fn compact_log_content(path: &Path, contents: &str) -> CompactLogRepo
         total_lines += 1;
         let parsed: Option<serde_json::Value> = serde_json::from_str(line).ok();
         let Some(v) = parsed else {
+            // Corruption breaks consecutiveness: heartbeats on either side of
+            // an unparseable line are NOT consecutive and must not merge.
+            flush_presence_run(&mut pending, &mut entries);
             unparseable_lines += 1;
             continue;
         };
         let Some(event_type) = v.get("event_type").and_then(|e| e.as_str()) else {
+            flush_presence_run(&mut pending, &mut entries);
             unparseable_lines += 1;
             continue;
         };
@@ -461,6 +472,7 @@ pub(crate) fn compact_log_content(path: &Path, contents: &str) -> CompactLogRepo
                 .and_then(|p| p.get("subject"))
                 .and_then(|s| s.as_str())
                 .map(str::to_string),
+            payload: payload.cloned(),
         };
         if is_heartbeat(event_type) {
             presence_lines += 1;
@@ -682,6 +694,77 @@ mod compact_log_tests {
         assert_eq!(r.unparseable_lines, 2);
         assert_eq!(r.presence_runs, 1);
         assert_eq!(r.entries.len(), 2, "wake event + one run");
+    }
+
+    /// Regression (codex review seq 4535, finding 2): an unparseable line
+    /// BETWEEN heartbeats breaks consecutiveness — the runs on either side
+    /// must not merge across the corruption.
+    #[test]
+    fn unparseable_line_splits_presence_runs() {
+        let contents = format!(
+            "{}\n{}\ncorrupted-not-json\n{}\n{}\n",
+            line(1, "presence", "codex:a", "hb"),
+            line(2, "presence", "codex:a", "hb"),
+            line(3, "presence", "codex:a", "hb"),
+            line(4, "presence", "codex:a", "hb"),
+        );
+        let r = compact_log_content(Path::new("test.jsonl"), &contents);
+        assert_eq!(r.unparseable_lines, 1);
+        assert_eq!(r.presence_runs, 2, "corruption splits the run in two");
+        assert_eq!(r.entries.len(), 2);
+        let (CompactLogEntry::PresenceRun(a), CompactLogEntry::PresenceRun(b)) =
+            (&r.entries[0], &r.entries[1])
+        else {
+            panic!("both entries must be runs");
+        };
+        assert_eq!((a.first_seq, a.last_seq, a.count), (1, 2, 2));
+        assert_eq!((b.first_seq, b.last_seq, b.count), (3, 4, 2));
+
+        // Missing event_type (parseable JSON, still not a valid line) splits
+        // a would-be run into two singleton pass-through events.
+        let contents = format!(
+            "{}\n{{\"no_event_type\":true}}\n{}\n",
+            line(1, "presence", "codex:a", "hb"),
+            line(2, "presence", "codex:a", "hb"),
+        );
+        let r = compact_log_content(Path::new("test.jsonl"), &contents);
+        assert_eq!(r.presence_runs, 0, "singletons on each side, no run");
+        assert_eq!(r.entries.len(), 2);
+    }
+
+    /// Regression (codex review seq 4535, finding 1): a pass-through event
+    /// keeps its FULL payload — summary, target, evidence, scope, ref, and
+    /// unknown future fields all survive compaction unchanged.
+    #[test]
+    fn passthrough_event_retains_full_payload() {
+        let payload = serde_json::json!({
+            "tool": "codex:a",
+            "subject": "handoff subject",
+            "summary": "the long summary",
+            "target": "claude_code:b",
+            "evidence": ["commit:abc123", "test:green"],
+            "scope": ["file:crates/rally-cli/src/doctor.rs"],
+            "ref": "fact_123",
+            "future_field": {"nested": true}
+        });
+        let contents = serde_json::json!({
+            "seq": 7,
+            "occurred_at": "2026-07-03T19:30:00Z",
+            "event_type": "handoff",
+            "payload": payload,
+        })
+        .to_string();
+        let r = compact_log_content(Path::new("test.jsonl"), &contents);
+        assert_eq!(r.entries.len(), 1);
+        let CompactLogEntry::Event(ev) = &r.entries[0] else {
+            panic!("handoff passes through as an event");
+        };
+        assert_eq!(
+            ev.payload.as_ref().expect("payload retained"),
+            &payload,
+            "payload must pass through byte-identical"
+        );
+        assert_eq!(ev.subject.as_deref(), Some("handoff subject"));
     }
 
     /// A log that ends mid-heartbeat-run still flushes the trailing run.
