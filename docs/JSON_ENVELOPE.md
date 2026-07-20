@@ -47,7 +47,7 @@ print(d['data'][d['command']])
 | `rotate` | `rotate: { threshold_days, threshold_source, cutoff_utc, dry_run, rotated, skipped, … }` | — |
 | `status` | `status: { repos, warnings }` | — |
 | `migrate-legacy` | `migrate-legacy: { slugs_found, facts_read, facts_migrated, facts_skipped_existing, warnings }` | — |
-| `doctor` | `doctor: { non_canonical?, suffix_collisions? } \| { live, stale, applied }` | — |
+| `doctor` | `doctor:` mode-dependent — `--canonical-paths` `{ non_canonical, suffix_collisions, warnings }` · `--prune-rooms` `{ live, stale, applied, warnings }` · `--reap-stale` `{ claims_reaped, lead_relinquished, applied }` · `--sweep-corrupt` `{ rally_dir, kept, swept, bytes_reclaimable, applied, keep, max_age_days, warnings }` · `--compact-log` `{ log_file, total_lines, presence_lines, presence_runs, lines_saved, unparseable_lines, entries, warnings }` | — |
 | `version` | `version: { version, build_id }` | — |
 | `whoami` | `whoami: { tool?, repo_root, repo_id, room_id, worktree, build_id, cwd }` | `repo_id` is stable repo identity; `room_id` is the active engagement label |
 | `sessions` | `sessions: { sessions: [...] }` | — |
@@ -73,6 +73,13 @@ An ack-timeout response is **`ok: true` / exit 0** — the inject *succeeded* (m
 | `wake-due` | `wake-due: { due: [...] }` | — |
 | `mission` (GET) | `mission: { text?, set_by?, set_at?, envelopes }` | — |
 | `mission` (SET) | `mission: { action, fact }` | — |
+
+**`doctor --compact-log` `entries[]` shapes** (internally tagged by `entry`):
+
+| `entry` | Fields |
+|---------|--------|
+| `presence_run` | `{ first_seq, last_seq, first_at, last_at, count, tools: { <tool>: <heartbeats> } }` — 2+ consecutive presence/heartbeat lines collapsed into one summarized entry |
+| `event` | `{ seq, occurred_at, event_type, tool?, subject?, payload? }` — any other line passed through; `payload` carries the full fact payload unchanged |
 
 ## Notes
 

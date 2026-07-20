@@ -2908,10 +2908,138 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
         let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
         return Ok(Output::new(args.json, text, body));
     }
+    if args.compact_log {
+        let data = doctor::run_compact_log(args.log_file)?;
+        let text = render_compact_log_text(&data);
+        let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
+        return Ok(Output::new(args.json, text, body));
+    }
     Err(RallyError::Usage(
-        "rally doctor requires --canonical-paths, --prune-rooms, --reap-stale, or --sweep-corrupt"
+        "rally doctor requires --canonical-paths, --prune-rooms, --reap-stale, --sweep-corrupt, or --compact-log"
             .to_string(),
     ))
+}
+
+/// Human rendering for `doctor --compact-log`: header with compaction stats,
+/// then one line per entry — heartbeat runs as `presence xN [tool(n) ...]`.
+/// Neutralize log-controlled text before terminal rendering: control
+/// characters (newline, CR, ESC, C0/C1) become U+FFFD so a crafted fact
+/// cannot spoof extra output lines or drive the terminal.
+fn sanitize_log_text(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
+fn render_compact_log_text(data: &doctor::CompactLogReport) -> String {
+    let mut out = format!(
+        "doctor compact-log: {} lines={} presence={} runs={} saved={} unparseable={}",
+        data.log_file.display(),
+        data.total_lines,
+        data.presence_lines,
+        data.presence_runs,
+        data.lines_saved,
+        data.unparseable_lines,
+    );
+    for entry in &data.entries {
+        match entry {
+            doctor::CompactLogEntry::PresenceRun(run) => {
+                let tools: Vec<String> = run
+                    .tools
+                    .iter()
+                    .map(|(tool, n)| format!("{}({n})", sanitize_log_text(tool)))
+                    .collect();
+                out.push_str(&format!(
+                    "\nseq {}..{}  {}..{}  presence x{}  [{}]",
+                    run.first_seq,
+                    run.last_seq,
+                    sanitize_log_text(&run.first_at),
+                    sanitize_log_text(&run.last_at),
+                    run.count,
+                    tools.join(" "),
+                ));
+            }
+            doctor::CompactLogEntry::Event(ev) => {
+                out.push_str(&format!(
+                    "\nseq {}  {}  {}  {}  {}",
+                    ev.seq,
+                    sanitize_log_text(&ev.occurred_at),
+                    sanitize_log_text(&ev.event_type),
+                    sanitize_log_text(ev.tool.as_deref().unwrap_or("-")),
+                    sanitize_log_text(ev.subject.as_deref().unwrap_or("")),
+                ));
+            }
+        }
+    }
+    for w in &data.warnings {
+        out.push_str(&format!("\nwarning {}: {}", w.code, w.message));
+    }
+    out
+}
+
+#[cfg(test)]
+mod compact_log_render_tests {
+    use super::*;
+
+    /// Log-controlled tool/subject values must not spoof output lines or
+    /// emit terminal control sequences (codex review finding 3, seq 4535).
+    #[test]
+    fn render_sanitizes_log_controlled_fields() {
+        let report = doctor::CompactLogReport {
+            log_file: std::path::PathBuf::from("seg.jsonl"),
+            total_lines: 2,
+            presence_lines: 0,
+            presence_runs: 0,
+            lines_saved: 0,
+            unparseable_lines: 0,
+            entries: vec![doctor::CompactLogEntry::Event(doctor::CompactLogEvent {
+                seq: 1,
+                occurred_at: "2026-07-03T19:30:00Z".to_string(),
+                event_type: "read".to_string(),
+                tool: Some("codex:a\x1b[31m".to_string()),
+                subject: Some("real subject\nseq 999  fake  spoofed  line".to_string()),
+                payload: None,
+            })],
+            warnings: Vec::new(),
+        };
+        let text = render_compact_log_text(&report);
+        assert!(!text.contains('\x1b'), "ESC must not reach the terminal");
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "header + one entry — embedded newline must not add a line"
+        );
+        assert!(
+            !text.contains("\nseq 999"),
+            "spoofed entry line must not appear at line start"
+        );
+    }
+
+    /// Presence-run tool ids are log-controlled too.
+    #[test]
+    fn render_sanitizes_presence_run_tools() {
+        let mut tools = std::collections::BTreeMap::new();
+        tools.insert("bad\ntool".to_string(), 2usize);
+        let report = doctor::CompactLogReport {
+            log_file: std::path::PathBuf::from("seg.jsonl"),
+            total_lines: 2,
+            presence_lines: 2,
+            presence_runs: 1,
+            lines_saved: 1,
+            unparseable_lines: 0,
+            entries: vec![doctor::CompactLogEntry::PresenceRun(doctor::PresenceRun {
+                first_seq: 1,
+                last_seq: 2,
+                first_at: "t1".to_string(),
+                last_at: "t2".to_string(),
+                count: 2,
+                tools,
+            })],
+            warnings: Vec::new(),
+        };
+        let text = render_compact_log_text(&report);
+        assert_eq!(text.lines().count(), 2, "run renders as exactly one line");
+    }
 }
 
 // claims-refresh -------------------------------------------------------------
