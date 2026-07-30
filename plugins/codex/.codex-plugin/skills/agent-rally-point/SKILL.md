@@ -106,44 +106,86 @@ rally next --tool "$TOOL" --json
 Continue only while the next action is actionable, safe, and inside the user's
 scope.
 
-## Waiting On a Peer — Pull Automatically
+## Receiving a Handoff
+
+Everything above is written from the sender's side. This section is the
+receiver's, and its first rule is the one that matters most:
+
+**ACK the instant you see a handoff targeting you — before you read the brief,
+before you plan, before you touch a file.** The ACK is two seconds of work and
+it is the only signal that separates "received" from "never delivered." Reading
+a long brief first, then acking, leaves the sender unable to tell which happened.
+
+```bash
+rally say handoff --tool "$TOOL" --ref <their-event-id> --target <their-tool> \
+  --subject "ACK — <lane>" --summary "Received. Reading the brief now." --json
+```
+
+Then, while you work the handoff, **post a status every ~10 minutes**. Silence
+longer than ~15 minutes is a coordination bug: peers cannot distinguish working
+from hung.
+
+```bash
+rally status post --tool "$TOOL" --state working --intent "<one-line>"
+```
+
+### Waiting — pull automatically
 
 Waiting is never passive. Whenever you are waiting on a Rally response — a
-handoff, an ACK, a blocker resolution, a decision, an artifact — poll for it
-yourself. Do not wait to be woken, and do not ask the user to tell you when it
-lands.
+handoff, an ACK, a blocker resolution, a decision, an artifact — fetch it
+yourself. Do not wait to be woken, and do not ask the user to relay it. Rally has
+**no push path**: `rally next` mints the wake intent only when you pull it.
 
 Injection is the primary channel *only* when the target is a managed session
 (`rally sessions` lists it). Pulling is always on: it is the fallback when
 injection cannot deliver, and the confirmation channel when it can.
 
-Poll at the cadence of the expected response:
-
-| Peer state | Interval |
-|---|---|
-| Active, response imminent (peer said it is handing off now) | 3–5s |
-| Working a task you are blocked behind | 30–60s |
-| Idle, long job, or overnight | 5–15 min |
-| Unknown | start at 10s, back off |
+Use the shipped watcher rather than hand-rolling a poll loop:
 
 ```bash
-rally next --tool "$TOOL" --json     # wake-intent + actionable item
-rally recent --limit 40 --json       # new facts, including ones targeting you
+rally watch --tool "$TOOL" --interval 5 --max-interval 300 \
+  --duration-hours 1 --on-activity 'rally next --tool "$TOOL" --json'
 ```
 
-Run the poll as a background watch that emits one event per NEW fact so you keep
-working instead of blocking on a sleep. Three constraints:
+Pick `--interval` from the cadence of the expected response: 3–5s when the peer
+says it is handing off now, 30–60s when you are blocked behind its task, 5–15 min
+when it is idle or the job runs overnight. `--max-interval` backs off from there;
+`--duration-hours` is the deadline that keeps the watch bounded.
 
-- **Bounded.** Every poll loop carries a deadline and exits. No unbounded watch.
+Two things a watcher must get right, whether it is `rally watch` or your own:
+
 - **Baseline first.** Record what already exists on the first pass and report
   only facts newer than that, or you replay room history as if it were new.
-- **Every room the peer might be in.** Rooms are cwd-scoped, so poll the repo
+- **Every room the peer might be in.** Rooms are cwd-scoped, so watch the repo
   room *and* the room for the cwd the peer's session was launched from. A peer
-  posting from `~` is invisible to a poller watching only the repo.
+  posting from `~` is invisible to a watcher scoped to the repo.
 
-On receipt, ACK immediately with `rally say handoff --ref <their-event-id>`
-before starting the work. An unacknowledged handoff is indistinguishable from an
-undelivered one.
+### Re-resolve the target in the room you are posting to
+
+A tool id is only meaningful inside one room. An id learned from a SessionStart
+prompt, an older log, or another repo may name a session that is stale — or
+absent — in the room you are about to post to. Before setting `--target`, read
+the live roster **of that room**:
+
+```bash
+rally room --json      # squads[]: who is here, last_seen_ts, status
+rally status read --json
+```
+
+Target the session that is actually working the paths in question — an active
+claim on the file under discussion is stronger evidence of the right peer than
+any id you were handed.
+
+### A room read that looks empty usually is not
+
+`rally next` recommends *one* action and skews toward stale unconsumed
+artifacts, so it can return "nothing actionable" while the room holds exactly
+what you need. Before concluding a peer has not responded, read the room itself:
+active claims name the files a peer is working, and a claim on the brief path is
+the handoff arriving one step early.
+
+Treat a cheap negative result as unproven when the method could not have seen
+the thing you are looking for.
 
 ## Managed Sessions
 

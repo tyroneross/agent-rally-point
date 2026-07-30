@@ -428,7 +428,18 @@ if (peers.length || claims.length || handoffs || nextAction || statusLines.lengt
 if (peers.length) msg += `Active peers: ${peers.slice(0, 8).join(", ")}${peers.length > 8 ? ` (+${peers.length - 8} more)` : ""}. `;
 if (statusLines.length) msg += `Agent status: ${statusLines.slice(0, 8).join("; ")}${statusLines.length > 8 ? ` (+${statusLines.length - 8} more)` : ""}. `;
 if (claims.length) msg += `Open claims: ${claims.slice(0, 8).join("; ")}. `;
-if (handoffs) msg += `${handoffs} open handoff(s). `;
+if (handoffs) {
+  const forMe = activeHandoffs.filter(h => h.target === tool);
+  const others = handoffs - forMe.length;
+  if (forMe.length) {
+    const detail = forMe.slice(0, 3).map(h => {
+      const ev = (Array.isArray(h.evidence) ? h.evidence : []).slice(0, 2).join(", ");
+      return `"${h.subject || "(no subject)"}" from ${h.tool || "?"} [${h.event_id || "?"}]${ev ? ` evidence: ${ev}` : ""}`;
+    }).join(" | ");
+    msg += `INBOUND HANDOFF${forMe.length > 1 ? "S" : ""} ADDRESSED TO YOU — ACK before doing the work: ${detail}${forMe.length > 3 ? ` (+${forMe.length - 3} more)` : ""}. ACK with \`rally say handoff --tool ${tool} --ref <event-id> --target <sender-tool>\`, then read the brief. `;
+  }
+  if (others) msg += `${others} other open handoff(s) (not addressed to you). `;
+}
 if (nextAction) msg += `Suggested next: ${nextAction}. `;
 msg += "Stale peers, expired claims, and non-actionable waits are omitted from this prompt; use `rally room` for full history. Before editing, check `rally room` / `rally next` and deconflict — do not edit a path another active agent has claimed (rally auto-checks before each write).";
 process.stdout.write(JSON.stringify({ agent_visible: { present: true, severity: "warn", message: msg } }));
