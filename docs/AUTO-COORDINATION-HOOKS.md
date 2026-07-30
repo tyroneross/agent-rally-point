@@ -44,6 +44,44 @@ scripts/install_rally_hooks.sh --uninstall [--repoint-codex] # revert
 Running the installer **without `--global` does nothing** but print this guidance —
 the portable project config is already committed.
 
+## Canonical generated host contract
+
+`config/host-integrations.json` is the host-neutral contract. It defines plugin
+identity, provider IDs, host-specific descriptions and keywords, hook cadence,
+event matchers, timeouts, and skill-frontmatter overlays. The CLI version remains
+canonical in `crates/rally-cli/Cargo.toml`; the generator reads it rather than
+duplicating it in the contract.
+
+```bash
+# Rewrite all derived Claude, Codex, Cursor, marketplace, skill, and artifact files.
+python3 scripts/generate_host_surfaces.py
+
+# Read-only drift gate used by release parity.
+python3 scripts/generate_host_surfaces.py --check
+
+# Inspect or reconcile the installed Claude Code and Codex providers.
+python3 scripts/sync_host_integrations.py --json
+python3 scripts/sync_host_integrations.py --apply --json
+```
+
+`rally-release.json` records the canonical provider, repository, release
+version, and deterministic digest of the generated surfaces. The same identity
+ships inside the Codex `.codex-plugin` payload so the installed cache can be
+attested at its real `local/.codex-plugin` root. The host reconciler compares
+the full identity, not version alone; it reports `current`, `restart_required`,
+`uninstalled`, `stale`, `duplicate_provider`, or `unknown`. Diagnosis is
+read-only and exits non-zero on drift. Apply mode refuses to mutate a host whose
+installed state could not be read, reduces each host to
+`agent-rally-point@agent-rally-point`, updates from the canonical marketplace,
+stops on the first failed plugin-manager command, then requires a host restart.
+
+This provides persistent source sync without silently changing a running agent:
+canonical edits regenerate all host surfaces, CI rejects stale generated files,
+and explicit reconciliation updates local host caches at a safe restart
+boundary. `scripts/check-release-parity.sh` also runs the generator/reconciler,
+hook, global-installer, and first-session provisioner suites in CI, pre-push,
+and release jobs.
+
 > **Other repos that adopt rally:** copy `.claude/settings.json` + `.codex/hooks.json`
 > into that repo, pointing the command at a `rally`-resolvable hook. The universal
 > zero-bundle mechanism (a `rally hook` binary subcommand so a one-line committed
@@ -73,6 +111,13 @@ the portable project config is already committed.
 
 
 **Why PreToolUse stays edit-scoped for Claude (deliberate).** Codex's `.codex/hooks.json` wires PreToolUse with *no matcher*, so it fires `before-write` on every tool call — consistent, but it spawns the hook + watchdog on reads/bash/etc. that have no file path and no-op. Claude keeps the `Edit|Write|MultiEdit|NotebookEdit` matcher for `before-write`; both hosts get continuous awareness from the cheaper `UserPromptSubmit` (idle) refresh plus `Stop` (after-write).
+
+**Duplicate registration is safe.** Claude Code can load both the installed
+plugin hooks and this repo's project hooks. Identical event envelopes share a
+short-lived, locked source-count record in the git-common directory. The largest
+per-source count is the number of logical events, so plugin/project/global hook
+ordering cannot change the result. A repeated event from the same source always
+runs; deduplication can never suppress a real retry or a strict-mode deny.
 
 **Identity model.** The hook argv names the host family (`codex`,
 `claude_code`, `cursor`, etc.). The routed Rally id must identify the working
@@ -131,8 +176,11 @@ RALLY_HOOKS=off
 
 | Path | Role |
 |------|------|
+| `config/host-integrations.json` | Canonical host-neutral plugin, provider, hook, and skill-frontmatter contract. |
+| `scripts/generate_host_surfaces.py` | Deterministically generates host manifests/settings, skill frontmatter, release identity, and the dereferenced Codex artifact. `--check` is the drift gate. |
+| `scripts/sync_host_integrations.py` | Read-only installed-host doctor by default; `--apply` removes duplicate providers, updates canonical caches, and reports restart requirements. |
 | `hooks/rally-coordination-hook.sh` | Single source of truth. Host-neutral; argv-dispatched by `<phase> <tool>`. Self-gates on missing `.rally/` (silent no-op). Defense-in-depth wall-clock watchdog with process-group-kill on overrun so a hung `rally` can never stall a host session. |
-| `scripts/install_rally_hooks.sh` | Idempotent installer that wires the hook into `~/.claude/settings.json`. Supports `--uninstall`, `--dry-run`, `--repoint-codex`. Pure shell (no Rust changes); resolves the repo path to an absolute string at install time. |
+| `scripts/install_rally_hooks.sh` | Idempotent installer that derives the global Claude hook entries from the generated project template, then rewrites only path and source scope using Python 3 or jq. Supports `--uninstall`, `--dry-run`, `--repoint-codex`. |
 | `tests/hooks/test_rally_coordination_hook.sh` | Self-gate, fail-open (missing + hung binary), advisory-only invariant, strict-mode, warn-never-denies. |
 | `tests/hooks/test_install_rally_hooks.sh` | Project hook cadence regression, install-from-empty, idempotency, preserves unrelated hooks, uninstall round-trip, `--dry-run`, codex repoint round-trip. Uses scratch HOME for global installer cases — never touches the user's real settings. |
 
@@ -162,60 +210,13 @@ scripts/install_rally_hooks.sh --quiet
 
 The installer is idempotent: re-running with no changes prints `no change`.
 
-## Exact JSON the installer writes
+## Generated settings the installer writes
 
-Merged into `~/.claude/settings.json` (preserves any existing entries):
-
-```jsonc
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "<repo>/hooks/rally-coordination-hook.sh start claude_code"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "<repo>/hooks/rally-coordination-hook.sh idle claude_code"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "<repo>/hooks/rally-coordination-hook.sh before-write claude_code"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "<repo>/hooks/rally-coordination-hook.sh after-write claude_code"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-`<repo>` is resolved to the absolute checkout path at install time (Claude Code
-does not reliably expand `~` in command strings).
+`.claude/settings.json` is the exact template. The installer preserves unrelated
+entries, replaces the project hook path with the absolute checkout path, and
+changes `RALLY_HOOK_SOURCE=project` to `RALLY_HOOK_SOURCE=global`. Matchers,
+timeouts, cadence, and all other fields remain byte-for-byte derived from the
+generated template. Claude Code does not reliably expand `~` in command strings.
 
 When `--repoint-codex` is passed, `~/.codex/rally-hook.sh` is replaced (after
 backing up to `.bak`) with a thin shim:

@@ -47,6 +47,8 @@
 #   RALLY_HOOKS            — "off" disables this hook for the current session.
 #   RALLY_HOOK_PROMPT      — startup prompt mode: once, always, or off.
 #   RALLY_HOOK_STRICT      — "1" to enable deny/block on high-severity signals.
+#   RALLY_HOOK_DEDUPE_SECS — duplicate registration window (default 5 seconds).
+#   RALLY_HOOK_DEDUPE_DIR  — test/diagnostic override for event markers.
 #
 # Exit code: 0 always (fail-open). Output goes on stdout per host hook contract.
 
@@ -269,27 +271,6 @@ phase="${1:-idle}"
 tool="${2:-claude_code}"
 
 hook_prompt_mode="${RALLY_HOOK_PROMPT:-once}"
-if [ "$have_node" = "1" ]; then
-  hooks_status="$(rally_timeout hooks status --json 2>/dev/null || true)"
-  hooks_meta="$({ printf '%s' "$hooks_status" | node -e '
-const fs = require("fs");
-try {
-  const parsed = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
-  const hooks = parsed?.data?.hooks || {};
-  const enabled = hooks.enabled === false ? "0" : "1";
-  const prompt = ["once", "always", "off"].includes(hooks.prompt) ? hooks.prompt : "once";
-  process.stdout.write(enabled + "\n" + prompt);
-} catch (_) {
-  process.stdout.write("1\nonce");
-}
-' ; } 2>/dev/null)"
-  hook_enabled="$(printf '%s\n' "$hooks_meta" | sed -n '1p')"
-  hook_prompt_mode="$(printf '%s\n' "$hooks_meta" | sed -n '2p')"
-  if [ "$hook_enabled" = "0" ]; then
-    exit 0
-  fi
-fi
-export RALLY_HOOK_PROMPT_MODE="$hook_prompt_mode"
 
 # Read stdin envelope if present; do not block if empty.
 input=""
@@ -348,6 +329,138 @@ elif [[ "$tool" != *:* ]]; then
   [ -z "$tool_suffix" ] && tool_suffix="session"
   tool="${tool}:${tool_suffix}"
 fi
+
+# Claude Code can load both the installed plugin hooks and this repo's project
+# hooks. They receive the same event envelope and otherwise execute every Rally
+# side effect twice. Track per-source counts for an identical envelope: the
+# number of logical events is the largest source count, so plugin/project/global
+# order cannot change the outcome. A repeated event from the same source raises
+# that maximum and always runs (especially a strict-mode deny); matching calls
+# from other registrations are suppressed. Empty-input calls are counted only
+# for SessionStart so tests/manual invocations of other phases stay repeatable.
+_duplicate_hook_event() {
+  if [ -z "$input" ] && [ "$phase" != "start" ]; then
+    return 1
+  fi
+  local source window now material signature safe_session safe_phase
+  local common_dir dedupe_dir state lock tmp acquired attempt
+  local stamp plugin_count project_count global_count executed max_count should_run value
+  source="${RALLY_HOOK_SOURCE:-unknown}"
+  case "$source" in
+    plugin|project|global) ;;
+    *) return 1 ;;
+  esac
+  window="${RALLY_HOOK_DEDUPE_SECS:-5}"
+  case "$window" in ''|*[!0-9]*|0) window=5 ;; esac
+  now="$(date +%s 2>/dev/null || printf '0')"
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  material="${input:-session:$session}"
+  signature="$(printf '%s' "$material" | cksum | awk '{print $1}')"
+  safe_session="$(printf '%s' "$session" | tr -c 'A-Za-z0-9_.:-' '_')"
+  safe_phase="$(printf '%s' "$phase" | tr -c 'A-Za-z0-9_.:-' '_')"
+  common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  [ -n "$common_dir" ] || return 1
+  case "$common_dir" in
+    /*) ;;
+    *) common_dir="$(pwd -P)/$common_dir" ;;
+  esac
+  dedupe_dir="${RALLY_HOOK_DEDUPE_DIR:-$common_dir/rally-hook-events}"
+  mkdir -p "$dedupe_dir" 2>/dev/null || return 1
+  state="$dedupe_dir/$safe_session.$safe_phase.$signature.state"
+  lock="$state.lock"
+  acquired=0
+  attempt=0
+  while [ "$attempt" -lt 20 ]; do
+    if mkdir "$lock" 2>/dev/null; then
+      acquired=1
+      break
+    fi
+    attempt=$(( attempt + 1 ))
+    sleep 0.01 2>/dev/null || true
+  done
+  [ "$acquired" = "1" ] || return 1
+
+  stamp=0
+  plugin_count=0
+  project_count=0
+  global_count=0
+  executed=0
+  if [ -f "$state" ]; then
+    read -r stamp plugin_count project_count global_count executed < "$state" || true
+  fi
+  for value in "$stamp" "$plugin_count" "$project_count" "$global_count" "$executed"; do
+    case "$value" in
+      ''|*[!0-9]*)
+        stamp=0
+        plugin_count=0
+        project_count=0
+        global_count=0
+        executed=0
+        break
+        ;;
+    esac
+  done
+  if [ "$now" -lt "$stamp" ] || [ $(( now - stamp )) -gt "$window" ]; then
+    plugin_count=0
+    project_count=0
+    global_count=0
+    executed=0
+  fi
+  case "$source" in
+    plugin) plugin_count=$(( plugin_count + 1 )) ;;
+    project) project_count=$(( project_count + 1 )) ;;
+    global) global_count=$(( global_count + 1 )) ;;
+  esac
+  max_count="$plugin_count"
+  [ "$project_count" -gt "$max_count" ] && max_count="$project_count"
+  [ "$global_count" -gt "$max_count" ] && max_count="$global_count"
+  should_run=0
+  if [ "$max_count" -gt "$executed" ]; then
+    executed="$max_count"
+    should_run=1
+  fi
+  tmp="$state.$$"
+  if ! printf '%s %s %s %s %s\n' \
+    "$now" "$plugin_count" "$project_count" "$global_count" "$executed" \
+    > "$tmp" 2>/dev/null || ! mv "$tmp" "$state" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    rmdir "$lock" 2>/dev/null || true
+    return 1
+  fi
+  rmdir "$lock" 2>/dev/null || true
+  find "$dedupe_dir" -type f -mmin +10 -delete 2>/dev/null || true
+  find "$dedupe_dir" -type d -name '*.lock' -mmin +10 -exec rmdir {} \; 2>/dev/null || true
+  [ "$should_run" = "1" ] && return 1
+  return 0
+}
+
+if _duplicate_hook_event; then
+  exit 0
+fi
+
+# Read hook enable/prompt settings after duplicate suppression so two host
+# registrations produce one complete Rally interaction, not merely one message.
+if [ "$have_node" = "1" ]; then
+  hooks_status="$(rally_timeout hooks status --json 2>/dev/null || true)"
+  hooks_meta="$({ printf '%s' "$hooks_status" | node -e '
+const fs = require("fs");
+try {
+  const parsed = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
+  const hooks = parsed?.data?.hooks || {};
+  const enabled = hooks.enabled === false ? "0" : "1";
+  const prompt = ["once", "always", "off"].includes(hooks.prompt) ? hooks.prompt : "once";
+  process.stdout.write(enabled + "\n" + prompt);
+} catch (_) {
+  process.stdout.write("1\nonce");
+}
+' ; } 2>/dev/null)"
+  hook_enabled="$(printf '%s\n' "$hooks_meta" | sed -n '1p')"
+  hook_prompt_mode="$(printf '%s\n' "$hooks_meta" | sed -n '2p')"
+  if [ "$hook_enabled" = "0" ]; then
+    exit 0
+  fi
+fi
+export RALLY_HOOK_PROMPT_MODE="$hook_prompt_mode"
 
 # Dispatch on phase.
 rally_output=""

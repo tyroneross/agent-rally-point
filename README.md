@@ -40,6 +40,26 @@ cargo install --path crates/rally-cli
 rally whoami --tool codex --json   # host runtime, room, lead, mission, ack status
 ```
 
+## Keep Claude Code and Codex on one canonical release
+
+Rally derives every host-facing manifest, hook setting, skill frontmatter, and
+packaged Codex artifact from `config/host-integrations.json` plus the CLI version
+in `crates/rally-cli/Cargo.toml`. Generated files carry the same release identity
+and content digest, including the identity inside Codex's installed
+`.codex-plugin` cache root, and the release gate rejects drift.
+
+```bash
+python3 scripts/generate_host_surfaces.py --check
+python3 scripts/sync_host_integrations.py --json          # read-only diagnosis
+python3 scripts/sync_host_integrations.py --apply --json  # reconcile installed hosts
+```
+
+The reconciler requires exactly one enabled provider per host:
+`agent-rally-point@agent-rally-point`. It removes stale duplicate providers,
+updates from the canonical marketplace, and reports when Claude Code or Codex
+must restart to load the new content. It does not mutate anything unless
+`--apply` is passed.
+
 ## The loop
 
 What an agent does each turn — small on purpose:

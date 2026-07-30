@@ -218,10 +218,16 @@ fi
 # 5. Heavy provisioning — download (checksum-verified) or cargo, BACKGROUNDED.
 # ---------------------------------------------------------------------------
 
-# Tag from the installed plugin version (no API call; pins to the matching
-# binary), API fallback only when no manifest version is readable.
+# Pin the binary to the generated plugin release identity. Git-source plugin
+# manifests intentionally omit `version`, so reading them made this branch dead
+# and silently fell through to GitHub "latest". Old plugin generations retain
+# the manifest fallback; the API is last-resort compatibility only.
 _resolve_tag() {
-  local manifest="" m ver
+  local identity="$PLUGIN_ROOT/rally-release.json" manifest="" m ver
+  if [ -f "$identity" ]; then
+    ver="$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$identity" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)"[[:space:]]*$/\1/')"
+    [ -n "$ver" ] && { printf 'v%s' "$ver"; return 0; }
+  fi
   for m in "$PLUGIN_ROOT/.claude-plugin/plugin.json" "$PLUGIN_ROOT/.codex-plugin/plugin.json"; do
     [ -f "$m" ] && { manifest="$m"; break; }
   done

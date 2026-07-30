@@ -14,10 +14,10 @@
     "dynamic-workflows",
     "multi-agent",
     "parallel-agents",
+    "host-neutral",
     "claude-code",
     "codex",
-    "gemini",
-    "host-neutral"
+    "gemini"
   ],
   "skills": "./skills"
 }

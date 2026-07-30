@@ -13,8 +13,8 @@
     "dynamic-workflows",
     "multi-agent",
     "parallel-agents",
-    "codex",
-    "host-neutral"
+    "host-neutral",
+    "codex"
   ],
   "skills": "./skills",
   "interface": {

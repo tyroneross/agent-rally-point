@@ -1,17 +1,50 @@
 {
-  "$comment": "Project-level rally auto-coordination hooks. Ships WITH the repo so it works on any user machine with NO global ~/.claude/settings.json change. ${CLAUDE_PROJECT_DIR} resolves to this repo root on any machine. The hook self-gates on .rally/ presence (no-op if absent) and fail-opens (never blocks an edit). Advisory/non-blocking by default; set RALLY_HOOK_STRICT=1 to hard-block on conflicts. Claude Code prompts to trust these on first use. Cadence parity with Codex (.codex/hooks.json): SessionStart=enter, UserPromptSubmit=per-turn presence refresh (idle), PreToolUse=before-write (kept edit-scoped on purpose — avoids firing on every read/bash tool), Stop=after-write. See docs/AUTO-COORDINATION-HOOKS.md.",
+  "$comment": "GENERATED from config/host-integrations.json. Portable project hooks work without global settings. Project and installed-plugin registration may overlap; the canonical hook counts registration sources for an identical event while preserving same-source repeats. Claude keeps edit-scoped PreToolUse while Codex intentionally checks every PreToolUse event. See docs/AUTO-COORDINATION-HOOKS.md.",
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/hooks/rally-coordination-hook.sh start claude_code" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "RALLY_HOOK_SOURCE=project \"${CLAUDE_PROJECT_DIR}/hooks/rally-coordination-hook.sh\" start claude_code",
+            "timeout": 5000
+          }
+        ]
+      }
     ],
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/hooks/rally-coordination-hook.sh idle claude_code" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "RALLY_HOOK_SOURCE=project \"${CLAUDE_PROJECT_DIR}/hooks/rally-coordination-hook.sh\" idle claude_code",
+            "timeout": 5000
+          }
+        ]
+      }
     ],
     "PreToolUse": [
-      { "matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [ { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/hooks/rally-coordination-hook.sh before-write claude_code" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "RALLY_HOOK_SOURCE=project \"${CLAUDE_PROJECT_DIR}/hooks/rally-coordination-hook.sh\" before-write claude_code",
+            "timeout": 10000
+          }
+        ],
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit"
+      }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/hooks/rally-coordination-hook.sh after-write claude_code" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "RALLY_HOOK_SOURCE=project \"${CLAUDE_PROJECT_DIR}/hooks/rally-coordination-hook.sh\" after-write claude_code",
+            "timeout": 5000
+          }
+        ]
+      }
     ]
   }
 }

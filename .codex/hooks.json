@@ -1,16 +1,48 @@
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command", "timeout": 5000, "command": "bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" start codex" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5000,
+            "command": "RALLY_HOOK_SOURCE=project bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" start codex"
+          }
+        ]
+      }
     ],
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "timeout": 5000, "command": "bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" idle codex" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5000,
+            "command": "RALLY_HOOK_SOURCE=project bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" idle codex"
+          }
+        ]
+      }
     ],
     "PreToolUse": [
-      { "hooks": [ { "type": "command", "timeout": 10000, "command": "bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" before-write codex" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10000,
+            "command": "RALLY_HOOK_SOURCE=project bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" before-write codex"
+          }
+        ]
+      }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "timeout": 5000, "command": "bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" after-write codex" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5000,
+            "command": "RALLY_HOOK_SOURCE=project bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" after-write codex"
+          }
+        ]
+      }
     ]
   }
 }

@@ -110,6 +110,69 @@ fi
 rm -rf "$H"
 
 # ----------------------------------------------------------------------
+# Test 1b: installed hooks retain generated matchers/timeouts and only rewrite
+# the command path/source for the global scope.
+# ----------------------------------------------------------------------
+T="global install is derived from the generated Claude project template"
+H="$(scratch_home)"
+HOME="$H" "$INSTALLER" --global --quiet >/dev/null 2>&1
+if python3 - "$REPO_ROOT/.claude/settings.json" "$H/.claude/settings.json" "$REPO_ROOT" <<'PY'
+import copy
+import json
+import sys
+
+template_path, installed_path, root = sys.argv[1:4]
+template = json.load(open(template_path, encoding="utf-8"))["hooks"]
+installed = json.load(open(installed_path, encoding="utf-8"))["hooks"]
+expected = copy.deepcopy(template)
+for groups in expected.values():
+    for group in groups:
+        for hook in group.get("hooks", []):
+            hook["command"] = hook["command"].replace(
+                '"${CLAUDE_PROJECT_DIR}/hooks/rally-coordination-hook.sh"',
+                f'"{root}/hooks/rally-coordination-hook.sh"',
+            ).replace("RALLY_HOOK_SOURCE=project", "RALLY_HOOK_SOURCE=global", 1)
+if installed != expected:
+    raise SystemExit("installed hook settings diverge from generated template")
+PY
+then
+  ok "$T"
+else
+  bad "$T" "global hook matcher/timeout/cadence drifted from canonical template"
+fi
+rm -rf "$H"
+
+# ----------------------------------------------------------------------
+# Test 1c: jq-only fallback produces the same generated global settings.
+# ----------------------------------------------------------------------
+T="jq fallback matches python3 generated-template merge"
+if command -v jq >/dev/null 2>&1; then
+  H_PY="$(scratch_home)"
+  H_JQ="$(scratch_home)"
+  RALLY_INSTALL_JSON_ENGINE=python3 HOME="$H_PY" "$INSTALLER" --global --quiet >/dev/null 2>&1
+  py_rc=$?
+  RALLY_INSTALL_JSON_ENGINE=jq HOME="$H_JQ" "$INSTALLER" --global --quiet >/dev/null 2>&1
+  jq_rc=$?
+  if [ "$py_rc" = "0" ] && [ "$jq_rc" = "0" ] && \
+    python3 - "$H_PY/.claude/settings.json" "$H_JQ/.claude/settings.json" <<'PY'
+import json
+import sys
+
+left = json.load(open(sys.argv[1], encoding="utf-8"))
+right = json.load(open(sys.argv[2], encoding="utf-8"))
+raise SystemExit(0 if left == right else 1)
+PY
+  then
+    ok "$T"
+  else
+    bad "$T" "python_rc=$py_rc jq_rc=$jq_rc or merged settings differ"
+  fi
+  rm -rf "$H_PY" "$H_JQ"
+else
+  ok "$T (jq unavailable; fallback branch not exercised)"
+fi
+
+# ----------------------------------------------------------------------
 # Test 2: idempotency — second install reports "no change"
 # ----------------------------------------------------------------------
 T="install is idempotent (2nd run = no change)"
@@ -153,6 +216,33 @@ if [ "$rc" = "0" ] && [ "$keep_other" = "1" ] && [ "$keep_audit" = "1" ] && [ "$
   ok "$T"
 else
   bad "$T" "rc=$rc keep_other=$keep_other keep_audit=$keep_audit add_rally=$add_rally"
+fi
+rm -rf "$H"
+
+# ----------------------------------------------------------------------
+# Test 3b: reinstall removes Rally hooks under retired template events while
+# preserving unrelated hooks on the same event.
+# ----------------------------------------------------------------------
+T="install removes retired Rally event hooks and preserves unrelated hooks"
+H="$(scratch_home)"
+cat > "$H/.claude/settings.json" <<'EOF'
+{
+  "hooks": {
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "/old/rally-coordination-hook.sh retired claude_code" } ] },
+      { "hooks": [ { "type": "command", "command": "/usr/local/bin/keep_notification.sh" } ] }
+    ]
+  }
+}
+EOF
+HOME="$H" "$INSTALLER" --global --quiet >/dev/null 2>&1
+rc=$?
+retired=$(grep -c "/old/rally-coordination-hook.sh" "$H/.claude/settings.json" 2>/dev/null || true)
+unrelated=$(grep -c "keep_notification.sh" "$H/.claude/settings.json" 2>/dev/null || true)
+if [ "$rc" = "0" ] && [ "$retired" = "0" ] && [ "$unrelated" = "1" ]; then
+  ok "$T"
+else
+  bad "$T" "rc=$rc retired=$retired unrelated=$unrelated"
 fi
 rm -rf "$H"
 

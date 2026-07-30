@@ -598,6 +598,109 @@ SID="test-dedup-$$"
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "dedup must suppress repeats, surface changes"; fi
 
 # ----------------------------------------------------------------------
+# Test 11b: installed-plugin + project hook registration must execute one
+# logical event once, including Rally side effects (not only message output).
+# ----------------------------------------------------------------------
+T="duplicate registration: identical event envelope runs Rally side effects once"
+registration_bin="$tmpdir/rally_registration"
+registration_calls="$tmpdir/rally_registration.calls"
+cat > "$registration_bin" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${CALLS:?}"
+if [ "$1" = "hooks" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"data":{"hooks":{"enabled":true,"prompt":"off"}}}'
+elif [ "$1" = "room" ]; then
+  printf '%s\n' '{"data":{"room":{"squads":[],"active_claims":[],"open_handoffs":[]}}}'
+elif [ "$1" = "next" ]; then
+  printf '%s\n' '{"data":{"next":{"actionable":false}}}'
+else
+  printf '%s\n' '{}'
+fi
+EOF
+chmod +x "$registration_bin"
+(
+  repo="$tmpdir/duplicate-registration-repo"
+  mkdir -p "$repo/.rally"
+  git -C "$repo" init -q
+  cd "$repo"
+  envelope='{"session_id":"duplicate-registration-session","hook_event_name":"SessionStart"}'
+  CALLS="$registration_calls" RALLY_HOOK_SOURCE=plugin RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
+    "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
+  first_count="$(wc -l < "$registration_calls" | tr -d ' ')"
+  CALLS="$registration_calls" RALLY_HOOK_SOURCE=project RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
+    "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
+  second_count="$(wc -l < "$registration_calls" | tr -d ' ')"
+  if [ "$first_count" -eq 0 ] || [ "$second_count" != "$first_count" ]; then
+    printf 'duplicate event added Rally calls: first=%s second=%s\n%s\n' \
+      "$first_count" "$second_count" "$(cat "$registration_calls" 2>/dev/null)" >&2
+    exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "plugin+project registration must be one logical event"; fi
+
+# ----------------------------------------------------------------------
+# Test 11c: identical events from the same registration source are distinct
+# invocations and must never be suppressed, including strict-mode denies.
+# ----------------------------------------------------------------------
+T="dedupe never suppresses repeated strict events from the same source"
+(
+  repo="$tmpdir/same-source-dedupe-repo"
+  mkdir -p "$repo/.rally"
+  git -C "$repo" init -q
+  cd "$repo"
+  envelope='{"session_id":"same-source-session","hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{"file_path":"claimed.txt"}}'
+  first="$(RALLY_HOOK_SOURCE=project RALLY_HOOK_STRICT=1 RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$stub_bin" \
+    "$HOOK" before-write claude_code <<<"$envelope" 2>/dev/null)"
+  second="$(RALLY_HOOK_SOURCE=project RALLY_HOOK_STRICT=1 RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$stub_bin" \
+    "$HOOK" before-write claude_code <<<"$envelope" 2>/dev/null)"
+  if ! printf '%s' "$first" | grep -q '"permissionDecision":"deny"'; then
+    printf 'first strict event was not denied: [%s]\n' "$first" >&2
+    exit 1
+  fi
+  if ! printf '%s' "$second" | grep -q '"permissionDecision":"deny"'; then
+    printf 'second same-source strict event was suppressed: [%s]\n' "$second" >&2
+    exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "same-source events must remain fail-safe"; fi
+
+# ----------------------------------------------------------------------
+# Test 11d: source-count dedupe stays correct when two same-envelope logical
+# events arrive grouped by registration source (plugin, plugin, project, project).
+# ----------------------------------------------------------------------
+T="dedupe source counts handle grouped registration arrival order"
+(
+  repo="$tmpdir/grouped-source-dedupe-repo"
+  calls="$tmpdir/grouped-source-dedupe.calls"
+  mkdir -p "$repo/.rally"
+  git -C "$repo" init -q
+  cd "$repo"
+  envelope='{"session_id":"grouped-source-session","hook_event_name":"SessionStart"}'
+  CALLS="$calls" RALLY_HOOK_SOURCE=plugin RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
+    "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
+  one="$(wc -l < "$calls" | tr -d ' ')"
+  CALLS="$calls" RALLY_HOOK_SOURCE=plugin RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
+    "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
+  two="$(wc -l < "$calls" | tr -d ' ')"
+  CALLS="$calls" RALLY_HOOK_SOURCE=project RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
+    "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
+  after_project_one="$(wc -l < "$calls" | tr -d ' ')"
+  CALLS="$calls" RALLY_HOOK_SOURCE=project RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
+    "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
+  after_project_two="$(wc -l < "$calls" | tr -d ' ')"
+  if [ "$one" -eq 0 ] || [ "$two" -le "$one" ] || \
+    [ "$after_project_one" != "$two" ] || [ "$after_project_two" != "$two" ]; then
+    printf 'grouped source counts wrong: one=%s two=%s project1=%s project2=%s\n' \
+      "$one" "$two" "$after_project_one" "$after_project_two" >&2
+    exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "two logical events must run exactly twice"; fi
+
+# ----------------------------------------------------------------------
 # Test 8: idle phase (UserPromptSubmit / per-turn refresh) — advisory only
 # ----------------------------------------------------------------------
 T="idle phase: exit 0 + valid JSON + never deny/block (default)"

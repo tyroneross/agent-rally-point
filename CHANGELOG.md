@@ -7,6 +7,20 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## v0.1.7 - 2026-07-30
+
+Canonical Claude Code and Codex host integration, plus the daemon and handoff
+work landed on `main` since v0.1.6.
+
+- **One canonical contract now generates every host surface.** `config/host-integrations.json` plus the Cargo package version drive Claude, Codex, Cursor, marketplace, skill-frontmatter, packaged-artifact, and release-identity files. Release parity rejects any generated drift.
+- **Installed hosts can be diagnosed and reconciled deterministically.** `scripts/sync_host_integrations.py` is read-only by default, compares a versioned content digest, detects stale caches and duplicate providers, and requires `--apply` before it removes noncanonical providers or updates the canonical marketplace.
+- **Release identity replaces the dead manifest-version fallback.** First-session CLI provisioning reads `rally-release.json`; GitHub latest is now only the final fallback when packaged identity is absent.
+- **Duplicate Claude hook registration no longer duplicates Rally side effects.** Locked per-source event counts collapse installed-plugin/project/global duplicates regardless of arrival order; repeated same-source events still run, including strict-mode denies.
+- **Host differences are explicit.** Claude keeps edit-scoped `PreToolUse`; Codex intentionally runs unscoped `PreToolUse`. Global Claude hook installation now derives from the generated project template, including matchers and timeouts.
+- **Rally now has a daemon-backed store path and hardened handover.** The `rallyd` thin-client route, warm-pool installation, bounded handover, burst robustness, and security fixes landed with direct-mode fail-open behavior preserved.
+- **Handoffs acknowledge receipt before work begins.** Receiver-side flow now ACKs first, watches the room for follow-up, and surfaces the sender; injectability and ACK-wait diagnostics no longer hide delivery state.
+- **Doctor and maintenance surfaces expanded.** `doctor --compact-log`, `doctor --sweep-corrupt`, one-shot `claims-refresh`, and append-run provenance validation are included.
+
 ## v0.1.6 - 2026-07-07
 
 Trustworthy room signal + read-surface ergonomics. Fable+Codex audited before release.

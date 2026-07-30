@@ -1,0 +1,157 @@
+{
+  "schema": "agent-rally.host-integrations.v1",
+  "plugin": {
+    "name": "agent-rally-point",
+    "display_name": "Agent Rally Point",
+    "author": {
+      "name": "Tyrone Ross",
+      "email": "tyrone@rosslabs.ai"
+    },
+    "developer_name": "Ross Labs",
+    "homepage": "https://github.com/tyroneross/agent-rally-point",
+    "repository": "https://github.com/tyroneross/agent-rally-point",
+    "license": "Apache-2.0",
+    "category": "development",
+    "keywords": [
+      "agent-coordination",
+      "rally",
+      "dynamic-workflows",
+      "multi-agent",
+      "parallel-agents",
+      "host-neutral"
+    ],
+    "descriptions": {
+      "claude_code": "Agent Rally Point — repo-local coordination surface for parallel coding agents (Claude Code, Codex, Gemini). Records claims, checks write boundaries, routes handoffs, and exposes room state via the rally CLI. Skills: agent-rally-point (per-session loop), rally-workflows (fan-out + dynamic-workflows protocol), mini-loop (per-task quality gate). Advisory-only hooks auto-fire on SessionStart + PreToolUse to surface room awareness and deconflict before edits — never blocks. Backend: rally CLI (cargo install --path crates/rally-cli).",
+      "codex": "Agent Rally Point coordination skills (agent-rally-point, rally-workflows, mini-loop) for Codex. Repo-local coordination via the rally CLI: claims, write-boundary checks, handoffs, dynamic-workflow task packets."
+    },
+    "host_keywords": {
+      "claude_code": [
+        "claude-code",
+        "codex",
+        "gemini"
+      ],
+      "codex": [
+        "codex"
+      ]
+    },
+    "codex_interface": {
+      "short_description": "Coordinate Codex work through Rally, dynamic workflow task packets, and a per-task quality loop.",
+      "long_description": "Agent Rally Point gives Codex a repo-local coordination surface for Rally claims, checks, artifacts, handoffs, and dynamic workflow task packets. Three skills: agent-rally-point (per-session loop), rally-workflows (fan-out + dynamic-workflows protocol), mini-loop (per-task assess/plan/execute/judge quality gate).",
+      "composer_icon": "./assets/app-icon-rally-point-v5.png",
+      "logo": "./assets/app-icon-rally-point-v5.png",
+      "capabilities": [
+        "Read",
+        "Write"
+      ],
+      "default_prompt": [
+        "Coordinate this repo with Rally.",
+        "Run a dynamic workflow through Rally."
+      ]
+    }
+  },
+  "providers": {
+    "claude_code": {
+      "canonical_id": "agent-rally-point@agent-rally-point",
+      "marketplace": "agent-rally-point",
+      "source": "https://github.com/tyroneross/agent-rally-point.git",
+      "update_command": [
+        "claude",
+        "plugin",
+        "update",
+        "agent-rally-point@agent-rally-point"
+      ],
+      "restart_required": true
+    },
+    "codex": {
+      "canonical_id": "agent-rally-point@agent-rally-point",
+      "marketplace": "agent-rally-point",
+      "source": "https://github.com/tyroneross/agent-rally-point.git",
+      "upgrade_command": [
+        "codex",
+        "plugin",
+        "marketplace",
+        "upgrade",
+        "agent-rally-point",
+        "--json"
+      ],
+      "install_command": [
+        "codex",
+        "plugin",
+        "add",
+        "agent-rally-point@agent-rally-point",
+        "--json"
+      ],
+      "restart_required": true
+    }
+  },
+  "skills": {
+    "agent-rally-point": {
+      "name": "agent-rally-point",
+      "description": "Use when working in a repository that uses Rally/Agent Rally Point for cross-agent coordination, especially at session start, before editing files, when deciding what to do next, handing work to another agent, recording facts/artifacts/decisions, resolving blockers, or coordinating with other coding agents through the `rally` CLI.",
+      "overlays": {
+        "claude_code": {},
+        "codex": {}
+      }
+    },
+    "mini-loop": {
+      "name": "mini-loop",
+      "description": "Ultra-light per-task quality loop for Rally Flow / dynamic-workflows fan-out. Wrap each fanned-out task in assess → plan → execute → mini-judge to raise accuracy, with zero tools or scripts. Use when running a workstream task and you want it to actually meet its validation + output contract, not just \"be done\".",
+      "overlays": {
+        "claude_code": {},
+        "codex": {}
+      }
+    },
+    "rally-workflows": {
+      "name": "rally-workflows",
+      "description": "Use when fanning out work across multiple agents, running a dynamic workflow, coordinating parallel subagents, or splitting a workstream across hosts, terminals, or machines through Agent Rally Point. Defines the workstream descriptor + task-packet protocol and the per-task rally coordination loop. Host-neutral — works for any coding agent.",
+      "overlays": {
+        "claude_code": {},
+        "codex": {}
+      }
+    }
+  },
+  "hooks": {
+    "phases": [
+      {
+        "phase": "start",
+        "timeout_ms": 5000,
+        "events": {
+          "claude_code": "SessionStart",
+          "codex": "SessionStart",
+          "cursor": "sessionStart"
+        }
+      },
+      {
+        "phase": "idle",
+        "timeout_ms": 5000,
+        "events": {
+          "claude_code": "UserPromptSubmit",
+          "codex": "UserPromptSubmit"
+        }
+      },
+      {
+        "phase": "before-write",
+        "timeout_ms": 10000,
+        "events": {
+          "claude_code": "PreToolUse",
+          "codex": "PreToolUse",
+          "cursor": "preToolUse"
+        },
+        "matchers": {
+          "claude_code": "Edit|Write|MultiEdit|NotebookEdit",
+          "codex": null,
+          "cursor": "Write|Edit"
+        }
+      },
+      {
+        "phase": "after-write",
+        "timeout_ms": 5000,
+        "events": {
+          "claude_code": "Stop",
+          "codex": "Stop",
+          "cursor": "stop"
+        }
+      }
+    ]
+  }
+}

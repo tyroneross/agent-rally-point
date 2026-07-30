@@ -351,6 +351,7 @@ case "\$url" in
   *.tar.gz) exit 1;;
   *) printf '%s' '$_FAKE_BODY' > "\$out";;
 esac
+[ -n "\${CURL_LOG:-}" ] && printf '%s\n' "\$url" >> "\$CURL_LOG"
 exit 0
 STUB
     chmod +x "$1/curl"
@@ -368,12 +369,14 @@ STUB
   T="f2 checksum match -> verified + installed (method=downloaded)"
   (
     sb="$TMPDIR_ROOT/ck-ok"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin/.claude-plugin"
-    printf '{"name":"x","version":"0.0.0-test"}\n' > "$sb/plugin/.claude-plugin/plugin.json"
+    printf '{"name":"x"}\n' > "$sb/plugin/.claude-plugin/plugin.json"
+    printf '{"schema":"agent-rally.release-identity.v1","version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
     _write_curl_stub "$sb/tools" "$_GOOD_HASH"
-    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    CURL_LOG="$sb/curl.log" HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
     m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
     [ "$m" = "downloaded" ] || { printf 'expected downloaded, got: %s\n' "$m" >&2; exit 1; }
     [ -x "$sb/home/.local/bin/rally" ] || { printf 'binary not installed\n' >&2; exit 1; }
+    grep -q '/v0.0.0-test/' "$sb/curl.log" || { printf 'release identity did not pin v0.0.0-test\n' >&2; exit 1; }
     exit 0
   )
   if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi

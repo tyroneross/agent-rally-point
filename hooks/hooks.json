@@ -1,13 +1,13 @@
 {
-  "$comment": "Agent Rally Point plugin hooks — auto-loaded by Claude Code at this standard path (do NOT also declare a 'hooks' key in .claude-plugin/plugin.json; see reference_plugin_hooks_autoload.md). The hook self-gates on .rally/ presence (silent no-op if absent) and fail-opens (never blocks). Advisory by default; export RALLY_HOOK_STRICT=1 to hard-block on high-severity coordination signals. Cadence parity with Codex (.codex/hooks.json): SessionStart=room awareness, UserPromptSubmit=per-turn presence refresh (idle), PreToolUse=deconflict before edits (kept edit-scoped on purpose — avoids firing on every read/bash tool), Stop=after-write.",
+  "$comment": "GENERATED from config/host-integrations.json. Claude plugin hooks are auto-loaded at this standard path. Project and plugin registration may both be active; the canonical hook counts registration sources for an identical event while preserving same-source repeats. Claude keeps edit-scoped PreToolUse while Codex intentionally checks every PreToolUse event.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "timeout": 5000,
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh start claude_code"
+            "command": "RALLY_HOOK_SOURCE=plugin \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" start claude_code",
+            "timeout": 5000
           }
         ]
       }
@@ -17,22 +17,22 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 5000,
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh idle claude_code"
+            "command": "RALLY_HOOK_SOURCE=plugin \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" idle claude_code",
+            "timeout": 5000
           }
         ]
       }
     ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
           {
             "type": "command",
-            "timeout": 10000,
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh before-write claude_code"
+            "command": "RALLY_HOOK_SOURCE=plugin \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" before-write claude_code",
+            "timeout": 10000
           }
-        ]
+        ],
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit"
       }
     ],
     "Stop": [
@@ -40,8 +40,8 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 5000,
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh after-write claude_code"
+            "command": "RALLY_HOOK_SOURCE=plugin \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" after-write claude_code",
+            "timeout": 5000
           }
         ]
       }

@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 # SPDX-License-Identifier: Apache-2.0
 #
-# check-release-parity.sh — fail if the CLI version and the bundled Codex
-# artifact have drifted from their canonical sources.
+# check-release-parity.sh — fail if release versions or generated host
+# integration surfaces have drifted from their canonical sources.
 #
 # Canonical CLI version: `crates/rally-cli/Cargo.toml` [package] `version`.
 # (NOT the root `Cargo.toml` [workspace.package] table — this workspace has
@@ -11,21 +11,24 @@
 # `rally-cli` is the crate that ships as the released `rally` binary, so it
 # is the canonical source of truth for release version numbers.)
 #
-# Checks, both required to pass:
+# Checks, all required to pass:
 #   1. Every one of the following has a `version` field equal to the
 #      canonical CLI version:
 #        .claude-plugin/plugin.json
 #        .codex-plugin/plugin.json
 #        plugins/codex/.codex-plugin/plugin.json
 #        .agents/plugins/marketplace.json
-#   2. plugins/codex/.codex-plugin/ is byte-identical to what
+#   2. Every generated Claude/Codex/Cursor manifest, hook, skill frontmatter,
+#      release identity, and packaged artifact matches a fresh render from
+#      config/host-integrations.json.
+#   3. plugins/codex/.codex-plugin/ is byte-identical to what
 #      scripts/build-codex-artifact.sh would (re)generate from the canonical
 #      .codex-plugin/ source right now — i.e. the committed artifact is not
 #      stale. Verified by INVOKING that script (RALLY_CODEX_DEST=<scratch>)
 #      rather than re-implementing its copy semantics here — single source
 #      of truth (SEC-003), no risk of the two scripts' `cp` flags drifting
 #      apart. The scratch dest means this never mutates the committed tree.
-#   3. plugins/codex/.codex-plugin/ contains NO symlinks (SEC-004),
+#   4. plugins/codex/.codex-plugin/ contains NO symlinks (SEC-004),
 #      independent of what the (2) content diff reports. Codex installs by
 #      copying the directory wholesale — a committed symlink ships as a
 #      dangling link on the installer's machine even if its target's
@@ -110,12 +113,50 @@ check_json_version "plugins/codex/.codex-plugin/plugin.json" optional
 # The marketplace manifest is where the version is tracked, so it stays strict.
 check_json_version ".agents/plugins/marketplace.json"
 
+claude_marketplace_version=$(python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+print((data.get("metadata") or {}).get("version", ""))
+' ".claude-plugin/marketplace.json")
+if [ "$claude_marketplace_version" != "$cli_version" ]; then
+  echo "check-release-parity: MISMATCH .claude-plugin/marketplace.json metadata.version — expected $cli_version, found ${claude_marketplace_version:-<missing>}" >&2
+  fail=1
+fi
+
+# --- all generated host surfaces -----------------------------------------
+if ! python3 scripts/generate_host_surfaces.py --check >&2; then
+  echo "check-release-parity: GENERATED HOST SURFACES STALE — run scripts/generate_host_surfaces.py" >&2
+  fail=1
+fi
+
+# --- host integration behavior -------------------------------------------
+# This script runs in CI, the pre-push gate, and the release workflow. Keep the
+# generated-surface tests and the host hook/installer/provisioner regressions on
+# the same mandatory path as manifest parity.
+echo "check-release-parity: host integration tests" >&2
+if ! python3 -m unittest \
+  tests/scripts/test_generate_host_surfaces.py \
+  tests/scripts/test_sync_host_integrations.py >&2; then
+  echo "check-release-parity: HOST GENERATOR/RECONCILER TESTS FAILED" >&2
+  fail=1
+fi
+for host_test in \
+  tests/hooks/test_rally_coordination_hook.sh \
+  tests/hooks/test_install_rally_hooks.sh \
+  tests/hooks/test_ensure_rally_binary.sh
+do
+  if ! "$host_test" >&2; then
+    echo "check-release-parity: HOST TEST FAILED — $host_test" >&2
+    fail=1
+  fi
+done
+
 # --- artifact freshness -----------------------------------------------
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/rally-parity-XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 
 if [ -d ".codex-plugin" ]; then
-  fresh="$scratch/fresh-codex-plugin"
+  fresh="$scratch/.codex-plugin"
   # SEC-003: generate the fresh comparison artifact by INVOKING the real
   # builder (single source of truth for the copy semantics: -L dereference,
   # .DS_Store strip) rather than re-implementing them here. RALLY_CODEX_DEST

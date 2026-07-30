@@ -96,21 +96,35 @@ fi
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 CODEX_HOOK="$HOME/.codex/rally-hook.sh"
 
-# --- json engine: jq preferred, python3 fallback ---------------------------
-if command -v jq >/dev/null 2>&1; then
-  JSON_ENGINE="jq"
-elif command -v python3 >/dev/null 2>&1; then
-  JSON_ENGINE="python3"
-else
-  echo "install_rally_hooks: need jq or python3 to edit settings.json" >&2
+# --- generated settings source ---------------------------------------------
+TEMPLATE_SETTINGS="$REPO_ROOT/.claude/settings.json"
+if [ ! -f "$TEMPLATE_SETTINGS" ]; then
+  echo "install_rally_hooks: generated template missing at $TEMPLATE_SETTINGS" >&2
   exit 1
 fi
-
-# Marker commands — identify-by-substring on uninstall.
-HOOK_CMD_START="$HOOK_PATH start claude_code"
-HOOK_CMD_IDLE="$HOOK_PATH idle claude_code"
-HOOK_CMD_PRETOOL="$HOOK_PATH before-write claude_code"
-HOOK_CMD_STOP="$HOOK_PATH after-write claude_code"
+case "${RALLY_INSTALL_JSON_ENGINE:-auto}" in
+  auto)
+    if command -v python3 >/dev/null 2>&1; then
+      JSON_ENGINE=python3
+    elif command -v jq >/dev/null 2>&1; then
+      JSON_ENGINE=jq
+    else
+      echo "install_rally_hooks: need python3 or jq to merge generated settings.json" >&2
+      exit 1
+    fi
+    ;;
+  python3|jq)
+    JSON_ENGINE="$RALLY_INSTALL_JSON_ENGINE"
+    if ! command -v "$JSON_ENGINE" >/dev/null 2>&1; then
+      echo "install_rally_hooks: requested JSON engine not found: $JSON_ENGINE" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "install_rally_hooks: invalid RALLY_INSTALL_JSON_ENGINE=$RALLY_INSTALL_JSON_ENGINE" >&2
+    exit 2
+    ;;
+esac
 
 # --- read existing settings -----------------------------------------------
 mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
@@ -121,94 +135,17 @@ else
   OLD_JSON="{}"
 fi
 
-# --- compute new settings --------------------------------------------------
-compute_new_jq() {
-  # $1 = action (install|uninstall)
-  local action="$1"
-  if [ "$action" = "install" ]; then
-    printf '%s' "$OLD_JSON" | jq \
-      --arg start_cmd "$HOOK_CMD_START" \
-      --arg pretool_cmd "$HOOK_CMD_PRETOOL" \
-      --arg idle_cmd "$HOOK_CMD_IDLE" \
-      --arg stop_cmd "$HOOK_CMD_STOP" \
-      --arg matcher "Edit|Write|MultiEdit|NotebookEdit" \
-      '
-      # Ensure hooks object
-      .hooks //= {}
-      # SessionStart
-      | .hooks.SessionStart //= []
-      | (.hooks.SessionStart |= (
-          # Remove any existing rally-coordination-hook entries (idempotency)
-          map(.hooks //= [] | .hooks |= map(select(.command // "" | contains("rally-coordination-hook.sh start") | not)))
-          | map(select(.hooks | length > 0))
-          # Append our entry
-          + [ { "hooks": [ { "type": "command", "command": $start_cmd } ] } ]
-        ))
-      # PreToolUse
-      | .hooks.PreToolUse //= []
-      | (.hooks.PreToolUse |= (
-          map(.hooks //= [] | .hooks |= map(select(.command // "" | contains("rally-coordination-hook.sh before-write") | not)))
-          | map(select(.hooks | length > 0))
-          + [ { "matcher": $matcher, "hooks": [ { "type": "command", "command": $pretool_cmd } ] } ]
-        ))
-      | .hooks.UserPromptSubmit //= []
-      | (.hooks.UserPromptSubmit |= (
-          map(.hooks //= [] | .hooks |= map(select(.command // "" | contains("rally-coordination-hook.sh idle") | not)))
-          | map(select(.hooks | length > 0))
-          + [ { "hooks": [ { "type": "command", "command": $idle_cmd } ] } ]
-        ))
-      | .hooks.Stop //= []
-      | (.hooks.Stop |= (
-          map(.hooks //= [] | .hooks |= map(select(.command // "" | contains("rally-coordination-hook.sh after-write") | not)))
-          | map(select(.hooks | length > 0))
-          + [ { "hooks": [ { "type": "command", "command": $stop_cmd } ] } ]
-        ))
-      '
-  else
-    # uninstall: strip any rally-coordination-hook entries; drop empty arrays.
-    printf '%s' "$OLD_JSON" | jq '
-      if .hooks then
-        .hooks.SessionStart = (
-          (.hooks.SessionStart // [])
-          | map(.hooks //= [] | .hooks |= map(select(.command // "" | contains("rally-coordination-hook.sh") | not)))
-          | map(select(.hooks | length > 0))
-        )
-        | .hooks.PreToolUse = (
-          (.hooks.PreToolUse // [])
-          | map(.hooks //= [] | .hooks |= map(select(.command // "" | contains("rally-coordination-hook.sh") | not)))
-          | map(select(.hooks | length > 0))
-        )
-        | .hooks.UserPromptSubmit = (
-          (.hooks.UserPromptSubmit // [])
-          | map(.hooks //= [] | .hooks |= map(select(.command // "" | contains("rally-coordination-hook.sh") | not)))
-          | map(select(.hooks | length > 0))
-        )
-        | .hooks.Stop = (
-          (.hooks.Stop // [])
-          | map(.hooks //= [] | .hooks |= map(select(.command // "" | contains("rally-coordination-hook.sh") | not)))
-          | map(select(.hooks | length > 0))
-        )
-        | (if (.hooks.SessionStart | length) == 0 then del(.hooks.SessionStart) else . end)
-        | (if (.hooks.PreToolUse  | length) == 0 then del(.hooks.PreToolUse)  else . end)
-        | (if (.hooks.UserPromptSubmit | length) == 0 then del(.hooks.UserPromptSubmit) else . end)
-        | (if (.hooks.Stop | length) == 0 then del(.hooks.Stop) else . end)
-        | (if (.hooks | length) == 0 then del(.hooks) else . end)
-      else . end
-    '
-  fi
-}
-
+# --- compute new settings from the generated project template ---------------
 compute_new_python() {
-  local action="$1"
   ACTION_ENV="$action" \
-  START_CMD="$HOOK_CMD_START" \
-  PRETOOL_CMD="$HOOK_CMD_PRETOOL" \
-  IDLE_CMD="$HOOK_CMD_IDLE" \
-  STOP_CMD="$HOOK_CMD_STOP" \
-  MATCHER="Edit|Write|MultiEdit|NotebookEdit" \
+  TEMPLATE_SETTINGS_ENV="$TEMPLATE_SETTINGS" \
+  HOOK_PATH_ENV="$HOOK_PATH" \
   OLD_JSON_ENV="$OLD_JSON" \
   python3 - <<'PY'
-import json, os, sys
+import copy
+import json
+import os
+import sys
 
 old_raw = os.environ.get("OLD_JSON_ENV", "{}")
 try:
@@ -221,22 +158,32 @@ if not isinstance(data, dict):
     sys.exit(1)
 
 action = os.environ["ACTION_ENV"]
-start_cmd = os.environ["START_CMD"]
-pretool_cmd = os.environ["PRETOOL_CMD"]
-idle_cmd = os.environ["IDLE_CMD"]
-stop_cmd = os.environ["STOP_CMD"]
-matcher = os.environ["MATCHER"]
-
+template_path = os.environ["TEMPLATE_SETTINGS_ENV"]
+hook_path = os.environ["HOOK_PATH_ENV"]
 MARKER = "rally-coordination-hook.sh"
 
-def strip(events, sub):
-    """Remove inner hooks whose command contains `sub`; drop empty groups."""
+try:
+    template = json.load(open(template_path, encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"install_rally_hooks: generated template is invalid: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+def strip(events):
+    """Remove Rally inner hooks while retaining unrelated hooks/groups."""
     out = []
     for group in events or []:
         if not isinstance(group, dict):
-            out.append(group); continue
+            out.append(group)
+            continue
         inner = group.get("hooks") or []
-        new_inner = [h for h in inner if not (isinstance(h, dict) and sub in (h.get("command") or ""))]
+        new_inner = [
+            hook
+            for hook in inner
+            if not (
+                isinstance(hook, dict)
+                and MARKER in (hook.get("command") or "")
+            )
+        ]
         if new_inner:
             new_group = dict(group)
             new_group["hooks"] = new_inner
@@ -248,36 +195,43 @@ if not isinstance(hooks, dict):
     hooks = {}
 
 if action == "install":
-    ss = strip(hooks.get("SessionStart"), "rally-coordination-hook.sh start")
-    ss.append({"hooks": [{"type": "command", "command": start_cmd}]})
-    hooks["SessionStart"] = ss
-
-    pt = strip(hooks.get("PreToolUse"), "rally-coordination-hook.sh before-write")
-    pt.append({"matcher": matcher, "hooks": [{"type": "command", "command": pretool_cmd}]})
-    hooks["PreToolUse"] = pt
-
-    ups = strip(hooks.get("UserPromptSubmit"), "rally-coordination-hook.sh idle")
-    ups.append({"hooks": [{"type": "command", "command": idle_cmd}]})
-    hooks["UserPromptSubmit"] = ups
-
-    st = strip(hooks.get("Stop"), "rally-coordination-hook.sh after-write")
-    st.append({"hooks": [{"type": "command", "command": stop_cmd}]})
-    hooks["Stop"] = st
-
+    template_hooks = template.get("hooks") or {}
+    if not isinstance(template_hooks, dict):
+        print("install_rally_hooks: generated template hooks must be an object", file=sys.stderr)
+        sys.exit(1)
+    # Remove every prior Rally hook first, including events no longer present in
+    # the generated template. Otherwise a retired event stays globally active.
+    for event in list(hooks):
+        remaining = strip(hooks.get(event))
+        if remaining:
+            hooks[event] = remaining
+        else:
+            del hooks[event]
+    for event, groups in template_hooks.items():
+        installed_groups = copy.deepcopy(groups)
+        for group in installed_groups:
+            for hook in group.get("hooks", []):
+                command = hook.get("command")
+                if not isinstance(command, str):
+                    continue
+                command = command.replace(
+                    '"${CLAUDE_PROJECT_DIR}/hooks/rally-coordination-hook.sh"',
+                    f'"{hook_path}"',
+                )
+                hook["command"] = command.replace(
+                    "RALLY_HOOK_SOURCE=project",
+                    "RALLY_HOOK_SOURCE=global",
+                    1,
+                )
+        hooks[event] = hooks.get(event, []) + installed_groups
     data["hooks"] = hooks
 else:  # uninstall
-    ss = strip(hooks.get("SessionStart"), MARKER)
-    pt = strip(hooks.get("PreToolUse"), MARKER)
-    ups = strip(hooks.get("UserPromptSubmit"), MARKER)
-    st = strip(hooks.get("Stop"), MARKER)
-    if ss: hooks["SessionStart"] = ss
-    elif "SessionStart" in hooks: del hooks["SessionStart"]
-    if pt: hooks["PreToolUse"] = pt
-    elif "PreToolUse" in hooks: del hooks["PreToolUse"]
-    if ups: hooks["UserPromptSubmit"] = ups
-    elif "UserPromptSubmit" in hooks: del hooks["UserPromptSubmit"]
-    if st: hooks["Stop"] = st
-    elif "Stop" in hooks: del hooks["Stop"]
+    for event in list(hooks):
+        remaining = strip(hooks.get(event))
+        if remaining:
+            hooks[event] = remaining
+        else:
+            del hooks[event]
     if hooks:
         data["hooks"] = hooks
     elif "hooks" in data:
@@ -287,17 +241,85 @@ print(json.dumps(data, indent=2))
 PY
 }
 
-if [ "$JSON_ENGINE" = "jq" ]; then
-  NEW_JSON="$(compute_new_jq "$ACTION")"
-else
-  NEW_JSON="$(compute_new_python "$ACTION")"
-fi
+compute_new_jq() {
+  printf '%s' "$OLD_JSON" | jq \
+    --slurpfile template "$TEMPLATE_SETTINGS" \
+    --arg action "$action" \
+    --arg hook_path "$HOOK_PATH" \
+    '
+    def strip_rally($events):
+      [
+        ($events // [])[] |
+        if type == "object" then
+          . as $group |
+          [
+            (.hooks // [])[] |
+            select((((.command? // "") | contains("rally-coordination-hook.sh"))) | not)
+          ] as $inner |
+          select(($inner | length) > 0) |
+          $group + {hooks: $inner}
+        else
+          .
+        end
+      ];
+    def rewrite_group:
+      .hooks = [
+        (.hooks // [])[] |
+        if ((.command? // null) | type) == "string" then
+          .command = (
+            .command
+            | split("\"${CLAUDE_PROJECT_DIR}/hooks/rally-coordination-hook.sh\"")
+            | join("\"" + $hook_path + "\"")
+            | split("RALLY_HOOK_SOURCE=project")
+            | join("RALLY_HOOK_SOURCE=global")
+          )
+        else
+          .
+        end
+      ];
+    if type != "object" then
+      error("settings.json root must be an object")
+    else
+      . as $data |
+      (($data.hooks // {}) |
+        if type == "object" then . else {} end |
+        with_entries(.value = strip_rally(.value)) |
+        with_entries(select((.value | length) > 0))
+      ) as $clean |
+      if $action == "install" then
+        (($template[0].hooks // {}) |
+          if type == "object" then . else error("generated template hooks must be an object") end
+        ) as $template_hooks |
+        (reduce ($template_hooks | keys_unsorted[]) as $event
+          ($clean;
+            .[$event] = (
+              (.[$event] // []) + ($template_hooks[$event] | map(rewrite_group))
+            )
+          )) as $hooks |
+        $data | if ($hooks | length) > 0 then .hooks = $hooks else del(.hooks) end
+      else
+        $data | if ($clean | length) > 0 then .hooks = $clean else del(.hooks) end
+      end
+    end
+    '
+}
+
+compute_new() {
+  if [ "$JSON_ENGINE" = "python3" ]; then
+    compute_new_python
+  else
+    compute_new_jq
+  fi
+}
+
+action="$ACTION"
+NEW_JSON="$(compute_new)"
 
 # Pretty-print OLD_JSON the same way for clean diffs.
-if [ "$JSON_ENGINE" = "jq" ]; then
-  OLD_PRETTY="$(printf '%s' "$OLD_JSON" | jq '.')"
-else
+if [ "$JSON_ENGINE" = "python3" ]; then
   OLD_PRETTY="$(OLD_JSON_ENV="$OLD_JSON" python3 -c 'import json,os; print(json.dumps(json.loads(os.environ["OLD_JSON_ENV"] or "{}"), indent=2))')"
+else
+  OLD_PRETTY="$(printf '%s' "$OLD_JSON" | jq '.')"
 fi
 
 # --- compare + write -------------------------------------------------------

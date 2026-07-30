@@ -1,23 +1,23 @@
 {
-  "$comment": "Cursor auto-coordination hooks (schema v1). Ships WITH the repo so it works on any machine with no ~/.cursor change; the command resolves the repo root via git so the path is portable. Cursor has no plugin marketplace, so coordination is delivered as a project hook here (not a plugin install like Claude Code / Codex). The hook self-gates on .rally/ presence (silent no-op if absent) and fail-opens (never blocks). Cursor's schema only injects an agent-visible message on preToolUse (agent_message); sessionStart/stop run rally side-effects (enter/next) with no visible output. Advisory by default; RALLY_HOOK_STRICT=1 turns preToolUse into a deny on high-severity collisions. See docs/AUTO-COORDINATION-HOOKS.md.",
+  "$comment": "GENERATED from config/host-integrations.json. Cursor schema v1 has no UserPromptSubmit equivalent; sessionStart/stop run side effects and preToolUse can inject agent_message. See docs/AUTO-COORDINATION-HOOKS.md.",
   "version": 1,
   "hooks": {
     "sessionStart": [
       {
-        "command": "bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" start cursor",
+        "command": "RALLY_HOOK_SOURCE=project bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" start cursor",
         "timeout": 5
       }
     ],
     "preToolUse": [
       {
-        "matcher": "Write|Edit",
-        "command": "bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" before-write cursor",
-        "timeout": 10
+        "command": "RALLY_HOOK_SOURCE=project bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" before-write cursor",
+        "timeout": 10,
+        "matcher": "Write|Edit"
       }
     ],
     "stop": [
       {
-        "command": "bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" after-write cursor",
+        "command": "RALLY_HOOK_SOURCE=project bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" after-write cursor",
         "timeout": 5
       }
     ]
