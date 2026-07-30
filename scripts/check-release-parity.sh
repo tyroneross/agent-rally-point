@@ -73,6 +73,8 @@ echo "check-release-parity: canonical CLI version = $cli_version ($cli_cargo_tom
 
 check_json_version() {
   path="$1"
+  # "optional" = an ABSENT version key is compliant; a PRESENT one must match.
+  optional="${2:-}"
   if [ ! -f "$path" ]; then
     echo "check-release-parity: MISSING $path" >&2
     fail=1
@@ -86,15 +88,26 @@ except Exception as exc:
     sys.exit(f"invalid JSON: {exc}")
 print(data.get("version", ""))
 ' "$path")
+  if [ -z "$found" ] && [ -n "$optional" ]; then
+    echo "check-release-parity: $path omits version (git-source policy, aeae79e) — OK" >&2
+    return
+  fi
   if [ "$found" != "$cli_version" ]; then
     echo "check-release-parity: MISMATCH $path — expected $cli_version, found ${found:-<missing>}" >&2
     fail=1
   fi
 }
 
-check_json_version ".claude-plugin/plugin.json"
-check_json_version ".codex-plugin/plugin.json"
-check_json_version "plugins/codex/.codex-plugin/plugin.json"
+# Plugin manifests install from a git source, where the host resolves the
+# revision itself and a hardcoded version only goes stale. aeae79e removed the
+# key from all three on purpose ("track via git tags + marketplace metadata").
+# This gate was not updated to match, so it failed on every push after that
+# commit. Absent is now compliant; a version that IS present must still match
+# the CLI, which is what keeps a stale number from shipping.
+check_json_version ".claude-plugin/plugin.json" optional
+check_json_version ".codex-plugin/plugin.json" optional
+check_json_version "plugins/codex/.codex-plugin/plugin.json" optional
+# The marketplace manifest is where the version is tracked, so it stays strict.
 check_json_version ".agents/plugins/marketplace.json"
 
 # --- artifact freshness -----------------------------------------------
