@@ -106,6 +106,45 @@ rally next --tool "$TOOL" --json
 Continue only while the next action is actionable, safe, and inside the user's
 scope.
 
+## Waiting On a Peer — Pull Automatically
+
+Waiting is never passive. Whenever you are waiting on a Rally response — a
+handoff, an ACK, a blocker resolution, a decision, an artifact — poll for it
+yourself. Do not wait to be woken, and do not ask the user to tell you when it
+lands.
+
+Injection is the primary channel *only* when the target is a managed session
+(`rally sessions` lists it). Pulling is always on: it is the fallback when
+injection cannot deliver, and the confirmation channel when it can.
+
+Poll at the cadence of the expected response:
+
+| Peer state | Interval |
+|---|---|
+| Active, response imminent (peer said it is handing off now) | 3–5s |
+| Working a task you are blocked behind | 30–60s |
+| Idle, long job, or overnight | 5–15 min |
+| Unknown | start at 10s, back off |
+
+```bash
+rally next --tool "$TOOL" --json     # wake-intent + actionable item
+rally recent --limit 40 --json       # new facts, including ones targeting you
+```
+
+Run the poll as a background watch that emits one event per NEW fact so you keep
+working instead of blocking on a sleep. Three constraints:
+
+- **Bounded.** Every poll loop carries a deadline and exits. No unbounded watch.
+- **Baseline first.** Record what already exists on the first pass and report
+  only facts newer than that, or you replay room history as if it were new.
+- **Every room the peer might be in.** Rooms are cwd-scoped, so poll the repo
+  room *and* the room for the cwd the peer's session was launched from. A peer
+  posting from `~` is invisible to a poller watching only the repo.
+
+On receipt, ACK immediately with `rally say handoff --ref <their-event-id>`
+before starting the work. An unacknowledged handoff is indistinguishable from an
+undelivered one.
+
 ## Managed Sessions
 
 Use managed sessions for reliable live delivery into visible panes:
