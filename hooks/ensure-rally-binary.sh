@@ -142,9 +142,26 @@ _binary_works() {
   [ -x "$b" ] && _timed 3 "$b" version >/dev/null 2>&1
 }
 
+_file_mtime_epoch() {
+  local f="$1" value=""
+  if value="$(stat -f %m "$f" 2>/dev/null)"; then
+    case "$value" in ''|*[!0-9]*) value="" ;; esac
+  else
+    value=""
+  fi
+  if [ -z "$value" ]; then
+    if value="$(stat -c %Y "$f" 2>/dev/null)"; then
+      case "$value" in ''|*[!0-9]*) value="" ;; esac
+    else
+      value=""
+    fi
+  fi
+  printf '%s\n' "${value:-0}"
+}
+
 _file_age_secs() {
   local f="$1" mt now
-  mt="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)"
+  mt="$(_file_mtime_epoch "$f")"
   now="$(date +%s 2>/dev/null || echo 0)"
   echo $(( now - mt ))
 }
@@ -368,6 +385,13 @@ _provision_bg() {
   _flock_acquire || frc=$?                        # capture rc without tripping set -e
   if [ "$frc" = 1 ]; then return 0; fi           # a live worker holds the flock → in progress
   if [ "$frc" = 0 ]; then
+    # Also acquire the portable pid lock while holding flock. A peer may have
+    # started without flock on PATH; ignoring its live/young pid lock would let
+    # the two locking strategies provision concurrently.
+    if ! _acquire_lock; then
+      _flock_release
+      return 0
+    fi
     via_flock=1
   else
     _acquire_lock || return 0                     # no flock → portable lock (another session has it)

@@ -405,6 +405,11 @@ T="f10 lock race: fresh empty lock not reclaimed (no double-provision)"
 (
   sb="$TMPDIR_ROOT/lock-young"; mkdir -p "$sb/home/.cache/rally" "$sb/tools" "$sb/plugin"
   printf '#!/usr/bin/env bash\nexit 1\n' > "$sb/tools/curl"; chmod +x "$sb/tools/curl"
+  # Exercise Linux behavior deterministically on every host: GNU stat may emit
+  # partial filesystem output before rejecting BSD flags, and flock may exist
+  # even when the competing worker used the portable pid lock.
+  printf '#!/usr/bin/env bash\nif [ "${1:-}" = "-f" ]; then printf "gnu-stat-partial-output\\n"; exit 1; fi\nif [ "${1:-}" = "-c" ]; then /bin/date +%%s; exit 0; fi\nexit 1\n' > "$sb/tools/stat"; chmod +x "$sb/tools/stat"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$sb/tools/flock"; chmod +x "$sb/tools/flock"
   : > "$sb/home/.cache/rally/.provision.lock"   # fresh, empty lock
   HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
   rc=$?

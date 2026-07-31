@@ -32,6 +32,23 @@ scratch_home() {
   printf '%s\n' "$h"
 }
 
+mtime_epoch() {
+  local value=""
+  if value="$(stat -f %m "$1" 2>/dev/null)"; then
+    case "$value" in ''|*[!0-9]*) value="" ;; esac
+  else
+    value=""
+  fi
+  if [ -z "$value" ]; then
+    if value="$(stat -c %Y "$1" 2>/dev/null)"; then
+      case "$value" in ''|*[!0-9]*) value="" ;; esac
+    else
+      value=""
+    fi
+  fi
+  printf '%s\n' "${value:-0}"
+}
+
 # Helper: read a JSON field with python3.
 jget() {
   # $1 = path to json file ; $2 = python expression on `data`
@@ -296,10 +313,10 @@ rm -rf "$H"
 T="--dry-run leaves settings.json untouched"
 H="$(scratch_home)"
 echo '{}' > "$H/.claude/settings.json"
-before_mtime="$(stat -f %m "$H/.claude/settings.json" 2>/dev/null || stat -c %Y "$H/.claude/settings.json" 2>/dev/null)"
+before_mtime="$(mtime_epoch "$H/.claude/settings.json")"
 sleep 1
 HOME="$H" "$INSTALLER" --global --dry-run --quiet >/dev/null 2>&1
-after_mtime="$(stat -f %m "$H/.claude/settings.json" 2>/dev/null || stat -c %Y "$H/.claude/settings.json" 2>/dev/null)"
+after_mtime="$(mtime_epoch "$H/.claude/settings.json")"
 if [ "$before_mtime" = "$after_mtime" ]; then
   ok "$T"
 else
