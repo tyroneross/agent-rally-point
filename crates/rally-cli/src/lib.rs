@@ -44,6 +44,66 @@ const SCHEMA_SESSION_ACTION: &str = "agent-rally.command.session-action.v1";
 const SCHEMA_ADOPT: &str = "agent-rally.command.adopt.v1";
 pub(crate) const FACT_SCHEMA: &str = "agent-rally.fact.v1";
 const SESSION_IDENTITY_RETRIES: usize = 4096;
+const SESSION_RESERVATION_LOCK_FILENAME: &str = "session-reservation.lock";
+
+#[cfg(unix)]
+mod session_reservation_lock {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+
+    const LOCK_EX: i32 = 2;
+    const LOCK_UN: i32 = 8;
+
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+
+    pub(super) struct Guard {
+        file: fs::File,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        }
+    }
+
+    pub(super) fn acquire(repo: &Path) -> Result<Guard> {
+        let rally_dir = repo.join(".rally");
+        fs::create_dir_all(&rally_dir)
+            .map_err(RallyError::io(format!("create {}", rally_dir.display())))?;
+        let path = rally_dir.join(SESSION_RESERVATION_LOCK_FILENAME);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(RallyError::io(format!("open {}", path.display())))?;
+        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+        if rc != 0 {
+            return Err(RallyError::Io {
+                context: format!("lock {}", path.display()),
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        Ok(Guard { file })
+    }
+}
+
+#[cfg(not(unix))]
+mod session_reservation_lock {
+    use super::*;
+
+    pub(super) struct Guard;
+
+    pub(super) fn acquire(repo: &Path) -> Result<Guard> {
+        fs::create_dir_all(repo.join(".rally"))
+            .map_err(RallyError::io("create .rally for session reservation"))?;
+        Ok(Guard)
+    }
+}
 
 macro_rules! cmd {
     ($($arg:expr),+ $(,)?) => {
@@ -4976,6 +5036,11 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
 
     // Refuse to re-adopt the same target. Read existing sessions and check.
     let room = RoomStore::open()?;
+    // Identity allocation spans a read → choose → conditional append sequence.
+    // Keep that whole sequence under one cross-process lock so two `run` /
+    // `adopt` processes cannot both return the same numbered identity even if
+    // independent SQLite pools observe the same pre-append context version.
+    let identity_guard = session_reservation_lock::acquire(&repo)?;
     let existing = active_session_records(&room)?;
     if let Some(prior) = existing.iter().find(|s| s.target == target) {
         return Err(RallyError::Usage(format!(
@@ -5019,17 +5084,17 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
     let landed_fact = with_watchdog_command_commit(|| {
         room.append_session_fact_if_context(&fact, context_version)
     })?;
-    if landed_fact.is_none() {
-        return Err(RallyError::Message(
-            "adopt: concurrent session-fact write detected; retry".to_string(),
-        ));
-    }
+    let landed_fact = landed_fact.ok_or_else(|| {
+        RallyError::Message("adopt: concurrent session-fact write detected; retry".to_string())
+    })?;
+    verify_session_reservation_readback(&room, &landed_fact, &session)?;
+    drop(identity_guard);
 
     // Daemon-first inject routing (move 2): same registration attempt as
     // `rally run`. Fail-open — an adopted tmux/cmux pane the daemon doesn't own
     // simply stays on the framed-tmux fallback.
     let mut session = session;
-    try_register_session_with_daemon(&room, &landed_fact, &mut session);
+    try_register_session_with_daemon(&room, &Some(landed_fact), &mut session);
 
     let body = envelope(
         "adopt",
@@ -5076,6 +5141,11 @@ fn reserve_numbered_session(
     agent_spec: &AgentSpec,
     input: SessionReservationInput<'_>,
 ) -> Result<ReservedSession> {
+    // Serialize the complete read → allocate → append identity transaction
+    // across processes. The store's mutation lock protects each individual
+    // append, while this lock protects the allocation decision between the
+    // session-facts read and its conditional append.
+    let _identity_guard = session_reservation_lock::acquire(input.repo)?;
     for attempt in 0..SESSION_IDENTITY_RETRIES {
         let (session_facts, context_version) = room.session_facts_with_context_version()?;
         let active_sessions = active_session_records_from_facts(session_facts);
@@ -5104,6 +5174,7 @@ fn reserve_numbered_session(
         if let Some(fact) = with_watchdog_command_commit(|| {
             room.append_session_fact_if_context(&fact, context_version)
         })? {
+            verify_session_reservation_readback(room, &fact, &session)?;
             return Ok(ReservedSession {
                 fact: Some(fact),
                 session,
@@ -5124,6 +5195,28 @@ fn reserve_numbered_session(
     Err(RallyError::Usage(format!(
         "could not reserve a unique managed session after {SESSION_IDENTITY_RETRIES} concurrent changes"
     )))
+}
+
+fn verify_session_reservation_readback(
+    room: &RoomStore,
+    reserved_fact: &Fact,
+    reserved_session: &ManagedSession,
+) -> Result<()> {
+    let durable = active_session_facts_from_facts(room.facts()?)
+        .into_iter()
+        .any(|(fact, session)| {
+            fact.event_id == reserved_fact.event_id
+                && session.session_id == reserved_session.session_id
+                && session.tool == reserved_session.tool
+        });
+    if durable {
+        Ok(())
+    } else {
+        Err(RallyError::Message(format!(
+            "session reservation readback failed for {}: append returned success but the active-session projection does not contain event {}",
+            reserved_session.session_id, reserved_fact.event_id
+        )))
+    }
 }
 
 fn numbered_session_identity(

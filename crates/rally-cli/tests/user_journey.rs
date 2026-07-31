@@ -2172,6 +2172,7 @@ fn rally_run_reserves_numbered_ids_under_parallel_launch() {
         })
         .collect::<Vec<_>>();
 
+    let mut returned_session_ids = BTreeSet::new();
     for handle in handles {
         let output = handle.join().unwrap();
         assert!(
@@ -2180,7 +2181,27 @@ fn rally_run_reserves_numbered_ids_under_parallel_launch() {
             String::from_utf8_lossy(&output.stderr),
             String::from_utf8_lossy(&output.stdout)
         );
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+            panic!(
+                "successful rally run returned invalid JSON: {err}\nstderr: {}\nstdout: {}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+        assert_eq!(
+            response["command"], "run",
+            "successful child must report a completed run, not a watchdog fallback: {response}"
+        );
+        let returned_session_id = response["data"]["run"]["session"]["session_id"]
+            .as_str()
+            .expect("run response must include session_id")
+            .to_string();
+        assert!(
+            returned_session_ids.insert(returned_session_id.clone()),
+            "two successful rally run children returned the same session_id {returned_session_id}"
+        );
     }
+    assert_eq!(returned_session_ids.len(), n);
 
     let sessions_resp = workspace.json(&["sessions", "--json"]);
     let sessions = sessions_resp["data"]["sessions"]["sessions"]

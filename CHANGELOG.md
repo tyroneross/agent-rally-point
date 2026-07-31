@@ -19,6 +19,7 @@ work landed on `main` since v0.1.6.
 - **Host differences are explicit.** Claude keeps edit-scoped `PreToolUse`; Codex intentionally runs unscoped `PreToolUse`. Global Claude hook installation now derives from the generated project template, including matchers and timeouts.
 - **Rally now has a daemon-backed store path and hardened handover.** The `rallyd` thin-client route, warm-pool installation, bounded handover, burst robustness, and security fixes landed with direct-mode fail-open behavior preserved.
 - **Handoffs acknowledge receipt before work begins.** Receiver-side flow now ACKs first, watches the room for follow-up, and surfaces the sender; injectability and ACK-wait diagnostics no longer hide delivery state.
+- **Concurrent managed-session launches cannot acknowledge a collapsed reservation.** `rally run` and `rally adopt` serialize numbered-identity allocation across processes and positively read back the exact active-session event before returning a normal success envelope. The Linux CI regression now also validates every child response and rejects duplicate returned IDs before checking durable projection cardinality.
 - **Doctor and maintenance surfaces expanded.** `doctor --compact-log`, `doctor --sweep-corrupt`, one-shot `claims-refresh`, and append-run provenance validation are included.
 
 ## v0.1.6 - 2026-07-07
