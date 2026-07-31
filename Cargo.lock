@@ -555,8 +555,6 @@ dependencies = [
 [[package]]
 name = "factstr-sqlite"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d08d73d4cc90830e34873054bc721b6821eb26b470aafa5b654093c8e0bdc0e"
 dependencies = [
  "factstr",
  "serde_json",

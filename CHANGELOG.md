@@ -20,6 +20,7 @@ work landed on `main` since v0.1.6.
 - **Rally now has a daemon-backed store path and hardened handover.** The `rallyd` thin-client route, warm-pool installation, bounded handover, burst robustness, and security fixes landed with direct-mode fail-open behavior preserved.
 - **Handoffs acknowledge receipt before work begins.** Receiver-side flow now ACKs first, watches the room for follow-up, and surfaces the sender; injectability and ACK-wait diagnostics no longer hide delivery state.
 - **Concurrent managed-session launches cannot acknowledge a collapsed reservation.** `rally run` and `rally adopt` serialize numbered-identity allocation across processes and positively read back the exact active-session event before returning a normal success envelope. The Linux CI regression now also validates every child response and rejects duplicate returned IDs before checking durable projection cardinality.
+- **Direct-mode SQLite teardown cannot destroy committed WAL facts.** Rally pins a vendored `factstr-sqlite` 0.5.2 delta that closes sqlx pools synchronously, closes room-owned pools under the mutation lock, fingerprints both `facts.db` and its WAL, and remeasures post-append counts instead of incrementing a potentially stale sidecar. This closes the production data-loss mechanism behind duplicate managed-session identities under parallel launch.
 - **Doctor and maintenance surfaces expanded.** `doctor --compact-log`, `doctor --sweep-corrupt`, one-shot `claims-refresh`, and append-run provenance validation are included.
 
 ## v0.1.6 - 2026-07-07

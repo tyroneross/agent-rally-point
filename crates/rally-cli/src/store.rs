@@ -737,7 +737,10 @@ pub(crate) enum RoomStore {
 /// [`DirectRoomStore::fact_store_handle`]'s cold branch = today's per-op open,
 /// byte-identical to main (G1). Chunk B installs a warm pool for daemon mode.
 pub(crate) struct DirectRoomStore {
-    fact_store: SqliteStore,
+    /// Room-lifetime pool used by the few direct accessors that do not open a
+    /// per-operation handle. Wrapped so Drop can close it while the room
+    /// mutation lock is still held.
+    fact_store: Option<SqliteStore>,
     /// Daemon-mode warm facts.db pool (L11/R1/G10). `Some` ⇒ the hot interior
     /// opens reuse this ONE pool instead of churning a pool per op (which
     /// factstr-sqlite 0.5.2's un-closed-on-Drop background checkpoint would race
@@ -821,6 +824,23 @@ fn acquire_room_mutation_lock(_room_dir: &Path) -> Result<RoomMutationLock> {
 impl Drop for RoomMutationLock {
     fn drop(&mut self) {
         let _ = unsafe { unix_lock::flock(self.file.as_raw_fd(), unix_lock::LOCK_UN) };
+    }
+}
+
+impl Drop for DirectRoomStore {
+    fn drop(&mut self) {
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .expect("facts db path must have a parent during store teardown");
+        // factstr-sqlite's vendored Drop closes the sqlx pool synchronously.
+        // Take every room-owned pool while holding the same cross-process lock
+        // used by append/reconcile so SQLite's final WAL checkpoint/unlink
+        // cannot escape into a peer process's mutation window.
+        let _guard = acquire_room_mutation_lock(room_dir)
+            .expect("acquire room mutation lock during store teardown");
+        drop(self.warm_fact_store.take());
+        drop(self.fact_store.take());
     }
 }
 
@@ -1373,7 +1393,7 @@ impl DirectRoomStore {
         seed_segments_from_db_if_absent(&log_dir, &archive_dir, &fact_store_path)?;
         let active_engagement = resolve_active_engagement_with_env(&dir, engagement);
         let store = Self {
-            fact_store,
+            fact_store: Some(fact_store),
             // Direct-CLI mode: no warm pool ⇒ per-op opens, byte-identical to
             // main (G1). Chunk B installs a warm pool for daemon mode.
             warm_fact_store: None,
@@ -1414,7 +1434,7 @@ impl DirectRoomStore {
         seed_segments_from_db_if_absent(&log_dir, &archive_dir, &fact_store_path)?;
         let active_engagement = resolve_active_engagement(&dir);
         let store = Self {
-            fact_store,
+            fact_store: Some(fact_store),
             // Direct-CLI mode: no warm pool ⇒ per-op opens (G1).
             warm_fact_store: None,
             cursor_path: dir.join("cursors.json"),
@@ -1722,11 +1742,10 @@ impl DirectRoomStore {
         Ok(fact)
     }
 
-    /// After a successful single-event append, advance the reconcile sidecar in
-    /// place: counts += 1, re-fingerprint the (now-grown) active segment + the
-    /// (now-grown) facts.db. Reads the pre-append sidecar established by open
-    /// or a previous reconcile; if it's missing/inconsistent, drops the sidecar
-    /// so the next op re-scans authoritatively. Never errors.
+    /// After a successful single-event append, rebuild the reconcile sidecar
+    /// from measured segment + database stats and fingerprint both the main
+    /// database and its WAL. If either side cannot be measured or they differ,
+    /// drop the sidecar so the next op re-scans authoritatively. Never errors.
     ///
     /// Non-Unix note: on non-Unix platforms the mutation lock is a no-op
     /// (see store.rs `acquire_room_mutation_lock` #[cfg(not(unix))]). A concurrent
@@ -1746,31 +1765,38 @@ impl DirectRoomStore {
             }
             return;
         };
-        let new_seg_fp = segments_fingerprint(&segments, &archived);
-        let new_db_fp = fingerprint_db(&self.facts_db_path);
-        match read_reconcile_cache(&self.facts_db_path) {
-            // The pre-append sidecar was consistent → just advance counts by one.
-            Some(prev)
-                if prev.canonical_count == prev.db_count
-                    && prev.canonical_max_seq == prev.db_max_seq =>
-            {
-                let cache = ReconcileCache {
-                    segments_fingerprint: new_seg_fp,
-                    db_fingerprint: new_db_fp,
-                    canonical_count: prev.canonical_count + 1,
-                    canonical_max_seq: prev.canonical_max_seq.max(appended_seq),
-                    db_count: prev.db_count + 1,
-                    db_max_seq: prev.db_max_seq.max(appended_seq),
-                };
-                let _ = write_reconcile_cache(&self.facts_db_path, &cache);
+        // Never advance counts from the previous sidecar. A lost WAL can leave
+        // that sidecar internally consistent while facts.db has rewound. Re-read
+        // both authoritative segments and the live SQLite view after the append;
+        // only publish a fast-path cache when they still agree exactly.
+        let Ok(canonical_stats) = segment_seq_stats(&segments, &archived) else {
+            if let Some(p) = reconcile_cache_path(&self.facts_db_path) {
+                let _ = fs::remove_file(p);
             }
-            // No trustworthy prior sidecar → drop any stale one; next op re-scans.
-            _ => {
-                if let Some(p) = reconcile_cache_path(&self.facts_db_path) {
-                    let _ = fs::remove_file(p);
-                }
+            return;
+        };
+        let Ok(db_stats) = read_db_event_stats(&self.facts_db_path) else {
+            if let Some(p) = reconcile_cache_path(&self.facts_db_path) {
+                let _ = fs::remove_file(p);
             }
+            return;
+        };
+        if canonical_stats != db_stats || canonical_stats.max_seq < appended_seq {
+            if let Some(p) = reconcile_cache_path(&self.facts_db_path) {
+                let _ = fs::remove_file(p);
+            }
+            return;
         }
+        let cache = ReconcileCache {
+            segments_fingerprint: segments_fingerprint(&segments, &archived),
+            db_fingerprint: fingerprint_db(&self.facts_db_path),
+            wal_fingerprint: fingerprint_wal(&self.facts_db_path),
+            canonical_count: canonical_stats.count,
+            canonical_max_seq: canonical_stats.max_seq,
+            db_count: db_stats.count,
+            db_max_seq: db_stats.max_seq,
+        };
+        let _ = write_reconcile_cache(&self.facts_db_path, &cache);
     }
 
     // -------------------------------------------------------------------------
@@ -2216,8 +2242,10 @@ impl DirectRoomStore {
     ///
     /// The read-seq is encoded in the fact's `summary` field as `"read_seq:<N>"`.
     pub(crate) fn last_checkpoint_seq(&self, tool: &str) -> Result<i64> {
-        let query = self
-            .fact_store
+        let fact_store = self.fact_store.as_ref().ok_or_else(|| {
+            RallyError::Message("room fact store is unavailable during teardown".to_string())
+        })?;
+        let query = fact_store
             .query(&FactQuery::for_event_types(["read"]))
             .map_err(|err| RallyError::Message(format!("query read checkpoints: {err}")))?;
         let max = query
@@ -3247,6 +3275,11 @@ struct ReconcileCache {
     /// A change here (mtime or size) means the db was rewritten/corrupted since
     /// we last trusted it → we must NOT take the fast path.
     db_fingerprint: Option<FileFingerprint>,
+    /// Fingerprint of `facts.db-wal`, when present. SQLite commits can live only
+    /// in the WAL while the main file stays byte-identical; omitting this made a
+    /// destructive WAL unlink invisible to the reconcile fast path.
+    #[serde(default)]
+    wal_fingerprint: Option<FileFingerprint>,
     canonical_count: i64,
     #[serde(default)]
     canonical_max_seq: i64,
@@ -3391,6 +3424,12 @@ fn fingerprint_db(path: &Path) -> Option<FileFingerprint> {
     Some(fp)
 }
 
+/// Fingerprint the live WAL with the same fixed-cost content signal as the main
+/// database. Absence is meaningful and therefore represented as `None`.
+fn fingerprint_wal(facts_db_path: &Path) -> Option<FileFingerprint> {
+    fingerprint_db(&facts_db_path.with_extension("db-wal"))
+}
+
 /// Hash of the first 4096 bytes of `path` (fewer if the file is shorter). Cheap,
 /// fixed-cost, content-sensitive. A read error hashes the empty slice — the
 /// resulting mismatch just forces the authoritative path, which is safe.
@@ -3490,6 +3529,7 @@ fn seed_segments_from_db_if_absent(
     let cache = ReconcileCache {
         segments_fingerprint: segments_fingerprint(&segments, &archived),
         db_fingerprint: fingerprint_db(facts_db_path),
+        wal_fingerprint: fingerprint_wal(facts_db_path),
         canonical_count: 0,
         canonical_max_seq: 0,
         db_count: 0,
@@ -3538,6 +3578,7 @@ fn reconcile_segments_and_db(
     // ----- Fast path: cheap fingerprint vs sidecar (O(#files)) -----
     let seg_fp = segments_fingerprint(&segments, &archived);
     let db_fp = fingerprint_db(facts_db_path);
+    let wal_fp = fingerprint_wal(facts_db_path);
     if let Some(cache) = read_reconcile_cache(facts_db_path)
         && cache.segments_fingerprint == seg_fp
         && cache.canonical_count == cache.db_count
@@ -3548,6 +3589,7 @@ fn reconcile_segments_and_db(
         // so this guard fails and we fall through to corruption detection.
         && db_fp.is_some()
         && cache.db_fingerprint == db_fp
+        && cache.wal_fingerprint == wal_fp
     {
         return Ok(());
     }
@@ -3608,6 +3650,7 @@ fn reconcile_segments_and_db(
     let cache = ReconcileCache {
         segments_fingerprint: seg_fp,
         db_fingerprint: fingerprint_db(facts_db_path),
+        wal_fingerprint: fingerprint_wal(facts_db_path),
         canonical_count: canonical_stats.count,
         canonical_max_seq: canonical_stats.max_seq,
         db_count: db_stats.count,
@@ -3637,6 +3680,7 @@ fn refresh_reconcile_cache_after_full_scan(
     let cache = ReconcileCache {
         segments_fingerprint: segments_fingerprint(&segments, &archived),
         db_fingerprint: fingerprint_db(facts_db_path),
+        wal_fingerprint: fingerprint_wal(facts_db_path),
         canonical_count: canonical_stats.count,
         canonical_max_seq: canonical_stats.max_seq,
         db_count: canonical_stats.count,
@@ -6216,6 +6260,69 @@ mod ledger_tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    #[test]
+    fn step3_wal_state_change_invalidates_an_otherwise_matching_sidecar() {
+        let root = unique_root("step3-wal-fingerprint");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "f"))
+            .unwrap();
+        let facts_db = root.join(".rally/facts.db");
+        let sidecar = root.join(".rally").join(RECONCILE_CACHE_FILENAME);
+        let stale_bytes = fs::read(&sidecar).expect("append writes sidecar");
+        let mut stale: ReconcileCache = serde_json::from_slice(&stale_bytes).unwrap();
+        assert!(
+            stale.wal_fingerprint.is_some(),
+            "open WAL must be represented in the sidecar"
+        );
+
+        drop(store);
+        assert!(
+            fingerprint_wal(&facts_db).is_none(),
+            "synchronous store close must checkpoint and remove the WAL"
+        );
+
+        // Make every legacy fast-path field match the post-close state while
+        // preserving the pre-close WAL fingerprint. Only WAL awareness can
+        // reject this otherwise self-consistent stale cache.
+        stale.db_fingerprint = fingerprint_db(&facts_db);
+        write_reconcile_cache(&facts_db, &stale).unwrap();
+        assert!(
+            reconcile_took_full_scan(&root),
+            "WAL disappearance must invalidate the reconcile fast path"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn step3_append_remeasures_counts_instead_of_incrementing_a_lie() {
+        let root = unique_root("step3-remeasure-after-append");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        store
+            .append_fact(&make_fact("e1", FactKind::Claim, "src/", "f"))
+            .unwrap();
+        let facts_db = root.join(".rally/facts.db");
+        let sidecar = root.join(".rally").join(RECONCILE_CACHE_FILENAME);
+        let mut lying: ReconcileCache =
+            serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+        lying.canonical_count = 100;
+        lying.canonical_max_seq = 100;
+        lying.db_count = 100;
+        lying.db_max_seq = 100;
+        write_reconcile_cache(&facts_db, &lying).unwrap();
+
+        let appended = store
+            .append_fact(&make_fact("e2", FactKind::Claim, "src/", "f"))
+            .unwrap();
+        let measured: ReconcileCache =
+            serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(measured.canonical_count, 2);
+        assert_eq!(measured.canonical_max_seq, appended.seq);
+        assert_eq!(measured.db_count, 2);
+        assert_eq!(measured.db_max_seq, appended.seq);
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// (b) Corrupt or delete the sidecar → the next reconcile falls through to
     /// the authoritative scan, rebuilds correctly, NO error, NO data loss, and
     /// re-seeds a valid sidecar (subsequent op is fast again).
@@ -6445,6 +6552,7 @@ mod ledger_tests {
         let adversarial_cache = ReconcileCache {
             segments_fingerprint: segments_fingerprint(&segments, &archived),
             db_fingerprint: fingerprint_db(&facts_db),
+            wal_fingerprint: fingerprint_wal(&facts_db),
             canonical_count: canonical_stats.count,
             canonical_max_seq: canonical_stats.max_seq,
             db_count: canonical_stats.count,

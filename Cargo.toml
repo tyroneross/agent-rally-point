@@ -42,6 +42,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dryoc = "0.8"
 rand = "0.8"
 
+[patch.crates-io]
+# factstr-sqlite 0.5.2 drops its sqlx pool asynchronously. The vendored delta
+# closes synchronously so SQLite's final WAL checkpoint/unlink completes before
+# Rally releases its cross-process mutation lock. See vendor/.../UPSTREAM.md.
+factstr-sqlite = { path = "vendor/factstr-sqlite" }
+
 # Release profile — tuned for the shipped binaries (arm64 macOS is the primary
 # target). Defaults leave codegen-units=16 and no LTO, so the release binary is
 # under-optimized. `rally` runs on every commit (before-write/before-complete
