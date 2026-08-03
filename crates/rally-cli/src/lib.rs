@@ -842,6 +842,11 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
     {
         return Ok(Output::new(false, help_text(), json!({})));
     }
+    // `rally --version` / `-V` mean `rally version`. Accept them rather than
+    // failing on the first thing most users type.
+    let normalized = crate::cli::normalize_flag_alias(args);
+    let args: &[String] = normalized.as_deref().unwrap_or(args);
+
     reject_unknown_command(args)?;
 
     let command = match parse_cli(args)? {

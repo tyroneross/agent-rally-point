@@ -800,6 +800,28 @@ const COMMANDS: &[&str] = &[
     "claims-refresh",
 ];
 
+/// Flag spellings people reach for that mean an existing subcommand.
+///
+/// `rally --version` is the first thing most users type and it used to fail with
+/// "unknown Rally command --version", naming neither the working form (`rally
+/// version`) nor `--help`. An error that does not say what to do next costs a
+/// round trip on someone's first minute with the tool.
+/// `--help` / `-h` are handled earlier in `run()`, so only version needs mapping here.
+const FLAG_ALIASES: &[(&str, &str)] = &[("--version", "version"), ("-V", "version")];
+
+/// Map a flag alias to its subcommand, so `rally --version` behaves as `rally version`.
+pub(crate) fn normalize_flag_alias(args: &[String]) -> Option<Vec<String>> {
+    let first = args.first()?;
+    let target = FLAG_ALIASES
+        .iter()
+        .find(|(flag, _)| flag == first)
+        .map(|(_, cmd)| *cmd)?;
+    let mut out = Vec::with_capacity(args.len());
+    out.push(target.to_string());
+    out.extend_from_slice(&args[1..]);
+    Some(out)
+}
+
 pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
     let Some(command) = args.first() else {
         return Ok(());
@@ -807,8 +829,9 @@ pub(crate) fn reject_unknown_command(args: &[String]) -> Result<()> {
     if COMMANDS.contains(&command.as_str()) {
         Ok(())
     } else {
+        // Point somewhere. A bare "unknown command" makes the user guess.
         Err(RallyError::Usage(format!(
-            "unknown Rally command {command}"
+            "unknown Rally command {command} — run `rally --help` for the command list"
         )))
     }
 }

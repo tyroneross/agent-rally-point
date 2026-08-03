@@ -564,3 +564,73 @@ fn status_global_filters_to_current_workspace_boundary() {
     fs::remove_dir_all(&workspace_b_root).ok();
     fs::remove_dir_all(&home).ok();
 }
+
+// ── DX: the first command a new user types ──────────────────────────────────
+
+/// `rally --version` used to fail with "unknown Rally command --version",
+/// naming neither the working form nor `--help`. An error that does not say
+/// what to do next costs a round trip in someone's first minute with the tool.
+///
+/// Asserts the aliases work AND that `version` itself still does — a fix that
+/// silently moved the behaviour would pass a one-sided test.
+#[test]
+fn version_flag_aliases_resolve_to_the_version_command() {
+    let canonical = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .arg("version")
+        .output()
+        .expect("run rally version");
+    assert!(
+        canonical.status.success(),
+        "`rally version` must keep working: {}",
+        String::from_utf8_lossy(&canonical.stderr)
+    );
+    let expected = String::from_utf8_lossy(&canonical.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        expected.starts_with("rally "),
+        "expected a version line, got: {expected:?}"
+    );
+
+    for flag in ["--version", "-V"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_rally"))
+            .arg(flag)
+            .output()
+            .unwrap_or_else(|e| panic!("run rally {flag}: {e}"));
+        assert!(
+            out.status.success(),
+            "`rally {flag}` must exit 0, got {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            expected,
+            "`rally {flag}` must print exactly what `rally version` prints"
+        );
+    }
+}
+
+/// An unknown command must point somewhere. Naming the bad token alone leaves
+/// the user guessing at the command list.
+#[test]
+fn unknown_command_error_names_help() {
+    let out = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .arg("frobnicate")
+        .output()
+        .expect("run rally frobnicate");
+    assert!(!out.status.success(), "an unknown command must not exit 0");
+    let msg = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        msg.contains("frobnicate"),
+        "the error must name the offending token: {msg:?}"
+    );
+    assert!(
+        msg.contains("--help"),
+        "the error must tell the user how to find the command list: {msg:?}"
+    );
+}
