@@ -61,10 +61,20 @@ deploy/install.sh install
 
 **Verified headlessly today:** daemon drives **mock** Claude + Codex sessions
 over the wire with seq-replay, TTL approvals, WS-level approval round-trip, audit
-log, deny-by-default authz policy, owner isolation, and a zero-knowledge relay
-that provably forwards only ciphertext. iOS app compiles + passes sim tests for
-all of the above surfaces. Live agent adapters are mock-verified; real-CLI smokes
-are gated behind `COCKPIT_LIVE=1` (no credit burned).
+log, per-connection session ownership on writes, a canonicalizing `repo_path`
+allowlist, a constant-time token check, refusal to bind non-loopback, and a
+zero-knowledge relay that provably forwards only ciphertext. iOS app compiles +
+passes sim tests for all of the above surfaces. Live agent adapters are
+mock-verified; real-CLI smokes are gated behind `COCKPIT_LIVE=1` (no credit
+burned).
+
+**Not verified, and not claimed:** the approval gate does not control the child
+agent. Cockpit spawns the CLI and reads its stdout, so a denied `tool_call` is
+withheld from clients but was never prevented — the tool may already have run.
+`tool_blocked` says so on the wire (`advisory: true`, `enforced: false`). Real
+containment needs an OS sandbox around the child, or a broker that executes
+tools itself. Tracked as ARP-003; the acceptance test that would close it is
+`arp003_execution_gate_definition_of_done` in `crates/cockpitd/tests/e2e.rs`.
 
 **Deferred — needs hardware/accounts, scaffolded + `TAG:UNTESTED`** (see
 `DEFERRED.md`): Tailscale tailnet binding, Secure-Enclave mTLS, Face ID, APNs,
@@ -74,11 +84,23 @@ outstanding.
 
 ## Security posture
 
-v1: dev bearer token over loopback. Production (per design §9): Tailscale tailnet
-+ Secure-Enclave mTLS + Face-ID-per-action + daemon-enforced deny-by-default
-command authorization + append-only audit. The authorization, audit, and crypto
-layers are built and tested; the transport-identity layer (tailnet + mTLS) is the
-deferred piece.
+v1: one dev bearer token over loopback, checked in constant time and failing
+closed when unset. Each connection owns the sessions it launches; another client
+cannot send, steer, close, or approve them. `repo_path` is canonicalized against
+an allowlist before the child agent is spawned. Binding beyond loopback requires
+an explicit `COCKPIT_ALLOW_NON_LOOPBACK=i-understand-the-risk`.
+
+Two limits stated plainly. **The authz policy is not enforced against the
+agent** — it filters the event stream and records an audit trail; the child
+process runs its tools regardless (ARP-003). **One shared token is not per-client
+identity** — ownership separates well-behaved clients, not attackers, because
+any token holder can assert any `client_id` (ARP-005 residual).
+
+Production (per design §9): Tailscale tailnet + Secure-Enclave mTLS +
+Face-ID-per-action + append-only audit, plus an OS sandbox or tool broker so the
+authorization decision actually binds the agent. The audit and crypto layers are
+built and tested; the transport-identity layer (tailnet + mTLS) and the
+enforcement layer are the deferred pieces.
 
 ## Data residency
 

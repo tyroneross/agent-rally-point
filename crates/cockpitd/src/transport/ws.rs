@@ -5,11 +5,35 @@
 //!
 //! Features:
 //! - Binds to `127.0.0.1:<port>` (default 8787, override via `COCKPIT_ADDR`).
+//!   Non-loopback binds are refused unless the operator acknowledges the risk
+//!   (see `crate::policy`).
 //! - Auth: first client frame must be `hello {token, protocol:1}`.
 //! - Handles all commands from COCKPIT-WIRE.md.
 //! - Fan-out: events from running sessions are broadcast to all subscribed clients.
 //! - Seq-numbered replay: `open_session {from_seq:N}` → events with seq>N, no gaps/dupes.
 //! - ~50ms output coalescing window.
+//!
+//! ## Ownership (ARP-005)
+//!
+//! Every authenticated connection acts as a [`Principal`]. The principal is
+//! written to `sessions.owner_id` at launch, and the mutating commands check it:
+//!
+//! | Command | Owner-checked |
+//! |---|---|
+//! | `send_prompt`, `steer`, `close_session`, `approve` | yes — non-owner gets `forbidden` |
+//! | `list_sessions`, `open_session`, `get_audit` | no — deliberately unscoped |
+//!
+//! Reads stay unscoped on purpose. With per-connection principals, scoping
+//! reads would break the reconnect-and-replay invariant that the iOS client
+//! depends on: a phone that drops WiFi comes back as a new principal and would
+//! lose its own timeline. Read isolation needs stable per-client credentials,
+//! which the shared bearer token cannot provide. A client that wants stable
+//! *control* across reconnects sends `client_id` in `hello`.
+//!
+//! ## What the approval gate below does NOT do (ARP-003)
+//!
+//! See the `run_pump` doc comment. Short version: the gate filters the event
+//! stream. It does not stop the child agent from running the tool.
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -33,9 +57,10 @@ use crate::{
     VERSION,
     authz::{self, AuthzPolicy},
     model::{Approval, Event, SessionStatus},
+    policy,
     protocol::{ApproveDecision, ClientCommand, ServerEvent},
     supervisor::AdapterEvent,
-    transport::AppState,
+    transport::{AppState, auth::Principal},
 };
 
 // H1a: `approval` has been removed from AppState. All approval operations
@@ -46,6 +71,15 @@ use crate::{
 
 /// Start the axum WebSocket server. Blocks until the server shuts down.
 pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_on(listener, state).await
+}
+
+/// Serve on a listener the caller already bound.
+///
+/// Tests use this: binding to port 0 and *then* handing the socket over removes
+/// the window where another test grabs the port between allocation and bind.
+pub async fn serve_on(listener: tokio::net::TcpListener, state: AppState) -> Result<()> {
     // H2: spawn the TTL auto-deny sweep task before accepting connections.
     // The task runs in the background for the lifetime of the server.
     // Interval is configurable via COCKPIT_SWEEP_INTERVAL_MS (default 5 s).
@@ -58,9 +92,11 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
 
     let app = Router::new().route("/", get(ws_handler)).with_state(state);
 
-    info!("cockpitd {} serving on ws://{}", VERSION, addr);
+    match listener.local_addr() {
+        Ok(addr) => info!("cockpitd {} serving on ws://{}", VERSION, addr),
+        Err(e) => warn!("cockpitd {} serving (local_addr unavailable: {e})", VERSION),
+    }
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -76,6 +112,8 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 /// Client context for a single WebSocket connection.
 struct ClientConn {
     state: Arc<AppState>,
+    /// The identity this connection acts as. Owns every session it launches.
+    principal: Principal,
     /// Sessions this client is subscribed to (for fan-out).
     subscribed: Vec<Uuid>,
     /// Global broadcast receiver (receives all session events).
@@ -83,14 +121,86 @@ struct ClientConn {
 }
 
 impl ClientConn {
-    fn new(state: Arc<AppState>) -> Self {
+    fn new(state: Arc<AppState>, principal: Principal) -> Self {
         let event_rx = state.event_tx.subscribe();
         Self {
             state,
+            principal,
             subscribed: Vec::new(),
             event_rx,
         }
     }
+}
+
+// ── Ownership enforcement (ARP-005) ───────────────────────────────────────────
+
+/// Result of comparing a connection's principal against a resource's owner.
+#[derive(Debug, PartialEq, Eq)]
+enum OwnerVerdict {
+    /// The caller owns the resource.
+    Owned,
+    /// The resource does not exist.
+    NotFound,
+    /// The resource exists and belongs to a different principal.
+    Forbidden,
+}
+
+/// Compare `owner` (as recorded in the store) against the caller's principal.
+///
+/// `None` means the row is missing.
+fn judge_owner(owner: Option<String>, principal: &Principal) -> OwnerVerdict {
+    match owner {
+        None => OwnerVerdict::NotFound,
+        Some(o) if o == principal.as_str() => OwnerVerdict::Owned,
+        Some(_) => OwnerVerdict::Forbidden,
+    }
+}
+
+/// Build the wire error for a failed ownership check.
+///
+/// `forbidden` and `not_found` are kept distinct. Session IDs are v4 UUIDs, so
+/// the existence signal is not usefully enumerable, and an operator debugging a
+/// two-client setup needs to know which of the two happened.
+fn owner_error(verdict: &OwnerVerdict, kind: &str, id: Uuid) -> ServerEvent {
+    match verdict {
+        OwnerVerdict::NotFound => ServerEvent::Error {
+            code: "not_found".into(),
+            message: format!("{kind} {id} not found"),
+        },
+        _ => ServerEvent::Error {
+            code: "forbidden".into(),
+            message: format!(
+                "{kind} {id} belongs to another client; send_prompt, steer, \
+                 close_session, and approve are restricted to the owning client"
+            ),
+        },
+    }
+}
+
+/// Owner check for a session. Returns `true` when the caller may proceed;
+/// otherwise sends the rejection frame and returns `false`.
+async fn allow_session_op(
+    ctx: &ClientConn,
+    session_id: Uuid,
+    sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
+) -> bool {
+    let owner = {
+        let sup = ctx.state.supervisor.lock().await;
+        sup.0.session_owner(session_id).ok().flatten()
+    };
+    let verdict = judge_owner(owner, &ctx.principal);
+    if verdict == OwnerVerdict::Owned {
+        return true;
+    }
+    warn!(
+        "principal {} refused on session {session_id} ({verdict:?})",
+        ctx.principal
+    );
+    let err = owner_error(&verdict, "session", session_id);
+    let _ = sink
+        .send(Message::Text(serde_json::to_string(&err).unwrap()))
+        .await;
+    false
 }
 
 /// Handle a single WebSocket connection.
@@ -98,12 +208,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sink, mut stream) = socket.split();
 
     // ── Auth: wait for hello ──────────────────────────────────────────────────
+    let mut principal: Option<Principal> = None;
     let authed = match stream.next().await {
         Some(Ok(Message::Text(text))) => match serde_json::from_str::<Value>(&text) {
             Ok(v) if v.get("t").and_then(|t| t.as_str()) == Some("hello") => {
                 let token = v.get("token").and_then(|t| t.as_str()).unwrap_or("");
                 match super::auth::validate_token(token) {
                     Ok(()) => {
+                        // ARP-005: mint this connection's identity. A client that
+                        // asserts `client_id` keeps its sessions across reconnects;
+                        // otherwise the identity dies with the socket.
+                        let claimed = v.get("client_id").and_then(|c| c.as_str());
+                        principal = Some(Principal::resolve(claimed));
                         let ok = ServerEvent::HelloOk {
                             server_version: VERSION.to_string(),
                             protocol: 1,
@@ -144,9 +260,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    info!("client authenticated");
+    let principal = principal.unwrap_or_else(Principal::per_connection);
+    info!("client authenticated as {principal}");
 
-    let mut ctx = ClientConn::new(state);
+    let mut ctx = ClientConn::new(state, principal);
     let coalesce_window = Duration::from_millis(50);
     let mut pending_events: Vec<(Uuid, Event)> = Vec::new();
     let mut flush_deadline: Option<tokio::time::Instant> = None;
@@ -320,6 +437,10 @@ async fn handle_command(
         }
 
         ClientCommand::SendPrompt { session_id, text } => {
+            // ARP-005: only the launching principal may drive the session.
+            if !allow_session_op(ctx, session_id, sink).await {
+                return;
+            }
             let mut sup = ctx.state.supervisor.lock().await;
             match sup.0.send_prompt(session_id, &text) {
                 Ok(()) => {}
@@ -336,6 +457,10 @@ async fn handle_command(
         }
 
         ClientCommand::Steer { session_id, text } => {
+            // ARP-005: steering is a write; same owner check as send_prompt.
+            if !allow_session_op(ctx, session_id, sink).await {
+                return;
+            }
             let mut sup = ctx.state.supervisor.lock().await;
             match sup.0.send_prompt(session_id, &text) {
                 Ok(()) => {}
@@ -361,18 +486,38 @@ async fn handle_command(
                 ApproveDecision::Deny => "deny",
             };
 
-            // H1a: all approvals live in the supervisor's store (single store).
-            // Look up the session_id for audit, then resolve in one place.
-            let (session_id_for_audit, resolve_result) = {
-                let mut sup = ctx.state.supervisor.lock().await;
+            // ARP-005: an approval inherits its session's owner. Resolving one
+            // decides whether another client's agent proceeds, so it is a write
+            // and gets the same check as send/steer/close.
+            let (session_id_for_audit, owner) = {
+                let sup = ctx.state.supervisor.lock().await;
                 let session_id = sup
                     .0
                     .get_approval(approval_id)
                     .ok()
                     .flatten()
                     .map(|a| a.session_id);
-                let result = sup.0.resolve_approval(approval_id, decision_str);
-                (session_id, result)
+                let owner = sup.0.approval_owner(approval_id).ok().flatten();
+                (session_id, owner)
+            };
+
+            let verdict = judge_owner(owner, &ctx.principal);
+            if verdict != OwnerVerdict::Owned {
+                warn!(
+                    "principal {} refused on approval {approval_id} ({verdict:?})",
+                    ctx.principal
+                );
+                let err = owner_error(&verdict, "approval", approval_id);
+                let _ = sink
+                    .send(Message::Text(serde_json::to_string(&err).unwrap()))
+                    .await;
+                return;
+            }
+
+            // H1a: all approvals live in the supervisor's store (single store).
+            let resolve_result = {
+                let mut sup = ctx.state.supervisor.lock().await;
+                sup.0.resolve_approval(approval_id, decision_str)
             };
 
             match resolve_result {
@@ -381,7 +526,7 @@ async fn handle_command(
                     {
                         let mut audit = ctx.state.audit.lock().await;
                         let _ = audit.0.append(
-                            "client",
+                            ctx.principal.as_str(),
                             "approval:resolved",
                             session_id_for_audit,
                             serde_json::json!({
@@ -439,6 +584,40 @@ async fn handle_command(
             repo_path,
             prompt,
         } => {
+            // ARP-005: repo_path becomes the child process's working directory.
+            // Canonicalize it and require it to sit inside a configured root
+            // before anything is spawned. The canonical path is what gets
+            // handed to the adapter, so the directory that was checked is the
+            // directory the child runs in.
+            let resolved_repo = match policy::resolve_repo_path(&repo_path) {
+                Ok(p) => p,
+                Err(rejection) => {
+                    warn!("principal {} launch refused: {rejection}", ctx.principal);
+                    {
+                        let mut audit = ctx.state.audit.lock().await;
+                        let _ = audit.0.append(
+                            ctx.principal.as_str(),
+                            "session:launch_refused",
+                            None,
+                            serde_json::json!({
+                                "agent_type": agent_type,
+                                "repo_path": repo_path,
+                                "reason": rejection.to_string(),
+                            }),
+                        );
+                    }
+                    let err = ServerEvent::Error {
+                        code: "repo_path_denied".into(),
+                        message: rejection.to_string(),
+                    };
+                    let _ = sink
+                        .send(Message::Text(serde_json::to_string(&err).unwrap()))
+                        .await;
+                    return;
+                }
+            };
+            let repo_path = resolved_repo.to_string_lossy().to_string();
+
             let session_id = {
                 let mut sup = ctx.state.supervisor.lock().await;
                 let event_tx = ctx.state.event_tx.clone();
@@ -446,7 +625,7 @@ async fn handle_command(
                     &agent_type,
                     &repo_path,
                     prompt.as_deref(),
-                    "local",
+                    ctx.principal.as_str(),
                     event_tx,
                 )
             };
@@ -466,12 +645,13 @@ async fn handle_command(
                     {
                         let mut audit = ctx.state.audit.lock().await;
                         let _ = audit.0.append(
-                            "client",
+                            ctx.principal.as_str(),
                             "session:launch",
                             Some(sid),
                             serde_json::json!({
                                 "agent_type": agent_type,
                                 "repo_path": repo_path,
+                                "owner": ctx.principal.as_str(),
                             }),
                         );
                     }
@@ -505,6 +685,10 @@ async fn handle_command(
         }
 
         ClientCommand::CloseSession { session_id } => {
+            // ARP-005: killing another client's agent is a write.
+            if !allow_session_op(ctx, session_id, sink).await {
+                return;
+            }
             let mut sup = ctx.state.supervisor.lock().await;
             match sup.0.kill_session(session_id) {
                 Ok(()) => {}
@@ -531,25 +715,60 @@ async fn handle_command(
 /// Drains AdapterEvents from `rx`, persists them to the supervisor's store, and
 /// broadcasts them as cockpit Events to all subscribed clients.
 ///
-/// ## Authz enforcement (G1 + H1b)
+/// # THIS IS NOT AN EXECUTION GATE (ARP-003)
+///
+/// Read this before trusting anything below it.
+///
+/// Cockpit spawns the agent CLI as a child process (`claude -p …`,
+/// `codex exec --json`) and reads its stdout. A `tool_call` reaches this
+/// function *after* the child has already decided to run the tool — often after
+/// it has already run it. Pausing this loop pauses **our reading of the child's
+/// output**. It does not pause the child. It sends the child nothing. The
+/// adapter's read task and the child process keep running while the pump is
+/// parked.
+///
+/// So the true guarantee of the "approval gate" is:
+///
+/// > The tool has already run, or may run at any moment regardless of the
+/// > decision. Cockpit filters what the operator is shown. It does not control
+/// > what the agent does.
+///
+/// A `deny` therefore means "not forwarded to the UI", never "prevented".
+/// The `tool_blocked` event carries `advisory: true` and `enforced: false` to
+/// say this on the wire.
+///
+/// What the gate is still worth: it surfaces tool activity for review, it
+/// records an audit trail, and it holds the session in `awaiting_input` so an
+/// operator sees the decision point. Treat it as a tripwire, not a control.
+///
+/// Anything that needs real containment must come from outside this process —
+/// run the child under an OS sandbox (`sandbox-exec`, a container, a
+/// least-privilege user) with the permissions you are willing to grant
+/// unconditionally.
+///
+/// The closing conditions for this finding live in
+/// `arp003_execution_gate_definition_of_done` in `tests/e2e.rs`.
+///
+/// ## Mechanics (G1 + H1b)
 /// When the adapter emits a `tool_call` Event, `authz::decide` is called with
 /// the conservative policy.  Decision outcomes:
 /// - `Permit` → broadcast the event as normal.
 /// - `RequireApproval` → register a pending Approval, broadcast an
-///   `approval_request` event so subscribed clients can respond, then PAUSE
-///   this session's pump by awaiting a per-approval `Notify`.  The `Approve`
-///   WS command calls `notify.notify_one()` after resolving the approval row.
+///   `approval_request` event so subscribed clients can respond, then park this
+///   session's pump on a per-approval `Notify`.  The `Approve` WS command calls
+///   `notify.notify_one()` after resolving the approval row.
 ///   After wakeup the pump reads the resolution:
 ///   - `allow` → continue (broadcast the tool_call event).
-///   - `deny` / `auto_denied` / anything else → emit a `tool_blocked` status
-///     event and skip forwarding the tool_call result.
+///   - `deny` / `auto_denied` / anything else → emit an advisory `tool_blocked`
+///     event and stop forwarding that tool_call to clients.
 ///
-/// H1b: native `approval_request` events from the Codex adapter are now gated
-/// the same way: the pump parks on a `Notify` until the client resolves the
-/// approval via the `Approve` WS command.
+/// H1b: native `approval_request` events from the Codex adapter follow the same
+/// path: the pump parks on a `Notify` until the client resolves the approval via
+/// the `Approve` WS command. Same caveat — Codex is spawned with stdin closed,
+/// so there is not even a channel on which to answer it.
 ///
-/// The gate is per-approval (not global), so other sessions' pumps are never
-/// blocked.  A tokio `Notify` is used rather than a channel so spurious wakeups
+/// The park is per-approval (not global), so other sessions' pumps are never
+/// stalled.  A tokio `Notify` is used rather than a channel so spurious wakeups
 /// are harmless (we re-check the DB after every notify).
 ///
 /// ## Multi-block turns (G2)
@@ -705,8 +924,13 @@ async fn run_pump(
                             }
                             let _ = event_tx.send(evt);
                         } else {
-                            // Denied — emit a tool_blocked status event (do NOT
-                            // feed the tool result back to the agent).
+                            // Denied — stop forwarding this tool_call to clients
+                            // and say so. ARP-003: the child agent was never told
+                            // about the decision and may already have run the
+                            // tool, so this is advisory, not enforcement. The
+                            // `kind` stays `tool_blocked` for wire compatibility
+                            // (docs/plans/COCKPIT-WIRE.md); the honest semantics
+                            // ride in the metadata flags and the content string.
                             let denial_reason = resolution.as_deref().unwrap_or("denied");
                             let mut blocked_evt = Event {
                                 session_id,
@@ -714,7 +938,8 @@ async fn run_pump(
                                 sender: "system".into(),
                                 kind: "tool_blocked".into(),
                                 content: format!(
-                                    "tool '{tool_name}' blocked by authz ({denial_reason})"
+                                    "tool '{tool_name}' not forwarded ({denial_reason}) — \
+                                     advisory only, the agent process was not prevented from running it"
                                 ),
                                 requires_user_input: false,
                                 created_at: evt.created_at,
@@ -722,6 +947,10 @@ async fn run_pump(
                                     "approval_id": approval_uuid.to_string(),
                                     "tool": tool_name,
                                     "reason": denial_reason,
+                                    // ARP-003 honesty flags — see run_pump docs.
+                                    "advisory": true,
+                                    "enforced": false,
+                                    "semantics": "not forwarded to clients; the child agent was not stopped and may have already executed this tool",
                                 }),
                             };
                             let blocked_seq = {
@@ -894,20 +1123,29 @@ async fn run_pump(
                         // Do NOT re-broadcast the approval_request event; it was
                         // already sent above. The pump continues to the next event.
                     } else {
-                        // Denied — emit tool_blocked and mark session active.
+                        // Denied — advisory only. See the ARP-003 note on
+                        // run_pump: Codex is spawned with stdin closed, so the
+                        // denial cannot reach the child even in principle.
                         let denial_reason = resolution.as_deref().unwrap_or("denied");
                         let mut blocked_evt = Event {
                             session_id,
                             seq: 0,
                             sender: "system".into(),
                             kind: "tool_blocked".into(),
-                            content: format!("tool '{tool}' blocked by authz ({denial_reason})"),
+                            content: format!(
+                                "tool '{tool}' not forwarded ({denial_reason}) — advisory only, \
+                                 the agent process was not prevented from running it"
+                            ),
                             requires_user_input: false,
                             created_at: evt.created_at,
                             metadata: serde_json::json!({
                                 "approval_id": approval_uuid.to_string(),
                                 "tool": tool,
                                 "reason": denial_reason,
+                                // ARP-003 honesty flags — see run_pump docs.
+                                "advisory": true,
+                                "enforced": false,
+                                "semantics": "not forwarded to clients; the child agent was not stopped and may have already executed this tool",
                             }),
                         };
                         let blocked_seq = {

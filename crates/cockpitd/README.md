@@ -35,7 +35,9 @@ deploy/install.sh uninstall
 | Var | Default | Meaning |
 |---|---|---|
 | `COCKPIT_TOKEN` | (empty → all auth fails) | dev bearer token required in the `hello` frame |
-| `COCKPIT_ADDR` | `127.0.0.1:8787` | WebSocket bind address (loopback v1; tailnet iface when deployed) |
+| `COCKPIT_ADDR` | `127.0.0.1:8787` | WebSocket bind address. Non-loopback is refused — see below |
+| `COCKPIT_ALLOW_NON_LOOPBACK` | unset | must equal `i-understand-the-risk` to bind anything but loopback |
+| `COCKPIT_REPO_ALLOWLIST` | `$HOME` | colon-separated directories a session may launch in |
 | `COCKPIT_DB` | `cockpitd.db` | SQLite event store path |
 | `COCKPIT_CLAUDE_BIN` | `claude` | claude binary (tests point this at a mock) |
 | `RUST_LOG` | `info` | tracing filter |
@@ -65,17 +67,40 @@ client (iOS / cockpit-cli)
   `seams.rs` `AuthProvider` (`DevTokenAuth` now, `MtlsAuth` stub) and `BindTarget`
   (loopback/tailnet) are the deferred-surface extension points.
 
-## Security (v1 vs deferred)
+## Security (what holds, what does not)
 
-v1 authenticates with a dev bearer token over loopback. The production posture —
-Tailscale tailnet, Secure-Enclave mTLS, Face ID, deny-by-default command
-allowlist — is enumerated with the exact finishing step in
-[`docs/plans/DEFERRED.md`](../../docs/plans/DEFERRED.md). Nothing gated is claimed
-working.
+v1 authenticates with one dev bearer token over loopback. Four guards are real
+and tested:
+
+- **Token check is constant-time** and fails closed when `COCKPIT_TOKEN` is
+  unset or empty (`transport/auth.rs`).
+- **Every connection gets a principal** that owns the sessions it launches.
+  `send_prompt`, `steer`, `close_session`, and `approve` reject a non-owner with
+  `forbidden`. Reads (`list_sessions`, `open_session`, `get_audit`) are
+  deliberately unscoped so a reconnecting client keeps its timeline.
+- **`repo_path` is canonicalized and allowlisted** before the child agent is
+  spawned in it. `..` traversal and symlinks pointing out of a root are refused
+  (`policy.rs`).
+- **Non-loopback binds are refused** unless the operator sets
+  `COCKPIT_ALLOW_NON_LOOPBACK=i-understand-the-risk`.
+
+Two things this does **not** give you:
+
+- **The approval gate does not control the agent.** Cockpit spawns the CLI and
+  reads its stdout. A denied `tool_call` is not forwarded to clients; the child
+  process was never stopped and may already have run the tool. `tool_blocked`
+  carries `advisory: true` and `enforced: false` for this reason. Run child
+  agents under an OS-level sandbox if you need containment. See
+  `transport::ws::run_pump` and `arp003_execution_gate_definition_of_done` in
+  `tests/e2e.rs`.
+- **One shared token is not per-client identity.** Ownership separates
+  well-behaved clients; anyone holding the token can claim any `client_id`.
+  Secure-Enclave mTLS is the planned replacement — see
+  [`docs/plans/DEFERRED.md`](../../docs/plans/DEFERRED.md).
 
 ## Status
 
-61 daemon tests pass (0 warnings). See
+All daemon tests pass with `clippy -D warnings` clean. See
 [`docs/superpowers/specs/2026-05-31-ios-agent-cockpit-design.md`](../../docs/superpowers/specs/2026-05-31-ios-agent-cockpit-design.md)
 for the design and [`docs/plans/2026-05-31-ios-agent-cockpit-PLAN.md`](../../docs/plans/2026-05-31-ios-agent-cockpit-PLAN.md)
 for the build plan.

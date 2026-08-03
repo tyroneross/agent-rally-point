@@ -125,6 +125,19 @@ pub trait ErasedSupervisor {
     fn resolve_approval(&mut self, id: uuid::Uuid, decision: &str) -> anyhow::Result<()>;
     /// List all pending (unresolved) approvals from the supervisor's store.
     fn list_pending_approvals(&self) -> anyhow::Result<Vec<crate::model::Approval>>;
+
+    // ── Ownership lookups (ARP-005) ───────────────────────────────────────────
+    /// The `owner_id` recorded when the session was launched, or `None` if the
+    /// session does not exist.
+    fn session_owner(&self, session_id: uuid::Uuid) -> anyhow::Result<Option<String>>;
+
+    /// The owner of the session an approval belongs to, or `None` if either the
+    /// approval or its session is missing.
+    ///
+    /// Approvals have no owner column. Ownership is derived from the session,
+    /// which is correct by construction: an approval only exists because a
+    /// session's agent asked for it.
+    fn approval_owner(&self, approval_id: uuid::Uuid) -> anyhow::Result<Option<String>>;
 }
 
 // ── Erased audit interface ────────────────────────────────────────────────────
@@ -233,6 +246,21 @@ impl<C: Clock> ErasedSupervisor for ConcreteSupervisor<C> {
     fn list_pending_approvals(&self) -> anyhow::Result<Vec<crate::model::Approval>> {
         use crate::approval::StorePendingExt as _;
         self.0.store.list_pending_approvals()
+    }
+
+    fn session_owner(&self, session_id: uuid::Uuid) -> anyhow::Result<Option<String>> {
+        Ok(self.0.store.get_session(session_id)?.map(|s| s.owner_id))
+    }
+
+    fn approval_owner(&self, approval_id: uuid::Uuid) -> anyhow::Result<Option<String>> {
+        let Some(approval) = self.0.store.get_approval(approval_id)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .0
+            .store
+            .get_session(approval.session_id)?
+            .map(|s| s.owner_id))
     }
 }
 

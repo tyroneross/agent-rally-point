@@ -30,7 +30,18 @@ use crate::model::{Approval, Event, Session, SessionStatus};
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ClientCommand {
     /// Auth handshake; must be the first frame.
-    Hello { token: String, protocol: u32 },
+    Hello {
+        token: String,
+        protocol: u32,
+        /// Optional stable identity so a reconnecting client keeps control of
+        /// the sessions it launched. Omit it and the connection gets a fresh
+        /// per-connection identity that dies with the socket.
+        ///
+        /// Self-asserted: any holder of the token can claim any `client_id`.
+        /// It separates well-behaved clients; it does not authenticate them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+    },
     /// Request current session list.
     ListSessions,
     /// Subscribe to a session and replay events from `from_seq` (exclusive).
@@ -150,7 +161,11 @@ pub fn protocol_schema() -> serde_json::Value {
                     "properties": {
                         "t": { "const": "hello" },
                         "token": { "type": "string" },
-                        "protocol": { "type": "integer", "const": 1 }
+                        "protocol": { "type": "integer", "const": 1 },
+                        "client_id": {
+                            "type": "string",
+                            "description": "Optional stable client identity ([A-Za-z0-9._-], <=64 chars). Self-asserted; separates clients, does not authenticate them."
+                        }
                     }
                 },
                 {
@@ -387,11 +402,43 @@ mod tests {
         let cmd = ClientCommand::Hello {
             token: "tok".into(),
             protocol: 1,
+            client_id: None,
         };
         let back: ClientCommand = rt_val(&cmd);
         let s = serde_json::to_string(&back).unwrap();
         assert!(s.contains(r#""t":"hello""#));
         assert!(s.contains("tok"));
+        assert!(
+            !s.contains("client_id"),
+            "an absent client_id must not appear on the wire"
+        );
+    }
+
+    #[test]
+    fn hello_without_client_id_still_decodes() {
+        // Backward compatibility: pre-ARP-005 clients send only token+protocol.
+        let v: ClientCommand =
+            serde_json::from_str(r#"{"t":"hello","token":"tok","protocol":1}"#).unwrap();
+        match v {
+            ClientCommand::Hello { client_id, .. } => assert!(client_id.is_none()),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_with_client_id_round_trips() {
+        let cmd = ClientCommand::Hello {
+            token: "tok".into(),
+            protocol: 1,
+            client_id: Some("iphone-15".into()),
+        };
+        let back: ClientCommand = rt_val(&cmd);
+        match back {
+            ClientCommand::Hello { client_id, .. } => {
+                assert_eq!(client_id.as_deref(), Some("iphone-15"))
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
     }
 
     #[test]

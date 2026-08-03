@@ -44,8 +44,20 @@ impl WsClient {
         let (ws, _) = connect_async(addr).await.context("connect to cockpitd")?;
         let (mut sink, mut stream) = ws.split();
 
-        // Send hello.
-        let hello = json!({"t": "hello", "token": token, "protocol": 1});
+        // Send hello with a STABLE client_id.
+        //
+        // ARP-005 bound sessions and approvals to the connection that created
+        // them. This CLI opens a fresh WebSocket per subcommand, so without a
+        // stable id every invocation would be a different principal and
+        // `cockpit-cli send` could not drive a session `cockpit-cli launch`
+        // had just started. The id separates well-behaved clients; it does not
+        // authenticate them (any token holder can claim any id).
+        let hello = json!({
+            "t": "hello",
+            "token": token,
+            "protocol": 1,
+            "client_id": "cockpit-cli",
+        });
         sink.send(Message::Text(hello.to_string()))
             .await
             .context("send hello")?;
@@ -91,6 +103,39 @@ impl WsClient {
                 None => bail!("connection closed"),
                 _ => continue,
             }
+        }
+    }
+
+    /// Fail if the server rejects the frame we just sent.
+    ///
+    /// `send_prompt` and `approve` get no success reply, so this CLI used to
+    /// print "sent" unconditionally — including when the daemon had refused the
+    /// command. After ARP-005 added owner binding, that turned a `forbidden`
+    /// refusal into a printed success, which is the same acknowledge-the-wrong-
+    /// step defect the root-cause register tracks as RC-001.
+    ///
+    /// We wait a bounded window for an `error` frame. One arriving is proof of
+    /// refusal. Silence is the best available evidence of acceptance — it is not
+    /// a positive receipt, and the wire protocol does not offer one for these
+    /// verbs. Say so rather than implying more.
+    pub async fn fail_on_error_frame(&mut self, window: std::time::Duration) -> Result<()> {
+        match tokio::time::timeout(window, self.recv_frame()).await {
+            Ok(Ok(v)) => {
+                if v.get("t").and_then(|t| t.as_str()) == Some("error") {
+                    let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                    let msg = v
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("(no message)");
+                    bail!("server refused the command: {code} — {msg}");
+                }
+                // Some other frame (an event, a broadcast). Not a refusal.
+                Ok(())
+            }
+            // Connection dropped is itself a failure worth surfacing.
+            Ok(Err(e)) => Err(e),
+            // Timed out with no error frame: accepted as far as we can tell.
+            Err(_) => Ok(()),
         }
     }
 
@@ -292,6 +337,9 @@ async fn cmd_send(addr: &str, token: &str, args: &[String]) -> Result<()> {
             "text": text,
         }))
         .await?;
+    client
+        .fail_on_error_frame(std::time::Duration::from_millis(750))
+        .await?;
     println!("sent");
     Ok(())
 }
@@ -314,6 +362,9 @@ async fn cmd_approve(addr: &str, token: &str, args: &[String]) -> Result<()> {
             "approval_id": approval_id,
             "decision": decision,
         }))
+        .await?;
+    client
+        .fail_on_error_frame(std::time::Duration::from_millis(750))
         .await?;
     println!("approved: {decision}");
     Ok(())

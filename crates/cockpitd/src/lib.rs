@@ -17,6 +17,7 @@
 //! - `adapter`    — agent adapters: Claude, Codex (B1/B2)
 //! - `approval`   — pending-approval state machine with TTL/auto-deny (B3)
 //! - `transport`  — WebSocket server + auth + Transport trait (C1)
+//! - `policy`     — repo-path allowlist + bind-address guard (ARP-005)
 
 /// Crate version string, surfaced in the daemon hello banner and protocol handshake.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -49,6 +50,9 @@ pub mod authz;
 
 // ── F4 ────────────────────────────────────────────────────────────────────────
 pub mod crypto;
+
+// ── ARP-005 (security audit) ──────────────────────────────────────────────────
+pub mod policy;
 
 #[cfg(test)]
 mod smoke {

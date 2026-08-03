@@ -8,9 +8,14 @@
 //!   cockpitd               -- same as serve (default)
 //!
 //! Environment:
-//!   COCKPIT_ADDR   = host:port to bind (default 127.0.0.1:8787)
-//!   COCKPIT_TOKEN  = bearer token required in hello frame
-//!   COCKPIT_DB     = path to SQLite database (default cockpitd.db)
+//!   COCKPIT_ADDR             = host:port to bind (default 127.0.0.1:8787).
+//!                              Non-loopback is refused; see below.
+//!   COCKPIT_ALLOW_NON_LOOPBACK = must equal "i-understand-the-risk" to bind
+//!                              anything other than loopback.
+//!   COCKPIT_TOKEN            = bearer token required in hello frame
+//!   COCKPIT_REPO_ALLOWLIST   = colon-separated directories a session may be
+//!                              launched in (default: $HOME)
+//!   COCKPIT_DB               = path to SQLite database (default cockpitd.db)
 
 use std::net::SocketAddr;
 
@@ -52,6 +57,33 @@ async fn serve_cmd() -> Result<()> {
         .unwrap_or_else(|_| "127.0.0.1:8787".into())
         .parse()
         .expect("invalid COCKPIT_ADDR");
+
+    // ARP-005: refuse to expose a one-shared-token daemon beyond loopback
+    // unless the operator has said, in words, that they know what that means.
+    if let Err(refusal) = cockpitd::policy::check_bind_addr_from_env(&addr) {
+        eprintln!("cockpitd: {refusal}");
+        std::process::exit(1);
+    }
+
+    // Surface the repo allowlist at startup so an operator sees the boundary
+    // before a launch is refused mid-session.
+    let roots = cockpitd::policy::configured_roots();
+    if roots.is_empty() {
+        tracing::warn!(
+            "no repo roots configured — every launch_session will be refused. \
+             Set {}=<colon-separated directories>.",
+            cockpitd::policy::REPO_ALLOWLIST_ENV
+        );
+    } else {
+        tracing::info!(
+            "sessions may be launched under: {}",
+            roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let db_path = std::env::var("COCKPIT_DB").unwrap_or_else(|_| "cockpitd.db".into());
     let audit_db_path =

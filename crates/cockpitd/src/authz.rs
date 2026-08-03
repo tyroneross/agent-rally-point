@@ -16,15 +16,26 @@
 //! The function `decide` is a pure, deterministic function with no I/O — easy
 //! to unit-test and easy to audit.
 //!
-//! ## Integration note (TAG:ASSUMED)
+//! ## Integration note
 //! The `decide` function is wired at the point where `tool_call` Events flow
 //! through the supervisor/transport pump. When a `tool_call` event arrives:
 //!   - If `decide → Permit`, the event is broadcast normally.
-//!   - If `decide → RequireApproval`, a pending `Approval` is created and the
-//!     `approval_request` frame is broadcast; the session is gated until resolved.
+//!   - If `decide → RequireApproval`, a pending `Approval` is created, the
+//!     `approval_request` frame is broadcast, and the pump parks until a client
+//!     resolves it.
 //!
-//! Full runtime enforcement wiring is TAG:ASSUMED until the next chunk adds the
-//! gating mechanism in the pump; the policy engine itself is fully real and tested.
+//! ## This policy is not enforced against the agent (ARP-003)
+//!
+//! "Deny-by-default" here means the *event stream* is held and, on denial, not
+//! forwarded. It does not mean the tool did not run. Cockpit spawns the agent
+//! CLI as a child process and only reads its stdout; a `tool_call` is observed
+//! after the child has already decided to act, and parking our reader neither
+//! stops the child nor tells it anything. See `transport::ws::run_pump` for the
+//! full statement and `arp003_execution_gate_definition_of_done` in
+//! `tests/e2e.rs` for what would close the gap.
+//!
+//! The decision function itself is real, pure, and tested. Its output is a
+//! recommendation surfaced to an operator, not a control on the agent.
 
 use serde::{Deserialize, Serialize};
 

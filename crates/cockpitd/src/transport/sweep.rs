@@ -8,7 +8,12 @@
 //! `created_at + ttl_secs` is in the past.  For each expired approval it:
 //!  1. Resolves the row to `auto_denied` in the store.
 //!  2. Wakes the parked gate (`Notify`) so the waiting `run_pump` task
-//!     unblocks, reads the resolution, and emits a `tool_blocked` event.
+//!     unblocks, reads the resolution, and emits an advisory `tool_blocked`
+//!     event.
+//!
+//! ARP-003: `tool_blocked` means "not forwarded to clients", not "prevented".
+//! Auto-deny releases *our* reader; the child agent was never held. See the
+//! `run_pump` doc comment in `transport::ws`.
 //!
 //! ## Deadlock safety
 //! `sweep_once` acquires the supervisor lock, collects expired IDs, resolves

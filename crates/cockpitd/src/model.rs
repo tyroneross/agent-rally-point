@@ -70,7 +70,10 @@ impl SessionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: Uuid,
-    /// Multi-user seam; default "local".
+    /// The principal that launched this session (ARP-005). Shaped
+    /// `conn:<uuid>` for a per-connection identity or `client:<id>` for one a
+    /// client asserted in `hello`. Only this principal may send, steer, close,
+    /// or resolve approvals for the session.
     pub owner_id: String,
     /// Open string — "claude", "codex", or any future agent.
     pub agent_type: String,
