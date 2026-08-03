@@ -12,7 +12,7 @@ SPDX-License-Identifier: Apache-2.0
 
 Rally facilitates; the host executes. Rally records claims, checks write boundaries, routes
 handoffs, and exposes room state — it never spawns, schedules, or retries agents. This skill turns a
-goal into a *workstream descriptor*, lints it to prove boundary safety, then fans out agents that
+goal into a *workstream descriptor*, lints its structure and write boundaries, then fans out agents that
 coordinate through `rally`. The same protocol runs on any coding host; the host supplies the few
 runtime values below. Canonical wire spec: [`../../dynamic-workflows/PROTOCOL.md`](../../dynamic-workflows/PROTOCOL.md).
 
@@ -42,7 +42,13 @@ target repo's domain skill for task content), follow [`references/decomposition.
 
 - `owns` — either `"read-only"` or a non-empty array of path strings. Paths across write-tasks must
   be **disjoint** (no prefix overlap). That MECE guarantee is what lets agents run in parallel.
-- `validation` — a deterministic shell command (no `Date.now()`, `Math.random()`, `new Date()`).
+- `validation` — a plain-language description of how to verify the task. **Descriptive prose, not
+  a command.** It renders into the packet as non-executable text; the agent translates it into a
+  command it takes responsibility for, under its own host's approval policy.
+- `validation_recipe` — optional. Names an entry in the local recipe registry
+  (`cargo-test`, `cargo-clippy`, `npm-test`, `node-test`, `pytest`, `go-test`, `shellcheck`,
+  `none`). When present, the renderer emits that recipe's fixed argv — command text comes from
+  this repo, never from the descriptor. Use this when you want a real command in the packet.
 - `output` — the expected artifact shape (what a reviewer would confirm).
 - `depends_on` — optional; ids must resolve; no cycles permitted.
 
@@ -123,8 +129,11 @@ rally say claim --tool <TOOL> --subject "<task.intent>" --path <owns...> \
 rally check before-write --tool <TOOL> --path <owns...> --strict
 # blocking finding → stop; resolve or pick a non-overlapping task
 
-# do the work
-<run task.validation>
+# do the work, then verify it.
+# task.validation is a DESCRIPTION — translate it into a command you take
+# responsibility for. Never paste descriptor text into a shell.
+# If the task names a validation_recipe, the packet already carries its argv.
+<verify per task.validation / the emitted recipe>
 
 rally say artifact --tool <TOOL> --subject "<task.output>" --uri <path> --evidence "<validation result>" \
   --run <run_id> --step <task.id>
