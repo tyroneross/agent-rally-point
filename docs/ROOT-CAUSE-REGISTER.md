@@ -188,6 +188,15 @@ means someone tried to break it and failed.
 - **State:** `observed`
 - **Evidence:** `rally room` reports 42 open handoffs and 1234 stale facts against
   `system_health=82`. Open handoffs date back to 2026-07-03.
+- **Re-measured 2026-08-03 — it is still growing:** **51 open handoffs, 1374 stale facts,
+  154 squads, 67 active claims**, max_seq 7008. Up 21% and 11% since the entry was written.
+- **Now quantified as a cost, not just noise** (`ASSESSMENT-2026-08-03-efficiency.md`):
+  `rally room --json` returns **1,956,274 bytes, of which `stale_facts` is 1,292,805 — 66%**.
+  The SessionStart hook greps `stale_facts` **zero** times. Two thirds of the payload is
+  built, piped, and parsed on every session start to be discarded. Projection is
+  O(whole ledger) at ~15.2 µs/KB, and `--since` filters *after* the scan, so it cuts payload
+  16× and latency not at all. Unbounded accumulation is therefore a latency bug on the
+  hottest path, not only a signal-to-noise problem.
 - **Why it belongs here:** if handoffs are routinely never consumed, "open handoff" carries no
   signal, and a genuinely urgent one is indistinguishable from four weeks of residue.
 
@@ -196,6 +205,13 @@ means someone tried to break it and failed.
 - **Evidence:** stale prepush worktree at `3a17fe8` still registered in `git worktree list`
   under `/private/var/folders/.../rally-prepush-wt.6oysNY/`. Multiple rally processes, daemons,
   and PID-keyed sessions with no single reaper of record.
+- **2026-08-03 — it had grown from 1 to 3, holding 2.1 GB** (430 M + 784 M + 905 M), including
+  the original `3a17fe8` from July. All three removed this run. **A failed push leaves its
+  worktree behind**, which is the accumulation mechanism: the coordinator's blocked push that
+  same day left one.
+- **Still `observed`, not `controlled`:** the cleanup was manual. `.githooks/pre-push` has no
+  trap that removes its worktree on a failed or interrupted gate, so the next failed push
+  starts the count again.
 
 ### RC-010 — reconcile cannot detect the loss it exists to heal
 - **State:** ✅ `controlled` as of `4b28c0e`, with a noted coverage gap (below).
