@@ -24,7 +24,17 @@ claude plugin marketplace add tyroneross/agent-rally-point
 claude plugin install agent-rally-point@agent-rally-point
 ```
 
-Hooks (SessionStart coordination + PreToolUse write-boundary checks) and skills (`agent-rally-point`, `rally-workflows`, `mini-loop`) activate on install. The `rally` CLI is **auto-provisioned on first session** — downloaded from GitHub Releases (SHA256-verified) or built from source as a fallback. Nothing else to run.
+Hooks (SessionStart coordination + PreToolUse write-boundary checks) and skills (`agent-rally-point`, `rally-workflows`, `mini-loop`) activate on install.
+
+Then install the `rally` CLI yourself — one explicit step:
+
+```bash
+scripts/install-rally.sh          # verified download; --dry-run to see the plan first
+```
+
+The installer verifies a SHA256 **and** a client-side build-provenance attestation
+(`gh attestation verify`) before the binary is made executable, and refuses rather than
+degrading if either check cannot be completed.
 
 **From source (manual / development):**
 
@@ -33,6 +43,11 @@ git clone https://github.com/tyroneross/agent-rally-point.git
 cd agent-rally-point
 cargo install --path crates/rally-cli
 ```
+
+**Opening this repo auto-loads its committed hooks.** That is the intended behaviour and it
+is a trust decision — read [`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md) for
+exactly what runs and how to turn it off (`RALLY_HOOKS=off`, `rally hooks off --scope repo`).
+The hooks are advisory, fail open, and never download, build, or install anything.
 
 **Verify either path:**
 
@@ -115,6 +130,24 @@ Rally assigns readable per-agent ids from the room: `rally run claude` becomes `
 - **[`docs/COMMAND-SEMANTICS.md`](docs/COMMAND-SEMANTICS.md)** — read/write behavior per command.
 - **[`docs/PROTOCOL-NORTH-STAR.md`](docs/PROTOCOL-NORTH-STAR.md)** — the long-term coordination protocol model.
 - **[`docs/AUTO-COORDINATION-HOOKS.md`](docs/AUTO-COORDINATION-HOOKS.md)** — automatic Claude Code / Codex hook wiring.
+- **[`docs/DESIGN-TRADEOFFS.md`](docs/DESIGN-TRADEOFFS.md)** — why hooks, why agents self-manage, why push-then-pull. The decisions and what they cost.
+- **[`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md)** — what Rally defends against and what it does not.
+
+## Security and maturity
+
+Rally assumes **one operator, on one machine, running agents you started yourself.** Every
+agent runs as your UID, so Rally coordinates them but cannot sandbox them. If a second
+contributor can land commits in your repo, read the trust model first — `.rally/log/*.jsonl`
+is committed content that replays on clone, and facts are not yet signed.
+
+An independent security audit (issue #52) produced 7 findings in August 2026. Triage, per-finding
+disposition, and what landed: [`docs/security/AUDIT-2026-08-02-issue-52-triage.md`](docs/security/AUDIT-2026-08-02-issue-52-triage.md).
+Known open defects live in [`docs/ROOT-CAUSE-REGISTER.md`](docs/ROOT-CAUSE-REGISTER.md); an entry
+closes only when an adversarial test proves the control fires.
+
+Honest maturity statement: proven daily on a small number of fresh macOS installs with one
+operator. Not proven on Linux beyond CI, on hosts beyond the four wired here, or with more than
+one human. Expect edge cases outside that envelope.
 
 ## How it works
 

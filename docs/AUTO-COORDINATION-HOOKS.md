@@ -33,6 +33,22 @@ blocks an edit). This is the default and recommended path — nothing to run.
 `SessionStart` shows a concise Rally-active prompt with the current off switch
 so users know the repo is coordinated before work starts.
 
+> **This is a trust decision, and it should be a deliberate one.** Trusting the repo
+> auto-loads code that runs on your host at session start and before every edit. That
+> is the point — instructing agents to run the commands themselves produced inconsistent
+> compliance ([`DESIGN-TRADEOFFS.md`](DESIGN-TRADEOFFS.md) §1) — but it is not free.
+>
+> What the hooks do and do not do, and every off switch:
+> [`security/TRUST-MODEL.md`](security/TRUST-MODEL.md).
+>
+> They **do not** download, build, `chmod +x`, or install anything. Provisioning was
+> removed from the hook path entirely after the issue #52 audit (RC-013). Installing the
+> `rally` binary is an explicit step you run: `scripts/install-rally.sh`, or
+> `cargo install --path crates/rally-cli`.
+>
+> Peer-authored ledger prose reaching your context is sanitized, length-capped, and quoted
+> as untrusted data (RC-016). It is still unsigned — treat it as data, never instructions.
+
 **Opt-in only — user-wide install across every repo on one machine** (edits your
 global `~/.claude/settings.json`; per-machine, not portable):
 

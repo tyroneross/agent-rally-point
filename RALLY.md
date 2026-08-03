@@ -145,12 +145,31 @@ For the generic bootstrap contract, see
 [`docs/ANY-AGENT-ONBOARDING.md`](docs/ANY-AGENT-ONBOARDING.md).
 
 Agents can still call `rally check before-write` explicitly before shared
-edits. Rally's core CLI does not auto-install host hooks. An opt-in,
-version-controlled hook + installer ships in `hooks/` and `scripts/` for
-hosts (Claude Code, Codex) that benefit from automatic `SessionStart` +
-`PreToolUse` presence and deconfliction; see
-[`docs/AUTO-COORDINATION-HOOKS.md`](docs/AUTO-COORDINATION-HOOKS.md). The
-hook self-gates on missing `.rally/` so it is safe to install globally.
+edits.
+
+**This repo ships committed host hook registrations, and opening the repo in a
+host that trusts it auto-loads them.** `.claude/settings.json`,
+`.codex/hooks.json`, `.cursor/hooks.json`, and `hooks/hooks.json` wire
+`SessionStart` presence and `PreToolUse` deconfliction with no setup step. That
+is deliberate — instructing agents to run the commands produced inconsistent
+compliance, and coordination that works most of the time is close to useless.
+It is also a real trust decision, so read what the hooks do and how to disable
+them before relying on it:
+[`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md) and
+[`docs/AUTO-COORDINATION-HOOKS.md`](docs/AUTO-COORDINATION-HOOKS.md).
+
+The hooks are advisory and fail open — they never block an edit and they exit 0
+when Rally is broken. They self-gate on missing `.rally/`, so they are a no-op
+in unrelated repos. They do not download, build, or install anything; the
+`rally` binary is installed by an explicit step you run
+(`scripts/install-rally.sh` or `cargo install --path crates/rally-cli`).
+
+Off: `RALLY_HOOKS=off` (session), `rally hooks off --scope repo` (repo),
+`rally hooks status` (check).
+
+Why hooks won over a hookless CLI, why agents self-manage instead of being
+managed, and why delivery is push-preferred with a pull floor:
+[`docs/DESIGN-TRADEOFFS.md`](docs/DESIGN-TRADEOFFS.md).
 
 ## Discovery & Session Management
 
