@@ -622,6 +622,93 @@ review answers the question you asked.
   Related: the repo already carries `fix(ci): make host parity checks Linux-safe` for the same
   class, which is why this is a recurrence rather than a first sighting.
 
+### RC-026 — the charter says Rally never spawns or executes; `rally-cli` spawns and executes
+- **State:** `observed` — **needs an operator decision, not a code fix.** Found by a NavGator-driven
+  architecture review, 2026-08-03.
+- **The contradiction, both sides quoted:**
+  - `NORTH_STAR.md:23` — *"Rally **records and advises; it never gates, grants, schedules, spawns,
+    retries, or executes.** … A feature that gates or executes work is off-charter."*
+  - `docs/RALLY_ARCHITECTURE.md:32` lists *"Managed-session delivery into tmux, cmux, ptyd panes"*
+    as something Rally **should own**, and `:54` documents managed sessions that
+    *"launch/inject/capture/stop"*.
+- **What the code does (verified at source, not inferred):** `crates/rally-cli/src/backends.rs`
+  builds `claude --name <n>` / `codex` launch commands and runs them through tmux
+  (`Command::new(tmux_bin)` at `:982`, `:1133`, `:1158`); `lib.rs:3978` runs
+  `std::process::Command::new("sh")` for `rally watch --on-activity <cmd>`; `lib.rs:1176`
+  self-spawns `rally daemon serve --detached`; processes are killed at `lib.rs:5428`, `:5560`,
+  `backends.rs:1430`.
+- **Why this is a register entry and not a bug report:** the two charters cannot both hold, and the
+  shipped implementation follows `RALLY_ARCHITECTURE.md`. The register's second standing pattern —
+  *claims about controls drift toward reassurance while the controls stay put* — applies to charter
+  text too. `NORTH_STAR.md` describes a product that the CLI stopped being some time ago, and
+  nothing noticed because no gate reads the charter.
+- **Not for an agent to resolve.** Which document is amended decides what features are on-charter.
+  That is Tyrone's call. Recorded here so the decision is made deliberately rather than by drift.
+- **Adversarial control once decided:** a `Command::new` allowlist test alongside the existing
+  `SEAM_NO_EXEC` check at `lib.rs:11183`. Today that check exists and the spawning code sits outside
+  its scope, which is how a charter invariant stayed green while being violated.
+
+### RC-027 — `agent-rally-watcher` tails a channel nothing has written since June
+- **State:** `mechanism` — the tool is effectively non-functional against current Rally.
+- **Mechanism:** the watcher tails `~/.agent-rally-point/apps/<slug>/changes.jsonl`
+  (`watcher.py:78`, `__init__.py:7`). No crate writes that file. Every occurrence in `crates/` is
+  either a doc comment calling it *"the existing substrate"* (`rally-protocol/src/lib.rs:31`) or a
+  test for the one-shot `rally migrate-legacy` drain, which `user_journey.rs:2468` labels
+  **legacy-only**. Current writes go to `.rally/log/<engagement>.jsonl`.
+- **Measured, not inferred:** on this machine the watcher's channel
+  (`~/.agent-rally-point/apps/agent-rally-point/changes.jsonl`) was last modified **2026-06-27** and
+  holds **19 lines**, while `.rally/log/` carries segments up to **873 KB** modified through
+  2026-07-20 plus today's active room. **The watcher has been watching a dead channel for roughly
+  five weeks** and reported nothing wrong, because "no events" and "no source" look identical from
+  inside a tail.
+- **Why it went unnoticed:** the substrate moved to per-repo `.rally/log/` and the consumer was
+  never repointed. The ARP-007 hardening landed this week — quarantine, sink containment,
+  AppleScript argv separation — all correct, all on a component reading a file nobody writes. The
+  hardening was real; the pipeline was already severed.
+- **This is the ack-the-wrong-step pattern again**, in its quietest form: the watcher successfully
+  tails, successfully finds nothing, and successfully reports health.
+- **Two options, both needing a decision:** repoint `watcher.py` at
+  `.rally/log/<engagement>.jsonl` (and handle its rotation/segment semantics, which differ from a
+  single append-only file), or archive the tool. Do not leave it shipping as if it works.
+- **Adversarial control required for either:** an end-to-end smoke — `rally say` on one side,
+  observed dispatch on the other. No such test exists, which is the reason a five-week outage was
+  invisible.
+
+### RC-028 — `e2e_authz_gate_allow` failed once in a pre-push worktree and has not reproduced
+- **State:** `observed`. **NOT fixed, NOT dismissed.** The mechanism is unknown; what landed is a
+  change that makes the next occurrence diagnosable.
+- **Evidence of the failure (peer-observed, 2026-08-03):** a pre-push gate run at `8ca55e0` panicked
+  at `crates/cockpitd/tests/e2e.rs:912` — *"authz gate must emit approval_request for
+  non-allowlisted write_file tool"* — with 26 passed, 1 failed, 1 ignored. The gate used the
+  serialized `cargo test --workspace -- --test-threads=1` fallback because `cargo-nextest` is not
+  installed. The commit under push was docs-only, so it cannot be the cause.
+- **Reproduction attempts — 8 runs, 8 passes, across four modes:**
+  | Mode | Result |
+  |---|---|
+  | `cargo test -p cockpitd --test e2e` (parallel) ×3 | 27/27 each |
+  | same, `-- --test-threads=1` ×3 | 27/27 each |
+  | `cargo test --workspace -- --test-threads=1` (the gate's exact command) | full workspace green, exit 0 |
+  | detached worktree under `$TMPDIR`, serialized (mimics the pre-push environment) | 27/27 |
+- **So it is intermittent, not deterministic.** One observation is not determinism. Per the standing
+  rule that a flaky gate certifies failures, this gets an entry rather than a shrug — but calling it
+  "fixed" on 8 green runs would be the same overclaim the register exists to catch.
+- **What DID get fixed — the reason it was untriageable.** The wait loop treated every `recv()`
+  error as `break`, then unwrapped with one message. **A dropped connection and a gate that never
+  fired produced the identical panic**, so the only evidence a failure produced could not
+  distinguish a transport failure from a real authz-gate defect. The loop now names why it gave up
+  (recv failure vs error frame vs silent window) and reports how many frames it saw. The next
+  occurrence will say which hypothesis it is.
+- **RC-011 is the same class**, already on this register: *"a test whose fixture cannot separate two
+  hypotheses will keep producing ambiguous root causes."* That entry was written about the
+  parallel-launch flake and predicted this exactly.
+- **Leading hypothesis, unconfirmed:** a transport/liveness hiccup under load in the pre-push
+  worktree, which the old code would have reported as a gate failure. ⚠️ Untested — the new message
+  is what would confirm or kill it.
+- **Not `controlled`:** no test asserts the gate fires under contention, and the trigger is unknown.
+- **Adjacent observation worth its own look:** `git worktree list` shows three leftover
+  `rally-prepush-wt.*` worktrees, including `3a17fe8` from July — the exact stale worktree RC-009
+  already records. A failed push leaves its worktree behind.
+
 ## Working hypothesis across entries
 
 RC-001, RC-005, and RC-007 share one shape: **an operation returns success for a step that is

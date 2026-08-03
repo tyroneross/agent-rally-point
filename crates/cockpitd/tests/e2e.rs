@@ -882,12 +882,30 @@ async fn e2e_authz_gate_allow() {
     // Check both snapshot events and live deltas.
     let mut approval_id_str: Option<String> = extract_approval_id_from_snapshot(&snapshot);
 
+    // Why this loop reports WHY it gave up (RC-028).
+    //
+    // It used to `break` on any recv error and then unwrap with a single message:
+    // "authz gate must emit approval_request". A dropped connection and a gate
+    // that never fired produced the identical panic, so a failure could not be
+    // triaged without a rerun — and this test failed once in a pre-push worktree
+    // and then passed 7/7 across four modes, which is precisely the situation
+    // where the panic text is the only evidence you get.
+    //
+    // RC-011 is the same defect class already on the register: a fixture that
+    // cannot separate two hypotheses keeps producing ambiguous root causes.
+    let mut give_up_reason = "no approval_request arrived within the read window";
+    let mut frames_seen = 0_usize;
     if approval_id_str.is_none() {
         // Not in snapshot — wait for live approval_request event.
         for _ in 0..40 {
             match timeout(Duration::from_secs(2), client.recv()).await {
                 Ok(v) => {
+                    frames_seen += 1;
                     let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
+                    if t == "error" {
+                        give_up_reason = "server sent an error frame instead of approval_request";
+                        break;
+                    }
                     if t == "event"
                         && let Some(evt) = v.get("event")
                         && evt.get("kind").and_then(|k| k.as_str()) == Some("approval_request")
@@ -903,13 +921,23 @@ async fn e2e_authz_gate_allow() {
                         }
                     }
                 }
-                Err(_) => break,
+                Err(_) => {
+                    // Distinguish "the socket died" from "the gate stayed silent".
+                    give_up_reason = "recv failed (connection closed or timed out) before any \
+                                      approval_request — this is a transport/liveness failure, \
+                                      NOT evidence that the authz gate is broken";
+                    break;
+                }
             }
         }
     }
 
-    let approval_id_str = approval_id_str
-        .expect("authz gate must emit approval_request for non-allowlisted write_file tool");
+    let approval_id_str = approval_id_str.unwrap_or_else(|| {
+        panic!(
+            "authz gate must emit approval_request for non-allowlisted write_file tool — \
+             gave up because: {give_up_reason} (frames observed after snapshot: {frames_seen})"
+        )
+    });
 
     // Send approve{allow}.
     let approval_id: Uuid = approval_id_str
