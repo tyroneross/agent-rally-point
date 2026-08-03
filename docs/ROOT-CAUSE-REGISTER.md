@@ -589,6 +589,33 @@ review answers the question you asked.
   fix reverted, because its traversal payload was CWD-relative. A test that litters the working tree
   when it fails is a test you stop trusting. Anchored in a tmpdir.
 
+### RC-025 — a test's premise depended on the host's software inventory (RC-006, caught in the act)
+- **State:** `controlled` as of the hermetic-PATH fix. Found by CI failing on a commit whose local
+  pre-push gate was fully green — **RC-006's exact signature, observed live during this run.**
+- **Mechanism:** `tests/hooks/test_ensure_rally_binary.sh` ran its sandboxes with
+  `PATH="$sb/tools:/usr/bin:/bin"` and treated `gh` as absent because no stub was written for it.
+  That is true on this Mac, where `gh` is at `/opt/homebrew/bin/gh` — outside the test PATH. It is
+  **false on the GitHub Actions Linux runner, which ships `gh` at `/usr/bin/gh`**.
+- **Consequence, both directions:**
+  - `SEC-012 an UNVERIFIABLE download still falls back to cargo` FAILED in CI. With `gh` present the
+    download was not unverifiable, it was *attestation-failed* — which the SEC-012 fix correctly
+    made terminal. The test asserted a path the runner never took.
+  - `ARP-001 no gh -> download refused` PASSED in CI **for the wrong reason**: it reached
+    `download-rejected` through the attestation-failure branch, not the missing-`gh` branch it
+    claims to exercise. A green test asserting a path it never took is the more dangerous half.
+- **Fix:** `_write_path_without <mirror> <tool>` builds a symlink mirror of `/usr/bin` and `/bin`
+  minus the named tool, and **asserts the tool is unresolvable in that mirror before proceeding** —
+  so the premise is established rather than hoped for. Both tests now use it.
+- **Adversarial control:** the helper's own self-check. Verified against a tool that genuinely
+  resides in `/usr/bin` (`env`): the mirror excludes it, `command -v` fails in the mirror, and 951
+  other tools still resolve. If a future host puts the omitted tool somewhere the mirror still
+  catches, the test hard-fails with a harness error instead of silently changing which branch it
+  exercises.
+- **Lesson, and it generalizes past this file:** a test whose premise is "tool X is absent" is
+  asserting something about the machine, not about the code. Establish absence inside the sandbox.
+  Related: the repo already carries `fix(ci): make host parity checks Linux-safe` for the same
+  class, which is why this is a recurrence rather than a first sighting.
+
 ## Working hypothesis across entries
 
 RC-001, RC-005, and RC-007 share one shape: **an operation returns success for a step that is

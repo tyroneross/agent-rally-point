@@ -370,6 +370,38 @@ exit $2
 STUB
     chmod +x "$1/gh"
   }
+  # A system PATH with ONE tool removed, so "tool is absent" is true on every host.
+  #
+  # These tests used PATH="$sb/tools:/usr/bin:/bin" and assumed `gh` was absent
+  # because no stub was written. That held on a Mac, where gh lives in
+  # /opt/homebrew/bin, and was FALSE on the GitHub Actions Linux runner, which
+  # ships gh at /usr/bin/gh. One test then failed only in CI, and its sibling
+  # passed in CI for the wrong reason — it took the attestation-failed path
+  # instead of the no-gh path it claimed to exercise.
+  #
+  # A test whose premise depends on the host's software inventory is not a test.
+  # Mirror the system dirs as symlinks, minus the named tool, and the absence is
+  # a fact we established rather than one we hoped for.
+  _write_path_without() {  # $1=mirror_dir  $2=tool_to_omit
+    local mirror="$1" omit="$2" d f base
+    mkdir -p "$mirror"
+    for d in /usr/bin /bin; do
+      [ -d "$d" ] || continue
+      for f in "$d"/*; do
+        [ -e "$f" ] || continue
+        base="$(basename "$f")"
+        [ "$base" = "$omit" ] && continue
+        [ -e "$mirror/$base" ] && continue      # first dir on the list wins, like PATH
+        ln -s "$f" "$mirror/$base" 2>/dev/null || true
+      done
+    done
+    # Prove the premise instead of assuming it.
+    if PATH="$mirror" command -v "$omit" >/dev/null 2>&1; then
+      printf 'test harness: %s is still resolvable in the mirrored PATH\n' "$omit" >&2
+      return 1
+    fi
+    return 0
+  }
   _poll_method() {  # $1=state_file ; echoes terminal method
     local m=""
     for _ in $(seq 1 40); do
@@ -437,8 +469,10 @@ STUB
   (
     sb="$TMPDIR_ROOT/attest-none"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
     printf '{"schema":"agent-rally.release-identity.v1","version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
-    _write_curl_stub "$sb/tools" "$_GOOD_HASH"   # good checksum, but no gh on PATH
-    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"   # good checksum
+    # gh must be genuinely absent, not merely unstubbed — CI runners ship it.
+    _write_path_without "$sb/nogh" gh || exit 1
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:$sb/nogh" "$HOOK" "$sb/plugin" >/dev/null 2>&1
     m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
     [ "$m" = "download-rejected" ] || { printf 'expected download-rejected, got: %s\n' "$m" >&2; exit 1; }
     [ ! -x "$sb/home/.local/bin/rally" ] || { printf 'UNVERIFIED binary was installed!\n' >&2; exit 1; }
@@ -578,9 +612,13 @@ STUB
   (
     sb="$TMPDIR_ROOT/unverifiable-carry"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin/crates/rally-cli"
     printf '{"schema":"agent-rally.release-identity.v1","version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
-    _write_curl_stub "$sb/tools" "$_GOOD_HASH"   # good checksum, but no gh on PATH
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"   # good checksum
     _write_working_cargo "$sb/tools" "$sb/cargo.log"
-    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" \
+    # UNVERIFIABLE means gh is missing. Establish that, do not assume it — this
+    # test passed on macOS and failed on the Linux runner because gh was present
+    # there, turning "unverifiable" into "attestation failed", which is terminal.
+    _write_path_without "$sb/nogh" gh || exit 1
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:$sb/nogh" \
       "$HOOK" "$sb/plugin" >/dev/null 2>&1
     m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
     [ "$m" = "source" ] || { printf 'expected the cargo fallback, got: %s\n' "$m" >&2; exit 1; }
