@@ -333,9 +333,17 @@ review answers the question you asked.
   to the behaviour of the code making it. The commit that introduced this calls itself
   `G1 authz enforcement loop` (`e60714e`). The word "enforcement" was self-asserted and never
   graded against the implementation.
-- **Fail-safe landed:** every claim that the event pump enforces tool authorization removed from
-  code comments, docs, and UI copy. `tool_blocked` marked advisory with its true meaning — *not
-  forwarded to the UI*, not *prevented*.
+- **Fail-safe landed — in Rust and in docs.** Every claim that the event pump enforces tool
+  authorization was removed from code comments (`authz.rs`, `ws.rs`, `sweep.rs`), both Cockpit
+  READMEs, `docs/plans/DEFERRED.md`, and the CHANGELOG. `tool_blocked` carries `advisory: true`,
+  `enforced: false`, and a semantics string.
+- ⚠️ **The iOS UI copy is NOT corrected.** An earlier version of this bullet said "code comments,
+  docs, and UI copy". No Swift file was touched. `ios/Cockpit/.../ApprovalView.swift` still renders
+  a shield icon with "Tool approval required" and a Deny/Allow pair, and nothing in `ios/` reads the
+  new `advisory`/`enforced` metadata — a shield plus "Deny" is precisely the presentation ARP-003
+  called harmful. Mitigating: that view is currently unreferenced dead code. Claiming a scope the
+  diff did not reach, inside the fail-safe built to stop exactly that, is the RC-C failure mode
+  again; caught by the audit of this remediation. Tracked as a follow-up.
 - **Required for `controlled` (acceptance test defined now so the follow-up has a definition of
   done):** with Cockpit configured to deny a tool, a child agent must be *unable to complete* that
   tool call — asserted by the tool's side effect being absent (e.g. a marker file the tool would
@@ -376,7 +384,24 @@ review answers the question you asked.
 - **First seen:** 2026-08-02 (issue #52). Long-standing by design.
 
 ### RC-017 — one bearer token grants global Cockpit control with no session ownership isolation (ARP-005, Medium)
-- **State:** `controlled` — see per-fix evidence below.
+- **State:** `controlled` for accidental cross-talk between well-behaved clients.
+  **OPEN against a deliberate token holder.** The first grading of this entry said plain
+  `controlled`, which claimed more than the adversarial control proves — see the honest limit below.
+  An independent audit of this remediation demonstrated the bypass live, so the grade is split
+  rather than left flattering.
+- **Honest limit — `client_id` is self-asserted.** Owner binding keys on the `client_id` a client
+  sends in its own `hello` frame. Any holder of the shared bearer token can send
+  `client_id: "cockpit-cli"` — a fixed constant published at `crates/cockpit-cli/src/main.rs` — and
+  inherit every session that CLI launched, including `steer`, which injects instructions into a
+  running agent. Verified: a second connection asserting the victim's `client_id` was NOT refused
+  (`send_failed` from a downstream adapter, never `forbidden`). ARP-005's headline — "one bearer
+  token grants global Cockpit control" — therefore still holds against an attacker who has the
+  token. **With one shared bearer token, cryptographic isolation between clients is impossible by
+  construction.** What landed is accident isolation, an honest audit trail keyed on the principal,
+  and an enforcement skeleton that becomes a real boundary the moment per-client credentials exist.
+  The code always said this (`crates/cockpitd/src/transport/auth.rs`: "Self-asserted, so it is not
+  an authentication boundary"); this register entry did not, and that gap is the point.
+- **Closing it needs per-client credentials**, not another check on the same shared secret.
 - **Mechanism:** Cockpit binds loopback by default and fails closed on a missing token — both
   correct. After authentication, however, the connection had no principal: any authenticated
   client could send/steer any session (`ws.rs:322-351`), resolve any approval by UUID
@@ -483,8 +508,12 @@ review answers the question you asked.
 - **Open for iOS:** `ios/Cockpit` sends no `client_id`. Same one-line fix; needs a Swift change and
   a device test.
 - **Honest limit on the whole mechanism:** `client_id` is self-asserted. With one shared bearer
-  token, any holder can claim any id. It separates well-behaved clients and gives a real audit
-  trail; it is not authentication, and RC-017 says so in the same terms.
+  token, any holder can claim any id — including this CLI's fixed `cockpit-cli` constant. It
+  separates well-behaved clients and gives a real audit trail; it is not authentication. RC-017
+  now records the same limit and the live demonstration of the bypass. (An earlier version of this
+  bullet asserted that RC-017 "says so in the same terms" when RC-017 said no such thing — a false
+  cross-reference, caught by the audit of this remediation. Exactly the RC-C failure mode of
+  claiming a control that is not there, committed while documenting a control that is not there.)
 - **Not `controlled` overall:** no test asserts that a reconnecting iOS client retains control.
 
 ### RC-023 — wiring the hook suites into the release gate made that gate recursive and flaky

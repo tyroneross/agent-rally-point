@@ -140,12 +140,31 @@ impl WsClient {
     }
 
     /// Receive frames until a matching `t` is seen. Returns that frame.
+    ///
+    /// An `error` frame ends the wait. This loop used to discard every
+    /// non-matching frame, including refusals, and `recv_frame` has no timeout —
+    /// so after ARP-005 introduced `repo_path_denied`, `cockpit-cli launch`
+    /// against a path outside the allowlist waited forever for a `session_list`
+    /// the daemon was never going to send. The daemon keeps the socket open
+    /// after an error, so nothing broke the wait.
+    ///
+    /// Same defect class as the `send`/`approve` silent-success fixed in RC-022,
+    /// wearing the other face: there it reported success it had not earned, here
+    /// it reported nothing at all. Both come from not reading the reply.
     pub async fn recv_until(&mut self, expected_t: &str) -> Result<Value> {
         loop {
             let v = self.recv_frame().await?;
             let t = v.get("t").and_then(|t| t.as_str()).unwrap_or("");
             if t == expected_t {
                 return Ok(v);
+            }
+            if t == "error" {
+                let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                let msg = v
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("(no message)");
+                bail!("server refused the command: {code} — {msg}");
             }
             // Print other frames so the user can see them.
             eprintln!("[recv] {}", serde_json::to_string(&v).unwrap_or_default());

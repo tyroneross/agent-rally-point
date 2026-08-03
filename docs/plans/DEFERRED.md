@@ -22,7 +22,7 @@ here is claimed working.
 
 These were "seams" in the original plan and are now real, tested code:
 - **Append-only audit log** (`audit.rs`) — commands/approvals/lifecycle, `get_audit` wire cmd.
-- **Deny-by-default command authorization** (`authz.rs` + enforcement loop in `run_pump`) — non-allowlisted tool_calls + Codex native approvals are gated per-session until approved.
+- **Advisory command-approval surface** (`authz.rs` + the review loop in `run_pump`) — non-allowlisted tool_calls and Codex native approvals surface for per-session approval. **This is not an execution control.** The gate sees a `tool_call` only after it appears in the child's event stream, and pausing the event pump does not pause the child process — the tool has already run, or may run regardless of the decision. Denial stops the result being forwarded to the UI; it does not stop the tool. See ARP-003 / RC-015; the real broker redesign is still outstanding.
 - **Multi-user crypto + zero-knowledge relay** (`crypto.rs`, `transport/relay.rs`) — see row above.
 - **WS-level approval round-trip** with TTL/auto-deny logic (`approval.rs`).
 

@@ -158,9 +158,15 @@ fn judge_owner(owner: Option<String>, principal: &Principal) -> OwnerVerdict {
 
 /// Build the wire error for a failed ownership check.
 ///
-/// `forbidden` and `not_found` are kept distinct. Session IDs are v4 UUIDs, so
-/// the existence signal is not usefully enumerable, and an operator debugging a
+/// `forbidden` and `not_found` are kept distinct because an operator debugging a
 /// two-client setup needs to know which of the two happened.
+///
+/// This does leak an existence signal. An earlier version of this comment argued
+/// the leak did not matter because session IDs are unguessable v4 UUIDs — which
+/// is beside the point while `list_sessions` returns every session to every
+/// authenticated caller regardless of owner. Nothing here needs guessing. Reads
+/// are deliberately unscoped today (see the table in the module header); if that
+/// changes, this distinction should be revisited with it.
 fn owner_error(verdict: &OwnerVerdict, kind: &str, id: Uuid) -> ServerEvent {
     match verdict {
         OwnerVerdict::NotFound => ServerEvent::Error {

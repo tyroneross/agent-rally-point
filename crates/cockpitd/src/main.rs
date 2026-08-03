@@ -65,6 +65,24 @@ async fn serve_cmd() -> Result<()> {
         std::process::exit(1);
     }
 
+    // Refuse to start without a token, rather than binding a port that can never
+    // serve anyone. Auth already fails every hello when COCKPIT_TOKEN is unset or
+    // empty, so the listener was pure footgun: it looks like a running daemon and
+    // is not one. A security review caught the trust model asserting this refusal
+    // before the code implemented it — the doc was right about what should happen,
+    // so the code moved to meet it.
+    match std::env::var("COCKPIT_TOKEN") {
+        Ok(t) if !t.is_empty() => {}
+        _ => {
+            eprintln!(
+                "cockpitd: refusing to start — COCKPIT_TOKEN is unset or empty, so every \
+                 client would be rejected at the hello frame. Set COCKPIT_TOKEN to a secret \
+                 value and restart."
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Surface the repo allowlist at startup so an operator sees the boundary
     // before a launch is refused mid-session.
     let roots = cockpitd::policy::configured_roots();

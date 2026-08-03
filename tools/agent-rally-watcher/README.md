@@ -16,7 +16,35 @@ Rally Point is the substrate (event posting, presence, channels). Rally Watcher 
 - **Per-consumer filtering**: `consumers.toml` maps tool-id (`claude_code`, `codex`, ...) to filter rules (kinds, senders, payload-field matches).
 - **Cursor persistence**: each consumer has a cursor at `~/.agent-rally-watcher/consumers/<tool>.cursor` so a daemon restart resumes mid-stream without dupes or gaps.
 - **Dispatch sinks (v0.1)**: append-to-file (stdout-pipe target), macOS `osascript` notify. HTTP POST stubbed.
-- **Daemon lifecycle**: `agent-rally-watcher start | stop | status | reload`. PID file + size-bounded log rotation at `~/.agent-rally-watcher/logs/daemon.log`.
+  File sinks are confined to `AGENT_RALLY_WATCHER_SINK_ROOT` (default `~/.agent-rally-watcher`) — see below.
+- **Daemon lifecycle**: `agent-rally-watcher start | stop | status | reload | ack-quarantine`. PID file + size-bounded log rotation at `~/.agent-rally-watcher/logs/daemon.log`.
+
+### Quarantine and stalling (read this before you debug "the watcher stopped")
+
+A malformed JSONL line does **not** get skipped. It is written to
+`~/.agent-rally-watcher/consumers/<tool>.quarantine.jsonl`, logged at WARNING, and the consumer's
+cursor **stops in front of it**. Nothing behind that line dispatches until you acknowledge it:
+
+```bash
+agent-rally-watcher ack-quarantine --consumer <tool>
+```
+
+This is deliberate. The previous behaviour advanced the cursor past the bad line, so the record was
+lost for that consumer forever while the consumer reported itself current — the same
+acknowledge-the-wrong-step defect tracked as RC-001/RC-005/RC-010 in the root-cause register. A
+visible stall you must clear beats a silent loss you never learn about.
+
+The tradeoff is real: one bad line halts delivery for that consumer until a human acts. Under the
+same-UID trust model any local process can append one. If that matters for your deployment, watch
+the daemon log — the stall is always logged, never silent.
+
+### Sink path constraints
+
+File sinks may only write inside `AGENT_RALLY_WATCHER_SINK_ROOT` (default `~/.agent-rally-watcher`).
+A configured path that resolves outside the root is refused, a symlinked leaf is refused, and the
+file is opened `O_NOFOLLOW`. Set the env var to widen it deliberately. Note the no-follow protection
+covers the final component only; a same-UID process substituting an intermediate directory is not
+defended, consistent with the repo's trust model.
 - **macOS launchd**: plist generator (`agent-rally-watcher install-launchd`) for boot-time autostart. Linux/systemd planned.
 
 ## Install
@@ -59,7 +87,9 @@ The daemon discovers the current repo's Rally Point channel via the same `app_sl
 ```toml
 # Each [consumers.<id>] table = one consumer (id is also the cursor name).
 # Filter rules AND-combine; missing fields match everything.
-# Sinks: file (append JSONL), notify (macOS osascript), http (POST, v0.2).
+# Sinks: file (append JSONL, confined to AGENT_RALLY_WATCHER_SINK_ROOT),
+#        notify (macOS osascript — body is passed as argv, never interpolated
+#        into script source), http (POST, v0.2).
 
 [consumers.claude_code.filter]
 kinds = ["feedback", "handoff", "dep-change"]

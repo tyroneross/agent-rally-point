@@ -105,7 +105,7 @@ export function assertIdentifier(field, value) {
  * close the block early and start one of its own. CommonMark allows fences of four
  * or more backticks for exactly this.
  */
-function fenceFor(body) {
+export function fenceFor(body) {
   const runs = String(body).match(/`+/g) ?? [];
   const longest = runs.reduce((max, r) => Math.max(max, r.length), 0);
   return "`".repeat(Math.max(3, longest + 1));
@@ -197,11 +197,35 @@ function renderRallyLoop({ task, runId, tool, recipeArgv }) {
 /** Render the full prompt packet (markdown) for one task. Pure function of its inputs. */
 export function renderPacket({ task, runId, toolPrefix }) {
   // Defence in depth: these three are rendered into command text, so validate them
-  // HERE too, not only in parseArgs. A library caller reaching renderPacket directly
-  // gets the same check the CLI gets.
+  // HERE too, not only in parseArgs.
   assertIdentifier("--run <run_id>", runId);
   assertIdentifier("--tool-prefix", toolPrefix);
   assertIdentifier("task.id", task?.id);
+
+  // ...and the descriptor's free-text fields, which render into the MARKDOWN body
+  // rather than into command text. This used to be the CLI's job alone
+  // (renderAll → lintWorkstream), so a library caller importing renderPacket
+  // directly got the three identifier checks above and nothing else — while the
+  // comment here claimed it "gets the same check the CLI gets". It did not. An
+  // `intent` carrying a newline plus a triple-backtick run could close the bash
+  // fence below and open its own under the "run these verbatim" heading.
+  //
+  // Run the real linter rather than restating its rules here, so the two cannot
+  // drift. `depends_on` is the only CROSS-task field and its ids resolve against
+  // the full descriptor, which we do not have — strip it so exactly the per-task
+  // field rules apply. MECE cannot self-conflict with a single task.
+  const { depends_on: _resolvedByCaller, ...taskFields } = task ?? {};
+  const fieldErrors = lintWorkstream({
+    workstream: "single-task render",
+    description: "synthesized by renderPacket for field validation",
+    tasks: [taskFields],
+  });
+  if (fieldErrors.length > 0) {
+    throw new Error(
+      `renderPacket: task fails workstream-lint (${fieldErrors.length}):\n  - ${fieldErrors.join("\n  - ")}`,
+    );
+  }
+
   const recipeArgv = recipeArgvFor(task);
   const tool = toolIdFor(task.id, toolPrefix);
   const owns = ownedPaths(task.owns);

@@ -3,7 +3,13 @@
 
 //! Deployment policy read from the environment (ARP-005).
 //!
-//! Two guards live here, both fail-closed:
+//! Two guards live here. The bind guard is fail-closed. The repo allowlist is
+//! fail-closed only once configured — **its default is `$HOME`**, which is a
+//! blast-radius cut, not a sandbox: it keeps a stolen token out of `/etc`,
+//! `/usr`, and other users' homes while a personal daemon keeps working. A
+//! token holder can still launch an agent at `~/Downloads`, `~/.ssh`, or
+//! `~/.aws` unless `COCKPIT_REPO_ALLOWLIST` names narrower roots. Set it.
+//! (Set-but-empty means allow nothing, which IS fail-closed.)
 //!
 //! 1. **Repo allowlist.** `launch_session { repo_path }` becomes the child
 //!    agent's working directory. Without a bound, a token holder can start an

@@ -1802,6 +1802,49 @@ async fn arp005_cross_owner_send_steer_close_denied() {
     );
 }
 
+// ── ARP-005: the LIMIT of owner binding, pinned by a test rather than by prose ──
+
+/// Owner binding does NOT stop a deliberate token holder. `client_id` is
+/// self-asserted, so anyone with the shared bearer token can claim the victim's
+/// id and inherit its sessions.
+///
+/// This test asserts the CURRENT behaviour on purpose. It is a characterization
+/// test, not an aspiration: RC-017 was first graded `controlled` without this
+/// caveat, and an independent audit demonstrated the bypass live. Prose in a
+/// register entry drifts; a test does not. If someone lands per-client
+/// credentials and closes RC-017 for real, THIS TEST MUST FAIL — and its failure
+/// is the signal to re-grade the entry, not to delete the test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arp005_client_id_impersonation_is_not_prevented() {
+    let addr = start_daemon_codex_gated().await;
+    let repo = allowed_repo_root();
+
+    // Alice launches a session under her asserted id.
+    let mut alice = TestClient::connect(addr).await;
+    alice.auth_as("alice").await;
+    let session_id = launch_as(&mut alice, "codex", repo.to_str().unwrap()).await;
+
+    // Mallory holds the same bearer token and simply CLAIMS to be alice.
+    let mut mallory = TestClient::connect(addr).await;
+    mallory.auth_as("alice").await;
+
+    mallory
+        .send(json!({"t": "send_prompt", "session_id": session_id, "text": "impersonated"}))
+        .await;
+
+    // The ownership check passes, because there is nothing to check against — the
+    // id was asserted, not proven. Any error that surfaces comes from downstream
+    // (the adapter), never from the owner gate.
+    let err = mallory.expect_error().await;
+    let code = err["code"].as_str().unwrap_or("");
+    assert_ne!(
+        code, "forbidden",
+        "documenting the limit: impersonating a client_id is NOT refused by owner binding. \
+         If this now returns `forbidden`, per-client credentials landed — re-grade RC-017 \
+         from `open against a deliberate token holder` to `controlled`, and rewrite this test."
+    );
+}
+
 // ── ARP-005: a session with no owner match is refused even when it exists ────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

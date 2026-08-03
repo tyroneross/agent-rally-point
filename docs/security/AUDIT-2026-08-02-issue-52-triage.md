@@ -175,6 +175,8 @@ build-loop's own security review — see the levers list in
 | Import and inspect the 26 tracked git bundles | audit "unreviewed surface" | Not a code fix; a separate review task. |
 | `cargo audit` / `cargo deny` dependency-vulnerability pass | audit "unreviewed surface" | The audit explicitly did not do this. Neither has this repo. |
 | `ios/Cockpit` must send a stable `client_id` | RC-022 | Swift change plus a device test. The CLI half is fixed; iOS reconnects would otherwise orphan their own sessions. |
+| iOS approval UI still implies enforcement | RC-015 | `ApprovalView.swift` shows a shield + "Tool approval required" + Deny/Allow and ignores the new `advisory`/`enforced` metadata. Currently dead code, so not urgent — but it is the exact presentation ARP-003 called harmful. |
+| Per-client credentials for Cockpit | RC-017 | The only real close for owner binding. `client_id` is self-asserted, so a token holder can impersonate any client. Pinned by `arp005_client_id_impersonation_is_not_prevented`. |
 | `docs/plans/COCKPIT-WIRE.md` needs the new wire fields | ARP-003/005 | Document optional `hello.client_id`, the `forbidden` and `repo_path_denied` error codes, and `tool_blocked`'s advisory metadata. |
 | A `rally show <event-id>` command | ARP-004 | The audit's ideal — inject an opaque ID and make the agent open the fact separately — is materially better with a single-fact reader. None exists; the preamble points at `rally room --json` instead. |
 | `ClaudeAdapter::send` runtime panic | RC-021 | Pre-existing crash on any live Claude session; found while testing, out of scope for both findings. |
