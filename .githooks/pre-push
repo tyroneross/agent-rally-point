@@ -48,6 +48,32 @@
 #   `git rev-parse --show-toplevel`), so the SUBJECT under test is always
 #   the pushed content — only the gate CODE's trust source changes.
 #
+# SEC-005 (2026-08 review of the ARP-006 fix): the pin ref is read from the
+# environment, and the environment is not trusted. Anything running as this UID
+# — a committed `.envrc`, a Makefile, an npm script — can set
+# RALLY_PREPUSH_GATE_PIN_REF=HEAD. The pinned copy is then byte-identical to
+# the pushed copy, `diff -q` says identical, the pushed branch's own gate script
+# runs, and the hook used to print an affirmative "gate scripts pinned to
+# HEAD @ <sha>" with no warning at all. The pin became a no-op that reported
+# success. Two changes:
+#   a. VACUITY CHECK. After the pin resolves, its commit is compared against
+#      every SHA being pushed. Equal means the pin reviewed nothing. The hook
+#      prints pin_commit and each pushed SHA side by side, always.
+#   b. An env-SUPPLIED pin that turns out vacuous is REFUSED (override with
+#      RALLY_PREPUSH_ACK_VACUOUS_PIN=1). A DEFAULT pin that is vacuous — you are
+#      pushing `main` itself, where the pin cannot be independent by
+#      construction — warns loudly and continues, because refusing there would
+#      block every push of the pin branch.
+#   The pushed SHAs for that check are extracted from the raw stdin tuples with
+#   awk, NOT with scripts/prepush-ref-updates.sh: the check decides whether the
+#   pin is trustworthy, so it must not depend on a script the pushed branch
+#   could have edited.
+#
+# SEC-005 (second half): scripts/prepush-ref-updates.sh is itself a gate script
+# — it runs from the working tree, before any other gate, and it decides which
+# SHAs get validated. It is now pinned exactly like the other two, so the pin
+# block below runs BEFORE the parser is invoked.
+#
 # Blocks the push on failure. Emergency override (skips the WHOLE hook,
 # pin check included): RALLY_SKIP_PREPUSH=1 git push
 #
@@ -74,15 +100,6 @@ stdin_capture=$(mktemp "${TMPDIR:-/tmp}/rally-prepush-stdin.XXXXXX")
 cat > "$stdin_capture"
 
 sha_file=$(mktemp "${TMPDIR:-/tmp}/rally-prepush-shas.XXXXXX")
-"$repo_root/scripts/prepush-ref-updates.sh" < "$stdin_capture" > "$sha_file"
-rm -f "$stdin_capture"
-
-if [ ! -s "$sha_file" ]; then
-  echo "pre-push: no non-deletion refs to validate (pure deletion push, or empty ref-update list) — nothing to gate" >&2
-  rm -f "$sha_file"
-  exit 0
-fi
-
 worktree_base=$(mktemp -d "${TMPDIR:-/tmp}/rally-prepush-wt.XXXXXX")
 pin_dir=$(mktemp -d "${TMPDIR:-/tmp}/rally-prepush-pin.XXXXXX")
 cleanup() {
@@ -98,15 +115,23 @@ cleanup() {
   fi
   git worktree prune >/dev/null 2>&1 || true
   rm -rf "$pin_dir" 2>/dev/null || true
-  rm -f "$sha_file"
+  rm -f "$sha_file" "$stdin_capture"
 }
 trap cleanup EXIT INT TERM
 
 # --- ARP-006: resolve the pinned (trusted) copy of each gate script -------
 # Pinned once per hook run (not per pushed SHA) — the pin ref does not move
 # mid-run, and every pushed SHA is compared against the same trusted baseline.
-GATE_SCRIPT_NAMES="run-quality-gate.sh check-release-parity.sh"
-pin_ref="${RALLY_PREPUSH_GATE_PIN_REF:-main}"
+# prepush-ref-updates.sh is in this list per SEC-005: it runs first, from the
+# working tree, and decides which SHAs get gated at all.
+GATE_SCRIPT_NAMES="run-quality-gate.sh check-release-parity.sh prepush-ref-updates.sh"
+if [ -n "${RALLY_PREPUSH_GATE_PIN_REF:-}" ]; then
+  pin_ref="$RALLY_PREPUSH_GATE_PIN_REF"
+  pin_ref_source="environment"
+else
+  pin_ref="main"
+  pin_ref_source="default"
+fi
 pin_commit=""
 if git rev-parse --verify --quiet "refs/heads/${pin_ref}^{commit}" >/dev/null 2>&1; then
   pin_commit=$(git rev-parse "refs/heads/${pin_ref}^{commit}")
@@ -124,6 +149,91 @@ if [ -n "$pin_commit" ]; then
   echo "pre-push: gate scripts pinned to ${pin_ref} @ ${pin_commit}" >&2
 else
   echo "pre-push: WARNING — pin ref '${pin_ref}' does not resolve; gate scripts will run from each pushed tree directly (reduced trust — expected only before '${pin_ref}' exists, e.g. brand-new repo bootstrap)" >&2
+fi
+
+# --- SEC-005: is the pin actually pinning anything? -----------------------
+# field 2 of each stdin tuple is local_sha. Read here with awk on purpose —
+# see the SEC-005 note in the header for why the parser cannot be trusted to
+# answer a question about whether the pin is trustworthy.
+pushed_shas_raw=$(awk '{ if ($2 != "" && $2 !~ /^0+$/) print $2 }' "$stdin_capture" | sort -u)
+
+if [ -n "$pin_commit" ] && [ -n "$pushed_shas_raw" ]; then
+  pin_is_vacuous=0
+  echo "pre-push: pin ${pin_ref} (${pin_ref_source}) @ ${pin_commit}" >&2
+  for pushed_sha in $pushed_shas_raw; do
+    if [ "$pushed_sha" = "$pin_commit" ]; then
+      pin_is_vacuous=1
+      echo "pre-push:   pushing ${pushed_sha}  <-- SAME COMMIT AS THE PIN" >&2
+    else
+      echo "pre-push:   pushing ${pushed_sha}" >&2
+    fi
+  done
+
+  if [ "$pin_is_vacuous" = "1" ]; then
+    echo "pre-push: WARNING — the pin resolves to a commit being pushed, so the pinned gate scripts and the pushed gate scripts are the same bytes. The pin reviewed nothing on this run." >&2
+    if [ "$pin_ref_source" = "environment" ] && [ "${RALLY_PREPUSH_ACK_VACUOUS_PIN:-}" != "1" ]; then
+      echo "pre-push: REFUSED — RALLY_PREPUSH_GATE_PIN_REF='${pin_ref}' was supplied from the environment and resolves to a commit in this push. That is exactly how the ARP-006 pin gets silently disabled (SEC-005): set it to HEAD, or to the branch you are pushing, and the pushed tree's own gate scripts execute while the hook reports a healthy pin." >&2
+      echo "pre-push: unset RALLY_PREPUSH_GATE_PIN_REF to use the default 'main' pin, point it at a ref you actually trust, or — if you genuinely mean to run unpinned — re-run with:" >&2
+      echo "pre-push:   RALLY_PREPUSH_ACK_VACUOUS_PIN=1 git push ..." >&2
+      exit 1
+    fi
+    if [ "$pin_ref_source" = "default" ]; then
+      echo "pre-push: continuing — you are pushing the pin branch itself, where the pin cannot be independent. The gate scripts in this push were NOT reviewed against an earlier baseline." >&2
+    else
+      echo "pre-push: continuing — RALLY_PREPUSH_ACK_VACUOUS_PIN=1 is set. Running effectively UNPINNED." >&2
+    fi
+  fi
+fi
+
+# --- ARP-006 / SEC-005: pinned-vs-candidate decision, one implementation ---
+#
+# resolve_gate_script SCRIPT_NAME CANDIDATE_PATH LABEL
+#
+# Echoes the path of the copy that should execute. Returns 1 to REFUSE.
+#   no pinned copy    -> the candidate (bootstrap; the warning was printed above)
+#   identical bytes   -> the pinned copy
+#   differs + ack     -> the candidate, after printing the diff
+#   differs, no ack   -> refuse, after printing the diff
+resolve_gate_script() {
+  rgs_name="$1"
+  rgs_candidate="$2"
+  rgs_label="$3"
+  if [ ! -f "$pin_dir/$rgs_name" ]; then
+    printf '%s' "$rgs_candidate"
+    return 0
+  fi
+  if diff -q "$pin_dir/$rgs_name" "$rgs_candidate" >/dev/null 2>&1; then
+    printf '%s' "$pin_dir/$rgs_name"
+    return 0
+  fi
+  if [ "${RALLY_PREPUSH_ACK_GATE_CHANGE:-}" = "1" ]; then
+    echo "pre-push: $rgs_label — scripts/$rgs_name DIFFERS from pinned ${pin_ref} @ ${pin_commit} — RALLY_PREPUSH_ACK_GATE_CHANGE=1 is set, running the PUSHED version:" >&2
+    diff -u "$pin_dir/$rgs_name" "$rgs_candidate" >&2 || true
+    printf '%s' "$rgs_candidate"
+    return 0
+  fi
+  echo "pre-push: REFUSED — $rgs_label's scripts/$rgs_name differs from the pinned ${pin_ref} @ ${pin_commit} copy." >&2
+  echo "pre-push: executing an unreviewed, pushed-tree gate script is exactly what ARP-006 closes — refusing by default." >&2
+  echo "pre-push: diff (- pinned ${pin_ref}, + candidate $rgs_label):" >&2
+  diff -u "$pin_dir/$rgs_name" "$rgs_candidate" >&2 || true
+  echo "pre-push: if this is a legitimate in-flight edit to the gate itself, review the diff above, then re-run with:" >&2
+  echo "pre-push:   RALLY_PREPUSH_ACK_GATE_CHANGE=1 git push ..." >&2
+  return 1
+}
+
+# --- run the ref-update parser through the same pin decision (SEC-005) ----
+# The parser runs from the WORKING TREE, so its candidate is the working-tree
+# copy, not a pushed worktree copy. Everything else is identical.
+if ! parser_exec_path=$(resolve_gate_script prepush-ref-updates.sh \
+       "$repo_root/scripts/prepush-ref-updates.sh" "working tree"); then
+  exit 1
+fi
+"$parser_exec_path" < "$stdin_capture" > "$sha_file"
+rm -f "$stdin_capture"
+
+if [ ! -s "$sha_file" ]; then
+  echo "pre-push: no non-deletion refs to validate (pure deletion push, or empty ref-update list) — nothing to gate" >&2
+  exit 0
 fi
 
 # git injects repo-scoping vars (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, …)
@@ -152,23 +262,8 @@ run_gated_script() {
     echo "pre-push: $sha — scripts/$gate_script_name not present in pushed tree; skipping" >&2
     return 0
   fi
-  gate_exec_path="$gate_pushed_script"
-  if [ -f "$pin_dir/$gate_script_name" ]; then
-    if diff -q "$pin_dir/$gate_script_name" "$gate_pushed_script" >/dev/null 2>&1; then
-      gate_exec_path="$pin_dir/$gate_script_name"
-    elif [ "${RALLY_PREPUSH_ACK_GATE_CHANGE:-}" = "1" ]; then
-      echo "pre-push: $sha — scripts/$gate_script_name DIFFERS from pinned ${pin_ref} @ ${pin_commit} — RALLY_PREPUSH_ACK_GATE_CHANGE=1 is set, running the PUSHED version:" >&2
-      diff -u "$pin_dir/$gate_script_name" "$gate_pushed_script" >&2 || true
-      gate_exec_path="$gate_pushed_script"
-    else
-      echo "pre-push: REFUSED — $sha's scripts/$gate_script_name differs from the pinned ${pin_ref} @ ${pin_commit} copy." >&2
-      echo "pre-push: executing an unreviewed, pushed-tree gate script is exactly what ARP-006 closes — refusing by default." >&2
-      echo "pre-push: diff (- pinned ${pin_ref}, + pushed $sha):" >&2
-      diff -u "$pin_dir/$gate_script_name" "$gate_pushed_script" >&2 || true
-      echo "pre-push: if this is a legitimate in-flight edit to the gate itself, review the diff above, then re-run with:" >&2
-      echo "pre-push:   RALLY_PREPUSH_ACK_GATE_CHANGE=1 git push ..." >&2
-      return 1
-    fi
+  if ! gate_exec_path=$(resolve_gate_script "$gate_script_name" "$gate_pushed_script" "$sha"); then
+    return 1
   fi
   # shellcheck disable=SC2086 # intentional word-split: unset each var name
   ( cd "$gate_wt" && unset $git_scope_vars && "$gate_exec_path" )

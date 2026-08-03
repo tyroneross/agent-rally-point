@@ -15,13 +15,25 @@
 # verification step is a hard stop with a printed reason. It never degrades to
 # an unverified download.
 #
-# Verification on the download path, both mandatory, both before the file is
-# made executable:
-#   1. SHA256 against the release's published <asset>.sha256.
-#   2. `gh attestation verify` against the sigstore build-provenance attestation
-#      published by .github/workflows/release.yml. This is the independent
-#      authority: the checksum lives on the same GitHub release as the binary,
-#      so it alone cannot catch a compromised release.
+# Verification on the download path, all mandatory, the first two before the
+# file is made executable:
+#   0. The release tag is validated against vMAJOR.MINOR.PATCH before it is
+#      interpolated into any URL, so tampered version metadata cannot redirect
+#      the download (SEC-002).
+#   1. SHA256 against the release's published <asset>.sha256, re-checked after
+#      the file is moved into place.
+#   2. `gh attestation verify --signer-workflow
+#      tyroneross/agent-rally-point/.github/workflows/release.yml` against the
+#      sigstore build-provenance attestation. The --signer-workflow pin is what
+#      makes this the independent authority: --repo alone would accept an
+#      attestation minted by ANY workflow in the repo holding
+#      `attestations: write`, so a contributor able to push such a workflow
+#      could sign an arbitrary binary. The pin asserts the exact signing
+#      identity. The checksum cannot do this job — it lives on the same GitHub
+#      release as the binary, so whoever swaps one swaps the other.
+#
+# A malformed tag, a checksum mismatch, or a failed attestation is tamper
+# evidence: the install stops there and does not fall back to a source build.
 #
 # Usage:
 #   scripts/install-rally.sh              # ask, then install (verified release)
@@ -37,17 +49,31 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 ENGINE="$REPO_ROOT/hooks/ensure-rally-binary.sh"
 GH_REPO="tyroneross/agent-rally-point"
+# Must stay in lockstep with SIGNER_WORKFLOW in hooks/ensure-rally-binary.sh —
+# this is only the printed plan; the engine does the enforcing.
+SIGNER_WORKFLOW="$GH_REPO/.github/workflows/release.yml"
 LOCAL_BIN="${HOME:-/nonexistent}/.local/bin"
 LOCAL_RALLY="$LOCAL_BIN/rally"
 CACHE_DIR="${XDG_CACHE_HOME:-${HOME:-/nonexistent}/.cache}/rally"
 STATE_FILE="$CACHE_DIR/provision.json"
+# Append-only record of every refused download. The state file holds one record
+# and gets overwritten; this does not (SEC-012).
+REJECTION_LOG="$CACHE_DIR/download-rejections.log"
 
 ASSUME_YES=0
 DRY_RUN=0
 MODE="release"
 
 usage() {
-  sed -n '5,32p' "$0" | sed 's/^# \{0,1\}//'
+  # Print the header comment block from line 5 through the "Exit codes:" line.
+  # A fixed line range used to be baked in here and silently truncated --help
+  # whenever the header grew.
+  awk '
+    NR < 5      { next }
+    !/^#/       { exit }
+                { sub(/^# ?/, ""); print }
+    /^Exit codes:/ { exit }
+  ' "$0"
 }
 
 while [ $# -gt 0 ]; do
@@ -62,6 +88,16 @@ done
 
 say()  { printf '%s\n' "$*"; }
 fail() { printf 'install-rally: %s\n' "$*" >&2; exit 1; }
+
+# Point the operator at the durable rejection record whenever one exists. A
+# refused download is tamper evidence; it must survive this run.
+_say_rejection_log() {
+  if [ -f "$REJECTION_LOG" ]; then
+    say "  rejections   $REJECTION_LOG"
+    say "               last: $(tail -1 "$REJECTION_LOG" 2>/dev/null || true)"
+  fi
+  return 0
+}
 
 if [ -z "${HOME:-}" ]; then
   fail "HOME is not set. There is nowhere safe to install."
@@ -94,15 +130,17 @@ say ""
 say "This is the only step that installs software. Hooks never do it."
 say ""
 if [ "$MODE" = "release" ]; then
-  say "Plan: download a prebuilt release binary and verify it twice."
+  say "Plan: download a prebuilt release binary and verify it."
   say "  source     https://github.com/$GH_REPO/releases (asset rally-${HOST_TRIPLE:-<unsupported-host>})"
+  say "  check 0    release tag must match vMAJOR.MINOR.PATCH before any URL is built"
   say "  check 1    SHA256 against the published <asset>.sha256"
-  say "  check 2    gh attestation verify --repo $GH_REPO (sigstore build provenance)"
+  say "  check 2    gh attestation verify --repo $GH_REPO --signer-workflow $SIGNER_WORKFLOW"
   say "  installs   $LOCAL_RALLY"
   say "  records    $STATE_FILE"
   say ""
-  say "Both checks run before the file is made executable. If either fails, or if"
-  say "either cannot run, nothing is installed and this exits non-zero."
+  say "Checks 1 and 2 run before the file is made executable, and the checksum is"
+  say "re-checked after the file is moved into place. If any check fails, or if any"
+  say "of them cannot run, nothing is installed and this exits non-zero."
 else
   say "Plan: build from the source in this checkout."
   say "  source     $REPO_ROOT/crates/rally-cli"
@@ -188,8 +226,8 @@ else
     downloaded)
       say "Installed $LOCAL_RALLY"
       say "  source       GitHub release asset rally-$HOST_TRIPLE"
-      say "  verified     SHA256 against the published <asset>.sha256"
-      say "  verified     build provenance via gh attestation verify --repo $GH_REPO"
+      say "  verified     SHA256 against the published <asset>.sha256, re-checked after install"
+      say "  verified     build provenance, pinned to $SIGNER_WORKFLOW"
       say "  NOT verified nothing else — no runtime sandbox, no reproducible-build check"
       ;;
     present)
@@ -198,20 +236,26 @@ else
       say "  To force a fresh verified download, remove it first: rm -f $LOCAL_RALLY"
       ;;
     source)
+      # SEC-012: the reason the download was refused is printed every time, not
+      # only when the engine happened to keep a hint. Losing it turned a refused
+      # download into a bare "Installed".
       say "Installed $LOCAL_RALLY"
       say "  built from   $REPO_ROOT/crates/rally-cli (the download path was rejected)"
       say "  verified     nothing — local source build, not a signed artifact"
-      [ -n "$_hint" ] && say "  why no download: $_hint"
+      say "  why no download: ${_hint:-no reason recorded — check $REJECTION_LOG}"
+      _say_rejection_log
       ;;
     download-rejected)
       say "REFUSED. Nothing was installed."
-      [ -n "$_hint" ] && say "  reason: $_hint"
+      say "  reason: ${_hint:-none recorded}"
+      _say_rejection_log
       say "  Build from the source you have instead: $0 --source"
       exit 1
       ;;
     *)
       say "Nothing was installed (result: ${_result:-unknown}, method: ${_method:-none})."
-      [ -n "$_hint" ] && say "  reason: $_hint"
+      say "  reason: ${_hint:-none recorded}"
+      _say_rejection_log
       say "  Build from the source you have instead: $0 --source"
       exit 1
       ;;

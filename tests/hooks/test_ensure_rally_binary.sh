@@ -447,6 +447,237 @@ STUB
     exit 0
   )
   if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "missing gh must fail closed"; fi
+
+  # -------------------------------------------------------------------------
+  # SEC-002: the release tag is committed content. rally-release.json is a file
+  # a second contributor can edit, and its `version` used to be interpolated
+  # straight into the download URL. curl normalizes RFC 3986 dot segments, so
+  # "0.1.7/../../../../attacker/evil/releases/download/v9" resolves to an
+  # attacker-controlled path — and the .sha256 is fetched from that same path,
+  # so checksum verification passes trivially.
+  # -------------------------------------------------------------------------
+  T="SEC-002 a traversal in the release tag is rejected before any URL is built"
+  (
+    sb="$TMPDIR_ROOT/tag-traversal"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
+    printf '{"schema":"agent-rally.release-identity.v1","version":"0.1.7/../../../../attacker/evil/releases/download/v9"}\n' \
+      > "$sb/plugin/rally-release.json"
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"
+    _write_gh_stub "$sb/tools" 0
+    CURL_LOG="$sb/curl.log" HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" \
+      PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
+    [ "$m" = "download-rejected" ] || { printf 'expected download-rejected, got: %s\n' "$m" >&2; exit 1; }
+    [ ! -e "$sb/home/.local/bin/rally" ] || { printf 'a traversal tag still installed a binary\n' >&2; exit 1; }
+    [ ! -s "$sb/curl.log" ] \
+      || { printf 'curl was reached with a malformed tag: %s\n' "$(cat "$sb/curl.log")" >&2; exit 1; }
+    grep -q 'malformed-release-tag' "$sb/home/.cache/rally/download-rejections.log" 2>/dev/null \
+      || { printf 'the malformed tag was not recorded durably\n' >&2; exit 1; }
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "a tag must be validated before it reaches a URL"; fi
+
+  T="SEC-002 a well-formed tag still resolves and downloads (positive control)"
+  (
+    sb="$TMPDIR_ROOT/tag-ok"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
+    printf '{"schema":"agent-rally.release-identity.v1","version":"1.2.3-rc.1"}\n' > "$sb/plugin/rally-release.json"
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"
+    _write_gh_stub "$sb/tools" 0
+    CURL_LOG="$sb/curl.log" HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" \
+      PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
+    [ "$m" = "downloaded" ] || { printf 'a valid prerelease tag was rejected, got: %s\n' "$m" >&2; exit 1; }
+    grep -q '/v1.2.3-rc.1/' "$sb/curl.log" || { printf 'tag not used: %s\n' "$(cat "$sb/curl.log")" >&2; exit 1; }
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "the tag validator must not reject legitimate versions"; fi
+
+  # -------------------------------------------------------------------------
+  # SEC-003: `gh attestation verify --repo X` only asserts that SOME workflow in
+  # repo X signed the artifact. Any workflow holding `attestations: write`
+  # satisfies that, so a contributor who can push a branch carrying such a
+  # workflow can sign an arbitrary binary and pass the gate.
+  #
+  # This stub models exactly that attestation: it is valid for the repo, so
+  # --repo alone passes, and it was NOT minted by release.yml, so pinning the
+  # signer workflow must reject it.
+  # -------------------------------------------------------------------------
+  _write_gh_stub_foreign_workflow() {  # $1=dir
+    cat > "$1/gh" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${GH_LOG:-}" ] && printf '%s\n' "$*" >> "$GH_LOG"
+pinned=0
+for a in "$@"; do
+  [ "$a" = "--signer-workflow" ] && pinned=1
+done
+# Signed by some other workflow in the same repo: --repo alone is satisfied,
+# a signer-workflow pin is not.
+[ "$pinned" = "1" ] && exit 1
+exit 0
+STUB
+    chmod +x "$1/gh"
+  }
+
+  T="SEC-003 an attestation minted by another workflow in the repo is REJECTED"
+  (
+    sb="$TMPDIR_ROOT/attest-foreign"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
+    printf '{"schema":"agent-rally.release-identity.v1","version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"
+    _write_gh_stub_foreign_workflow "$sb/tools"
+    GH_LOG="$sb/gh.log" HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" \
+      PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
+    [ "$m" = "download-rejected" ] || { printf 'expected download-rejected, got: %s\n' "$m" >&2; exit 1; }
+    [ ! -e "$sb/home/.local/bin/rally" ] || { printf 'a foreign-workflow attestation installed a binary\n' >&2; exit 1; }
+    grep -q -- '--signer-workflow tyroneross/agent-rally-point/.github/workflows/release.yml' "$sb/gh.log" \
+      || { printf 'the signer workflow was never pinned: %s\n' "$(cat "$sb/gh.log" 2>/dev/null)" >&2; exit 1; }
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "attestation must be pinned to the signing workflow"; fi
+
+  # -------------------------------------------------------------------------
+  # SEC-012: a failed provenance check is active-substitution evidence, and it
+  # is the one signal that must never be downgraded to a silent fallback. It
+  # used to record `download-rejected`, return 1, fall through to cargo, and
+  # have the cargo success overwrite the hint with an empty string — after
+  # which the installer printed a bare "Installed".
+  # -------------------------------------------------------------------------
+  _write_working_cargo() {  # $1=dir  $2=log path
+    cat > "$1/cargo" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$2"
+mkdir -p "\$HOME/.local/bin"
+printf '#!/usr/bin/env bash\ncase "\${1:-}" in\n  version) exit 0 ;;\n  *) exit 2 ;;\nesac\n' > "\$HOME/.local/bin/rally"
+chmod +x "\$HOME/.local/bin/rally"
+exit 0
+STUB
+    chmod +x "$1/cargo"
+  }
+
+  T="SEC-012 a FAILED attestation is terminal — cargo is never reached"
+  (
+    sb="$TMPDIR_ROOT/tamper-terminal"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin/crates/rally-cli"
+    printf '{"schema":"agent-rally.release-identity.v1","version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"
+    _write_gh_stub "$sb/tools" 1                 # attestation rejects the file
+    _write_working_cargo "$sb/tools" "$sb/cargo.log"
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" \
+      "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
+    [ "$m" = "download-rejected" ] \
+      || { printf 'tamper evidence was overwritten, method is now: %s\n' "$m" >&2; exit 1; }
+    [ ! -e "$sb/cargo.log" ] \
+      || { printf 'cargo ran after tamper evidence: %s\n' "$(cat "$sb/cargo.log")" >&2; exit 1; }
+    [ ! -e "$sb/home/.local/bin/rally" ] || { printf 'something was installed anyway\n' >&2; exit 1; }
+    h="$(grep -o '"hint":"[^"]*"' "$sb/home/.cache/rally/provision.json" | cut -d'"' -f4 || true)"
+    case "$h" in *"attestation FAILED"*) ;; *) printf 'the hint no longer names the failure: %s\n' "$h" >&2; exit 1;; esac
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "tamper evidence must not be downgraded to a fallback"; fi
+
+  T="SEC-012 an UNVERIFIABLE download still falls back to cargo, carrying the reason"
+  (
+    sb="$TMPDIR_ROOT/unverifiable-carry"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin/crates/rally-cli"
+    printf '{"schema":"agent-rally.release-identity.v1","version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"   # good checksum, but no gh on PATH
+    _write_working_cargo "$sb/tools" "$sb/cargo.log"
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" \
+      "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
+    [ "$m" = "source" ] || { printf 'expected the cargo fallback, got: %s\n' "$m" >&2; exit 1; }
+    [ -e "$sb/cargo.log" ] || { printf 'cargo never ran\n' >&2; exit 1; }
+    h="$(grep -o '"hint":"[^"]*"' "$sb/home/.cache/rally/provision.json" | cut -d'"' -f4 || true)"
+    case "$h" in
+      *gh*) ;;
+      *) printf 'the cargo-success record blanked the download rejection reason: [%s]\n' "$h" >&2; exit 1 ;;
+    esac
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "the rejection reason must survive the cargo fallback"; fi
+
+  # -------------------------------------------------------------------------
+  # SEC-015: no predictable temp path, and re-verify what actually landed.
+  # -------------------------------------------------------------------------
+  T="SEC-015 a broken mktemp fails closed — no predictable /tmp fallback"
+  (
+    sb="$TMPDIR_ROOT/mktemp-broken"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
+    printf '{"schema":"agent-rally.release-identity.v1","version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"
+    _write_gh_stub "$sb/tools" 0
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$sb/tools/mktemp"; chmod +x "$sb/tools/mktemp"
+    before="$(ls -d /tmp/rally-dl-* 2>/dev/null | wc -l | tr -d ' ')"
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" \
+      "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
+    [ "$m" != "downloaded" ] || { printf 'downloaded through a predictable temp path\n' >&2; exit 1; }
+    [ ! -e "$sb/home/.local/bin/rally" ] || { printf 'installed despite a broken mktemp\n' >&2; exit 1; }
+    after="$(ls -d /tmp/rally-dl-* 2>/dev/null | wc -l | tr -d ' ')"
+    [ "$before" = "$after" ] || { printf 'a predictable /tmp/rally-dl-* path was created\n' >&2; exit 1; }
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "mktemp must be mandatory, not best-effort"; fi
+
+  T="SEC-015 the download staging dir lives under the cache and is 0700"
+  (
+    sb="$TMPDIR_ROOT/dl-perms"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
+    printf '{"schema":"agent-rally.release-identity.v1","version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"
+    _write_gh_stub "$sb/tools" 0
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" \
+      "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    dl="$sb/home/.cache/rally/dl"
+    [ -d "$dl" ] || { printf 'no staging dir under the cache: downloads still land elsewhere\n' >&2; exit 1; }
+    mode="$(ls -ld "$dl" | awk '{print $1}')"
+    case "$mode" in
+      drwx------*) ;;
+      *) printf 'staging dir is %s, expected drwx------\n' "$mode" >&2; exit 1 ;;
+    esac
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "staging must be private and out of shared /tmp"; fi
+
+  # The verify -> chmod -> exec -> mv window, driven for real: the downloaded
+  # file is executed once as a liveness probe, and this one replaces ITSELF
+  # during that probe (via a rename, so the running shell keeps its own inode).
+  # Whatever lands in ~/.local/bin is therefore NOT what was verified.
+  T="SEC-015 a binary that swaps itself after verification is caught after the move"
+  (
+    sb="$TMPDIR_ROOT/post-mv-swap"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
+    printf '{"schema":"agent-rally.release-identity.v1","version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
+    _SWAP_BODY='#!/usr/bin/env bash
+case "${1:-}" in
+  version)
+    printf "%s\n" "#!/usr/bin/env bash" "exit 0" > "$0.swap"
+    mv "$0.swap" "$0"
+    exit 0
+    ;;
+  *) exit 2 ;;
+esac'
+    _SWAP_HASH="$(printf '%s' "$_SWAP_BODY" | shasum -a 256 | awk '{print $1}')"
+    cat > "$sb/tools/curl" <<STUB
+#!/usr/bin/env bash
+out=""; url=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in -o) out="\$2"; shift 2;; http*) url="\$1"; shift;; *) shift;; esac
+done
+case "\$url" in
+  *.sha256) printf '%s  rally\n' "$_SWAP_HASH";;
+  *) printf '%s' '$_SWAP_BODY' > "\$out";;
+esac
+exit 0
+STUB
+    chmod +x "$sb/tools/curl"
+    _write_gh_stub "$sb/tools" 0
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" \
+      "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
+    [ ! -e "$sb/home/.local/bin/rally" ] \
+      || { printf 'a swapped binary survived in %s\n' "$sb/home/.local/bin/rally" >&2; exit 1; }
+    [ "$m" = "download-rejected" ] || { printf 'the swap was not recorded, method=%s\n' "$m" >&2; exit 1; }
+    grep -q 'post-move-sha256-mismatch' "$sb/home/.cache/rally/download-rejections.log" 2>/dev/null \
+      || { printf 'the swap was not recorded durably\n' >&2; exit 1; }
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "the installed bytes must be the verified bytes"; fi
 else
   ok "f2 checksum tests (skipped — shasum unavailable)"
 fi

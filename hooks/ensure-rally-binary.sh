@@ -25,18 +25,44 @@
 # installer reports what happened instead of detaching a worker. The pid/flock
 # pair still guards against two concurrent installs racing on the same target.
 #
-# SECURITY (download path), both checks mandatory, both BEFORE chmod/exec:
+# SECURITY (download path). Three checks, all mandatory, the first two BEFORE
+# chmod/exec:
+#   0. The release TAG is validated against ^v<major>.<minor>.<patch>[-+pre]$
+#      before it is interpolated into any URL (SEC-002). The tag comes from
+#      rally-release.json, a plugin manifest, or the GitHub API — all of them
+#      content a second contributor can edit. A value like
+#      "0.1.7/../../../../attacker/evil/releases/download/v9" is normalized by
+#      curl RFC 3986 dot-segment handling into an attacker-controlled URL, and
+#      the .sha256 would then be fetched from that same attacker path, so the
+#      checksum check would pass trivially. Both curl calls also pass
+#      --path-as-is as a second layer.
 #   1. SHA256 against the release's published <asset>.sha256. Defends transit
 #      and CDN corruption and partial downloads. It does NOT defend a
 #      compromised GitHub account or release — whoever can swap the binary can
-#      swap its checksum, which is the same authority.
+#      swap its checksum, which is the same authority. Re-checked after the
+#      final mv, against the hash captured at verify time, so the
+#      verify -> chmod -> mv window cannot install different bytes (SEC-015).
 #   2. `gh attestation verify` against the sigstore build-provenance attestation
-#      the release workflow publishes (.github/workflows/release.yml). This is
-#      the independent authority, and it DOES defend substitution. It used to be
-#      an out-of-band human step; ARP-001 makes it client-side and mandatory.
-# A mismatch, a missing checksum, a missing `gh`, or a failed attestation all
-# reject the download. There is no unverified fallback: cargo build from the
-# checked-out source is the alternative, and the caller chooses it explicitly.
+#      the release workflow publishes, PINNED with --signer-workflow to
+#      tyroneross/agent-rally-point/.github/workflows/release.yml (SEC-003).
+#      Without that pin, any workflow in the repo holding `attestations: write`
+#      could mint an attestation that passes here, so a contributor who can push
+#      a branch containing such a workflow could sign an arbitrary binary. With
+#      the pin, the check asserts the exact signing identity, which is what
+#      makes it the independent authority.
+# A malformed tag, a checksum mismatch, a missing checksum, a missing `gh`, or a
+# failed attestation all reject the download. There is no unverified fallback:
+# cargo build from the checked-out source is the alternative, and the caller
+# chooses it explicitly.
+#
+# TAMPER IS TERMINAL (SEC-012). A malformed tag, a checksum MISMATCH, or a
+# FAILED attestation is active-substitution evidence. Those stop provisioning
+# outright — no cargo fallback, and the reason is written to
+# $CACHE_DIR/download-rejections.log as well as the state file. A merely
+# UNVERIFIABLE download (no `gh` installed, no published checksum, no curl) is
+# not tamper evidence, so it still falls through to cargo, but its reason is
+# carried into the cargo-success state record instead of being overwritten with
+# an empty hint.
 #
 # REMOVED (ARP-001): the shipped-prebuilt path, which copied
 # <plugin>/bin/<triple>/rally into $HOME/.local/bin and ran it. A plugin package
@@ -248,11 +274,41 @@ if _check_existing; then exit 0; fi
 # happened to contain, with no checksum and no attestation to check it against.
 # ---------------------------------------------------------------------------
 
+# Carried across the download -> cargo boundary so a rejection reason is never
+# lost (SEC-012). _TAMPER_EVIDENCE=1 means "we saw active-substitution
+# evidence"; provisioning stops there rather than falling back to cargo.
+_REJECTION_HINT=""
+_TAMPER_EVIDENCE=0
+
+# Record a download rejection once, in all three places that matter: the state
+# file, the durable append-only log, and the carry-forward hint.
+#   $1 = short machine tag for the log · $2 = human reason · $3 = 1 if tamper
+_record_rejection() {
+  local kind="$1" why="$2" tamper="${3:-0}"
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  printf '%s %s\n' "$(date +%s 2>/dev/null || echo 0)" "$kind" \
+    >> "$CACHE_DIR/download-rejections.log" 2>/dev/null || true
+  _REJECTION_HINT="$why"
+  [ "$tamper" = "1" ] && _TAMPER_EVIDENCE=1
+  _write_state "download-rejected" "unavailable" "" "$why"
+  return 0
+}
+
+# SEC-002: the ONLY tag shape that may be interpolated into a release URL.
+# Anchored, so a path traversal, a scheme, a host, or a query string cannot pass.
+_tag_is_valid() {
+  printf '%s' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.]+)?$'
+}
+
 # Pin the binary to the generated plugin release identity. Git-source plugin
 # manifests intentionally omit `version`, so reading them made this branch dead
 # and silently fell through to GitHub "latest". Old plugin generations retain
 # the manifest fallback; the API is last-resort compatibility only.
-_resolve_tag() {
+#
+# _resolve_tag_raw reads the three sources. NOTHING may call it directly — every
+# one of those sources is content a second contributor can edit, so callers use
+# _resolve_tag, which validates.
+_resolve_tag_raw() {
   local identity="$PLUGIN_ROOT/rally-release.json" manifest="" m ver
   if [ -f "$identity" ]; then
     ver="$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$identity" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)"[[:space:]]*$/\1/')"
@@ -267,67 +323,116 @@ _resolve_tag() {
   fi
   command -v curl >/dev/null 2>&1 || return 1
   local j
-  j="$(curl -fsSL --max-time 8 "https://api.github.com/repos/$GH_REPO/releases/latest" 2>/dev/null || true)"
+  j="$(curl -fsSL --path-as-is --max-time 8 "https://api.github.com/repos/$GH_REPO/releases/latest" 2>/dev/null || true)"
   printf '%s' "$j" | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4
 }
 
-# Verify a downloaded FILE against <asset>.sha256.
+# The validating gate every caller uses. Covers all three sources at one exit.
+#   0 valid (tag on stdout) · 1 nothing resolved · 2 resolved but MALFORMED
+# On 2 the raw value is still echoed so the caller can name it in the rejection
+# record — the caller must never put it in a URL.
+_resolve_tag() {
+  local t
+  t="$(_resolve_tag_raw 2>/dev/null || true)"
+  [ -n "$t" ] || return 1
+  printf '%s' "$t"
+  _tag_is_valid "$t" || return 2
+  return 0
+}
+
+# Hash a local file. Empty output means no sum tool.
+_sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  fi
+}
+
+# Verify a downloaded FILE against <asset>.sha256. On success the matched hash
+# is left in _VERIFIED_SHA so the post-mv re-check (SEC-015) needs no second
+# network fetch.
 #   0 verified · 1 mismatch · 2 unverifiable (no checksum published, or no sum tool)
+_VERIFIED_SHA=""
 _verify_sha256() {
   local file="$1" tag="$2" asset="$3"
+  _VERIFIED_SHA=""
   command -v curl >/dev/null 2>&1 || return 2
-  local sumtool=""
-  if command -v shasum >/dev/null 2>&1; then sumtool="shasum -a 256"
-  elif command -v sha256sum >/dev/null 2>&1; then sumtool="sha256sum"
-  else return 2; fi
+  if ! command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1; then return 2; fi
   local want
-  want="$(curl -fsSL --max-time 8 "https://github.com/$GH_REPO/releases/download/$tag/$asset.sha256" 2>/dev/null | awk '{print $1}' | head -1)"
+  want="$(curl -fsSL --path-as-is --max-time 8 "https://github.com/$GH_REPO/releases/download/$tag/$asset.sha256" 2>/dev/null | awk '{print $1}' | head -1)"
   [ -z "$want" ] && return 2
   local got
-  got="$($sumtool "$file" 2>/dev/null | awk '{print $1}')"
-  [ -n "$got" ] && [ "$got" = "$want" ] && return 0
+  got="$(_sha256_of "$file")"
+  [ -n "$got" ] && [ "$got" = "$want" ] && { _VERIFIED_SHA="$want"; return 0; }
   return 1
 }
 
 # Verify a downloaded FILE against the release's sigstore build-provenance
-# attestation. This is the INDEPENDENT authority: unlike the .sha256, it is not
-# something a compromised release can rewrite, because the signature chains to
-# the workflow identity recorded in the public transparency log.
+# attestation, pinned to the signing workflow.
+#
+# SEC-003: --repo alone only asserts "some workflow in this repo signed it".
+# Any workflow holding `attestations: write` satisfies that, so a contributor who
+# can push a branch carrying such a workflow could sign an arbitrary binary and
+# pass this gate. --signer-workflow asserts the exact identity in the
+# certificate, which is what makes this the INDEPENDENT authority: unlike the
+# .sha256, it is not something a compromised release can rewrite, because the
+# signature chains to a named workflow recorded in the public transparency log.
 #   0 verified · 1 attestation rejected the file · 2 cannot verify (no `gh`)
-# There is no "assume fine" branch. Callers treat 1 and 2 the same way.
+# There is no "assume fine" branch.
+SIGNER_WORKFLOW="$GH_REPO/.github/workflows/release.yml"
 _verify_attestation() {
   local file="$1"
   command -v gh >/dev/null 2>&1 || return 2
-  _timed 60 gh attestation verify "$file" --repo "$GH_REPO" >/dev/null 2>&1 || return 1
+  _timed 60 gh attestation verify "$file" --repo "$GH_REPO" \
+    --signer-workflow "$SIGNER_WORKFLOW" >/dev/null 2>&1 || return 1
   return 0
 }
 
 _do_download() {
   command -v curl >/dev/null 2>&1 || return 1
   [ -n "$HOST_TRIPLE" ] || return 1
-  local tag; tag="$(_resolve_tag)"; [ -n "$tag" ] || return 1
+
+  # SEC-002 gate: nothing reaches a URL until the tag matches the pinned shape.
+  local tag="" trc=0
+  tag="$(_resolve_tag)" || trc=$?
+  if [ "$trc" = "2" ]; then
+    # Log-injection guard: the malformed value is attacker-influenced, so it is
+    # reduced to a printable, bounded, single-line form before being recorded.
+    local safe_tag
+    safe_tag="$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._+-' '?' | cut -c1-80)"
+    _record_rejection "malformed-release-tag $safe_tag" \
+      "release tag \"$safe_tag\" does not match the required vMAJOR.MINOR.PATCH shape — download rejected before any URL was built (SEC-002, possible tamper of rally-release.json or the plugin manifest)" 1
+    return 1
+  fi
+  [ -n "$tag" ] || return 1
+
   local asset="rally-${HOST_TRIPLE}"
   local url="https://github.com/$GH_REPO/releases/download/${tag}/${asset}"
-  local tmp; tmp="$(mktemp 2>/dev/null || echo "/tmp/rally-dl-$$")"
-  if ! curl -fsSL --max-time 120 -o "$tmp" "$url" 2>/dev/null; then
+
+  # SEC-015: no predictable fallback path. `mktemp` missing is fail-closed, and
+  # the download lands in a 0700 dir under the cache rather than in shared /tmp,
+  # so a pre-created symlink cannot capture the write.
+  local dldir="$CACHE_DIR/dl"
+  mkdir -p "$dldir" 2>/dev/null || return 1
+  chmod 700 "$dldir" 2>/dev/null || true
+  local tmp=""
+  tmp="$(mktemp "$dldir/rally-dl.XXXXXX" 2>/dev/null || true)"
+  [ -n "$tmp" ] || return 1
+
+  if ! curl -fsSL --path-as-is --max-time 120 -o "$tmp" "$url" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null || true; return 1
   fi
   # FAIL-CLOSED: verify BEFORE chmod/exec. Reject mismatch AND unverifiable.
   _verify_sha256 "$tmp" "$tag" "$asset"
   local vrc=$?
   if [ "$vrc" != "0" ]; then
-    local why
-    if [ "$vrc" = "1" ]; then
-      why="sha256 MISMATCH for $asset@$tag — download rejected (possible tamper/corruption)"
-      # A mismatch is potential tamper evidence; record it durably so it survives
-      # a later cargo-success overwrite of the single-record state file.
-      printf '%s sha256-mismatch %s@%s\n' "$(date +%s 2>/dev/null || echo 0)" "$asset" "$tag" \
-        >> "$CACHE_DIR/download-rejections.log" 2>/dev/null || true
-    else
-      why="no verifiable sha256 for $asset@$tag — download rejected (fail-closed)"
-    fi
     rm -f "$tmp" 2>/dev/null || true
-    _write_state "download-rejected" "unavailable" "" "$why"
+    if [ "$vrc" = "1" ]; then
+      _record_rejection "sha256-mismatch $asset@$tag" \
+        "sha256 MISMATCH for $asset@$tag — download rejected (possible tamper/corruption)" 1
+    else
+      _record_rejection "sha256-unverifiable $asset@$tag" \
+        "no verifiable sha256 for $asset@$tag — download rejected (fail-closed)" 0
+    fi
     return 1
   fi
   # Second gate, also BEFORE chmod/exec: client-side provenance (ARP-001).
@@ -336,22 +441,31 @@ _do_download() {
   _verify_attestation "$tmp"
   local arc=$?
   if [ "$arc" != "0" ]; then
-    local awhy
-    if [ "$arc" = "1" ]; then
-      awhy="build-provenance attestation FAILED for $asset@$tag — download rejected (possible substitution). Verify by hand: gh attestation verify <file> --repo $GH_REPO"
-      printf '%s attestation-failed %s@%s\n' "$(date +%s 2>/dev/null || echo 0)" "$asset" "$tag" \
-        >> "$CACHE_DIR/download-rejections.log" 2>/dev/null || true
-    else
-      awhy="cannot verify build provenance: the GitHub CLI (gh) is not installed, so the attestation for $asset@$tag cannot be checked. Download rejected (fail-closed). Install gh and re-run, or build from source with cargo install --path crates/rally-cli."
-    fi
     rm -f "$tmp" 2>/dev/null || true
-    _write_state "download-rejected" "unavailable" "" "$awhy"
+    if [ "$arc" = "1" ]; then
+      _record_rejection "attestation-failed $asset@$tag" \
+        "build-provenance attestation FAILED for $asset@$tag — download rejected (possible substitution). Verify by hand: gh attestation verify <file> --repo $GH_REPO --signer-workflow $SIGNER_WORKFLOW" 1
+    else
+      _record_rejection "attestation-unverifiable $asset@$tag" \
+        "cannot verify build provenance: the GitHub CLI (gh) is not installed, so the attestation for $asset@$tag cannot be checked. Download rejected (fail-closed). Install gh and re-run, or build from source with cargo install --path crates/rally-cli." 0
+    fi
     return 1
   fi
   chmod +x "$tmp" 2>/dev/null || true
   if ! _timed 5 "$tmp" version >/dev/null 2>&1; then rm -f "$tmp" 2>/dev/null || true; return 1; fi
   mkdir -p "$LOCAL_BIN" 2>/dev/null || true
   mv "$tmp" "$LOCAL_RALLY" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+  # SEC-015: re-hash what actually landed, against the hash we verified. This
+  # closes the verify -> chmod -> mv window cheaply. It does NOT make the path
+  # same-UID safe; the trust model already says same-UID is not defended.
+  local final_sha
+  final_sha="$(_sha256_of "$LOCAL_RALLY")"
+  if [ -n "$_VERIFIED_SHA" ] && [ "$final_sha" != "$_VERIFIED_SHA" ]; then
+    rm -f "$LOCAL_RALLY" 2>/dev/null || true
+    _record_rejection "post-move-sha256-mismatch $asset@$tag" \
+      "the installed file changed between verification and install for $asset@$tag — removed, nothing installed (possible substitution)" 1
+    return 1
+  fi
   _write_state "downloaded" "ok" "$LOCAL_RALLY" ""
   return 0
 }
@@ -361,7 +475,10 @@ _do_cargo() {
   [ -d "$PLUGIN_ROOT/crates/rally-cli" ] || return 1
   if cargo install --path "$PLUGIN_ROOT/crates/rally-cli" --root "$HOME/.local" --quiet >/dev/null 2>&1 \
      && _binary_works "$LOCAL_RALLY"; then
-    _write_state "source" "ok" "$LOCAL_RALLY" ""
+    # SEC-012: carry the download rejection forward instead of blanking it. The
+    # old code wrote an empty hint here, so the installer lost the reason the
+    # download was refused and printed a bare "Installed".
+    _write_state "source" "ok" "$LOCAL_RALLY" "$_REJECTION_HINT"
     return 0
   fi
   return 1
@@ -446,6 +563,12 @@ _provision() {
   fi
   mkdir -p "$LOCAL_BIN" 2>/dev/null || true
   if _do_download; then :
+  elif [ "$_TAMPER_EVIDENCE" = "1" ]; then
+    # SEC-012: a malformed tag, a checksum mismatch, or a failed attestation is
+    # active-substitution evidence, and that is the one signal that must never be
+    # downgraded to a silent fallback. Stop here; _record_rejection already wrote
+    # the state file and the durable log, and the installer refuses on it.
+    :
   elif _do_cargo; then :
   else
     case "$(grep -o '"method":"[^"]*"' "$STATE_FILE" 2>/dev/null | cut -d'"' -f4 || true)" in

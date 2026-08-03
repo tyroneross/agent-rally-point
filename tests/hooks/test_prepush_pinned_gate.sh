@@ -101,7 +101,7 @@ run_prepush() {
   stdin_data="$1"
   shift
   ( cd "$FIXTURE" && printf '%s\n' "$stdin_data" \
-      | env -u RALLY_SKIP_PREPUSH -u RALLY_PREPUSH_ACK_GATE_CHANGE \
+      | env -u RALLY_SKIP_PREPUSH -u RALLY_PREPUSH_ACK_GATE_CHANGE -u RALLY_PREPUSH_ACK_VACUOUS_PIN \
         RALLY_TEST_MARKER="$GATE_MARKER" RALLY_TEST_GATE_EXIT=0 \
         "$@" \
         sh .githooks/pre-push origin fake-remote-url ) 2>&1
@@ -226,6 +226,125 @@ if [ "$rc" = "0" ] && [ "$recorded" = "$SHA_MAIN" ] && printf '%s' "$out" | grep
 else
   bad "$T" "rc=$rc recorded=[$recorded]"; note "$out"
 fi
+
+# ===========================================================================
+# SEC-005 — the pin must not be able to silently pin to the thing it is
+# supposed to be reviewing.
+#
+# RALLY_PREPUSH_GATE_PIN_REF is read from the environment, and the environment
+# is attacker-reachable: a committed .envrc, a Makefile, an npm script, or any
+# process running as this UID can set it. Point it at HEAD (or at the branch
+# being pushed) and the pinned copy is byte-identical to the pushed copy —
+# `diff -q` says identical, the pushed branch's own gate script runs, and the
+# hook used to print an affirmative "gate scripts pinned to HEAD @ <sha>" with
+# no warning. ARP-006 became a no-op that reported success.
+# ===========================================================================
+
+T="SEC-005: an env-supplied pin that resolves to the pushed commit is REFUSED"
+: > "$GATE_MARKER"
+rm -f "$MALICIOUS_MARKER"
+out=$(run_prepush "refs/heads/feature $SHA_MALICIOUS refs/heads/feature $ZERO" \
+        RALLY_PREPUSH_GATE_PIN_REF=feature)
+rc=$?
+if [ "$rc" != "0" ] && printf '%s' "$out" | grep -q "REFUSED"; then
+  ok "$T"
+else
+  bad "$T" "expected non-zero rc + REFUSED, got rc=$rc"; note "$out"
+fi
+
+T="SEC-005: the malicious gate did NOT run under a self-pinned ref"
+if [ ! -e "$MALICIOUS_MARKER" ]; then
+  ok "$T"
+else
+  bad "$T" "$MALICIOUS_MARKER exists — a self-pin let the pushed gate script execute"
+fi
+
+T="SEC-005: refusal prints the pin commit and each pushed SHA side by side"
+if printf '%s' "$out" | grep -q "SAME COMMIT AS THE PIN" \
+   && printf '%s' "$out" | grep -qF "$SHA_MALICIOUS" \
+   && printf '%s' "$out" | grep -q "RALLY_PREPUSH_ACK_VACUOUS_PIN"; then
+  ok "$T"
+else
+  bad "$T" "operator cannot see the pin-vs-pushed relationship"; note "$out"
+fi
+
+# The literal attack from the finding: RALLY_PREPUSH_GATE_PIN_REF=HEAD while the
+# working tree sits on the malicious branch.
+T="SEC-005: RALLY_PREPUSH_GATE_PIN_REF=HEAD is refused, not silently accepted"
+git -C "$FIXTURE" checkout -q feature
+: > "$GATE_MARKER"
+rm -f "$MALICIOUS_MARKER"
+out=$(run_prepush "refs/heads/feature $SHA_MALICIOUS refs/heads/feature $ZERO" \
+        RALLY_PREPUSH_GATE_PIN_REF=HEAD)
+rc=$?
+if [ "$rc" != "0" ] && [ ! -e "$MALICIOUS_MARKER" ]; then
+  ok "$T"
+else
+  bad "$T" "rc=$rc marker_exists=$([ -e "$MALICIOUS_MARKER" ] && echo yes || echo no)"; note "$out"
+fi
+git -C "$FIXTURE" checkout -q main
+rm -f "$MALICIOUS_MARKER"
+
+T="SEC-005: RALLY_PREPUSH_ACK_VACUOUS_PIN=1 runs, and says it is running unpinned"
+: > "$GATE_MARKER"
+rm -f "$MALICIOUS_MARKER"
+out=$( ( cd "$FIXTURE" && printf '%s\n' "refs/heads/feature $SHA_MALICIOUS refs/heads/feature $ZERO" \
+      | env -u RALLY_SKIP_PREPUSH -u RALLY_PREPUSH_ACK_GATE_CHANGE \
+        RALLY_PREPUSH_GATE_PIN_REF=feature RALLY_PREPUSH_ACK_VACUOUS_PIN=1 \
+        RALLY_TEST_MARKER="$GATE_MARKER" RALLY_TEST_GATE_EXIT=0 \
+        sh .githooks/pre-push origin fake-remote-url ) 2>&1 )
+rc=$?
+if [ "$rc" = "0" ] && [ -e "$MALICIOUS_MARKER" ] && printf '%s' "$out" | grep -q "effectively UNPINNED"; then
+  ok "$T"
+else
+  bad "$T" "rc=$rc marker_exists=$([ -e "$MALICIOUS_MARKER" ] && echo yes || echo no)"; note "$out"
+fi
+rm -f "$MALICIOUS_MARKER"
+
+# Pushing `main` with the DEFAULT pin is the one vacuous case that cannot be
+# avoided — the pin branch IS the push. It stays allowed, but it must say so
+# instead of printing a healthy-looking "pinned to main @ <sha>".
+T="SEC-005: default pin on the pin branch itself warns instead of affirming"
+: > "$GATE_MARKER"
+out=$(run_prepush "refs/heads/main $SHA_MAIN refs/heads/main $ZERO")
+rc=$?
+if [ "$rc" = "0" ] \
+   && printf '%s' "$out" | grep -q "SAME COMMIT AS THE PIN" \
+   && printf '%s' "$out" | grep -q "NOT reviewed against an earlier baseline"; then
+  ok "$T"
+else
+  bad "$T" "rc=$rc — a vacuous default pin must be loud"; note "$out"
+fi
+
+# ---------------------------------------------------------------------------
+# SEC-005 (second half): scripts/prepush-ref-updates.sh runs first, from the
+# working tree, and decides which SHAs get gated at all. It was not in
+# GATE_SCRIPT_NAMES, so it was a third gate script with no pin.
+# ---------------------------------------------------------------------------
+T="SEC-005: a modified scripts/prepush-ref-updates.sh is pinned too, and refused"
+git -C "$FIXTURE" checkout -q -b parser-attack main
+PARSER_MARKER="$(mktemp "${scratch_parent%/}/rally-prepush-pin-parser-marker.XXXXXX")"
+rm -f "$PARSER_MARKER"
+cat > "$FIXTURE/scripts/prepush-ref-updates.sh" <<STUB
+#!/bin/sh
+touch "$PARSER_MARKER"
+awk '{ if (\$2 != "" && \$2 !~ /^0+\$/) print \$2 }' | sort -u
+STUB
+chmod +x "$FIXTURE/scripts/prepush-ref-updates.sh"
+git -C "$FIXTURE" add -A
+git -C "$FIXTURE" commit -q -m "parser-attack: ref-update parser writes a marker"
+SHA_PARSER="$(git -C "$FIXTURE" rev-parse HEAD)"
+: > "$GATE_MARKER"
+out=$(run_prepush "refs/heads/parser-attack $SHA_PARSER refs/heads/parser-attack $ZERO")
+rc=$?
+if [ "$rc" != "0" ] && [ ! -e "$PARSER_MARKER" ] \
+   && printf '%s' "$out" | grep -q "prepush-ref-updates.sh"; then
+  ok "$T"
+else
+  bad "$T" "rc=$rc parser_marker=$([ -e "$PARSER_MARKER" ] && echo created || echo absent)"; note "$out"
+fi
+rm -f "$PARSER_MARKER"
+git -C "$FIXTURE" checkout -q main
 
 # ===========================================================================
 # Summary

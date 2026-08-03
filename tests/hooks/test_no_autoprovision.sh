@@ -279,6 +279,96 @@ T="ARP-001: installer refuses the download path without gh"
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "missing gh must be a hard stop, not a downgrade"; fi
 
+# ---------------------------------------------------------------------------
+# 9 (SEC-001). The hook must never execute a binary that resolves inside the
+#    repo it is scanning. The old code preferred ./target/debug/rally, so a
+#    hostile repo could ship a committed .rally/log/*.jsonl (committed by
+#    design — the .rally self-gate is NOT a mitigation) plus a committed
+#    executable at that path, and opening the repo ran it.
+#
+#    METHOD: plant an executable at ./target/debug/rally that writes a marker
+#    file. Run every phase. The marker must not appear.
+# ---------------------------------------------------------------------------
+T="SEC-001: an executable planted at ./target/debug/rally is never executed"
+(
+  sb="$TMPDIR_ROOT/repo-relative"; mkdir -p "$sb/home" "$sb/repo/.rally/log" "$sb/repo/target/debug"
+  _make_recorders "$sb"
+  marker="$sb/repo-binary-executed"
+  printf '#!/usr/bin/env bash\nprintf x > "%s"\nprintf "%%s" "{}"\nexit 0\n' "$marker" \
+    > "$sb/repo/target/debug/rally"
+  /bin/chmod +x "$sb/repo/target/debug/rally"
+  # A rally repo commits its ledger, so .rally/ presence is attacker-reachable.
+  printf '%s\n' '{}' > "$sb/repo/.rally/log/planted.jsonl"
+  cd "$sb/repo" || exit 1
+  for phase in start before-write after-write idle; do
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" \
+      PATH="$sb/stub:${NODE_DIR:+$NODE_DIR:}/usr/bin:/bin" \
+      "$HOOK" "$phase" claude_code </dev/null >/dev/null 2>/dev/null
+    rc=$?
+    [ "$rc" = "0" ] || { printf '%s exited %s\n' "$phase" "$rc" >&2; exit 1; }
+    [ ! -e "$marker" ] || { printf 'the %s phase EXECUTED the repo-relative binary\n' "$phase" >&2; exit 1; }
+  done
+  reason="$(_assert_no_provisioning "$sb")" || { printf '%s\n' "$reason" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "no hook phase may execute a binary under the scanned repo"; fi
+
+# ---------------------------------------------------------------------------
+# 10 (SEC-001). RALLY_BIN survives as a dev override, but the repo must not be
+#    able to aim it at itself. A relative path, an absolute path inside the
+#    scanned repo, and a symlink that resolves into the repo are all refused.
+#    The last case in this block is the POSITIVE control: an absolute path
+#    outside the repo still runs, so the check discriminates instead of just
+#    disabling the override.
+# ---------------------------------------------------------------------------
+T="SEC-001: RALLY_BIN inside the scanned repo is refused; outside still works"
+(
+  sb="$TMPDIR_ROOT/rally-bin-scope"; mkdir -p "$sb/home" "$sb/repo/.rally" "$sb/repo/tools" "$sb/outside"
+  _make_recorders "$sb"
+  inside_marker="$sb/inside-executed"
+  outside_marker="$sb/outside-executed"
+  printf '#!/usr/bin/env bash\nprintf x > "%s"\nprintf "%%s" "{}"\nexit 0\n' "$inside_marker" \
+    > "$sb/repo/tools/rally"
+  printf '#!/usr/bin/env bash\nprintf x > "%s"\nprintf "%%s" "{}"\nexit 0\n' "$outside_marker" \
+    > "$sb/outside/rally"
+  /bin/chmod +x "$sb/repo/tools/rally" "$sb/outside/rally"
+  ln -s "$sb/repo/tools/rally" "$sb/laundered-rally"
+  cd "$sb/repo" || exit 1
+
+  _run_with_bin() {  # $1 = RALLY_BIN value ; echoes stderr
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" \
+      PATH="$sb/stub:${NODE_DIR:+$NODE_DIR:}/usr/bin:/bin" \
+      RALLY_BIN="$1" "$HOOK" start claude_code </dev/null 2>&1 >/dev/null
+  }
+
+  # (a) absolute, inside the repo
+  err="$(_run_with_bin "$sb/repo/tools/rally")"
+  [ ! -e "$inside_marker" ] || { printf 'an in-repo absolute RALLY_BIN was executed\n' >&2; exit 1; }
+  printf '%s' "$err" | grep -q "refusing RALLY_BIN" \
+    || { printf 'no refusal printed for an in-repo RALLY_BIN: %s\n' "$err" >&2; exit 1; }
+
+  # (b) relative
+  err="$(_run_with_bin "tools/rally")"
+  [ ! -e "$inside_marker" ] || { printf 'a relative RALLY_BIN was executed\n' >&2; exit 1; }
+  printf '%s' "$err" | grep -q "refusing RALLY_BIN" \
+    || { printf 'no refusal printed for a relative RALLY_BIN: %s\n' "$err" >&2; exit 1; }
+
+  # (c) symlink outside the repo that resolves back into it
+  err="$(_run_with_bin "$sb/laundered-rally")"
+  [ ! -e "$inside_marker" ] || { printf 'a symlink into the repo laundered RALLY_BIN\n' >&2; exit 1; }
+  printf '%s' "$err" | grep -q "refusing RALLY_BIN" \
+    || { printf 'no refusal printed for a laundering symlink: %s\n' "$err" >&2; exit 1; }
+
+  # (d) POSITIVE CONTROL: absolute, outside the repo — must still run.
+  _run_with_bin "$sb/outside/rally" >/dev/null
+  [ -e "$outside_marker" ] \
+    || { printf 'an absolute RALLY_BIN outside the repo was refused too — the check is a blanket disable\n' >&2; exit 1; }
+
+  reason="$(_assert_no_provisioning "$sb")" || { printf '%s\n' "$reason" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "RALLY_BIN must be absolute and outside the scanned repo"; fi
+
 echo ""
 echo "Passed: $PASS / Failed: $FAIL"
 if [ "$FAIL" -gt 0 ]; then
