@@ -453,6 +453,40 @@ review answers the question you asked.
   mechanism by which stale claims become actively obstructive rather than merely noisy.
 - **Not `controlled`:** no test asserts that an expired lease is non-binding on the claim path.
 
+### RC-021 — `ClaudeAdapter::send` panics the daemon task on any live Claude session
+- **State:** `observed` — found while building the ARP-005 ownership tests, not from the audit.
+- **Evidence:** `crates/cockpitd/src/adapter/claude.rs:175` calls `Handle::block_on` from inside a
+  tokio worker thread, which panics with *"Cannot start a runtime from within a runtime"*. Any
+  `send_prompt` or `steer` against a live Claude session kills the connection.
+- **Why it was never caught:** no test had ever driven that path. The ARP-005 ownership tests were
+  deliberately routed through the codex-gated mock to avoid entangling a security fix with this
+  pre-existing crash, which is how it surfaced.
+- **Fix shape:** restructure the stdin handle — likely `Arc<Mutex<ChildStdin>>` plus a spawned
+  write — rather than blocking inside the runtime.
+- **Not `controlled`:** no test exercises `send`/`steer` against a real Claude adapter.
+
+### RC-022 — owner binding orphans clients that reconnect without a stable identity
+- **State:** `fixed` for `cockpit-cli`, `observed` for the iOS client.
+- **Mechanism:** ARP-005 bound sessions and approvals to the connection that created them. Any
+  client that opens a new connection per operation, or reconnects, arrives as a **new principal**
+  and loses write access to its own session. `cockpit-cli` opened a fresh WebSocket per subcommand
+  and hit this immediately; `ios/Cockpit` reconnects on every network change and has the same
+  exposure.
+- **Compounding defect (the reason this is not merely a config nit):** `cockpit-cli` printed
+  `sent` without reading the reply, so the refusal was **invisible** — a `forbidden` in the daemon
+  log and a success on the operator's terminal. A hardening change turned a harmless
+  fire-and-forget into an actively misleading one. Same shape as RC-001: acknowledging the wrong
+  step.
+- **Fixed for the CLI:** sends a stable `client_id`, and `fail_on_error_frame` surfaces a refusal.
+  Verified live — a send to an unknown session now prints
+  `server refused the command: not_found` instead of `sent`.
+- **Open for iOS:** `ios/Cockpit` sends no `client_id`. Same one-line fix; needs a Swift change and
+  a device test.
+- **Honest limit on the whole mechanism:** `client_id` is self-asserted. With one shared bearer
+  token, any holder can claim any id. It separates well-behaved clients and gives a real audit
+  trail; it is not authentication, and RC-017 says so in the same terms.
+- **Not `controlled` overall:** no test asserts that a reconnecting iOS client retains control.
+
 ## Working hypothesis across entries
 
 RC-001, RC-005, and RC-007 share one shape: **an operation returns success for a step that is

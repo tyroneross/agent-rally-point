@@ -7,6 +7,88 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Security — issue #52 independent audit (Lattice)
+
+Seven findings from the first genuinely independent security review of this repo:
+3 Critical, 1 High, 2 Medium, 1 Low. Six are fixed with adversarial tests; one
+(ARP-003) has a fail-safe and a registered redesign. Per-finding triage:
+[`docs/security/AUDIT-2026-08-02-issue-52-triage.md`](docs/security/AUDIT-2026-08-02-issue-52-triage.md).
+Register entries RC-013..RC-019.
+
+**This supersedes the 0.1.2 "Binary auto-provision" behaviour below.** Lifecycle
+hooks no longer provision anything.
+
+- **Hooks no longer install software (ARP-001, Critical).** The SessionStart hook
+  called `ensure-rally-binary.sh` on both the `.rally`-present and `.rally`-absent
+  paths, so opening and trusting this repo could download a release binary,
+  `chmod +x` it, run it, and write `~/.local/bin/rally` before you ran any project
+  code — and could fall back to `cargo install` from repo source or execute an
+  unverifiable shipped plugin binary. Both call sites are gone. The hook detects
+  and advises; it never executes a candidate binary, even to probe it.
+  Provisioning moved to `scripts/install-rally.sh`, run by a human, fail-closed on
+  **both** SHA256 and client-side `gh attestation verify`. `ensure-rally-binary.sh`
+  refuses (exit 3) unless `RALLY_EXPLICIT_INSTALL=1`, so re-wiring it into a hook
+  later fails closed. The unverifiable shipped-prebuilt path is deleted, not gated.
+- **Ledger prose is quoted before it reaches model context (ARP-004, High).** Peer
+  subjects, evidence, intent, and paths flowed into `additionalContext` /
+  `systemMessage` unsanitized, so anyone who could write `.rally/` could put
+  instructions in a high-trust channel. All of it now passes one sanitizer:
+  identifiers on a strict allowlist that excludes whitespace, prose flattened,
+  length-capped, and wrapped in guillemets behind a fixed preamble telling the
+  model the following is peer-authored and unauthenticated. Facts are still
+  unsigned — see the trust model.
+- **The workstream linter stopped claiming to be a safety proof (ARP-002,
+  Critical).** `owns` permitted `;` `|` `&` `>` `(` `)`; `validation` needed only
+  to be non-empty and was rendered verbatim into a `bash` block labelled "run
+  these verbatim"; `runId`/`toolPrefix` were interpolated after a non-empty check.
+  Now: positive allowlists, one shell-quoting helper on every rendered value,
+  identifier validation at both CLI and library entry points, and descriptor
+  `validation` rendered as non-executable prose. A new local recipe registry
+  supplies real commands by name, so command text comes from this repo rather
+  than the descriptor. Every "proves a plan is safe to fan out" claim is gone.
+- **Cockpit binds sessions and approvals to an owner (ARP-005, Medium).**
+  Constant-time token compare, a principal per authenticated connection, owner
+  checks on send/steer/close/approve, `repo_path` canonicalized into a
+  `COCKPIT_REPO_ALLOWLIST` (default `$HOME`), and non-loopback bind refused
+  without an explicit risk-naming override. `hello` gained an optional
+  `client_id` so a reconnecting client keeps control of its session.
+- **Cockpit no longer claims to enforce tool authorization (ARP-003, Critical —
+  fail-safe).** The approval gate pauses the event pump, not the child process:
+  the tool has already run. Codex is spawned with stdin null so no denial can be
+  delivered, and Claude's pre-execution hook needs an MCP server this workspace
+  does not have — both are redesigns. Every enforcement claim is corrected,
+  `tool_blocked` carries `advisory: true` / `enforced: false`, and the redesign's
+  acceptance test is written down as an `#[ignore]`d test. **Not closed.**
+- **The pre-push gate no longer runs the pushed commit's own gate scripts
+  (ARP-006, Medium).** Gate code is pinned via `git show <ref>:scripts/<name>`;
+  a differing pushed copy is refused with a diff unless explicitly acknowledged.
+  Hook docs corrected — it is opt-in via `core.hooksPath`, and enabling it is a
+  trust decision.
+- **Watcher hardening (ARP-007, Low).** Malformed JSONL is quarantined and the
+  cursor stops before it instead of silently advancing past a lost record;
+  `ack-quarantine` resumes. macOS notifications pass title/body as `argv` to an
+  `on run argv` script rather than interpolating them into script source.
+  `watchfiles` pinned with a committed `uv.lock`. File sinks bounded by
+  `AGENT_RALLY_WATCHER_SINK_ROOT`, rejecting symlinked leaves and opening
+  `O_NOFOLLOW`.
+- **`cockpit-cli` stopped printing success for refused commands.** It opens a new
+  socket per subcommand, so owner binding made every invocation a different
+  principal — and it printed `sent` without reading the reply. Same
+  acknowledge-the-wrong-step shape as RC-001. Now sends a stable `client_id` and
+  fails loudly on an error frame.
+- **The release-parity gate runs every hook suite.** It ran a hardcoded list of
+  three while seven existed, so the two adversarial suites closing RC-013 and
+  RC-016 would have run in no gate at all. It now globs `tests/hooks/test_*.sh`
+  and fails on an empty glob rather than passing zero tests vacuously.
+- **New docs.** [`docs/DESIGN-TRADEOFFS.md`](docs/DESIGN-TRADEOFFS.md) (why hooks,
+  why agents self-manage, why push-then-pull, and what is actually proven),
+  [`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md) (what is and is
+  not defended), and
+  [`docs/rca-2026-08-02-security-findings-escaped.md`](docs/rca-2026-08-02-security-findings-escaped.md)
+  (why every gate stayed dormant). `skills/agent-rally-point/SKILL.md` no longer
+  claims Rally does not install host hooks — four committed registration files do,
+  and the docs now say so plainly along with every off switch.
+
 ## v0.1.7 - 2026-07-30
 
 Canonical Claude Code and Codex host integration, plus the daemon and handoff

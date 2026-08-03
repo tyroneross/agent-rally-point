@@ -174,3 +174,9 @@ build-loop's own security review — see the levers list in
 | Distinguish committed historical log from live trusted state | ARP-004 | Needs a protocol-level provenance field; pairs with fact signing. |
 | Import and inspect the 26 tracked git bundles | audit "unreviewed surface" | Not a code fix; a separate review task. |
 | `cargo audit` / `cargo deny` dependency-vulnerability pass | audit "unreviewed surface" | The audit explicitly did not do this. Neither has this repo. |
+| `ios/Cockpit` must send a stable `client_id` | RC-022 | Swift change plus a device test. The CLI half is fixed; iOS reconnects would otherwise orphan their own sessions. |
+| `docs/plans/COCKPIT-WIRE.md` needs the new wire fields | ARP-003/005 | Document optional `hello.client_id`, the `forbidden` and `repo_path_denied` error codes, and `tool_blocked`'s advisory metadata. |
+| A `rally show <event-id>` command | ARP-004 | The audit's ideal — inject an opaque ID and make the agent open the fact separately — is materially better with a single-fact reader. None exists; the preamble points at `rally room --json` instead. |
+| `ClaudeAdapter::send` runtime panic | RC-021 | Pre-existing crash on any live Claude session; found while testing, out of scope for both findings. |
+| Fix the `claim` / `check` lease-expiry disagreement | RC-020 | `check` treats an expired lease as advisory; `claim` hard-refuses on it. |
+| Quote peer prose at the source in `crates/rally-cli` | ARP-004 | The hook boundary is sanitized, but `agent_visible` messages are assembled in the CLI. Defence belongs at both ends. |

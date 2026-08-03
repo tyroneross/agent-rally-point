@@ -3,10 +3,21 @@
 #
 # Release workflow: builds the rally CLI for all 4 supported target triples on
 # every version tag (v*), publishes each binary + a SHA256 sidecar, and signs a
-# build-provenance attestation. ensure-rally-binary.sh verifies the SHA256
-# before executing a downloaded binary (integrity); the attestation is the
-# anti-tamper layer against release-asset substitution, verifiable out-of-band
-# with `gh attestation verify rally-<triple> --repo tyroneross/agent-rally-point`.
+# build-provenance attestation.
+#
+# Both artifacts are now verified CLIENT-SIDE, before the downloaded file is
+# made executable, by scripts/install-rally.sh (ARP-001). The SHA256 covers
+# integrity; the attestation is the anti-tamper layer against release-asset
+# substitution, because the checksum lives on the same release as the binary
+# and cannot catch a compromised release on its own.
+#
+# The installer is fail-closed: a missing `gh`, a missing checksum, or a failed
+# attestation stops the download path rather than degrading to an unverified
+# install. This used to be out-of-band-only verification performed by a human,
+# which was the gap ARP-001 named.
+#
+# Manual check, still useful for auditing a published release:
+#   gh attestation verify rally-<triple> --repo tyroneross/agent-rally-point
 
 name: Release
 
