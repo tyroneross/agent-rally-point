@@ -21,7 +21,7 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
 HOOK="$REPO_ROOT/hooks/ensure-rally-binary.sh"
-. "$REPO_ROOT/tests/hooks/lib/hermetic_path.sh"
+. "$REPO_ROOT/tests/hooks/helpers/hermetic_path.sh"
 
 # Stand in for the explicit installer. Exported so every sandboxed subshell
 # below inherits it; `env -i` call sites pass it by hand.

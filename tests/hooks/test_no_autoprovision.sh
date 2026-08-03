@@ -24,7 +24,7 @@ set -u
 # (deliberately not -e: we assert on exit codes)
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
-. "$REPO_ROOT/tests/hooks/lib/hermetic_path.sh"
+. "$REPO_ROOT/tests/hooks/helpers/hermetic_path.sh"
 HOOK="$REPO_ROOT/hooks/rally-coordination-hook.sh"
 ENGINE="$REPO_ROOT/hooks/ensure-rally-binary.sh"
 
