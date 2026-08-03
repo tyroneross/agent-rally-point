@@ -140,16 +140,29 @@ if ! python3 -m unittest \
   echo "check-release-parity: HOST GENERATOR/RECONCILER TESTS FAILED" >&2
   fail=1
 fi
-for host_test in \
-  tests/hooks/test_rally_coordination_hook.sh \
-  tests/hooks/test_install_rally_hooks.sh \
-  tests/hooks/test_ensure_rally_binary.sh
-do
+# Run EVERY suite in tests/hooks/, not a hand-maintained list.
+#
+# This was a hardcoded list of three files. Four suites existed that it never
+# ran — including test_no_autoprovision.sh and test_context_sanitization.sh, the
+# adversarial controls that close RC-013 and RC-016. A control no gate executes
+# is a hypothesis (see docs/ROOT-CAUSE-REGISTER.md), and a list someone must
+# remember to extend will drift again the next time a suite is added. Globbing
+# removes the remembering.
+_host_tests_found=0
+for host_test in tests/hooks/test_*.sh; do
+  [ -f "$host_test" ] || continue          # no glob match → literal string
+  _host_tests_found=$((_host_tests_found + 1))
   if ! "$host_test" >&2; then
     echo "check-release-parity: HOST TEST FAILED — $host_test" >&2
     fail=1
   fi
 done
+# An empty glob means the suites moved or the gate is running from the wrong
+# directory. Either way it must fail loudly rather than silently pass zero tests.
+if [ "$_host_tests_found" -eq 0 ]; then
+  echo "check-release-parity: NO HOST TESTS FOUND under tests/hooks/ — refusing to pass vacuously" >&2
+  fail=1
+fi
 
 # --- artifact freshness -----------------------------------------------
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/rally-parity-XXXXXX")

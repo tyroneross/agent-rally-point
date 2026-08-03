@@ -11,6 +11,14 @@
 #   hooks/rally-coordination-hook.sh automatically. The hook self-gates on
 #   missing .rally/, so it is safe to install globally.
 #
+# What it does NOT do:
+#   It does not install the rally CLI, and neither do the hooks it registers.
+#   Hooks fire on session start, so anything they install would run before you
+#   ran any project code (ARP-001). Install the binary yourself, once:
+#       scripts/install-rally.sh
+#   That step asks first, verifies the release checksum and its build-provenance
+#   attestation, and refuses rather than installing something it cannot verify.
+#
 # Optional (Codex parity):
 #   With --repoint-codex, backs up ~/.codex/rally-hook.sh to .bak and replaces
 #   it with a thin shim that exec's the in-repo versioned hook. Closes the
@@ -401,6 +409,8 @@ if [ "$ACTION" = "install" ] && [ "$DRY_RUN" = "0" ] && [ "$CLAUDE_CHANGED" = "1
   say ""
   say "Installed. Hook will fire on Claude Code SessionStart + UserPromptSubmit + PreToolUse(Edit|Write|MultiEdit) + Stop."
   say "Self-gates outside rally repos (.rally/ absent → exit 0)."
+  say "The hooks do not install the rally CLI. If you have not installed it yet:"
+  say "  $REPO_ROOT/scripts/install-rally.sh"
   say "Strict mode (off by default): export RALLY_HOOK_STRICT=1"
   say "Uninstall: $0 --uninstall"
 fi

@@ -9,12 +9,22 @@
 #
 # All tests run inside isolated sandboxes (tmpdir HOME + restricted PATH) so
 # they never touch the real machine's files or network.
+#
+# ARP-001: the script under test refuses to do anything unless
+# RALLY_EXPLICIT_INSTALL=1 is set, which only scripts/install-rally.sh sets.
+# Every test that exercises provisioning therefore sets it. The guard itself is
+# covered here (refusal case) and in tests/hooks/test_no_autoprovision.sh (the
+# hook path cannot reach it at all).
 
 set -u
 # (deliberately not -e: we need to catch exit codes from the hook)
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
 HOOK="$REPO_ROOT/hooks/ensure-rally-binary.sh"
+
+# Stand in for the explicit installer. Exported so every sandboxed subshell
+# below inherits it; `env -i` call sites pass it by hand.
+export RALLY_EXPLICIT_INSTALL=1
 
 if [ ! -x "$HOOK" ]; then
   echo "FAIL: hook missing or not executable at $HOOK"
@@ -234,17 +244,19 @@ T="provision.json: written file is valid JSON with ts/method/result fields"
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 # ---------------------------------------------------------------------------
-# Test 5: shipped-binary path — prebuilt exists in plugin bin/<triple>/rally
-#          → copied to $HOME/.local/bin/rally, recorded as shipped-binary
+# Test 5 (ARP-001): the shipped-prebuilt path is GONE. A binary sitting in the
+# plugin at bin/<triple>/rally carries no checksum and no attestation, so it
+# must never be copied into $HOME and run. Nothing is installed; the run falls
+# through to the (unreachable, here) download/cargo paths and records
+# unavailable.
 # ---------------------------------------------------------------------------
-T="shipped-binary: prebuilt in plugin bin/<triple>/ → copied + method=shipped-binary"
+T="ARP-001: a shipped plugin prebuilt is NOT copied or executed"
 (
   sandbox="$TMPDIR_ROOT/t5"
   export HOME="$sandbox/home"
   export XDG_CACHE_HOME="$sandbox/home/.cache"
   mkdir -p "$HOME"
 
-  # Detect the real triple for this host
   _us="$(uname -s 2>/dev/null || echo unknown)"
   _um="$(uname -m 2>/dev/null || echo unknown)"
   TRIPLE=""
@@ -254,46 +266,38 @@ T="shipped-binary: prebuilt in plugin bin/<triple>/ → copied + method=shipped-
     Linux:x86_64)              TRIPLE="x86_64-unknown-linux-gnu" ;;
     Linux:aarch64|Linux:arm64) TRIPLE="aarch64-unknown-linux-gnu";;
   esac
-
-  if [ -z "$TRIPLE" ]; then
-    # Can't test shipped-binary on unrecognised host; skip gracefully
-    printf 'SKIP (unknown triple)\n'
-    exit 0
-  fi
+  if [ -z "$TRIPLE" ]; then printf 'SKIP (unknown triple)\n'; exit 0; fi
 
   plugin_root="$sandbox/plugin"
   mkdir -p "$plugin_root/bin/$TRIPLE"
-  _make_fake_rally "$plugin_root/bin/$TRIPLE/rally"
+  # A "prebuilt" that records the fact it was executed. If the removed path came
+  # back, this marker appears.
+  marker="$sandbox/shipped-was-executed"
+  printf '#!/usr/bin/env bash\nprintf x > "%s"\ncase "${1:-}" in version) exit 0;; *) exit 2;; esac\n' "$marker" \
+    > "$plugin_root/bin/$TRIPLE/rally"
+  chmod +x "$plugin_root/bin/$TRIPLE/rally"
 
-  # PATH with no rally binary, no cargo
+  # No rally, no cargo, no curl on PATH.
   export PATH="/usr/bin:/bin"
 
   "$HOOK" "$plugin_root"
   rc=$?
   if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
 
+  if [ -f "$marker" ]; then
+    printf 'shipped plugin binary was EXECUTED\n' >&2; exit 1
+  fi
+  if [ -e "$HOME/.local/bin/rally" ]; then
+    printf 'shipped plugin binary was INSTALLED into $HOME\n' >&2; exit 1
+  fi
   state_file="$XDG_CACHE_HOME/rally/provision.json"
-  if [ ! -f "$state_file" ]; then
-    printf 'provision.json not written\n' >&2; exit 1
-  fi
-
-  method="$(grep -o '"method":"[^"]*"' "$state_file" | cut -d'"' -f4 || true)"
-  result="$(grep -o '"result":"[^"]*"' "$state_file" | cut -d'"' -f4 || true)"
-
-  if [ "$method" != "shipped-binary" ]; then
-    printf 'expected method=shipped-binary, got: %s\n' "$method" >&2; exit 1
-  fi
-  if [ "$result" != "ok" ]; then
-    printf 'expected result=ok, got: %s\n' "$result" >&2; exit 1
-  fi
-
-  # Binary must now be at $HOME/.local/bin/rally
-  if [ ! -x "$HOME/.local/bin/rally" ]; then
-    printf '$HOME/.local/bin/rally not installed\n' >&2; exit 1
+  method="$(grep -o '"method":"[^"]*"' "$state_file" 2>/dev/null | cut -d'"' -f4 || true)"
+  if [ "$method" = "shipped-binary" ]; then
+    printf 'shipped-binary provisioning path is still live\n' >&2; exit 1
   fi
   exit 0
 )
-if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "unverifiable plugin prebuilts must never be installed"; fi
 
 # ---------------------------------------------------------------------------
 # Test 6: idempotency — running twice with rally already present does NOT
@@ -356,6 +360,16 @@ exit 0
 STUB
     chmod +x "$1/curl"
   }
+  # ARP-001: the download path now requires `gh attestation verify` to pass as
+  # well. This stub stands in for a working gh; $2 is its exit code.
+  _write_gh_stub() {  # $1=dir  $2=exit_code
+    cat > "$1/gh" <<STUB
+#!/usr/bin/env bash
+[ -n "\${GH_LOG:-}" ] && printf '%s\n' "\$*" >> "\$GH_LOG"
+exit $2
+STUB
+    chmod +x "$1/gh"
+  }
   _poll_method() {  # $1=state_file ; echoes terminal method
     local m=""
     for _ in $(seq 1 40); do
@@ -366,17 +380,20 @@ STUB
     printf '%s' "$m"
   }
 
-  T="f2 checksum match -> verified + installed (method=downloaded)"
+  T="f2 checksum match + attestation verified -> installed (method=downloaded)"
   (
     sb="$TMPDIR_ROOT/ck-ok"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin/.claude-plugin"
     printf '{"name":"x"}\n' > "$sb/plugin/.claude-plugin/plugin.json"
     printf '{"schema":"agent-rally.release-identity.v1","version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
     _write_curl_stub "$sb/tools" "$_GOOD_HASH"
-    CURL_LOG="$sb/curl.log" HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    _write_gh_stub "$sb/tools" 0
+    CURL_LOG="$sb/curl.log" GH_LOG="$sb/gh.log" HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
     m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
     [ "$m" = "downloaded" ] || { printf 'expected downloaded, got: %s\n' "$m" >&2; exit 1; }
     [ -x "$sb/home/.local/bin/rally" ] || { printf 'binary not installed\n' >&2; exit 1; }
     grep -q '/v0.0.0-test/' "$sb/curl.log" || { printf 'release identity did not pin v0.0.0-test\n' >&2; exit 1; }
+    grep -q 'attestation verify' "$sb/gh.log" || { printf 'attestation was never checked: %s\n' "$(cat "$sb/gh.log" 2>/dev/null)" >&2; exit 1; }
+    grep -q 'tyroneross/agent-rally-point' "$sb/gh.log" || { printf 'attestation not scoped to the repo\n' >&2; exit 1; }
     exit 0
   )
   if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
@@ -386,6 +403,7 @@ STUB
     sb="$TMPDIR_ROOT/ck-bad"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin/.claude-plugin"
     printf '{"name":"x","version":"0.0.0-test"}\n' > "$sb/plugin/.claude-plugin/plugin.json"
     _write_curl_stub "$sb/tools" "deadbeef00000000000000000000000000000000000000000000000000000000"
+    _write_gh_stub "$sb/tools" 0
     HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
     m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
     [ "$m" = "download-rejected" ] || { printf 'expected download-rejected, got: %s\n' "$m" >&2; exit 1; }
@@ -393,6 +411,42 @@ STUB
     exit 0
   )
   if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+  # ARP-001: the checksum and the binary come from the same GitHub release, so a
+  # good checksum proves nothing about a compromised release. Provenance is the
+  # independent authority and it is mandatory.
+  T="ARP-001 attestation FAILS -> rejected even with a matching checksum"
+  (
+    sb="$TMPDIR_ROOT/attest-bad"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin/.claude-plugin"
+    printf '{"schema":"agent-rally.release-identity.v1","version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"
+    _write_gh_stub "$sb/tools" 1
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
+    [ "$m" = "download-rejected" ] || { printf 'expected download-rejected, got: %s\n' "$m" >&2; exit 1; }
+    [ ! -x "$sb/home/.local/bin/rally" ] || { printf 'UNATTESTED binary was installed!\n' >&2; exit 1; }
+    grep -q 'attestation-failed' "$sb/home/.cache/rally/download-rejections.log" 2>/dev/null \
+      || { printf 'rejection was not recorded durably\n' >&2; exit 1; }
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "a failed attestation must reject the download"; fi
+
+  # No gh means provenance CANNOT be checked. Fail closed; do not fall through
+  # to an unverified install.
+  T="ARP-001 no gh -> download refused, never silently unverified"
+  (
+    sb="$TMPDIR_ROOT/attest-none"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
+    printf '{"schema":"agent-rally.release-identity.v1","version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"   # good checksum, but no gh on PATH
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
+    [ "$m" = "download-rejected" ] || { printf 'expected download-rejected, got: %s\n' "$m" >&2; exit 1; }
+    [ ! -x "$sb/home/.local/bin/rally" ] || { printf 'UNVERIFIED binary was installed!\n' >&2; exit 1; }
+    h="$(grep -o '"hint":"[^"]*"' "$sb/home/.cache/rally/provision.json" | cut -d'"' -f4 || true)"
+    case "$h" in *gh*) ;; *) printf 'hint does not name the missing tool: %s\n' "$h" >&2; exit 1;; esac
+    exit 0
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "missing gh must fail closed"; fi
 else
   ok "f2 checksum tests (skipped — shasum unavailable)"
 fi
@@ -437,43 +491,54 @@ T="f11 corrupt-state: malformed ts -> hook still exits 0"
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 # ---------------------------------------------------------------------------
-# Test: f1 never-block — a caller that CAPTURES the hook's stdout must not block
-# for the background worker's lifetime (worker fds are detached).
+# ARP-001 GUARD: without RALLY_EXPLICIT_INSTALL=1 the script refuses outright.
+# It exits 3, touches no network, no compiler, and no $HOME. This is the
+# fail-closed backstop for a future accidental re-wiring into a lifecycle hook.
 # ---------------------------------------------------------------------------
-T="f1 never-block: stdout-capturing caller returns fast despite a slow worker"
+T="ARP-001 guard: no RALLY_EXPLICIT_INSTALL -> exit 3, nothing provisioned"
 (
-  sb="$TMPDIR_ROOT/fdblock"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
-  printf '#!/usr/bin/env bash\nsleep 6\nexit 1\n' > "$sb/tools/curl"; chmod +x "$sb/tools/curl"
-  t0=$(date +%s)
-  out=$(HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin")
-  t1=$(date +%s)
-  [ $((t1-t0)) -lt 3 ] || { printf 'caller blocked %ss on the worker\n' "$((t1-t0))" >&2; exit 1; }
+  sb="$TMPDIR_ROOT/guard"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin/crates/rally-cli"
+  # Recorders: if any of these fire, provisioning happened.
+  for t in curl cargo chmod gh; do
+    printf '#!/usr/bin/env bash\nprintf x > "%s/called.%s"\nexit 0\n' "$sb" "$t" > "$sb/tools/$t"
+    chmod +x "$sb/tools/$t"
+  done
+  env -i HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" \
+    /bin/bash "$HOOK" "$sb/plugin" >/dev/null 2>"$sb/err"
+  rc=$?
+  [ "$rc" = 3 ] || { printf 'expected exit 3, got %s\n' "$rc" >&2; exit 1; }
+  for t in curl cargo chmod gh; do
+    [ ! -f "$sb/called.$t" ] || { printf '%s was invoked by a refused run\n' "$t" >&2; exit 1; }
+  done
+  [ ! -e "$sb/home/.local/bin/rally" ] || { printf 'binary installed by a refused run\n' >&2; exit 1; }
+  [ ! -e "$sb/home/.cache/rally/provision.json" ] || { printf 'state written by a refused run\n' >&2; exit 1; }
+  grep -q "install-rally.sh" "$sb/err" || { printf 'refusal does not name the installer: %s\n' "$(cat "$sb/err")" >&2; exit 1; }
   exit 0
 )
-if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "worker must detach inherited fds"; fi
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "hook-context invocation must fail closed"; fi
 
 # ---------------------------------------------------------------------------
-# Test: f3 handoff — after the hook returns, the lock names a LIVE pid (the
-# worker), on every bash. Run under /bin/bash explicitly so the macOS 3.2 path
-# (no $BASHPID) is exercised; the suite otherwise runs under a newer bash and
-# would miss a 3.2-only regression.
+# ARP-001: provisioning is now FOREGROUND. The old f1/f3 tests asserted the
+# opposite (detached worker, lock handed to a background pid) because a
+# lifecycle hook could not be allowed to block. No hook calls this any more, and
+# a human installer must report its own outcome, so the run is synchronous and
+# the lock is released before return.
 # ---------------------------------------------------------------------------
-T="f3 handoff: lock names a live pid after return (forced /bin/bash 3.2 path)"
-if [ -x /bin/bash ]; then
-  (
-    sb="$TMPDIR_ROOT/handoff"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
-    printf '#!/bin/bash\nsleep 8\nexit 1\n' > "$sb/tools/curl"; chmod +x "$sb/tools/curl"
-    env -i HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" /bin/bash "$HOOK" "$sb/plugin" >/dev/null 2>&1
-    lk="$sb/home/.cache/rally/.provision.lock"; c="$(cat "$lk" 2>/dev/null || echo)"
-    live=1; { [ -n "$c" ] && kill -0 "$c" 2>/dev/null; } || live=0
-    pkill -f "$sb/tools/curl" 2>/dev/null || true
-    [ "$live" = 1 ] || { printf 'lock did not name a live pid: [%s]\n' "$c" >&2; exit 1; }
-    exit 0
-  )
-  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "worker pid handoff broken (bash 3.2)"; fi
-else
-  ok "$T (skipped — /bin/bash unavailable)"
-fi
+T="ARP-001 foreground: run is synchronous and leaves no live lock behind"
+(
+  sb="$TMPDIR_ROOT/fg"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$sb/tools/curl"; chmod +x "$sb/tools/curl"
+  HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" = 0 ] || { printf 'rc=%s\n' "$rc" >&2; exit 1; }
+  # Terminal state is already on disk at return time — no polling needed.
+  r="$(grep -o '"result":"[^"]*"' "$sb/home/.cache/rally/provision.json" 2>/dev/null | cut -d'"' -f4 || true)"
+  [ "$r" = "unavailable" ] || { printf 'expected a terminal result at return, got: %s\n' "$r" >&2; exit 1; }
+  [ ! -f "$sb/home/.cache/rally/.provision.lock" ] || { printf 'lock survived the run\n' >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "explicit install must be synchronous"; fi
+
 
 # ---------------------------------------------------------------------------
 # Test: f2 liveness — a binary that crashes by SIGNAL on `version` must be
@@ -485,7 +550,7 @@ if [ -x /bin/bash ]; then
     sb="$TMPDIR_ROOT/sigcrash"; mkdir -p "$sb/home/.local/bin" "$sb/tools" "$sb/plugin"
     printf '#!/bin/bash\ncase "${1:-}" in version) kill -SEGV $$;; *) exit 2;; esac\n' > "$sb/home/.local/bin/rally"; chmod +x "$sb/home/.local/bin/rally"
     printf '#!/bin/bash\nexit 1\n' > "$sb/tools/curl"; chmod +x "$sb/tools/curl"   # no real network
-    env -i HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" /bin/bash "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    env -i RALLY_EXPLICIT_INSTALL=1 HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" /bin/bash "$HOOK" "$sb/plugin" >/dev/null 2>&1
     m="$(grep -o '"method":"[^"]*"' "$sb/home/.cache/rally/provision.json" 2>/dev/null | cut -d'"' -f4 || true)"
     [ "$m" != "present" ] || { printf 'crashing binary stamped present\n' >&2; exit 1; }
     exit 0
@@ -505,7 +570,7 @@ if [ -x /bin/bash ]; then
     sb="$TMPDIR_ROOT/sigcrash-path"; mkdir -p "$sb/home" "$sb/bin" "$sb/plugin"
     printf '#!/bin/bash\ncase "${1:-}" in version) kill -SEGV $$;; *) exit 2;; esac\n' > "$sb/bin/rally"; chmod +x "$sb/bin/rally"
     printf '#!/bin/bash\nexit 1\n' > "$sb/bin/curl"; chmod +x "$sb/bin/curl"
-    env -i HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/bin:/usr/bin:/bin" /bin/bash "$HOOK" "$sb/plugin" >/dev/null 2>&1
+    env -i RALLY_EXPLICIT_INSTALL=1 HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/bin:/usr/bin:/bin" /bin/bash "$HOOK" "$sb/plugin" >/dev/null 2>&1
     m="$(grep -o '"method":"[^"]*"' "$sb/home/.cache/rally/provision.json" 2>/dev/null | cut -d'"' -f4 || true)"
     [ "$m" != "present" ] || { printf 'crashing PATH binary stamped present\n' >&2; exit 1; }
     exit 0
@@ -525,7 +590,7 @@ T="flock acquire: with flock present + acquirable, the hook provisions"
   sb="$TMPDIR_ROOT/flock-ok"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
   printf '#!/bin/bash\nexit 0\n' > "$sb/tools/flock"; chmod +x "$sb/tools/flock"   # acquires
   printf '#!/bin/bash\nexit 1\n' > "$sb/tools/curl"; chmod +x "$sb/tools/curl"     # no network
-  env -i HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+  env -i RALLY_EXPLICIT_INSTALL=1 HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
   rc=$?; [ "$rc" = 0 ] || { printf 'rc=%s\n' "$rc" >&2; exit 1; }
   [ -f "$sb/home/.cache/rally/provision.json" ] || { printf 'flock path did not provision\n' >&2; exit 1; }
   exit 0
@@ -537,7 +602,7 @@ T="flock busy: with flock held by a peer, the hook backs off (no provisioning)"
   sb="$TMPDIR_ROOT/flock-busy"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
   printf '#!/bin/bash\nexit 1\n' > "$sb/tools/flock"; chmod +x "$sb/tools/flock"   # busy (can't acquire)
   printf '#!/bin/bash\nexit 1\n' > "$sb/tools/curl"; chmod +x "$sb/tools/curl"
-  env -i HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
+  env -i RALLY_EXPLICIT_INSTALL=1 HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" "$HOOK" "$sb/plugin" >/dev/null 2>&1
   rc=$?; [ "$rc" = 0 ] || { printf 'rc=%s\n' "$rc" >&2; exit 1; }
   [ ! -f "$sb/home/.cache/rally/provision.json" ] || { printf 'backed-off run still provisioned\n' >&2; exit 1; }
   exit 0

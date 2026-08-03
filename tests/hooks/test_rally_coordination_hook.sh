@@ -345,7 +345,7 @@ chmod +x "$status_prompt_bin"
   rc=$?
   if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
   printf '%s' "$out" | grep -q "Agent status:" || { printf 'missing status header: %s\n' "$out" >&2; exit 1; }
-  printf '%s' "$out" | grep -q "claude_code:lead: working on crates/rally-cli (engine dispatch)" || { printf 'missing working peer: %s\n' "$out" >&2; exit 1; }
+  printf '%s' "$out" | grep -q "claude_code:lead: working on crates/rally-cli («engine dispatch»)" || { printf 'missing working peer: %s\n' "$out" >&2; exit 1; }
   printf '%s' "$out" | grep -q "gemini:qa: idle, next check-in 2999-01-01T00:05:00Z" || { printf 'missing idle wake-after: %s\n' "$out" >&2; exit 1; }
   printf '%s' "$out" | grep -q "codex:blocked: blocked on fact_blocker" || { printf 'missing blocked ref: %s\n' "$out" >&2; exit 1; }
   if printf '%s' "$out" | grep -q "stale-peer"; then
@@ -367,7 +367,7 @@ T="UserPromptSubmit prompt includes peer status changes"
   if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
   printf '%s' "$out" | grep -q "UserPromptSubmit" || { printf 'missing UserPromptSubmit envelope: %s\n' "$out" >&2; exit 1; }
   printf '%s' "$out" | grep -q "Agent status:" || { printf 'missing status header: %s\n' "$out" >&2; exit 1; }
-  printf '%s' "$out" | grep -q "claude_code:lead: working on crates/rally-cli (engine dispatch)" || { printf 'missing working peer: %s\n' "$out" >&2; exit 1; }
+  printf '%s' "$out" | grep -q "claude_code:lead: working on crates/rally-cli («engine dispatch»)" || { printf 'missing working peer: %s\n' "$out" >&2; exit 1; }
   printf '%s' "$out" | grep -q "gemini:qa: idle, next check-in 2999-01-01T00:05:00Z" || { printf 'missing peer next check-in: %s\n' "$out" >&2; exit 1; }
   if printf '%s' "$out" | grep -q "codex:observer: idle"; then
     printf 'per-turn prompt should omit self-only status noise: %s\n' "$out" >&2

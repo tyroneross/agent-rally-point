@@ -2,40 +2,64 @@
 # SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 # SPDX-License-Identifier: Apache-2.0
 #
-# ensure-rally-binary.sh — Auto-provision the rally CLI on first SessionStart.
+# ensure-rally-binary.sh — provisioning engine for the rally CLI.
 #
-# CHARTER (fail-open, never-block): this script ALWAYS exits 0 and never blocks
-# the hook. ALL network + compiler work (download, cargo build) runs in ONE
-# backgrounded, locked worker; local liveness probes are time-bounded. Even a
-# hung on-disk binary cannot stall the hook. Idempotency + handoff via a state
-# file in XDG_CACHE_HOME and a single pid lock.
+# NOT A HOOK. Nothing in hooks/ or in any generated host surface may call this
+# file. It is invoked by scripts/install-rally.sh, which a human runs on
+# purpose, and by nothing else.
 #
-# Usage: ensure-rally-binary.sh [plugin_root]
+# CHARTER (ARP-001, fail-closed): trusting or opening a repo must never install
+# software. This script therefore refuses to run unless the caller sets
+# RALLY_EXPLICIT_INSTALL=1, which only the explicit installer does. A future
+# accidental re-wiring into a lifecycle hook fails closed: the guard fires, the
+# script exits 3 without touching the network, the compiler, or $HOME.
+#
+# Usage: RALLY_EXPLICIT_INSTALL=1 ensure-rally-binary.sh [plugin_root]
 #   plugin_root resolved: $1 → $CLAUDE_PLUGIN_ROOT → dirname($0)/..
 #
-# Provision order (first success wins): reachable on PATH/known-loc → shipped
-# prebuilt in plugin → download from GitHub Releases (checksum-verified) →
-# cargo build (backgrounded) → unavailable.
+# Provision order (first success wins): already reachable and working →
+# download from GitHub Releases (SHA256- AND attestation-verified) → cargo
+# build from local source → unavailable.
 #
-# SECURITY (download path): a downloaded binary is SHA256-verified against the
-# release's published <asset>.sha256 BEFORE it is made executable. The download
-# path is FAIL-CLOSED: a mismatch OR an unverifiable download (no checksum, no
-# sum tool) is rejected and never executed — cargo (verified source) is the
-# fallback. Scope: the same-repo .sha256 defends transit/CDN corruption +
-# partial downloads. It does NOT defend GitHub-account compromise (an attacker
-# who can swap the binary can swap its checksum). The release also publishes a
-# sigstore build-provenance attestation (release.yml) which DOES defend
-# substitution, but it is verified OUT OF BAND by a human/CI via
-# `gh attestation verify rally-<triple> --repo tyroneross/agent-rally-point` —
-# NOT client-side here, because a fail-open hook cannot reliably distinguish a
-# real tamper from a network/auth error without turning every offline start
-# into a hard failure.
+# Provisioning runs in the FOREGROUND. A human is waiting on the result, so the
+# installer reports what happened instead of detaching a worker. The pid/flock
+# pair still guards against two concurrent installs racing on the same target.
+#
+# SECURITY (download path), both checks mandatory, both BEFORE chmod/exec:
+#   1. SHA256 against the release's published <asset>.sha256. Defends transit
+#      and CDN corruption and partial downloads. It does NOT defend a
+#      compromised GitHub account or release — whoever can swap the binary can
+#      swap its checksum, which is the same authority.
+#   2. `gh attestation verify` against the sigstore build-provenance attestation
+#      the release workflow publishes (.github/workflows/release.yml). This is
+#      the independent authority, and it DOES defend substitution. It used to be
+#      an out-of-band human step; ARP-001 makes it client-side and mandatory.
+# A mismatch, a missing checksum, a missing `gh`, or a failed attestation all
+# reject the download. There is no unverified fallback: cargo build from the
+# checked-out source is the alternative, and the caller chooses it explicitly.
+#
+# REMOVED (ARP-001): the shipped-prebuilt path, which copied
+# <plugin>/bin/<triple>/rally into $HOME/.local/bin and ran it. A plugin package
+# carries no attestation, so that path was unverifiable by construction.
 #
 # State file: ${XDG_CACHE_HOME:-$HOME/.cache}/rally/provision.json
-#   {ts, method, result("ok"|"building"|"unavailable"), binary, hint}
-# Exit code: 0 always.
+#   {ts, method, result("ok"|"unavailable"), binary, hint}
+# Exit codes: 0 provisioning attempted and recorded · 3 refused (not an
+# explicit install).
 
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# ARP-001 GUARD — first executable statement, before any path, network, or
+# state work. Provisioning happens only when a human asked for it.
+# ---------------------------------------------------------------------------
+if [ "${RALLY_EXPLICIT_INSTALL:-}" != "1" ]; then
+  printf '%s\n' \
+    "ensure-rally-binary: refusing to provision. This script installs software and" \
+    "is not reachable from a lifecycle hook by design (ARP-001). Run the explicit" \
+    "installer instead: scripts/install-rally.sh" >&2
+  exit 3
+fi
 
 # A usable HOME (or XDG_CACHE_HOME) is required for every install target and the
 # state/lock dir. Without one there is nothing safe to do — exit 0 (charter)
@@ -217,22 +241,11 @@ fi
 if _check_existing; then exit 0; fi
 
 # ---------------------------------------------------------------------------
-# 4. Shipped prebuilt copy (local, fast — stays synchronous)
-# ---------------------------------------------------------------------------
-if [ -n "$HOST_TRIPLE" ]; then
-  _shipped="$PLUGIN_ROOT/bin/$HOST_TRIPLE/rally"
-  if [ -f "$_shipped" ]; then
-    mkdir -p "$LOCAL_BIN" 2>/dev/null || true
-    if cp "$_shipped" "$LOCAL_RALLY" 2>/dev/null && chmod +x "$LOCAL_RALLY" 2>/dev/null && _binary_works "$LOCAL_RALLY"; then
-      _write_state "shipped-binary" "ok" "$LOCAL_RALLY" ""
-      exit 0
-    fi
-    rm -f "$LOCAL_RALLY" 2>/dev/null || true
-  fi
-fi
-
-# ---------------------------------------------------------------------------
-# 5. Heavy provisioning — download (checksum-verified) or cargo, BACKGROUNDED.
+# 4. Provisioning — download (SHA256 + attestation verified) or cargo.
+#
+# The shipped-prebuilt path that used to live here is gone (ARP-001): copying
+# and running <plugin>/bin/<triple>/rally trusted whatever a plugin package
+# happened to contain, with no checksum and no attestation to check it against.
 # ---------------------------------------------------------------------------
 
 # Pin the binary to the generated plugin release identity. Git-source plugin
@@ -276,6 +289,19 @@ _verify_sha256() {
   return 1
 }
 
+# Verify a downloaded FILE against the release's sigstore build-provenance
+# attestation. This is the INDEPENDENT authority: unlike the .sha256, it is not
+# something a compromised release can rewrite, because the signature chains to
+# the workflow identity recorded in the public transparency log.
+#   0 verified · 1 attestation rejected the file · 2 cannot verify (no `gh`)
+# There is no "assume fine" branch. Callers treat 1 and 2 the same way.
+_verify_attestation() {
+  local file="$1"
+  command -v gh >/dev/null 2>&1 || return 2
+  _timed 60 gh attestation verify "$file" --repo "$GH_REPO" >/dev/null 2>&1 || return 1
+  return 0
+}
+
 _do_download() {
   command -v curl >/dev/null 2>&1 || return 1
   [ -n "$HOST_TRIPLE" ] || return 1
@@ -302,6 +328,24 @@ _do_download() {
     fi
     rm -f "$tmp" 2>/dev/null || true
     _write_state "download-rejected" "unavailable" "" "$why"
+    return 1
+  fi
+  # Second gate, also BEFORE chmod/exec: client-side provenance (ARP-001).
+  # The checksum and the binary come from the same GitHub authority, so the
+  # checksum alone cannot catch a compromised release. This can.
+  _verify_attestation "$tmp"
+  local arc=$?
+  if [ "$arc" != "0" ]; then
+    local awhy
+    if [ "$arc" = "1" ]; then
+      awhy="build-provenance attestation FAILED for $asset@$tag — download rejected (possible substitution). Verify by hand: gh attestation verify <file> --repo $GH_REPO"
+      printf '%s attestation-failed %s@%s\n' "$(date +%s 2>/dev/null || echo 0)" "$asset" "$tag" \
+        >> "$CACHE_DIR/download-rejections.log" 2>/dev/null || true
+    else
+      awhy="cannot verify build provenance: the GitHub CLI (gh) is not installed, so the attestation for $asset@$tag cannot be checked. Download rejected (fail-closed). Install gh and re-run, or build from source with cargo install --path crates/rally-cli."
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+    _write_state "download-rejected" "unavailable" "" "$awhy"
     return 1
   fi
   chmod +x "$tmp" 2>/dev/null || true
@@ -362,13 +406,13 @@ _acquire_lock() {
 }
 
 # Preferred lock: a held flock gives TRUE mutual exclusion with zero TOCTOU (it
-# closes the portable path's narrow reclaim race entirely). The WORKER inherits
-# the locked fd 9 and holds it for its lifetime — auto-released by the OS on exit
-# OR crash, so it can never wedge. flock(1) is Linux-standard and absent on stock
-# macOS; there `_flock_acquire` returns 2 and `_provision_bg` uses the portable
-# path below. A FIXED fd (9) keeps this parseable on bash 3.2 (which lacks
+# closes the portable path's narrow reclaim race entirely). We hold the locked
+# fd 9 for the duration of the provision — auto-released by the OS on exit OR
+# crash, so it can never wedge. flock(1) is Linux-standard and absent on stock
+# macOS; there `_flock_acquire` returns 2 and `_provision` uses the portable
+# path. A FIXED fd (9) keeps this parseable on bash 3.2 (which lacks
 # `{var}`-fd syntax); the whole branch parses-but-never-runs where flock is gone.
-#   returns: 0 = acquired (we hold fd 9; hand it to the worker), 1 = busy, 2 = unavailable
+#   returns: 0 = acquired (we hold fd 9), 1 = busy, 2 = unavailable
 _flock_acquire() {
   command -v flock >/dev/null 2>&1 || return 2
   mkdir -p "$CACHE_DIR" 2>/dev/null || true
@@ -379,11 +423,15 @@ _flock_acquire() {
 }
 _flock_release() { exec 9>&- 2>/dev/null || true; }
 
-_provision_bg() {
+# FOREGROUND (ARP-001). The old version detached a background worker because a
+# lifecycle hook must never block. No hook calls this any more: a human ran the
+# installer and is waiting on the answer, so the work happens inline and the
+# caller reads the outcome straight out of the state file.
+_provision() {
   mkdir -p "$CACHE_DIR" 2>/dev/null || true
   local via_flock=0 frc=0
   _flock_acquire || frc=$?                        # capture rc without tripping set -e
-  if [ "$frc" = 1 ]; then return 0; fi           # a live worker holds the flock → in progress
+  if [ "$frc" = 1 ]; then return 0; fi           # another install holds the flock
   if [ "$frc" = 0 ]; then
     # Also acquire the portable pid lock while holding flock. A peer may have
     # started without flock on PATH; ignoring its live/young pid lock would let
@@ -394,42 +442,21 @@ _provision_bg() {
     fi
     via_flock=1
   else
-    _acquire_lock || return 0                     # no flock → portable lock (another session has it)
+    _acquire_lock || return 0                     # no flock → portable lock (another install has it)
   fi
   mkdir -p "$LOCAL_BIN" 2>/dev/null || true
-  _write_state "provisioning" "building" "" "Provisioning rally in background; binary will be at $LOCAL_RALLY when ready."
-  # Worker runs with all inherited fds detached (`>/dev/null 2>&1 </dev/null`) so
-  # a caller that captures the hook's stdout never blocks on the worker's
-  # lifetime. On bash 4+ the worker also stamps its own pid first (belt-and-
-  # suspenders, closing the parent-killed-before-stamp window); on bash 3.2
-  # BASHPID is unset, so this is a no-op and the parent stamp below is the path.
-  (
-    [ -n "${BASHPID:-}" ] && printf '%s\n' "$BASHPID" > "$LOCK_FILE" 2>/dev/null || true
-    if _do_download; then :
-    elif _do_cargo; then :
-    else
-      case "$(grep -o '"method":"[^"]*"' "$STATE_FILE" 2>/dev/null | cut -d'"' -f4 || true)" in
-        download-rejected) : ;;
-        *) _write_state "none" "unavailable" "" "no verifiable prebuilt download and no cargo build available" ;;
-      esac
-    fi
-    rm -f "$LOCK_FILE" 2>/dev/null || true
-  ) >/dev/null 2>&1 </dev/null &
-  local bg=$!
-  disown "$bg" 2>/dev/null || true
-  if [ "$via_flock" = 1 ]; then
-    # The worker subshell inherited fd 9 (the held flock); the hook drops its own
-    # copy so the lock is held by — and only by — the worker, until it exits.
-    _flock_release
+  if _do_download; then :
+  elif _do_cargo; then :
   else
-    # Portable path: hand the lock to the worker's REAL pid — known via $! on
-    # EVERY bash version (unlike $BASHPID, bash-4.0+). Guard with kill -0 so a
-    # fast worker that already finished + removed the lock is not resurrected.
-    if kill -0 "$bg" 2>/dev/null; then
-      printf '%s\n' "$bg" > "$LOCK_FILE" 2>/dev/null || true
-    fi
+    case "$(grep -o '"method":"[^"]*"' "$STATE_FILE" 2>/dev/null | cut -d'"' -f4 || true)" in
+      download-rejected) : ;;
+      *) _write_state "none" "unavailable" "" "no verifiable release download and no cargo build available" ;;
+    esac
   fi
+  rm -f "$LOCK_FILE" 2>/dev/null || true
+  [ "$via_flock" = 1 ] && _flock_release
+  return 0
 }
 
-_provision_bg
+_provision
 exit 0
