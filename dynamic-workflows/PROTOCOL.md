@@ -10,8 +10,15 @@ SPDX-License-Identifier: Apache-2.0
 A **workstream** is a coordination plan for several agents working the same repo. It is
 **not** an execution engine. Rally (the `rally` CLI) facilitates — it records facts, checks
 write boundaries, routes handoffs, and exposes room state. **Each host runs its own agents.**
-This module gives you the descriptor format, a linter that proves a plan is safe to fan out,
-and host-facing skills that map the plan onto the rally primitives.
+This module gives you the descriptor format, a linter that checks a plan's structure before
+you fan out, and host-facing skills that map the plan onto the rally primitives.
+
+> **The linter is not a security boundary.** It checks structure, determinism, MECE write
+> boundaries, dependency integrity, and the charset of the identifiers and paths that get
+> rendered into commands. It does not read your code, sandbox anything, or tell a helpful
+> descriptor from a hostile one. A clean lint does **not** mean a descriptor is safe to run.
+> Treat a descriptor from an author you do not trust the way you would treat a pull request
+> from a stranger. See §1b.
 
 > **The boundary, stated once:** in-memory subagents are a *host* strategy (Claude `Agent`/`Task`,
 > Codex delegation, Pi child agents). They are Tier-1 fan-out, hidden behind the host. Rally never
@@ -35,10 +42,11 @@ documents the same contract.
   "thread": "string",            // optional — the rally thread_id this workstream coordinates under
   "tasks": [                     // required, non-empty
     {
-      "id": "string",            // required, unique across tasks
+      "id": "string",            // required, unique, /^[A-Za-z0-9._-]+$/
       "intent": "string",        // required — what this task achieves
       "owns": ["path", ...] | "read-only",  // required — MECE write scope, or read-only
-      "validation": "string",    // required — the command that verifies the task (deterministic)
+      "validation": "string",    // required — PROSE describing how to verify. Not run.
+      "validation_recipe": "name",           // optional — a recipe from the local registry
       "output": "string",        // required — the expected result shape / artifact
       "tier": "host-native" | "cross-host",  // optional, default host-native
       "depends_on": ["taskId", ...],         // optional — must resolve, no cycles
@@ -47,6 +55,26 @@ documents the same contract.
   ]
 }
 ```
+
+### `validation` is a description; `validation_recipe` is a command
+
+`validation` is free prose written by whoever wrote the descriptor. Nothing checks it and
+nothing runs it. `core/packet.mjs` renders it in a ```` ```text ```` block, never a
+```` ```bash ```` block, and tells the receiving agent to work out the command itself and
+run it under its own host's approval policy. A descriptor cannot hand an agent command text
+to paste into a shell.
+
+When you want a real command in the packet, name a **recipe**:
+
+```jsonc
+"validation": "the rally-cli store tests pass",
+"validation_recipe": "cargo-test"
+```
+
+The recipe's argv lives in `VALIDATION_RECIPES` in `core/workstream-lint.mjs` — local source,
+reviewed like any other code. The descriptor supplies only the name. Current recipes:
+`cargo-clippy`, `cargo-test`, `go-test`, `node-test`, `none`, `npm-test`, `pytest`,
+`shellcheck`. An unknown name is a lint error. Adding one is a code change and a review.
 
 ### Lineage (run / step / parent-step)
 
@@ -64,18 +92,46 @@ omitting them costs only observability, never correctness.
 ### Lint rules (enforced)
 
 1. **Structural completeness** — every task declares `id`, `intent`, `owns`, `validation`, `output`.
-2. **MECE boundaries** — no two write-tasks may `own` overlapping paths (prefix-aware). This is the
-   guarantee that lets agents fan out without colliding. Use `"read-only"` for review/analysis tasks.
+2. **MECE boundaries** — no two write-tasks may `own` overlapping paths (prefix-aware). This is what
+   lets agents fan out without colliding. Use `"read-only"` for review/analysis tasks.
 3. **Determinism** — declared commands (`validation`, `commands[]`) must not contain `Date.now()`,
    `Math.random()`, or `new Date()`; a shared plan must be reproducible. (Rule lifted from
    pi-dynamic-workflows, MIT — see `NOTICE`.)
 4. **Dependency integrity** — `depends_on` ids must resolve; no cycles.
+5. **Charset limits on anything rendered into a command:**
+   - `id` — `/^[A-Za-z0-9._-]+$/`.
+   - `owns` paths — only `[A-Za-z0-9._/-]`, plus an optional trailing `*` or `**` on the last
+     segment. Repo-relative only: no leading `/`, no `..` segment, no `//`, no trailing `/`.
+     Everything else is rejected, including `;` `|` `&` `>` `<` `(` `)` `$` backtick, quotes,
+     backslash, whitespace, and control characters.
+   - `intent`, `output` — no `"`, `$`, backtick, newline, or control character.
+   - `validation` — no triple-backtick fence, no control characters.
+   - `validation_recipe` — must name a recipe in the local registry.
 
 Run it before any fan-out:
 
 ```bash
 node core/workstream-lint.mjs my.workstream.json   # exit 0 valid · 1 violations · 2 parse error
 ```
+
+## 1b. What the linter does not do
+
+Rule 5 exists so that a rendered command cannot be broken out of — an `owns` path cannot append
+a second command to a `--path` argument. It is not a judgement about intent. The linter:
+
+- does not read the code a task will touch, or the diff it produces;
+- does not sandbox, contain, or restrict anything at run time;
+- does not verify that `validation` describes a real or honest check;
+- cannot distinguish a useful task from a hostile one.
+
+`core/packet.mjs` carries the same posture into the packets it renders. Only two kinds of command
+text reach a ```` ```bash ```` block: the rally loop the generator writes itself, and the argv of a
+named recipe from the local registry. Every value interpolated into those commands is POSIX
+shell-quoted (`shellQuote`), so a value stays one argument whatever it contains — including a value
+that never went through the linter. Descriptor prose renders as prose.
+
+Running the work a descriptor describes is the host's call, under the host's own approval policy.
+Rally facilitates; it does not vouch.
 
 ## 2. Spawn tiers
 
@@ -94,7 +150,8 @@ rally enter --tool <you>
   → guard:   rally check before-write --tool <you> --path <owns...> --strict
              (blocking finding → stop, resolve, or pick a non-overlapping task)
   → do the work (host-native or via rally run/inject)
-  → verify:  run task.validation  (must be deterministic)
+  → verify:  run task.validation_recipe if it names one; otherwise read task.validation,
+             decide the command yourself, and run it under this host's approval policy
   → record:  rally say artifact --tool <you> --subject "<task.output>" --uri <path> --evidence "<validation result>"
   → release: rally say release --tool <you> --ref <claim-id> --subject "done"
   → rally next --tool <you>

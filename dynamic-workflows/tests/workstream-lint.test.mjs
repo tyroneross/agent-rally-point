@@ -72,6 +72,9 @@ for (const ch of ['"', "$", "`"]) {
   });
 }
 
+// ARP-002: `owns` moved from a 4-character denylist to a positive allowlist, so the
+// message changed from "must not contain <chars>" to "must contain only <charset>".
+// The assertion still pins an owns-specific rejection of this exact input.
 test("rejects an owns path containing whitespace (would split into multiple --path tokens)", () => {
   const errors = lintWorkstream({
     workstream: "w",
@@ -79,8 +82,8 @@ test("rejects an owns path containing whitespace (would split into multiple --pa
     tasks: [{ id: "x", intent: "i", owns: ["src/my file.js"], validation: "v", output: "o" }],
   });
   assert.ok(
-    errors.some((e) => /owns.*must not contain whitespace/.test(e)),
-    `expected an owns-whitespace error, got: ${errors.join("; ")}`,
+    errors.some((e) => /`owns` path "src\/my file\.js" must contain only/.test(e)),
+    `expected an owns-charset error, got: ${errors.join("; ")}`,
   );
 });
 
@@ -119,7 +122,7 @@ test("rejects an owns path containing a shell metacharacter (\" $ backtick)", ()
       tasks: [{ id: "x", intent: "i", owns: [bad], validation: "v", output: "o" }],
     });
     assert.ok(
-      errors.some((e) => /owns.*must not contain/.test(e)),
+      errors.some((e) => /`owns` path .* must contain only/.test(e)),
       `expected an owns shell-metachar error for ${JSON.stringify(bad)}, got: ${errors.join("; ")}`,
     );
   }

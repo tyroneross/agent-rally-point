@@ -56,16 +56,28 @@ const DESCRIPTOR = {
 };
 const RUN = "run-empirical-001";
 
-/** Split a `rally ...` line into argv (the emitted lines use plain space-delimited,
- *  shell-safe tokens — the lint guarantees no whitespace/quote chars get this far). */
+/** Split a `rally ...` line into argv.
+ *
+ *  Safety comes from packet.mjs's shellQuote(), NOT from the lint. The lint
+ *  constrains identifiers; the renderer quotes every emitted value. So this
+ *  tokenizer must understand POSIX single-quoted spans ('...' with '\'' escapes)
+ *  as well as double-quoted spans and bare tokens.
+ *
+ *  It used to honor double quotes only. When --subject moved to single-quoting
+ *  (ARP-002), that stale assumption split `'wire a and b'` into four tokens and
+ *  fed stray positionals to the real CLI. The emitted command was correct; the
+ *  tokenizer was not. */
 function railsToArgv(line) {
   // Drop a trailing line-continuation backslash if present.
   const clean = line.replace(/\\\s*$/, "").trim();
-  // Tokenize, honoring double-quoted --subject "..." spans.
   const out = [];
-  const re = /"([^"]*)"|(\S+)/g;
+  const re = /'((?:[^']|'\\'')*)'|"([^"]*)"|(\S+)/g;
   let m;
-  while ((m = re.exec(clean)) !== null) out.push(m[1] !== undefined ? m[1] : m[2]);
+  while ((m = re.exec(clean)) !== null) {
+    if (m[1] !== undefined) out.push(m[1].replaceAll("'\\''", "'"));
+    else if (m[2] !== undefined) out.push(m[2]);
+    else out.push(m[3]);
+  }
   return out.slice(1); // drop the leading "rally"
 }
 

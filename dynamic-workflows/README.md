@@ -4,14 +4,20 @@
 # Rally Flow
 
 > **Rally Flow** — Agent Rally Point's take on dynamic workflows. The host-side workstream protocol
-> + guardrail + skills + durable resume that sits on rally. *Rally facilitates; hosts execute.*
+> + descriptor linter + skills + durable resume that sits on rally. *Rally facilitates; hosts execute.*
 > (Implemented in this `dynamic-workflows/` directory.)
 
 A **portable, self-contained module** — workstream protocol + a zero-dependency descriptor linter
-(guardrail) + host-facing skills (Claude, Codex) — that lets any agent coordinate a multi-agent
-workstream through the `rally` CLI. **Rally facilitates; hosts execute.**
++ host-facing skills (Claude, Codex) — that lets any agent coordinate a multi-agent workstream
+through the `rally` CLI. **Rally facilitates; hosts execute.**
 
 Drop this directory into any repo. No install required; no runtime dependencies.
+
+**The linter is not a security boundary.** It checks structure, determinism, MECE write boundaries,
+dependency integrity, and the charset of anything rendered into a command. It does not read your
+code, sandbox anything, or judge intent. A clean lint does not mean a descriptor is safe to run —
+a descriptor from an author you do not trust is untrusted input. `PROTOCOL.md §1b` states the limits
+in full.
 
 ---
 
@@ -22,13 +28,14 @@ Drop this directory into any repo. No install required; no runtime dependencies.
 | `PROTOCOL.md` | Canonical spec: descriptor format, lint rules, spawn tiers, the agent loop, and **durable fan-out & resume** |
 | `COORDINATION.md` | Frontier-agent coordination doctrine — two modes, the rules (first-agent-is-lead, proactive engagement, instruction contract), rally-facilitates-not-coordinates |
 | `MODEL-TIERS.md` | Host-neutral model-tier taxonomy (frontier/executing/fast) + the empirical A/B verdict |
-| `core/workstream-lint.mjs` | Zero-dependency linter — validates a descriptor before fan-out (exits 0/1/2) |
+| `core/workstream-lint.mjs` | Zero-dependency linter — structure, determinism, MECE boundaries, dependency integrity, and command-charset limits (exits 0/1/2). Also holds `VALIDATION_RECIPES`, the local registry of named commands a descriptor may ask for by name |
+| `core/packet.mjs` | Renders a ready-to-paste prompt packet per task. Shell-quotes every value; only the rally loop and a named recipe reach a ```` ```bash ```` block |
 | `core/workstream-status.mjs` | **Resume helper** — derives done/claimed/pending + the `to_dispatch` set from a `rally room` snapshot (the durable counterpart to pi's in-memory progress) |
 | `core/route.mjs` | **Deterministic routing** (ported host-neutral from pi): `parallel`/`pipeline`/`budget` + onError/abort failure-visibility |
 | `core/limiter.mjs` | Bounded-concurrency helper hosts can use to cap their own Tier-1 fan-out |
 | [`../skills/rally-workflows/SKILL.md`](../skills/rally-workflows/SKILL.md) | Host-neutral Rally Flow skill (moved out of this module) mapping a workstream onto rally primitives; references `PROTOCOL.md` |
 | `examples/*.workstream.json` | One valid + two invalid descriptors (linter demos) |
-| `tests/*.test.mjs` | Tests across lint / status / route / limiter (Node built-in runner) — run `npm test` |
+| `tests/*.test.mjs` | Tests across lint / packet / status / route / limiter (Node built-in runner) — run `npm test`. `tests/injection.test.mjs` is the adversarial suite: every test is an attack on the linter or the renderer |
 | `package.json` | Module manifest; no runtime dependencies (exports: lint/status/route/limiter) |
 | `NOTICE` | MIT attribution for the portions lifted from pi-dynamic-workflows |
 
@@ -72,7 +79,8 @@ via [tyroneross/pi-dynamic-workflows-fork](https://github.com/tyroneross/pi-dyna
 - Pi SDK and TUI plumbing.
 
 **Why:** Rally is a coordination facilitator, never an executor. Keeping execution machinery here
-would blur the boundary that makes the module safe to embed in any host. See `PROTOCOL.md §5`.
+would blur the boundary this module is built around: it emits text, a host decides what to run.
+See `PROTOCOL.md §5`.
 
 ---
 

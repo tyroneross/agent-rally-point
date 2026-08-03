@@ -11,12 +11,24 @@
 /**
  * workstream-lint — validate a JSON workstream descriptor before fan-out.
  *
- * A workstream is a coordination plan, not an execution engine. This linter is
- * the guardrail that makes a descriptor safe to hand to several agents:
+ * A workstream is a coordination plan, not an execution engine. This linter
+ * checks four things:
  *   1. structural completeness  (every task declares owns + validation + output)
  *   2. determinism              (no Date.now()/Math.random()/new Date() in commands)
  *   3. MECE boundaries          (no two write-tasks own overlapping paths)
  *   4. dependency integrity     (depends_on ids resolve; no cycles)
+ *
+ * It also constrains the charset of the identifiers and paths that packet.mjs
+ * renders into shell command text, so a rendered command cannot be broken out of.
+ *
+ * WHAT THIS LINTER IS NOT: it is not a security boundary. A clean lint does NOT
+ * mean a descriptor is safe to execute. It does not read the code a task will
+ * touch, it does not sandbox anything, and it cannot tell a helpful task from a
+ * hostile one. `validation`, `description`, `intent`, and `output` are free prose
+ * written by whoever wrote the descriptor — treat a descriptor from an author you
+ * do not trust as untrusted input, exactly like a pull request from a stranger.
+ * Running anything a descriptor describes is the host's decision, under the host's
+ * own approval policy.
  *
  * Usage:  node workstream-lint.mjs <descriptor.json>
  * Exit:   0 clean · 1 lint violations · 2 usage/parse error
@@ -31,8 +43,118 @@ const DETERMINISM_BLOCKLIST = /\bDate\s*\.\s*now\b|\bMath\s*\.\s*random\b|\bnew\
 
 const TIERS = new Set(["host-native", "cross-host"]);
 
+/**
+ * Named validation recipes — the ONLY command text this module will ever render
+ * into a runnable block.
+ *
+ * A descriptor author picks a recipe by NAME (`"validation_recipe": "cargo-test"`).
+ * The argv lives here, in local source, under this repo's review. A descriptor can
+ * never supply command text that reaches a bash block; that is the whole point of
+ * the indirection. Adding a recipe is a code change, reviewed like any other.
+ *
+ * `appendOwnedPaths` lets a file-scoped tool receive the task's own `owns` paths as
+ * arguments. The renderer shell-quotes each one; they are already charset-limited by
+ * the `owns` allowlist below.
+ */
+export const VALIDATION_RECIPES = Object.freeze({
+  none: Object.freeze({
+    argv: Object.freeze([]),
+    description: "no automated check — the agent states in its artifact evidence how it verified",
+  }),
+  "cargo-test": Object.freeze({
+    argv: Object.freeze(["cargo", "test"]),
+    description: "Rust workspace test suite",
+  }),
+  "cargo-clippy": Object.freeze({
+    argv: Object.freeze(["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]),
+    description: "Rust lint, warnings denied",
+  }),
+  "npm-test": Object.freeze({
+    argv: Object.freeze(["npm", "test"]),
+    description: "the package's own npm test script",
+  }),
+  "node-test": Object.freeze({
+    argv: Object.freeze(["node", "--test"]),
+    description: "Node built-in test runner",
+  }),
+  pytest: Object.freeze({
+    argv: Object.freeze(["python3", "-m", "pytest", "-q"]),
+    description: "pytest, quiet",
+  }),
+  "go-test": Object.freeze({
+    argv: Object.freeze(["go", "test", "./..."]),
+    description: "Go test suite",
+  }),
+  shellcheck: Object.freeze({
+    argv: Object.freeze(["shellcheck"]),
+    appendOwnedPaths: true,
+    description: "shellcheck over the task's owned paths",
+  }),
+});
+
+/** Recipe names, sorted — for error messages and docs. */
+export const VALIDATION_RECIPE_NAMES = Object.freeze(Object.keys(VALIDATION_RECIPES).sort());
+
+/** Look a recipe up without inheriting anything from Object.prototype. */
+export function lookupRecipe(name) {
+  if (typeof name !== "string") return null;
+  return Object.hasOwn(VALIDATION_RECIPES, name) ? VALIDATION_RECIPES[name] : null;
+}
+
+/**
+ * Identifiers rendered bare into command text (task ids, run ids, tool prefixes).
+ * Positive allowlist: letters, digits, dot, underscore, hyphen. Nothing else — no
+ * whitespace, no quotes, no shell metacharacter, no path separator, no control char.
+ */
+export const IDENTIFIER_RE = /^[A-Za-z0-9._-]+$/;
+
+/** C0 controls + DEL. These have no place in a one-line command argument. */
+const CONTROL_CHARS_RE = /[\u0000-\u001F\u007F]/;
+/** Same, but tolerating LF — for fields that may legitimately span lines. */
+const CONTROL_CHARS_NO_LF_RE = /[\u0000-\u0009\u000B-\u001F\u007F]/;
+
+/** Characters allowed anywhere in an `owns` path, before the structural checks. */
+const OWNS_CHARSET_RE = /^[A-Za-z0-9._/*-]+$/;
+/** A single path segment: one or more allowlisted chars, no glob. */
+const OWNS_SEGMENT_RE = /^[A-Za-z0-9._-]+$/;
+/** The LAST segment may end in a `*` or `**` glob (`docs/*`, `src/**`, `plan-*`). */
+const OWNS_LAST_SEGMENT_RE = /^[A-Za-z0-9._-]*\*{0,2}$/;
+
 function isNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
+}
+
+/**
+ * Validate one `owns` path against the positive allowlist.
+ * Returns null if acceptable, else a human-readable reason.
+ *
+ * Rejects, among everything else not on the allowlist: `;` `|` `&` `>` `<` `(` `)`
+ * `$` backtick, quotes, whitespace, backslash, newline, and any control character —
+ * so a path can never append a second command to a rendered `--path` argument.
+ * Also rejects absolute paths and any `..` segment, so a path cannot escape the repo.
+ */
+export function ownsPathProblem(p) {
+  if (typeof p !== "string" || p.length === 0) return "must be a non-empty string";
+  if (!OWNS_CHARSET_RE.test(p)) {
+    return "must contain only [A-Za-z0-9._/-] plus a trailing * or ** glob — no whitespace, quotes, or shell metacharacters";
+  }
+  if (p.startsWith("/")) return "must be repo-relative, not absolute (leading /)";
+  if (p.endsWith("/")) return "must not end in a path separator";
+  const segments = p.split("/");
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (seg.length === 0) return "must not contain an empty path segment (//)";
+    if (seg === "." || seg === "..") return "must not contain a . or .. segment (path escape)";
+    const last = i === segments.length - 1;
+    if (last) {
+      if (!OWNS_LAST_SEGMENT_RE.test(seg)) {
+        return "may only use * or ** as a trailing glob on the last segment";
+      }
+    } else if (!OWNS_SEGMENT_RE.test(seg)) {
+      return "may only use * or ** as a trailing glob on the last segment";
+    }
+  }
+  return null;
 }
 
 /** Normalize a task's `owns` into an array of owned path strings (empty for read-only). */
@@ -94,21 +216,24 @@ export function lintWorkstream(doc) {
 
     const label = isNonEmptyString(task.id) ? task.id : where;
 
+    // `intent` and `output` are prose that packet.mjs renders into a --subject
+    // argument. The renderer shell-quotes them (packet.mjs `shellQuote`), so quoting
+    // characters cannot break the token — but a newline or control character would
+    // still corrupt a one-line command and mangle the recorded fact, so reject those
+    // here. The `" $ backtick` rejection stays as defence in depth: a subject that
+    // needs none of them is one fewer thing for a reviewer to reason about.
     if (!isNonEmptyString(task.intent)) e(`task ${label}: \`intent\` must be a non-empty string`);
-    // packet.mjs interpolates `intent` inside a double-quoted bash --subject. A
-    // double-quote, `$`, or backtick would break out of that quoting (or trigger
-    // shell expansion / command substitution) in the emitted rally command.
     else if (/["$`]/.test(task.intent)) {
-      e(`task ${label}: \`intent\` must not contain " $ or backtick — they break the emitted bash --subject quoting`);
+      e(`task ${label}: \`intent\` must not contain " $ or backtick — it is rendered into a bash --subject argument`);
+    } else if (CONTROL_CHARS_RE.test(task.intent)) {
+      e(`task ${label}: \`intent\` must not contain a newline or control character — it is rendered into a one-line bash --subject argument`);
     }
     if (!isNonEmptyString(task.validation)) e(`task ${label}: \`validation\` must be a non-empty string (how to verify the task)`);
     if (!isNonEmptyString(task.output)) e(`task ${label}: \`output\` must be a non-empty string (expected result shape)`);
-    // packet.mjs interpolates `output` inside a double-quoted bash --subject at
-    // the `rally say artifact` line, exactly like `intent` on the claim line. The
-    // same characters break out of that quoting (or trigger shell expansion /
-    // command substitution) in the emitted rally command.
     else if (/["$`]/.test(task.output)) {
-      e(`task ${label}: \`output\` must not contain " $ or backtick — they break the emitted bash --subject quoting`);
+      e(`task ${label}: \`output\` must not contain " $ or backtick — it is rendered into a bash --subject argument`);
+    } else if (CONTROL_CHARS_RE.test(task.output)) {
+      e(`task ${label}: \`output\` must not contain a newline or control character — it is rendered into a one-line bash --subject argument`);
     }
 
     // owns: required — either the literal "read-only" or a non-empty array of path strings
@@ -118,13 +243,13 @@ export function lintWorkstream(doc) {
       e(`task ${label}: \`owns\` must be "read-only" or a non-empty array of path strings`);
     } else {
       for (const p of ownedPaths(owns)) {
-        // packet.mjs emits owns paths bare (unquoted) as `--path <p>` on the
-        // rally claim + before-write lines. Whitespace would split one path into
-        // multiple shell tokens (silently claiming the wrong boundary); a quote,
-        // `$`, or backtick would break quoting or trigger shell expansion /
-        // command substitution in those bare positions.
-        if (/[\s"$`]/.test(p)) {
-          e(`task ${label}: \`owns\` path "${p}" must not contain whitespace, " $ or backtick — it is emitted bare as a --path token in the rally claim/before-write commands`);
+        // Positive allowlist (see ownsPathProblem). packet.mjs also shell-quotes each
+        // path, so these two checks are independent: the allowlist keeps the declared
+        // boundary readable and repo-relative; the quoting keeps the rendered token
+        // intact even for a path that never passed through this linter.
+        const problem = ownsPathProblem(p);
+        if (problem) {
+          e(`task ${label}: \`owns\` path "${p}" ${problem}`);
         }
         writeOwners.push({ id: label, path: p });
       }
@@ -134,9 +259,31 @@ export function lintWorkstream(doc) {
       e(`task ${label}: \`tier\` must be one of ${[...TIERS].join(" | ")}`);
     }
 
+    // validation_recipe: optional. It names a recipe from the LOCAL registry above;
+    // an unknown name is a hard error rather than a silent fall-through to prose,
+    // because the recipe is the only path by which a task gets a runnable command.
+    if (task.validation_recipe !== undefined) {
+      if (!lookupRecipe(task.validation_recipe)) {
+        e(
+          `task ${label}: \`validation_recipe\` must be one of ${VALIDATION_RECIPE_NAMES.join(" | ")} — recipes are defined locally in workstream-lint.mjs; a descriptor cannot supply command text`,
+        );
+      }
+    }
+
     // determinism: scan the declared validation string + every command for the blocklist
     if (isNonEmptyString(task.validation) && DETERMINISM_BLOCKLIST.test(task.validation)) {
       e(`task ${label}: \`validation\` is non-deterministic (Date.now()/Math.random()/new Date()) — declared commands must be reproducible`);
+    }
+    // `validation` renders inside a fenced markdown block. A backtick run of three or
+    // more is an attempt (deliberate or accidental) to close that fence early and
+    // inject its own block — including a ```bash block the reader would then trust.
+    // The renderer widens its fence to survive this; reject it here as well so the
+    // descriptor itself stays reviewable.
+    if (isNonEmptyString(task.validation) && /```/.test(task.validation)) {
+      e(`task ${label}: \`validation\` must not contain a triple-backtick fence — it would break out of the markdown block the packet renders it in`);
+    }
+    if (isNonEmptyString(task.validation) && CONTROL_CHARS_NO_LF_RE.test(task.validation)) {
+      e(`task ${label}: \`validation\` must not contain control characters`);
     }
     if (Array.isArray(task.commands)) {
       task.commands.forEach((cmd, ci) => {
