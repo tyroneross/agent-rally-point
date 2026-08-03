@@ -259,6 +259,12 @@ Seven findings from the first genuinely independent security read of this repo
 Why every existing gate stayed dormant:
 [`rca-2026-08-02-security-findings-escaped.md`](rca-2026-08-02-security-findings-escaped.md).
 
+⚠️ **Every `controlled` grading in RC-013..RC-025 is pending independent Codex verification** of
+`fdfc750..HEAD`, running separately from the session that dispatched this work. The gradings are
+this run's own, and this run has already been wrong once about a `controlled` claim — RC-017 was
+graded closed on a property a live probe disproved. Treat them as provisional until that verdict
+lands, and re-grade rather than defend if it disagrees.
+
 The process root cause spanning all seven, recorded once here rather than repeated per entry:
 **every prior review was scoped to "is this mechanism implemented correctly?" and never to
 "should this mechanism exist here at all?"** The provisioner survived four numbered audit rounds
