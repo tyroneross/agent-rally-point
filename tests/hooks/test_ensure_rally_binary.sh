@@ -21,6 +21,7 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
 HOOK="$REPO_ROOT/hooks/ensure-rally-binary.sh"
+. "$REPO_ROOT/tests/hooks/lib/hermetic_path.sh"
 
 # Stand in for the explicit installer. Exported so every sandboxed subshell
 # below inherits it; `env -i` call sites pass it by hand.
@@ -370,38 +371,9 @@ exit $2
 STUB
     chmod +x "$1/gh"
   }
-  # A system PATH with ONE tool removed, so "tool is absent" is true on every host.
-  #
-  # These tests used PATH="$sb/tools:/usr/bin:/bin" and assumed `gh` was absent
-  # because no stub was written. That held on a Mac, where gh lives in
-  # /opt/homebrew/bin, and was FALSE on the GitHub Actions Linux runner, which
-  # ships gh at /usr/bin/gh. One test then failed only in CI, and its sibling
-  # passed in CI for the wrong reason — it took the attestation-failed path
-  # instead of the no-gh path it claimed to exercise.
-  #
-  # A test whose premise depends on the host's software inventory is not a test.
-  # Mirror the system dirs as symlinks, minus the named tool, and the absence is
-  # a fact we established rather than one we hoped for.
-  _write_path_without() {  # $1=mirror_dir  $2=tool_to_omit
-    local mirror="$1" omit="$2" d f base
-    mkdir -p "$mirror"
-    for d in /usr/bin /bin; do
-      [ -d "$d" ] || continue
-      for f in "$d"/*; do
-        [ -e "$f" ] || continue
-        base="$(basename "$f")"
-        [ "$base" = "$omit" ] && continue
-        [ -e "$mirror/$base" ] && continue      # first dir on the list wins, like PATH
-        ln -s "$f" "$mirror/$base" 2>/dev/null || true
-      done
-    done
-    # Prove the premise instead of assuming it.
-    if PATH="$mirror" command -v "$omit" >/dev/null 2>&1; then
-      printf 'test harness: %s is still resolvable in the mirrored PATH\n' "$omit" >&2
-      return 1
-    fi
-    return 0
-  }
+  # RC-025 hermetic PATH helper lives in lib/hermetic_path.sh (shared with
+  # test_no_autoprovision.sh so the two cannot drift).
+  _write_path_without() { write_path_without "$@"; }
   _poll_method() {  # $1=state_file ; echoes terminal method
     local m=""
     for _ in $(seq 1 40); do

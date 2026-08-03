@@ -24,6 +24,7 @@ set -u
 # (deliberately not -e: we assert on exit codes)
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
+. "$REPO_ROOT/tests/hooks/lib/hermetic_path.sh"
 HOOK="$REPO_ROOT/hooks/rally-coordination-hook.sh"
 ENGINE="$REPO_ROOT/hooks/ensure-rally-binary.sh"
 
@@ -268,8 +269,11 @@ T="ARP-001: installer refuses the download path without gh"
   # curl + shasum present, gh absent.
   printf '#!/usr/bin/env bash\nexit 0\n' > "$sb/stub/curl";   /bin/chmod +x "$sb/stub/curl"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$sb/stub/shasum"; /bin/chmod +x "$sb/stub/shasum"
+  # RC-025: gh must be provably absent. CI runners ship it at /usr/bin/gh, so
+  # "no stub written" is not "not installed" — assert the premise.
+  write_path_without "$sb/nogh" gh || exit 1
   out=$(HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" \
-        PATH="$sb/stub:/usr/bin:/bin" "$installer" --yes 2>&1)
+        PATH="$sb/stub:$sb/nogh" "$installer" --yes 2>&1)
   rc=$?
   [ "$rc" != "0" ] || { printf 'installer must refuse without gh, got rc=0: %s\n' "$out" >&2; exit 1; }
   printf '%s' "$out" | grep -q "Refusing the download path" \
