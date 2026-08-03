@@ -487,6 +487,34 @@ review answers the question you asked.
   trail; it is not authentication, and RC-017 says so in the same terms.
 - **Not `controlled` overall:** no test asserts that a reconnecting iOS client retains control.
 
+### RC-023 — wiring the hook suites into the release gate made that gate recursive and flaky
+- **State:** `controlled` as of `bf78424`. **Self-inflicted during the issue #52 remediation** and
+  recorded because the standing rule has no exception for "we caused it and we fixed it".
+- **Mechanism:** `check-release-parity.sh` ran a hardcoded list of three hook suites while seven
+  existed, so `test_no_autoprovision.sh` and `test_context_sanitization.sh` — the adversarial
+  controls closing RC-013 and RC-016 — ran in no gate at all. Replacing the list with a glob over
+  `tests/hooks/test_*.sh` fixed that and introduced a worse problem: `.githooks/pre-push` invokes
+  `check-release-parity.sh`, and `test_prepush_*.sh` drives that hook end to end. Parity → prepush
+  suite → hook → parity. **Measured at 6 nested invocations in one run**, competing for the same
+  detached worktrees.
+- **Evidence it was flaky, not merely slow:** two consecutive runs on an identical tree returned
+  `exit 1` then `exit 0`. Caught only because the exit code was checked rather than the printed
+  `✅ all versions aligned` line, which appeared in both.
+- **Why this belongs here rather than being quietly amended:** a gate whose verdict depends on a
+  race is worse than the gap it replaced. It certifies failures as passes. RC-006 (local gate
+  green, CI red) and RC-012 (main red for 19 days, unnoticed) are the same pathology already on
+  this register, and this entry is the third instance — which makes "gates that report a verdict
+  they did not earn" a pattern in its own right, not three accidents.
+- **Fix:** the parity gate skips `test_prepush_*` by name with the reason written at the skip; the
+  pre-push suites run in CI, where nothing re-enters them, and the CI step fails on an empty glob
+  rather than passing vacuously.
+- **Adversarial control:** reliability measured, not assumed — **5/5 consecutive passes** and
+  **0 nested `pre-push:` invocations** after the fix, against 6 before. The empty-glob guard exists
+  on both sides so neither surface can pass zero tests silently.
+- **Lesson:** a coverage fix that routes a gate through a test of that same gate is a recursion,
+  and recursion in a gate reads as flake. Check the invocation graph before globbing, and measure
+  N-consecutive reliability rather than trusting one green run.
+
 ## Working hypothesis across entries
 
 RC-001, RC-005, and RC-007 share one shape: **an operation returns success for a step that is
