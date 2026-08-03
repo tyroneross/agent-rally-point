@@ -148,9 +148,21 @@ fi
 # is a hypothesis (see docs/ROOT-CAUSE-REGISTER.md), and a list someone must
 # remember to extend will drift again the next time a suite is added. Globbing
 # removes the remembering.
+#
+# EXCEPT the pre-push suites. `.githooks/pre-push` invokes THIS script, and
+# test_prepush_*.sh drives that hook end to end. Running them here recurses:
+# parity → prepush suite → hook → parity → … Measured at 6 nested invocations,
+# competing for the same detached worktrees, which made this gate return 1 and
+# then 0 on identical trees. A gate whose verdict depends on a race certifies
+# failures as passes, so the recursion is cut here rather than tolerated.
+# The pre-push suites run in CI instead (.github/workflows/ci.yml), where
+# nothing re-enters them.
 _host_tests_found=0
 for host_test in tests/hooks/test_*.sh; do
   [ -f "$host_test" ] || continue          # no glob match → literal string
+  case "$(basename "$host_test")" in
+    test_prepush_*) continue ;;            # see recursion note above
+  esac
   _host_tests_found=$((_host_tests_found + 1))
   if ! "$host_test" >&2; then
     echo "check-release-parity: HOST TEST FAILED — $host_test" >&2
