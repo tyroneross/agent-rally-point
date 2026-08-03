@@ -544,6 +544,51 @@ review answers the question you asked.
   and recursion in a gate reads as flake. Check the invocation graph before globbing, and measure
   N-consecutive reliability rather than trusting one green run.
 
+### RC-024 — the issue #52 remediation shipped seven defects of the class it was fixing
+- **State:** `controlled` for the seven blocking findings (adversarial tests + 11 mutations, all
+  convicting). **Open** as a process observation.
+- **How they were found:** the remediation was reviewed adversarially before push — an independent
+  auditor and a security reviewer, both told to assume a second untrusted contributor. Between them
+  they found 1 Critical, 4 High, and a set of Mediums **in the fixes themselves**.
+- **The Critical is the one that matters.** `SEC-001`: ARP-001 removed provisioning from the hook
+  path, and the same hook still resolved `RALLY_BIN` by preferring `./target/debug/rally`. A hostile
+  repo commits `.rally/log/*.jsonl` (committed by design, so the `.rally` self-gate is not a
+  mitigation) plus an executable `target/debug/rally`, and opening and trusting the repo executes
+  it. **The fix for "a hook must not execute a repo-supplied binary" left a hook executing a
+  repo-supplied binary**, twenty lines away, because the change was scoped to the provisioning call
+  sites and never asked what else in that file runs something.
+- **The others, each a claim outrunning its implementation:**
+  - `SEC-004` — the untrusted-data preamble was chosen by sniffing the untrusted data for the
+    preamble's own marker. The label could be suppressed by the thing it was labelling.
+  - `SEC-005` — the ARP-006 pin self-disabled when `RALLY_PREPUSH_GATE_PIN_REF` named the pushed
+    ref, while printing an affirmative "pinned" line. A no-op that reports success.
+  - `SEC-003` — `gh attestation verify --repo` accepts an attestation from ANY workflow in the repo,
+    so the "independent authority" was not pinned to the signer. The comment described a check the
+    code did not perform.
+  - `SEC-002` — the release tag flowed unvalidated from committed JSON into a download URL.
+  - `SEC-012` — a failed attestation, which is active-substitution evidence, was overwritten by a
+    later cargo success and the installer printed `Installed`.
+  - `RC-017` was graded `controlled` on a property it does not have (see that entry).
+  - `RC-015` claimed the fail-safe corrected "UI copy" when no Swift was touched.
+- **Root cause — the same one as RC-A/RC-C, turned on ourselves.** Each fix was scoped to the
+  finding as written. ARP-001 said "provisioning"; we removed provisioning. It did not say "and
+  everything else in this file that executes something", so we did not look. That is
+  *solicited-review shape* reproduced inside the remediation: **answering the question you were
+  handed rather than the question the finding implies.** And five of the seven are claims that
+  outran their implementation, which is RC-C committed while fixing RC-C.
+- **What actually worked, and is the transferable lesson:** the defects were caught *before push*
+  by review that was told to choose its own scope and to assume a hostile second contributor. Not
+  by tests — every suite was green. Not by the implementers — all four reported honest,
+  mutation-validated work. **Adversarial review of the remediation is not optional overhead; it
+  found a Critical that every other control passed.**
+- **Adversarial controls:** 130 assertions across 7 hook suites, 11 mutations each producing the
+  expected failure. Notable: the `SEC-004` mutation passed on its first run because the harness
+  reverted only one of two duplicated renderer blocks — *a partial revert of a duplicated defence
+  looks exactly like a passing test*, which is the same shape as the finding being tested.
+- **Also from this round:** a test wrote `etc/hostile.jsonl` into the repo whenever it ran with the
+  fix reverted, because its traversal payload was CWD-relative. A test that litters the working tree
+  when it fails is a test you stop trusting. Anchored in a tmpdir.
+
 ## Working hypothesis across entries
 
 RC-001, RC-005, and RC-007 share one shape: **an operation returns success for a step that is
