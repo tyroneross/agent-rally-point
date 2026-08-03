@@ -99,6 +99,10 @@ uv.lock
 cockpitd.db
 cockpitd.db-shm
 cockpitd.db-wal
+# The audit log is a sibling of COCKPIT_DB, so it lands here too.
+cockpitd.db.audit.db
+cockpitd.db.audit.db-shm
+cockpitd.db.audit.db-wal
 
 # Runtime coordination state + backups + local bundles (never commit; see 2026-07-02 takeover)
 .rally.bak-*/

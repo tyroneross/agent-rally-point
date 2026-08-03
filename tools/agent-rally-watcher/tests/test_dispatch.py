@@ -81,11 +81,22 @@ def test_file_sink_rejects_path_outside_root(tmp_path: Path, tmp_path_factory) -
     assert not escape_target.exists()
 
 
-def test_file_sink_rejects_relative_path_traversal(tmp_path: Path) -> None:
-    """A relative path with '../' segments that would land outside the root is REJECTED."""
-    result = dispatch(REC, {"type": "file", "path": "../../etc/hostile.jsonl"})
+def test_file_sink_rejects_relative_path_traversal(tmp_path: Path, monkeypatch) -> None:
+    """A relative path with '../' segments that would land outside the root is REJECTED.
+
+    The traversal is anchored inside a tmpdir rather than written as a bare
+    '../../etc/...'. That earlier form resolved against the CWD, so a run with the
+    fix reverted — a mutation check, exactly what this test exists to survive —
+    wrote a real file into the repo at etc/hostile.jsonl. A test that litters the
+    working tree when it fails is a test you stop trusting.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path / "a" / "b")
+    result = dispatch(REC, {"type": "file", "path": "../../escaped/hostile.jsonl"})
     assert not result.delivered
     assert "escapes allowed root" in result.detail
+    assert not (tmp_path / "escaped" / "hostile.jsonl").exists()
 
 
 def test_file_sink_rejects_symlink_leaf(tmp_path: Path, tmp_path_factory) -> None:
