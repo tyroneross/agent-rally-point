@@ -15,7 +15,12 @@ from typing import Iterable
 
 import pytest
 
-from agent_rally_watcher.cursor import load_cursor
+from agent_rally_watcher.cursor import (
+    load_cursor,
+    load_quarantine_ack,
+    quarantine_path,
+    save_quarantine_ack,
+)
 from agent_rally_watcher.filter import Consumer, FilterRule
 from agent_rally_watcher.watcher import Watcher, _process_once, run_watcher
 
@@ -260,6 +265,144 @@ def test_seek_to_end_does_not_clobber_existing_cursor(tmp_path: Path) -> None:
     # All 5 records dispatched because cursor was at 0 and was not clobbered
     lines = (tmp_path / "restart.out.jsonl").read_text(encoding="utf-8").strip().split("\n")
     assert len(lines) == 5
+
+
+# ===========================================================================
+# ARP-007 adversarial controls — quarantine semantics
+# ===========================================================================
+
+
+def test_malformed_line_is_quarantined_and_stalls_cursor(tmp_path: Path) -> None:
+    """A corrupt complete line is NOT silently skipped: it lands in the
+    quarantine ledger, is surfaced via a warning log, and the cursor does
+    NOT advance past it (nor past anything after it) until acknowledged."""
+    channel_dir = tmp_path / "channel"
+    cursor_root = tmp_path / "cursors"
+    changes = _seed_channel(channel_dir)  # 5 well-formed records
+    pre_corrupt_size = changes.stat().st_size
+
+    corrupt_line = "{not valid json at all"
+    good_line_after = json.dumps({"kind": "feedback", "run_id": "after-corrupt", "payload": {}})
+    with open(changes, "a", encoding="utf-8") as fh:
+        fh.write(corrupt_line + "\n")
+        fh.write(good_line_after + "\n")
+
+    rule = FilterRule()  # match everything
+    consumer = _consumer(tmp_path, "quarantine_test", rule)
+    watcher = Watcher(channel_dir=channel_dir, consumers=[consumer], cursor_root=cursor_root)
+
+    delivered = _process_once(watcher)
+
+    # The 5 pre-existing (good) fixture records dispatch normally — this is
+    # the FIRST-ever sweep for this consumer, so they're read in the SAME
+    # sweep that then hits the corrupt line. The good record AFTER the
+    # corrupt line must NOT have dispatched — the consumer stalls at the
+    # corrupt line, so nothing queued behind it gets silently lost OR
+    # silently delivered out of a broken sequence.
+    assert delivered.get("quarantine_test", 0) == 5
+    out_path = tmp_path / "quarantine_test.out.jsonl"
+    out_text = out_path.read_text(encoding="utf-8")
+    assert len(out_text.strip().split("\n")) == 5
+    assert "after-corrupt" not in out_text
+
+    # Cursor sits exactly at the byte offset where the corrupt line starts —
+    # NOT advanced past it (this is the direct fix for the audit finding:
+    # the old behavior advanced the cursor past corrupt lines silently).
+    cursor = load_cursor("quarantine_test", root=cursor_root)
+    assert cursor.offset == pre_corrupt_size
+
+    # The raw corrupt line landed in the quarantine ledger — durable,
+    # inspectable record; NOT a silent drop.
+    qpath = quarantine_path("quarantine_test", cursor_root)
+    assert qpath.exists()
+    entries = [json.loads(line) for line in qpath.read_text(encoding="utf-8").splitlines()]
+    assert len(entries) == 1
+    assert entries[0]["offset"] == pre_corrupt_size
+    assert entries[0]["raw"].rstrip("\n") == corrupt_line
+    assert "error" in entries[0] and entries[0]["error"]
+
+
+def test_quarantine_does_not_duplicate_across_repeated_stalled_sweeps(tmp_path: Path) -> None:
+    """Re-sweeping while stalled at the same corrupt line must not bloat the
+    quarantine ledger with duplicate entries."""
+    channel_dir = tmp_path / "channel"
+    cursor_root = tmp_path / "cursors"
+    changes = _seed_channel(channel_dir)
+    with open(changes, "a", encoding="utf-8") as fh:
+        fh.write("{still not valid json\n")
+
+    rule = FilterRule()
+    consumer = _consumer(tmp_path, "repeat_stall", rule)
+    watcher = Watcher(channel_dir=channel_dir, consumers=[consumer], cursor_root=cursor_root)
+
+    _process_once(watcher)
+    _process_once(watcher)
+    _process_once(watcher)
+
+    qpath = quarantine_path("repeat_stall", cursor_root)
+    entries = qpath.read_text(encoding="utf-8").splitlines()
+    assert len(entries) == 1
+
+
+def test_quarantine_ack_unstalls_the_consumer(tmp_path: Path) -> None:
+    """After the operator acknowledges the quarantined offset, the consumer
+    resumes forward progress — including the good record queued behind the
+    bad line — without re-quarantining."""
+    channel_dir = tmp_path / "channel"
+    cursor_root = tmp_path / "cursors"
+    changes = _seed_channel(channel_dir)
+    pre_corrupt_size = changes.stat().st_size
+    corrupt_line = "{not valid json at all"
+    with open(changes, "a", encoding="utf-8") as fh:
+        fh.write(corrupt_line + "\n")
+        fh.write(json.dumps({"kind": "feedback", "run_id": "after-corrupt", "payload": {}}) + "\n")
+
+    rule = FilterRule()
+    consumer = _consumer(tmp_path, "ack_test", rule)
+    watcher = Watcher(channel_dir=channel_dir, consumers=[consumer], cursor_root=cursor_root)
+
+    _process_once(watcher)  # first-ever sweep: delivers the 5 fixture records, then stalls at the corrupt line
+    cursor_before = load_cursor("ack_test", root=cursor_root)
+    assert cursor_before.offset == pre_corrupt_size
+
+    # Operator acknowledges everything currently quarantined for this consumer.
+    corrupt_line_len = len((corrupt_line + "\n").encode("utf-8"))
+    save_quarantine_ack("ack_test", pre_corrupt_size + corrupt_line_len, cursor_root)
+    assert load_quarantine_ack("ack_test", cursor_root) > 0
+
+    delivered = _process_once(watcher)
+    # This sweep's OWN delivered count (not cumulative across sweeps) is
+    # just the one record that was stalled behind the corrupt line — the 5
+    # fixture records already delivered on the warm-up sweep above.
+    assert delivered.get("ack_test", 0) == 1
+    out_lines = (tmp_path / "ack_test.out.jsonl").read_text(encoding="utf-8").strip().split("\n")
+    assert len(out_lines) == 6  # 5 from warm-up + 1 unstalled by the ack
+    assert json.loads(out_lines[-1])["run_id"] == "after-corrupt"
+
+    # Cursor advanced all the way to EOF — past the acked corrupt line AND
+    # the good record after it.
+    cursor_after = load_cursor("ack_test", root=cursor_root)
+    assert cursor_after.offset == changes.stat().st_size
+
+    # No duplicate ledger entry was written on the ack'd sweep.
+    qpath = quarantine_path("ack_test", cursor_root)
+    entries = qpath.read_text(encoding="utf-8").splitlines()
+    assert len(entries) == 1
+
+
+def test_valid_jsonl_still_processes_unaffected_by_quarantine_logic(tmp_path: Path) -> None:
+    """Positive control: a channel with no malformed lines is completely
+    unaffected by the quarantine machinery."""
+    channel_dir = tmp_path / "channel"
+    cursor_root = tmp_path / "cursors"
+    _seed_channel(channel_dir)
+    rule = FilterRule()
+    consumer = _consumer(tmp_path, "clean", rule)
+    watcher = Watcher(channel_dir=channel_dir, consumers=[consumer], cursor_root=cursor_root)
+
+    delivered = _process_once(watcher)
+    assert delivered["clean"] == 5
+    assert not quarantine_path("clean", cursor_root).exists()
 
 
 def test_run_watcher_drives_via_injected_backend(tmp_path: Path) -> None:

@@ -19,17 +19,57 @@ only after dispatch returns, so a crash mid-dispatch may re-deliver the
 in-flight record on restart. File / notify sinks tolerate this (append
 is idempotent at JSONL granularity in practice; notify deduplication is
 the consumer's problem if they care).
+
+ARP-007 quarantine semantics (2026-08 third-party security audit, GitHub
+issue #52): a syntactically malformed complete line (bad JSON, or bytes
+that don't decode as UTF-8) used to be silently skipped, with the cursor
+advancing past it — the record was lost for that consumer forever, with no
+trace. Now:
+
+    1. The FIRST time a given malformed line is seen, its raw bytes are
+       appended to that consumer's quarantine ledger
+       (``cursor.quarantine_path``) and a WARNING is logged. This is a
+       durable, inspectable record — never a silent drop.
+    2. The cursor STOPS right before that line. It does not advance past
+       unacknowledged corruption, and — deliberately — nothing AFTER the
+       bad line dispatches either, for this consumer, until it is dealt
+       with. This is intentional backpressure: a consumer that silently
+       skipped ahead would look "healthy" while quietly losing data;
+       stalling forces the condition to be noticed (the ledger + the
+       warning log are exactly how it gets noticed).
+    3. To avoid an UNBOUNDED stall once the operator has reviewed the
+       ledger, ``cursor.save_quarantine_ack(consumer_id, offset)`` (or
+       ``agent-rally-watcher ack-quarantine --consumer <id>``, cli.py)
+       raises that consumer's acknowledgement watermark. Any malformed
+       line whose start-offset is below the watermark is treated as
+       already-reviewed: it is NOT re-quarantined (no duplicate ledger
+       entries across the many sweeps that occur while stalled at the
+       same offset) and the cursor advances past it, resuming forward
+       progress — including any GOOD records that were queued up behind
+       the bad line.
+
+    Net effect: a bad line is quarantined exactly once per stall, reported
+    non-silently, and the consumer can always be made to progress again —
+    via an explicit, logged operator action, never automatically.
 """
 from __future__ import annotations
 
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .cursor import Cursor, cursor_path, load_cursor, save_cursor
+from .cursor import (
+    Cursor,
+    cursor_path,
+    load_cursor,
+    load_quarantine_ack,
+    quarantine_path,
+    save_cursor,
+)
 from .dispatch import dispatch
 from .filter import Consumer, match
 
@@ -60,12 +100,54 @@ class Watcher:
         return self.channel_dir / _CHANGES_FILENAME
 
 
-def _read_new_lines(path: Path, offset: int) -> tuple[list[dict[str, Any]], int]:
+def _quarantine_line(
+    consumer_id: str, cursor_root: Path | None, line_start: int, raw: bytes, exc: Exception
+) -> None:
+    """Append one malformed-line entry to ``consumer_id``'s quarantine ledger.
+
+    Deduplicated by ``offset``: while a consumer is stalled at the same bad
+    line (every sweep re-reads from the same cursor offset until acked),
+    this must not append a fresh ledger entry each time.
+    """
+    qpath = quarantine_path(consumer_id, cursor_root)
+    if qpath.exists():
+        try:
+            with open(qpath, "r", encoding="utf-8") as fh:
+                for existing in fh:
+                    try:
+                        entry = json.loads(existing)
+                    except ValueError:
+                        continue
+                    if entry.get("offset") == line_start:
+                        return  # already recorded this sweep-stall
+        except OSError:
+            pass  # fall through and attempt to record anyway
+    qpath.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "offset": line_start,
+        "length": len(raw),
+        "raw": raw.decode("utf-8", errors="replace"),
+        "error": f"{type(exc).__name__}: {exc}",
+        "quarantined_at": time.time(),
+    }
+    with open(qpath, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
+def _read_new_lines(
+    path: Path, offset: int, *, consumer_id: str, cursor_root: Path | None
+) -> tuple[list[dict[str, Any]], int]:
     """Read complete lines from ``offset`` to EOF.
 
     Returns ``(records, new_offset)``. Partial trailing line is left for
     the next call: ``new_offset`` only advances past lines terminated by
     ``\\n``. Mirrors agent-rally-point's ``read_changes_since`` semantics.
+
+    ARP-007: a malformed complete line (bad JSON / bad UTF-8) is quarantined
+    (see module docstring) and ``new_offset`` STOPS right before it, unless
+    it is already below this consumer's quarantine-ack watermark (in which
+    case it is skipped without re-quarantining and ``new_offset`` advances
+    past it normally).
     """
     try:
         size = path.stat().st_size
@@ -76,17 +158,38 @@ def _read_new_lines(path: Path, offset: int) -> tuple[list[dict[str, Any]], int]
         offset = 0
     records: list[dict[str, Any]] = []
     new_offset = offset
+    acked_through = load_quarantine_ack(consumer_id, cursor_root)
     try:
         with open(path, "rb") as fh:
             fh.seek(offset)
-            for raw in fh:
-                if not raw.endswith(b"\n"):
-                    break
-                new_offset += len(raw)
+            while True:
+                line_start = fh.tell()
+                raw = fh.readline()
+                if not raw or not raw.endswith(b"\n"):
+                    break  # EOF, or a partial trailing line held for next sweep
                 try:
                     records.append(json.loads(raw.decode("utf-8")))
-                except (ValueError, UnicodeDecodeError):
-                    continue  # skip corrupt line, keep offset advancing
+                    new_offset = fh.tell()
+                except (ValueError, UnicodeDecodeError) as exc:
+                    if line_start < acked_through:
+                        # Operator already reviewed + acknowledged this
+                        # offset (or an offset covering it) — move on.
+                        new_offset = fh.tell()
+                        continue
+                    _quarantine_line(consumer_id, cursor_root, line_start, raw, exc)
+                    logger.warning(
+                        "consumer=%s malformed line quarantined at byte offset %d (%s: %s) — "
+                        "cursor stalled here until acknowledged: "
+                        "cursor.save_quarantine_ack(%r, ...) or "
+                        "`agent-rally-watcher ack-quarantine --consumer %s`",
+                        consumer_id,
+                        line_start,
+                        type(exc).__name__,
+                        exc,
+                        consumer_id,
+                        consumer_id,
+                    )
+                    break  # stall: new_offset does not include this line
     except OSError:
         return [], offset
     return records, new_offset
@@ -98,8 +201,10 @@ def _process_once(watcher: Watcher) -> dict[str, int]:
     path = watcher.changes_path
     for consumer in watcher.consumers:
         cursor = load_cursor(consumer.id, watcher.cursor_root)
-        records, new_offset = _read_new_lines(path, cursor.offset)
-        if not records:
+        records, new_offset = _read_new_lines(
+            path, cursor.offset, consumer_id=consumer.id, cursor_root=watcher.cursor_root
+        )
+        if not records and new_offset == cursor.offset:
             continue
         n = 0
         for rec in records:

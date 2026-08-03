@@ -23,7 +23,10 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "watchfiles>=0.21",
+    # ARP-007 (2026-08 security audit, GitHub issue #52): upper-bounded so a
+    # future major release can't resolve in unreviewed — pair with uv.lock
+    # (committed) for a fully pinned, reproducible install.
+    "watchfiles>=0.21,<2.0",
 ]
 
 [project.optional-dependencies]

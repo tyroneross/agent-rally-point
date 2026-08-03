@@ -18,7 +18,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
-    { name = "watchfiles", specifier = ">=0.21" },
+    { name = "watchfiles", specifier = ">=0.21,<2.0" },
 ]
 provides-extras = ["test"]
 

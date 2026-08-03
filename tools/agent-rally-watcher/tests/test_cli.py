@@ -3,6 +3,7 @@
 """CLI channel-dir resolution: canonical → legacy → default fallback."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,39 @@ def test_legacy_warning_emits_once(_isolate_home, capsys):
 
     captured = capsys.readouterr()
     assert captured.err.count("legacy channel dir") == 1
+
+
+# ARP-007: `ack-quarantine` subcommand
+
+
+def test_ack_quarantine_no_ledger_reports_nothing_to_do(_isolate_home, capsys):
+    rc = cli.main(["ack-quarantine", "--consumer", "nope"])
+    assert rc == 1
+    assert "nothing to acknowledge" in capsys.readouterr().err
+
+
+def test_ack_quarantine_defaults_to_everything_on_ledger(_isolate_home, capsys):
+    from agent_rally_watcher.cursor import load_quarantine_ack, quarantine_path
+
+    qpath = quarantine_path("claude_code")
+    qpath.parent.mkdir(parents=True, exist_ok=True)
+    qpath.write_text(
+        json.dumps({"offset": 100, "length": 25, "raw": "x", "error": "bad json"}) + "\n",
+        encoding="utf-8",
+    )
+
+    rc = cli.main(["ack-quarantine", "--consumer", "claude_code"])
+    assert rc == 0
+    assert load_quarantine_ack("claude_code") == 125
+    assert "acknowledged quarantine" in capsys.readouterr().out
+
+
+def test_ack_quarantine_explicit_through_overrides_default(_isolate_home):
+    from agent_rally_watcher.cursor import load_quarantine_ack
+
+    rc = cli.main(["ack-quarantine", "--consumer", "claude_code", "--through", "999"])
+    assert rc == 0
+    assert load_quarantine_ack("claude_code") == 999
 
 
 def test_env_override_short_circuits_fallback(_isolate_home, monkeypatch):

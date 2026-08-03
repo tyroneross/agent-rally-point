@@ -4,23 +4,58 @@
 #
 # Local pre-push gate — replaces the ubuntu GitHub Actions rally-gate.
 #
+# OPT-IN, not automatic. Git does not read this file unless
+# `core.hooksPath` is pointed at `.githooks` — a per-clone, per-operator
+# decision (`git config core.hooksPath .githooks`). Cloning this repo does
+# NOT turn the hook on by itself; there is no trust-on-clone bootstrap here.
+# Enabling it is a trust decision: once enabled, this hook executes shell
+# code (scripts/run-quality-gate.sh, scripts/check-release-parity.sh) on
+# every `git push`. See the ARP-006 note below for how that execution is
+# scoped, and READ those two scripts yourself before you flip the switch —
+# nothing about `core.hooksPath` audits their contents for you.
+#
 # Validates the EXACT objects being pushed, not the current (possibly dirty,
 # possibly ahead-of/behind-the-push) working tree: for every distinct
 # non-deletion `local_sha` git is about to push (computed by
 # scripts/prepush-ref-updates.sh from the ref-update tuples git supplies on
 # stdin), this hook checks out a clean DETACHED worktree at that exact SHA
-# and runs the shared quality gate (scripts/run-quality-gate.sh) inside it.
-# Detached worktrees are always torn down via a trap — success, gate
-# failure, or interrupt — so a blocked push never leaves stray worktrees.
+# so the gate exercises the pushed CONTENT. Detached worktrees are always
+# torn down via a trap — success, gate failure, or interrupt — so a blocked
+# push never leaves stray worktrees.
 #
-# Blocks the push on failure. Emergency override: RALLY_SKIP_PREPUSH=1 git push
+# ARP-006 (2026-08 third-party security audit, GitHub issue #52): the gate
+# scripts THEMSELVES are not trusted just because they came from the pushed
+# worktree — a pushed branch that edits scripts/run-quality-gate.sh or
+# scripts/check-release-parity.sh would otherwise silently execute its own
+# (possibly malicious) version of those scripts on this machine. Fix:
+#   1. Pin: resolve both gate scripts from a REF, not a working-tree path —
+#      ${RALLY_PREPUSH_GATE_PIN_REF:-main} — on the theory that `main` is
+#      reviewed/trusted and the pushed worktree is not.
+#   2. Compare: diff the pinned copy against the pushed worktree's copy of
+#      each script.
+#        - Identical -> run the pinned copy (same bytes either way).
+#        - Different -> REFUSE by default and print the diff. A pushed
+#          change to the gate script itself never executes unreviewed. If
+#          the diff is a legitimate in-flight edit to the gate (the push
+#          IS the change), re-run with RALLY_PREPUSH_ACK_GATE_CHANGE=1 to
+#          explicitly accept running the pushed tree's version — an
+#          operator decision, never a silent default.
+#   3. No pin ref resolves at all (e.g. no `main` branch yet — bootstrap) ->
+#      fall back to the pushed worktree's own copy, loudly, since there is
+#      nothing else to pin to.
+#   Either way, the script that actually RUNS still `cd`s into the pushed
+#   worktree (both gate scripts resolve their own repo_root via
+#   `git rev-parse --show-toplevel`), so the SUBJECT under test is always
+#   the pushed content — only the gate CODE's trust source changes.
 #
-# Installed via `git config core.hooksPath .githooks` (versioned, survives
-# clone, fires for agent pushes too). The actual gate steps (fmt/clippy/
-# tests/doctests/audit) live in scripts/run-quality-gate.sh — ONE definition
-# shared with CI (.github/workflows/ci.yml) so local and CI can never
-# silently diverge. Keep the toolchain pin (RALLY_QG_TOOLCHAIN /
-# rust-toolchain.toml) in lockstep across both.
+# Blocks the push on failure. Emergency override (skips the WHOLE hook,
+# pin check included): RALLY_SKIP_PREPUSH=1 git push
+#
+# The actual gate steps (fmt/clippy/tests/doctests/audit) live in
+# scripts/run-quality-gate.sh — ONE definition shared with CI
+# (.github/workflows/ci.yml) so local and CI can never silently diverge.
+# Keep the toolchain pin (RALLY_QG_TOOLCHAIN / rust-toolchain.toml) in
+# lockstep across both.
 set -e
 
 if [ "${RALLY_SKIP_PREPUSH:-}" = "1" ]; then
@@ -49,10 +84,11 @@ if [ ! -s "$sha_file" ]; then
 fi
 
 worktree_base=$(mktemp -d "${TMPDIR:-/tmp}/rally-prepush-wt.XXXXXX")
+pin_dir=$(mktemp -d "${TMPDIR:-/tmp}/rally-prepush-pin.XXXXXX")
 cleanup() {
   # Runs on EVERY exit path (normal completion, a gate failure under `set -e`,
-  # or an interrupt) — the single place worktrees get torn down, so a failed
-  # push never leaves one behind.
+  # or an interrupt) — the single place worktrees + the pin scratch dir get
+  # torn down, so a failed push never leaves one behind.
   if [ -d "$worktree_base" ]; then
     for d in "$worktree_base"/*; do
       [ -d "$d" ] || continue
@@ -61,9 +97,34 @@ cleanup() {
     rm -rf "$worktree_base"
   fi
   git worktree prune >/dev/null 2>&1 || true
+  rm -rf "$pin_dir" 2>/dev/null || true
   rm -f "$sha_file"
 }
 trap cleanup EXIT INT TERM
+
+# --- ARP-006: resolve the pinned (trusted) copy of each gate script -------
+# Pinned once per hook run (not per pushed SHA) — the pin ref does not move
+# mid-run, and every pushed SHA is compared against the same trusted baseline.
+GATE_SCRIPT_NAMES="run-quality-gate.sh check-release-parity.sh"
+pin_ref="${RALLY_PREPUSH_GATE_PIN_REF:-main}"
+pin_commit=""
+if git rev-parse --verify --quiet "refs/heads/${pin_ref}^{commit}" >/dev/null 2>&1; then
+  pin_commit=$(git rev-parse "refs/heads/${pin_ref}^{commit}")
+elif git rev-parse --verify --quiet "${pin_ref}^{commit}" >/dev/null 2>&1; then
+  pin_commit=$(git rev-parse "${pin_ref}^{commit}")
+fi
+
+if [ -n "$pin_commit" ]; then
+  for gate_script_name in $GATE_SCRIPT_NAMES; do
+    if git cat-file -e "${pin_commit}:scripts/${gate_script_name}" 2>/dev/null; then
+      git show "${pin_commit}:scripts/${gate_script_name}" > "$pin_dir/$gate_script_name" 2>/dev/null
+      chmod +x "$pin_dir/$gate_script_name"
+    fi
+  done
+  echo "pre-push: gate scripts pinned to ${pin_ref} @ ${pin_commit}" >&2
+else
+  echo "pre-push: WARNING — pin ref '${pin_ref}' does not resolve; gate scripts will run from each pushed tree directly (reduced trust — expected only before '${pin_ref}' exists, e.g. brand-new repo bootstrap)" >&2
+fi
 
 # git injects repo-scoping vars (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, …)
 # into a hook's environment. Those leak into EVERY `git` subprocess the gate
@@ -76,20 +137,55 @@ trap cleanup EXIT INT TERM
 # (GIT_AUTHOR_*, GIT_COMMITTER_*, GIT_CONFIG_*) are deliberately left intact.
 git_scope_vars='GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_COMMON_DIR GIT_QUARANTINE_PATH GIT_INTERNAL_GITDIR_HOOK_PATH GIT_REFLOG_ACTION'
 
+# run_gated_script SCRIPT_NAME WORKTREE_DIR
+#
+# Decides WHICH copy of scripts/$SCRIPT_NAME to execute (pinned vs pushed —
+# see the ARP-006 header note) and runs it with cwd=$WORKTREE_DIR so the
+# gate's SUBJECT is always the pushed tree, regardless of where its CODE
+# came from. Returns the gate's own exit status; under `set -e` a non-zero
+# return here aborts the whole hook (push blocked), same as before ARP-006.
+run_gated_script() {
+  gate_script_name="$1"
+  gate_wt="$2"
+  gate_pushed_script="$gate_wt/scripts/$gate_script_name"
+  if [ ! -f "$gate_pushed_script" ]; then
+    echo "pre-push: $sha — scripts/$gate_script_name not present in pushed tree; skipping" >&2
+    return 0
+  fi
+  gate_exec_path="$gate_pushed_script"
+  if [ -f "$pin_dir/$gate_script_name" ]; then
+    if diff -q "$pin_dir/$gate_script_name" "$gate_pushed_script" >/dev/null 2>&1; then
+      gate_exec_path="$pin_dir/$gate_script_name"
+    elif [ "${RALLY_PREPUSH_ACK_GATE_CHANGE:-}" = "1" ]; then
+      echo "pre-push: $sha — scripts/$gate_script_name DIFFERS from pinned ${pin_ref} @ ${pin_commit} — RALLY_PREPUSH_ACK_GATE_CHANGE=1 is set, running the PUSHED version:" >&2
+      diff -u "$pin_dir/$gate_script_name" "$gate_pushed_script" >&2 || true
+      gate_exec_path="$gate_pushed_script"
+    else
+      echo "pre-push: REFUSED — $sha's scripts/$gate_script_name differs from the pinned ${pin_ref} @ ${pin_commit} copy." >&2
+      echo "pre-push: executing an unreviewed, pushed-tree gate script is exactly what ARP-006 closes — refusing by default." >&2
+      echo "pre-push: diff (- pinned ${pin_ref}, + pushed $sha):" >&2
+      diff -u "$pin_dir/$gate_script_name" "$gate_pushed_script" >&2 || true
+      echo "pre-push: if this is a legitimate in-flight edit to the gate itself, review the diff above, then re-run with:" >&2
+      echo "pre-push:   RALLY_PREPUSH_ACK_GATE_CHANGE=1 git push ..." >&2
+      return 1
+    fi
+  fi
+  # shellcheck disable=SC2086 # intentional word-split: unset each var name
+  ( cd "$gate_wt" && unset $git_scope_vars && "$gate_exec_path" )
+}
+
 while IFS= read -r sha; do
   [ -n "$sha" ] || continue
   wt="$worktree_base/$sha"
   echo "pre-push: $sha — creating clean detached worktree…" >&2
   git worktree add --detach "$wt" "$sha" >/dev/null
   echo "pre-push: $sha — running quality gate (scripts/run-quality-gate.sh)…" >&2
-  # shellcheck disable=SC2086 # intentional word-split: unset each var name
-  ( cd "$wt" && unset $git_scope_vars && ./scripts/run-quality-gate.sh )
+  run_gated_script run-quality-gate.sh "$wt"
   echo "pre-push: $sha — running release parity (scripts/check-release-parity.sh)…" >&2
   # f2: parity uses RALLY_CODEX_DEST (SEC-003) to regenerate the Codex
   # artifact into a scratch dir, so this never mutates the detached
   # worktree it runs in.
-  # shellcheck disable=SC2086
-  ( cd "$wt" && unset $git_scope_vars && ./scripts/check-release-parity.sh )
+  run_gated_script check-release-parity.sh "$wt"
   echo "pre-push: $sha ✅ gate + parity passed" >&2
 done < "$sha_file"
 
