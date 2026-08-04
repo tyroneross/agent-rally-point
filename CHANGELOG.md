@@ -7,6 +7,69 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Security — one fact could take the whole room down (RC-037, RC-038, RC-034)
+
+Three v0.2.0 release blockers. The first two were live-reproduced against the
+release binary before the fix and again after it; each carries a test that fails
+when the fix is reverted.
+
+- **A coarse claim no longer locks every agent out of claiming (RC-037,
+  Critical).** One `rally say claim --scope workspace:zzz` made every later claim
+  of every path by every other agent fail, permanently: a `workspace:` scope
+  overlapped every scope regardless of identifier, `repo:` overlapped every path,
+  and `append_fact` hard-errors on a claim conflict. Containment is now decided by
+  identifier — the explicit wildcard `*`, or a path the finer scope sits beneath —
+  so an opaque root contains nothing but itself. Room-wide breadth stays
+  expressible as `workspace:*` / `repo:*` and is gated on the lead seat.
+- **The rejection message named a scope its owner did not hold (RC-037).** It
+  rendered the requested scope in both slots, so a rogue holding `workspace:zzz`
+  produced `codex:99 already owns file:src/lib.rs`. It now reports what the owner
+  holds and what you asked for, separately.
+- **The hook stopped swallowing auto-claim failures (RC-037).** The PreToolUse
+  auto-claim ended in `|| true`, so when claim registration broke room-wide every
+  edit still proceeded, nothing was claimed, and nothing said so — deconfliction
+  degraded to zero while the hook reported healthy. Failures now print the CLI's
+  own message to stderr, once per session per failure class. Still advisory: a
+  failed claim never blocks an edit.
+- **An unscoped blocker no longer denies every write (RC-038, Critical).** One
+  `rally say blocker --subject "everything is blocked"` flipped `check
+  before-write` from `allow: true` to `allow: false` for every agent and every
+  path, and `RALLY_HOOK_STRICT=1` turns that into a hard deny on every edit. A
+  room-wide freeze is a real thing a lead needs, so it is gated rather than
+  removed: the lead's unscoped blocker still stops the room (`room-freeze`);
+  anyone else's is surfaced as a warning the agent reads and decides about
+  (`unscoped-blocker`). Unscoped binding decisions are labelled `unscoped-decision`
+  instead of being reported as applying to a path they never named.
+- **The pre-push gate no longer executes host tests the pin never reviewed
+  (RC-034).** The gate pinned three dispatcher scripts from a trusted ref, then
+  globbed and ran `tests/hooks/test_*.sh` from the pushed tree — so adding a new
+  test file bypassed the pin while the hook printed a healthy pin message. Host
+  tests absent from, or modified relative to, the pinned commit are now refused by
+  name unless explicitly acknowledged. An env-supplied `RALLY_PREPUSH_GATE_PIN_REF`
+  now requires an operator ack in every case, not only when it resolves to a commit
+  in the push. The hook header states plainly what the pin does not cover — the
+  gate still compiles and runs pushed-tree code by design.
+
+Room-wide effects now require the lead seat, and the lead seat is taken by first
+join and is not authenticated. That raises the bar from "any writer" to "the
+first writer"; it is not an authorization boundary. See
+[`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md).
+
+### Fixed — discoverability
+
+- **`rally --help` names every command it accepts.** It listed 31 of 42; `doctor`,
+  `risks`, `decisions`, `artifacts`, `claims`, `lead`, `ack`, `worktree`,
+  `daemon`, `self-exit-check`, and `claims-refresh` were real and invisible, and
+  the unknown-command handler routed users to that same incomplete list. A test now
+  fails when a command is registered without a help line.
+- **`rally check-ci` help advertises the real flag name** (`--receipt-threshold-secs`,
+  not `--receipt-threshold`).
+- **Documentation matches the CLI.** `--include-legacy` was documented and did not
+  exist; `rally worktree-gc` is `rally worktree gc`; `rally run` needs its
+  positional agent. README states the MSRV and the pinned toolchain as the two
+  different things they are, and lists the runtime prerequisites (`git`, `tmux`,
+  `node`, `python3`, `gh`).
+
 ### Security — issue #52 independent audit (Lattice)
 
 Seven findings from the first genuinely independent security review of this repo:

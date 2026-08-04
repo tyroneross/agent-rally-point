@@ -180,15 +180,17 @@ rally sessions --json                          # list managed sessions in the ro
 rally attach <session|name|tool> --json        # attach to an existing managed session
 rally capture <session|name|tool> --json       # capture a managed session's current output
 rally stop <session|name|tool> --json          # stop a managed session
-rally locate <event-id> [--include-legacy] --json   # find which channel an event lives in
-rally recent [--all] [--limit N] [--include-legacy] --json   # recent activity across channels
+rally locate <event-id> --json                                  # find which channel an event lives in
+rally recent [--all] [--limit N] [--include-archived] --json    # recent activity across channels
 ```
 
 `sessions`, `attach`, `capture`, and `stop` operate on managed sessions started
 by `rally run`. `locate` and `recent` answer "where is this?" / "what just
-happened?" across the channels Rally knows about; `--include-legacy` also scans
-the retiring `~/.agent-rally-point/apps/` JSONL channels (the pre-`.rally/`
-per-repo store, kept readable during migration).
+happened?" across the rooms-based channels Rally knows about. The legacy
+`~/.agent-rally-point/apps/` JSONL store and its `--include-legacy` flag have
+been retired — facts written there no longer surface in `locate` or `recent`.
+`--include-archived` on `recent` re-includes recency-decayed facts that would
+otherwise drop out of the default listing.
 
 ## Useful Fact Writes
 

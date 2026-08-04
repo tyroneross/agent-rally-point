@@ -159,9 +159,19 @@ fn top_level_help_and_docs_advertise_ptyd_backend() {
         .and_then(Path::parent)
         .expect("rally-cli crate should live under <repo>/crates/rally-cli");
     let readme = fs::read_to_string(repo.join("README.md")).expect("README.md");
+    // Assert the BACKEND LIST, not a whole invocation string. This used to
+    // require the literal `rally run --backend <auto|tmux|cmux|ptyd>`, which
+    // omits the required positional agent argument (`cli.rs`'s
+    // `positional::<String>("AGENT")`) — so the test held README to a command
+    // that does not run. Pinning an example's exact bytes to check a list of
+    // values makes the example uncorrectable; check the values.
     assert!(
-        readme.contains("rally run --backend <auto|tmux|cmux|ptyd>"),
+        readme.contains("--backend <auto|tmux|cmux|ptyd>"),
         "README must document ptyd and auto as supported run backends"
+    );
+    assert!(
+        readme.contains("rally run claude"),
+        "README's `rally run` example must include the required positional agent"
     );
     let rally = fs::read_to_string(repo.join("RALLY.md")).expect("RALLY.md");
     assert!(

@@ -33,6 +33,10 @@
 #      copying the directory wholesale — a committed symlink ships as a
 #      dangling link on the installer's machine even if its target's
 #      CONTENT happens to diff clean here.
+#   5. Every tests/hooks/test_*.sh this script executes existed, byte for
+#      byte, at the pre-push pin — but ONLY when .githooks/pre-push supplies
+#      one via RALLY_PREPUSH_PIN_COMMIT (RC-034, see the loop below). CI, the
+#      release workflow, and manual runs pass no pin and are unaffected.
 #
 # Exit 0 only when both hold. JSON is parsed with `python3 -c` (portable, no
 # jq dependency) to match the rest of this repo's tooling (see
@@ -157,12 +161,75 @@ fi
 # failures as passes, so the recursion is cut here rather than tolerated.
 # The pre-push suites run in CI instead (.github/workflows/ci.yml), where
 # nothing re-enters them.
+#
+# RC-034: the glob is an ENTRY POINT the pre-push pin does not cover.
+# .githooks/pre-push pins three script NAMES and diffs them against the pushed
+# tree. Adding tests/hooks/test_zz_anything.sh modifies none of those names, so
+# the hook prints "gate scripts pinned to main @ <sha>" and this pinned script
+# then executes the new file out of the pushed worktree. The only assertion
+# over this file set was the non-zero count below, which fires on too few and
+# never on unexpected.
+#
+# When the hook hands us its resolved pin (RALLY_PREPUSH_PIN_COMMIT), list the
+# host tests that existed at that commit and refuse anything here that is
+# absent from, or differs from, that list. The pin's object DB is shared with
+# the detached worktree this runs in, so `git ls-tree`/`git show` resolve.
+#
+# Unset means no pin exists to compare against — CI, the release workflow, a
+# manual run — and the loop behaves exactly as it did before. Do not turn that
+# into a refusal: those three callers are the ones that must keep working.
+_pinned_host_tests=""
+if [ -n "${RALLY_PREPUSH_PIN_COMMIT:-}" ]; then
+  _pinned_host_tests=$(git ls-tree --name-only "$RALLY_PREPUSH_PIN_COMMIT" tests/hooks/ 2>/dev/null || true)
+  echo "check-release-parity: host tests pinned to ${RALLY_PREPUSH_PIN_COMMIT}" >&2
+fi
+
+# Returns 0 when $1 may execute. Prints its own refusal and returns 1 otherwise.
+host_test_is_pinned() {
+  hti_path="$1"
+  [ -n "${RALLY_PREPUSH_PIN_COMMIT:-}" ] || return 0
+
+  hti_reason=""
+  # Newline-delimited membership test: wrap both sides so a prefix like
+  # tests/hooks/test_a.sh cannot match tests/hooks/test_ab.sh.
+  case "
+$_pinned_host_tests
+" in
+    *"
+$hti_path
+"*)
+      if ! git show "${RALLY_PREPUSH_PIN_COMMIT}:${hti_path}" 2>/dev/null \
+           | diff -q - "$hti_path" >/dev/null 2>&1; then
+        hti_reason="DIFFERS from the copy at the pin"
+      fi
+      ;;
+    *) hti_reason="is ABSENT at the pin (added by this push)" ;;
+  esac
+  [ -n "$hti_reason" ] || return 0
+
+  if [ "${RALLY_PREPUSH_ACK_UNPINNED_HOST_TEST:-}" = "1" ]; then
+    echo "check-release-parity: $hti_path $hti_reason — RALLY_PREPUSH_ACK_UNPINNED_HOST_TEST=1 is set, EXECUTING IT ANYWAY out of the pushed tree." >&2
+    return 0
+  fi
+  echo "check-release-parity: REFUSED — $hti_path $hti_reason ${RALLY_PREPUSH_PIN_COMMIT}." >&2
+  echo "check-release-parity: this gate executes every tests/hooks/test_*.sh in the pushed tree, so an unreviewed one is arbitrary code on the pusher's machine (RC-034). Refusing by default." >&2
+  echo "check-release-parity: if the push IS the change to that suite, review it, then re-run with:" >&2
+  echo "check-release-parity:   RALLY_PREPUSH_ACK_UNPINNED_HOST_TEST=1 git push ..." >&2
+  return 1
+}
+
 _host_tests_found=0
 for host_test in tests/hooks/test_*.sh; do
   [ -f "$host_test" ] || continue          # no glob match → literal string
   case "$(basename "$host_test")" in
     test_prepush_*) continue ;;            # see recursion note above
   esac
+  # Before execution, and after the skip above: a skipped file never runs here,
+  # so it needs no pin check from this loop.
+  if ! host_test_is_pinned "$host_test"; then
+    fail=1
+    continue
+  fi
   _host_tests_found=$((_host_tests_found + 1))
   if ! "$host_test" >&2; then
     echo "check-release-parity: HOST TEST FAILED — $host_test" >&2

@@ -45,6 +45,24 @@ peer-authored and unverified. An injected subject cannot forge an instruction li
 `--tool` and role. There is no signature, so a fact claiming to come from `codex:01` may not
 have. Committed history and live state are not distinguished at the protocol level.
 
+**A single fact can no longer take the room down (RC-037, RC-038).** Two denial-of-service
+paths were live and independently reproduced, both reachable from one committed ledger line:
+
+- One `claim --scope workspace:zzz` conflicted with every later claim of every path by every
+  agent, permanently, because a `workspace:` scope overlapped every scope regardless of
+  identifier and `append_fact` hard-errors on a claim conflict. Overlap is now decided by
+  identifier, not by type: an opaque root contains nothing but itself.
+- One `blocker` with no scope flipped `check before-write` to `allow: false` for every agent,
+  which `RALLY_HOOK_STRICT=1` turns into a hard deny on every edit. An unscoped blocker from a
+  non-lead is now a warning.
+
+**Room-wide effects now require the lead seat.** `workspace:*` / `repo:*` claims and unscoped
+freezes are gated on it. That is a real narrowing — the writer must hold a specific position
+rather than merely be able to write — but read the limit honestly: **the lead seat is taken by
+first join and is itself unauthenticated.** An agent or commit that enters an empty room first
+holds it. This raises the bar from "any writer" to "the first writer, or whoever the current
+lead is"; it is not an authorization boundary, and it was never claimed as one.
+
 **If this is your situation:** review `.rally/log/` diffs in pull requests the way you review
 code. It is executable content in the sense that matters — it steers agents.
 

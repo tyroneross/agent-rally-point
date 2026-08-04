@@ -48,6 +48,46 @@
 #   `git rev-parse --show-toplevel`), so the SUBJECT under test is always
 #   the pushed content — only the gate CODE's trust source changes.
 #
+#   WHAT THE PIN DOES NOT COVER. The pin protects three DISPATCHER scripts by
+#   name. It does not, and cannot, protect the code those dispatchers go on to
+#   execute out of the pushed tree, which by design includes: every `cargo
+#   test` body, `build.rs`, and proc macro that run-quality-gate.sh compiles
+#   and runs; scripts/generate_host_surfaces.py and the
+#   tests/scripts/test_*.py unittest modules that check-release-parity.sh
+#   invokes; scripts/build-codex-artifact.sh; and every tests/hooks/test_*.sh
+#   the parity script globs. Running pushed code is the POINT of a gate — the
+#   pin only decides who dispatches it. Read "gate scripts pinned to <ref> @
+#   <sha>" as "the three dispatchers were reviewed", never as "nothing
+#   unreviewed will execute".
+#
+# RC-034 (2026-08 independent security review; docs/ROOT-CAUSE-REGISTER.md):
+# the gap above was exploitable through a file the pin never looked at. A push
+# that ADDS tests/hooks/test_zz_anything.sh touches none of the three pinned
+# names, so the pin reports healthy, and the PINNED check-release-parity.sh
+# then globs and executes the new attacker-supplied file. Two changes:
+#   a. This hook exports the resolved pin as RALLY_PREPUSH_PIN_COMMIT.
+#      check-release-parity.sh uses it to list the host tests that existed at
+#      the pin and REFUSES any tests/hooks/test_*.sh in the pushed tree that
+#      is absent from, or differs from, that list. Override per the same
+#      idiom: RALLY_PREPUSH_ACK_UNPINNED_HOST_TEST=1. When the variable is
+#      unset — CI, the release workflow, a manual run — the parity script
+#      behaves exactly as before, because there is no pin to compare against.
+#      This NARROWS the pushed-code surface by one entry point. It does not
+#      eliminate it: the cargo, python, and build-codex-artifact.sh paths
+#      listed above still execute pushed content, unpinned.
+#   b. The vacuity check (SEC-005a) only catches an env pin aimed at a commit
+#      IN this push. An env pin aimed at any other attacker-controlled ref —
+#      a local `evil` branch carrying the same malicious gate scripts as the
+#      pushed branch — resolves fine, is not in the push, and used to pass
+#      silently while `diff -q` reported the pinned and pushed copies
+#      identical. Content-identity was being read as evidence of review. Since
+#      SEC-005's premise is that the environment is not trusted, a RESOLVING
+#      env-supplied pin now requires RALLY_PREPUSH_ACK_ENV_PIN=1 in EVERY
+#      case, not only the vacuous one. The DEFAULT `main` pin is unchanged.
+#      An env pin that does NOT resolve still takes the bootstrap fallback
+#      below (loud warning, pushed-tree gate scripts, no ack) — that path is
+#      unchanged and remains a way to run the three dispatchers unpinned.
+#
 # SEC-005 (2026-08 review of the ARP-006 fix): the pin ref is read from the
 # environment, and the environment is not trusted. Anything running as this UID
 # — a committed `.envrc`, a Makefile, an npm script — can set
@@ -151,6 +191,20 @@ else
   echo "pre-push: WARNING — pin ref '${pin_ref}' does not resolve; gate scripts will run from each pushed tree directly (reduced trust — expected only before '${pin_ref}' exists, e.g. brand-new repo bootstrap)" >&2
 fi
 
+# RC-034: hand the resolved pin to the gate scripts so they can extend the pin
+# to the entry points they dispatch (check-release-parity.sh uses it to reject
+# a tests/hooks/test_*.sh that did not exist at the pin). Assigned from
+# $pin_commit unconditionally, and UNSET when nothing pinned: the environment
+# is not trusted, so an inherited RALLY_PREPUSH_PIN_COMMIT — which would let a
+# caller name a commit that already contains the attacker's test file — must
+# never survive into the gate.
+if [ -n "$pin_commit" ]; then
+  RALLY_PREPUSH_PIN_COMMIT="$pin_commit"
+  export RALLY_PREPUSH_PIN_COMMIT
+else
+  unset RALLY_PREPUSH_PIN_COMMIT
+fi
+
 # --- SEC-005: is the pin actually pinning anything? -----------------------
 # field 2 of each stdin tuple is local_sha. Read here with awk on purpose —
 # see the SEC-005 note in the header for why the parser cannot be trusted to
@@ -182,6 +236,28 @@ if [ -n "$pin_commit" ] && [ -n "$pushed_shas_raw" ]; then
     else
       echo "pre-push: continuing — RALLY_PREPUSH_ACK_VACUOUS_PIN=1 is set. Running effectively UNPINNED." >&2
     fi
+  fi
+
+  # --- RC-034b: every env-supplied pin needs an ack, not just a vacuous one --
+  # The vacuity test above is SHA identity, so it only catches a pin aimed at a
+  # commit in this push. Aim it at any other ref the attacker controls — a
+  # local `evil` branch carrying the same gate scripts as the pushed branch —
+  # and the pin resolves, the SHAs differ, `diff -q` reports the pinned and
+  # pushed copies identical, and the hook prints an affirmative pin line. The
+  # pin's whole claim is "this ref was reviewed", and only an operator can
+  # assert that about a ref the environment chose. Reachable in practice: a
+  # committed `.envrc` plus one `direnv allow`.
+  # RALLY_PREPUSH_ACK_VACUOUS_PIN=1 satisfies this too — it is the strictly
+  # stronger statement ("I accept running effectively unpinned"), and the
+  # vacuous branch above has already printed its louder, more specific message.
+  if [ "$pin_ref_source" = "environment" ] \
+     && [ "${RALLY_PREPUSH_ACK_ENV_PIN:-}" != "1" ] \
+     && [ "${RALLY_PREPUSH_ACK_VACUOUS_PIN:-}" != "1" ]; then
+    echo "pre-push: REFUSED — RALLY_PREPUSH_GATE_PIN_REF='${pin_ref}' (@ ${pin_commit}) was supplied by the ENVIRONMENT, and the environment is not trusted (SEC-005). A pin only means anything if a human vouched for the ref it names; anything running as this UID can name one — a committed .envrc, a Makefile, an npm script." >&2
+    echo "pre-push: the vacuity check above cannot cover this: point the pin at a branch you control that carries the SAME gate scripts as the push, and the SHAs differ, diff -q says identical, and the pin reports healthy having reviewed nothing (RC-034)." >&2
+    echo "pre-push: unset RALLY_PREPUSH_GATE_PIN_REF to use the default 'main' pin, or — if you chose '${pin_ref}' deliberately and trust it — re-run with:" >&2
+    echo "pre-push:   RALLY_PREPUSH_ACK_ENV_PIN=1 git push ..." >&2
+    exit 1
   fi
 fi
 

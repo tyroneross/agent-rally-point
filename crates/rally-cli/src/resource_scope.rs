@@ -201,15 +201,69 @@ fn access_modes_conflict(a: AccessMode, b: AccessMode) -> bool {
     )
 }
 
+/// The wildcard identifier that makes a namespace root deliberately room-wide.
+/// Spelled explicitly (`workspace:*`, `repo:*`) so breadth is a stated intent
+/// rather than a side effect of the type lattice. `claim_authority` gates who
+/// may hold one.
+pub(crate) const WILDCARD_IDENTIFIER: &str = "*";
+
+impl ResourceType {
+    /// A namespace ROOT — a type that can contain finer-grained resources.
+    /// Roots are the only scopes whose overlap is decided by containment
+    /// rather than by identity.
+    pub(crate) fn is_namespace_root(&self) -> bool {
+        matches!(self, Self::Workspace | Self::Repo)
+    }
+}
+
+/// Does namespace root `root` contain `other`?
+///
+/// RC-037: this used to be answered by TYPE alone — `(Workspace, _) => true`
+/// made a `workspace:` scope overlap every scope of every type regardless of
+/// identifier, and `(Repo, File | Dir) => true` did the same one rung down.
+/// A single `rally say claim --scope workspace:zzz` therefore conflicted with
+/// every later claim in the room, and `store::append_fact` hard-errors on a
+/// claim conflict, so the first writer locked every other agent out of
+/// claiming anything, permanently, from any scope identifier at all.
+///
+/// Containment is now decided by IDENTIFIER, and only when the identifier
+/// actually answers the question:
+///   - `*` is the explicit room-wide wildcard and contains everything.
+///   - a path-shaped root contains a path-shaped scope beneath it.
+///   - an opaque identifier (`workspace:zzz`, `repo:some-name`) answers
+///     nothing about whether `src/lib.rs` lives inside it, so it contains
+///     NOTHING but itself.
+///
+/// The last case is the deliberate one. Rally is an advisory coordination
+/// tool, and an unknowable containment relation must fail OPEN — reporting a
+/// conflict it cannot substantiate is what produced the room-wide lockout.
+/// An agent that genuinely means "I own everything here" says so with the
+/// wildcard, which is authority-gated in `claim_authority::breadth_violation`.
+fn root_contains(root: &ResourceScope, other: &ResourceScope) -> bool {
+    if root.identifier == WILDCARD_IDENTIFIER {
+        return true;
+    }
+    match other.resource_type {
+        ResourceType::File | ResourceType::Dir | ResourceType::Repo | ResourceType::Workspace => {
+            path_contains(&root.identifier, &other.identifier)
+        }
+        _ => false,
+    }
+}
+
 fn resources_overlap(a: &ResourceScope, b: &ResourceScope) -> bool {
     if a.resource_type == b.resource_type && a.identifier == b.identifier {
         return true;
     }
 
+    if a.resource_type.is_namespace_root() && root_contains(a, b) {
+        return true;
+    }
+    if b.resource_type.is_namespace_root() && root_contains(b, a) {
+        return true;
+    }
+
     match (&a.resource_type, &b.resource_type) {
-        (ResourceType::Workspace, _) | (_, ResourceType::Workspace) => true,
-        (ResourceType::Repo, ResourceType::File | ResourceType::Dir)
-        | (ResourceType::File | ResourceType::Dir, ResourceType::Repo) => true,
         (ResourceType::Dir, ResourceType::File) => path_contains(&a.identifier, &b.identifier),
         (ResourceType::File, ResourceType::Dir) => path_contains(&b.identifier, &a.identifier),
         (ResourceType::Dir, ResourceType::Dir) => {
@@ -273,6 +327,74 @@ mod tests {
         let reader = ResourceScope::parse_claim_scope("shared_read:file:src/lib.rs").unwrap();
         let writer = ResourceScope::parse_claim_scope("file:src/lib.rs").unwrap();
         assert!(!reader.conflicts_with(&writer));
+    }
+
+    /// RC-037 adversarial control. Revert `root_contains` to the old
+    /// `(Workspace, _) => true` arm and this test fails: an opaque workspace
+    /// identifier would once again conflict with an unrelated file path, which
+    /// is what locked every agent out of claiming room-wide.
+    #[test]
+    fn resource_scope_opaque_workspace_does_not_swallow_every_scope() {
+        let workspace = ResourceScope::parse_claim_scope("workspace:zzz").unwrap();
+        for other in [
+            "file:src/lib.rs",
+            "dir:crates",
+            "branch:main",
+            "port:8080",
+            "task:build",
+            "repo:some-other-repo",
+            "workspace:yyy",
+        ] {
+            let scope = ResourceScope::parse_claim_scope(other).unwrap();
+            assert!(
+                !workspace.conflicts_with(&scope),
+                "workspace:zzz must not conflict with {other} — it says nothing about whether \
+                 {other} lives inside it"
+            );
+            assert!(
+                !scope.conflicts_with(&workspace),
+                "conflict must stay symmetric for {other}"
+            );
+        }
+    }
+
+    /// Same control one rung down: an opaque `repo:` identifier must not
+    /// conflict with every path in the room.
+    #[test]
+    fn resource_scope_opaque_repo_does_not_swallow_every_path() {
+        let repo = ResourceScope::parse_claim_scope("repo:agent-rally-point").unwrap();
+        let file = ResourceScope::parse_claim_scope("file:src/lib.rs").unwrap();
+        let dir = ResourceScope::parse_claim_scope("dir:crates").unwrap();
+        assert!(!repo.conflicts_with(&file));
+        assert!(!repo.conflicts_with(&dir));
+        assert!(!file.conflicts_with(&repo));
+    }
+
+    /// Breadth is still expressible — it just has to be SAID. The explicit
+    /// wildcard keeps the old room-wide semantics for the agent that means it.
+    #[test]
+    fn resource_scope_wildcard_root_still_contains_everything() {
+        let wildcard = ResourceScope::parse_claim_scope("workspace:*").unwrap();
+        let file = ResourceScope::parse_claim_scope("file:src/lib.rs").unwrap();
+        let port = ResourceScope::parse_claim_scope("port:8080").unwrap();
+        assert!(wildcard.conflicts_with(&file));
+        assert!(file.conflicts_with(&wildcard));
+        assert!(wildcard.conflicts_with(&port));
+
+        let repo_wildcard = ResourceScope::parse_claim_scope("repo:*").unwrap();
+        assert!(repo_wildcard.conflicts_with(&file));
+    }
+
+    /// A path-shaped root still contains the paths beneath it — the useful
+    /// half of containment survives, because the identifier answers the
+    /// question.
+    #[test]
+    fn resource_scope_path_shaped_root_contains_paths_beneath_it() {
+        let root = ResourceScope::parse_claim_scope("workspace:crates/rally-cli").unwrap();
+        let inside = ResourceScope::parse_claim_scope("file:crates/rally-cli/src/lib.rs").unwrap();
+        let outside = ResourceScope::parse_claim_scope("file:crates/rally-ui/src/main.rs").unwrap();
+        assert!(root.conflicts_with(&inside));
+        assert!(!root.conflicts_with(&outside));
     }
 
     #[test]

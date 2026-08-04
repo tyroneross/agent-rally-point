@@ -29,7 +29,17 @@ pub(crate) struct ActiveClaimIndex {
 pub(crate) struct ClaimConflict {
     pub(crate) existing_claim_id: String,
     pub(crate) existing_owner: Option<String>,
+    /// The scope the INCOMING claim asked for.
     pub(crate) scope: String,
+    /// The scope the EXISTING owner actually holds.
+    ///
+    /// RC-037: the rejection message used to render `scope` in both slots, so
+    /// a rogue holding `workspace:zzz` produced
+    /// `claim conflict: codex:99 already owns file:src/lib.rs` — naming a file
+    /// its owner had never claimed. The reader was told the wrong thing about
+    /// who owns what, which is worse than no message at all when the next step
+    /// is deciding whether to negotiate or take over.
+    pub(crate) existing_scope: String,
 }
 
 /// Stamp a `lease_expires_at:` evidence marker with an EXPLICIT lease window
@@ -144,12 +154,72 @@ pub(crate) fn detect_conflict(facts: &[Fact], incoming: &Fact) -> Option<ClaimCo
                         existing_claim_id: existing.claim_id,
                         existing_owner: existing.owner_tool,
                         scope: new_scope.canonical_key(),
+                        existing_scope: existing_scope.canonical_key(),
                     });
                 }
             }
         }
     }
     None
+}
+
+/// The tool holding the lead seat, derived from the ledger.
+///
+/// Mirrors the projection in `store::snapshot_from_facts_with_policy`: the
+/// latest lead-family decision wins, and a `role:lead:relinquished` reopens the
+/// seat. Lifted out so the claim-breadth gate can answer "is this agent the
+/// lead" without building a full room snapshot on every claim append.
+pub(crate) fn lead_from_facts(facts: &[Fact]) -> Option<String> {
+    facts
+        .iter()
+        .filter(|fact| {
+            fact.kind == FactKind::Decision
+                && (fact.subject == "role:lead" || fact.subject == "role:lead:relinquished")
+        })
+        .max_by_key(|fact| fact.seq)
+        .filter(|fact| fact.subject == "role:lead")
+        .and_then(|fact| fact.tool.clone())
+}
+
+/// RC-037, second half: who may hold a ROOM-WIDE claim.
+///
+/// `workspace:*` and `repo:*` mean "I own everything in this room". That is a
+/// legitimate thing for a lead to assert while it reorganizes a tree, and an
+/// unacceptable thing for any agent to assert unilaterally — every other
+/// agent's claim then fails to append, and (per RC-037) the hook swallowed
+/// that failure, so deconfliction died room-wide with no signal.
+///
+/// The rule is deliberately narrow: it gates the EXPLICIT wildcard only. A
+/// path-shaped or opaque coarse claim (`workspace:crates/rally-cli`,
+/// `repo:agent-rally-point`) is unaffected, because after the `root_contains`
+/// fix those no longer swallow the room.
+///
+/// Returns the refusal message when the claim must be rejected.
+pub(crate) fn breadth_violation(incoming: &Fact, facts: &[Fact]) -> Option<String> {
+    let record = active_claim_record_from_fact(incoming)?;
+    let wildcard = record.resource_scopes.iter().find(|scope| {
+        scope.resource_type.is_namespace_root()
+            && scope.identifier == crate::resource_scope::WILDCARD_IDENTIFIER
+    })?;
+
+    let lead = lead_from_facts(facts);
+    let claimer = record.owner_tool.as_deref().unwrap_or("<unknown tool>");
+    match lead.as_deref() {
+        Some(lead_tool) if lead_tool == claimer => None,
+        Some(lead_tool) => Some(format!(
+            "claim refused: scope {} is room-wide and only the lead may hold it. \
+             {lead_tool} holds the lead seat, not {claimer}. Claim the specific paths \
+             you are editing, or ask {lead_tool} to hand off the lead first.",
+            wildcard.canonical_key()
+        )),
+        None => Some(format!(
+            "claim refused: scope {} is room-wide and only the lead may hold it. \
+             This room has no lead. Claim the specific paths you are editing, or take \
+             the lead seat first with \
+             `rally lead assign --tool {claimer} --to {claimer}`.",
+            wildcard.canonical_key()
+        )),
+    }
 }
 
 pub(crate) fn index_from_facts(facts: &[Fact]) -> ActiveClaimIndex {
@@ -276,6 +346,91 @@ mod tests {
         let conflict = detect_conflict(&[existing], &incoming).unwrap();
         assert_eq!(conflict.existing_claim_id, "claim-a");
         assert_eq!(conflict.scope, "file:src/lib.rs");
+    }
+
+    fn lead_decision(tool: &str, seq: i64) -> Fact {
+        Fact {
+            kind: FactKind::Decision,
+            subject: "role:lead".to_string(),
+            seq,
+            ..fact("lead-decision", tool, vec![])
+        }
+    }
+
+    /// RC-037 adversarial control, message half. Revert the `existing_scope`
+    /// field and this fails: the rejection named the scope the CLAIMER asked
+    /// for as the scope the OWNER holds, so a rogue holding `workspace:zzz`
+    /// produced "codex:99 already owns file:src/lib.rs".
+    #[test]
+    fn claim_conflict_names_the_scope_the_owner_actually_holds() {
+        let existing = fact("claim-a", "tool-a", vec!["workspace:*"]);
+        let incoming = fact("claim-b", "tool-b", vec!["file:src/lib.rs"]);
+        let conflict = detect_conflict(&[existing], &incoming).unwrap();
+        assert_eq!(
+            conflict.existing_scope, "workspace:*",
+            "the message must report what the owner holds"
+        );
+        assert_eq!(
+            conflict.scope, "file:src/lib.rs",
+            "and separately what was requested"
+        );
+    }
+
+    /// RC-037 adversarial control, lockout half, at the authority layer.
+    /// Remove the `breadth_violation` call and a non-lead can hold
+    /// `workspace:*`, which conflicts with every later claim in the room.
+    #[test]
+    fn breadth_gate_refuses_room_wide_claim_from_a_non_lead() {
+        let lead = lead_decision("tool-lead", 1);
+        let incoming = fact("claim-rogue", "tool-rogue", vec!["workspace:*"]);
+        let refusal = breadth_violation(&incoming, &[lead])
+            .expect("a non-lead must not hold a room-wide claim");
+        assert!(refusal.contains("only the lead may hold it"), "{refusal}");
+        assert!(refusal.contains("tool-lead"), "{refusal}");
+    }
+
+    #[test]
+    fn breadth_gate_refuses_room_wide_claim_when_the_room_has_no_lead() {
+        let incoming = fact("claim-rogue", "tool-rogue", vec!["repo:*"]);
+        let refusal =
+            breadth_violation(&incoming, &[]).expect("no lead means nobody may claim room-wide");
+        assert!(refusal.contains("no lead"), "{refusal}");
+    }
+
+    /// The lead keeps the capability — breadth is authority-gated, not banned.
+    #[test]
+    fn breadth_gate_allows_the_lead_to_claim_room_wide() {
+        let lead = lead_decision("tool-lead", 1);
+        let incoming = fact("claim-lead", "tool-lead", vec!["workspace:*"]);
+        assert!(breadth_violation(&incoming, &[lead]).is_none());
+    }
+
+    /// The gate is narrow on purpose: a coarse-but-specific claim is ordinary
+    /// work and must not need the lead seat.
+    #[test]
+    fn breadth_gate_ignores_non_wildcard_coarse_claims() {
+        for scope in ["workspace:crates/rally-cli", "repo:agent-rally-point"] {
+            let incoming = fact("claim-x", "tool-x", vec![scope]);
+            assert!(
+                breadth_violation(&incoming, &[]).is_none(),
+                "{scope} is bounded and must not require the lead seat"
+            );
+        }
+    }
+
+    #[test]
+    fn lead_from_facts_reopens_the_seat_on_relinquish() {
+        let claimed = lead_decision("tool-lead", 1);
+        let relinquished = Fact {
+            subject: "role:lead:relinquished".to_string(),
+            seq: 2,
+            ..lead_decision("tool-lead", 2)
+        };
+        assert_eq!(
+            lead_from_facts(std::slice::from_ref(&claimed)).as_deref(),
+            Some("tool-lead")
+        );
+        assert_eq!(lead_from_facts(&[claimed, relinquished]), None);
     }
 
     #[test]

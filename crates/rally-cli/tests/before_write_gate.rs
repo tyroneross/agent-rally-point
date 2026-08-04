@@ -113,6 +113,16 @@ fn before_write_gate_cannot_be_bypassed_by_warn_mode_missing_path_or_unknown_too
             .any(|finding| finding["code"] == "claimed-path")
     );
 
+    // `claude` claimed first above, so it holds the first-join lead seat, and
+    // its unscoped blocker is a genuine room-wide freeze.
+    //
+    // RC-038 changed what an unscoped blocker means. It used to hard-stop every
+    // write from every writer, so this assertion passed for a reason it did not
+    // state — the blocker's AUTHOR was never checked, and a rogue peer's
+    // identical fact denied the whole room. The freeze is now authority-gated
+    // (see `check::check_before_write`) and reports under `room-freeze`, so
+    // this test keeps its original subject (strict mode must still deny) while
+    // no longer certifying the denial-of-service alongside it.
     workspace.json(&[
         "say",
         "blocker",
@@ -143,7 +153,7 @@ fn before_write_gate_cannot_be_bypassed_by_warn_mode_missing_path_or_unknown_too
     assert!(
         missing_path_findings
             .iter()
-            .any(|finding| finding["code"] == "active-blocker")
+            .any(|finding| finding["code"] == "room-freeze")
     );
 
     let omitted_tool =
@@ -173,6 +183,179 @@ fn before_write_gate_cannot_be_bypassed_by_warn_mode_missing_path_or_unknown_too
             .as_str()
             .unwrap()
             .contains("requires a real --tool")
+    );
+
+    workspace.cleanup();
+}
+
+/// RC-038 end-to-end adversarial control, through the real binary.
+///
+/// Live-reproduced before the fix: `rally say blocker` with no scope, from a
+/// peer holding no authority, flipped `check before-write` from `allow: true`
+/// to `allow: false` for every agent and every path, and `--strict` returned
+/// exit 4 — which the coordination hook translates to
+/// `permissionDecision: "deny"` under `RALLY_HOOK_STRICT=1`. One unauthenticated
+/// fact, writable by any peer or by any commit touching the git-tracked ledger,
+/// stopped every edit in the room.
+///
+/// Revert the authority gate in `check::check_before_write` and this fails.
+#[test]
+fn unscoped_blocker_from_a_non_lead_does_not_deny_every_write() {
+    let workspace = Workspace::new("rally-rc038-unscoped-blocker");
+
+    // `lead_agent` enters first and takes the first-join lead seat.
+    workspace.json(&["enter", "--json", "--tool", "lead_agent"]);
+    workspace.json(&["enter", "--json", "--tool", "rogue"]);
+
+    let (before, _) = workspace.json_with_status(&[
+        "check",
+        "before-write",
+        "--json",
+        "--tool",
+        "lead_agent",
+        "--path",
+        "src/lib.rs",
+    ]);
+    assert_eq!(
+        before["data"]["check"]["allow"], true,
+        "baseline: the room must allow this write before the blocker lands"
+    );
+
+    workspace.json(&[
+        "say",
+        "blocker",
+        "--json",
+        "--tool",
+        "rogue",
+        "--subject",
+        "everything is blocked",
+    ]);
+
+    let (after, after_output) = workspace.json_with_status(&[
+        "check",
+        "before-write",
+        "--json",
+        "--tool",
+        "lead_agent",
+        "--path",
+        "src/lib.rs",
+        "--strict",
+    ]);
+    assert_eq!(
+        after["data"]["check"]["allow"], true,
+        "a non-lead's unscoped blocker must not deny an unrelated write"
+    );
+    assert_eq!(
+        after_output.status.code(),
+        Some(0),
+        "strict mode must not turn a non-lead's unscoped blocker into a hard deny"
+    );
+    let findings = after["data"]["check"]["findings"].as_array().unwrap();
+    let finding = findings
+        .iter()
+        .find(|finding| finding["code"] == "unscoped-blocker")
+        .expect("the blocker must still be surfaced to the agent, just not as a stop");
+    assert_eq!(finding["severity"], "warn");
+    assert!(
+        finding["message"]
+            .as_str()
+            .unwrap()
+            .contains("everything is blocked"),
+        "the agent must still be able to read what the blocker said"
+    );
+
+    workspace.cleanup();
+}
+
+/// RC-037 end-to-end adversarial control, through the real binary.
+///
+/// Live-reproduced before the fix: one `rally say claim --scope workspace:zzz`
+/// made every later claim of any path, by any other agent, fail to append —
+/// permanently, because nothing expires a claim whose owner keeps posting
+/// presence. The rejection also named a file the coarse claimant did not own.
+///
+/// Revert `resource_scope::root_contains` and the first assertion fails;
+/// revert `claim_authority::breadth_violation` and the third fails.
+#[test]
+fn coarse_claim_does_not_lock_the_room_out_of_claiming() {
+    let workspace = Workspace::new("rally-rc037-coarse-claim");
+
+    workspace.json(&["enter", "--json", "--tool", "lead_agent"]);
+    workspace.json(&["enter", "--json", "--tool", "rogue"]);
+
+    workspace.json(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "rogue",
+        "--scope",
+        "workspace:zzz",
+        "--subject",
+        "coarse claim",
+    ]);
+
+    // 1. The lockout is gone: an opaque workspace identifier says nothing about
+    //    whether src/lib.rs lives inside it, so it no longer conflicts.
+    let peer_claim = workspace.output(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "lead_agent",
+        "--path",
+        "src/lib.rs",
+        "--subject",
+        "normal work",
+    ]);
+    assert!(
+        peer_claim.status.success(),
+        "a coarse claim by one agent must not block every other claim in the room; stderr: {}",
+        String::from_utf8_lossy(&peer_claim.stderr)
+    );
+
+    // 2. A genuine same-path conflict is still rejected, and the message now
+    //    names the scope the OWNER holds rather than the one the claimant asked
+    //    for.
+    let colliding = workspace.output(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "rogue",
+        "--path",
+        "src/lib.rs",
+        "--subject",
+        "collide",
+    ]);
+    assert_eq!(colliding.status.code(), Some(2));
+    let body: Value = serde_json::from_slice(&colliding.stderr).unwrap();
+    let message = body["error"].as_str().unwrap();
+    assert!(
+        message.contains("lead_agent holds file:src/lib.rs"),
+        "the rejection must name the real owner and the scope it really holds; got: {message}"
+    );
+
+    // 3. Room-wide breadth is still expressible, and still gated: the lead may
+    //    take it, a peer may not.
+    let rogue_wildcard = workspace.output(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "rogue",
+        "--scope",
+        "workspace:*",
+        "--subject",
+        "room-wide grab",
+    ]);
+    assert_eq!(rogue_wildcard.status.code(), Some(2));
+    let body: Value = serde_json::from_slice(&rogue_wildcard.stderr).unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("only the lead may hold it")
     );
 
     workspace.cleanup();

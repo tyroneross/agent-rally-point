@@ -745,7 +745,7 @@ pub(crate) struct DaemonStartArgs {
     pub(crate) idle_exit_secs: Option<u64>,
 }
 
-const COMMANDS: &[&str] = &[
+pub(crate) const COMMANDS: &[&str] = &[
     "init",
     "hooks",
     "enter",

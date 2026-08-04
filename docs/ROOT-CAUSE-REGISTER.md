@@ -885,8 +885,32 @@ review answers the question you asked.
   `tests/hooks/test_zz_probe.sh` and asserts REFUSED plus no marker; and one that sets an
   attacker-controlled pin ref with matching content and asserts REFUSED. The `GATE_MARKER` harness
   for this already exists at `tests/hooks/test_prepush_pinned_gate.sh:56`.
-- **Deliberately not fixed in this run.** Changing the gate mid-release, with the fix unverified by a
-  live push, risks losing the ability to push at all. Queued as the next workstream.
+- **State update 2026-08-04: PARTIALLY FIXED, adversarial control proven.**
+  - **Closed:** the host-test glob. `.githooks/pre-push:194-207` exports the resolved pin commit;
+    `scripts/check-release-parity.sh:165-232` lists `tests/hooks/` at that commit and refuses any
+    working-tree host test that is absent from it OR differs in content, naming the file and the
+    override. `RALLY_PREPUSH_PIN_COMMIT` is explicitly `unset` when no pin resolves, so an inherited
+    value cannot re-open the hole through the fix for it.
+  - **Closed:** the A2 environment path, by a stronger rule than the one proposed. Rather than
+    testing whether an env-supplied pin is vacuous, an env-supplied pin now requires
+    `RALLY_PREPUSH_ACK_ENV_PIN=1` in EVERY case — the SEC-005 premise is that the environment is not
+    trusted, so its pin cannot be self-certifying. The default `main` pin is unchanged.
+  - **Adversarial control:** `tests/hooks/test_prepush_gate_scope.sh`, 20 assertions. Revert-proof
+    measured four ways: parity reverted → 5 failures; hook reverted → 4; both → 9; fixed → 0. The
+    marker assertion the entry called for is among them ("the unpinned host test's body did NOT
+    execute"). Runs in CI via `.github/workflows/ci.yml:97-110`.
+  - **Still open, and the header now says so at `:51-61`:** `cargo test` / `cargo clippy` still
+    compile and run the pushed tree's `build.rs`, proc macros, and test bodies — by far the largest
+    surface, unchanged. `check-release-parity.sh` still runs the pushed
+    `generate_host_surfaces.py`, `build-codex-artifact.sh`, and the two hardcoded
+    `tests/scripts/` unittest modules (an EDIT to those is caught by the pin diff; a NEW file there
+    is not). The pin is still whatever local `main` points at; ancestor-reachability from a trusted
+    upstream was NOT implemented — it needs a remote-ref policy decision and would change behavior
+    for offline pushes.
+  - **⚠️ New defect found while fixing this — see RC-046.**
+  - **Verification limit:** every assertion drives the hook with synthetic stdin tuples against
+    throwaway `git init` fixtures. No real `git push` exercised the change until this run's own
+    push, which is the first end-to-end evidence.
 
 ### RC-035 — the installer propagates repo bytes into `$HOME`
 - **State:** `mechanism`. **NOT fixed.**
@@ -939,6 +963,32 @@ review answers the question you asked.
   message to name the actual conflicting scope; surface the auto-claim failure instead of `|| true`.
 - **Adversarial control:** claim `workspace:x` as one tool, assert another tool can still claim a
   file path.
+- **State update 2026-08-04: FIXED, all three halves, adversarial controls proven.**
+  - **Lockout:** `resource_scope::root_contains` decides containment by IDENTIFIER, not by type. A
+    namespace root contains a finer scope only when its identifier answers the question — the
+    explicit wildcard `*`, or a path the finer scope sits beneath. An opaque `workspace:zzz` or
+    `repo:some-name` contains nothing but itself. **Unknowable containment fails open**, because
+    reporting a conflict the code cannot substantiate is exactly what produced the lockout.
+  - **Breadth authority:** `claim_authority::breadth_violation` refuses `workspace:*` / `repo:*` from
+    anyone but the lead, at append time, naming the current lead and the alternative. The capability
+    survives for the agent that legitimately needs it. ⚠️ The lead seat is first-join and
+    unauthenticated — this raises the bar from "any writer" to "the first writer", and is documented
+    as such in `docs/security/TRUST-MODEL.md` rather than claimed as authorization.
+  - **Wrong message:** `ClaimConflict` carries `existing_scope` alongside `scope`; the rejection now
+    reads `lead_agent holds file:src/lib.rs (claim <id>), which overlaps the scope you requested,
+    file:src/lib.rs`.
+  - **Silent half:** `hooks/rally-coordination-hook.sh` replaces `|| true` with
+    `_rally_advise_claim_failed`, which prints the CLI's own error to stderr once per session per
+    failure class. Still non-fatal — a failed claim never blocks an edit — but no longer invisible.
+  - **Adversarial controls, revert-measured:** `resource_scope.rs` (4 unit tests; reverting
+    `root_contains` fails 3), `claim_authority.rs` (5 unit tests; reverting the gate fails 2),
+    `tests/before_write_gate.rs::coarse_claim_does_not_lock_the_room_out_of_claiming` (end-to-end
+    through the real binary; fails on either revert). Live repro before the fix and after it is in
+    this run's report.
+  - **Not addressed:** the lease-scaling observation stands — a coarse claim still gets the 2 h
+    window and `claim_reclaim_eligible` still keys on owner silence, so a presence-posting owner
+    holds a legitimate claim indefinitely. That is RC-041-adjacent reaper work, tracked with the
+    handoff-expiry item, not part of this fix.
 
 ### RC-038 — one unscoped blocker hard-stops every write by every agent
 - **State:** `observed`, live-reproduced. **NOT fixed.**
@@ -950,6 +1000,27 @@ review answers the question you asked.
   Empty-scope `binding-decision` (`check.rs:194-214`) matches universally too.
 - **Fix shape:** require non-empty scope on blockers, or downgrade empty-scope to warn.
 - **Adversarial control:** post an unscoped blocker, assert `check before-write` still allows.
+- **State update 2026-08-04: FIXED, adversarial control proven.**
+  - Neither proposed shape was taken as written. Requiring a scope removes a capability a lead
+    genuinely needs (freeze the room during a release), and a blanket downgrade to warn removes it
+    just as completely. The fix gates it on the same rule RC-037's wildcard uses — **a room-wide
+    effect requires the lead seat**. The lead's unscoped blocker stops every write and reports as
+    `room-freeze`; anyone else's reports as `unscoped-blocker` at `warn` and carries the subject so
+    the agent still reads it. `check.rs` no longer treats an empty scope as matching every path.
+  - Unscoped binding decisions are labelled `unscoped-decision` and no longer carry a `path` they
+    never named. They were already `info`, so this changes reporting honesty, not gating.
+  - **Adversarial controls, revert-measured:** 4 unit tests in `check.rs` (reverting the authority
+    check fails 2) plus
+    `tests/before_write_gate.rs::unscoped_blocker_from_a_non_lead_does_not_deny_every_write`, which
+    drives the real binary and asserts both `allow: true` and strict exit 0.
+  - **An existing test had encoded the defect.**
+    `before_write_gate_cannot_be_bypassed_by_warn_mode_missing_path_or_unknown_tool` asserted the
+    unscoped blocker's hard stop and passed for a reason it did not state: the blocker's AUTHOR was
+    never checked, and the fixture's author happened to be the first-join lead. It now asserts
+    `room-freeze` and keeps its original subject. This is the register's
+    "oracle baseline can encode the defect" pattern, found by the fix rather than by the test.
+  - **Residual, stated in the trust model:** an agent that enters an empty room first holds the lead
+    seat and can therefore still freeze the room.
 
 ### RC-039 — no write-side caps anywhere on the fact surface
 - **State:** `observed`. **NOT fixed.**
@@ -1078,6 +1149,42 @@ review answers the question you asked.
   autocrlf; the cross-process mutation lock is a documented no-op on Windows
   (`store.rs:819-822`), so two agents get ZERO mutual exclusion on the core value proposition; three
   committed symlinks ship broken without Developer Mode.
+
+### RC-046 — an unresolvable env pin still disables the pre-push gate with only a warning
+- **State:** `observed`, found while fixing RC-034. **NOT fixed.**
+- **Mechanism:** `.githooks/pre-push:136-144` resolves the pin ref; when it does not resolve, the
+  bootstrap fallback runs all three dispatcher scripts from the pushed tree, prints a warning, and
+  requires no acknowledgement. RC-034's new env-pin ack (`:241-261`) fires only when the pin
+  RESOLVES, so `RALLY_PREPUSH_GATE_PIN_REF=does-not-exist` skips both controls. Reachable the same
+  way as the RC-034 A2 path: `.envrc` is not in `.gitignore`, so a committed one plus `direnv allow`
+  supplies the variable.
+- **Why it was left:** `tests/hooks/test_prepush_pinned_gate.sh:215-228` asserts `rc=0` for exactly
+  this path. Changing it turns that suite red, and it was out of the fixing agent's owned scope
+  during a release-blocker run. Fixing it means deciding what an unresolvable pin should mean —
+  refuse, or ack — and updating that assertion in the same commit.
+- **Fix shape:** treat "env-supplied AND unresolvable" as the strictest case, not the most permissive
+  one: refuse unless acked. Keep the default `main`-does-not-resolve bootstrap path permissive, since
+  that is the genuine brand-new-repo case.
+- **Adversarial control:** a prepush case setting an env pin to a nonexistent ref, asserting REFUSED
+  without the ack and permitted with it, plus a marker proving the pushed gate script did not run.
+- **Effort:** S — one conditional in `.githooks/pre-push`, one assertion update in
+  `test_prepush_pinned_gate.sh`, one new case in `test_prepush_gate_scope.sh`.
+
+### RC-047 — `rally --help` omitted a quarter of the CLI, and nothing checked
+- **State:** `FIXED 2026-08-04`, with a regression control.
+- **Mechanism:** `help_text()` was a hand-maintained string list and `cli::COMMANDS` was the real
+  registry. They drifted to 31 of 42: `doctor`, `risks`, `decisions`, `artifacts`, `claims`, `lead`,
+  `ack`, `worktree`, `daemon`, `self-exit-check`, `claims-refresh` were all real, all documented
+  elsewhere, and invisible to anyone who typed `--help` first. `reject_unknown_command` routes a
+  mistyped command to that same list, so a user who guessed a real name and mistyped it was sent to
+  a list that did not contain it.
+- **Shape:** this is the register's second pattern in a low-stakes register — a surface asserting
+  completeness with nothing grading it. The one-time fix is the 11 added lines; the durable fix is
+  `help_text_names_every_registered_command`, which fails when a command joins `COMMANDS` without a
+  help line.
+- **Not covered:** the test matches on the command NAME, so a help line whose flags have drifted from
+  the parser still passes. `--receipt-threshold` vs `--receipt-threshold-secs` was found by hand in
+  this run, not by a check. Grading flag spellings against `bpaf` needs a different mechanism.
 
 ## Working hypothesis across entries
 

@@ -19,6 +19,17 @@ Rally **advises and never blocks**. A failing hook still lets your edit through.
 - **Room state on demand.** `rally room`, `rally risks`, and `rally next` project current claims, decisions, risks, and a recommended next action from the log.
 - **One room, any host.** Claude Code, Codex, Gemini, and Cursor share a room; each agent passes its own `--tool` id.
 
+## Prerequisites
+
+| Tool | Required for | Without it |
+|------|---------------|------------|
+| `git` | Cloning the repo; `.rally/log/` is committed, append-only content. | No repo, no ledger. |
+| `tmux` | The default backend for `rally run` / `rally inject` (`--backend auto` falls back to tmux when no `ptyd` socket is live — see `crates/rally-cli/src/backends.rs`). | Managed sessions cannot launch or receive injected messages, unless you configure `cmux` or a live `ptyd` daemon instead. |
+| `node` | Rendering the committed hooks' JSON output — SessionStart's room summary, PreToolUse's deconfliction warning (`hooks/rally-coordination-hook.sh`). | Hooks still run their Rally side effects (enter, status, claims) but print no warning text; a one-line stderr notice names the gap once per session, and hooks still exit 0. |
+| `python3` | `scripts/generate_host_surfaces.py --check` and `scripts/sync_host_integrations.py`, the host-surface drift checks under "Keeping hosts on one release" below. | Those two scripts don't run; the CLI and hooks are unaffected. |
+| `gh` (GitHub CLI) | `scripts/install-rally.sh` only — it requires `gh attestation verify` (build-provenance check) before making the downloaded binary executable. | The installer refuses to install rather than fall back to an unverified download. Not needed for `cargo install --path crates/rally-cli`. |
+| `jq` | ⚠️ Uncertain / optional — appears only in dev-facing scripts (`scripts/coordination-smoke.sh`, `scripts/check-release-parity.sh`, `scripts/install_rally_hooks.sh`), not in the documented install or `rally` CLI paths. | Those specific scripts fail if run directly; nothing else is affected. |
+
 ## Install
 
 **As a Claude Code plugin:**
@@ -44,7 +55,7 @@ cd agent-rally-point
 cargo install --path crates/rally-cli
 ```
 
-Building from source needs Rust 1.85 or newer.
+Building from source needs Rust 1.89 or newer — the MSRV pinned in `Cargo.toml`'s `rust-version`. For a reproducible build (matching `rustfmt`/`clippy` output), use the exact toolchain `rust-toolchain.toml` pins (currently 1.95.0); `rustup` picks it up automatically inside this checkout.
 
 Hooks also need `node` on PATH to render their output — SessionStart's room summary and PreToolUse's deconfliction warning are both built by parsing `rally`'s JSON in a small Node script. Without `node`, the hooks still run their Rally side effects (enter, status, claims), but no warning text is produced; they print a one-line notice naming the gap once per session (on stderr) and still exit 0.
 
@@ -116,8 +127,8 @@ rally claims --json
 ## Managed sessions
 
 ```bash
-rally run claude                            # becomes claude-01, tool claude_code:01
-rally run --backend <auto|tmux|cmux|ptyd>   # auto = ptyd if live, else tmux
+rally run claude                                  # becomes claude-01, tool claude_code:01
+rally run claude --backend <auto|tmux|cmux|ptyd>  # auto = ptyd if live, else tmux
 rally inject <session|name|tool> --handoff <event-id> --json
 ```
 
@@ -180,7 +191,7 @@ cargo test --all
 git diff --check
 ```
 
-Primary code must compile on Rust 1.85.
+Primary code must compile on Rust 1.89 (the MSRV in `Cargo.toml`). These verification commands themselves run under the exact toolchain `rust-toolchain.toml` pins (1.95.0) — `cargo fmt --check` needs a matching `rustfmt` build or its diff is meaningless.
 
 ## License
 

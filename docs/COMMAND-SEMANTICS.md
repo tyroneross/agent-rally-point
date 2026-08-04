@@ -70,7 +70,7 @@ Definitions:
 | `rally version` | no | no | no | yes | Pure process metadata. |
 | `rally watch` | no | yes | optional | conditional | `--once`/projection-only use is audit-friendly; `--on-activity` executes an external command. |
 | `rally route-findings` | yes | yes | no | no | Converts verified findings into risks or handoffs. |
-| `rally worktree-gc` | optional | yes | yes | no | Dry-run is inspection; apply removes worktrees/branches after its safety checks. |
+| `rally worktree gc` | optional | yes | yes | no | Dry-run is inspection; apply removes worktrees/branches after its safety checks. |
 
 ## Simplification Direction
 

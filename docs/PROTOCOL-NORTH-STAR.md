@@ -369,6 +369,21 @@ Claims should be as narrow as possible and as broad as necessary. A broad claim
 such as `repo:easy-terminal` should be rare and time-bounded. Most claims should
 target files, directories, branches, ports, processes, or task ids.
 
+**Containment is decided by identifier, not by type (RC-037).** A namespace root
+(`workspace:`, `repo:`) contains a finer scope only when its identifier answers
+the question: the explicit wildcard `*`, or a path the finer scope sits beneath.
+An opaque root such as `workspace:zzz` says nothing about whether `src/lib.rs`
+lives inside it, so it contains nothing but itself. Treating an unknowable
+containment relation as a conflict is what let one coarse claim reject every
+other claim in the room, permanently.
+
+**Room-wide breadth is explicit and authority-gated.** `workspace:*` and `repo:*`
+mean "everything in this room", and only the lead may hold one. Anyone else is
+refused at append time with the reason and the alternative. The gate gives the
+lead a real capability and denies an unauthorized agent a room-wide lock; it does
+not authenticate the lead seat itself — see
+[`docs/security/TRUST-MODEL.md`](security/TRUST-MODEL.md).
+
 Claim acquisition should be deterministic:
 
 1. Canonicalize requested scope.
@@ -391,6 +406,9 @@ Conflict examples:
 | `dir:Sources`, `namespace` + `exclusive` | `file:Sources/a.swift`, `exclusive` | Conflict. |
 | `file:a.swift`, `shared_read` | `file:a.swift`, `exclusive` | Allow or warn, policy-dependent. |
 | `repo:easy-terminal`, `advisory` | `file:a.swift`, `exclusive` | Allow with warning. |
+| `workspace:zzz`, `namespace` | `file:a.swift`, `exclusive` | Allow — an opaque root does not contain a path it never names. |
+| `workspace:*`, `namespace` (lead) | `file:a.swift`, `exclusive` | Conflict — the wildcard is deliberately room-wide. |
+| `workspace:*` requested by a non-lead | — | Reject at append: only the lead may hold a room-wide claim. |
 
 Conflict policy should be explicit:
 

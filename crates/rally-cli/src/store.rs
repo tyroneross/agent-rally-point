@@ -1767,14 +1767,23 @@ impl DirectRoomStore {
         }
         if fact.kind == FactKind::Claim {
             let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+            // RC-037: gate room-wide breadth BEFORE conflict detection. A
+            // `workspace:*` claim conflicts with everything by design, so if it
+            // ever lands, every later claim in the room fails to append. Refuse
+            // the unauthorized wildcard at the door rather than let it become a
+            // permanent room-wide lock.
+            if let Some(refusal) = claim_authority::breadth_violation(&fact, &facts) {
+                return Err(RallyError::Usage(refusal));
+            }
             if let Some(conflict) = claim_authority::detect_conflict(&facts, &fact) {
                 return Err(RallyError::Usage(format!(
-                    "claim conflict: {} already owns {}; existing claim {} conflicts with requested scope {}",
+                    "claim conflict: {} holds {} (claim {}), which overlaps the scope you \
+                     requested, {}",
                     conflict
                         .existing_owner
                         .as_deref()
                         .unwrap_or("unknown owner"),
-                    conflict.scope,
+                    conflict.existing_scope,
                     conflict.existing_claim_id,
                     conflict.scope
                 )));

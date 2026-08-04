@@ -7550,6 +7550,37 @@ mod tests {
         parts.iter().map(|s| s.to_string()).collect()
     }
 
+    /// `rally --help` must name every command `rally` accepts.
+    ///
+    /// It named 31 of 42. The 11 it omitted — `doctor`, `risks`, `decisions`,
+    /// `artifacts`, `claims`, `lead`, `ack`, `worktree`, `daemon`,
+    /// `self-exit-check`, `claims-refresh` — were real, documented elsewhere,
+    /// and invisible to anyone who typed `--help` first. The unknown-command
+    /// handler routes users to that same text, so a user who guessed a real
+    /// command name and mistyped it was sent to a list that did not contain it.
+    ///
+    /// This is the durable control, not the one-time fix: a command added to
+    /// `cli::COMMANDS` without a help line fails here.
+    #[test]
+    fn help_text_names_every_registered_command() {
+        let help = help_text();
+        let missing: Vec<&str> = crate::cli::COMMANDS
+            .iter()
+            .copied()
+            .filter(|command| {
+                !help
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&format!("rally {command}")))
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "`rally --help` omits registered commands: {missing:?}. Add a usage line to \
+             help_text() for each — a command users cannot discover is a command they \
+             will not use."
+        );
+    }
+
     // ---- P1c: session liveness — real pane probe beats presence TTL -------
 
     fn liveness_session(session_id: &str, tool: &str) -> ManagedSession {
@@ -13664,8 +13695,26 @@ fn help_text() -> String {
         "  rally locate <event-id> [--json]",
         "  rally recent [--all] [--limit <n>] [--json]",
         "  rally migrate-legacy [--json]  # one-shot replay of legacy ~/.agent-rally-point/apps/<slug>/changes.jsonl into this repo ledger",
+        "  rally ack --tool <tool> [--json]  # acknowledge rules/guardrails/lead/mission (coordination-mandate C1)",
         "  rally check before-write --tool <tool> --path <path> [--strict] [--json]",
         "  rally check before-complete --tool <tool> [--strict] [--json]",
+        "  rally check tier-fit --role <role> [--proposed-tier <tier>] [--json]  # advisory: does this role's tier fit",
+        "  rally check liveness [--tool <tool>] [--enforce] [--json]  # conflicted-out squads; --enforce releases their claims, never blocks",
+        "  rally check coordination --tool <committer> [--changed <path>]... [--json]",
+        "",
+        "  Room projections (read-only slices of `rally room`):",
+        "  rally claims [--json]      # active claims",
+        "  rally risks [--json]       # active coordination risks",
+        "  rally decisions [--json]   # current decisions",
+        "  rally artifacts [--json]   # recent artifacts",
+        "",
+        "  rally lead show|handoff|assign|relinquish [--json]  # lead title; rally records, never enforces",
+        "  rally doctor [--canonical-paths] [--prune-rooms] [--reap-stale] [--sweep-corrupt] [--apply] [--json]",
+        "    read-only until --apply; --reap-stale closes over-TTL presence, claims, and leads",
+        "  rally worktree gc [--apply] [--json]   # sweep-reap leftover per-agent worktrees",
+        "  rally daemon serve|start|stop|status [--json]  # per-repo rallyd store daemon",
+        "  rally claims-refresh --tool <tool> --lane <lane> --manifest <path> [--json]",
+        "  rally self-exit-check --tool <tool> [--persistent] [--required-streak <n>] [--json]",
         "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <auto|tmux|cmux|ptyd>] [--dry-run] [--json]",
         "    managed run ids auto-number active agents, e.g. claude-01 / claude_code:01",
         "  rally sessions [--reap] [--json] [--tmux-bin <path>] [--cmux-bin <path>]",
@@ -13689,7 +13738,7 @@ fn help_text() -> String {
         "  rally backlog done --tool <tool> --id <id> [--json]",
         "  rally board [--json]",
         "  rally route-findings --file <findings.json> [--tool <tool>] --verified [--json]",
-        "  rally check-ci [--strict] [--receipt-threshold <secs>] [--json]  # read-only CI gate: exits 0 (pass) or 4 with --strict (fail)",
+        "  rally check-ci [--strict] [--receipt-threshold-secs <secs>] [--json]  # read-only CI gate: exits 0 (pass) or 4 with --strict (fail)",
         "Fact kinds: claim, claim.expired, release, blocker, resolve, decision, artifact, handoff, risk, lesson, session, wake, standby, presence, backlog-item, mission",
         "  rally mission [--json]                                        # GET: current north-star + agent envelopes",
         "  rally mission --set \"<north-star>\" [--tool <t>] [--json]    # SET mission",

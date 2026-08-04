@@ -191,15 +191,19 @@ fn check_before_write(
             }
         }
     }
+    // RC-038: an EMPTY scope matches every path, so an unscoped fact used to
+    // apply to every write by every agent in the room. Distinguish the two
+    // cases by code and severity rather than collapsing them: a fact that named
+    // this path is evidence about this write; a fact that named nothing is
+    // context, and context must not decide the write.
     for decision in &snapshot.current_decisions {
-        if decision.scope.is_empty()
-            || path.is_some_and(|path| {
-                decision
-                    .scope
-                    .iter()
-                    .any(|scope| path_matches_scope(scope, path))
-            })
-        {
+        let scoped_match = path.is_some_and(|path| {
+            decision
+                .scope
+                .iter()
+                .any(|scope| path_matches_scope(scope, path))
+        });
+        if scoped_match {
             findings.push(CheckFinding {
                 code: "binding-decision",
                 severity: "info",
@@ -209,17 +213,26 @@ fn check_before_write(
                 path: path.map(str::to_string),
                 scope: Vec::new(),
             });
+        } else if decision.scope.is_empty() {
+            findings.push(CheckFinding {
+                code: "unscoped-decision",
+                severity: "info",
+                message: decision.subject.clone(),
+                fact_id: Some(decision.event_id.clone()),
+                owner: None,
+                path: None,
+                scope: Vec::new(),
+            });
         }
     }
     for blocker in &snapshot.active_blockers {
-        if blocker.scope.is_empty()
-            || path.is_some_and(|path| {
-                blocker
-                    .scope
-                    .iter()
-                    .any(|scope| path_matches_scope(scope, path))
-            })
-        {
+        let scoped_match = path.is_some_and(|path| {
+            blocker
+                .scope
+                .iter()
+                .any(|scope| path_matches_scope(scope, path))
+        });
+        if scoped_match {
             findings.push(CheckFinding {
                 code: "active-blocker",
                 severity: "stop",
@@ -229,6 +242,59 @@ fn check_before_write(
                 path: path.map(str::to_string),
                 scope: Vec::new(),
             });
+        } else if blocker.scope.is_empty() {
+            // RC-038, live-reproduced: one
+            // `rally say blocker --subject "everything is blocked"` flipped
+            // `check before-write` from allow to deny for EVERY agent, and
+            // under RALLY_HOOK_STRICT=1 that became `permissionDecision: deny`
+            // on every edit in the room. Any peer — or any commit touching the
+            // git-tracked ledger — could post it.
+            //
+            // A room-wide freeze is still a real thing a lead needs, so the
+            // capability is gated rather than removed, on the same rule
+            // RC-037's `workspace:*` gate uses: a room-wide effect requires
+            // the lead seat. The lead's unscoped blocker still stops every
+            // write; anyone else's is surfaced as a warning the agent reads
+            // and decides about.
+            //
+            // Residual risk, documented in docs/security/TRUST-MODEL.md: the
+            // lead seat can be taken by first join, so an agent that enters an
+            // empty room first can still freeze it. That is the same authority
+            // rally already extends to the lead everywhere else, and it is far
+            // narrower than "any fact from any writer".
+            let from_lead = blocker.tool.is_some() && blocker.tool == snapshot.lead;
+            if from_lead {
+                findings.push(CheckFinding {
+                    code: "room-freeze",
+                    severity: "stop",
+                    message: format!(
+                        "{} — room-wide freeze declared by the lead ({}).",
+                        blocker.subject,
+                        blocker.tool.as_deref().unwrap_or("unknown"),
+                    ),
+                    fact_id: Some(blocker.event_id.clone()),
+                    owner: blocker.tool.clone(),
+                    path: path.map(str::to_string),
+                    scope: Vec::new(),
+                });
+            } else {
+                findings.push(CheckFinding {
+                    code: "unscoped-blocker",
+                    severity: "warn",
+                    message: format!(
+                        "{} — posted by {}, who does not hold the lead seat, and naming no \
+                         scope, so it does not block this write. Re-post it with \
+                         `--scope file:<path>` to stop writes to a specific path, or take \
+                         the lead seat to declare a room-wide freeze.",
+                        blocker.subject,
+                        blocker.tool.as_deref().unwrap_or("an unidentified writer"),
+                    ),
+                    fact_id: Some(blocker.event_id.clone()),
+                    owner: blocker.tool.clone(),
+                    path: None,
+                    scope: Vec::new(),
+                });
+            }
         }
     }
 }
@@ -289,6 +355,145 @@ mod tests {
             event_id: format!("fact_{tool}"),
             ..Default::default()
         }
+    }
+
+    fn blocker(tool: &str, subject: &str, scope: Vec<&str>) -> Fact {
+        Fact {
+            tool: Some(tool.to_string()),
+            subject: subject.to_string(),
+            scope: scope.into_iter().map(str::to_string).collect(),
+            event_id: format!("blocker_{tool}"),
+            ..Default::default()
+        }
+    }
+
+    /// RC-038 adversarial control. Revert the empty-scope branch to the old
+    /// `scope.is_empty() || matches` condition at severity `stop` and this
+    /// fails: one unscoped blocker from ANY writer denied every write by every
+    /// agent in the room, and under `RALLY_HOOK_STRICT=1` that was a hard deny
+    /// on every edit.
+    #[test]
+    fn before_write_unscoped_blocker_from_a_non_lead_does_not_stop_the_write() {
+        let snapshot = RoomSnapshot {
+            active_blockers: vec![blocker("rogue", "everything is blocked", vec![])],
+            lead: Some("the-lead".to_string()),
+            ..Default::default()
+        };
+        let mut findings = Vec::new();
+        check_before_write(&snapshot, "beta", Some("src/foo.rs"), &mut findings);
+
+        assert!(
+            !findings.iter().any(|f| f.severity == "stop"),
+            "an unscoped blocker must not hard-stop an unrelated write; got {:?}",
+            findings
+                .iter()
+                .map(|f| (f.code, f.severity))
+                .collect::<Vec<_>>()
+        );
+        let f = findings
+            .iter()
+            .find(|f| f.code == "unscoped-blocker")
+            .expect("the unscoped blocker must still be surfaced, just not as a stop");
+        assert_eq!(f.severity, "warn");
+        assert!(
+            f.message.contains("everything is blocked"),
+            "the agent must still read the blocker's subject"
+        );
+    }
+
+    /// The capability survives the fix: the LEAD's unscoped blocker is a real
+    /// room-wide freeze and still stops every write. RC-038 removes the DoS,
+    /// not the freeze.
+    #[test]
+    fn before_write_unscoped_blocker_from_the_lead_freezes_the_room() {
+        let snapshot = RoomSnapshot {
+            active_blockers: vec![blocker("the-lead", "release freeze", vec![])],
+            lead: Some("the-lead".to_string()),
+            ..Default::default()
+        };
+        let mut findings = Vec::new();
+        check_before_write(&snapshot, "beta", Some("src/foo.rs"), &mut findings);
+        let f = findings
+            .iter()
+            .find(|f| f.code == "room-freeze")
+            .expect("the lead's unscoped blocker must still freeze the room");
+        assert_eq!(f.severity, "stop");
+    }
+
+    /// A room with no lead has nobody who can freeze it, so an unscoped
+    /// blocker from anyone is advisory.
+    #[test]
+    fn before_write_unscoped_blocker_without_a_lead_does_not_stop_the_write() {
+        let snapshot = RoomSnapshot {
+            active_blockers: vec![blocker("someone", "everything is blocked", vec![])],
+            lead: None,
+            ..Default::default()
+        };
+        let mut findings = Vec::new();
+        check_before_write(&snapshot, "beta", Some("src/foo.rs"), &mut findings);
+        assert!(!findings.iter().any(|f| f.severity == "stop"));
+    }
+
+    /// The other half of the same control: a blocker that NAMES this path
+    /// still hard-stops. Deconfliction is narrowed, not removed.
+    #[test]
+    fn before_write_scoped_blocker_still_stops_the_write() {
+        let snapshot = RoomSnapshot {
+            active_blockers: vec![blocker(
+                "peer",
+                "migration in flight",
+                vec!["file:src/foo.rs"],
+            )],
+            ..Default::default()
+        };
+        let mut findings = Vec::new();
+        check_before_write(&snapshot, "beta", Some("src/foo.rs"), &mut findings);
+        let f = findings
+            .iter()
+            .find(|f| f.code == "active-blocker")
+            .expect("a scoped blocker on this path must still fire");
+        assert_eq!(f.severity, "stop");
+    }
+
+    /// A scoped blocker on a DIFFERENT path must not leak onto this write.
+    #[test]
+    fn before_write_blocker_scoped_elsewhere_is_silent() {
+        let snapshot = RoomSnapshot {
+            active_blockers: vec![blocker("peer", "other lane", vec!["file:src/other.rs"])],
+            ..Default::default()
+        };
+        let mut findings = Vec::new();
+        check_before_write(&snapshot, "beta", Some("src/foo.rs"), &mut findings);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.code == "active-blocker" || f.code == "unscoped-blocker"),
+            "a blocker scoped to another path must produce no blocker finding"
+        );
+    }
+
+    /// RC-038 second half — an unscoped binding decision matched every path
+    /// too. It stays visible (`info`, so it never gated the write) but is now
+    /// labelled as unscoped so a reader is not told it applies to this path.
+    #[test]
+    fn before_write_unscoped_decision_is_labelled_unscoped() {
+        let mut decision = blocker("lead", "prefer async over threads", vec![]);
+        decision.event_id = "decision_lead".to_string();
+        let snapshot = RoomSnapshot {
+            current_decisions: vec![decision],
+            ..Default::default()
+        };
+        let mut findings = Vec::new();
+        check_before_write(&snapshot, "beta", Some("src/foo.rs"), &mut findings);
+        let f = findings
+            .iter()
+            .find(|f| f.code == "unscoped-decision")
+            .expect("an unscoped decision must be surfaced as unscoped");
+        assert_eq!(f.severity, "info");
+        assert!(
+            f.path.is_none(),
+            "an unscoped decision must not be reported as applying to this path"
+        );
     }
 
     fn squad(tool: &str, status: &str) -> Squad {

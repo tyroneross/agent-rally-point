@@ -392,6 +392,38 @@ _rally_status_working() {
   rally_timeout status post --tool "$tool" --state working --file "$path" --intent "editing $path" --json >/dev/null 2>&1 || true
 }
 
+# RC-037: report a failed auto-claim instead of swallowing it.
+#
+# The auto-claim is best-effort and must never block an edit, so this stays
+# advisory and always returns 0. But "best-effort" was implemented as `|| true`,
+# which made a room-wide claim-registration outage indistinguishable from
+# healthy operation — the agent kept editing, believing it held claims it had
+# never been granted.
+#
+# Stdout belongs to the host's JSON hook contract, so this goes to stderr,
+# alongside the SEC-001 containment refusals and the node-absence advisory.
+# Rate-limited to once per session per failure class (the CLI's first error
+# token) using the `.rally/.hook-seen` marker directory those notices already
+# own, so a persistent outage does not spam every tool call while a NEW failure
+# still gets through.
+_rally_advise_claim_failed() {
+  rcf_path="$1"
+  rcf_err="$2"
+  rcf_root="$(find_rally_root 2>/dev/null || pwd)"
+  rcf_session="$(printf '%s' "${session:-anon}" | tr -c 'A-Za-z0-9_.:-' '_')"
+  # Classify by the leading words of the CLI's message so distinct failures
+  # (claim conflict vs breadth refusal vs binary missing) each report once.
+  rcf_class="$(printf '%s' "$rcf_err" | tr -d '\n' | cut -c1-40 | tr -c 'A-Za-z0-9_.:-' '_')"
+  rcf_marker_dir="$rcf_root/.rally/.hook-seen"
+  rcf_marker="$rcf_marker_dir/$rcf_session.claim-failed.$rcf_class.seen"
+  [ -f "$rcf_marker" ] && return 0
+  printf 'rally-hook: auto-claim FAILED for %s — this edit is proceeding UNCLAIMED, so peers will not see it as yours. rally said: %s\n' \
+    "$rcf_path" "$(printf '%s' "$rcf_err" | tr '\n' ' ' | cut -c1-400)" >&2
+  mkdir -p "$rcf_marker_dir" 2>/dev/null || true
+  printf '1' > "$rcf_marker" 2>/dev/null || true
+  return 0
+}
+
 phase="${1:-idle}"
 tool="${2:-claude_code}"
 
@@ -811,7 +843,22 @@ try {
 }
 ' "$tool" "$path" ; } 2>/dev/null)"
       if [ "$already_claimed" != "yes" ]; then
-        rally_timeout say claim --tool "$tool" --path "$path" --subject "auto-claim $path" --json >/dev/null 2>&1 || true
+        # RC-037: this used to end in `|| true`, discarding both the exit code
+        # and stderr. When claim registration broke room-wide — one coarse
+        # claim was enough — every edit still proceeded, no claim was ever
+        # recorded, and nothing said so. Deconfliction degraded to nothing
+        # while the hook reported healthy, which is the register's first
+        # pattern: an ack for a step nobody asked about.
+        #
+        # Still non-fatal by design (this hook is advisory and must never
+        # break someone's edit), but no longer silent: the failure goes to
+        # stderr with the CLI's own message, once per session per reason, via
+        # the same `.rally/.hook-seen` marker the node-absence advisory uses.
+        _claim_err="$(rally_timeout say claim --tool "$tool" --path "$path" --subject "auto-claim $path" --json 2>&1 >/dev/null)" || _claim_failed=1
+        if [ "${_claim_failed:-0}" = "1" ]; then
+          _rally_advise_claim_failed "$path" "$_claim_err"
+          _claim_failed=0
+        fi
       fi
     fi
   fi
