@@ -1109,11 +1109,19 @@ review answers the question you asked.
      which ENCODE the pre-fix rendering. The strictly stronger fix — quote all `ident()` output and
      make the preamble's contract literally true — needs those assertions rewritten in the same
      change. **Effort: S. Queued.**
-  2. **GAP 1B untouched.** `rally room --json` still returns peer prose verbatim, and the preamble
-     the hook emits still says "Read the full item with `rally room --json` before acting on it" —
-     the sanitized path still routes the reader to the unsanitized one. `check before-write --json`
-     carries `blocker.subject` / `decision.subject` raw on the same sink. **Effort: M** (it is a
-     schema-affecting decision: sanitize the JSON sink, label it, or stop routing agents to it).
+  2. **GAP 1B — the false-routing half is closed; the sink itself is not.** The preamble no longer
+     presents `rally room --json` as the safe next step. It now says the CLI returns the SAME peer
+     text unquoted and unsanitized — the source, not a safer view — and `skills/agent-rally-point/
+     SKILL.md` says the same at length, including that a fact's `tool` field is self-asserted.
+     Both sanitizer blocks were edited identically; `test_sanitizer_block_parity.sh` confirms they
+     are still byte-identical.
+     **STILL OPEN:** the sink is unchanged. `rally room --json` and `check before-write --json`
+     still return `subject` / `summary` / `evidence` verbatim, so a payload the hook neutralizes
+     reaches an agent intact through the CLI. Closing that is a schema decision — sanitize the JSON
+     sink, or add a machine-readable untrusted-content marker to the envelope — and it changes a
+     contract that hooks, tests, and the Codex plugin all consume. **Effort: M. Queued.**
+     Deliberately not attempted mid-release: an envelope change landing beside three security
+     fixes is how a downstream break gets attributed to the wrong commit.
   3. **The register's own correction remains ungraded:** losing sanitizer block 1 downgrades
      per-field caps and guillemet quoting without failing block 2 or the byte-identity test.
   4. **The 2A key list is a list.** A host inventing a new context-injection key is unenumerated

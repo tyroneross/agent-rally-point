@@ -137,6 +137,57 @@ fn subcommand_help_handles_positionals_without_panicking() {
     workspace.cleanup();
 }
 
+/// `rally … --json | head` must not panic.
+///
+/// Rust ignores SIGPIPE, so a reader that stops early surfaced as an EPIPE
+/// write error, and `println!` panics on that: "failed printing to stdout:
+/// Broken pipe (os error 32)", exit 101. The room payload is hundreds of
+/// kilobytes of JSON, so piping it into something that stops reading is the
+/// normal way to look at it, not an edge case.
+///
+/// Driven through a real shell pipeline because that is the only way to close
+/// the pipe the way `head` does; asserting on the child's stdout alone would
+/// never reproduce it.
+#[test]
+fn json_output_piped_to_a_short_reader_does_not_panic() {
+    let workspace = Workspace::new("rally-sigpipe");
+    workspace.output(&["enter", "--json", "--tool", "claude_code:01"]);
+
+    let bin = env!("CARGO_BIN_EXE_rally");
+    for reader in ["head -c 10", "head -1", "true"] {
+        let piped = Command::new("sh")
+            .arg("-c")
+            // stdout MUST go into the pipe — that is the whole mechanism. An
+            // earlier draft wrote `2>&1 >/dev/null | head`, which sends stdout
+            // to a regular file and stderr to the pipe, so no pipe ever broke
+            // and the test passed with the fix reverted. stderr is left to the
+            // shell so `Command` captures the panic if one happens.
+            .arg(format!("'{bin}' room --json | {reader}"))
+            .current_dir(&workspace.cwd)
+            .env("HOME", &workspace.home)
+            .env("RALLY_NO_AUTO_REAP", "1")
+            .output()
+            .expect("shell pipeline runs");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&piped.stdout),
+            String::from_utf8_lossy(&piped.stderr)
+        );
+        assert!(
+            !combined.contains("panicked"),
+            "`rally room --json | {reader}` panicked instead of exiting quietly; \
+             a reader closing the pipe is not an error. Got:\n{combined}"
+        );
+        assert!(
+            !combined.contains("Broken pipe"),
+            "`rally room --json | {reader}` surfaced a broken-pipe error to the user; \
+             got:\n{combined}"
+        );
+    }
+
+    workspace.cleanup();
+}
+
 #[test]
 fn top_level_help_and_docs_advertise_ptyd_backend() {
     let workspace = Workspace::new("rally-help-ptyd-backend");

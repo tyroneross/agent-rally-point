@@ -40,6 +40,16 @@ these is a call site, not new policy.
   binary was stale. The check states what it compared and what that does not
   prove; it never blocks.
 
+### Fixed — `rally … --json | head` no longer panics
+
+Rust ignores `SIGPIPE`, so a reader that stops early arrived as an `EPIPE` write
+error and `println!` panics on that: `failed printing to stdout: Broken pipe`,
+exit 101. Every `| head`, `| jq`, `| grep -q`, `| less` that quit early printed a
+panic. The room payload is hundreds of kilobytes of JSON, so piping it into
+something that stops reading is how people read it, not an edge case. Rally now
+exits 0 quietly, matching every other Unix CLI — handled in `std`, with no new
+dependency and no `unsafe`.
+
 ### Fixed — errors that named the wrong thing
 
 - **`rally run` says "tmux" when tmux is missing.** It launched with no
@@ -69,9 +79,15 @@ these is a call site, not new policy.
   unsanitized, un-allowlisted one, and its hostile fixtures no longer forge lines
   only with `\n` — which is why the `ident()` gap survived a green suite.
 
-Not closed: a three-word directive still renders bare, and `rally room --json`
-still returns peer prose verbatim while the preamble routes readers to it. See
-RC-040 in the register.
+- **The sanitized path stopped advertising an unsanitized one.** The hook's
+  preamble told the reader to "read the full item with `rally room --json`" —
+  which returns the same peer text unquoted and uncapped. It now says so plainly,
+  and `skills/agent-rally-point/SKILL.md` documents that `--json` is the source
+  rather than a safer view, and that a fact's `tool` field is self-asserted.
+
+Not closed: a three-word directive still renders bare, and the `--json` sink
+itself still returns peer prose verbatim — labelling it is done, sanitizing it is
+a schema decision deliberately deferred out of a held release. See RC-040.
 
 ### Security — one fact could take the whole room down (RC-037, RC-038, RC-034)
 

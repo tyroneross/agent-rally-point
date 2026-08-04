@@ -57,7 +57,49 @@ impl RenderedOutput {
         if let Some(err) = self.stderr {
             eprintln!("{err}");
         } else {
-            println!("{}", self.stdout);
+            write_line_or_exit_on_broken_pipe(&self.stdout);
+        }
+    }
+}
+
+/// Write one line to stdout, exiting quietly when the reader has closed the pipe.
+///
+/// Rust sets `SIGPIPE` to `SIG_IGN` at startup, so a closed downstream reader
+/// arrives as an `EPIPE` write error rather than as a signal — and `println!`
+/// treats that error as unrecoverable:
+///
+/// ```text
+/// $ rally room --json | head
+/// thread 'main' panicked at library/std/src/io/stdio.rs:
+/// failed printing to stdout: Broken pipe (os error 32)
+/// ```
+///
+/// Every `rally … --json | head`, `| jq`, `| grep -q`, `| less` that quit early
+/// printed a panic and exited 101. The payload here is hundreds of kilobytes of
+/// JSON, so piping it into something that stops reading is not an edge case, it
+/// is how people read it.
+///
+/// A reader closing the pipe is not an error — it is the reader saying it has
+/// enough — so this exits 0, matching what every other Unix CLI does. Handled
+/// here in `std` rather than by restoring `SIG_DFL` through `libc`: it needs no
+/// new dependency, no `unsafe`, and it behaves the same on Windows, where the
+/// signal does not exist.
+fn write_line_or_exit_on_broken_pipe(line: &str) {
+    use std::io::{ErrorKind, Write};
+
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    let wrote = handle
+        .write_all(line.as_bytes())
+        .and_then(|()| handle.write_all(b"\n"))
+        .and_then(|()| handle.flush());
+
+    match wrote {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(err) => {
+            eprintln!("rally: failed writing to stdout: {err}");
+            std::process::exit(1);
         }
     }
 }
