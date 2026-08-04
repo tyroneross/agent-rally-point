@@ -46,6 +46,8 @@ cargo install --path crates/rally-cli
 
 Building from source needs Rust 1.85 or newer.
 
+Hooks also need `node` on PATH to render their output — SessionStart's room summary and PreToolUse's deconfliction warning are both built by parsing `rally`'s JSON in a small Node script. Without `node`, the hooks still run their Rally side effects (enter, status, claims), but no warning text is produced; they print a one-line notice naming the gap once per session (on stderr) and still exit 0.
+
 **Check either path:**
 
 ```bash

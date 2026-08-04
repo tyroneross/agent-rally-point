@@ -46,6 +46,13 @@
 #     .rally/ (subjects, evidence, intents, tool ids, paths, scopes) is
 #     sanitized and quoted before it reaches the host's model context. See the
 #     "UNTRUSTED-DATA BOUNDARY" block in each node renderer below.
+#   - NODE REQUIRED FOR HOOK OUTPUT. Every rendered advisory (room awareness,
+#     PreToolUse deconfliction warnings) is built by parsing rally's JSON in
+#     node. Without node on PATH, rally CLI calls above still run (enter,
+#     status, claims), but no advisory can be built. The hook says so once
+#     per session on stderr (see `_rally_advise_node_missing`) and still
+#     exits 0 — silence would make "node missing" indistinguishable from
+#     "nothing to report".
 #   - Advisory only (default): emits `additionalContext` / `systemMessage`,
 #     never `permissionDecision: "deny"` / `decision: "block"`.
 #   - Strict mode (opt-in, RALLY_HOOK_STRICT=1): high-severity coordination
@@ -76,6 +83,16 @@
 # Exit code: 0 always (fail-open). Output goes on stdout per host hook contract.
 
 set -euo pipefail
+
+# Shared install-hint phrase reused by every "rally CLI is missing" advisory
+# (the offer branch below when .rally/ is absent, and the not-installed
+# branch further down when .rally/ IS present). One string so the two
+# messages describe the same two install paths without drifting apart. The
+# in-.rally branch used to build its own `cd <consumer-repo-root> &&
+# scripts/install-rally.sh` command, which fails in every consumer repo
+# because neither scripts/install-rally.sh nor crates/rally-cli exists there
+# — only in a checkout of tyroneross/agent-rally-point itself.
+_RALLY_INSTALL_HINT='`scripts/install-rally.sh` in a checkout of tyroneross/agent-rally-point (checksum- and attestation-verified release download), or `cargo install --path crates/rally-cli` in that same checkout (build from source)'
 
 # --- Self-gate: walk up from $PWD to find .rally/; exit 0 if absent --------
 find_rally_root() {
@@ -135,7 +152,7 @@ try { const c = JSON.parse(fs.readFileSync(p,"utf8")); process.stdout.write(Stri
           if command -v node >/dev/null 2>&1; then
             _offer_msg="Agent Rally Point is installed but this repo isn't coordinated yet. Run \`rally init\` to enable automatic multi-agent coordination (presence, before-write deconfliction, handoffs). One-time prompt — silence with \`RALLY_HOOKS=off\`."
             if [ "$_rally_present" = "0" ]; then
-              _offer_msg="Agent Rally Point hooks are installed but the rally CLI is not. Hooks never install it. Install it yourself first: \`scripts/install-rally.sh\` in a checkout of tyroneross/agent-rally-point (verified release download), or \`cargo install --path crates/rally-cli\` (build from source). Then run \`rally init\` here to enable coordination. One-time prompt — silence with \`RALLY_HOOKS=off\`."
+              _offer_msg="Agent Rally Point hooks are installed but the rally CLI is not. Hooks never install it. Install it yourself first: $_RALLY_INSTALL_HINT. Then run \`rally init\` here to enable coordination. One-time prompt — silence with \`RALLY_HOOKS=off\`."
             fi
             node -e '
 const msg = process.argv[1] || "";
@@ -262,8 +279,14 @@ fi
 # the explicit installer and stops.
 if ! command -v "$RALLY_BIN" >/dev/null 2>&1 && [ ! -x "$RALLY_BIN" ]; then
   if [ "${1:-idle}" = "start" ]; then
-    rally_root="$(find_rally_root 2>/dev/null || true)"
-    msg="Agent Rally Point: the rally CLI is not installed (looked for: $RALLY_BIN). This repo uses .rally/, so coordination is off until you install the binary. Hooks never install it — that is deliberate. Install it yourself: \`cd ${rally_root:-<rally-repo>} && scripts/install-rally.sh\` (checksum- and attestation-verified release download), or \`cd ${rally_root:-<rally-repo>} && cargo install --path crates/rally-cli\` (build from source). Both write to ~/.local/bin/rally. Until then these hooks no-op and rally skills will report errors."
+    # BLOCKER 3: this used to interpolate the CONSUMER repo's root into
+    # `cd <root> && scripts/install-rally.sh` / `cd <root> && cargo install
+    # --path crates/rally-cli`. Both commands fail in a consumer repo — that
+    # source tree only exists in a checkout of tyroneross/agent-rally-point.
+    # The sibling advisory above (the no-.rally/ offer branch) already gets
+    # this right; reuse its shared install hint instead of building a second,
+    # inconsistent one here.
+    msg="Agent Rally Point: the rally CLI is not installed (looked for: $RALLY_BIN). This repo uses .rally/, so coordination is off until you install the binary. Hooks never install it — that is deliberate. Install it yourself: $_RALLY_INSTALL_HINT. Both write to ~/.local/bin/rally. Until then these hooks no-op and rally skills will report errors."
     if command -v node >/dev/null 2>&1; then
       printf '%s' "$msg" | node -e '
 let m=""; process.stdin.on("data",c=>m+=c); process.stdin.on("end",()=>{
@@ -801,9 +824,44 @@ else
   rally_output="$(rally_timeout next --tool "$tool" --audit --json 2>/dev/null || true)"
 fi
 
+# --- Node-absence advisory (BLOCKER 2, RC-027 shape) ------------------------
+# Every render path below needs node to parse rally's JSON and build the
+# host's hook envelope. Before this function existed, a missing node meant a
+# silent `exit 0` here: `rally enter` / `status post` / `check before-write`
+# above still ran and the ledger still looked healthy, but the PreToolUse
+# deconfliction warning — this tool's headline feature — never reached the
+# agent, and nothing said why. "Absent" and "healthy" were indistinguishable
+# from the consumer's side, the same shape RC-027 names for the watcher.
+#
+# Stdout stays reserved for the host's JSON hook contract, which we cannot
+# build without node, so this goes on stderr — the channel the SEC-001
+# RALLY_BIN/PATH-containment refusals above already use for hook-authored
+# diagnostics that sit outside that contract. Once per session: reuse the
+# `.rally/.hook-seen` marker directory the anti-spam JSON renderer below
+# already owns for its own one-time notices, so whichever phase (SessionStart
+# or PreToolUse) fires first suppresses the identical notice on every later
+# phase in the same session instead of repeating on every tool call.
+_rally_advise_node_missing() {
+  local root marker_dir marker safe_session
+  root="$(find_rally_root 2>/dev/null || pwd)"
+  safe_session="$(printf '%s' "${session:-anon}" | tr -c 'A-Za-z0-9_.:-' '_')"
+  marker_dir="$root/.rally/.hook-seen"
+  marker="$marker_dir/$safe_session.node-missing.seen"
+  [ -f "$marker" ] && return 0
+  printf 'rally-hook: node is not on PATH — coordination output is DISABLED this session (SessionStart room-awareness, PreToolUse deconfliction warnings). rally CLI calls (enter/status/claims) above still ran silently. Install node to restore hook output. This notice is once per session; see %s.\n' \
+    "$marker" >&2
+  mkdir -p "$marker_dir" 2>/dev/null || true
+  printf '1' > "$marker" 2>/dev/null || true
+  return 0
+}
+
 # Render the host-specific output envelope from rally's JSON output.
-# Without node we can't parse rally JSON — emit nothing (silent no-op).
-if [ "$have_node" != "1" ]; then exit 0; fi
+# Without node we can't parse rally JSON — say why (once per session, on
+# stderr) and stay fail-open.
+if [ "$have_node" != "1" ]; then
+  _rally_advise_node_missing
+  exit 0
+fi
 
 # RALLY_HOOK_STRICT=1 → translator may emit deny/block on high-severity signals.
 # Default (any other value): force advisory-only.

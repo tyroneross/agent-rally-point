@@ -281,3 +281,5 @@ rally whoami --tool <you> --json
 rally enter --tool <you> --json
 rally ack --tool <you>
 ```
+
+The committed hooks also need `node` on PATH to render output (they parse `rally`'s JSON in Node). Without it the hooks still run their Rally calls silently but produce no advisory text; a one-line stderr notice names the gap once per session and the hooks stay fail-open (exit 0).
