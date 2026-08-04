@@ -291,6 +291,17 @@ pub(crate) struct CoordinationConfig {
     pub(crate) miss_multiplier: i64,
     /// Adaptive-liveness: extra grace (seconds) on top of the missed-beats window.
     pub(crate) grace_secs: i64,
+    /// Room composition: relevance weights used to rank items for budget fill.
+    pub(crate) relevance: crate::relevance::RelevanceWeights,
+    /// Room composition: fraction of the consumer's context the room may occupy.
+    /// `0.0` disables the byte ceiling entirely.
+    pub(crate) room_budget_fraction: f64,
+    /// Room composition: assumed consumer context size in bytes. Multiplied by
+    /// `room_budget_fraction` to yield the ceiling.
+    pub(crate) consumer_context_bytes: i64,
+    /// `next`: how long an unanswered handoff stays an active obligation before
+    /// it is de-prioritised out of the waiting/candidate projections.
+    pub(crate) stale_wait_secs: i64,
 }
 
 impl Default for CoordinationConfig {
@@ -303,6 +314,10 @@ impl Default for CoordinationConfig {
             default_cadence_secs: crate::liveness::DEFAULT_CADENCE_SECS,
             miss_multiplier: crate::liveness::MISS_MULTIPLIER,
             grace_secs: crate::liveness::GRACE_SECS,
+            relevance: crate::relevance::RelevanceWeights::default(),
+            room_budget_fraction: crate::relevance::DEFAULT_ROOM_BUDGET_FRACTION,
+            consumer_context_bytes: crate::relevance::DEFAULT_CONSUMER_CONTEXT_BYTES,
+            stale_wait_secs: crate::next::DEFAULT_STALE_WAIT_SECS,
         }
     }
 }
@@ -311,6 +326,11 @@ impl CoordinationConfig {
     /// Half-life expressed in seconds (the unit `decay::recency_weight` wants).
     pub(crate) fn half_life_secs(&self) -> i64 {
         (self.half_life_hours * 3600.0).round() as i64
+    }
+
+    /// The room byte ceiling, or `None` when the ceiling is disabled.
+    pub(crate) fn room_budget_bytes(&self) -> Option<usize> {
+        crate::relevance::budget_bytes(self.room_budget_fraction, self.consumer_context_bytes)
     }
 }
 
@@ -353,6 +373,45 @@ fn coordination_from_value(value: &Value, into: &mut CoordinationConfig) {
         && v >= 0
     {
         into.grace_secs = v;
+    }
+    if let Some(v) = coord.get("room_budget_fraction").and_then(Value::as_f64)
+        && v >= 0.0
+        && v <= 1.0
+    {
+        into.room_budget_fraction = v;
+    }
+    if let Some(v) = coord.get("consumer_context_bytes").and_then(Value::as_i64)
+        && v >= 0
+    {
+        into.consumer_context_bytes = v;
+    }
+    if let Some(v) = coord.get("stale_wait_secs").and_then(Value::as_i64)
+        && v > 0
+    {
+        into.stale_wait_secs = v;
+    }
+    let Some(rel) = coord.get("relevance").and_then(Value::as_object) else {
+        return;
+    };
+    // stale_author_factor is clamped to (0, 1] at USE time in
+    // `relevance::relevance` too — a value outside the range there falls back to
+    // the default rather than inverting the signal. Rejecting it here as well
+    // means a typo is ignored at config-read, matching the other knobs.
+    if let Some(v) = rel.get("stale_author_factor").and_then(Value::as_f64)
+        && v > 0.0
+        && v <= 1.0
+    {
+        into.relevance.stale_author_factor = v;
+    }
+    if let Some(v) = rel.get("addressed_boost").and_then(Value::as_f64)
+        && v >= 0.0
+    {
+        into.relevance.addressed_boost = v;
+    }
+    if let Some(v) = rel.get("path_overlap_boost").and_then(Value::as_f64)
+        && v >= 0.0
+    {
+        into.relevance.path_overlap_boost = v;
     }
 }
 
@@ -406,8 +465,50 @@ pub(crate) fn resolve_coordination(repo_root: &Path) -> Result<CoordinationConfi
     // grace may be 0; coord_env_i64 only accepts >0, which is fine — a 0 grace
     // override is a no-op (the missed-beats window already dominates).
     coord_env_i64("RALLY_GRACE_SECS", &mut cfg.grace_secs);
+    // Room composition. The two budget knobs accept 0, which DISABLES the
+    // ceiling — an operator must be able to turn the bound off, or it is not a
+    // choice. `coord_env_f64`'s guard already decides acceptance, so the
+    // fraction needs no special helper; the integer one does, because
+    // `coord_env_i64` hardcodes `> 0`.
+    coord_env_f64(
+        "RALLY_ROOM_BUDGET_FRACTION",
+        &mut cfg.room_budget_fraction,
+        |v| (0.0..=1.0).contains(&v),
+    );
+    coord_env_i64_allow_zero(
+        "RALLY_CONSUMER_CONTEXT_BYTES",
+        &mut cfg.consumer_context_bytes,
+    );
+    coord_env_i64("RALLY_STALE_WAIT_SECS", &mut cfg.stale_wait_secs);
+    coord_env_f64(
+        "RALLY_STALE_AUTHOR_FACTOR",
+        &mut cfg.relevance.stale_author_factor,
+        |v| v > 0.0 && v <= 1.0,
+    );
+    coord_env_f64(
+        "RALLY_ADDRESSED_BOOST",
+        &mut cfg.relevance.addressed_boost,
+        |v| v >= 0.0,
+    );
+    coord_env_f64(
+        "RALLY_PATH_OVERLAP_BOOST",
+        &mut cfg.relevance.path_overlap_boost,
+        |v| v >= 0.0,
+    );
 
     Ok(cfg)
+}
+
+/// Like [`coord_env_i64`] but accepts 0 (a meaningful "disabled" value for the
+/// budget knobs). Negative values are still rejected.
+fn coord_env_i64_allow_zero(name: &str, slot: &mut i64) {
+    if let Some(v) = env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        && v >= 0
+    {
+        *slot = v;
+    }
 }
 
 #[cfg(test)]

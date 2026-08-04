@@ -133,6 +133,7 @@ mod next;
 mod output;
 pub mod rallyd_core;
 mod reaper;
+mod relevance;
 mod resource_scope;
 mod retrospective;
 mod ripple;
@@ -950,7 +951,16 @@ fn command_self_exit_check(args: cli::SelfExitCheckArgs) -> Result<Output> {
 
     // next_actionable: does rally next surface addressed work?
     let backlog_items = list_backlog_items(&room).unwrap_or_default();
-    let next = build_next(&snapshot, &tool, None, &[], 1, backlog_items);
+    let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    let next = build_next(
+        &snapshot,
+        &tool,
+        None,
+        &[],
+        1,
+        backlog_items,
+        coord.stale_wait_secs,
+    );
     let next_actionable = next.actionable;
 
     // This cycle is "empty" only when work is resolved AND next is non-actionable.
@@ -2809,6 +2819,7 @@ fn command_next(args: NextArgs) -> Result<Output> {
     let snapshot = room.snapshot()?;
     // #7: always read the backlog store and surface ready items in next output.
     let backlog_items = list_backlog_items(&room).unwrap_or_default();
+    let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
     let next = build_next(
         &snapshot,
         &tool,
@@ -2816,6 +2827,7 @@ fn command_next(args: NextArgs) -> Result<Output> {
         &paths,
         limit,
         backlog_items,
+        coord.stale_wait_secs,
     );
     let action = next.action;
     let target_event_id = next

@@ -7,7 +7,12 @@ use crate::backlog::BacklogItem;
 use crate::store::{Fact, FactKind, RoomSnapshot};
 use crate::{FACT_SCHEMA, normalize_path, path_matches_scope, shell_quote};
 
-const STALE_WAIT_SECS: i64 = 24 * 60 * 60;
+/// Default window after which an unanswered handoff stops counting as an active
+/// obligation in the `next` projection. Overridable via
+/// `coordination.stale_wait_secs` (config) or `RALLY_STALE_WAIT_SECS` (env) —
+/// resolved by the caller and threaded in, so this module stays pure and the
+/// window can flex per repo instead of being pinned at one day for everyone.
+pub(crate) const DEFAULT_STALE_WAIT_SECS: i64 = 24 * 60 * 60;
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub(crate) struct EntryData {
@@ -259,8 +264,9 @@ pub(crate) fn build_next(
     paths: &[String],
     limit: usize,
     backlog_items: Vec<BacklogItem>,
+    stale_wait_secs: i64,
 ) -> NextResult {
-    let waiting_on = waiting_on_facts(snapshot, tool);
+    let waiting_on = waiting_on_facts(snapshot, tool, stale_wait_secs);
     let waiting = !waiting_on.is_empty();
 
     // #7: filter backlog items to those ready for pickup:
@@ -308,6 +314,7 @@ pub(crate) fn build_next(
         waiting,
         &waiting_on,
         &backlog_items,
+        stale_wait_secs,
     );
     candidates.sort_by(compare_next_candidates);
 
@@ -360,14 +367,14 @@ pub(crate) fn build_next(
     }
 }
 
-fn waiting_on_facts(snapshot: &RoomSnapshot, tool: &str) -> Vec<Fact> {
+fn waiting_on_facts(snapshot: &RoomSnapshot, tool: &str, stale_wait_secs: i64) -> Vec<Fact> {
     let stale_targets = snapshot.takeover_eligible_owners();
     snapshot
         .open_handoffs
         .iter()
         .chain(snapshot.active_blockers.iter())
         .filter(|fact| waiting_on_peer(fact, tool))
-        .filter(|fact| !stale_wait_obligation(fact, &stale_targets))
+        .filter(|fact| !stale_wait_obligation(fact, &stale_targets, stale_wait_secs))
         .cloned()
         .collect()
 }
@@ -380,11 +387,14 @@ fn next_candidates(
     waiting: bool,
     waiting_on: &[Fact],
     backlog_items: &[BacklogItem],
+    stale_wait_secs: i64,
 ) -> Vec<NextCandidate> {
     let mut candidates = Vec::new();
 
     for handoff in &snapshot.open_handoffs {
-        if assigned_to_tool(handoff, tool) && !stale_targeted_handoff(handoff, tool) {
+        if assigned_to_tool(handoff, tool)
+            && !stale_targeted_handoff(handoff, tool, stale_wait_secs)
+        {
             candidates.push(NextCandidate::from_fact(
                 "respond_to_handoff",
                 "open_handoff_targeted_to_this_tool",
@@ -718,19 +728,32 @@ fn waiting_on_peer(fact: &Fact, tool: &str) -> bool {
             .is_some_and(|target| target != tool && target != "all")
 }
 
-fn stale_wait_obligation(fact: &Fact, stale_targets: &BTreeSet<String>) -> bool {
+fn stale_wait_obligation(
+    fact: &Fact,
+    stale_targets: &BTreeSet<String>,
+    stale_wait_secs: i64,
+) -> bool {
     fact.target
         .as_deref()
         .is_some_and(|target| stale_targets.contains(target))
-        || fact_age_secs(fact).is_some_and(stale_wait_age)
+        || fact_age_secs(fact).is_some_and(|age| stale_wait_age(age, stale_wait_secs))
 }
 
-fn stale_targeted_handoff(fact: &Fact, tool: &str) -> bool {
-    fact.target.as_deref() == Some(tool) && fact_age_secs(fact).is_some_and(stale_wait_age)
+fn stale_targeted_handoff(fact: &Fact, tool: &str, stale_wait_secs: i64) -> bool {
+    fact.target.as_deref() == Some(tool)
+        && fact_age_secs(fact).is_some_and(|age| stale_wait_age(age, stale_wait_secs))
 }
 
-fn stale_wait_age(age_secs: i64) -> bool {
-    age_secs > STALE_WAIT_SECS
+/// STRICT greater-than, matching `decay::is_archivable`: an obligation exactly
+/// at the window is still active. A non-positive window falls back to the
+/// default rather than marking every handoff stale.
+fn stale_wait_age(age_secs: i64, stale_wait_secs: i64) -> bool {
+    let window = if stale_wait_secs > 0 {
+        stale_wait_secs
+    } else {
+        DEFAULT_STALE_WAIT_SECS
+    };
+    age_secs > window
 }
 
 fn fact_age_secs(fact: &Fact) -> Option<i64> {
@@ -938,7 +961,15 @@ mod tests {
             .squads
             .push(squad("claude_code:l4", "2000-01-01T00:00:00Z", "idle"));
 
-        let result = build_next(&snapshot, "codex", None, &[], 10, Vec::new());
+        let result = build_next(
+            &snapshot,
+            "codex",
+            None,
+            &[],
+            10,
+            Vec::new(),
+            DEFAULT_STALE_WAIT_SECS,
+        );
 
         assert_eq!(result.action, "proceed_solo");
         assert!(
@@ -961,7 +992,15 @@ mod tests {
             "active",
         ));
 
-        let result = build_next(&snapshot, "codex", None, &[], 10, Vec::new());
+        let result = build_next(
+            &snapshot,
+            "codex",
+            None,
+            &[],
+            10,
+            Vec::new(),
+            DEFAULT_STALE_WAIT_SECS,
+        );
 
         assert_eq!(result.action, "wait");
         assert_eq!(result.waiting_on.len(), 1);
@@ -976,19 +1015,33 @@ mod tests {
             "2000-01-01T00:00:00Z",
         ));
 
-        let result = build_next(&snapshot, "codex", None, &[], 10, Vec::new());
+        let result = build_next(
+            &snapshot,
+            "codex",
+            None,
+            &[],
+            10,
+            Vec::new(),
+            DEFAULT_STALE_WAIT_SECS,
+        );
         assert_eq!(result.action, "proceed_solo");
         assert!(!result.actionable);
     }
 
     #[test]
     fn targeted_handoff_ttl_is_strict_and_bad_timestamps_fail_open() {
-        assert!(!stale_wait_age(STALE_WAIT_SECS));
-        assert!(stale_wait_age(STALE_WAIT_SECS + 1));
+        assert!(!stale_wait_age(
+            DEFAULT_STALE_WAIT_SECS,
+            DEFAULT_STALE_WAIT_SECS
+        ));
+        assert!(stale_wait_age(
+            DEFAULT_STALE_WAIT_SECS + 1,
+            DEFAULT_STALE_WAIT_SECS
+        ));
 
         let malformed = handoff("bad-time", "codex", "not-a-timestamp");
         assert!(
-            !stale_targeted_handoff(&malformed, "codex"),
+            !stale_targeted_handoff(&malformed, "codex", DEFAULT_STALE_WAIT_SECS),
             "malformed timestamps must remain actionable"
         );
     }
@@ -1010,7 +1063,15 @@ mod tests {
             seq: 42,
         };
 
-        let result = build_next(&snapshot, "codex", None, &[], 10, vec![item]);
+        let result = build_next(
+            &snapshot,
+            "codex",
+            None,
+            &[],
+            10,
+            vec![item],
+            DEFAULT_STALE_WAIT_SECS,
+        );
 
         assert_eq!(result.action, "update_plan_status");
         assert!(result.actionable);
