@@ -14,5 +14,6 @@
   },
   "repo": "agent-rally-point",
   "room_cmd": "rally room",
+  "rotate_threshold_days": 30,
   "schema": "agent-rally.manifest.v1"
 }

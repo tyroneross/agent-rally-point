@@ -244,6 +244,69 @@ committed, durable across clone/machine. `facts.db` is a pure cache that
 `rally` rebuilds from the ledger on first open. Managed session lifecycle
 facts ride the same ledger.
 
+## What `rally room` Gives You
+
+`rally room --json` returns what is relevant to you now, not everything the room
+has ever held. Relevance is computed from signals Rally already tracks, so the
+answer changes with the situation and with who is asking.
+
+**Four signals compose the ranking.** How recently a fact was written (the same
+exponential decay that drives archiving). Whether its author is still beating
+inside their own adaptive liveness window. Whether the fact is addressed to you.
+And how much its scope overlaps the working set you declared with `--path`. Pass
+`--tool` and `--path` and you get a different, better room than a bare call —
+that is the point.
+
+**A missing signal never costs an item its place.** Every factor is neutral when
+it cannot be measured, so an item whose relevance is unknowable is ranked on age
+alone rather than sunk. Only a positive measurement — an author provably past
+their window — moves anything down.
+
+**Some things are never cut.** Active claims, blockers, peers, system health, and
+any handoff addressed to you ship whole regardless of size. Dropping one of those
+risks the write collision this tool exists to prevent, so their size is
+controlled by expiry, not by cutting. Everything else is ranked and fitted to a
+byte budget, and every non-empty bucket always contributes at least its top item.
+
+**Nothing is ever dropped silently.** `totals` carries true counts for every
+bucket on every response, so "1,390 archived facts" and "no archived facts" can
+never look the same from your side. If anything was omitted, a `composition`
+block names the bucket, the counts, the omitted event ids, and the command that
+returns the full view. If the never-cut buckets alone exceed the budget, the room
+ships over budget and says so rather than cutting state you need.
+
+### Getting the full view
+
+```bash
+rally room --include-archived --json   # everything, no budget applied
+rally room --tool <you> --path src/store.rs --json   # ranked for your lane
+rally room --budget-bytes 0 --json     # disable the ceiling for this call
+rally locate <event-id> --json         # one item named in composition.omitted_ids
+```
+
+`--include-archived` is the drill-in, so the budget does not apply to it. An
+escape hatch that is itself truncated is not an escape hatch.
+
+### Tuning it
+
+Every threshold is config, resolved default → user → repo → env, under
+`coordination` in `.rally/config.json`:
+
+| Key | Default | What it does |
+|---|---|---|
+| `room_budget_fraction` | `0.05` | Share of the consumer's context the room may occupy. `0` disables the ceiling. |
+| `consumer_context_bytes` | `4000000` | Assumed consumer context. With the default fraction this is a 200 KB ceiling. |
+| `half_life_hours` | `48` | Recency decay half-life. |
+| `archive_floor_weight` | `0.05` | Below this weight a fact is archived out of the active buckets. |
+| `relevance.stale_author_factor` | `0.5` | Multiplier for a provably-stale author. Clamped to `(0, 1]`. |
+| `relevance.addressed_boost` | `1.0` | Boost when an item is addressed to you. |
+| `relevance.path_overlap_boost` | `1.0` | Boost at full overlap with your declared paths. |
+| `stale_wait_secs` | `86400` | When an unanswered handoff stops counting as an active obligation. |
+| `rotate_threshold_days` | `30` | Age at which a log segment is eligible for `rally rotate`. |
+
+Each has a `RALLY_`-prefixed env override (`RALLY_ROOM_BUDGET_FRACTION`,
+`RALLY_HALF_LIFE_HOURS`, and so on) that beats repo config.
+
 ## Single-Writer Daemon (rallyd, optional)
 
 `rallyd` is a per-repo daemon that owns `.rally/facts.db` so exactly one process
