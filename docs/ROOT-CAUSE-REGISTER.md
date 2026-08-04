@@ -1031,6 +1031,9 @@ review answers the question you asked.
   arrive through a PR as well as through a running peer.
 
 ### RC-040 — ARP-004 sanitization is bypassed by unquoted identifiers and by the `--json` sink
+
+> **State update 2026-08-04: GAPS 1A, 2A and 2B FIXED with revert-proof controls. GAP 1B still
+> open.** Detail at the end of this entry.
 - **State:** `observed`, live-reproduced. **NOT fixed.** The newline-forgery class ARP-004 was built
   for IS genuinely closed — U+2028/2029, RLO, bidi isolates, ZWSP, ZWJ, BOM, tag chars and all Cc
   are neutralized in both blocks, and guillemet-close and preamble-suppression are closed
@@ -1063,6 +1066,90 @@ review answers the question you asked.
   guillemet quoting block 2 cannot reconstruct. **Losing block 1 silently downgrades quality without
   failing block 2.** The existing byte-identity test does not protect what it appears to.
 
+#### RC-040 — 2026-08-04 fix detail
+
+- **GAP 1A closed by prose DENSITY, not by length or by collapsing punctuation.** `ident()` now
+  splits into `hostId()` (charset normalizer, unchanged) and a density gate: a value carrying more
+  than three vowel-bearing letter-runs is wrapped in guillemets. Length cannot separate payload from
+  data here — the longest benign scope in this ledger is 177 chars and its longest single path
+  component is an 87-char hyphen-joined English filename. Collapsing `-`/`.`/`:`/`/` would mangle
+  `crates/rally-cli` everywhere. Density does separate: over 7,231 event ids, 157 tool ids and 451
+  scopes, event ids top out at 4 words and tool ids at 7 (97% ≤ 4), while the two RC-040 payloads
+  score 12 and 13. Cost, stated plainly: ~80% of real file-path scopes now render QUOTED — full
+  content, guillemets around it. Scope rendering is additionally budgeted at 200 chars per claim
+  (covers 97.5% of 1,036 real claims; median 79) and names the remainder.
+- **A bypass the fix itself introduced, caught by its own generic assertion:** `shown.join(",")`
+  welded N benign scopes into ONE punctuation-joined token, reassembling exactly the shape the
+  per-value gate breaks (`file:stop-all,file:work-now`). Fixed to `", "` — the space is what makes
+  a per-token metric sound at all.
+- **`validate_agent_id`:** `MAX_AGENT_ID_LEN` 128 → 64, plus `MAX_AGENT_ID_PROSE_WORDS = 8`
+  mirroring the hook's metric. Ids are minted `<host-family>:<segment>` with the segment cut at 40,
+  so the construction ceiling is 52 bytes; **0 of 125 distinct real ids in this ledger are
+  rejected**, longest 52 (independently re-measured by the orchestrator). The read-side stem cap
+  moved to its own constant so an id written before this change still resolves to the same file.
+- **GAP 2A:** the suite now enumerates every `additionalContext` / `systemMessage` /
+  `agent_message` / `permissionDecisionReason` sink in the hook and requires each to emit the
+  sanitized value or match an allowlist keyed by EXACT emitter text. Two sinks are allowlisted, each
+  with a mechanical check rather than a comment: both emit strictly above the first ledger read, and
+  neither source variable's assignments contain command substitution or an unexpected `$NAME`. A
+  stale allowlist entry fails the test, because an entry that no longer matches is a lie.
+- **GAP 2B:** new fixtures drive a hyphen-joined imperative through a claim scope and through a peer
+  tool id, asserting the marker never appears outside a quoted span AND that no unquoted token
+  carries more than three prose words. Both fail on the unfixed hook.
+- **Revert-proof messages, verbatim:** `hyphen-joined directive rendered OUTSIDE the guillemet
+  contract`; `rogue tool id rendered OUTSIDE the guillemet contract`; `sanitizer destroyed useful
+  content`; `scopes were dropped without saying so`; `line 1303 writes systemMessage from
+  rawMessage, which is neither the sanitized message nor allowlisted`.
+- **Suites:** `test_context_sanitization.sh` 12/12, `test_sanitizer_block_parity.sh` 5/5 (blocks
+  still byte-identical), `test_rally_coordination_hook.sh` 34/34, `rally-protocol` agent-id bounds
+  5/5 — all re-run by the orchestrator, not only by the implementer.
+- **STILL OPEN:**
+  1. **A ≤3-word directive renders bare** (`codex:edit-freely-now`). The floor is 3 because
+     `tests/hooks/test_rally_coordination_hook.sh` pins unquoted renderings at three assertions,
+     which ENCODE the pre-fix rendering. The strictly stronger fix — quote all `ident()` output and
+     make the preamble's contract literally true — needs those assertions rewritten in the same
+     change. **Effort: S. Queued.**
+  2. **GAP 1B untouched.** `rally room --json` still returns peer prose verbatim, and the preamble
+     the hook emits still says "Read the full item with `rally room --json` before acting on it" —
+     the sanitized path still routes the reader to the unsanitized one. `check before-write --json`
+     carries `blocker.subject` / `decision.subject` raw on the same sink. **Effort: M** (it is a
+     schema-affecting decision: sanitize the JSON sink, label it, or stop routing agents to it).
+  3. **The register's own correction remains ungraded:** losing sanitizer block 1 downgrades
+     per-field caps and guillemet quoting without failing block 2 or the byte-identity test.
+  4. **The 2A key list is a list.** A host inventing a new context-injection key is unenumerated
+     until someone adds it — stated as a KNOWN LIMIT in the test.
+
+### RC-048 — the room byte budget governs three sections and leaves the three biggest alone
+- **State:** `observed`, measured this run. **NOT fixed.**
+- **Mechanism:** driving the ceiling to 0.1% of the consumer context (4 KB requested) against this
+  repo's own room still emitted **154 KB**. The budget trimmed every bucket it governs down to a
+  single item and did not touch the three that carry the bytes:
+
+  | section | bytes | items | budgeted |
+  |---|---|---|---|
+  | `active_claims` | 67,786 | 95 | no |
+  | `system_health` | 56,413 | 75 | no |
+  | `squads` | 17,600 | 122 | no |
+  | everything else | ~6,000 | — | yes, cut to 1 item each |
+
+  92% of the payload is outside the control. On a synthetic ledger made only of claims and presence
+  facts the budget moved the payload by **2 bytes**.
+- **This is the register's third pattern again** — a verdict computed correctly and applied to the
+  wrong set — and it lands in the feature the previous run shipped, which is the sharpest possible
+  demonstration that "the policy is implemented and tested" does not answer "does it reach the
+  data".
+- **It also explains why RC-043's fixture deletion GREW the payload**, and why reaping matters more
+  than it looks: the budget cannot trim claims, so expiry is the ONLY thing that stops a claim
+  costing bytes forever.
+- **Deliberately not fixed here.** Making three more sections budget-aware changes what every agent
+  reads on every room call; landing that beside three security fixes in a held release is how a
+  regression gets attributed to the wrong change. **Effort: M. Queued.**
+- **Adversarial control already in place:**
+  `crates/rally-cli/tests/room_budget_scaling.rs::budget_binds_on_the_buckets_it_governs` asserts a
+  ≥20% reduction against a ledger built ENTIRELY from governed buckets (measured 93.2%). Its first
+  draft asserted only `tight < default` and passed on a 2-byte difference — true, and no evidence
+  at all. The fixture had to be rebuilt before the assertion meant anything.
+
 ### RC-041 — `rally inject` is mechanically sound and has no authorization
 - **State:** `observed`. **NOT fixed.** Quoting and escaping are STRONG and no break was found:
   single chokepoint `sanitize_inject_text` (`backends.rs:569-608`), `tmux send-keys -H` one hex token
@@ -1093,9 +1180,55 @@ review answers the question you asked.
   **The 6.1× payload win in `d9d9b0a` is a payload win only** — no latency claim is made or implied.
 - **Consequence for testing:** "a 10,000-fact ledger stays under budget" tests BYTES and will pass
   while latency regresses. A latency criterion is needed alongside it.
+- **2026-08-04 — the latency criterion now exists, and it MODERATES this entry's claim.**
+  `crates/rally-cli/tests/room_budget_scaling.rs` asserts both criteria at an 8x scale gap.
+  Measured, release binary, min-of-3:
+
+  | facts | wall time | ratio vs previous |
+  |---|---|---|
+  | 400 | 38 ms | — |
+  | 1,600 | 51 ms | 1.34x for 4x data |
+  | 6,400 | 119 ms | 2.33x for 4x data |
+
+  Debug-binary run at the test's own scales: 800 → 6,400 facts cost 92.5 → 690.3 ms, a **7.47x rise
+  for 8x the data**. That is SUB-LINEAR, not quadratic. The nested scans this entry names are real
+  in the source and the shape they imply is quadratic, but at the sizes a room actually reaches the
+  term is not dominant. What the numbers do show is the exponent CREEPING UP with N (1.34x then
+  2.33x for the same 4x step), which is a superlinear term becoming visible rather than one that
+  already rules.
+- **Correction to this entry, therefore:** the ~6.4M / ~670M inner-iteration figures are a
+  reasoned projection from the loop structure, not a measurement, and the measured wall time does
+  not currently track them. Keep the entry open — the structure is still wrong and the projection
+  is still where it heads — but do not cite the iteration counts as observed cost. This is the
+  register's own "reasoned, not measured" caution applied to the register.
+- **The test's honest limit:** with ~3x headroom over linear it catches a SHAPE change, not a
+  constant-factor regression. A change making composition uniformly twice as slow passes it.
 
 ### RC-043 — a git-tracked test fixture replays into the production room
-- **State:** `observed`. **NOT fixed.**
+- **State:** `PARTIALLY FIXED 2026-08-04` — fixture deleted; the read-path filter is still open.
+- **Measured before deletion** (isolated A/B over two scratch copies, `room --json`, 12 runs each,
+  min/max trimmed): warm room 141.1 → 123.6 ms (−17.5 ms, −14.2%); cold replay with `facts.db`
+  wiped 231 → 173 ms (−58 ms, −33.5%); 1,140 lines = **15.8% of the live segments**, confirming
+  the 16% estimate. Content: 70 claims, 46 distinct REAL tool ids, kinds spread across read/wake/
+  risk/resolve/artifact/release/presence/handoff/decision/session.
+- **The payload number inverts the expected sign and is the real finding.** Removing the fixture
+  made the room payload BIGGER — 223,725 → 228,020 bytes, +4,295 bytes. The budget is byte-capped,
+  so 1,140 fixture facts were never adding bytes; they were **displacing real coordination facts
+  out of a fixed budget**. This entry's original framing ("invisible but still costing") is right
+  about cost and understates the harm: it was also evicting content agents needed.
+- **Nothing depended on it**, verified four ways: `doctor.rs` passes `test.jsonl` as a LABEL with
+  contents supplied inline (no file read); the `store.rs` / `user_journey.rs` hits are comments;
+  every integration test builds an isolated temp workspace; no test sets engagement `test`.
+  Post-deletion `.rally/.reconcile-cache.json` rebuilt itself (canonical_count 7,215 → 6,098) and
+  the fixture-only ids appear zero times in the payload.
+- **Citation correction:** `is_reserved_fixture_engagement` is at `store.rs:3752-3757`, not
+  `:3053-3057`.
+- **Still open — the read path.** Deleting the file does not stop a re-clone or a re-add from
+  replaying it. Fix shape: filter reserved-fixture engagements in `read_segment_files`
+  (`store.rs:4391`), the single chokepoint all 15+ callers share, so replay, reconcile, and
+  readback agree. ~4 lines plus a test; the blast-radius risk did not materialise (no test writes
+  a `test`-labelled segment). **Effort: S. Queued.**
+- **Superseded original state:** `observed`. **NOT fixed.**
 - **Mechanism:** `.rally/log/test.jsonl` holds 1,140 facts — 16% of the fold — under a reserved
   fixture engagement. `is_reserved_fixture_engagement` (`store.rs:3053-3057`) guards WRITES only;
   nothing filters READS, so `read_segment_files` replays it into the live room. It contributes ~70

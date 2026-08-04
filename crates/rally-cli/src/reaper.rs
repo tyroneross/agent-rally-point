@@ -22,6 +22,17 @@ use crate::error::Result;
 use crate::store::{Fact, FactKind, RoomStore};
 use crate::{FACT_SCHEMA, new_id, now_string};
 
+/// Default handoff expiry: 30 days.
+///
+/// Chosen to match the log-rotation threshold rather than the 24 h
+/// `stale_wait_secs` de-prioritisation, because those answer different
+/// questions. 24 h is "stop ranking this first"; expiry is "this obligation is
+/// over". A handoff unanswered for a month is not pending work — measured at 42
+/// of 51 open handoffs in this repo's own room. Override with
+/// `coordination.handoff_expiry_secs` or `RALLY_HANDOFF_EXPIRY_SECS`; `0`
+/// disables expiry.
+pub(crate) const DEFAULT_HANDOFF_EXPIRY_SECS: i64 = 30 * 24 * 60 * 60;
+
 // =============================================================================
 // Output types
 // =============================================================================
@@ -42,11 +53,37 @@ pub(crate) struct ReapedClaim {
     pub(crate) reason: String,
 }
 
+/// A handoff that was (or would be) expired.
+///
+/// Handoffs had no expiry verdict at all: `open_handoffs` closes one only on a
+/// `Resolve`/`Receipt`/`Artifact` that references it, so an unanswered handoff
+/// was immortal. `next` de-prioritises after `stale_wait_secs` (24 h), which
+/// changes ranking and nothing else — measured at 42 of 51 open handoffs older
+/// than 30 days, every one of them still projected, ranked, and budgeted on
+/// every room read. Claims got a lease; handoffs never did. This closes that
+/// parity gap.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct ReapedHandoff {
+    /// The `event_id` of the original handoff fact.
+    pub(crate) handoff_id: String,
+    /// The tool that wrote the handoff.
+    pub(crate) from_tool: String,
+    /// The handoff's target, when it named one.
+    pub(crate) target: Option<String>,
+    /// The handoff's `created_at`.
+    pub(crate) created_at: String,
+    /// Whole days the handoff sat unanswered.
+    pub(crate) age_days: i64,
+}
+
 /// Result returned by `run_reap_stale`.
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub(crate) struct ReapReport {
     /// Claims that were reaped (ClaimExpired fact appended for each).
     pub(crate) claims_reaped: Vec<ReapedClaim>,
+    /// Handoffs that were expired (a `Resolve` fact appended for each).
+    #[serde(default)]
+    pub(crate) handoffs_expired: Vec<ReapedHandoff>,
     /// Tools whose squad status was idle long enough to be cleared (informational;
     /// squads are not directly removable — this records which tools were stale).
     pub(crate) squads_idle_cleared: Vec<String>,
@@ -73,6 +110,75 @@ pub(crate) struct ReapReport {
 pub(crate) fn run_reap_stale(apply: bool) -> Result<ReapReport> {
     let room = RoomStore::open()?;
     run_reap_stale_in_room(&room, apply)
+}
+
+/// Default auto-reap interval: 1 hour.
+pub(crate) const DEFAULT_AUTO_REAP_INTERVAL_SECS: i64 = 60 * 60;
+
+/// Marker recording the last auto-reap, relative to `.rally/`.
+const AUTO_REAP_MARKER: &str = ".last-auto-reap";
+
+/// Run the reaper from `rally enter`, at most once per interval.
+///
+/// The reaper was correct and unreachable. `--reap-stale --apply` is the only
+/// caller, nothing invokes it, and a dry run against this repo's own room
+/// reported **69 of 69 active claims already eligible** — every claim in the
+/// room was reapable and none had been reaped. A verdict nothing acts on is not
+/// a policy; this is the call site.
+///
+/// `enter` is the right hook because it is the one command every agent runs,
+/// once, at the start of a session — the moment stale state costs the most and
+/// a few milliseconds of cleanup costs the least.
+///
+/// Three properties this must not violate:
+/// - **Never fails `enter`.** Any error is reported to stderr and swallowed.
+///   Cleanup is not worth blocking an agent's session start.
+/// - **Rate-limited by a file marker, not by the ledger.** Ten agents entering
+///   at once must not write ten reap passes. The marker is `.rally/.last-auto-reap`;
+///   a missing or unparseable marker reaps (fail-toward-cleanup, since the
+///   reaper's own eligibility math is fail-closed).
+/// - **Opt-out.** `RALLY_NO_AUTO_REAP=1`, or `auto_reap_interval_secs: 0`.
+///
+/// Returns the report when a reap ran, `None` when it was skipped.
+pub(crate) fn maybe_reap_on_enter(room: &RoomStore) -> Option<ReapReport> {
+    if std::env::var("RALLY_NO_AUTO_REAP").is_ok_and(|v| v == "1") {
+        return None;
+    }
+    let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    let interval = coord.auto_reap_interval_secs;
+    if interval <= 0 {
+        return None;
+    }
+
+    let marker = room.repo_root().join(".rally").join(AUTO_REAP_MARKER);
+    let now = chrono::Utc::now();
+    if let Ok(text) = std::fs::read_to_string(&marker)
+        && let Ok(last) = chrono::DateTime::parse_from_rfc3339(text.trim())
+        && (now - last.with_timezone(&chrono::Utc)).num_seconds() < interval
+    {
+        return None;
+    }
+
+    // Claim the interval BEFORE reaping. Two agents entering in the same second
+    // both read a stale marker; whichever writes first makes the other's next
+    // read recent, so at most one extra pass runs instead of one per agent.
+    // Reaping twice is harmless (idempotent) — this bounds the waste, it does
+    // not need to be a lock.
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(
+        &marker,
+        now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    );
+
+    match run_reap_stale_in_room(room, true) {
+        Ok(report) => Some(report),
+        Err(err) => {
+            eprintln!("rally: auto-reap skipped ({err})");
+            None
+        }
+    }
 }
 
 /// Inner implementation — takes an explicit `&RoomStore` so tests can inject a
@@ -201,6 +307,89 @@ pub(crate) fn run_reap_stale_in_room(room: &RoomStore, apply: bool) -> Result<Re
         claims_reaped.push(reaped);
     }
 
+    // --- Handoff expiry ---
+    //
+    // Same fail-closed contract as claims: an unparseable `created_at` is
+    // NEVER expired. A handoff closes on a later Resolve/Receipt/Artifact that
+    // references it, so the reaper writes a `Resolve` with `from_session_id:
+    // None` — which `handoff_closer_matches_target` treats as target-agnostic,
+    // the same path legacy completion markers take.
+    let handoff_ttl_secs = coord.handoff_expiry_secs;
+    let now = chrono::Utc::now();
+    let mut handoffs_expired: Vec<ReapedHandoff> = Vec::new();
+    if handoff_ttl_secs > 0 {
+        for handoff in &snapshot.open_handoffs {
+            let Some(created) = chrono::DateTime::parse_from_rfc3339(&handoff.created_at)
+                .ok()
+                .map(|t| t.with_timezone(&chrono::Utc))
+            else {
+                // Fail closed: no parseable age means no expiry verdict.
+                preserved += 1;
+                continue;
+            };
+            let age_secs = (now - created).num_seconds();
+            if age_secs < handoff_ttl_secs {
+                preserved += 1;
+                continue;
+            }
+
+            let reaped = ReapedHandoff {
+                handoff_id: handoff.event_id.clone(),
+                from_tool: handoff.tool.clone().unwrap_or_default(),
+                target: handoff.target.clone(),
+                created_at: handoff.created_at.clone(),
+                age_days: age_secs / 86_400,
+            };
+
+            if apply {
+                let expiry_fact = Fact {
+                    from_session_id: None,
+                    schema: FACT_SCHEMA.to_string(),
+                    event_id: new_id("fact"),
+                    seq: 0,
+                    thread_id: new_id("room"),
+                    kind: FactKind::Resolve,
+                    tool: Some("rally".to_string()),
+                    role: None,
+                    subject: format!(
+                        "reaper: handoff {} expired unanswered after {} days (from: {}, to: {})",
+                        handoff.event_id,
+                        reaped.age_days,
+                        handoff.tool.as_deref().unwrap_or("unknown"),
+                        handoff.target.as_deref().unwrap_or("all"),
+                    ),
+                    scope: handoff.scope.clone(),
+                    created_at: now_string(),
+                    summary: Some("reaper:reason=handoff-expired".to_string()),
+                    evidence: vec![
+                        format!("reaper:ref_id={}", handoff.event_id),
+                        "reaper:reason=handoff-expired".to_string(),
+                        format!("reaper:age_days={}", reaped.age_days),
+                    ],
+                    target: None,
+                    ref_id: Some(handoff.event_id.clone()),
+                    status: None,
+                    severity: None,
+                    uri: None,
+                    session: None,
+                };
+                match room.append_fact_verified(&expiry_fact) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "reaper: skipping handoff {} (already closed or lock error): {}",
+                            handoff.event_id, e
+                        );
+                        preserved += 1;
+                        continue;
+                    }
+                }
+            }
+
+            handoffs_expired.push(reaped);
+        }
+    }
+
     // --- Lead relinquish ---
     // Only relinquish the lead when the lead's owning tool is in the
     // DESTRUCTIVE stale set (>2h silence). This is the same predicate used
@@ -250,6 +439,7 @@ pub(crate) fn run_reap_stale_in_room(room: &RoomStore, apply: bool) -> Result<Re
 
     Ok(ReapReport {
         claims_reaped,
+        handoffs_expired,
         squads_idle_cleared,
         lead_relinquished,
         preserved_future_or_active: preserved,
@@ -384,6 +574,185 @@ mod tests {
             session: None,
         };
         room.append_fact_verified(&fact).unwrap()
+    }
+
+    /// Append a Handoff `ago_secs` seconds in the past.
+    fn append_handoff(room: &RoomStore, event_id: &str, tool: &str, ago_secs: i64) -> Fact {
+        let fact = Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: event_id.to_string(),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Handoff,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("handoff: {event_id}"),
+            scope: Vec::new(),
+            created_at: past_ts(ago_secs),
+            summary: None,
+            evidence: Vec::new(),
+            target: Some("someone-else".to_string()),
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&fact).unwrap()
+    }
+
+    // -------------------------------------------------------------------------
+    // Handoff expiry — parity with claims
+    // -------------------------------------------------------------------------
+
+    /// Handoffs had no expiry verdict at all: nothing closed an unanswered one,
+    /// so it stayed in `open_handoffs` forever. Delete the handoff-expiry block
+    /// in `run_reap_stale_in_room` and this fails.
+    #[test]
+    fn over_ttl_handoff_is_expired_and_leaves_open_handoffs() {
+        let root = unique_root("handoff-ttl");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        let ago = DEFAULT_HANDOFF_EXPIRY_SECS + 24 * 60 * 60;
+        let handoff = append_handoff(&room, "handoff-ancient", "author", ago);
+        assert_eq!(room.snapshot().unwrap().open_handoffs.len(), 1);
+
+        let report = run_reap_stale_in_room(&room, true).unwrap();
+
+        assert_eq!(report.handoffs_expired.len(), 1);
+        assert_eq!(report.handoffs_expired[0].handoff_id, handoff.event_id);
+        assert!(report.handoffs_expired[0].age_days >= 30);
+        assert!(
+            room.snapshot().unwrap().open_handoffs.is_empty(),
+            "an expired handoff must leave open_handoffs"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A handoff inside the window is untouched — expiry closes obligations
+    /// that are over, not ones nobody has gotten to yet.
+    #[test]
+    fn fresh_handoff_is_not_expired() {
+        let root = unique_root("handoff-fresh");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        append_handoff(&room, "handoff-fresh", "author", 60 * 60);
+        let report = run_reap_stale_in_room(&room, true).unwrap();
+
+        assert!(report.handoffs_expired.is_empty());
+        assert_eq!(room.snapshot().unwrap().open_handoffs.len(), 1);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Fail-closed, same contract as claims: an unparseable `created_at`
+    /// yields no age, so it yields no expiry verdict.
+    #[test]
+    fn handoff_with_unparseable_timestamp_is_never_expired() {
+        let root = unique_root("handoff-bad-ts");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        let mut fact = append_handoff(&room, "handoff-bad", "author", 60);
+        fact.created_at = "not-a-timestamp".to_string();
+        fact.event_id = "handoff-bad-2".to_string();
+        room.append_fact_verified(&fact).unwrap();
+
+        let report = run_reap_stale_in_room(&room, true).unwrap();
+        assert!(
+            !report
+                .handoffs_expired
+                .iter()
+                .any(|h| h.handoff_id == "handoff-bad-2"),
+            "an unparseable timestamp must never produce an expiry verdict"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Dry-run reports the verdict and writes nothing — the property that made
+    /// `--reap-stale` safe to run must survive handoff expiry.
+    #[test]
+    fn handoff_expiry_dry_run_writes_nothing() {
+        let root = unique_root("handoff-dry");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        append_handoff(
+            &room,
+            "handoff-dry",
+            "author",
+            DEFAULT_HANDOFF_EXPIRY_SECS + 60,
+        );
+        let report = run_reap_stale_in_room(&room, false).unwrap();
+
+        assert_eq!(report.handoffs_expired.len(), 1);
+        assert!(!report.applied);
+        assert_eq!(
+            room.snapshot().unwrap().open_handoffs.len(),
+            1,
+            "a dry run must not close the handoff"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // Auto-reap on enter — the missing call site
+    // -------------------------------------------------------------------------
+
+    /// The reaper was correct and unreachable: `--reap-stale --apply` was its
+    /// only caller and nothing invoked it. Delete the `maybe_reap_on_enter`
+    /// call in `command_enter` and the room never gets cleaned; delete the
+    /// marker write here and every concurrent enter reaps.
+    #[test]
+    fn auto_reap_runs_once_then_respects_the_interval() {
+        let root = unique_root("auto-reap");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        let ago = 3 * 60 * 60_i64;
+        append_presence(&room, "stale-tool", ago);
+        append_claim(&room, "claim-stale", "stale-tool");
+
+        let first = maybe_reap_on_enter(&room).expect("first enter must reap");
+        assert_eq!(first.claims_reaped.len(), 1);
+
+        // Second call inside the interval is skipped entirely — ten agents
+        // entering at once must not each run a reap pass.
+        append_presence(&room, "other-stale", ago);
+        append_claim(&room, "claim-stale-2", "other-stale");
+        assert!(
+            maybe_reap_on_enter(&room).is_none(),
+            "a second enter inside the interval must not reap again"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Auto-reap is opt-out, and the opt-out is checked before any work.
+    #[test]
+    fn auto_reap_respects_the_opt_out() {
+        let _guard = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = unique_root("auto-reap-off");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        append_presence(&room, "stale-tool", 3 * 60 * 60);
+        append_claim(&room, "claim-stale", "stale-tool");
+
+        unsafe { std::env::set_var("RALLY_NO_AUTO_REAP", "1") };
+        let result = maybe_reap_on_enter(&room);
+        unsafe { std::env::remove_var("RALLY_NO_AUTO_REAP") };
+
+        assert!(result.is_none(), "RALLY_NO_AUTO_REAP=1 must skip the reap");
+        assert_eq!(
+            room.snapshot().unwrap().active_claims.len(),
+            1,
+            "the claim must survive when auto-reap is off"
+        );
+
+        fs::remove_dir_all(root).ok();
     }
 
     // -------------------------------------------------------------------------

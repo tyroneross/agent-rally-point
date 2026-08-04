@@ -495,6 +495,62 @@ impl BackendRunner {
         Ok(commands)
     }
 
+    /// Fail with a dependency-naming error when the backend's launcher binary
+    /// is not on PATH (or the explicit `--tmux-bin`/`--cmux-bin` path does not
+    /// resolve to an executable).
+    ///
+    /// Without this, `rally run` on a machine with no tmux surfaced only the
+    /// raw spawn failure — `run tmux: No such file or directory (os error 2)`
+    /// from `run_command_owned` — which never says the missing dependency is
+    /// tmux, never says how to install it, and never points at a backend that
+    /// would work. Probing FIRST turns that into one actionable message.
+    ///
+    /// Probe only, never a launch: `resolve_executable` is a pure PATH walk, so
+    /// this adds no subprocess and cannot hang. The established
+    /// `--tmux-bin /usr/bin/true` test idiom still passes — that path exists and
+    /// is executable.
+    ///
+    /// `Backend::Ptyd` is exempt: it spawns over a daemon socket, not a binary,
+    /// and `require_ptyd_socket` already reports an unresolved socket by name.
+    pub(crate) fn ensure_backend_available(&self) -> Result<()> {
+        let (bin, dep) = match self.backend {
+            Backend::Tmux => (self.tmux_bin.as_str(), "tmux"),
+            Backend::Cmux => (self.cmux_bin.as_str(), "cmux"),
+            Backend::Ptyd => return Ok(()),
+        };
+        if resolve_executable(bin, std::env::var_os("PATH").as_deref()).is_some() {
+            return Ok(());
+        }
+        Err(RallyError::Command(missing_backend_message(
+            dep,
+            bin,
+            &self.usable_alternatives(),
+        )))
+    }
+
+    /// Backends other than the current one that would actually work right now,
+    /// named in launch-preference order. Each entry is probed — an alternative
+    /// is only offered when its own dependency resolves, so the remediation
+    /// never sends the user to a second failure.
+    fn usable_alternatives(&self) -> Vec<&'static str> {
+        let path = std::env::var_os("PATH");
+        let mut out = Vec::new();
+        if self.backend != Backend::Ptyd && self.ptyd_socket.is_some() {
+            out.push("ptyd");
+        }
+        if self.backend != Backend::Tmux
+            && resolve_executable(&self.tmux_bin, path.as_deref()).is_some()
+        {
+            out.push("tmux");
+        }
+        if self.backend != Backend::Cmux
+            && resolve_executable(&self.cmux_bin, path.as_deref()).is_some()
+        {
+            out.push("cmux");
+        }
+        out
+    }
+
     pub(crate) fn start(
         &self,
         target: &str,
@@ -502,6 +558,7 @@ impl BackendRunner {
         command: &[String],
         name: &str,
     ) -> Result<String> {
+        self.ensure_backend_available()?;
         let commands = self.start_commands(target, cwd, command, name)?;
         match self.backend {
             Backend::Tmux => run_commands(&commands).map(|()| target.to_string()),
@@ -871,6 +928,91 @@ fn tmux_start_command(
         format!("RALLY_PARENT_PID={}", std::process::id()),
         shell_command,
     ])
+}
+
+/// Resolve `bin` to an executable file, or `None` when nothing runnable exists
+/// at that name. Pure over the injected `path` value (the process `PATH`, or a
+/// test-supplied string) — no global state is read or mutated, so the absent and
+/// present branches are unit-testable without touching the real environment.
+///
+/// A `bin` containing a separator is a PATH-independent reference (this is how
+/// `--tmux-bin /usr/bin/true` works) and is checked directly. A bare name is
+/// searched across `PATH` entries in order, matching what `Command::new` will
+/// do at spawn time.
+///
+/// "Executable" is the unix mode bits, not merely existence: a non-executable
+/// file on PATH would still fail at spawn, so reporting it as present would just
+/// move the confusing error later.
+fn resolve_executable(bin: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if bin.is_empty() {
+        return None;
+    }
+    if bin.contains(std::path::MAIN_SEPARATOR) {
+        let candidate = PathBuf::from(bin);
+        return is_executable_file(&candidate).then_some(candidate);
+    }
+    std::env::split_paths(path?)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(bin))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
+/// The remediation text for a missing backend dependency: what is missing, how
+/// to install it on each platform, and which backend to use instead.
+///
+/// `alternatives` must already be probed (see `usable_alternatives`) — listing
+/// an unavailable backend here would hand the user a second failing command,
+/// the exact defect that made `rally inject` recommend `rally run` after
+/// `rally run` had just failed for this reason.
+fn missing_backend_message(dep: &str, bin: &str, alternatives: &[&'static str]) -> String {
+    let install = match dep {
+        "tmux" => {
+            "install it: `brew install tmux` (macOS) or \
+                   `sudo apt install tmux` / `sudo dnf install tmux` (Linux)"
+        }
+        _ => "install it, or pass an explicit path with the matching --*-bin flag",
+    };
+    let fallback = if alternatives.is_empty() {
+        "no other backend is available on this machine either — \
+         `rally inject` still queues a ledger wake that a registered pane can deliver, \
+         and `rally adopt <tool> --tmux <target>` registers a pane you started yourself"
+            .to_string()
+    } else {
+        format!(
+            "or use an available backend: {}",
+            alternatives
+                .iter()
+                .map(|b| format!("`rally run <agent> --backend {b}`"))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        )
+    };
+    // Name what was actually probed. An explicit `--tmux-bin /path` was never
+    // searched on PATH, so saying "not found on PATH" would misdescribe the
+    // check and send the user to fix the wrong thing.
+    let looked = if bin.contains(std::path::MAIN_SEPARATOR) {
+        format!("no executable at {bin}")
+    } else {
+        format!("{bin} not found on PATH")
+    };
+    format!(
+        "{dep} is not installed ({looked}) — rally run needs it to launch a managed session. To fix: {install}; {fallback}."
+    )
 }
 
 /// Bracketed-paste start marker: `ESC [ 200 ~`.
@@ -1670,14 +1812,16 @@ mod tests {
     use super::{Backend, BackendRunner, verify_needle};
     use super::{
         CR, PASTE_END, PASTE_START, classify_orphan_processes, classify_orphan_tmux,
-        frame_line_bytes, hex_tokens, parse_cmux_start_target, parse_etime_secs, pid_is_alive,
-        sanitize_inject_text, shell_words, tmux_inject_commands,
+        frame_line_bytes, hex_tokens, missing_backend_message, parse_cmux_start_target,
+        parse_etime_secs, pid_is_alive, resolve_executable, sanitize_inject_text, shell_words,
+        tmux_inject_commands,
     };
     use crate::check::CheckData;
     use crate::cli::BackendBins;
     use crate::store::Fact;
     use crate::{EnterData, Envelope, NextData, RoomData, SayData};
     use schemars::schema_for;
+    use std::path::PathBuf;
 
     // ---- P1a: legacy tmux/cmux inject landing-verify -----------------------
 
@@ -1798,6 +1942,127 @@ mod tests {
         assert!(
             iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
             "empty/unavailable capture is unverifiable, not a failed landing"
+        );
+    }
+
+    // ---- backend availability probe ---------------------------------------
+
+    /// Create a temp dir holding one executable stub named `name`, and return
+    /// (dir, full path). Used to exercise the "present" branch without putting
+    /// anything on the real PATH.
+    fn stub_bin_dir(tag: &str, name: &str) -> (PathBuf, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rally-probe-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn resolve_executable_finds_bare_name_only_in_the_injected_path() {
+        let (dir, _) = stub_bin_dir("bare", "tmux");
+        let injected = std::ffi::OsString::from(dir.to_string_lossy().into_owned());
+        assert!(
+            resolve_executable("tmux", Some(injected.as_os_str())).is_some(),
+            "a bare name must resolve against the injected PATH entry"
+        );
+        assert!(
+            resolve_executable("tmux", Some(std::ffi::OsStr::new("/nonexistent-rally-dir")))
+                .is_none(),
+            "absent from every PATH entry => unresolved, no fallback to the real PATH"
+        );
+        assert!(
+            resolve_executable("tmux", None).is_none(),
+            "no PATH at all => unresolved rather than a panic"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_executable_checks_explicit_paths_and_the_exec_bit() {
+        // `--tmux-bin /usr/bin/true` is an established test idiom; the probe
+        // must keep accepting it or every one of those tests would start failing.
+        assert!(
+            resolve_executable("/usr/bin/true", None).is_some(),
+            "a separator-bearing bin is a direct path, checked without PATH"
+        );
+        assert!(resolve_executable("/nonexistent/rally/tmux", None).is_none());
+
+        // Present but not executable => still unusable: reporting it available
+        // would only move the same spawn failure downstream.
+        let (dir, _) = stub_bin_dir("noexec", "placeholder");
+        let plain = dir.join("not-executable");
+        std::fs::write(&plain, "data").unwrap();
+        assert!(
+            resolve_executable(&plain.to_string_lossy(), None).is_none(),
+            "a non-executable file is not a usable backend binary"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_backend_available_names_tmux_and_how_to_install_it_when_absent() {
+        let runner = tmux_runner("/nonexistent/rally-test/tmux");
+        let err = runner
+            .ensure_backend_available()
+            .expect_err("an unresolvable tmux binary must fail the probe, not the spawn");
+        let msg = err.to_string();
+        // The whole point of the probe: the failure says the word "tmux".
+        assert!(msg.contains("tmux"), "error must name tmux; got: {msg}");
+        assert!(
+            msg.contains("brew install tmux"),
+            "error must give the macOS install command; got: {msg}"
+        );
+        assert!(
+            msg.contains("apt install tmux"),
+            "error must give a Linux install command; got: {msg}"
+        );
+        // Never recommend the command that just failed.
+        assert!(
+            !msg.contains("`rally run <agent>`"),
+            "remediation must not point back at the bare failing command; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ensure_backend_available_passes_when_the_configured_binary_resolves() {
+        let (dir, bin) = stub_bin_dir("present", "tmux");
+        assert!(
+            tmux_runner(&bin).ensure_backend_available().is_ok(),
+            "an executable at the configured --tmux-bin path is available"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_backend_message_offers_only_probed_alternatives() {
+        let with_alt = missing_backend_message("tmux", "tmux", &["cmux"]);
+        assert!(
+            with_alt.contains("--backend cmux"),
+            "a probed-available backend is offered by name; got: {with_alt}"
+        );
+
+        // The probe wording must describe what was actually checked.
+        assert!(
+            missing_backend_message("tmux", "tmux", &[]).contains("not found on PATH"),
+            "a bare name was searched on PATH"
+        );
+        assert!(
+            missing_backend_message("tmux", "/opt/tmux", &[])
+                .contains("no executable at /opt/tmux"),
+            "an explicit --tmux-bin path was never searched on PATH"
+        );
+
+        let none = missing_backend_message("tmux", "tmux", &[]);
+        assert!(
+            !none.contains("--backend"),
+            "with nothing else installed, offer no backend at all; got: {none}"
+        );
+        assert!(
+            none.contains("rally adopt"),
+            "the no-backend case still needs a path forward; got: {none}"
         );
     }
 

@@ -298,6 +298,9 @@ pub(crate) struct DoctorArgs {
     pub(crate) compact_log: bool,
     /// Segment file for --compact-log (default: the current room's active segment).
     pub(crate) log_file: Option<String>,
+    /// Compare the RUNNING binary's build stamp against this checkout's HEAD.
+    /// Read-only; reports skew, never blocks.
+    pub(crate) binary_skew: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1479,6 +1482,9 @@ fn doctor_parser() -> impl Parser<DoctorArgs> {
         .help("Render a diagnostic log with presence/heartbeat runs collapsed into counts (read-only)")
         .switch();
     let log_file = optional_string_arg("log-file", "PATH");
+    let binary_skew = long("binary-skew")
+        .help("Compare the running binary's build stamp against this checkout's HEAD (read-only)")
+        .switch();
     construct!(DoctorArgs {
         json,
         canonical_paths,
@@ -1489,7 +1495,8 @@ fn doctor_parser() -> impl Parser<DoctorArgs> {
         keep,
         max_age_days,
         compact_log,
-        log_file
+        log_file,
+        binary_skew
     })
 }
 

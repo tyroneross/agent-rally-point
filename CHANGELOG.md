@@ -7,6 +7,72 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Fixed — verdicts that nothing acted on
+
+Rally kept computing correct cleanup decisions and never calling them. Each of
+these is a call site, not new policy.
+
+- **The stale-state reaper now runs.** `rally doctor --reap-stale --apply` was
+  its only caller and nothing invoked it, so a dry run against this repo's own
+  room found **82 of 98 active claims already eligible** — the eligibility math
+  had been correct and unused for the room's whole life. `rally enter` now reaps,
+  at most once an hour per room, rate-limited by `.rally/.last-auto-reap` and
+  fail-open: it never fails `enter`. Disable with `RALLY_NO_AUTO_REAP=1` or
+  `coordination.auto_reap_interval_secs: 0`.
+- **Handoffs can expire.** A handoff closed only on a `Resolve`/`Receipt`/
+  `Artifact` that referenced it, so an unanswered one was immortal; `next`
+  de-prioritised after 24 h, which changed ranking and nothing else. Measured:
+  **42 open handoffs aged 31–56 days**, every one still projected and budgeted on
+  every room read. Default expiry is 30 days
+  (`coordination.handoff_expiry_secs`, `0` disables), fail-closed on an
+  unparseable timestamp exactly like claims.
+- **A test fixture stopped being replayed into the production room.**
+  `.rally/log/test.jsonl` was git-tracked and loaded on every read: 1,140 facts,
+  70 claims, 46 real tool ids, 15.8% of the live ledger. Deleting it cut warm
+  `rally room` by 17.5 ms (14.2%) and cold replay by 58 ms (33.5%) — and **grew
+  the payload by 4,295 bytes of real content**, because the fixture had been
+  displacing genuine coordination facts out of a fixed budget.
+- **`rally doctor --binary-skew`** compares the running binary's build stamp
+  against the checkout's HEAD. Measured on this machine: the installed
+  `~/.local/bin/rally` predated the `--version` fix and returned **1,746,109
+  bytes** from `rally room --json` where a current build returned **232,616** —
+  7.5x the context, injected into every agent, with nothing anywhere saying the
+  binary was stale. The check states what it compared and what that does not
+  prove; it never blocks.
+
+### Fixed — errors that named the wrong thing
+
+- **`rally run` says "tmux" when tmux is missing.** It launched with no
+  availability probe, so the failure never named the dependency. The message now
+  names it, gives the install command for macOS and Linux, and offers only
+  backends it probed as usable.
+- **`rally inject` stopped recommending the command that just failed.** Its
+  remediation led with `rally run <agent>` — which fails for the same missing
+  backend. It now leads with `rally adopt`.
+
+### Security — ARP-004 sanitizer gaps (RC-040, partial)
+
+- **Peer text can no longer read as hook narration.** `ident()` allowlisted
+  `- . : /`, so hyphen-joined words rendered as fluent English OUTSIDE the
+  guillemet contract while the preamble told the reader only guillemet spans were
+  quoted data. Identifiers are now classified by prose density — over three
+  vowel-bearing words gets quoted — chosen over a length cap because the longest
+  benign scope in this ledger is 177 characters and the RC-040 payloads score 12
+  and 13 words against a real-identifier maximum of 7. Scope rendering is capped
+  at 200 characters per claim and says how many it dropped.
+- **`validate_agent_id` rejects directive-shaped ids.** The bound is 64 bytes and
+  8 prose words; all 125 distinct ids in this repo's ledger pass, the longest at
+  52 bytes.
+- **The sanitization suite now grades coverage, not just presence.** It asserted
+  "exactly two sanitizer blocks" and never "every model-context sink routes
+  through one". It now enumerates every context sink and fails on an
+  unsanitized, un-allowlisted one, and its hostile fixtures no longer forge lines
+  only with `\n` — which is why the `ident()` gap survived a green suite.
+
+Not closed: a three-word directive still renders bare, and `rally room --json`
+still returns peer prose verbatim while the preamble routes readers to it. See
+RC-040 in the register.
+
 ### Security — one fact could take the whole room down (RC-037, RC-038, RC-034)
 
 Three v0.2.0 release blockers. The first two were live-reproduced against the

@@ -62,7 +62,8 @@ Definitions:
 | `rally mission` | no | yes | no | yes | GET is read-oriented; `--set`, `--may`, and `--must-check` append mission facts. |
 | `rally backlog list` | no | yes | no | yes | Listing is read-oriented; `add` and `done` append facts. |
 | `rally check-ci` | no | yes | no | yes | Read-only CI health gate; strict mode changes exit code, not ledger state. |
-| `rally doctor` | no | yes | no | yes | Dry inspection by default; `--apply` rewrites the discovery index and is not audit-safe. |
+| `rally doctor` | no | yes | no | yes | Dry inspection by default; `--apply` rewrites the discovery index and is not audit-safe. `--binary-skew` is read-only and never exits non-zero on skew. |
+| `rally enter` | yes | yes | no | no | Also runs the stale-state reaper, at most once an hour per room. Disable with `RALLY_NO_AUTO_REAP=1` or `coordination.auto_reap_interval_secs: 0`. |
 | `rally retrospective` | no | yes | no | yes | Writes the requested retrospective output file, not ledger facts. |
 | `rally rotate` | yes | yes | no | no | Moves old segments into archive unless `--dry-run` is used. |
 | `rally migrate-legacy` | yes | yes | no | no | Replays legacy room data into repo-local ledger segments. |

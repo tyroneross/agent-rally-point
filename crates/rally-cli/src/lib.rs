@@ -1897,6 +1897,30 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     let room = RoomStore::open()?;
     let room_id = room.active_engagement().to_string();
 
+    // Reap stale state before snapshotting, so this session starts against a
+    // clean room rather than inheriting every dead agent's claims.
+    //
+    // The reaper had no caller. `rally doctor --reap-stale --apply` was the
+    // only way to reach it and nothing invoked that, so a dry run against this
+    // repo's own room found 69 of 69 active claims already eligible — the
+    // eligibility math had been right and unused for the room's whole life.
+    // Rate-limited and fail-open inside `maybe_reap_on_enter`; it never fails
+    // `enter`.
+    if let Some(report) = reaper::maybe_reap_on_enter(&room)
+        && (!report.claims_reaped.is_empty() || !report.handoffs_expired.is_empty())
+    {
+        // stderr, not the JSON body: `enter`'s schema is consumed by hooks and
+        // round-trip tests, and cleanup is a side note, not a result the caller
+        // asked for. Silence would repeat the mistake this fixes, though — a
+        // reap that closes 69 claims should say so once.
+        eprintln!(
+            "rally: auto-reap closed {} stale claim(s) and {} expired handoff(s) \
+             (run `rally doctor --reap-stale` to inspect; RALLY_NO_AUTO_REAP=1 to disable)",
+            report.claims_reaped.len(),
+            report.handoffs_expired.len()
+        );
+    }
+
     // Snapshot BEFORE writing presence so the cursor window reflects peer work
     // only (not the agent's own enter heartbeat).
     let snapshot_before = room.snapshot()?;
@@ -3112,8 +3136,14 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
         let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
         return Ok(Output::new(args.json, text, body));
     }
+    if args.binary_skew {
+        let data = doctor::run_binary_skew()?;
+        let text = format!("doctor binary-skew: {}", data.detail);
+        let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
+        return Ok(Output::new(args.json, text, body));
+    }
     Err(RallyError::Usage(
-        "rally doctor requires --canonical-paths, --prune-rooms, --reap-stale, --sweep-corrupt, or --compact-log"
+        "rally doctor requires --canonical-paths, --prune-rooms, --reap-stale, --sweep-corrupt, --compact-log, or --binary-skew"
             .to_string(),
     ))
 }
@@ -6218,7 +6248,7 @@ fn command_inject_ledger(
         status: "presence_only_unmanaged".to_string(),
         via: None,
         reason: Some(format!(
-            "no active managed session for {agent_id}; delivery is ledger-queued (a rally-termd-registered pane may still deliver). For guaranteed live injection: `rally run <agent>` or `rally adopt {agent_id} --tmux <target>`."
+            "no active managed session for {agent_id}; delivery is ledger-queued (a rally-termd-registered pane may still deliver). For guaranteed live injection, adopt a pane you already started: `rally adopt {agent_id} --tmux <target>`. `rally run <agent>` also mints one, when a backend is installed."
         )),
     };
     if effective_require_ack && !dry_run {
@@ -6598,7 +6628,7 @@ fn build_agent_injectability(
                 session_id: None,
                 target: None,
                 reason: Some(format!(
-                    "no active managed session for {}; `rally inject` can only queue a ledger wake, not deliver to a live pane. Use `rally run <agent>` or `rally adopt {} --tmux <target>` / `--cmux <target>` for live injection.",
+                    "no active managed session for {}; `rally inject` can only queue a ledger wake, not deliver to a live pane. Adopt a pane you already started: `rally adopt {} --tmux <target>` / `--cmux <target>`. `rally run <agent>` also works when a backend is installed — if it fails, it now names the missing dependency.",
                     tool, tool
                 )),
             }
@@ -7476,7 +7506,9 @@ fn ledger_async_fallback_plan(agent_id: &str) -> Value {
             "rally room --json; confirm the target squad is active (not stale/absent)"
         ],
         "for_live_delivery": [
-            format!("launch the target as a managed session: `rally run <agent>` (mints an injectable pane for {agent_id})"),
+            format!(
+                "launch the target as a managed session: `rally run <agent>` (mints an injectable pane for {agent_id}; needs tmux or a live ptyd socket, and names which one is missing if not)"
+            ),
             format!("or adopt an already-running pane: `rally adopt {agent_id} --tmux <target>`"),
             "for anything time-sensitive, ALSO post a durable `rally say handoff` (dual-channel)"
         ]

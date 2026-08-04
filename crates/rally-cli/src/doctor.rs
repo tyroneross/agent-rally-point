@@ -3,12 +3,13 @@
 
 //! `rally doctor` — diagnostics and remediation for path hygiene, room registry, and stale state.
 //!
-//! Five independent modes:
+//! Six independent modes:
 //!   --canonical-paths  scan active claims for non-canonical scopes and suffix collisions
 //!   --prune-rooms      classify registry entries as live/stale; remove stale ones with --apply
 //!   --reap-stale       reap over-TTL in-room claims and stale lead leases (dry-run; commit with --apply)
 //!   --sweep-corrupt    sweep disposable facts.db.corrupt.* snapshots (dry-run; remove with --apply)
 //!   --compact-log      render a diagnostic log with presence/heartbeat runs collapsed into counts
+//!   --binary-skew      compare the RUNNING binary's build stamp against this repo's HEAD
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -594,6 +595,593 @@ pub(crate) fn run_prune_rooms(apply: bool) -> Result<PruneRoomsReport> {
         applied: apply,
         warnings: Vec::new(),
     })
+}
+
+// =============================================================================
+// binary-skew logic
+// =============================================================================
+
+/// The build stamp `build.rs` embeds as `RALLY_BUILD_ID`, split into its parts.
+///
+/// Format is `<version>+<git-short-hash>[-dirty]`, or `<version>+nogit` when
+/// the build had no git available. `nogit` is parsed as "no commit" rather than
+/// a commit literally named `nogit`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ParsedBuildId {
+    pub(crate) version: String,
+    /// The short hash the binary was built from. `None` for a `+nogit` build or
+    /// a stamp that does not carry the `+<hash>` suffix at all.
+    pub(crate) commit: Option<String>,
+    /// The build tree had uncommitted build-relevant changes, so `commit` names
+    /// the parent commit rather than the exact source that was compiled.
+    pub(crate) dirty: bool,
+}
+
+/// Split a `RALLY_BUILD_ID` stamp. Never fails — an unrecognised stamp yields
+/// the whole string as `version` with no commit, which downgrades the check to
+/// "cannot compare" instead of producing a wrong verdict.
+pub(crate) fn parse_build_id(build_id: &str) -> ParsedBuildId {
+    let Some((version, rest)) = build_id.split_once('+') else {
+        return ParsedBuildId {
+            version: build_id.to_string(),
+            commit: None,
+            dirty: false,
+        };
+    };
+    let (hash, dirty) = match rest.strip_suffix("-dirty") {
+        Some(h) => (h, true),
+        None => (rest, false),
+    };
+    let commit = if hash.is_empty() || hash == "nogit" {
+        None
+    } else {
+        Some(hash.to_string())
+    };
+    ParsedBuildId {
+        version: version.to_string(),
+        commit,
+        dirty,
+    }
+}
+
+/// What the running binary's stamp says relative to the repo it is operating on.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SkewVerdict {
+    /// Binary commit == repo HEAD. The strongest statement available.
+    InSync,
+    /// Binary commit is an ancestor of HEAD: the repo has moved on, so the
+    /// binary is missing every commit since. This is the finding worth acting on.
+    BinaryBehindHead,
+    /// Binary commit is a real commit here but NOT an ancestor of HEAD — a
+    /// different branch, or a rebased/amended history. Not ordered, so not
+    /// reported as "behind".
+    Diverged,
+    /// The binary carries no commit (`+nogit`) but its version differs from the
+    /// repo's `Cargo.toml`. Version-level skew only — a commit-level difference
+    /// at the same version is invisible to this branch.
+    VersionMismatch,
+    /// No commit in the stamp and the versions agree. Consistent as far as this
+    /// check can see, which is not the same as in sync.
+    VersionOnlyMatch,
+    /// Nothing could be compared: no HEAD, unreadable git, or a commit the repo
+    /// does not contain.
+    Unknown,
+}
+
+/// Git facts about the repo under inspection, injected so the classifier is
+/// pure and both branches are testable without building throwaway repos.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RepoSkewFacts {
+    /// `git rev-parse --short HEAD`.
+    pub(crate) head_short: Option<String>,
+    /// The repo contains the binary's commit object (`git cat-file -e`).
+    pub(crate) build_commit_present: bool,
+    /// `git merge-base --is-ancestor <build-commit> HEAD` succeeded.
+    pub(crate) build_commit_is_ancestor: bool,
+    /// `git rev-list --count <build-commit>..HEAD`.
+    pub(crate) commits_behind: Option<i64>,
+    /// `version` from the repo's workspace `Cargo.toml`.
+    pub(crate) manifest_version: Option<String>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct BinarySkewReport {
+    /// The repo this binary was pointed at.
+    pub(crate) repo_root: PathBuf,
+    /// The running binary's full `RALLY_BUILD_ID` stamp.
+    pub(crate) binary_build_id: String,
+    pub(crate) binary_version: String,
+    /// Short hash from the stamp; absent for a `+nogit` build.
+    pub(crate) binary_commit: Option<String>,
+    /// The binary was built from a tree with uncommitted changes.
+    pub(crate) binary_dirty: bool,
+    pub(crate) repo_head: Option<String>,
+    pub(crate) repo_version: Option<String>,
+    pub(crate) verdict: SkewVerdict,
+    /// Commits on HEAD that the binary does not contain. Only meaningful for
+    /// `binary_behind_head`.
+    pub(crate) commits_behind: Option<i64>,
+    /// One sentence stating what was compared and what that does or does not prove.
+    pub(crate) detail: String,
+    pub(crate) warnings: Vec<DiscoveryWarning>,
+}
+
+/// Pure core: classify the running binary against the repo.
+///
+/// The check reports only what the existing build stamp can support. `build.rs`
+/// already embeds `<version>+<short-hash>[-dirty]`, so a commit-level comparison
+/// is available for normal builds; a `+nogit` build carries only a version, and
+/// the verdict says so rather than implying commit-level confidence it does not
+/// have. Diagnostic only — every failure path yields a verdict plus a warning,
+/// never an error.
+pub(crate) fn classify_binary_skew(
+    repo_root: &Path,
+    build_id: &str,
+    facts: &RepoSkewFacts,
+) -> BinarySkewReport {
+    let parsed = parse_build_id(build_id);
+    let mut warnings: Vec<DiscoveryWarning> = Vec::new();
+    let mut commits_behind = None;
+
+    let (verdict, detail) = match (&parsed.commit, &facts.head_short) {
+        (Some(commit), Some(head)) if commit == head => (
+            SkewVerdict::InSync,
+            format!("binary was built from HEAD ({head})"),
+        ),
+        (Some(commit), Some(head)) if !facts.build_commit_present => {
+            warnings.push(DiscoveryWarning {
+                code: "skew_build_commit_unknown".to_string(),
+                message: format!(
+                    "commit {commit} from the running binary is not in this repo; \
+                     the binary was built elsewhere, or its commit was garbage-collected"
+                ),
+                path: Some(repo_root.to_path_buf()),
+                count: None,
+            });
+            (
+                SkewVerdict::Unknown,
+                format!(
+                    "binary commit {commit} is absent from this repo, so it cannot be ordered against HEAD ({head})"
+                ),
+            )
+        }
+        (Some(commit), Some(head)) if facts.build_commit_is_ancestor => {
+            commits_behind = facts.commits_behind;
+            let behind = facts
+                .commits_behind
+                .map(|n| format!("{n} commit(s)"))
+                .unwrap_or_else(|| "an unknown number of commits".to_string());
+            (
+                SkewVerdict::BinaryBehindHead,
+                format!(
+                    "binary was built at {commit}, {behind} behind HEAD ({head}) — \
+                     it is missing every change since; rebuild and reinstall to pick them up"
+                ),
+            )
+        }
+        (Some(commit), Some(head)) => (
+            SkewVerdict::Diverged,
+            format!(
+                "binary commit {commit} is not an ancestor of HEAD ({head}) — \
+                 a different branch or a rewritten history, so 'behind' does not apply"
+            ),
+        ),
+        (Some(commit), None) => {
+            warnings.push(DiscoveryWarning {
+                code: "skew_head_unresolved".to_string(),
+                message: format!("cannot read HEAD at {}", repo_root.display()),
+                path: Some(repo_root.to_path_buf()),
+                count: None,
+            });
+            (
+                SkewVerdict::Unknown,
+                format!("binary reports commit {commit} but this repo's HEAD is unreadable"),
+            )
+        }
+        (None, _) => {
+            // `+nogit` build: version is the only comparable field. Say plainly
+            // what that misses rather than implying commit-level confidence.
+            let caveat = "this compares versions only and cannot see commit-level skew: \
+                          a binary many commits old at the same version reads as consistent";
+            match (&facts.manifest_version, &parsed.version) {
+                (Some(repo_v), bin_v) if repo_v != bin_v => (
+                    SkewVerdict::VersionMismatch,
+                    format!(
+                        "binary carries no commit stamp; version {bin_v} differs from the repo's {repo_v} — {caveat}"
+                    ),
+                ),
+                (Some(repo_v), _) => (
+                    SkewVerdict::VersionOnlyMatch,
+                    format!(
+                        "binary carries no commit stamp; version matches the repo's {repo_v} — {caveat}"
+                    ),
+                ),
+                (None, _) => {
+                    warnings.push(DiscoveryWarning {
+                        code: "skew_manifest_version_unreadable".to_string(),
+                        message: format!("cannot read a version from {}", repo_root.display()),
+                        path: Some(repo_root.to_path_buf()),
+                        count: None,
+                    });
+                    (
+                        SkewVerdict::Unknown,
+                        "binary carries no commit stamp and the repo's version is unreadable — nothing to compare".to_string(),
+                    )
+                }
+            }
+        }
+    };
+
+    // A dirty build stamp names the PARENT commit, not the source that was
+    // compiled, so even `in_sync` is only "built from a tree based on HEAD".
+    let detail = if parsed.dirty {
+        format!(
+            "{detail}. The stamp is -dirty: the binary was built from uncommitted changes, so its commit names the parent, not the compiled source"
+        )
+    } else {
+        detail
+    };
+
+    BinarySkewReport {
+        repo_root: repo_root.to_path_buf(),
+        binary_build_id: build_id.to_string(),
+        binary_version: parsed.version,
+        binary_commit: parsed.commit,
+        binary_dirty: parsed.dirty,
+        repo_head: facts.head_short.clone(),
+        repo_version: facts.manifest_version.clone(),
+        verdict,
+        commits_behind,
+        detail,
+        warnings,
+    }
+}
+
+/// Run `git -C <repo_root> <args>`, returning trimmed stdout on success.
+/// `None` on any failure — git absent, non-zero exit, empty or non-UTF8 output.
+fn git_in(repo_root: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// Manifest paths searched for the repo's declared version, in order. The
+/// rally-cli crate manifest comes FIRST because that is the version the running
+/// binary's `CARGO_PKG_VERSION` came from; this repo's workspace `Cargo.toml`
+/// declares no `version` key at all (`[workspace.package]` carries edition,
+/// license, and rust-version only), so rooting the lookup there would report
+/// "version unreadable" on a healthy checkout.
+const VERSION_MANIFESTS: [&str; 2] = ["crates/rally-cli/Cargo.toml", "Cargo.toml"];
+
+/// TOML table headers whose `version` key names the package's OWN version.
+/// Anything under `[dependencies]` and friends is a dependency requirement and
+/// must never be mistaken for it.
+const VERSION_SECTIONS: [&str; 2] = ["package", "workspace.package"];
+
+/// `version = "..."` from a `[package]` or `[workspace.package]` table.
+/// Deliberately a line scan, not a TOML parse: this is the fallback for `+nogit`
+/// builds only, and a parser dependency would cost more than the branch is worth.
+fn parse_manifest_version(text: &str) -> Option<String> {
+    let mut section = String::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = header.to_string();
+            continue;
+        }
+        if !VERSION_SECTIONS.contains(&section.as_str()) {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("version")
+            && let Some(value) = rest.trim_start().strip_prefix('=')
+        {
+            let v = value.trim().trim_matches('"').to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn manifest_version(repo_root: &Path) -> Option<String> {
+    VERSION_MANIFESTS.iter().find_map(|rel| {
+        fs::read_to_string(repo_root.join(rel))
+            .ok()
+            .and_then(|text| parse_manifest_version(&text))
+    })
+}
+
+/// Collect the repo-side git facts the classifier needs. Every probe is
+/// best-effort; a failure narrows the verdict rather than erroring.
+fn collect_skew_facts(repo_root: &Path, build_commit: Option<&str>) -> RepoSkewFacts {
+    let head_short = git_in(repo_root, &["rev-parse", "--short", "HEAD"]);
+    let mut facts = RepoSkewFacts {
+        head_short,
+        manifest_version: manifest_version(repo_root),
+        ..RepoSkewFacts::default()
+    };
+    let Some(commit) = build_commit else {
+        return facts;
+    };
+    facts.build_commit_present = git_in(repo_root, &["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .is_some()
+        // `cat-file -e` prints nothing on success, so `git_in`'s empty-output
+        // rule reports None for a commit that DOES exist. Re-ask with a command
+        // that produces output.
+        || git_in(repo_root, &["rev-parse", "--verify", "--quiet", &format!("{commit}^{{commit}}")]).is_some();
+    if facts.build_commit_present {
+        facts.build_commit_is_ancestor = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["merge-base", "--is-ancestor", commit, "HEAD"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if facts.build_commit_is_ancestor {
+            facts.commits_behind = git_in(
+                repo_root,
+                &["rev-list", "--count", &format!("{commit}..HEAD")],
+            )
+            .and_then(|s| s.parse().ok());
+        }
+    }
+    facts
+}
+
+/// `rally doctor --binary-skew`: compare the RUNNING binary's `RALLY_BUILD_ID`
+/// against the repo it is operating on.
+///
+/// Diagnostic only. It never blocks a command and never exits non-zero on skew —
+/// the point is that an agent on a stale `~/.local/bin/rally` gets told so,
+/// not that its work is stopped.
+///
+/// Reached from `command_doctor` via `DoctorArgs::binary_skew`. Wiring the call
+/// site is the whole point: the measured failure was that every agent on this
+/// machine silently ran a `~/.local/bin/rally` old enough to predate the
+/// `--version` fix, so `rally room --json` returned 1.99 MB where a current
+/// build returned 230 KB, and nothing anywhere said the binary was stale.
+pub(crate) fn run_binary_skew() -> Result<BinarySkewReport> {
+    let room = RoomStore::open()?;
+    let repo_root = room.repo_root().to_path_buf();
+    let parsed = parse_build_id(crate::BUILD_ID);
+    let facts = collect_skew_facts(&repo_root, parsed.commit.as_deref());
+    Ok(classify_binary_skew(&repo_root, crate::BUILD_ID, &facts))
+}
+
+#[cfg(test)]
+mod binary_skew_tests {
+    use super::*;
+
+    fn facts(head: &str, present: bool, ancestor: bool, behind: Option<i64>) -> RepoSkewFacts {
+        RepoSkewFacts {
+            head_short: Some(head.to_string()),
+            build_commit_present: present,
+            build_commit_is_ancestor: ancestor,
+            commits_behind: behind,
+            manifest_version: Some("0.1.7".to_string()),
+        }
+    }
+
+    #[test]
+    fn parse_build_id_splits_version_commit_and_dirty() {
+        assert_eq!(
+            parse_build_id("0.1.7+6e20ee8"),
+            ParsedBuildId {
+                version: "0.1.7".to_string(),
+                commit: Some("6e20ee8".to_string()),
+                dirty: false,
+            }
+        );
+        assert_eq!(
+            parse_build_id("0.1.7+0448c33-dirty"),
+            ParsedBuildId {
+                version: "0.1.7".to_string(),
+                commit: Some("0448c33".to_string()),
+                dirty: true,
+            }
+        );
+        // `nogit` is build.rs's "git was unavailable" sentinel, not a commit.
+        assert_eq!(parse_build_id("0.1.7+nogit").commit, None);
+        // An unrecognised stamp must not invent a commit to compare.
+        assert_eq!(parse_build_id("weird").commit, None);
+        assert_eq!(parse_build_id("weird").version, "weird");
+    }
+
+    #[test]
+    fn binary_built_from_head_is_in_sync() {
+        let r = classify_binary_skew(
+            Path::new("/repo"),
+            "0.1.7+6e20ee8",
+            &facts("6e20ee8", true, true, Some(0)),
+        );
+        assert_eq!(r.verdict, SkewVerdict::InSync);
+        assert!(r.warnings.is_empty());
+        assert_eq!(r.commits_behind, None, "in-sync reports no behind-count");
+    }
+
+    /// The measured real case (2026-08-04): a binary stamped 0448c33 while the
+    /// repo sits at 6e20ee8. Ancestor => ordered => "behind", with the count.
+    #[test]
+    fn ancestor_commit_is_reported_behind_with_a_count() {
+        let r = classify_binary_skew(
+            Path::new("/repo"),
+            "0.1.7+0448c33",
+            &facts("6e20ee8", true, true, Some(1)),
+        );
+        assert_eq!(r.verdict, SkewVerdict::BinaryBehindHead);
+        assert_eq!(r.commits_behind, Some(1));
+        assert!(r.detail.contains("0448c33") && r.detail.contains("6e20ee8"));
+        assert!(
+            r.detail.contains("rebuild"),
+            "a behind verdict must say what to do; got: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn non_ancestor_commit_is_diverged_not_behind() {
+        let r = classify_binary_skew(
+            Path::new("/repo"),
+            "0.1.7+aaaaaaa",
+            &facts("6e20ee8", true, false, None),
+        );
+        assert_eq!(
+            r.verdict,
+            SkewVerdict::Diverged,
+            "an unordered pair must not be claimed as 'behind'"
+        );
+        assert_eq!(r.commits_behind, None);
+    }
+
+    #[test]
+    fn commit_absent_from_the_repo_is_unknown_and_warns() {
+        let r = classify_binary_skew(
+            Path::new("/repo"),
+            "0.1.7+deadbee",
+            &facts("6e20ee8", false, false, None),
+        );
+        assert_eq!(r.verdict, SkewVerdict::Unknown);
+        assert_eq!(r.warnings.len(), 1);
+        assert_eq!(r.warnings[0].code, "skew_build_commit_unknown");
+    }
+
+    #[test]
+    fn unreadable_head_is_unknown_not_a_false_in_sync() {
+        let r = classify_binary_skew(
+            Path::new("/repo"),
+            "0.1.7+6e20ee8",
+            &RepoSkewFacts::default(),
+        );
+        assert_eq!(r.verdict, SkewVerdict::Unknown);
+        assert_eq!(r.warnings[0].code, "skew_head_unresolved");
+    }
+
+    /// A `+nogit` binary can only be compared by version, and the report has to
+    /// say so — otherwise a matching version reads as proof of no skew.
+    #[test]
+    fn nogit_build_falls_back_to_version_and_states_the_limit() {
+        let mismatch = classify_binary_skew(
+            Path::new("/repo"),
+            "0.1.6+nogit",
+            &facts("6e20ee8", false, false, None),
+        );
+        assert_eq!(mismatch.verdict, SkewVerdict::VersionMismatch);
+        assert!(mismatch.detail.contains("cannot see commit-level skew"));
+
+        let matched = classify_binary_skew(
+            Path::new("/repo"),
+            "0.1.7+nogit",
+            &facts("6e20ee8", false, false, None),
+        );
+        assert_eq!(matched.verdict, SkewVerdict::VersionOnlyMatch);
+        assert!(
+            matched.detail.contains("cannot see commit-level skew"),
+            "a version-only match must not read as commit-level confidence"
+        );
+    }
+
+    #[test]
+    fn dirty_stamp_is_disclosed_even_when_the_commit_matches_head() {
+        let r = classify_binary_skew(
+            Path::new("/repo"),
+            "0.1.7+6e20ee8-dirty",
+            &facts("6e20ee8", true, true, Some(0)),
+        );
+        assert_eq!(r.verdict, SkewVerdict::InSync);
+        assert!(r.binary_dirty);
+        assert!(
+            r.detail.contains("-dirty"),
+            "an in-sync verdict from a dirty build must disclose the caveat; got: {}",
+            r.detail
+        );
+    }
+
+    /// A dependency requirement must never be read as the package's own version.
+    #[test]
+    fn manifest_version_reads_the_package_table_not_dependencies() {
+        let toml = "[package]\nname = \"rally-cli\"\nversion = \"0.1.7\"\n\n\
+                    [dependencies]\nserde = { version = \"1.0\" }\n";
+        assert_eq!(parse_manifest_version(toml), Some("0.1.7".to_string()));
+
+        // This repo's own workspace manifest shape: no version key anywhere.
+        let workspace = "[workspace]\nmembers = [\"crates/rally-cli\"]\n\n\
+                         [workspace.package]\nedition = \"2024\"\nrust-version = \"1.89\"\n";
+        assert_eq!(
+            parse_manifest_version(workspace),
+            None,
+            "a manifest with no version key must report None, not a wrong value"
+        );
+
+        // A version-bearing dependency table alone yields nothing.
+        assert_eq!(
+            parse_manifest_version("[dependencies]\nserde = { version = \"1.0\" }\n"),
+            None
+        );
+    }
+
+    /// Exercises the real I/O collector (git + manifest) against this checkout,
+    /// which the pure classifier tests cannot reach. Self-skipping rather than
+    /// brittle: a source tarball or a git-less CI box has no HEAD to read, and
+    /// that is a legitimate `Unknown`, not a failure.
+    #[test]
+    fn collect_skew_facts_reads_this_checkout() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crates/rally-cli has a workspace root")
+            .to_path_buf();
+
+        let head = git_in(&repo_root, &["rev-parse", "--short", "HEAD"]);
+        let Some(head) = head else {
+            return; // no git / not a checkout
+        };
+
+        // The binary's OWN commit against this repo: `cat-file -e` prints
+        // nothing on success, which is exactly the case that would silently
+        // report a present commit as absent if the collector trusted stdout.
+        let f = collect_skew_facts(&repo_root, Some(&head));
+        assert_eq!(f.head_short.as_deref(), Some(head.as_str()));
+        assert!(
+            f.build_commit_present,
+            "HEAD must resolve as present in its own repo — the empty-stdout \
+             `cat-file -e` case is the one that regresses here"
+        );
+        assert!(f.build_commit_is_ancestor, "HEAD is an ancestor of itself");
+        assert_eq!(f.commits_behind, Some(0));
+        assert_eq!(
+            f.manifest_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "the manifest lookup must find the same version the binary was built with"
+        );
+
+        // A commit that cannot exist stays absent rather than defaulting to present.
+        let bogus =
+            collect_skew_facts(&repo_root, Some("0000000000000000000000000000000000000000"));
+        assert!(!bogus.build_commit_present);
+        assert!(!bogus.build_commit_is_ancestor);
+    }
+
+    /// The check is diagnostic: no branch returns Err, and every unresolvable
+    /// case lands on Unknown plus a warning.
+    #[test]
+    fn no_input_shape_produces_a_hard_failure() {
+        for stamp in ["", "+", "0.1.7+", "0.1.7+nogit-dirty", "garbage+x+y"] {
+            let r = classify_binary_skew(Path::new("/repo"), stamp, &RepoSkewFacts::default());
+            assert!(
+                !r.detail.is_empty(),
+                "every stamp must yield a stated verdict; {stamp:?} did not"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

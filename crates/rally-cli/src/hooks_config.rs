@@ -302,6 +302,15 @@ pub(crate) struct CoordinationConfig {
     /// `next`: how long an unanswered handoff stays an active obligation before
     /// it is de-prioritised out of the waiting/candidate projections.
     pub(crate) stale_wait_secs: i64,
+    /// Reaper: how long an unanswered handoff stays OPEN before the reaper
+    /// expires it. Distinct from `stale_wait_secs`, which only changes ranking
+    /// — an unanswered handoff was otherwise immortal in `open_handoffs`.
+    /// `0` disables handoff expiry entirely.
+    pub(crate) handoff_expiry_secs: i64,
+    /// Reaper: minimum seconds between automatic reap passes triggered by
+    /// `rally enter`. `0` disables auto-reap, leaving
+    /// `rally doctor --reap-stale --apply` as the only caller.
+    pub(crate) auto_reap_interval_secs: i64,
 }
 
 impl Default for CoordinationConfig {
@@ -318,6 +327,8 @@ impl Default for CoordinationConfig {
             room_budget_fraction: crate::relevance::DEFAULT_ROOM_BUDGET_FRACTION,
             consumer_context_bytes: crate::relevance::DEFAULT_CONSUMER_CONTEXT_BYTES,
             stale_wait_secs: crate::next::DEFAULT_STALE_WAIT_SECS,
+            handoff_expiry_secs: crate::reaper::DEFAULT_HANDOFF_EXPIRY_SECS,
+            auto_reap_interval_secs: crate::reaper::DEFAULT_AUTO_REAP_INTERVAL_SECS,
         }
     }
 }
@@ -388,6 +399,18 @@ fn coordination_from_value(value: &Value, into: &mut CoordinationConfig) {
         && v > 0
     {
         into.stale_wait_secs = v;
+    }
+    // Zero is meaningful here: it turns handoff expiry off.
+    if let Some(v) = coord.get("handoff_expiry_secs").and_then(Value::as_i64)
+        && v >= 0
+    {
+        into.handoff_expiry_secs = v;
+    }
+    // Zero is meaningful here too: it turns auto-reap off.
+    if let Some(v) = coord.get("auto_reap_interval_secs").and_then(Value::as_i64)
+        && v >= 0
+    {
+        into.auto_reap_interval_secs = v;
     }
     let Some(rel) = coord.get("relevance").and_then(Value::as_object) else {
         return;
@@ -479,6 +502,11 @@ pub(crate) fn resolve_coordination(repo_root: &Path) -> Result<CoordinationConfi
         &mut cfg.consumer_context_bytes,
     );
     coord_env_i64("RALLY_STALE_WAIT_SECS", &mut cfg.stale_wait_secs);
+    coord_env_i64_allow_zero("RALLY_HANDOFF_EXPIRY_SECS", &mut cfg.handoff_expiry_secs);
+    coord_env_i64_allow_zero(
+        "RALLY_AUTO_REAP_INTERVAL_SECS",
+        &mut cfg.auto_reap_interval_secs,
+    );
     coord_env_f64(
         "RALLY_STALE_AUTHOR_FACTOR",
         &mut cfg.relevance.stale_author_factor,
