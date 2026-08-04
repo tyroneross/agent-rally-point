@@ -375,8 +375,7 @@ fn coordination_from_value(value: &Value, into: &mut CoordinationConfig) {
         into.grace_secs = v;
     }
     if let Some(v) = coord.get("room_budget_fraction").and_then(Value::as_f64)
-        && v >= 0.0
-        && v <= 1.0
+        && (0.0..=1.0).contains(&v)
     {
         into.room_budget_fraction = v;
     }

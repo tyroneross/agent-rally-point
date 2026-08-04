@@ -2836,9 +2836,15 @@ fn command_room(args: RoomArgs) -> Result<Output> {
     // above is a write-path authority (`append_state_transition_verified`
     // gates `resolve` on membership in its buckets) and must stay whole.
     let coord = hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
-    let consumer = crate::relevance::ConsumerContext {
-        tool: query.tool.clone(),
-        paths: query.paths.clone(),
+    let consumer = if query.tool.is_none() && query.paths.is_empty() {
+        // No caller identity declared: rank on recency and author staleness
+        // alone. Explicitly neutral, not accidentally empty.
+        crate::relevance::ConsumerContext::neutral()
+    } else {
+        crate::relevance::ConsumerContext {
+            tool: query.tool.clone(),
+            paths: query.paths.clone(),
+        }
     };
     let snapshot = store::compose_room_output(
         projected,

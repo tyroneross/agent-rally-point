@@ -1997,6 +1997,7 @@ impl DirectRoomStore {
                         "release failed: ref {ref_id} is not an active claim (already released, never existed, or invalid); nothing to release"
                     )));
                 }
+                assert_claim_release_authorized(&snapshot_before, fact, ref_id, "release")?;
             }
             FactKind::Resolve => {
                 // Resolve must reference a live blocker, risk, handoff, claim,
@@ -2038,6 +2039,11 @@ impl DirectRoomStore {
                         "resolve failed: ref {ref_id} is not a live blocker, claim, handoff, risk, or unconsumed artifact (already resolved, never existed, or invalid); nothing to resolve"
                     )));
                 }
+                // A Resolve naming a live CLAIM closes that claim exactly as a
+                // Release does (`claim_authority::later_fact_refs_claim` treats
+                // Resolve/Release/Receipt/ClaimExpired identically), so it must
+                // clear the same authorization bar.
+                assert_claim_release_authorized(&snapshot_before, fact, ref_id, "resolve")?;
                 if let Some(handoff) = open_handoff
                     && !handoff_closer_matches_target(handoff, fact)
                 {
@@ -2620,6 +2626,60 @@ fn handoff_is_closed(handoff: &Fact, facts: &[Fact]) -> bool {
 /// This is the body formerly inlined in `RoomStore::snapshot`. Extracted so
 /// that both `snapshot()` and `snapshot_with_readers()` can call it without
 /// loading facts twice (fix #2 — one DB round-trip instead of two).
+/// Authorization gate for closing somebody else's claim.
+///
+/// `claim_authority::later_fact_refs_claim` closes an active claim on ANY later
+/// `Resolve | Release | Receipt | ClaimExpired` carrying its `event_id` as
+/// `ref_id`, with no regard for who wrote it. The 30-minute / 2-hour takeover
+/// authorization lived only in `command_release_by_path`, which `command_say`
+/// reaches ONLY when `ref_id` is absent. So `--ref` walked straight past it:
+/// any peer could strip any other agent's live claim by event id and
+/// immediately re-claim the path. Reproduced end to end against a claim
+/// seconds old — `active_claims` went 1 -> 0 -> 1 with the owner flipped.
+///
+/// That is a complete bypass of the control that makes claims mean anything,
+/// and it defeats the property Rally exists to provide.
+///
+/// Two ways past this gate, matching `command_release_by_path` exactly:
+/// * **Self-release** — the acting tool owns the claim. Always allowed, no
+///   time bar; releasing your own work is the normal path.
+/// * **Takeover** — the owner is silent past the size-scaled reclaim timeout
+///   (`claim_reclaim_eligible`, fail-closed: an owner whose `last_seen_ts` is
+///   missing or unparseable is NEVER reclaimable).
+///
+/// A ref that names no active claim is not this gate's business and passes
+/// through — the liveness checks above already rejected the invalid cases.
+fn assert_claim_release_authorized(
+    snapshot: &RoomSnapshot,
+    fact: &Fact,
+    ref_id: &str,
+    verb: &str,
+) -> Result<()> {
+    let Some(claim) = snapshot.active_claims.iter().find(|c| c.event_id == ref_id) else {
+        return Ok(());
+    };
+    let owner = claim.tool.as_deref().unwrap_or("<unknown>");
+    let actor = fact.tool.as_deref().unwrap_or("<unknown>");
+    if claim.tool.as_deref() == fact.tool.as_deref() {
+        return Ok(());
+    }
+    let coord = crate::hooks_config::resolve_coordination(Path::new(".")).unwrap_or_default();
+    let (takeover_eligible, size) = snapshot.claim_reclaim_eligible(claim, &coord);
+    if takeover_eligible {
+        return Ok(());
+    }
+    let timeout_minutes = match size {
+        crate::decay::WorkSize::Small => coord.reclaim_small_minutes,
+        crate::decay::WorkSize::Large => coord.reclaim_large_minutes,
+    };
+    Err(RallyError::Usage(format!(
+        "{verb} failed: claim {ref_id} is owned by {owner} and {actor} is not the owner. \
+         A non-owner may only take over a claim whose owner has been silent for \
+         {timeout_minutes} minutes; {owner} is still active. Ask {owner} to release it, \
+         or wait out the reclaim window."
+    )))
+}
+
 /// Recency weight for a fact, from its `created_at` and the policy half-life.
 /// A fact whose `created_at` fails to parse is treated as fresh (weight 1.0):
 /// decay must never hide a message just because its timestamp is malformed.
@@ -3581,7 +3641,7 @@ fn never_cut_bytes(snapshot: &RoomSnapshot) -> (usize, Vec<String>) {
         ),
     ];
     let total = sized.iter().map(|(b, _)| *b).sum();
-    sized.sort_by(|a, b| b.0.cmp(&a.0));
+    sized.sort_by_key(|(bytes, _)| std::cmp::Reverse(*bytes));
     let causes = sized
         .into_iter()
         .filter(|(b, _)| *b > 0)
@@ -5409,6 +5469,13 @@ mod ledger_tests {
             "file:src/lib.rs",
             "release old claim",
         );
+        // The release must be authored by the claim's OWNER. `make_fact`
+        // defaults to `tool: "test"`, so this fixture was performing a
+        // non-owner release without meaning to — it passed only because the
+        // takeover authorization was missing from the `--ref` path (RC-029).
+        // What this test actually asserts is projection ORDER, not authority,
+        // so it is set to a self-release and its real assertion is unchanged.
+        release.tool = Some("tool-a".to_string());
         release.ref_id = Some(old_claim.event_id);
         store.append_state_transition_verified(&release).unwrap();
         let later_claim = claim_fact(

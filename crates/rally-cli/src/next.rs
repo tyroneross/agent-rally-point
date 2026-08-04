@@ -379,6 +379,10 @@ fn waiting_on_facts(snapshot: &RoomSnapshot, tool: &str, stale_wait_secs: i64) -
         .collect()
 }
 
+// One more parameter than clippy's default threshold. The alternative — bundling
+// these into a params struct — would add a type whose only purpose is to satisfy
+// a lint, for a private function with a single call site.
+#[allow(clippy::too_many_arguments)]
 fn next_candidates(
     snapshot: &RoomSnapshot,
     tool: &str,
