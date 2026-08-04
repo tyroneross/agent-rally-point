@@ -963,7 +963,39 @@ review answers the question you asked.
   message to name the actual conflicting scope; surface the auto-claim failure instead of `|| true`.
 - **Adversarial control:** claim `workspace:x` as one tool, assert another tool can still claim a
   file path.
-- **State update 2026-08-04: FIXED, all three halves, adversarial controls proven.**
+- **State update 2026-08-04 (revised same day after an independent audit): PARTIALLY FIXED.
+  NOT closed. The room-wide lockout is still reachable in one command.**
+  - **The bypass:** `breadth_violation` compares `record.owner_tool` — which comes from
+    `fact.tool`, self-asserted — against `lead_from_facts`. A rogue passing `--tool <lead-id>`
+    is indistinguishable from the lead. Live-reproduced against the release binary AFTER the fix:
+
+    ```
+    $ rally say claim --tool honest-lead --scope 'workspace:*' --subject grab   # issued by a rogue
+    $ rally say claim --tool someone-else --path src/lib.rs --subject work
+    {"error":"claim conflict: honest-lead holds workspace:* ... "}              # lockout restored
+    ```
+
+    A second route needs no impersonation: `rally lead assign --tool rogue --to rogue` succeeds
+    against a LIVE incumbent, and `claim_authority.rs` prints that exact command to the agent it
+    just refused.
+  - **Why the controls missed it:** every adversarial test synthesizes the rogue's claim under the
+    rogue's OWN `tool` value. They are revert-proof and they grade the first move only. The
+    register's standard is "someone tried to break it and failed"; this was "someone tried the one
+    move the fix anticipated".
+  - **What IS fixed and is worth keeping:** the accidental lockout. An opaque `workspace:zzz` no
+    longer swallows the room, the conflict message no longer names a scope its owner does not hold,
+    and the hook no longer swallows the failure. Those close the case that actually happened.
+  - **What closing this needs:** authority bound to something the writer cannot choose — a session
+    identity correlated to a registered session — plus authorization on `rally lead assign` against
+    a live incumbent. **Effort: M–L. Not attempted here; it is a protocol change, not a patch.**
+  - **Also open (audit finding):** `repo:<name>` now conflicts with no path at all, and a
+    path-shaped root fails open on a leading `./` or a trailing `/`, because `canonical_identifier`
+    canonicalizes only File and Dir. Anyone using `repo:` or a loosely-spelled `workspace:` root as
+    a coarse lock now silently protects nothing, with no warning at claim time.
+- **Superseded claim, recorded rather than deleted:** this entry said
+  "FIXED, all three halves, adversarial controls proven" for a few hours. It was wrong in the
+  precise way the register's third pattern describes.
+- **Original 2026-08-04 detail follows.**
   - **Lockout:** `resource_scope::root_contains` decides containment by IDENTIFIER, not by type. A
     namespace root contains a finer scope only when its identifier answers the question — the
     explicit wildcard `*`, or a path the finer scope sits beneath. An opaque `workspace:zzz` or
@@ -1000,7 +1032,19 @@ review answers the question you asked.
   Empty-scope `binding-decision` (`check.rs:194-214`) matches universally too.
 - **Fix shape:** require non-empty scope on blockers, or downgrade empty-scope to warn.
 - **Adversarial control:** post an unscoped blocker, assert `check before-write` still allows.
-- **State update 2026-08-04: FIXED, adversarial control proven.**
+- **State update 2026-08-04 (revised same day after an independent audit): PARTIALLY FIXED.
+  NOT closed.** The freeze gate compares `blocker.tool` against `snapshot.lead`, and `blocker.tool`
+  is self-asserted. Live-reproduced after the fix: `rally say blocker --tool <lead-id>
+  --subject 'impersonated freeze'` returns `allow=false`, `room-freeze/stop` — RC-038 verbatim,
+  and under `RALLY_HOOK_STRICT=1` a hard deny on every edit. The unit tests all post the blocker
+  under the rogue's own id, so none of them tries the adjacent move.
+  **A second defect the gate introduced:** the verdict reads the CURRENT lead, so taking the seat
+  AFTER a legitimate freeze was posted silently downgrades that still-active freeze from `stop` to
+  `warn`. The reaper's lead-relinquish does the same thing with no attacker involved. The fix shape
+  is to evaluate the lead as of the blocker's own seq. **Effort: S–M. Queued.**
+  What IS fixed: the unauthenticated non-impersonating case, which is the one that was reported.
+- **Superseded claim:** this entry said "FIXED, adversarial control proven". Recorded, not deleted.
+- **Original 2026-08-04 detail follows.**
   - Neither proposed shape was taken as written. Requiring a scope removes a capability a lead
     genuinely needs (freeze the room during a release), and a blanket downgrade to warn removes it
     just as completely. The fix gates it on the same rule RC-037's wildcard uses — **a room-wide
@@ -1126,6 +1170,53 @@ review answers the question you asked.
      per-field caps and guillemet quoting without failing block 2 or the byte-identity test.
   4. **The 2A key list is a list.** A host inventing a new context-injection key is unenumerated
      until someone adds it — stated as a KNOWN LIMIT in the test.
+
+### RC-050 — both new authority gates read a self-asserted field
+- **State:** `observed`, live-reproduced 2026-08-04 by an independent audit and re-verified by the
+  orchestrator. **NOT fixed.** Supersedes the "FIXED" claims on RC-037 and RC-038.
+- **Mechanism:** `claim_authority::breadth_violation` and `check::check_before_write` both decide
+  authority by comparing `fact.tool` / `blocker.tool` against the projected lead. `fact.tool` is
+  self-asserted — `skills/agent-rally-point/SKILL.md` says so in the same commit. `--tool <lead-id>`
+  satisfies both gates. `rally lead assign --tool rogue --to rogue` also succeeds against a live
+  incumbent, so no impersonation is even required.
+- **Why it survived a green suite:** every adversarial test posts the rogue's fact under the rogue's
+  OWN id. The tests are revert-proof and grade the first move only.
+- **Fix shape:** bind authority to `from_session_id` correlated to a registered session, and
+  authorize `lead assign` against a live incumbent. **Effort: M–L — a protocol change.**
+- **Adversarial control required:** a rogue posting an unscoped blocker with `--tool <lead-id>` must
+  still yield `allow: true`; a rogue claiming `workspace:*` with `--tool <lead-id>` must be refused.
+
+### RC-051 — auto-reap on `enter` shipped three regressions and is now opt-in
+- **State:** `mitigated` by defaulting off (`DEFAULT_AUTO_REAP_INTERVAL_SECS = 0`). Root causes NOT
+  fixed.
+- **Measured, release binary:** (1) 8 concurrent `rally enter` against a room with 6 eligible claims
+  returned 8/8 exit 4 with auto-reap ON and 8/8 exit 0 with it OFF — the "never fails enter" claim
+  covered the reaper's own `Err` return, not the mutation watchdog above it. (2) It closed a LIVE
+  agent's claim: nothing in production renews `lease_expires_at` (`renew_claim_lease` has no
+  production caller), so every single-file claim expires 30 minutes after creation and any peer's
+  `enter` then frees the path, silently, with no notice to the owner. (3) It widened RC-044,
+  already-recorded concurrent-`enter` store corruption.
+- **Also:** the rate-limit marker is written BEFORE the pass, so a no-op or partial reap burns the
+  whole window; and the marker read/write is a lock-free TOCTOU, so the "at most one extra pass"
+  comment is unproven.
+- **What must exist before it goes back on:** a lease-renewal caller on the presence/heartbeat path,
+  a bound on facts appended per pass under the watchdog budget, and a concurrency test asserting
+  N concurrent enters all exit 0. **Effort: M.**
+- **Partial hardening already applied:** the automatic path acts only on the writer-stamped lease
+  signal (`ReapMode::LeaseOnly`), because owner-staleness derives from a peer-writable `created_at`
+  and would otherwise let one committed ledger line destroy a victim's claims.
+
+### RC-052 — a prose edit silently broke a machine-readable envelope field
+- **State:** ✅ `controlled` 2026-08-04.
+- **Mechanism:** `command_claims_refresh` parsed the claim-conflict owner with
+  `.split("already owns").next()`. RC-037's message rewrite dropped that phrase, so the delimiter
+  vanished and the `owner` field of `agent-rally.command.claims-refresh.v1` became the entire
+  sentence instead of a tool id. Nothing graded the message shape.
+- **Fix:** parse the first whitespace-delimited token after `claim conflict:`, which both the old and
+  new wording guarantee. **Still open:** the conflict should be carried structurally rather than
+  re-parsed from prose. **Effort: S.**
+- **Class:** the register's first pattern — a step succeeded that was not the step the caller cared
+  about — reached by a documentation-quality edit.
 
 ### RC-048 — the room byte budget governs three sections and leaves the three biggest alone
 - **State:** `observed`, measured this run. **NOT fixed.**

@@ -47,7 +47,7 @@ Examples:
   rally_wake.py --tmux-target main:0.0 "doorbell" \
       --confirm-channel <repo_root>/.rally/ledger.jsonl
 """
-import argparse, json, subprocess, sys, time
+import argparse, json, os, subprocess, sys, time
 
 
 def run(cmd, parse=False):
@@ -57,9 +57,99 @@ def run(cmd, parse=False):
     return json.loads(p.stdout) if parse else p.stdout
 
 
+# ---- sanitization (RC-041 gap 3D) -----------------------------------------
+# This script used to hand the raw message straight to `tmux send-keys -l`,
+# which made the Rust chokepoint comment false: `sanitize_inject_text`
+# (crates/rally-cli/src/backends.rs) claims "no future caller can route around"
+# it, and this caller did.
+#
+# The fix is a MIRROR, not a redirect. Routing through `rally inject` was the
+# preferred shape and does not work here: `rally inject` resolves its target to
+# a managed session record or a rally-termd agent id, and this script exists
+# precisely for a pane rally never launched, addressed as `session:window.pane`.
+# Sending through the CLI would write a ledger directive nobody delivers and
+# leave the pane untouched - a silent no-op in place of a wake. So the rule is
+# implemented twice and GRADED ONCE, against
+# crates/rally-cli/tests/inject_sanitizer_cases.json, from both sides.
+#
+# Deliberately NOT using `unicodedata.category`, even though Python ships the
+# full table and Rust does not: a rule the two implementations state
+# differently is a rule with a hole. The Rust enumeration is canonical; the
+# ranges below are its transcription, in the same order, with the same
+# known limit (unassigned Cn is not covered beyond the noncharacters).
+SANITIZER_FIXTURES = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "crates", "rally-cli", "tests", "inject_sanitizer_cases.json",
+)
+
+
+def _is_invisible_or_reordering(cp):
+    """Mirror of backends.rs::is_invisible_or_reordering - see it for the why
+    of each range."""
+    if cp & 0xFFFE == 0xFFFE:          # every U+xFFFE / U+xFFFF: noncharacter
+        return True
+    return (
+        cp == 0x00AD                                    # SOFT HYPHEN
+        or 0x0600 <= cp <= 0x0605                       # Arabic number signs
+        or cp in (0x061C, 0x06DD, 0x070F, 0x08E2)       # ALM, ayah, SAM
+        or 0x0890 <= cp <= 0x0891
+        or cp == 0x180E                                 # MONGOLIAN VOWEL SEP
+        or 0x200B <= cp <= 0x200F                       # ZWSP..RLM
+        or cp in (0x2028, 0x2029)                       # Zl, Zp
+        or 0x202A <= cp <= 0x202E                       # bidi embed/override
+        or 0x2060 <= cp <= 0x206F                       # word joiner..deprecated
+        or 0xFDD0 <= cp <= 0xFDEF                       # noncharacters
+        or cp == 0xFEFF                                 # BOM / ZWNBSP
+        or 0xFFF9 <= cp <= 0xFFFB                       # interlinear annotation
+        or 0x1D173 <= cp <= 0x1D17A                     # musical format
+        or 0xE0000 <= cp <= 0xE00FF                     # TAG block
+        or 0xE000 <= cp <= 0xF8FF                       # private use (BMP)
+        or 0xF0000 <= cp <= 0xFFFFD                     # private use (plane 15)
+        or 0x100000 <= cp <= 0x10FFFD                   # private use (plane 16)
+    )
+
+
+def sanitize_wake_text(text):
+    """Drop every control/format/reordering character except TAB.
+
+    Same contract as the Rust side: TAB survives, C0/C1/DEL do not, and neither
+    does anything invisible or direction-flipping. A newline is dropped because
+    the submit key is sent separately - a body newline would submit a partial
+    line."""
+    return "".join(
+        ch for ch in text
+        if ch == "\t"
+        or not (_is_control(ch) or _is_invisible_or_reordering(ord(ch)))
+    )
+
+
+def _is_control(ch):
+    """General category Cc, matching Rust's char::is_control exactly."""
+    cp = ord(ch)
+    return cp <= 0x1F or 0x7F <= cp <= 0x9F
+
+
+def self_test(path):
+    """Grade this file's sanitizer against the shared fixture list. Exit 0 when
+    every case matches; print each mismatch and exit 1 otherwise."""
+    with open(path, encoding="utf-8") as f:
+        cases = json.load(f)["cases"]
+    failures = []
+    for case in cases:
+        got = sanitize_wake_text(case["input"])
+        if got != case["expected"]:
+            failures.append({"name": case["name"],
+                             "expected": case["expected"], "got": got})
+    print(json.dumps({"cases": len(cases), "failures": failures}, ensure_ascii=True))
+    return 1 if failures else 0
+
+
 # ---- tmux backend (no agent-status API; address pane explicitly, doorbell is low-harm) ----
 def tmux_send(target, text):
-    run(["tmux", "send-keys", "-t", target, "-l", text])  # -l = literal, NO paste bracket
+    # `-l` writes the argument literally, so a control byte in `text` would be
+    # a keystroke, not content: the same keystroke-injection class the Rust
+    # framer closes. Sanitize first, always.
+    run(["tmux", "send-keys", "-t", target, "-l", sanitize_wake_text(text)])
     run(["tmux", "send-keys", "-t", target, "C-m"])        # submit
     return ["C-m"]
 
@@ -78,10 +168,14 @@ def main():
         "For ptyd/Easy Terminal use `rally inject` (ledger). "
         "For managed `rally run` sessions use `rally inject`."
     )
-    ap.add_argument("message",
+    ap.add_argument("message", nargs="?",
                     help="SHORT doorbell nudge — point to the mailbox, don't carry the payload")
-    ap.add_argument("--tmux-target", required=True,
-                    help="tmux target, e.g. session:window.pane")
+    ap.add_argument("--self-test", nargs="?", const=SANITIZER_FIXTURES, default=None,
+                    metavar="FIXTURES_JSON",
+                    help="grade sanitize_wake_text against the shared fixture list and exit")
+    # Required for a real wake, but NOT for --self-test, which touches no pane.
+    ap.add_argument("--tmux-target",
+                    help="tmux target, e.g. session:window.pane (required to wake)")
     ap.add_argument("--confirm-channel",
                     help="changes.jsonl path; success = a new line appears (agent posted back)")
     ap.add_argument("--confirm-timeout", type=float, default=45.0)
@@ -89,6 +183,13 @@ def main():
                     help="warn above this — paste-collapse risk")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
+
+    if a.self_test:
+        sys.exit(self_test(a.self_test))
+    if not a.tmux_target:
+        ap.error("--tmux-target is required")
+    if a.message is None:
+        ap.error("a doorbell message is required")
 
     if len(a.message) > a.max_nudge_chars:
         print(json.dumps({"warning": f"nudge is {len(a.message)} chars > {a.max_nudge_chars}; "

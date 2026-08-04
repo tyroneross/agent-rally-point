@@ -714,7 +714,9 @@ fn emit_timeout_fail_open(wants_json: bool, fail_open: bool, timeout: Duration) 
     if wants_json {
         // Neutral envelope: the codex/claude/gemini wrappers parse this and,
         // finding no `agent_visible.present`, emit `{}` — i.e. allow the write.
-        println!("{}", json!({ "ok": true, "product": "rally" }));
+        crate::output::write_line_or_exit_on_broken_pipe(
+            &json!({ "ok": true, "product": "rally" }).to_string(),
+        );
     }
     let _ = fail_open; // semantics identical either way; kept for clarity/logging
     eprintln!(
@@ -760,7 +762,7 @@ fn emit_timeout_fail_closed_before_write(wants_json: bool, timeout: Duration) {
                 }
             }
         });
-        println!("{payload}");
+        crate::output::write_line_or_exit_on_broken_pipe(&payload.to_string());
     }
     eprintln!(
         "rally: before-write hook exceeded {}ms wall-clock budget — failing CLOSED (RALLY_BEFORE_WRITE_FAILCLOSED is set; blocking write to prevent silent claim collision)",
@@ -795,7 +797,7 @@ fn emit_timeout_fail_closed_mutation(wants_json: bool, timeout: Duration) {
                 }
             }
         });
-        println!("{payload}");
+        crate::output::write_line_or_exit_on_broken_pipe(&payload.to_string());
     }
     eprintln!("rally: {message}");
 }
@@ -819,7 +821,7 @@ fn emit_timeout_committed_mutation(wants_json: bool, timeout: Duration) {
                 }
             }
         });
-        println!("{payload}");
+        crate::output::write_line_or_exit_on_broken_pipe(&payload.to_string());
     }
     eprintln!("rally: {message}");
 }
@@ -3368,11 +3370,21 @@ fn command_claims_refresh(args: ClaimsRefreshArgs) -> Result<Output> {
             // A live peer holds a conflicting claim — record and keep going so
             // one conflict never blocks the rest of the manifest.
             Err(RallyError::Usage(msg)) if msg.contains("claim conflict") => {
+                // The owner is the first whitespace-delimited token after
+                // "claim conflict:". This used to split on the literal
+                // "already owns", and RC-037's message rewrite dropped that
+                // phrase — so the delimiter vanished, `split().next()` returned
+                // the whole remainder, and this field silently became the
+                // entire sentence instead of a tool id. A machine-readable
+                // envelope field was broken by a prose edit with nothing
+                // grading it. Splitting on whitespace depends only on the
+                // owner being the first thing named, which both the old and new
+                // wording guarantee.
                 let owner = msg
                     .split("claim conflict:")
                     .nth(1)
-                    .and_then(|s| s.split("already owns").next())
-                    .map(|s| s.trim().to_string())
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .map(str::to_string)
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "unknown".to_string());
                 conflicts.push(ClaimConflictEntry {
@@ -4115,7 +4127,7 @@ fn watch_emit_activity(
             "tool_last": tool_last,
             "ts": now_string(),
         });
-        println!("{line}");
+        crate::output::write_line_or_exit_on_broken_pipe(&line.to_string());
     }
 }
 
@@ -4129,7 +4141,7 @@ fn watch_emit_heartbeat(room_id: &str, tool: Option<&str>, current_seq: i64, int
         "interval": interval,
         "ts": now_string(),
     });
-    println!("{line}");
+    crate::output::write_line_or_exit_on_broken_pipe(&line.to_string());
 }
 
 /// Run `--on-activity <cmd>` via the shell with the context env vars.
@@ -5772,12 +5784,24 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     let target = args.target;
     let sender_tool = args.tool;
     let urgent = args.urgent;
-    // SEC-006: `Directive.from` is caller-supplied. The daemon treats it as
-    // INFORMATIONAL ONLY (it never branches on `from` for trust — the
-    // authoritative sender-roster + capability check lives in ptyd's termd
-    // `authorize()`). The write-side gate here rejects a malformed / traversal /
-    // control-char sender id so a garbage identity can never reach the ledger
-    // or the SEC-015 audit trail.
+    // SEC-006: `Directive.from` is caller-supplied. The write-side gate here
+    // rejects a malformed / traversal / control-char sender id so a garbage
+    // identity can never reach the ledger or the SEC-015 audit trail.
+    //
+    // CORRECTION (RC-041 gap 3B, 2026-08-04). This comment used to end by
+    // saying the authoritative sender check "lives in ptyd's termd
+    // `authorize()`", which read as: rally need not check. Two things are wrong
+    // with that, both checkable from this side. `daemon_client::send_agent`
+    // transmits `{to, text, submit, confirm}` and NO sender at all
+    // (`daemon_client.rs`), so nothing downstream of the RPC can bind a
+    // delivery to the `--tool` asserted here — at best termd authorizes the
+    // connecting process. And the `tmux_framed_fallback` path
+    // (`command_inject_managed`, taken whenever `session.daemon_registered` is
+    // false, which is every pre-daemon session) reaches no daemon at all.
+    // termd's own source is out of repo and NOT vendored, so what it does with
+    // the ledger `from` field is unverified here either way.
+    // `inject_authorization_refusal` below is therefore the check that actually
+    // covers this binary's delivery paths.
     rally_protocol::ledger::validate_agent_id(&sender_tool)
         .map_err(|e| RallyError::Usage(format!("invalid --tool sender id: {e}")))?;
 
@@ -5785,6 +5809,20 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     // unchanged), or rally-termd-registered ledger agent (ledger-only). See
     // `InjectTarget` for the order-matters rationale (managed wins over id).
     let inject_target = resolve_inject_target(&target, &args.bins)?;
+
+    // RC-041 gap 3B: WHO may inject into WHOM. Runs after resolution because
+    // the rule is about the target's identity, and before either arm because
+    // both deliver. `--dry-run` is exempt: it plans and delivers nothing.
+    if !dry_run {
+        let target_tool = match &inject_target {
+            InjectTarget::Managed(session) => session.tool.clone(),
+            InjectTarget::LedgerAgent(agent_id) => agent_id.clone(),
+        };
+        if let Some(refusal) = inject_authorization_refusal(&sender_tool, &target_tool) {
+            return Err(RallyError::Usage(refusal));
+        }
+    }
+
     match inject_target {
         InjectTarget::Managed(session) => command_inject_managed(
             args.json,
@@ -5809,6 +5847,194 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
             args.require_ack,
             args.timeout_seconds,
         ),
+    }
+}
+
+/// The `--tool` value when the caller named nobody (`cli.rs` defaults it to
+/// this). Not a real agent id — `validate_agent_id` accepts it, and every
+/// unattended shell invocation of `rally inject` carries it.
+const INJECT_SENDER_UNIDENTIFIED: &str = "unknown";
+
+/// RC-041 gap 3B — who may inject into whom, decided from ledger state.
+///
+/// Reads the room to answer two questions the policy needs (who holds the lead
+/// seat; has the target opened a handoff to this sender) and delegates the
+/// decision to [`inject_authority_refusal`]. Returns the refusal message, or
+/// `None` to allow.
+///
+/// FAIL-OPEN on a room we cannot read. A storage error tells us nothing about
+/// who leads the room, and turning it into a refusal would convert a local
+/// SQLite hiccup into a room-wide coordination outage — the RC-038 failure
+/// shape, arriving from the other direction.
+fn inject_authorization_refusal(sender_tool: &str, target_tool: &str) -> Option<String> {
+    let room = RoomStore::open().ok()?;
+    let snapshot = room.snapshot().ok()?;
+    // Consent = the TARGET named this sender in an open handoff. That is the
+    // one invitation in the fact vocabulary the target itself authors; a
+    // handoff the SENDER wrote would be the sender authorizing itself.
+    let target_invited_sender = snapshot.open_handoffs.iter().any(|fact| {
+        fact.tool.as_deref() == Some(target_tool) && fact.target.as_deref() == Some(sender_tool)
+    });
+    inject_authority_refusal(
+        sender_tool,
+        target_tool,
+        snapshot.lead.as_deref(),
+        target_invited_sender,
+    )
+}
+
+/// The inject authorization rule, as a pure function of ledger-derived state.
+///
+/// An inject is authorized when ANY of these holds:
+///   1. `sender == target` — an agent driving its own pane.
+///   2. the sender holds the LEAD SEAT — the documented lead-to-peer flow in
+///      `docs/HANDOFFS-AND-LAUNCHING-AGENTS.md` (launch a session, then inject
+///      the first instruction).
+///   3. the target opened a handoff naming the sender — the target asked, so a
+///      reply into its pane is invited.
+///   4. the room has NO lead — nobody holds the authority the rule delegates,
+///      so there is nobody to route through. Refusing here would strand the
+///      bootstrap case (`rally run` a peer, then inject its first instruction,
+///      before anyone has entered and taken the seat) and every workspace that
+///      never assigns a lead. Same reading as RC-038's "a room with no lead has
+///      nobody who can freeze it", and the OPPOSITE of
+///      `claim_authority::breadth_violation`, which refuses in a leaderless
+///      room — deliberately, because a refused claim costs a retry while a
+///      refused inject strands a launched agent with no instruction.
+///
+///   5. the sender named NOBODY — `--tool` was omitted, so it carries the CLI
+///      default [`INJECT_SENDER_UNIDENTIFIED`]. That is the documented human
+///      form (`rally inject claude-foo-01 --text "…"` in
+///      `docs/HANDOFFS-AND-LAUNCHING-AGENTS.md`), used by the operator who
+///      launched every pane in the room. Rally cannot tell that operator from
+///      an agent declining to name itself, and refusing would break the
+///      documented flow while stopping nothing: the same caller can assert any
+///      id it likes. What it gets instead is the honest rendering — the payload
+///      arrives labelled `from «unknown»`, which is the weakest provenance the
+///      channel can show.
+///
+/// Everything else is refused: a non-lead injecting into an agent that did not
+/// ask, in a room that has someone to route through.
+///
+/// WHAT THIS IS WORTH, stated exactly, because a gate whose value is overstated
+/// is worse than none. `--tool` is self-asserted and rally authenticates
+/// nothing, so an attacker who claims the LEAD's id passes rule 2 and one who
+/// claims nothing passes rule 5. What is actually blocked is the agent that
+/// names ITSELF and has no standing. The value is therefore not exclusion, it
+/// is FORCED CHOICE: reach a stranger's pane only by lying about who you are
+/// (recorded in `Directive.from` and the SEC-015 audit trail, contradicted by
+/// the real lead's own presence facts) or by arriving as `unknown` in front of
+/// the recipient and any human watching. The gate sits at the same epistemic
+/// tier as `claim_authority::breadth_violation`, which likewise trusts a
+/// self-declared `owner_tool`. Closing rule 5 needs a caller credential this
+/// protocol does not have — say so rather than let the check imply one exists.
+fn inject_authority_refusal(
+    sender_tool: &str,
+    target_tool: &str,
+    lead: Option<&str>,
+    target_invited_sender: bool,
+) -> Option<String> {
+    if sender_tool == target_tool
+        || target_invited_sender
+        || sender_tool == INJECT_SENDER_UNIDENTIFIED
+    {
+        return None;
+    }
+    let lead = lead?;
+    if lead == sender_tool {
+        return None;
+    }
+    Some(format!(
+        "inject refused: {sender_tool} does not hold the lead seat and {target_tool} has not \
+         opened a handoff to it, so {sender_tool} may not write into {target_tool}'s session. \
+         {lead} holds the lead seat. To fix: ask {lead} to inject, or post \
+         `rally say handoff --tool {sender_tool} --target {target_tool} --subject <what you need>` \
+         and let {target_tool} pull it on its next `rally next`."
+    ))
+}
+
+#[cfg(test)]
+mod inject_authority_tests {
+    use super::inject_authority_refusal;
+
+    #[test]
+    fn self_inject_is_allowed_even_under_a_lead() {
+        assert!(
+            inject_authority_refusal("codex:01", "codex:01", Some("claude_code:00"), false)
+                .is_none(),
+            "an agent driving its own pane needs no authority"
+        );
+    }
+
+    #[test]
+    fn the_lead_may_inject_any_peer() {
+        assert!(
+            inject_authority_refusal("claude_code:00", "codex:01", Some("claude_code:00"), false)
+                .is_none(),
+            "lead-to-peer is the documented handoff flow"
+        );
+    }
+
+    #[test]
+    fn a_target_that_opened_a_handoff_may_be_answered() {
+        assert!(
+            inject_authority_refusal("codex:02", "codex:01", Some("claude_code:00"), true)
+                .is_none(),
+            "the target asked; answering it is not an intrusion"
+        );
+    }
+
+    #[test]
+    fn a_leaderless_room_still_injects() {
+        assert!(
+            inject_authority_refusal("codex:02", "codex:01", None, false).is_none(),
+            "no lead seat means no authority to route through; refusing would strand \
+             the launch-then-inject bootstrap"
+        );
+    }
+
+    /// The RC-041 gap 3B case: a peer with no standing writes into another
+    /// agent's pane. Delete the `lead == sender_tool` / consent branches and
+    /// this is the test that stops passing for the right reason.
+    #[test]
+    fn a_non_lead_peer_may_not_inject_a_stranger() {
+        let refusal =
+            inject_authority_refusal("codex:02", "codex:01", Some("claude_code:00"), false)
+                .expect("a non-lead injecting a stranger must be refused");
+        assert!(
+            refusal.contains("claude_code:00"),
+            "the refusal must name who CAN do it; got {refusal}"
+        );
+        assert!(
+            refusal.contains("rally say handoff"),
+            "the refusal must name what to do instead; got {refusal}"
+        );
+    }
+
+    /// Impersonation is NOT stopped here, and the rule's doc comment says so.
+    /// Pinned as a test so the limit cannot quietly be forgotten and restated
+    /// as a guarantee.
+    #[test]
+    fn claiming_the_leads_id_still_passes_this_gate() {
+        assert!(
+            inject_authority_refusal("claude_code:00", "codex:01", Some("claude_code:00"), false)
+                .is_none(),
+            "KNOWN LIMIT: --tool is self-asserted; this gate blocks shapes, not liars"
+        );
+    }
+
+    /// The operator form from `docs/HANDOFFS-AND-LAUNCHING-AGENTS.md` —
+    /// `rally inject <session> --text "…"` with no `--tool` — must keep
+    /// working, and naming nobody is also the cheapest way past this gate. Both
+    /// facts are pinned here so neither is discovered by surprise.
+    #[test]
+    fn an_unidentified_caller_is_allowed_and_that_is_the_weak_point() {
+        assert!(
+            inject_authority_refusal("unknown", "codex:01", Some("claude_code:00"), false)
+                .is_none(),
+            "the documented no---tool operator flow must not break, and refusing it \
+             would stop nothing: the same caller can assert any id"
+        );
     }
 }
 
@@ -5885,6 +6111,25 @@ fn command_inject_managed(
     // [E]: a ptyd session pins the exact socket it was spawned+registered on, so
     // this inject's agent.send reaches the SAME daemon (never a re-resolved one).
     backend_runner.pin_ptyd_socket(session.daemon_socket.as_deref());
+    // RC-041 gap 3A: name the sender so every payload this runner delivers
+    // carries a provenance label. `sender_tool` passed `validate_agent_id` in
+    // `command_inject`, so the label cannot itself carry a forged line or a
+    // control byte.
+    //
+    // The `unknown` case is translated HERE, not in the label builder, because
+    // this is the layer that knows `unknown` is a CLI placeholder rather than
+    // an agent (`cli.rs::inject_parser` substitutes it when `--tool` is
+    // omitted; see INJECT_SENDER_UNIDENTIFIED). Passing it through rendered the
+    // label as `from «unknown»`, which reads as an agent literally named
+    // `unknown` and told the recipient nothing it did not already know. There
+    // is no better source to resolve it from: rally sets no ambient
+    // caller-identity variable, and the ledger write on this same path records
+    // the identical placeholder in `Directive.from`. So the honest fix is to
+    // render it AS a placeholder — `state_inject_sender` is simply not called,
+    // and the label says `(none stated)`. The label itself is never skipped.
+    if sender_tool != INJECT_SENDER_UNIDENTIFIED {
+        backend_runner.state_inject_sender(&sender_tool);
+    }
     let live_target = if dry_run {
         session.target.clone()
     } else {

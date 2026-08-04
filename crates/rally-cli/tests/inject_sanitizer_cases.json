@@ -1,0 +1,150 @@
+{
+  "_comment": [
+    "RC-041 gap 3C/3D - the SHARED grading list for inject-text sanitization.",
+    "Two implementations must agree on it: sanitize_inject_text +",
+    "is_invisible_or_reordering (crates/rally-cli/src/backends.rs) and",
+    "sanitize_wake_text (scripts/rally_wake.py). The Rust list is canonical; the",
+    "Python one mirrors it because rally_wake.py writes to a tmux pane the rally",
+    "binary cannot address, so it cannot route through the CLI chokepoint.",
+    "Graded from both sides by crates/rally-cli/tests/inject_security.rs.",
+    "Every codepoint under test is written as a \\u escape ON PURPOSE: a literal",
+    "invisible character here would be unreviewable, which is exactly the",
+    "property that makes it hostile in a pane.",
+    "NUL is absent on purpose - it cannot cross argv, so the CLI leg could not",
+    "carry it; backends.rs covers NUL in a unit test."
+  ],
+  "cases": [
+    {
+      "name": "u2028_line_separator",
+      "input": "before\u2028after",
+      "expected": "beforeafter",
+      "why": "Zl, not Cc - the ARP-004 forged-line class survived char::is_control"
+    },
+    {
+      "name": "u2029_paragraph_separator",
+      "input": "before\u2029after",
+      "expected": "beforeafter",
+      "why": "Zp, same class as U+2028"
+    },
+    {
+      "name": "rlo_bidi_override",
+      "input": "delete a\u202eb file",
+      "expected": "delete ab file",
+      "why": "U+202E reverses displayed order - the pane can read backwards from the bytes"
+    },
+    {
+      "name": "lrm_rlm_marks",
+      "input": "a\u200e\u200fb",
+      "expected": "ab",
+      "why": "zero-width directional marks"
+    },
+    {
+      "name": "bidi_isolates",
+      "input": "a\u2066b\u2069c",
+      "expected": "abc",
+      "why": "U+2066-U+2069 isolate and reorder a span"
+    },
+    {
+      "name": "zwsp_hides_a_word_boundary",
+      "input": "pass\u200bword",
+      "expected": "password",
+      "why": "ZWSP splits a token the reader sees as whole"
+    },
+    {
+      "name": "bom_leading",
+      "input": "\ufeffhello",
+      "expected": "hello",
+      "why": "U+FEFF is zero-width and makes the first token unmatchable"
+    },
+    {
+      "name": "soft_hyphen",
+      "input": "ho\u00adme",
+      "expected": "home",
+      "why": "U+00AD is invisible in most renderers"
+    },
+    {
+      "name": "tag_characters",
+      "input": "hi\udb40\udc41\udb40\udc42",
+      "expected": "hi",
+      "why": "the TAG block mirrors ASCII invisibly - the prompt-smuggling carrier"
+    },
+    {
+      "name": "private_use",
+      "input": "a\ue000b",
+      "expected": "ab",
+      "why": "Co renders per-font with no interoperable meaning"
+    },
+    {
+      "name": "noncharacter_fffe",
+      "input": "a\ufffeb",
+      "expected": "ab",
+      "why": "permanent noncharacter (Cn)"
+    },
+    {
+      "name": "arabic_letter_mark",
+      "input": "a\u061cb",
+      "expected": "ab",
+      "why": "Cf, and directional like the bidi marks"
+    },
+    {
+      "name": "word_joiner",
+      "input": "a\u2060b",
+      "expected": "ab",
+      "why": "zero-width joiner-class format control"
+    },
+    {
+      "name": "mongolian_vowel_separator",
+      "input": "a\u180eb",
+      "expected": "ab",
+      "why": "zero-width in modern Unicode, historically a space"
+    },
+    {
+      "name": "esc_paste_end_marker",
+      "input": "a\u001b[201~b",
+      "expected": "a[201~b",
+      "why": "the paste-breakout guard - ESC dropped, so the frame cannot close early"
+    },
+    {
+      "name": "newline_and_cr",
+      "input": "a\nb\rc",
+      "expected": "abc",
+      "why": "this path appends its own submit CR; a body newline could submit a partial line"
+    },
+    {
+      "name": "del_and_c1",
+      "input": "a\u007fb\u0085c",
+      "expected": "abc",
+      "why": "DEL and the C1 block are Cc"
+    },
+    {
+      "name": "keeps_tab",
+      "input": "a\tb",
+      "expected": "a\tb",
+      "why": "tab is the one Cc character the channel keeps - real content in pasted text"
+    },
+    {
+      "name": "keeps_spaces_and_punctuation",
+      "input": "two words -- and: punctuation!",
+      "expected": "two words -- and: punctuation!",
+      "why": "ordinary prose must survive intact"
+    },
+    {
+      "name": "keeps_non_latin_scripts",
+      "input": "\u65e5\u672c\u8a9e caf\u00e9 \u2713 \u03a9 \u0645\u0631\u062d\u0628\u0627",
+      "expected": "\u65e5\u672c\u8a9e caf\u00e9 \u2713 \u03a9 \u0645\u0631\u062d\u0628\u0627",
+      "why": "CJK, accents, symbols and Arabic letters are content, not controls"
+    },
+    {
+      "name": "keeps_variation_selector_supplement",
+      "input": "\u6f22\udb40\udd00",
+      "expected": "\u6f22\udb40\udd00",
+      "why": "U+E0100 is Mn, not C - a real Ideographic Variation Sequence, kept on purpose"
+    },
+    {
+      "name": "keeps_combining_marks",
+      "input": "e\u0301",
+      "expected": "e\u0301",
+      "why": "combining acute is Mn - decomposed text must survive"
+    }
+  ]
+}

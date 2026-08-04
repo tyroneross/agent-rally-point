@@ -56,12 +56,32 @@ paths were live and independently reproduced, both reachable from one committed 
   which `RALLY_HOOK_STRICT=1` turns into a hard deny on every edit. An unscoped blocker from a
   non-lead is now a warning.
 
-**Room-wide effects now require the lead seat.** `workspace:*` / `repo:*` claims and unscoped
-freezes are gated on it. That is a real narrowing — the writer must hold a specific position
-rather than merely be able to write — but read the limit honestly: **the lead seat is taken by
-first join and is itself unauthenticated.** An agent or commit that enters an empty room first
-holds it. This raises the bar from "any writer" to "the first writer, or whoever the current
-lead is"; it is not an authorization boundary, and it was never claimed as one.
+**Room-wide effects are checked against the lead seat, and that check is bypassed by one flag.**
+`workspace:*` / `repo:*` claims and unscoped freezes compare `fact.tool` against the room lead.
+`fact.tool` is **self-asserted** — the same thing this document says two paragraphs above, and the
+same thing `skills/agent-rally-point/SKILL.md` tells agents. So passing `--tool <lead-id>` satisfies
+the gate. Both bypasses are live-reproduced against the release binary:
+
+```
+$ rally say claim --tool honest-lead --scope 'workspace:*' --subject grab   # issued by a rogue
+$ rally say claim --tool someone-else --path src/lib.rs --subject work
+{"error":"claim conflict: honest-lead holds workspace:* ... "}              # room-wide lockout, restored
+```
+
+`rally say blocker --tool <lead-id>` restores the room-wide deny the same way. And the seat itself
+is not defended: `rally lead assign --tool rogue --to rogue` succeeds against a **live incumbent**,
+so "first join" is not the bar either.
+
+**What the gate actually buys, stated exactly:** it stops the accidental case and the honest one —
+an agent that names itself truthfully and has no standing. It does not stop an adversary, and it is
+one flag deep. Do not read it as an authorization boundary. Closing it needs authority bound to
+something the writer cannot choose (a session identity correlated to a registered session), which
+does not exist yet.
+
+An earlier version of this section claimed the gate "raises the bar from any writer to the first
+writer". That was wrong, and it was wrong in the specific way this repo's register warns about —
+a claim about a control that drifted toward reassurance while the control stayed put. It is
+recorded here rather than quietly rewritten.
 
 **If this is your situation:** review `.rally/log/` diffs in pull requests the way you review
 code. It is executable content in the sense that matters — it steers agents.

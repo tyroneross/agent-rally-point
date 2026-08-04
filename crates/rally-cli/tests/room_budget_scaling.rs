@@ -382,7 +382,13 @@ fn room_payload_stays_under_budget_at_high_fact_count() {
     // Assert against a fixed generous bound rather than recomputing the config
     // here: this test's job is to catch "the budget stopped applying", not to
     // re-derive the budget's arithmetic, which its own unit tests own.
-    const CEILING_BYTES: usize = 2 * 1024 * 1024;
+    // Calibrated against a MEASURED failure, not picked as a round number. On
+    // this fixture the budgeted payload is ~1.04 MB and the same fixture with
+    // the budget fully disabled is 1,682,140 bytes. The first draft asserted
+    // 2 MiB, which the budget-disabled run clears by 415 KB — so the test
+    // certified a budget that had been deleted. 1.2 MB sits above the budgeted
+    // measurement and below the disabled one.
+    const CEILING_BYTES: usize = 1_200_000;
     assert!(
         bytes < CEILING_BYTES,
         "room payload was {bytes} bytes from a 4,000-fact ledger, over the \

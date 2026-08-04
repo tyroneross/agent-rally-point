@@ -2852,9 +2852,22 @@ fn rally_uses_native_cmux_managed_session_commands() {
     assert_eq!(cmux_inject["data"]["inject"]["commands"][0][1], "send-key");
     assert_eq!(cmux_inject["data"]["inject"]["commands"][0][4], "ctrl+u");
     assert_eq!(cmux_inject["data"]["inject"]["commands"][1][1], "send");
+    // RC-041 gap 3A (2026-08-04): the delivered payload now carries a
+    // provenance label, so this expectation changed from the bare message to
+    // the labelled form. Injected text lands in the recipient as a USER TURN,
+    // indistinguishable from its operator's own typing, and rally authenticates
+    // no sender — the label is the only thing that tells the recipient which it
+    // is reading. It is unconditional BY DESIGN: `--tool` is self-asserted, so
+    // any carve-out (self-inject, unnamed caller) would be one a peer could
+    // select its way into. `--tool` is omitted here, so the label says
+    // `(none stated)` — a form no valid agent id can render as — rather than
+    // naming the CLI's `unknown` placeholder as if it were an agent.
+    // The label is asserted here, on the `commands` the envelope reports,
+    // because that array IS the delivered bytes; the security contract itself
+    // is graded in tests/inject_security.rs.
     assert_eq!(
         cmux_inject["data"]["inject"]["commands"][1][4],
-        "hello cmux"
+        "[rally: UNVERIFIED SENDER (none stated)] hello cmux"
     );
     assert_eq!(cmux_inject["data"]["inject"]["commands"][2][1], "send-key");
     assert_eq!(cmux_inject["data"]["inject"]["commands"][2][4], "enter");

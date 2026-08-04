@@ -686,7 +686,16 @@ fn inject_to_ptyd_session_is_daemon_only_sanitized_with_receipt() {
         "no functional paste-end marker may survive: {sent_text:?}"
     );
     // Printable residue survives in order (CR removed, so line1+line2 join).
-    assert!(sent_text.starts_with("line1line2"), "got {sent_text:?}");
+    // RC-041 gap 3A prefixes every delivered payload with a provenance label,
+    // so the payload no longer starts the line. Strip the label and re-assert
+    // the ORIGINAL property against the body — the payload leads its own text,
+    // with the neutered paste marker trailing it. Asserting `ends_with` instead
+    // would have been wrong: the sanitized residue legitimately follows.
+    let body = sent_text
+        .split_once("] ")
+        .map(|(_, rest)| rest)
+        .unwrap_or(sent_text);
+    assert!(body.starts_with("line1line2"), "got {sent_text:?}");
 
     // A Receipt fact ref'ing the directive is present in the ledger.
     let directive_seq = data["directive_seq"].as_u64().unwrap();
@@ -1121,7 +1130,13 @@ fn real_ptyd_inject_actually_submits_and_is_received() {
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            if scrollback.contains(&format!("GOT:{token}")) {
+            // Split rather than concatenated: RC-041 gap 3A puts the
+            // provenance label between the child's `GOT:` echo and the token.
+            // Against a real ptyd daemon the pane showed
+            // `GOT:[rally: UNVERIFIED SENDER claude_code:01] CONTRACT_84016`,
+            // i.e. the labelled line submitted and was read as one line — the
+            // delivery this test grades succeeded, only the substring shape moved.
+            if scrollback.contains("GOT:") && scrollback.contains(&token) {
                 received = true;
                 break;
             }

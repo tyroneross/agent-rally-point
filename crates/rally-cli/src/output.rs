@@ -84,7 +84,7 @@ impl RenderedOutput {
 /// here in `std` rather than by restoring `SIG_DFL` through `libc`: it needs no
 /// new dependency, no `unsafe`, and it behaves the same on Windows, where the
 /// signal does not exist.
-fn write_line_or_exit_on_broken_pipe(line: &str) {
+pub(crate) fn write_line_or_exit_on_broken_pipe(line: &str) {
     use std::io::{ErrorKind, Write};
 
     let stdout = std::io::stdout();

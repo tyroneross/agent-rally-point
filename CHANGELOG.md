@@ -14,11 +14,19 @@ these is a call site, not new policy.
 
 - **The stale-state reaper now runs.** `rally doctor --reap-stale --apply` was
   its only caller and nothing invoked it, so a dry run against this repo's own
-  room found **82 of 98 active claims already eligible** — the eligibility math
-  had been correct and unused for the room's whole life. `rally enter` now reaps,
-  at most once an hour per room, rate-limited by `.rally/.last-auto-reap` and
-  fail-open: it never fails `enter`. Disable with `RALLY_NO_AUTO_REAP=1` or
-  `coordination.auto_reap_interval_secs: 0`.
+  room found **82 of 98 active claims already eligible** (measured 2026-08-04;
+  an earlier dry run on 2026-08-03, before the fixture deletion below, reported
+  69 of 69 — different ledger, different day, both real). `rally enter` can now
+  reap, but it is **OFF by default** and opt-in via
+  `coordination.auto_reap_interval_secs` or `RALLY_AUTO_REAP_INTERVAL_SECS`.
+  It shipped on for one commit and an independent audit measured three failures
+  against the release binary: 8 concurrent `rally enter` returned 8/8 exit 4
+  with auto-reap on versus 8/8 exit 0 with it off; it closed a LIVE agent's
+  claim (nothing in production renews `lease_expires_at`, so every single-file
+  claim expires 30 minutes after it is made); and it widened RC-044, an
+  already-unfixed concurrent-enter store-corruption path. The call site exists —
+  that was the actual finding — and stays opt-in until lease renewal exists and
+  concurrent enter is bounded.
 - **Handoffs can expire.** A handoff closed only on a `Resolve`/`Receipt`/
   `Artifact` that referenced it, so an unanswered one was immortal; `next`
   de-prioritised after 24 h, which changed ranking and nothing else. Measured:
@@ -37,8 +45,12 @@ these is a call site, not new policy.
   `~/.local/bin/rally` predated the `--version` fix and returned **1,746,109
   bytes** from `rally room --json` where a current build returned **232,616** —
   7.5x the context, injected into every agent, with nothing anywhere saying the
-  binary was stale. The check states what it compared and what that does not
-  prove; it never blocks.
+  binary was stale. (A doc comment in `doctor.rs` rounds the same pair to
+  1.99 MB / 230 KB from an earlier measurement on a larger ledger; the byte
+  figures here are the ones taken on 2026-08-04.) The check states what it
+  compared and what that does not prove, and it never blocks — but it has **no
+  automatic caller**: it runs only when someone types `--binary-skew`, so an
+  agent that does not already suspect skew still will not be told.
 
 ### Fixed — `rally … --json | head` no longer panics
 
@@ -48,7 +60,10 @@ exit 101. Every `| head`, `| jq`, `| grep -q`, `| less` that quit early printed 
 panic. The room payload is hundreds of kilobytes of JSON, so piping it into
 something that stops reading is how people read it, not an edge case. Rally now
 exits 0 quietly, matching every other Unix CLI — handled in `std`, with no new
-dependency and no `unsafe`.
+dependency and no `unsafe`. The first fix covered only the main output path, so
+`rally watch --json` — the command most likely to be piped into `head` — still
+panicked; the streaming emitters and the watchdog fail-open payloads now route
+through the same writer.
 
 ### Fixed — errors that named the wrong thing
 
@@ -71,8 +86,10 @@ dependency and no `unsafe`.
   and 13 words against a real-identifier maximum of 7. Scope rendering is capped
   at 200 characters per claim and says how many it dropped.
 - **`validate_agent_id` rejects directive-shaped ids.** The bound is 64 bytes and
-  8 prose words; all 125 distinct ids in this repo's ledger pass, the longest at
-  52 bytes.
+  8 prose words. Every real id passes, longest 52 bytes. Two counts of "every"
+  appear in this repo because they measure different sets: 157 distinct ids
+  across live segments plus archives, 125 across live segments alone. Both were
+  checked; neither has an id over 64 bytes.
 - **The sanitization suite now grades coverage, not just presence.** It asserted
   "exactly two sanitizer blocks" and never "every model-context sink routes
   through one". It now enumerates every context sink and fails on an
@@ -91,9 +108,24 @@ a schema decision deliberately deferred out of a held release. See RC-040.
 
 ### Security — one fact could take the whole room down (RC-037, RC-038, RC-034)
 
+> **Read this first. RC-037 and RC-038 are NOT closed.** Both fixes hold against
+> an agent that names itself honestly. Both are bypassed by one flag: the gates
+> compare `fact.tool` against the room lead, and `fact.tool` is self-asserted, so
+> `--tool <lead-id>` satisfies them. Live-reproduced against the release binary
+> after the fix — `rally say claim --tool <lead-id> --scope 'workspace:*'`
+> restores the room-wide claim lockout, and `rally say blocker --tool <lead-id>`
+> restores the room-wide deny. `rally lead assign --to <self>` additionally
+> succeeds against a live incumbent, so the seat is not defended either.
+>
+> The adversarial tests below are real and revert-proof, and they graded only the
+> first move: every one of them posts the rogue's fact under the rogue's OWN id.
+> That is the failure this repo's register names — a control tested against the
+> bypass an attacker has no reason to choose. The accidental and honest cases are
+> genuinely fixed; the adversarial case is not. See RC-037 and RC-038.
+
 Three v0.2.0 release blockers. The first two were live-reproduced against the
 release binary before the fix and again after it; each carries a test that fails
-when the fix is reverted.
+when the fix is reverted — subject to the bypass stated above.
 
 - **A coarse claim no longer locks every agent out of claiming (RC-037,
   Critical).** One `rally say claim --scope workspace:zzz` made every later claim
@@ -128,8 +160,10 @@ when the fix is reverted.
   test file bypassed the pin while the hook printed a healthy pin message. Host
   tests absent from, or modified relative to, the pinned commit are now refused by
   name unless explicitly acknowledged. An env-supplied `RALLY_PREPUSH_GATE_PIN_REF`
-  now requires an operator ack in every case, not only when it resolves to a commit
-  in the push. The hook header states plainly what the pin does not cover — the
+  that RESOLVES now requires an operator ack, not only when it resolves to a commit
+  in the push. An env pin that does NOT resolve still takes the bootstrap fallback
+  with a warning and no ack, which also disables the new host-test check — recorded
+  as RC-046, not fixed. The hook header states plainly what the pin does not cover — the
   gate still compiles and runs pushed-tree code by design.
 
 Room-wide effects now require the lead seat, and the lead seat is taken by first

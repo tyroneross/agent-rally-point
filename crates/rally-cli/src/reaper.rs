@@ -112,8 +112,35 @@ pub(crate) fn run_reap_stale(apply: bool) -> Result<ReapReport> {
     run_reap_stale_in_room(&room, apply)
 }
 
-/// Default auto-reap interval: 1 hour.
-pub(crate) const DEFAULT_AUTO_REAP_INTERVAL_SECS: i64 = 60 * 60;
+/// Default auto-reap interval: **0 — OFF**. Opt in with
+/// `coordination.auto_reap_interval_secs` or `RALLY_AUTO_REAP_INTERVAL_SECS`.
+///
+/// It shipped ON for exactly one commit. An independent audit measured three
+/// separate failures, all against the release binary, and each of them is worse
+/// than the stale state the reap was cleaning up:
+///
+/// 1. **`rally enter` failed for every concurrent agent.** 8 concurrent enters
+///    against a room with 6 eligible claims: auto-reap ON gave 8/8 exit 4
+///    ("mutating command exceeded 3000ms wall-clock budget BEFORE its primary
+///    durable append committed; failing closed"); OFF gave 8/8 exit 0. The
+///    "never fails enter" property was implemented for the reaper's own `Err`
+///    return and never held against the mutation watchdog sitting above it.
+/// 2. **It closed LIVE agents' claims.** Nothing in production renews
+///    `lease_expires_at` — `renew_claim_lease` has no production caller — so
+///    every single-file claim expires 30 minutes after it is made and every
+///    coarse claim after 2 hours, regardless of whether the owner is working.
+///    Measured: an active owner's claim was closed by a PEER's `enter`, the
+///    owner was never told, and a third agent then claimed the same file with
+///    no conflict. That is the collision Rally exists to prevent.
+/// 3. **RC-044** already records concurrent `rally enter` as an unfixed
+///    store-corruption path. Adding a mutation-heavy pass to it widened a known
+///    defect without a control.
+///
+/// So the call site stays — the reaper is reachable, which was the actual
+/// finding — but it is opt-in until lease renewal exists and concurrent enter
+/// is bounded. Turning it on by default before then trades a slow leak for a
+/// fast outage.
+pub(crate) const DEFAULT_AUTO_REAP_INTERVAL_SECS: i64 = 0;
 
 /// Marker recording the last auto-reap, relative to `.rally/`.
 const AUTO_REAP_MARKER: &str = ".last-auto-reap";
@@ -154,9 +181,16 @@ pub(crate) fn maybe_reap_on_enter(room: &RoomStore) -> Option<ReapReport> {
     let now = chrono::Utc::now();
     if let Ok(text) = std::fs::read_to_string(&marker)
         && let Ok(last) = chrono::DateTime::parse_from_rfc3339(text.trim())
-        && (now - last.with_timezone(&chrono::Utc)).num_seconds() < interval
     {
-        return None;
+        let age = (now - last.with_timezone(&chrono::Utc)).num_seconds();
+        // A FUTURE-dated marker reads as `age < interval` forever, which
+        // disables the reaper permanently. Same-UID writes are conceded by the
+        // trust model, but a marker that silently switches off a load-bearing
+        // control should not also be undetectable: treat a future stamp as
+        // stale and reap.
+        if (0..interval).contains(&age) {
+            return None;
+        }
     }
 
     // Claim the interval BEFORE reaping. Two agents entering in the same second
@@ -172,7 +206,7 @@ pub(crate) fn maybe_reap_on_enter(room: &RoomStore) -> Option<ReapReport> {
         now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     );
 
-    match run_reap_stale_in_room(room, true) {
+    match run_reap_stale_in_room_with_mode(room, true, ReapMode::LeaseOnly) {
         Ok(report) => Some(report),
         Err(err) => {
             eprintln!("rally: auto-reap skipped ({err})");
@@ -181,9 +215,58 @@ pub(crate) fn maybe_reap_on_enter(room: &RoomStore) -> Option<ReapReport> {
     }
 }
 
+/// Which staleness signals a reap pass is allowed to act on.
+///
+/// The two signals are not equally trustworthy, and wiring the reaper to
+/// `rally enter` is what made the difference matter.
+///
+/// - **Lease expiry** is stamped by the claim's OWN writer, at claim time, and
+///   is monotonic — a past lease cannot un-expire. Backdating one only expires
+///   the backdater's own claim.
+/// - **Owner staleness** is derived from `last_seen_ts`, which is the
+///   `created_at` of the highest-seq fact naming that tool — a value written
+///   verbatim from the ledger line, not from the reader's clock. `.rally/log/`
+///   is git-tracked, so one committed line carrying `tool: "victim:01"`, a high
+///   `seq`, and a `created_at` three hours in the past makes the victim look
+///   stale to every reader. Under the old design that only mattered if a human
+///   ran `doctor --reap-stale --apply`; wired to `enter`, it would fire on the
+///   next session start of any agent and close every one of the victim's
+///   claims. The under-lock revival guard re-reads the same poisoned projection
+///   and confirms the reap rather than blocking it.
+///
+/// So the automatic path takes only the signal an attacker cannot aim at
+/// someone else, and owner-staleness stays behind the deliberate operator
+/// command. That keeps the fix to "the reaper had no caller" without turning a
+/// peer-controlled timestamp into a claim-destruction primitive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReapMode {
+    /// Act on both signals. `rally doctor --reap-stale --apply` — a human ran it.
+    Full,
+    /// Act only on writer-stamped lease expiry. The automatic `enter` path.
+    LeaseOnly,
+}
+
+/// Most facts one automatic pass may append.
+///
+/// A ledger seeded with thousands of eligible claims would otherwise make the
+/// first `enter` of each interval spend its whole budget in the reap loop, and
+/// the hook's watchdog kills the process group at 5s — costing that agent its
+/// presence registration in exchange for cleanup nobody asked for. Capping
+/// resumes on the next interval instead; the reaper is idempotent, so a partial
+/// pass is a shorter pass, not a broken one.
+const AUTO_REAP_MAX_FACTS: usize = 200;
+
 /// Inner implementation — takes an explicit `&RoomStore` so tests can inject a
 /// temp store without touching the process-global cwd.
 pub(crate) fn run_reap_stale_in_room(room: &RoomStore, apply: bool) -> Result<ReapReport> {
+    run_reap_stale_in_room_with_mode(room, apply, ReapMode::Full)
+}
+
+pub(crate) fn run_reap_stale_in_room_with_mode(
+    room: &RoomStore,
+    apply: bool,
+    mode: ReapMode,
+) -> Result<ReapReport> {
     let snapshot = room.snapshot()?;
     let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
 
@@ -214,7 +297,23 @@ pub(crate) fn run_reap_stale_in_room(room: &RoomStore, apply: bool) -> Result<Re
 
         // A claim is reaped when EITHER its owner-squad is >timeout stale OR
         // its own lease has provably expired. Both signals are fail-closed.
-        if !(owner_eligible || lease_eligible) {
+        //
+        // ReapMode::LeaseOnly drops the owner-stale signal. `last_seen_ts` is
+        // the `created_at` of the highest-seq fact naming that tool, written
+        // verbatim from a git-tracked ledger line, so one committed fact
+        // carrying a victim's id and a backdated timestamp makes the victim
+        // look stale to every reader. The lease is stamped by the claim's own
+        // writer and is monotonic, so backdating one only expires the
+        // backdater's own claim.
+        let eligible = match mode {
+            ReapMode::Full => owner_eligible || lease_eligible,
+            ReapMode::LeaseOnly => lease_eligible,
+        };
+        if !eligible {
+            preserved += 1;
+            continue;
+        }
+        if mode == ReapMode::LeaseOnly && claims_reaped.len() >= AUTO_REAP_MAX_FACTS {
             preserved += 1;
             continue;
         }
@@ -707,23 +806,64 @@ mod tests {
     /// marker write here and every concurrent enter reaps.
     #[test]
     fn auto_reap_runs_once_then_respects_the_interval() {
+        let _guard = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Auto-reap is OFF by default (see DEFAULT_AUTO_REAP_INTERVAL_SECS),
+        // so this test opts in explicitly. It grades the rate limit, not the
+        // default.
+        unsafe { std::env::set_var("RALLY_AUTO_REAP_INTERVAL_SECS", "3600") };
         let root = unique_root("auto-reap");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
-        let ago = 3 * 60 * 60_i64;
-        append_presence(&room, "stale-tool", ago);
-        append_claim(&room, "claim-stale", "stale-tool");
+        // LEASE-expired, not owner-stale: the automatic path deliberately acts
+        // only on the writer-stamped signal (see `ReapMode`), because
+        // owner-staleness is derived from a peer-writable timestamp.
+        append_presence(&room, "owner", 5);
+        append_claim_with_lease(&room, "claim-leased", "owner", &past_ts(60 * 60));
 
         let first = maybe_reap_on_enter(&room).expect("first enter must reap");
         assert_eq!(first.claims_reaped.len(), 1);
 
         // Second call inside the interval is skipped entirely — ten agents
         // entering at once must not each run a reap pass.
-        append_presence(&room, "other-stale", ago);
-        append_claim(&room, "claim-stale-2", "other-stale");
+        append_claim_with_lease(&room, "claim-leased-2", "owner", &past_ts(60 * 60));
         assert!(
             maybe_reap_on_enter(&room).is_none(),
             "a second enter inside the interval must not reap again"
+        );
+
+        unsafe { std::env::remove_var("RALLY_AUTO_REAP_INTERVAL_SECS") };
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Auto-reap must be OFF unless someone opts in. It shipped on for one
+    /// commit and an audit measured 8/8 concurrent `rally enter` failures plus
+    /// live agents' claims being closed; flipping the default back on without
+    /// lease renewal and a concurrency bound would re-introduce both.
+    #[test]
+    fn auto_reap_is_off_by_default() {
+        let _guard = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = unique_root("auto-reap-default");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        append_presence(&room, "owner", 5);
+        append_claim_with_lease(&room, "claim-leased", "owner", &past_ts(60 * 60));
+
+        assert_eq!(
+            DEFAULT_AUTO_REAP_INTERVAL_SECS, 0,
+            "auto-reap must stay opt-in until lease renewal exists"
+        );
+        assert!(
+            maybe_reap_on_enter(&room).is_none(),
+            "the default configuration must not reap on enter"
+        );
+        assert_eq!(
+            room.snapshot().unwrap().active_claims.len(),
+            1,
+            "a claim must survive `enter` under default configuration"
         );
 
         fs::remove_dir_all(root).ok();
