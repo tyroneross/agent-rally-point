@@ -3362,7 +3362,16 @@ pub(crate) fn compose_room_output(
         );
     }
 
-    let budget = budget_override.or_else(|| coord.room_budget_bytes());
+    // `--include-archived` IS the drill-in. A caller who asks for the full view
+    // and receives a budget-truncated one has no way left to see everything, so
+    // the ceiling does not apply — an escape hatch that is itself truncated is
+    // not an escape hatch. An explicit `--budget-bytes` still wins, because that
+    // caller asked for a bound with their eyes open.
+    let budget = match (budget_override, include_archived) {
+        (Some(explicit), _) => Some(explicit),
+        (None, true) => None,
+        (None, false) => coord.room_budget_bytes(),
+    };
 
     let mut over_budget_causes: Vec<String> = Vec::new();
     if let Some(budget) = budget {
@@ -3638,6 +3647,15 @@ fn never_cut_bytes(snapshot: &RoomSnapshot) -> (usize, Vec<String>) {
                 .map(|s| s.len())
                 .unwrap_or(0),
             "squads".to_string(),
+        ),
+        // Derived, not independently cuttable: `unconsumed_artifacts` is a
+        // subset of `recent_artifacts` and is re-derived from whatever that
+        // bucket emits, so it shrinks on its own. It still costs bytes, and
+        // leaving it out of the accounting made ~44 KB invisible to the budget
+        // on this repo — the ceiling cannot bound what it does not count.
+        (
+            snapshot.unconsumed_artifacts.iter().map(fact_bytes).sum(),
+            "unconsumed_artifacts".to_string(),
         ),
     ];
     let total = sized.iter().map(|(b, _)| *b).sum();

@@ -1747,24 +1747,64 @@ fn presence_signal_evidence(room: &RoomStore) -> Vec<String> {
     evidence
 }
 
-/// The current worktree HEAD sha, or `None` when it cannot be read (detached
-/// bootstrap, no commits yet, git unavailable). Never returns a placeholder.
+/// The current worktree HEAD sha, read from `.git` WITHOUT spawning git.
+///
+/// This runs on the presence path, which the SessionStart hook drives under a
+/// 5-second budget, so a subprocess per beat is the wrong cost — and an extra
+/// spawn inside `rally run` measurably widened an existing intermittent failure
+/// under cross-suite contention (RC-005 / RC-044 territory).
+///
+/// Handles the three shapes that matter: a linked worktree (`.git` is a FILE
+/// pointing at the real gitdir), a detached HEAD (the sha is in `HEAD`), and an
+/// attached branch (`HEAD` names a ref, resolved from `refs/` then
+/// `packed-refs`). Anything else returns `None`, and a `None` stamps nothing —
+/// never a placeholder, because `code_progress_age_per_tool` reads a constant
+/// value as "HEAD did not move", which would be a false verdict rather than an
+/// absent signal.
 fn current_head_sha(repo_root: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if sha.is_empty() || sha == "HEAD" {
-        None
+    let git_path = repo_root.join(".git");
+    let git_dir = if git_path.is_dir() {
+        git_path
     } else {
-        Some(sha)
+        // Linked worktree: `.git` is a file containing `gitdir: <path>`.
+        let raw = fs::read_to_string(&git_path).ok()?;
+        let target = raw.trim().strip_prefix("gitdir:")?.trim();
+        let target = Path::new(target);
+        if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            repo_root.join(target)
+        }
+    };
+
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let Some(ref_name) = head.strip_prefix("ref:").map(str::trim) else {
+        // Detached HEAD — the sha is right there.
+        return valid_sha(head);
+    };
+
+    if let Ok(direct) = fs::read_to_string(git_dir.join(ref_name))
+        && let Some(sha) = valid_sha(direct.trim())
+    {
+        return Some(sha);
     }
+    // Packed refs: `<sha> <refname>` lines, `^<sha>` peel lines skipped.
+    let packed = fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+    packed.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with('^') {
+            return None;
+        }
+        let (sha, name) = line.split_once(' ')?;
+        (name.trim() == ref_name).then(|| valid_sha(sha))?
+    })
+}
+
+/// A 40- or 64-character lowercase hex object id, or `None`.
+fn valid_sha(candidate: &str) -> Option<String> {
+    let ok = matches!(candidate.len(), 40 | 64) && candidate.chars().all(|c| c.is_ascii_hexdigit());
+    ok.then(|| candidate.to_ascii_lowercase())
 }
 
 /// Tier-aware presence. Lead auto-assign is **frontier-only**: an undeclared
