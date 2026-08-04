@@ -386,8 +386,9 @@ pub(crate) fn run_init(repo_root: PathBuf, worktree_root: PathBuf) -> Result<Ini
         })
     })();
 
-    // MUTATION-TEST: drop the cleanup-on-error path entirely.
-    let _ = rally_dir_existed_before;
+    if result.is_err() && !rally_dir_existed_before {
+        let _ = fs::remove_dir_all(&rally_dir);
+    }
 
     result
 }
