@@ -99,13 +99,10 @@ pub(crate) struct ConsumerContext {
 
 impl ConsumerContext {
     /// A caller that declared nothing. All consumer-relative factors evaluate
-    /// to the neutral 1.0.
+    /// to the neutral 1.0, so the ranking falls back to recency and author
+    /// staleness alone.
     pub(crate) fn neutral() -> Self {
         Self::default()
-    }
-
-    pub(crate) fn is_neutral(&self) -> bool {
-        self.tool.is_none() && self.paths.is_empty()
     }
 }
 
@@ -508,14 +505,8 @@ mod tests {
     }
 
     #[test]
-    fn neutral_context_reports_itself_neutral() {
-        assert!(ConsumerContext::neutral().is_neutral());
-        assert!(
-            !ConsumerContext {
-                tool: Some("claude_code:01".into()),
-                paths: vec![],
-            }
-            .is_neutral()
-        );
+    fn neutral_context_declares_nothing() {
+        let c = ConsumerContext::neutral();
+        assert!(c.tool.is_none() && c.paths.is_empty());
     }
 }

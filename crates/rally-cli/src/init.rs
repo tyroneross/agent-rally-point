@@ -21,6 +21,7 @@
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -41,6 +42,21 @@ const DOC_DOCTRINE: &str = "dynamic-workflows/COORDINATION.md";
 const DOC_PROTOCOL: &str = "dynamic-workflows/PROTOCOL.md";
 const DOC_BOARD: &str = "docs/ORCHESTRATION.md";
 const DOC_ANY_AGENT_ONBOARDING: &str = "docs/ANY-AGENT-ONBOARDING.md";
+
+/// `(manifest label, repo-relative path)` for every pointer doc
+/// agent-rally-point knows how to document. These are **optional** in a
+/// consumer repo: agent-rally-point's own doctrine/protocol/board docs have
+/// no reason to exist outside this repo, so a target repo carrying none of
+/// them is the normal case, not an error. Each pair that resolves under
+/// `worktree_root` at `rally init` time is recorded in the manifest; each
+/// pair that doesn't is silently omitted (see `build_manifest`).
+const POINTER_DOCS: &[(&str, &str)] = &[
+    ("guide", DOC_GUIDE),
+    ("doctrine", DOC_DOCTRINE),
+    ("protocol", DOC_PROTOCOL),
+    ("board", DOC_BOARD),
+    ("any_agent_onboarding", DOC_ANY_AGENT_ONBOARDING),
+];
 
 /// Result of `rally init` for one of the pointer-doc targets.
 #[derive(Debug, Serialize)]
@@ -66,13 +82,18 @@ pub(crate) struct InitOutcome {
     pub(crate) room_cmd: String,
 }
 
+/// Which pointer docs resolved under the worktree at init time, and which
+/// were omitted (label only — no error, no noise). This is the legibility
+/// mechanism for rule "no silent success where absence and health look
+/// identical": a caller can always tell "5 resolved, 0 omitted" (this repo)
+/// from "0 resolved, 5 omitted" (a fresh consumer repo) without either being
+/// a failure.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ManifestDocs {
-    pub(crate) guide: String,
-    pub(crate) doctrine: String,
-    pub(crate) protocol: String,
-    pub(crate) board: String,
-    pub(crate) any_agent_onboarding: String,
+    /// label -> repo-relative path, only for docs that resolved.
+    pub(crate) resolved: BTreeMap<String, String>,
+    /// labels whose pointer doc does not exist under the worktree.
+    pub(crate) omitted: Vec<String>,
 }
 
 /// Build the pointer block written into `CLAUDE.md`/`AGENTS.md`. Plain
@@ -222,37 +243,23 @@ fn upsert_pointer_in_doc(repo_root: &Path, filename: &str) -> Result<PointerOutc
     })
 }
 
-/// Build the manifest JSON value. Pointers are repo-relative strings; each
-/// one is verified to resolve at write time (failure surfaces as a hard
-/// error rather than shipping a stale pointer). Pointer resolution is
-/// checked against `worktree_root` because that is where the docs live for
-/// the currently-checked-out branch; a fresh linked worktree may not have
-/// the same docs as the main checkout.
+/// Build the manifest JSON value. Pointer docs are **optional**: a consumer
+/// repo has no reason to carry agent-rally-point's own documentation, so
+/// each pointer's presence is checked, not required. Only the docs that
+/// resolve under `worktree_root` are written into `manifest["docs"]`; the
+/// rest are recorded as omitted (label only) so a caller can tell "healthy,
+/// nothing to point at" from "broken" without a warning being necessary.
+/// Pointer resolution is checked against `worktree_root` because that is
+/// where the docs live for the currently-checked-out branch; a fresh linked
+/// worktree may not have the same docs as the main checkout.
 fn build_manifest(repo_root: &Path, worktree_root: &Path) -> Result<(Value, ManifestDocs)> {
-    let docs = ManifestDocs {
-        guide: DOC_GUIDE.to_string(),
-        doctrine: DOC_DOCTRINE.to_string(),
-        protocol: DOC_PROTOCOL.to_string(),
-        board: DOC_BOARD.to_string(),
-        any_agent_onboarding: DOC_ANY_AGENT_ONBOARDING.to_string(),
-    };
-
-    // Verify each doc pointer resolves now. If something has moved we want
-    // a loud failure, not a manifest full of dead links.
-    for (label, rel) in [
-        ("docs.guide", &docs.guide),
-        ("docs.doctrine", &docs.doctrine),
-        ("docs.protocol", &docs.protocol),
-        ("docs.board", &docs.board),
-        ("docs.any_agent_onboarding", &docs.any_agent_onboarding),
-    ] {
-        let resolved = worktree_root.join(rel);
-        if !resolved.exists() {
-            return Err(RallyError::Message(format!(
-                "manifest pointer {label} -> {rel} does not resolve under {} \
-                 (move or update the constant in init.rs)",
-                worktree_root.display()
-            )));
+    let mut resolved = BTreeMap::new();
+    let mut omitted = Vec::new();
+    for (label, rel) in POINTER_DOCS {
+        if worktree_root.join(rel).exists() {
+            resolved.insert((*label).to_string(), (*rel).to_string());
+        } else {
+            omitted.push((*label).to_string());
         }
     }
 
@@ -262,16 +269,19 @@ fn build_manifest(repo_root: &Path, worktree_root: &Path) -> Result<(Value, Mani
         .unwrap_or("unknown")
         .to_string();
 
+    let docs_value = Value::Object(
+        resolved
+            .iter()
+            .map(|(label, rel)| (label.clone(), Value::String(rel.clone())))
+            .collect(),
+    );
+
     let manifest = json!({
         "schema": MANIFEST_SCHEMA,
         "repo": repo_name,
-        "docs": {
-            "guide": docs.guide,
-            "doctrine": docs.doctrine,
-            "protocol": docs.protocol,
-            "board": docs.board,
-            "any_agent_onboarding": docs.any_agent_onboarding,
-        },
+        "docs": docs_value,
+        "pointer_docs_resolved": resolved.len(),
+        "pointer_docs_omitted": omitted.len(),
         "ledger": format!(".rally/{LOG_DIRNAME}/"),
         "ledger_filename_legacy": format!(".rally/{LEDGER_FILENAME}"),
         "room_cmd": "rally room",
@@ -283,7 +293,7 @@ fn build_manifest(repo_root: &Path, worktree_root: &Path) -> Result<(Value, Mani
         },
     });
 
-    Ok((manifest, docs))
+    Ok((manifest, ManifestDocs { resolved, omitted }))
 }
 
 fn write_manifest(
@@ -336,27 +346,50 @@ fn write_manifest(
 ///
 /// Idempotent: re-running this function leaves all three artifacts
 /// byte-for-byte identical when nothing has changed.
+///
+/// No partial state on failure: pointer docs are optional (see
+/// `build_manifest`), so the only remaining failure modes here are I/O
+/// errors on write (permissions, a doc path collision, a full disk). We
+/// still create `.rally/` eagerly — before the manifest write — so the
+/// manifest write can't race the first `rally room` open creating it
+/// independently. To reconcile that with "no partial `.rally/` on failure",
+/// the whole body runs behind a closure and, if it errors AND `.rally/`
+/// did not already exist before this call, we remove what we just created.
+/// (We do not attempt a more surgical "only created before every
+/// precondition passes" ordering because the manifest write intentionally
+/// happens *inside* `.rally/`; splitting that would mean writing the
+/// manifest to a staging location and moving it in, which is more moving
+/// parts for the same guarantee.)
 pub(crate) fn run_init(repo_root: PathBuf, worktree_root: PathBuf) -> Result<InitOutcome> {
-    // Ensure `.rally/` exists so manifest write doesn't race with first room open.
     let rally_dir = repo_root.join(".rally");
-    fs::create_dir_all(&rally_dir)
-        .map_err(RallyError::io(format!("create {}", rally_dir.display())))?;
+    let rally_dir_existed_before = rally_dir.exists();
 
-    let (manifest, docs) = write_manifest(&repo_root, &worktree_root)?;
+    let result = (|| -> Result<InitOutcome> {
+        // Ensure `.rally/` exists so manifest write doesn't race with first room open.
+        fs::create_dir_all(&rally_dir)
+            .map_err(RallyError::io(format!("create {}", rally_dir.display())))?;
 
-    let mut pointers = Vec::with_capacity(POINTER_DOC_TARGETS.len());
-    for filename in POINTER_DOC_TARGETS {
-        pointers.push(upsert_pointer_in_doc(&worktree_root, filename)?);
-    }
+        let (manifest, docs) = write_manifest(&repo_root, &worktree_root)?;
 
-    Ok(InitOutcome {
-        repo_root: repo_root.display().to_string(),
-        manifest,
-        pointers,
-        docs,
-        ledger_dir: format!(".rally/{LOG_DIRNAME}/"),
-        room_cmd: "rally room".to_string(),
-    })
+        let mut pointers = Vec::with_capacity(POINTER_DOC_TARGETS.len());
+        for filename in POINTER_DOC_TARGETS {
+            pointers.push(upsert_pointer_in_doc(&worktree_root, filename)?);
+        }
+
+        Ok(InitOutcome {
+            repo_root: repo_root.display().to_string(),
+            manifest,
+            pointers,
+            docs,
+            ledger_dir: format!(".rally/{LOG_DIRNAME}/"),
+            room_cmd: "rally room".to_string(),
+        })
+    })();
+
+    // MUTATION-TEST: drop the cleanup-on-error path entirely.
+    let _ = rally_dir_existed_before;
+
+    result
 }
 
 #[cfg(test)]
@@ -548,8 +581,10 @@ mod tests {
     }
 
     #[test]
-    fn init_fails_when_doc_pointer_does_not_resolve() {
-        // Build a fake repo missing the doctrine doc.
+    fn init_omits_a_missing_pointer_doc_instead_of_failing() {
+        // A consumer repo missing one of agent-rally-point's own doctrine
+        // docs must NOT fail `rally init` — that doc is simply not this
+        // repo's concern. Build a fake repo missing the doctrine doc only.
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -564,10 +599,22 @@ mod tests {
             }
             fs::write(&path, format!("# stub {rel}\n")).unwrap();
         }
-        let err = run_init(root.clone(), root.clone()).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("docs.doctrine"), "got: {msg}");
-        assert!(msg.contains(DOC_DOCTRINE), "got: {msg}");
+        let outcome = run_init(root.clone(), root.clone()).unwrap();
+        assert_eq!(outcome.docs.omitted, vec!["doctrine".to_string()]);
+        assert_eq!(outcome.docs.resolved.len(), 4);
+        assert!(!outcome.docs.resolved.contains_key("doctrine"));
+
+        let manifest_path = root.join(".rally/manifest.json");
+        let parsed: Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert!(
+            parsed["docs"].get("doctrine").is_none(),
+            "missing doc must not appear in manifest docs: {}",
+            parsed["docs"]
+        );
+        assert_eq!(parsed["docs"]["guide"], DOC_GUIDE);
+        assert_eq!(parsed["pointer_docs_resolved"], 4);
+        assert_eq!(parsed["pointer_docs_omitted"], 1);
 
         fs::remove_dir_all(&root).ok();
     }

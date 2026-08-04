@@ -211,6 +211,10 @@ pub(crate) struct RoomArgs {
     pub(crate) readers: bool,
     /// Re-include recency-decayed (archived) facts in the room snapshot.
     pub(crate) include_archived: bool,
+    /// Explicit byte ceiling for this response, overriding the configured
+    /// `room_budget_fraction x consumer_context_bytes`. `0` disables the
+    /// ceiling for this call.
+    pub(crate) budget_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -1384,6 +1388,13 @@ fn room_parser() -> impl Parser<RoomArgs> {
     let include_archived = long("include-archived")
         .help("re-include recency-decayed (archived) facts in the snapshot")
         .switch();
+    let budget_bytes = long("budget-bytes")
+        .help(
+            "byte ceiling for this response; 0 disables it. Overrides the configured \
+             room_budget_fraction x consumer_context_bytes.",
+        )
+        .argument::<usize>("BYTES")
+        .optional();
     construct!(RoomArgs {
         json,
         tool,
@@ -1393,7 +1404,8 @@ fn room_parser() -> impl Parser<RoomArgs> {
         thread_id,
         since,
         readers,
-        include_archived
+        include_archived,
+        budget_bytes
     })
 }
 

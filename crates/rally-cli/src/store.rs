@@ -368,6 +368,71 @@ pub(crate) struct ReadReceipt {
     pub(crate) status: String,
 }
 
+/// TRUE counts for every room bucket, taken BEFORE any budget fill or archive
+/// drop. Always serialized, whether or not anything was omitted.
+///
+/// This is the honesty contract. `stale_facts` is empty in the default room
+/// output, so without a count beside it "1390 archived facts" and "no archived
+/// facts" would be indistinguishable from the consumer's side — the exact
+/// failure mode that let RC-027 hide a severed channel for five weeks.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
+pub(crate) struct RoomTotals {
+    pub(crate) active_claims: usize,
+    pub(crate) active_blockers: usize,
+    pub(crate) open_handoffs: usize,
+    pub(crate) current_decisions: usize,
+    pub(crate) current_risks: usize,
+    pub(crate) system_health: usize,
+    pub(crate) recent_artifacts: usize,
+    pub(crate) unconsumed_artifacts: usize,
+    pub(crate) stale_facts: usize,
+    pub(crate) squads: usize,
+}
+
+/// What one bucket contributed, and what it left out.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+pub(crate) struct BucketComposition {
+    pub(crate) total: usize,
+    pub(crate) emitted: usize,
+    pub(crate) omitted: usize,
+    /// Event ids of the omitted items, for a targeted `rally locate <id>`.
+    /// Populated for the actionable classes; omitted for `stale_facts`, where
+    /// the drill-in is `--include-archived` rather than 1000+ ids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) omitted_ids: Vec<String>,
+    /// Why the omission happened: `"budget"` or `"archived"`.
+    pub(crate) reason: String,
+}
+
+/// Present ONLY when the room omitted something. Its absence is the positive
+/// statement that the response is complete.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+pub(crate) struct RoomComposition {
+    /// The byte ceiling in force, or `None` when the ceiling is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) budget_bytes: Option<usize>,
+    /// Approximate serialized size of the emitted buckets.
+    pub(crate) emitted_bytes: usize,
+    /// Per-bucket accounting. Only buckets that omitted something appear.
+    pub(crate) buckets: BTreeMap<String, BucketComposition>,
+    /// Commands that return the full view.
+    pub(crate) drill_in: Vec<String>,
+    /// TRUE when the never-cut buckets ALONE exceed the ceiling, so the room
+    /// shipped over budget rather than dropping correctness-bearing state.
+    ///
+    /// This is the defined behavior for "never-cut exceeds budget", and it is
+    /// deliberately loud. `squads` grows monotonically (32 → 78 → 147 → 155
+    /// distinct tools over four months, and tool ids are per-session so they
+    /// never recur), and un-reaped claims grow with it, so this condition is
+    /// reachable rather than hypothetical. The alternative — cutting a claim or
+    /// a peer to fit — trades a payload problem for a write collision.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) over_budget: bool,
+    /// Which never-cut buckets drove an over-budget response, largest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) over_budget_causes: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 pub(crate) struct RoomSnapshot {
     pub(crate) max_seq: i64,
@@ -421,6 +486,24 @@ pub(crate) struct RoomSnapshot {
     /// unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mission: Option<String>,
+    /// TRUE bucket counts as projected, before any output-path composition.
+    /// `#[serde(default)]` so a payload from an older daemon still deserializes.
+    #[serde(default)]
+    pub(crate) totals: RoomTotals,
+    /// Present only when the output path omitted something. Absence is the
+    /// positive statement that this response is complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) composition: Option<RoomComposition>,
+    /// Tools whose liveness is PROVABLY `Stale` (all four signals present and
+    /// past the adaptive window) at projection time. The only input the
+    /// relevance model has that may lower an item's rank, so it is derived
+    /// where the signals live rather than re-inferred downstream.
+    ///
+    /// Internal: not serialized. A routed (daemon) snapshot therefore arrives
+    /// with this empty, which the relevance model reads as "no author is
+    /// provably stale" — the fail-open direction.
+    #[serde(skip)]
+    pub(crate) stale_authors: BTreeSet<String>,
 }
 
 impl RoomSnapshot {
@@ -517,11 +600,18 @@ impl RoomSnapshot {
         (eligible, size)
     }
 
+    /// Apply the caller's `--tool` / `--path` / `--event` / `--thread` /
+    /// `--since` query.
+    ///
+    /// `totals` is RECOMPUTED from the filtered buckets rather than carried
+    /// through. Totals answer "how much did this query match", so composition
+    /// can then answer "how much of that shipped". Carrying pre-filter totals
+    /// would make every filtered response report an omission it did not make.
     pub(crate) fn filtered(self, query: &RoomQuery) -> Self {
         if query.is_empty() {
             return self;
         }
-        Self {
+        let mut filtered = Self {
             max_seq: self.max_seq,
             content_max_seq: self.content_max_seq,
             last_activity_ts: self.last_activity_ts,
@@ -542,7 +632,23 @@ impl RoomSnapshot {
             lead_epoch: self.lead_epoch,
             readers: self.readers,
             mission: self.mission,
-        }
+            totals: self.totals,
+            composition: self.composition,
+            stale_authors: self.stale_authors,
+        };
+        filtered.totals = RoomTotals {
+            active_claims: filtered.active_claims.len(),
+            active_blockers: filtered.active_blockers.len(),
+            open_handoffs: filtered.open_handoffs.len(),
+            current_decisions: filtered.current_decisions.len(),
+            current_risks: filtered.current_risks.len(),
+            system_health: filtered.system_health.len(),
+            recent_artifacts: filtered.recent_artifacts.len(),
+            unconsumed_artifacts: filtered.unconsumed_artifacts.len(),
+            stale_facts: filtered.stale_facts.len(),
+            squads: filtered.squads.len(),
+        };
+        filtered
     }
 }
 
@@ -2524,6 +2630,47 @@ fn fact_recency_weight(fact: &Fact, now_secs: i64, half_life_secs: i64) -> f64 {
     }
 }
 
+/// Recency weight for RANKING, which is not the same question as recency
+/// weight for VISIBILITY.
+///
+/// [`fact_recency_weight`] answers "may this fact be archived?" and deliberately
+/// returns 1.0 for a timestamp it cannot trust, so decay never hides a message
+/// on the strength of a bad stamp. That is the right answer for visibility and
+/// the wrong one for ranking: under a budget fill, weight 1.0 does not merely
+/// keep an untrustworthy fact — it puts it at the FRONT and evicts trustworthy
+/// facts behind it.
+///
+/// Two untrusted cases, both MEASURED rather than absent, both floored to the
+/// archive floor so the fact stays visible (the floor comparison is strict `<`)
+/// but cannot jump the queue:
+///
+/// * **Unparseable or empty `created_at`.** `Fact::created_at` carries
+///   `#[serde(default)]`, so an omitted field deserializes to `""`. Segments are
+///   committed, merged across machines, and hand-edited during conflict
+///   resolution, so this is a live route rather than a theoretical one.
+/// * **Future-dated.** `decay::recency_weight` clamps a negative age to 0 and
+///   returns exactly 1.0. A machine whose clock is two days fast would
+///   otherwise pin its facts above every peer's for two days with no
+///   malformation anywhere. A negative age is a measurement of clock skew, not
+///   evidence of freshness.
+///
+/// The clamp in `decay.rs` is left alone: it is pinned by a shared golden-vector
+/// fixture that must stay byte-identical with the Python mirror. This wrapper is
+/// the local, ranking-only correction.
+fn fact_rank_weight(fact: &Fact, now_secs: i64, half_life_secs: i64, floor: f64) -> f64 {
+    match chrono::DateTime::parse_from_rfc3339(&fact.created_at) {
+        Ok(dt) => {
+            let age = now_secs - dt.timestamp();
+            if age < 0 {
+                floor
+            } else {
+                crate::decay::recency_weight(age, half_life_secs)
+            }
+        }
+        Err(_) => floor,
+    }
+}
+
 /// Sort a bucket newest-first by recency weight (DESC), tie-broken by seq (DESC)
 /// so the existing insertion-order behavior is preserved for equal-age facts.
 fn sort_by_recency(facts: &mut [Fact], now_secs: i64, half_life_secs: i64) {
@@ -2749,8 +2896,13 @@ fn snapshot_from_facts_with_policy(
         })
         .cloned()
         .collect::<Vec<_>>();
+    // Ordered by recency; NOT count-capped. The archive floor above is the
+    // adaptive bound (a decision that has decayed past it is already in
+    // `stale_facts`); a fixed `truncate(20)` on top of that was a blind cut
+    // that could hide the 21st-freshest live decision with no signal saying so.
+    // Byte-bounding happens once, on the OUTPUT path, where it can report what
+    // it left out — see `compose_room_output`.
     sort_by_recency(&mut current_decisions, now_secs, half_life_secs);
-    current_decisions.truncate(20);
 
     // DI-1: split kind=risk facts into human coordination risks (current_risks)
     // vs system-generated health/telemetry (system_health), keyed on a known
@@ -2786,7 +2938,6 @@ fn snapshot_from_facts_with_policy(
         }
     }
     sort_by_recency(&mut current_risks, now_secs, half_life_secs);
-    current_risks.truncate(20);
     // Dedup telemetry by subject (freshest kept) so historical un-guarded
     // accumulation (pre-DI-4 binary-drift / duplicate-squad rows) collapses to
     // one row per distinct signal.
@@ -2819,7 +2970,6 @@ fn snapshot_from_facts_with_policy(
         .cloned()
         .collect::<Vec<_>>();
     sort_by_recency(&mut recent_artifacts, now_secs, half_life_secs);
-    recent_artifacts.truncate(20);
     let consumed_refs = facts
         .iter()
         .filter(|f| f.kind == "handoff" || f.kind == "resolve")
@@ -2891,6 +3041,9 @@ fn snapshot_from_facts_with_policy(
     let cadence = coord.default_cadence_secs;
     let mult = coord.miss_multiplier;
     let grace = coord.grace_secs;
+    // Provably-stale authors, captured for the relevance model. Collected here
+    // because this is the ONLY place the four liveness signals are in hand.
+    let mut stale_authors: BTreeSet<String> = BTreeSet::new();
     let squads = tool_last
         .into_iter()
         .filter_map(|(tool, (seq, ts))| {
@@ -2926,6 +3079,25 @@ fn snapshot_from_facts_with_policy(
             // DROPPED from the default snapshot; `include_archived` restores it.
             // This direction is opposite the reaper's fail-CLOSED removal path on
             // purpose: hiding a still-alive peer is the dangerous direction here.
+            // --- Two different bars, on purpose ---------------------------
+            // DROPPING a squad (below) and REAPING a claim are destructive or
+            // hiding decisions, so they demand four-signal unanimity: hiding a
+            // live peer causes the write collision this system prevents.
+            //
+            // RANKING an item lower is neither destructive nor hiding — the
+            // item still ships if the budget allows, and any omission is
+            // reported with its event id. So ranking uses the one signal that
+            // is present on EVERY tool: heartbeat age against this session's
+            // adaptive window. That is a positive measurement, not an absence.
+            //
+            // This distinction is load-bearing. `Liveness::Stale` requires
+            // signal (c) `code_progress_age`, which no writer produced until
+            // this release, so a demotion keyed on `Stale` alone would have
+            // been unreachable on every fact in the existing ledger — a dead
+            // factor shipped as a live one.
+            if heartbeat_age > window {
+                stale_authors.insert(tool.clone());
+            }
             let dropped = matches!(verdict, crate::liveness::Liveness::Stale) && !include_archived;
             if dropped {
                 return None;
@@ -2964,6 +3136,19 @@ fn snapshot_from_facts_with_policy(
         .max_by_key(|f| f.seq)
         .map(|f| f.subject.clone());
 
+    let totals = RoomTotals {
+        active_claims: active_claims.len(),
+        active_blockers: active_blockers.len(),
+        open_handoffs: open_handoffs.len(),
+        current_decisions: current_decisions.len(),
+        current_risks: current_risks.len(),
+        system_health: system_health.len(),
+        recent_artifacts: recent_artifacts.len(),
+        unconsumed_artifacts: unconsumed_artifacts.len(),
+        stale_facts: stale_facts.len(),
+        squads: squads.len(),
+    };
+
     RoomSnapshot {
         max_seq,
         content_max_seq,
@@ -2983,7 +3168,433 @@ fn snapshot_from_facts_with_policy(
         lead_epoch,
         readers: Vec::new(),
         mission,
+        totals,
+        composition: None,
+        stale_authors,
     }
+}
+
+// =============================================================================
+// Output-path room composition
+// =============================================================================
+//
+// The byte budget lives HERE and nowhere else. It is deliberately NOT part of
+// `snapshot_from_facts_with_policy`, because that projection is a WRITE-PATH
+// AUTHORITY: `append_state_transition_verified` gates `rally resolve` on
+// membership in `current_risks` / `open_handoffs` / `unconsumed_artifacts` /
+// `system_health` (store.rs, "Assert the target is live BEFORE writing"), and
+// the `system_health` bucket backs the enter-path idempotency guard. A fact the
+// budget dropped from the projection would make `resolve` reject a fact that
+// exists, and would let duplicate health rows re-append. Composition is a view
+// concern; it stays on the view.
+
+/// The budgeted (informational) buckets, in the order their guaranteed top-1
+/// is claimed. Everything NOT listed here is never-cut.
+///
+/// The split is by CONSEQUENCE, not by size:
+/// * `active_claims` / `active_blockers` / `squads` — dropping one risks the
+///   write collision Rally exists to prevent, or hides a peer.
+/// * `system_health` — reads like telemetry, but the enter-path duplicate guard
+///   reads this projection; a dropped subject re-appends a row to the ledger on
+///   the next enter, so cutting it is a ledger-growth bug.
+/// * `open_handoffs` — budgeted ONLY for handoffs not assigned to the caller;
+///   assigned ones are pulled out and reserved before anything competes.
+const BUDGETED_BUCKETS: &[&str] = &[
+    "current_decisions",
+    "recent_artifacts",
+    "current_risks",
+    "open_handoffs",
+];
+
+/// True when a handoff is assigned to `tool` under the SAME rule `rally next`
+/// uses (`next::assigned_to_tool`): an explicit target match, or an untargeted
+/// / broadcast handoff, which is addressed to everyone including the caller.
+///
+/// Assigned handoffs are never budget-cut. Narrowing this to an exact target
+/// match would make a broadcast handoff droppable, which is the "hides an
+/// assignment" failure the never-cut class exists to prevent.
+fn handoff_assigned_to(fact: &Fact, tool: &str) -> bool {
+    match fact.target.as_deref() {
+        None | Some("all") => true,
+        Some(target) => target == tool,
+    }
+}
+
+/// True when a fact names `tool` as its recipient: an explicit `target`, a
+/// `to:<tool>` evidence stamp (how injected content records its recipient), or
+/// the tool appearing in the fact's scope.
+fn fact_addressed_to(fact: &Fact, tool: &str) -> bool {
+    if fact.target.as_deref() == Some(tool) {
+        return true;
+    }
+    if fact
+        .evidence
+        .iter()
+        .any(|e| e.strip_prefix("to:").is_some_and(|t| t.trim() == tool))
+    {
+        return true;
+    }
+    fact.scope.iter().any(|s| s == tool)
+}
+
+/// Approximate serialized size of a fact, in bytes. Used only for budget
+/// accounting, so an exact match with the final envelope is unnecessary — but
+/// it must never UNDER-count, or the budget could be overrun silently.
+fn fact_bytes(fact: &Fact) -> usize {
+    serde_json::to_string(fact).map(|s| s.len()).unwrap_or(0) + 1
+}
+
+/// One item competing for budget.
+struct Candidate {
+    bucket: &'static str,
+    index: usize,
+    score: f64,
+    bytes: usize,
+    seq: i64,
+}
+
+/// Compose the room for OUTPUT: honor the archive verdict, rank the
+/// informational buckets by relevance, and fill a byte budget.
+///
+/// Guarantees, each asserted by a test:
+/// 1. **Never-cut buckets are emitted whole**, whatever the budget says.
+/// 2. **Every non-empty budgeted bucket emits at least its top item.** This
+///    guarantee OUTRANKS the ceiling — a budget too small to hold the top-1 set
+///    is overrun, loudly, rather than emptying a bucket.
+/// 3. **A handoff assigned to the caller is never cut.**
+/// 4. **Nothing is dropped silently.** `totals` always carries true counts, and
+///    any omission produces a `composition` block naming the bucket, the count,
+///    the omitted event ids, and the command that returns the full view.
+/// 5. **An item whose relevance cannot be computed is not demoted for it.** An
+///    unparseable timestamp scores 1.0 (`fact_recency_weight`), which places it
+///    at the TOP of the fill, not the bottom. That is the deliberate cost of the
+///    fail-open direction: a corrupt stamp can outrank a genuinely fresh item.
+///    Removal is the destructive direction, so ambiguity resolves toward keeping.
+pub(crate) fn compose_room_output(
+    mut snapshot: RoomSnapshot,
+    coord: &crate::hooks_config::CoordinationConfig,
+    consumer: &crate::relevance::ConsumerContext,
+    include_archived: bool,
+    budget_override: Option<usize>,
+) -> RoomSnapshot {
+    let mut buckets: BTreeMap<String, BucketComposition> = BTreeMap::new();
+
+    // --- Honor the archive verdict ---------------------------------------
+    // The fold already decided these facts are below the archive floor and
+    // moved them out of the active buckets. Serializing them anyway contradicts
+    // the verdict it just reached. The raw segments stay on disk; the count
+    // stays in `totals`; `--include-archived` returns them.
+    if !include_archived && !snapshot.stale_facts.is_empty() {
+        let total = snapshot.stale_facts.len();
+        snapshot.stale_facts.clear();
+        buckets.insert(
+            "stale_facts".to_string(),
+            BucketComposition {
+                total,
+                emitted: 0,
+                omitted: total,
+                // Deliberately no ids: the drill-in for the archive class is one
+                // flag, and a four-figure id list would reintroduce the payload
+                // this removes.
+                omitted_ids: Vec::new(),
+                reason: "archived".to_string(),
+            },
+        );
+    }
+
+    let budget = budget_override.or_else(|| coord.room_budget_bytes());
+
+    let mut over_budget_causes: Vec<String> = Vec::new();
+    if let Some(budget) = budget {
+        over_budget_causes = apply_budget(&mut snapshot, coord, consumer, budget, &mut buckets);
+    }
+    let over_budget = !over_budget_causes.is_empty();
+
+    if over_budget || !buckets.is_empty() {
+        let emitted_bytes = emitted_bytes(&snapshot);
+        let mut drill_in = vec![
+            "rally room --json                     # this view".to_string(),
+            "rally locate <event-id> --json        # one omitted item".to_string(),
+        ];
+        if buckets.contains_key("stale_facts") {
+            drill_in.insert(
+                0,
+                "rally room --include-archived --json  # every archived fact".to_string(),
+            );
+        }
+        snapshot.composition = Some(RoomComposition {
+            budget_bytes: budget,
+            emitted_bytes,
+            buckets,
+            drill_in,
+            over_budget,
+            over_budget_causes,
+        });
+    }
+    snapshot
+}
+
+/// Rank the budgeted buckets by relevance and fill `budget` bytes.
+/// Returns the never-cut buckets that drove an over-budget response, largest
+/// first. An empty vec means the ceiling held.
+fn apply_budget(
+    snapshot: &mut RoomSnapshot,
+    coord: &crate::hooks_config::CoordinationConfig,
+    consumer: &crate::relevance::ConsumerContext,
+    budget: usize,
+    buckets: &mut BTreeMap<String, BucketComposition>,
+) -> Vec<String> {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let half_life_secs = coord.half_life_secs();
+    let weights = &coord.relevance;
+
+    // Never-cut buckets are emitted whole and consume budget first. What is
+    // left is what the informational buckets compete for. When they alone
+    // exceed the ceiling we ship over budget and SAY SO — cutting a claim or a
+    // peer to fit would trade a payload problem for a write collision.
+    let (reserved, mut over_budget_causes) = never_cut_bytes(snapshot);
+    let mut remaining = budget.saturating_sub(reserved);
+    if reserved <= budget {
+        over_budget_causes.clear();
+    }
+
+    let score_of = |fact: &Fact| -> f64 {
+        // Ranking weight, not visibility weight — see `fact_rank_weight`.
+        let recency = fact_rank_weight(fact, now_secs, half_life_secs, coord.archive_floor_weight);
+        let author_liveness = fact.tool.as_deref().map(|t| {
+            if snapshot.stale_authors.contains(t) {
+                crate::liveness::Liveness::Stale
+            } else {
+                // Live and Unknown are both neutral in the relevance model, so
+                // they need not be distinguished here.
+                crate::liveness::Liveness::Live
+            }
+        });
+        let signals = crate::relevance::RelevanceSignals {
+            author_liveness,
+            addressed_to_caller: consumer
+                .tool
+                .as_deref()
+                .is_some_and(|t| fact_addressed_to(fact, t)),
+            path_overlap: crate::relevance::path_overlap(&consumer.paths, &fact.scope),
+        };
+        crate::relevance::relevance(recency, &signals, weights)
+    };
+
+    // Handoffs assigned to the caller are correctness-bearing: split them out
+    // and reserve them before anything competes.
+    let assigned_handoffs: Vec<Fact> = match consumer.tool.as_deref() {
+        Some(tool) => {
+            let (mine, theirs): (Vec<Fact>, Vec<Fact>) = snapshot
+                .open_handoffs
+                .drain(..)
+                .partition(|f| handoff_assigned_to(f, tool));
+            snapshot.open_handoffs = theirs;
+            mine
+        }
+        None => Vec::new(),
+    };
+    remaining = remaining.saturating_sub(assigned_handoffs.iter().map(fact_bytes).sum::<usize>());
+
+    // Rank each budgeted bucket. Ties break by seq DESC, matching
+    // `sort_by_recency`, so ordering stays deterministic.
+    let mut ranked: BTreeMap<&'static str, Vec<Candidate>> = BTreeMap::new();
+    for name in BUDGETED_BUCKETS {
+        let facts = bucket_ref(snapshot, name);
+        let mut cands: Vec<Candidate> = facts
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| Candidate {
+                bucket: name,
+                index,
+                score: score_of(fact),
+                bytes: fact_bytes(fact),
+                seq: fact.seq,
+            })
+            .collect();
+        cands.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.seq.cmp(&a.seq))
+        });
+        ranked.insert(name, cands);
+    }
+
+    // Pass 1 — the floor. Every non-empty bucket emits its top item, even when
+    // the budget cannot afford it. A bucket that silently empties is the
+    // failure mode this whole design exists to avoid.
+    let mut keep: BTreeMap<&'static str, BTreeSet<usize>> = BTreeMap::new();
+    for (name, cands) in &ranked {
+        if let Some(top) = cands.first() {
+            keep.entry(name).or_default().insert(top.index);
+            remaining = remaining.saturating_sub(top.bytes);
+        }
+    }
+
+    // Pass 2 — global fill by descending relevance across all budgeted buckets.
+    // Cross-bucket comparison is meaningful because every score shares the same
+    // recency spine and the same consumer-relative factors.
+    let mut rest: Vec<&Candidate> = ranked
+        .values()
+        .flat_map(|c| c.iter().skip(1))
+        .collect::<Vec<_>>();
+    rest.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.seq.cmp(&a.seq))
+    });
+    for cand in rest {
+        if cand.bytes > remaining {
+            continue;
+        }
+        remaining -= cand.bytes;
+        keep.entry(cand.bucket).or_default().insert(cand.index);
+    }
+
+    // Rebuild each budgeted bucket, preserving its relevance order.
+    for name in BUDGETED_BUCKETS {
+        let kept = keep.remove(name).unwrap_or_default();
+        let order: Vec<usize> = ranked
+            .get(name)
+            .map(|c| c.iter().map(|x| x.index).collect())
+            .unwrap_or_default();
+        let facts = bucket_mut(snapshot, name);
+        let total = facts.len();
+        if kept.len() == total {
+            continue;
+        }
+        let omitted_ids: Vec<String> = order
+            .iter()
+            .filter(|i| !kept.contains(i))
+            .filter_map(|i| facts.get(*i).map(|f| f.event_id.clone()))
+            .collect();
+        let mut rebuilt: Vec<Fact> = Vec::with_capacity(kept.len());
+        for i in &order {
+            if kept.contains(i)
+                && let Some(f) = facts.get(*i)
+            {
+                rebuilt.push(f.clone());
+            }
+        }
+        let emitted = rebuilt.len();
+        *facts = rebuilt;
+        buckets.insert(
+            (*name).to_string(),
+            BucketComposition {
+                total,
+                emitted,
+                omitted: total - emitted,
+                omitted_ids,
+                reason: "budget".to_string(),
+            },
+        );
+    }
+
+    // Re-attach the caller's assigned handoffs at the front — they were never
+    // in the competition, and they are the first thing the caller needs.
+    if !assigned_handoffs.is_empty() {
+        let mut merged = assigned_handoffs;
+        merged.append(&mut snapshot.open_handoffs);
+        snapshot.open_handoffs = merged;
+        if let Some(entry) = buckets.get_mut("open_handoffs") {
+            entry.emitted = snapshot.open_handoffs.len();
+            entry.total = snapshot.totals.open_handoffs;
+            entry.omitted = entry.total.saturating_sub(entry.emitted);
+        }
+    }
+
+    // `unconsumed_artifacts` is DERIVED from `recent_artifacts`; several call
+    // sites assume the subset relation. Re-derive it from what actually shipped
+    // so the relation survives composition.
+    let emitted_artifact_ids: BTreeSet<String> = snapshot
+        .recent_artifacts
+        .iter()
+        .map(|f| f.event_id.clone())
+        .collect();
+    let before = snapshot.unconsumed_artifacts.len();
+    snapshot
+        .unconsumed_artifacts
+        .retain(|f| emitted_artifact_ids.contains(&f.event_id));
+    let after = snapshot.unconsumed_artifacts.len();
+    if after < before {
+        buckets.insert(
+            "unconsumed_artifacts".to_string(),
+            BucketComposition {
+                total: snapshot.totals.unconsumed_artifacts,
+                emitted: after,
+                omitted: snapshot.totals.unconsumed_artifacts.saturating_sub(after),
+                omitted_ids: Vec::new(),
+                reason: "budget".to_string(),
+            },
+        );
+    }
+
+    over_budget_causes
+}
+
+fn bucket_ref<'a>(snapshot: &'a RoomSnapshot, name: &str) -> &'a Vec<Fact> {
+    match name {
+        "current_decisions" => &snapshot.current_decisions,
+        "current_risks" => &snapshot.current_risks,
+        "recent_artifacts" => &snapshot.recent_artifacts,
+        "open_handoffs" => &snapshot.open_handoffs,
+        other => unreachable!("bucket_ref: {other} is not a budgeted bucket"),
+    }
+}
+
+fn bucket_mut<'a>(snapshot: &'a mut RoomSnapshot, name: &str) -> &'a mut Vec<Fact> {
+    match name {
+        "current_decisions" => &mut snapshot.current_decisions,
+        "current_risks" => &mut snapshot.current_risks,
+        "recent_artifacts" => &mut snapshot.recent_artifacts,
+        "open_handoffs" => &mut snapshot.open_handoffs,
+        other => unreachable!("bucket_mut: {other} is not a budgeted bucket"),
+    }
+}
+
+/// Bytes consumed by the buckets that are never budget-cut, plus those buckets
+/// named largest-first so an over-budget response can say WHICH one caused it.
+fn never_cut_bytes(snapshot: &RoomSnapshot) -> (usize, Vec<String>) {
+    let mut sized: Vec<(usize, String)> = vec![
+        (
+            snapshot.active_claims.iter().map(fact_bytes).sum(),
+            "active_claims".to_string(),
+        ),
+        (
+            snapshot.active_blockers.iter().map(fact_bytes).sum(),
+            "active_blockers".to_string(),
+        ),
+        (
+            snapshot.system_health.iter().map(fact_bytes).sum(),
+            "system_health".to_string(),
+        ),
+        (
+            serde_json::to_string(&snapshot.squads)
+                .map(|s| s.len())
+                .unwrap_or(0),
+            "squads".to_string(),
+        ),
+    ];
+    let total = sized.iter().map(|(b, _)| *b).sum();
+    sized.sort_by(|a, b| b.0.cmp(&a.0));
+    let causes = sized
+        .into_iter()
+        .filter(|(b, _)| *b > 0)
+        .map(|(_, name)| name)
+        .collect();
+    (total, causes)
+}
+
+/// Approximate serialized size of everything the room will emit.
+fn emitted_bytes(snapshot: &RoomSnapshot) -> usize {
+    serde_json::to_string(snapshot)
+        .map(|s| s.len())
+        .unwrap_or(0)
 }
 
 fn open_fact_store(path: &Path) -> Result<SqliteStore> {

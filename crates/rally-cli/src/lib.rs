@@ -1715,6 +1715,58 @@ fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
     ensure_presence_tiered(room, tool, None)
 }
 
+/// Evidence stamps that make the adaptive-liveness signals READABLE.
+///
+/// Two keys, both consumed by `store.rs`:
+/// * `branch_head_sha:<sha>` — the worktree HEAD at the moment of the beat.
+///   `code_progress_age_per_tool` compares consecutive stamps for a tool and
+///   reports forward progress when the sha MOVED. Two stamped beats are needed
+///   before the signal can fire, so it activates a session at a time rather
+///   than retroactively.
+/// * `planned_heartbeat_secs:<n>` — the cadence this agent intends to beat at.
+///   `planned_cadence_for_tool` reads it to size that session's staleness
+///   window, which is what makes the window adaptive rather than one global
+///   default applied to every agent.
+///
+/// Fail-open in every branch: an unavailable HEAD stamps nothing rather than
+/// stamping a placeholder, because `code_progress_age_per_tool` treats a
+/// missing stamp as "signal absent" (correct) and would read `unknown` as a
+/// value that never changes (a false "no progress" verdict).
+fn presence_signal_evidence(room: &RoomStore) -> Vec<String> {
+    let mut evidence = Vec::new();
+    if let Some(sha) = current_head_sha(room.repo_root()) {
+        evidence.push(format!("branch_head_sha:{sha}"));
+    }
+    let coord = hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    if coord.default_cadence_secs > 0 {
+        evidence.push(format!(
+            "planned_heartbeat_secs:{}",
+            coord.default_cadence_secs
+        ));
+    }
+    evidence
+}
+
+/// The current worktree HEAD sha, or `None` when it cannot be read (detached
+/// bootstrap, no commits yet, git unavailable). Never returns a placeholder.
+fn current_head_sha(repo_root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if sha.is_empty() || sha == "HEAD" {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
 /// Tier-aware presence. Lead auto-assign is **frontier-only**: an undeclared
 /// tier (`None`) stays lead-eligible (back-compat with lazy-auto-enter callers),
 /// but a declared `executing`/`fast` agent entering an empty room does NOT take
@@ -1742,7 +1794,14 @@ fn ensure_presence_tiered(room: &RoomStore, tool: &str, tier: Option<&str>) -> R
         scope: Vec::new(),
         created_at: now_string(),
         summary: Some(format!("build_id:{BUILD_ID}")),
-        evidence: Vec::new(),
+        // Liveness signal stamps. `code_progress_age_per_tool` and
+        // `planned_cadence_for_tool` (store.rs) both read presence evidence for
+        // these keys; until this writer existed, NEITHER key appeared anywhere
+        // in the ledger, so signal (c) was permanently absent, `is_live` could
+        // never return `Stale` (it needs all four signals present), and the
+        // "adaptive" window always fell back to the default cadence. The reader
+        // and its doc comment described a writer that did not exist.
+        evidence: presence_signal_evidence(room),
         target: None,
         ref_id: None,
         status: None,
@@ -2762,16 +2821,32 @@ fn command_release_by_path(
 fn command_room(args: RoomArgs) -> Result<Output> {
     let room = RoomStore::open()?;
     let json_output = args.json;
+    let budget_override = args.budget_bytes;
     let query = RoomQuery::from(args);
     // R10: use snapshot_with_readers when --readers is passed so that
     // ReadReceipt projection happens; otherwise use the cheaper default path.
-    let snapshot = if query.readers {
+    let projected = if query.readers {
         room.snapshot_with_readers_archived(query.include_archived)?
             .filtered(&query)
     } else {
         room.snapshot_with_archived(query.include_archived)?
             .filtered(&query)
     };
+    // Composition is an OUTPUT concern and runs only here — the projection
+    // above is a write-path authority (`append_state_transition_verified`
+    // gates `resolve` on membership in its buckets) and must stay whole.
+    let coord = hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    let consumer = crate::relevance::ConsumerContext {
+        tool: query.tool.clone(),
+        paths: query.paths.clone(),
+    };
+    let snapshot = store::compose_room_output(
+        projected,
+        &coord,
+        &consumer,
+        query.include_archived,
+        budget_override,
+    );
     // R10: extract readers from snapshot (populated by snapshot_with_readers).
     let readers = snapshot.readers.clone();
     // Rank-11: surface mission at the top level so agents see it without parsing snapshot.
