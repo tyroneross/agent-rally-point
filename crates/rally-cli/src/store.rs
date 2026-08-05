@@ -2685,26 +2685,33 @@ fn handoff_is_closed(handoff: &Fact, facts: &[Fact]) -> bool {
         .any(|closer| fact_closes_handoff(handoff, closer))
 }
 
-/// Pure projection of a `RoomSnapshot` from an already-loaded facts slice.
-///
-/// This is the body formerly inlined in `RoomStore::snapshot`. Extracted so
-/// that both `snapshot()` and `snapshot_with_readers()` can call it without
-/// loading facts twice (fix #2 — one DB round-trip instead of two).
-/// ARP-R-02. The claim-close authorization gate MOVED to
-/// `write_authority::assert_claim_close_authorized`.
-///
-/// It lived here, called from exactly two arms of
-/// `append_state_transition_verified` — Release and Resolve. But
-/// `claim_authority::closes_active_claim` closes a claim on FOUR kinds, and the
-/// doc comment on this very function named all four while the code covered two.
-/// `Receipt` and `ClaimExpired` reached `append_fact` with no ownership check,
-/// so `rally say receipt --tool rogue --ref <claim-id>` took any live claim in
-/// the room, seconds old, with a live lease. Reproduced end to end.
-///
-/// The replacement is keyed off `closes_active_claim` itself and runs at the
-/// write boundary, so the kinds that close a claim and the kinds that must be
-/// authorized to close one are one list. Two hand-copied call sites is how the
-/// gap opened; there is now one call site and no list to copy.
+// NOTE (orphaned doc block): the items these paragraphs documented were
+// moved out of this file (the RoomSnapshot projection was inlined back into
+// its callers; the claim-close gate moved to
+// `write_authority::assert_claim_close_authorized` under ARP-R-02). The prose
+// is kept as historical context. It is `//`, not `///`, precisely because a
+// doc comment with no item silently attaches to the NEXT one -- here
+// `fact_recency_weight`, which it does not describe.
+// Pure projection of a `RoomSnapshot` from an already-loaded facts slice.
+//
+// This is the body formerly inlined in `RoomStore::snapshot`. Extracted so
+// that both `snapshot()` and `snapshot_with_readers()` can call it without
+// loading facts twice (fix #2 — one DB round-trip instead of two).
+// ARP-R-02. The claim-close authorization gate MOVED to
+// `write_authority::assert_claim_close_authorized`.
+//
+// It lived here, called from exactly two arms of
+// `append_state_transition_verified` — Release and Resolve. But
+// `claim_authority::closes_active_claim` closes a claim on FOUR kinds, and the
+// doc comment on this very function named all four while the code covered two.
+// `Receipt` and `ClaimExpired` reached `append_fact` with no ownership check,
+// so `rally say receipt --tool rogue --ref <claim-id>` took any live claim in
+// the room, seconds old, with a live lease. Reproduced end to end.
+//
+// The replacement is keyed off `closes_active_claim` itself and runs at the
+// write boundary, so the kinds that close a claim and the kinds that must be
+// authorized to close one are one list. Two hand-copied call sites is how the
+// gap opened; there is now one call site and no list to copy.
 
 /// Recency weight for a fact, from its `created_at` and the policy half-life.
 /// A fact whose `created_at` fails to parse is treated as fresh (weight 1.0):
@@ -3222,7 +3229,7 @@ fn snapshot_from_facts_with_policy(
     let lead_epoch = latest_lead_fact.map(|f| f.seq);
     let lead = latest_lead_fact
         .filter(|f| f.subject == claim_authority::LEAD_SUBJECT)
-        .and_then(|f| claim_authority::lead_beneficiary(f));
+        .and_then(claim_authority::lead_beneficiary);
 
     // The authorized room-wide freeze, decided ADMISSION-TIME (see the field's
     // doc on `RoomSnapshot`). An unscoped blocker freezes the room only if its

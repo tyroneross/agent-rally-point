@@ -1454,6 +1454,83 @@ review answers the question you asked.
   the parser still passes. `--receipt-threshold` vs `--receipt-threshold-secs` was found by hand in
   this run, not by a check. Grading flag spellings against `bpaf` needs a different mechanism.
 
+### RC-064 — a test fixture wrote its identity into the real repo, and 64 commits carry it
+- **State:** `fixed` — the source is eliminated and two gates are in place. **Not `controlled`
+  until the adversarial tests below run green in the gate; see "What closes this" at the end.**
+- **Symptom:** 64 commits on `main`, all dated 2026-07-10, authored `Rally Test
+  <rally@example.test>`. That address exists nowhere except in test fixtures.
+- **Mechanism, cited:** three fixtures ran `git -C <root> config user.email rally@example.test`
+  — `crates/rally-cli/src/lib.rs:8187`, `crates/rally-cli/src/run_worktree.rs:446`,
+  `crates/rally-cli/tests/user_journey.rs:244`. `git config` defaults to `--local`, and
+  `--local` does not mean "the directory I named". It means "the repository that encloses the
+  directory I named", discovered by walking up. A fixture whose root resolved to — or sat
+  inside — the real checkout wrote a repo-local override into the real `.git/config`. A local
+  override outranks the global one, so every commit made in that clone afterward carried the
+  fixture identity, and nothing said so.
+- **Two more sites the first count missed:** `crates/rally-cli/tests/init_consumer_repo.rs:75`
+  and `crates/rally-cli/tests/worktree_gc.rs:65` do the same thing with
+  `init-consumer-test@example.test` and `gc-test@example.test`. Five call sites, not three. The
+  two extra ones had not fired yet. Counting three would have left the class alive at two sites,
+  which is precisely how this defect arrived.
+- **The precedent, and why it is the actual lesson.** Contributor PR #11, May 2026, titled
+  *"test: override core.hooksPath in tmp-repo fixtures so post-commit tests survive contributor-global
+  config leak"* — the same defect class, in the same fixtures, fixed for `core.hooksPath` two
+  months earlier by an outside contributor. The fix was correct and it held. It covered one
+  config key. `user.email` was never in scope, so the class walked around it and landed in July
+  on an uncovered path.
+
+  **A fix scoped to the key that failed does not close a defect whose shape is "fixtures write
+  into config".** The May fix treated the symptom's coordinate. The durable control has to be
+  the property: a fixture writes NO config, ever, and cannot address a real repo at all.
+- **The fix, at the top of the ladder rather than the bottom.** The reflex here is a detect-gate,
+  and a detect-gate would have caught the 65th commit and none of the first 64. What landed
+  instead, strongest first:
+  1. **Eliminate.** All five fixtures route through one helper that passes identity per
+     invocation (`git -c user.name=… -c user.email=…` plus `GIT_AUTHOR_*`/`GIT_COMMITTER_*` on
+     the child process). Nothing is written to any config file, so a wrong working directory is
+     inert. One shared implementation, not five copies — five copies is the May fix's failure
+     mode with extra steps.
+  2. **Impossible-state.** The same helper asserts its root is under the process temp dir before
+     the first git command runs. A fixture pointed at a real checkout dies at the assert instead
+     of succeeding quietly.
+  3. **Automated block.** `scripts/check-git-identity.sh` refuses a commit whose author or
+     committer is not on a config-driven allowlist, wired into `.githooks/pre-commit` (before
+     the commit object exists) and `.githooks/pre-push` (backstop for commits made elsewhere).
+  4. **Detect.** A read-only cross-repo auditor, outside this repo, reports drift on a schedule.
+- **Two things the gate deliberately does not do.** It reads only the author and committer
+  fields, never the commit body — this repo's `CONTRIBUTING.md` requires a `Co-Authored-By:
+  Claude … <noreply@anthropic.com>` trailer on AI-assisted commits, and a check that flagged
+  that convention would be turned off within a day. And the push gate scopes itself to
+  `--not --remotes=origin`: only commits not yet on the remote. The 64 contaminated commits and
+  the 63 legitimate contributor commits are already pushed and are excluded structurally. No
+  date cutoff, no grandfather list, nothing that drifts.
+- **Not contamination, and an allowlist entry exists to say so:** `jason <technique@gmail.com>`,
+  63 commits, May 26-28, GitHub user `jason`, 30 merged PRs (#11-#40), operator-confirmed
+  authorized collaborator. Removing that line from the allowlist manufactures a 63-commit false
+  positive against a real contributor's work — including the PR that fixed the earlier instance
+  of this defect.
+- **No history was rewritten and none should be.** Operator constraint, and it is the right
+  call: the 64 commits are an accurate record that this happened, and the register's value comes
+  from recurrence being visible.
+- **What closes this.** Two adversarial controls, both required:
+  (a) a test that runs a fixture with its working directory pointed at a real repository and
+  asserts no config write occurs — the fixture must be provably inert against the exact
+  condition that caused the defect, not merely correct in the temp dir;
+  (b) a test that the commit gate REJECTS a fabricated identity, with the allowlist itself
+  mutation-checked so a pass cannot come from the gate reading nothing.
+  A gate proven only on its happy path certifies nothing. Until both run green in
+  `scripts/check-release-parity.sh`, this entry stays `fixed`, not `controlled`.
+- **Shape, for the working hypothesis at the end of this file:** this is a third pattern, distinct
+  from "an ack for the wrong step" and "a decision reached and discarded." Call it **a fix scoped
+  to the instance rather than the class.** The May fix was correct, tested, and held — and the
+  defect recurred anyway, because the control's shape was narrower than the failure's shape. The
+  question this adds to the register's checklist: *what property does this control establish, and
+  is that property the one that failed?*
+- **First seen:** 2026-07-10 (commits). **Diagnosed:** 2026-08-04.
+- **Evidence:** `git log --author='rally@example.test'` → 64 commits. Local override present in
+  `.git/config` at diagnosis, absent from the global config, and unset before this entry was
+  written. `1737d9b` is the re-authored unpushed commit.
+
 ## Independent design audit, 2026-08-04 — pinned at `006d417`
 
 Eleven findings from a structural read of the store, composition, reaper, identity and hook layers.

@@ -39,6 +39,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod common;
+use common::test_git_fixture::fixture_git;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -57,24 +60,8 @@ fn tmp_dir(label: &str) -> PathBuf {
 /// commit. A consumer repo — deliberately carries none of
 /// agent-rally-point's own doc pointers.
 fn init_repo(root: &Path) {
-    let run = |args: &[&str]| {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .expect("git invocation");
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
-    run(&["init", "-q", "-b", "main"]);
-    run(&["config", "user.email", "init-consumer-test@example.test"]);
-    run(&["config", "user.name", "Init Consumer Test"]);
-    run(&["commit", "--allow-empty", "-m", "initial"]);
+    fixture_git(root, &["init", "-q", "-b", "main"]);
+    fixture_git(root, &["commit", "--allow-empty", "-m", "initial"]);
 }
 
 fn run_rally(root: &Path, args: &[&str]) -> Output {
@@ -131,15 +118,15 @@ fn markdown_links(block: &str) -> Vec<(String, String)> {
             break;
         };
         let close = open + close_rel;
-        if block[close + 1..].starts_with('(') {
-            if let Some(paren_close_rel) = block[close + 1..].find(')') {
-                let paren_close = close + 1 + paren_close_rel;
-                let text = block[open + 1..close].to_string();
-                let target = block[close + 2..paren_close].to_string();
-                out.push((text, target));
-                i = paren_close + 1;
-                continue;
-            }
+        if block[close + 1..].starts_with('(')
+            && let Some(paren_close_rel) = block[close + 1..].find(')')
+        {
+            let paren_close = close + 1 + paren_close_rel;
+            let text = block[open + 1..close].to_string();
+            let target = block[close + 2..paren_close].to_string();
+            out.push((text, target));
+            i = paren_close + 1;
+            continue;
         }
         i = close + 1;
     }

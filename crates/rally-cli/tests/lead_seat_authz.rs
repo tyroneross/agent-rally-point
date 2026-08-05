@@ -271,7 +271,7 @@ fn force_seizure_succeeds_and_is_recorded_as_a_seizure() {
         "the seizure must be on the record: {evidence:?}"
     );
     assert!(
-        evidence.iter().any(|e| *e == "displaced:victim"),
+        evidence.contains(&"displaced:victim"),
         "the record must name who was displaced: {evidence:?}"
     );
     ws.cleanup();

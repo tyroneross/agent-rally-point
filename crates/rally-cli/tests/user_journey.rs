@@ -12,6 +12,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod common;
+use common::test_git_fixture::fixture_git;
+
 /// Serializes the heavy `rally run` managed-session tests against each other.
 /// Each spawns subprocesses that write session-reservation facts to one SQLite
 /// store; running several concurrently compounds write-lock contention past the
@@ -226,24 +229,8 @@ fn git_available() -> bool {
 /// `main`.  Used by tests that exercise the default-on worktree
 /// provisioning path (which calls real `git worktree add`).
 fn init_real_repo(root: &Path) {
-    let run = |args: &[&str]| {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .expect("git invocation");
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
-    run(&["init", "-q", "-b", "main"]);
-    run(&["config", "user.email", "rally@example.test"]);
-    run(&["config", "user.name", "Rally Test"]);
-    run(&["commit", "--allow-empty", "-q", "-m", "initial"]);
+    fixture_git(root, &["init", "-q", "-b", "main"]);
+    fixture_git(root, &["commit", "--allow-empty", "-q", "-m", "initial"]);
 }
 
 /// Build a [`Workspace`] backed by a REAL git repo (not a stub `.git` dir)

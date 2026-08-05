@@ -428,24 +428,9 @@ mod tests {
     }
 
     fn init_test_repo(root: &Path) {
-        let run = |args: &[&str]| {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(args)
-                .output()
-                .expect("git invocation");
-            assert!(
-                out.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        run(&["init", "-q", "-b", "main"]);
-        run(&["config", "user.email", "rally@example.test"]);
-        run(&["config", "user.name", "Rally Test"]);
-        run(&["commit", "--allow-empty", "-m", "initial"]);
+        use crate::test_git_fixture::fixture_git;
+        fixture_git(root, &["init", "-q", "-b", "main"]);
+        fixture_git(root, &["commit", "--allow-empty", "-m", "initial"]);
     }
 
     #[test]
@@ -558,22 +543,8 @@ mod tests {
 
         // Add a commit on the per-agent branch to make it unmerged.
         fs::write(pw.path.join("note.txt"), b"work in progress").unwrap();
-        let run = |cwd: &Path, args: &[&str]| {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(cwd)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{} {}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        run(&pw.path, &["add", "note.txt"]);
-        run(&pw.path, &["commit", "-m", "wip"]);
+        crate::test_git_fixture::fixture_git(&pw.path, &["add", "note.txt"]);
+        crate::test_git_fixture::fixture_git(&pw.path, &["commit", "-m", "wip"]);
 
         let outcome = cleanup(&repo, &pw.path, &pw.branch, "git");
 

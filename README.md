@@ -195,6 +195,10 @@ git diff --check
 
 Primary code must compile on Rust 1.89 (the MSRV in `Cargo.toml`). These verification commands themselves run under the exact toolchain `rust-toolchain.toml` pins (1.95.0) — `cargo fmt --check` needs a matching `rustfmt` build or its diff is meaningless.
 
+### Commit identity
+
+`.githooks/pre-commit` and `.githooks/pre-push` refuse a commit whose author or committer is not on `config/git-identity-allowlist.txt`. Both stay silent when your identity is correct, and they read only the author and committer fields — a `Co-Authored-By:` trailer naming an AI model is the documented convention here and passes untouched. Set your identity globally and add yourself to the allowlist in your PR; [`CONTRIBUTING.md`](CONTRIBUTING.md) has the four rejected address shapes and the one-line fix for a repo-local override. The defect that motivated the gate is [`docs/ROOT-CAUSE-REGISTER.md`](docs/ROOT-CAUSE-REGISTER.md) RC-064.
+
 ## License
 
 Apache-2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).

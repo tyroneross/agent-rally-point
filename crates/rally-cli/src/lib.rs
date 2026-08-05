@@ -144,6 +144,8 @@ mod session_identity;
 mod source_grounding;
 mod store;
 mod store_client;
+#[cfg(test)]
+mod test_git_fixture;
 mod tier_fit;
 pub mod worktree_gc;
 mod worktree_guard;
@@ -8166,31 +8168,14 @@ mod tests {
             .unwrap_or(false)
     }
 
-    fn run_git(root: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .expect("git invocation");
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
     fn init_status_git_repo(root: &Path, branch: &str) -> String {
-        run_git(root, &["init"]);
-        run_git(root, &["config", "user.email", "rally@example.test"]);
-        run_git(root, &["config", "user.name", "Rally Test"]);
+        use crate::test_git_fixture::fixture_git;
+        fixture_git(root, &["init"]);
         std::fs::write(root.join("tracked.txt"), "status done\n").unwrap();
-        run_git(root, &["add", "tracked.txt"]);
-        run_git(root, &["commit", "-m", "initial"]);
-        run_git(root, &["checkout", "-B", branch]);
-        run_git(root, &["rev-parse", "--verify", "HEAD"])
+        fixture_git(root, &["add", "tracked.txt"]);
+        fixture_git(root, &["commit", "-m", "initial"]);
+        fixture_git(root, &["checkout", "-B", branch]);
+        fixture_git(root, &["rev-parse", "--verify", "HEAD"])
     }
 
     // Plan F functional core (Chunk 3): self_host_guard_* tests removed

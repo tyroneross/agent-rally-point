@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# git-identity-allowlist.txt — addresses accepted as commit author/committer
+# by scripts/check-git-identity.sh. One entry per line, `#` comments and
+# blank lines ignored. Matching is exact and case-insensitive on the EMAIL
+# only (the name field is not checked against this file).
+#
+# Resolution order (see scripts/check-git-identity.sh):
+#   1. $RALLY_IDENTITY_ALLOWLIST if set (absolute path) — lets a fork or a
+#      consumer repo override without editing this tracked file.
+#   2. <repo-root>/config/git-identity-allowlist.txt (this file).
+#   3. Neither resolves -> FAIL CLOSED. A gate that silently passes because
+#      its config vanished is worse than no gate.
+#
+# Deny-by-default: an address that is neither listed here nor a known-bad
+# shape (see the SUSPECT_* patterns in scripts/check-git-identity.sh) is
+# rejected as unknown. That is deliberate — see the header of
+# scripts/check-git-identity.sh for why "neither known-good nor known-bad"
+# is exactly the case that produced the defect this gate exists to catch.
+
+# Operator
+46267523+tyroneross@users.noreply.github.com
+tyrone.ross@gmail.com
+
+# Authorized human collaborator: GitHub user `jason`, 30 merged PRs (#11-#40),
+# May 2026. Jason's own PR #11 fixed this same defect class for
+# core.hooksPath in tmp-repo fixtures. His commits are legitimate contributor
+# work. Removing him from this list produces a false positive on 63 real
+# commits.
+technique@gmail.com

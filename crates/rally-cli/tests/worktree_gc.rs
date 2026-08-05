@@ -21,6 +21,9 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod common;
+use common::test_git_fixture::fixture_git;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -47,24 +50,8 @@ fn git_available() -> bool {
 
 /// Initialise a bare-minimum git repo: `git init -b main` + initial empty commit.
 fn init_repo(root: &Path) {
-    let run = |args: &[&str]| {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .expect("git invocation");
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
-    run(&["init", "-q", "-b", "main"]);
-    run(&["config", "user.email", "gc-test@example.test"]);
-    run(&["config", "user.name", "GC Test"]);
-    run(&["commit", "--allow-empty", "-m", "initial"]);
+    fixture_git(root, &["init", "-q", "-b", "main"]);
+    fixture_git(root, &["commit", "--allow-empty", "-m", "initial"]);
 }
 
 /// Provision a rally-managed worktree (`rally/<session-id>`) using the same
@@ -76,19 +63,16 @@ fn init_repo(root: &Path) {
 fn make_rally_worktree(repo: &Path, session_id: &str) -> PathBuf {
     fs::create_dir_all(repo.join(".rally").join("worktrees")).unwrap();
     let wt_path = repo.join(".rally").join("worktrees").join(session_id);
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["worktree", "add", "-b"])
-        .arg(format!("rally/{session_id}"))
-        .arg(&wt_path)
-        .arg("HEAD")
-        .output()
-        .expect("git worktree add");
-    assert!(
-        out.status.success(),
-        "git worktree add failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+    fixture_git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &format!("rally/{session_id}"),
+            wt_path.to_str().expect("utf8 worktree path"),
+            "HEAD",
+        ],
     );
     // Canonicalize to match what git returns in --porcelain output.
     wt_path.canonicalize().unwrap_or(wt_path)
@@ -96,45 +80,20 @@ fn make_rally_worktree(repo: &Path, session_id: &str) -> PathBuf {
 
 /// Add one file-commit in the worktree's branch so it is unmerged relative to main.
 fn add_commit_in_worktree(wt_path: &Path) {
-    let run = |args: &[&str]| {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(wt_path)
-            .args(args)
-            .output()
-            .expect("git");
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
     fs::write(wt_path.join("wip.txt"), b"work in progress").unwrap();
-    run(&["add", "wip.txt"]);
-    run(&["commit", "-m", "wip"]);
+    fixture_git(wt_path, &["add", "wip.txt"]);
+    fixture_git(wt_path, &["commit", "-m", "wip"]);
 }
 
 /// Merge a branch into `main` in the canonical repo.
 fn merge_branch_into_main(repo: &Path, branch: &str) {
-    let run = |args: &[&str]| {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .expect("git");
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
     // Switch canonical to main first (it should already be there), then merge.
     // The canonical repo was never checked out to any branch in the worktree
     // tests — HEAD stays on main.
-    run(&["merge", "--no-ff", branch, "-m", &format!("Merge {branch}")]);
+    fixture_git(
+        repo,
+        &["merge", "--no-ff", branch, "-m", &format!("Merge {branch}")],
+    );
 }
 
 // ---------------------------------------------------------------------------
