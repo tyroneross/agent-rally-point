@@ -37,17 +37,16 @@
 //! question is answered by the other suite, and reading only one of them is how
 //! a reviewer concludes more than the evidence supports.
 //!
-//! # A divergence this suite found, rather than confirmed
+//! # Why the field-bound payload is 8 KiB
 //!
-//! `field_bounds_are_identical_in_direct_and_routed_mode` was written to check
-//! the new ARP-R-04 bounds. Reverting those bounds does not merely un-gate the
-//! oversized write — it makes the two modes DISAGREE: a 200 KB subject is
-//! accepted in direct mode and refused in routed mode, because the daemon wire
-//! carries its own line-length ceiling that the direct path never consults.
-//! Same ledger, opposite outcome, decided by whether rallyd happened to be
-//! running. That is a third instance of the design audit's D1/D6 class, on the
-//! WRITE path rather than the read path, and it was closed as a side effect of
-//! bounding fields at the door rather than by anyone noticing it.
+//! `field_bounds_are_identical_in_direct_and_routed_mode` uses an 8 KiB
+//! subject: large enough to exceed ARP-R-04's 4 KiB subject bound, but small
+//! enough for every supported host to pass it to the CLI as one argument.
+//! The older 200 KB fixture exceeded Linux's per-argument limit before rally
+//! could inspect it, and Rally's current 8 MiB daemon-frame limit means that
+//! size no longer proves the historical transport divergence anyway. This
+//! suite proves direct/routed equivalence; `retrospective_sanitizer.rs` proves
+//! the field bound exists and independently exercises renderer volume limits.
 
 #![cfg(unix)]
 #![allow(clippy::zombie_processes)]
@@ -314,14 +313,14 @@ fn lead_seat_authorization_is_identical_in_direct_and_routed_mode() {
 #[test]
 fn field_bounds_are_identical_in_direct_and_routed_mode() {
     assert_parity("field-bounds", |room| {
-        let huge = "A".repeat(200_000);
+        let oversize_subject = "A".repeat(8_192);
         let oversize = room.ok(&[
             "say",
             "artifact",
             "--tool",
             "alpha",
             "--subject",
-            &huge,
+            &oversize_subject,
             "--json",
         ]);
         let newline_id = room.ok(&[
