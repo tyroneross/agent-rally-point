@@ -16,3 +16,11 @@ threads-required = "num-test-threads"
 [[profile.default.overrides]]
 filter = 'test(envelope_owners_dirty)'
 threads-required = "num-test-threads"
+
+# This control asserts that a repo-sized stale-state pass completes inside the
+# real 3s mutation watchdog. Its module contract explicitly excludes
+# concurrency; running it beside the full suite turns scheduler contention into
+# a product-watchdog failure instead of testing reaper progress.
+[[profile.default.overrides]]
+filter = 'test(a_repo_sized_ledger_drains_within_the_default_watchdog)'
+threads-required = "num-test-threads"
