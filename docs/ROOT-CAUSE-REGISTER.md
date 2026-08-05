@@ -1556,8 +1556,59 @@ stated. **Nothing here is `controlled`**: per the standing rule this cycle, clos
 adversarial control tested with the ADJACENT move, not the move it was built to stop. None of these
 has one yet, so each is `observed` or `mechanism`, and each states what the control would have to do.
 
-D1, D2, D6 and D9 from the same audit are being handled in other workstreams this run and appear
-here only where they cross-reference.
+D9 from the same audit was closed with ARP-R-01 (authority is admission-time everywhere). D1, D2 and
+D6 are below.
+
+### RC-065 — routing dropped four snapshot projections, so the daemon changed behaviour (D1, D6)
+
+- **State:** ✅ `controlled` 2026-08-05. `crates/rally-cli/tests/snapshot_wire_internals.rs`.
+- **Mechanism.** `RoomSnapshot::{content_max_seq, last_activity_ts, pending_wakes, stale_authors}`
+  are `#[serde(skip)]` so they stay out of the public room JSON. `rallyd` serialized its reply with
+  the same impl, so `#[serde(skip)]` silently answered a SECOND question — "drop this when routed" —
+  that nobody chose. Three behaviours then depended on whether a daemon happened to be running:
+  1. **Ranking.** `apply_budget`'s `score_of` demotes an item whose author is in `stale_authors`
+     (`store.rs`). Empty over the wire means no item is ever demoted, so the same ledger composes
+     into a different room.
+  2. **Read checkpoints.** `enter` (`lib.rs:2161`) and `next` (`lib.rs:3007`) pass
+     `snapshot.content_max_seq` to `maybe_append_read_checkpoint`, which coalesces at
+     `read_seq <= last_checkpoint`. A routed caller passed 0, so it wrote NO checkpoint, ever, and
+     its read position never advanced.
+  3. **Wake coalescing.** `append_next_wake_intent` (`lib.rs:7079`) dedupes against
+     `pending_wakes`. Empty means the guard never matches, so every routed poll appended a
+     duplicate wake intent.
+- **Fix.** A `__internals` side-channel: `store::SnapshotInternals` rides beside the snapshot in the
+  `StoreOk::Snapshot` payload, written by `rallyd_core::snapshot_to_wire` and read by
+  `store_client::snapshot_from_value`. Serializing the fields outright would have fixed routing and
+  changed the public schema in one move, adding an unbudgeted `pending_wakes` array to every room
+  read — the payload growth RC-054 is open about. The two questions are now separate, and the public
+  `rally room --json` bytes are unchanged. Every internals field is `#[serde(default)]`, so an older
+  daemon's reply still deserializes to the old empty values.
+- **Adversarial controls, all on the real path.** Every assertion is made on CLI output or ledger
+  contents, never on the wire helpers — a test that called `snapshot_to_wire_value` directly would
+  stay green if the daemon stopped calling it, which is this register's closing question.
+  Mutation-validated four ways: neutering the daemon-side write fails all three behavioural tests,
+  neutering the client-side read fails all three, and dropping one field from `SnapshotInternals`
+  fails the structural test plus the behavioural test that field feeds.
+- **Tested with the ADJACENT move.** The three behavioural tests cover the four fields that exist
+  today and would not notice a FIFTH one added later — which is exactly how this class arrived. So
+  `every_skipped_snapshot_field_rides_the_wire_side_channel` parses `store.rs` and asserts every
+  `#[serde(skip)]` field of `RoomSnapshot` appears in `SnapshotInternals`. Source parsing is not a
+  shortcut here: a skipped field is by definition absent from the serialized form, so there is
+  nothing to reflect over at runtime.
+- **What the controls do NOT cover.** `last_activity_ts` rides the side-channel but has no
+  behavioural assertion — its only consumer is `status_global`'s room-age display, and nothing here
+  would notice if it were dropped again. A field carried in `SnapshotInternals` but restored into
+  the wrong place would also pass the structural test. And parity is asserted for one stale author
+  and one live author: it establishes that both modes run the same relevance model, not that the
+  model is right.
+- **A premise that failed silently first.** The composition test passed before the fix was even
+  loaded, because the backdating it relies on never reached the read path —
+  `DirectRoomStore::facts` reconciles segments into `facts.db` by event id and SKIPS ids it already
+  holds, so editing a segment line in place changes nothing a read returns. Both risks kept the same
+  timestamp and the omission was decided by the seq tie-break, which is identical in both modes. The
+  test now asserts its own premise (the stale author's item must be the NEWER one) before asserting
+  parity. A parity test that compares two identical wrong answers is the shape this register keeps
+  finding; it found one in its own control this time.
 
 ### RC-053 — lease renewal writes to a sidecar that no expiry path reads (D3)
 - **State:** `mechanism`. **NOT fixed.**

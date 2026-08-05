@@ -549,6 +549,21 @@ mod imp {
         items.into_iter().map(to_wire_value).collect()
     }
 
+    /// Snapshots do NOT go through [`to_wire_value`]. Four `RoomSnapshot`
+    /// projections are `#[serde(skip)]` so they stay out of the public room
+    /// JSON, and serializing the snapshot plainly would drop them on the wire
+    /// too — which made the daemon path rank, checkpoint, and coalesce
+    /// differently from the direct path (design audit D1/D6). See
+    /// `store::SnapshotInternals`.
+    fn snapshot_to_wire(snapshot: &store::RoomSnapshot) -> Result<Value, StoreError> {
+        store::snapshot_to_wire_value(snapshot).map_err(|e| {
+            StoreError::new(
+                StoreErrorKind::Internal,
+                format!("serialize snapshot reply: {e}"),
+            )
+        })
+    }
+
     /// Dispatch one request against the single-owner store. Applies the request's
     /// engagement BEFORE the op (L9/R4); answers `Ping` directly.
     fn dispatch_one(
@@ -676,7 +691,7 @@ mod imp {
                     .snapshot_with_archived(include_archived)
                     .map_err(rally_to_wire)?;
                 StoreOk::Snapshot {
-                    snapshot: to_wire_value(&snap)?,
+                    snapshot: snapshot_to_wire(&snap)?,
                 }
             }
             StoreOp::SnapshotWithReadersArchived { include_archived } => {
@@ -684,7 +699,7 @@ mod imp {
                     .snapshot_with_readers_archived(include_archived)
                     .map_err(rally_to_wire)?;
                 StoreOk::SnapshotWithReaders {
-                    snapshot: to_wire_value(&snap)?,
+                    snapshot: snapshot_to_wire(&snap)?,
                 }
             }
             StoreOp::LastCheckpointSeq { tool } => {

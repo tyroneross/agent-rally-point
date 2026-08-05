@@ -439,19 +439,24 @@ pub(crate) struct RoomSnapshot {
     /// R10: highest seq of a substantive (non-read-checkpoint) fact.
     /// Used internally by `command_next` to record the read position WITHOUT
     /// inflating it with the read-checkpoint's own seq (anti-loop).
-    /// Not serialized to JSON — internal field only.
+    ///
+    /// Omitted from the PUBLIC room JSON, and carried across the daemon wire in
+    /// the [`SnapshotInternals`] side-channel — see that type for why the two
+    /// are different questions.
     #[serde(skip)]
     pub(crate) content_max_seq: i64,
     /// `created_at` of the highest-seq fact; `None` when the room is empty.
     /// Populated by `snapshot_from_facts` so `status_global` avoids a second
-    /// `store.facts()` call. Not serialized to the public room JSON.
+    /// `store.facts()` call. Omitted from the public room JSON; carried over the
+    /// daemon wire in [`SnapshotInternals`].
     #[serde(skip)]
     pub(crate) last_activity_ts: Option<String>,
     pub(crate) active_claims: Vec<Fact>,
     pub(crate) active_blockers: Vec<Fact>,
     pub(crate) open_handoffs: Vec<Fact>,
     /// Pending wake intents used to coalesce repeated `next` polls. Internal
-    /// projection only; the public room schema remains unchanged.
+    /// projection only; the public room schema remains unchanged. Carried over
+    /// the daemon wire in [`SnapshotInternals`].
     #[serde(skip)]
     pub(crate) pending_wakes: Vec<Fact>,
     pub(crate) current_decisions: Vec<Fact>,
@@ -525,11 +530,124 @@ pub(crate) struct RoomSnapshot {
     /// relevance model has that may lower an item's rank, so it is derived
     /// where the signals live rather than re-inferred downstream.
     ///
-    /// Internal: not serialized. A routed (daemon) snapshot therefore arrives
-    /// with this empty, which the relevance model reads as "no author is
-    /// provably stale" — the fail-open direction.
+    /// Omitted from the public room JSON, and carried across the daemon wire in
+    /// [`SnapshotInternals`]. Before that side-channel existed this field was
+    /// dropped by routing, so Direct and Routed mode ranked the SAME ledger
+    /// differently — design audit D1.
     #[serde(skip)]
     pub(crate) stale_authors: BTreeSet<String>,
+}
+
+/// The four `#[serde(skip)]` projections on [`RoomSnapshot`], carried across the
+/// daemon wire beside the snapshot.
+///
+/// # The two questions `#[serde(skip)]` was answering at once
+///
+/// `RoomSnapshot`'s `Serialize` impl serves two consumers: the PUBLIC room JSON
+/// that `rally room --json` prints, and the daemon wire that `rallyd` replies
+/// on. `#[serde(skip)]` answered "keep this out of the public schema" and, as a
+/// side effect nobody chose, also answered "drop this when rallyd is running".
+///
+/// The second answer is a behaviour change disguised as a serialization detail.
+/// Design audit D1 and D6 traced three consequences, all silent:
+///
+/// * **Ranking (D1).** `apply_budget` demotes items whose author is in
+///   `stale_authors`. Empty over the wire means no item is ever demoted, so the
+///   same ledger composes into a DIFFERENT room depending on whether a daemon
+///   happened to be up.
+/// * **Read checkpoints (D6).** `enter` and `next` pass
+///   `snapshot.content_max_seq` to `maybe_append_read_checkpoint`, which
+///   coalesces at `read_seq <= last_checkpoint` — so a routed caller passing 0
+///   wrote no checkpoint at all, and its read position never advanced.
+/// * **Wake coalescing (D6).** `append_next_wake_intent` looks for an existing
+///   pending wake before appending one. An empty `pending_wakes` means the guard
+///   never matches, so a routed caller appends a DUPLICATE wake intent.
+///
+/// # Why a side-channel rather than serializing the fields
+///
+/// Serializing them would fix routing and change the public room schema at the
+/// same time, adding an unbudgeted `pending_wakes` array to every `rally room
+/// --json` response — which is the payload growth RC-054 is open about. The two
+/// questions stay separate: this struct rides the wire, and the public schema is
+/// byte-identical to what it was.
+///
+/// Every field is `#[serde(default)]`, so a reply from a daemon that predates
+/// this struct deserializes to the same empty values the old code produced.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct SnapshotInternals {
+    #[serde(default)]
+    pub(crate) content_max_seq: i64,
+    #[serde(default)]
+    pub(crate) last_activity_ts: Option<String>,
+    #[serde(default)]
+    pub(crate) pending_wakes: Vec<Fact>,
+    #[serde(default)]
+    pub(crate) stale_authors: BTreeSet<String>,
+}
+
+/// Key the internals ride under in the wire snapshot object.
+///
+/// Double-underscored so it cannot collide with a `RoomSnapshot` field name, and
+/// removed on the way in, so a snapshot that round-trips the wire is byte-equal
+/// to one that never left the process.
+pub(crate) const WIRE_INTERNALS_KEY: &str = "__internals";
+
+impl RoomSnapshot {
+    /// Lift the skipped projections out for the wire.
+    pub(crate) fn internals(&self) -> SnapshotInternals {
+        SnapshotInternals {
+            content_max_seq: self.content_max_seq,
+            last_activity_ts: self.last_activity_ts.clone(),
+            pending_wakes: self.pending_wakes.clone(),
+            stale_authors: self.stale_authors.clone(),
+        }
+    }
+
+    /// Restore the skipped projections after the wire.
+    pub(crate) fn restore_internals(&mut self, internals: SnapshotInternals) {
+        self.content_max_seq = internals.content_max_seq;
+        self.last_activity_ts = internals.last_activity_ts;
+        self.pending_wakes = internals.pending_wakes;
+        self.stale_authors = internals.stale_authors;
+    }
+}
+
+/// Serialize a snapshot FOR THE WIRE: the public shape plus [`SnapshotInternals`]
+/// under [`WIRE_INTERNALS_KEY`].
+///
+/// A snapshot that does not serialize to a JSON object is returned unchanged.
+/// No `RoomSnapshot` does; the branch exists so a future `#[serde]` change
+/// degrades to the old behaviour instead of panicking.
+pub(crate) fn snapshot_to_wire_value(
+    snapshot: &RoomSnapshot,
+) -> std::result::Result<Value, serde_json::Error> {
+    let mut value = serde_json::to_value(snapshot)?;
+    let internals = serde_json::to_value(snapshot.internals())?;
+    if let Value::Object(map) = &mut value {
+        map.insert(WIRE_INTERNALS_KEY.to_string(), internals);
+    }
+    Ok(value)
+}
+
+/// Deserialize a wire snapshot, restoring [`SnapshotInternals`] if present.
+///
+/// A payload without the key yields the pre-side-channel values (zero / empty),
+/// so an older daemon still answers a newer client.
+pub(crate) fn snapshot_from_wire_value(
+    mut value: Value,
+) -> std::result::Result<RoomSnapshot, serde_json::Error> {
+    let internals = match &mut value {
+        Value::Object(map) => map
+            .remove(WIRE_INTERNALS_KEY)
+            .map(serde_json::from_value::<SnapshotInternals>)
+            .transpose()?,
+        _ => None,
+    };
+    let mut snapshot: RoomSnapshot = serde_json::from_value(value)?;
+    if let Some(internals) = internals {
+        snapshot.restore_internals(internals);
+    }
+    Ok(snapshot)
 }
 
 impl RoomSnapshot {

@@ -330,6 +330,14 @@ fn from_value<T: DeserializeOwned>(value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(RallyError::json("parse wire reply"))
 }
 
+/// Snapshots do NOT go through [`from_value`]. The daemon ships the four
+/// `#[serde(skip)]` projections in a side-channel key so routed callers rank,
+/// checkpoint, and coalesce the same way direct callers do (design audit
+/// D1/D6). See `store::SnapshotInternals`.
+fn snapshot_from_value(value: Value) -> Result<RoomSnapshot> {
+    store::snapshot_from_wire_value(value).map_err(RallyError::json("parse wire snapshot reply"))
+}
+
 /// Reply-shape mismatch: the daemon answered a DIFFERENT `StoreOk` variant
 /// than the op that was sent. Should be unreachable given the closed
 /// `StoreOp`/`StoreOk` pairing, but the wire is still a boundary — never
@@ -462,7 +470,7 @@ impl RoutedRoomStore {
 
     pub(crate) fn snapshot_with_archived(&self, include_archived: bool) -> Result<RoomSnapshot> {
         match self.dispatch(StoreOp::SnapshotWithArchived { include_archived })? {
-            StoreOk::Snapshot { snapshot } => from_value(snapshot),
+            StoreOk::Snapshot { snapshot } => snapshot_from_value(snapshot),
             _ => Err(unexpected_reply("snapshot_with_archived")),
         }
     }
@@ -472,7 +480,7 @@ impl RoutedRoomStore {
         include_archived: bool,
     ) -> Result<RoomSnapshot> {
         match self.dispatch(StoreOp::SnapshotWithReadersArchived { include_archived })? {
-            StoreOk::SnapshotWithReaders { snapshot } => from_value(snapshot),
+            StoreOk::SnapshotWithReaders { snapshot } => snapshot_from_value(snapshot),
             _ => Err(unexpected_reply("snapshot_with_readers_archived")),
         }
     }

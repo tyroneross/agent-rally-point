@@ -7,6 +7,21 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Fixed — routing no longer changes behaviour
+
+- **The room composes the same way with and without `rallyd`.** Four
+  `RoomSnapshot` projections were `#[serde(skip)]` to keep them out of the public
+  room JSON, and the daemon reply used the same serializer — so routing dropped
+  them. Three behaviours changed depending on whether a daemon happened to be
+  running: relevance ranking stopped demoting stale authors, `enter` and `next`
+  wrote no read checkpoint at all (the coalescing guard skips a zero position),
+  and repeated `next` polls appended a DUPLICATE wake intent every time. The
+  fields now ride a `__internals` side-channel beside the snapshot; the public
+  `rally room --json` schema is unchanged. Controls:
+  `crates/rally-cli/tests/snapshot_wire_internals.rs` asserts all three through
+  the real CLI and daemon, plus a structural check that a FIFTH skipped field
+  cannot be added without carrying it. Mutation-validated four ways.
+
 ## v0.2.0 - 2026-08-04
 
 ### Fixed — verdicts that nothing acted on
