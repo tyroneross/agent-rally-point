@@ -26,7 +26,7 @@ The gate rejects four shapes:
 | `noreply@anthropic.com`, `noreply@openai.com` in the author or committer field | Agent identities. See the next section — these belong in a trailer, not in authorship. |
 | Anything not on the allowlist | Deny by default. |
 
-**Never set your identity with `git config` inside a test fixture.** `git config` defaults to `--local`, and `--local` writes to whichever repository git resolves — which is not always the one you named. `git -C <scratch>` looks airtight and is not: git injects `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_INDEX_FILE` into a hook's environment, **those override `-C`**, and the pre-push gate used to run `cargo test` without clearing them. Fixture config writes resolved against the real repository, the local override outranked the global identity, and 70 commits landed under `Rally Test <rally@example.test>` before anyone noticed.
+**Never set your identity with `git config` inside a test fixture.** `git config` defaults to `--local`, and `--local` writes to whichever repository git resolves — which is not always the one you named. `git -C <scratch>` looks airtight and is not: git injects `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_INDEX_FILE` into a hook's environment, **those override `-C`**, and the pre-push gate used to run `cargo test` without clearing them. Fixture config writes resolved against the real repository, the local override outranked the global identity, and 64 commits landed on `main` under `Rally Test <rally@example.test>` before anyone noticed.
 
 A fixture that writes no config at all is immune to this regardless of what the environment says. That is why the helper below exists. `docs/ROOT-CAUSE-REGISTER.md` RC-064 has the forensic detail.
 

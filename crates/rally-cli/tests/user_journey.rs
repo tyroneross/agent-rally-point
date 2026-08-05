@@ -4310,28 +4310,8 @@ fn rally_owners_dirty_maps_dirty_path_to_claim_session() {
     let src_dir = workspace.cwd.join("src");
     fs::create_dir_all(&src_dir).unwrap();
     fs::write(src_dir.join("lib.rs"), "pub fn value() -> i32 { 1 }\n").unwrap();
-    let add = Command::new("git")
-        .arg("-C")
-        .arg(&workspace.cwd)
-        .args(["add", "src/lib.rs"])
-        .output()
-        .unwrap();
-    assert!(
-        add.status.success(),
-        "git add failed: {}",
-        String::from_utf8_lossy(&add.stderr)
-    );
-    let commit = Command::new("git")
-        .arg("-C")
-        .arg(&workspace.cwd)
-        .args(["commit", "-q", "-m", "add lib"])
-        .output()
-        .unwrap();
-    assert!(
-        commit.status.success(),
-        "git commit failed: {}",
-        String::from_utf8_lossy(&commit.stderr)
-    );
+    fixture_git(&workspace.cwd, &["add", "src/lib.rs"]);
+    fixture_git(&workspace.cwd, &["commit", "-q", "-m", "add lib"]);
 
     let claim = workspace.json(&[
         "say",

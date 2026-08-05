@@ -3,7 +3,7 @@
 
 //! Adversarial control for the fixture git-identity isolation guard.
 //!
-//! Closes the register entry for the 2026-07-10 identity leak: 70 commits
+//! Closes the register entry for the 2026-07-10 identity leak: 64 commits on `main`
 //! authored `Rally Test <rally@example.test>` landed in the REAL
 //! agent-rally-point checkout because Git exported repository-scoping
 //! variables such as `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_INDEX_FILE` into a
@@ -20,15 +20,19 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
-use common::test_git_fixture::{FIXTURE_EMAIL, assert_fixture_root, fixture_git};
+use common::test_git_fixture::{
+    FIXTURE_EMAIL, GIT_REPOSITORY_SCOPE_ENV_VARS, assert_fixture_root, fixture_git,
+    fixture_git_command,
+};
 
 const HOSTILE_ENV_CHILD: &str = "RALLY_FIXTURE_GIT_HOSTILE_ENV_CHILD";
 const HOSTILE_ENV_SCRATCH: &str = "RALLY_FIXTURE_GIT_HOSTILE_ENV_SCRATCH";
 const HOSTILE_ENV_HEAD_OUT: &str = "RALLY_FIXTURE_GIT_HOSTILE_ENV_HEAD_OUT";
+const HOSTILE_SUITE_CHILD: &str = "RALLY_FIXTURE_GIT_HOSTILE_SUITE_CHILD";
 
 fn git_available() -> bool {
     Command::new("git")
@@ -36,6 +40,36 @@ fn git_available() -> bool {
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
+}
+
+/// Runs a raw repo-scoped Git command without fixture identity overrides.
+/// Decoy setup needs the repository's own local identity, but it must still
+/// be immune to hostile hook variables that override `git -C <root>`.
+fn repo_git(root: &std::path::Path, args: &[&str]) -> Output {
+    let mut command = fixture_git_command(root);
+    command.args(args);
+    command.output().expect("git invocation")
+}
+
+fn apply_hostile_git_scope(command: &mut Command, decoy: &std::path::Path) {
+    let git_dir = decoy.join(".git");
+    let index = git_dir.join("index");
+    let objects = git_dir.join("objects");
+    let ceiling = decoy.parent().unwrap_or(decoy);
+    for var in GIT_REPOSITORY_SCOPE_ENV_VARS {
+        match *var {
+            "GIT_DIR" | "GIT_COMMON_DIR" => command.env(var, &git_dir),
+            "GIT_WORK_TREE" => command.env(var, decoy),
+            "GIT_INDEX_FILE" => command.env(var, &index),
+            "GIT_OBJECT_DIRECTORY" | "GIT_QUARANTINE_PATH" | "GIT_ALTERNATE_OBJECT_DIRECTORIES" => {
+                command.env(var, &objects)
+            }
+            "GIT_CEILING_DIRECTORIES" => command.env(var, ceiling),
+            "GIT_PREFIX" => command.env(var, "hostile-prefix/"),
+            "GIT_NAMESPACE" => command.env(var, "rally-hostile"),
+            _ => unreachable!("all repository-scope variables are mapped"),
+        };
+    }
 }
 
 fn tmp_dir(label: &str) -> PathBuf {
@@ -87,6 +121,22 @@ fn fixture_git_rejects_nested_path_outside_tempdir() {
 }
 
 #[test]
+fn fixture_git_rejects_config_subcommand() {
+    let root = tmp_dir("reject-config");
+    let result = std::panic::catch_unwind(|| {
+        fixture_git(
+            &root,
+            &["config", "user.email", "must-not-write@rally.invalid"],
+        );
+    });
+    assert!(
+        result.is_err(),
+        "fixture_git must make config writes unavailable through its normal API"
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn fixture_git_writes_no_identity_config() {
     if !git_available() {
         eprintln!("skipping: git not on PATH");
@@ -109,12 +159,7 @@ fn fixture_git_writes_no_identity_config() {
 
     // Nothing was ever written to local config: `git config --local --get
     // user.email` must exit non-zero (git's convention for "key not set").
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .args(["config", "--local", "--get", "user.email"])
-        .output()
-        .expect("git config --get");
+    let out = repo_git(&root, &["config", "--local", "--get", "user.email"]);
     assert!(
         !out.status.success(),
         "user.email must NOT be present in local config after fixture_git commits; got: {}",
@@ -154,12 +199,7 @@ fn fixture_git_leaves_decoy_real_repo_config_untouched() {
     // would have clobbered had `-C` resolved here instead of the intended
     // fixture root.
     let setup = |args: &[&str]| {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&decoy)
-            .args(args)
-            .output()
-            .expect("git invocation");
+        let out = repo_git(&decoy, args);
         assert!(
             out.status.success(),
             "decoy setup git {:?} failed: {}",
@@ -249,12 +289,7 @@ fn fixture_git_ignores_inherited_git_dir_pointing_at_another_repo() {
     let scratch = tmp_dir("envleak-scratch");
 
     let setup = |args: &[&str]| {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&decoy)
-            .args(args)
-            .output()
-            .expect("git invocation");
+        let out = repo_git(&decoy, args);
         assert!(
             out.status.success(),
             "decoy setup git {:?} failed: {}",
@@ -269,30 +304,25 @@ fn fixture_git_ignores_inherited_git_dir_pointing_at_another_repo() {
 
     let decoy_config = decoy.join(".git").join("config");
     let config_before = fs::read(&decoy_config).expect("read decoy config before");
-    let decoy_head_before = {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&decoy)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("git invocation");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
+    let decoy_head_before =
+        String::from_utf8_lossy(&repo_git(&decoy, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
 
     // Reproduce the hostile condition in a child test process. Environment
     // variables configured on Command affect only the child, so sibling tests
     // in this process cannot observe GIT_DIR while they run raw Git commands.
     let head_out = scratch.join("child-head.txt");
-    let child = Command::new(std::env::current_exe().expect("current test binary"))
+    let mut child_command = Command::new(std::env::current_exe().expect("current test binary"));
+    child_command
         .arg("--exact")
         .arg("fixture_git_ignores_inherited_git_dir_pointing_at_another_repo")
         .arg("--test-threads=1")
         .env(HOSTILE_ENV_CHILD, "1")
         .env(HOSTILE_ENV_SCRATCH, &scratch)
-        .env(HOSTILE_ENV_HEAD_OUT, &head_out)
-        .env("GIT_DIR", decoy.join(".git"))
-        .env("GIT_WORK_TREE", &decoy)
-        .env("GIT_INDEX_FILE", decoy.join(".git/index"))
+        .env(HOSTILE_ENV_HEAD_OUT, &head_out);
+    apply_hostile_git_scope(&mut child_command, &decoy);
+    let child = child_command
         .output()
         .expect("launch hostile-environment child test");
     assert!(
@@ -312,15 +342,10 @@ fn fixture_git_ignores_inherited_git_dir_pointing_at_another_repo() {
         fs::read(&decoy_config).expect("read decoy config after"),
         "an inherited GIT_DIR must not let a fixture write into another repo's config"
     );
-    let decoy_head_after = {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&decoy)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("git invocation");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
+    let decoy_head_after =
+        String::from_utf8_lossy(&repo_git(&decoy, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
     assert_eq!(
         decoy_head_before, decoy_head_after,
         "an inherited GIT_DIR must not let a fixture commit into another repo"
@@ -338,4 +363,72 @@ fn fixture_git_ignores_inherited_git_dir_pointing_at_another_repo() {
 
     fs::remove_dir_all(&decoy).ok();
     fs::remove_dir_all(&scratch).ok();
+}
+
+/// Launch the complete integration-test binary with every repository-scoping
+/// variable pointed at an external decoy. This catches future raw Git setup
+/// commands that bypass the shared sanitized command boundary.
+#[test]
+fn fixture_test_binary_is_hermetic_under_inherited_git_scope() {
+    if std::env::var_os(HOSTILE_SUITE_CHILD).is_some() {
+        return;
+    }
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+
+    let decoy = tmp_dir("whole-suite-decoy");
+    let setup = |args: &[&str]| {
+        let out = repo_git(&decoy, args);
+        assert!(
+            out.status.success(),
+            "whole-suite decoy setup git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    setup(&["init", "-q", "-b", "main"]);
+    setup(&["config", "user.email", "decoy-human@rossl.example"]);
+    setup(&["config", "user.name", "Decoy Human"]);
+    setup(&["commit", "--allow-empty", "-m", "decoy initial"]);
+
+    let config_path = decoy.join(".git/config");
+    let index_path = decoy.join(".git/index");
+    let config_before = fs::read(&config_path).expect("read whole-suite decoy config before");
+    let index_before = fs::read(&index_path).expect("read whole-suite decoy index before");
+    let head_before = repo_git(&decoy, &["rev-parse", "HEAD"]).stdout;
+
+    let mut child_command = Command::new(std::env::current_exe().expect("current test binary"));
+    child_command
+        .arg("--test-threads=8")
+        .env(HOSTILE_SUITE_CHILD, "1");
+    apply_hostile_git_scope(&mut child_command, &decoy);
+    let child = child_command
+        .output()
+        .expect("launch full hostile-environment fixture test binary");
+    assert!(
+        child.status.success(),
+        "the complete fixture test binary must pass under hostile Git scope; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+
+    assert_eq!(
+        config_before,
+        fs::read(&config_path).expect("read whole-suite decoy config after"),
+        "the hostile whole-suite run must not alter the decoy config"
+    );
+    assert_eq!(
+        index_before,
+        fs::read(&index_path).expect("read whole-suite decoy index after"),
+        "the hostile whole-suite run must not alter the decoy index"
+    );
+    assert_eq!(
+        head_before,
+        repo_git(&decoy, &["rev-parse", "HEAD"]).stdout,
+        "the hostile whole-suite run must not move the decoy HEAD"
+    );
+
+    fs::remove_dir_all(&decoy).ok();
 }

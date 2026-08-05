@@ -5,7 +5,7 @@
 //! in this crate's tests.
 //!
 //! # The defect this closes
-//! On 2026-07-10, 70 commits landed in the REAL agent-rally-point checkout
+//! On 2026-07-10, 64 commits landed on `main` in the REAL agent-rally-point checkout
 //! authored `Rally Test <rally@example.test>`. Fixture helpers ran
 //! `git -C <root> config user.email rally@example.test`, and `git config`
 //! (default `--local`) wrote into the real repository.
@@ -58,6 +58,21 @@ use std::process::Command;
 pub const FIXTURE_NAME: &str = "Rally Fixture";
 pub const FIXTURE_EMAIL: &str = "fixture@rally.invalid";
 
+/// Git variables that redirect repository discovery or object/index access.
+/// Every test command that relies on `git -C <root>` must clear these first.
+pub const GIT_REPOSITORY_SCOPE_ENV_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_QUARANTINE_PATH",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
 /// Panics unless `root` resolves to a path inside the process temp dir.
 ///
 /// This defense-in-depth guard rejects a fixture root outside the process temp
@@ -79,7 +94,7 @@ pub fn assert_fixture_root(root: &Path) {
         "fixture root {actual:?} is OUTSIDE the expected temp dir {expected:?} — \
          a test fixture tried to operate on a path outside the process temp \
          directory. Refusing the Git operation contains the bad-root hazard. \
-         This is separate from the 70-commit `rally@example.test` identity \
+         This is separate from the 64-commit `rally@example.test` identity \
          leak, which `fixture_git` closes by clearing repository-scoping \
          environment variables and never writing fixture identity to config."
     );
@@ -119,14 +134,17 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
 /// inside the process temp dir first, then asserts the command succeeded.
 /// Returns trimmed stdout.
 pub fn fixture_git(root: &Path, args: &[&str]) -> String {
-    assert_fixture_root(root);
-    let out = Command::new("git")
+    assert_ne!(
+        args.first(),
+        Some(&"config"),
+        "fixture_git refuses the `git config` subcommand; fixture identity must be supplied per invocation"
+    );
+    let mut command = fixture_git_command(root);
+    command
         .arg("-c")
         .arg(format!("user.name={FIXTURE_NAME}"))
         .arg("-c")
         .arg(format!("user.email={FIXTURE_EMAIL}"))
-        .arg("-C")
-        .arg(root)
         .args(args)
         // Belt and braces: `-c` above covers anything reading config;
         // these env vars cover commit-creation call paths directly.
@@ -134,28 +152,8 @@ pub fn fixture_git(root: &Path, args: &[&str]) -> String {
         .env("GIT_AUTHOR_EMAIL", FIXTURE_EMAIL)
         .env("GIT_COMMITTER_NAME", FIXTURE_NAME)
         .env("GIT_COMMITTER_EMAIL", FIXTURE_EMAIL)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        // THE actual July-10 mechanism (RC-064, corrected 2026-08-05): git
-        // injects these into a hook's environment, and they OVERRIDE `-C`.
-        // The pre-push gate ran `cargo test` without clearing them, so
-        // `git -C <scratch>` in a fixture resolved against the REAL repo.
-        // `.githooks/pre-push` was fixed at `6616b711`, but a fixture that
-        // depends on its caller having cleared the environment is a fixture
-        // waiting for the next caller who forgets. Clearing them HERE makes
-        // the fixture correct no matter who spawns it -- including `cargo
-        // test` run by hand inside a hook, which no gate covers.
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_PREFIX")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_QUARANTINE_PATH")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("GIT_NAMESPACE")
-        .output()
-        .expect("git invocation");
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    let out = command.output().expect("git invocation");
     assert!(
         out.status.success(),
         "git {:?} failed: {}",
@@ -163,4 +161,24 @@ pub fn fixture_git(root: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Builds a repository-scoped Git command for test scaffolding.
+///
+/// Callers that intentionally need a repository's own local configuration
+/// can add arguments to this command without inheriting hook-provided scope
+/// variables that would override `-C <root>`.
+pub fn fixture_git_command(root: &Path) -> Command {
+    assert_fixture_root(root);
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root);
+    // THE actual July-10 mechanism (RC-064, corrected 2026-08-05): git
+    // injects these into a hook's environment, and they OVERRIDE `-C`.
+    // Clearing them at the shared command-construction boundary protects both
+    // fixture_git and raw test setup commands that intentionally need their
+    // repository's own local configuration.
+    for var in GIT_REPOSITORY_SCOPE_ENV_VARS {
+        command.env_remove(var);
+    }
+    command
 }

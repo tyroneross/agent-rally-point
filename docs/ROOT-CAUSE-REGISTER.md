@@ -1479,9 +1479,10 @@ review answers the question you asked.
   a regression test (`tests/hooks/test_prepush_changed_files.sh`) exporting real-repo `GIT_DIR`
   and asserting the gate resolves the pushed SHA. The "wrong fixture root" reading above is a
   real generalized hazard and the eliminate-tier fix below still closes it, but it is NOT the
-  contemporaneous explanation for these 70 commits. Recording both: the control is right, the
-  original diagnosis was not, and a register that keeps a wrong mechanism teaches the wrong
-  lesson to whoever reads it next.
+  contemporaneous explanation for the 64 commits on `main` (70 contaminated commits are reachable
+  across all local refs: three unmerged commits and three stash-created objects). Recording both:
+  the control is right, the original diagnosis was not, and a register that keeps a wrong mechanism
+  teaches the wrong lesson to whoever reads it next.
 - **Two more sites the first count missed:** `crates/rally-cli/tests/init_consumer_repo.rs:75`
   and `crates/rally-cli/tests/worktree_gc.rs:65` do the same thing with
   `init-consumer-test@example.test` and `gc-test@example.test`. Five call sites, not three. The
