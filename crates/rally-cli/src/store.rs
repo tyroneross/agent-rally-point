@@ -2880,6 +2880,22 @@ fn invalidate_segment_fold_memo() {
     }
 }
 
+/// Return the cached fold only when every room key and fingerprint component
+/// matches. Kept as a pure helper so the adversarial same-fingerprint control
+/// can exercise the exact production predicate while holding the memo lock;
+/// calling `facts_from_segments` there would release the lock and let an
+/// unrelated parallel test replace the process-global one-slot cache.
+fn segment_fold_memo_hit(
+    memo: &Option<SegmentFoldMemo>,
+    log_dir: &Path,
+    archive_dir: &Path,
+    fingerprint: &[FileFingerprint],
+) -> Option<Vec<Fact>> {
+    let memo = memo.as_ref()?;
+    (memo.log_dir == log_dir && memo.archive_dir == archive_dir && memo.fingerprint == fingerprint)
+        .then(|| (*memo.facts).clone())
+}
+
 fn facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> {
     let live = read_segment_files(log_dir)?;
     let archived = replay_archive_segments(archive_dir)?;
@@ -2887,12 +2903,9 @@ fn facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> 
 
     // A poisoned lock is not a reason to fail a read: fall through and fold.
     if let Ok(memo) = SEGMENT_FOLD_MEMO.lock()
-        && let Some(memo) = memo.as_ref()
-        && memo.log_dir == log_dir
-        && memo.archive_dir == archive_dir
-        && memo.fingerprint == fingerprint
+        && let Some(facts) = segment_fold_memo_hit(&memo, log_dir, archive_dir, &fingerprint)
     {
-        return Ok((*memo.facts).clone());
+        return Ok(facts);
     }
 
     let mut entries: Vec<LedgerLine> = Vec::new();
@@ -6911,14 +6924,16 @@ mod ledger_tests {
         let live = read_segment_files(&log_dir).unwrap();
         let archived = replay_archive_segments(&archive_dir).unwrap();
         let rewritten_fingerprint = segments_fingerprint(&live, &archived);
-        {
+        let cached_hit = {
             let mut memo = SEGMENT_FOLD_MEMO.lock().unwrap();
-            let cached = memo.as_mut().expect("old room fold must be cached");
-            cached.fingerprint = rewritten_fingerprint;
-        }
+            memo.as_mut()
+                .expect("old room fold must be cached")
+                .fingerprint = rewritten_fingerprint.clone();
+            segment_fold_memo_hit(&memo, &log_dir, &archive_dir, &rewritten_fingerprint)
+                .expect("adversarial fingerprint collision must hit the cached fold")
+        };
         assert_eq!(
-            facts_from_segments(&log_dir, &archive_dir).unwrap()[0].event_id,
-            "event-old",
+            cached_hit[0].event_id, "event-old",
             "adversarial fingerprint collision must exercise the cached value"
         );
 
