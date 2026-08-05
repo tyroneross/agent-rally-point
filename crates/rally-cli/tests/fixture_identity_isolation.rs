@@ -50,27 +50,42 @@ fn tmp_dir(label: &str) -> PathBuf {
     p
 }
 
-/// The real agent-rally-point checkout's `rally-cli` crate root — used ONLY
-/// as a probe path to prove the guard rejects it. Never mutated; no git
-/// command is ever run against it in this file.
-fn real_repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+/// A path that is outside the process temp dir on every platform this builds
+/// for — used ONLY as a probe to prove the guard rejects it. Never mutated; no
+/// git command is ever run against it in this file.
+///
+/// This deliberately does NOT use `CARGO_MANIFEST_DIR`. The pre-push gate builds
+/// in a detached worktree under `$TMPDIR`, so there the crate root IS inside the
+/// temp dir and the guard correctly does not fire — a `should_panic` test keyed
+/// on the manifest dir passes locally and fails in the gate. The assertion under
+/// test is "outside temp is rejected", so the probe must be outside temp by
+/// construction rather than by assumption about where the checkout lives.
+fn outside_tempdir_probe() -> PathBuf {
+    PathBuf::from("/rally-fixture-guard-probe-never-created")
 }
 
 #[test]
 #[should_panic(expected = "is OUTSIDE the expected temp dir")]
 fn fixture_root_outside_tempdir_panics() {
-    assert_fixture_root(&real_repo_root());
+    assert_fixture_root(&outside_tempdir_probe());
 }
 
 #[test]
 #[should_panic(expected = "is OUTSIDE the expected temp dir")]
-fn fixture_git_rejects_path_inside_real_checkout() {
-    // A path constructed UNDER CARGO_MANIFEST_DIR (not the crate root itself)
-    // proves the guard rejects any path inside the real checkout, not merely
-    // the one exact root string.
-    let inside_real_checkout = real_repo_root().join("src");
-    assert_fixture_root(&inside_real_checkout);
+fn fixture_git_rejects_nested_path_outside_tempdir() {
+    // A nested path proves the guard rejects by prefix, not by exact string
+    // match on one known root.
+    //
+    // Scope limit, stated because the guard's name overpromises: this control
+    // is "outside the process temp dir is rejected", NOT "the real checkout is
+    // rejected". Those coincide only while the checkout lives outside `$TMPDIR`.
+    // In the pre-push gate — and in any CI or dev setup that builds under a temp
+    // path — the checkout IS inside the temp dir and this guard cannot fire. The
+    // unconditional control is `fixture_git_writes_no_identity_config` below:
+    // the fixture writes no config anywhere, so a bad root is inert regardless
+    // of where it points. This guard is defense in depth, not the boundary.
+    let nested = outside_tempdir_probe().join("src");
+    assert_fixture_root(&nested);
 }
 
 #[test]
