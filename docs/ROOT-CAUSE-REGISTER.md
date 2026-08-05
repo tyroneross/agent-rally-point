@@ -1463,10 +1463,25 @@ review answers the question you asked.
   — `crates/rally-cli/src/lib.rs:8187`, `crates/rally-cli/src/run_worktree.rs:446`,
   `crates/rally-cli/tests/user_journey.rs:244`. `git config` defaults to `--local`, and
   `--local` does not mean "the directory I named". It means "the repository that encloses the
-  directory I named", discovered by walking up. A fixture whose root resolved to — or sat
-  inside — the real checkout wrote a repo-local override into the real `.git/config`. A local
-  override outranks the global one, so every commit made in that clone afterward carried the
-  fixture identity, and nothing said so.
+  directory I named", discovered by walking up. A local override outranks the global one, so
+  every commit made in that clone afterward carried the fixture identity, and nothing said so.
+- **CORRECTED 2026-08-05 — the July 10 mechanism was environment inheritance, not a wrong fixture
+  root.** An independent forensic pass (Codex, pinned at `1737d9b`) established that all three
+  original fixtures already invoked git with an explicit `-C <scratch>` and never relied on the
+  process working directory. The failing condition was narrower and less obvious: git injects
+  `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and siblings into a hook's environment, and those
+  variables **override `-C`**. At incident parent `20a40bafd`, `.githooks/pre-push:68-79` changed
+  into a detached worktree without clearing them before running `scripts/run-quality-gate.sh`, so
+  the cargo tests it spawned resolved `git -C <scratch> config` against the REAL repository.
+  Vulnerable writers: `init_status_git_repo`, `init_test_repo`, `init_real_repo`. Which fired
+  first is **unknown** — `6616b711` names the failing groups but the gate output is gone.
+  That hook was fixed in `6616b711`, which unsets the scope vars in both gate subshells and adds
+  a regression test (`tests/hooks/test_prepush_changed_files.sh`) exporting real-repo `GIT_DIR`
+  and asserting the gate resolves the pushed SHA. The "wrong fixture root" reading above is a
+  real generalized hazard and the eliminate-tier fix below still closes it, but it is NOT the
+  contemporaneous explanation for these 70 commits. Recording both: the control is right, the
+  original diagnosis was not, and a register that keeps a wrong mechanism teaches the wrong
+  lesson to whoever reads it next.
 - **Two more sites the first count missed:** `crates/rally-cli/tests/init_consumer_repo.rs:75`
   and `crates/rally-cli/tests/worktree_gc.rs:65` do the same thing with
   `init-consumer-test@example.test` and `gc-test@example.test`. Five call sites, not three. The
