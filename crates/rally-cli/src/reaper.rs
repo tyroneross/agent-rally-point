@@ -111,6 +111,10 @@ pub(crate) struct ReapReport {
     /// idempotent, and each pass starts from a fresh projection.
     #[serde(default)]
     pub(crate) remaining: usize,
+    /// Durable writes this apply pass attempted, whether they landed or failed.
+    /// Zero for dry runs and apply passes with no eligible work.
+    #[serde(default)]
+    pub(crate) attempted_writes: usize,
     /// Items whose durable append FAILED: a `ClaimExpired`, a handoff `Resolve`,
     /// or the lead relinquish that did not reach the ledger.
     ///
@@ -118,16 +122,18 @@ pub(crate) struct ReapReport {
     /// only previous signal was a stderr line nothing parses.
     #[serde(default)]
     pub(crate) write_failures: usize,
-    /// Every staged write landed.
+    /// At least one write was attempted and every attempted write landed.
     ///
     /// This used to be a copy of the `--apply` argument, so `rally doctor
     /// --reap-stale --apply --json` answered `applied: true` and `ok: true`
-    /// against a fully unwritable ledger (D7). It is now `apply &&
-    /// write_failures == 0`: false either because nothing was attempted or
-    /// because something was attempted and did not land. Which one is answered
-    /// by `write_failures`, and `rally doctor` exits non-zero when it is
-    /// non-zero.
+    /// against a fully unwritable ledger (D7). `attempted_writes` distinguishes
+    /// a no-op from an attempted pass, and `complete` distinguishes a partial
+    /// budgeted pass from a fully drained one.
     pub(crate) applied: bool,
+    /// The apply pass reached every eligible action and every attempted write
+    /// landed. False for dry runs, partial passes, and write failures.
+    #[serde(default)]
+    pub(crate) complete: bool,
 }
 
 // =============================================================================
@@ -365,6 +371,16 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
     apply: bool,
     mode: ReapMode,
 ) -> Result<ReapReport> {
+    let budget = apply.then(reap_apply_budget).flatten();
+    run_reap_stale_in_room_with_budget(room, apply, mode, budget)
+}
+
+fn run_reap_stale_in_room_with_budget(
+    room: &RoomStore,
+    apply: bool,
+    mode: ReapMode,
+    budget: Option<std::time::Duration>,
+) -> Result<ReapReport> {
     // The clock starts BEFORE the projection, not before the append loop. The
     // opening `snapshot()` is a full ledger read and is the same cost the
     // watchdog is measuring; a budget that ignored it would be a budget for the
@@ -377,9 +393,10 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
     let mut preserved: usize = 0;
     let mut write_failures: usize = 0;
     let mut remaining: usize = 0;
-    // Only a writing pass needs a budget: a dry run appends nothing and is one
-    // projection, so bounding it would only make the preview lie.
-    let budget = apply.then(reap_apply_budget).flatten();
+    // One counter governs the whole queue, independently of whether an append
+    // succeeds. Action zero is the global forward-progress floor; every later
+    // claim, handoff, or lead action observes the same elapsed-time budget.
+    let mut attempted_actions: usize = 0;
 
     // Identify the stale-owner set at snapshot time (squad-level, 2h bar).
     // Used for the lead relinquish decision; claim eligibility is per-claim
@@ -425,15 +442,16 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
             preserved += 1;
             continue;
         }
-        // Guaranteed forward progress: the FIRST eligible item is always
+        // Guaranteed forward progress: the FIRST eligible action is always
         // attempted, even when the opening projection already spent the budget.
         // Without this floor a ledger slow enough to exhaust the budget before
         // the loop starts would return `remaining: N` forever and never shrink,
         // which is the failure this budget exists to end.
-        if !claims_reaped.is_empty() && budget.is_some_and(|b| started.elapsed() >= b) {
+        if attempted_actions > 0 && budget.is_some_and(|b| started.elapsed() >= b) {
             remaining += 1;
             continue;
         }
+        attempted_actions += 1;
 
         let reason = match (owner_eligible, lease_eligible) {
             (true, true) => "owner-stale+lease-expired",
@@ -548,10 +566,11 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
                 preserved += 1;
                 continue;
             }
-            if budget.is_some_and(|b| started.elapsed() >= b) {
+            if attempted_actions > 0 && budget.is_some_and(|b| started.elapsed() >= b) {
                 remaining += 1;
                 continue;
             }
+            attempted_actions += 1;
 
             let reaped = ReapedHandoff {
                 handoff_id: handoff.event_id.clone(),
@@ -623,6 +642,11 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
     // log, count as preserved, omit from the report.
     let lead_relinquished: Option<String> = if let Some(lead_tool) = &snapshot.lead {
         if stale_owners.contains(lead_tool.as_str()) {
+            if attempted_actions > 0 && budget.is_some_and(|b| started.elapsed() >= b) {
+                remaining += 1;
+                None
+            } else {
+                attempted_actions += 1;
             let mut relinquish_committed = true;
             if apply {
                 let relinquish_fact = Fact {
@@ -667,6 +691,7 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
             } else {
                 None
             }
+            }
         } else {
             None
         }
@@ -687,8 +712,10 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
         lead_relinquished,
         preserved_future_or_active: preserved,
         remaining,
+        attempted_writes: if apply { attempted_actions } else { 0 },
         write_failures,
-        applied: apply && write_failures == 0,
+        applied: apply && attempted_actions > 0 && write_failures == 0,
+        complete: apply && remaining == 0 && write_failures == 0,
     })
 }
 
