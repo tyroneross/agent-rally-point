@@ -1864,26 +1864,30 @@ D6 are below.
   | state | full drain | per verified append |
   |---|---|---|
   | before | 40.6 s | ~645 ms |
-  | after the three cost cuts | 29.5 s | ~470 ms |
+  | after the cost cuts | 29.5 s | ~470 ms |
   | after the pass budget | 15 passes, every one ≤ 2.5 s, 0 watchdog failures | unchanged |
 
-- **What is mitigated — three cost cuts, each independently justified.**
+- **What is mitigated — two cost cuts, each independently justified.**
   1. **The segment fold is memoized** on the fingerprint the reconcile sidecar already trusts
      (`(name, len, mtime_ns)` per file). It removes no fold; it makes the REPEATS free. Within one
      append the room mutation lock is held, so the post-write folds collapse to one parse.
-  2. **The two tail reads are now O(1) in decoding, as their comments always claimed.**
-     `last_seq_in_segment` and `segment_event_id_present_tail_first` both called
-     `read_segment_entries(..)` — which parses every line — and only then took `.last()` or
-     `.rev()`. This entry already recorded that false O(1) claim and corrected the prose; the code
-     now matches it. One deliberate widening: corruption further back in a segment is no longer
-     raised by a caller that finds what it wants in the tail. Every full fold still raises it on the
-     next read.
-  3. **`append_state_transition_verified` takes its projections only where it reads them.** Two
+  2. **`append_state_transition_verified` takes its projections only where it reads them.** Two
      unconditional `self.snapshot()` calls — a full ledger load plus the quadratic room projection,
      each — ran before and after every write. `ClaimExpired` and `Receipt` fall into the match's
      `_ => {}` arm and used NEITHER. A 63-claim reap therefore computed 126 room projections and
      discarded all of them. The calls now live inside the `Release` and `Resolve` arms, where
      they cannot drift away from their use again.
+- **A third cut was attempted and REVERTED, and the reversal is the interesting part.**
+  `last_seq_in_segment` and `segment_event_id_present_tail_first` both call `read_segment_entries`,
+  which parses every line, and only then take `.last()` or `.rev()` — the false O(1) this entry
+  already recorded. Making the decode actually tail-first bought ~3% (31.0 s → 30.1 s) and cost the
+  invariant that COMPLETED corruption anywhere in a canonical segment is always loud: a scanner
+  that stops at a valid tail never reaches a corrupt line behind it. `ledger_tests` asserts exactly
+  that invariant on both functions, and it now seeds a VALID line after the corrupt one, so a
+  tail-first scanner cannot pass by finding the good tail first. The readback is the silent-drop
+  detector; weakening its corruption sensitivity is the wrong trade at any price, and at 3% it is
+  not even a tempting one. **Recorded rather than deleted** — the next reader will have the same
+  idea, and the measurement is why it should not be taken.
 - **What is NOT fixed, measured after the cuts.** A verified append still makes FOUR full passes
   over the ledger: `segment_seq_stats` and `read_db_event_stats` (both inside
   `refresh_reconcile_cache_after_append`, which deliberately re-reads BOTH sides rather than

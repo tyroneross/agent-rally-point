@@ -2118,12 +2118,9 @@ impl DirectRoomStore {
         let event_id = &appended.event_id;
 
         // Fast path: the fact was JUST appended to the active segment, and it is
-        // the newest line there. Scan the active segment tail-first — on the
-        // happy path the event is the last line, so this is O(1) instead of
-        // O(#segments * #lines). Correctness is unchanged: a true silent-drop
-        // misses here (the line was never written), so we fall through to the
-        // full live+archive scan, which also misses, yielding the error. The
-        // active-first scan can only ADD a hit, never mask a real absence.
+        // the newest line there. Validate the whole active segment, then search
+        // its parsed entries tail-first. A valid tail must never hide completed
+        // corruption earlier in the canonical segment.
         let active = self.active_segment_path();
         if segment_event_id_present_tail_first(&active, event_id)? {
             return Ok(appended);
@@ -4765,92 +4762,28 @@ fn segment_event_id_present<'a>(
     Ok(false)
 }
 
-/// R9-readback fast path: scan a SINGLE segment file for `event_id`, tail-first.
+/// R9-readback fast path: validate a SINGLE segment file, then scan for
+/// `event_id` tail-first.
 ///
 /// The event we just appended is the newest line in the active segment, so the
-/// last non-empty line is the overwhelmingly likely hit. Reading the whole file
-/// and walking lines bottom-up keeps this allocation-light and O(1) on the happy
-/// path. A missing file (segment not yet created — impossible right after an
-/// append, but handled defensively) returns `false`, deferring to the full scan.
+/// last non-empty line is the overwhelmingly likely hit. A missing file
+/// (segment not yet created — impossible right after an append, but handled
+/// defensively) returns `false`, deferring to the full scan.
 ///
 /// Correctness: returning `false` here NEVER produces a false readback failure —
 /// the caller falls through to the authoritative full live+archive scan. A
-/// `true` here is a genuine presence (we matched the exact `event_id`).
+/// `true` here is a genuine presence (we matched the exact `event_id`) and all
+/// completed lines in the segment passed canonical validation.
 fn segment_event_id_present_tail_first(path: &Path, event_id: &str) -> Result<bool> {
-    Ok(visit_segment_entries_newest_first(path, |entry| {
-        (entry.payload.get("event_id").and_then(|v| v.as_str()) == Some(event_id)).then_some(())
-    })?
-    .is_some())
-}
-
-/// Parse a segment's lines NEWEST FIRST, stopping as soon as `visit` returns
-/// `Some`.
-///
-/// # Why not `read_segment_entries(..).into_iter().rev()`
-///
-/// That parses every line into a `Vec` and only then reverses it, so the number
-/// of COMPARISONS is O(1) on the happy path but the PARSE is unconditional. Both
-/// the readback gate and the seq dup gate ran on every append and were described
-/// in their own comments as O(1) while costing a full segment parse each — two
-/// of the ten folds design audit D10 counted (RC-058). Reading the file is still
-/// O(file); decoding is now O(lines actually examined), which for both callers is
-/// one.
-///
-/// # The torn-tail rule, preserved
-///
-/// A final line with no terminating newline that fails to parse is a crash
-/// artifact, not corruption, and is skipped — same verdict the forward reader
-/// reaches by breaking out of its loop. Any other parse failure is corruption and
-/// is loud.
-///
-/// # One deliberate widening
-///
-/// The forward reader parses every line, so it raises corruption anywhere in the
-/// segment even when the caller only wanted the tail. This visitor raises it only
-/// for lines it actually reaches. A caller that finds what it wants in the tail
-/// therefore no longer notices corruption further back — which every full fold
-/// (`facts_from_segments`, `segment_seq_stats`, `refresh_log_index`) still does,
-/// on the very next read.
-fn visit_segment_entries_newest_first<T>(
-    path: &Path,
-    mut visit: impl FnMut(LedgerLine) -> Option<T>,
-) -> Result<Option<T>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        // Same benign-race tolerance as `read_segment_entries`: a listed segment
-        // can be rotated away before it is opened.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            let ctx = format!("read canonical segment {}", path.display());
-            return Err(RallyError::io(ctx)(err));
-        }
-    };
-    let ends_with_newline = text.ends_with('\n');
-    let lines: Vec<&str> = text.lines().collect();
-    let last_index = lines.len().saturating_sub(1);
-    for (index, raw) in lines.iter().enumerate().rev() {
-        let line = raw.trim_end_matches('\r');
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<LedgerLine>(line) {
-            Ok(entry) => {
-                if let Some(found) = visit(entry) {
-                    return Ok(Some(found));
-                }
-            }
-            Err(_) if index == last_index && !ends_with_newline => continue,
-            Err(err) => {
-                return Err(RallyError::Message(format!(
-                    "completed canonical segment corruption in {} at line {}: {}",
-                    path.display(),
-                    index + 1,
-                    err
-                )));
-            }
+    if !path.exists() {
+        return Ok(false);
+    }
+    for entry in read_segment_entries(path)?.into_iter().rev() {
+        if entry.payload.get("event_id").and_then(|v| v.as_str()) == Some(event_id) {
+            return Ok(true);
         }
     }
-    Ok(None)
+    Ok(false)
 }
 
 /// Raw count of non-empty lines across the given segment files. Test-only:
@@ -4929,10 +4862,15 @@ fn next_canonical_seq(log_dir: &Path, archive_dir: &Path, facts_db_path: &Path) 
 /// `None` when the segment is absent/empty. Used as a defense-in-depth dup gate:
 /// an allocated seq must always exceed the active segment's tail, else we would
 /// write a duplicate that bricks segment replay. Reads the (per-engagement,
-/// typically small) active segment; scans from the end for the last non-empty
-/// line.
+/// typically small) active segment and validates every completed line before
+/// trusting the last entry.
 fn last_seq_in_segment(segment_path: &Path) -> Result<Option<i64>> {
-    visit_segment_entries_newest_first(segment_path, |entry| Some(entry.seq))
+    if !segment_path.exists() {
+        return Ok(None);
+    }
+    Ok(read_segment_entries(segment_path)?
+        .last()
+        .map(|entry| entry.seq))
 }
 
 /// Events currently held by the derived sqlite cache. Compared against
@@ -6765,6 +6703,92 @@ mod ledger_tests {
     }
 
     #[test]
+    fn segment_fold_memo_is_room_scoped_and_invalidates_on_change() {
+        invalidate_segment_fold_memo();
+        let root_a = unique_root("segment-memo-room-a");
+        let root_b = unique_root("segment-memo-room-b");
+        let a1 = ledger_line(1, "decision", "room-a-1", "alpha");
+        let b1 = ledger_line(1, "decision", "room-b-1", "beta");
+        write_segment(&root_a, "log", "alpha.jsonl", &[a1.as_str()]);
+        write_segment(&root_b, "log", "beta.jsonl", &[b1.as_str()]);
+        let log_a = root_a.join(".rally").join(LOG_DIRNAME);
+        let archive_a = root_a.join(".rally").join(ARCHIVE_DIRNAME);
+        let log_b = root_b.join(".rally").join(LOG_DIRNAME);
+        let archive_b = root_b.join(".rally").join(ARCHIVE_DIRNAME);
+
+        let facts_a = facts_from_segments(&log_a, &archive_a).unwrap();
+        let facts_b = facts_from_segments(&log_b, &archive_b).unwrap();
+        assert_eq!(facts_a[0].event_id, "room-a-1");
+        assert_eq!(facts_b[0].event_id, "room-b-1");
+
+        let b2 = ledger_line(2, "decision", "room-b-2", "beta");
+        {
+            let path = log_b.join("beta.jsonl");
+            let mut file = OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(b2.as_bytes()).unwrap();
+            file.write_all(b"\n").unwrap();
+            file.sync_data().unwrap();
+        }
+        let facts_b_after_append = facts_from_segments(&log_b, &archive_b).unwrap();
+        assert_eq!(
+            facts_b_after_append
+                .iter()
+                .map(|fact| fact.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["room-b-1", "room-b-2"]
+        );
+
+        fs::remove_dir_all(root_a).ok();
+        fs::remove_dir_all(root_b).ok();
+        invalidate_segment_fold_memo();
+    }
+
+    /// Model a same-length rewrite whose filesystem fingerprint collides with
+    /// the cached one. Explicit invalidation must still force a fresh fold.
+    #[test]
+    fn segment_fold_memo_explicit_invalidation_handles_same_length_rewrite() {
+        invalidate_segment_fold_memo();
+        let root = unique_root("segment-memo-same-length");
+        let old = ledger_line(1, "decision", "event-old", "alpha");
+        let new = ledger_line(1, "decision", "event-new", "alpha");
+        assert_eq!(old.len(), new.len(), "fixture must preserve file length");
+        write_segment(&root, "log", "alpha.jsonl", &[old.as_str()]);
+        let log_dir = root.join(".rally").join(LOG_DIRNAME);
+        let archive_dir = root.join(".rally").join(ARCHIVE_DIRNAME);
+        assert_eq!(
+            facts_from_segments(&log_dir, &archive_dir).unwrap()[0].event_id,
+            "event-old"
+        );
+
+        fs::write(log_dir.join("alpha.jsonl"), format!("{new}\n")).unwrap();
+        // Force the adversarial metadata-collision state deterministically:
+        // retain the old cached facts while matching the rewritten file's
+        // current fingerprint.
+        let live = read_segment_files(&log_dir).unwrap();
+        let archived = replay_archive_segments(&archive_dir).unwrap();
+        let rewritten_fingerprint = segments_fingerprint(&live, &archived);
+        {
+            let mut memo = SEGMENT_FOLD_MEMO.lock().unwrap();
+            let cached = memo.as_mut().expect("old room fold must be cached");
+            cached.fingerprint = rewritten_fingerprint;
+        }
+        assert_eq!(
+            facts_from_segments(&log_dir, &archive_dir).unwrap()[0].event_id,
+            "event-old",
+            "adversarial fingerprint collision must exercise the cached value"
+        );
+
+        invalidate_segment_fold_memo();
+        assert_eq!(
+            facts_from_segments(&log_dir, &archive_dir).unwrap()[0].event_id,
+            "event-new"
+        );
+
+        fs::remove_dir_all(root).ok();
+        invalidate_segment_fold_memo();
+    }
+
+    #[test]
     fn last_seq_in_segment_reads_tail_or_none() {
         let root = unique_root("last-seq-tail");
         // Absent segment → None.
@@ -8582,9 +8606,12 @@ mod ledger_tests {
         let facts_db = store.facts_db_path.clone();
         let db_len_before = fs::metadata(&facts_db).unwrap().len();
 
+        let valid_tail = ledger_line(3, "decision", "valid-tail", "default");
         {
             let mut file = OpenOptions::new().append(true).open(&segment).unwrap();
             file.write_all(b"completed-corruption\n").unwrap();
+            file.write_all(valid_tail.as_bytes()).unwrap();
+            file.write_all(b"\n").unwrap();
             file.sync_data().unwrap();
         }
 
@@ -8602,9 +8629,7 @@ mod ledger_tests {
         assert_completed(segment_seq_stats(&live, &archived).unwrap_err());
         assert_completed(last_seq_in_segment(&segment).unwrap_err());
         assert_completed(segment_event_id_present(live.iter(), &fact.event_id).unwrap_err());
-        assert_completed(
-            segment_event_id_present_tail_first(&segment, &fact.event_id).unwrap_err(),
-        );
+        assert_completed(segment_event_id_present_tail_first(&segment, "valid-tail").unwrap_err());
         assert_completed(store.refresh_log_index().unwrap_err());
         assert_completed(rebuild_db_from_segments(&live, &archived, &facts_db).unwrap_err());
 

@@ -42,10 +42,8 @@ All notable changes to Agent Rally Point are documented here.
   same size (6,563 facts, 63 expired claims), a full drain took **40.6 s** against
   a 3 s watchdog.
 
-  Three cost cuts took it to **29.5 s**: the segment fold is memoized on the
-  fingerprint the reconcile sidecar already trusts; `last_seq_in_segment` and the
-  post-append readback stop parsing a whole segment to look at its tail (both
-  already documented themselves as O(1)); and
+  Two cost cuts took it to **29.5 s**: the segment fold is memoized on the
+  fingerprint the reconcile sidecar already trusts, and
   `append_state_transition_verified` takes its before/after room projections
   only inside the `Release` and `Resolve` arms that read them — `ClaimExpired`
   computed two full projections per claim and used neither, so a 63-claim reap

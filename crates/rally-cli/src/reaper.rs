@@ -647,50 +647,50 @@ fn run_reap_stale_in_room_with_budget(
                 None
             } else {
                 attempted_actions += 1;
-            let mut relinquish_committed = true;
-            if apply {
-                let relinquish_fact = Fact {
-                    from_session_id: None,
-                    schema: FACT_SCHEMA.to_string(),
-                    event_id: new_id("fact"),
-                    seq: 0,
-                    thread_id: new_id("room"),
-                    kind: FactKind::Decision,
-                    tool: Some("rally".to_string()),
-                    role: None,
-                    subject: "role:lead:relinquished".to_string(),
-                    scope: Vec::new(),
-                    created_at: now_string(),
-                    summary: Some(format!(
-                        "reaper: lead {} relinquished (stale owner)",
-                        lead_tool
-                    )),
-                    evidence: vec![format!("reaper:stale-lead={lead_tool}")],
-                    target: None,
-                    ref_id: None,
-                    status: None,
-                    severity: None,
-                    uri: None,
-                    session: None,
-                };
-                match room.append_fact_verified(&relinquish_fact) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!(
-                            "reaper: keeping lead {lead_tool} (relinquish append failed): {e}"
-                        );
-                        write_failures += 1;
-                        relinquish_committed = false;
+                let mut relinquish_committed = true;
+                if apply {
+                    let relinquish_fact = Fact {
+                        from_session_id: None,
+                        schema: FACT_SCHEMA.to_string(),
+                        event_id: new_id("fact"),
+                        seq: 0,
+                        thread_id: new_id("room"),
+                        kind: FactKind::Decision,
+                        tool: Some("rally".to_string()),
+                        role: None,
+                        subject: "role:lead:relinquished".to_string(),
+                        scope: Vec::new(),
+                        created_at: now_string(),
+                        summary: Some(format!(
+                            "reaper: lead {} relinquished (stale owner)",
+                            lead_tool
+                        )),
+                        evidence: vec![format!("reaper:stale-lead={lead_tool}")],
+                        target: None,
+                        ref_id: None,
+                        status: None,
+                        severity: None,
+                        uri: None,
+                        session: None,
+                    };
+                    match room.append_fact_verified(&relinquish_fact) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!(
+                                "reaper: keeping lead {lead_tool} (relinquish append failed): {e}"
+                            );
+                            write_failures += 1;
+                            relinquish_committed = false;
+                        }
                     }
                 }
-            }
-            // Dry-run keeps `relinquish_committed = true`: nothing was written,
-            // and the report already says so via `applied: false`.
-            if relinquish_committed {
-                Some(lead_tool.clone())
-            } else {
-                None
-            }
+                // Dry-run keeps `relinquish_committed = true`: nothing was
+                // written, and the report already says so via `applied: false`.
+                if relinquish_committed {
+                    Some(lead_tool.clone())
+                } else {
+                    None
+                }
             }
         } else {
             None
@@ -874,6 +874,31 @@ mod tests {
         room.append_fact_verified(&fact).unwrap()
     }
 
+    fn append_lead(room: &RoomStore, tool: &str, ago_secs: i64) -> Fact {
+        let fact = Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Decision,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: "role:lead".to_string(),
+            scope: Vec::new(),
+            created_at: past_ts(ago_secs),
+            summary: Some(format!("{tool} is lead")),
+            evidence: vec!["assigned:test".to_string()],
+            target: Some(tool.to_string()),
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&fact).unwrap()
+    }
+
     // -------------------------------------------------------------------------
     // Handoff expiry — parity with claims
     // -------------------------------------------------------------------------
@@ -965,6 +990,145 @@ mod tests {
             1,
             "a dry run must not close the handoff"
         );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A zero-duration budget models a projection that has already consumed
+    /// the whole allowance. The first eligible handoff must still land; later
+    /// passes must keep shrinking the queue instead of reporting the same
+    /// `remaining` count forever.
+    #[test]
+    fn zero_budget_handoff_only_queue_makes_global_progress() {
+        let root = unique_root("handoff-budget-floor");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        let ago = DEFAULT_HANDOFF_EXPIRY_SECS + 60;
+        append_handoff(&room, "handoff-budget-a", "author-a", ago);
+        append_handoff(&room, "handoff-budget-b", "author-b", ago);
+
+        let first = run_reap_stale_in_room_with_budget(
+            &room,
+            true,
+            ReapMode::Full,
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+        assert_eq!(first.handoffs_expired.len(), 1);
+        assert_eq!(first.attempted_writes, 1);
+        assert_eq!(first.remaining, 1);
+        assert!(first.applied);
+        assert!(!first.complete);
+
+        let second = run_reap_stale_in_room_with_budget(
+            &room,
+            true,
+            ReapMode::Full,
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+        assert_eq!(second.handoffs_expired.len(), 1);
+        assert_eq!(second.attempted_writes, 1);
+        assert_eq!(second.remaining, 0);
+        assert!(second.applied);
+        assert!(second.complete);
+        assert!(room.snapshot().unwrap().open_handoffs.is_empty());
+
+        let no_op = run_reap_stale_in_room_with_budget(
+            &room,
+            true,
+            ReapMode::Full,
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+        assert_eq!(no_op.attempted_writes, 0);
+        assert!(!no_op.applied, "a no-op did not apply a durable write");
+        assert!(no_op.complete, "a no-op queue is fully drained");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Claims, handoffs, and lead cleanup share one budget. A zero budget must
+    /// not reset its progress floor for each category and accidentally perform
+    /// three unbounded appends in one pass.
+    #[test]
+    fn zero_budget_is_global_across_claim_handoff_and_lead() {
+        let root = unique_root("mixed-budget-floor");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        let stale = 3 * 60 * 60;
+        append_presence(&room, "stale-owner", stale);
+        append_claim(&room, "claim-mixed-budget", "stale-owner");
+        append_handoff(
+            &room,
+            "handoff-mixed-budget",
+            "handoff-author",
+            DEFAULT_HANDOFF_EXPIRY_SECS + 60,
+        );
+        append_lead(&room, "stale-owner", stale);
+
+        let first = run_reap_stale_in_room_with_budget(
+            &room,
+            true,
+            ReapMode::Full,
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+        assert_eq!(first.claims_reaped.len(), 1);
+        assert!(first.handoffs_expired.is_empty());
+        assert!(first.lead_relinquished.is_none());
+        assert_eq!(first.attempted_writes, 1);
+        assert_eq!(first.remaining, 2);
+        assert!(!first.complete);
+
+        let second = run_reap_stale_in_room_with_budget(
+            &room,
+            true,
+            ReapMode::Full,
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+        assert_eq!(second.handoffs_expired.len(), 1);
+        assert!(second.lead_relinquished.is_none());
+        assert_eq!(second.attempted_writes, 1);
+        assert_eq!(second.remaining, 1);
+
+        let third = run_reap_stale_in_room_with_budget(
+            &room,
+            true,
+            ReapMode::Full,
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+        assert_eq!(third.lead_relinquished.as_deref(), Some("stale-owner"));
+        assert_eq!(third.attempted_writes, 1);
+        assert_eq!(third.remaining, 0);
+        assert!(third.complete);
+        assert!(room.snapshot().unwrap().lead.is_none());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Lead-only rooms get the same first-action floor as claim-only and
+    /// handoff-only rooms.
+    #[test]
+    fn zero_budget_lead_only_queue_makes_progress() {
+        let root = unique_root("lead-budget-floor");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        let stale = 3 * 60 * 60;
+        append_presence(&room, "stale-lead", stale);
+        append_lead(&room, "stale-lead", stale);
+
+        let report = run_reap_stale_in_room_with_budget(
+            &room,
+            true,
+            ReapMode::Full,
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+        assert_eq!(report.lead_relinquished.as_deref(), Some("stale-lead"));
+        assert_eq!(report.attempted_writes, 1);
+        assert_eq!(report.remaining, 0);
+        assert!(report.applied);
+        assert!(report.complete);
 
         fs::remove_dir_all(root).ok();
     }
