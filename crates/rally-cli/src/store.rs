@@ -525,10 +525,19 @@ pub(crate) struct RoomSnapshot {
     /// positive statement that this response is complete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) composition: Option<RoomComposition>,
-    /// Tools whose liveness is PROVABLY `Stale` (all four signals present and
-    /// past the adaptive window) at projection time. The only input the
-    /// relevance model has that may lower an item's rank, so it is derived
-    /// where the signals live rather than re-inferred downstream.
+    /// Tools whose newest fact is older than that tool's adaptive window at
+    /// projection time. The only input the relevance model has that may lower an
+    /// item's rank, so it is derived where the signals live rather than
+    /// re-inferred downstream.
+    ///
+    /// **This is a HEARTBEAT verdict, not a `Liveness` one.** Membership here
+    /// does NOT mean `Liveness::Stale`: dropping a squad demands four-signal
+    /// unanimity because hiding a live peer causes a write collision, while
+    /// ranking an item lower hides nothing and so uses the one signal present on
+    /// every tool. The reasoning is stated at the insertion site in
+    /// `snapshot_from_facts_with_policy` and in the `relevance` module docs; all
+    /// three said different things until design audit D2, and this is the
+    /// contract the three now share.
     ///
     /// Omitted from the public room JSON, and carried across the daemon wire in
     /// [`SnapshotInternals`]. Before that side-channel existed this field was
@@ -3606,17 +3615,16 @@ fn apply_budget(
     let score_of = |fact: &Fact| -> f64 {
         // Ranking weight, not visibility weight — see `fact_rank_weight`.
         let recency = fact_rank_weight(fact, now_secs, half_life_secs, coord.archive_floor_weight);
-        let author_liveness = fact.tool.as_deref().map(|t| {
-            if snapshot.stale_authors.contains(t) {
-                crate::liveness::Liveness::Stale
-            } else {
-                // Live and Unknown are both neutral in the relevance model, so
-                // they need not be distinguished here.
-                crate::liveness::Liveness::Live
-            }
-        });
+        // `stale_authors` is a HEARTBEAT verdict, not a `Liveness` one — see
+        // the insertion site in `snapshot_from_facts_with_policy` and the
+        // `relevance` module docs for why ranking and dropping use different
+        // bars. An unresolved author is neutral.
+        let author_past_heartbeat_window = fact
+            .tool
+            .as_deref()
+            .is_some_and(|t| snapshot.stale_authors.contains(t));
         let signals = crate::relevance::RelevanceSignals {
-            author_liveness,
+            author_past_heartbeat_window,
             addressed_to_caller: consumer
                 .tool
                 .as_deref()
@@ -9185,6 +9193,68 @@ mod squad_decay_tests {
 
     fn has_squad(snap: &RoomSnapshot, tool: &str) -> bool {
         snap.squads.iter().any(|s| s.tool == tool)
+    }
+
+    /// D2 — the demotion contract, pinned.
+    ///
+    /// `stale_authors` is filled from HEARTBEAT age, not from a
+    /// `Liveness::Stale` verdict. Three sources said three different things
+    /// until the design audit: the field doc and the `relevance` module docs
+    /// both claimed only a provably-`Stale` author could be demoted, while the
+    /// producer inserted on heartbeat age alone.
+    ///
+    /// The code's behaviour is the one that was kept, because the alternative is
+    /// unreachable: `Liveness::Stale` requires the code-progress signal, which
+    /// needs two presence facts carrying DIFFERENT `branch_head_sha` stamps. No
+    /// writer produced those until recently, so a demotion keyed on `Stale`
+    /// would have been dead on every fact already in a ledger.
+    ///
+    /// This test builds exactly that case — one silent author with a heartbeat
+    /// well past its window and no code-progress signal — and asserts it IS
+    /// demoted. Narrowing the producer to match the old prose fails here.
+    ///
+    /// What it does NOT cover: the size of the demotion, or whether the ranking
+    /// that results is the right one. Those are `relevance`'s own tests.
+    #[test]
+    fn heartbeat_gap_demotes_even_when_liveness_is_not_provably_stale() {
+        let coord = CoordinationConfig::default();
+        // One presence fact, 90 minutes old, no sha stamp. Heartbeat is present
+        // and past the default 31-minute window; code-progress is absent.
+        let facts = seqd(vec![fact(FactKind::Presence, "silent-tool", 90 * 60)]);
+
+        // Premise: the four-signal verdict must NOT be Stale, or this test is
+        // asserting the old contract by accident.
+        let signals = crate::liveness::LivenessSignals {
+            heartbeat_age: Some(90 * 60),
+            inject_age: None,
+            code_progress_age: None,
+            plan_age: None,
+        };
+        let window = crate::liveness::adaptive_window_secs(
+            coord.default_cadence_secs,
+            coord.default_cadence_secs,
+            coord.miss_multiplier,
+            coord.grace_secs,
+        );
+        assert_ne!(
+            crate::liveness::is_live(&signals, window),
+            crate::liveness::Liveness::Stale,
+            "premise: with only a heartbeat signal the verdict must be Unknown, \
+             not Stale — otherwise this test cannot distinguish the two contracts"
+        );
+
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+        assert!(
+            snap.stale_authors.contains("silent-tool"),
+            "an author silent past its window must be demotable even though its \
+             four-signal verdict is not Stale; keying the demotion on Stale makes \
+             it unreachable on any ledger without code-progress stamps"
+        );
+        assert!(
+            snap.squads.iter().any(|s| s.tool == "silent-tool"),
+            "and it must still be VISIBLE: dropping needs four-signal unanimity, \
+             demoting does not. The two bars diverging is the contract."
+        );
     }
 
     #[test]

@@ -22,6 +22,8 @@
 //! 3. **Wake coalescing.** `append_next_wake_intent` looks for a matching entry
 //!    in `pending_wakes` before appending. Empty means the guard never matches,
 //!    so a routed caller appends a DUPLICATE wake intent on every poll.
+//! 4. **Global status age.** `status_global` reads `last_activity_ts` from the
+//!    snapshot. Empty over the wire makes an active room look timestamp-less.
 //!
 //! # Why these tests are shaped this way
 //!
@@ -34,16 +36,11 @@
 //!
 //! # What these tests do NOT cover
 //!
-//! * `last_activity_ts` has no behavioural assertion here. Its only consumer is
-//!   `status_global`'s display of room age; it rides the same side-channel and
-//!   is carried for the same reason, but nothing below would notice if it were
-//!   dropped again.
 //! * Parity is asserted for ONE stale author and ONE live author. It does not
 //!   establish that the relevance model itself is right — only that both modes
 //!   run the same one.
-//! * A daemon that is running an OLDER build (no side-channel key) still yields
-//!   the old empty values by design. That degradation is deliberate and is not
-//!   asserted against.
+//! * Daemon/client build compatibility is a separate transport contract. These
+//!   tests require the daemon they start to exercise the current binary.
 
 #![cfg(unix)]
 #![allow(clippy::zombie_processes)]
@@ -107,6 +104,7 @@ impl Room {
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env("RALLY_HOOKS", "off")
+            .env("RALLY_GLOBAL_INDEX", "1")
             .env("RALLY_DEFAULT_CADENCE_SECS", CADENCE_SECS)
             .env("RALLY_MISS_MULTIPLIER", "1")
             .env("RALLY_HOOK_TIMEOUT_MS", WATCHDOG_MS)
@@ -266,15 +264,17 @@ struct Daemon {
 }
 
 impl Daemon {
-    /// Returns `None` when the daemon does not come up inside the corridor. The
-    /// caller then SKIPS: a test that silently ran the direct path twice while
-    /// claiming to cover the routed one is worse than no test.
-    fn start(room: &Room) -> Option<Self> {
-        let log = fs::File::create(room.cwd.join(".rally").join("rallyd-serve.log")).ok()?;
+    /// Starts the current test binary's daemon or fails the test with its log.
+    /// A green routed-path test must prove that the daemon actually ran.
+    fn start(room: &Room) -> Result<Self, String> {
+        let log_path = room.cwd.join(".rally").join("rallyd-serve.log");
+        let log = fs::File::create(&log_path)
+            .map_err(|e| format!("create {}: {e}", log_path.display()))?;
         let child = Command::new(env!("CARGO_BIN_EXE_rally"))
             .current_dir(&room.cwd)
             .env("HOME", &room.home)
             .env("RALLY_HOOKS", "off")
+            .env("RALLY_GLOBAL_INDEX", "1")
             .env("RALLY_DEFAULT_CADENCE_SECS", CADENCE_SECS)
             .env("RALLY_MISS_MULTIPLIER", "1")
             .env("RALLY_HOOK_TIMEOUT_MS", WATCHDOG_MS)
@@ -282,7 +282,7 @@ impl Daemon {
             .stdout(Stdio::null())
             .stderr(Stdio::from(log))
             .spawn()
-            .ok()?;
+            .map_err(|e| format!("spawn rallyd: {e}"))?;
         let mut d = Daemon {
             child,
             addr: room.cwd.join(".rally").join("rallyd.sock.addr"),
@@ -291,12 +291,22 @@ impl Daemon {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if d.addr.exists() && room.run(&["daemon", "status", "--json"]).status.success() {
-                return Some(d);
+                return Ok(d);
+            }
+            if let Ok(Some(status)) = d.child.try_wait() {
+                d.stopped = true;
+                let log = fs::read_to_string(&log_path).unwrap_or_default();
+                return Err(format!(
+                    "rallyd exited before becoming ready ({status}); log:\n{log}"
+                ));
             }
             thread::sleep(Duration::from_millis(100));
         }
         d.stop();
-        None
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        Err(format!(
+            "rallyd did not become ready within 20s; log:\n{log}"
+        ))
     }
 
     fn stop(&mut self) {
@@ -373,6 +383,39 @@ fn seed_two_authors(room: &Room) -> (String, String) {
 fn seed_plain(room: &Room) {
     room.say_risk("peer-one", "first risk");
     room.say_risk("peer-two", "second risk");
+}
+
+fn latest_fact_timestamp(room: &Room) -> String {
+    room.ledger_facts()
+        .into_iter()
+        .max_by_key(|fact| fact["seq"].as_i64().unwrap_or_default())
+        .and_then(|fact| fact["created_at"].as_str().map(str::to_string))
+        .expect("seeded room must contain a timestamped fact")
+}
+
+fn status_last_activity(room: &Room) -> String {
+    let status = room.json(&["status", "--global", "--json"]);
+    let canonical = fs::canonicalize(&room.cwd).unwrap_or_else(|_| room.cwd.clone());
+    status["data"]["status"]["repos"]
+        .as_array()
+        .and_then(|repos| {
+            repos.iter().find(|repo| {
+                repo["repo"]
+                    .as_str()
+                    .is_some_and(|path| PathBuf::from(path) == canonical)
+            })
+        })
+        .and_then(|repo| repo["last_activity_ts"].as_str())
+        .unwrap_or_else(|| panic!("global status omitted last_activity_ts: {status}"))
+        .to_string()
+}
+
+fn assert_no_wire_internals(value: &Value, surface: &str) {
+    let json = serde_json::to_string(value).expect("serialize public JSON");
+    assert!(
+        !json.contains("\"__internals\""),
+        "{surface} leaked the daemon-only __internals side-channel: {json}"
+    );
 }
 
 /// Assert the seeded room is actually in the state the D1 assertion needs.
@@ -469,10 +512,8 @@ fn direct_and_routed_compose_the_same_room() {
 
     let budgets: Vec<usize> = (2..=14).map(|n| n * 250).collect();
 
-    let Some(mut daemon) = Daemon::start(&room) else {
-        eprintln!("SKIP: rallyd did not come up; routed path not exercised");
-        return;
-    };
+    let mut daemon = Daemon::start(&room)
+        .unwrap_or_else(|e| panic!("routed composition control requires rallyd: {e}"));
     let routed: Vec<_> = budgets
         .iter()
         .map(|b| risk_composition(&room, *b))
@@ -542,10 +583,8 @@ fn routed_next_advances_the_read_checkpoint() {
 
     let routed_room = Room::new("ckpt-routed");
     seed_plain(&routed_room);
-    let Some(mut daemon) = Daemon::start(&routed_room) else {
-        eprintln!("SKIP: rallyd did not come up; routed path not exercised");
-        return;
-    };
+    let mut daemon = Daemon::start(&routed_room)
+        .unwrap_or_else(|e| panic!("routed checkpoint control requires rallyd: {e}"));
     let v = routed_room.json(&["next", "--tool", "reader-peer", "--json"]);
     assert_eq!(v["ok"], Value::Bool(true), "routed next: {v}");
     let routed_checkpoints = routed_room.count_kind_by_tool("read", "reader-peer");
@@ -592,13 +631,15 @@ fn routed_next_coalesces_wake_intents() {
     let direct_room = Room::new("wake-direct");
     seed_plain(&direct_room);
     let direct_wakes = poll_twice(&direct_room);
+    assert_eq!(
+        direct_wakes, 1,
+        "premise: two direct polls must coalesce to exactly one wake intent"
+    );
 
     let routed_room = Room::new("wake-routed");
     seed_plain(&routed_room);
-    let Some(mut daemon) = Daemon::start(&routed_room) else {
-        eprintln!("SKIP: rallyd did not come up; routed path not exercised");
-        return;
-    };
+    let mut daemon = Daemon::start(&routed_room)
+        .unwrap_or_else(|e| panic!("routed wake control requires rallyd: {e}"));
     let routed_wakes = poll_twice(&routed_room);
     daemon.stop();
 
@@ -608,6 +649,44 @@ fn routed_next_coalesces_wake_intents() {
          produced {direct_wakes}; the coalescing guard reads `pending_wakes`, \
          which routing was dropping"
     );
+    assert_eq!(
+        routed_wakes, 1,
+        "two routed polls must coalesce to exactly one wake intent"
+    );
+}
+
+/// `status --global` consumes `last_activity_ts`; both store modes must report
+/// the timestamp of the ledger's highest-seq fact rather than a default null.
+#[test]
+fn direct_and_routed_status_report_last_activity() {
+    let room = Room::new("last-activity");
+    seed_plain(&room);
+    let expected = latest_fact_timestamp(&room);
+
+    let direct = status_last_activity(&room);
+    assert_eq!(direct, expected, "direct status used the wrong room age");
+
+    let mut daemon = Daemon::start(&room)
+        .unwrap_or_else(|e| panic!("routed status control requires rallyd: {e}"));
+    let routed = status_last_activity(&room);
+    daemon.stop();
+    assert_eq!(routed, expected, "routed status dropped last_activity_ts");
+}
+
+/// The wire side-channel must never become part of the public room response.
+#[test]
+fn wire_internals_are_absent_from_public_room_json() {
+    let room = Room::new("public-json");
+    seed_plain(&room);
+
+    let direct = room.json(&["room", "--json"]);
+    assert_no_wire_internals(&direct, "direct room JSON");
+
+    let mut daemon = Daemon::start(&room)
+        .unwrap_or_else(|e| panic!("routed public-JSON control requires rallyd: {e}"));
+    let routed = room.json(&["room", "--json"]);
+    daemon.stop();
+    assert_no_wire_internals(&routed, "routed room JSON");
 }
 
 /// The ADJACENT move — a FIFTH skipped field, added later, silently dropped
@@ -624,10 +703,6 @@ fn routed_next_coalesces_wake_intents() {
 /// fields at runtime — cannot work: a skipped field is by definition absent from
 /// the serialized form, so there is nothing to reflect over.
 ///
-/// What this does NOT cover: a field that is carried in `SnapshotInternals` but
-/// never restored, or restored into the wrong place. `restore_internals` is
-/// four assignments in one place; the behavioural tests above cover the three
-/// that have consumers.
 #[test]
 fn every_skipped_snapshot_field_rides_the_wire_side_channel() {
     let store_rs = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -648,6 +723,7 @@ fn every_skipped_snapshot_field_rides_the_wire_side_channel() {
 
     let snapshot_body = body("struct RoomSnapshot {");
     let internals_body = body("struct SnapshotInternals {");
+    let impl_body = body("impl RoomSnapshot {");
 
     let mut skipped: Vec<String> = Vec::new();
     let mut pending = false;
@@ -678,6 +754,14 @@ fn every_skipped_snapshot_field_rides_the_wire_side_channel() {
              to SnapshotInternals (and to internals()/restore_internals()), or \
              state in its doc comment why an empty value over the daemon wire is \
              correct."
+        );
+        assert!(
+            impl_body.contains(&format!("{field}: self.{field}")),
+            "RoomSnapshot.{field} is not lifted into SnapshotInternals"
+        );
+        assert!(
+            impl_body.contains(&format!("self.{field} = internals.{field}")),
+            "SnapshotInternals.{field} is not restored into RoomSnapshot"
         );
     }
 }

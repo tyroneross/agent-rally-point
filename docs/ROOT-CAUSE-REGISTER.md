@@ -1610,6 +1610,45 @@ D6 are below.
   parity. A parity test that compares two identical wrong answers is the shape this register keeps
   finding; it found one in its own control this time.
 
+### RC-066 — three sources stated three different demotion contracts (D2)
+
+- **State:** ✅ `controlled` 2026-08-05.
+  `store::squad_decay_tests::heartbeat_gap_demotes_even_when_liveness_is_not_provably_stale`.
+- **Mechanism.** The producer inserted into `RoomSnapshot::stale_authors` on `heartbeat_age >
+  window` alone. The field's own doc comment said "PROVABLY `Stale` (all four signals present and
+  past the adaptive window)". The `relevance` module docs said "Only a *provably* stale author
+  demotes an item, mirroring the squad rule". And `RelevanceSignals::author_liveness` was typed
+  `Option<Liveness>`, so the call site had to LAUNDER a heartbeat verdict into a
+  `Liveness::Stale` value to pass it — a type that asserted something the data did not support.
+- **Contract chosen: heartbeat age.** The code's behaviour was kept, and the reasoning was already
+  written at the insertion site: `Liveness::Stale` requires the code-progress signal, which needs
+  two presence facts carrying different `branch_head_sha` stamps. No writer produced those until
+  this release, so a demotion keyed on `Stale` would have been unreachable on every fact already in
+  a ledger — a dead factor shipped as a live one. RANKING and DROPPING use different bars on
+  purpose: hiding a live peer causes the write collision this system exists to prevent, while
+  ranking an item lower hides nothing (it still ships if the budget allows, and any omission is
+  reported with its event id).
+- **Made structural, not just documented.** `author_liveness: Option<Liveness>` is now
+  `author_past_heartbeat_window: bool`. The four sources cannot drift apart again by prose, because
+  there is no longer a `Liveness` value in the ranking path to disagree about. The config key
+  `coordination.relevance.stale_author_factor` keeps its published name.
+- **A fourth disagreement, found while tracing.** The `relevance` module doc claimed a floor — "the
+  returned score is never below the recency weight it was given" — which the code does not
+  implement, and could not: the demotion multiplies BELOW the recency weight, which is the whole
+  point. The function-level doc scoped the floor correctly to absent signals; the module-level one
+  did not. Corrected.
+- **Adversarial control.** One author, one presence fact 90 minutes old, no sha stamp. The test
+  first asserts its own premise — that the four-signal verdict is NOT `Stale` — and then asserts
+  the author IS demoted. Narrowing the producer to `matches!(verdict, Stale)` fails it.
+  **Tested with the ADJACENT move:** the opposite error is conflating the two bars in the other
+  direction, so the same test also asserts the author stays VISIBLE in `squads`. Widening the DROP
+  predicate to heartbeat age fails that assertion plus three existing fail-open tests.
+- **What the control does NOT cover.** The size of the demotion, whether 0.5 is the right factor,
+  and whether the resulting ranking is good. Those are `relevance`'s own tests and a judgement the
+  register does not make. It also does not cover a future writer that starts stamping
+  `branch_head_sha` widely, which would make `Stale` reachable and reopen the choice on the merits
+  rather than on reachability.
+
 ### RC-053 — lease renewal writes to a sidecar that no expiry path reads (D3)
 - **State:** `mechanism`. **NOT fixed.**
 - **Mechanism, three parts, all verified:**

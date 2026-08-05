@@ -10,37 +10,54 @@
 //!
 //! * **recency** — [`crate::decay::recency_weight`], the same exponential
 //!   half-life that drives archive-floor partitioning.
-//! * **author liveness** — [`crate::liveness::is_live`], the same adaptive
-//!   four-signal window that drives squad visibility.
+//! * **author heartbeat** — whether the author's newest fact is older than the
+//!   adaptive window [`crate::liveness::adaptive_window_secs`] computes for it.
 //! * **addressed-to-me** — the caller is the item's `target`, is named in a
 //!   `to:<tool>` evidence stamp, or appears in the item's scope.
 //! * **path overlap** — the fraction of the caller's declared working set that
 //!   the item's scope touches.
+//!
+//! # RANKING and DROPPING use different bars, on purpose
+//!
+//! Dropping a squad from the room is a HIDING decision, so it demands
+//! four-signal unanimity: a provable [`crate::liveness::Liveness::Stale`]
+//! verdict, with `Unknown` kept visible. Ranking an item lower is neither
+//! destructive nor hiding — the item still ships if the budget allows, and any
+//! omission is reported with its event id — so ranking uses the one signal
+//! present on EVERY tool: heartbeat age against that tool's adaptive window.
+//!
+//! That is a deliberate divergence, not an oversight, and it is load-bearing.
+//! `Liveness::Stale` requires the code-progress signal, which no writer produced
+//! until recently, so a demotion keyed on `Stale` would have been unreachable on
+//! every fact already in a ledger — a dead factor shipped as a live one. The
+//! producer is `store::snapshot_from_facts_with_policy`, which is the only place
+//! all four liveness signals are in hand; it fills `RoomSnapshot::stale_authors`
+//! from heartbeat age alone and says so at the insertion site.
 //!
 //! # The fail-open invariant
 //!
 //! The model is MULTIPLICATIVE with recency as the spine, and **every factor is
 //! 1.0 when its signal is absent**. An item whose consumer-relative signals
 //! cannot be computed therefore scores exactly its recency weight — it is never
-//! demoted for a signal nobody could measure. Only a *provably* stale author
-//! demotes an item, mirroring the squad rule where only a provably-`Stale`
-//! squad is dropped and `Unknown` stays visible.
+//! demoted for a signal nobody could measure.
 //!
-//! [`relevance`] enforces this with a floor: the returned score is never below
-//! the recency weight it was given. Boosts may raise an item; absent signals
-//! may not lower it.
+//! The invariant covers ABSENT signals only. A heartbeat past the window is a
+//! positive measurement, and it is the one factor that may lower a score below
+//! the recency weight it was given. Boosts may raise an item; absence may not
+//! lower it.
 //!
 //! Time is INJECTED (callers pass ages) so the math is pure and deterministically
 //! testable — the established rally-cli convention shared with `decay` and
 //! `liveness`. Tunables live in `hooks_config` under `coordination.relevance`
 //! and resolve default → user → repo → env like every other coordination knob.
 
-use crate::liveness::Liveness;
-
-/// Multiplier applied to an item whose AUTHOR is provably stale (all four
-/// liveness signals present and past the adaptive window). `Live` and `Unknown`
-/// authors are never demoted. 0.5 halves the item's effective age-weight, which
-/// at the default 48 h half-life is worth exactly one half-life of extra age.
+/// Multiplier applied to an item whose AUTHOR's newest fact is older than that
+/// author's adaptive window. An author still inside its window is never demoted.
+/// 0.5 halves the item's effective age-weight, which at the default 48 h
+/// half-life is worth exactly one half-life of extra age.
+///
+/// The name predates the contract it now carries and is kept because it is a
+/// published config key (`coordination.relevance.stale_author_factor`).
 pub(crate) const DEFAULT_STALE_AUTHOR_FACTOR: f64 = 0.5;
 
 /// Boost applied when an item is addressed to the caller. 1.0 doubles the score
@@ -67,7 +84,8 @@ pub(crate) const DEFAULT_CONSUMER_CONTEXT_BYTES: i64 = 4_000_000;
 /// config chain as every other coordination knob.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RelevanceWeights {
-    /// Multiplier for a provably-stale author. Must be in `(0.0, 1.0]`.
+    /// Multiplier for an author past its heartbeat window. Must be in
+    /// `(0.0, 1.0]`.
     pub(crate) stale_author_factor: f64,
     /// Additive boost when the item is addressed to the caller. `>= 0.0`.
     pub(crate) addressed_boost: f64,
@@ -112,9 +130,14 @@ impl ConsumerContext {
 /// fail-open invariant rather than inferring absence from a zero.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RelevanceSignals {
-    /// The item author's liveness verdict. `None` = the author could not be
-    /// resolved (no `tool`, or no squad entry) → neutral.
-    pub(crate) author_liveness: Option<Liveness>,
+    /// True when the item's author has not written anything inside its adaptive
+    /// window. False also covers "author could not be resolved" (no `tool`, or
+    /// no squad entry) — both are neutral, neither demotes.
+    ///
+    /// This is a HEARTBEAT verdict, not a [`crate::liveness::Liveness`] one. See
+    /// the module docs for why ranking and dropping use different bars; the
+    /// field is typed as a bool so the two cannot be confused at a call site.
+    pub(crate) author_past_heartbeat_window: bool,
     /// True when the item names the caller as recipient. False also covers
     /// "no caller declared" — both are neutral, neither demotes.
     pub(crate) addressed_to_caller: bool,
@@ -132,10 +155,10 @@ pub(crate) struct RelevanceSignals {
 /// Guarantees, each asserted by a test:
 /// 1. **Fail-open floor** — the result is never below `recency`. An absent or
 ///    unreadable signal cannot push an item down the ranking.
-/// 2. **Only provable staleness demotes** — `Liveness::Unknown` and
-///    `Liveness::Live` are neutral; only `Liveness::Stale` applies
-///    `stale_author_factor`, and even then the floor in (1) does not apply to
-///    it, because a provably-stale author IS a measured signal.
+/// 2. **Only a measured heartbeat gap demotes** — an author inside its window,
+///    and an author that could not be resolved at all, are both neutral. Only
+///    `author_past_heartbeat_window` applies `stale_author_factor`, and the
+///    floor in (1) does not apply to it, because it IS a measured signal.
 /// 3. **Monotone in recency** — with identical signals, a fresher item always
 ///    outranks an older one.
 ///
@@ -150,11 +173,12 @@ pub(crate) fn relevance(recency: f64, signals: &RelevanceSignals, w: &RelevanceW
         1.0
     };
 
-    // Author liveness: the ONLY factor that may reduce a score, and only on a
-    // provable Stale verdict. Absent / Unknown / Live are all neutral.
-    let liveness_factor = match signals.author_liveness {
-        Some(Liveness::Stale) => clamp_unit(w.stale_author_factor, DEFAULT_STALE_AUTHOR_FACTOR),
-        _ => 1.0,
+    // Author heartbeat: the ONLY factor that may reduce a score, and only on a
+    // measured gap. An unresolved author is neutral.
+    let liveness_factor = if signals.author_past_heartbeat_window {
+        clamp_unit(w.stale_author_factor, DEFAULT_STALE_AUTHOR_FACTOR)
+    } else {
+        1.0
     };
 
     // Consumer-relative boosts: additive on top of 1.0, never below it.
@@ -174,9 +198,9 @@ pub(crate) fn relevance(recency: f64, signals: &RelevanceSignals, w: &RelevanceW
 }
 
 /// Clamp a configured stale-author factor into `(0.0, 1.0]`, falling back to
-/// `fallback` when the value is unusable. A factor above 1.0 would let a
-/// provably-dead author's items OUTRANK a live author's — the config surface
-/// must not be able to invert the signal.
+/// `fallback` when the value is unusable. A factor above 1.0 would let a silent
+/// author's items OUTRANK an active author's — the config surface must not be
+/// able to invert the signal.
 fn clamp_unit(value: f64, fallback: f64) -> f64 {
     if value.is_finite() && value > 0.0 && value <= 1.0 {
         value
@@ -286,46 +310,41 @@ mod tests {
     }
 
     #[test]
-    fn unknown_author_liveness_is_neutral_not_stale() {
-        // Mirrors the squad rule: Unknown means "cannot prove dead", and cannot
-        // prove dead must never cost an item its place.
-        let unknown = RelevanceSignals {
-            author_liveness: Some(Liveness::Unknown),
-            ..Default::default()
-        };
-        let live = RelevanceSignals {
-            author_liveness: Some(Liveness::Live),
+    fn an_author_inside_its_window_is_neutral() {
+        // An author that is still writing, and an author that could not be
+        // resolved at all, must both cost an item nothing.
+        let inside = RelevanceSignals {
+            author_past_heartbeat_window: false,
             ..Default::default()
         };
         let absent = RelevanceSignals::default();
-        assert_eq!(relevance(0.4, &unknown, &w()), 0.4);
-        assert_eq!(relevance(0.4, &live, &w()), 0.4);
+        assert_eq!(relevance(0.4, &inside, &w()), 0.4);
         assert_eq!(relevance(0.4, &absent, &w()), 0.4);
     }
 
     #[test]
-    fn only_provable_stale_demotes() {
-        let stale = RelevanceSignals {
-            author_liveness: Some(Liveness::Stale),
+    fn only_a_measured_heartbeat_gap_demotes() {
+        let silent = RelevanceSignals {
+            author_past_heartbeat_window: true,
             ..Default::default()
         };
-        assert!(relevance(0.4, &stale, &w()) < 0.4);
-        assert!((relevance(0.4, &stale, &w()) - 0.2).abs() < 1e-12);
+        assert!(relevance(0.4, &silent, &w()) < 0.4);
+        assert!((relevance(0.4, &silent, &w()) - 0.2).abs() < 1e-12);
     }
 
     #[test]
     fn score_never_below_recency_for_absent_signals() {
         // Exhaustive over the absent/neutral combinations.
-        for liveness in [None, Some(Liveness::Live), Some(Liveness::Unknown)] {
-            for overlap in [None, Some(0.0)] {
+        for overlap in [None, Some(0.0)] {
+            {
                 let s = RelevanceSignals {
-                    author_liveness: liveness,
+                    author_past_heartbeat_window: false,
                     addressed_to_caller: false,
                     path_overlap: overlap,
                 };
                 assert!(
                     relevance(0.3, &s, &w()) >= 0.3,
-                    "liveness={liveness:?} overlap={overlap:?} demoted an item on absent signals"
+                    "overlap={overlap:?} demoted an item on absent signals"
                 );
             }
         }
@@ -374,7 +393,7 @@ mod tests {
         let s = RelevanceSignals {
             addressed_to_caller: true,
             path_overlap: Some(0.7),
-            author_liveness: Some(Liveness::Stale),
+            author_past_heartbeat_window: true,
         };
         assert!(relevance(0.9, &s, &w()) > relevance(0.4, &s, &w()));
     }
@@ -389,15 +408,15 @@ mod tests {
             stale_author_factor: 4.0,
             ..RelevanceWeights::default()
         };
-        let stale = RelevanceSignals {
-            author_liveness: Some(Liveness::Stale),
+        let silent = RelevanceSignals {
+            author_past_heartbeat_window: true,
             ..Default::default()
         };
-        let live = RelevanceSignals {
-            author_liveness: Some(Liveness::Live),
+        let active = RelevanceSignals {
+            author_past_heartbeat_window: false,
             ..Default::default()
         };
-        assert!(relevance(0.5, &stale, &bad) <= relevance(0.5, &live, &bad));
+        assert!(relevance(0.5, &silent, &bad) <= relevance(0.5, &active, &bad));
     }
 
     #[test]
@@ -410,7 +429,7 @@ mod tests {
         let s = RelevanceSignals {
             addressed_to_caller: true,
             path_overlap: Some(1.0),
-            author_liveness: None,
+            author_past_heartbeat_window: false,
         };
         assert!(
             relevance(0.5, &s, &bad) >= 0.5,

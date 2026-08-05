@@ -22,6 +22,21 @@ All notable changes to Agent Rally Point are documented here.
   the real CLI and daemon, plus a structural check that a FIFTH skipped field
   cannot be added without carrying it. Mutation-validated four ways.
 
+### Changed — one demotion contract instead of three
+
+- **Relevance demotes an author that has gone quiet, and now says so
+  everywhere.** The producer demoted on heartbeat age; the field doc, the
+  `relevance` module doc, and the `Option<Liveness>` signal type all claimed only
+  a provably-`Stale` author could be demoted. Heartbeat age is the contract that
+  shipped and the one that was kept — `Liveness::Stale` needs a code-progress
+  signal no writer produced until this release, so keying the demotion on it
+  would have been dead on every existing ledger. Ranking and dropping use
+  different bars on purpose: hiding a live peer causes a write collision, ranking
+  one lower hides nothing. The signal is now
+  `author_past_heartbeat_window: bool`, so the sources cannot drift apart by
+  prose again. The config key `coordination.relevance.stale_author_factor` is
+  unchanged. Registered as RC-066.
+
 ## v0.2.0 - 2026-08-04
 
 ### Fixed — verdicts that nothing acted on
