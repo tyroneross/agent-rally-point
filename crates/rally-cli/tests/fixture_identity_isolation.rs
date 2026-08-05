@@ -199,3 +199,121 @@ fn fixture_git_leaves_decoy_real_repo_config_untouched() {
 
     fs::remove_dir_all(&decoy).ok();
 }
+
+/// The regression test for RC-064's ACTUAL mechanism, corrected 2026-08-05.
+///
+/// The original diagnosis — "a fixture whose root drifted into a real
+/// checkout" — was wrong. All three July-10 fixtures already passed an
+/// explicit `git -C <scratch>`. What defeated `-C` was environment
+/// inheritance: git injects `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE`
+/// into a hook's environment, **those override `-C`**, and the pre-push gate
+/// ran `cargo test` without clearing them. So `git -C <scratch> config`
+/// resolved against the REAL repository.
+///
+/// `.githooks/pre-push` was fixed at `6616b711` by clearing the scope vars in
+/// its gate subshells. That closes the path the gate controls. It does NOT
+/// close the fixture itself, which stays vulnerable to any future caller who
+/// forgets — a hand-run `cargo test` inside a hook, a new gate script, a
+/// different host. `fixture_git` therefore clears the vars itself, and this
+/// test is what proves it: it reproduces the exact hostile condition by
+/// exporting `GIT_DIR` at a decoy repo, and asserts the write lands in the
+/// fixture and never in the decoy.
+///
+/// Note what this test does NOT rely on: `assert_fixture_root` cannot help
+/// here. Both roots are legitimately inside the temp dir. The temp-dir guard
+/// would have let the original incident through untouched.
+#[test]
+fn fixture_git_ignores_inherited_git_dir_pointing_at_another_repo() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let decoy = tmp_dir("envleak-decoy");
+    let scratch = tmp_dir("envleak-scratch");
+
+    let setup = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&decoy)
+            .args(args)
+            .output()
+            .expect("git invocation");
+        assert!(
+            out.status.success(),
+            "decoy setup git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    setup(&["init", "-q", "-b", "main"]);
+    setup(&["config", "user.email", "decoy-human@rossl.example"]);
+    setup(&["config", "user.name", "Decoy Human"]);
+    setup(&["commit", "--allow-empty", "-m", "decoy initial"]);
+
+    let decoy_config = decoy.join(".git").join("config");
+    let config_before = fs::read(&decoy_config).expect("read decoy config before");
+    let decoy_head_before = {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&decoy)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git invocation");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Reproduce the hostile condition: GIT_DIR (and friends) exported at the
+    // decoy, exactly as git would inject them into a hook's environment.
+    // SAFETY: single-threaded test process; set before any fixture_git call
+    // and removed immediately after.
+    unsafe {
+        std::env::set_var("GIT_DIR", decoy.join(".git"));
+        std::env::set_var("GIT_WORK_TREE", &decoy);
+    }
+
+    let result = std::panic::catch_unwind(|| {
+        fixture_git(&scratch, &["init", "-q", "-b", "main"]);
+        fixture_git(&scratch, &["commit", "--allow-empty", "-m", "scratch commit"]);
+        fixture_git(&scratch, &["rev-parse", "HEAD"])
+    });
+
+    unsafe {
+        std::env::remove_var("GIT_DIR");
+        std::env::remove_var("GIT_WORK_TREE");
+    }
+
+    let scratch_head = result.expect("fixture_git must work under a hostile GIT_DIR");
+
+    // The decoy must be untouched: no config write, and no new commit.
+    assert_eq!(
+        config_before,
+        fs::read(&decoy_config).expect("read decoy config after"),
+        "an inherited GIT_DIR must not let a fixture write into another repo's config"
+    );
+    let decoy_head_after = {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&decoy)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git invocation");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(
+        decoy_head_before, decoy_head_after,
+        "an inherited GIT_DIR must not let a fixture commit into another repo"
+    );
+
+    // And the fixture's own repo really did get the commit.
+    assert!(
+        !scratch_head.is_empty(),
+        "the fixture repo must have its own HEAD"
+    );
+    assert_ne!(
+        scratch_head, decoy_head_after,
+        "the fixture commit must live in the fixture repo, not the decoy"
+    );
+
+    fs::remove_dir_all(&decoy).ok();
+    fs::remove_dir_all(&scratch).ok();
+}

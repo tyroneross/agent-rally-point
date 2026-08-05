@@ -5,15 +5,33 @@
 //! in this crate's tests.
 //!
 //! # The defect this closes
-//! On 2026-07-10, 64 commits landed in the REAL agent-rally-point checkout
-//! authored `Rally Test <rally@example.test>`. The mechanism: fixture helpers
-//! ran `git -C <root> config user.email rally@example.test`. `git config`
-//! (default `--local`) discovers the enclosing repo by walking up from
-//! `-C <root>`. If `root` ever resolved to — or sat inside — the real
-//! checkout (or was a linked worktree, where `--local` writes to the MAIN
-//! repo's `.git/config`), the fixture silently wrote a local identity
-//! override into the real repo that beat the correct global identity for
-//! every later commit.
+//! On 2026-07-10, 70 commits landed in the REAL agent-rally-point checkout
+//! authored `Rally Test <rally@example.test>`. Fixture helpers ran
+//! `git -C <root> config user.email rally@example.test`, and `git config`
+//! (default `--local`) wrote into the real repository.
+//!
+//! `-C <root>` looks like it makes that impossible. It does not. Git injects
+//! `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` into a hook's environment,
+//! and **those override `-C`**. The pre-push gate ran `cargo test` without
+//! clearing them, so a fixture's `git -C <scratch>` resolved against the real
+//! checkout. The local override then beat the correct global identity for
+//! every later commit. (RC-064, mechanism corrected 2026-08-05 by an
+//! independent forensic pass; the earlier "fixture root drifted into a real
+//! checkout" reading was a real but DIFFERENT hazard, and was not what
+//! happened here.)
+//!
+//! Two independent controls follow from that, and the distinction matters:
+//!   1. [`fixture_git`] writes no config at all, so there is nothing to
+//!      misroute no matter what the environment says. This is what actually
+//!      closes the incident.
+//!   2. It also clears the repo-scoping env vars, so a fixture's `init` and
+//!      `commit` cannot be redirected either — the hook was fixed at
+//!      `6616b711`, but a fixture that depends on its caller having cleaned
+//!      the environment is waiting for the next caller who forgets.
+//!
+//! [`assert_fixture_root`] is a THIRD, weaker control against a different
+//! hazard. It would not have caught the July 10 incident: those fixture roots
+//! were correct.
 //!
 //! Contributor PR #11 (May 2026) fixed this exact defect CLASS for
 //! `core.hooksPath` in tmp-repo fixtures. It reappeared in July on a path
@@ -115,6 +133,25 @@ pub fn fixture_git(root: &Path, args: &[&str]) -> String {
         .env("GIT_COMMITTER_NAME", FIXTURE_NAME)
         .env("GIT_COMMITTER_EMAIL", FIXTURE_EMAIL)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        // THE actual July-10 mechanism (RC-064, corrected 2026-08-05): git
+        // injects these into a hook's environment, and they OVERRIDE `-C`.
+        // The pre-push gate ran `cargo test` without clearing them, so
+        // `git -C <scratch>` in a fixture resolved against the REAL repo.
+        // `.githooks/pre-push` was fixed at `6616b711`, but a fixture that
+        // depends on its caller having cleared the environment is a fixture
+        // waiting for the next caller who forgets. Clearing them HERE makes
+        // the fixture correct no matter who spawns it -- including `cargo
+        // test` run by hand inside a hook, which no gate covers.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_PREFIX")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_QUARANTINE_PATH")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_NAMESPACE")
         .output()
         .expect("git invocation");
     assert!(
