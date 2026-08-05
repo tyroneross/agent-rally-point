@@ -146,7 +146,11 @@ test("rejects a task id with a shell/path-unsafe character", () => {
 // JSON-shaped `output` strings, p01..p10 ids, councils/runs/* owns paths) must
 // still lint clean under the tightened output/owns/id rules.
 test("accepts the production haiku-scale descriptor (no f1 false positives)", () => {
-  const prod = "/Users/tyroneross/dev/git-folder/AI User Personas/councils/runs/haiku-scale-20260609-01/workstream.json";
+  // A path with spaces and a deep nesting, which is what this assertion is
+  // actually about. It used to hardcode a real path into a PRIVATE sibling repo
+  // on the maintainer's machine — a fixture that named someone's other project
+  // and only ran correctly on one laptop (ARP-R-06).
+  const prod = "/tmp/example-workspace/AI User Personas/councils/runs/haiku-scale-20260609-01/workstream.json";
   let doc;
   try {
     doc = JSON.parse(readFileSync(prod, "utf8"));

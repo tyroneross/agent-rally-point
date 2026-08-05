@@ -7,7 +7,25 @@ SPDX-License-Identifier: Apache-2.0
 
 User directive (2026-05-31): rally formalizes a **lead agent** that orchestrates and
 coordinates autonomous multi-agent work. Rally **records + exposes** the lead and the
-mission; it **never enforces** behavior (charter: facilitator, not executor).
+mission, and it **does not enforce the lead's coordination decisions** — the charter is
+facilitator, not executor. Lanes, merges, and priorities remain doctrine the agents
+choose to follow.
+
+**The seat does gate two room-wide capabilities, added after RC-037 and RC-038.** A
+`workspace:*` / `repo:*` claim, which conflicts with every later claim in the room, and
+an unscoped `blocker`, which flips `check before-write` to `allow: false` for every
+agent, are accepted only when `fact.tool` matches the lead as of that fact; from a
+non-lead they degrade to a warning. Both are room-wide denial-of-service paths, which
+is why they are gated and ordinary per-path claims are not.
+
+That gate compares `--tool`, which the writer supplies and no credential binds. It stops
+an agent acting under its own name and does **not** stop one that passes
+`--tool <lead-id>`.
+`crates/rally-cli/tests/lead_seat_authz.rs::impersonation_is_not_stopped_and_this_test_says_so`
+asserts that residual so it cannot rot into a belief that the seat is defended. Read the
+gate as a guard against the accidental and honest case, not as an authorization boundary;
+[`docs/security/TRUST-MODEL.md`](security/TRUST-MODEL.md) states it in full, including a
+retraction of an earlier claim of exactly this shape.
 
 ## Model
 

@@ -13,7 +13,7 @@ finished.
 The right end state is:
 
 ```text
-/Users/tyroneross/dev/git-folder/agent-rally-point
+~/dev/git-folder/agent-rally-point
 ```
 
 as the single local folder for the Agent Rally Point product, with retired or
@@ -32,7 +32,7 @@ archives until one terminal owns reconciliation.
 
 | Item | Current state | Assessment |
 |---|---|---|
-| Canonical checkout | `/Users/tyroneross/dev/git-folder/agent-rally-point` | Correct folder. Keep this as the only product checkout. |
+| Canonical checkout | `~/dev/git-folder/agent-rally-point` | Correct folder. Keep this as the only product checkout. |
 | Local `main` | `d709435` | Contains local-only merge/security/fleet work. |
 | GitHub `main` | `500e42f` | `git ls-remote origin refs/heads/main` also reports `500e42f`; remote state is current. |
 | Divergence | `main...origin/main [ahead 11, behind 9]` | This must be reconciled before any consolidation push. |
@@ -58,13 +58,13 @@ engagement segment.
 
 | Folder | Current state | Should be | Why |
 |---|---|---|---|
-| `/Users/tyroneross/dev/git-folder/agent-rally-point` | Main worktree, branch `main`, HEAD `d709435` | Canonical product folder | This is the repo named by the consolidation rule and docs. |
-| `/Users/tyroneross/dev/git-folder/agent-rally-point-cockpit` | Linked worktree, branch `feat/agent-cockpit`, clean | Temporary lane until merged or archived | Cockpit source belongs to Rally if it is part of the product, but the sibling folder should not remain permanent. |
-| `/Users/tyroneross/dev/git-folder/agent-rally-point-sec-harden` | Linked worktree, branch `bl/security-harden-control-plane`, one untracked bundle | Temporary lane until branch is merged or archived | Security work may be product work, but it should land through the canonical repo and then the worktree can be retired. |
-| `/Users/tyroneross/dev/git-folder/agent-rally-point-wt-runiso` | Linked worktree, branch `feat/rally-run-worktree-isolation`, clean | Temporary lane until merged or archived | Run isolation is product work; the lane should not remain as an extra product folder after merge. |
-| `/Users/tyroneross/dev/git-folder/agent-rally-watcher` | Missing | Correct to be absent if fully imported | Watcher now lives under `tools/agent-rally-watcher/` as legacy reference. |
-| `/Users/tyroneross/dev/git-folder/agent-rally-point-lane-a` | Missing | Correct to be absent if archived | No current folder to reconcile. |
-| `/Users/tyroneross/dev/git-folder/agent-builder` | Separate repo | Remain separate | User explicitly excluded it from Rally consolidation. |
+| `~/dev/git-folder/agent-rally-point` | Main worktree, branch `main`, HEAD `d709435` | Canonical product folder | This is the repo named by the consolidation rule and docs. |
+| `~/dev/git-folder/agent-rally-point-cockpit` | Linked worktree, branch `feat/agent-cockpit`, clean | Temporary lane until merged or archived | Cockpit source belongs to Rally if it is part of the product, but the sibling folder should not remain permanent. |
+| `~/dev/git-folder/agent-rally-point-sec-harden` | Linked worktree, branch `bl/security-harden-control-plane`, one untracked bundle | Temporary lane until branch is merged or archived | Security work may be product work, but it should land through the canonical repo and then the worktree can be retired. |
+| `~/dev/git-folder/agent-rally-point-wt-runiso` | Linked worktree, branch `feat/rally-run-worktree-isolation`, clean | Temporary lane until merged or archived | Run isolation is product work; the lane should not remain as an extra product folder after merge. |
+| `~/dev/git-folder/agent-rally-watcher` | Missing | Correct to be absent if fully imported | Watcher now lives under `tools/agent-rally-watcher/` as legacy reference. |
+| `~/dev/git-folder/agent-rally-point-lane-a` | Missing | Correct to be absent if archived | No current folder to reconcile. |
+| `~/dev/git-folder/agent-builder` | Separate repo | Remain separate | User explicitly excluded it from Rally consolidation. |
 
 ## Key files: where they are and where they should be
 
@@ -102,7 +102,7 @@ engagement segment.
 | Native watcher | `crates/rally-cli/src/lib.rs` has `rally watch` code/spec surfaces | Make this the active watch/dispatch path | It reads repo-local `.rally/log` and avoids the legacy global apps store. |
 | Python watcher | `tools/agent-rally-watcher/` still watches legacy `~/.agent-rally-point/apps/<app>/changes.jsonl` | Keep as reference only until native parity; do not use as active product path | It documents useful dispatch behavior but points at the wrong canonical store. |
 | Build Loop embedded bridge | Local Build Loop still contains `scripts/rally_point/**`, `scripts/agent_rally.py`, `coordination_status.py`, and `coordination_rally.py` with legacy fallback references | Build Loop should resolve to the owning repo and shell to native `rally` for writes, or use a bridge that writes repo-local `.rally/log` | This prevents Build Loop-managed agents from becoming invisible to native-rally agents. |
-| Easy Terminal | Easy Terminal docs require ET work to coordinate from `/Users/tyroneross/dev/git-folder/easy-terminal/.rally` | Keep ET coordination in Easy Terminal's repo, even when editing Rally or ptyd as support work | The owner of the work owns the ledger. Do not centralize project facts into Agent Rally Point. |
+| Easy Terminal | Easy Terminal docs require ET work to coordinate from `~/dev/git-folder/easy-terminal/.rally` | Keep ET coordination in Easy Terminal's repo, even when editing Rally or ptyd as support work | The owner of the work owns the ledger. Do not centralize project facts into Agent Rally Point. |
 | Host runtime | `rally whoami` sees Easy Terminal's ptyd socket and `under_ptyd: true` | Treat as delivery/runtime context, not source-of-truth storage | ptyd can inject/capture sessions; it should not determine where facts are stored. |
 
 ## Recommendations
@@ -116,7 +116,7 @@ engagement segment.
 2. Keep the one-folder product boundary strict.
 
    The only permanent local product folder should be
-   `/Users/tyroneross/dev/git-folder/agent-rally-point`. Worktrees may exist
+   `~/dev/git-folder/agent-rally-point`. Worktrees may exist
    during active work, but after merge they should be removed or archived.
    Historical source should be preserved with bundles in `archive/bundles/`.
 
@@ -179,7 +179,7 @@ Use this sequence for consolidation work:
 ## Final target shape
 
 ```text
-/Users/tyroneross/dev/git-folder/agent-rally-point/
+~/dev/git-folder/agent-rally-point/
   AGENTS.md
   CLAUDE.md
   RALLY.md

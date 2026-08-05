@@ -147,6 +147,7 @@ mod store_client;
 mod tier_fit;
 pub mod worktree_gc;
 mod worktree_guard;
+mod write_authority;
 
 use backends::*;
 use backlog::{
@@ -13716,9 +13717,25 @@ fn command_lead(args: LeadArgs) -> Result<Output> {
     }
 }
 
-/// Append a `role:lead` decision transferring the title to `t.to`. The latest
-/// such decision wins in the projection, so this just records the transfer
-/// (charter: records/exposes, never enforces).
+/// Append a `role:lead` decision transferring the title to `t.to`.
+///
+/// ARP-R-01, two fixes here; the gate itself is at the write boundary in
+/// `write_authority::assert_lead_transfer_authorized`, so a hand-built fact or
+/// a routed daemon request clears the same bar this command does.
+///
+/// **Attribution.** This used to stamp `tool: Some(t.to)` — the BENEFICIARY.
+/// The ledger recorded a seizure as authored by the agent that gained the seat,
+/// so the one field an investigator reads to find out who took it named the
+/// wrong agent, and no gate could be built on `fact.tool` because it did not
+/// hold the actor. Now `tool` is the ACTOR and `target` is the beneficiary;
+/// `claim_authority::lead_beneficiary` reads `target` and falls back to `tool`
+/// so the three pre-existing lead facts in this repo's ledger still replay to
+/// the same lead. The ledger is append-only — a projection change has to stay
+/// backward-compatible or it rewrites history it cannot edit.
+///
+/// **Precondition.** The only one used to be `ensure_presence`, which CREATES
+/// presence rather than checking standing — so it admitted every caller,
+/// including one that had never entered the room.
 fn set_lead(json: bool, t: &LeadTargetArgs, mode: &str) -> Result<Output> {
     let room = RoomStore::open()?;
     ensure_presence(&room, &t.tool)?;
@@ -13727,6 +13744,19 @@ fn set_lead(json: bool, t: &LeadTargetArgs, mode: &str) -> Result<Output> {
     if let Some(p) = &prior {
         evidence.push(format!("from:{p}"));
     }
+    // Recorded on the fact, not just accepted as a flag: a seizure that leaves
+    // no trace in the ledger is indistinguishable from a handoff to anyone
+    // reading the room later, which is the entire value this flag has.
+    if t.force {
+        evidence.push(crate::write_authority::LEAD_FORCE_MARKER.to_string());
+        if let Some(p) = &prior {
+            evidence.push(format!("displaced:{p}"));
+        }
+    }
+    let summary = match (&prior, t.force) {
+        (Some(p), true) => format!("{} took the lead seat from {p} (via {mode}, --force)", t.to),
+        _ => format!("{} is lead (via {mode})", t.to),
+    };
     let fact = Fact {
         from_session_id: None,
         schema: FACT_SCHEMA.to_string(),
@@ -13734,14 +13764,14 @@ fn set_lead(json: bool, t: &LeadTargetArgs, mode: &str) -> Result<Output> {
         seq: 0,
         thread_id: new_id("room"),
         kind: FactKind::Decision,
-        tool: Some(t.to.clone()),
+        tool: Some(t.tool.clone()),
         role: None,
         subject: "role:lead".to_string(),
         scope: Vec::new(),
         created_at: now_string(),
-        summary: Some(format!("{} is lead (via {mode})", t.to)),
+        summary: Some(summary),
         evidence,
-        target: None,
+        target: Some(t.to.clone()),
         ref_id: None,
         status: None,
         severity: None,
@@ -13985,7 +14015,7 @@ fn help_text() -> String {
         "  rally decisions [--json]   # current decisions",
         "  rally artifacts [--json]   # recent artifacts",
         "",
-        "  rally lead show|handoff|assign|relinquish [--json]  # lead title; rally records, never enforces",
+        "  rally lead show|handoff|assign|relinquish [--json]  # lead title; the seat gates room-wide claims, the room freeze, and its own transfer",
         "  rally doctor [--canonical-paths] [--prune-rooms] [--reap-stale] [--sweep-corrupt] [--apply] [--json]",
         "    read-only until --apply; --reap-stale closes over-TTL presence, claims, and leads",
         "  rally worktree gc [--apply] [--json]   # sweep-reap leftover per-agent worktrees",

@@ -262,7 +262,21 @@ fn check_before_write(
             // empty room first can still freeze it. That is the same authority
             // rally already extends to the lead everywhere else, and it is far
             // narrower than "any fact from any writer".
-            let from_lead = blocker.tool.is_some() && blocker.tool == snapshot.lead;
+            //
+            // ARP-R-01 / D9. This used to read `blocker.tool == snapshot.lead`
+            // — the CURRENT lead — which re-authorized the fact on every call
+            // and made the verdict retroactive in both directions. Live: the
+            // same fact id armed into a room-wide deny when its author later
+            // took the seat, and the honest lead's freeze disarmed when anyone
+            // else took it.
+            //
+            // The projection now decides this once, against the lead as of the
+            // blocker's own seq, and publishes the answer as
+            // `room_freeze_id`. This function REPORTS that decision; it does
+            // not make one. `room_freeze_id` is None on a pre-fix daemon
+            // payload, which reads as "no authorized freeze" — see the field's
+            // doc for why that is the right degradation.
+            let from_lead = snapshot.room_freeze_id.as_deref() == Some(blocker.event_id.as_str());
             if from_lead {
                 findings.push(CheckFinding {
                     code: "room-freeze",
@@ -406,8 +420,18 @@ mod tests {
     /// not the freeze.
     #[test]
     fn before_write_unscoped_blocker_from_the_lead_freezes_the_room() {
+        // ARP-R-01: `check` no longer decides WHICH unscoped blocker is an
+        // authorized freeze — the projection does, at the blocker's own seq,
+        // and publishes `room_freeze_id`. This test grades the reporting half,
+        // so it states the projection's verdict directly. The DECIDING half
+        // (including the retroactive arm and disarm that motivated the change)
+        // is graded in `tests/room_freeze_admission_time.rs` against real
+        // ledgers, because a hand-built snapshot cannot express "the seat
+        // changed hands after this blocker was written".
+        let b = blocker("the-lead", "release freeze", vec![]);
         let snapshot = RoomSnapshot {
-            active_blockers: vec![blocker("the-lead", "release freeze", vec![])],
+            room_freeze_id: Some(b.event_id.clone()),
+            active_blockers: vec![b],
             lead: Some("the-lead".to_string()),
             ..Default::default()
         };

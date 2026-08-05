@@ -88,11 +88,22 @@ pub(crate) struct ReapReport {
     /// squads are not directly removable — this records which tools were stale).
     pub(crate) squads_idle_cleared: Vec<String>,
     /// Tool whose lead lease was relinquished, if any.
+    ///
+    /// Under `apply` this is populated ONLY after the relinquish fact is
+    /// durably appended (D7). It previously reported the tool whether or not
+    /// the write landed, so a caller could read "seat is open" off a report
+    /// whose durable write had failed.
     pub(crate) lead_relinquished: Option<String>,
-    /// Number of claims that were inspected but KEPT (future-dated lease, owner
-    /// timestamp unparseable, or owner still active).
+    /// Number of inspected items that were KEPT rather than closed: claims with
+    /// a future-dated lease, an unparseable owner timestamp, or a live owner;
+    /// handoffs inside their TTL or with an unparseable `created_at`; and
+    /// anything whose durable append failed, including a stale lead whose
+    /// relinquish did not land (D7).
     pub(crate) preserved_future_or_active: usize,
-    /// Whether the staged facts were actually written (`apply=true`).
+    /// The pass ran in write mode (`apply=true`) — NOT that every staged write
+    /// landed. Per-item success is carried by the item lists: an append that
+    /// failed leaves its entry out of `claims_reaped` / `handoffs_expired` /
+    /// `lead_relinquished` and lands in `preserved_future_or_active` instead.
     pub(crate) applied: bool,
 }
 
@@ -160,10 +171,12 @@ const AUTO_REAP_MARKER: &str = ".last-auto-reap";
 /// Three properties this must not violate:
 /// - **Never fails `enter`.** Any error is reported to stderr and swallowed.
 ///   Cleanup is not worth blocking an agent's session start.
-/// - **Rate-limited by a file marker, not by the ledger.** Ten agents entering
-///   at once must not write ten reap passes. The marker is `.rally/.last-auto-reap`;
-///   a missing or unparseable marker reaps (fail-toward-cleanup, since the
-///   reaper's own eligibility math is fail-closed).
+/// - **Rate-limited by a file marker, not by the ledger — SEQUENTIALLY only.**
+///   The marker is `.rally/.last-auto-reap`; a missing or unparseable marker
+///   reaps (fail-toward-cleanup, since the reaper's own eligibility math is
+///   fail-closed). This bounds how OFTEN a pass may run, not how MANY may run
+///   at once: see D8 at the marker write below for the concurrent bound the
+///   check-and-set does not deliver.
 /// - **Opt-out.** `RALLY_NO_AUTO_REAP=1`, or `auto_reap_interval_secs: 0`.
 ///
 /// Returns the report when a reap ran, `None` when it was skipped.
@@ -193,18 +206,46 @@ pub(crate) fn maybe_reap_on_enter(room: &RoomStore) -> Option<ReapReport> {
         }
     }
 
-    // Claim the interval BEFORE reaping. Two agents entering in the same second
-    // both read a stale marker; whichever writes first makes the other's next
-    // read recent, so at most one extra pass runs instead of one per agent.
-    // Reaping twice is harmless (idempotent) — this bounds the waste, it does
-    // not need to be a lock.
+    // Stamp the interval BEFORE reaping.
+    //
+    // D8 — THE BOUND THIS DOES NOT DELIVER. The comment here used to claim "at
+    // most one extra pass runs instead of one per agent". It does not. The read
+    // above and the write below are two separate syscalls with no lock, no
+    // `O_EXCL`, and no compare-and-swap, so N processes that all read the stale
+    // marker before any of them writes it ALL proceed: under N concurrent
+    // `rally enter` calls, N passes fire. The honest bound is:
+    //
+    // - **Sequential:** at most one pass per `interval` — the age check above
+    //   is a real gate once a previous pass's marker is visible.
+    // - **Concurrent:** UNBOUNDED in the number of overlapping enters. Nothing
+    //   here serialises them.
+    //
+    // Why the racy version stays rather than growing a lock here: the correct
+    // primitive already exists as `store::acquire_room_mutation_lock`, and it
+    // is private to `store.rs`. A second, differently-shaped lock in this file
+    // would be the divergence, not the fix — the fix is to export that one.
+    // Meanwhile the exposure is capped from the other side: auto-reap is OFF by
+    // default (`DEFAULT_AUTO_REAP_INTERVAL_SECS`), each pass is
+    // `ReapMode::LeaseOnly` and capped at `AUTO_REAP_MAX_FACTS`, and the reap
+    // is idempotent, so a duplicated pass wastes work rather than corrupting
+    // state. That is a cost argument, not a bound, and it is the reason the
+    // "concurrent enter is bounded" gate on turning this default back on is
+    // still OPEN.
     if let Some(parent) = marker.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(
+    // Surface a failed marker write (D7-adjacent). Silently dropping it turns
+    // the rate limit off entirely — an unwritable `.rally/` means every single
+    // `enter` reaps, which is the measured-outage condition, not a slow leak.
+    if let Err(e) = std::fs::write(
         &marker,
         now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-    );
+    ) {
+        eprintln!(
+            "rally: auto-reap rate-limit marker not written ({}): {e} — the next enter will reap again",
+            marker.display()
+        );
+    }
 
     match run_reap_stale_in_room_with_mode(room, true, ReapMode::LeaseOnly) {
         Ok(report) => Some(report),
@@ -493,8 +534,16 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
     // Only relinquish the lead when the lead's owning tool is in the
     // DESTRUCTIVE stale set (>2h silence). This is the same predicate used
     // for per-claim reclaim, just at the squad level.
+    //
+    // D7: the append result used to be DISCARDED (`let _ = ...`) while the
+    // report still named the tool, so a failed durable write produced
+    // `applied: true, lead_relinquished: "<tool>"` and a caller read the seat
+    // as open while the ledger still held the lease. The claim and handoff
+    // paths above already got this right; this one now mirrors them exactly —
+    // log, count as preserved, omit from the report.
     let lead_relinquished: Option<String> = if let Some(lead_tool) = &snapshot.lead {
         if stale_owners.contains(lead_tool.as_str()) {
+            let mut relinquish_committed = true;
             if apply {
                 let relinquish_fact = Fact {
                     from_session_id: None,
@@ -520,9 +569,24 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
                     uri: None,
                     session: None,
                 };
-                let _ = room.append_fact_verified(&relinquish_fact);
+                match room.append_fact_verified(&relinquish_fact) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "reaper: keeping lead {lead_tool} (relinquish append failed): {e}"
+                        );
+                        preserved += 1;
+                        relinquish_committed = false;
+                    }
+                }
             }
-            Some(lead_tool.clone())
+            // Dry-run keeps `relinquish_committed = true`: nothing was written,
+            // and the report already says so via `applied: false`.
+            if relinquish_committed {
+                Some(lead_tool.clone())
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -1083,6 +1147,12 @@ mod tests {
                 uri: None,
                 session: None,
             };
+            // D7 audit — this discard is NOT the D7 defect. Nothing here
+            // reports the release as applied: the assertions below re-read the
+            // room and grade the DURABLE outcome, so a dropped write shows up
+            // as `a_still_live == true` and fails the test. The discard is what
+            // lets the loop model the production stop path, which releases
+            // best-effort across many claims.
             let _ = room.append_state_transition_verified(&release);
         }
 
@@ -1183,6 +1253,9 @@ mod tests {
                 uri: None,
                 session: None,
             };
+            // D7 audit — same verdict as the sibling test above: the discard is
+            // safe because the grading is done on the re-read snapshot, not on
+            // the append's return value.
             let _ = room.append_state_transition_verified(&release);
         }
 

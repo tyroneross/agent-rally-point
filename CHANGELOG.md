@@ -115,7 +115,15 @@ a schema decision deliberately deferred out of a held release. See RC-040.
 > after the fix — `rally say claim --tool <lead-id> --scope 'workspace:*'`
 > restores the room-wide claim lockout, and `rally say blocker --tool <lead-id>`
 > restores the room-wide deny. `rally lead assign --to <self>` additionally
-> succeeds against a live incumbent, so the seat is not defended either.
+> succeeded against a live incumbent, so the seat was not defended either.
+>
+> [Updated 2026-08-04: the seat IS now gated (ARP-R-01) — a transfer requires a
+> leaderless room, an actor that is the incumbent, a stale incumbent, or an
+> explicit `--force` that records the seizure. That closes the honest-name path
+> and nothing beyond it: `--tool <incumbent>` still works, so the seat now shares
+> the same single residual as the other two gates rather than sitting open
+> beneath them. The paragraph above is left as written because it was true when
+> written and the correction is worth more than a clean page.]
 >
 > The adversarial tests below are real and revert-proof, and they graded only the
 > first move: every one of them posts the rogue's fact under the rogue's OWN id.
@@ -154,22 +162,40 @@ when the fix is reverted — subject to the bypass stated above.
   anyone else's is surfaced as a warning the agent reads and decides about
   (`unscoped-blocker`). Unscoped binding decisions are labelled `unscoped-decision`
   instead of being reported as applying to a path they never named.
-- **The pre-push gate no longer executes host tests the pin never reviewed
-  (RC-034).** The gate pinned three dispatcher scripts from a trusted ref, then
-  globbed and ran `tests/hooks/test_*.sh` from the pushed tree — so adding a new
-  test file bypassed the pin while the hook printed a healthy pin message. Host
-  tests absent from, or modified relative to, the pinned commit are now refused by
-  name unless explicitly acknowledged. An env-supplied `RALLY_PREPUSH_GATE_PIN_REF`
-  that RESOLVES now requires an operator ack, not only when it resolves to a commit
-  in the push. An env pin that does NOT resolve still takes the bootstrap fallback
-  with a warning and no ack, which also disables the new host-test check — recorded
-  as RC-046, not fixed. The hook header states plainly what the pin does not cover — the
-  gate still compiles and runs pushed-tree code by design.
+- **The pre-push gate refuses, rather than warns, on the paths where the pin
+  reviewed nothing (RC-034, ARP-R-05).** The gate pinned three dispatcher scripts
+  from a trusted ref, then globbed and ran `tests/hooks/test_*.sh` from the pushed
+  tree — so adding a new test file bypassed the pin while the hook printed a
+  healthy pin message. Host tests absent from, or modified relative to, the pinned
+  commit are now refused by name unless explicitly acknowledged. An env-supplied
+  `RALLY_PREPUSH_GATE_PIN_REF` that RESOLVES now requires an operator ack, not only
+  when it resolves to a commit in the push. Read this as narrowing the unreviewed
+  surface, not closing it: the gate still compiles and runs pushed-tree code by
+  design, and each refusal has an env-var override that runs it anyway.
+  ARP-R-05 closed three ways the gate reported success on a path that reviewed
+  nothing. (a) A DEFAULT pin resolving to a commit in the push — pushing `main`
+  while the pin is `main`, which is this repo's ordinary path — used to warn and
+  continue; it now refuses behind the same `RALLY_PREPUSH_ACK_VACUOUS_PIN=1` that
+  already gated the env case. A check that passed on every normal push was
+  certifying nothing. (b) The affirmative `gate scripts pinned to <ref> @ <sha>`
+  line printed before any diff had run. It is replaced by a neutral resolve marker
+  at that point and a post-comparison summary that names each path, which copy ran
+  (pinned or pushed), and why; the closing line reports the SHA count and the two
+  dispatchers that exited 0 instead of `all gates green`. (c)
+  `hooks/ensure-rally-binary.sh` — `curl`, `chmod +x`, `cargo install` — is
+  executed by two of the PINNED host test suites but could not be pinned itself,
+  because the pin hardcoded a `scripts/` prefix. The pin is now keyed on
+  repo-relative paths and that file is in the set as a compare-only entry.
+  An env pin that does NOT resolve still takes the bootstrap fallback with a
+  warning and no ack, which also disables the host-test check — recorded as
+  RC-046, not fixed. The hook header states plainly what the pin does not cover.
 
-Room-wide effects now require the lead seat, and the lead seat is taken by first
-join and is not authenticated. That raises the bar from "any writer" to "the
-first writer"; it is not an authorization boundary. See
-[`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md).
+Room-wide effects require the lead seat, and the lead seat is not authenticated:
+`fact.tool` is self-asserted. The seat's own transfer is gated as of 2026-08-04
+(ARP-R-01), so it is no longer takeable under a rogue's honest name — but
+`--tool <incumbent>` still satisfies every one of these checks. They stop the
+accidental and honest cases; they do not stop an adversary and they are not an
+authorization boundary. See [`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md).
 
 ### Fixed — discoverability
 

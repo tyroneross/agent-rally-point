@@ -568,22 +568,90 @@ fn rc041_3d_the_python_wake_path_sanitizes_to_the_same_rule() {
     );
 }
 
-/// The claim the Rust chokepoint comment makes — "no future caller can route
-/// around it" — was false while `rally_wake.py` shelled `tmux send-keys -l`
-/// directly. Grade the SHAPE, so re-adding a raw send fails here even if the
-/// fixture list is untouched.
+/// The Python-side adversarial controls for `scripts/rally_wake.py`
+/// (ARP-R-11): payload-as-flag, malformed target, forged provenance label,
+/// non-atomic writes, and the structural chokepoint check.
+///
+/// Run from here ON PURPOSE. `scripts/check-release-parity.sh` executes a
+/// hardcoded list of `tests/scripts/test_*.py`, so a suite that is not on
+/// somebody's list is a control nobody runs — a hypothesis, not a gate
+/// (docs/ROOT-CAUSE-REGISTER.md). `cargo test` already runs this file, and the
+/// invariant is the same one this file exists to defend: the wake path obeys
+/// the inject chokepoint's rules.
 #[test]
-fn rc041_3d_the_python_wake_path_has_no_unsanitized_send() {
-    let script = repo_root().join("scripts/rally_wake.py");
+fn arp_r11_the_python_wake_controls_run() {
+    let root = repo_root();
+    let out = std::process::Command::new("python3")
+        .current_dir(&root)
+        .args(["-m", "unittest", "tests/scripts/test_rally_wake.py"])
+        .output()
+        .expect("python3 must be available to run the wake-path controls");
+    assert!(
+        out.status.success(),
+        "tests/scripts/test_rally_wake.py failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// D4 — the claim the Rust chokepoint comment makes ("no future caller can
+/// route around it") must be graded on the PATH, not on a spelling.
+///
+/// What this replaces: a line scan that fired only on a line containing both
+/// `send-keys` and `"-l"` and then asserted that same line also said
+/// `sanitize_wake_text`. Reformatting the call, moving the sanitized text into
+/// a variable, or switching `-l` to `-H` all silenced it with the hole intact —
+/// and the fixed script does use `-H`, so that check would now pass on any
+/// content whatsoever.
+///
+/// The structural analyzer (`tests/scripts/test_rally_wake.py --analyze`)
+/// parses the script and asserts every process it runs comes out of the single
+/// chokepoint function. NEGATIVE CONTROL INLINE: the same analyzer is pointed
+/// at a scratch copy with a raw `tmux send-keys` appended, and must reject it.
+/// A verifier only ever seen to pass is not evidence.
+#[test]
+fn arp_r11_the_python_wake_path_has_one_chokepoint() {
+    let root = repo_root();
+    let analyzer = root.join("tests/scripts/test_rally_wake.py");
+    let script = root.join("scripts/rally_wake.py");
+
+    let analyze = |path: &std::path::Path| -> (bool, String) {
+        let out = std::process::Command::new("python3")
+            .current_dir(&root)
+            .arg(&analyzer)
+            .arg("--analyze")
+            .arg(path)
+            .output()
+            .expect("python3 must be available to run the structural analyzer");
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+
+    let (ok, report) = analyze(&script);
+    assert!(ok, "rally_wake.py routes around its chokepoint: {report}");
+
+    let scratch = std::env::temp_dir().join(unique_name("rally-wake-mutant"));
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let mutant = scratch.join("mutant_rally_wake.py");
     let source = std::fs::read_to_string(&script).expect("read rally_wake.py");
-    for (n, line) in source.lines().enumerate() {
-        let is_send = line.contains("send-keys") && line.contains("\"-l\"");
-        if is_send {
-            assert!(
-                line.contains("sanitize_wake_text"),
-                "rally_wake.py:{} writes a literal send-keys without sanitizing: {line}",
-                n + 1
-            );
-        }
-    }
+    std::fs::write(
+        &mutant,
+        format!(
+            "{source}\n\ndef reintroduced_hole(target, text):\n    \
+             run([\"tmux\", \"send-keys\", \"-t\", target, \"-l\", text])\n"
+        ),
+    )
+    .expect("write mutant");
+    let (mutant_ok, mutant_report) = analyze(&mutant);
+    let _ = std::fs::remove_dir_all(&scratch);
+    assert!(
+        !mutant_ok,
+        "the analyzer accepted a re-added raw send-keys — it has no teeth: {mutant_report}"
+    );
 }

@@ -346,7 +346,15 @@ chmod +x "$status_prompt_bin"
   if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
   printf '%s' "$out" | grep -q "Agent status:" || { printf 'missing status header: %s\n' "$out" >&2; exit 1; }
   printf '%s' "$out" | grep -q "claude_code:lead: working on crates/rally-cli («engine dispatch»)" || { printf 'missing working peer: %s\n' "$out" >&2; exit 1; }
-  printf '%s' "$out" | grep -q "gemini:qa: idle, next check-in 2999-01-01T00:05:00Z" || { printf 'missing idle wake-after: %s\n' "$out" >&2; exit 1; }
+  # ARP-R-08 TRADEOFF, pinned deliberately. `gemini:qa` used to render bare and
+  # now renders QUOTED, because rule 4 of the identifier shape rejects any word
+  # shorter than 3 characters and `qa` is 2. That rule is what stops `rm-rf-tmp`,
+  # `curl-x-sh` and `chmod-a-x` -- it halves the bare rate on a hostile command
+  # corpus (66.7% -> 37.0%) for 2.5pp of real tool ids. The whole ledger has
+  # exactly three such casualties (`ci`, `agent:c`, `tool-a:01`), so the rule was
+  # NOT loosened to make this assertion pass; the assertion was updated and the
+  # cost recorded here. The wake_after timestamp beside it must still be bare.
+  printf '%s' "$out" | grep -q "«gemini:qa»: idle, next check-in 2999-01-01T00:05:00Z" || { printf 'missing idle wake-after: %s\n' "$out" >&2; exit 1; }
   printf '%s' "$out" | grep -q "codex:blocked: blocked on fact_blocker" || { printf 'missing blocked ref: %s\n' "$out" >&2; exit 1; }
   if printf '%s' "$out" | grep -q "stale-peer"; then
     printf 'stale status leaked: %s\n' "$out" >&2
@@ -368,7 +376,8 @@ T="UserPromptSubmit prompt includes peer status changes"
   printf '%s' "$out" | grep -q "UserPromptSubmit" || { printf 'missing UserPromptSubmit envelope: %s\n' "$out" >&2; exit 1; }
   printf '%s' "$out" | grep -q "Agent status:" || { printf 'missing status header: %s\n' "$out" >&2; exit 1; }
   printf '%s' "$out" | grep -q "claude_code:lead: working on crates/rally-cli («engine dispatch»)" || { printf 'missing working peer: %s\n' "$out" >&2; exit 1; }
-  printf '%s' "$out" | grep -q "gemini:qa: idle, next check-in 2999-01-01T00:05:00Z" || { printf 'missing peer next check-in: %s\n' "$out" >&2; exit 1; }
+  # Quoted for the same ARP-R-08 reason as the SessionStart case above.
+  printf '%s' "$out" | grep -q "«gemini:qa»: idle, next check-in 2999-01-01T00:05:00Z" || { printf 'missing peer next check-in: %s\n' "$out" >&2; exit 1; }
   if printf '%s' "$out" | grep -q "codex:observer: idle"; then
     printf 'per-turn prompt should omit self-only status noise: %s\n' "$out" >&2
     exit 1
@@ -899,6 +908,256 @@ if command -v node >/dev/null 2>&1; then
 else
   ok "$T (skipped — node unavailable in test env)"
 fi
+
+# ----------------------------------------------------------------------
+# Test 17 (ARP-R-08): the identifier shape gate, graded adversarially.
+#
+# RC-040 rendered an identifier BARE unless proseWords() -- runs of >=3 ASCII
+# letters containing a vowel -- exceeded 3. That measures vowel-bearing English,
+# and the payload class the boundary exists to stop is shell-shaped, which is
+# systematically vowel-poor: `now-run-rm-rf` scored 2, `rm-rf-tmp` 0,
+# `curl-x-sh` 1, `chmod-a-x` 1. All four reached the model channel OUTSIDE the
+# guillemet contract the preamble promises the reading agent.
+#
+# These cases assert the HOSTILE value is neutralized, not merely that benign
+# values survive. A test that only checks the benign direction is exactly the
+# green suite GAP 1A lived through.
+# ----------------------------------------------------------------------
+adv_bin="$tmpdir/rally_adv"
+cat > "$adv_bin" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "hooks" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"data":{"hooks":{"enabled":true,"prompt":"off"}}}'
+elif [ "$1" = "room" ]; then
+  cat "${ROOM_JSON:?}"
+elif [ "$1" = "status" ] && [ "$2" = "read" ]; then
+  cat "${STATUS_JSON:?}"
+elif [ "$1" = "next" ]; then
+  printf '%s\n' '{"data":{"next":{"actionable":false}}}'
+else
+  printf '%s\n' '{}'
+fi
+EOF
+chmod +x "$adv_bin"
+
+# _adv_render <case-name> <peer-tool> <scopes-json-array> <status-file> <blocked-ref>
+# Drives the value through the four ident() sinks a peer controls on start --
+# squad id, claim scope, status file, blocked ref -- and prints the rendered
+# model-channel message.
+_adv_render() {
+  _ad="$tmpdir/adv-$1"
+  mkdir -p "$_ad/repo/.rally"
+  ADV_TOOL="$2" ADV_SCOPES="$3" ADV_FILE="$4" ADV_REF="$5" node -e '
+const fs = require("fs");
+const t = process.env.ADV_TOOL;
+fs.writeFileSync(process.argv[1], JSON.stringify({ data: { room: {
+  squads: [
+    { tool: t, status: "active", last_seen_ts: "2999-01-01T00:00:00Z" },
+    { tool: "claude_code:self", status: "active", last_seen_ts: "2999-01-01T00:00:00Z" }
+  ],
+  active_claims: [
+    { tool: t, scope: JSON.parse(process.env.ADV_SCOPES),
+      evidence: ["lease_expires_at:2999-01-01T00:00:00Z"] }
+  ],
+  open_handoffs: []
+}}}));
+fs.writeFileSync(process.argv[2], JSON.stringify({ data: { status_read: { states: [
+  { tool: t, state: "working", file: process.env.ADV_FILE, intent: "refactor",
+    stale: false, last_seen_ts: "2999-01-01T00:00:00Z" },
+  { tool: "codex:peer", state: "blocked", ref: process.env.ADV_REF,
+    stale: false, last_seen_ts: "2999-01-01T00:00:00Z" }
+]}}}));
+' "$_ad/room.json" "$_ad/status.json"
+  (
+    cd "$_ad/repo" || exit 1
+    ROOM_JSON="$_ad/room.json" STATUS_JSON="$_ad/status.json" \
+      RALLY_BIN="$adv_bin" RALLY_TOOL_ID="claude_code:self" \
+      "$HOOK" start claude_code </dev/null 2>/dev/null
+  ) | node -e '
+const fs = require("fs");
+let p = {};
+try { p = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch (_) {}
+const msg = (p && p.hookSpecificOutput && p.hookSpecificOutput.additionalContext)
+  || (p && p.systemMessage) || "";
+process.stdout.write(msg);
+'
+}
+
+# ---- Case 1: shell-shaped payloads must never render bare ----------------
+# Each is BELOW the old density threshold (scores 2, 0, 1, 1) and so rendered
+# bare before ARP-R-08. Injected as a claim scope AND as a peer tool id.
+T="ARP-R-08 case 1: vowel-poor command shapes never render outside guillemets"
+adv_fail=""
+i=0
+for adv in now-run-rm-rf rm-rf-tmp curl-x-sh chmod-a-x; do
+  i=$((i+1))
+  msg="$(_adv_render "c1-$i" "codex:$adv" "[\"file:src/$adv\", \"$adv\"]" "src/$adv" "fact_blocker")"
+  if [ -z "$msg" ]; then adv_fail="$adv_fail; empty render for $adv"; continue; fi
+  outside="$(printf '%s' "$msg" | node -e '
+const fs = require("fs");
+process.stdout.write(fs.readFileSync(0, "utf8").split(/«[^»]*»/).join(" "));
+')"
+  # The payload appears as a scope, a bare scope, a tool id and a status file.
+  # None of those renderings may survive with the guillemet spans removed.
+  if printf '%s' "$outside" | grep -q -- "$adv"; then
+    adv_fail="$adv_fail; $adv rendered BARE (outside the guillemet contract)"
+  fi
+done
+if [ -z "$adv_fail" ]; then ok "$T"; else bad "$T" "${adv_fail#; }"; fi
+
+# ---- Case 1b: the same payloads as the peer TOOL ID alone ----------------
+T="ARP-R-08 case 1b: a command-shaped peer tool id cannot pass as narration"
+adv_fail=""
+i=0
+for adv in now-run-rm-rf rm-rf-tmp curl-x-sh chmod-a-x; do
+  i=$((i+1))
+  msg="$(_adv_render "c1b-$i" "$adv" '["file:dynamic-workflows"]' "src/lib.rs" "fact_blocker")"
+  outside="$(printf '%s' "$msg" | node -e '
+const fs = require("fs");
+process.stdout.write(fs.readFileSync(0, "utf8").split(/«[^»]*»/).join(" "));
+')"
+  if printf '%s' "$outside" | grep -q -- "$adv"; then
+    adv_fail="$adv_fail; tool id $adv rendered BARE"
+  fi
+done
+if [ -z "$adv_fail" ]; then ok "$T"; else bad "$T" "${adv_fail#; }"; fi
+
+# ---- Case 2: truncation must not reintroduce excluded characters --------
+# `fact.alpha.beta.<46 digits>` is 62 chars: inside the shape gate (3 words
+# across 3 parts, all >=3 chars) so it renders BARE, but longer than the 60-char
+# cap on a blocked ref, so clip() fires. Two things are graded.
+#   (a) The marker may not put `[` or `]` back into a value the allowlist just
+#       stripped them from. `[...]` is also a live glob in the copy-pasteable
+#       `rally say handoff --tool <id>` that hostId() feeds.
+#   (b) The marker may not change the bare/quoted decision. Under the old order
+#       clip() ran FIRST, so `...[truncated]` added the vowel-bearing word
+#       `truncated` to the count -- taking this value from 3 words to 4 and
+#       flipping it from bare to quoted purely because it was long.
+T="ARP-R-08 case 2: clip() marker adds no excluded character and cannot flip the shape decision"
+adv_long="fact.alpha.beta.0123456789012345678901234567890123456789012345"
+msg="$(_adv_render "c2" "codex:peer" '["file:dynamic-workflows"]' "src/lib.rs" "$adv_long")"
+adv_fail=""
+[ "${#adv_long}" = "62" ] || adv_fail="$adv_fail; fixture drifted: length ${#adv_long}, expected 62"
+if [ -z "$msg" ]; then
+  adv_fail="$adv_fail; empty render"
+else
+  case "$msg" in
+    *"[truncated]"*) adv_fail="$adv_fail; old bracketed marker is still emitted" ;;
+  esac
+  case "$msg" in
+    *"["*|*"]"*) adv_fail="$adv_fail; truncation reintroduced a bracket the allowlist excludes" ;;
+  esac
+  case "$msg" in
+    *"...+truncated"*) : ;;
+    *) adv_fail="$adv_fail; value was not clipped, so the marker path is untested" ;;
+  esac
+  # The decision is taken on the FULL value, so this stays bare despite clipping.
+  case "$msg" in
+    *"blocked on fact.alpha.beta."*) : ;;
+    *) adv_fail="$adv_fail; clipped-but-valid identifier no longer renders bare" ;;
+  esac
+  case "$msg" in
+    *"«fact.alpha.beta."*) adv_fail="$adv_fail; the truncation marker flipped the bare/quoted decision" ;;
+  esac
+fi
+if [ -z "$adv_fail" ]; then ok "$T"; else bad "$T" "${adv_fail#; }"; fi
+
+# ---- Case 3 (GAP 2B): benign scopes must not reassemble into a directive -
+# Two words per part is the floor real ids need (`dynamic-workflows`,
+# `store-efficiency`), so a TWO-word value such as `file:stop-all` is an admitted
+# residual of the shape gate. The defence at that point is renderScopes() joining
+# with ", " so each scope stays its own whitespace-delimited token. This asserts
+# the residual cannot be chained: no unquoted token may exceed the shape gate.
+T="ARP-R-08 case 3 (GAP 2B): individually-benign scopes do not reassemble into a readable directive"
+msg="$(_adv_render "c3" "codex:peer" \
+  '["file:stop-all","file:work-now","file:obey-lead","file:delete-tests","file:report-done"]' \
+  "src/lib.rs" "fact_blocker")"
+adv_fail=""
+if [ -z "$msg" ]; then
+  adv_fail="; empty render"
+else
+  adv_fail="$(printf '%s' "$msg" | node -e '
+const fs = require("fs");
+const msg = fs.readFileSync(0, "utf8");
+// The same shape gate the renderer applies, restated here so a loosened gate in
+// the hook cannot quietly loosen its own test.
+function bareShape(s) {
+  if (!s || s.length > 64 || s.indexOf("?") !== -1) return false;
+  let words = 0;
+  for (const part of s.split(/[:\/@.+]/)) {
+    if (!part) continue;
+    let n = 0;
+    for (const seg of part.split(/[-_]/)) {
+      if (!/^[A-Za-z]+$/.test(seg)) continue;
+      if (seg.length < 3) return false;
+      n++;
+    }
+    if (n > 2) return false;
+    words += n;
+  }
+  return words <= 4;
+}
+const outside = msg.split(/«[^»]*»/).join(" ");
+// A comma-welded run is the reassembly bug: `file:stop-all,file:work-now` is one
+// token and reads as a directive even though each scope passed the gate alone.
+if (/[A-Za-z0-9],[A-Za-z0-9]/.test(outside)) {
+  process.stdout.write("; scopes were welded by a bare comma into one token");
+}
+// Grade the WORD-COUNT half of the shape only, not the >=3-character minimum.
+// Hook narration is hook-authored and legitimately contains short English words
+// (`by`, `on`, `to`); the minimum-length rule exists to judge peer-authored
+// IDENTIFIER values, so applying it to narration would grade the wrong text.
+// Word count is the half that detects reassembly: narration is space-separated
+// and carries one word per token, so only a punctuation-joined payload scores.
+function wordShape(s) {
+  let words = 0;
+  for (const part of s.split(/[:\/@.+]/)) {
+    if (!part) continue;
+    let n = 0;
+    for (const seg of part.split(/[-_]/)) if (/^[A-Za-z]+$/.test(seg)) n++;
+    if (n > 2) return false;
+    words += n;
+  }
+  return words <= 4;
+}
+const bad = outside.split(/\s+/).filter(t => t && !wordShape(t));
+if (bad.length) {
+  process.stdout.write("; unquoted token reads as a phrase: " + JSON.stringify(bad[0]));
+}
+// bareShape() is kept as the per-VALUE oracle: every scope in this fixture is an
+// admitted two-word residual, so if any stops being bare the fixture has drifted
+// and stopped exercising the reassembly path it exists to cover.
+const residuals = ["file:stop-all", "file:work-now", "file:obey-lead"];
+const missing = residuals.filter(r => !bareShape(r) || !outside.includes(r));
+if (missing.length) {
+  process.stdout.write("; fixture drifted, no longer exercises the residual: " + JSON.stringify(missing));
+}
+')"
+fi
+if [ -z "$adv_fail" ]; then ok "$T"; else bad "$T" "${adv_fail#; }"; fi
+
+# ---- Case 4: negative controls from the real ledger ----------------------
+# Guards the opposite failure: a gate that quotes everything is safe and useless.
+# All three values are taken from .rally/log/*.jsonl.
+T="ARP-R-08 case 4: real event ids, tool ids, and short scopes still render bare"
+msg="$(_adv_render "c4" "claude_code:01" \
+  '["file:dynamic-workflows","file:crates/rally-cli"]' \
+  "crates/rally-cli" "fact_118b7_18b78850b4da3100")"
+adv_fail=""
+if [ -z "$msg" ]; then
+  adv_fail="; empty render"
+else
+  outside="$(printf '%s' "$msg" | node -e '
+const fs = require("fs");
+process.stdout.write(fs.readFileSync(0, "utf8").split(/«[^»]*»/).join(" "));
+')"
+  for real in "fact_118b7_18b78850b4da3100" "claude_code:01" "file:dynamic-workflows" "file:crates/rally-cli"; do
+    printf '%s' "$outside" | grep -q -- "$real" || adv_fail="$adv_fail; real ledger value quoted unnecessarily: $real"
+  done
+  # A benign id must not be mangled into the allowlist placeholder either.
+  printf '%s' "$msg" | grep -qE '[A-Za-z0-9]\?[A-Za-z0-9]' && adv_fail="$adv_fail; a benign identifier was mangled"
+fi
+if [ -z "$adv_fail" ]; then ok "$T"; else bad "$T" "${adv_fail#; }"; fi
 
 # Summary
 # ----------------------------------------------------------------------

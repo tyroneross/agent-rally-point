@@ -475,6 +475,32 @@ pub(crate) struct RoomSnapshot {
     /// Agents can use this as a cheap epoch to detect stale lead context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) lead_epoch: Option<i64>,
+    /// `event_id` of the ONE unscoped blocker that is an AUTHORIZED room-wide
+    /// freeze, if any: its author held the lead seat AT ITS OWN `seq`.
+    ///
+    /// ARP-R-01 / design audit D9. `check_before_write` used to decide this
+    /// itself, comparing each unscoped blocker's author against the CURRENT
+    /// lead. That made the verdict a function of the room's present state
+    /// rather than of the fact, and the same fact id flipped both ways in live
+    /// testing: a non-lead's blocker armed into a room-wide deny once its
+    /// author later took the seat, and the honest lead's freeze disarmed the
+    /// moment anyone else took it. The room's only stop control was removable
+    /// in one command.
+    ///
+    /// The decision is made HERE, in the projection, where the fact slice and
+    /// each fact's `seq` are both in hand, and `check` reports it. Authority is
+    /// a property of the moment a fact was written.
+    ///
+    /// This field SERIALIZES on purpose. Three sibling fields are
+    /// `#[serde(skip)]` and therefore arrive empty over the daemon wire, which
+    /// the design audit (D1/D6) found silently changes behavior in routed mode.
+    /// `check` runs client-side on a possibly-routed snapshot, so a skipped
+    /// field here would mean no freeze is ever enforced with rallyd running.
+    /// `#[serde(default)]` keeps an older daemon's payload deserializable; it
+    /// yields `None`, which degrades to "no room-wide freeze" — the direction
+    /// that fails toward letting work proceed rather than toward a stuck room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) room_freeze_id: Option<String>,
     /// R10: per-tool read receipts projected from `FactKind::Read` checkpoints.
     /// Populated only when `include_readers` is requested (see
     /// `RoomStore::snapshot_with_readers`); empty in the default snapshot.
@@ -630,6 +656,7 @@ impl RoomSnapshot {
             squads: self.squads,
             lead: self.lead,
             lead_epoch: self.lead_epoch,
+            room_freeze_id: self.room_freeze_id.clone(),
             readers: self.readers,
             mission: self.mission,
             totals: self.totals,
@@ -1765,6 +1792,30 @@ impl DirectRoomStore {
                 }
             }
         }
+        // ---- WRITE-BOUNDARY AUTHORITY (ARP-R-01, ARP-R-02, ARP-R-04) -------
+        //
+        // The one gate every durable write passes, in BOTH store modes: routed
+        // mode reaches this same method through `rallyd_core::run_op`, so a
+        // hand-built daemon request is gated by the process that owns the
+        // ledger rather than by the client that asked. That equivalence is
+        // asserted by `tests/write_authority_daemon_parity.rs`, not assumed —
+        // the design audit's D1/D6 findings are what assuming costs.
+        //
+        // Placed here rather than at the commands because three cycles of this
+        // defect class (RC-029, ARP-R-01, ARP-R-02) all had the same shape: a
+        // correct rule guarding one spelling of an action, and the ledger
+        // accepting the action. Field bounds always apply; the claim-close and
+        // lead-transfer arms self-select on kind, so ordinary writes pay one
+        // `matches!` and nothing else.
+        if crate::write_authority::needs_authority_check(&fact) {
+            let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+            let coord =
+                crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+            let snapshot = snapshot_from_facts_with_policy(&facts, &coord, false);
+            crate::write_authority::assert_write_authorized(&fact, &facts, &snapshot, &coord)?;
+        } else {
+            crate::write_authority::assert_field_bounds(&fact)?;
+        }
         if fact.kind == FactKind::Claim {
             let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
             // RC-037: gate room-wide breadth BEFORE conflict detection. A
@@ -2006,7 +2057,11 @@ impl DirectRoomStore {
                         "release failed: ref {ref_id} is not an active claim (already released, never existed, or invalid); nothing to release"
                     )));
                 }
-                assert_claim_release_authorized(&snapshot_before, fact, ref_id, "release")?;
+                // ARP-R-02: the ownership gate that used to live here now runs
+                // in `write_authority::assert_claim_close_authorized`, called
+                // from `append_fact` for ALL FOUR kinds that close a claim.
+                // Two hand-copied call sites (here and the Resolve arm below)
+                // were how `Receipt` and `ClaimExpired` ended up ungated.
             }
             FactKind::Resolve => {
                 // Resolve must reference a live blocker, risk, handoff, claim,
@@ -2049,10 +2104,10 @@ impl DirectRoomStore {
                     )));
                 }
                 // A Resolve naming a live CLAIM closes that claim exactly as a
-                // Release does (`claim_authority::later_fact_refs_claim` treats
-                // Resolve/Release/Receipt/ClaimExpired identically), so it must
-                // clear the same authorization bar.
-                assert_claim_release_authorized(&snapshot_before, fact, ref_id, "resolve")?;
+                // Release does, so it must clear the same authorization bar —
+                // and so must Receipt and ClaimExpired, which is why that bar
+                // now lives at the write boundary in `write_authority` instead
+                // of being asserted per-arm here (ARP-R-02).
                 if let Some(handoff) = open_handoff
                     && !handoff_closer_matches_target(handoff, fact)
                 {
@@ -2635,59 +2690,21 @@ fn handoff_is_closed(handoff: &Fact, facts: &[Fact]) -> bool {
 /// This is the body formerly inlined in `RoomStore::snapshot`. Extracted so
 /// that both `snapshot()` and `snapshot_with_readers()` can call it without
 /// loading facts twice (fix #2 — one DB round-trip instead of two).
-/// Authorization gate for closing somebody else's claim.
+/// ARP-R-02. The claim-close authorization gate MOVED to
+/// `write_authority::assert_claim_close_authorized`.
 ///
-/// `claim_authority::later_fact_refs_claim` closes an active claim on ANY later
-/// `Resolve | Release | Receipt | ClaimExpired` carrying its `event_id` as
-/// `ref_id`, with no regard for who wrote it. The 30-minute / 2-hour takeover
-/// authorization lived only in `command_release_by_path`, which `command_say`
-/// reaches ONLY when `ref_id` is absent. So `--ref` walked straight past it:
-/// any peer could strip any other agent's live claim by event id and
-/// immediately re-claim the path. Reproduced end to end against a claim
-/// seconds old — `active_claims` went 1 -> 0 -> 1 with the owner flipped.
+/// It lived here, called from exactly two arms of
+/// `append_state_transition_verified` — Release and Resolve. But
+/// `claim_authority::closes_active_claim` closes a claim on FOUR kinds, and the
+/// doc comment on this very function named all four while the code covered two.
+/// `Receipt` and `ClaimExpired` reached `append_fact` with no ownership check,
+/// so `rally say receipt --tool rogue --ref <claim-id>` took any live claim in
+/// the room, seconds old, with a live lease. Reproduced end to end.
 ///
-/// That is a complete bypass of the control that makes claims mean anything,
-/// and it defeats the property Rally exists to provide.
-///
-/// Two ways past this gate, matching `command_release_by_path` exactly:
-/// * **Self-release** — the acting tool owns the claim. Always allowed, no
-///   time bar; releasing your own work is the normal path.
-/// * **Takeover** — the owner is silent past the size-scaled reclaim timeout
-///   (`claim_reclaim_eligible`, fail-closed: an owner whose `last_seen_ts` is
-///   missing or unparseable is NEVER reclaimable).
-///
-/// A ref that names no active claim is not this gate's business and passes
-/// through — the liveness checks above already rejected the invalid cases.
-fn assert_claim_release_authorized(
-    snapshot: &RoomSnapshot,
-    fact: &Fact,
-    ref_id: &str,
-    verb: &str,
-) -> Result<()> {
-    let Some(claim) = snapshot.active_claims.iter().find(|c| c.event_id == ref_id) else {
-        return Ok(());
-    };
-    let owner = claim.tool.as_deref().unwrap_or("<unknown>");
-    let actor = fact.tool.as_deref().unwrap_or("<unknown>");
-    if claim.tool.as_deref() == fact.tool.as_deref() {
-        return Ok(());
-    }
-    let coord = crate::hooks_config::resolve_coordination(Path::new(".")).unwrap_or_default();
-    let (takeover_eligible, size) = snapshot.claim_reclaim_eligible(claim, &coord);
-    if takeover_eligible {
-        return Ok(());
-    }
-    let timeout_minutes = match size {
-        crate::decay::WorkSize::Small => coord.reclaim_small_minutes,
-        crate::decay::WorkSize::Large => coord.reclaim_large_minutes,
-    };
-    Err(RallyError::Usage(format!(
-        "{verb} failed: claim {ref_id} is owned by {owner} and {actor} is not the owner. \
-         A non-owner may only take over a claim whose owner has been silent for \
-         {timeout_minutes} minutes; {owner} is still active. Ask {owner} to release it, \
-         or wait out the reclaim window."
-    )))
-}
+/// The replacement is keyed off `closes_active_claim` itself and runs at the
+/// write boundary, so the kinds that close a claim and the kinds that must be
+/// authorized to close one are one list. Two hand-copied call sites is how the
+/// gap opened; there is now one call site and no list to copy.
 
 /// Recency weight for a fact, from its `created_at` and the policy half-life.
 /// A fact whose `created_at` fails to parse is treated as fresh (weight 1.0):
@@ -3182,20 +3199,41 @@ fn snapshot_from_facts_with_policy(
         })
         .collect::<Vec<_>>();
 
-    // Lead is the tool from the most-recent decision with subject "role:lead".
-    // Lead = the tool of the latest `role:lead` decision, UNLESS the latest
-    // lead-family decision is a `role:lead:relinquished` (seat reopened → None).
+    // Lead = the beneficiary of the latest `role:lead` decision, UNLESS the
+    // latest lead-family decision is a `role:lead:relinquished` (seat reopened
+    // → None).
+    //
+    // ARP-R-01. This block used to re-implement the predicate and the extractor
+    // that `claim_authority` also owns, and the copies drifted the moment
+    // `set_lead` started stamping the ACTOR in `tool` and the beneficiary in
+    // `target`: the write gate read the new shape, this projection read the old
+    // one, and a legitimate `lead handoff` reported success while the seat did
+    // not move. Caught by the post-fix verification run, not by review — two
+    // projections of one fact is the same defect shape as the two hand-copied
+    // claim-close gates in ARP-R-02, so it gets the same treatment.
+    //
+    // Both now share `is_lead_decision` and `lead_beneficiary`. Only the epoch
+    // (the seq, for cheap staleness detection) is computed locally, because it
+    // is a property of the fact rather than of the seat.
     let latest_lead_fact = facts
         .iter()
-        .filter(|f| {
-            f.kind == "decision"
-                && (f.subject == "role:lead" || f.subject == "role:lead:relinquished")
-        })
+        .filter(|f| claim_authority::is_lead_decision(f))
         .max_by_key(|f| f.seq);
     let lead_epoch = latest_lead_fact.map(|f| f.seq);
     let lead = latest_lead_fact
-        .filter(|f| f.subject == "role:lead")
-        .and_then(|f| f.tool.clone());
+        .filter(|f| f.subject == claim_authority::LEAD_SUBJECT)
+        .and_then(|f| claim_authority::lead_beneficiary(f));
+
+    // The authorized room-wide freeze, decided ADMISSION-TIME (see the field's
+    // doc on `RoomSnapshot`). An unscoped blocker freezes the room only if its
+    // author held the seat as of that blocker's own seq. Newest such blocker
+    // wins, matching how every other latest-fact-wins projection here behaves.
+    let room_freeze_id = active_blockers
+        .iter()
+        .filter(|b| b.scope.is_empty())
+        .filter(|b| b.tool.is_some() && b.tool == claim_authority::lead_as_of(facts, b.seq))
+        .max_by_key(|b| b.seq)
+        .map(|b| b.event_id.clone());
 
     // Mission: latest-by-seq Mission fact whose scope contains "mission".
     // "mission" scope distinguishes north-star facts from envelope facts.
@@ -3235,6 +3273,7 @@ fn snapshot_from_facts_with_policy(
         squads,
         lead,
         lead_epoch,
+        room_freeze_id,
         readers: Vec::new(),
         mission,
         totals,
@@ -8912,13 +8951,27 @@ mod sec001_takeover_guard_tests {
         let r = root("reaper-lease-survives");
         let store = RoomStore::open_at(r.clone()).unwrap();
         // live-owner claims a single file just now AND is fresh (active squad).
-        let claim = fact_at(
+        let mut claim = fact_at(
             "claim-l",
             FactKind::Claim,
             "live-owner",
             "file:src/a.rs",
             &iso_ago(5),
         );
+        // ARP-R-02. The lease marker used to be absent here, and the test still
+        // passed — because the gate it exercised read the reaper's OWN
+        // `reaper:reason=lease-expired` evidence, which the reaper asserts about
+        // itself. That made the fixture describe a state the product cannot
+        // produce (`command_say` calls `ensure_lease_evidence` on every claim)
+        // while grading a signal a rogue could equally have stamped.
+        //
+        // The gate now reads the lease the CLAIM declared about ITSELF, so the
+        // fixture has to carry one. Same intent as before — a lease-expired
+        // close must not be refused merely because the owner is active — but
+        // now asserted against the mechanism that actually authorizes it.
+        claim
+            .evidence
+            .push(format!("lease_expires_at:{}", iso_ago(60)));
         store.append_fact(&claim).unwrap();
         let presence = fact_at(
             "pres-l",

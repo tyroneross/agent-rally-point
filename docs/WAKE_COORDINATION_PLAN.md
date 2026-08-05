@@ -12,7 +12,7 @@
 
 **Read this first, in a fresh terminal, as either Claude Code or Codex.** This single file is the entry point: it gives you the full context, your owned piece, and how to coordinate with your peer **through agent-rally-point itself** (this build dogfoods the tool we're building).
 
-Repo/worktree: `/Users/tyroneross/dev/git-folder/agent-rally-point-integration` (branch `integration`, off `origin/main` = PR45).
+Repo/worktree: `~/dev/git-folder/agent-rally-point-integration` (branch `integration`, off `origin/main` = PR45).
 
 ---
 
@@ -48,8 +48,8 @@ Out of scope: pushing `origin/main`; deleting worktrees; re-introducing rally-co
 > ⚠️ **ROOM-SPLIT — read this or you will silently coordinate alone.** Rally keys the room on the *worktree path*, so this `integration` worktree resolves to an **empty room** (`repo_2d586a64350cdfbd`) while all real traffic is in the **main repo's room** (`repo_196422842096be12`). Until canonical room-keying lands (P3), **force every coordination command to the main repo workdir**:
 
 ```bash
-S=/Users/tyroneross/.claude/plugins/cache/rosslabs-ai-toolkit/build-loop/0.12.16/scripts
-RALLYDIR=/Users/tyroneross/dev/git-folder/agent-rally-point   # the SHARED room — not the integration worktree
+S=~/.claude/plugins/cache/rosslabs-ai-toolkit/build-loop/0.12.16/scripts
+RALLYDIR=~/dev/git-folder/agent-rally-point   # the SHARED room — not the integration worktree
 CH=$HOME/.agent-rally-point/apps/repo_196422842096be12/changes.jsonl
 ```
 (Codex: same paths; or use the host-neutral `agent_rally.py` with the same `--workdir`.)
@@ -76,7 +76,7 @@ Rules: verdicts gate (don't advance a piece past `verification-pending` until th
 ## 5. Decisions log (P4 + any mid-flight)
 <!-- append: date — decision — ratified-by -->
 - 2026-05-28 — Default wake confirmation should be Rally channel-confirm; Herdr v4 status is useful only after target session restart and should remain a secondary liveness/delivery signal. Token echo remains valid for direct reply tests; tmux/no-integration paths use channel-confirm. — ratified-by: codex + claude_code ✅
-- 2026-05-28 — Coordination for this integration run uses the original Rally channel for `/Users/tyroneross/dev/git-folder/agent-rally-point` (`repo_196422842096be12`); the integration worktree resolves to a separate empty room. Force `--workdir /Users/tyroneross/dev/git-folder/agent-rally-point` on all coordination commands (now baked into §3) until canonical room-keying lands. — ratified-by: codex + claude_code ✅
+- 2026-05-28 — Coordination for this integration run uses the original Rally channel for `~/dev/git-folder/agent-rally-point` (`repo_196422842096be12`); the integration worktree resolves to a separate empty room. Force `--workdir ~/dev/git-folder/agent-rally-point` on all coordination commands (now baked into §3) until canonical room-keying lands. — ratified-by: codex + claude_code ✅
 - 2026-05-28 — **Room-keying fix (folded into P3):** the room-split root cause is the rally CLI keying `repo_id` on the *worktree path*. Fix = derive the channel/repo identity from `git rev-parse --git-common-dir` (worktree-invariant). Reference implementation already exists and is proven: build-loop `scripts/rally_point/channel_paths.py::app_slug()` (both worktrees → identical git-common-dir → one room). Port that logic into the rally CLI's discovery/repo-id; build-loop's `discovery_bridge` then inherits the fix automatically. — proposed-by: claude_code; implemented-by: codex; pending: validation + Claude PASS
 
 - 2026-05-28 — **DONE (live, build-loop side):** worktree canonicalization added to build-loop coordination (`channel_paths.canonical_workdir` + `discovery_bridge.resolve` entry); merged build-loop `main` `506537d`, patched into both plugin caches. ✅ Validated live: both `agent-rally-point` and `agent-rally-point-integration` now resolve to `repo_196422842096be12`. The §3 `--workdir` stopgap is now auto-handled (kept as fallback for older build-loop). REMAINING (codex/P3): the standalone `rally` CLI still keys `repo_id` on worktree path (385851f added discovery cmds but not common-dir keying) — add it for non-build-loop use. — claude_code

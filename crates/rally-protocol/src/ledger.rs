@@ -129,6 +129,165 @@ fn agent_id_prose_words(agent: &str) -> usize {
     words
 }
 
+// ---- write-boundary size bounds on free-text fact fields (ARP-R-04) --------
+//
+// ROOT CAUSE, not a symptom fix. `validate_agent_id` bounds ONE field, and every
+// defect that has landed on the rendering side since — RC-040's over-long id,
+// ARP-R-04's forged `## SYSTEM DIRECTIVE` heading in `.rally/RETROSPECTIVE.md`,
+// the hook's per-claim scope budget — shares one cause: the WRITE boundary
+// accepted an unbounded string, so every reader downstream had to invent its own
+// truncation policy and each one had to get it right independently. Bounding at
+// the door does not make a renderer safe (a 60-byte payload still forges a
+// heading; the renderer still has to escape), but it removes the volume half of
+// every one of those defects at a single point.
+//
+// The numbers are MEASURED, not chosen. Over the 6,792 facts in this repo's
+// `.rally/log/*.jsonl` + `.rally/archive/*.jsonl`:
+//
+//   field           median   p99     p99.9   max      bound    headroom
+//   subject             59    534       973    2,264    4,096      1.8x
+//   summary             28  1,110     2,179    7,823   16,384      2.1x
+//   evidence item       61    254       982    1,789    4,096      2.3x
+//   evidence count       0      7        13       20       64      3.2x
+//   scope item          34    144       177      177      512      2.9x
+//   scope count          0      3         8       22       64      2.9x
+//   uri                 30    101       101      101    2,048     20.3x
+//
+// `uri` gets deliberate slack: 101 is what THIS repo happens to hold, and a real
+// URL is legitimately long. The others clear their observed maximum by ~2-3x,
+// which is enough that a bound never fires on real coordination traffic and
+// small enough that no single field can dominate a room read.
+//
+// MAX_FACT_TEXT_BYTES is the control that actually caps cost. The per-field
+// bounds multiply out to ~313 KB, which would be a worse outcome than no bound
+// at all; the whole-fact cap is what a reader can rely on. 64 KiB matches the
+// bound `rally inject` already applies to a single delivery, so the two write
+// surfaces agree on how much text one write may move.
+
+/// Maximum bytes in a fact's `subject`.
+pub const MAX_SUBJECT_LEN: usize = 4_096;
+/// Maximum bytes in a fact's `summary`.
+pub const MAX_SUMMARY_LEN: usize = 16_384;
+/// Maximum bytes in one `evidence` entry.
+pub const MAX_EVIDENCE_ITEM_LEN: usize = 4_096;
+/// Maximum number of `evidence` entries on one fact.
+pub const MAX_EVIDENCE_ITEMS: usize = 64;
+/// Maximum bytes in one `scope` entry.
+pub const MAX_SCOPE_ITEM_LEN: usize = 512;
+/// Maximum number of `scope` entries on one fact.
+pub const MAX_SCOPE_ITEMS: usize = 64;
+/// Maximum bytes in a fact's `uri`.
+pub const MAX_URI_LEN: usize = 2_048;
+/// Maximum TOTAL bytes across every free-text field on one fact. The per-field
+/// bounds stop one field from dominating; this is the bound a reader can budget
+/// against. Matches the 64 KiB `rally inject` already enforces per delivery.
+pub const MAX_FACT_TEXT_BYTES: usize = 64 * 1024;
+
+/// The free-text fields of one fact, borrowed for bounds checking.
+///
+/// A struct rather than seven positional arguments so that adding a rendered
+/// field to `Fact` and forgetting to bound it is a compile error at the
+/// construction site, not a silent omission — the omission is exactly how
+/// ARP-R-04 shipped with three of four field families covered.
+#[derive(Debug, Default)]
+pub struct FactTextFields<'a> {
+    /// The fact's one-line subject.
+    pub subject: &'a str,
+    /// The fact's longer body, when it has one.
+    pub summary: Option<&'a str>,
+    /// Evidence entries attached to the fact.
+    pub evidence: &'a [String],
+    /// Scope entries (claim paths, tags) attached to the fact.
+    pub scope: &'a [String],
+    /// The fact's artifact URI, when it has one.
+    pub uri: Option<&'a str>,
+}
+
+/// Reject a fact whose free-text fields exceed the measured write-boundary
+/// bounds (ARP-R-04). Byte lengths, not character counts: the bound exists to
+/// cap what a reader must budget for, and a reader budgets bytes.
+///
+/// Refusals name the field, the actual size, and the bound, so a caller that
+/// legitimately needs more knows exactly what to split.
+pub fn validate_fact_text_bounds(fields: &FactTextFields<'_>) -> io::Result<()> {
+    let too_long = |what: &str, got: usize, limit: usize| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{what} is {got} bytes, over the {limit}-byte write-boundary bound (ARP-R-04). \
+                 Ledger text is rendered into agent context and into git-tracked documents, so \
+                 it is bounded where it is written rather than at each reader. Split it, or \
+                 attach the long form as an artifact and reference it by uri."
+            ),
+        )
+    };
+    let too_many = |what: &str, got: usize, limit: usize| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("fact carries {got} {what} entries, over the limit of {limit} (ARP-R-04)"),
+        )
+    };
+
+    if fields.subject.len() > MAX_SUBJECT_LEN {
+        return Err(too_long("subject", fields.subject.len(), MAX_SUBJECT_LEN));
+    }
+    if let Some(summary) = fields.summary
+        && summary.len() > MAX_SUMMARY_LEN
+    {
+        return Err(too_long("summary", summary.len(), MAX_SUMMARY_LEN));
+    }
+    if let Some(uri) = fields.uri
+        && uri.len() > MAX_URI_LEN
+    {
+        return Err(too_long("uri", uri.len(), MAX_URI_LEN));
+    }
+    if fields.evidence.len() > MAX_EVIDENCE_ITEMS {
+        return Err(too_many(
+            "evidence",
+            fields.evidence.len(),
+            MAX_EVIDENCE_ITEMS,
+        ));
+    }
+    for (i, item) in fields.evidence.iter().enumerate() {
+        if item.len() > MAX_EVIDENCE_ITEM_LEN {
+            return Err(too_long(
+                &format!("evidence[{i}]"),
+                item.len(),
+                MAX_EVIDENCE_ITEM_LEN,
+            ));
+        }
+    }
+    if fields.scope.len() > MAX_SCOPE_ITEMS {
+        return Err(too_many("scope", fields.scope.len(), MAX_SCOPE_ITEMS));
+    }
+    for (i, item) in fields.scope.iter().enumerate() {
+        if item.len() > MAX_SCOPE_ITEM_LEN {
+            return Err(too_long(
+                &format!("scope[{i}]"),
+                item.len(),
+                MAX_SCOPE_ITEM_LEN,
+            ));
+        }
+    }
+
+    // Whole-fact cap. Checked last so a caller sees the SPECIFIC field refusal
+    // first when one field is the problem, and this aggregate refusal only when
+    // the fact is oversized without any single field being.
+    let total = fields.subject.len()
+        + fields.summary.map_or(0, str::len)
+        + fields.uri.map_or(0, str::len)
+        + fields.evidence.iter().map(String::len).sum::<usize>()
+        + fields.scope.iter().map(String::len).sum::<usize>();
+    if total > MAX_FACT_TEXT_BYTES {
+        return Err(too_long(
+            "fact free text, in total",
+            total,
+            MAX_FACT_TEXT_BYTES,
+        ));
+    }
+    Ok(())
+}
+
 /// Keep ledger lock waits below the CLI's default watchdog while allowing a
 /// short, active writer to finish its fsync transaction.
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);

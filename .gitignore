@@ -48,32 +48,41 @@ Thumbs.db
 target/
 
 # Local Rally room state.
-# Four things in .rally/ are canonical (committed) and survive clone/machine
-# with no external service:
-#   - `.rally/ledger.jsonl` (R1) and/or `.rally/log/**` (R5): the append-only
-#     durable record of every fact. R5 supersedes the monolith with
-#     per-engagement segments; R1's `.rally/ledger.jsonl` remains a valid
-#     input path during migration.
-#   - `.rally/archive/**` (R7): rotated old segments, still replayable.
-#   - `.rally/manifest.json` (R4): self-describing pointers to docs + ledger
-#     so any agent landing in the repo finds the rally point.
-#   - `.rally/RETROSPECTIVE.md` (R6): human-readable digest grouped by
-#     engagement. Derived view (regenerate via `rally retrospective`; do
-#     not hand-edit) but committed so a fresh clone sees the history.
+#
+# ARP-R-06, 2026-08-04 — THE LEDGER IS NO LONGER DISTRIBUTED.
+#
+# `.rally/log/**`, `.rally/archive/**`, and `.rally/RETROSPECTIVE.md` used to be
+# committed, on the reasoning that a fresh clone should see the project's
+# coordination history. Measured, that reasoning did not survive contact with
+# what the ledger actually contains:
+#
+#   * 3,680 facts replaying into 93 unreleased claims, 60 open handoffs
+#     addressed to specific agent seats, 84 agent identities, and a foreign
+#     lead seat. A cloner does not inherit history — they inherit the
+#     maintainer's LIVE ROOM, complete with work assigned to machines they do
+#     not have.
+#   * 956 matches for `tyrones-macbook-pro-2.local` and `/Users/tyroneross/…`
+#     across 25 tracked files, 544 of them in `.rally/`. Active claim scopes
+#     name personal files (`Movies/rally-hero-video/…`,
+#     `.claude/projects/…/memory/MEMORY.md`) and private sibling repos.
+#   * 106 KB of peer prose per room read, on every read, forever.
+#
+# The ledger remains the canonical local record and is still append-only,
+# replayable, and machine-portable — it is simply not something a stranger
+# should receive by cloning. `.rally/manifest.json` still ships, so an agent
+# landing in a fresh clone still finds the rally point; it just finds an EMPTY
+# room, which is the correct starting state for someone else's repository.
+#
+# WHAT DE-TRACKING DOES NOT DO: the bytes remain in git history. A cloner can
+# still recover every one of them with `git log`. Removing them for real means
+# rewriting history, which is irreversible and is a separate, deliberate
+# decision — see the release-hygiene note in docs/security/TRUST-MODEL.md.
+#
 # Everything else under .rally/ is a derived cache (facts.db, room.db,
 # cursors.json, .reconcile-cache.json, tmp files) that `rally` rebuilds from
-# the ledger on first open. The reconcile sidecar (.reconcile-cache.json) is a
-# disposable fingerprint cache for the O(1) reconcile fast path; a
-# missing/corrupt sidecar just forces a full authoritative scan + rebuild.
+# the ledger on first open.
 .rally/*
-!.rally/ledger.jsonl
 !.rally/manifest.json
-!.rally/RETROSPECTIVE.md
-!.rally/log/
-.rally/log/index.json
-!.rally/archive/
-.rally/log/*.tmp-*
-.rally/archive/*.tmp-*
 .rally2/
 
 # build-loop's own runtime + planning artifacts. build-loop is one optional
@@ -106,6 +115,16 @@ cockpitd.db.audit.db-wal
 
 # Runtime coordination state + backups + local bundles (never commit; see 2026-07-02 takeover)
 .rally.bak-*/
-archive/bundles/
+# archive/bundles/ was listed here from 2026-07-02 and tracked anyway: .gitignore has
+# no effect on already-tracked paths, so the rule read as policy while 18 bundles
+# (68.6 MiB) stayed in HEAD. De-tracked 2026-08-04 (ARP-R-06). The bundles carry full
+# pre-sanitization history of this repo AND sibling repos; see the release-hygiene note
+# in docs/security/TRUST-MODEL.md for what de-tracking does and does not remove.
+# ARP-R-06: the whole of archive/ is de-tracked, not just bundles/. It also held
+# `stashes-2026-06-11/` — six recovery patches plus a bundle, carrying 30
+# `/Users/tyroneross/…` paths and the maintainer's hostname. Same class as the
+# bundles: internal recovery artifacts that a cloner has no use for and that
+# leak the machine they were cut on. Files stay on disk; history still has them.
+archive/
 agent-rally-point.worktrees/
 RALLY-VERSION-MISMATCH-ASSESSMENT-*.md

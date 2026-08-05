@@ -111,12 +111,23 @@ run_prepush() {
 # Positive control: a clean push (pushed tree's gate == pinned main's gate)
 # still runs the gate and succeeds.
 # ---------------------------------------------------------------------------
+# ARP-R-05a: pushed from a BRANCH, not from `main`. Pushing the pin branch
+# itself is now refused (the pin would be comparing the gate scripts against
+# their own bytes), so a positive control has to be a push the pin can
+# genuinely review.
+git -C "$FIXTURE" checkout -q -b clean-work main
+echo "work" > "$FIXTURE/NOTES.md"
+git -C "$FIXTURE" add -A
+git -C "$FIXTURE" commit -q -m "clean-work: ordinary push, gate scripts untouched"
+SHA_CLEAN="$(git -C "$FIXTURE" rev-parse HEAD)"
+git -C "$FIXTURE" checkout -q main
+
 T="positive control: clean push (gate unmodified) runs via pin and succeeds"
 : > "$GATE_MARKER"
-out=$(run_prepush "refs/heads/main $SHA_MAIN refs/heads/main $ZERO")
+out=$(run_prepush "refs/heads/clean-work $SHA_CLEAN refs/heads/clean-work $ZERO")
 rc=$?
 recorded="$(cat "$GATE_MARKER" 2>/dev/null)"
-if [ "$rc" = "0" ] && [ "$recorded" = "$SHA_MAIN" ] && printf '%s' "$out" | grep -q "gate scripts pinned to main"; then
+if [ "$rc" = "0" ] && [ "$recorded" = "$SHA_CLEAN" ] && printf '%s' "$out" | grep -q "pin comparison complete — pinned main"; then
   ok "$T"
 else
   bad "$T" "rc=$rc recorded=[$recorded]"; note "$out"
@@ -302,18 +313,36 @@ fi
 rm -f "$MALICIOUS_MARKER"
 
 # Pushing `main` with the DEFAULT pin is the one vacuous case that cannot be
-# avoided — the pin branch IS the push. It stays allowed, but it must say so
-# instead of printing a healthy-looking "pinned to main @ <sha>".
-T="SEC-005: default pin on the pin branch itself warns instead of affirming"
+# avoided — the pin branch IS the push. SEC-005 allowed it with a warning.
+# ARP-R-05a refuses it: that warning fired on this repo's ordinary push, so the
+# check passed on the only path anyone uses while the gate ran the push's own
+# code. It is now the same operator ack as the env case. Full control:
+# tests/hooks/test_prepush_pin.sh.
+T="ARP-R-05: default pin on the pin branch itself is REFUSED, not warned about"
 : > "$GATE_MARKER"
 out=$(run_prepush "refs/heads/main $SHA_MAIN refs/heads/main $ZERO")
 rc=$?
-if [ "$rc" = "0" ] \
+recorded="$(cat "$GATE_MARKER" 2>/dev/null)"
+if [ "$rc" != "0" ] && [ -z "$recorded" ] \
    && printf '%s' "$out" | grep -q "SAME COMMIT AS THE PIN" \
+   && printf '%s' "$out" | grep -q "REFUSED" \
+   && printf '%s' "$out" | grep -q "RALLY_PREPUSH_ACK_VACUOUS_PIN=1 git push"; then
+  ok "$T"
+else
+  bad "$T" "rc=$rc recorded=[$recorded] — a vacuous default pin must refuse"; note "$out"
+fi
+
+T="ARP-R-05: the acked pin-branch push proceeds and says it is unpinned"
+: > "$GATE_MARKER"
+out=$(run_prepush "refs/heads/main $SHA_MAIN refs/heads/main $ZERO" \
+        RALLY_PREPUSH_ACK_VACUOUS_PIN=1)
+rc=$?
+recorded="$(cat "$GATE_MARKER" 2>/dev/null)"
+if [ "$rc" = "0" ] && [ "$recorded" = "$SHA_MAIN" ] \
    && printf '%s' "$out" | grep -q "NOT reviewed against an earlier baseline"; then
   ok "$T"
 else
-  bad "$T" "rc=$rc — a vacuous default pin must be loud"; note "$out"
+  bad "$T" "rc=$rc recorded=[$recorded] — the ack must remain a real escape hatch"; note "$out"
 fi
 
 # ---------------------------------------------------------------------------

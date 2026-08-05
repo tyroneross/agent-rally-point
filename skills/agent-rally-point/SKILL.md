@@ -80,6 +80,9 @@ rally check before-write --tool "$TOOL" --path <path> --strict --json
 ```
 
 If the check returns blocking findings, stop and resolve them before editing.
+`--strict` makes the command exit 4 on a stop finding rather than exit 0 with a
+warning, so a harness reading the exit code aborts the write. Drop `--strict` to
+keep the finding advisory.
 
 3. **Record meaningful outputs**:
 
@@ -242,8 +245,20 @@ Committed hook registrations: `.claude/settings.json` (Claude Code),
 | UserPromptSubmit | Refreshes idle status. |
 | Stop | Records that the write completed. |
 
-The hooks are advisory and fail open — they never block an edit, and they exit 0
-even when Rally is broken.
+The hooks are advisory by default, and three opt-in switches make them block.
+Default posture: PreToolUse returns `permissionDecision: "allow"` with a warning,
+so the edit goes through, and every hook exits 0 even when Rally is broken — in
+every posture, because a refusal travels in the hook's JSON, not its exit code.
+
+| Switch (off unless set) | Effect |
+|-------------------------|--------|
+| `RALLY_HOOK_STRICT=1` | The hook emits `permissionDecision: "deny"` / `decision: "block"` on a high-severity signal (`severity == "stop"` or `allow == false`). |
+| `rally check before-write --strict` | Exits 4 on a stop finding. Step 2 of the loop above passes `--strict`. |
+| `RALLY_BEFORE_WRITE_FAILCLOSED=1` or `--fail-closed` | `check before-write` exits 4 when its snapshot read times out, instead of exiting 0. |
+
+Under `RALLY_HOOK_STRICT=1` an unscoped blocker becomes a hard deny on every edit
+by every agent in the room, so strict mode is a real availability risk — see
+[`docs/security/TRUST-MODEL.md`](../../docs/security/TRUST-MODEL.md).
 
 They do **not** download, build, `chmod +x`, or install anything. Provisioning was
 removed from every lifecycle hook (see RC-013). Installing the `rally` binary is an

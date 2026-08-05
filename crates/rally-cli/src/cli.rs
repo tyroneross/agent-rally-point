@@ -545,6 +545,15 @@ pub(crate) struct LeadTargetArgs {
     pub(crate) tool: String,
     pub(crate) to: String,
     pub(crate) user_designated: bool,
+    /// ARP-R-01. Take the seat from a LIVE incumbent, on the record.
+    ///
+    /// Not a credential. rally's trust boundary is the UID, so anything that
+    /// can run `rally lead assign` can also pass this flag. What it buys is
+    /// that the seizure is deliberate and is written into the ledger AS a
+    /// seizure, naming the incumbent it displaced — an auditable act rather
+    /// than one indistinguishable from a normal handoff. See
+    /// `write_authority::assert_lead_transfer_authorized`.
+    pub(crate) force: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1041,7 +1050,18 @@ fn cli_parser() -> OptionParser<CliCommand> {
 
     let lead = lead_parser()
         .to_options()
-        .descr("Lead-agent title: show, hand off, or assign. Rally records/exposes only — never enforces.")
+        // ARP-R-03: this used to read "Rally records/exposes only — never
+        // enforces." That was true when written and is not now: the seat gates
+        // room-wide claims (RC-037), the room-wide freeze (RC-038), and its own
+        // transfer (ARP-R-01). `--help` is the highest-reach surface in the
+        // product, so a stale claim here outlives every doc fix.
+        .descr(
+            "Lead-agent title: show, hand off, assign, or relinquish. Rally records and exposes \
+             the lead; it does not enforce the lead's decisions. The seat itself now gates three \
+             things: a room-wide `workspace:*`/`repo:*` claim, a room-wide freeze, and its own \
+             transfer. Those checks compare a self-asserted `--tool`, so they stop an agent \
+             acting under its own name and not one that claims another's.",
+        )
         .command("lead")
         .map(CliCommand::Lead);
 
@@ -2071,11 +2091,15 @@ fn lead_parser() -> impl Parser<LeadArgs> {
         .map(|_| LeadSubcommand::Show);
     let h_tool = string_arg("tool", "TOOL");
     let h_to = string_arg("to", "TOOL");
-    let handoff = construct!(h_tool, h_to)
-        .map(|(tool, to)| LeadTargetArgs {
+    let h_force = long("force")
+        .help("Take the seat from a live incumbent, recorded as a seizure (not a credential).")
+        .switch();
+    let handoff = construct!(h_tool, h_to, h_force)
+        .map(|(tool, to, force)| LeadTargetArgs {
             tool,
             to,
             user_designated: false,
+            force,
         })
         .to_options()
         .descr("Hand the lead title to another (frontier) agent.")
@@ -2086,11 +2110,15 @@ fn lead_parser() -> impl Parser<LeadArgs> {
     let a_ud = long("user-designated")
         .help("Mark as user-designated (supersedes a first-join lead).")
         .switch();
-    let assign = construct!(a_tool, a_to, a_ud)
-        .map(|(tool, to, user_designated)| LeadTargetArgs {
+    let a_force = long("force")
+        .help("Take the seat from a live incumbent, recorded as a seizure (not a credential).")
+        .switch();
+    let assign = construct!(a_tool, a_to, a_ud, a_force)
+        .map(|(tool, to, user_designated, force)| LeadTargetArgs {
             tool,
             to,
             user_designated,
+            force,
         })
         .to_options()
         .descr("Assign the lead (user-designated supersedes first-join).")

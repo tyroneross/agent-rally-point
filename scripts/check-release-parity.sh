@@ -37,6 +37,13 @@
 #      byte, at the pre-push pin — but ONLY when .githooks/pre-push supplies
 #      one via RALLY_PREPUSH_PIN_COMMIT (RC-034, see the loop below). CI, the
 #      release workflow, and manual runs pass no pin and are unaffected.
+#      ARP-R-05c: pinning those test FILES was not sufficient on its own.
+#      test_no_autoprovision.sh and test_ensure_rally_binary.sh both execute
+#      hooks/ensure-rally-binary.sh (curl, chmod +x, cargo install) out of the
+#      pushed tree, so a push that left every test here byte-identical while
+#      editing that engine still reached execution unreviewed. .githooks/pre-push
+#      now pins hooks/ensure-rally-binary.sh itself, compare-only — this script
+#      never dispatches it directly, so there is nothing to check from here.
 #
 # Exit 0 only when both hold. JSON is parsed with `python3 -c` (portable, no
 # jq dependency) to match the rest of this repo's tooling (see

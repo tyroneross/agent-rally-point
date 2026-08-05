@@ -88,11 +88,30 @@ fn claim_closed_by_later_fact(claim: &Fact, facts: &[Fact]) -> bool {
     })
 }
 
-fn later_fact_refs_claim(fact: &Fact, claim_id: &str) -> bool {
+/// The fact kinds that CLOSE an active claim.
+///
+/// ARP-R-02. This used to be a `matches!` arm inside `later_fact_refs_claim`
+/// and a SECOND, hand-copied pair of match arms in `store.rs` deciding which
+/// closes were authorization-checked. The two drifted immediately: the
+/// projection closed on four kinds, the gate covered two, and `Receipt` and
+/// `ClaimExpired` reached the ledger with no ownership check at all. A rogue
+/// posting `rally say receipt --tool rogue --ref <claim-id>` took any live
+/// claim, seconds old, with 30 minutes of lease remaining — reproduced end to
+/// end, `active_claims` 1 -> 0 -> 1 with the owner flipped.
+///
+/// One list, read by BOTH the projection and the write gate, so a fifth
+/// closing kind cannot silently add a fifth bypass: adding a kind here changes
+/// what closes a claim and what must be authorized to close one, in the same
+/// edit.
+pub(crate) fn closes_active_claim(kind: &FactKind) -> bool {
     matches!(
-        fact.kind,
+        kind,
         FactKind::Resolve | FactKind::Release | FactKind::Receipt | FactKind::ClaimExpired
-    ) && fact.ref_id.as_deref() == Some(claim_id)
+    )
+}
+
+fn later_fact_refs_claim(fact: &Fact, claim_id: &str) -> bool {
+    closes_active_claim(&fact.kind) && fact.ref_id.as_deref() == Some(claim_id)
 }
 
 /// A `Release` closes EVERY active claim whose scope overlaps the release
@@ -163,6 +182,31 @@ pub(crate) fn detect_conflict(facts: &[Fact], incoming: &Fact) -> Option<ClaimCo
     None
 }
 
+/// Is this a lead-family decision (seat taken, or seat reopened)?
+pub(crate) fn is_lead_decision(fact: &Fact) -> bool {
+    fact.kind == FactKind::Decision
+        && (fact.subject == LEAD_SUBJECT || fact.subject == LEAD_RELINQUISHED_SUBJECT)
+}
+
+pub(crate) const LEAD_SUBJECT: &str = "role:lead";
+pub(crate) const LEAD_RELINQUISHED_SUBJECT: &str = "role:lead:relinquished";
+
+/// Who a lead-family decision names as the INCOMING lead.
+///
+/// ARP-R-01, attribution half. `set_lead` used to stamp `fact.tool = <the
+/// beneficiary>`, so the ledger recorded a seizure as authored by the agent
+/// that GAINED the seat — the one field an investigator would read to find out
+/// who took it named the wrong agent, and no authorization gate could be built
+/// on `fact.tool` because it did not hold the actor.
+///
+/// New lead facts stamp `tool` = the ACTOR and `target` = the BENEFICIARY.
+/// Legacy facts (three exist in this repo's ledger, all pre-dating the fix)
+/// carry no `target`, so `tool` is still read as the beneficiary for those. The
+/// ledger is append-only; an old room must keep replaying to the same lead.
+pub(crate) fn lead_beneficiary(fact: &Fact) -> Option<String> {
+    fact.target.clone().or_else(|| fact.tool.clone())
+}
+
 /// The tool holding the lead seat, derived from the ledger.
 ///
 /// Mirrors the projection in `store::snapshot_from_facts_with_policy`: the
@@ -170,15 +214,34 @@ pub(crate) fn detect_conflict(facts: &[Fact], incoming: &Fact) -> Option<ClaimCo
 /// seat. Lifted out so the claim-breadth gate can answer "is this agent the
 /// lead" without building a full room snapshot on every claim append.
 pub(crate) fn lead_from_facts(facts: &[Fact]) -> Option<String> {
+    lead_as_of(facts, i64::MAX)
+}
+
+/// The tool holding the lead seat AS OF `seq` — that is, considering only
+/// lead-family decisions at or before `seq`.
+///
+/// ARP-R-01, retroactive half. Every lead-gated control used to compare against
+/// the CURRENT lead, which made the gate's verdict a function of the room's
+/// present state rather than of the fact being judged. Live consequence, both
+/// directions, on the SAME fact id:
+///
+/// * **Retroactive arm.** A non-lead posts an unscoped blocker; it projects as
+///   `unscoped-blocker` / allow:true. That agent later takes the seat, and the
+///   same blocker re-projects as `room-freeze` / allow:false — a room-wide DoS
+///   armed after the fact, by a write that touched nothing.
+/// * **Retroactive disarm.** The honest lead declares a freeze; anyone else
+///   takes the seat and the freeze degrades to allow:true. The room's only stop
+///   control was removable in one command.
+///
+/// Authority is a property of the moment a fact was written. A fact carries its
+/// own `seq`, so ask the question at that point.
+pub(crate) fn lead_as_of(facts: &[Fact], seq: i64) -> Option<String> {
     facts
         .iter()
-        .filter(|fact| {
-            fact.kind == FactKind::Decision
-                && (fact.subject == "role:lead" || fact.subject == "role:lead:relinquished")
-        })
+        .filter(|fact| is_lead_decision(fact) && fact.seq <= seq)
         .max_by_key(|fact| fact.seq)
-        .filter(|fact| fact.subject == "role:lead")
-        .and_then(|fact| fact.tool.clone())
+        .filter(|fact| fact.subject == LEAD_SUBJECT)
+        .and_then(lead_beneficiary)
 }
 
 /// RC-037, second half: who may hold a ROOM-WIDE claim.
@@ -212,11 +275,26 @@ pub(crate) fn breadth_violation(incoming: &Fact, facts: &[Fact]) -> Option<Strin
              you are editing, or ask {lead_tool} to hand off the lead first.",
             wildcard.canonical_key()
         )),
+        // ARP-R-01. This message used to end with
+        // "…or take the lead seat first with
+        //  `rally lead assign --tool {claimer} --to {claimer}`."
+        //
+        // It printed the bypass to the caller it had just refused. The gate's
+        // whole content is "only the lead may do this", and the refusal handed
+        // over the one command that made the reader the lead — an unauthorized
+        // agent was told, in the refusal itself, exactly how to become
+        // authorized. `set_lead` had no precondition at the time, so the
+        // instruction worked.
+        //
+        // The seat is gated now (`write_authority::assert_lead_transfer_authorized`),
+        // so the command no longer succeeds against a live incumbent under a
+        // rogue's own name. The instruction still does not belong here: a
+        // refusal explains the boundary and names who can move it. It does not
+        // coach around it.
         None => Some(format!(
             "claim refused: scope {} is room-wide and only the lead may hold it. \
-             This room has no lead. Claim the specific paths you are editing, or take \
-             the lead seat first with \
-             `rally lead assign --tool {claimer} --to {claimer}`.",
+             This room has no lead, so no agent currently holds room-wide authority. \
+             Claim the specific paths you are editing.",
             wildcard.canonical_key()
         )),
     }

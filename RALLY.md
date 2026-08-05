@@ -34,6 +34,11 @@ rules were ingested, `next` gives a concrete action contract, `check` protects
 shared boundaries, `say` records durable facts, and `room` inspects the current
 projection.
 
+`--strict` on `check before-write` is a blocking flag: it exits 4 when a stop
+finding is present, so a harness reading the exit code aborts the write. Drop it
+to keep the finding advisory. "How Agents Wire This In" below lists the other two
+blocking switches.
+
 ## Identify Yourself
 
 Pick a stable `tool` id and use it across sessions. Peers address you by this
@@ -158,11 +163,27 @@ them before relying on it:
 [`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md) and
 [`docs/AUTO-COORDINATION-HOOKS.md`](docs/AUTO-COORDINATION-HOOKS.md).
 
-The hooks are advisory and fail open — they never block an edit and they exit 0
-when Rally is broken. They self-gate on missing `.rally/`, so they are a no-op
-in unrelated repos. They do not download, build, or install anything; the
-`rally` binary is installed by an explicit step you run
-(`scripts/install-rally.sh` or `cargo install --path crates/rally-cli`).
+The hooks are advisory by default, and three opt-in switches make them block.
+Default posture: PreToolUse returns `permissionDecision: "allow"` with a warning,
+so the edit goes through, and every hook exits 0 even when Rally is broken. The
+switches, each off unless you set it:
+
+- `RALLY_HOOK_STRICT=1` — the hook emits `permissionDecision: "deny"` (PreToolUse)
+  or `decision: "block"` (Stop) on a high-severity signal. The hook still exits 0;
+  the refusal travels in the JSON, not the exit code.
+- `rally check before-write --strict` — exits 4 when a stop finding is present. The
+  Load-Bearing Commands block above passes `--strict`; drop it for warn-only.
+- `RALLY_BEFORE_WRITE_FAILCLOSED=1` (or `--fail-closed`) — makes `check before-write`
+  exit 4 when its snapshot read exceeds the watchdog timeout instead of exiting 0.
+
+What strict mode costs you is in
+[`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md): one unscoped blocker
+becomes a hard deny on every edit in the room.
+
+The hooks self-gate on missing `.rally/`, so they are a no-op in unrelated repos.
+They do not download, build, or install anything; the `rally` binary is installed
+by an explicit step you run (`scripts/install-rally.sh` or
+`cargo install --path crates/rally-cli`).
 
 Off: `RALLY_HOOKS=off` (session), `rally hooks off --scope repo` (repo),
 `rally hooks status` (check).
@@ -206,7 +227,14 @@ rally say risk --tool <you> --subject "managed session unavailable" --severity m
 ## Lead & Backlog
 
 ```bash
-# Lead-agent title — rally records/exposes only, never enforces (see COORDINATION.md):
+# Lead-agent title. Rally records and exposes the lead and does not enforce the
+# lead's decisions (see COORDINATION.md) — with one exception: the seat gates two
+# room-wide capabilities. A `workspace:*` / `repo:*` claim (RC-037) and an unscoped
+# blocker, which freezes every agent's `check before-write` (RC-038), are accepted
+# only from the seat holder; from anyone else they degrade to a warning. That check
+# compares self-asserted `--tool`, so it stops an agent acting under its own name
+# and does not stop one that passes `--tool <lead-id>`. Detail and residual:
+# docs/security/TRUST-MODEL.md.
 rally lead show --json                                          # current lead, tier, how-assigned
 rally lead handoff --tool <lead> --to <frontier-tool> --json    # transfer the title
 rally lead assign  --tool <you> --to <tool> [--user-designated] --json   # set lead (user-designated supersedes first-join)

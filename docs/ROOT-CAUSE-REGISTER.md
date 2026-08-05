@@ -231,7 +231,7 @@ means someone tried to break it and failed.
   silently dropped in a future edit without any test noticing. Worth a follow-up assertion.
 - **Superseded prior state:** `mechanism`
 - **Evidence (verified at source):** `reconcile_segments_and_db` (`store.rs:3526`) fast-paths on the
-  sidecar when fingerprints match. `fingerprint_db` (`store.rs:3388`) hashes **only the main db file**
+  sidecar when fingerprints match. `fingerprint_db` (`store.rs:3389`) hashes **only the main db file**
   — in WAL mode the main file's bytes do not change on append, so WAL loss is invisible to it.
   `refresh_reconcile_cache_after_append` (`store.rs:1738`) advances `canonical_count`/`db_count`
   **by one from the previous sidecar** rather than recounting, so the first post-wipe writer inherits
@@ -726,7 +726,12 @@ review answers the question you asked.
   already records. A failed push leaves its worktree behind.
 
 ### RC-029 — any peer can strip any other agent's live claim and take it
-- **State:** ✅ `controlled` as of `3863f6e`, pending the independent Codex audit's verdict.
+- **State:** ✅ `controlled` as of `3863f6e` for Resolve and Release; **WITHDRAWN 2026-08-04**,
+  then re-established for all four closing kinds. See ARP-R-02 below. The `controlled` mark was
+  premature: the fix covered two of the four kinds that close a claim, and its own doc comment
+  named all four. Withdrawing it is recorded here rather than quietly upgraded, because the
+  interesting fact is not that a gap existed — it is that six mutation-validated adversarial
+  tests reported a healthy control over a half-covered surface.
 - **Severity: highest on this register.** It defeats the one property Rally exists to provide.
   Every deconfliction decision downstream inherits it, and the hook's auto-claim path means most
   claims are written by agents that would never notice the theft.
@@ -1202,6 +1207,17 @@ review answers the question you asked.
 - **What must exist before it goes back on:** a lease-renewal caller on the presence/heartbeat path,
   a bound on facts appended per pass under the watchdog budget, and a concurrency test asserting
   N concurrent enters all exit 0. **Effort: M.**
+- **CORRECTION 2026-08-04 — the first precondition as written is insufficient, and building to it
+  would produce a fix that does not work.** "Add a renewal caller" assumes `renew_claim_lease`
+  renews something the expiry path reads. It does not. `renew_claim_lease` (`store.rs:2221-2229`,
+  dispatch at `store.rs:1286-1294`) rebuilds `claim-index.json` from facts and then edits that
+  sidecar; it appends no durable fact. The reaper builds its own index directly from facts
+  (`reaper.rs:285-286`) and never opens the sidecar, so a renewed claim still expires on the next
+  pass. Wiring a caller onto the presence path would satisfy the precondition, pass its own test,
+  and change nothing about which claims get reaped. The corrected precondition: **renewal must
+  become a durable fact the projection honors, or expiry must read the sidecar** — one of the two,
+  decided before any caller is written. Registered separately as RC-053 (D3), which carries the
+  full mechanism.
 - **Partial hardening already applied:** the automatic path acts only on the writer-stamped lease
   signal (`ReapMode::LeaseOnly`), because owner-staleness derives from a peer-writable `created_at`
   and would otherwise let one committed ledger line destroy a victim's claims.
@@ -1250,7 +1266,7 @@ review answers the question you asked.
   at all. The fixture had to be rebuilt before the assertion meant anything.
 
 ### RC-041 — `rally inject` is mechanically sound and has no authorization
-- **State:** `observed`. **NOT fixed.** Quoting and escaping are STRONG and no break was found:
+- **State:** `partial` — 3C and 3D closed, 3A closed for `rally_wake.py`, 3B open by decision. Quoting and escaping are STRONG and no break was found:
   single chokepoint `sanitize_inject_text` (`backends.rs:569-608`), `tmux send-keys -H` one hex token
   per byte (no shell, no key interpretation), paste-breakout closed because PASTE_END starts with ESC
   which is stripped, 64 KiB bound with ledger-write-before-send ordering.
@@ -1263,8 +1279,28 @@ review answers the question you asked.
 - **3C:** `sanitize_inject_text` filters Rust `char::is_control()` (Cc only) — U+2028/2029, RLO,
   ZWSP, BOM survive into the recipient's pane and transcript, defeating a human reading over the
   agent's shoulder.
-- **3D:** `scripts/rally_wake.py:61-64` runs `tmux send-keys -l` with NO sanitization, contradicting
-  the chokepoint comment's claim that "no future caller can route around" it.
+- **3D:** ✅ CLOSED. Stale as written since `8151ab4` (`rally_wake.py` gained `sanitize_wake_text`)
+  and fully closed 2026-08-04 by ARP-R-11: `--` terminator, target shape validation, hex-token
+  payload, provenance label with forged-label scrub, and one invocation for clear+payload+submit.
+  The parity test that was supposed to guard the chokepoint graded a SPELLING (`send-keys` plus
+  `"-l"` on one line) and matched zero lines against the fixed file, so it would have passed
+  vacuously forever; it now asserts structurally that the chokepoint function is on the path.
+- **3A:** ✅ CLOSED for `rally_wake.py` by ARP-R-11; still open for `rally inject` itself.
+- **State reconciliation (ARP-R-09).** This entry read `observed. NOT fixed.` while commit
+  `8151ab4` was titled "close RC-041". Both were partly right and the register was the one that
+  misled: 3C and 3D were addressed there, 3A and 3B were not. Corrected in place rather than
+  re-titled, so the drift is legible.
+- **3B remains the open one, and it is RC-063 in miniature.** `inject_authority_refusal`
+  (`lib.rs:5905-5931`) already documents its own value honestly and at length — an attacker
+  claiming the lead's id passes rule 2, one claiming nothing passes rule 5, and what is blocked is
+  the agent that names itself and has no standing. **Rule 5 authorizes when `--tool` is OMITTED**,
+  so reaching any pane requires omitting a flag. The reviewed alternative — require an explicit
+  `--anonymous` — would make that an affirmative act rather than an omission, at the cost of
+  breaking the documented operator form (`rally inject <pane> --text "…"`,
+  `docs/HANDOFFS-AND-LAUNCHING-AGENTS.md`). **Decision owed, deliberately not taken this run:**
+  the change is small and its cost falls on the human flow, so it wants an operator's call rather
+  than an implementer's. Not a defect of reasoning — the code's own comment already says the gate
+  buys forced choice and not exclusion.
 
 ### RC-042 — the room projection is quadratic and the byte budget does not touch it
 - **State:** `observed`. **NOT fixed.** Registered because it makes an acceptance criterion
@@ -1417,6 +1453,688 @@ review answers the question you asked.
 - **Not covered:** the test matches on the command NAME, so a help line whose flags have drifted from
   the parser still passes. `--receipt-threshold` vs `--receipt-threshold-secs` was found by hand in
   this run, not by a check. Grading flag spellings against `bpaf` needs a different mechanism.
+
+## Independent design audit, 2026-08-04 — pinned at `006d417`
+
+Eleven findings from a structural read of the store, composition, reaper, identity and hook layers.
+Every citation below was re-verified against the working tree at `006d417` by the writing agent;
+where the audit's line reference had drifted, the corrected one is used and the correction is
+stated. **Nothing here is `controlled`**: per the standing rule this cycle, closure requires an
+adversarial control tested with the ADJACENT move, not the move it was built to stop. None of these
+has one yet, so each is `observed` or `mechanism`, and each states what the control would have to do.
+
+D1, D2, D6 and D9 from the same audit are being handled in other workstreams this run and appear
+here only where they cross-reference.
+
+### RC-053 — lease renewal writes to a sidecar that no expiry path reads (D3)
+- **State:** `mechanism`. **NOT fixed.**
+- **Mechanism, three parts, all verified:**
+  1. `claim_authority::renew_claim_lease` (`claim_authority.rs:247-260` @ `006d417`) mutates
+     `record.lease_expires_at` in the in-memory index and calls `write_index(path, &index)`. It
+     appends nothing to the ledger. The only durable effect is `.rally/claim-index.json`.
+  2. Its caller `DirectRoomStore::renew_claim_lease` (`store.rs:2221-2229`) calls
+     `self.rebuild_claim_index()?` FIRST, which rewrites that sidecar from facts
+     (`store.rs:2214-2218`) — so each renewal also erases every prior renewal before applying its
+     own. And `append_fact` rewrites the sidecar from facts after every `Claim | Release | Resolve |
+     ClaimExpired` append (`store.rs:1849-1856`), so a renewal survives only until the next
+     claim-class write by anyone in the room.
+  3. Neither expiry path can see it. The reaper does `let facts = room.facts()?;` then
+     `index_from_facts(&facts)` (`reaper.rs:285-286`) and passes that to
+     `claim_authority::expired_claims` — the sidecar is never opened. `expire_claim_leases_at`
+     (`store.rs:2237-2247`) does read the sidecar, but calls `rebuild_claim_index()` on the line
+     before, destroying the renewal it is about to read. That function is also `#[allow(dead_code)]`
+     with no CLI caller, which the register already records.
+- **Consequence:** every claim expires at `claim_time + lease`, unconditionally, no matter what any
+  renewal caller does. RC-051's stated precondition for re-enabling auto-reap ("add a renewal
+  caller") is therefore satisfiable without changing behaviour, which is why it is corrected in
+  place there.
+- **Why review missed it:** a unit test named
+  `claim_authority_lease_renewal_is_index_only` (`claim_authority.rs`, `006d417`) asserts exactly
+  this and passes. The behaviour has a name, a test and a green result; nothing anywhere asserts
+  that a renewed claim is still live after a reap pass. The test grades the function; the question
+  is whether any reader honours it. That is the register's third pattern reached from the test side.
+- **The choice that is owed:** make renewal a durable fact (a `ClaimRenewed` kind, or a lease stamp
+  the projection folds like `ClaimExpired`), or make expiry authoritative on the sidecar. The two
+  are not interchangeable — the first survives replay from segments and a git-merged ledger; the
+  second does not, and `claim-index.json` is a derived cache rebuilt on every claim-class append.
+- **Adversarial control:** renew a claim's lease, append an unrelated `Claim` fact from a second
+  tool, then run the reaper — assert the renewed claim is NOT in `claims_reaped`. Against today's
+  code that fails at the second step, before the reaper runs at all.
+
+### RC-054 — the byte budget is a bucket allocator, not a response ceiling, and it can report `over_budget: false` while over budget (D4)
+- **State:** `mechanism`, verified by code trace. **NOT fixed.** Structural sizing of the unbudgeted
+  tail was NOT measured in this pass; see "what would settle it".
+- **Mechanism:**
+  - Only four buckets compete for the remaining budget: `BUDGETED_BUCKETS` =
+    `current_decisions`, `recent_artifacts`, `current_risks`, `open_handoffs`
+    (`store.rs:3260-3276`).
+  - `never_cut_bytes` (`store.rs:3640-3678`) reserves `active_claims`, `active_blockers`,
+    `system_health`, `squads` and `unconsumed_artifacts`. It counts nothing else — not the fixed
+    snapshot fields (`max_seq`, `lead`, `lead_epoch`), not `totals`, not `readers`, not `mission`,
+    not the composition metadata, and not the caller's ASSIGNED handoffs, which are split out and
+    reserved separately at `store.rs:3465-3478`.
+  - The final envelope adds more after composition has finished. `command_room`
+    (`lib.rs:2915-2939`) clones `readers` and `mission` to top-level `RoomData` fields while
+    `room: snapshot.clone()` still carries both, and builds `agent_injectability`
+    (`lib.rs:2927-2928`) after `compose_room_output` returned. None of that is budgeted or counted.
+  - `emitted_bytes` (`store.rs:3681-3685`) serializes the snapshot at `store.rs:3392`, and
+    `snapshot.composition` is assigned at `store.rs:3403` — so the one field a reader would use to
+    check the ceiling excludes the block it is reported in.
+  - **The honesty signal can be wrong.** `over_budget` is derived once, from the INITIAL reserve:
+    `apply_budget` computes `(reserved, causes) = never_cut_bytes(...)` and clears `causes` when
+    `reserved <= budget` (`store.rs:3436-3439`); `over_budget = !over_budget_causes.is_empty()`
+    (`store.rs:3389`). Everything subtracted afterwards uses `saturating_sub` and never touches
+    `causes`: the assigned handoffs (`store.rs:3478`) and the pass-1 guaranteed top item of every
+    non-empty bucket (`store.rs:3505-3514`). A response whose reserve fit but whose guaranteed
+    items did not is over budget and reports `over_budget: false`.
+  - **And it can carry no composition block at all.** The rebuild loop `continue`s when
+    `kept.len() == total` (`store.rs:3546`), so if every budgeted bucket has exactly one item
+    no `BucketComposition` is inserted; with `over_budget` false and `buckets` empty, the
+    `if over_budget || !buckets.is_empty()` guard (`store.rs:3391`) skips `composition` entirely.
+    The absence of `composition` is documented on the field itself as "the positive statement that
+    this response is complete" (`store.rs:496`, `RoomSnapshot::composition`). In that case it is
+    not.
+- **Same class as RC-048, and here is exactly how much wider.** RC-048 recorded that the budget did
+  not COUNT the three largest sections. At `006d417` it counts five of them, and `never_cut_bytes`
+  names the ~44 KB `unconsumed_artifacts` gap it closed. RC-048's specific defect is addressed.
+  What is not: (a) the reserve is still not the whole response — fixed fields, `totals`, `readers`,
+  `mission`, composition metadata and assigned handoffs sit outside it; (b) two subtractions happen
+  after the verdict and cannot raise it, so the overrun is unbounded rather than merely uncounted;
+  (c) `emitted_bytes` excludes the block it lives in; (d) the all-buckets-have-one-item case emits
+  no composition metadata at all. RC-048 is a coverage gap. This is a reporting defect: the field
+  that says the ceiling held can say so while it did not.
+- **Why review missed it:** every part is locally correct. The reserve is honest about what it
+  reserves, the saturating arithmetic is the right choice for not underflowing, and the guaranteed
+  top-1 exists precisely so a bucket cannot silently empty. The defect is only visible in the
+  ORDER: the verdict is computed at step 1 and two more subtractions happen at steps 3 and 4.
+  `room_budget_scaling.rs::budget_binds_on_the_buckets_it_governs` grades the buckets it governs,
+  which is what its name says and is not this.
+- **What would settle the sizing:** emit a room payload with `--budget-bytes` set below the
+  never-cut reserve and compare `len(stdout)` against both `budget_bytes` and the reported
+  `emitted_bytes`. Not run here — it requires driving the release binary against the live room,
+  which mutates `.rally/` derived caches outside this change's scope.
+- **Adversarial control:** a fixture where the reserve fits the budget but the four guaranteed
+  top-1 items do not, asserting either `over_budget: true` or a serialized payload within the
+  ceiling. A second asserting `emitted_bytes` equals the byte length the caller actually receives.
+
+### RC-055 — the never-cut classes still have no structural bound (D5)
+- **State:** `mechanism`, measured on this ledger. **NOT fixed.**
+- **Mechanism — `system_health` dedup is by COMPLETE SUBJECT, not by class.** The four prefixes in
+  `SYSTEM_HEALTH_SUBJECT_PREFIXES` (`store.rs:2981-2986`) are a CLASSIFIER — `is_system_health_subject`
+  only decides which bucket a risk fact lands in (`store.rs:2987-2991`). The dedup key is
+  `f.subject.clone()`, the whole string (`store.rs:3014-3021`). The comment immediately below
+  (`store.rs:3021-3025`) justifies not truncating the bucket on the grounds that it is "bounded by
+  the small, machine-generated system vocabulary". The vocabulary is four prefixes; the key is not.
+- **Measured, this repo, 2026-08-04:** over `.rally/log/*.jsonl` + `.rally/archive/*.jsonl`
+  (6,931 records, of which 853 are `kind: risk`), **731 system-health facts collapse to 250
+  distinct subjects, not to 4.** By prefix: `external-intake:` 122 distinct, `unmanaged-agent:` 65,
+  `binary-drift:` 45, `duplicate-active-squad-id:` 18. The ledger is live and peers were writing to
+  it during this run, so re-measuring gives a larger N; every figure in this section and in RC-058
+  comes from one atomic pass so they are consistent with each other.
+  `external-intake:` interpolates an absolute
+  filesystem path into the subject (`lib.rs:2387`), so its distinct count is bounded by the
+  paths anyone ever passes — which is to say, unbounded. RC-048 measured this bucket at 56,413
+  bytes across 75 rows in the live room; that is the un-archived remainder of the same 248.
+- **Second half — broadcast handoffs are never-cut for EVERYONE.** `handoff_assigned_to`
+  (`store.rs:3285-3291`) returns `true` for `None | Some("all")`, so an untargeted handoff counts as
+  assigned to every caller that identifies itself, and assigned handoffs are pulled out of the
+  competition before anything competes (`store.rs:3465-3478`). The doc comment states the tradeoff
+  and takes it deliberately — narrowing to an exact target match would make a broadcast handoff
+  droppable. The consequence is unstated: the never-cut set grows with the count of open broadcast
+  handoffs, and the register already measures 42 of 51 open handoffs older than 30 days.
+- **Why review missed it:** the prefix list and the dedup sit 30 lines apart and read as one
+  mechanism. A reader who sees a four-element `const` above a dedup loop infers the const is the
+  key. It is not; nothing checks that it is.
+- **Fix shape, stated as a choice:** key `system_health` on the PREFIX class plus a bounded
+  discriminator (a hash, or a capped-cardinality set per prefix with an overflow row naming the
+  count), and either bound the assigned-handoff reservation or expire broadcast handoffs. Both
+  change what the enter-path duplicate guard reads — see the design observation on that coupling
+  below.
+- **Adversarial control:** append 500 `external-intake:` risk facts with distinct paths and assert
+  the composed room's `system_health` row count stays bounded. Today it returns 500.
+
+### RC-056 — the reaper reports success on a failed durable write (D7)
+- **State:** ✅ `controlled` as of this run. `crates/rally-cli/tests/reaper_write_integrity.rs`
+  performs the hostile action — a relinquish whose durable append fails — and asserts the report
+  does NOT claim it applied. Mutation-validated: restoring the discarded `let _ =` kills that test
+  and no other, which is the correct signature. Mechanism verified at `006d417`.
+- **Wider than reported, found by asking the adjacent question.** `applied: true` never meant "the
+  writes landed" — it is a copy of the `--apply` argument. `rally doctor --reap-stale --apply
+  --json` returns exit 0 and `ok: true` against a fully unwritable ledger. Only the per-item lists
+  carry write outcomes. That is `lib.rs::command_doctor`'s to fix and is NOT closed by this entry.
+  time of this audit.
+- **Mechanism, three sites, two different failure shapes:**
+  1. **Claims.** `append_fact_verified` failure prints to stderr, does `preserved += 1`, and
+     `continue`s past `claims_reaped.push(reaped)` (`reaper.rs:392-403`, list push skipped at `:406`).
+  2. **Handoffs.** Same shape (`reaper.rs:475-485`), skipping `handoffs_expired.push(reaped)` at
+     `reaper.rs:488`.
+     For both, the report's item lists stay honest — but the failure is counted into
+     `preserved_future_or_active`, whose own doc says it means "future-dated lease, owner timestamp
+     unparseable, or owner still active" (`reaper.rs:92-94`). A write failure is none of those. The
+     report has no field for "the write failed", so the only signal is a stderr line nothing parses.
+  3. **Lead relinquish — this one is a false report, not a mislabeled counter.**
+     `let _ = room.append_fact_verified(&relinquish_fact);` (`reaper.rs:523`) discards the result
+     and the very next expression is `Some(lead_tool.clone())` (`reaper.rs:525`), which becomes
+     `ReapReport.lead_relinquished`. There is no stderr line on this path. A report carrying
+     `applied: true` (`reaper.rs:545`, whose doc reads "Whether the staged facts were actually
+     written") and `lead_relinquished: Some("claude_code:01")` can be produced when the relinquish
+     fact never reached the ledger. The next reader projects the OLD lead and the report says the
+     seat was vacated.
+- **Class:** the register's first pattern, verbatim — an operation returns success for a step that
+  is not the step the caller cares about. It is the fifth instance after RC-001, RC-005, RC-007 and
+  RC-019, and the first one found inside a component built after that pattern was named.
+- **Adversarial control:** run a reap against a room whose ledger directory is read-only, and assert
+  the report either errors or reports `lead_relinquished: None` and a non-zero write-failure count
+  distinct from `preserved_future_or_active`. Today it reports the relinquish as done.
+
+### RC-057 — the reaper's rate limit is a lock-free read-then-write, and its stated bound is not established (D8)
+- **State:** `mechanism`, **NOT controlled — and deliberately so.** The false bound was deleted
+  from the comment rather than made true. The correct primitive (`store::acquire_room_mutation_lock`)
+  is private to `store.rs`; building a second locking primitive inside `reaper.rs` to bound a
+  feature that ships OFF by default would put the fix in the wrong layer. The comment now states
+  the real bound (sequential: one pass per interval; concurrent: unbounded), and RC-051's
+  precondition for re-enabling the default stays OPEN because of it. An honest unbounded comment
+  beats a bound the code does not deliver. Mechanism verified at `006d417`.
+- **Mechanism:** `maybe_reap_on_enter` reads `.rally/.last-auto-reap` with
+  `std::fs::read_to_string` (`reaper.rs:182-194`) and, on a stale or unparseable marker, writes the
+  current timestamp with `std::fs::write` (`reaper.rs:202-207`). There is no lock, no
+  `create_new`/`O_EXCL`, and no compare-and-swap. N processes entering inside the same window all
+  read the stale marker before any of them writes, so all N reap. The comment at `reaper.rs:195-199`
+  states the bound as "at most one extra pass runs instead of one per agent" — that holds only if
+  the reads and writes interleave, which nothing enforces. It is the same TOCTOU RC-051 already
+  flags as "unproven"; this entry gives the mechanism and says what would establish a bound.
+- **Also:** `std::fs::write` truncates before writing, and unlike `claim_authority::write_index`
+  (temp file + `fs::rename`) it is not atomic. A concurrent reader can observe a zero-length or
+  partial marker, fail to parse it, and reap. That direction is fail-toward-cleanup and documented
+  as such, so it is a cost, not a hazard — but it means the marker cannot be relied on as a bound
+  even against a single competing writer.
+- **Why the comment survived:** it describes a real serialization that would hold under a lock, and
+  the surrounding prose ("this bounds the waste, it does not need to be a lock") frames the absence
+  of a lock as a deliberate tradeoff. The tradeoff is real; the bound named in the same sentence is
+  the part that is not established.
+- **Adversarial control:** launch N concurrent `rally enter` with auto-reap enabled against a room
+  with eligible claims and count reap passes in the ledger. The assertion is `passes <= 2`. This
+  must be run N-consecutive per the flaky-gate rule, since a single green run of a race is evidence
+  of nothing.
+
+### RC-058 — the write path re-reads the whole ledger about five times per append, and it lands before the read path does (D10)
+- **State:** `mechanism`, measured against this ledger. **NOT fixed.**
+- **Mechanism — one verified append performs, in order:**
+
+  | step | site | records decoded |
+  |---|---|---|
+  | takeover-`Release` revival guard (conditional) | `store.rs:1695-1696` — `facts_from_segments` + a full `snapshot_from_facts_with_policy` | 6,442 + a projection |
+  | owner-stale `ClaimExpired` revival guard (conditional) | `store.rs:1740-1741` — same pair again | 6,442 + a projection |
+  | breadth + conflict check (`Claim` only) | `store.rs:1769` — `facts_from_segments`, then `breadth_violation` (`:1775`) and `detect_conflict` (`:1778`) | 6,442 |
+  | seq allocation | `store.rs:1792-1793` — `next_canonical_seq`; its sidecar fast path usually HITS (`store.rs:4590-4596`) | ~0 (O(#files) stat) |
+  | dup gate | `store.rs:1799` — `last_seq_in_segment` parses the whole active segment and takes `.last()` (`store.rs:4607-4619`) | 1,044 |
+  | reconcile sidecar refresh | `store.rs:1843` → `segment_seq_stats` (`store.rs:1887`) | 6,442 |
+  | …and its db half | `store.rs:1893` → `read_db_event_stats`, a full `Fact::from_value` per row; its own `TODO(perf)` at `store.rs:4658` says so | 6,442 |
+  | segment index refresh | `store.rs:1847` → `refresh_log_index`; its fingerprint fast path (`store.rs:5058`) ALWAYS misses after an append, because the append just changed the active segment's length and mtime | 6,931 |
+  | claim index refresh (claim-class kinds) | `store.rs:1854` — another `facts_from_segments` | 6,442 |
+  | readback | `store.rs:1950` → `segment_event_id_present_tail_first` | 1,044 |
+
+  The first two rows are mutually exclusive and both conditional; the unconditional cost is the
+  last five rows.
+
+- **Measured inputs, 2026-08-04, one atomic pass:** 16 live segments totalling 6,442 records; the
+  sole archive file is `ledger-pre-segment.jsonl` (489 records), excluded from replay by
+  `replay_archive_segments` (`store.rs:4556-4561`) but INCLUDED by `refresh_log_index`, which uses
+  plain `read_segment_files` on the archive dir (`store.rs:5049`) — hence 6,931 there and 6,442
+  everywhere else. `facts.db` holds 6,442 rows (read-only `select count(*) from events`). Active
+  segment `agent-rally-point-main-20260730.jsonl` = 1,044 lines. The ledger is live; peers wrote to
+  it during this run, so a re-measurement will exceed these figures.
+- **Arithmetic, inputs shown:** an ordinary append — no revival guard, not a `Claim` — decodes
+  6,442 + 6,442 + 6,931 + 1,044 + 1,044 = **21,903 records**. A `Claim` adds two more full segment
+  folds: **34,787**. At 150 appends/day and N growing 6,931 → 7,081 over that day, the floor is
+  3 × 150 × ~7,006 ≈ **3.2M record decodes per day** for the segment folds alone, before the
+  claim-class surcharge and before the SQLite half.
+- **"Tail-first readback" is O(L), not the O(1) its comment claims.**
+  `segment_event_id_present_tail_first` (`store.rs:4517-4527`) calls
+  `read_segment_entries(path)?` — which parses every line of the segment into a `Vec` — and only
+  then does `.into_iter().rev()`. The reversal makes the number of COMPARISONS O(1) on the happy
+  path; the parse is unconditional. Its own doc comment (`store.rs:4510`) and the caller's
+  (`store.rs:1944-1948`) both describe it as O(1). Correcting the claim, not the code.
+- **Relation to RC-042, which is the point of this entry.** RC-042 records the READ path's nested
+  scans and, in its own 2026-08-04 correction, moderates that to "superlinear term becoming visible
+  rather than one that already rules" — measured 38 → 51 → 119 ms across 400 → 1,600 → 6,400 facts.
+  A room read pays one or two full folds. An ordinary append pays three plus two segment parses; a
+  `Claim` pays five plus two; a close-claim with a revival guard pays five plus two plus a full
+  projection. And it is the write path that runs under the 3-second mutation watchdog. **The write
+  path is worse and it hits the failure boundary first** — RC-051's measurement (8/8 concurrent
+  `enter` exiting 4 with auto-reap on) is what this looks like from the outside.
+- **Why review missed it:** every one of the ten steps is individually justified in a comment, and
+  three of them carry a fast path that genuinely works in the case it was written for.
+  `refresh_log_index`'s fingerprint check is correct and is defeated by the append it follows;
+  `next_canonical_seq`'s sidecar check is correct and DOES hit. No reader of any single site would
+  find this. It is only visible by counting the folds along one call.
+- **Adversarial control:** a latency criterion on the WRITE path at an 8× scale gap, mirroring what
+  `room_budget_scaling.rs` did for reads, plus an instrumented counter asserting the number of full
+  segment folds per append does not grow. A byte or count assertion will not catch it; RC-042's
+  entry already records that lesson from the read side.
+
+### RC-059 — Rust and the hook disagree about who is present and which claims bind, and the disagreement inverts (D11)
+- **State:** `mechanism`, verified by code trace both sides. **NOT fixed.**
+- **Mechanism — presence.** Rust drops a squad from the snapshot only on a provable
+  `Liveness::Stale` verdict (`store.rs:3170`), keeping Live AND Unknown; the fail-open direction is
+  documented at `store.rs:3162-3166`. The separate 15-minute `status` label ("active"/"idle") is
+  computed at `store.rs:3125-3131` and the code says it "is independent of the drop decision". The
+  hook then keys everything on that label: `activeTools` retains only
+  `s.status === "active"` (`hooks/rally-coordination-hook.sh:755-759`).
+  RC-030 establishes that `Liveness::Stale` is unreachable for most tools, so the common case is a
+  squad Rust RETAINS and the hook OMITS.
+- **Mechanism — claims, and this is the half that bites.** The hook filters
+  `activeTools.has(c.tool) && !leaseExpired(c)`
+  (`hooks/rally-coordination-hook.sh:801-803`, `leaseExpired` at `:762-771`). Rust's
+  `is_active_claim_fact` (`claim_authority.rs:77-81` @ `006d417`) makes no reference to
+  `lease_expires_at` at all — a claim is active until an explicit close fact. So the PROMPT can omit
+  a claim that `claim_authority::detect_conflict` still enforces at append time
+  (`store.rs:1778-1790`) and that `check before-write` still reports. **The agent is told a path is
+  free and then refused when it claims it.** Same for the handoff filter
+  (`hooks/rally-coordination-hook.sh:804-806`), which hides any handoff older than 24 h whose author
+  is not in `activeTools` — an idle author's handoff disappears from the prompt while remaining
+  open in the room.
+- **A narrower version is already on the register, twice, and neither covers this.** RC-031's final
+  bullet records the same file's `factIsRecent` treating an unparseable timestamp as not-recent
+  while Rust ranked it first — one field, opposite verdicts. RC-020 records `rally check` honouring
+  lease expiry while `rally say claim` refuses on it — but both sides of RC-020 are Rust, and
+  `check` at least emits a `stale-owner-claim` warn the agent can read. **What is wider here:** the
+  disagreement spans the two implementations, it covers presence and claims and handoffs rather than
+  one timestamp field, and the hook's direction is silent OMISSION rather than a warning — so the
+  agent has no signal at all before the refusal lands.
+- **Why review missed it:** each filter is defensible in isolation. Hiding a lease-expired claim
+  from a 120-character prompt excerpt is the right call for prompt density, and Rust keeping it is
+  the right call for a write-path authority that must not lose a live claim. Nothing compares the
+  two, and no test asserts that a claim visible to the enforcement path is visible in the prompt.
+- **Adversarial control:** one fixture ledger, projected both ways — through `rally room --json` and
+  through the hook's renderer — asserting that every claim the write path will REFUSE is present in
+  the rendered prompt. Direction matters: the prompt may show more than the enforcer blocks; it must
+  never show less.
+
+### RC-060 — `--include-archived` is complete only when no explicit budget is supplied (D12)
+- **State:** `observed`. Recorded as a documentation-or-behaviour choice, not a security defect.
+- **Mechanism:** `include_archived` disables the archive partition at projection time
+  (`store.rs:2891-2897`) and restores `stale_facts` in composition (`store.rs:3356-3372`). The
+  budget, however, is resolved as `(Some(explicit), _) => Some(explicit)` before the
+  `(None, true) => None` arm (`store.rs:3379-3383`), so `--include-archived --budget-bytes N` still
+  applies the ceiling and can still emit budget-reason omissions. The comment above it states this
+  deliberately: "An explicit `--budget-bytes` still wins, because that caller asked for a bound with
+  their eyes open."
+- **Why it is registered anyway:** `--include-archived` is what the composition block's own
+  `drill_in` recommends when `stale_facts` was omitted (`store.rs:3397-3402`), and the escape-hatch
+  argument in the code reads as unconditional. A caller who combines the two flags gets a
+  truncated escape hatch and the reason is not surfaced in the response.
+- **The choice that is owed:** either document the conditionality where `--include-archived` is
+  described (`RALLY.md`, the drill-in string), or make the composition block name the budget as the
+  reason when both were supplied. The current behaviour is defensible; only its discoverability is
+  not.
+- **Adversarial control:** a case running `room --include-archived --budget-bytes <small>` and
+  asserting the response either contains every archived fact or names the budget as the cause.
+
+### RC-061 — a third implemented policy with no consumer: envelope authorization (D13)
+- **State:** `observed`. **NOT a bypass**, and not claimed as one.
+- **Mechanism:** `event_envelope::required_role` maps each `PrivilegedAction` to a minimum role —
+  `ReleaseOthersClaim`, `TransferClaim`, `CancelWork` and `SupersedeOthersWork` require
+  `Role::LeadAgent` (`event_envelope.rs:293-301`) — and `authorize` compares a context's role rank
+  against it (`event_envelope.rs:309-312`). **It has no production call site.** The only references
+  in the tree are the module's own unit tests (`event_envelope.rs:480-504`); a repo-wide grep for
+  `event_envelope::authorize` outside that file returns nothing.
+- **What `say` actually invokes is VALIDATION, and it runs too late to gate anything.**
+  `command_say` appends via `append_fact_verified` / `append_state_transition_verified` at
+  `lib.rs:2448-2451`, and only then calls `pk.validate(...)` in `CompatMode::Lenient`
+  (`lib.rs:2460-2476`), turning any result into a `SayWarning` with code `envelope-incomplete`. The
+  fact is already durable. The comment says so plainly ("Advisory... never blocks"), so this is not
+  a misrepresentation — it is an ordering worth stating, because a reader auditing "does Rally
+  validate its protocol envelopes" finds a yes that is post-hoc.
+- **Why this belongs on the register even though the code is honest about it:** it is the third
+  named instance of the register's own "computed then discarded" pattern. The other two, both
+  already recorded in the third-pattern table: `expire_claim_leases_at` implements lease expiry and
+  is `#[allow(dead_code)]` with zero production callers, and the reaper itself was correct and
+  reachable only through `doctor --reap-stale --apply` with nothing invoking it (which is what
+  RC-051's call site was added to fix, and what RC-053 now shows was fixed on the wrong side).
+  RC-030 is the same pattern from the writer's side. The pattern is not one subsystem's habit; it
+  is now four subsystems.
+- **The question to ask, restated from the working hypothesis:** not "is this policy correct" but
+  "who invokes it, and has anyone measured that they do". `authorize` answers the first and fails
+  the second.
+- **Adversarial control (for whoever wires it):** a rogue `TransferClaim` with an `Observer`-role
+  auth context must be refused, and the same request from the lead's context must be permitted —
+  with the caveat that RC-063 bounds what the role field can currently mean.
+
+### RC-062 — first-run corruption: the mechanism is structurally possible; causation is NOT claimed (D14)
+- **State:** `observed`. **This UPDATES RC-044 and does not upgrade it. RC-044's mechanism stays a
+  HYPOTHESIS.**
+- **What is verified in the source, and only that:**
+  - `DirectRoomStore.fact_store` is a **room-lifetime** SQLite pool (`store.rs:846-849`), opened at
+    construction (`store.rs:1502`, `store.rs:1543`) and closed at `Drop` (`store.rs:949`). It spans
+    every operation the store performs, including quarantine and replacement of the file underneath
+    it.
+  - `read_db_event_stats` opens a **second, independent pool** on the same path
+    (`store.rs:4648`), and its own comment says so ("opens a fresh pool directly (not via
+    `fact_store_handle`)", `store.rs:4640-4647`). On a malformed-db error it calls
+    `quarantine_corrupt_db` (`store.rs:4653`, `store.rs:4665`) while the room-lifetime pool is still
+    open on the old inode. It runs on **every append**, via
+    `refresh_reconcile_cache_after_append` (`store.rs:1893`) — see RC-058.
+  - `quarantine_corrupt_db` (`store.rs:4735-4769`) renames the main file with a fatal
+    `fs::rename` (`:4753`) and then renames the `db-shm` and `db-wal` siblings **best-effort and
+    independently**, each discarded with `let _ =` (`:4761-4767`). The main file's move is atomic;
+    the set of three is not.
+  - `last_checkpoint_seq` (`store.rs:2365-2390`) queries the room-lifetime pool with **no mutation
+    lock**. The lock sites in this file are `store.rs:946, 1488, 1537, 1677, 2132, 2188, 2285`;
+    `2365` is not among them.
+- **What is NOT claimed:** that any of the above produced the 35 quarantined `facts.db.corrupt.*`
+  files, or the 2-in-36 failure rate RC-044 records from a peer-run 6-way concurrent first-run
+  `enter`. Those remain unreproduced by this repo's agents. The finding here is narrower and
+  stronger for being narrow: the ingredients RC-044's proposed mechanism needs — a pool outliving
+  the file it opened, a second pool that can rename that file, and an unlocked read against the
+  first — are each present in the source and each cited.
+- **Blast radius, bounded:** derived-cache corruption only. The canonical JSONL segments are
+  unaffected, quarantine renames rather than deletes, and `rebuild_db_from_segments`
+  (`store.rs:4784+`) replays from the segments. RC-044's "losslessness is intact" holds.
+- **What settling it requires, stated so nobody settles it cheaply:** a repeated first-run
+  concurrency test with **pool-lifetime and WAL tracing** — which pool held which inode at the
+  moment of each quarantine, and which `-wal` file each open resolved to — run N-consecutive.
+  Wall-clock repro without that tracing distinguishes nothing, because the quarantine cascade is
+  self-similar: `is_malformed_db_error` substring-matches "corrupt", and every quarantine filename
+  contains `.corrupt.`, which RC-044 already records as a second-order hazard.
+- **Adversarial control:** a test that opens the room-lifetime pool, quarantines the db underneath
+  it from a second handle, and asserts the first pool's next query either errors cleanly or is
+  re-pointed — rather than writing WAL frames against a replaced inode.
+
+### RC-063 — identity in Rally is descriptive, not authoritative, and that bounds every lead-gated fix this cycle (D15)
+- **State:** `observed`, structural. **NOT fixed. Not fixable as a patch.**
+- **This entry exists to bound the others.** RC-037, RC-038 and RC-050 each record a specific
+  authority gate reading a self-asserted field. This is the general statement, and it is the reason
+  those three cannot be closed by improving the gates.
+- **Mechanism, three layers, all verified:**
+  1. **`from_session_id` is derived from caller-controlled environment.**
+     `EndpointInputs::from_env` (`session_identity.rs:353-381`) reads `HOSTNAME`, `TTY`,
+     `TERM_SESSION_ID`, `TMUX_PANE`, `RALLY_SESSION_ID`, `GITHUB_ACTIONS`, `GITHUB_RUN_ID` —
+     every one settable by the process making the call. `derive_endpoint`
+     (`session_identity.rs:139-200`) orders them highest-fidelity-first, which means the classes
+     that read as most trustworthy (`cloud:`, `managed:`) are the ones reachable with two
+     environment variables.
+  2. **The lease token is the constant `"live"`.** `current_protocol_session`
+     (`lib.rs:3482-3490`) mints with `"live"` (`lib.rs:3489`) and takes `tool_type`/`actor` by
+     splitting `--tool` (`lib.rs:3484-3488`). The doc comment states the reason openly: the lease is
+     deterministic "until a registry-backed lease exists" (`lib.rs:3478-3481`). So
+     `from_session_id` = `sess:<caller-chosen endpoint>#live` — reproducible by anyone who can set
+     two env vars and pass a flag.
+  3. **Most privileged and lifecycle facts do not carry it at all.** Exactly one production write
+     path stamps it: `command_say` (`lib.rs:2420-2425`). Everything else writes
+     `from_session_id: None`. In `lib.rs` that includes `set_lead` (`:13731`, the fact that GRANTS
+     the seat), the lead-relinquish arm (`:13675`), `command_release_by_path` (`:2824`, the claim
+     TAKEOVER path RC-029 was about), `command_ack` (`:13577`), `command_mission`
+     (`:13790, :13841`), presence (`:1827, :1860`), and ten more; plus all eleven reaper writes
+     (`reaper.rs`) and eight in `store.rs`.
+- **The consequence, in plain words: every "only the lead may X" control in this codebase is
+  checkable only against a self-asserted field.** `lead_from_facts`
+  (`claim_authority.rs:172-182` @ `006d417`) resolves the seat as `fact.tool.clone()` from the
+  highest-seq `role:lead` decision — and that decision is written by `set_lead` with
+  `from_session_id: None`. So it is not merely that the gates decline to check the session lease;
+  **the record that grants the seat carries no lease to check.** Binding the gates to
+  `from_session_id` would not work today even if someone wrote the code, because the incumbent's
+  own fact has none. `ActiveClaimRecord` does carry `from_session_id` when present
+  (pinned by `claim_authority.rs::active_claim_record_preserves_authoring_session_id`), so the
+  plumbing exists on the claim side and stops at the seat.
+- **A downstream cost already paid.** `handoff_closer_matches_target` (`store.rs:2604-2616`) opens
+  with `if closer.from_session_id.is_none() { return true; }` — a legacy-compat branch for
+  pre-session-identity rows. Because everything except `command_say` writes `None`, that branch is
+  the common one, so target correlation on handoff closure is off for every reaper-written
+  `Resolve` and every other non-`say` closer. A control written for a migration window became the
+  default path.
+- **Two coherent options. The current state is a third thing that reads as (2) and behaves as (1).**
+  1. **Drop the claim.** Treat `lead`, `role` and `tool` as advisory PROVENANCE, remove every
+     "only the lead may" phrasing from code comments, refusal messages, `TRUST-MODEL.md` and
+     SKILL.md, and let the gates warn rather than refuse. Honest, cheap, and consistent with the
+     north star's "warnings over hard locks".
+  2. **Make identity real.** A registry or daemon mints an opaque session lease; `tool` and `role`
+     are DERIVED from that lease rather than passed alongside it; facts are stamped at the trusted
+     boundary rather than by the client; and a privileged action is authorized against the session
+     that held the lead **at the relevant epoch**, not against whoever holds it at read time.
+     (The epoch half is not optional — RC-038 already records that taking the seat after a
+     legitimate freeze silently downgrades that freeze, with no attacker involved.)
+- **What this bounds, stated so no fix overclaims:** any lead-gated fix landing this cycle raises
+  the bar from "any writer" to "any writer who reads the room first and passes `--tool <lead-id>`".
+  That is a real improvement against ACCIDENT and no improvement against INTENT. RC-037's entry
+  already says this about the first-join lead seat; the same sentence applies to every gate built
+  on `fact.tool`, and it should appear in each of their fix notes rather than in one of them.
+- **The choice is owed and unmade.** This entry does not pick. It records that (1) and (2) are both
+  coherent, that the status quo is neither, and that continuing to ship gates without deciding
+  produces controls whose test suites pass and whose stated property is false — which is precisely
+  what RC-050 found and what the register's second pattern (claims drift toward reassurance) names.
+- **Adversarial control (for either option):** under (1), a test asserting no refusal message
+  anywhere claims authority. Under (2), a rogue passing `--tool <lead-id>` with a forged
+  `RALLY_SESSION_ID` must be refused for a `workspace:*` claim, an unscoped blocker, and a
+  `lead assign` against a live incumbent — three moves, not one, because RC-050's lesson is that
+  grading the first move is how the second one ships.
+
+### Design observations from the same audit
+
+Not defects. Recorded because each explains why one of the entries above is shaped the way it is.
+
+- **The snapshot cache accelerates one command.** `try_load_cached_snapshot_for` has exactly one
+  call site: the `check before-write` fast path (`lib.rs:4687-4696`), which skips the mutation lock
+  and SQLite entirely when the cache is fresh and already records the caller's presence. `room`
+  (`lib.rs:2894-2900`), `next` (`lib.rs:2966`) and `status` still take the full load and projection
+  on every invocation. The cache was built for the watchdog-bound gate and is correctly scoped to
+  it; the observation is that the three commands agents actually read the room with do not benefit.
+- **`system_health` is never-cut because a PRESENTATION bucket doubles as the enter-path dedup
+  index.** The reasoning is at `store.rs:3266-3269` and `store.rs:3023-3027`: cutting a health row
+  from the view would let the enter-path duplicate guard re-append it, so a display decision became
+  a ledger-growth decision and payload size became a correctness concern. A separate keyed health
+  index — the guard reading its own structure rather than the room's — removes the coupling and
+  makes RC-055's bounding question a pure display question.
+- **Segment rotation reduces file size, not replay or projection cost.** `facts_from_segments`
+  (`store.rs:2585-2601`) unions live segments with `replay_archive_segments`
+  (`store.rs:4556-4561`), which returns every rotated segment and excludes only the R5 migration
+  monolith. Rotation moves lines between directories; the fold still reads all of them. Anything
+  sizing the write path by "the active segment is small" (RC-058's dup gate and readback do
+  correctly depend on that) must not generalize it to the folds, which do not.
+
+### ARP-R-01 — the lead seat was unauthenticated, and every room-wide control rooted in it
+
+- **State:** ⚠️ `mitigated`, **NOT `controlled`.** Read RC-063 before reading this as closed.
+- **Severity.** The lead seat is the authority root. RC-037 gates room-wide claims on it and
+  RC-038 gates the room-wide freeze on it, so one unauthenticated command re-opened both.
+- **Mechanism.** `set_lead` (`lib.rs:13722-13751` at `006d417`) had one precondition:
+  `ensure_presence(&room, &t.tool)` — which CREATES presence rather than checking standing. No
+  comparison against the incumbent, none against `--to`.
+- **Reproduced live**, release binary, under the rogue's OWN honest name — no impersonation
+  needed: `rally lead assign --tool rogue --to rogue` succeeded against a live incumbent AND
+  against a `--user-designated` one; `rally lead relinquish --tool rogue` vacated the seat to null.
+- **Consequences, both reproduced.** (a) RC-037's lockout fully restored: take the seat, claim
+  `workspace:*`, every other agent is locked out. (b) RC-038 was retroactive **in both
+  directions** — the SAME fact id re-projected from `unscoped-blocker`/allow to
+  `room-freeze`/deny once its author later took the seat, and a legitimate freeze declared by the
+  honest lead degraded to allow the moment anyone else took it. The room's only stop control was
+  removable in one command.
+- **Two aggravating defects in the same surface.** `claim_authority.rs:216-220` printed the bypass
+  to the caller it had just refused ("take the lead seat first with `rally lead assign --tool
+  {claimer} --to {claimer}`"). And `set_lead` stamped `fact.tool = t.to` — the BENEFICIARY — so
+  the ledger recorded a seizure as authored by the agent that gained the seat, and no gate could
+  be built on `fact.tool` because it did not hold the actor.
+- **Fix.** `write_authority::assert_lead_transfer_authorized`, called from
+  `DirectRoomStore::append_fact` so it binds the daemon path too. A transfer needs a leaderless
+  room, an actor that IS the incumbent, an incumbent silent past the reclaim window, or an
+  explicit `--force` that records the seizure and names the displaced incumbent. Attribution
+  corrected: `tool` = actor, `target` = beneficiary, with a `target.or(tool)` fallback so the
+  three legacy lead facts in this repo's ledger still replay to the same lead. The bypass
+  instruction is gone from the refusal.
+- **Retroactivity fixed by picking a TIME, not by patching a comparison** (design audit D9).
+  Authority is now ADMISSION-TIME everywhere: `RoomSnapshot::room_freeze_id` is decided in the
+  projection against `claim_authority::lead_as_of(facts, blocker.seq)`, and `check_before_write`
+  REPORTS that verdict instead of re-deriving it against the current lead. Claims were already
+  admission-time; blockers now match. The field serializes deliberately — three sibling fields
+  are `#[serde(skip)]` and arrive empty over the daemon wire (D1/D6), which is exactly how a
+  client-side gate silently stops existing in routed mode.
+- **Adversarial controls.** `crates/rally-cli/tests/lead_seat_authz.rs` (11) and
+  `tests/room_freeze_admission_time.rs` (4). Each performs the hostile action. Tested with the
+  ADJACENT move, not the reported one: `handoff` as well as `assign` (both call `set_lead`),
+  relinquish-as-denial rather than seizure, and `--user-designated` as a claimed authority.
+  `tests/write_authority_daemon_parity.rs` re-runs the sequence against a live `rally daemon
+  serve` and requires identical verdicts. Mutation-validated: neutering the lead arm kills 4 of
+  11 in `lead_seat_authz` and nothing in the other three suites, which is the correct specificity.
+- **A defect the controls caught in the fix itself.** The first version returned success on a
+  legitimate `lead handoff` while the seat did NOT move: the write gate read the new attribution
+  (`target`) and the room projection still read the old one (`tool`). Two projections of one fact
+  — the same shape as ARP-R-02's two hand-copied gates. Both now share `is_lead_decision` and
+  `lead_beneficiary`. This is why the negative controls assert the OUTCOME (`lead == helper`) and
+  not merely `ok: true`.
+- **THE RESIDUAL, and why this entry is not `controlled`.** `--tool` is self-asserted.
+  `rally lead assign --tool <incumbent> --to rogue` still succeeds. The gate closes the path where
+  an agent acts under its own name; it does not stop one willing to claim another's. Per RC-063,
+  no gate in this codebase can do better until identity is minted rather than asserted.
+  `lead_seat_authz.rs::impersonation_is_not_stopped_and_this_test_says_so` ASSERTS the bypass, so
+  the residual is in the test output rather than in a comment somebody has to remember — and the
+  day identity becomes authoritative, that test fails and forces this entry to be rewritten.
+  This repo has already had to retract one claim of this shape (`TRUST-MODEL.md:105-108`); the
+  assertion is the mechanism that stops a third.
+
+### ARP-R-02 — the claim-takeover gate covered two of the four kinds that close a claim
+
+- **State:** ✅ `controlled` as of this run. Supersedes RC-029's withdrawn mark.
+- **Mechanism.** `claim_authority.rs:91-96` closes a claim on
+  `Resolve | Release | Receipt | ClaimExpired`. `assert_claim_release_authorized` had exactly two
+  call sites — `store.rs:2009` (Release) and `store.rs:2055` (Resolve). Receipt and ClaimExpired
+  reached `append_state_transition_verified` with no ownership check. The gate's own doc comment
+  at `store.rs:2641` named all four kinds while the code covered two.
+- **Reproduced live** against a claim seconds old with a 30-minute lease:
+  `rally say receipt --tool rogue --ref <cid>` → ok, `active_claims` 0, rogue then claims the
+  path. `claim.expired` and the alias `claim_expired` behave identically. SEC-001's in-lock
+  re-check does not catch it: that fires only on a `reaper:reason=owner-stale` evidence marker,
+  and a hand-posted close carries none — and a rogue that DID stamp one would simply set
+  `reaper:owner=` to itself, which the guard's ownership comparison then passes.
+- **WHY THE SUITE MISSED IT, and this is the durable lesson.**
+  `tests/claim_takeover_authz.rs` had six tests, every one an adversarial control, every one
+  mutation-validated: neutering the gate killed four and left the two negative controls standing,
+  which is the correct signature and reads as strong evidence. It is strong evidence about the
+  code that EXISTS. **Mutation validation cannot detect a path with no gate to mutate.** Coverage
+  of the ORACLE — is there a test per closing kind? — is a different question from strength of the
+  tests present, and only the first would have found this. A register entry that says "control
+  validated by mutation" is therefore not sufficient for closure on its own; the closing question
+  is "validated across which inputs".
+- **Fix.** The authorization moved to `write_authority::assert_claim_close_authorized`, called
+  once from `DirectRoomStore::append_fact` and keyed off `claim_authority::closes_active_claim` —
+  the SAME predicate the projection uses. The set of kinds that close a claim and the set that
+  must be authorized to close one are now one list, so a fifth closing kind cannot add a fifth
+  bypass. Two hand-copied call sites were the whole mechanism; there is now one and no list to
+  copy.
+- **A third authorization arm, added because arm 2 alone would have broken lease expiry.**
+  `claim_reclaim_eligible` measures OWNER SILENCE only, so a lease-expired claim whose owner is
+  live is not takeover-eligible and the reaper could no longer close it. The gate reads the lease
+  the CLAIM declared about ITSELF — not the reaper's self-asserted `reaper:reason=` marker, which
+  is precisely the field a rogue would forge. A unit fixture (`reaper_lease_expired_close_survives_owner_activity`)
+  had to be corrected during this work: it asserted the lease-expired path using a claim carrying
+  NO lease marker, a state `command_say` cannot produce, so it graded the forgeable signal. That
+  is the RC-025 / oracle-encodes-the-defect pattern again.
+- **Adversarial controls.** Six new tests in `tests/claim_takeover_authz.rs` (12 total):
+  Receipt, `claim.expired`, the `claim_expired` ALIAS (a gate keyed on spelling rather than parsed
+  kind would close one and leave the other), receipt-strip-then-seize asserting ownership did not
+  move, plus two negative controls (a receipt closing a peer's HANDOFF, and owner self-close).
+  Mutation-validated: neutering the claim-close arm kills 7 of 12 and nothing in the other three
+  suites.
+
+### ARP-R-06 — a fresh clone inherited the maintainer's live room, and 68.6 MiB of foreign history
+
+- **State:** ⚠️ `mitigated` for new clones, **`observed` for history.** Not closable by de-tracking.
+- **Mechanism.** 15 tracked ledger files replayed on clone into 3,680 facts: 93 unreleased claims,
+  60 open handoffs addressed to specific agent seats, 84 agent identities, and a foreign lead seat
+  (`claude_code:51dbfe82-…`), on paths absent from the clone. Plus 956 occurrences of
+  `tyrones-macbook-pro-2.local` and `/Users/tyroneross/…` across 25 tracked files, with active
+  claim scopes naming personal files (`Movies/rally-hero-video/…`,
+  `.claude/projects/…/memory/MEMORY.md`) and private sibling repos (102 references to
+  `dev/git-folder/build-loop`).
+- **`.gitignore` already said not to commit the bundles.** `archive/bundles/` was listed as
+  ignored from 2026-07-02 and 18 bundles (68.6 MiB) stayed in `HEAD` anyway, because `.gitignore`
+  has no effect on already-tracked paths. The rule read as policy while the bytes shipped. A
+  second live footgun: `!.rally/log/` un-ignored the whole directory, so two untracked segments
+  (1.97 MiB, one of them a personal video project) were one `git add .` from the release.
+- **Action taken.** `.rally/log/`, `.rally/archive/`, `.rally/RETROSPECTIVE.md`, and all of
+  `archive/` de-tracked (`git rm --cached`; files stay on disk). `.gitignore` rewritten so the
+  un-ignore cannot re-admit them. 22 absolute home paths rewritten to `~/` across five internal
+  docs. One test fixture de-personalized: `dynamic-workflows/tests/workstream-lint.test.mjs` hard-coded
+  a path into a PRIVATE sibling repo, so the assertion named someone's other project and only ran
+  correctly on one laptop. Tracked files 403 → 394; files carrying personal content 25 → 2, both
+  of which quote the path as evidence in a finding.
+- **What is NOT fixed, and why the entry stays open.** Every de-tracked byte is still in git
+  history and `git log` recovers all of it. Real removal means rewriting history and force-pushing:
+  irreversible, breaks every existing clone and fork, and NOT authorized. The 18 bundles carry
+  full pre-sanitization history of this repo **and of repositories that are not this one**, and
+  they have not been audited for credentials — a regex sweep over compressed packfiles is not a
+  credential audit. No secret is known present; none is ruled out.
+- **Adversarial control (owed, not written).** A test that clones the repo into a scratch dir and
+  asserts the resulting room is empty and `git log -p` surfaces no `/Users/` path would close the
+  first half. The second half cannot be closed by a test at all — only by a history decision.
+
+### ARP-R-05/07/08/11 and the design-audit fixes landed this run
+
+Recorded compactly; each has its own adversarial controls in-tree.
+
+- **ARP-R-05 (pre-push pin).** The vacuity check REFUSED a vacuous env pin and only WARNED on a
+  vacuous DEFAULT pin — which is this repo's own workflow, so the check passed on the only path
+  anyone uses while the gate executed the pushed tree's code. A check that never fires on the
+  normal path certifies nothing. Default now refuses behind the same ack. The affirmative line
+  moved after the last comparison and enumerates what was compared;
+  `all gates green ✅` is gone. `hooks/ensure-rally-binary.sh` joined the pin set (compare-only):
+  the pinned host tests execute it and it carries `curl`, `chmod +x`, and `cargo install`, so a
+  push leaving every pinned test byte-identical reached execution. The CHANGELOG's "no longer
+  executes host tests the pin never reviewed" was false on the default path and is corrected.
+  Controls: `tests/hooks/test_prepush_pin.sh` (17), mutation-validated 3 ways.
+  **Operator-visible cost: pushing `main` now needs `RALLY_PREPUSH_ACK_VACUOUS_PIN=1`.**
+- **ARP-R-07 (`rally init`).** The generated pointer block taught `rally room --json` with no
+  untrusted-data caveat — the labelling had landed everywhere except the file the product writes
+  into the user's repo. And all six "deeper docs" links were dead in any repo but this one, because
+  `pointer_block()` hardcoded them while `build_manifest()` separately tracked which resolved.
+  Unified to one `POINTER_DOCS` source; links emit only when the target exists.
+- **ARP-R-08 (`ident()`).** The density heuristic counted vowel-bearing English words while the
+  danger is shell-shaped text, which is systematically vowel-poor: `now-run-rm-rf` scored 2 and
+  rendered BARE, as did `rm-rf-tmp`, `curl-x-sh`, `chmod-a-x`. And `clip()` ran inside the
+  allowlist step, so `...[truncated]` reintroduced `[`/`]` and added a word to the count the gate
+  measured. Default INVERTED: quote everything, render bare only on a strict positive shape
+  (≤64 chars, no substitution mark, ≤2 words per part, every word ≥3 chars, ≤4 words overall).
+  Measured against the live ledger: event ids 99.9% bare, timestamps 100%, tool ids 93.5% (up
+  from 86.3%). Residual stated as a limit: a two-word value still renders bare, because two words
+  per part is the floor real ids need.
+- **ARP-R-11 (`rally_wake.py`).** No `--` terminator before target or payload, no target shape
+  validation, no provenance label, two non-atomic writes with no `C-u`. All four closed; payload
+  now ships as `-H` hex tokens after `--`, which can neither begin with `-` nor end with `;`. A
+  hazard found while verifying: `cmd-parse.y` ends a command at any argument whose last character
+  is an unescaped `;`, so `--` alone would not have sufficed. The parity test at
+  `inject_security.rs:576-589` fired only on a line containing both `send-keys` and `"-l"` — it
+  graded a spelling, and against the fixed file it matches zero lines, so it would have passed
+  vacuously forever. Replaced with an AST analyzer asserting the chokepoint function is on the
+  path, proven spelling-independent by a mutant that reflows every line.
+- **ARP-R-04 durable half.** Free-text fact fields are now bounded at the write boundary
+  (`rally_protocol::ledger::validate_fact_text_bounds`), thresholds measured over 6,792 real facts
+  at ~2-3× observed maximum, plus a 64 KiB whole-fact cap matching the bound `rally inject`
+  already applies. Identity fields (`tool`, `target`, `role`) reject control characters:
+  `rally say --tool $'atk\n## FORGED'` was ACCEPTED before this, making the renderer the sole
+  barrier — the assumption that produced ARP-R-04.
+  **This closed an unreported direct/routed divergence.** Without the bound, a 200 KB subject is
+  ACCEPTED in direct mode and REFUSED in routed mode, because the daemon wire carries its own
+  line-length ceiling the direct path never consults. Same ledger, opposite outcome, decided by
+  whether rallyd happened to be running — a third instance of the D1/D6 class, on the write path,
+  found by `write_authority_daemon_parity.rs` rather than by anyone looking for it.
+
+### A note on what "validated by mutation" is worth
+
+Two entries this cycle carried mutation-validated adversarial controls and were still wrong:
+RC-029 (gate on two of four kinds) and RC-038 (verdict computed at the wrong TIME). In both cases
+the mutation table was accurate and the conclusion drawn from it was not.
+
+Mutation validation answers: *given this control, would a test notice if it broke?* It cannot
+answer: *is the control on every path that reaches the effect?* or *is the control asking its
+question at the right moment?* Those need, respectively, an enumeration of the paths (which is why
+ARP-R-02's fix is keyed off the projection's own kind set rather than a hand-copied list) and a
+decision about WHEN authority is evaluated (which is why ARP-R-01's fix picks admission-time and
+applies it everywhere, per design-audit D9).
+
+Practical consequence for this register: `- **Control validated by mutation:**` is necessary and
+not sufficient for a `controlled` mark. The closing question is **"what authority does this trust,
+and can the actor simply assert it?"** — asked of the ADJACENT move, not the one the control was
+built to stop. Every control added this run was tested that way, and RC-063 is the answer that
+bounds all of them.
 
 ## Working hypothesis across entries
 

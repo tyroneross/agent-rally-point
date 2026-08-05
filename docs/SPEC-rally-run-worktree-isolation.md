@@ -20,7 +20,7 @@ Companion to build-loop's run-entry isolation (Phase 1a, already landed on the b
 Prefer reusing/extending `worktree_guard.rs` + existing session teardown over new modules. Minimal deps. Keep the advisory hazard detector as a backstop for any `--shared` use.
 
 ## Constraints (HARD)
-- Work ONLY in `/Users/tyroneross/dev/git-folder/agent-rally-point-wt-runiso` (branch `feat/rally-run-worktree-isolation`, off clean `main` @ 3024aa4). NEVER touch the canonical `agent-rally-point` checkout or the `agent-rally-point-cockpit` worktree.
+- Work ONLY in `~/dev/git-folder/agent-rally-point-wt-runiso` (branch `feat/rally-run-worktree-isolation`, off clean `main` @ 3024aa4). NEVER touch the canonical `agent-rally-point` checkout or the `agent-rally-point-cockpit` worktree.
 - Preserve the single-agent / solo case (transparent: the agent just runs in a worktree). Don't break the existing room-sharing test — extend it to assert per-agent worktrees still share one room.
 - `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all` all green. Add tests for: per-agent worktree provisioning, common-room sharing across two agents' worktrees, cleanup on stop, `--shared` opt-out.
 - Do NOT push; do NOT merge to main. Commit on the feature branch.

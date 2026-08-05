@@ -42,12 +42,19 @@ Confirmation is via the CHANNEL (a changes.jsonl line bump = the agent
 posted back), not TUI scraping — scraping false-positives on the injected
 text's own echo.
 
+Provenance (ARP-R-11 D2): the nudge lands as a USER TURN in the recipient's
+pane, so it carries the same `[rally: UNVERIFIED SENDER <who>] ` label the
+Rust inject path prefixes (`backends.rs::inject_provenance_label`). Name the
+sender with `--tool`; an unnamed wake renders `(none stated)` rather than
+being silently unlabelled.
+
 Examples:
-  rally_wake.py --tmux-target rev:0.0 "Read <coordination-file> then continue"
+  rally_wake.py --tmux-target rev:0.0 --tool claude_code:01 \
+      "Read <coordination-file> then continue"
   rally_wake.py --tmux-target main:0.0 "doorbell" \
       --confirm-channel <repo_root>/.rally/ledger.jsonl
 """
-import argparse, json, os, subprocess, sys, time
+import argparse, json, os, re, subprocess, sys, time
 
 
 def run(cmd, parse=False):
@@ -129,29 +136,221 @@ def _is_control(ch):
     return cp <= 0x1F or 0x7F <= cp <= 0x9F
 
 
+# ---- provenance label (ARP-R-11 D2) ---------------------------------------
+# The wake writes into a live agent's input, where it lands as a USER TURN —
+# indistinguishable from something the human operator typed. The Rust inject
+# path labels every delivery (`backends.rs`, RC-041 gap 3A); this path did not,
+# so a peer could ring a doorbell that read as the operator's own instruction.
+#
+# Same MIRROR rule as the sanitizer above: the wording, the scrub, and the
+# order of operations are transcriptions of the Rust originals, not a second
+# design. Do NOT invent a different label here — two spellings of one label is
+# a label the recipient cannot rely on.
+WAKE_LABEL_MARK = "UNVERIFIED SENDER"          # backends.rs::INJECT_LABEL_MARK
+WAKE_SENDER_NONE_STATED = "(none stated)"      # ::INJECT_SENDER_NONE_STATED
+WAKE_LABEL_REMOVED = "[trust-label-removed]"   # ::INJECT_LABEL_REMOVED
+
+
+def wake_provenance_label(sender):
+    """Mirror of backends.rs::inject_provenance_label.
+
+    NON-FORGEABLE BY STRUCTURE: `sender` is filtered to the `validate_agent_id`
+    allowlist rather than merely sanitized, so it cannot contain the `]` that
+    ends the label and cannot append a second, better-looking one after it."""
+    rendered = re.sub(r"[^A-Za-z0-9:_-]", "", sender or "")
+    return "[rally: {} {}] ".format(WAKE_LABEL_MARK,
+                                    rendered or WAKE_SENDER_NONE_STATED)
+
+
+def _eq_ignore_ascii_case(a, b):
+    """Rust's `char::eq_ignore_ascii_case`, NOT Python's `str.lower()`.
+
+    `str.lower()` is Unicode-aware, so U+212A KELVIN SIGN lowercases to `k` and
+    a payload spelling the marker with it would be scrubbed here but not by the
+    Rust side. A rule the two implementations state differently is a rule with
+    a hole (same reasoning as `_is_invisible_or_reordering` above)."""
+    if "A" <= a <= "Z":
+        a = chr(ord(a) + 32)
+    if "A" <= b <= "Z":
+        b = chr(ord(b) + 32)
+    return a == b
+
+
+def _match_label_mark(chars, start, words):
+    """Mirror of backends.rs::match_label_mark — match `words` at `start`,
+    allowing any run of whitespace between words. Returns one past the match.
+
+    `str.isspace()` and Rust's `char::is_whitespace` disagree only on the C0
+    separators U+001C–U+001F, and `sanitize_wake_text` has already removed
+    every one of those by the time this runs."""
+    i = start
+    for n, word in enumerate(words):
+        if n:
+            ws_start = i
+            while i < len(chars) and chars[i].isspace():
+                i += 1
+            if i == ws_start:
+                return None
+        for wc in word:
+            if i >= len(chars) or not _eq_ignore_ascii_case(chars[i], wc):
+                return None
+            i += 1
+    return i
+
+
+def strip_wake_label_mark(text):
+    """Mirror of backends.rs::strip_inject_label_mark — remove any forged copy
+    of the marker from a payload. The label is worthless if the payload can
+    carry its own, and removing it SILENTLY would let a payload delete the
+    evidence of its own attempt, so the scar is visible.
+
+    Call AFTER `sanitize_wake_text`: the sanitizer removes the zero-width
+    characters a payload would otherwise hide inside the marker
+    (`UNVERIFIED​ SENDER`), so scrubbing second sees the text the human
+    will see."""
+    words = WAKE_LABEL_MARK.split(" ")
+    chars = list(text)
+    out, i = [], 0
+    while i < len(chars):
+        end = _match_label_mark(chars, i, words)
+        if end is not None:
+            out.append(WAKE_LABEL_REMOVED)
+            i = end
+        else:
+            out.append(chars[i])
+            i += 1
+    return "".join(out)
+
+
+def deliverable_wake_text(sender, text):
+    """The exact text this script delivers: sanitized, label-scrubbed, then
+    prefixed with this delivery's provenance line — the same three steps, in
+    the same order, as backends.rs::deliverable_inject_text."""
+    return wake_provenance_label(sender) + strip_wake_label_mark(
+        sanitize_wake_text(text))
+
+
 def self_test(path):
     """Grade this file's sanitizer against the shared fixture list. Exit 0 when
-    every case matches; print each mismatch and exit 1 otherwise."""
+    every case matches; print each mismatch and exit 1 otherwise.
+
+    `failures` grades `sanitize_wake_text` alone (the rule the fixture list
+    states). `deliverable_failures` grades the COMPOSITION the pane actually
+    receives against the same list, which is what the Rust side grades via
+    `plan_delivery`: label + scrub(sanitize(input)). Grading only the leaf
+    would let the two sides compose the same functions in different orders and
+    still both report green."""
     with open(path, encoding="utf-8") as f:
         cases = json.load(f)["cases"]
-    failures = []
+    failures, deliverable_failures = [], []
+    label = wake_provenance_label("selftest")
     for case in cases:
         got = sanitize_wake_text(case["input"])
         if got != case["expected"]:
             failures.append({"name": case["name"],
                              "expected": case["expected"], "got": got})
-    print(json.dumps({"cases": len(cases), "failures": failures}, ensure_ascii=True))
-    return 1 if failures else 0
+        want = label + strip_wake_label_mark(case["expected"])
+        delivered = deliverable_wake_text("selftest", case["input"])
+        if delivered != want:
+            deliverable_failures.append({"name": case["name"],
+                                         "expected": want, "got": delivered})
+    print(json.dumps({"cases": len(cases), "failures": failures,
+                      "deliverable_failures": deliverable_failures},
+                     ensure_ascii=True))
+    return 1 if failures or deliverable_failures else 0
+
+
+# ---- tmux target validation (ARP-R-11 D1) ---------------------------------
+# `--tmux-target` was passed straight to `tmux -t`. `-t` takes a required
+# argument, so a hostile value cannot become a flag by itself — but an
+# unvalidated one selects a pane by tmux's own fuzzy rules (a bare name matches
+# any session with that prefix), so a typo or a crafted value rings the wrong
+# agent's doorbell, and there is no confirmation channel that would notice.
+# Refuse anything outside the documented target grammar instead.
+#
+# Grammar per tmux(1) "COMMANDS": the id forms %pane / @window / $session, a
+# bare session name, or [session]:[window][.pane]. Session and window names in
+# this repo are `rally-*` / plain identifiers; the allowlist below deliberately
+# excludes the `{...}`, `+`/`-` and `!` relative forms, which no rally caller
+# needs and which are exactly the shapes that resolve to "whatever is current".
+_TMUX_NAME = r"[A-Za-z0-9_][A-Za-z0-9_.-]*"
+TMUX_TARGET_RE = re.compile(
+    r"\A(?:"
+    r"[%@$][0-9]+"                                       # %pane / @window / $session
+    r"|" + _TMUX_NAME +                                  # bare session name
+    r"|(?:" + _TMUX_NAME + r")?"                         # [session]
+    r":(?:" + _TMUX_NAME + r")?"                         # :[window]
+    r"(?:\.%?[0-9]+)?"                                   # [.pane]
+    r")\Z",
+    re.ASCII,
+)
+
+
+def validate_tmux_target(target):
+    """Return `target` unchanged, or raise ValueError. Refuses rather than
+    escapes: there is no quoting that makes an unknown target shape safe, and a
+    doorbell rung at the wrong pane is silent by design (no confirmation).
+
+    `\\A`/`\\Z` rather than `^`/`$` on purpose — `$` also matches before a
+    trailing newline, which would admit `rev:0.0\\nkill-server`."""
+    if not isinstance(target, str) or not target:
+        raise ValueError("tmux target is required")
+    if len(target) > 128 or not TMUX_TARGET_RE.match(target):
+        raise ValueError(
+            "refusing tmux target {!r}: expected session:window.pane, a bare "
+            "session name, or a %pane/@window/$session id".format(target))
+    return target
 
 
 # ---- tmux backend (no agent-status API; address pane explicitly, doorbell is low-harm) ----
-def tmux_send(target, text):
-    # `-l` writes the argument literally, so a control byte in `text` would be
-    # a keystroke, not content: the same keystroke-injection class the Rust
-    # framer closes. Sanitize first, always.
-    run(["tmux", "send-keys", "-t", target, "-l", sanitize_wake_text(text)])
-    run(["tmux", "send-keys", "-t", target, "C-m"])        # submit
-    return ["C-m"]
+def _hex_tokens(text):
+    """UTF-8 bytes as the lowercase 2-hex-digit tokens `send-keys -H` expects,
+    one per byte — the same encoding as backends.rs::hex_tokens."""
+    return ["{:02x}".format(b) for b in text.encode("utf-8")]
+
+
+def tmux_wake_commands(target, text, sender=""):
+    """THE chokepoint: the only place in this script that names tmux.
+
+    Returns the complete argv for ONE `tmux` invocation. Every guard is applied
+    here so that "wrote to a pane" and "sanitized + labelled + validated" are
+    the same code path, not two that a future caller has to remember to pair
+    (`tests/scripts/test_rally_wake.py` asserts that structurally).
+
+    ARP-R-11 D1 — two separate hazards, both closed by the encoding:
+      * `--` terminates flag parsing. CONFIRMED against tmux 3.6a
+        `arguments.c::args_parse_flags`: the exact token `--` is consumed and
+        stops the flag loop, so every later value is positional.
+      * the payload is sent as `-H` hex tokens rather than `-l` text. A hex
+        token can neither begin with `-` (flag) nor end with `;` (tmux 3.6a
+        `cmd-parse.y` ends a command at any argument with an unescaped trailing
+        semicolon — which matters now that the three writes share one
+        invocation). `-l` alone would leave both shapes reachable from payload
+        text. This is also the encoding the Rust inject path already uses.
+
+    ARP-R-11 D3 — what IS and IS NOT atomic after this change:
+      IS: one process, one client→server round trip. tmux runs a `;`-separated
+          command sequence in order and, per tmux(1), "if a command in the
+          sequence encounters an error, no subsequent commands are executed" —
+          so a failed C-u cannot be followed by a payload, and a failed payload
+          cannot be followed by a bare Enter. The old two-`tmux`-process shape
+          could leave exactly those half-states.
+      IS NOT: a lock on the pane. Each command is a separate item on the
+          server's queue, and nothing stops the pane's human (or another
+          client) from typing between our C-u and our payload. The window is
+          reduced from two process spawns to intra-server sequencing; it is not
+          eliminated, and no caller should assume it is."""
+    target = validate_tmux_target(target)
+    body = deliverable_wake_text(sender, text)
+    # C-u first: clears whatever is already sitting at the prompt, so a stale
+    # half-typed line cannot be prefixed to the nudge (and, with it, submitted).
+    # C-u / C-m need no `--`: they are literals here, never caller-controlled.
+    return (
+        ["tmux", "send-keys", "-t", target, "C-u", ";",
+         "send-keys", "-t", target, "-H", "--"]
+        + _hex_tokens(body)
+        + [";", "send-keys", "-t", target, "C-m"]        # submit
+    )
 
 
 def channel_lines(path):
@@ -176,6 +375,10 @@ def main():
     # Required for a real wake, but NOT for --self-test, which touches no pane.
     ap.add_argument("--tmux-target",
                     help="tmux target, e.g. session:window.pane (required to wake)")
+    ap.add_argument("--tool", default="",
+                    help="the sender id to name in the provenance label; "
+                         "unset renders " + WAKE_SENDER_NONE_STATED
+                         + " (self-asserted — rally authenticates nothing)")
     ap.add_argument("--confirm-channel",
                     help="changes.jsonl path; success = a new line appears (agent posted back)")
     ap.add_argument("--confirm-timeout", type=float, default=45.0)
@@ -198,13 +401,24 @@ def main():
 
     backend, target, agent, status = "tmux", a.tmux_target, "?", "unknown"
 
+    # Build BEFORE branching, so --dry-run exercises the same validation and the
+    # same argv the real wake would run (a dry run that skipped the guards would
+    # certify a target that the live path then refuses).
+    try:
+        commands = tmux_wake_commands(target, a.message, a.tool)
+    except ValueError as exc:
+        sys.exit(json.dumps({"error": str(exc), "target": target}))
+
     if a.dry_run:
         print(json.dumps({"would_wake": target, "backend": backend, "agent": agent,
-                          "status": status, "submit_keys": ["C-m"]}))
+                          "status": status, "submit_keys": ["C-m"],
+                          "label": wake_provenance_label(a.tool),
+                          "argv": commands}, ensure_ascii=True))
         return
 
     base = channel_lines(a.confirm_channel) if a.confirm_channel else None
-    submit_keys = tmux_send(target, a.message)
+    run(commands)
+    submit_keys = ["C-m"]
 
     # Honest confirmation: woke=true ONLY when the channel shows the agent posted back.
     # Without --confirm-channel we report delivery only (woke=None).

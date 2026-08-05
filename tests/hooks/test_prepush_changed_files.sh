@@ -185,7 +185,7 @@ run_prepush() {
   local gate_exit="${2:-0}"
   local parity_exit="${3:-0}"
   ( cd "$FIXTURE" && printf '%s\n' "$stdin_data" \
-      | env -u RALLY_SKIP_PREPUSH RALLY_TEST_MARKER="$MARKER" RALLY_TEST_GATE_EXIT="$gate_exit" \
+      | env -u RALLY_SKIP_PREPUSH RALLY_PREPUSH_ACK_VACUOUS_PIN=1 RALLY_TEST_MARKER="$MARKER" RALLY_TEST_GATE_EXIT="$gate_exit" \
         RALLY_TEST_PARITY_MARKER="$PARITY_MARKER" RALLY_TEST_PARITY_EXIT="$parity_exit" \
         sh .githooks/pre-push origin fake-remote-url ) 2>&1
 }

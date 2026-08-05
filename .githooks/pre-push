@@ -48,17 +48,18 @@
 #   `git rev-parse --show-toplevel`), so the SUBJECT under test is always
 #   the pushed content — only the gate CODE's trust source changes.
 #
-#   WHAT THE PIN DOES NOT COVER. The pin protects three DISPATCHER scripts by
-#   name. It does not, and cannot, protect the code those dispatchers go on to
-#   execute out of the pushed tree, which by design includes: every `cargo
-#   test` body, `build.rs`, and proc macro that run-quality-gate.sh compiles
-#   and runs; scripts/generate_host_surfaces.py and the
-#   tests/scripts/test_*.py unittest modules that check-release-parity.sh
-#   invokes; scripts/build-codex-artifact.sh; and every tests/hooks/test_*.sh
-#   the parity script globs. Running pushed code is the POINT of a gate — the
-#   pin only decides who dispatches it. Read "gate scripts pinned to <ref> @
-#   <sha>" as "the three dispatchers were reviewed", never as "nothing
-#   unreviewed will execute".
+#   WHAT THE PIN DOES NOT COVER. The pin protects three DISPATCHER scripts,
+#   plus one compare-only path (see ARP-R-05 below). It does not, and cannot,
+#   protect the code those dispatchers go on to execute out of the pushed
+#   tree, which by design includes: every `cargo test` body, `build.rs`, and
+#   proc macro that run-quality-gate.sh compiles and runs;
+#   scripts/generate_host_surfaces.py and the tests/scripts/test_*.py unittest
+#   modules that check-release-parity.sh invokes;
+#   scripts/build-codex-artifact.sh; and every tests/hooks/test_*.sh the parity
+#   script globs. Running pushed code is the POINT of a gate — the pin only
+#   decides who dispatches it. Read the end-of-run "gate-script pin comparison
+#   complete" summary as "these named paths were diffed against the pin", never
+#   as "nothing unreviewed will execute".
 #
 # RC-034 (2026-08 independent security review; docs/ROOT-CAUSE-REGISTER.md):
 # the gap above was exploitable through a file the pin never looked at. A push
@@ -102,8 +103,9 @@
 #   b. An env-SUPPLIED pin that turns out vacuous is REFUSED (override with
 #      RALLY_PREPUSH_ACK_VACUOUS_PIN=1). A DEFAULT pin that is vacuous — you are
 #      pushing `main` itself, where the pin cannot be independent by
-#      construction — warns loudly and continues, because refusing there would
-#      block every push of the pin branch.
+#      construction — used to warn loudly and continue. SUPERSEDED by ARP-R-05a
+#      below: it is now refused behind the same ack, because "warns and
+#      continues" on the repo's normal path is not a control.
 #   The pushed SHAs for that check are extracted from the raw stdin tuples with
 #   awk, NOT with scripts/prepush-ref-updates.sh: the check decides whether the
 #   pin is trustworthy, so it must not depend on a script the pushed branch
@@ -113,6 +115,48 @@
 # — it runs from the working tree, before any other gate, and it decides which
 # SHAs get validated. It is now pinned exactly like the other two, so the pin
 # block below runs BEFORE the parser is invoked.
+#
+# ARP-R-05 (2026-08 independent security re-assessment;
+# docs/ROOT-CAUSE-REGISTER.md): the gate reported success on a path that
+# reviewed nothing. Three defects, all in "what the operator is told versus what
+# was actually compared":
+#   a. THE DEFAULT PIN'S VACUITY CHECK ONLY WARNED. SEC-005b refused a vacuous
+#      ENV pin but let a vacuous DEFAULT pin continue with a warning, on the
+#      reasoning that refusing would block every push of the pin branch. But
+#      pushing `main` while the pin IS `main` is this repo's NORMAL path: the
+#      warning fired on essentially every push, the gate scripts in the push
+#      were compared against themselves, and the hook went on to execute the
+#      pushed tree's code anyway. A control that never fires on the path
+#      everyone uses is not a control; it is a log line. The default case is now
+#      REFUSED behind the ack that already gated the env case
+#      (RALLY_PREPUSH_ACK_VACUOUS_PIN=1). It is a deliberate operator decision
+#      per push of the pin branch, not a silent default — and it is a two-word
+#      prefix, not a workflow change.
+#   b. THE AFFIRMATIVE PIN LINE PRINTED BEFORE ANY COMPARISON. "gate scripts
+#      pinned to <ref> @ <sha>" used to print immediately after `git show`
+#      copied the pinned bytes out — before resolve_gate_script had diffed
+#      anything, and before the vacuity check ran. A reader saw an affirmative
+#      statement about a comparison that had not happened. Now: a NEUTRAL
+#      "pin ref resolves to <sha>; nothing compared yet" marker at that point,
+#      and the affirmative line moved to AFTER the last comparison, where it
+#      enumerates each path, which copy ran (pinned vs pushed), and why. The
+#      end-of-run line likewise no longer says "all gates green"; it names the
+#      SHA count and the two dispatchers that exited 0, and restates that the
+#      unpinned code they dispatched is not covered by any of it.
+#   c. hooks/ensure-rally-binary.sh WAS EXECUTED BY PINNED TESTS BUT NOT PINNED.
+#      The pin resolved a hardcoded `scripts/<name>` prefix, so only files under
+#      scripts/ could ever join the set. tests/hooks/test_no_autoprovision.sh
+#      and tests/hooks/test_ensure_rally_binary.sh both EXECUTE
+#      hooks/ensure-rally-binary.sh, and that file contains `curl`, `chmod +x`,
+#      and `cargo install`. RC-034 pinned the test files themselves — so a push
+#      that left every pinned test byte-identical while editing the engine those
+#      tests invoke reached execution unreviewed, with the hook reporting a
+#      healthy pin. Fix: the pin is now keyed on repo-relative PATHS
+#      (GATE_SCRIPT_PATHS), not bare names under scripts/, and
+#      hooks/ensure-rally-binary.sh is in the set as a COMPARE-ONLY entry — this
+#      hook never dispatches it, so it gets the pinned-vs-pushed diff and the
+#      same refusal, but no exec path. Pinned copies live in $pin_dir under a
+#      flattened name (`/` -> `__`) so two paths can never collide there.
 #
 # Blocks the push on failure. Emergency override (skips the WHOLE hook,
 # pin check included): RALLY_SKIP_PREPUSH=1 git push
@@ -140,6 +184,10 @@ stdin_capture=$(mktemp "${TMPDIR:-/tmp}/rally-prepush-stdin.XXXXXX")
 cat > "$stdin_capture"
 
 sha_file=$(mktemp "${TMPDIR:-/tmp}/rally-prepush-shas.XXXXXX")
+# ARP-R-05b: every pinned-vs-pushed VERDICT is appended here as it is decided,
+# and the whole file is printed once at the end. The affirmative pin statement
+# therefore cannot be emitted before the comparisons it describes.
+pin_summary=$(mktemp "${TMPDIR:-/tmp}/rally-prepush-pinsummary.XXXXXX")
 worktree_base=$(mktemp -d "${TMPDIR:-/tmp}/rally-prepush-wt.XXXXXX")
 pin_dir=$(mktemp -d "${TMPDIR:-/tmp}/rally-prepush-pin.XXXXXX")
 cleanup() {
@@ -155,7 +203,7 @@ cleanup() {
   fi
   git worktree prune >/dev/null 2>&1 || true
   rm -rf "$pin_dir" 2>/dev/null || true
-  rm -f "$sha_file" "$stdin_capture"
+  rm -f "$sha_file" "$stdin_capture" "$pin_summary"
 }
 trap cleanup EXIT INT TERM
 
@@ -164,7 +212,26 @@ trap cleanup EXIT INT TERM
 # mid-run, and every pushed SHA is compared against the same trusted baseline.
 # prepush-ref-updates.sh is in this list per SEC-005: it runs first, from the
 # working tree, and decides which SHAs get gated at all.
-GATE_SCRIPT_NAMES="run-quality-gate.sh check-release-parity.sh prepush-ref-updates.sh"
+#
+# ARP-R-05c: keyed on repo-relative PATHS, not bare names under scripts/. The
+# old `scripts/${name}` prefix made it structurally impossible to pin anything
+# outside that one directory — which is how hooks/ensure-rally-binary.sh (curl,
+# chmod +x, cargo install), executed by two of the PINNED host test suites,
+# stayed outside the pin while the hook reported healthy.
+GATE_SCRIPT_PATHS="scripts/run-quality-gate.sh scripts/check-release-parity.sh scripts/prepush-ref-updates.sh hooks/ensure-rally-binary.sh"
+# Subset of the above that this hook never EXECUTES. It is reached transitively:
+# check-release-parity.sh globs and runs tests/hooks/test_*.sh, and
+# test_no_autoprovision.sh / test_ensure_rally_binary.sh invoke this file out of
+# the pushed tree. So it needs the pinned-vs-pushed comparison and the refusal,
+# but there is no exec path to choose — nothing here ever picks "run the pinned
+# copy instead", because this hook does not run it at all.
+GATE_COMPARE_ONLY_PATHS="hooks/ensure-rally-binary.sh"
+
+# Pinned copies are stored flat in $pin_dir, so the path separator has to go.
+# `__` rather than a bare `_` keeps distinct paths distinct
+# (scripts/a__b.sh and scripts/a/b.sh would otherwise collide).
+pin_slot() { printf '%s' "$1" | sed 's|/|__|g'; }
+
 if [ -n "${RALLY_PREPUSH_GATE_PIN_REF:-}" ]; then
   pin_ref="$RALLY_PREPUSH_GATE_PIN_REF"
   pin_ref_source="environment"
@@ -180,13 +247,20 @@ elif git rev-parse --verify --quiet "${pin_ref}^{commit}" >/dev/null 2>&1; then
 fi
 
 if [ -n "$pin_commit" ]; then
-  for gate_script_name in $GATE_SCRIPT_NAMES; do
-    if git cat-file -e "${pin_commit}:scripts/${gate_script_name}" 2>/dev/null; then
-      git show "${pin_commit}:scripts/${gate_script_name}" > "$pin_dir/$gate_script_name" 2>/dev/null
-      chmod +x "$pin_dir/$gate_script_name"
+  pin_fetched=0
+  for gate_script_path in $GATE_SCRIPT_PATHS; do
+    if git cat-file -e "${pin_commit}:${gate_script_path}" 2>/dev/null; then
+      git show "${pin_commit}:${gate_script_path}" > "$pin_dir/$(pin_slot "$gate_script_path")" 2>/dev/null
+      chmod +x "$pin_dir/$(pin_slot "$gate_script_path")"
+      pin_fetched=$((pin_fetched + 1))
     fi
   done
-  echo "pre-push: gate scripts pinned to ${pin_ref} @ ${pin_commit}" >&2
+  # ARP-R-05b: NEUTRAL. Copying bytes out of a ref is not review, and this is
+  # the only thing that has happened so far. The affirmative statement — which
+  # paths were diffed, and which copy ran — is emitted after the last
+  # comparison, near the end of this file. Do not restore an affirmative line
+  # here: it would be a claim about work that has not run yet.
+  echo "pre-push: pin ref '${pin_ref}' (${pin_ref_source}) resolves to ${pin_commit}; fetched ${pin_fetched} pinned gate-script copies — nothing compared yet" >&2
 else
   echo "pre-push: WARNING — pin ref '${pin_ref}' does not resolve; gate scripts will run from each pushed tree directly (reduced trust — expected only before '${pin_ref}' exists, e.g. brand-new repo bootstrap)" >&2
 fi
@@ -231,8 +305,22 @@ if [ -n "$pin_commit" ] && [ -n "$pushed_shas_raw" ]; then
       echo "pre-push:   RALLY_PREPUSH_ACK_VACUOUS_PIN=1 git push ..." >&2
       exit 1
     fi
+    # ARP-R-05a: the DEFAULT pin gets the same refusal as the env pin. This used
+    # to warn and continue, on the reasoning that refusing would block every
+    # push of the pin branch — but pushing `main` with the pin at `main` IS this
+    # repo's normal path, so the warning fired on nearly every push and the
+    # gate ran the pushed tree's code regardless. That made the vacuity check a
+    # log line on the only path that matters. Same ack as the env case: one
+    # deliberate operator decision per push of the pin branch.
+    if [ "$pin_ref_source" = "default" ] && [ "${RALLY_PREPUSH_ACK_VACUOUS_PIN:-}" != "1" ]; then
+      echo "pre-push: REFUSED — the default pin '${pin_ref}' resolves to ${pin_commit}, a commit in this push. You are pushing the pin branch itself, so every path in GATE_SCRIPT_PATHS (${GATE_SCRIPT_PATHS}) would be diffed against its own bytes: identical by construction, reviewed by nobody." >&2
+      echo "pre-push: this is the repo's ORDINARY path, which is precisely why it is refused rather than warned about (ARP-R-05): a check that passes on every normal push certifies nothing, and the gate still goes on to execute this push's code on this machine." >&2
+      echo "pre-push: push a branch and let it be compared against '${pin_ref}', or — if you mean to push '${pin_ref}' itself and accept that its gate scripts were reviewed against no earlier baseline — re-run with:" >&2
+      echo "pre-push:   RALLY_PREPUSH_ACK_VACUOUS_PIN=1 git push ..." >&2
+      exit 1
+    fi
     if [ "$pin_ref_source" = "default" ]; then
-      echo "pre-push: continuing — you are pushing the pin branch itself, where the pin cannot be independent. The gate scripts in this push were NOT reviewed against an earlier baseline." >&2
+      echo "pre-push: continuing — RALLY_PREPUSH_ACK_VACUOUS_PIN=1 is set and you are pushing the pin branch itself, where the pin cannot be independent. The gate scripts in this push were NOT reviewed against an earlier baseline. Running effectively UNPINNED." >&2
     else
       echo "pre-push: continuing — RALLY_PREPUSH_ACK_VACUOUS_PIN=1 is set. Running effectively UNPINNED." >&2
     fi
@@ -263,7 +351,17 @@ fi
 
 # --- ARP-006 / SEC-005: pinned-vs-candidate decision, one implementation ---
 #
-# resolve_gate_script SCRIPT_NAME CANDIDATE_PATH LABEL
+# resolve_gate_script SCRIPT_PATH CANDIDATE_PATH LABEL [MODE]
+#
+# SCRIPT_PATH is repo-relative (ARP-R-05c): scripts/run-quality-gate.sh,
+# hooks/ensure-rally-binary.sh, … The pinned copy lives at
+# "$pin_dir/$(pin_slot SCRIPT_PATH)".
+#
+# MODE is "exec" (default — this hook is about to run the returned path) or
+# "compare" (this hook never runs it; the pinned host tests do). The decision
+# table and the refusal are identical; only the wording changes, because
+# telling an operator "refusing to execute" about a file this hook does not
+# execute would misdescribe the risk they are being asked to accept.
 #
 # Echoes the path of the copy that should execute. Returns 1 to REFUSE.
 #   no pinned copy    -> the candidate (bootstrap; the warning was printed above)
@@ -271,44 +369,91 @@ fi
 #   differs + ack     -> the candidate, after printing the diff
 #   differs, no ack   -> refuse, after printing the diff
 resolve_gate_script() {
-  rgs_name="$1"
+  rgs_path="$1"
   rgs_candidate="$2"
   rgs_label="$3"
-  if [ ! -f "$pin_dir/$rgs_name" ]; then
+  rgs_mode="${4:-exec}"
+  rgs_pinned="$pin_dir/$(pin_slot "$rgs_path")"
+  if [ ! -f "$rgs_pinned" ]; then
     printf '%s' "$rgs_candidate"
     return 0
   fi
-  if diff -q "$pin_dir/$rgs_name" "$rgs_candidate" >/dev/null 2>&1; then
-    printf '%s' "$pin_dir/$rgs_name"
+  if diff -q "$rgs_pinned" "$rgs_candidate" >/dev/null 2>&1; then
+    printf '%s' "$rgs_pinned"
     return 0
   fi
   if [ "${RALLY_PREPUSH_ACK_GATE_CHANGE:-}" = "1" ]; then
-    echo "pre-push: $rgs_label — scripts/$rgs_name DIFFERS from pinned ${pin_ref} @ ${pin_commit} — RALLY_PREPUSH_ACK_GATE_CHANGE=1 is set, running the PUSHED version:" >&2
-    diff -u "$pin_dir/$rgs_name" "$rgs_candidate" >&2 || true
+    if [ "$rgs_mode" = "compare" ]; then
+      echo "pre-push: $rgs_label — $rgs_path DIFFERS from pinned ${pin_ref} @ ${pin_commit} — RALLY_PREPUSH_ACK_GATE_CHANGE=1 is set, the pinned host tests will run the PUSHED version:" >&2
+    else
+      echo "pre-push: $rgs_label — $rgs_path DIFFERS from pinned ${pin_ref} @ ${pin_commit} — RALLY_PREPUSH_ACK_GATE_CHANGE=1 is set, running the PUSHED version:" >&2
+    fi
+    diff -u "$rgs_pinned" "$rgs_candidate" >&2 || true
     printf '%s' "$rgs_candidate"
     return 0
   fi
-  echo "pre-push: REFUSED — $rgs_label's scripts/$rgs_name differs from the pinned ${pin_ref} @ ${pin_commit} copy." >&2
-  echo "pre-push: executing an unreviewed, pushed-tree gate script is exactly what ARP-006 closes — refusing by default." >&2
+  echo "pre-push: REFUSED — $rgs_label's $rgs_path differs from the pinned ${pin_ref} @ ${pin_commit} copy." >&2
+  if [ "$rgs_mode" = "compare" ]; then
+    echo "pre-push: this hook never dispatches $rgs_path — the PINNED tests/hooks/test_*.sh do (it carries curl, chmod +x and cargo install), so pinning the test files alone left it reachable: every pinned test stays byte-identical, the pin reports healthy, and this file executes unreviewed (ARP-R-05). Refusing by default." >&2
+  else
+    echo "pre-push: executing an unreviewed, pushed-tree gate script is exactly what ARP-006 closes — refusing by default." >&2
+  fi
   echo "pre-push: diff (- pinned ${pin_ref}, + candidate $rgs_label):" >&2
-  diff -u "$pin_dir/$rgs_name" "$rgs_candidate" >&2 || true
+  diff -u "$rgs_pinned" "$rgs_candidate" >&2 || true
   echo "pre-push: if this is a legitimate in-flight edit to the gate itself, review the diff above, then re-run with:" >&2
   echo "pre-push:   RALLY_PREPUSH_ACK_GATE_CHANGE=1 git push ..." >&2
   return 1
 }
 
+# record_pin_outcome SCRIPT_PATH LABEL EXEC_PATH [MODE]
+#
+# ARP-R-05b: one line per comparison, appended as the verdict is reached and
+# printed together at the end. Derives the verdict from the path
+# resolve_gate_script actually returned, so the summary cannot drift from the
+# decision it describes.
+record_pin_outcome() {
+  rpo_path="$1"
+  rpo_label="$2"
+  rpo_exec="$3"
+  rpo_mode="${4:-exec}"
+  rpo_pinned="$pin_dir/$(pin_slot "$rpo_path")"
+  if [ ! -f "$rpo_pinned" ]; then
+    rpo_verdict="NOT PINNED (absent at ${pin_ref:-<unresolved>}) — pushed copy, unreviewed"
+  elif [ "$rpo_exec" = "$rpo_pinned" ]; then
+    if [ "$rpo_mode" = "compare" ]; then
+      rpo_verdict="identical to pin — compared only (run by the pinned host tests, not by this hook)"
+    else
+      rpo_verdict="identical to pin — ran the PINNED copy"
+    fi
+  else
+    if [ "$rpo_mode" = "compare" ]; then
+      rpo_verdict="DIFFERS from pin — pushed copy accepted under RALLY_PREPUSH_ACK_GATE_CHANGE=1"
+    else
+      rpo_verdict="DIFFERS from pin — ran the PUSHED copy under RALLY_PREPUSH_ACK_GATE_CHANGE=1"
+    fi
+  fi
+  echo "pre-push:   ${rpo_path} [${rpo_label}]: ${rpo_verdict}" >> "$pin_summary"
+}
+
 # --- run the ref-update parser through the same pin decision (SEC-005) ----
 # The parser runs from the WORKING TREE, so its candidate is the working-tree
 # copy, not a pushed worktree copy. Everything else is identical.
-if ! parser_exec_path=$(resolve_gate_script prepush-ref-updates.sh \
+if ! parser_exec_path=$(resolve_gate_script scripts/prepush-ref-updates.sh \
        "$repo_root/scripts/prepush-ref-updates.sh" "working tree"); then
   exit 1
 fi
+record_pin_outcome scripts/prepush-ref-updates.sh "working tree" "$parser_exec_path"
 "$parser_exec_path" < "$stdin_capture" > "$sha_file"
 rm -f "$stdin_capture"
 
 if [ ! -s "$sha_file" ]; then
   echo "pre-push: no non-deletion refs to validate (pure deletion push, or empty ref-update list) — nothing to gate" >&2
+  # ARP-R-05b: the parser comparison above IS a comparison, so report it rather
+  # than exiting with the pin's state unstated.
+  if [ -s "$pin_summary" ]; then
+    echo "pre-push: gate-script pin comparison complete — pinned ${pin_ref} @ ${pin_commit}:" >&2
+    cat "$pin_summary" >&2
+  fi
   exit 0
 fi
 
@@ -323,41 +468,95 @@ fi
 # (GIT_AUTHOR_*, GIT_COMMITTER_*, GIT_CONFIG_*) are deliberately left intact.
 git_scope_vars='GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_COMMON_DIR GIT_QUARANTINE_PATH GIT_INTERNAL_GITDIR_HOOK_PATH GIT_REFLOG_ACTION'
 
-# run_gated_script SCRIPT_NAME WORKTREE_DIR
+# run_gated_script SCRIPT_PATH WORKTREE_DIR
 #
-# Decides WHICH copy of scripts/$SCRIPT_NAME to execute (pinned vs pushed —
-# see the ARP-006 header note) and runs it with cwd=$WORKTREE_DIR so the
-# gate's SUBJECT is always the pushed tree, regardless of where its CODE
-# came from. Returns the gate's own exit status; under `set -e` a non-zero
-# return here aborts the whole hook (push blocked), same as before ARP-006.
+# Decides WHICH copy of $SCRIPT_PATH to execute (pinned vs pushed — see the
+# ARP-006 header note) and runs it with cwd=$WORKTREE_DIR so the gate's
+# SUBJECT is always the pushed tree, regardless of where its CODE came from.
+# Returns the gate's own exit status; under `set -e` a non-zero return here
+# aborts the whole hook (push blocked), same as before ARP-006.
 run_gated_script() {
-  gate_script_name="$1"
+  gate_script_path="$1"
   gate_wt="$2"
-  gate_pushed_script="$gate_wt/scripts/$gate_script_name"
+  gate_pushed_script="$gate_wt/$gate_script_path"
   if [ ! -f "$gate_pushed_script" ]; then
-    echo "pre-push: $sha — scripts/$gate_script_name not present in pushed tree; skipping" >&2
+    echo "pre-push: $sha — $gate_script_path not present in pushed tree; skipping" >&2
     return 0
   fi
-  if ! gate_exec_path=$(resolve_gate_script "$gate_script_name" "$gate_pushed_script" "$sha"); then
+  if ! gate_exec_path=$(resolve_gate_script "$gate_script_path" "$gate_pushed_script" "$sha"); then
     return 1
   fi
+  record_pin_outcome "$gate_script_path" "$sha" "$gate_exec_path"
   # shellcheck disable=SC2086 # intentional word-split: unset each var name
   ( cd "$gate_wt" && unset $git_scope_vars && "$gate_exec_path" )
 }
 
+# compare_gated_script SCRIPT_PATH WORKTREE_DIR
+#
+# ARP-R-05c. Same pinned-vs-pushed decision and same refusal as
+# run_gated_script, minus the exec: these paths are reached transitively (the
+# pinned tests/hooks/test_*.sh invoke hooks/ensure-rally-binary.sh out of the
+# pushed worktree), so there is nothing for this hook to run — only something
+# for it to refuse. Called BEFORE the dispatchers below, so a hostile copy is
+# rejected before check-release-parity.sh gets the chance to glob and run the
+# tests that would execute it.
+compare_gated_script() {
+  cmp_script_path="$1"
+  cmp_wt="$2"
+  cmp_pinned="$pin_dir/$(pin_slot "$cmp_script_path")"
+  # Nothing pinned (bootstrap / absent at the pin) — the loud warning was
+  # already printed by the pin block; there is no baseline to compare against.
+  [ -f "$cmp_pinned" ] || return 0
+  cmp_pushed="$cmp_wt/$cmp_script_path"
+  if [ ! -f "$cmp_pushed" ]; then
+    echo "pre-push: $sha — $cmp_script_path absent from the pushed tree; nothing to compare (it cannot execute either)" >&2
+    return 0
+  fi
+  if ! cmp_exec_path=$(resolve_gate_script "$cmp_script_path" "$cmp_pushed" "$sha" compare); then
+    return 1
+  fi
+  record_pin_outcome "$cmp_script_path" "$sha" "$cmp_exec_path" compare
+  return 0
+}
+
+sha_count=0
 while IFS= read -r sha; do
   [ -n "$sha" ] || continue
+  sha_count=$((sha_count + 1))
   wt="$worktree_base/$sha"
   echo "pre-push: $sha — creating clean detached worktree…" >&2
   git worktree add --detach "$wt" "$sha" >/dev/null
+  for cmp_path in $GATE_COMPARE_ONLY_PATHS; do
+    echo "pre-push: $sha — comparing $cmp_path against the pin (executed by the pinned host tests, not by this hook)…" >&2
+    compare_gated_script "$cmp_path" "$wt"
+  done
   echo "pre-push: $sha — running quality gate (scripts/run-quality-gate.sh)…" >&2
-  run_gated_script run-quality-gate.sh "$wt"
+  run_gated_script scripts/run-quality-gate.sh "$wt"
   echo "pre-push: $sha — running release parity (scripts/check-release-parity.sh)…" >&2
   # f2: parity uses RALLY_CODEX_DEST (SEC-003) to regenerate the Codex
   # artifact into a scratch dir, so this never mutates the detached
   # worktree it runs in.
-  run_gated_script check-release-parity.sh "$wt"
+  run_gated_script scripts/check-release-parity.sh "$wt"
   echo "pre-push: $sha ✅ gate + parity passed" >&2
 done < "$sha_file"
 
-echo "pre-push: all gates green ✅" >&2
+# --- ARP-R-05b: the affirmative pin statement, AFTER the last comparison ----
+# Every line below is a verdict that was already reached above. This is the
+# only place the hook is entitled to assert anything about the pin, and it
+# asserts exactly what was diffed against what — not "pinned", which reads as
+# a guarantee about code the pin never saw.
+if [ -s "$pin_summary" ]; then
+  echo "pre-push: gate-script pin comparison complete — pinned ${pin_ref} @ ${pin_commit}:" >&2
+  cat "$pin_summary" >&2
+elif [ -n "$pin_commit" ]; then
+  echo "pre-push: gate-script pin ${pin_ref} @ ${pin_commit} resolved, but NO path was compared against it on this run." >&2
+else
+  echo "pre-push: no gate-script pin was in effect on this run — every gate script came from the pushed tree, unreviewed." >&2
+fi
+
+# Not "all gates green": the two dispatchers exiting 0 is all that was
+# established. Everything they compiled and ran out of the pushed tree ran
+# unpinned, and a blanket all-clear here is what let the earlier affirmative
+# line be read as coverage it never had (ARP-R-05b).
+echo "pre-push: gated ${sha_count} pushed SHA(s) — scripts/run-quality-gate.sh and scripts/check-release-parity.sh each exited 0 on every one." >&2
+echo "pre-push: that verdict covers those two dispatchers only. The pushed-tree code they compiled and executed — cargo test bodies, build.rs, proc macros, scripts/generate_host_surfaces.py, tests/scripts/*.py, scripts/build-codex-artifact.sh, the globbed tests/hooks/test_*.sh — ran on this machine and is NOT covered by the pin. See the header note." >&2

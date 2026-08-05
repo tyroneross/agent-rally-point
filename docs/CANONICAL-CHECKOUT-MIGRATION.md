@@ -4,7 +4,7 @@
 This repo's canonical source checkout is:
 
 ```text
-/Users/tyroneross/dev/git-folder/agent-rally-point
+~/dev/git-folder/agent-rally-point
 ```
 
 The checkout should be on `main` and track `origin/main`. Other local worktrees
@@ -24,7 +24,7 @@ product itself:
 
 Keep project coordination in the project repo that owns the work:
 
-- Easy Terminal work coordinates from `/Users/tyroneross/dev/git-folder/easy-terminal/.rally`.
+- Easy Terminal work coordinates from `~/dev/git-folder/easy-terminal/.rally`.
 - Build Loop work coordinates from the Build Loop repo or its resolved canonical channel.
 - A plugin or sibling repo keeps its own `.rally` unless the work is explicitly an
   `agent-rally-point` source change.
@@ -91,4 +91,4 @@ Known local lanes after this migration:
 - `fix/b19-codex-hook-repoint`: preserved branch with coordination-ledger history;
   do not merge wholesale into `main`.
 - `agent-rally-point-coord`: broken stale worktree snapshot, archived at
-  `/Users/tyroneross/dev/git-folder/_archive/agent-rally-point-canonical-migration-20260601T231008Z/agent-rally-point-coord-broken-snapshot`.
+  `~/dev/git-folder/_archive/agent-rally-point-canonical-migration-20260601T231008Z/agent-rally-point-coord-broken-snapshot`.

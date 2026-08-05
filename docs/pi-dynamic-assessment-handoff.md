@@ -41,7 +41,7 @@ Answers are settled (§5). The only open item is a build/no-build gate (§6).
 
 ### Agent Rally Point (this repo — the substrate)
 - **Repo:** https://github.com/tyroneross/agent-rally-point.git
-- **Primary checkout:** `/Users/tyroneross/dev/git-folder/agent-rally-point`
+- **Primary checkout:** `~/dev/git-folder/agent-rally-point`
   - current branch at handoff: `codex/rally-global-discovery` @ `3d9e567`
 - **Worktrees:** `-integration`, `-main`, `-rally2-primary` (same repo, sibling dirs under
   `~/dev/git-folder/`).

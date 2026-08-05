@@ -33,8 +33,12 @@ rather than dressed up.
 
 ### A second contributor you do not fully trust
 
-`.rally/log/*.jsonl` is committed git content. It replays on a fresh clone. A contributor who
-can land a commit can seed facts that a later agent reads as coordination truth.
+`.rally/log/*.jsonl` is no longer committed (see §"What a fresh clone of this repository gives
+you"), so a fresh clone starts empty. That removes the seeded-room problem for THIS repo and does
+not remove the underlying exposure: the ledger is still a file on a shared machine, and a project
+that chooses to commit it — the default before 2026-08-04, and still a defensible choice for a
+private repo — gets a room a contributor can seed with facts a later agent reads as coordination
+truth.
 
 **What is defended now:** peer-authored prose no longer reaches model context raw. The
 SessionStart hook sanitizes it — control characters and newlines stripped, length capped,
@@ -54,7 +58,8 @@ paths were live and independently reproduced, both reachable from one committed 
   identifier, not by type: an opaque root contains nothing but itself.
 - One `blocker` with no scope flipped `check before-write` to `allow: false` for every agent,
   which `RALLY_HOOK_STRICT=1` turns into a hard deny on every edit. An unscoped blocker from a
-  non-lead is now a warning.
+  non-lead is now a warning. The room-wide deny is still reachable under strict mode by a writer
+  that passes `--tool <lead-id>`; §"Opening this repo runs code" below states what that costs.
 
 **Room-wide effects are checked against the lead seat, and that check is bypassed by one flag.**
 `workspace:*` / `repo:*` claims and unscoped freezes compare `fact.tool` against the room lead.
@@ -68,23 +73,46 @@ $ rally say claim --tool someone-else --path src/lib.rs --subject work
 {"error":"claim conflict: honest-lead holds workspace:* ... "}              # room-wide lockout, restored
 ```
 
-`rally say blocker --tool <lead-id>` restores the room-wide deny the same way. And the seat itself
-is not defended: `rally lead assign --tool rogue --to rogue` succeeds against a **live incumbent**,
-so "first join" is not the bar either.
+`rally say blocker --tool <lead-id>` restores the room-wide deny the same way.
 
-**What the gate actually buys, stated exactly:** it stops the accidental case and the honest one —
-an agent that names itself truthfully and has no standing. It does not stop an adversary, and it is
-one flag deep. Do not read it as an authorization boundary. Closing it needs authority bound to
-something the writer cannot choose (a session identity correlated to a registered session), which
-does not exist yet.
+**The seat itself is now gated, to exactly the same depth and no further (ARP-R-01).** Until
+2026-08-04 the seat had no gate at all: `rally lead assign --tool rogue --to rogue` succeeded
+against a **live incumbent** and against a `--user-designated` one, and
+`rally lead relinquish --tool rogue` vacated it to null. One command under a rogue's own honest
+name granted every room-wide capability above. A transfer now requires a leaderless room, an
+actor that IS the incumbent, an incumbent silent past the reclaim window, or an explicit
+`--force` that records the seizure and names who it displaced.
+
+That closes the honest-name path and nothing beyond it. `rally lead assign --tool <incumbent>
+--to rogue` still succeeds, because the gate compares `fact.tool`, and `fact.tool` is the same
+self-asserted field this document has already said twice cannot be trusted. So all three
+room-wide controls — the wildcard claim, the freeze, and the seat — now share one residual
+rather than the seat being an open door beneath the other two.
+
+**What the gates actually buy, stated exactly:** they stop the accidental case and the honest one
+— an agent that names itself truthfully and has no standing. They do not stop an adversary, and
+they are one flag deep. Do not read them as an authorization boundary. Closing them needs
+authority bound to something the writer cannot choose (a session identity correlated to a
+registered session), which does not exist yet. `crates/rally-cli/tests/lead_seat_authz.rs`
+contains a test named `impersonation_is_not_stopped_and_this_test_says_so` that ASSERTS the
+bypass still works, so this paragraph cannot quietly drift out of date: if identity ever becomes
+authoritative, that test fails and forces the rewrite.
+
+**Two things the fix also corrected, both of which had made the room harder to reason about.**
+The ledger recorded a seizure as authored by the agent that GAINED the seat, so the one field an
+investigator would read named the wrong agent; the actor is now the author and the beneficiary is
+the target. And the freeze verdict was computed against the CURRENT lead on every check rather
+than against the lead when the blocker was written, so the same fact id armed into a room-wide
+deny once its author later took the seat, and a legitimate freeze disarmed the moment anyone else
+took it. Authority is now decided once, as of the fact's own position in the ledger.
 
 An earlier version of this section claimed the gate "raises the bar from any writer to the first
 writer". That was wrong, and it was wrong in the specific way this repo's register warns about —
 a claim about a control that drifted toward reassurance while the control stayed put. It is
 recorded here rather than quietly rewritten.
 
-**If this is your situation:** review `.rally/log/` diffs in pull requests the way you review
-code. It is executable content in the sense that matters — it steers agents.
+**If this is your situation:** if you commit `.rally/log/`, review its diffs in pull requests the
+way you review code. It is executable content in the sense that matters — it steers agents.
 
 ### An untrusted process running as your user
 
@@ -145,7 +173,33 @@ What the hooks no longer do, as of this audit's fixes: download a binary, `chmod
 run `cargo install`, execute a repo-shipped binary to probe it, or write to `~/.local/bin`.
 Provisioning moved out of the hook path entirely. See RC-013.
 
-The hooks fail open. They never block an edit, and they exit 0 even when Rally is broken.
+**The hooks fail open by default, and three opt-in switches make them fail closed.** In the
+default posture PreToolUse returns `permissionDecision: "allow"` with a warning, so the edit
+goes through, and every hook exits 0 even when Rally is broken. The exit code stays 0 in every
+posture — a refusal travels in the hook's JSON, not its exit status. Each switch below is off
+unless you set it:
+
+| Switch | What it does |
+|--------|--------------|
+| `RALLY_HOOK_STRICT=1` | The hook emits `permissionDecision: "deny"` (PreToolUse) or `decision: "block"` (Stop) on a high-severity signal — `severity == "stop"` or `allow == false`. Low-severity findings stay advisory. Codex PreToolUse stays fail-open because Codex rejects the Claude `permissionDecision` field. |
+| `rally check before-write --strict` | Exits 4 when a stop finding is present, so a wrapper that reads the exit code aborts the write. The canonical agent loop in `README.md`, `RALLY.md`, and `skills/agent-rally-point/SKILL.md` passes `--strict`, so this path is on for anyone who copies it. |
+| `RALLY_BEFORE_WRITE_FAILCLOSED=1` or `--fail-closed` | Makes `check before-write` exit 4 when its snapshot read exceeds the watchdog timeout, instead of exiting 0 with a neutral envelope. Applies to `check before-write` only. `--fail-open` on the same call reasserts the default. |
+
+One more fail-closed path is **not** opt-in, and it is not an edit gate: a mutating command
+(`rally say`, `enter`, `inject`, `lead handoff`, `backlog add`, ...) exits 4 when the watchdog
+fires before the write commits, so a caller cannot read a timeout as a successful append. Your
+edit is unaffected, and the hooks that call these commands still exit 0.
+
+**What strict mode does to the room-freeze denial of service (RC-038).** Under
+`RALLY_HOOK_STRICT=1` an unscoped blocker is not advisory. It flips `check before-write` to
+`allow: false` for every agent in the room, and strict mode converts that into
+`permissionDecision: "deny"` on every edit by every agent — a room-wide halt from one committed
+ledger line, persisting until someone resolves the blocker. The lead-seat gate narrows who can
+raise it: an unscoped blocker from a non-lead now degrades to a warning. That gate compares
+self-asserted `--tool`, so `rally say blocker --tool <lead-id>` still lands it, exactly as the
+live reproduction above shows. **Strict mode plus one forged `--tool` still freezes the room.**
+Do not enable `RALLY_HOOK_STRICT=1` in a room whose `.rally/log/` you would not review line by
+line before trusting it.
 
 ### Turning it off
 
@@ -178,3 +232,36 @@ cases on Linux, on hosts other than the four wired here, and in any configuratio
 one human.
 
 The parts most likely to surprise you are the ones this document says are not defended.
+
+## What a fresh clone of this repository gives you (ARP-R-06)
+
+Until 2026-08-04 this repo committed its own live coordination room. Cloning it did not give you
+the project's history — it gave you the maintainer's working state: 3,680 facts replaying into
+93 unreleased claims, 60 open handoffs addressed to specific agent seats, 84 agent identities,
+and a foreign lead seat, on paths that do not exist in your checkout. It also carried 956
+occurrences of the maintainer's hostname and home directory across 25 tracked files, with active
+claim scopes naming personal files and private sibling repositories, plus 18 git bundles
+(68.6 MiB) holding full pre-sanitization history of this repo **and of repositories that are not
+this one**.
+
+`.rally/log/`, `.rally/archive/`, `.rally/RETROSPECTIVE.md`, and `archive/` are no longer tracked.
+A fresh clone now starts with an empty room, which is the correct state for someone else's
+repository. `.rally/manifest.json` still ships, so an agent landing in the clone still finds the
+rally point.
+
+**What de-tracking does not do, stated plainly because the difference matters.** Every one of
+those bytes is still in git history. `git log` recovers all of it, including the bundles. Removing
+them for real means rewriting history and force-pushing, which is irreversible, breaks every
+existing clone and fork, and is a decision that has not been made. Until it is:
+
+- Treat this repository's history as containing the maintainer's machine paths, hostname, and
+  coordination ledger.
+- The bundles have **not** been audited for credentials. A regex sweep over compressed packfiles
+  is not a credential audit. No secret is known to be present; none has been ruled out either.
+
+If you are evaluating this repo for internal use, that history is what you are taking on.
+
+**Resetting a room you inherited.** If you cloned before this change, or you want a clean room in
+a fork: delete `.rally/log/`, `.rally/archive/`, and the derived caches (`.rally/facts.db`,
+`.rally/room.db`, `.rally/*.json` other than `manifest.json`), then run any `rally` command. The
+room rebuilds empty from the absent ledger.

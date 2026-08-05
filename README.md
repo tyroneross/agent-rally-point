@@ -10,7 +10,7 @@ Apache-2.0. CLI version 0.1.7.
 
 Two agents editing one checkout overwrite each other's uncommitted work, redo the same task, and lose the record of who decided what. The usual answers are a human babysitting a queue or an orchestration server. Rally is a third option: a durable, git-friendly record of who is doing what right now, that any agent reads and writes in one command.
 
-Rally **advises and never blocks**. A failing hook still lets your edit through.
+Rally **advises by default; three opt-in switches make it block.** In the default posture a failing hook still lets your edit through — PreToolUse returns `permissionDecision: "allow"` with a warning, and every hook exits 0 even when Rally is broken. Setting `RALLY_HOOK_STRICT=1` turns a high-severity collision into a hard deny, `rally check before-write --strict` exits 4 on a stop finding, and `RALLY_BEFORE_WRITE_FAILCLOSED=1` makes that same check exit 4 when it times out. Each is off unless you turn it on. Full list and blast radius: [`docs/AUTO-COORDINATION-HOOKS.md`](docs/AUTO-COORDINATION-HOOKS.md) and [`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md).
 
 ## What you get
 
@@ -108,6 +108,8 @@ rally say handoff  --tool codex --target claude_code --subject "review docs" --j
 rally say resolve  --tool codex --ref <blocker-id> --subject "resolved" --json
 rally room --json
 ```
+
+The `--strict` on `check before-write` above is one of the three blocking switches: it exits 4 when a stop finding is present, so a harness that reads the exit code aborts the write. Drop `--strict` to get the warning without the non-zero exit.
 
 `rally next` returns `actionable`, `requires_human`, `stop_reason`, `suggested_claims`, `suggested_commands`, and `completion` — enough for a harness to act on its own without turning Rally into a scheduler. Every command takes `--json`.
 
