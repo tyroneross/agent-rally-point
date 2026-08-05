@@ -6704,6 +6704,9 @@ mod ledger_tests {
 
     #[test]
     fn segment_fold_memo_is_room_scoped_and_invalidates_on_change() {
+        let _guard = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         invalidate_segment_fold_memo();
         let root_a = unique_root("segment-memo-room-a");
         let root_b = unique_root("segment-memo-room-b");
@@ -6747,6 +6750,9 @@ mod ledger_tests {
     /// the cached one. Explicit invalidation must still force a fresh fold.
     #[test]
     fn segment_fold_memo_explicit_invalidation_handles_same_length_rewrite() {
+        let _guard = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         invalidate_segment_fold_memo();
         let root = unique_root("segment-memo-same-length");
         let old = ledger_line(1, "decision", "event-old", "alpha");
