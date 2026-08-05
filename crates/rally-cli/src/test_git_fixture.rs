@@ -53,15 +53,17 @@ use std::process::Command;
 /// Identity every fixture repo commits under. Never written to any config
 /// file — see module docs. Uses the RFC 2606 reserved `.invalid` TLD so it
 /// can never be a routable address, and so it reads as distinct from the
-/// `@example.test` string that already sits in 64 historical commits (a
+/// `@example.test` string that already sits in 70 historical commits (a
 /// leak detector can tell a NEW leak from the known-historical ones).
 pub const FIXTURE_NAME: &str = "Rally Fixture";
 pub const FIXTURE_EMAIL: &str = "fixture@rally.invalid";
 
 /// Panics unless `root` resolves to a path inside the process temp dir.
 ///
-/// This is the impossible-state guard: a fixture whose root escaped to a
-/// real checkout dies here, BEFORE git ever runs against it.
+/// This defense-in-depth guard rejects a fixture root outside the process temp
+/// dir before Git runs. It does not protect against repository-scoping
+/// environment variables redirecting a valid scratch root; [`fixture_git`]
+/// clears those variables at the child-command boundary.
 ///
 /// Both `root` and `std::env::temp_dir()` are canonicalized before
 /// comparison (macOS's `/var` -> `/private/var` symlink would otherwise
@@ -76,10 +78,10 @@ pub fn assert_fixture_root(root: &Path) {
         actual.starts_with(&expected),
         "fixture root {actual:?} is OUTSIDE the expected temp dir {expected:?} — \
          a test fixture tried to operate on a path outside the process temp \
-         directory. This guard exists specifically to stop a fixture from \
-         writing git identity (or any other git config) into a REAL checkout; \
-         see the 64-commit `rally@example.test` identity leak from 2026-07-10 \
-         that this module's callers close for good."
+         directory. Refusing the Git operation contains the bad-root hazard. \
+         This is separate from the 70-commit `rally@example.test` identity \
+         leak, which `fixture_git` closes by clearing repository-scoping \
+         environment variables and never writing fixture identity to config."
     );
 }
 

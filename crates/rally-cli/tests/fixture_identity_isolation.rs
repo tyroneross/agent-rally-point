@@ -3,26 +3,20 @@
 
 //! Adversarial control for the fixture git-identity isolation guard.
 //!
-//! Closes the register entry for the 2026-07-10 identity leak: 64 commits
+//! Closes the register entry for the 2026-07-10 identity leak: 70 commits
 //! authored `Rally Test <rally@example.test>` landed in the REAL
-//! agent-rally-point checkout because a fixture ran
-//! `git -C <root> config user.email ...` against a root that resolved into
-//! (or sat inside) the real repo. `git config`'s default `--local` scope
-//! writes to whatever repo `-C <root>` discovers by walking up from `root` —
-//! so any fixture that ever calls that subcommand is one bad root away from
-//! repeating the leak, no matter how carefully the root is normally chosen.
+//! agent-rally-point checkout because Git exported repository-scoping
+//! variables such as `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_INDEX_FILE` into a
+//! hook. Those variables override `git -C <root>`, so a fixture's local-config
+//! command targeted the real checkout even though its scratch root was valid.
 //!
-//! These tests prove, independently, the two controls that close it for
-//! good:
-//! 1. `assert_fixture_root` panics BEFORE git ever runs, for any path
-//!    outside the process temp dir — the impossible-state guard.
-//! 2. `fixture_git` never writes to any git config file, PERIOD — even when
-//!    pointed at a repo that already carries its own identity config. This
-//!    is tested against a throwaway decoy repo (never the real checkout),
-//!    independently of guard #1, because guard #1 permits any temp-dir path
-//!    through — the decoy lives in the temp dir on purpose, so this test
-//!    isolates "does `fixture_git` itself ever write config" from "does the
-//!    guard reject a bad root".
+//! These tests prove the independent controls that close it:
+//! 1. `fixture_git` clears inherited repository-scoping variables before
+//!    every child Git command.
+//! 2. `fixture_git` never writes identity into a Git config file, even when
+//!    pointed at a repo that already carries its own identity config.
+//! 3. `assert_fixture_root` rejects paths outside the process temp dir as
+//!    defense in depth against a separate bad-root hazard.
 
 use std::fs;
 use std::path::PathBuf;
@@ -31,6 +25,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
 use common::test_git_fixture::{FIXTURE_EMAIL, assert_fixture_root, fixture_git};
+
+const HOSTILE_ENV_CHILD: &str = "RALLY_FIXTURE_GIT_HOSTILE_ENV_CHILD";
+const HOSTILE_ENV_SCRATCH: &str = "RALLY_FIXTURE_GIT_HOSTILE_ENV_SCRATCH";
+const HOSTILE_ENV_HEAD_OUT: &str = "RALLY_FIXTURE_GIT_HOSTILE_ENV_HEAD_OUT";
 
 fn git_available() -> bool {
     Command::new("git")
@@ -224,6 +222,25 @@ fn fixture_git_leaves_decoy_real_repo_config_untouched() {
 /// would have let the original incident through untouched.
 #[test]
 fn fixture_git_ignores_inherited_git_dir_pointing_at_another_repo() {
+    // The parent test launches this exact test in a child process with the
+    // hostile Git variables set only on that child. Keeping the ambient
+    // environment process-local prevents a concurrent libtest thread from
+    // observing the reproduction setup.
+    if std::env::var_os(HOSTILE_ENV_CHILD).is_some() {
+        let scratch =
+            PathBuf::from(std::env::var_os(HOSTILE_ENV_SCRATCH).expect("child scratch path"));
+        let head_out =
+            PathBuf::from(std::env::var_os(HOSTILE_ENV_HEAD_OUT).expect("child HEAD output path"));
+        fixture_git(&scratch, &["init", "-q", "-b", "main"]);
+        fixture_git(
+            &scratch,
+            &["commit", "--allow-empty", "-m", "scratch commit"],
+        );
+        let scratch_head = fixture_git(&scratch, &["rev-parse", "HEAD"]);
+        fs::write(head_out, scratch_head).expect("write child HEAD output");
+        return;
+    }
+
     if !git_available() {
         eprintln!("skipping: git not on PATH");
         return;
@@ -262,27 +279,32 @@ fn fixture_git_ignores_inherited_git_dir_pointing_at_another_repo() {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
 
-    // Reproduce the hostile condition: GIT_DIR (and friends) exported at the
-    // decoy, exactly as git would inject them into a hook's environment.
-    // SAFETY: single-threaded test process; set before any fixture_git call
-    // and removed immediately after.
-    unsafe {
-        std::env::set_var("GIT_DIR", decoy.join(".git"));
-        std::env::set_var("GIT_WORK_TREE", &decoy);
-    }
-
-    let result = std::panic::catch_unwind(|| {
-        fixture_git(&scratch, &["init", "-q", "-b", "main"]);
-        fixture_git(&scratch, &["commit", "--allow-empty", "-m", "scratch commit"]);
-        fixture_git(&scratch, &["rev-parse", "HEAD"])
-    });
-
-    unsafe {
-        std::env::remove_var("GIT_DIR");
-        std::env::remove_var("GIT_WORK_TREE");
-    }
-
-    let scratch_head = result.expect("fixture_git must work under a hostile GIT_DIR");
+    // Reproduce the hostile condition in a child test process. Environment
+    // variables configured on Command affect only the child, so sibling tests
+    // in this process cannot observe GIT_DIR while they run raw Git commands.
+    let head_out = scratch.join("child-head.txt");
+    let child = Command::new(std::env::current_exe().expect("current test binary"))
+        .arg("--exact")
+        .arg("fixture_git_ignores_inherited_git_dir_pointing_at_another_repo")
+        .arg("--test-threads=1")
+        .env(HOSTILE_ENV_CHILD, "1")
+        .env(HOSTILE_ENV_SCRATCH, &scratch)
+        .env(HOSTILE_ENV_HEAD_OUT, &head_out)
+        .env("GIT_DIR", decoy.join(".git"))
+        .env("GIT_WORK_TREE", &decoy)
+        .env("GIT_INDEX_FILE", decoy.join(".git/index"))
+        .output()
+        .expect("launch hostile-environment child test");
+    assert!(
+        child.status.success(),
+        "fixture_git must work under a hostile Git environment; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let scratch_head = fs::read_to_string(&head_out)
+        .expect("read child HEAD output")
+        .trim()
+        .to_string();
 
     // The decoy must be untouched: no config write, and no new commit.
     assert_eq!(
