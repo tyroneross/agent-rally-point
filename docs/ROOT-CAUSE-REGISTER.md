@@ -1853,7 +1853,70 @@ D6 are below.
   of nothing.
 
 ### RC-058 — the write path re-reads the whole ledger about five times per append, and it lands before the read path does (D10)
-- **State:** `mechanism`, measured against this ledger. **NOT fixed.**
+- **State:** ⚠️ `mitigated` 2026-08-05, **NOT fixed.** The reaper COMPLETES now; the per-append cost
+  is 27% lower and still dominates. Read "What is mitigated" and "What is not" as one statement.
+- **The consequence that forced the issue.** `rally doctor --reap-stale --apply` was unusable:
+  3 of 3 attempts against this repo's room returned `watchdog-timeout-uncommitted-mutation`, and 63
+  lease-expired claims had been unreclaimable since 2026-08-03. The cleanup that would shrink the
+  working set was blocked by the size of the working set.
+- **Measured, synthetic ledger sized like this repo's own (6,563 facts, 63 expired claims):**
+
+  | state | full drain | per verified append |
+  |---|---|---|
+  | before | 40.6 s | ~645 ms |
+  | after the three cost cuts | 29.5 s | ~470 ms |
+  | after the pass budget | 15 passes, every one ≤ 2.5 s, 0 watchdog failures | unchanged |
+
+- **What is mitigated — three cost cuts, each independently justified.**
+  1. **The segment fold is memoized** on the fingerprint the reconcile sidecar already trusts
+     (`(name, len, mtime_ns)` per file). It removes no fold; it makes the REPEATS free. Within one
+     append the room mutation lock is held, so the post-write folds collapse to one parse.
+  2. **The two tail reads are now O(1) in decoding, as their comments always claimed.**
+     `last_seq_in_segment` and `segment_event_id_present_tail_first` both called
+     `read_segment_entries(..)` — which parses every line — and only then took `.last()` or
+     `.rev()`. This entry already recorded that false O(1) claim and corrected the prose; the code
+     now matches it. One deliberate widening: corruption further back in a segment is no longer
+     raised by a caller that finds what it wants in the tail. Every full fold still raises it on the
+     next read.
+  3. **`append_state_transition_verified` takes its projections only where it reads them.** Two
+     unconditional `self.snapshot()` calls — a full ledger load plus the quadratic room projection,
+     each — ran before and after every write. `ClaimExpired` and `Receipt` fall into the match's
+     `_ => {}` arm and used NEITHER. A 63-claim reap therefore computed 126 room projections and
+     discarded all of them. The calls now live inside the `Release` and `Resolve` arms, where
+     they cannot drift away from their use again.
+- **What is NOT fixed, measured after the cuts.** A verified append still makes FOUR full passes
+  over the ledger: `segment_seq_stats` and `read_db_event_stats` (both inside
+  `refresh_reconcile_cache_after_append`, which deliberately re-reads BOTH sides rather than
+  advancing counts, because a lost WAL can leave a sidecar internally consistent while `facts.db`
+  has rewound), `refresh_log_index` (whose fingerprint fast path is defeated by the append it
+  follows), and the claim-index fold. Profiling attributes the time to `serde_json` parsing and
+  `factstr_sqlite::row_to_event_record` — that is, to full decodes, not to the projection's nested
+  scans. `read_db_event_stats` opens a FRESH sqlite pool per call to produce a COUNT, and its own
+  `TODO(perf)` says so. Getting a per-append cost low enough for 63 of them to fit in 3 s means
+  answering that count without decoding every row.
+- **So the pass is BOUNDED rather than cheap.** `--apply` stops appending when a wall-clock budget
+  is spent (`DEFAULT_REAP_APPLY_BUDGET_MS = 2000`, `RALLY_REAP_BUDGET_MS` to override, `0` for the
+  old unbounded behaviour) and reports `remaining`. The clock starts BEFORE the opening projection,
+  not before the loop, because that projection is the same cost the watchdog is measuring. A
+  forward-progress floor always attempts the FIRST eligible item, so a ledger slow enough to exhaust
+  the budget during its own projection still shrinks by one per pass instead of reporting
+  `remaining: N` forever. The reaper is idempotent, so a partial pass is a shorter pass.
+- **This is staging, and it is named as such.** It does not hide the cost — the cost is in the table
+  above and the four remaining passes are enumerated. It makes the tool usable while the cost stays
+  open.
+- **Adversarial control:** `crates/rally-cli/tests/reaper_scale.rs`. A repo-sized ledger drains to
+  zero with NO `--timeout-ms`, so the criterion is the product's own default watchdog rather than a
+  stopwatch that grades the machine. Mutation-validated three ways: setting the budget to 0 fails
+  pass 1 with the exact watchdog error an operator saw; removing the forward-progress floor (with a
+  1 ms budget) fails with `reported 24 remaining but reaped nothing`; and the same 1 ms budget WITH
+  the floor still drains, proving the floor is what carries it. **Tested with the ADJACENT move:**
+  the obvious control is "the pass completes", which a reaper that reaps nothing also satisfies — so
+  the test asserts progress per pass, a total equal to the eligible count, and, independently of
+  the report, that the room holds zero active claims at the end.
+- **What the control does NOT cover.** It does not assert the reaper is fast — only bounded. It is
+  single-process, so RC-057's concurrent-pass question is untouched. And the synthetic ledger is one
+  segment of uniform records; a real ledger has many segments plus a rotated archive, which the fold
+  cost scales with differently.
 - **Mechanism — one verified append performs, in order:**
 
   | step | site | records decoded |

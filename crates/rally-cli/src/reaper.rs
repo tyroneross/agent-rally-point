@@ -104,6 +104,13 @@ pub(crate) struct ReapReport {
     /// still working — the count said "kept on purpose" for something nobody
     /// chose to keep (D7).
     pub(crate) preserved_future_or_active: usize,
+    /// Eligible items this pass did NOT attempt because its wall-clock budget was
+    /// spent. Zero means the pass reached everything it judged eligible.
+    ///
+    /// Non-zero is not an error: run the command again. The reaper is
+    /// idempotent, and each pass starts from a fresh projection.
+    #[serde(default)]
+    pub(crate) remaining: usize,
     /// Items whose durable append FAILED: a `ClaimExpired`, a handoff `Resolve`,
     /// or the lead relinquish that did not reach the ledger.
     ///
@@ -313,6 +320,40 @@ pub(crate) enum ReapMode {
 /// pass is a shorter pass, not a broken one.
 const AUTO_REAP_MAX_FACTS: usize = 200;
 
+/// Wall-clock budget one `--apply` pass may spend appending, in milliseconds.
+///
+/// # Why a budget rather than a bigger timeout
+///
+/// One verified append re-reads the whole ledger four times — `segment_seq_stats`
+/// and `read_db_event_stats` (both inside the post-append sidecar refresh),
+/// `refresh_log_index`, and the claim-index fold — and design audit D10
+/// (RC-058) counts the rest. Measured on a synthetic ledger the size of this
+/// repo's own (6,563 facts, 63 expired claims): 40.6 s before this run's cost
+/// cuts, 29.5 s after. The mutation watchdog allows 3 s by default, so a full
+/// drain COULD NOT COMPLETE, and the cleanup that would shrink the working set
+/// was blocked by the size of the working set.
+///
+/// Raising the timeout to fit would hide that. Instead the pass stops when its
+/// budget is spent and REPORTS what it did not reach, so every invocation
+/// finishes and the operator can see the queue draining. The reaper is
+/// idempotent, so a partial pass is a shorter pass, not a broken one — the same
+/// argument [`AUTO_REAP_MAX_FACTS`] already makes for the automatic path.
+///
+/// The per-append cost is a separate open entry. This makes the tool usable; it
+/// does not make it cheap.
+const DEFAULT_REAP_APPLY_BUDGET_MS: u64 = 2_000;
+
+/// Resolve the apply budget. `RALLY_REAP_BUDGET_MS` raises it for a deliberate
+/// bulk drain (pair it with `--timeout-ms`); `0` disables the budget entirely,
+/// which is the old unbounded behaviour and is available on purpose.
+fn reap_apply_budget() -> Option<std::time::Duration> {
+    let ms = std::env::var("RALLY_REAP_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REAP_APPLY_BUDGET_MS);
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
 /// Inner implementation — takes an explicit `&RoomStore` so tests can inject a
 /// temp store without touching the process-global cwd.
 pub(crate) fn run_reap_stale_in_room(room: &RoomStore, apply: bool) -> Result<ReapReport> {
@@ -324,12 +365,21 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
     apply: bool,
     mode: ReapMode,
 ) -> Result<ReapReport> {
+    // The clock starts BEFORE the projection, not before the append loop. The
+    // opening `snapshot()` is a full ledger read and is the same cost the
+    // watchdog is measuring; a budget that ignored it would be a budget for the
+    // cheap half of the pass.
+    let started = std::time::Instant::now();
     let snapshot = room.snapshot()?;
     let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
 
     let mut claims_reaped: Vec<ReapedClaim> = Vec::new();
     let mut preserved: usize = 0;
     let mut write_failures: usize = 0;
+    let mut remaining: usize = 0;
+    // Only a writing pass needs a budget: a dry run appends nothing and is one
+    // projection, so bounding it would only make the preview lie.
+    let budget = apply.then(reap_apply_budget).flatten();
 
     // Identify the stale-owner set at snapshot time (squad-level, 2h bar).
     // Used for the lead relinquish decision; claim eligibility is per-claim
@@ -373,6 +423,15 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
         }
         if mode == ReapMode::LeaseOnly && claims_reaped.len() >= AUTO_REAP_MAX_FACTS {
             preserved += 1;
+            continue;
+        }
+        // Guaranteed forward progress: the FIRST eligible item is always
+        // attempted, even when the opening projection already spent the budget.
+        // Without this floor a ledger slow enough to exhaust the budget before
+        // the loop starts would return `remaining: N` forever and never shrink,
+        // which is the failure this budget exists to end.
+        if !claims_reaped.is_empty() && budget.is_some_and(|b| started.elapsed() >= b) {
+            remaining += 1;
             continue;
         }
 
@@ -487,6 +546,10 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
             let age_secs = (now - created).num_seconds();
             if age_secs < handoff_ttl_secs {
                 preserved += 1;
+                continue;
+            }
+            if budget.is_some_and(|b| started.elapsed() >= b) {
+                remaining += 1;
                 continue;
             }
 
@@ -623,6 +686,7 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
         squads_idle_cleared,
         lead_relinquished,
         preserved_future_or_active: preserved,
+        remaining,
         write_failures,
         applied: apply && write_failures == 0,
     })

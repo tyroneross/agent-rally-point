@@ -3119,12 +3119,19 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
         // did not hold. The failure count is the thing to fail on, not the
         // presence of the `--apply` flag.
         let write_failures = data.write_failures;
+        let remaining = data.remaining;
         let text = format!(
-            "doctor reap-stale: claims_reaped={} lead_relinquished={} write_failures={} applied={}",
+            "doctor reap-stale: claims_reaped={} lead_relinquished={} remaining={} write_failures={} applied={}{}",
             data.claims_reaped.len(),
             data.lead_relinquished.is_some(),
+            remaining,
             write_failures,
             data.applied,
+            if remaining > 0 {
+                " — budget spent; run again to continue"
+            } else {
+                ""
+            },
         );
         let mut body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
         if write_failures > 0 {

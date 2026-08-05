@@ -32,6 +32,33 @@ All notable changes to Agent Rally Point are documented here.
   command answers `ok: false` at exit 1 while still printing the full report.
   Closes the second half of RC-056.
 
+### Fixed — the stale-state reaper finishes
+
+- **`rally doctor --reap-stale --apply` completes on a real ledger.** It could
+  not: 3 of 3 attempts against this repo's room returned
+  `watchdog-timeout-uncommitted-mutation`, and 63 lease-expired claims had been
+  unreclaimable since 2026-08-03 — the cleanup that would shrink the working set
+  was blocked by the size of the working set. Measured on a synthetic ledger the
+  same size (6,563 facts, 63 expired claims), a full drain took **40.6 s** against
+  a 3 s watchdog.
+
+  Three cost cuts took it to **29.5 s**: the segment fold is memoized on the
+  fingerprint the reconcile sidecar already trusts; `last_seq_in_segment` and the
+  post-append readback stop parsing a whole segment to look at its tail (both
+  already documented themselves as O(1)); and
+  `append_state_transition_verified` takes its before/after room projections
+  only inside the `Release` and `Resolve` arms that read them — `ClaimExpired`
+  computed two full projections per claim and used neither, so a 63-claim reap
+  built and discarded 126 of them.
+
+  That is not enough to fit 63 appends in 3 s, so the pass is **bounded** rather
+  than cheap: `--apply` stops when its wall-clock budget is spent and reports
+  `remaining`, and the operator runs it again. Measured: 15 passes, every one
+  under 2.5 s, zero watchdog failures, room drained to zero active claims.
+  `RALLY_REAP_BUDGET_MS` raises the budget for a deliberate bulk drain; `0`
+  restores the old unbounded pass. **The remaining cost is not hidden** — four
+  full ledger reads per verified append are enumerated and still open as RC-058.
+
 ### Changed — one demotion contract instead of three
 
 - **Relevance demotes an author that has gone quiet, and now says so

@@ -2169,9 +2169,18 @@ impl DirectRoomStore {
         })?;
 
         // Assert the target is live BEFORE writing.
-        let snapshot_before = self.snapshot()?;
+        //
+        // The projection is taken INSIDE each arm that reads it, not once above
+        // the match. It used to be unconditional, so `ClaimExpired` and `Receipt`
+        // — whose arms are `_ => {}` — each paid a full `facts()` load plus the
+        // quadratic room projection TWICE per fact and used neither. That is
+        // what made the reaper unusable: 63 expired claims meant 126 discarded
+        // projections, and the pass could not finish inside the mutation
+        // watchdog. Keeping the call at its use site makes the two impossible to
+        // drift apart again (RC-058/RC-042).
         match fact.kind {
             FactKind::Release => {
+                let snapshot_before = self.snapshot()?;
                 // A release must reference an active claim (or resolve any fact by
                 // event_id).  We check the broader "is this event_id currently
                 // un-released" by looking at active_claims.
@@ -2191,6 +2200,7 @@ impl DirectRoomStore {
                 // were how `Receipt` and `ClaimExpired` ended up ungated.
             }
             FactKind::Resolve => {
+                let snapshot_before = self.snapshot()?;
                 // Resolve must reference a live blocker, risk, handoff, claim,
                 // or an unconsumed artifact.  Artifacts are consumed by resolve
                 // (via the `consumed_refs` projection) which drops them from
@@ -2251,10 +2261,11 @@ impl DirectRoomStore {
         // Write + canonical readback.
         let appended = self.append_fact_verified(fact)?;
 
-        // Assert the projected status flipped.
-        let snapshot_after = self.snapshot()?;
+        // Assert the projected status flipped. Same rule as above: taken inside
+        // the arms that read it.
         match fact.kind {
             FactKind::Release => {
+                let snapshot_after = self.snapshot()?;
                 let still_active = snapshot_after
                     .active_claims
                     .iter()
@@ -2266,6 +2277,7 @@ impl DirectRoomStore {
                 }
             }
             FactKind::Resolve => {
+                let snapshot_after = self.snapshot()?;
                 let still_active = snapshot_after
                     .active_blockers
                     .iter()
@@ -2764,9 +2776,76 @@ fn facts_from_db_with_query_recovery(
     }
 }
 
+/// Process-local memo for [`facts_from_segments`], keyed on the segment
+/// fingerprint the reconcile sidecar already uses.
+///
+/// # Why this exists
+///
+/// One verified append folds the whole segment set about five times: the
+/// breadth/conflict check before the write, then `segment_seq_stats`,
+/// `refresh_log_index` and the claim-index rebuild after it, plus up to two
+/// conditional revival guards (design audit D10 / RC-058). Every one of those
+/// folds is individually justified and none of them knows about the others, so
+/// the cost is only visible by counting along one call — which is why review
+/// never found it and why a reap of 63 expired claims took 40 seconds against a
+/// 6,500-fact ledger while the mutation watchdog allows 3.
+///
+/// The memo does not remove a single fold; it makes the repeats free. Within one
+/// append the room mutation lock is held, so nothing can change underneath the
+/// post-write folds and they collapse to one parse. Across appends the first
+/// fold after each write re-parses and the rest hit.
+///
+/// # Why the fingerprint is trusted
+///
+/// `(name, len, mtime_ns)` per file, the SAME signal
+/// `refresh_reconcile_cache_after_full_scan` already trusts, and for the same
+/// reason: JSONL segments are append-only, so any content change also changes
+/// `len`. The one documented exception is `seed_segment_from_db`, which
+/// `truncate`s and rewrites — both of its call sites fire only when there are NO
+/// segments at all, so the fingerprint goes from empty to non-empty and the memo
+/// misses anyway. They also call [`invalidate_segment_fold_memo`] explicitly,
+/// because relying on that argument silently is how the next same-length rewrite
+/// path would break this.
+///
+/// # What this does NOT do
+///
+/// It does not make the fold cheaper, it does not survive the process, and it
+/// does not help a cold single-command invocation, which still folds once per
+/// distinct segment state. RC-058's other costs — `read_db_event_stats`
+/// deserializing every row to produce a count, `last_seq_in_segment` parsing a
+/// whole segment to take its last line — are untouched and stay open.
+static SEGMENT_FOLD_MEMO: std::sync::Mutex<Option<SegmentFoldMemo>> = std::sync::Mutex::new(None);
+
+struct SegmentFoldMemo {
+    log_dir: PathBuf,
+    archive_dir: PathBuf,
+    fingerprint: Vec<FileFingerprint>,
+    facts: std::sync::Arc<Vec<Fact>>,
+}
+
+/// Forget the memo. Call from any path that rewrites a segment file without
+/// changing its length.
+fn invalidate_segment_fold_memo() {
+    if let Ok(mut memo) = SEGMENT_FOLD_MEMO.lock() {
+        *memo = None;
+    }
+}
+
 fn facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> {
     let live = read_segment_files(log_dir)?;
     let archived = replay_archive_segments(archive_dir)?;
+    let fingerprint = segments_fingerprint(&live, &archived);
+
+    // A poisoned lock is not a reason to fail a read: fall through and fold.
+    if let Ok(memo) = SEGMENT_FOLD_MEMO.lock()
+        && let Some(memo) = memo.as_ref()
+        && memo.log_dir == log_dir
+        && memo.archive_dir == archive_dir
+        && memo.fingerprint == fingerprint
+    {
+        return Ok((*memo.facts).clone());
+    }
+
     let mut entries: Vec<LedgerLine> = Vec::new();
     for path in live.iter().chain(archived.iter()) {
         entries.extend(read_segment_entries(path)?);
@@ -2779,6 +2858,15 @@ fn facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> 
             continue;
         }
         facts.push(Fact::from_value(entry.payload, entry.seq)?);
+    }
+
+    if let Ok(mut memo) = SEGMENT_FOLD_MEMO.lock() {
+        *memo = Some(SegmentFoldMemo {
+            log_dir: log_dir.to_path_buf(),
+            archive_dir: archive_dir.to_path_buf(),
+            fingerprint,
+            facts: std::sync::Arc::new(facts.clone()),
+        });
     }
     Ok(facts)
 }
@@ -4392,6 +4480,7 @@ fn seed_segments_from_db_if_absent(
     let db_stats = read_db_event_stats(facts_db_path)?;
     if db_stats.count > 0 {
         seed_segment_from_db(log_dir, facts_db_path)?;
+        invalidate_segment_fold_memo();
         refresh_reconcile_cache_after_full_scan(log_dir, archive_dir, facts_db_path, db_stats);
         return Ok(());
     }
@@ -4491,6 +4580,7 @@ fn reconcile_segments_and_db(
         // No segments yet but the db has events: first-run upgrade from a
         // pre-segment install. Seed a segment so the canonical record exists.
         seed_segment_from_db(log_dir, facts_db_path)?;
+        invalidate_segment_fold_memo();
         // State just changed; let the next op re-fingerprint. Drop the sidecar.
         if let Some(p) = reconcile_cache_path(facts_db_path) {
             let _ = fs::remove_file(p);
@@ -4687,15 +4777,80 @@ fn segment_event_id_present<'a>(
 /// the caller falls through to the authoritative full live+archive scan. A
 /// `true` here is a genuine presence (we matched the exact `event_id`).
 fn segment_event_id_present_tail_first(path: &Path, event_id: &str) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    for entry in read_segment_entries(path)?.into_iter().rev() {
-        if entry.payload.get("event_id").and_then(|v| v.as_str()) == Some(event_id) {
-            return Ok(true);
+    Ok(visit_segment_entries_newest_first(path, |entry| {
+        (entry.payload.get("event_id").and_then(|v| v.as_str()) == Some(event_id)).then_some(())
+    })?
+    .is_some())
+}
+
+/// Parse a segment's lines NEWEST FIRST, stopping as soon as `visit` returns
+/// `Some`.
+///
+/// # Why not `read_segment_entries(..).into_iter().rev()`
+///
+/// That parses every line into a `Vec` and only then reverses it, so the number
+/// of COMPARISONS is O(1) on the happy path but the PARSE is unconditional. Both
+/// the readback gate and the seq dup gate ran on every append and were described
+/// in their own comments as O(1) while costing a full segment parse each — two
+/// of the ten folds design audit D10 counted (RC-058). Reading the file is still
+/// O(file); decoding is now O(lines actually examined), which for both callers is
+/// one.
+///
+/// # The torn-tail rule, preserved
+///
+/// A final line with no terminating newline that fails to parse is a crash
+/// artifact, not corruption, and is skipped — same verdict the forward reader
+/// reaches by breaking out of its loop. Any other parse failure is corruption and
+/// is loud.
+///
+/// # One deliberate widening
+///
+/// The forward reader parses every line, so it raises corruption anywhere in the
+/// segment even when the caller only wanted the tail. This visitor raises it only
+/// for lines it actually reaches. A caller that finds what it wants in the tail
+/// therefore no longer notices corruption further back — which every full fold
+/// (`facts_from_segments`, `segment_seq_stats`, `refresh_log_index`) still does,
+/// on the very next read.
+fn visit_segment_entries_newest_first<T>(
+    path: &Path,
+    mut visit: impl FnMut(LedgerLine) -> Option<T>,
+) -> Result<Option<T>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        // Same benign-race tolerance as `read_segment_entries`: a listed segment
+        // can be rotated away before it is opened.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            let ctx = format!("read canonical segment {}", path.display());
+            return Err(RallyError::io(ctx)(err));
+        }
+    };
+    let ends_with_newline = text.ends_with('\n');
+    let lines: Vec<&str> = text.lines().collect();
+    let last_index = lines.len().saturating_sub(1);
+    for (index, raw) in lines.iter().enumerate().rev() {
+        let line = raw.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<LedgerLine>(line) {
+            Ok(entry) => {
+                if let Some(found) = visit(entry) {
+                    return Ok(Some(found));
+                }
+            }
+            Err(_) if index == last_index && !ends_with_newline => continue,
+            Err(err) => {
+                return Err(RallyError::Message(format!(
+                    "completed canonical segment corruption in {} at line {}: {}",
+                    path.display(),
+                    index + 1,
+                    err
+                )));
+            }
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// Raw count of non-empty lines across the given segment files. Test-only:
@@ -4777,12 +4932,7 @@ fn next_canonical_seq(log_dir: &Path, archive_dir: &Path, facts_db_path: &Path) 
 /// typically small) active segment; scans from the end for the last non-empty
 /// line.
 fn last_seq_in_segment(segment_path: &Path) -> Result<Option<i64>> {
-    if !segment_path.exists() {
-        return Ok(None);
-    }
-    Ok(read_segment_entries(segment_path)?
-        .last()
-        .map(|entry| entry.seq))
+    visit_segment_entries_newest_first(segment_path, |entry| Some(entry.seq))
 }
 
 /// Events currently held by the derived sqlite cache. Compared against
