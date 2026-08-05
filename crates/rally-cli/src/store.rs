@@ -2035,12 +2035,12 @@ impl DirectRoomStore {
             loop {
                 match fact_store.append(vec![NewEvent::new(event_type.clone(), payload.clone())]) {
                     Ok(r) => break r,
-                    Err(err) if is_db_locked(&err) => {
+                    Err(err) if is_transient_store_contention(&err) => {
                         let Some(backoff) = budget.next_backoff() else {
                             return Err(RallyError::Message(format!(
                                 "append fact: retry budget exhausted after {} attempts \
                                  within this command's watchdog budget while the \
-                                 database stayed locked ({err}). The fact was NOT \
+                                 store stayed contended ({err}). The fact was NOT \
                                  written. `rally doctor --reap-stale` lists holders; \
                                  `--timeout-ms` raises this command's budget.",
                                 budget.attempts(),
@@ -4035,14 +4035,15 @@ fn open_fact_store(path: &Path) -> Result<SqliteStore> {
     loop {
         match SqliteStore::open_with_busy_timeout(path, budgets.busy_timeout) {
             Ok(store) => return Ok(store),
-            Err(err) if is_bootstrap_metadata_race(&err) || is_db_locked(&err) => {
+            Err(err) if is_bootstrap_metadata_race(&err) || is_transient_store_contention(&err) => {
                 let Some(backoff) = budget.next_backoff() else {
                     // Budget spent — say that, rather than asserting a
                     // contender nobody observed.
                     return Err(RallyError::Message(format!(
                         "open fact store: retry budget exhausted after {} attempts \
                          within this command's watchdog budget while the database \
-                         stayed locked ({err}). Something is holding {}; \
+                         stayed contended ({err}). Something is holding or \
+                         saturating {}; \
                          `rally doctor --reap-stale` lists holders and stale \
                          presence, and `--timeout-ms` raises this command's budget.",
                         budget.attempts(),
@@ -4075,6 +4076,30 @@ fn is_bootstrap_metadata_race(err: &impl std::fmt::Display) -> bool {
 fn is_db_locked(err: &impl std::fmt::Display) -> bool {
     let msg = err.to_string();
     msg.contains("database is locked") || msg.contains("code: 5")
+}
+
+fn is_transient_store_contention(err: &impl std::fmt::Display) -> bool {
+    let msg = err.to_string();
+    is_db_locked(err) || msg.contains("pool timed out while waiting for an open connection")
+}
+
+#[cfg(test)]
+mod store_contention_tests {
+    use super::*;
+
+    #[test]
+    fn pool_checkout_timeout_is_retryable_contention() {
+        assert!(is_transient_store_contention(
+            &"sqlx backend failure: pool timed out while waiting for an open connection"
+        ));
+    }
+
+    #[test]
+    fn unrelated_store_failure_is_not_retryable_contention() {
+        assert!(!is_transient_store_contention(
+            &"sqlx backend failure: invalid database URL"
+        ));
+    }
 }
 
 // =============================================================================

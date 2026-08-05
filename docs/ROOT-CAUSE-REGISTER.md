@@ -1603,7 +1603,9 @@ review answers the question you asked.
     had sixteen. Caught by independent audit before landing.
   - The sqlx pool `acquire_timeout` now uses one quarter of the caller-supplied SQLite blocking
     budget (`vendor/factstr-sqlite/src/connection.rs::open_pool`), closing the remaining pool-wait
-    boundary rather than leaving a library default outside the watchdog arithmetic.
+    boundary rather than leaving a library default outside the watchdog arithmetic. Both pool
+    checkout timeouts and `SQLITE_BUSY` feed the same deadline-derived retry loop, so transient
+    pool saturation no longer converts a bounded attempt into an immediate command failure.
 - **The correction that matters more than the fix.** This was reported as "a stale or zero-length
   `facts.db-wal`/`-shm` pair makes SQLite report busy/locked on open". **It does not.** Measured
   against both the 0.1.7 and 0.2.0 binaries: zero-length WAL 0.061s, garbage non-empty WAL 0.073s,

@@ -108,7 +108,9 @@ All notable changes to Agent Rally Point are documented here.
   they are not independent: a loop stops *starting* attempts at its deadline, so
   an attempt begun just inside it still blocks a full `busy_timeout` past it.
   Pool acquisition is a separate wait capped at one quarter of that SQLite
-  budget, and the invariant counts both waits for both retry loops.
+  budget, and the invariant counts both waits for both retry loops. A saturated
+  pool now consumes the same deadline-derived retry budget as `SQLITE_BUSY`
+  instead of failing the command on its first checkout timeout.
   An invariant test walks every watchdog setting from the 100ms floor to
   `inject`'s 605s ceiling and asserts the composed worst case — both loops plus
   both blocking overshoots — with an eighth of the budget left over.
