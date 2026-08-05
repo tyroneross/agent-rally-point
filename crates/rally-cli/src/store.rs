@@ -6020,12 +6020,19 @@ mod ledger_tests {
             f.sync_all().unwrap();
         }
 
-        // Sanity: the corrupted db cannot be opened directly. SQLite's first
-        // act on open is to validate the magic header; a wrong header is
-        // detected before any page is read, so this is parallel-test-safe.
+        // Sanity: the corrupted db must fail either while opening or on the
+        // first real page traversal. SQLite may defer page-1 validation until
+        // the query when the pool/bootstrap path opens lazily.
+        let malformed_error = match open_fact_store(&facts_db) {
+            Ok(store) => store
+                .query(&FactQuery::all())
+                .expect_err("precondition: page-1 read must expose the corrupt header")
+                .to_string(),
+            Err(err) => err.to_string(),
+        };
         assert!(
-            open_fact_store(&facts_db).is_err(),
-            "precondition: corruption is visible to sqlite"
+            is_malformed_db_error(&malformed_error),
+            "precondition: corruption must classify as malformed; got {malformed_error}"
         );
 
         // Reopen the room. This is the failure path before the fix; with the
