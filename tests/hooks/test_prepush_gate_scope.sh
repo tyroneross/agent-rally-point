@@ -29,8 +29,8 @@
 #      Each host test writes a marker file; a marker's ABSENCE is the proof
 #      that the file never executed.
 #   2. Drives the REAL .githooks/pre-push against a second fixture with
-#      trivial stubs for the two gate scripts (not the real cargo gate, which
-#      would make this suite as slow as a full build).
+#      trivial stubs for the quality, release-parity, and identity gates (not
+#      the real policy/build gates, which would obscure this plumbing oracle).
 #
 # Named test_prepush_* on purpose: check-release-parity.sh skips that prefix
 # to avoid recursing into itself (see its host-test loop), so this suite runs
@@ -330,6 +330,15 @@ cp "$PARSER" "$H/scripts/prepush-ref-updates.sh"
 cp "$PREPUSH_HOOK" "$H/.githooks/pre-push"
 chmod +x "$H/scripts/prepush-ref-updates.sh" "$H/.githooks/pre-push"
 
+# Identity policy is outside this suite's pin-plumbing scope. The real hook
+# still has to resolve and invoke its mandatory dependency before either
+# downstream gate can expose the pin value, so provide a neutral executable
+# stub instead of letting a missing fixture file short-circuit every case.
+cat > "$H/scripts/check-git-identity.sh" <<'STUB'
+#!/bin/sh
+exit 0
+STUB
+
 cat > "$H/scripts/run-quality-gate.sh" <<'STUB'
 #!/bin/sh
 exit 0
@@ -341,7 +350,7 @@ cat > "$H/scripts/check-release-parity.sh" <<STUB
 printf '%s\n' "\${RALLY_PREPUSH_PIN_COMMIT:-<unset>}" >> "$PIN_ECHO"
 exit 0
 STUB
-chmod +x "$H/scripts/run-quality-gate.sh" "$H/scripts/check-release-parity.sh"
+chmod +x "$H/scripts/check-git-identity.sh" "$H/scripts/run-quality-gate.sh" "$H/scripts/check-release-parity.sh"
 
 echo "base" > "$H/README.md"
 git -C "$H" add -A

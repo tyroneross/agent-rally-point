@@ -72,6 +72,15 @@ chmod +x "$FIXTURE/scripts/prepush-ref-updates.sh"
 cp "$PREPUSH_HOOK" "$FIXTURE/.githooks/pre-push"
 chmod +x "$FIXTURE/.githooks/pre-push"
 
+# Identity policy has its own adversarial suite. Preserve the real hook's
+# mandatory dependency here with a neutral executable stub so this fixture
+# continues to isolate pinned-gate selection and malicious-script refusal.
+cat > "$FIXTURE/scripts/check-git-identity.sh" <<'STUB'
+#!/bin/sh
+exit 0
+STUB
+chmod +x "$FIXTURE/scripts/check-git-identity.sh"
+
 # Trivial honest stub gate — records the SHA it ran against, like
 # test_prepush_changed_files.sh's stub. This is the TRUSTED version that
 # will be committed on `main` and pinned.

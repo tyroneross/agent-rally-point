@@ -109,7 +109,7 @@ out=$(printf 'refs/heads/a abc123 refs/heads/a %s\n' "$ZERO" | "$PARSER")
 
 # ===========================================================================
 # Layer 2: end-to-end — real .githooks/pre-push against a fixture git repo,
-# with a trivial stubbed scripts/run-quality-gate.sh.
+# with trivial stubs for the quality, release-parity, and identity gates.
 # ===========================================================================
 
 # Some machines have a `.rally/` marker walkable from the default mktemp
@@ -136,6 +136,18 @@ cp "$PARSER" "$FIXTURE/scripts/prepush-ref-updates.sh"
 chmod +x "$FIXTURE/scripts/prepush-ref-updates.sh"
 cp "$PREPUSH_HOOK" "$FIXTURE/.githooks/pre-push"
 chmod +x "$FIXTURE/.githooks/pre-push"
+
+# The real hook resolves and executes the identity gate before it creates a
+# detached worktree. This suite exercises ref-update routing rather than
+# identity policy, so provide the dependency explicitly and keep it neutral.
+# Omitting this stub makes every non-deletion case fail before either marker
+# gate runs, which is exactly what CI should catch when the hook gains a new
+# mandatory dependency.
+cat > "$FIXTURE/scripts/check-git-identity.sh" <<'STUB'
+#!/bin/sh
+exit 0
+STUB
+chmod +x "$FIXTURE/scripts/check-git-identity.sh"
 
 # Trivial stub gate — NOT the real cargo gate (that would make this suite as
 # slow as a full build). Records the SHA it was run against (via
