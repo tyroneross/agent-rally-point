@@ -754,12 +754,21 @@ fn forged_trust_label_is_scrubbed() {
 #[test]
 fn oversized_field_cannot_bury_later_sections() {
     let ws = Workspace::new("volume");
-    let flood = "A".repeat(200_000);
+    let cli_flood = "A".repeat(8_192);
+    let ledger_flood = "A".repeat(200_000);
 
     // OUTER BOUNDARY: ARP-R-04 bounds `subject` at 4,096 bytes at the write
-    // boundary, measured against a real ledger (max observed 2,264). A 200 KB
-    // subject no longer reaches the ledger through the CLI at all.
-    let err = ws.say_refused(&["say", "decision", "--tool", "atk:01", "--subject", &flood]);
+    // boundary, measured against a real ledger (max observed 2,264). An 8 KB
+    // subject is large enough to prove rejection without exceeding a host OS's
+    // single-argument limit before rally can inspect it.
+    let err = ws.say_refused(&[
+        "say",
+        "decision",
+        "--tool",
+        "atk:01",
+        "--subject",
+        &cli_flood,
+    ]);
     assert!(
         err.contains("write-boundary bound"),
         "the refusal must name the bound: {err}"
@@ -771,7 +780,7 @@ fn oversized_field_cannot_bury_later_sections() {
     ws.append_raw_fact(
         1,
         "decision",
-        serde_json::json!({ "tool": "atk:01", "subject": flood }),
+        serde_json::json!({ "tool": "atk:01", "subject": ledger_flood }),
     );
     ws.append_raw_fact(
         2,
