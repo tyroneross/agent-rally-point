@@ -31,3 +31,14 @@ thiserror.workspace = true
 # dependencies (the H4 architectural lint asserts rally-cli does not depend
 # on `ptyd` either directly or transitively).
 rally-protocol = { version = "0.1.0", path = "../rally-protocol" }
+
+[dev-dependencies]
+# TEST-ONLY. `retry_budget_watchdog.rs` needs to hold a GENUINE SQLite write
+# lock on facts.db while `rally` tries to mutate it — the only way to exercise
+# the retry paths for real rather than simulating them behind a seam. `bundled`
+# compiles SQLite from source so the control does not depend on a host sqlite3
+# binary being installed (it is not present on every CI image).
+#
+# Dev-only: it is absent from the shipped `rally` binary's dependency graph, so
+# the H4 architectural lint above is unaffected.
+rusqlite.workspace = true

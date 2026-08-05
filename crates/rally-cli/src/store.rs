@@ -11,6 +11,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::thread;
+#[cfg(test)]
 use std::time::Duration;
 
 /// Filename of the **legacy** monolithic ledger (R1).
@@ -118,6 +119,7 @@ fn retry_jitter_ms() -> u64 {
     // base back-off so it perturbs rather than dominates the schedule.
     hasher.finish() % 23
 }
+use crate::retry_budget::RetryBudget;
 use crate::{
     FACT_SCHEMA, claim_authority, normalize_paths, now_string, path_matches_scope, repo_root,
     short_id,
@@ -2019,15 +2021,32 @@ impl DirectRoomStore {
         let payload = serde_json::to_value(&fact).map_err(RallyError::json("render fact"))?;
         // The room lock serializes Rally writers; keep a short retry for
         // transient SQLite lock errors from readers or older Rally binaries.
+        //
+        // Budgeted against what the watchdog has LEFT, so this loop and the
+        // `open_fact_store` loop that already ran cannot jointly outlast it
+        // (they used to: 2040ms + 2720ms against 3000ms). Because each takes a
+        // fraction of the REMAINDER, the two compose without knowing about each
+        // other — see `crate::retry_budget`.
         let result = {
-            let jitter = retry_jitter_ms();
-            let mut attempts = 0;
+            let mut budget = RetryBudget::new(
+                crate::retry_budget::budgets_for(crate::watchdog_remaining()).retry,
+                retry_jitter_ms(),
+            );
             loop {
                 match fact_store.append(vec![NewEvent::new(event_type.clone(), payload.clone())]) {
                     Ok(r) => break r,
-                    Err(err) if attempts < 16 && is_db_locked(&err) => {
-                        attempts += 1;
-                        thread::sleep(Duration::from_millis(15 * attempts + jitter));
+                    Err(err) if is_db_locked(&err) => {
+                        let Some(backoff) = budget.next_backoff() else {
+                            return Err(RallyError::Message(format!(
+                                "append fact: retry budget exhausted after {} attempts \
+                                 within this command's watchdog budget while the \
+                                 database stayed locked ({err}). The fact was NOT \
+                                 written. `rally doctor --reap-stale` lists holders; \
+                                 `--timeout-ms` raises this command's budget.",
+                                budget.attempts(),
+                            )));
+                        };
+                        thread::sleep(backoff);
                     }
                     Err(err) => return Err(RallyError::Message(format!("append fact: {err}"))),
                 }
@@ -3978,16 +3997,46 @@ fn open_fact_store(path: &Path) -> Result<SqliteStore> {
     // Per-retrier jitter (pid + thread id + process-global salt) de-synchronizes
     // concurrent retriers across BOTH threads and processes — the thundering-herd
     // cure; budget raised for write-burst tolerance (B-write-burst-scale).
-    let jitter = retry_jitter_ms();
-    let mut attempts = 0;
+    //
+    // BOTH budgets below are derived from this command's watchdog deadline
+    // rather than chosen independently of it. Before 2026-08-05 this loop ran
+    // `20ms * attempt` for 16 attempts (2720ms) and the append loop another
+    // 2040ms against a 3000ms watchdog, while SQLite's own busy timeout sat at
+    // 5s — so a contended mutation was killed by the watchdog every time and
+    // this loop never executed an iteration. See `crate::retry_budget`.
+    // `Option`, deliberately: `None` means no watchdog is armed (daemon serve),
+    // which is a different question from "how much is left".
+    // One call returns BOTH budgets because they are not independent: a loop
+    // stops STARTING attempts at its deadline, so an attempt begun just inside
+    // it still blocks a full busy_timeout past it. `None` means no watchdog is
+    // armed (daemon serve) — a different question from "how much is left".
+    let budgets = crate::retry_budget::budgets_for(crate::watchdog_remaining());
+    if budgets.busy_timeout.is_zero() {
+        return Err(RallyError::Message(
+            "open fact store: no watchdog budget remains; the database was not opened".to_string(),
+        ));
+    }
+    // Fixed HERE for the life of the pool: it governs how long SQLite blocks
+    // inside EVERY later call on this handle, the append included.
+    let mut budget = RetryBudget::new(budgets.retry, retry_jitter_ms());
     loop {
-        match SqliteStore::open(path) {
+        match SqliteStore::open_with_busy_timeout(path, budgets.busy_timeout) {
             Ok(store) => return Ok(store),
-            Err(err)
-                if attempts < 16 && (is_bootstrap_metadata_race(&err) || is_db_locked(&err)) =>
-            {
-                attempts += 1;
-                thread::sleep(Duration::from_millis(20 * attempts + jitter));
+            Err(err) if is_bootstrap_metadata_race(&err) || is_db_locked(&err) => {
+                let Some(backoff) = budget.next_backoff() else {
+                    // Budget spent — say that, rather than asserting a
+                    // contender nobody observed.
+                    return Err(RallyError::Message(format!(
+                        "open fact store: retry budget exhausted after {} attempts \
+                         within this command's watchdog budget while the database \
+                         stayed locked ({err}). Something is holding {}; \
+                         `rally doctor --reap-stale` lists holders and stale \
+                         presence, and `--timeout-ms` raises this command's budget.",
+                        budget.attempts(),
+                        path.display(),
+                    )));
+                };
+                thread::sleep(backoff);
             }
             Err(err) => return Err(RallyError::Message(format!("open fact store: {err}"))),
         }
@@ -5590,7 +5639,9 @@ pub(crate) fn write_snapshot_cache_for(repo_root: &Path, snapshot: &RoomSnapshot
 #[cfg(test)]
 mod ledger_tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use rusqlite::Connection;
+    use std::sync::mpsc;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn fact_from_session_id_round_trips_and_defaults_none() {
@@ -5690,6 +5741,60 @@ mod ledger_tests {
             uri: None,
             session: None,
         }
+    }
+
+    /// The process-level contention controls acquire the database lock before
+    /// the command starts, so they necessarily exercise pool-open retries
+    /// first. This control opens and warms the pool BEFORE contention, then
+    /// proves the append loop itself retries after SQLite's first busy wait
+    /// expires. Removing the append retry loop makes this fail.
+    #[test]
+    fn warm_append_retries_after_pool_open_when_holder_releases() {
+        let root = unique_root("warm-append-retry");
+        let _deadline = crate::install_watchdog_deadline(Instant::now() + Duration::from_secs(3));
+        let mut store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("append-retry-control".to_string()),
+        )
+        .unwrap();
+        store.install_warm_fact_store().unwrap();
+
+        let db = root.join(".rally/facts.db");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let conn = Connection::open(db).expect("holder opens facts.db");
+            conn.pragma_update(None, "journal_mode", "WAL").ok();
+            conn.execute_batch("BEGIN EXCLUSIVE")
+                .expect("holder takes EXCLUSIVE");
+            ready_tx.send(()).ok();
+            // The warm pool was opened with <375ms busy_timeout. Holding for
+            // 700ms guarantees the first append returns SQLITE_BUSY, while the
+            // retry budget still has time to land the second attempt.
+            std::thread::sleep(Duration::from_millis(700));
+            conn.execute_batch("ROLLBACK").ok();
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("holder acquired lock before append");
+
+        let started = Instant::now();
+        let appended = store
+            .append_fact(&make_fact(
+                "append-retry",
+                FactKind::Artifact,
+                "retry-control",
+                "land after holder release",
+            ))
+            .expect("append retry must land after the holder releases");
+        assert_eq!(appended.subject, "subject-append-retry");
+        assert!(
+            started.elapsed() >= Duration::from_millis(375),
+            "append completed before the first busy wait; control was vacuous"
+        );
+
+        holder.join().expect("holder thread joins");
+        drop(store);
+        fs::remove_dir_all(root).ok();
     }
 
     fn claim_fact(event_id: &str, tool: &str, scope: &str, lease_expires_at: &str) -> Fact {

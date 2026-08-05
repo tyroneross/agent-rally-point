@@ -752,6 +752,16 @@ mod imp {
 
     #[allow(clippy::too_many_lines)]
     pub(super) fn serve_unix(config: ServeConfig) -> Result<(), ServeError> {
+        // `daemon serve` is a lifetime process, not a bounded command. Both the
+        // CLI dispatcher and standalone rallyd must reach this function with no
+        // watchdog installed; otherwise a short SQLite budget would be derived
+        // from a deadline guaranteed to expire while serving. Enforce that
+        // contract at the real serve entry point, not only in parser tests.
+        if crate::watchdog_remaining().is_some() {
+            return Err(ServeError::new(
+                "daemon serve entered with a command watchdog armed; refusing to start",
+            ));
+        }
         // Reset the process-global flag so a prior signal (or test run) does not
         // pre-empt this serve, then install the signal handlers.
         SHUTDOWN.store(false, Ordering::SeqCst);
@@ -1022,6 +1032,21 @@ mod imp {
                 }
                 other => panic!("v1 request was not rejected: {other:?}"),
             }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn daemon_serve_rejects_an_armed_command_watchdog() {
+            let repo_root = unique_repo_root("armed-watchdog");
+            let _deadline =
+                crate::install_watchdog_deadline(Instant::now() + Duration::from_secs(3));
+            let err = super::serve_unix(ServeConfig {
+                repo_root: repo_root.clone(),
+                idle_exit_secs: Some(1),
+                foreground: true,
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains("watchdog armed"), "{err}");
             std::fs::remove_dir_all(repo_root).ok();
         }
 

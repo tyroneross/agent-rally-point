@@ -86,6 +86,62 @@ All notable changes to Agent Rally Point are documented here.
   prose again. The config key `coordination.relevance.stale_author_factor` is
   unchanged. Registered as RC-066.
 
+### Fixed — a mutation could not finish inside its own timeout
+
+- **Contended writes now fail in 1.66s with a usable error instead of dying at
+  3.0s blaming a contender.** Four timeout budgets governed one mutation and
+  nothing coupled them: SQLite's `busy_timeout` (5000ms, blocking inside a
+  single call), the `open_fact_store` retry loop (2720ms), the append retry loop
+  (2040ms), and the watchdog that had to contain all three (3000ms). The busy
+  timeout is the one that fired — SQLite swallowed the lock error for 5s while
+  the watchdog killed the process at 3s, so **the two retry loops never ran a
+  single iteration.** Measured on an empty scratch repo with no peers, no
+  daemon, hooks off, debug build, against a real `BEGIN EXCLUSIVE` holder:
+  before, exit 4 at 3.040s with `watchdog-timeout-uncommitted-mutation`; after,
+  exit 1 at 1.415s naming the exhausted budget and the path being held.
+  Uncontended writes are unchanged — 0.028s both sides, medians of 10
+  interleaved runs on a quiesced host.
+
+  On the watchdog-armed path all three budgets now derive from the single
+  deadline the watchdog enforces (`crates/rally-cli/src/retry_budget.rs`). One
+  function returns the blocking budget and the retry budget together, because
+  they are not independent: a loop stops *starting* attempts at its deadline, so
+  an attempt begun just inside it still blocks a full `busy_timeout` past it.
+  An invariant test walks every watchdog setting from the 100ms floor to
+  `inject`'s 605s ceiling and asserts the composed worst case — both loops plus
+  both blocking overshoots — with an eighth of the budget left over.
+
+  `rally daemon serve` deliberately runs with no watchdog, so nothing is derived
+  there and it keeps upstream's 5s blocking budget unchanged. Deriving a short
+  deadline from an absent watchdog would be the same defect pointed the other
+  way. The real daemon serve entry point now rejects an accidentally armed
+  watchdog, and sqlx pool acquisition shares the SQLite blocking budget.
+
+  Validated by mutation in three directions: restoring the 5s busy timeout,
+  restoring the independent retry fraction, and stubbing the retry loop to never
+  retry each fail a control. The wall-clock assertions are opt-in behind
+  `RALLY_TIMING_TESTS=1` — they fail on a saturated host for reasons unrelated
+  to the fix — while the shape assertions run unconditionally.
+
+- **The watchdog timeout message says what was observed.** It previously read
+  "retry after contention clears", which asserted a cause nothing had measured
+  and advised an action that re-ran the same arithmetic to the same end. It now
+  reports a wall-clock budget expiry, points at `rally doctor --reap-stale` to
+  find actual holders, and says that retrying unchanged will hit the same
+  budget.
+
+- **Correction to the record:** a stale or zero-length `facts.db-wal`/`-shm`
+  pair does **not** cause SQLite to report busy/locked, and was wrongly named as
+  the trigger. Measured against both the 0.1.7 and 0.2.0 binaries, every variant
+  — zero-length, garbage non-empty, mismatched salt, garbage `-shm` — completes
+  in 0.049–0.073s. A stale WAL is the fingerprint of an abandoned holder, not a
+  cause of contention; the negative result is pinned as a test. Separately, the
+  reaper timeout previously attributed to the quadratic projection cost (design
+  audit D10) was misattributed: `rally doctor --reap-stale` failed 3/3 with a
+  watchdog timeout under contention and completed in 1.43s once uncontended.
+  The projection cost is real and still worth fixing; it is not why the reaper
+  timed out. See RC-067 in `docs/ROOT-CAUSE-REGISTER.md`.
+
 ### Fixed — verdicts that nothing acted on
 
 Rally kept computing correct cleanup decisions and never calling them. Each of

@@ -5,4 +5,5 @@ mod schema;
 mod sqlite_store;
 mod stream_registry;
 
+pub use connection::DEFAULT_BUSY_TIMEOUT;
 pub use sqlite_store::SqliteStore;

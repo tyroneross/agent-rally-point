@@ -1412,6 +1412,7 @@ dependencies = [
  "factstr",
  "factstr-sqlite",
  "rally-protocol",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",

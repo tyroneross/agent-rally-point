@@ -7,6 +7,7 @@ use std::sync::{
     mpsc::{self, Receiver, Sender},
 };
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use factstr::{
     AppendResult, DurableStream, EventQuery, EventRecord, EventStore, EventStoreError, EventStream,
@@ -66,7 +67,38 @@ struct DurableReplayState {
 }
 
 impl SqliteStore {
+    /// Open with upstream's default SQLite busy timeout
+    /// ([`crate::connection::DEFAULT_BUSY_TIMEOUT`], 5s).
+    ///
+    /// Callers running under a deadline SHORTER than 5s must use
+    /// [`SqliteStore::open_with_busy_timeout`] instead — see that method.
     pub fn open(database_path: impl AsRef<Path>) -> Result<Self, sqlx::Error> {
+        Self::open_with_busy_timeout(database_path, crate::connection::DEFAULT_BUSY_TIMEOUT)
+    }
+
+    /// Open with an explicit SQLite busy timeout.
+    ///
+    /// # Why this exists (rally vendor delta, 2026-08-05)
+    ///
+    /// `busy_timeout` is how long SQLite blocks INSIDE a single call while
+    /// waiting for a lock before returning `SQLITE_BUSY`. Upstream hardcodes 5s.
+    /// Rally runs every command under a 3000ms wall-clock watchdog, so with the
+    /// upstream default a contended open blocked for 5s inside sqlx while
+    /// rally's watchdog killed the process at 3s — and rally's own lock-retry
+    /// loops never executed a single iteration, because the error they retry on
+    /// was still being swallowed by SQLite's busy handler.
+    ///
+    /// Measured: `rally say claim` against a genuine `BEGIN EXCLUSIVE` holder
+    /// exited 4 at 3.009–3.049s with `watchdog-timeout-uncommitted-mutation`,
+    /// every time, regardless of rally's retry configuration.
+    ///
+    /// A busy timeout is a deadline like any other. Passing one longer than the
+    /// caller's own deadline makes the caller's timeout unenforceable, so this
+    /// has to be the caller's decision rather than a library constant.
+    pub fn open_with_busy_timeout(
+        database_path: impl AsRef<Path>,
+        busy_timeout: Duration,
+    ) -> Result<Self, sqlx::Error> {
         let database_path = database_path.as_ref().to_path_buf();
         ensure_parent_directory(&database_path).map_err(sqlx_io_error)?;
 
@@ -83,7 +115,7 @@ impl SqliteStore {
 
                 let result = match runtime {
                     Ok(runtime) => runtime.block_on(async {
-                        let pool = open_pool(&bootstrap_path).await?;
+                        let pool = open_pool(&bootstrap_path, busy_timeout).await?;
                         initialize_schema(&pool).await?;
                         Ok::<_, sqlx::Error>(pool)
                     }),

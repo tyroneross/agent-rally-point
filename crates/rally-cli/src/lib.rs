@@ -136,6 +136,7 @@ mod reaper;
 mod relevance;
 mod resource_scope;
 mod retrospective;
+mod retry_budget;
 mod ripple;
 mod rotate;
 mod route_findings;
@@ -200,6 +201,44 @@ const SCHEMA_DAEMON: &str = "agent-rally.command.daemon.v1";
 thread_local! {
     static WATCHDOG_COMMIT_SIGNAL: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
     static WATCHDOG_COMMIT_ARM_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Instant at which this command's watchdog fires.
+    ///
+    /// Installed on the worker thread by [`run_with_watchdog`] so code deep in
+    /// the command path can budget against the SAME deadline the watchdog will
+    /// enforce, instead of guessing with an independent constant. Retry loops
+    /// read it through [`watchdog_remaining`].
+    static WATCHDOG_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+struct WatchdogDeadlineGuard;
+
+impl Drop for WatchdogDeadlineGuard {
+    fn drop(&mut self) {
+        WATCHDOG_DEADLINE.with(|slot| slot.set(None));
+    }
+}
+
+fn install_watchdog_deadline(deadline: Instant) -> WatchdogDeadlineGuard {
+    WATCHDOG_DEADLINE.with(|slot| slot.set(Some(deadline)));
+    WatchdogDeadlineGuard
+}
+
+/// Time left before this command's watchdog fires.
+///
+/// `None` when no watchdog is armed — `daemon serve` (which legitimately blocks
+/// for the daemon's lifetime), the inline fallback path, and in-process tests.
+///
+/// `None` is resolved DIFFERENTLY by each consumer, and the asymmetry is
+/// deliberate (see [`crate::retry_budget::budgets_for`]): the SQLite blocking
+/// budget falls back to upstream's 5s, because inventing a short deadline where
+/// none exists would break `daemon serve`; the retry budget falls back to a
+/// multiple of that, because a loop must stay finite even with no deadline to
+/// answer to. Neither is "unbounded".
+pub(crate) fn watchdog_remaining() -> Option<Duration> {
+    WATCHDOG_DEADLINE.with(|slot| {
+        slot.get()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    })
 }
 
 struct WatchdogCommitSignalGuard;
@@ -518,10 +557,17 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
     let (tx, rx) = std::sync::mpsc::channel::<WatchdogResult>();
     let commit_signal = Arc::new(AtomicBool::new(false));
     let worker_commit_signal = Arc::clone(&commit_signal);
+    // Anchored BEFORE the spawn, so the in-process deadline is always at or
+    // EARLIER than the `recv_timeout` the main thread enforces. The skew is the
+    // thread-spawn latency and it can only shorten the retry budget, never
+    // extend it past the watchdog — the safe direction. Anchoring inside the
+    // worker would invert that and let a loop outlive the watchdog.
+    let deadline = Instant::now() + timeout;
     let worker = thread::Builder::new()
         .name("rally-command".to_string())
         .spawn(move || {
             let _commit_signal_guard = install_watchdog_commit_signal(worker_commit_signal);
+            let _deadline_guard = install_watchdog_deadline(deadline);
             let result = match run_inner_with(&args) {
                 Ok(output) => {
                     let exit_code = output.exit_code;
@@ -773,6 +819,20 @@ fn emit_timeout_fail_closed_before_write(wants_json: bool, timeout: Duration) {
     );
 }
 
+/// Operator guidance for a mutation the watchdog killed before it committed.
+///
+/// The old text said "retry after contention clears", which asserted a cause
+/// nothing had observed. Until 2026-08-05 it was usually WRONG twice over: the
+/// retry schedule (2720ms open + 2040ms append) outlasted the 3000ms watchdog on
+/// its own, so the timeout meant "this command's retry budget was mis-sized",
+/// and retrying re-ran the same arithmetic to the same end. That budget is now
+/// derived from this watchdog (see `crate::retry_budget`), so reaching this
+/// message means the command genuinely ran out of wall-clock — and the honest
+/// advice is to find out what held it, not to assume a contender and wait.
+const WATCHDOG_MUTATION_GUIDANCE: &str = "Rally mutation timed out before the durable append committed; the fact was NOT written. \
+This is a wall-clock budget expiry, not evidence of a contender: run `rally doctor --reap-stale` to list live holders and stale presence, \
+and re-run with `--timeout-ms <n>` if the room is simply large. Retrying unchanged will hit the same budget.";
+
 fn emit_timeout_fail_closed_mutation(wants_json: bool, timeout: Duration) {
     let message = format!(
         "mutating command exceeded {}ms wall-clock budget before its primary durable append committed; failing closed so the caller does not treat a dropped write as success",
@@ -795,7 +855,7 @@ fn emit_timeout_fail_closed_mutation(wants_json: bool, timeout: Duration) {
                     "agent_visible": {
                         "present": true,
                         "severity": "stop",
-                        "message": "Rally mutation timed out before the durable append committed; retry after contention clears."
+                        "message": WATCHDOG_MUTATION_GUIDANCE
                     }
                 }
             }

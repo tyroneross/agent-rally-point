@@ -1547,6 +1547,118 @@ review answers the question you asked.
   `.git/config` at diagnosis, absent from the global config, and unset before this entry was
   written. `1737d9b` is the re-authored unpushed commit.
 
+### RC-067 — three timeout budgets were chosen independently, and the largest one silently voided the other two
+- **State:** `controlled` — the control fails on revert of either element, and the test itself was
+  validated by mutation (both mutations run and both convict; see "Adversarial control").
+- **Symptom:** every mutation that met a held database lock died at almost exactly 3.0s with
+  `watchdog-timeout-uncommitted-mutation`, and the error told the operator to "retry after
+  contention clears" — which retried into the identical arithmetic and failed identically.
+- **Mechanism, cited, and it is three constants rather than the two first reported.** Line numbers
+  pinned at **`4cc36ab`** (pre-fix); symbols named because line numbers drift on every edit:
+
+  | budget | value | where (`@4cc36ab`) |
+  |--------|-------|--------------------|
+  | SQLite `busy_timeout` (blocks INSIDE one call) | **5000ms** | `vendor/factstr-sqlite/src/connection.rs::open_pool` :14 |
+  | `open_fact_store` retry loop, `20ms * attempt` × 16 | 2720ms | `crates/rally-cli/src/store.rs::open_fact_store` :3746 |
+  | append retry loop, `15ms * attempt` × 16 | 2040ms | `crates/rally-cli/src/store.rs::RoomStore::append_fact` :1870 |
+  | **the deadline all three had to fit inside** | **3000ms** | `crates/rally-cli/src/lib.rs::DEFAULT_WATCHDOG_TIMEOUT_MS` :274 |
+
+  Nothing coupled them. The busy timeout is the one that actually fired: SQLite swallowed the lock
+  error inside a single call for up to 5s while the watchdog killed the process at 3s, so **the two
+  retry loops never executed a single iteration.** They were not too slow; they were unreachable.
+  Their own 4760ms combined budget was a second, independent violation waiting behind the first.
+- **Measured, 2026-08-05** — debug build, quiesced host, empty scratch room, no peers, no daemon,
+  hooks off, genuine `BEGIN EXCLUSIVE` holder. Conditions stated because an independent audit could
+  not reproduce the uncontended figure on a loaded machine, where the same command measured
+  1.1–5.2s:
+
+  | | uncontended (median of 10, interleaved) | contended |
+  |---|---|---|
+  | before | 0.028s | **rc=4 at 3.040s**, `watchdog-timeout-uncommitted-mutation` |
+  | after | 0.028s | **rc=1 at 1.415s**, names the exhausted budget and the held path |
+
+  The uncontended pair is measured INTERLEAVED — before/after alternating inside one loop — because
+  an earlier pair of SEQUENTIAL measurement blocks, taken while the host carried a load average of
+  24-48 from orphaned processes belonging to no agent in this room, showed a 24ms gap that was
+  entirely load drift. Interleaved under that same load it fell to +4ms; on a quiesced host the two
+  are identical. A wall-clock number from a loaded host measures the host.
+
+- **Fix:** on the watchdog-ARMED path all three budgets derive from the one deadline the watchdog
+  will enforce (`crates/rally-cli/src/retry_budget.rs`). A single function returns the blocking
+  budget and the retry budget TOGETHER, because they are not independent: a loop stops *starting*
+  attempts at its deadline, so an attempt begun just inside it still blocks a full `busy_timeout`
+  past it. Each retry loop takes a third of what remains, each in-SQLite block an eighth, and the
+  block is additionally clamped to upstream's 5s so `inject`'s 605s watchdog cannot buy a 151s
+  blind wait. Composed worst case at the 3000ms default: 1000 + 375 + 541 + 375 = **2291ms**,
+  leaving 709ms for the append + fsync. There is no longer a set of constants that can contradict
+  each other, which is the class rather than the instance — RC-064's lesson applies directly.
+- **What the fix does NOT cover, stated so nobody reads it as total:**
+  - **The unarmed path keeps upstream behaviour on purpose.** `rally daemon serve` and the
+    standalone `rallyd` binary run with no watchdog by design, so nothing is derived there: the
+    blocking budget stays at upstream's 5s and the retry budget is a multiple of it. Deriving a
+    short deadline from an absent watchdog is the same defect pointed the other way, and the first
+    draft of this fix did exactly that — it gave `daemon serve` one attempt where the pre-fix code
+    had sixteen. Caught by independent audit before landing.
+  - The sqlx pool `acquire_timeout` now uses the same caller-supplied blocking budget
+    (`vendor/factstr-sqlite/src/connection.rs::open_pool`), closing the remaining pool-wait
+    boundary rather than leaving a library default outside the watchdog arithmetic.
+- **The correction that matters more than the fix.** This was reported as "a stale or zero-length
+  `facts.db-wal`/`-shm` pair makes SQLite report busy/locked on open". **It does not.** Measured
+  against both the 0.1.7 and 0.2.0 binaries: zero-length WAL 0.061s, garbage non-empty WAL 0.073s,
+  garbage `-shm` 0.065s, WAL with mismatched salt 0.067s — SQLite recovers all of them without
+  reporting busy/locked, so a stale WAL never enters the retry path at all. The negative result is
+  pinned as a test (`stale_wal_is_not_what_trips_the_retry_path`) rather than a note, so it is
+  checked rather than remembered. A stale WAL is the **fingerprint of an abandoned holder, not a
+  cause of contention.**
+- **Why that fingerprint is everywhere (a testable hypothesis, NOT a claim):** on timeout the
+  watchdog calls `std::process::exit(4)` and abandons the worker thread mid-operation
+  (`lib.rs`, `run_with_watchdog`, whose own comment says "abandoning the worker thread; the kernel
+  reaps any fd/lock/child it held"). SQLite unlinks `-wal`/`-shm` only on a CLEAN last-connection
+  close, so every one of these kills leaves the pair on disk. Under the pre-fix code EVERY contended
+  mutation was killed this way, at 3.0s, every time — a mass producer of abandoned WAL pairs. That
+  is consistent with the observation that **13 of 14 quarantined `.rally/facts.db.corrupt.*` sets
+  carry a 0-byte `-db-wal`**. **Causation of the corruption is NOT claimed here** — see RC-062,
+  which holds the same line about RC-044's mechanism. What this fix changes is the RATE of abrupt
+  mid-operation exits, not any corruption path.
+- **Does RC-044 get re-diagnosed? No — it gets a narrowed question.** RC-044 is a `code: 522` disk
+  I/O error and a corruption cascade under 6-way concurrent first-run `enter`; this entry is a
+  timeout. A timeout does not produce a `522`. The connection worth testing is upstream of both:
+  RC-062 already established that a pool can outlive the file it opened, and this entry establishes
+  that the pre-fix code killed processes mid-operation at a high and predictable rate. Those two
+  compose into the abandoned-holder-plus-stale-WAL state RC-044's proposed mechanism needs. **RC-044
+  stays `observed`.** What would settle it is the pool-lifetime + WAL tracing run RC-062 already
+  specifies, now re-run with the watchdog kill rate driven to zero — if quarantines track the kill
+  rate, the link is real; if they do not, this entry is irrelevant to RC-044 and should say so.
+- **Adversarial control** (`crates/rally-cli/tests/retry_budget_watchdog.rs`,
+  `crates/rally-cli/src/retry_budget.rs`): a genuine `BEGIN EXCLUSIVE` holder — a real lock, not a
+  seam — plus an invariant that walks every watchdog setting from the 100ms floor to `inject`'s
+  605s ceiling and asserts the COMPOSED worst case (both retry loops plus both blocking
+  overshoots) stays under the deadline with an eighth left over. The sum, not the parts: an
+  earlier draft asserted the blocking terms and the retry terms as two separate inequalities, each
+  of which passed while their sum reached exactly 100% of the watchdog — the same "each part is
+  fine, the whole is not" shape as the defect itself. **Validated by mutation, three directions:**
+  restoring the 5s busy timeout fails 2 of 4 integration controls; restoring the independent retry
+  fraction fails 5 unit invariants; and stubbing `next_backoff` to never retry fails
+  `write_still_retries_and_succeeds_when_the_holder_releases`, which proves that control reaches
+  rally's own retry loop instead of being absorbed inside SQLite's busy handler — the first draft
+  held the lock 400ms against a 750ms blocking budget and was therefore vacuous.
+- **Flakiness, measured and bounded.** The integration controls assert wall-clock elapsed bounds
+  against a DEBUG binary whose own startup consumes part of the same budget. Under induced CPU
+  saturation an independent audit drove them to fail 3 runs of 3; quiesced, 6 of 6 passed. Per this
+  register's own rule that a flaky gate certifies failures, the wall-clock assertions are now
+  opt-in behind `RALLY_TIMING_TESTS=1`, while the SHAPE assertions — no
+  `watchdog-timeout-uncommitted-mutation`, an error naming what was observed, the fact actually
+  landing — run unconditionally and convict the reverted fix on their own.
+- **Superseded prior state:** the reaper timeout was attributed in the room to the quadratic
+  projection cost (design audit D10). **That attribution was wrong and is retracted.** The
+  projection cost is real and still worth fixing; it is not why the reaper timed out. `rally doctor
+  --reap-stale` failed 3/3 with a watchdog timeout while a holder was present and completed in
+  1.43s once the database was uncontended — the same signature as every other mutation here, and
+  independent of projection size.
+- **First seen:** 2026-08-05 (measured; the constants date to earlier releases).
+- **Evidence:** rally facts `fact_4fdf_18c8d972c6d44588` (measurement + correction),
+  `fact_fba1_18c8da1fc32f8b60` (concurrent-writer clobber during the fix).
+
 ## Independent design audit, 2026-08-04 — pinned at `006d417`
 
 Eleven findings from a structural read of the store, composition, reaper, identity and hook layers.
