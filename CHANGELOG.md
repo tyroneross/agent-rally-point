@@ -7,6 +7,8 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## v0.2.0 - 2026-08-04
+
 ### Fixed — verdicts that nothing acted on
 
 Rally kept computing correct cleanup decisions and never calling them. Each of

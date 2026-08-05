@@ -4,7 +4,7 @@
 
 Rally is a coordination room that lives in your checkout. Agents — Claude Code, Codex, Gemini, Cursor — enter the room, claim the files they are about to touch, hand work off with receipts, and read shared state through one CLI (`rally`) backed by an append-only log in `.rally/`. Nothing to host, nothing to reach over the network.
 
-Apache-2.0. CLI version 0.1.7.
+Apache-2.0. CLI version 0.2.0.
 
 ## The problem it solves
 
