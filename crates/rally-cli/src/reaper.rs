@@ -94,16 +94,32 @@ pub(crate) struct ReapReport {
     /// the write landed, so a caller could read "seat is open" off a report
     /// whose durable write had failed.
     pub(crate) lead_relinquished: Option<String>,
-    /// Number of inspected items that were KEPT rather than closed: claims with
+    /// Number of inspected items KEPT by POLICY rather than closed: claims with
     /// a future-dated lease, an unparseable owner timestamp, or a live owner;
-    /// handoffs inside their TTL or with an unparseable `created_at`; and
-    /// anything whose durable append failed, including a stale lead whose
-    /// relinquish did not land (D7).
+    /// handoffs inside their TTL or with an unparseable `created_at`; and the
+    /// auto-reap per-pass cap.
+    ///
+    /// A failed durable write is NOT counted here. It used to be, which made a
+    /// broken ledger indistinguishable from a healthy one whose owners were all
+    /// still working — the count said "kept on purpose" for something nobody
+    /// chose to keep (D7).
     pub(crate) preserved_future_or_active: usize,
-    /// The pass ran in write mode (`apply=true`) — NOT that every staged write
-    /// landed. Per-item success is carried by the item lists: an append that
-    /// failed leaves its entry out of `claims_reaped` / `handoffs_expired` /
-    /// `lead_relinquished` and lands in `preserved_future_or_active` instead.
+    /// Items whose durable append FAILED: a `ClaimExpired`, a handoff `Resolve`,
+    /// or the lead relinquish that did not reach the ledger.
+    ///
+    /// Non-zero means the room is not in the state this report describes. The
+    /// only previous signal was a stderr line nothing parses.
+    #[serde(default)]
+    pub(crate) write_failures: usize,
+    /// Every staged write landed.
+    ///
+    /// This used to be a copy of the `--apply` argument, so `rally doctor
+    /// --reap-stale --apply --json` answered `applied: true` and `ok: true`
+    /// against a fully unwritable ledger (D7). It is now `apply &&
+    /// write_failures == 0`: false either because nothing was attempted or
+    /// because something was attempted and did not land. Which one is answered
+    /// by `write_failures`, and `rally doctor` exits non-zero when it is
+    /// non-zero.
     pub(crate) applied: bool,
 }
 
@@ -313,6 +329,7 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
 
     let mut claims_reaped: Vec<ReapedClaim> = Vec::new();
     let mut preserved: usize = 0;
+    let mut write_failures: usize = 0;
 
     // Identify the stale-owner set at snapshot time (squad-level, 2h bar).
     // Used for the lead relinquish decision; claim eligibility is per-claim
@@ -438,7 +455,7 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
                         "reaper: skipping {} (already closed or lock error): {}",
                         claim.event_id, e
                     );
-                    preserved += 1;
+                    write_failures += 1;
                     continue;
                 }
             }
@@ -520,7 +537,7 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
                             "reaper: skipping handoff {} (already closed or lock error): {}",
                             handoff.event_id, e
                         );
-                        preserved += 1;
+                        write_failures += 1;
                         continue;
                     }
                 }
@@ -575,7 +592,7 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
                         eprintln!(
                             "reaper: keeping lead {lead_tool} (relinquish append failed): {e}"
                         );
-                        preserved += 1;
+                        write_failures += 1;
                         relinquish_committed = false;
                     }
                 }
@@ -606,7 +623,8 @@ pub(crate) fn run_reap_stale_in_room_with_mode(
         squads_idle_cleared,
         lead_relinquished,
         preserved_future_or_active: preserved,
-        applied: apply,
+        write_failures,
+        applied: apply && write_failures == 0,
     })
 }
 

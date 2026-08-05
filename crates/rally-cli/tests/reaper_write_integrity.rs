@@ -82,6 +82,19 @@ impl TempRoom {
 
     /// The reaper's report from `doctor --reap-stale`, applied or dry-run.
     fn reap(&self, apply: bool) -> (Value, String) {
+        let (report, stderr, envelope_ok, exit) = self.reap_full(apply);
+        assert!(
+            exit == Some(0) && envelope_ok,
+            "this room's reap was expected to succeed: exit={exit:?} ok={envelope_ok} \
+             report={report} stderr={stderr}"
+        );
+        (report, stderr)
+    }
+
+    /// The reap plus the two verdict channels a caller actually reads: the
+    /// envelope's `ok` and the process exit code. `reap` asserts both are
+    /// healthy; the failed-write tests need to inspect them.
+    fn reap_full(&self, apply: bool) -> (Value, String, bool, Option<i32>) {
         let mut args = vec![
             "doctor",
             "--reap-stale",
@@ -93,15 +106,14 @@ impl TempRoom {
             args.push("--apply");
         }
         let out = self.run(&args);
-        assert!(
-            out.status.success(),
-            "doctor --reap-stale must not fail the command: status={:?} stderr={}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        );
         let body = stdout_json(&out);
         let report = body["data"]["doctor"].clone();
-        (report, String::from_utf8_lossy(&out.stderr).into_owned())
+        (
+            report,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            body["ok"] == Value::Bool(true),
+            out.status.code(),
+        )
     }
 
     fn current_lead(&self) -> Value {
@@ -278,7 +290,7 @@ fn failed_lead_relinquish_write_is_not_reported_as_applied() {
     );
 
     room.freeze_ledger();
-    let (report, stderr) = room.reap(true);
+    let (report, stderr, envelope_ok, exit) = room.reap_full(true);
     room.thaw_ledger();
 
     assert_eq!(
@@ -287,14 +299,42 @@ fn failed_lead_relinquish_write_is_not_reported_as_applied() {
         "a relinquish whose durable append failed must NOT appear in the report; \
          got {report} (stderr={stderr})"
     );
-    assert_eq!(
-        report["preserved_future_or_active"], 1,
-        "the kept lead must be counted as preserved, matching the claim/handoff \
-         convention; got {report}"
-    );
     assert!(
         stderr.contains("keeping lead stale-lead:01"),
         "a dropped relinquish must say so on stderr; stderr={stderr}"
+    );
+
+    // D7, second half. The item list was already honest; the SUMMARY was not.
+    // `applied` was a copy of `--apply`, the failure was counted into a field
+    // whose own doc says "future-dated lease, owner unparseable, or owner still
+    // active", and the envelope answered `ok: true` at exit 0. A caller that
+    // read the summary rather than diffing the lists — which is what a script
+    // does — could not tell an unwritable ledger from a healthy one.
+    assert_eq!(
+        report["write_failures"], 1,
+        "a failed durable append must be counted as a WRITE FAILURE; got {report}"
+    );
+    assert_eq!(
+        report["preserved_future_or_active"], 0,
+        "and must NOT be laundered into the kept-by-policy count, which means \
+         something entirely different; got {report}"
+    );
+    assert_eq!(
+        report["applied"],
+        Value::Bool(false),
+        "`applied` must mean the staged writes landed, not that --apply was \
+         passed; got {report}"
+    );
+    assert!(
+        !envelope_ok,
+        "the envelope must not answer ok:true for a pass whose writes failed; \
+         got {report}"
+    );
+    assert_ne!(
+        exit,
+        Some(0),
+        "and the exit code must not say success either; a script reading only \
+         the exit code is the most common caller there is"
     );
 
     // Ground truth, independent of the report: the seat never reopened.
@@ -387,7 +427,7 @@ fn failed_claim_expiry_write_is_not_reported_as_reaped() {
     ]);
 
     room.freeze_ledger();
-    let (report, stderr) = room.reap(true);
+    let (report, stderr, envelope_ok, exit) = room.reap_full(true);
     room.thaw_ledger();
 
     assert_eq!(
@@ -397,8 +437,23 @@ fn failed_claim_expiry_write_is_not_reported_as_reaped() {
          got {report} (stderr={stderr})"
     );
     assert!(
-        report["preserved_future_or_active"].as_u64().unwrap_or(0) >= 1,
-        "the un-closed claim must be counted as preserved; got {report}"
+        report["write_failures"].as_u64().unwrap_or(0) >= 1,
+        "the un-closed claim must be counted as a WRITE FAILURE, not as kept by \
+         policy; got {report}"
+    );
+    assert_eq!(
+        report["applied"],
+        Value::Bool(false),
+        "`applied` must mean the staged writes landed; got {report}"
+    );
+    assert!(
+        !envelope_ok,
+        "envelope must not answer ok:true; got {report}"
+    );
+    assert_ne!(
+        exit,
+        Some(0),
+        "exit code must not say success; got {report}"
     );
     assert_eq!(
         room.active_claim_subjects(),

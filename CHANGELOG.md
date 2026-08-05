@@ -22,6 +22,16 @@ All notable changes to Agent Rally Point are documented here.
   the real CLI and daemon, plus a structural check that a FIFTH skipped field
   cannot be added without carrying it. Mutation-validated four ways.
 
+- **`rally doctor --reap-stale --apply` now fails when its writes fail.** It
+  returned exit 0, `ok: true` and `applied: true` against a fully unwritable
+  ledger, because `applied` was a copy of the `--apply` flag and a failed append
+  was counted into `preserved_future_or_active` — a field whose own doc says
+  "future-dated lease, owner unparseable, or owner still active". The per-item
+  lists were honest; the summary a script reads was not. Failed appends now have
+  their own `write_failures` count, `applied` means the writes landed, and the
+  command answers `ok: false` at exit 1 while still printing the full report.
+  Closes the second half of RC-056.
+
 ### Changed — one demotion contract instead of three
 
 - **Relevance demotes an author that has gone quiet, and now says so

@@ -1781,11 +1781,23 @@ D6 are below.
   performs the hostile action — a relinquish whose durable append fails — and asserts the report
   does NOT claim it applied. Mutation-validated: restoring the discarded `let _ =` kills that test
   and no other, which is the correct signature. Mechanism verified at `006d417`.
-- **Wider than reported, found by asking the adjacent question.** `applied: true` never meant "the
-  writes landed" — it is a copy of the `--apply` argument. `rally doctor --reap-stale --apply
-  --json` returns exit 0 and `ok: true` against a fully unwritable ledger. Only the per-item lists
-  carry write outcomes. That is `lib.rs::command_doctor`'s to fix and is NOT closed by this entry.
-  time of this audit.
+- **The summary half, closed 2026-08-05.** `applied: true` never meant "the writes landed" — it was
+  a copy of the `--apply` argument, and `rally doctor --reap-stale --apply --json` returned exit 0
+  and `ok: true` against a fully unwritable ledger. Only the per-item lists carried write outcomes,
+  so a caller that read the summary rather than diffing the lists — which is what a script does —
+  could not tell a broken ledger from a healthy room whose owners were all still working. Three
+  changes: `ReapReport.write_failures` counts failed appends separately from
+  `preserved_future_or_active` (which now means only what its name says); `applied` is
+  `apply && write_failures == 0`; and `command_doctor` answers `ok: false` at exit 1 when any write
+  failed, while still printing the full report so an operator can see which items landed.
+  Mutation-validated both ways: restoring `applied: apply` fails two tests, and removing the doctor
+  verdict gate fails the same two. The negative control (writable ledger) still requires the
+  relinquish to be reported AND to land, so the fix cannot be satisfied by always reporting failure.
+- **What the summary controls do NOT cover.** A PARTIAL pass — some appends land, some fail — is
+  reported as `applied: false` with a non-empty `claims_reaped`, which is honest but untested. And
+  the failure is still injected only through a read-only `.rally/log/`; no append-failure hook
+  exists in the binary, so a failure mode that is not filesystem-shaped (a lock error, a corrupt
+  segment mid-append) is not exercised.
 - **Mechanism, three sites, two different failure shapes:**
   1. **Claims.** `append_fact_verified` failure prints to stderr, does `preserved += 1`, and
      `continue`s past `claims_reaped.push(reaped)` (`reaper.rs:392-403`, list push skipped at `:406`).

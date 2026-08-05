@@ -47,7 +47,7 @@
 
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -402,7 +402,7 @@ fn status_last_activity(room: &Room) -> String {
             repos.iter().find(|repo| {
                 repo["repo"]
                     .as_str()
-                    .is_some_and(|path| PathBuf::from(path) == canonical)
+                    .is_some_and(|path| Path::new(path) == canonical)
             })
         })
         .and_then(|repo| repo["last_activity_ts"].as_str())

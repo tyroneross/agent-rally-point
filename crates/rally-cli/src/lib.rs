@@ -3114,13 +3114,26 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
     }
     if args.reap_stale {
         let data = reaper::run_reap_stale(args.apply)?;
+        // D7: a reap whose durable appends failed used to answer `ok: true`,
+        // exit 0, `applied: true` — the report claimed a room state the ledger
+        // did not hold. The failure count is the thing to fail on, not the
+        // presence of the `--apply` flag.
+        let write_failures = data.write_failures;
         let text = format!(
-            "doctor reap-stale: claims_reaped={} lead_relinquished={} applied={}",
+            "doctor reap-stale: claims_reaped={} lead_relinquished={} write_failures={} applied={}",
             data.claims_reaped.len(),
             data.lead_relinquished.is_some(),
+            write_failures,
             data.applied,
         );
-        let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
+        let mut body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
+        if write_failures > 0 {
+            // The report BODY is kept — it names which items landed and which
+            // did not, and an operator needs that more than a bare error. Only
+            // the verdict changes.
+            body["ok"] = Value::Bool(false);
+            return Ok(Output::new(args.json, text, body).with_exit_code(1));
+        }
         return Ok(Output::new(args.json, text, body));
     }
     if args.sweep_corrupt {
