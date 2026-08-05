@@ -30,8 +30,10 @@ configured its retries. See RC-067 in `docs/ROOT-CAUSE-REGISTER.md`.
 The delta adds `SqliteStore::open_with_busy_timeout` and leaves
 `SqliteStore::open` delegating to it with `DEFAULT_BUSY_TIMEOUT` (upstream's 5s),
 so any other consumer keeps the upstream 5s database setting. Rally passes an
-eighth of its remaining watchdog budget, and sqlx pool acquisition is capped by
-the same caller-supplied duration.
+eighth of its remaining watchdog budget, and sqlx pool acquisition is capped at
+one quarter of that duration. `SqliteStore::open` keeps sqlx's upstream pool
+acquisition default; the coupling applies only to the explicit deadline-aware
+constructor.
 
 Upstreamable as-is: it is additive, preserves the existing default, and a
 library cannot know its caller's deadline. Remove this delta if upstream adopts

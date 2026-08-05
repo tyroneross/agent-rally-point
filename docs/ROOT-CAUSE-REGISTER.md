@@ -1589,9 +1589,11 @@ review answers the question you asked.
   attempts at its deadline, so an attempt begun just inside it still blocks a full `busy_timeout`
   past it. Each retry loop takes a third of what remains, each in-SQLite block an eighth, and the
   block is additionally clamped to upstream's 5s so `inject`'s 605s watchdog cannot buy a 151s
-  blind wait. Composed worst case at the 3000ms default: 1000 + 375 + 541 + 375 = **2291ms**,
-  leaving 709ms for the append + fsync. There is no longer a set of constants that can contradict
-  each other, which is the class rather than the instance — RC-064's lesson applies directly.
+  blind wait. Pool acquisition is a distinct boundary capped at a quarter of each SQLite block and
+  counted explicitly. Composed worst case at the 3000ms default: 1000 + 93.75 + 375 + 510 + 93.75
+  + 375 = **2447.5ms**, leaving 552.5ms for the append + fsync. There is no longer a set of
+  constants that can contradict each other, which is the class rather than the instance — RC-064's
+  lesson applies directly.
 - **What the fix does NOT cover, stated so nobody reads it as total:**
   - **The unarmed path keeps upstream behaviour on purpose.** `rally daemon serve` and the
     standalone `rallyd` binary run with no watchdog by design, so nothing is derived there: the
@@ -1599,8 +1601,8 @@ review answers the question you asked.
     short deadline from an absent watchdog is the same defect pointed the other way, and the first
     draft of this fix did exactly that — it gave `daemon serve` one attempt where the pre-fix code
     had sixteen. Caught by independent audit before landing.
-  - The sqlx pool `acquire_timeout` now uses the same caller-supplied blocking budget
-    (`vendor/factstr-sqlite/src/connection.rs::open_pool`), closing the remaining pool-wait
+  - The sqlx pool `acquire_timeout` now uses one quarter of the caller-supplied SQLite blocking
+    budget (`vendor/factstr-sqlite/src/connection.rs::open_pool`), closing the remaining pool-wait
     boundary rather than leaving a library default outside the watchdog arithmetic.
 - **The correction that matters more than the fix.** This was reported as "a stale or zero-length
   `facts.db-wal`/`-shm` pair makes SQLite report busy/locked on open". **It does not.** Measured

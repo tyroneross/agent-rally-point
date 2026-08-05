@@ -88,7 +88,7 @@ All notable changes to Agent Rally Point are documented here.
 
 ### Fixed — a mutation could not finish inside its own timeout
 
-- **Contended writes now fail in 1.66s with a usable error instead of dying at
+- **Contended writes now fail in 1.415s with a usable error instead of dying at
   3.0s blaming a contender.** Four timeout budgets governed one mutation and
   nothing coupled them: SQLite's `busy_timeout` (5000ms, blocking inside a
   single call), the `open_fact_store` retry loop (2720ms), the append retry loop
@@ -107,6 +107,8 @@ All notable changes to Agent Rally Point are documented here.
   function returns the blocking budget and the retry budget together, because
   they are not independent: a loop stops *starting* attempts at its deadline, so
   an attempt begun just inside it still blocks a full `busy_timeout` past it.
+  Pool acquisition is a separate wait capped at one quarter of that SQLite
+  budget, and the invariant counts both waits for both retry loops.
   An invariant test walks every watchdog setting from the 100ms floor to
   `inject`'s 605s ceiling and asserts the composed worst case — both loops plus
   both blocking overshoots — with an eighth of the budget left over.
@@ -115,7 +117,8 @@ All notable changes to Agent Rally Point are documented here.
   there and it keeps upstream's 5s blocking budget unchanged. Deriving a short
   deadline from an absent watchdog would be the same defect pointed the other
   way. The real daemon serve entry point now rejects an accidentally armed
-  watchdog, and sqlx pool acquisition shares the SQLite blocking budget.
+  watchdog, and sqlx pool acquisition uses one quarter of the SQLite blocking
+  budget.
 
   Validated by mutation in three directions: restoring the 5s busy timeout,
   restoring the independent retry fraction, and stubbing the retry loop to never

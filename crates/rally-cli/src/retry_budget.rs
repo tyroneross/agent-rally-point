@@ -56,14 +56,15 @@
 //!
 //! ```text
 //! open loop budget        R/3
+//!   + pool acquire        R/32   (a quarter of the SQLite blocking budget)
 //!   + one busy overshoot  R/8    (last attempt starts just inside the deadline)
 //! append loop budget      (remainder)/3
+//!   + pool acquire        R/32
 //!   + one busy overshoot  R/8
 //! ```
 //!
-//! At the 3000ms default: 1000 + 375 + 541 + 375 = 2291ms worst case, leaving
-//! **709ms** for the durable append and its fsync — roughly twelve times the
-//! ~60ms an uncontended write measures.
+//! At the 3000ms default: 1000 + 93.75 + 375 + 510 + 93.75 + 375 = 2447.5ms
+//! worst case, leaving **552.5ms** for the durable append and its fsync.
 
 use std::time::{Duration, Instant};
 
@@ -243,10 +244,13 @@ mod tests {
         let b = budgets_for(Some(watchdog));
         let open = b.retry;
         // A loop stops STARTING attempts at its deadline; an attempt begun just
-        // inside it still blocks a full busy_timeout past it.
-        let after_open = watchdog.saturating_sub(open + b.busy_timeout);
+        // inside it can still wait for a pool checkout and then a full SQLite
+        // busy_timeout. Count both distinct blocking boundaries.
+        let blocking_overshoot =
+            factstr_sqlite::acquire_timeout_for(b.busy_timeout) + b.busy_timeout;
+        let after_open = watchdog.saturating_sub(open + blocking_overshoot);
         let append = spend_fraction(after_open);
-        open + b.busy_timeout + append + b.busy_timeout
+        open + blocking_overshoot + append + blocking_overshoot
     }
 
     /// THE CLASS-CLOSING INVARIANT.
@@ -299,6 +303,10 @@ mod tests {
                 b.busy_timeout,
             );
             assert!(b.busy_timeout <= Duration::from_millis(watchdog_ms));
+            assert!(
+                factstr_sqlite::acquire_timeout_for(b.busy_timeout) < b.busy_timeout,
+                "pool acquisition must remain a strict sub-budget of SQLite blocking"
+            );
         }
         // The two settings that motivated the ceiling.
         assert_eq!(
@@ -413,7 +421,10 @@ mod tests {
 
         assert_eq!(b.busy_timeout, Duration::from_millis(375));
         assert_eq!(b.retry, Duration::from_millis(1000));
-        assert_eq!(composed_worst_case(watchdog), Duration::from_millis(2291));
+        assert_eq!(
+            composed_worst_case(watchdog),
+            Duration::from_micros(2_447_500)
+        );
     }
 
     /// A budget hands out sleeps until the deadline, then stops. This is what

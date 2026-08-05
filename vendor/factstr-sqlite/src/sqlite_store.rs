@@ -73,7 +73,7 @@ impl SqliteStore {
     /// Callers running under a deadline SHORTER than 5s must use
     /// [`SqliteStore::open_with_busy_timeout`] instead — see that method.
     pub fn open(database_path: impl AsRef<Path>) -> Result<Self, sqlx::Error> {
-        Self::open_with_busy_timeout(database_path, crate::connection::DEFAULT_BUSY_TIMEOUT)
+        Self::open_with_timeouts(database_path, crate::connection::DEFAULT_BUSY_TIMEOUT, None)
     }
 
     /// Open with an explicit SQLite busy timeout.
@@ -99,6 +99,18 @@ impl SqliteStore {
         database_path: impl AsRef<Path>,
         busy_timeout: Duration,
     ) -> Result<Self, sqlx::Error> {
+        Self::open_with_timeouts(
+            database_path,
+            busy_timeout,
+            Some(crate::connection::acquire_timeout_for(busy_timeout)),
+        )
+    }
+
+    fn open_with_timeouts(
+        database_path: impl AsRef<Path>,
+        busy_timeout: Duration,
+        acquire_timeout: Option<Duration>,
+    ) -> Result<Self, sqlx::Error> {
         let database_path = database_path.as_ref().to_path_buf();
         ensure_parent_directory(&database_path).map_err(sqlx_io_error)?;
 
@@ -115,7 +127,8 @@ impl SqliteStore {
 
                 let result = match runtime {
                     Ok(runtime) => runtime.block_on(async {
-                        let pool = open_pool(&bootstrap_path, busy_timeout).await?;
+                        let pool =
+                            open_pool(&bootstrap_path, busy_timeout, acquire_timeout).await?;
                         initialize_schema(&pool).await?;
                         Ok::<_, sqlx::Error>(pool)
                     }),
@@ -531,6 +544,8 @@ impl EventStore for SqliteStore {
         }
 
         let committed_append = self.run_async("append", move |pool| async move {
+            #[cfg(test)]
+            append_acquire_probe::note();
             let mut connection = pool.acquire().await.map_err(sqlx_backend_failure)?;
 
             sqlx::query("BEGIN IMMEDIATE")
@@ -680,6 +695,116 @@ impl EventStore for SqliteStore {
         handle: HandleStream,
     ) -> Result<EventStream, EventStoreError> {
         self.register_durable_stream(durable_stream.name(), event_query, handle)
+    }
+}
+
+#[cfg(test)]
+mod append_acquire_probe {
+    use std::sync::{Mutex, mpsc::SyncSender};
+
+    static BEFORE_ACQUIRE: Mutex<Option<SyncSender<()>>> = Mutex::new(None);
+
+    pub(super) fn arm(sender: SyncSender<()>) {
+        *BEFORE_ACQUIRE.lock().unwrap() = Some(sender);
+    }
+
+    pub(super) fn note() {
+        if let Ok(mut slot) = BEFORE_ACQUIRE.lock()
+            && let Some(sender) = slot.take()
+        {
+            let _ = sender.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod timeout_composition_tests {
+    use super::*;
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    /// Saturate every pool slot, release one only after append is waiting, and
+    /// keep a SQLite write transaction held after checkout succeeds. This
+    /// proves pool acquisition and SQLite busy handling are sequential waits;
+    /// the release-budget invariant must count both.
+    #[test]
+    fn delayed_pool_acquire_then_sqlite_busy_consumes_both_boundaries() {
+        const BUSY: Duration = Duration::from_millis(500);
+        const RELEASE_AFTER: Duration = Duration::from_millis(75);
+
+        let path = std::env::temp_dir().join(format!(
+            "factstr-timeout-composition-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Arc::new(SqliteStore::open_with_busy_timeout(&path, BUSY).unwrap());
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+
+        // Warm and hold all four slots before append begins.
+        let mut held = runtime.block_on(async {
+            let mut connections = Vec::new();
+            for _ in 0..4 {
+                connections.push(store.pool.acquire().await.unwrap());
+            }
+            connections
+        });
+        runtime
+            .block_on(sqlx::query("BEGIN EXCLUSIVE").execute(held[0].as_mut()))
+            .unwrap();
+
+        let (before_acquire_tx, before_acquire_rx) = mpsc::sync_channel(1);
+        append_acquire_probe::arm(before_acquire_tx);
+        let append_store = Arc::clone(&store);
+        let append = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = append_store.append(vec![NewEvent::new(
+                "timeout-composition",
+                serde_json::json!({"control": true}),
+            )]);
+            (started.elapsed(), result)
+        });
+
+        before_acquire_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("append reached pool acquisition");
+        std::thread::sleep(RELEASE_AFTER);
+        // Release one idle slot before the 125ms acquire timeout. Append now
+        // proceeds to BEGIN IMMEDIATE and waits independently on the 500ms
+        // SQLite busy handler held by connection zero.
+        runtime.block_on(async {
+            let mut released = held.pop().unwrap();
+            released.return_to_pool().await;
+        });
+
+        let (elapsed, result) = append.join().expect("append thread joins");
+        let error = result
+            .expect_err("held write transaction must block append")
+            .to_string();
+
+        runtime.block_on(async move {
+            sqlx::query("ROLLBACK")
+                .execute(held[0].as_mut())
+                .await
+                .unwrap();
+            for connection in &mut held {
+                connection.return_to_pool().await;
+            }
+            drop(held);
+        });
+        drop(store);
+        std::fs::remove_file(path).ok();
+
+        assert!(
+            error.to_ascii_lowercase().contains("locked"),
+            "append must reach SQLite after pool checkout, not time out acquiring: {error}"
+        );
+        assert!(
+            elapsed >= BUSY + Duration::from_millis(50),
+            "elapsed {elapsed:?} did not include both the delayed pool checkout and SQLite busy wait"
+        );
     }
 }
 
