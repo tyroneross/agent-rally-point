@@ -1853,13 +1853,16 @@ D6 are below.
   of nothing.
 
 ### RC-058 — the write path re-reads the whole ledger about five times per append, and it lands before the read path does (D10)
-- **State:** ⚠️ `mitigated` 2026-08-05, **NOT fixed.** The reaper COMPLETES now; the per-append cost
-  is 27% lower and still dominates. Read "What is mitigated" and "What is not" as one statement.
+- **State:** ⚠️ `mitigated` 2026-08-05, **NOT fixed.** The reaper COMPLETES now. A manual D10
+  measurement found the per-append cost 27% lower and still dominant. Read "What is mitigated"
+  and "What is not" as one statement.
 - **The consequence that forced the issue.** `rally doctor --reap-stale --apply` was unusable:
   3 of 3 attempts against this repo's room returned `watchdog-timeout-uncommitted-mutation`, and 63
   lease-expired claims had been unreclaimable since 2026-08-03. The cleanup that would shrink the
   working set was blocked by the size of the working set.
-- **Measured, synthetic ledger sized like this repo's own (6,563 facts, 63 expired claims):**
+- **Manual D10 measurement, synthetic ledger sized like this repo's own (6,563 facts, 63 expired
+  claims):** These figures came from the author run recorded in the D10 commit narrative; they are
+  not reproduced by a checked-in benchmark artifact.
 
   | state | full drain | per verified append |
   |---|---|---|
@@ -1908,17 +1911,19 @@ D6 are below.
 - **This is staging, and it is named as such.** It does not hide the cost — the cost is in the table
   above and the four remaining passes are enumerated. It makes the tool usable while the cost stays
   open.
-- **Adversarial control:** `crates/rally-cli/tests/reaper_scale.rs`. A repo-sized ledger drains to
-  zero with NO `--timeout-ms`, so the criterion is the product's own default watchdog rather than a
-  stopwatch that grades the machine. Mutation-validated three ways: setting the budget to 0 fails
-  pass 1 with the exact watchdog error an operator saw; removing the forward-progress floor (with a
-  1 ms budget) fails with `reported 24 remaining but reaped nothing`; and the same 1 ms budget WITH
-  the floor still drains, proving the floor is what carries it. **Tested with the ADJACENT move:**
-  the obvious control is "the pass completes", which a reaper that reaps nothing also satisfies — so
-  the test asserts progress per pass, a total equal to the eligible count, and, independently of
-  the report, that the room holds zero active claims at the end.
+- **Adversarial controls, each named at its committed location.** The repo-sized claim drain in
+  `crates/rally-cli/tests/reaper_scale.rs` runs with NO `--timeout-ms`, so the criterion is the
+  product's own default watchdog rather than a stopwatch that grades the machine. It asserts its
+  eligible-count premise, progress on every partial pass, the exact total reaped, and independently
+  verifies that the room holds zero active claims. The deterministic global-floor controls live in
+  `crates/rally-cli/src/reaper.rs`: a `Duration::ZERO` injected budget covers handoff-only,
+  claim+handoff+lead, and lead-only queues, plus partial/no-op/complete reporting. The separate
+  `RALLY_REAP_BUDGET_MS=0` test in `reaper_scale.rs` is deliberately one-sided observational
+  evidence: a watchdog timeout proves the unbounded risk, while completion is also accepted because
+  elapsed time is machine-dependent. It is not a mutation proof for the floor.
 - **What the control does NOT cover.** It does not assert the reaper is fast — only bounded. It is
-  single-process, so RC-057's concurrent-pass question is untouched. And the synthetic ledger is one
+  single-process, so RC-057's concurrent-pass question is untouched. The deterministic floor tests
+  are unit-scale; the repo-sized integration control is claim-only. And the synthetic ledger is one
   segment of uniform records; a real ledger has many segments plus a rotated archive, which the fold
   cost scales with differently.
 - **Mechanism — one verified append performs, in order:**

@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rally_protocol::store_wire::WIRE_VERSION;
 use serde_json::Value;
 
 // ── flock / kill: hand-declared externs, mirroring store.rs's own no-`libc`
@@ -716,8 +717,9 @@ fn spawn_one_ping_then_die(
     .unwrap();
 
     let pong = format!(
-        r#"{{"ok":{{"kind":"pong","repo_root":{},"pid":424242,"wire_version":1}}}}"#,
-        serde_json::to_string(canonical_repo_root).unwrap()
+        r#"{{"ok":{{"kind":"pong","repo_root":{},"pid":424242,"wire_version":{}}}}}"#,
+        serde_json::to_string(canonical_repo_root).unwrap(),
+        WIRE_VERSION
     );
     std::thread::spawn(move || {
         // Answer the single probe ping, then let `listener` drop → subsequent

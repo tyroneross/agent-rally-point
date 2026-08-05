@@ -328,7 +328,7 @@ Every threshold is config, resolved default → user → repo → env, under
 | `consumer_context_bytes` | `4000000` | Assumed consumer context. With the default fraction this is a 200 KB ceiling. |
 | `half_life_hours` | `48` | Recency decay half-life. |
 | `archive_floor_weight` | `0.05` | Below this weight a fact is archived out of the active buckets. |
-| `relevance.stale_author_factor` | `0.5` | Multiplier for a provably-stale author. Clamped to `(0, 1]`. |
+| `relevance.stale_author_factor` | `0.5` | Multiplier for an author past its adaptive heartbeat window. Clamped to `(0, 1]`. |
 | `relevance.addressed_boost` | `1.0` | Boost when an item is addressed to you. |
 | `relevance.path_overlap_boost` | `1.0` | Boost at full overlap with your declared paths. |
 | `stale_wait_secs` | `86400` | When an unanswered handoff stops counting as an active obligation. |

@@ -501,9 +501,8 @@ pub(crate) struct RoomSnapshot {
     /// the design audit (D1/D6) found silently changes behavior in routed mode.
     /// `check` runs client-side on a possibly-routed snapshot, so a skipped
     /// field here would mean no freeze is ever enforced with rallyd running.
-    /// `#[serde(default)]` keeps an older daemon's payload deserializable; it
-    /// yields `None`, which degrades to "no room-wide freeze" — the direction
-    /// that fails toward letting work proceed rather than toward a stuck room.
+    /// `#[serde(default)]` keeps older persisted/public payloads deserializable;
+    /// daemon compatibility is enforced separately by the wire-version probe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) room_freeze_id: Option<String>,
     /// R10: per-tool read receipts projected from `FactKind::Read` checkpoints.
@@ -518,7 +517,7 @@ pub(crate) struct RoomSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mission: Option<String>,
     /// TRUE bucket counts as projected, before any output-path composition.
-    /// `#[serde(default)]` so a payload from an older daemon still deserializes.
+    /// `#[serde(default)]` so older persisted/public payloads still deserialize.
     #[serde(default)]
     pub(crate) totals: RoomTotals,
     /// Present only when the output path omitted something. Absence is the
@@ -580,8 +579,9 @@ pub(crate) struct RoomSnapshot {
 /// questions stay separate: this struct rides the wire, and the public schema is
 /// byte-identical to what it was.
 ///
-/// Every field is `#[serde(default)]`, so a reply from a daemon that predates
-/// this struct deserializes to the same empty values the old code produced.
+/// Every field is `#[serde(default)]` for additive changes within a compatible
+/// wire version. A v1 daemon that predates this struct is rejected by the v2
+/// identity probe; it must never route a client with empty internals.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct SnapshotInternals {
     #[serde(default)]
@@ -593,6 +593,17 @@ pub(crate) struct SnapshotInternals {
     #[serde(default)]
     pub(crate) stale_authors: BTreeSet<String>,
 }
+
+/// Hard, fail-loud bounds for the daemon-only snapshot side-channel.
+///
+/// The side-channel preserves exact direct/routed behaviour, so it is never
+/// silently truncated. Crossing any bound returns a structured daemon error
+/// rather than dropping wake-dedupe or relevance state. The aggregate byte cap
+/// is deliberately much smaller than the 8 MiB frame limit: other public
+/// snapshot fields still need room inside that frame.
+pub(crate) const MAX_WIRE_PENDING_WAKES: usize = 1_024;
+pub(crate) const MAX_WIRE_STALE_AUTHORS: usize = 4_096;
+pub(crate) const MAX_WIRE_SNAPSHOT_INTERNALS_BYTES: usize = 512 * 1_024;
 
 /// Key the internals ride under in the wire snapshot object.
 ///
@@ -631,7 +642,28 @@ pub(crate) fn snapshot_to_wire_value(
     snapshot: &RoomSnapshot,
 ) -> std::result::Result<Value, serde_json::Error> {
     let mut value = serde_json::to_value(snapshot)?;
-    let internals = serde_json::to_value(snapshot.internals())?;
+    let internals = snapshot.internals();
+    if internals.pending_wakes.len() > MAX_WIRE_PENDING_WAKES {
+        return Err(serde_json::Error::io(std::io::Error::other(format!(
+            "snapshot internals exceed pending-wake bound: {} > {}",
+            internals.pending_wakes.len(),
+            MAX_WIRE_PENDING_WAKES
+        ))));
+    }
+    if internals.stale_authors.len() > MAX_WIRE_STALE_AUTHORS {
+        return Err(serde_json::Error::io(std::io::Error::other(format!(
+            "snapshot internals exceed stale-author bound: {} > {}",
+            internals.stale_authors.len(),
+            MAX_WIRE_STALE_AUTHORS
+        ))));
+    }
+    let internals = serde_json::to_value(internals)?;
+    let internals_bytes = serde_json::to_vec(&internals)?.len();
+    if internals_bytes > MAX_WIRE_SNAPSHOT_INTERNALS_BYTES {
+        return Err(serde_json::Error::io(std::io::Error::other(format!(
+            "snapshot internals exceed byte bound: {internals_bytes} > {MAX_WIRE_SNAPSHOT_INTERNALS_BYTES}"
+        ))));
+    }
     if let Value::Object(map) = &mut value {
         map.insert(WIRE_INTERNALS_KEY.to_string(), internals);
     }
@@ -640,8 +672,9 @@ pub(crate) fn snapshot_to_wire_value(
 
 /// Deserialize a wire snapshot, restoring [`SnapshotInternals`] if present.
 ///
-/// A payload without the key yields the pre-side-channel values (zero / empty),
-/// so an older daemon still answers a newer client.
+/// A payload without the key yields defaults only for additive compatibility
+/// within the current wire version. The identity probe rejects v1 daemons
+/// before this decoder runs.
 pub(crate) fn snapshot_from_wire_value(
     mut value: Value,
 ) -> std::result::Result<RoomSnapshot, serde_json::Error> {
@@ -6792,6 +6825,101 @@ mod ledger_tests {
 
         fs::remove_dir_all(root).ok();
         invalidate_segment_fold_memo();
+    }
+
+    #[test]
+    fn snapshot_wire_internals_fail_loud_at_count_bounds() {
+        let mut snapshot = RoomSnapshot {
+            stale_authors: (0..=MAX_WIRE_STALE_AUTHORS)
+                .map(|index| format!("stale-author-{index}"))
+                .collect(),
+            ..RoomSnapshot::default()
+        };
+        let stale_error = snapshot_to_wire_value(&snapshot).unwrap_err().to_string();
+        assert!(stale_error.contains("stale-author bound"), "{stale_error}");
+
+        snapshot.stale_authors.clear();
+        let pending = make_fact("pending-wake", FactKind::Wake, "", "pending wake");
+        snapshot.pending_wakes = vec![pending; MAX_WIRE_PENDING_WAKES + 1];
+        let wake_error = snapshot_to_wire_value(&snapshot).unwrap_err().to_string();
+        assert!(wake_error.contains("pending-wake bound"), "{wake_error}");
+    }
+
+    #[test]
+    fn snapshot_wire_internals_fail_loud_at_byte_bound() {
+        let mut snapshot = RoomSnapshot::default();
+        let mut pending = make_fact("large-pending-wake", FactKind::Wake, "", "pending wake");
+        pending.summary = Some("x".repeat(MAX_WIRE_SNAPSHOT_INTERNALS_BYTES));
+        snapshot.pending_wakes.push(pending);
+        let error = snapshot_to_wire_value(&snapshot).unwrap_err().to_string();
+        assert!(error.contains("byte bound"), "{error}");
+    }
+
+    /// Golden for the FULL public RoomSnapshot surface. Populate every
+    /// optional field so a new public key cannot slip in as an unobserved
+    /// serde default, and assert the four daemon-only projections stay absent.
+    #[test]
+    fn public_room_snapshot_schema_keys_are_pinned() {
+        let mut snapshot = RoomSnapshot {
+            lead: Some("codex".to_string()),
+            lead_epoch: Some(7),
+            room_freeze_id: Some("freeze-1".to_string()),
+            readers: vec![ReadReceipt {
+                tool: "codex".to_string(),
+                last_read_seq: 7,
+                behind_by: 0,
+                status: "caught_up".to_string(),
+            }],
+            mission: Some("ship safely".to_string()),
+            composition: Some(RoomComposition::default()),
+            ..RoomSnapshot::default()
+        };
+        snapshot
+            .system_health
+            .push(make_fact("health-1", FactKind::Risk, "", "health"));
+        snapshot
+            .active_claims
+            .push(make_fact("claim-1", FactKind::Claim, "src/", "claim"));
+
+        let value = serde_json::to_value(snapshot).unwrap();
+        let keys = value
+            .as_object()
+            .expect("RoomSnapshot must serialize as an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected = [
+            "active_blockers",
+            "active_claims",
+            "composition",
+            "current_decisions",
+            "current_risks",
+            "lead",
+            "lead_epoch",
+            "max_seq",
+            "mission",
+            "open_handoffs",
+            "readers",
+            "recent_artifacts",
+            "room_freeze_id",
+            "squads",
+            "stale_facts",
+            "system_health",
+            "totals",
+            "unconsumed_artifacts",
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        assert_eq!(keys, expected);
+        assert!(!value.to_string().contains(WIRE_INTERNALS_KEY));
+        for private in [
+            "content_max_seq",
+            "last_activity_ts",
+            "pending_wakes",
+            "stale_authors",
+        ] {
+            assert!(!keys.contains(private), "private key leaked: {private}");
+        }
     }
 
     #[test]

@@ -7,6 +7,8 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## v0.2.0 - 2026-08-04
+
 ### Fixed — routing no longer changes behaviour
 
 - **The room composes the same way with and without `rallyd`.** Four
@@ -20,7 +22,13 @@ All notable changes to Agent Rally Point are documented here.
   `rally room --json` schema is unchanged. Controls:
   `crates/rally-cli/tests/snapshot_wire_internals.rs` asserts all three through
   the real CLI and daemon, plus a structural check that a FIFTH skipped field
-  cannot be added without carrying it. Mutation-validated four ways.
+  cannot be added without carrying it. A full public `RoomSnapshot` key golden
+  now pins the external schema. The wire version is **2**, so an installed v1
+  daemon is rejected during the identity probe instead of silently supplying
+  empty internals; client- and daemon-side rejection controls grade the cutover.
+  The side-channel also fails loud above 1,024 pending wakes, 4,096 stale
+  authors, or 512 KiB total, preserving exact behavior without letting private
+  state consume the 8 MiB frame. Mutation-validated controls cover each bound.
 
 - **`rally doctor --reap-stale --apply` now fails when its writes fail.** It
   returned exit 0, `ok: true` and `applied: true` against a fully unwritable
@@ -40,7 +48,8 @@ All notable changes to Agent Rally Point are documented here.
   unreclaimable since 2026-08-03 — the cleanup that would shrink the working set
   was blocked by the size of the working set. Measured on a synthetic ledger the
   same size (6,563 facts, 63 expired claims), a full drain took **40.6 s** against
-  a 3 s watchdog.
+  a 3 s watchdog. These performance figures are manual observations from the
+  D10 author run, not a checked-in benchmark artifact.
 
   Two cost cuts took it to **29.5 s**: the segment fold is memoized on the
   fingerprint the reconcile sidecar already trusts, and
@@ -51,11 +60,16 @@ All notable changes to Agent Rally Point are documented here.
 
   That is not enough to fit 63 appends in 3 s, so the pass is **bounded** rather
   than cheap: `--apply` stops when its wall-clock budget is spent and reports
-  `remaining`, and the operator runs it again. Measured: 15 passes, every one
-  under 2.5 s, zero watchdog failures, room drained to zero active claims.
+  `remaining`, and the operator runs it again. The same manual run completed in
+  15 passes, every one under 2.5 s, with zero watchdog failures and zero active
+  claims left.
   `RALLY_REAP_BUDGET_MS` raises the budget for a deliberate bulk drain; `0`
   restores the old unbounded pass. **The remaining cost is not hidden** — four
   full ledger reads per verified append are enumerated and still open as RC-058.
+  Committed controls separate the evidence: `reaper_scale.rs` proves a
+  repo-sized claim queue drains under the default watchdog, while deterministic
+  zero-duration unit controls prove first-action progress across claim,
+  handoff, and lead queues.
 
 ### Changed — one demotion contract instead of three
 
@@ -71,8 +85,6 @@ All notable changes to Agent Rally Point are documented here.
   `author_past_heartbeat_window: bool`, so the sources cannot drift apart by
   prose again. The config key `coordination.relevance.stale_author_factor` is
   unchanged. Registered as RC-066.
-
-## v0.2.0 - 2026-08-04
 
 ### Fixed — verdicts that nothing acted on
 

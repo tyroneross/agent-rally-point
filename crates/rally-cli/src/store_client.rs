@@ -566,3 +566,52 @@ impl RoutedRoomStore {
         self.active_engagement = engagement.to_string();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    #[test]
+    fn probe_rejects_a_v1_daemon_after_the_snapshot_wire_change() {
+        assert_eq!(WIRE_VERSION, 2, "this control grades the v1 to v2 cutover");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let rally_dir = std::env::temp_dir().join(format!("rally-wire-v1-{nonce}"));
+        std::fs::create_dir_all(&rally_dir).unwrap();
+        let socket = std::env::temp_dir().join(format!("rally-wire-v1-{nonce}.sock"));
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::write(
+            rally_dir.join(ADDR_FILENAME),
+            socket.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: StoreRequest = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(request.wire_version, 2);
+            let response = StoreResponse::Ok(StoreOk::Pong {
+                repo_root: "/expected/repo".to_string(),
+                pid: 42,
+                wire_version: 1,
+            });
+            let mut writer = &stream;
+            writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+        });
+
+        assert!(
+            probe_identity(&rally_dir, "/expected/repo").is_none(),
+            "a v1 daemon must not route a v2 client through a reply that omits snapshot internals"
+        );
+        server.join().unwrap();
+        std::fs::remove_file(&socket).ok();
+        std::fs::remove_dir_all(&rally_dir).ok();
+    }
+}

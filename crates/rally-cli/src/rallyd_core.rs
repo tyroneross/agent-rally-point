@@ -1004,6 +1004,27 @@ mod imp {
             )
         }
 
+        #[test]
+        fn daemon_rejects_v1_requests_after_the_snapshot_wire_change() {
+            assert_eq!(WIRE_VERSION, 2, "this control grades the v1 to v2 cutover");
+            let repo_root = unique_repo_root("reject-v1");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let request = StoreRequest {
+                wire_version: 1,
+                engagement: None,
+                op: StoreOp::Ping,
+            };
+            match dispatch_one(&mut store, "/expected/repo", request) {
+                StoreResponse::Err(error) => {
+                    assert_eq!(error.kind, StoreErrorKind::Transport);
+                    assert!(error.message.contains("daemon speaks 2"));
+                    assert!(error.message.contains("client sent 1"));
+                }
+                other => panic!("v1 request was not rejected: {other:?}"),
+            }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
         // Smoke test (Chunk B integration checkpoint): start the daemon on a temp
         // room, ping it, do two CONSECUTIVE appends + a snapshot round trip over a
         // raw socket, assert single-store total order, then shut down and confirm
