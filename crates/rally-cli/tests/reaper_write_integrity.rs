@@ -76,6 +76,34 @@ impl TempRoom {
         stdout_json(&out)
     }
 
+    fn init_observed_worktree(&self) {
+        let git_ok = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(&self.cwd)
+                .args(args)
+                .output()
+                .unwrap_or_else(|error| panic!("spawn git {args:?}: {error}"));
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git_ok(&["init", "--quiet"]);
+        fs::write(self.cwd.join("observed.txt"), "observed\n").expect("write observed fixture");
+        git_ok(&["add", "observed.txt"]);
+        git_ok(&[
+            "-c",
+            "user.name=Rally Test",
+            "-c",
+            "user.email=rally-test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "observed fixture",
+        ]);
+    }
+
     fn log_dir(&self) -> PathBuf {
         self.cwd.join(".rally").join("log")
     }
@@ -475,14 +503,25 @@ fn failed_claim_expiry_write_is_not_reported_as_reaped() {
 #[test]
 fn auto_reap_interval_gate_holds_for_sequential_enters_only() {
     let room = TempRoom::new("d8-sequential-gate");
-    room.run_ok(&[
-        "enter",
-        "--tool",
-        "owner:01",
-        "--json",
-        "--timeout-ms",
-        TIMEOUT_MS,
-    ]);
+    room.init_observed_worktree();
+    let owner_enter = room
+        .rally()
+        .env("RALLY_OBSERVER_PID", "2000000000")
+        .args([
+            "enter",
+            "--tool",
+            "owner:01",
+            "--json",
+            "--timeout-ms",
+            TIMEOUT_MS,
+        ])
+        .output()
+        .expect("spawn owner enter");
+    assert!(
+        owner_enter.status.success(),
+        "owner enter must succeed: {}",
+        String::from_utf8_lossy(&owner_enter.stderr)
+    );
     let seed_claim = |subject: &str, path: &str| {
         room.run_ok(&[
             "say",
@@ -502,6 +541,8 @@ fn auto_reap_interval_gate_holds_for_sequential_enters_only() {
     };
     seed_claim("claim-a", "file:src/a.rs");
 
+    // The owner is externally observed dead with an unchanged worktree HEAD,
+    // making its expired claim eligible under the same rule production uses.
     // Opt in to auto-reap for the two enters below (default is OFF).
     let enter = |tool: &str| -> String {
         let out = room
