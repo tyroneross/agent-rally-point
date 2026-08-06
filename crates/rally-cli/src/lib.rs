@@ -1780,6 +1780,43 @@ fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
     ensure_presence_tiered(room, tool, None)
 }
 
+/// Durably extend every active claim owned by `tool` from a self-authored
+/// heartbeat. The lease window stays size-scaled by the same policy used when
+/// the claim was acquired. A failure is returned to the heartbeat caller: a
+/// successful self-report must not claim renewal when the durable ledger did
+/// not advance.
+fn renew_owned_claim_leases(room: &RoomStore, tool: &str) -> Result<usize> {
+    let snapshot = room.snapshot()?;
+    let coord = hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    let now = chrono::Utc::now();
+    let mut renewed = 0;
+    for claim in snapshot
+        .active_claims
+        .iter()
+        .filter(|claim| claim.tool.as_deref() == Some(tool))
+    {
+        let resource_scopes = claim
+            .scope
+            .iter()
+            .filter_map(|scope| crate::resource_scope::ResourceScope::parse_claim_scope(scope))
+            .collect::<Vec<_>>();
+        let size = crate::decay::classify_work_size(&resource_scopes, claim.scope.len());
+        let lease_secs = crate::decay::reclaim_timeout_secs(
+            size,
+            coord.reclaim_small_minutes,
+            coord.reclaim_large_minutes,
+        );
+        let lease_expires_at = claim_authority::lease_marker_at(now, lease_secs);
+        if room
+            .renew_claim_lease(&claim.event_id, lease_expires_at)?
+            .is_some()
+        {
+            renewed += 1;
+        }
+    }
+    Ok(renewed)
+}
+
 /// Evidence stamps that make the adaptive-liveness signals READABLE.
 ///
 /// Two keys, both consumed by `store.rs`:
@@ -2012,6 +2049,9 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // at once. The blocks still use `snapshot_before` (pre-presence) for their
     // dedup checks, so behavior is unchanged when none of them fire.
     with_watchdog_command_commit(|| ensure_presence_tiered(&room, &tool, args.tier.as_deref()))?;
+    // `enter` is a self-authored liveness signal. Advance every claim this tool
+    // still owns so the reaper reads the same durable lease the agent renewed.
+    with_watchdog_command_commit(|| renew_owned_claim_leases(&room, &tool).map(|_| ()))?;
 
     // Layer 2 — event-driven liveness-lease safety net: when a new agent joins,
     // opportunistically sweep detached `rally-*` orphan tmux sessions that the
@@ -4091,6 +4131,10 @@ fn command_status_post(json: bool, mut args: cli::StatusPostArgs) -> Result<Outp
         session: None,
     };
     let appended = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
+    // The shipped coordination hook emits status posts as heartbeats. Renew
+    // after the presence append so liveness and lease durability succeed or
+    // fail together from the caller's perspective.
+    with_watchdog_command_commit(|| renew_owned_claim_leases(&room, &args.tool).map(|_| ()))?;
     let state = agent_state::project_presence_to_state(&appended)
         .unwrap_or(agent_state::AgentState::Idle { wake_after: None });
     let text = format!("status post tool={} seq={}", args.tool, appended.seq);
@@ -8302,6 +8346,48 @@ mod tests {
         assert_eq!(presence_count, 1, "exactly one presence fact for tool-x");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn heartbeat_renews_every_owned_claim_durably() {
+        let root = unique_root("heartbeat-renews-claims");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        ensure_presence(&room, "tool-x").unwrap();
+        let claim = store::Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: "claim-heartbeat-renew".to_string(),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Claim,
+            tool: Some("tool-x".to_string()),
+            role: None,
+            subject: "claim for heartbeat renewal".to_string(),
+            scope: vec!["file:src/lib.rs".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: vec!["lease_expires_at:2000-01-01T00:00:00Z".to_string()],
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&claim).unwrap();
+        let before = room.facts().unwrap().len();
+
+        assert_eq!(renew_owned_claim_leases(&room, "tool-x").unwrap(), 1);
+
+        let facts = room.facts().unwrap();
+        assert_eq!(facts.len(), before + 1);
+        assert_eq!(facts.last().unwrap().kind, store::FactKind::ClaimRenewed);
+        assert_eq!(
+            facts.last().unwrap().ref_id.as_deref(),
+            Some("claim-heartbeat-renew")
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// Component B acceptance test 2: a second call for the same tool writes no

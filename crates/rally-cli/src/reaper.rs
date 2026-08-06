@@ -165,10 +165,12 @@ pub(crate) fn run_reap_stale(apply: bool) -> Result<ReapReport> {
 ///    durable append committed; failing closed"); OFF gave 8/8 exit 0. The
 ///    "never fails enter" property was implemented for the reaper's own `Err`
 ///    return and never held against the mutation watchdog sitting above it.
-/// 2. **It closed LIVE agents' claims.** Nothing in production renews
-///    `lease_expires_at` — `renew_claim_lease` has no production caller — so
-///    every single-file claim expires 30 minutes after it is made and every
-///    coarse claim after 2 hours, regardless of whether the owner is working.
+/// 2. **It closed LIVE agents' claims.** At the time it shipped, nothing in
+///    production renewed `lease_expires_at`, so every single-file claim expired
+///    30 minutes after it was made and every coarse claim after 2 hours,
+///    regardless of whether the owner was working. Presence/status heartbeats
+///    now durably renew owned claims; observed-liveness safety remains a
+///    separate gate before changing the default.
 ///    Measured: an active owner's claim was closed by a PEER's `enter`, the
 ///    owner was never told, and a third agent then claimed the same file with
 ///    no conflict. That is the collision Rally exists to prevent.
@@ -290,9 +292,9 @@ pub(crate) fn maybe_reap_on_enter(room: &RoomStore) -> Option<ReapReport> {
 /// The two signals are not equally trustworthy, and wiring the reaper to
 /// `rally enter` is what made the difference matter.
 ///
-/// - **Lease expiry** is stamped by the claim's OWN writer, at claim time, and
-///   is monotonic — a past lease cannot un-expire. Backdating one only expires
-///   the backdater's own claim.
+/// - **Lease expiry** is stamped by the claim's OWN writer and advanced by its
+///   self-authored heartbeat. The append boundary re-checks the effective lease
+///   under lock, so a reap computed before a concurrent renewal is refused.
 /// - **Owner staleness** is derived from `last_seen_ts`, which is the
 ///   `created_at` of the highest-seq fact naming that tool — a value written
 ///   verbatim from the ledger line, not from the reader's clock. `.rally/log/`
@@ -1755,6 +1757,46 @@ mod tests {
             "reaped claim must leave active_claims"
         );
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn durable_renewal_after_original_expiry_survives_reap() {
+        let root = unique_root("durable-renewal-survives-reap");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        append_presence(&room, "live-owner", 5);
+        let past_lease = past_ts(3600);
+        let claim = append_claim_with_lease(
+            &room,
+            "claim-renewed-after-expiry",
+            "live-owner",
+            &past_lease,
+        );
+        let renewed_until = {
+            use chrono::{SecondsFormat, Utc};
+            (Utc::now() + chrono::Duration::seconds(3600))
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        };
+        room.renew_claim_lease(&claim.event_id, renewed_until.clone())
+            .unwrap()
+            .expect("active claim must renew");
+
+        let report = run_reap_stale_in_room(&room, true).unwrap();
+
+        assert!(report.claims_reaped.is_empty());
+        let active = room
+            .snapshot()
+            .unwrap()
+            .active_claims
+            .into_iter()
+            .find(|fact| fact.event_id == claim.event_id)
+            .expect("renewed claim must remain active");
+        assert!(
+            active
+                .evidence
+                .iter()
+                .any(|item| item == &format!("lease_expires_at:{renewed_until}"))
+        );
         fs::remove_dir_all(&root).ok();
     }
 

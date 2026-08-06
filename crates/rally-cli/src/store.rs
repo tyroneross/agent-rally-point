@@ -129,6 +129,11 @@ use crate::{
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FactKind {
     Claim,
+    /// Durable lease extension for an existing claim. `ref_id` names the
+    /// original claim and `lease_expires_at:` carries the new authoritative
+    /// deadline. This is an internal store transition, not a public `say` kind.
+    #[serde(rename = "claim.renewed")]
+    ClaimRenewed,
     #[serde(rename = "claim.expired")]
     ClaimExpired,
     Release,
@@ -202,6 +207,9 @@ impl FactKind {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "claim" => Some(Self::Claim),
+            // `claim.renewed` is intentionally internal-only. Renewals enter
+            // through `RoomStore::renew_claim_lease`, which verifies the live
+            // target and owner under the write lock.
             "claim.expired" | "claim_expired" => Some(Self::ClaimExpired),
             "release" => Some(Self::Release),
             "blocker" => Some(Self::Blocker),
@@ -227,6 +235,7 @@ impl FactKind {
     pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::Claim => "claim",
+            Self::ClaimRenewed => "claim.renewed",
             Self::ClaimExpired => "claim.expired",
             Self::Release => "release",
             Self::Blocker => "blocker",
@@ -1912,46 +1921,94 @@ impl DirectRoomStore {
         // snapshot→append gap could still have its claim closed — the racy
         // OWNER-STALE signal. Mirror the Release guard: under the held mutation
         // lock, re-snapshot fresh facts and re-assert the closure is still
-        // justified. A LEASE-EXPIRED close is exempt — a past lease cannot
-        // un-expire (monotonic), so we only re-validate OWNER-STALE-only
-        // closures. The reaper stamps `reaper:reason=` + `reaper:owner=` so this
-        // guard can distinguish without re-parsing the subject.
+        // justified. Durable renewal means lease expiry is no longer monotonic:
+        // a lease that was expired in the unlocked snapshot may have advanced
+        // before this append. Re-check every reason the reaper stamped and
+        // proceed only while at least one remains true.
         if fact.kind == FactKind::ClaimExpired {
             let reason = Self::reaper_marker(&fact.evidence, "reason");
-            // Only a PURE owner-stale close is racy. A close that also carries
-            // the lease-expired signal ("lease-expired" or
-            // "owner-stale+lease-expired") is monotonic-safe and exempt.
-            if reason == Some("owner-stale")
+            let owner_reason = matches!(reason, Some("owner-stale" | "owner-stale+lease-expired"));
+            let lease_reason =
+                matches!(reason, Some("lease-expired" | "owner-stale+lease-expired"));
+            if (owner_reason || lease_reason)
                 && let Some(owner) = Self::reaper_marker(&fact.evidence, "owner")
+                && let Some(ref_id) = fact.ref_id.as_deref()
             {
                 let coord =
                     crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
                 let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
                 let fresh = snapshot_from_facts_with_policy(&facts, &coord, false);
-                // The specific claim this ClaimExpired closes (by ref).
-                let ref_id = fact.ref_id.as_deref();
-                let still_owns = fresh.active_claims.iter().any(|c| {
-                    c.tool.as_deref() == Some(owner) && Some(c.event_id.as_str()) == ref_id
-                });
-                let still_eligible = fresh
+                let active_claim = fresh
                     .active_claims
                     .iter()
-                    .filter(|c| {
-                        c.tool.as_deref() == Some(owner) && Some(c.event_id.as_str()) == ref_id
-                    })
-                    .any(|c| fresh.claim_reclaim_eligible(c, &coord).0);
-                // The claim still HOLDS but is NO LONGER reap-eligible means
-                // the owner came back to life in the gap → refuse the reap.
-                // If the claim is already gone (already closed) we let the
-                // append proceed; the projection dedups via ref_id.
-                if still_owns && !still_eligible {
+                    .find(|c| c.tool.as_deref() == Some(owner) && c.event_id == ref_id);
+                let owner_still_stale = owner_reason
+                    && active_claim
+                        .is_some_and(|claim| fresh.claim_reclaim_eligible(claim, &coord).0);
+                let lease_still_expired = lease_reason
+                    && active_claim.is_some_and(|claim| {
+                        claim
+                            .evidence
+                            .iter()
+                            .find_map(|item| item.strip_prefix("lease_expires_at:"))
+                            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                            .is_some_and(|expires| expires <= chrono::Utc::now())
+                    });
+                // If the claim is already closed, allow the append and let the
+                // projection deduplicate it. If it is still active, at least
+                // one of the reasons computed by the unlocked pass must remain
+                // true under this lock.
+                if active_claim.is_some() && !owner_still_stale && !lease_still_expired {
                     return Err(RallyError::Usage(format!(
-                        "reap refused: owner {owner} revived under the mutation \
-                             lock (owner-stale ClaimExpired for claim {} no longer \
-                             eligible); not closing a now-live owner's claim",
-                        ref_id.unwrap_or("<unknown>")
+                        "reap refused: claim {ref_id} is no longer eligible under the mutation \
+                         lock (owner revived or lease renewed); not closing an active claim"
                     )));
                 }
+            }
+        }
+        // Durable renewal is an internal state transition. Re-assert its target
+        // and monotonicity under the same lock that assigns its sequence so two
+        // concurrent renewals cannot shorten or duplicate the effective lease.
+        if fact.kind == FactKind::ClaimRenewed {
+            let claim_id = fact.ref_id.as_deref().ok_or_else(|| {
+                RallyError::Usage("renew claim lease: missing claim ref".to_string())
+            })?;
+            let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+            let current =
+                claim_authority::active_claim_record(&facts, claim_id).ok_or_else(|| {
+                    RallyError::Usage(format!(
+                        "renew claim lease: ref {claim_id} is not an active claim"
+                    ))
+                })?;
+            if fact.tool != current.owner_tool {
+                return Err(RallyError::Usage(format!(
+                    "renew claim lease: {} does not own claim {claim_id}",
+                    fact.tool.as_deref().unwrap_or("<unknown>")
+                )));
+            }
+            let requested_raw = fact
+                .evidence
+                .iter()
+                .find_map(|item| item.strip_prefix("lease_expires_at:"))
+                .ok_or_else(|| {
+                    RallyError::Usage(
+                        "renew claim lease: missing lease_expires_at evidence".to_string(),
+                    )
+                })?;
+            let requested = chrono::DateTime::parse_from_rfc3339(requested_raw).map_err(|err| {
+                RallyError::Usage(format!(
+                    "renew claim lease: lease_expires_at must be RFC3339: {err}"
+                ))
+            })?;
+            if current
+                .lease_expires_at
+                .as_deref()
+                .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                .is_some_and(|existing| existing >= requested)
+            {
+                return Err(RallyError::Usage(format!(
+                    "renew claim lease: requested lease does not advance claim {claim_id}"
+                )));
             }
         }
         // ---- WRITE-BOUNDARY AUTHORITY (ARP-R-01, ARP-R-02, ARP-R-04) -------
@@ -2078,7 +2135,11 @@ impl DirectRoomStore {
         let _ = self.refresh_index(fact.seq);
         if matches!(
             fact.kind,
-            FactKind::Claim | FactKind::Release | FactKind::Resolve | FactKind::ClaimExpired
+            FactKind::Claim
+                | FactKind::ClaimRenewed
+                | FactKind::Release
+                | FactKind::Resolve
+                | FactKind::ClaimExpired
         ) {
             let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
             claim_authority::write_index_from_facts(&self.claim_index_path, &facts)
@@ -2466,9 +2527,50 @@ impl DirectRoomStore {
         claim_id: &str,
         lease_expires_at: String,
     ) -> Result<Option<claim_authority::ActiveClaimRecord>> {
-        self.rebuild_claim_index()?;
-        claim_authority::renew_claim_lease(&self.claim_index_path, claim_id, lease_expires_at)
-            .map_err(|err| RallyError::Message(format!("renew claim lease: {err}")))
+        let requested = chrono::DateTime::parse_from_rfc3339(&lease_expires_at).map_err(|err| {
+            RallyError::Usage(format!(
+                "renew claim lease: lease_expires_at must be RFC3339: {err}"
+            ))
+        })?;
+        let facts = self.facts()?;
+        let Some(current) = claim_authority::active_claim_record(&facts, claim_id) else {
+            return Ok(None);
+        };
+        if current
+            .lease_expires_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|existing| existing >= requested)
+        {
+            // Renewal is monotonic. Equal/older retries are idempotent and
+            // must never shorten the authoritative lease.
+            return Ok(Some(current));
+        }
+
+        let renewal = Fact {
+            from_session_id: current.from_session_id.clone(),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: crate::new_id("fact"),
+            seq: 0,
+            thread_id: crate::new_id("room"),
+            kind: FactKind::ClaimRenewed,
+            tool: current.owner_tool.clone(),
+            role: None,
+            subject: format!("claim lease renewed: {claim_id}"),
+            scope: current.raw_scope.clone(),
+            created_at: now_string(),
+            summary: None,
+            evidence: vec![format!("lease_expires_at:{lease_expires_at}")],
+            target: None,
+            ref_id: Some(claim_id.to_string()),
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        self.append_fact_verified(&renewal)?;
+        let facts = self.facts()?;
+        Ok(claim_authority::active_claim_record(&facts, claim_id))
     }
 
     #[cfg(test)]
@@ -3227,7 +3329,7 @@ fn snapshot_from_facts_with_policy(
     let active_claims = facts
         .iter()
         .filter(|fact| claim_authority::is_active_claim_fact(fact, facts))
-        .cloned()
+        .map(|fact| claim_authority::project_effective_claim(fact, facts))
         .collect::<Vec<_>>();
     let active_blockers = facts
         .iter()
@@ -6003,7 +6105,7 @@ mod ledger_tests {
     }
 
     #[test]
-    fn claim_lease_renewal_updates_index_without_durable_event() {
+    fn claim_lease_renewal_appends_durable_event_and_projects_effective_lease() {
         let root = unique_root("claim-lease-renew");
         let store = RoomStore::open_at(root.clone()).unwrap();
         let claim = claim_fact(
@@ -6019,13 +6121,19 @@ mod ledger_tests {
             .renew_claim_lease("claim-renew", "2099-01-01T00:30:00Z".to_string())
             .unwrap()
             .unwrap();
-        let after_count = store.facts().unwrap().len();
+        let facts = store.facts().unwrap();
+        let after_count = facts.len();
         let index = claim_authority::read_index(store.claim_index_path()).unwrap();
+        let snapshot = store.snapshot().unwrap();
 
         assert_eq!(
-            before_count, after_count,
-            "lease renewal must not append durable facts"
+            before_count + 1,
+            after_count,
+            "lease renewal must append exactly one durable fact"
         );
+        let renewal = facts.last().expect("renewal fact");
+        assert_eq!(renewal.kind, FactKind::ClaimRenewed);
+        assert_eq!(renewal.ref_id.as_deref(), Some("claim-renew"));
         assert_eq!(
             renewed.lease_expires_at.as_deref(),
             Some("2099-01-01T00:30:00Z")
@@ -6035,6 +6143,49 @@ mod ledger_tests {
                 .claims
                 .get("claim-renew")
                 .and_then(|record| record.lease_expires_at.as_deref()),
+            Some("2099-01-01T00:30:00Z")
+        );
+        assert!(
+            snapshot.active_claims[0]
+                .evidence
+                .iter()
+                .any(|item| item == "lease_expires_at:2099-01-01T00:30:00Z")
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn claim_lease_renewal_is_monotonic_and_retry_idempotent() {
+        let root = unique_root("claim-lease-renew-idempotent");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let claim = claim_fact(
+            "claim-renew",
+            "tool-a",
+            "file:src/lib.rs",
+            "2099-01-01T00:00:00Z",
+        );
+        store.append_fact_verified(&claim).unwrap();
+        store
+            .renew_claim_lease("claim-renew", "2099-01-01T00:30:00Z".to_string())
+            .unwrap();
+        let after_first = store.facts().unwrap().len();
+
+        let equal = store
+            .renew_claim_lease("claim-renew", "2099-01-01T00:30:00Z".to_string())
+            .unwrap()
+            .unwrap();
+        let older = store
+            .renew_claim_lease("claim-renew", "2099-01-01T00:15:00Z".to_string())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(store.facts().unwrap().len(), after_first);
+        assert_eq!(
+            equal.lease_expires_at.as_deref(),
+            Some("2099-01-01T00:30:00Z")
+        );
+        assert_eq!(
+            older.lease_expires_at.as_deref(),
             Some("2099-01-01T00:30:00Z")
         );
         fs::remove_dir_all(&root).ok();
@@ -9538,10 +9689,8 @@ mod sec001_takeover_guard_tests {
 
     #[test]
     fn reaper_lease_expired_close_survives_owner_activity() {
-        // A LEASE-EXPIRED close is monotonic-safe: a past lease cannot un-expire,
-        // so the under-lock guard must NOT refuse it even when the owner is fully
-        // active (fresh presence). This is the dual-signal case the owner-stale
-        // re-check must leave alone.
+        // A LEASE-EXPIRED close remains valid while the effective lease is still
+        // expired, even when the owner is fully active (fresh presence).
         let r = root("reaper-lease-survives");
         let store = RoomStore::open_at(r.clone()).unwrap();
         // live-owner claims a single file just now AND is fresh (active squad).
@@ -9576,7 +9725,7 @@ mod sec001_takeover_guard_tests {
         );
         store.append_fact(&presence).unwrap();
         // The reaper closes the claim on the LEASE-EXPIRED signal. Even though
-        // the owner is active, the guard exempts lease-expired closures.
+        // the owner is active, the under-lock lease check still passes.
         let expired = reaper_claim_expired("claim-l", "live-owner", "lease-expired");
         store
             .append_fact(&expired)
@@ -9585,6 +9734,42 @@ mod sec001_takeover_guard_tests {
         assert!(
             !snap.active_claims.iter().any(|c| c.event_id == "claim-l"),
             "lease-expired ClaimExpired must close the claim despite owner activity"
+        );
+        fs::remove_dir_all(&r).ok();
+    }
+
+    #[test]
+    fn reaper_lease_expired_close_is_refused_after_concurrent_renewal() {
+        let r = root("reaper-renewal-race");
+        let store = RoomStore::open_at(r.clone()).unwrap();
+        let mut claim = fact_at(
+            "claim-l",
+            FactKind::Claim,
+            "live-owner",
+            "file:src/a.rs",
+            &iso_ago(5),
+        );
+        claim
+            .evidence
+            .push(format!("lease_expires_at:{}", iso_ago(60)));
+        store.append_fact(&claim).unwrap();
+        store
+            .renew_claim_lease("claim-l", "2099-01-01T00:00:00Z".to_string())
+            .unwrap();
+
+        let expired = reaper_claim_expired("claim-l", "live-owner", "lease-expired");
+        let err = store.append_fact(&expired).unwrap_err().to_string();
+        assert!(
+            err.contains("reap refused") && err.contains("lease renewed"),
+            "renewed lease must win the snapshot-to-append race; got: {err}"
+        );
+        assert!(
+            store
+                .snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|fact| fact.event_id == "claim-l")
         );
         fs::remove_dir_all(&r).ok();
     }
