@@ -128,3 +128,7 @@ cockpitd.db.audit.db-wal
 archive/
 agent-rally-point.worktrees/
 RALLY-VERSION-MISMATCH-ASSESSMENT-*.md
+
+# Vendored [patch] crates resolve through the workspace's root Cargo.lock, so a
+# lock generated inside the vendored dir governs nothing and only churns.
+vendor/*/Cargo.lock
