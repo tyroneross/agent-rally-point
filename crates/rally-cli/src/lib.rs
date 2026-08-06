@@ -130,6 +130,7 @@ mod hooks_config;
 mod init;
 mod liveness;
 mod next;
+mod observed_liveness;
 mod output;
 pub mod rallyd_core;
 mod reaper;
@@ -1819,7 +1820,7 @@ fn renew_owned_claim_leases(room: &RoomStore, tool: &str) -> Result<usize> {
 
 /// Evidence stamps that make the adaptive-liveness signals READABLE.
 ///
-/// Two keys, both consumed by `store.rs`:
+/// Four keys consumed by the liveness projection and external observer:
 /// * `branch_head_sha:<sha>` — the worktree HEAD at the moment of the beat.
 ///   `code_progress_age_per_tool` compares consecutive stamps for a tool and
 ///   reports forward progress when the sha MOVED. Two stamped beats are needed
@@ -1829,6 +1830,12 @@ fn renew_owned_claim_leases(room: &RoomStore, tool: &str) -> Result<usize> {
 ///   `planned_cadence_for_tool` reads it to size that session's staleness
 ///   window, which is what makes the window adaptive rather than one global
 ///   default applied to every agent.
+/// * `worktree_path:<absolute-path>` — the checkout an external observer may
+///   inspect. The observer verifies that it belongs to this room's git common
+///   directory before reading it.
+/// * `observer_pid:<pid>` — the long-lived host process supplied by the shipped
+///   hook. Never fall back to the short-lived `rally` child pid: that would be
+///   dead as soon as the heartbeat returns and falsely demote every agent.
 ///
 /// Fail-open in every branch: an unavailable HEAD stamps nothing rather than
 /// stamping a placeholder, because `code_progress_age_per_tool` treats a
@@ -1836,8 +1843,16 @@ fn renew_owned_claim_leases(room: &RoomStore, tool: &str) -> Result<usize> {
 /// value that never changes (a false "no progress" verdict).
 fn presence_signal_evidence(room: &RoomStore) -> Vec<String> {
     let mut evidence = Vec::new();
-    if let Some(sha) = current_head_sha(room.repo_root()) {
+    if let Some(sha) = observed_liveness::current_head_sha(room.repo_root()) {
         evidence.push(format!("branch_head_sha:{sha}"));
+    }
+    if let Ok(path) = fs::canonicalize(room.repo_root()) {
+        evidence.push(format!("worktree_path:{}", path.display()));
+    }
+    if let Ok(raw) = env::var("RALLY_OBSERVER_PID")
+        && raw.parse::<i32>().ok().is_some_and(|pid| pid > 1)
+    {
+        evidence.push(format!("observer_pid:{raw}"));
     }
     let coord = hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
     if coord.default_cadence_secs > 0 {
@@ -1847,66 +1862,6 @@ fn presence_signal_evidence(room: &RoomStore) -> Vec<String> {
         ));
     }
     evidence
-}
-
-/// The current worktree HEAD sha, read from `.git` WITHOUT spawning git.
-///
-/// This runs on the presence path, which the SessionStart hook drives under a
-/// 5-second budget, so a subprocess per beat is the wrong cost — and an extra
-/// spawn inside `rally run` measurably widened an existing intermittent failure
-/// under cross-suite contention (RC-005 / RC-044 territory).
-///
-/// Handles the three shapes that matter: a linked worktree (`.git` is a FILE
-/// pointing at the real gitdir), a detached HEAD (the sha is in `HEAD`), and an
-/// attached branch (`HEAD` names a ref, resolved from `refs/` then
-/// `packed-refs`). Anything else returns `None`, and a `None` stamps nothing —
-/// never a placeholder, because `code_progress_age_per_tool` reads a constant
-/// value as "HEAD did not move", which would be a false verdict rather than an
-/// absent signal.
-fn current_head_sha(repo_root: &Path) -> Option<String> {
-    let git_path = repo_root.join(".git");
-    let git_dir = if git_path.is_dir() {
-        git_path
-    } else {
-        // Linked worktree: `.git` is a file containing `gitdir: <path>`.
-        let raw = fs::read_to_string(&git_path).ok()?;
-        let target = raw.trim().strip_prefix("gitdir:")?.trim();
-        let target = Path::new(target);
-        if target.is_absolute() {
-            target.to_path_buf()
-        } else {
-            repo_root.join(target)
-        }
-    };
-
-    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let head = head.trim();
-    let Some(ref_name) = head.strip_prefix("ref:").map(str::trim) else {
-        // Detached HEAD — the sha is right there.
-        return valid_sha(head);
-    };
-
-    if let Ok(direct) = fs::read_to_string(git_dir.join(ref_name))
-        && let Some(sha) = valid_sha(direct.trim())
-    {
-        return Some(sha);
-    }
-    // Packed refs: `<sha> <refname>` lines, `^<sha>` peel lines skipped.
-    let packed = fs::read_to_string(git_dir.join("packed-refs")).ok()?;
-    packed.lines().find_map(|line| {
-        let line = line.trim();
-        if line.starts_with('#') || line.starts_with('^') {
-            return None;
-        }
-        let (sha, name) = line.split_once(' ')?;
-        (name.trim() == ref_name).then(|| valid_sha(sha))?
-    })
-}
-
-/// A 40- or 64-character lowercase hex object id, or `None`.
-fn valid_sha(candidate: &str) -> Option<String> {
-    let ok = matches!(candidate.len(), 40 | 64) && candidate.chars().all(|c| c.is_ascii_hexdigit());
-    ok.then(|| candidate.to_ascii_lowercase())
 }
 
 /// Tier-aware presence. Lead auto-assign is **frontier-only**: an undeclared
@@ -1924,7 +1879,11 @@ fn ensure_presence_tiered(room: &RoomStore, tool: &str, tier: Option<&str>) -> R
     // so that `command_enter` can detect when different builds are writing to
     // the same room.  Format: "build_id:<BUILD_ID>" — minimal, no schema bump.
     let presence_fact = Fact {
-        from_session_id: None,
+        from_session_id: Some(
+            current_protocol_session(Some(tool))
+                .from_session_id()
+                .to_string(),
+        ),
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -4110,7 +4069,11 @@ fn command_status_post(json: bool, mut args: cli::StatusPostArgs) -> Result<Outp
 
     let subject = build_status_subject(&args.state, &args);
     let fact = store::Fact {
-        from_session_id: None,
+        from_session_id: Some(
+            current_protocol_session(Some(&args.tool))
+                .from_session_id()
+                .to_string(),
+        ),
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -4122,7 +4085,7 @@ fn command_status_post(json: bool, mut args: cli::StatusPostArgs) -> Result<Outp
         scope: Vec::new(),
         created_at: now_string(),
         summary: Some(format!("build_id:{BUILD_ID}")),
-        evidence: Vec::new(),
+        evidence: presence_signal_evidence(&room),
         target: None,
         ref_id: None,
         status: None,
@@ -8387,6 +8350,51 @@ mod tests {
             facts.last().unwrap().ref_id.as_deref(),
             Some("claim-heartbeat-renew")
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn presence_stamps_worktree_and_external_host_pid() {
+        let _guard = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = unique_root("presence-observer-stamps");
+        init_status_git_repo(&root, "main");
+        unsafe { env::set_var("RALLY_OBSERVER_PID", "424242") };
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        ensure_presence(&room, "tool-observed").unwrap();
+
+        unsafe { env::remove_var("RALLY_OBSERVER_PID") };
+        let presence = room
+            .facts()
+            .unwrap()
+            .into_iter()
+            .find(|fact| {
+                fact.kind == store::FactKind::Presence
+                    && fact.tool.as_deref() == Some("tool-observed")
+            })
+            .unwrap();
+        let canonical = fs::canonicalize(&root).unwrap();
+        assert!(
+            presence
+                .evidence
+                .iter()
+                .any(|item| item == &format!("worktree_path:{}", canonical.display()))
+        );
+        assert!(
+            presence
+                .evidence
+                .iter()
+                .any(|item| item == "observer_pid:424242")
+        );
+        assert!(
+            presence
+                .evidence
+                .iter()
+                .any(|item| item.starts_with("branch_head_sha:"))
+        );
+        assert!(presence.from_session_id.is_some());
         std::fs::remove_dir_all(root).ok();
     }
 

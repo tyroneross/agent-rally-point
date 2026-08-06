@@ -84,6 +84,12 @@
 
 set -euo pipefail
 
+# The rally CLI process is intentionally short-lived, so it cannot be the pid
+# an external liveness observer checks later. The hook's parent is the host
+# agent process that launched this hook. Preserve an explicit override for
+# wrappers that can provide a more precise long-lived pid.
+export RALLY_OBSERVER_PID="${RALLY_OBSERVER_PID:-$PPID}"
+
 # Shared install-hint phrase reused by every "rally CLI is missing" advisory
 # (the offer branch below when .rally/ is absent, and the not-installed
 # branch further down when .rally/ IS present). One string so the two

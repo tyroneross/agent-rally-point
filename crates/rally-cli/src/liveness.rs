@@ -5,8 +5,8 @@
 //!
 //! Replaces the fixed `IDLE_THRESHOLD_SECS` / `TAKEOVER_STALE_SECS` cutoffs for
 //! the squad/presence projection with a window that ADAPTS to each session's
-//! planned heartbeat cadence, and decides liveness from FOUR independent
-//! signals. A session is LIVE if ANY signal is fresh within its adaptive window.
+//! planned heartbeat cadence, and decides liveness from four independent
+//! self-reported signals plus one authoritative observed verdict.
 //!
 //! Two fail-directions, each defaulting to the SAFE side:
 //! * **Squad projection** is FAIL-OPEN — a missing/unparseable signal yields
@@ -48,10 +48,7 @@ pub(crate) enum Liveness {
     Unknown,
 }
 
-/// The four liveness signals, each an OPTIONAL age in seconds since it was last
-/// fresh. `None` = the signal was never observed / could not be parsed (absent).
-/// A `Some(age)` with `age <= window` is FRESH; `Some(age)` with `age > window`
-/// is STALE for that one signal.
+/// The four self-reported ages plus an OPTIONAL external observer verdict.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LivenessSignals {
     /// (a) Heartbeat / presence `last_seen` age.
@@ -64,6 +61,10 @@ pub(crate) struct LivenessSignals {
     /// (d) Declared active work — age of the session's newest live claim /
     /// mission / handoff.
     pub(crate) plan_age: Option<i64>,
+    /// (e) External process/worktree observation. `Some(true)` is observed
+    /// live, `Some(false)` is observed dead, and `None` is unavailable. Unlike
+    /// the four ages, an observed-dead result overrides a fresh self-report.
+    pub(crate) observed_alive: Option<bool>,
 }
 
 impl LivenessSignals {
@@ -104,13 +105,20 @@ pub(crate) fn adaptive_window_secs(
     interval * mult + grace
 }
 
-/// Decide liveness from the four signals against the adaptive `window`.
+/// Decide liveness from the external verdict, then the four age signals against
+/// the adaptive `window`.
 ///
 /// Rules (the EXACT contract the golden fixture asserts):
-/// * any signal `Some(age)` with `age <= window` → [`Liveness::Live`].
+/// * observed live/dead wins over self-reported ages.
+/// * otherwise any age `Some(age)` with `age <= window` → [`Liveness::Live`].
 /// * else if EVERY signal is `Some(_)` (all parseable) → [`Liveness::Stale`].
 /// * else (no fresh signal AND at least one `None`) → [`Liveness::Unknown`].
 pub(crate) fn is_live(signals: &LivenessSignals, window: i64) -> Liveness {
+    match signals.observed_alive {
+        Some(true) => return Liveness::Live,
+        Some(false) => return Liveness::Stale,
+        None => {}
+    }
     let arr = signals.as_array();
     let any_fresh = arr.iter().any(|s| matches!(s, Some(age) if *age <= window));
     if any_fresh {
@@ -249,6 +257,10 @@ mod tests {
     /// window math and the same `is_live` verdict here as in the Python mirror.
     #[test]
     fn matches_shared_golden_vectors() {
+        // The shared Build Loop mirror deliberately covers the four portable
+        // scalar ages. External observation needs repo-local filesystem and
+        // process I/O, so crate-local observer/reaper tests cover that fifth
+        // verdict while the shared vectors remain byte-identical.
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/liveness_vectors.json"
@@ -285,6 +297,7 @@ mod tests {
                 inject_age: opt(&sig["inject_age"]),
                 code_progress_age: opt(&sig["code_progress_age"]),
                 plan_age: opt(&sig["plan_age"]),
+                observed_alive: None,
             };
             let window = adaptive_window_secs(interval, default_cadence, mult, grace);
             let got = is_live(&signals, window);
@@ -470,6 +483,7 @@ mod tests {
             inject_age: Some(window + 1),
             code_progress_age: Some(window + 1),
             plan_age: Some(window + 1),
+            observed_alive: None,
         };
         assert_eq!(is_live(&s, window), Liveness::Stale);
     }
@@ -480,6 +494,28 @@ mod tests {
             is_live(&LivenessSignals::default(), 1860),
             Liveness::Unknown
         );
+    }
+
+    #[test]
+    fn observed_dead_overrides_a_fresh_heartbeat() {
+        let signals = LivenessSignals {
+            heartbeat_age: Some(0),
+            observed_alive: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(is_live(&signals, 1860), Liveness::Stale);
+    }
+
+    #[test]
+    fn observed_live_overrides_stale_self_reports() {
+        let signals = LivenessSignals {
+            heartbeat_age: Some(9999),
+            inject_age: Some(9999),
+            code_progress_age: Some(9999),
+            plan_age: Some(9999),
+            observed_alive: Some(true),
+        };
+        assert_eq!(is_live(&signals, 1860), Liveness::Live);
     }
 
     #[test]

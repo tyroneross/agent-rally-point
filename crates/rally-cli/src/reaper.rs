@@ -178,10 +178,12 @@ pub(crate) fn run_reap_stale(apply: bool) -> Result<ReapReport> {
 ///    store-corruption path. Adding a mutation-heavy pass to it widened a known
 ///    defect without a control.
 ///
-/// So the call site stays — the reaper is reachable, which was the actual
-/// finding — but it is opt-in until lease renewal exists and concurrent enter
-/// is bounded. Turning it on by default before then trades a slow leak for a
-/// fast outage.
+/// Durable renewal and observed-dead corroboration now close the live-claim
+/// safety defect. The call site stays opt-in because the interval marker still
+/// has no cross-process compare-and-swap (concurrent enters may each run a
+/// pass), legacy claims have no observer stamp, and changing a destructive
+/// default remains an operator decision. The evidence supports "safe when
+/// opted in for stamped sessions," not a default flip.
 pub(crate) const DEFAULT_AUTO_REAP_INTERVAL_SECS: i64 = 0;
 
 /// Marker recording the last auto-reap, relative to `.rally/`.
@@ -306,15 +308,15 @@ pub(crate) fn maybe_reap_on_enter(room: &RoomStore) -> Option<ReapReport> {
 ///   claims. The under-lock revival guard re-reads the same poisoned projection
 ///   and confirms the reap rather than blocking it.
 ///
-/// So the automatic path takes only the signal an attacker cannot aim at
-/// someone else, and owner-staleness stays behind the deliberate operator
-/// command. That keeps the fix to "the reaper had no caller" without turning a
-/// peer-controlled timestamp into a claim-destruction primitive.
+/// So the automatic path requires BOTH writer-stamped lease expiry and an
+/// external observed-dead verdict. Owner-staleness stays behind the deliberate
+/// operator command. Unknown observer evidence never authorizes auto-removal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReapMode {
     /// Act on both signals. `rally doctor --reap-stale --apply` — a human ran it.
     Full,
-    /// Act only on writer-stamped lease expiry. The automatic `enter` path.
+    /// Act only on writer-stamped lease expiry corroborated by observed death.
+    /// The automatic `enter` path.
     LeaseOnly,
 }
 
@@ -410,6 +412,7 @@ fn run_reap_stale_in_room_with_budget(
     // fail-closed: expired_claims only includes claims with a parseable
     // lease_expires_at <= now; unparseable or missing lease → not included.
     let facts = room.facts()?;
+    let observed_tools = crate::observed_liveness::observe_tools(room.repo_root(), &facts);
     let claim_index = crate::claim_authority::index_from_facts(&facts);
     let lease_expired_ids: std::collections::BTreeSet<String> =
         crate::claim_authority::expired_claims(&claim_index, &facts, chrono::Utc::now())
@@ -421,6 +424,27 @@ fn run_reap_stale_in_room_with_budget(
     for claim in &snapshot.active_claims {
         let (owner_eligible, _size) = snapshot.claim_reclaim_eligible(claim, &coord);
         let lease_eligible = lease_expired_ids.contains(&claim.event_id);
+        let observed = claim
+            .tool
+            .as_deref()
+            .and_then(|tool| observed_tools.get(tool).copied())
+            .unwrap_or(crate::observed_liveness::ObservedLiveness::Unknown);
+        let observed_verdict = crate::liveness::is_live(
+            &crate::liveness::LivenessSignals {
+                observed_alive: observed.as_signal(),
+                ..Default::default()
+            },
+            0,
+        );
+
+        // External live evidence is a veto in both automatic and explicit
+        // modes. The automatic enter path additionally requires observed-dead
+        // corroboration; Unknown remains fail-closed. A human-invoked Full pass
+        // retains the legacy ability to clean old, unstamped ledgers.
+        if observed_verdict == crate::liveness::Liveness::Live {
+            preserved += 1;
+            continue;
+        }
 
         // A claim is reaped when EITHER its owner-squad is >timeout stale OR
         // its own lease has provably expired. Both signals are fail-closed.
@@ -430,11 +454,13 @@ fn run_reap_stale_in_room_with_budget(
         // verbatim from a git-tracked ledger line, so one committed fact
         // carrying a victim's id and a backdated timestamp makes the victim
         // look stale to every reader. The lease is stamped by the claim's own
-        // writer and is monotonic, so backdating one only expires the
-        // backdater's own claim.
+        // writer and durably renewed by its heartbeat. The automatic mode also
+        // requires the external observed-dead verdict computed above.
         let eligible = match mode {
             ReapMode::Full => owner_eligible || lease_eligible,
-            ReapMode::LeaseOnly => lease_eligible,
+            ReapMode::LeaseOnly => {
+                lease_eligible && observed_verdict == crate::liveness::Liveness::Stale
+            }
         };
         if !eligible {
             preserved += 1;
@@ -503,15 +529,14 @@ fn run_reap_stale_in_room_with_budget(
                 scope: claim.scope.clone(),
                 created_at: now_string(),
                 summary: Some(format!("reaper:reason={}", reaped.reason)),
-                // Stamp the reap reason onto evidence so the under-lock re-check
-                // in `store::append_fact` (SEC-001 owner-revival guard) can
-                // distinguish a racy OWNER-STALE close (must re-validate) from a
-                // monotonic LEASE-EXPIRED close (exempt — a past lease cannot
-                // un-expire). The owner-tool is stamped too so the guard knows
-                // whose liveness to re-check without re-parsing the subject.
+                // Stamp the reap reasons onto evidence so the append boundary
+                // can re-check owner age, effective durable lease, and an
+                // observed-stale verdict under the mutation lock. The owner is
+                // explicit so no subject parsing participates in authority.
                 evidence: vec![
                     format!("reaper:ref_id={}", claim.event_id),
                     format!("reaper:reason={}", reaped.reason),
+                    format!("reaper:observed={}", observed.as_str()),
                     format!(
                         "reaper:owner={}",
                         claim.tool.as_deref().unwrap_or("unknown")
@@ -773,6 +798,49 @@ mod tests {
             created_at: past_ts(ago_secs),
             summary: None,
             evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&fact).unwrap();
+    }
+
+    fn init_observed_worktree(root: &std::path::Path) {
+        crate::test_git_fixture::fixture_git(root, &["init"]);
+        fs::write(root.join("observed.txt"), "observed\n").unwrap();
+        crate::test_git_fixture::fixture_git(root, &["add", "observed.txt"]);
+        crate::test_git_fixture::fixture_git(root, &["commit", "-m", "observed fixture"]);
+    }
+
+    fn append_observed_presence(
+        room: &RoomStore,
+        tool: &str,
+        worktree: &std::path::Path,
+        pid: u32,
+    ) {
+        let head = crate::observed_liveness::current_head_sha(worktree).expect("fixture HEAD");
+        let worktree = fs::canonicalize(worktree).unwrap();
+        let fact = Fact {
+            from_session_id: Some(format!("sess:test:{tool}")),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Presence,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("observed presence: {tool}"),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: None,
+            evidence: vec![
+                format!("branch_head_sha:{head}"),
+                format!("worktree_path:{}", worktree.display()),
+                format!("observer_pid:{pid}"),
+            ],
             target: None,
             ref_id: None,
             status: None,
@@ -1153,12 +1221,13 @@ mod tests {
         // default.
         unsafe { std::env::set_var("RALLY_AUTO_REAP_INTERVAL_SECS", "3600") };
         let root = unique_root("auto-reap");
+        init_observed_worktree(&root);
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         // LEASE-expired, not owner-stale: the automatic path deliberately acts
         // only on the writer-stamped signal (see `ReapMode`), because
         // owner-staleness is derived from a peer-writable timestamp.
-        append_presence(&room, "owner", 5);
+        append_observed_presence(&room, "owner", &root, 2_000_000_000);
         append_claim_with_lease(&room, "claim-leased", "owner", &past_ts(60 * 60));
 
         let first = maybe_reap_on_enter(&room).expect("first enter must reap");
@@ -1173,6 +1242,37 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("RALLY_AUTO_REAP_INTERVAL_SECS") };
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn automatic_pass_preserves_quiet_live_agent_and_reaps_crashed_agent() {
+        let root = unique_root("observed-live-and-crashed");
+        init_observed_worktree(&root);
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        append_observed_presence(&room, "quiet-live", &root, std::process::id());
+        let live_claim =
+            append_claim_with_lease(&room, "claim-quiet-live", "quiet-live", &past_ts(60 * 60));
+        append_observed_presence(&room, "crashed", &root, 2_000_000_000);
+        let crashed_claim =
+            append_claim_with_lease(&room, "claim-crashed", "crashed", &past_ts(60 * 60));
+
+        let report = run_reap_stale_in_room_with_mode(&room, true, ReapMode::LeaseOnly).unwrap();
+
+        assert_eq!(report.claims_reaped.len(), 1);
+        assert_eq!(report.claims_reaped[0].claim_id, crashed_claim.event_id);
+        let active = room.snapshot().unwrap().active_claims;
+        assert!(
+            active
+                .iter()
+                .any(|claim| claim.event_id == live_claim.event_id)
+        );
+        assert!(
+            !active
+                .iter()
+                .any(|claim| claim.event_id == crashed_claim.event_id)
+        );
         fs::remove_dir_all(root).ok();
     }
 
@@ -1193,7 +1293,7 @@ mod tests {
 
         assert_eq!(
             DEFAULT_AUTO_REAP_INTERVAL_SECS, 0,
-            "auto-reap must stay opt-in until lease renewal exists"
+            "auto-reap must stay opt-in until concurrent enter is bounded and the operator flips the destructive default"
         );
         assert!(
             maybe_reap_on_enter(&room).is_none(),

@@ -1954,11 +1954,23 @@ impl DirectRoomStore {
                             .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
                             .is_some_and(|expires| expires <= chrono::Utc::now())
                     });
+                let observed_still_stale =
+                    if Self::reaper_marker(&fact.evidence, "observed") == Some("stale") {
+                        crate::observed_liveness::observe_tools(&self.repo_root, &facts)
+                            .get(owner)
+                            .is_some_and(|verdict| {
+                                *verdict == crate::observed_liveness::ObservedLiveness::Stale
+                            })
+                    } else {
+                        true
+                    };
                 // If the claim is already closed, allow the append and let the
                 // projection deduplicate it. If it is still active, at least
                 // one of the reasons computed by the unlocked pass must remain
                 // true under this lock.
-                if active_claim.is_some() && !owner_still_stale && !lease_still_expired {
+                if active_claim.is_some()
+                    && ((!owner_still_stale && !lease_still_expired) || !observed_still_stale)
+                {
                     return Err(RallyError::Usage(format!(
                         "reap refused: claim {ref_id} is no longer eligible under the mutation \
                          lock (owner revived or lease renewed); not closing an active claim"
@@ -3543,6 +3555,10 @@ fn snapshot_from_facts_with_policy(
                 inject_age: inject_ages.get(&tool).copied(),
                 code_progress_age: progress_ages.get(&tool).copied(),
                 plan_age: plan_ages.get(&tool).copied(),
+                // Pure ledger projection has no process/filesystem access.
+                // The reaper supplies the external observer verdict at its I/O
+                // boundary; absence here preserves the existing fail-open view.
+                observed_alive: None,
             };
             let verdict = crate::liveness::is_live(&signals, window);
 
@@ -9773,6 +9789,71 @@ mod sec001_takeover_guard_tests {
         );
         fs::remove_dir_all(&r).ok();
     }
+
+    #[test]
+    fn observed_stale_close_is_refused_after_live_session_reappears() {
+        let r = root("reaper-observer-race");
+        crate::test_git_fixture::fixture_git(&r, &["init"]);
+        fs::write(r.join("observed.txt"), "observed\n").unwrap();
+        crate::test_git_fixture::fixture_git(&r, &["add", "observed.txt"]);
+        crate::test_git_fixture::fixture_git(&r, &["commit", "-m", "observed fixture"]);
+        let head = crate::observed_liveness::current_head_sha(&r).unwrap();
+        let canonical = fs::canonicalize(&r).unwrap();
+        let store = RoomStore::open_at(r.clone()).unwrap();
+        let mut claim = fact_at(
+            "claim-observed",
+            FactKind::Claim,
+            "owner",
+            "file:src/a.rs",
+            &iso_ago(5),
+        );
+        claim
+            .evidence
+            .push(format!("lease_expires_at:{}", iso_ago(60)));
+        store.append_fact(&claim).unwrap();
+
+        let observed_presence = |event_id: &str, pid: u32| {
+            let mut fact = fact_at(
+                event_id,
+                FactKind::Presence,
+                "owner",
+                "presence",
+                &iso_ago(0),
+            );
+            fact.from_session_id = Some("sess:test:owner".to_string());
+            fact.evidence = vec![
+                format!("branch_head_sha:{head}"),
+                format!("worktree_path:{}", canonical.display()),
+                format!("observer_pid:{pid}"),
+            ];
+            fact
+        };
+        store
+            .append_fact(&observed_presence("presence-dead", 2_000_000_000))
+            .unwrap();
+        let mut expired = reaper_claim_expired("claim-observed", "owner", "lease-expired");
+        expired.evidence.push("reaper:observed=stale".to_string());
+
+        // The same session posts a newer stamp whose externally observed host
+        // pid is live before the stale close reaches the write lock.
+        store
+            .append_fact(&observed_presence("presence-live", std::process::id()))
+            .unwrap();
+        let err = store.append_fact(&expired).unwrap_err().to_string();
+        assert!(
+            err.contains("reap refused"),
+            "live observer evidence must win the snapshot-to-append race: {err}"
+        );
+        assert!(
+            store
+                .snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|fact| fact.event_id == "claim-observed")
+        );
+        fs::remove_dir_all(&r).ok();
+    }
 }
 
 #[cfg(test)]
@@ -9868,6 +9949,7 @@ mod squad_decay_tests {
             inject_age: None,
             code_progress_age: None,
             plan_age: None,
+            observed_alive: None,
         };
         let window = crate::liveness::adaptive_window_secs(
             coord.default_cadence_secs,
