@@ -1663,6 +1663,67 @@ review answers the question you asked.
 - **Evidence:** rally facts `fact_4fdf_18c8d972c6d44588` (measurement + correction),
   `fact_fba1_18c8da1fc32f8b60` (concurrent-writer clobber during the fix).
 
+### RC-068 — `system_health` is unbounded, never-cut, and re-emitted per entry, so it truncates the coordination signal it sits beside
+
+- **State:** `mechanism`, measured against this repo's live room 2026-08-06. **NOT fixed.**
+- **Symptom the operator reported:** `rally room` shows one item per bucket with
+  `reason: "budget"`, and the reaction is to reach for a bigger ceiling. The ceiling is not the
+  cause.
+- **Measurement, taken after a full `doctor --reap-stale --apply` drain** (so nothing below is
+  stale-backlog noise — the room was as clean as retirement can make it: 1 active claim, 0 blockers):
+
+  | Bucket | Bytes | Share of room | Emitted |
+  |---|---|---|---|
+  | `system_health` | 109,197 | **56%** | all 147 |
+  | `squads` | 26,845 | 14% | all 185 |
+  | *every coordination bucket combined* | ~5,000 | **2.5%** | **1 each** |
+
+  Total room payload 196,363 bytes. The two never-cut buckets take 70% of it; handoffs, claims,
+  risks, decisions and artifacts split 2.5% and are cut to their guaranteed top-1.
+- **Mechanism, three parts.**
+  1. `system_health` is 147 `risk` facts averaging **742 bytes** each, and ~600 of those bytes are a
+     remediation `summary` repeated verbatim on every instance.
+  2. It is **not deduplicated**. 81 `unmanaged-agent` risks span 86 distinct tools, but one tool
+     (`claude_code:07cd7416-…`) carries **27 copies of the identical warning** — the risk is
+     re-emitted on every `rally enter`, so growth is linear in session count and never retired. The
+     remaining kinds are `external-intake` (30), `binary-drift` (24), `duplicate-active-squad-id`
+     (12). Entering the room to write this entry added one more.
+  3. `never_cut_bytes` reserves `system_health` and `squads` (RC-054 documents the reserve set), so
+     the composer protects the two unbounded buckets and spends the ceiling on the four that carry
+     the actual coordination.
+- **Consequence:** the room's information density falls as the room ages, and it fails in the worst
+  direction — the bucket that says *"an agent once entered without a managed session, not blocked,
+  informational"* is preserved in full while the bucket that says *"someone handed you work"* is
+  truncated to one row. Raising the ceiling scales the 70% waste linearly; it does not fix the ratio.
+- **This is RC-055's specified control, failing in production.** RC-055 (D5) specifies exactly:
+  *append 500 `external-intake:` facts with distinct paths, assert `system_health` stays bounded.*
+  The 2026-08-06 audit found that control **absent**. This entry is what its absence bought — not a
+  hypothetical, a measured 56%. The `external-intake` kind is 30 of the 147.
+- **Fix options, modelled against the live data rather than estimated:**
+
+  | Option | Result | Δ |
+  |---|---|---|
+  | A. Dedupe to latest per `(subject-prefix, tool)` | 147 → 102 items, 75.8 KB | −31% |
+  | B. A + replace the repeated `summary` with a pointer | 102 items, 44.1 KB | **−60%** |
+  | C. B + a 7-day TTL | **no further gain** | −60% |
+
+  C adding nothing is itself the finding: dedup already retains only the newest instance per key, so
+  every survivor is recent and a TTL has nothing left to remove. **Age is not the lever here;
+  cardinality is.** The durable fix is to stop enumerating: emit `system_health` as a count plus
+  top-N with a `--include-health` escape, which is the same shape the room already uses for
+  `stale_facts` (`reason: "archived"`, 1,191 omitted, 0 emitted, and nobody misses them).
+- **What is NOT the fix, recorded so it is not retried:** raising or removing the emitted-response
+  ceiling. That ceiling landed deliberately at `47f1dc9` to close D4/D12 — a room that reports
+  `over_budget: false` while over budget. Removing it re-opens a settled finding and leaves the 70%
+  ratio untouched.
+- **Adversarial control (owed, not written):** enter the room N times as N distinct tools, then
+  assert `system_health` byte size is sub-linear in N **and** that `open_handoffs` emits more than
+  its guaranteed floor. The second half is the one that matters — a bound on `system_health` that
+  still starves the coordination buckets has not fixed the reported symptom. RC-055's version tests
+  only the first half, which is why it would have passed while this defect grew.
+- **First seen:** 2026-08-06 (measured; the accumulation dates to the July session ramp — 35 of the
+  147 predate August).
+
 ## Independent design audit, 2026-08-04 — pinned at `006d417`
 
 Eleven findings from a structural read of the store, composition, reaper, identity and hook layers.
