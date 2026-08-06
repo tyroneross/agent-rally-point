@@ -271,9 +271,9 @@ chmod +x "$prompt_bin"
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 # ----------------------------------------------------------------------
-# Test 2e: noisy room projection is trimmed to actionable current state
+# Test 2e: startup rendering preserves Rust's fail-open room projection
 # ----------------------------------------------------------------------
-T="SessionStart prompt omits stale peers, expired claims, and non-actionable waits"
+T="SessionStart prompt keeps Rust-visible idle peers and active claims"
 noise_bin="$tmpdir/rally_noise"
 cat > "$noise_bin" <<'EOF'
 #!/usr/bin/env bash
@@ -283,7 +283,7 @@ elif [ "$1" = "enter" ]; then
   :
 elif [ "$1" = "room" ]; then
   cat <<'JSON'
-{"data":{"room":{"squads":[{"tool":"claude_code","status":"active","last_seen_ts":"2999-01-01T00:00:00Z"},{"tool":"stale-peer","status":"idle","last_seen_ts":"2000-01-01T00:00:00Z"}],"active_claims":[{"tool":"claude_code","scope":["file:active.rs"],"evidence":["lease_expires_at:2999-01-01T00:00:00Z"]},{"tool":"claude_code","scope":["file:expired.rs"],"evidence":["lease_expires_at:2000-01-01T00:00:00Z"]},{"tool":"stale-peer","scope":["file:idle.rs"],"evidence":["lease_expires_at:2999-01-01T00:00:00Z"]}],"open_handoffs":[{"tool":"stale-peer","target":"codex","created_at":"2000-01-01T00:00:00Z"}]}}}
+{"data":{"room":{"squads":[{"tool":"claude_code","status":"active","last_seen_ts":"2999-01-01T00:00:00Z"},{"tool":"unknown-peer","status":"idle","last_seen_ts":"2000-01-01T00:00:00Z"}],"active_claims":[{"tool":"claude_code","scope":["file:active.rs"],"evidence":["lease_expires_at:2999-01-01T00:00:00Z"]},{"tool":"claude_code","scope":["file:expired.rs"],"evidence":["lease_expires_at:2000-01-01T00:00:00Z"]},{"tool":"unknown-peer","scope":["file:unknown.rs"],"evidence":["lease_expires_at:2999-01-01T00:00:00Z"]}],"open_handoffs":[{"tool":"pruned-peer","target":"codex","created_at":"2000-01-01T00:00:00Z"}]}}}
 JSON
 elif [ "$1" = "next" ]; then
   printf '%s\n' '{"data":{"next":{"actionable":false,"action":"wait"}}}'
@@ -299,17 +299,19 @@ chmod +x "$noise_bin"
   out=$(RALLY_BIN="$noise_bin" "$HOOK" start codex </dev/null 2>/dev/null)
   rc=$?
   if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
-  printf '%s' "$out" | grep -q "Active peers: claude_code" || { printf 'missing active peer: %s\n' "$out" >&2; exit 1; }
-  printf '%s' "$out" | grep -q "file:active.rs" || { printf 'missing active claim: %s\n' "$out" >&2; exit 1; }
-  for bad_text in "stale-peer" "file:expired.rs" "file:idle.rs" "Suggested next: wait"; do
+  printf '%s' "$out" | grep -q "Visible peers: claude_code, unknown-peer" || { printf 'missing Rust-visible peers: %s\n' "$out" >&2; exit 1; }
+  for required_text in "file:active.rs" "file:expired.rs" "file:unknown.rs"; do
+    printf '%s' "$out" | grep -q "$required_text" || { printf 'missing active claim (%s): %s\n' "$required_text" "$out" >&2; exit 1; }
+  done
+  for bad_text in "pruned-peer" "Suggested next: wait"; do
     if printf '%s' "$out" | grep -q "$bad_text"; then
-      printf 'stale/non-actionable text leaked (%s): %s\n' "$bad_text" "$out" >&2
+      printf 'pruned/non-actionable text leaked (%s): %s\n' "$bad_text" "$out" >&2
       exit 1
     fi
   done
   exit 0
 )
-if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "startup prompt must stay concise and current"; fi
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "startup prompt must follow the Rust projection"; fi
 
 # ----------------------------------------------------------------------
 # Test 2f: agent status is surfaced from the typed status projection.

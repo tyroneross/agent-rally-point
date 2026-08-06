@@ -14,24 +14,20 @@
 //! breaking way: every field is optional and `#[serde(default)]`, so an old
 //! ledger row missing all of them still deserializes (replay-safe).
 //!
-//! Three pure capabilities sit on top of the envelope:
+//! Two pure capabilities sit on top of the envelope:
 //!
 //! 1. [`ProtocolEventKind::validate`] — event-kind validation: which ids are
 //!    mandatory for a given kind (claim events need `claim_id`, replies need
 //!    `ref_event_id` + `causation_id`, etc). Gated by [`CompatMode`] so the
 //!    `from_session_id` requirement only bites once the compatibility gate is
 //!    explicitly enabled (north star Builder Implication #1/#6).
-//! 2. [`authorize`] — **advisory** authorization for privileged events (release
-//!    another session's claim, transfer, cancel/supersede work, publish
-//!    validation, risky operations). Local trusted rooms start advisory; this is
-//!    the seam where signed/policy-checked writes plug in later.
-//! 3. [`Deduper`] — idempotency: a duplicate `event_id`/`idempotency_key` does
+//! 2. [`Deduper`] — idempotency: a duplicate `event_id`/`idempotency_key` does
 //!    not create a duplicate durable fact.
 //!
 //! ## Charter alignment
-//! Pure: no ledger writes, no clock, no spawning. `validate`/`authorize` return
-//! decisions; the caller (the `say` write-path, in the later integration task)
-//! decides whether to reject, warn, or record. Rally facilitates; hosts execute.
+//! Pure: no ledger writes, no clock, no spawning. `validate` returns decisions;
+//! the caller (the `say` write-path, in the later integration task) decides
+//! whether to reject, warn, or record. Rally facilitates; hosts execute.
 //!
 //! ## Staged delivery
 //! `#![allow(dead_code)]`: Phase-4 module of a staged build; its surface is
@@ -43,9 +39,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-/// Coordination authority roles, lowest trust first. `rank()` gives the partial
-/// order used by [`authorize`]. `System` is the internal brainstem/authority
-/// itself and outranks everyone.
+/// Coordination authority roles carried in an envelope's auth context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Role {
@@ -55,20 +49,6 @@ pub(crate) enum Role {
     Maintainer,
     Owner,
     System,
-}
-
-impl Role {
-    /// Monotonic trust rank; higher can do everything a lower can.
-    fn rank(self) -> u8 {
-        match self {
-            Role::Observer => 0,
-            Role::Agent => 1,
-            Role::LeadAgent => 2,
-            Role::Maintainer => 3,
-            Role::Owner => 4,
-            Role::System => 5,
-        }
-    }
 }
 
 /// Authorization context carried on a privileged event.
@@ -177,23 +157,6 @@ pub(crate) enum ProtocolEventKind {
     OperationResult,
 }
 
-/// A privileged action whose authorization is checked advisorily.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PrivilegedAction {
-    /// Release a claim owned by a different session.
-    ReleaseOthersClaim,
-    /// Transfer claim ownership to another session.
-    TransferClaim,
-    /// Cancel work by external decision.
-    CancelWork,
-    /// Supersede another session's work.
-    SupersedeOthersWork,
-    /// Publish a validation result.
-    PublishValidation,
-    /// Record intent/result of a risky operation (merge/push/deploy/prune).
-    RiskyOperation,
-}
-
 /// A validation failure: which required id was missing for which kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EnvelopeError {
@@ -287,28 +250,6 @@ impl ProtocolEventKind {
             Err(errors)
         }
     }
-}
-
-/// Minimum role required for a privileged action.
-fn required_role(action: PrivilegedAction) -> Role {
-    match action {
-        PrivilegedAction::ReleaseOthersClaim
-        | PrivilegedAction::TransferClaim
-        | PrivilegedAction::CancelWork
-        | PrivilegedAction::SupersedeOthersWork => Role::LeadAgent,
-        PrivilegedAction::PublishValidation | PrivilegedAction::RiskyOperation => Role::Agent,
-    }
-}
-
-/// Advisory authorization decision for a privileged action.
-///
-/// Returns `true` when `ctx`'s role meets the minimum for `action`. This is
-/// advisory by design — local trusted rooms surface a denial as a warning; only
-/// hardened rooms turn it into a hard reject (north star: "Warnings over hard
-/// locks"). A missing `auth_context` is treated as the lowest trust (`Observer`).
-pub(crate) fn authorize(action: PrivilegedAction, ctx: Option<&AuthContext>) -> bool {
-    let role = ctx.map(|c| c.role).unwrap_or(Role::Observer);
-    role.rank() >= required_role(action).rank()
 }
 
 /// Idempotency guard: collapses duplicate writer retries to one durable fact.
@@ -463,45 +404,6 @@ mod tests {
                 .validate(&env(), CompatMode::Strict)
                 .is_ok()
         );
-    }
-
-    #[test]
-    fn observer_cannot_release_anothers_claim_but_lead_can() {
-        let observer = AuthContext {
-            role: Role::Observer,
-            policy_version: None,
-            capabilities: vec![],
-        };
-        let lead = AuthContext {
-            role: Role::LeadAgent,
-            policy_version: None,
-            capabilities: vec![],
-        };
-        assert!(!authorize(
-            PrivilegedAction::ReleaseOthersClaim,
-            Some(&observer)
-        ));
-        assert!(authorize(PrivilegedAction::ReleaseOthersClaim, Some(&lead)));
-        // Missing auth context = lowest trust.
-        assert!(!authorize(PrivilegedAction::ReleaseOthersClaim, None));
-    }
-
-    #[test]
-    fn lead_can_transfer_and_agent_can_publish_validation() {
-        let agent = AuthContext {
-            role: Role::Agent,
-            policy_version: None,
-            capabilities: vec![],
-        };
-        let lead = AuthContext {
-            role: Role::LeadAgent,
-            policy_version: None,
-            capabilities: vec![],
-        };
-        assert!(authorize(PrivilegedAction::TransferClaim, Some(&lead)));
-        assert!(!authorize(PrivilegedAction::TransferClaim, Some(&agent)));
-        assert!(authorize(PrivilegedAction::PublishValidation, Some(&agent)));
-        assert!(!authorize(PrivilegedAction::PublishValidation, None));
     }
 
     #[test]

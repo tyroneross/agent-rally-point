@@ -130,6 +130,7 @@ mod hooks_config;
 mod init;
 mod liveness;
 mod next;
+mod observed_liveness;
 mod output;
 pub mod rallyd_core;
 mod reaper;
@@ -1780,9 +1781,46 @@ fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
     ensure_presence_tiered(room, tool, None)
 }
 
+/// Durably extend every active claim owned by `tool` from a self-authored
+/// heartbeat. The lease window stays size-scaled by the same policy used when
+/// the claim was acquired. A failure is returned to the heartbeat caller: a
+/// successful self-report must not claim renewal when the durable ledger did
+/// not advance.
+fn renew_owned_claim_leases(room: &RoomStore, tool: &str) -> Result<usize> {
+    let snapshot = room.snapshot()?;
+    let coord = hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    let now = chrono::Utc::now();
+    let mut renewed = 0;
+    for claim in snapshot
+        .active_claims
+        .iter()
+        .filter(|claim| claim.tool.as_deref() == Some(tool))
+    {
+        let resource_scopes = claim
+            .scope
+            .iter()
+            .filter_map(|scope| crate::resource_scope::ResourceScope::parse_claim_scope(scope))
+            .collect::<Vec<_>>();
+        let size = crate::decay::classify_work_size(&resource_scopes, claim.scope.len());
+        let lease_secs = crate::decay::reclaim_timeout_secs(
+            size,
+            coord.reclaim_small_minutes,
+            coord.reclaim_large_minutes,
+        );
+        let lease_expires_at = claim_authority::lease_marker_at(now, lease_secs);
+        if room
+            .renew_claim_lease(&claim.event_id, lease_expires_at)?
+            .is_some()
+        {
+            renewed += 1;
+        }
+    }
+    Ok(renewed)
+}
+
 /// Evidence stamps that make the adaptive-liveness signals READABLE.
 ///
-/// Two keys, both consumed by `store.rs`:
+/// Four keys consumed by the liveness projection and external observer:
 /// * `branch_head_sha:<sha>` — the worktree HEAD at the moment of the beat.
 ///   `code_progress_age_per_tool` compares consecutive stamps for a tool and
 ///   reports forward progress when the sha MOVED. Two stamped beats are needed
@@ -1792,6 +1830,12 @@ fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
 ///   `planned_cadence_for_tool` reads it to size that session's staleness
 ///   window, which is what makes the window adaptive rather than one global
 ///   default applied to every agent.
+/// * `worktree_path:<absolute-path>` — the checkout an external observer may
+///   inspect. The observer verifies that it belongs to this room's git common
+///   directory before reading it.
+/// * `observer_pid:<pid>` — the long-lived host process supplied by the shipped
+///   hook. Never fall back to the short-lived `rally` child pid: that would be
+///   dead as soon as the heartbeat returns and falsely demote every agent.
 ///
 /// Fail-open in every branch: an unavailable HEAD stamps nothing rather than
 /// stamping a placeholder, because `code_progress_age_per_tool` treats a
@@ -1799,8 +1843,16 @@ fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
 /// value that never changes (a false "no progress" verdict).
 fn presence_signal_evidence(room: &RoomStore) -> Vec<String> {
     let mut evidence = Vec::new();
-    if let Some(sha) = current_head_sha(room.repo_root()) {
+    if let Some(sha) = observed_liveness::current_head_sha(room.repo_root()) {
         evidence.push(format!("branch_head_sha:{sha}"));
+    }
+    if let Ok(path) = fs::canonicalize(room.repo_root()) {
+        evidence.push(format!("worktree_path:{}", path.display()));
+    }
+    if let Ok(raw) = env::var("RALLY_OBSERVER_PID")
+        && raw.parse::<i32>().ok().is_some_and(|pid| pid > 1)
+    {
+        evidence.push(format!("observer_pid:{raw}"));
     }
     let coord = hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
     if coord.default_cadence_secs > 0 {
@@ -1810,66 +1862,6 @@ fn presence_signal_evidence(room: &RoomStore) -> Vec<String> {
         ));
     }
     evidence
-}
-
-/// The current worktree HEAD sha, read from `.git` WITHOUT spawning git.
-///
-/// This runs on the presence path, which the SessionStart hook drives under a
-/// 5-second budget, so a subprocess per beat is the wrong cost — and an extra
-/// spawn inside `rally run` measurably widened an existing intermittent failure
-/// under cross-suite contention (RC-005 / RC-044 territory).
-///
-/// Handles the three shapes that matter: a linked worktree (`.git` is a FILE
-/// pointing at the real gitdir), a detached HEAD (the sha is in `HEAD`), and an
-/// attached branch (`HEAD` names a ref, resolved from `refs/` then
-/// `packed-refs`). Anything else returns `None`, and a `None` stamps nothing —
-/// never a placeholder, because `code_progress_age_per_tool` reads a constant
-/// value as "HEAD did not move", which would be a false verdict rather than an
-/// absent signal.
-fn current_head_sha(repo_root: &Path) -> Option<String> {
-    let git_path = repo_root.join(".git");
-    let git_dir = if git_path.is_dir() {
-        git_path
-    } else {
-        // Linked worktree: `.git` is a file containing `gitdir: <path>`.
-        let raw = fs::read_to_string(&git_path).ok()?;
-        let target = raw.trim().strip_prefix("gitdir:")?.trim();
-        let target = Path::new(target);
-        if target.is_absolute() {
-            target.to_path_buf()
-        } else {
-            repo_root.join(target)
-        }
-    };
-
-    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let head = head.trim();
-    let Some(ref_name) = head.strip_prefix("ref:").map(str::trim) else {
-        // Detached HEAD — the sha is right there.
-        return valid_sha(head);
-    };
-
-    if let Ok(direct) = fs::read_to_string(git_dir.join(ref_name))
-        && let Some(sha) = valid_sha(direct.trim())
-    {
-        return Some(sha);
-    }
-    // Packed refs: `<sha> <refname>` lines, `^<sha>` peel lines skipped.
-    let packed = fs::read_to_string(git_dir.join("packed-refs")).ok()?;
-    packed.lines().find_map(|line| {
-        let line = line.trim();
-        if line.starts_with('#') || line.starts_with('^') {
-            return None;
-        }
-        let (sha, name) = line.split_once(' ')?;
-        (name.trim() == ref_name).then(|| valid_sha(sha))?
-    })
-}
-
-/// A 40- or 64-character lowercase hex object id, or `None`.
-fn valid_sha(candidate: &str) -> Option<String> {
-    let ok = matches!(candidate.len(), 40 | 64) && candidate.chars().all(|c| c.is_ascii_hexdigit());
-    ok.then(|| candidate.to_ascii_lowercase())
 }
 
 /// Tier-aware presence. Lead auto-assign is **frontier-only**: an undeclared
@@ -1887,7 +1879,11 @@ fn ensure_presence_tiered(room: &RoomStore, tool: &str, tier: Option<&str>) -> R
     // so that `command_enter` can detect when different builds are writing to
     // the same room.  Format: "build_id:<BUILD_ID>" — minimal, no schema bump.
     let presence_fact = Fact {
-        from_session_id: None,
+        from_session_id: Some(
+            current_protocol_session(Some(tool))
+                .from_session_id()
+                .to_string(),
+        ),
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -2012,6 +2008,9 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // at once. The blocks still use `snapshot_before` (pre-presence) for their
     // dedup checks, so behavior is unchanged when none of them fire.
     with_watchdog_command_commit(|| ensure_presence_tiered(&room, &tool, args.tier.as_deref()))?;
+    // `enter` is a self-authored liveness signal. Advance every claim this tool
+    // still owns so the reaper reads the same durable lease the agent renewed.
+    with_watchdog_command_commit(|| renew_owned_claim_leases(&room, &tool).map(|_| ()))?;
 
     // Layer 2 — event-driven liveness-lease safety net: when a new agent joins,
     // opportunistically sweep detached `rally-*` orphan tmux sessions that the
@@ -4070,7 +4069,11 @@ fn command_status_post(json: bool, mut args: cli::StatusPostArgs) -> Result<Outp
 
     let subject = build_status_subject(&args.state, &args);
     let fact = store::Fact {
-        from_session_id: None,
+        from_session_id: Some(
+            current_protocol_session(Some(&args.tool))
+                .from_session_id()
+                .to_string(),
+        ),
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -4082,7 +4085,7 @@ fn command_status_post(json: bool, mut args: cli::StatusPostArgs) -> Result<Outp
         scope: Vec::new(),
         created_at: now_string(),
         summary: Some(format!("build_id:{BUILD_ID}")),
-        evidence: Vec::new(),
+        evidence: presence_signal_evidence(&room),
         target: None,
         ref_id: None,
         status: None,
@@ -4091,6 +4094,10 @@ fn command_status_post(json: bool, mut args: cli::StatusPostArgs) -> Result<Outp
         session: None,
     };
     let appended = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
+    // The shipped coordination hook emits status posts as heartbeats. Renew
+    // after the presence append so liveness and lease durability succeed or
+    // fail together from the caller's perspective.
+    with_watchdog_command_commit(|| renew_owned_claim_leases(&room, &args.tool).map(|_| ()))?;
     let state = agent_state::project_presence_to_state(&appended)
         .unwrap_or(agent_state::AgentState::Idle { wake_after: None });
     let text = format!("status post tool={} seq={}", args.tool, appended.seq);
@@ -8302,6 +8309,93 @@ mod tests {
         assert_eq!(presence_count, 1, "exactly one presence fact for tool-x");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn heartbeat_renews_every_owned_claim_durably() {
+        let root = unique_root("heartbeat-renews-claims");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        ensure_presence(&room, "tool-x").unwrap();
+        let claim = store::Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: "claim-heartbeat-renew".to_string(),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Claim,
+            tool: Some("tool-x".to_string()),
+            role: None,
+            subject: "claim for heartbeat renewal".to_string(),
+            scope: vec!["file:src/lib.rs".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: vec!["lease_expires_at:2000-01-01T00:00:00Z".to_string()],
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&claim).unwrap();
+        let before = room.facts().unwrap().len();
+
+        assert_eq!(renew_owned_claim_leases(&room, "tool-x").unwrap(), 1);
+
+        let facts = room.facts().unwrap();
+        assert_eq!(facts.len(), before + 1);
+        assert_eq!(facts.last().unwrap().kind, store::FactKind::ClaimRenewed);
+        assert_eq!(
+            facts.last().unwrap().ref_id.as_deref(),
+            Some("claim-heartbeat-renew")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn presence_stamps_worktree_and_external_host_pid() {
+        let _guard = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = unique_root("presence-observer-stamps");
+        init_status_git_repo(&root, "main");
+        unsafe { env::set_var("RALLY_OBSERVER_PID", "424242") };
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        ensure_presence(&room, "tool-observed").unwrap();
+
+        unsafe { env::remove_var("RALLY_OBSERVER_PID") };
+        let presence = room
+            .facts()
+            .unwrap()
+            .into_iter()
+            .find(|fact| {
+                fact.kind == store::FactKind::Presence
+                    && fact.tool.as_deref() == Some("tool-observed")
+            })
+            .unwrap();
+        let canonical = fs::canonicalize(&root).unwrap();
+        assert!(
+            presence
+                .evidence
+                .iter()
+                .any(|item| item == &format!("worktree_path:{}", canonical.display()))
+        );
+        assert!(
+            presence
+                .evidence
+                .iter()
+                .any(|item| item == "observer_pid:424242")
+        );
+        assert!(
+            presence
+                .evidence
+                .iter()
+                .any(|item| item.starts_with("branch_head_sha:"))
+        );
+        assert!(presence.from_session_id.is_some());
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// Component B acceptance test 2: a second call for the same tool writes no

@@ -70,7 +70,7 @@ pub(crate) fn active_claim_records(facts: &[Fact]) -> Vec<ActiveClaimRecord> {
     facts
         .iter()
         .filter(|fact| is_active_claim_fact(fact, facts))
-        .filter_map(active_claim_record_from_fact)
+        .filter_map(|fact| active_claim_record_from_facts(fact, facts))
         .collect()
 }
 
@@ -155,6 +155,65 @@ pub(crate) fn active_claim_record_from_fact(fact: &Fact) -> Option<ActiveClaimRe
         resource_scopes,
         lease_expires_at: lease_expires_at(fact),
     })
+}
+
+/// Project one active claim with its latest valid durable renewal applied.
+///
+/// A renewal is valid only when it references the claim and names the same
+/// owner. That keeps a hand-edited or future untrusted ledger row from
+/// extending another tool's claim merely by guessing its event id.
+pub(crate) fn active_claim_record_from_facts(
+    fact: &Fact,
+    facts: &[Fact],
+) -> Option<ActiveClaimRecord> {
+    let mut record = active_claim_record_from_fact(fact)?;
+    if let Some(expires_at) = latest_renewed_lease(fact, facts) {
+        record.lease_expires_at = Some(expires_at);
+    }
+    Some(record)
+}
+
+/// Return the active claim record for `claim_id`, including durable renewal.
+pub(crate) fn active_claim_record(facts: &[Fact], claim_id: &str) -> Option<ActiveClaimRecord> {
+    facts
+        .iter()
+        .find(|fact| fact.event_id == claim_id && is_active_claim_fact(fact, facts))
+        .and_then(|fact| active_claim_record_from_facts(fact, facts))
+}
+
+/// Clone an active claim fact with its effective lease marker projected into
+/// evidence. The original event id, owner, scope, and authored timestamp stay
+/// unchanged; only the derived lease view advances.
+pub(crate) fn project_effective_claim(fact: &Fact, facts: &[Fact]) -> Fact {
+    let mut projected = fact.clone();
+    if let Some(expires_at) = latest_renewed_lease(fact, facts) {
+        projected
+            .evidence
+            .retain(|item| !item.starts_with(LEASE_EVIDENCE_PREFIX));
+        projected
+            .evidence
+            .push(format!("{LEASE_EVIDENCE_PREFIX}{expires_at}"));
+    }
+    projected
+}
+
+pub(crate) fn latest_renewed_lease(claim: &Fact, facts: &[Fact]) -> Option<String> {
+    facts
+        .iter()
+        .filter(|fact| {
+            fact.kind == FactKind::ClaimRenewed
+                && fact.ref_id.as_deref() == Some(claim.event_id.as_str())
+                && fact.tool == claim.tool
+        })
+        .filter_map(|fact| {
+            let lease = lease_expires_at(fact)?;
+            let parsed = parse_time(&lease)?;
+            Some((parsed, lease))
+        })
+        // Projection remains monotonic even for an imported or hand-edited
+        // ledger that bypassed the append-boundary ordering guard.
+        .max_by_key(|(parsed, _)| *parsed)
+        .map(|(_, lease)| lease)
 }
 
 pub(crate) fn detect_conflict(facts: &[Fact], incoming: &Fact) -> Option<ClaimConflict> {
@@ -319,22 +378,6 @@ pub(crate) fn read_index(path: &Path) -> Result<ActiveClaimIndex, String> {
     }
     let text = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
     serde_json::from_str(&text).map_err(|err| format!("parse {}: {err}", path.display()))
-}
-
-#[allow(dead_code)]
-pub(crate) fn renew_claim_lease(
-    path: &Path,
-    claim_id: &str,
-    lease_expires_at: String,
-) -> Result<Option<ActiveClaimRecord>, String> {
-    let mut index = read_index(path)?;
-    let Some(record) = index.claims.get_mut(claim_id) else {
-        return Ok(None);
-    };
-    record.lease_expires_at = Some(lease_expires_at);
-    let updated = record.clone();
-    write_index(path, &index)?;
-    Ok(Some(updated))
 }
 
 #[allow(dead_code)]
@@ -561,33 +604,6 @@ mod tests {
 
         assert_eq!(index.claims.len(), 1);
         assert!(index.claims.contains_key("claim-b"));
-    }
-
-    #[test]
-    fn claim_authority_lease_renewal_is_index_only() {
-        let temp = std::env::temp_dir().join(format!(
-            "rally-claim-index-test-{}-{}.json",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap()
-        ));
-        let mut claim = fact("claim-a", "tool-a", vec!["file:src/lib.rs"]);
-        ensure_lease_evidence(
-            &mut claim.evidence,
-            crate::decay::DEFAULT_RECLAIM_SMALL_MINUTES * 60,
-        );
-        write_index_from_facts(&temp, &[claim]).unwrap();
-        let before_len = read_index(&temp).unwrap().claims.len();
-        let renewed = renew_claim_lease(&temp, "claim-a", "2099-01-01T00:00:00Z".to_string())
-            .unwrap()
-            .unwrap();
-        let after = read_index(&temp).unwrap();
-        assert_eq!(before_len, 1);
-        assert_eq!(after.claims.len(), 1);
-        assert_eq!(
-            renewed.lease_expires_at.as_deref(),
-            Some("2099-01-01T00:00:00Z")
-        );
-        let _ = fs::remove_file(temp);
     }
 
     #[test]

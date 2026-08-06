@@ -1036,6 +1036,66 @@ mod imp {
         }
 
         #[test]
+        fn routed_renewal_appends_the_same_durable_fact_as_direct_mode() {
+            let repo_root = unique_repo_root("renewal-parity");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let claim = crate::store::Fact {
+                from_session_id: Some("sess:test".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "claim-routed-renew".to_string(),
+                seq: 0,
+                thread_id: crate::new_id("room"),
+                kind: crate::store::FactKind::Claim,
+                tool: Some("tool-a".to_string()),
+                role: None,
+                subject: "routed renewal claim".to_string(),
+                scope: vec!["file:src/lib.rs".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: vec!["lease_expires_at:2000-01-01T00:00:00Z".to_string()],
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact_verified(&claim).unwrap();
+            let before = store.facts().unwrap().len();
+
+            let response = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(
+                    None,
+                    StoreOp::RenewClaimLease {
+                        claim_id: claim.event_id.clone(),
+                        lease_expires_at: "2099-01-01T00:00:00Z".to_string(),
+                    },
+                ),
+            );
+
+            assert!(
+                matches!(
+                    response,
+                    StoreResponse::Ok(StoreOk::RenewClaimLease { record: Some(_) })
+                ),
+                "routed renewal failed: {response:?}"
+            );
+            let facts = store.facts().unwrap();
+            assert_eq!(facts.len(), before + 1);
+            assert_eq!(
+                facts.last().unwrap().kind,
+                crate::store::FactKind::ClaimRenewed
+            );
+            assert_eq!(
+                facts.last().unwrap().ref_id.as_deref(),
+                Some(claim.event_id.as_str())
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
         fn daemon_serve_rejects_an_armed_command_watchdog() {
             let repo_root = unique_repo_root("armed-watchdog");
             let _deadline =
