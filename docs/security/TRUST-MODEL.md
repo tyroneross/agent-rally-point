@@ -256,8 +256,21 @@ existing clone and fork, and is a decision that has not been made. Until it is:
 
 - Treat this repository's history as containing the maintainer's machine paths, hostname, and
   coordination ledger.
-- The bundles have **not** been audited for credentials. A regex sweep over compressed packfiles
-  is not a credential audit. No secret is known to be present; none has been ruled out either.
+- The bundles **have** been audited for credentials, and the audit found none. A regex sweep over
+  compressed packfiles is not a credential audit, so this was not one: on 2026-08-05 all 18 bundles
+  were `git bundle verify`-ed, fetched into throwaway bare repos, and scanned blob-by-blob after
+  decompression — 1,252–1,812 blobs each across 626 distinct paths, including files deleted in
+  history. The scanner was mutation-validated first: a `.env`, an `id_ed25519`, AWS credentials, a
+  JWT, a `ghp_` token and a Slack token were planted and then deleted so they existed only in
+  history; all 11 detector classes fired, none missed. Two hits total, both benign — a repeated
+  `deadbeef` test placeholder in `PtydProtocolTests.swift`, and a Swift variable assignment matching
+  the regex. Zero hits for private keys, cloud keys, provider tokens, JWTs, connection strings, or
+  `.env` / `.npmrc` / `.netrc` / `id_rsa` / `.pem` files. Two independent false-negative checks (a
+  626-path inventory and an entropy sweep) came back empty.
+
+  What this does **not** clear is the machine paths, hostname, and coordination ledger described
+  above — those are still in the history and are not secrets to be ruled out, they are present by
+  inspection. De-tracking the bundles was a size fix, not a privacy fix.
 
 If you are evaluating this repo for internal use, that history is what you are taking on.
 

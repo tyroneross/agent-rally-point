@@ -13911,8 +13911,18 @@ fn command_lead(args: LeadArgs) -> Result<Output> {
 /// Append a `role:lead` decision transferring the title to `t.to`.
 ///
 /// ARP-R-01, two fixes here; the gate itself is at the write boundary in
-/// `write_authority::assert_lead_transfer_authorized`, so a hand-built fact or
-/// a routed daemon request clears the same bar this command does.
+/// `write_authority::assert_lead_transfer_authorized`, reached only from
+/// `DirectRoomStore::append_fact` (`store.rs:2051`). Every writer that goes
+/// through `append_fact` clears the same bar this command does — a `Fact` built
+/// in Rust and passed in, or a routed daemon request.
+///
+/// It does NOT bind a line appended directly to a segment file. The projection
+/// reads segments without passing the write boundary, so a direct append
+/// bypasses this gate and every other write-boundary control — lead transfer,
+/// claim close, breadth, field bounds. That is a property of the trust model,
+/// not a bug here: `docs/security/TRUST-MODEL.md` states that a local process
+/// which can write `.rally/` can write facts, and that these gates are not an
+/// authorization boundary. Do not cite this gate as one.
 ///
 /// **Attribution.** This used to stamp `tool: Some(t.to)` — the BENEFICIARY.
 /// The ledger recorded a seizure as authored by the agent that gained the seat,

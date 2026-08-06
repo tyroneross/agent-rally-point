@@ -1766,7 +1766,8 @@ D6 are below.
   rather than on reachability.
 
 ### RC-053 — lease renewal writes to a sidecar that no expiry path reads (D3)
-- **State:** `mechanism`. **NOT fixed.**
+- **State:** `fixed`, controls `validated`. **FIXED at `20e69ad`** (corrected 2026-08-06; this entry
+  read `mechanism` / NOT fixed for five commits after the fix landed — see "Correction" below).
 - **Mechanism, three parts, all verified:**
   1. `claim_authority::renew_claim_lease` (`claim_authority.rs:247-260` @ `006d417`) mutates
      `record.lease_expires_at` in the in-memory index and calls `write_index(path, &index)`. It
@@ -1797,8 +1798,33 @@ D6 are below.
   are not interchangeable — the first survives replay from segments and a git-merged ledger; the
   second does not, and `claim-index.json` is a derived cache rebuilt on every claim-class append.
 - **Adversarial control:** renew a claim's lease, append an unrelated `Claim` fact from a second
-  tool, then run the reaper — assert the renewed claim is NOT in `claims_reaped`. Against today's
-  code that fails at the second step, before the reaper runs at all.
+  tool, then run the reaper — assert the renewed claim is NOT in `claims_reaped`. Against the code
+  as described above, that failed at the second step, before the reaper ran at all.
+- **Correction (2026-08-06).** Everything above describes the code at `006d417` and is left intact
+  as the mechanism record. It has not been true since `20e69ad`. The entry stayed at `mechanism` /
+  NOT fixed through five merged commits because nothing updates the register at merge — the same
+  gap RC-D names, reached from the other end. **Entry at receipt, state update at merge.**
+- **What the fix took, and it took the harder of the two options.** Renewal is now a durable
+  `FactKind::ClaimRenewed` fact, not a sidecar edit. `claim_authority::latest_renewed_lease`
+  (`claim_authority.rs:200-210`) folds it into the active-claim projection, applied at `:170` and
+  `:189`. The reaper reads that same projection (`reaper.rs:416-418`), so the third part of the
+  mechanism — "neither expiry path can see it" — is structurally gone rather than patched. It also
+  went past what this entry asked: ownership and monotonicity are re-checked under the mutation lock
+  (`store.rs:1984-2000`), and a `ClaimExpired` append is refused there outright if the lease was
+  renewed (`:1973-1979`).
+- **Controls, executed 2026-08-06 (not merely cited):**
+  - `reaper::durable_renewal_after_original_expiry_survives_reap` (`reaper.rs:1987`)
+  - `store::claim_lease_renewal_appends_durable_event_and_projects_effective_lease` (`store.rs:6542`)
+  - `store::claim_lease_renewal_is_monotonic_and_retry_idempotent` (`store.rs:6592`)
+  - `store::reaper_lease_expired_close_is_refused_after_concurrent_renewal` (`store.rs:10176`)
+  - `lib::heartbeat_renews_every_owned_claim_durably` (`lib.rs:8345`) — the caller
+  - `rallyd_core::routed_renewal_appends_the_same_durable_fact_as_direct_mode` (`rallyd_core.rs:1039`)
+    — daemon parity
+- **Residual, named rather than closed.** The adversarial control above specifies an intervening
+  unrelated `Claim` from a *second tool*, and no test includes that step. The step is structurally
+  moot now that renewal is a ledger fact rather than a sidecar the next claim-class append would
+  rebuild — but nothing pins that, so a future change back toward sidecar semantics would not be
+  caught by this suite. Closing it is one test, not a redesign.
 
 ### RC-054 — the byte budget is a bucket allocator, not a response ceiling, and it can report `over_budget: false` while over budget (D4)
 - **State:** `mechanism`, verified by code trace. **NOT fixed.** Structural sizing of the unbudgeted
@@ -2443,9 +2469,14 @@ Not defects. Recorded because each explains why one of the entries above is shap
 - **What is NOT fixed, and why the entry stays open.** Every de-tracked byte is still in git
   history and `git log` recovers all of it. Real removal means rewriting history and force-pushing:
   irreversible, breaks every existing clone and fork, and NOT authorized. The 18 bundles carry
-  full pre-sanitization history of this repo **and of repositories that are not this one**, and
-  they have not been audited for credentials — a regex sweep over compressed packfiles is not a
-  credential audit. No secret is known present; none is ruled out.
+  full pre-sanitization history of this repo **and of repositories that are not this one**.
+  **Credential audit completed 2026-08-06 (this line previously read "not audited"):** all 18
+  bundles were verified, fetched into throwaway bare repos, and scanned blob-by-blob after
+  decompression — 1,252–1,812 blobs each, 626 distinct paths, including files deleted in history.
+  The scanner was mutation-validated against planted-then-deleted secrets across all 11 detector
+  classes with zero misses. Two hits, both benign. Zero credentials. See
+  `docs/security/TRUST-MODEL.md` for the full result. **This clears secrets and nothing else** —
+  machine paths, hostname, and coordination ledger are still present by inspection.
 - **Adversarial control (owed, not written).** A test that clones the repo into a scratch dir and
   asserts the resulting room is empty and `git log -p` surfaces no `/Users/` path would close the
   first half. The second half cannot be closed by a test at all — only by a history decision.
@@ -2499,6 +2530,31 @@ Recorded compactly; each has its own adversarial controls in-tree.
   line-length ceiling the direct path never consults. Same ledger, opposite outcome, decided by
   whether rallyd happened to be running — a third instance of the D1/D6 class, on the write path,
   found by `write_authority_daemon_parity.rs` rather than by anyone looking for it.
+
+### ARP-R-10 — the finding does not exist in this repository, and that is the finding
+
+- **State:** `unrecoverable`. Recorded 2026-08-06 so the next reader does not re-run the search.
+- **What it is.** Nothing. The ARP-R set is referenced throughout as R-01..R-11, and R-10 appears in
+  no commit message, no register entry, no source comment, no test, no CHANGELOG line, no Rally fact
+  in `.rally/log/` or `.rally/archive/`, no `.rally.bak-*` tree, no stash, and no reflog entry.
+- **Search performed, so it is not repeated.** `git log --all --grep`, `git log --all -S`, and
+  `git grep` across all 636 commits; the full worktree including ignored and untracked paths; all
+  three `.rally.bak-*` trees; `git stash list`; `git log -g`. **The identical search returns hits
+  for ARP-R-09 and ARP-R-11**, so the apparatus is sound and the absence is real rather than a
+  failed grep.
+- **Three explanations, and the evidence does not separate them.** The reviewer numbered R-01..R-11
+  and R-10 was withdrawn or merged into a neighbour before the report was recorded; R-10 was
+  recorded only in a session transcript that never became an artifact; or the numbering skipped.
+- **Why the second is not a stretch.** ARP-R-03 and ARP-R-04 are both real findings with fixes
+  in-tree and neither got a register entry when it arrived. The recording step demonstrably dropped
+  findings in this cycle, so "recorded nowhere durable" is the explanation with a precedent.
+- **Disposition: accepted as unrecoverable, deliberately.** Closing it by archaeology costs more
+  than it returns, and asking the reviewing session is no longer possible. What is worth fixing is
+  the mechanism, not this instance.
+- **The durable lever, which is the actual output of this entry.** A finding must get a register
+  entry **at receipt**, before it is triaged or fixed — not at fix time, which is when three of
+  eleven ARP-R findings fell through. Paired with the merge-time state update that RC-053 needed,
+  that is two lines in the merge checklist covering both ends of a finding's life.
 
 ### A note on what "validated by mutation" is worth
 
