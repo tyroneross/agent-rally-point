@@ -27,6 +27,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Wall-clock budget for every spawned command. Generous enough that a cold
@@ -253,9 +254,25 @@ fn set_mode(_path: &Path, _mode: u32) {
     panic!("reaper write-integrity fixtures need unix permission bits");
 }
 
+/// A fixture path no other fixture can name.
+///
+/// The timestamp alone is not enough. macOS reports `SystemTime::now()` at
+/// microsecond granularity (`as_nanos()` always ends in `000`), so two test
+/// PROCESSES that reach the same fixture within the same microsecond compute
+/// the same path — and since `init_observed_worktree` now runs a real
+/// `git init` there, the loser dies on `cannot copy ... /.git/info/exclude:
+/// File exists` rather than on anything it was grading. Two concurrent
+/// `cargo test` invocations against this crate are enough to hit it.
+///
+/// The pid plus a per-process counter closes both directions, matching the
+/// `unique_root` helper the `reaper.rs` unit tests already use. `Drop` removes
+/// these directories, so a collision leaves no evidence behind either.
 fn temp_path(name: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(
-        "{name}-{}",
+        "{name}-{}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

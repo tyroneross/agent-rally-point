@@ -1276,6 +1276,129 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    /// The automatic reap decision is THREE-way on the external observation,
+    /// and the third arm is the one nothing else pinned.
+    /// [`crate::observed_liveness::ObservedLiveness`] reaches
+    /// [`crate::liveness::is_live`] as `observed_alive`, so the arms are:
+    ///
+    /// | observation           | `observed_alive` | `ReapMode::LeaseOnly` |
+    /// |-----------------------|------------------|-----------------------|
+    /// | observed live         | `Some(true)`     | preserved (veto)      |
+    /// | observed dead         | `Some(false)`    | REAPED                |
+    /// | unavailable/unstamped | `None`           | preserved (fail-closed) |
+    ///
+    /// `automatic_pass_preserves_quiet_live_agent_and_reaps_crashed_agent`
+    /// grades the first two arms. The third had no test, which left the
+    /// contract able to collapse into two: relaxing the rule to
+    /// `observed_verdict != Liveness::Live` — the intuitive "only decline when
+    /// we can SEE it alive" reading — keeps every other test in this file green
+    /// while making every claim on a host whose observation never resolves
+    /// automatically reapable. That is the destructive direction, and
+    /// `liveness.rs` pins reaper removal as FAIL-CLOSED precisely because
+    /// removal cannot be undone. Grading all three arms in one pass is what
+    /// makes that relaxation fail here instead of shipping.
+    ///
+    /// The second pass asserts the trade this fail-closed rule actually makes.
+    /// An unobserved room is not left UNREAPABLE — `ReapMode::Full`, the
+    /// human-invoked `rally doctor --reap-stale --apply`, still closes the same
+    /// claim on the lease signal alone. It is left needing a human. That second
+    /// pass doubles as the non-vacuity guard: it proves the unobserved claim
+    /// was lease-eligible the whole time, so its survival above is the
+    /// observation rule doing work rather than an inert fixture.
+    #[test]
+    fn automatic_reap_decision_is_three_way_on_observation() {
+        let root = unique_root("observed-three-way");
+        init_observed_worktree(&root);
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        // Arm 1 — observed live: this process is running, so `kill -0` answers
+        // yes and the observer returns Live.
+        append_observed_presence(&room, "observed-live", &root, std::process::id());
+        let live_claim = append_claim_with_lease(
+            &room,
+            "claim-observed-live",
+            "observed-live",
+            &past_ts(3600),
+        );
+
+        // Arm 2 — observed dead: a pid far above the system maximum cannot
+        // exist, and the worktree HEAD still matches the stamped beat, so the
+        // observer is allowed destructive certainty.
+        append_observed_presence(&room, "observed-dead", &root, 2_000_000_000);
+        let dead_claim = append_claim_with_lease(
+            &room,
+            "claim-observed-dead",
+            "observed-dead",
+            &past_ts(3600),
+        );
+
+        // Arm 3 — unavailable: presence with no `worktree_path:` /
+        // `observer_pid:` stamps, which is every host that has not installed
+        // the coordination hook. `observe_tools` creates no entry for the tool
+        // and the reaper falls back to Unknown.
+        append_presence(&room, "unobserved", 5);
+        let unobserved_claim =
+            append_claim_with_lease(&room, "claim-unobserved", "unobserved", &past_ts(3600));
+
+        let automatic = run_reap_stale_in_room_with_mode(&room, true, ReapMode::LeaseOnly).unwrap();
+
+        let reaped: Vec<&str> = automatic
+            .claims_reaped
+            .iter()
+            .map(|entry| entry.claim_id.as_str())
+            .collect();
+        assert_eq!(
+            reaped,
+            vec![dead_claim.event_id.as_str()],
+            "the automatic pass must close the observed-dead claim and ONLY that \
+             claim: observed-live is vetoed and unavailable observation is \
+             fail-closed"
+        );
+
+        let active = room.snapshot().unwrap().active_claims;
+        let still_active = |id: &str| active.iter().any(|claim| claim.event_id == id);
+        assert!(
+            still_active(&live_claim.event_id),
+            "observed live must survive an automatic pass even with an expired lease"
+        );
+        assert!(
+            still_active(&unobserved_claim.event_id),
+            "unavailable observation must NOT authorize automatic removal — this is \
+             the arm that silently disappears if the rule is relaxed to \
+             `observed_verdict != Live`"
+        );
+        assert!(
+            !still_active(&dead_claim.event_id),
+            "observed dead with an expired lease is the one automatic-reap case"
+        );
+
+        // The operator path, and the non-vacuity guard for the assertion above.
+        let operator = run_reap_stale_in_room_with_mode(&room, true, ReapMode::Full).unwrap();
+        let operator_reaped: Vec<&str> = operator
+            .claims_reaped
+            .iter()
+            .map(|entry| entry.claim_id.as_str())
+            .collect();
+        assert_eq!(
+            operator_reaped,
+            vec![unobserved_claim.event_id.as_str()],
+            "an unobserved host is not left unreapable: the human-invoked Full pass \
+             still closes the same lease-expired claim, which also proves that claim \
+             was eligible all along and the automatic pass spared it by rule"
+        );
+        assert!(
+            room.snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|claim| claim.event_id == live_claim.event_id),
+            "observed live is a veto in BOTH modes — a human pass must not close it \
+             either"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
     /// Auto-reap must be OFF unless someone opts in. It shipped on for one
     /// commit and an audit measured 8/8 concurrent `rally enter` failures plus
     /// live agents' claims being closed; flipping the default back on without
