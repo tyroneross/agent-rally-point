@@ -411,6 +411,10 @@ pub(crate) struct BucketComposition {
     /// the drill-in is `--include-archived` rather than 1000+ ids.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) omitted_ids: Vec<String>,
+    /// TRUE when `omitted_ids` hit their response-size cap. `omitted` remains
+    /// the complete count; callers can use `rally locate` for a known id.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) omitted_ids_truncated: bool,
     /// Why the omission happened: `"budget"` or `"archived"`.
     pub(crate) reason: String,
 }
@@ -422,7 +426,8 @@ pub(crate) struct RoomComposition {
     /// The byte ceiling in force, or `None` when the ceiling is disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) budget_bytes: Option<usize>,
-    /// Approximate serialized size of the emitted buckets.
+    /// Exact pretty-printed byte size of the final `rally room --json`
+    /// response, including its trailing newline.
     pub(crate) emitted_bytes: usize,
     /// Per-bucket accounting. Only buckets that omitted something appear.
     pub(crate) buckets: BTreeMap<String, BucketComposition>,
@@ -3391,18 +3396,19 @@ fn snapshot_from_facts_with_policy(
     // DI-1: split kind=risk facts into human coordination risks (current_risks)
     // vs system-generated health/telemetry (system_health), keyed on a known
     // machine subject prefix. Keeps the risk view trustworthy; telemetry stays
-    // auditable in its own bucket. `SYSTEM_HEALTH_SUBJECT_PREFIXES` is the single
-    // source of truth for the telemetry class.
+    // auditable in its own bucket. `system_health_class` is the single source
+    // of truth for both classification and bounded projection.
     const SYSTEM_HEALTH_SUBJECT_PREFIXES: &[&str] = &[
         "external-intake:",
         "unmanaged-agent:",
         "duplicate-active-squad-id:",
         "binary-drift:",
     ];
-    fn is_system_health_subject(subject: &str) -> bool {
+    fn system_health_class(subject: &str) -> Option<&'static str> {
         SYSTEM_HEALTH_SUBJECT_PREFIXES
             .iter()
-            .any(|p| subject.starts_with(p))
+            .copied()
+            .find(|prefix| subject.starts_with(prefix))
     }
 
     let mut current_risks: Vec<Fact> = Vec::new();
@@ -3415,28 +3421,26 @@ fn snapshot_from_facts_with_policy(
             stale_facts.push(f.clone());
             continue;
         }
-        if is_system_health_subject(&f.subject) {
+        if system_health_class(&f.subject).is_some() {
             system_health_all.push(f.clone());
         } else {
             current_risks.push(f.clone());
         }
     }
     sort_by_recency(&mut current_risks, now_secs, half_life_secs);
-    // Dedup telemetry by subject (freshest kept) so historical un-guarded
-    // accumulation (pre-DI-4 binary-drift / duplicate-squad rows) collapses to
-    // one row per distinct signal.
+    // Dedup telemetry by prefix class (freshest kept). A complete subject often
+    // embeds a path, pid, session id, or build pair; using it as the key lets a
+    // machine mint an unbounded never-cut bucket with nominally unique rows.
     sort_by_recency(&mut system_health_all, now_secs, half_life_secs);
-    let mut seen_subjects: BTreeSet<String> = BTreeSet::new();
+    let mut seen_classes: BTreeSet<&'static str> = BTreeSet::new();
     let mut system_health: Vec<Fact> = Vec::new();
     for f in system_health_all {
-        if seen_subjects.insert(f.subject.clone()) {
+        if system_health_class(&f.subject).is_some_and(|class| seen_classes.insert(class)) {
             system_health.push(f);
         }
     }
-    // NOT truncated: the bucket is already deduped by subject (bounded by the
-    // small, machine-generated system vocabulary), and the enter-path
-    // idempotency guards read this projection — a truncation could drop a prior
-    // subject and defeat the guard, re-appending duplicates to the ledger.
+    // NOT truncated: prefix classes bound this never-cut bucket to the small,
+    // machine-generated system vocabulary.
 
     let mut recent_artifacts = facts
         .iter()
@@ -3716,6 +3720,10 @@ const BUDGETED_BUCKETS: &[&str] = &[
     "open_handoffs",
 ];
 
+/// Keep omission metadata bounded too. The count remains exact even when the
+/// convenience id sample is capped.
+const MAX_OMITTED_IDS: usize = 64;
+
 /// True when a handoff is assigned to `tool` under the SAME rule `rally next`
 /// uses (`next::assigned_to_tool`): an explicit target match, or an untargeted
 /// / broadcast handoff, which is addressed to everyone including the caller.
@@ -3780,13 +3788,17 @@ struct Candidate {
 ///    at the TOP of the fill, not the bottom. That is the deliberate cost of the
 ///    fail-open direction: a corrupt stamp can outrank a genuinely fresh item.
 ///    Removal is the destructive direction, so ambiguity resolves toward keeping.
-pub(crate) fn compose_room_output(
+pub(crate) fn compose_room_output<F>(
     mut snapshot: RoomSnapshot,
     coord: &crate::hooks_config::CoordinationConfig,
     consumer: &crate::relevance::ConsumerContext,
     include_archived: bool,
     budget_override: Option<usize>,
-) -> RoomSnapshot {
+    measure_output: F,
+) -> RoomSnapshot
+where
+    F: Fn(&RoomSnapshot) -> usize,
+{
     let mut buckets: BTreeMap<String, BucketComposition> = BTreeMap::new();
 
     // --- Honor the archive verdict ---------------------------------------
@@ -3807,6 +3819,7 @@ pub(crate) fn compose_room_output(
                 // flag, and a four-figure id list would reintroduce the payload
                 // this removes.
                 omitted_ids: Vec::new(),
+                omitted_ids_truncated: false,
                 reason: "archived".to_string(),
             },
         );
@@ -3818,6 +3831,7 @@ pub(crate) fn compose_room_output(
     // not an escape hatch. An explicit `--budget-bytes` still wins, because that
     // caller asked for a bound with their eyes open.
     let budget = match (budget_override, include_archived) {
+        (Some(0), _) => None,
         (Some(explicit), _) => Some(explicit),
         (None, true) => None,
         (None, false) => coord.room_budget_bytes(),
@@ -3827,30 +3841,275 @@ pub(crate) fn compose_room_output(
     if let Some(budget) = budget {
         over_budget_causes = apply_budget(&mut snapshot, coord, consumer, budget, &mut buckets);
     }
-    let over_budget = !over_budget_causes.is_empty();
+    if !over_budget_causes.is_empty() || !buckets.is_empty() {
+        install_composition(
+            &mut snapshot,
+            budget,
+            &buckets,
+            !over_budget_causes.is_empty(),
+            over_budget_causes.clone(),
+        );
+    }
 
-    if over_budget || !buckets.is_empty() {
-        let emitted_bytes = emitted_bytes(&snapshot);
-        let mut drill_in = vec![
-            "rally room --json                     # this view".to_string(),
-            "rally locate <event-id> --json        # one omitted item".to_string(),
-        ];
-        if buckets.contains_key("stale_facts") {
-            drill_in.insert(
-                0,
-                "rally room --include-archived --json  # every archived fact".to_string(),
-            );
+    if let Some(limit) = budget {
+        // The ranking pass budgets fact bodies. The final command envelope also
+        // contains fixed snapshot fields, totals, duplicate readers/mission,
+        // agent injectability, composition metadata, pretty-print whitespace,
+        // and the trailing newline. Measure that exact response and trim the
+        // lowest-ranked droppable fact until the real ceiling holds.
+        if measure_output(&snapshot) > limit && snapshot.composition.is_none() {
+            install_composition(&mut snapshot, budget, &buckets, false, Vec::new());
         }
-        snapshot.composition = Some(RoomComposition {
-            budget_bytes: budget,
-            emitted_bytes,
-            buckets,
-            drill_in,
-            over_budget,
-            over_budget_causes,
-        });
+        loop {
+            let bytes = stabilize_emitted_bytes(&mut snapshot, &measure_output);
+            if bytes <= limit {
+                if let Some(composition) = snapshot.composition.as_mut() {
+                    composition.over_budget = false;
+                    composition.over_budget_causes.clear();
+                }
+                stabilize_emitted_bytes(&mut snapshot, &measure_output);
+                break;
+            }
+            let mut estimated_bytes = bytes;
+            let mut trimmed = false;
+            while estimated_bytes > limit {
+                let Some(estimated_savings) =
+                    trim_lowest_budgeted(&mut snapshot, coord, consumer, &mut buckets)
+                else {
+                    break;
+                };
+                trimmed = true;
+                estimated_bytes = estimated_bytes.saturating_sub(estimated_savings);
+            }
+            if trimmed {
+                install_composition(&mut snapshot, budget, &buckets, false, Vec::new());
+                continue;
+            }
+
+            // Nothing correctness-safe remains to cut. Report the actual
+            // overflow instead of deriving a false PASS from an incomplete
+            // reserve estimate.
+            over_budget_causes = exact_over_budget_causes(&snapshot, consumer);
+            install_composition(&mut snapshot, budget, &buckets, true, over_budget_causes);
+            stabilize_emitted_bytes(&mut snapshot, &measure_output);
+            break;
+        }
+    } else if snapshot.composition.is_some() {
+        stabilize_emitted_bytes(&mut snapshot, &measure_output);
     }
     snapshot
+}
+
+fn install_composition(
+    snapshot: &mut RoomSnapshot,
+    budget: Option<usize>,
+    buckets: &BTreeMap<String, BucketComposition>,
+    over_budget: bool,
+    over_budget_causes: Vec<String>,
+) {
+    let mut drill_in = vec![
+        "rally room --json                     # this view".to_string(),
+        "rally locate <event-id> --json        # one omitted item".to_string(),
+    ];
+    if buckets.contains_key("stale_facts") {
+        drill_in.insert(
+            0,
+            "rally room --include-archived --json  # every archived fact".to_string(),
+        );
+    }
+    let emitted_bytes = snapshot
+        .composition
+        .as_ref()
+        .map(|composition| composition.emitted_bytes)
+        .unwrap_or(0);
+    snapshot.composition = Some(RoomComposition {
+        budget_bytes: budget,
+        emitted_bytes,
+        buckets: buckets.clone(),
+        drill_in,
+        over_budget,
+        over_budget_causes,
+    });
+}
+
+/// Set `composition.emitted_bytes` to the exact self-describing response size.
+/// The value's own decimal width participates in the measurement, so converge
+/// instead of assuming one assignment is enough.
+fn stabilize_emitted_bytes<F>(snapshot: &mut RoomSnapshot, measure_output: &F) -> usize
+where
+    F: Fn(&RoomSnapshot) -> usize,
+{
+    for _ in 0..8 {
+        let bytes = measure_output(snapshot);
+        let Some(composition) = snapshot.composition.as_mut() else {
+            return bytes;
+        };
+        if composition.emitted_bytes == bytes {
+            return bytes;
+        }
+        composition.emitted_bytes = bytes;
+    }
+    measure_output(snapshot)
+}
+
+fn composition_score(
+    snapshot: &RoomSnapshot,
+    fact: &Fact,
+    coord: &crate::hooks_config::CoordinationConfig,
+    consumer: &crate::relevance::ConsumerContext,
+    now_secs: i64,
+) -> f64 {
+    let recency = fact_rank_weight(
+        fact,
+        now_secs,
+        coord.half_life_secs(),
+        coord.archive_floor_weight,
+    );
+    let signals = crate::relevance::RelevanceSignals {
+        author_past_heartbeat_window: fact
+            .tool
+            .as_deref()
+            .is_some_and(|tool| snapshot.stale_authors.contains(tool)),
+        addressed_to_caller: consumer
+            .tool
+            .as_deref()
+            .is_some_and(|tool| fact_addressed_to(fact, tool)),
+        path_overlap: crate::relevance::path_overlap(&consumer.paths, &fact.scope),
+    };
+    crate::relevance::relevance(recency, &signals, &coord.relevance)
+}
+
+/// Remove one lowest-ranked fact while preserving the top item in every
+/// informational bucket and every handoff assigned to the caller.
+fn trim_lowest_budgeted(
+    snapshot: &mut RoomSnapshot,
+    coord: &crate::hooks_config::CoordinationConfig,
+    consumer: &crate::relevance::ConsumerContext,
+    buckets: &mut BTreeMap<String, BucketComposition>,
+) -> Option<usize> {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let mut lowest: Option<(&'static str, usize, f64, i64)> = None;
+    for &name in BUDGETED_BUCKETS {
+        let facts = bucket_ref(snapshot, name);
+        let unassigned_handoffs = if name == "open_handoffs" {
+            consumer.tool.as_deref().map_or(0, |tool| {
+                facts
+                    .iter()
+                    .filter(|fact| !handoff_assigned_to(fact, tool))
+                    .count()
+            })
+        } else {
+            0
+        };
+        for (index, fact) in facts.iter().enumerate() {
+            let removable =
+                if name == "open_handoffs" {
+                    consumer.tool.as_deref().is_some_and(|tool| {
+                        !handoff_assigned_to(fact, tool) && unassigned_handoffs > 1
+                    }) || (consumer.tool.is_none() && facts.len() > 1)
+                } else {
+                    facts.len() > 1
+                };
+            if !removable {
+                continue;
+            }
+            let score = composition_score(snapshot, fact, coord, consumer, now_secs);
+            if lowest.as_ref().is_none_or(|(_, _, best_score, best_seq)| {
+                score < *best_score || (score == *best_score && fact.seq < *best_seq)
+            }) {
+                lowest = Some((name, index, score, fact.seq));
+            }
+        }
+    }
+    let (name, index, _, _) = lowest?;
+
+    let total = bucket_total(snapshot, name);
+    let removed = bucket_mut(snapshot, name).remove(index);
+    let estimated_fact_bytes = serde_json::to_string_pretty(&removed)
+        .map(|rendered| rendered.len() + 1)
+        .unwrap_or_else(|_| fact_bytes(&removed));
+    let removed_id = removed.event_id;
+    let emitted = bucket_ref(snapshot, name).len();
+    let entry = buckets.entry(name.to_string()).or_default();
+    entry.total = total;
+    entry.emitted = emitted;
+    entry.omitted = total.saturating_sub(emitted);
+    entry.reason = "budget".to_string();
+    let id_metadata_bytes = if entry.omitted_ids.len() < MAX_OMITTED_IDS {
+        let bytes = removed_id.len() + 16;
+        entry.omitted_ids.push(removed_id);
+        bytes
+    } else {
+        0
+    };
+    entry.omitted_ids_truncated = entry.omitted > entry.omitted_ids.len();
+
+    sync_unconsumed_artifacts(snapshot, buckets);
+    Some(
+        estimated_fact_bytes
+            .saturating_sub(id_metadata_bytes)
+            .max(1),
+    )
+}
+
+fn bucket_total(snapshot: &RoomSnapshot, name: &str) -> usize {
+    match name {
+        "current_decisions" => snapshot.totals.current_decisions,
+        "current_risks" => snapshot.totals.current_risks,
+        "recent_artifacts" => snapshot.totals.recent_artifacts,
+        "open_handoffs" => snapshot.totals.open_handoffs,
+        other => unreachable!("bucket_total: {other} is not a budgeted bucket"),
+    }
+}
+
+fn sync_unconsumed_artifacts(
+    snapshot: &mut RoomSnapshot,
+    buckets: &mut BTreeMap<String, BucketComposition>,
+) {
+    let emitted_artifact_ids: BTreeSet<&str> = snapshot
+        .recent_artifacts
+        .iter()
+        .map(|fact| fact.event_id.as_str())
+        .collect();
+    snapshot
+        .unconsumed_artifacts
+        .retain(|fact| emitted_artifact_ids.contains(fact.event_id.as_str()));
+    let emitted = snapshot.unconsumed_artifacts.len();
+    let total = snapshot.totals.unconsumed_artifacts;
+    if emitted < total {
+        buckets.insert(
+            "unconsumed_artifacts".to_string(),
+            BucketComposition {
+                total,
+                emitted,
+                omitted: total - emitted,
+                omitted_ids: Vec::new(),
+                omitted_ids_truncated: true,
+                reason: "budget".to_string(),
+            },
+        );
+    }
+}
+
+fn exact_over_budget_causes(
+    snapshot: &RoomSnapshot,
+    consumer: &crate::relevance::ConsumerContext,
+) -> Vec<String> {
+    let (_, mut causes) = never_cut_bytes(snapshot);
+    if consumer.tool.as_deref().is_some_and(|tool| {
+        snapshot
+            .open_handoffs
+            .iter()
+            .any(|fact| handoff_assigned_to(fact, tool))
+    }) {
+        causes.push("assigned_handoffs".to_string());
+    }
+    causes.push("response_floor".to_string());
+    causes.dedup();
+    causes
 }
 
 /// Rank the budgeted buckets by relevance and fill `budget` bytes.
@@ -3990,6 +4249,7 @@ fn apply_budget(
             .iter()
             .filter(|i| !kept.contains(i))
             .filter_map(|i| facts.get(*i).map(|f| f.event_id.clone()))
+            .take(MAX_OMITTED_IDS)
             .collect();
         let mut rebuilt: Vec<Fact> = Vec::with_capacity(kept.len());
         for i in &order {
@@ -4007,6 +4267,7 @@ fn apply_budget(
                 total,
                 emitted,
                 omitted: total - emitted,
+                omitted_ids_truncated: total - emitted > omitted_ids.len(),
                 omitted_ids,
                 reason: "budget".to_string(),
             },
@@ -4029,28 +4290,7 @@ fn apply_budget(
     // `unconsumed_artifacts` is DERIVED from `recent_artifacts`; several call
     // sites assume the subset relation. Re-derive it from what actually shipped
     // so the relation survives composition.
-    let emitted_artifact_ids: BTreeSet<String> = snapshot
-        .recent_artifacts
-        .iter()
-        .map(|f| f.event_id.clone())
-        .collect();
-    let before = snapshot.unconsumed_artifacts.len();
-    snapshot
-        .unconsumed_artifacts
-        .retain(|f| emitted_artifact_ids.contains(&f.event_id));
-    let after = snapshot.unconsumed_artifacts.len();
-    if after < before {
-        buckets.insert(
-            "unconsumed_artifacts".to_string(),
-            BucketComposition {
-                total: snapshot.totals.unconsumed_artifacts,
-                emitted: after,
-                omitted: snapshot.totals.unconsumed_artifacts.saturating_sub(after),
-                omitted_ids: Vec::new(),
-                reason: "budget".to_string(),
-            },
-        );
-    }
+    sync_unconsumed_artifacts(snapshot, buckets);
 
     over_budget_causes
 }
@@ -4115,13 +4355,6 @@ fn never_cut_bytes(snapshot: &RoomSnapshot) -> (usize, Vec<String>) {
         .map(|(_, name)| name)
         .collect();
     (total, causes)
-}
-
-/// Approximate serialized size of everything the room will emit.
-fn emitted_bytes(snapshot: &RoomSnapshot) -> usize {
-    serde_json::to_string(snapshot)
-        .map(|s| s.len())
-        .unwrap_or(0)
 }
 
 fn open_fact_store(path: &Path) -> Result<SqliteStore> {
@@ -6031,6 +6264,191 @@ mod ledger_tests {
             "resolved telemetry must leave system_health"
         );
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn system_health_is_bounded_by_prefix_class() {
+        let mut facts = Vec::with_capacity(1_000);
+        for index in 0..1_000 {
+            let mut fact = make_fact(
+                &format!("external-{index}"),
+                FactKind::Risk,
+                "external-intake",
+                "quarantined external path",
+            );
+            fact.seq = index + 1;
+            fact.subject = format!("external-intake: /private/source/{index}");
+            facts.push(fact);
+        }
+
+        let snapshot = snapshot_from_facts_with_policy(
+            &facts,
+            &crate::hooks_config::CoordinationConfig::default(),
+            true,
+        );
+
+        assert_eq!(snapshot.system_health.len(), 1);
+        assert_eq!(snapshot.system_health[0].event_id, "external-999");
+        assert_eq!(snapshot.totals.system_health, 1);
+    }
+
+    fn measured_room_bytes(snapshot: &RoomSnapshot, fixed_envelope_bytes: usize) -> usize {
+        fixed_envelope_bytes
+            + serde_json::to_string_pretty(snapshot)
+                .expect("snapshot serialization")
+                .len()
+            + 1
+    }
+
+    fn ten_x_composition_snapshot() -> RoomSnapshot {
+        const BASELINE_FACTS: usize = 100;
+        let mut facts = Vec::with_capacity(BASELINE_FACTS * 10);
+        for index in 0..BASELINE_FACTS * 10 {
+            let kind = match index % 4 {
+                0 => FactKind::Decision,
+                1 => FactKind::Artifact,
+                2 => FactKind::Risk,
+                _ => FactKind::Handoff,
+            };
+            let is_handoff = kind == FactKind::Handoff;
+            let mut fact = make_fact(
+                &format!("compose-{index}"),
+                kind,
+                "src/composition.rs",
+                &"wide response body ".repeat(12),
+            );
+            fact.seq = index as i64 + 1;
+            if is_handoff {
+                fact.target = Some("another-tool".to_string());
+            }
+            facts.push(fact);
+        }
+        snapshot_from_facts_with_policy(
+            &facts,
+            &crate::hooks_config::CoordinationConfig::default(),
+            true,
+        )
+    }
+
+    #[test]
+    fn exact_room_ceiling_counts_fixed_envelope_and_composition_metadata() {
+        const BUDGET: usize = 32_000;
+        const FIXED_ENVELOPE: usize = 1_800;
+        let coord = crate::hooks_config::CoordinationConfig::default();
+        let consumer = crate::relevance::ConsumerContext::neutral();
+        let composed = compose_room_output(
+            ten_x_composition_snapshot(),
+            &coord,
+            &consumer,
+            false,
+            Some(BUDGET),
+            |snapshot| measured_room_bytes(snapshot, FIXED_ENVELOPE),
+        );
+        let actual = measured_room_bytes(&composed, FIXED_ENVELOPE);
+        let composition = composed
+            .composition
+            .as_ref()
+            .expect("ten-x ledger must require composition");
+
+        assert!(actual <= BUDGET, "{actual} exceeded {BUDGET}");
+        assert_eq!(composition.emitted_bytes, actual);
+        assert!(!composition.over_budget);
+        assert!(
+            composition
+                .buckets
+                .values()
+                .any(|bucket| bucket.omitted > 0)
+        );
+        assert_eq!(composed.totals.current_decisions, 250);
+        assert_eq!(composed.totals.current_risks, 250);
+    }
+
+    #[test]
+    fn exact_room_ceiling_reports_an_uncuttable_top_one_floor() {
+        const BUDGET: usize = 1;
+        const FIXED_ENVELOPE: usize = 600;
+        let mut snapshot = ten_x_composition_snapshot();
+        snapshot.current_decisions.truncate(1);
+        snapshot.current_risks.truncate(1);
+        snapshot.recent_artifacts.truncate(1);
+        snapshot.open_handoffs.truncate(1);
+        snapshot.unconsumed_artifacts.clear();
+        snapshot.totals.current_decisions = 1;
+        snapshot.totals.current_risks = 1;
+        snapshot.totals.recent_artifacts = 1;
+        snapshot.totals.open_handoffs = 1;
+        snapshot.totals.unconsumed_artifacts = 0;
+        let coord = crate::hooks_config::CoordinationConfig::default();
+        let consumer = crate::relevance::ConsumerContext::neutral();
+        let composed = compose_room_output(
+            snapshot,
+            &coord,
+            &consumer,
+            false,
+            Some(BUDGET),
+            |candidate| measured_room_bytes(candidate, FIXED_ENVELOPE),
+        );
+        let actual = measured_room_bytes(&composed, FIXED_ENVELOPE);
+        let composition = composed
+            .composition
+            .as_ref()
+            .expect("an over-budget floor must report composition");
+
+        assert!(actual > BUDGET);
+        assert!(composition.over_budget);
+        assert_eq!(composition.emitted_bytes, actual);
+        assert!(
+            composition.buckets.is_empty(),
+            "one-item bucket floors must not claim an omission"
+        );
+        assert!(
+            composition
+                .over_budget_causes
+                .iter()
+                .any(|cause| cause == "response_floor")
+        );
+    }
+
+    #[test]
+    fn include_archived_with_explicit_budget_keeps_every_fact_and_reports_overflow() {
+        const BUDGET: usize = 100;
+        let stale_facts = (0..10)
+            .map(|index| {
+                make_fact(
+                    &format!("archived-{index}"),
+                    FactKind::Artifact,
+                    "archive",
+                    "archived fact remains complete",
+                )
+            })
+            .collect::<Vec<_>>();
+        let snapshot = RoomSnapshot {
+            totals: RoomTotals {
+                stale_facts: stale_facts.len(),
+                ..RoomTotals::default()
+            },
+            stale_facts,
+            ..RoomSnapshot::default()
+        };
+        let coord = crate::hooks_config::CoordinationConfig::default();
+        let consumer = crate::relevance::ConsumerContext::neutral();
+
+        let composed = compose_room_output(
+            snapshot,
+            &coord,
+            &consumer,
+            true,
+            Some(BUDGET),
+            |candidate| measured_room_bytes(candidate, 300),
+        );
+
+        assert_eq!(composed.stale_facts.len(), 10);
+        assert!(
+            composed
+                .composition
+                .as_ref()
+                .is_some_and(|composition| composition.over_budget)
+        );
     }
 
     #[test]

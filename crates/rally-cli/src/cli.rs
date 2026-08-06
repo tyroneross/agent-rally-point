@@ -209,7 +209,10 @@ pub(crate) struct RoomArgs {
     pub(crate) since: Option<i64>,
     /// R10: project per-tool read receipts from ledger read-checkpoint facts.
     pub(crate) readers: bool,
-    /// Re-include recency-decayed (archived) facts in the room snapshot.
+    /// Re-include recency-decayed (archived) facts in the room snapshot. This
+    /// disables the configured default ceiling; an explicit nonzero
+    /// `--budget-bytes` still applies and reports overflow rather than cutting
+    /// the archived completeness floor.
     pub(crate) include_archived: bool,
     /// Explicit byte ceiling for this response, overriding the configured
     /// `room_budget_fraction x consumer_context_bytes`. `0` disables the
@@ -1409,12 +1412,16 @@ fn room_parser() -> impl Parser<RoomArgs> {
         .help("R10: project per-tool read receipts from ledger read-checkpoint facts")
         .switch();
     let include_archived = long("include-archived")
-        .help("re-include recency-decayed (archived) facts in the snapshot")
+        .help(
+            "re-include every recency-decayed fact; disables the configured default ceiling. \
+             An explicit --budget-bytes still applies and reports overflow rather than cutting \
+             archived facts",
+        )
         .switch();
     let budget_bytes = long("budget-bytes")
         .help(
-            "byte ceiling for this response; 0 disables it. Overrides the configured \
-             room_budget_fraction x consumer_context_bytes.",
+            "byte ceiling for the complete response; 0 disables it. Overrides the configured \
+             room_budget_fraction x consumer_context_bytes, including with --include-archived.",
         )
         .argument::<usize>("BYTES")
         .optional();
