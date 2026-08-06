@@ -833,23 +833,21 @@ try { nxt = JSON.parse(process.env.RALLY_NEXT_JSON || "{}"); } catch (_) {}
 try { status = JSON.parse(process.env.RALLY_STATUS_JSON || "{}"); } catch (_) {}
 const R = room?.data?.room || {};
 const squads = Array.isArray(R.squads) ? R.squads : [];
-const activeTools = new Set(
+// The Rust room projection already drops only provably-Stale squads. An
+// `idle` squad can therefore be Unknown (not proven stale) and remains visible
+// by design. Do not replace that fail-open verdict with a JS status check.
+const visibleTools = new Set(
+  squads
+    .filter(s => s && s.tool && s.tool !== "rally")
+    .map(s => s.tool)
+);
+const recentlyActiveTools = new Set(
   squads
     .filter(s => s && s.status === "active" && s.tool && s.tool !== "rally")
     .map(s => s.tool)
 );
-const peers = [...activeTools].filter(t => t !== tool);
+const peers = [...visibleTools].filter(t => t !== tool);
 const nowMs = Date.now();
-function leaseExpired(fact) {
-  const evidence = Array.isArray(fact?.evidence) ? fact.evidence : [];
-  const lease = evidence
-    .map(String)
-    .find(e => e.startsWith("lease_expires_at:"))
-    ?.slice("lease_expires_at:".length);
-  if (!lease) return false;
-  const parsed = Date.parse(lease);
-  return Number.isFinite(parsed) && parsed <= nowMs;
-}
 function factIsRecent(fact, maxAgeMs) {
   const parsed = Date.parse(fact?.created_at || "");
   return Number.isFinite(parsed) && (nowMs - parsed) <= maxAgeMs;
@@ -883,11 +881,14 @@ function renderScopes(list) {
   return (shown.join(", ") || "?") + (dropped > 0 ? ` (+${dropped} more scope${dropped > 1 ? "s" : ""})` : "");
 }
 const claims = (Array.isArray(R.active_claims) ? R.active_claims : [])
-  .filter(c => c && c.tool !== tool && activeTools.has(c.tool) && !leaseExpired(c))
+  // `active_claims` is the canonical Rust enforcement projection. Lease
+  // timestamps are context, not abandonment authority, and an owner need not
+  // have a visible squad row for before-write to enforce the claim.
+  .filter(c => c && c.tool !== tool)
   .map(c => `${renderScopes(Array.isArray(c.scope) ? c.scope : [])} (by ${ident(c.tool, 60)})`);
 const activeHandoffs = (Array.isArray(R.open_handoffs) ? R.open_handoffs : [])
   .filter(h => h && (h.target === tool || h.target === "all" || !h.target))
-  .filter(h => factIsRecent(h, 24 * 60 * 60 * 1000) || activeTools.has(h.tool));
+  .filter(h => factIsRecent(h, 24 * 60 * 60 * 1000) || recentlyActiveTools.has(h.tool));
 const handoffs = activeHandoffs.length;
 const nextData = nxt?.data?.next || {};
 const nextAction = nextData.actionable ? prose(nextData.action, 120) : "";
@@ -918,7 +919,7 @@ if (showPrompt) {
 // start phase — the one phase whose JSON this hook authored itself.
 const ledgerData = Boolean(peers.length || claims.length || handoffs || nextAction || statusLines.length);
 if (ledgerData) msg += "Active room state: ";
-if (peers.length) msg += `Active peers: ${peers.slice(0, 8).map(p => ident(p, 60)).join(", ")}${peers.length > 8 ? ` (+${peers.length - 8} more)` : ""}. `;
+if (peers.length) msg += `Visible peers: ${peers.slice(0, 8).map(p => ident(p, 60)).join(", ")}${peers.length > 8 ? ` (+${peers.length - 8} more)` : ""}. `;
 if (statusLines.length) msg += `Agent status: ${statusLines.slice(0, 8).join("; ")}${statusLines.length > 8 ? ` (+${statusLines.length - 8} more)` : ""}. `;
 if (claims.length) msg += `Open claims: ${claims.slice(0, 8).join("; ")}. `;
 if (handoffs) {
@@ -937,7 +938,7 @@ if (handoffs) {
   if (others) msg += `${others} other open handoff(s) (not addressed to you). `;
 }
 if (nextAction) msg += `Suggested next: ${nextAction}. `;
-msg += "Stale peers, expired claims, and non-actionable waits are omitted from this prompt; use `rally room` for full history. Before editing, check `rally room` / `rally next` and deconflict — do not edit a path another active agent has claimed (rally auto-checks before each write).";
+msg += "Provably stale peers, inactive claims, and non-actionable waits are omitted from this prompt; use `rally room` for full history. Before editing, check `rally room` / `rally next` and deconflict — do not edit a path covered by an active claim owned by another agent (rally auto-checks before each write).";
 process.stdout.write(JSON.stringify({ agent_visible: { present: true, severity: "warn", message: msg }, ledger_data: ledgerData }));
 ' ; } 2>/dev/null)"
   fi
