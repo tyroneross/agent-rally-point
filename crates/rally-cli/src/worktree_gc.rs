@@ -22,7 +22,7 @@
 //!   work, but we must not even attempt that when the owner is active).
 //!
 //! # Reuse of cleanup()
-//! [`run_worktree::cleanup`] performs the safe remove sequence:
+//! `run_worktree::cleanup` performs the safe remove sequence:
 //! bundle-if-unmerged → `git worktree remove --force` (with rm-rf+prune
 //! fallback) → `git branch -d` (safe, refuses unmerged). This module
 //! ENUMERATES and FILTERS, then delegates every actual removal to `cleanup()`.
@@ -30,7 +30,7 @@
 //! # Liveness
 //! The caller supplies [`PresenceFact`] values (a flat projection of the room's
 //! `FactKind::Presence` facts). The reaper computes staleness from `created_at`
-//! vs `now_ts` using the same threshold as [`agent_state::IDLE_THRESHOLD_SECS`]
+//! vs `now_ts` using the same threshold as `agent_state::IDLE_THRESHOLD_SECS`
 //! (but overridable by the caller's `ttl_secs`). Owner derivation: the agent
 //! name is extracted from the branch name (`rally/<agent>-<rest>`) and matched
 //! against the `tool` field in each presence fact using prefix/substring
@@ -157,7 +157,7 @@ pub struct GcReport {
 ///
 /// Parses git's worktree list, filters for rally-managed entries,
 /// classifies each as reapable or skippable, and (when `config.apply`)
-/// calls [`run_worktree::cleanup`] on each reapable entry.
+/// calls `run_worktree::cleanup` on each reapable entry.
 pub fn run_gc(config: GcConfig) -> Result<GcReport, String> {
     let repo = &config.repo_root;
     let git_bin = &config.git_bin;
