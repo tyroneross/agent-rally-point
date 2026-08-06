@@ -367,11 +367,12 @@ fn published_fact_schema_covers_runtime_fact_kinds() {
     // The remaining kinds are either stable (never renamed away from their
     // `#[serde(rename_all = "snake_case")]` default) or `rally`-internal
     // (presence/session/wake/read/receipt/standby/mission/unknown/
-    // claim.expired are RALLY-RECORDS-ONLY — emitted by internal flows, not
-    // postable one-to-one via `say`) — kept as a literal list, now with the
-    // one drift-prone entry sourced from the runtime round-trip above.
+    // claim.renewed/claim.expired are RALLY-RECORDS-ONLY — emitted by internal
+    // flows, not postable one-to-one via `say`) — kept as a literal list, now
+    // with the one drift-prone entry sourced from the runtime round-trip above.
     let runtime: std::collections::BTreeSet<&str> = [
         "claim",
+        "claim.renewed",
         "claim.expired",
         "release",
         "blocker",
