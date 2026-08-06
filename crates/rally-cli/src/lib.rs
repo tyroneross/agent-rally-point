@@ -2974,20 +2974,44 @@ fn command_room(args: RoomArgs) -> Result<Output> {
             paths: query.paths.clone(),
         }
     };
+    // These top-level fields are part of the emitted response but live outside
+    // `RoomSnapshot`. Build them before composition so the ceiling measures the
+    // exact pretty-printed command envelope instead of a partial store view.
+    let readers = projected.readers.clone();
+    let mission = projected.mission.clone();
+    let session_views = read_session_views(&room, BackendBins::default()).unwrap_or_default();
+    let agent_injectability =
+        build_agent_injectability(&projected, &session_views, query.tool.as_deref());
+    let measure_query = query.clone();
+    let measure_readers = readers.clone();
+    let measure_mission = mission.clone();
+    let measure_injectability = agent_injectability.clone();
+    let measure_output = |candidate: &RoomSnapshot| {
+        envelope(
+            "room",
+            SCHEMA_ROOM,
+            RoomData {
+                query: measure_query.clone(),
+                room: candidate.clone(),
+                readers: measure_readers.clone(),
+                mission: measure_mission.clone(),
+                agent_injectability: measure_injectability.clone(),
+            },
+        )
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        // `Output::render` adds one trailing newline.
+        .map(|rendered| rendered.len() + 1)
+        .unwrap_or(usize::MAX)
+    };
     let snapshot = store::compose_room_output(
         projected,
         &coord,
         &consumer,
         query.include_archived,
         budget_override,
+        measure_output,
     );
-    // R10: extract readers from snapshot (populated by snapshot_with_readers).
-    let readers = snapshot.readers.clone();
-    // Rank-11: surface mission at the top level so agents see it without parsing snapshot.
-    let mission = snapshot.mission.clone();
-    let session_views = read_session_views(&room, BackendBins::default()).unwrap_or_default();
-    let agent_injectability =
-        build_agent_injectability(&snapshot, &session_views, query.tool.as_deref());
     let body = envelope(
         "room",
         SCHEMA_ROOM,
@@ -2999,6 +3023,12 @@ fn command_room(args: RoomArgs) -> Result<Output> {
             agent_injectability,
         },
     )?;
+    if let Some(composition) = &snapshot.composition {
+        let actual_bytes = serde_json::to_string_pretty(&body)
+            .map(|rendered| rendered.len() + 1)
+            .unwrap_or(usize::MAX);
+        debug_assert_eq!(composition.emitted_bytes, actual_bytes);
+    }
     let text = format!(
         "room claims={} blockers={} handoffs={} decisions={} risks={} artifacts={} system_health={}",
         snapshot.active_claims.len(),
@@ -12834,7 +12864,7 @@ struct RoomData {
     agent_injectability: Vec<AgentInjectability>,
 }
 
-#[derive(JsonSchema, Serialize)]
+#[derive(Clone, JsonSchema, Serialize)]
 struct AgentInjectability {
     tool: String,
     injectable: bool,

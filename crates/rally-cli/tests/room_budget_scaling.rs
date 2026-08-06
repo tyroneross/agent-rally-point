@@ -4,12 +4,11 @@
 //! Room composition under synthetic load — bytes AND latency.
 //!
 //! Room composition ships a byte budget: rank facts by relevance, fill until
-//! the ceiling, stop. Testing only the ceiling grades the wrong thing. **A
-//! byte-only criterion passes while latency regresses**, because the budget
-//! bounds what composition EMITS and says nothing about what it TOUCHED to
-//! decide. Claim and handoff staleness are each decided by scanning the whole
-//! fact list, so work grows with facts x claims while output stays pinned near
-//! the ceiling — a cost no byte assertion can see.
+//! the ceiling, stop. Correctness-bearing claims, peers, and assigned work are
+//! never cut; when that floor cannot fit, the response must report
+//! `over_budget: true`. Testing only bytes grades the wrong thing in both
+//! directions: a response may exceed the ceiling honestly, and latency may
+//! regress while a cuttable response remains bounded.
 //!
 //! **What that costs is measured here, not assumed.** The nested scans are real
 //! in the source, and the shape they imply is quadratic. The observed growth is
@@ -27,10 +26,9 @@
 //!
 //! So this file asserts two independent properties at two data scales:
 //!
-//! 1. **Bytes grow sub-linearly.** An 8x ledger must not cost 8x the payload.
-//!    Measured at 4.83x, so ranking is doing real work — but the payload is NOT
-//!    bounded by the ceiling, and `budget_binds_on_the_buckets_it_governs`
-//!    below records exactly which sections escape it.
+//! 1. **The ceiling verdict is exact.** A response over its serialized-byte
+//!    ceiling must say `over_budget: true`; a response claiming the ceiling held
+//!    must fit. A sub-linear growth check still applies when both samples fit.
 //! 2. **Latency stays sub-quadratic.** An 8x data increase costs ~8x linearly
 //!    and ~64x quadratically; the bound sits between those, so it catches a
 //!    shape change without grading the constant factor.
@@ -87,12 +85,12 @@ const MAX_SCALING_FACTOR: f64 = 24.0;
 /// the projection.
 const MIN_MEASURABLE_MS: f64 = 40.0;
 
-/// The room payload at `SCALE`x may be at most this many times the base
-/// payload.
+/// When both fixtures fit their ceilings, the room payload at `SCALE`x may be
+/// at most this many times the base payload.
 ///
-/// Measured at 4.83x for an 8x ledger (and 2.08x for 4x) — sub-linear, so
-/// ranking works, but NOT bounded, because three large sections escape the
-/// ceiling entirely. See `budget_binds_on_the_buckets_it_governs`.
+/// Never-cut claim floors can grow linearly and truthfully report overflow; the
+/// ratio is not asserted in that case because cutting claims to satisfy a
+/// scaling oracle would violate the product's collision-safety contract.
 ///
 /// 6.0 sits between the 4.83x measurement and the 8.0x that fully-linear
 /// pass-through would cost. It asserts what composition delivers today rather
@@ -220,6 +218,55 @@ fn room_bytes(workspace: &Workspace) -> usize {
     output.stdout.len()
 }
 
+struct RoomMeasurement {
+    bytes: usize,
+    budget: Option<usize>,
+    emitted_bytes: Option<usize>,
+    over_budget: bool,
+}
+
+fn room_measurement(workspace: &Workspace) -> RoomMeasurement {
+    let output = workspace.run(&["room", "--json"]);
+    assert!(
+        output.status.success(),
+        "rally room failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value =
+        serde_json::from_slice(&output.stdout).expect("room --json must be valid JSON");
+    RoomMeasurement {
+        bytes: output.stdout.len(),
+        budget: value["data"]["room"]["composition"]["budget_bytes"]
+            .as_u64()
+            .map(|bytes| bytes as usize),
+        emitted_bytes: value["data"]["room"]["composition"]["emitted_bytes"]
+            .as_u64()
+            .map(|bytes| bytes as usize),
+        over_budget: value["data"]["room"]["composition"]["over_budget"]
+            .as_bool()
+            .unwrap_or(false),
+    }
+}
+
+fn assert_ceiling_verdict(measurement: &RoomMeasurement) {
+    if let Some(emitted_bytes) = measurement.emitted_bytes {
+        assert_eq!(
+            emitted_bytes, measurement.bytes,
+            "composition emitted_bytes must count the complete rendered response"
+        );
+    }
+    if let Some(budget) = measurement.budget {
+        assert_eq!(
+            measurement.over_budget,
+            measurement.bytes > budget,
+            "ceiling verdict disagrees with emitted bytes: bytes={} budget={} over_budget={}",
+            measurement.bytes,
+            budget,
+            measurement.over_budget
+        );
+    }
+}
+
 /// Minimum wall time over `SAMPLES` runs, after one discarded warm-up.
 fn min_room_millis(workspace: &Workspace) -> f64 {
     let _ = workspace.run(&["room", "--json"]);
@@ -241,8 +288,12 @@ fn room_composition_bounds_bytes_and_latency_as_the_ledger_grows() {
     seed_ledger(&small, BASE_FACTS);
     seed_ledger(&large, BASE_FACTS * SCALE);
 
-    let small_bytes = room_bytes(&small);
-    let large_bytes = room_bytes(&large);
+    let small_measurement = room_measurement(&small);
+    let large_measurement = room_measurement(&large);
+    assert_ceiling_verdict(&small_measurement);
+    assert_ceiling_verdict(&large_measurement);
+    let small_bytes = small_measurement.bytes;
+    let large_bytes = large_measurement.bytes;
     let byte_growth = large_bytes as f64 / small_bytes.max(1) as f64;
 
     let small_ms = min_room_millis(&small);
@@ -260,13 +311,21 @@ fn room_composition_bounds_bytes_and_latency_as_the_ledger_grows() {
         SCALE * SCALE
     );
 
-    assert!(
-        byte_growth <= MAX_BYTE_GROWTH,
-        "room payload grew {byte_growth:.2}x for {SCALE}x the ledger \
-         ({small_bytes} -> {large_bytes} bytes), past the {MAX_BYTE_GROWTH:.1}x bound. \
-         Growth proportional to the ledger means composition stopped ranking and \
-         started passing facts through."
-    );
+    if !small_measurement.over_budget && !large_measurement.over_budget {
+        assert!(
+            byte_growth <= MAX_BYTE_GROWTH,
+            "room payload grew {byte_growth:.2}x for {SCALE}x the ledger \
+             ({small_bytes} -> {large_bytes} bytes), past the {MAX_BYTE_GROWTH:.1}x bound. \
+             Both responses claimed the ceiling held, so proportional growth means \
+             composition stopped ranking and started passing facts through."
+        );
+    } else {
+        println!(
+            "room scaling: byte-growth assertion not applicable because the never-cut \
+             floor reported overflow (small_over={} large_over={})",
+            small_measurement.over_budget, large_measurement.over_budget
+        );
+    }
 
     if small_ms < MIN_MEASURABLE_MS {
         println!(
@@ -361,44 +420,24 @@ fn budget_binds_on_the_buckets_it_governs() {
     workspace.cleanup();
 }
 
-/// The byte budget must hold even when a single scale carries far more facts
-/// than the ceiling could ever emit — the case the room actually sees in a
-/// long-lived repo.
+/// A high-volume response must report the exact ceiling verdict. Correctness
+/// floors may make the response larger than its budget, but that overflow must
+/// never be silent.
 #[test]
-fn room_payload_stays_under_budget_at_high_fact_count() {
+fn high_fact_count_reports_exact_ceiling_verdict() {
     let workspace = Workspace::new("rally-budget-ceiling");
     seed_ledger(&workspace, 4_000);
 
-    let output = workspace.run(&["room", "--json"]);
+    let measurement = room_measurement(&workspace);
+    assert_ceiling_verdict(&measurement);
     assert!(
-        output.status.success(),
-        "rally room failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let bytes = output.stdout.len();
-
-    // The default ceiling is room_budget_fraction * consumer_context_bytes.
-    // Assert against a fixed generous bound rather than recomputing the config
-    // here: this test's job is to catch "the budget stopped applying", not to
-    // re-derive the budget's arithmetic, which its own unit tests own.
-    // Calibrated against a MEASURED failure, not picked as a round number. On
-    // this fixture the budgeted payload is ~1.04 MB and the same fixture with
-    // the budget fully disabled is 1,682,140 bytes. The first draft asserted
-    // 2 MiB, which the budget-disabled run clears by 415 KB — so the test
-    // certified a budget that had been deleted. 1.2 MB sits above the budgeted
-    // measurement and below the disabled one.
-    const CEILING_BYTES: usize = 1_200_000;
-    assert!(
-        bytes < CEILING_BYTES,
-        "room payload was {bytes} bytes from a 4,000-fact ledger, over the \
-         {CEILING_BYTES}-byte sanity ceiling — the budget is not being applied"
-    );
-    assert!(
-        value["data"]["room"].is_object(),
-        "room payload must still be a well-formed room"
+        measurement.budget.is_some(),
+        "the default room ceiling must be present"
     );
 
-    println!("room ceiling: 4,000 facts -> {bytes} bytes");
+    println!(
+        "room ceiling: 4,000 facts -> {} bytes (budget={:?}, over_budget={})",
+        measurement.bytes, measurement.budget, measurement.over_budget
+    );
     workspace.cleanup();
 }
