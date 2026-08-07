@@ -7,6 +7,81 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## v0.2.1 - 2026-08-07
+
+### Ledger — one additive schema change, called out because the version number understates it
+
+- **Claim-lease renewal is now a durable `ClaimRenewed` fact** rather than an edit to
+  `.rally/claim-index.json`. Renewal previously wrote only to that sidecar, which
+  `append_fact` rebuilds from facts after every claim-class write — so a renewal survived
+  until the next claim by anyone in the room, and neither expiry path read it. Every claim
+  expired at `claim_time + lease` unconditionally, no matter what a renewal caller did.
+  `claim_authority::latest_renewed_lease` now folds the fact into the active-claim projection
+  and the reaper reads that same projection, so the "no reader honours it" mechanism is gone
+  structurally rather than patched. Ownership and monotonicity are re-checked under the
+  mutation lock, and a `ClaimExpired` append is refused outright if the lease was renewed.
+  Six controls, including daemon parity. (RC-053)
+
+  **Compatibility, stated plainly because a patch bump does not signal it:** this adds a fact
+  kind to the ledger schema. A **0.2.0 reader replaying a 0.2.1 ledger will meet a
+  `ClaimRenewed` kind it does not know.** Rooms are repo-local and single-operator, so in
+  practice this bites only a machine running a stale `rally` against a room another version
+  has written. Upgrade both sides together.
+
+### Fixed — reaping no longer acts on evidence it cannot trust
+
+- **Automatic reap requires observed death, not just a stale timestamp.** `last_seen_ts` is
+  the `created_at` of the highest-seq fact naming a tool — a value written verbatim from the
+  ledger line, not from the reader's clock. Owner-staleness alone could therefore be asserted
+  by any writer. The automatic path now requires **both** writer-stamped lease expiry **and**
+  an external observed-dead verdict; owner-staleness stays behind the deliberate
+  `doctor --reap-stale` operator command, and unknown observer evidence never authorises
+  removal. `ReapMode::Full` remains the operator escape hatch.
+
+- **The room enforces its emitted response ceiling.** `over_budget` could report `false` while
+  the response was over budget, because the ceiling was a bucket allocator rather than a bound
+  on what the caller receives. (D4/D12)
+
+- **The coordination hook and the Rust room projection agree.** They had drifted, so the hook
+  and `rally room` could describe the same room differently.
+
+### Removed
+
+- **Unused advisory authorization in `rally-protocol`.** A third implemented policy with no
+  consumer. Dead policy reads as an enforced one to the next reader. (D13)
+
+### Documentation — four claims that misled the reader, and two new register findings
+
+- **A false in-code claim about the authority gates is corrected.** The lead-transfer doc
+  comment said a hand-built fact "clears the same bar this command does". True of a `Fact`
+  passed to `append_fact`; **false of a line appended directly to a segment file**, which
+  never reaches the write boundary and therefore bypasses every gate — lead transfer, claim
+  close, breadth, field bounds. The comment now says which writers the gate binds and which it
+  does not, and points at `TRUST-MODEL.md` instead of reading as an authority claim.
+
+- **The bundle credential audit is recorded in-repo.** `TRUST-MODEL.md` told every reader the
+  18 git bundles "have not been audited for credentials … none has been ruled out". They were
+  audited on 2026-08-05 — verified, fetched into throwaway repos, scanned blob-by-blob after
+  decompression across 626 distinct paths, with the scanner mutation-validated against
+  planted-then-deleted secrets across all 11 detector classes. **Zero credentials.** The
+  result had lived only as a fact in a de-tracked ledger. Scoped explicitly: it clears
+  secrets, not the machine paths and hostname that are present by inspection.
+
+- **RC-053 and ARP-R-10 register entries corrected/added.** RC-053 read "not fixed" for five
+  merged commits after the fix landed. ARP-R-10 had no entry anywhere and is now recorded
+  unrecoverable with the search that proves the absence is real. Root cause of both, now a
+  merge-checklist line at each end: nothing wrote an entry when a finding *arrived*, and
+  nothing updated its state at *merge*.
+
+- **Two new findings recorded, no code changed.** **RC-068** — `system_health` is 56% of the
+  room payload (109 KB of 196 KB), never-cut and never deduplicated, so it starves every
+  coordination bucket to one item; measured after a full reap drain, with fix options modelled
+  against live data. **RC-069** — the pre-push vacuity gate tests SHA identity rather than
+  gate-script change, so it refuses every ordinary push and its acknowledgement degrades to
+  reflex.
+
+- `cargo doc` warnings: 3 → 0.
+
 ## v0.2.0 - 2026-08-04
 
 ### Fixed — routing no longer changes behaviour
