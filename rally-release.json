@@ -1,7 +1,7 @@
 {
   "schema": "agent-rally.release-identity.v1",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "canonical_provider": "agent-rally-point@agent-rally-point",
   "source": "https://github.com/tyroneross/agent-rally-point.git",
-  "generated_surface_digest": "sha256:a26fe2e19a794cbe480cb511e2608285c1d57a8654f879cdd1c5f69103494599"
+  "generated_surface_digest": "sha256:6c285932fcfbd2e522f77c0ca2cdd1b881fdaab27f0fdd675b68ff0bc8db693a"
 }
