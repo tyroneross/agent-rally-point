@@ -1663,6 +1663,56 @@ review answers the question you asked.
 - **Evidence:** rally facts `fact_4fdf_18c8d972c6d44588` (measurement + correction),
   `fact_fba1_18c8da1fc32f8b60` (concurrent-writer clobber during the fix).
 
+### RC-069 — the pre-push vacuity gate tests SHA identity, not gate-script change, so it refuses every ordinary push and its ack degrades to reflex
+
+- **State:** `mechanism`, reproduced 2026-08-06 on a real refused push. **NOT fixed.**
+- **What the gate does.** `.githooks/pre-push:288-320` computes `pin_is_vacuous` by **SHA identity**:
+  `pushed_sha == pin_commit`. When true it REFUSES unless `RALLY_PREPUSH_ACK_VACUOUS_PIN=1`.
+- **What it is trying to protect.** That the five paths in `GATE_SCRIPT_PATHS` executing on this
+  machine were reviewed against a baseline the pushed tree does not control.
+- **The gap: those are different questions.** SHA identity answers *"am I pushing the pin branch?"*
+  The protective question is *"did any gate script change in this push?"* Two pushes that answer the
+  first identically can answer the second oppositely:
+
+  | Push | Gate scripts changed | SHA-identity verdict | What the ack asserts | True? |
+  |---|---|---|---|---|
+  | 5 docs commits, 0 executable lines | **none** | vacuous → REFUSED | "reviewed against no baseline" | vacuously true — there was nothing to review |
+  | 1 commit rewriting `run-quality-gate.sh` to `exit 0` | **one, fatally** | vacuous → REFUSED | "reviewed against no baseline" | seriously true — and the ack waves it through |
+
+  Same refusal, same message, same single environment variable. **The gate cannot distinguish
+  "nothing to review" from "the gate was rewritten."**
+- **Consequence, and it is the defect ARP-R-05 was fixing, one level up.** ARP-R-05 changed the
+  default pin from warn-and-continue to refuse, on the correct reasoning that *a check which never
+  fires on the normal path certifies nothing*. But the hook's own header concedes pushing `main`
+  with the pin at `main` **is this repo's ordinary path** (`:315-321`). So the refusal now fires on
+  essentially every push, and **a check that ALWAYS fires on the normal path certifies nothing
+  either** — the operator learns to prepend the variable without reading the message, which is
+  behaviourally identical to ignoring the warning it replaced. The failure mode was relocated, not
+  removed. Same family as RC-050: a control whose suite passes and whose stated property is false.
+- **Reproduced, not theorised.** A 5-commit docs-only push on 2026-08-06 was refused. All five
+  `GATE_SCRIPT_PATHS` were verified byte-identical to `origin/main` (`git diff origin/main..HEAD --
+  <path>` empty for each), and the whole Rust diff contained zero non-comment lines. There was
+  nothing a pin could have reviewed, and the gate demanded an acknowledgement that there was.
+- **Fix: gate on the delta, not on the SHA.** Replace the identity test with the question the gate
+  actually cares about:
+  1. Compute `git diff <upstream-merge-base>..HEAD -- $GATE_SCRIPT_PATHS`.
+  2. **Empty** → the pin has nothing to review and its vacuity is harmless. **Pass, no ack, no
+     prompt.** Constraint satisfied, so the push proceeds.
+  3. **Non-empty** → gate scripts changed in a push of the pin branch with nothing independent
+     reviewing them. **Refuse**, and name *which* scripts changed with a diffstat, rather than the
+     current generic paragraph. Then require the ack.
+- **Why this is stricter, not looser.** Today the ack is typed on every push, so its information
+  content is near zero. Under the delta test it fires only when a gate script actually changed —
+  rare, specific, and carrying a diffstat the operator can read in seconds. **An ack that is rare is
+  an ack that gets read.** The dangerous push in the table above stops being indistinguishable from
+  the harmless one.
+- **Adversarial control (owed, not written):** two pushes of the pin branch — one touching no gate
+  script (assert exit 0 with no ack set), one modifying `scripts/run-quality-gate.sh` (assert
+  refusal, and assert the refusal message names that file). The second half is what makes it a
+  control rather than a smoke test: a gate that refuses without naming the cause reproduces the
+  unreadable-message half of this defect.
+- **First seen:** 2026-08-06 (mechanism dates to ARP-R-05a, `:313-321`).
+
 ### RC-068 — `system_health` is unbounded, never-cut, and re-emitted per entry, so it truncates the coordination signal it sits beside
 
 - **State:** `mechanism`, measured against this repo's live room 2026-08-06. **NOT fixed.**
