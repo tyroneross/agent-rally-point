@@ -1665,7 +1665,8 @@ review answers the question you asked.
 
 ### RC-069 — the pre-push vacuity gate tests SHA identity, not gate-script change, so it refuses every ordinary push and its ack degrades to reflex
 
-- **State:** `mechanism`, reproduced 2026-08-06 on a real refused push. **NOT fixed.**
+- **State:** `fixed`, controls `validated`. **FIXED 2026-08-07.** Mechanism below is retained as the
+  record of the defect; see "Fix as landed" at the end of the entry.
 - **What the gate does.** `.githooks/pre-push:288-320` computes `pin_is_vacuous` by **SHA identity**:
   `pushed_sha == pin_commit`. When true it REFUSES unless `RALLY_PREPUSH_ACK_VACUOUS_PIN=1`.
 - **What it is trying to protect.** That the five paths in `GATE_SCRIPT_PATHS` executing on this
@@ -1712,6 +1713,43 @@ review answers the question you asked.
   control rather than a smoke test: a gate that refuses without naming the cause reproduces the
   unreadable-message half of this defect.
 - **First seen:** 2026-08-06 (mechanism dates to ARP-R-05a, `:313-321`).
+- **Fix as landed (2026-08-07), and it is smaller than the plan above.** The plan proposed building
+  a gate-script delta test. Reading the hook first showed that test **already exists**:
+  `resolve_gate_script` (`:374-406`) diffs each pinned script against the pushed candidate and, on a
+  difference, refuses **naming the path and printing a unified diff**, behind
+  `RALLY_PREPUSH_ACK_GATE_CHANGE=1`. It was simply unreachable under a vacuous pin, because the
+  pinned copy *is* the candidate. So the fix gives the pin a baseline that is not itself rather than
+  duplicating the comparison: when the **default** pin is vacuous, re-point `pin_commit` at the
+  remote's current sha (stdin field 4, read with awk for the reason SEC-005 gives for field 2),
+  re-fetch the pinned copies, and let the existing machinery decide.
+- **Net behaviour.** A push of the pin branch touching no gate script now **passes silently** — the
+  claim "nothing to review" is proven against the remote rather than assumed. A push of the pin
+  branch that rewrites a gate script is still refused, but now through the gate-change path, so the
+  operator sees **which file and what changed** instead of a bare vacuity notice. That is strictly
+  more informative than the ack it replaces.
+- **Fail-closed, deliberately.** A missing, all-zero (new ref), or not-locally-present remote sha
+  means no baseline can be computed, and the vacuity refusal stands unchanged. *Cannot compute* must
+  never render as *nothing changed*. A push updating more than one ref also declines the baseline
+  (`rc069_extra != 1`) rather than guessing which remote sha to trust.
+- **RC-034b is untouched.** The environment pin still requires its ack in every case. That rule is
+  about the pin's PROVENANCE, not its independence, so a recovered baseline must not relax it —
+  asserted by control R4.
+- **Controls, executed 2026-08-07 — `tests/hooks/test_prepush_pin.sh`, 17 → 25 assertions, all pass:**
+  - **R1** — vacuous default pin + real baseline + no gate-script change → exit 0 with no ack, and
+    the run names the baseline it re-pinned to (a silent substitution would be as opaque as a blind
+    ack).
+  - **R2** — same, but with `scripts/run-quality-gate.sh` neutered → refused, the message **names
+    that path**, prints the diff, cites the gate-change ack, and the neutered gate does not execute.
+  - **R3** — baseline sha well-formed but absent locally → refusal stands.
+  - **R4** — env-supplied pin still refused despite a clean baseline.
+- **Mutation-validated, both arms, because a control that cannot fail proves nothing:**
+  - Disabling the baseline recovery → **R1 fails** (and R2's diff assertion fails, because the
+    refusal reverts to the vacuity path that shows no diff — so R2 grades *which kind* of refusal
+    fired, not merely that one did).
+  - Removing the local-presence check → **R3 alone fails**, confirming the fail-closed arm is
+    load-bearing and precisely targeted.
+  - The 17 pre-existing assertions pass unchanged before and after, and every D-case pushes a ZERO
+    remote sha, so the legacy contract is graded entirely through the fail-closed arm.
 
 ### RC-068 — `system_health` is unbounded, never-cut, and re-emitted per entry, so it truncates the coordination signal it sits beside
 

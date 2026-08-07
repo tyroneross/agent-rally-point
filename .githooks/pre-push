@@ -299,6 +299,66 @@ if [ -n "$pin_commit" ] && [ -n "$pushed_shas_raw" ]; then
 
   if [ "$pin_is_vacuous" = "1" ]; then
     echo "pre-push: WARNING — the pin resolves to a commit being pushed, so the pinned gate scripts and the pushed gate scripts are the same bytes. The pin reviewed nothing on this run." >&2
+
+    # --- RC-069: recover a real baseline before refusing --------------------
+    # The vacuity test above is SHA IDENTITY: "am I pushing the pin branch?"
+    # The question the gate actually protects is different: "did any gate
+    # script CHANGE in this push?" Those diverge. A docs-only push of `main`
+    # and a push of `main` that rewrites run-quality-gate.sh to `exit 0` are
+    # identical under SHA identity, get the same refusal, and are waved through
+    # by the same single variable — which never shows the operator a diff.
+    # Refusing on every ordinary push also made the ack reflex, which is the
+    # defect ARP-R-05a fixed one level down: a check that ALWAYS fires on the
+    # normal path certifies no more than one that never fires.
+    #
+    # So: when the DEFAULT pin is vacuous, re-point it at what the remote
+    # already has (stdin field 4). That is a baseline the pushed tree does not
+    # control, which is the property the pin was for. The comparison in
+    # resolve_gate_script() then does the real work and already emits the
+    # specific message — it names the path and prints a unified diff.
+    #
+    # Field 4 is read with awk directly, for the same reason SEC-005 gives for
+    # field 2 above: the tuple parser must not be the thing that answers a
+    # question about whether the pin can be trusted.
+    #
+    # FAIL CLOSED. A missing, all-zero (new ref), or not-locally-present
+    # remote sha means no baseline can be computed, and "cannot compute" must
+    # never read as "nothing changed" — those cases fall through to the
+    # refusal below exactly as before.
+    #
+    # The ENVIRONMENT pin is deliberately NOT given this path. RC-034b requires
+    # an ack for every env-supplied pin, vacuous or not; recovering a baseline
+    # for it would relax a rule that is about the pin's PROVENANCE, not its
+    # independence.
+    if [ "$pin_ref_source" = "default" ]; then
+      rc069_baseline=$(awk '{ if ($4 != "" && $4 !~ /^0+$/) print $4 }' "$stdin_capture" | sort -u | head -n 1)
+      rc069_extra=$(awk '{ if ($4 != "" && $4 !~ /^0+$/) print $4 }' "$stdin_capture" | sort -u | wc -l | tr -d ' ')
+      if [ -n "$rc069_baseline" ] \
+         && [ "$rc069_extra" = "1" ] \
+         && git cat-file -e "${rc069_baseline}^{commit}" 2>/dev/null; then
+        pin_commit="$rc069_baseline"
+        pin_ref="${pin_ref} (remote baseline ${rc069_baseline})"
+        pin_is_vacuous=0
+        : > "$pin_dir/.rc069-rebased" 2>/dev/null || true
+        rm -f "$pin_dir"/*__* 2>/dev/null || true
+        pin_refetched=0
+        for gate_script_path in $GATE_SCRIPT_PATHS; do
+          if git cat-file -e "${pin_commit}:${gate_script_path}" 2>/dev/null; then
+            git show "${pin_commit}:${gate_script_path}" > "$pin_dir/$(pin_slot "$gate_script_path")" 2>/dev/null
+            chmod +x "$pin_dir/$(pin_slot "$gate_script_path")"
+            pin_refetched=$((pin_refetched + 1))
+          fi
+        done
+        RALLY_PREPUSH_PIN_COMMIT="$pin_commit"
+        export RALLY_PREPUSH_PIN_COMMIT
+        echo "pre-push: RC-069 — re-pinned to the remote's current ${rc069_baseline}, which this push does not control; re-fetched ${pin_refetched} gate-script copies. If none of them changed in this push there is nothing to review and this proceeds silently; if one did, the comparison below names it and prints the diff." >&2
+      else
+        echo "pre-push: RC-069 — no usable remote baseline (new ref, or the remote sha is not present locally; try 'git fetch'), so the vacuity refusal stands. Failing closed: 'cannot compute' is not 'nothing changed'." >&2
+      fi
+    fi
+  fi
+
+  if [ "$pin_is_vacuous" = "1" ]; then
     if [ "$pin_ref_source" = "environment" ] && [ "${RALLY_PREPUSH_ACK_VACUOUS_PIN:-}" != "1" ]; then
       echo "pre-push: REFUSED — RALLY_PREPUSH_GATE_PIN_REF='${pin_ref}' was supplied from the environment and resolves to a commit in this push. That is exactly how the ARP-006 pin gets silently disabled (SEC-005): set it to HEAD, or to the branch you are pushing, and the pushed tree's own gate scripts execute while the hook reports a healthy pin." >&2
       echo "pre-push: unset RALLY_PREPUSH_GATE_PIN_REF to use the default 'main' pin, point it at a ref you actually trust, or — if you genuinely mean to run unpinned — re-run with:" >&2

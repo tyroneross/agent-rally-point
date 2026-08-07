@@ -387,6 +387,123 @@ fi
 rm -f "$ORDER_OUT"
 
 # ===========================================================================
+# R — RC-069: a vacuous DEFAULT pin recovers the remote baseline instead of
+#     refusing blindly.
+#
+# Every D-case above pushes with a ZERO remote sha, so it exercises the
+# fail-closed arm: no baseline exists and the vacuity refusal stands. These
+# cases supply a REAL remote sha — the state origin already has — which the
+# pushed tree does not control, and which is therefore a baseline the pin can
+# legitimately use.
+#
+# The distinction under test is the one SHA identity cannot draw: pushing the
+# pin branch WITHOUT touching a gate script vs pushing it WITH a rewritten gate
+# script. Before the fix both refuse identically and the same single ack waves
+# either through without ever showing a diff.
+#
+# Ordering note: these advance the fixture's `main`, so they run last. R1's
+# baseline is the pre-advance SHA_MAIN that every D-case used.
+# ===========================================================================
+SHA_REMOTE_BASE="$SHA_MAIN"
+
+# --- R1: pin branch pushed, no gate script touched -> PASS, no ack ---------
+echo "docs only" >> "$FIXTURE/README.md"
+git -C "$FIXTURE" add -A
+git -C "$FIXTURE" commit -q -m "docs: touch nothing that executes"
+SHA_DOCS="$(git -C "$FIXTURE" rev-parse HEAD)"
+
+T="R1: vacuous default pin + real baseline + no gate-script change is ALLOWED with no ack"
+clear_markers
+out=$(run_prepush "refs/heads/main $SHA_DOCS refs/heads/main $SHA_REMOTE_BASE")
+rc=$?
+if [ "$rc" = "0" ] && ! printf '%s' "$out" | grep -q "REFUSED"; then
+  ok "$T"
+else
+  bad "$T" "rc=$rc — nothing executable changed, so there is nothing for a pin to review"; note "$out"
+fi
+
+T="R1: the run says which baseline it re-pinned to"
+if printf '%s' "$out" | grep -q "RC-069" \
+   && printf '%s' "$out" | grep -q "$SHA_REMOTE_BASE"; then
+  ok "$T"
+else
+  bad "$T" "a silent substitution is as opaque as a blind ack — it must name the baseline"; note "$out"
+fi
+
+# --- R2: pin branch pushed WITH a rewritten gate script -> REFUSE ----------
+cat > "$FIXTURE/scripts/run-quality-gate.sh" <<'STUB'
+#!/bin/sh
+# neutered: passes without running anything
+exit 0
+STUB
+chmod +x "$FIXTURE/scripts/run-quality-gate.sh"
+git -C "$FIXTURE" add -A
+git -C "$FIXTURE" commit -q -m "attack: neuter the quality gate while pushing the pin branch"
+SHA_GATEMOD="$(git -C "$FIXTURE" rev-parse HEAD)"
+
+T="R2: vacuous default pin + real baseline + a rewritten gate script is REFUSED"
+clear_markers
+out=$(run_prepush "refs/heads/main $SHA_GATEMOD refs/heads/main $SHA_REMOTE_BASE")
+rc=$?
+if [ "$rc" != "0" ] && printf '%s' "$out" | grep -q "REFUSED"; then
+  ok "$T"
+else
+  bad "$T" "rc=$rc — a gate script changed against the remote baseline and must not pass"; note "$out"
+fi
+
+T="R2: the refusal NAMES the changed gate script"
+if printf '%s' "$out" | grep -q "scripts/run-quality-gate.sh"; then
+  ok "$T"
+else
+  bad "$T" "a refusal that does not say which file changed reproduces the unreadable-message half of RC-069"; note "$out"
+fi
+
+T="R2: the refusal prints the diff and the gate-change override"
+if printf '%s' "$out" | grep -q "RALLY_PREPUSH_ACK_GATE_CHANGE=1" \
+   && printf '%s' "$out" | grep -q "neutered"; then
+  ok "$T"
+else
+  bad "$T" "the operator must see WHAT changed, not just that something did"; note "$out"
+fi
+
+T="R2: the neutered gate did not execute"
+if [ -z "$(cat "$GATE_MARKER" 2>/dev/null)" ]; then
+  ok "$T"
+else
+  bad "$T" "the pushed gate script ran despite the refusal"; note "$out"
+fi
+
+# --- R3: fail closed when the baseline is not present locally -------------
+# A well-formed sha that this repo has never seen. "Cannot compute" must read
+# as refusal, never as "nothing changed" — otherwise an unfetchable baseline
+# becomes a bypass.
+T="R3: an unresolvable remote baseline FAILS CLOSED (refusal stands)"
+clear_markers
+ABSENT="0123456789abcdef0123456789abcdef01234567"
+out=$(run_prepush "refs/heads/main $SHA_GATEMOD refs/heads/main $ABSENT")
+rc=$?
+if [ "$rc" != "0" ] && printf '%s' "$out" | grep -q "REFUSED"; then
+  ok "$T"
+else
+  bad "$T" "rc=$rc — an absent baseline must not be treated as a clean one"; note "$out"
+fi
+
+# --- R4: the ENV pin keeps its stricter rule (RC-034b preserved) ----------
+# RC-034b requires an ack for every env-supplied pin, vacuous or not. That rule
+# is about the pin's PROVENANCE, not its independence, so recovering a baseline
+# must not relax it.
+T="R4: an env-supplied pin is still refused even with a clean remote baseline"
+clear_markers
+out=$(run_prepush "refs/heads/main $SHA_DOCS refs/heads/main $SHA_REMOTE_BASE" \
+        RALLY_PREPUSH_GATE_PIN_REF=main)
+rc=$?
+if [ "$rc" != "0" ]; then
+  ok "$T"
+else
+  bad "$T" "RC-034b relaxed as a side effect — an env pin must still need its ack"; note "$out"
+fi
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 echo ""
