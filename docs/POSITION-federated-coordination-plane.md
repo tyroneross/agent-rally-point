@@ -10,6 +10,8 @@
 > **Status:** working position, not ratified. **Last revised:** 2026-08-08 (v5).
 > **Supersedes:** nothing. **Superseded by:** nothing.
 > **Room:** `federated-coordination-plane`, facts seq 8976–9032.
+> **Router design:** [`ROUTER-ARCHITECTURE.md`](ROUTER-ARCHITECTURE.md) defines the current-to-target
+> delivery path, process boundaries, capability delta, incremental cutover, and regression controls.
 
 ---
 
