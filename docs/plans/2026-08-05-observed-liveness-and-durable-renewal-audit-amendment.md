@@ -20,7 +20,10 @@ preservation-sensitive PersonalLLMWiki structural proposal.
 The 2026-08-07 auditability extension adds S11-S13 after S10. It preserves the same
 append-only and advisory charter while covering four gaps the first amendment did not own:
 request-versus-interpretation provenance, typed backlog closure, a compact audit projection with
-a real context ceiling, and read-only laptop-wide room inventory.
+a real context ceiling, and read-only bounded room inventory. This revision also makes the compact
+projection a typed critical-operations brief rather than a blind character cut, and requires every
+time/statistical claim to carry machine-checked scope, clock, formula, denominator, and validation
+provenance.
 
 ## Approach Lenses
 
@@ -257,13 +260,25 @@ agent/activity/plan provenance, OpenTelemetry for execution correlation, Azure E
 append-only history plus query projections, Google SRE for actionable signal separation, and the
 peer-reviewed *Lost in the Middle* result for long-context retrieval risk.
 
-The fixed 24-hour sample found 2,556 events across 18 active rooms: 54.07% mechanical telemetry,
+The original analysis was a retrospective 86,400-second ledger-time slice from
+`2026-08-07T04:25:06Z` through `2026-08-08T04:25:06Z` over four explicit workspace roots; it was
+not 24 hours of continuous observation and it was not an unrestricted laptop scan. The revalidated
+script records those roots, the capture clock, duration, input hashes, formulas, and reconciliation
+checks. That slice found 2,556 events across 18 active rooms: 54.07% mechanical telemetry,
 33.14% lifecycle control, 12.17% mixed-origin risk, and 0.63% explicit semantic coordination. In
 this repo, 69 of 100 events were presence/read telemetry; only one of nine semantic-or-risk facts
 carried evidence, and none carried a ref, URI, scope, or run marker. On the same copied ledger,
 current source reduced system-health rows 153→4 and bytes 108,703→2,840, but the complete room still
 emitted 194,876 bytes. The extension therefore optimizes both provenance completeness and the
 consumer projection; neither metric alone is sufficient.
+
+Critical-operation formats converge on the same control: stable fields prevent omission, priority
+puts the decision first, a complete source remains available for drill-in, and the receiver closes
+the loop. USMC O-SMEAC says standard order formats expedite understanding, prevent omissions, and
+facilitate ready reference; AHRQ TeamSTEPPS combines SBAR with check-back; FAA readback requires the
+receiver to repeat critical clearance elements with identity; Google SRE keeps the most important
+live incident state at the top and requires explicit acknowledgement of command handoff. S12 adapts
+those mechanisms without implying that one bounded message can contain all historical detail.
 
 ## Auditability-extension approach lenses
 
@@ -278,9 +293,11 @@ rather than widening every legacy fact or rewriting history. Build the compact v
 scoped snapshot, not a second database.
 
 **Bridge/backcast:** S11 defines and validates request→interpretation→decision→artifact lineage and
-typed backlog closure. S12 projects that lineage under a 12 KiB exact envelope with drill-in IDs.
-S13 reuses the same summaries for explicit bounded filesystem discovery without enabling or
-writing the global index.
+typed backlog closure. S12 projects that lineage as one deterministic critical brief: mandatory
+fields first, delta since the last acknowledged brief, explicit omissions, and drill-in IDs under
+a 12 KiB audit envelope and 4,000-character hook envelope. S13 reuses the same summaries for
+explicit bounded filesystem discovery and emits machine-checked time/statistical provenance without
+enabling or writing the global index.
 
 **Recommendation:** execute the bridge. A new provenance service or authenticated identity system
 would cross the settled local-first/same-UID authority boundary; structured linked facts close the
@@ -338,6 +355,30 @@ events never render individually. The exact pretty-printed response including th
 must be at most 12,288 bytes; if a never-cut safety item alone exceeds the ceiling, return an explicit
 overflow error and drill-in command instead of a nominal PASS.
 
+Define `critical_brief.v1` as the repeatable agent-to-agent transmission inside that envelope. Its
+mandatory order is: (1) schema/repo/engagement/run/path plus `generated_at`, source sequence, and
+brief hash; (2) user-request ref, active interpretation, objective, constraints, and acceptance
+criteria; (3) current phase, accountable owner, and changes since the last acknowledged brief;
+(4) blockers, conflicting claims, safety holds, and unresolved decisions; (5) next action, owner,
+trigger/due condition, and stop condition; (6) verification artifacts with external refs; (7)
+handoffs and their target-authored ACK state; and (8) suppressed counts plus opaque drill-in IDs.
+The receiver acknowledges `brief_sha256` and `source_seq`; a general presence ACK does not close the
+handoff. Same input state produces byte-identical field order, content, and hash.
+
+The 4,000-character hook boundary remains defense in depth against unbounded untrusted ledger text,
+but blind tail clipping is not the composition strategy. The hook serializes a smaller
+`critical_brief.v1` projection by field priority. It may elide bounded optional prose only after
+preserving every mandatory field, and it must report each omitted category/count and a drill-in
+command. If mandatory fields cannot fit, it emits a typed `brief_overflow` containing the source
+sequence and retrieval command; it never emits a plausible-looking partial brief followed only by
+`...[truncated]`.
+
+**Path A vs Path B:** Path A keeps the existing free-text message and 4,000-character tail cut. It
+retains the ARP-004 injection bound but cannot prove which operational facts survived. Path B uses
+the typed priority brief above, preserves the same security boundary, and adds omission accounting
+and closed-loop acknowledgement. Choose Path B because it prevents the adjacent failure the current
+cap permits: legitimate low-priority prose consuming the envelope before a later blocker or action.
+
 Make limits complete: `next --limit N` caps primary alternatives and suggested backlog items, while
 separate explicit flags may widen either list. The shipped hook reads the scoped audit view and
 continues its surface-on-change behavior; it does not call the repository-wide room projection.
@@ -350,7 +391,14 @@ engagement selection, closure filtering, presence suppression, exact envelope me
 limit on suggestions fails a focused control. A model-facing smoke captures actual bytes and the
 3-4 bytes/token range; the gate is on bytes, not the estimate.
 
-### S13 — Explicit read-only laptop inventory · after S12 integration
+An adjacent-move fixture puts oversized optional prose before a late blocker, conflicting claim,
+next action, evidence ref, and unacknowledged handoff. Today's blind `line(message, 4000)` fails by
+dropping at least one late field. The typed brief passes only if all mandatory fields survive,
+optional omissions carry exact counts/drill-in IDs, the serialized hook output stays within 4,000
+characters, and the recipient's ACK references the exact brief hash and source sequence. Permuting
+input iteration order produces the same bytes and hash.
+
+### S13 — Explicit read-only room inventory · after S12 integration
 
 **Owns:** `crates/rally-cli/src/discovery.rs`, `crates/rally-cli/src/cli.rs` and
 `crates/rally-cli/src/lib.rs` inventory integration only,
@@ -365,6 +413,20 @@ managed/unmanaged session counts, semantic artifact/decision/handoff counts, pro
 and exact compact-view bytes. Default output suppresses individual presence identities and raw
 subjects; `--include-presence-only` and per-room drill-in restore them.
 
+Every numeric output carries `captured_at` in UTC, explicit roots, interval start/end,
+`duration_seconds`, whether the interval is rolling or caller-supplied, inclusion boundary, input
+manifest hashes, count/denominator/formula, and machine-readable validation results. A rolling
+`--since 24h` slice ends at the command's captured clock and proves `duration_seconds=86400`; it is
+labelled `retrospective_ledger_event_slice`, never “24 hours observed.” A caller-supplied interval
+is never silently replaced by current time. “Laptop-wide” is allowed only when the reported roots
+and pruned directories justify it; otherwise the result says “explicit-root inventory.”
+
+Duplicate reporting distinguishes `events_in_repeated_key_groups` from
+`events_repeating_a_prior_key`; the latter subtracts the first occurrence in each group. Percentages
+use the emitted denominator and a declared rounding rule. Category counts, room partitions, event
+totals, interval duration, and read-only ledger sequence all reconcile or the command exits nonzero
+without a success envelope.
+
 The command labels activity as `recent`, `stale`, or `unknown`; filesystem presence is never reported
 as a live agent. Duplicate Git common directories and Rally manifests dedupe to one repo/worktree
 record. Unreadable or corrupt rooms become per-room warnings rather than aborting the scan.
@@ -374,6 +436,13 @@ duplicate worktree pointer, malformed JSONL, and unrelated cache directories ret
 set without writing any file. Before/after filesystem manifests and global-index hashes are
 byte-identical. The same fixture proves presence-only records do not create a `recent contributor`
 and that explicit drill-in can still retrieve them.
+
+A clock-boundary fixture uses timezone-aware timestamps immediately before, at, and after both
+interval endpoints; only the inclusive in-range records count. An 86,400-second rolling fixture,
+zero-denominator fixture, category reconciliation fixture, and three-identical-key fixture prove
+duration, percentage, and duplicate formulas. The last fixture must report three events in the
+repeated group but only two events repeating a prior key. Removing any root, input hash, denominator,
+formula, capture clock, or validation result fails schema parity.
 
 ## Parallelism and integration
 
@@ -414,7 +483,10 @@ surface and S12 reads S11 closure/provenance while S13 reuses S12 compact summar
 | Interpretation never masquerades as the user request | agent inference presented as user intent | S11 distinct kind/ref/session chain |
 | Closed work never remains suggested | stale backlog drives duplicate work | S11 terminal successor + S12 `next --limit` controls |
 | Full history never becomes the default LLM prompt | 49k-76k estimated-token room injection | S12 exact 12 KiB audit-envelope gate |
+| A safety cap never chooses context by blind tail position | a late blocker/action disappears behind earlier prose | S12 typed priority brief + omission manifest + overflow control |
+| A handoff is never assumed understood because it was delivered | receiver acts on a different interpretation | S12 hash/source-sequence check-back ACK |
 | Inventory never mutates discovery state | an audit changes the thing it measures | S13 before/after filesystem and index hashes |
+| A time/statistical claim never hides its clock or denominator | a retrospective slice is reported as observation time or duplicate groups as duplicate events | S13 timestamp/formula/reconciliation gates |
 
 ## Read-Before-Edit Map
 
@@ -423,9 +495,9 @@ surface and S12 reads S11 closure/provenance while S13 reuses S12 compact summar
 | S8 | `reaper.rs:155-285`, reaper concurrency tests, S1-S3 commits | preserve opt-out, observed-death bar, work cap, and existing report contract | reaper/config + engine tests |
 | S9 | `store.rs:2426-2453,2565-2572,2899-2923`, selected-segment loaders, `store_client.rs:353-357,464-485`, `store_wire.rs:46-52,141-144`, `rallyd_core.rs:568-590,689-697`, daemon handover/version controls, room budget tests | bypass the repo-wide DB for scoped participants, keep collision authority repo-wide, and cut direct/routed/archive reads to wire v3 without changing the unfiltered operation | store/wire/daemon + parity tests |
 | S10 | `lib.rs:1951-1991`, managed launch/adopt session construction, handoff prompt + `wait_for_resolution` at `lib.rs:7680-7745`, `lib.rs:4465-4498`, `rally ack` at `lib.rs:13637-13666`, room schema, hook parity, workflow skill, and user-journey consumers | preserve enter ordering, stamp launched children, persist adopted-session scope, make handoff resolve distinct from general ACK/delivery, and update every room-output consumer together | CLI/lib/schema/hook/docs + integration journeys |
-| S11 | `store.rs:434-465`, `event_envelope.rs`, `backlog.rs`, fact/say schemas, S9 engagement/run projector, and the fixed-window metadata-coverage result | reuse existing optional provenance fields without conflating user request and interpretation or breaking legacy rows | envelope/store/backlog/CLI + provenance journey |
-| S12 | `store.rs:3995-4065,4484-4523`, `next.rs` suggestion construction, hook caps/dedup, S9/S10 scoped room schema, and measured 0.2.0/0.2.1 outputs | build one bounded consumer view, preserve never-cut collision truth, and make list limits apply to every rendered list | audit module/next/CLI/hook/schema/docs + exact-byte controls |
-| S13 | `discovery.rs:116-316,592-611`, global-status tests, manifest/worktree resolution, and the 125-room filesystem scan method | preserve opt-in indexed discovery while adding an explicit read-only scan whose activity labels cannot imply process liveness | discovery/CLI/schema/docs + no-write fixture |
+| S11 | `store.rs:434-465`, `event_envelope.rs`, `backlog.rs`, fact/say schemas, S9 engagement/run projector, and the historical/current metadata-coverage results | reuse existing optional provenance fields without conflating user request and interpretation or breaking legacy rows | envelope/store/backlog/CLI + provenance journey |
+| S12 | `store.rs:3995-4065,4484-4523`, `next.rs` suggestion construction, `hooks/rally-coordination-hook.sh:1373-1379`, hook caps/dedup, S9/S10 scoped room schema, measured 0.2.0/0.2.1 outputs, AHRQ SBAR/check-back, FAA readback, USMC O-SMEAC, and Google SRE handoff/state-document guidance | build one bounded consumer view, preserve never-cut collision truth, make omissions explicit, close the communication loop, and make list limits apply to every rendered list | audit module/next/CLI/hook/schema/docs + exact-byte/adjacent-move/ACK controls |
+| S13 | `discovery.rs:116-316,592-611`, global-status tests, manifest/worktree resolution, and `research/analysis-runs/rally-auditability-20260807/rally_audit.py` plus its original/current result artifacts | preserve opt-in indexed discovery while adding an explicit read-only scan whose activity labels cannot imply process liveness, and make clock/scope/formula provenance mandatory | discovery/CLI/schema/docs + no-write/time/math fixtures |
 
 ## API and caller audit
 
@@ -480,11 +552,14 @@ inclusion both off and on. It must also exercise the adjacent moves:
 quiet live agent, crashed fresh-heartbeat agent, ACK without work, work without ACK, and a
 cross-engagement path conflict.
 
-For S11-S13 the independent audit must also replay the fixed 24-hour shapes: repeated idle presence,
+For S11-S13 the independent audit must also replay the revalidated historical 86,400-second slice
+and a newly captured rolling 24-hour slice: repeated idle presence,
 a completed-but-planned backlog item, one evidence-rich free-text artifact with empty structured
 refs, a health-heavy room, and a 125-room discovery tree. It compares full ledger, scoped room,
 compact audit, `next --limit 1`, and inventory outputs. Git SHA/test evidence is checked outside
-Rally, and the audit records exact response bytes before interpreting token impact.
+Rally. The audit script records exact roots, UTC clock, interval duration, input hashes, formulas,
+denominators, reconciliation verdicts, and response bytes before interpreting time, percentage,
+duplicate, or token impact.
 
 ## Outcomes a user can observe
 
@@ -494,8 +569,8 @@ Rally, and the audit records exact response bytes before interpreting token impa
 | S9 | old presence makes a scoped task look multi-agent | an engagement/run view contains only matched participants while the repository default stays compatible |
 | S10 | delivery/ACK can be mistaken for collaboration | only acknowledged, in-scope output changes the collaboration state |
 | S11 | agent prose can blur user request, interpretation, and outcome; completed work can remain planned | linked immutable request/interpretation/decision/artifact records and terminal backlog successors preserve the distinction |
-| S12 | a model may consume 49k-76k estimated tokens of repository-wide room output | a scoped audit brief stays at or below 12 KiB and exposes drill-in IDs for omitted history |
-| S13 | answering “all open Rally rooms on this laptop” requires an ad hoc filesystem script | one explicit read-only command returns bounded room/activity/provenance status without mutating the global index |
+| S12 | a model may consume 49k-76k estimated tokens, while a blind 4,000-character cut can drop a late critical fact | a deterministic priority brief fits its transport, exposes omissions/drill-in IDs, and requires hash-bound receiver acknowledgement |
+| S13 | answering “all open Rally rooms on this laptop” requires an ad hoc scan whose time and root scope can be misunderstood | one explicit read-only command returns bounded room/activity/provenance status with checked clock, scope, formulas, and no global-index mutation |
 
 ## Out of scope
 
