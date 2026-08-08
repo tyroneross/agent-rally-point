@@ -9,6 +9,9 @@
 > **Pinned revisions:** Agent Rally Point `e332f4f`; RossLabs Agent Harness `16689b2`;
 > RossLabs AI Assistant `a5f55aa`; Easy Terminal `99e4c78`.
 > Each repository was inspected with its existing unrelated working-tree changes preserved.
+> **Decision guide:** [`BACKGROUND-PROCESS-DESIGN-TRADEOFFS.md`](BACKGROUND-PROCESS-DESIGN-TRADEOFFS.md)
+> compares process forms, placement, lifecycle, inputs, outputs, protocols, compatibility, friction,
+> performance, security, and testing decisions.
 
 ## Bottom line
 

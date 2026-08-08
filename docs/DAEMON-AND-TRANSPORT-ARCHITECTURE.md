@@ -14,6 +14,9 @@
 > **Plain-language companion:** [`DAEMON-PRIMER.md`](DAEMON-PRIMER.md) explains daemon lifecycle,
 > triggers, authority, and the related background components across Rally Point, Agent Harness,
 > AI Assistant, and Easy Terminal.
+> **Tradeoff guide:** [`BACKGROUND-PROCESS-DESIGN-TRADEOFFS.md`](BACKGROUND-PROCESS-DESIGN-TRADEOFFS.md)
+> enumerates process-placement, communication, compatibility, autonomy, performance, security, and
+> test-design choices across the current stack.
 
 ## Purpose
 
