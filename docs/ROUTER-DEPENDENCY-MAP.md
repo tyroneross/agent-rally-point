@@ -12,6 +12,8 @@
 > though its freshness stamp reported zero dirty files, so counts are discovery evidence rather
 > than a clean-commit attestation.
 > **Companion decision:** [`ROUTER-ARCHITECTURE.md`](ROUTER-ARCHITECTURE.md).
+> **Detailed process contracts:**
+> [`DAEMON-AND-TRANSPORT-ARCHITECTURE.md`](DAEMON-AND-TRANSPORT-ARCHITECTURE.md).
 
 ## Conclusion
 
@@ -74,6 +76,7 @@ flowchart TD
     Ptyd[ptyd server]
     Mux[tmux or cmux]
     Termd[rally-termd / terminal-rally-point]
+    Embedded[embedded ptyd Session and PTY executor]
     Receipt[Receipt and Rally receipt facts]
     Ack[Target-authored ACK or completion]
 
@@ -86,7 +89,7 @@ flowchart TD
     BR --> PC --> Ptyd
     BR --> Mux
     Inbox -. separately started consumer .-> Termd
-    Termd --> Ptyd
+    Termd --> Embedded
     Ptyd --> Receipt
     Mux --> Receipt
     Ack --> RS
@@ -104,7 +107,7 @@ flowchart TD
 | `BackendRunner` | `Backend`, external commands, `daemon_client` | Start, attach, capture, stop, liveness, tmux/cmux inject, `ptyd` inject | Durable retry after CLI exit |
 | `daemon_client` | `ptyd` JSON-RPC over Unix socket | Rally-owned `ptyd` discovery, start/register/send/read/stop calls | `rallyd`; cross-provider routing |
 | `ptyd` server | PTY/process runtime and `agent.send` | Process lifecycle, identity-to-pane map, terminal/structured send evidence | Rally canonical facts and provider-neutral route policy |
-| `rally-termd` | `FileInbox`, `ptyd` delivery executor | Optional external inbox subscriber with high-water marks and receipts | Rally-owned startup, multi-adapter routing, native provider adapters |
+| `rally-termd` | `FileInbox`, embedded `ptyd::Session`, PTY delivery executor | Optional external inbox subscriber with high-water marks and receipts | Connection to the separate `ptyd server`, Rally-owned startup, multi-adapter routing, native provider adapters |
 | `cockpitd` | Its own SQLite, WebSocket transport, session supervisor, one selected process adapter | App-facing session launch, event stream, approvals, Claude/Codex adapter code | Rally ledger, Rally identity, Rally delivery queue |
 
 ### Current call paths
@@ -154,13 +157,17 @@ evidence, but sender-authored transport evidence is not a target ACK.
 separately launched rally-termd
   -> FileInbox::read_since
   -> RegisteredPolicy authorization
-  -> PtyDeliveryExecutor
+  -> embedded SessionPaneResolver + PtyDeliveryExecutor
   -> Receipt + persisted last_acted_seq
 ```
 
 The sibling `ptyd` repository implements this path. The installed `rally-termd` accepts explicit
-`--ledger`, `--state`, and repeated `--agent` arguments. Rally does not currently discover, start,
-configure, or monitor it. On 2026-08-08, `ptyd server` was running but `rally-termd` was not.
+`--ledger`, `--state`, and repeated `--agent` arguments. Its production wiring creates its own
+`ptyd::Session`; it does not send to the independently running `ptyd server` socket. Rally does not
+currently discover, start, configure, or monitor it. On 2026-08-08, `ptyd server` was running but
+`rally-termd` was not. Its execute-then-receipt-then-high-water order also leaves a crash window in
+which a PTY action may be repeated; exact-once delivery requires endpoint idempotency that PTY input
+cannot generally provide.
 
 #### 5. Target ACK and completion
 
@@ -200,7 +207,7 @@ server, not a Rally delivery router.
 | Terminal route implementation | `BackendRunner` | Wrap as terminal adapters, then narrow its role |
 | `ptyd` structured send | `daemon_client` and live `ptyd agent.send` | Rename to `ptyd_client`; first dogfood adapter |
 | Store daemon | `rallyd` and store wire parity | Keep pure; add only atomic delivery-state operations when needed |
-| Inbox subscriber logic | sibling `ptyd::termd` | Reuse algorithm/tests; do not make `ptyd` the provider-neutral router |
+| Inbox subscriber logic | sibling `ptyd::termd` | Reuse watcher, policy, and state tests; replace embedded-session execution and address its crash window |
 | Claude stream codec | `cockpitd::adapter::claude` | Reuse parsing lessons only; it is not Claude Channel transport |
 | Codex event codec | `cockpitd::adapter::codex` | Reuse parsing lessons only; it is not app-server transport |
 | ACK semantics | Rally handoff/resolve wait and receipt distinction | Preserve as the common adapter contract |

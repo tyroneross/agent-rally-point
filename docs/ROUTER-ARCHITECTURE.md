@@ -11,6 +11,9 @@
 > judge, or source of truth.
 > **Dependency map:** [`ROUTER-DEPENDENCY-MAP.md`](ROUTER-DEPENDENCY-MAP.md) maps current source,
 > reusable components, proposed changes, and the regression blast radius.
+> **Process contracts:**
+> [`DAEMON-AND-TRANSPORT-ARCHITECTURE.md`](DAEMON-AND-TRANSPORT-ARCHITECTURE.md) defines lifecycle,
+> inputs, outputs, state, interactions, and failure ownership for each daemon and transport.
 
 ## Decision
 
@@ -73,11 +76,12 @@ sender
 
 The sender process owns route selection and transport execution. If it exits, no resident process
 started or supervised by Rally continues delivery. A separate `rally-termd`/`terminal-rally-point`
-binary in the sibling `ptyd` project can consume Rally's existing `FileInbox`, but Rally does not
-start it, monitor it, or use it to choose among transports. The installed `rally-termd` binary was
-not running during the 2026-08-08 assessment. `rallyd` does not consume pending messages or select
-transports. `ptyd` can deliver to a pane it owns, but it cannot choose among Claude Channels, Codex
-app-server, OpenCode, A2A, and other Rally endpoints.
+binary in the sibling `ptyd` project can consume Rally's existing `FileInbox`, but its production
+wiring embeds a new `ptyd::Session`; it does not connect to the separately running `ptyd server`
+socket. Rally does not start it, monitor it, or use it to choose among transports. The installed
+`rally-termd` binary was not running during the 2026-08-08 assessment. `rallyd` does not consume
+pending messages or select transports. `ptyd` can deliver to a pane it owns, but it cannot choose
+among Claude Channels, Codex app-server, OpenCode, A2A, and other Rally endpoints.
 
 ## Target behavior
 
