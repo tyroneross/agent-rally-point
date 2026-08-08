@@ -11,6 +11,9 @@
 > **Related decisions:** [`ROUTER-ARCHITECTURE.md`](ROUTER-ARCHITECTURE.md) defines the product
 > direction. [`ROUTER-DEPENDENCY-MAP.md`](ROUTER-DEPENDENCY-MAP.md) defines the dependency changes
 > and regression blast radius.
+> **Plain-language companion:** [`DAEMON-PRIMER.md`](DAEMON-PRIMER.md) explains daemon lifecycle,
+> triggers, authority, and the related background components across Rally Point, Agent Harness,
+> AI Assistant, and Easy Terminal.
 
 ## Purpose
 
@@ -192,13 +195,13 @@ This distinction is mandatory across every current and proposed transport.
 
 ## `rallyd` contract
 
-### `ptyd` runtime responsibility
+### `rallyd` responsibility
 
 `rallyd` serializes operations that touch canonical Rally state and keeps one warm projection pool.
 It protects total ordering and direct/daemon parity. It does not read pending delivery directives,
 select endpoints, send messages, supervise agents, or invoke provider APIs.
 
-### `ptyd` inputs
+### `rallyd` inputs
 
 | Input | Required fields | Validation |
 | --- | --- | --- |
@@ -211,7 +214,7 @@ Current store operations include fact append variants, conditional session appen
 reads, claim-index rebuild, claim renewal/expiry, read checkpoints, projected read receipts, and
 `Ping`.
 
-### `ptyd` outputs
+### `rallyd` outputs
 
 | Output | Meaning |
 | --- | --- |
