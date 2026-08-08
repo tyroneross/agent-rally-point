@@ -1318,7 +1318,15 @@ fn say_parser() -> impl Parser<SayArgs> {
     let reason = optional_string_arg("reason", "REASON");
     let wake_after = optional_string_arg("wake-after", "OFFSET_OR_ISO");
     let ref_standby = optional_string_arg("ref-standby", "EVENT_ID");
-    let kind = positional::<String>("KIND").parse(parse_fact_kind);
+    // KIND is a closed set, so `--help` has to name it. Discovering the set by
+    // trial costs a junk fact in a live room per guess.
+    let kind_help = format!(
+        "fact kind to post; one of: {}",
+        FactKind::say_kinds_display()
+    );
+    let kind = positional::<String>("KIND")
+        .help(kind_help.as_str())
+        .parse(parse_fact_kind);
     construct!(
         json,
         tool,
@@ -1882,8 +1890,15 @@ fn handoff_arg() -> impl Parser<Option<String>> {
 }
 
 fn parse_fact_kind(value: String) -> Result<FactKind> {
-    FactKind::parse(&value)
-        .ok_or_else(|| RallyError::Usage(format!("unsupported fact kind {value}")))
+    FactKind::parse(&value).ok_or_else(|| {
+        // Name the valid set, not just the bad token: an error that only says
+        // what failed leaves the caller guessing, and each guess is a fact
+        // written to a live room.
+        RallyError::Usage(format!(
+            "unsupported fact kind {value}; valid kinds: {}",
+            FactKind::say_kinds_display()
+        ))
+    })
 }
 
 fn parse_i64_arg(name: &str, value: String) -> Result<i64> {

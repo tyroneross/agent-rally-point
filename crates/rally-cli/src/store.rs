@@ -204,6 +204,86 @@ pub(crate) enum FactKind {
 }
 
 impl FactKind {
+    /// Every variant, in the order `rally say --help` lists them. Kept beside
+    /// the enum so the declaration and this slice are read together.
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Claim,
+        Self::ClaimRenewed,
+        Self::ClaimExpired,
+        Self::Release,
+        Self::Blocker,
+        Self::Resolve,
+        Self::Decision,
+        Self::Artifact,
+        Self::Handoff,
+        Self::Risk,
+        Self::Lesson,
+        Self::Session,
+        Self::Wake,
+        Self::Presence,
+        Self::Read,
+        Self::BacklogItem,
+        Self::Receipt,
+        Self::Standby,
+        Self::Mission,
+        Self::Unknown,
+    ];
+
+    /// Whether `rally say --help` and the unsupported-kind error advertise this
+    /// kind as a KIND a caller may type.
+    ///
+    /// Deliberately exhaustive with no `_` arm: a new variant fails to compile
+    /// here until someone decides whether callers may author it. That is the
+    /// drift lock — the advertised list is derived from this match, never
+    /// hand-maintained alongside it.
+    pub(crate) const fn advertised_in_say(&self) -> bool {
+        match self {
+            Self::Claim
+            | Self::ClaimExpired
+            | Self::Release
+            | Self::Blocker
+            | Self::Resolve
+            | Self::Decision
+            | Self::Artifact
+            | Self::Handoff
+            | Self::Risk
+            | Self::Lesson
+            | Self::Session
+            | Self::Wake
+            | Self::Presence
+            | Self::Read
+            | Self::BacklogItem
+            | Self::Receipt
+            | Self::Standby
+            | Self::Mission => true,
+            // Renewals enter through `RoomStore::renew_claim_lease`, which
+            // verifies the live target and owner under the write lock. `parse`
+            // rejects it, so advertising it would hand callers a kind that fails.
+            Self::ClaimRenewed => false,
+            // The `#[serde(other)]` fallback for facts written by a newer
+            // producer. `parse` accepts it for round-tripping, but it is not a
+            // kind anyone should author — listing it in a discovery surface
+            // invites exactly the junk facts this enumeration exists to prevent.
+            Self::Unknown => false,
+        }
+    }
+
+    /// The KIND values `rally say` advertises, in `ALL` order. Single source of
+    /// truth for `rally say --help` and the unsupported-kind error, so neither
+    /// surface can drift from the other or from [`FactKind::parse`].
+    pub(crate) fn say_kinds() -> Vec<&'static str> {
+        Self::ALL
+            .iter()
+            .filter(|kind| kind.advertised_in_say())
+            .map(|kind| kind.as_str())
+            .collect()
+    }
+
+    /// [`FactKind::say_kinds`] rendered for a help line or an error message.
+    pub(crate) fn say_kinds_display() -> String {
+        Self::say_kinds().join(", ")
+    }
+
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "claim" => Some(Self::Claim),
@@ -261,6 +341,92 @@ impl FactKind {
 impl PartialEq<&str> for FactKind {
     fn eq(&self, other: &&str) -> bool {
         self.as_str() == *other
+    }
+}
+
+#[cfg(test)]
+mod fact_kind_say_surface_tests {
+    use super::FactKind;
+
+    /// Anything `rally say --help` and the unsupported-kind error advertise must
+    /// actually work. Advertising a kind that `parse` rejects is worse than
+    /// advertising nothing: it sends the caller down a path that fails.
+    #[test]
+    fn every_advertised_kind_parses_and_round_trips() {
+        for kind in FactKind::say_kinds() {
+            let parsed = FactKind::parse(kind).unwrap_or_else(|| {
+                panic!("advertised kind {kind:?} is rejected by FactKind::parse")
+            });
+            assert_eq!(
+                parsed.as_str(),
+                kind,
+                "advertised kind {kind:?} is not the canonical spelling"
+            );
+        }
+    }
+
+    /// `ALL` has to list every variant or `say_kinds` silently under-reports.
+    /// `advertised_in_say` is exhaustive, so a new variant cannot compile
+    /// without a decision — but nothing forces it into `ALL`, and this does.
+    #[test]
+    fn all_lists_every_variant_exactly_once() {
+        let mut seen: Vec<&str> = FactKind::ALL.iter().map(FactKind::as_str).collect();
+        let count = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), count, "FactKind::ALL repeats a variant");
+        // Every kind `parse` accepts must appear. `claim_expired` is an alias of
+        // `claim.expired`, so it is checked through its canonical spelling.
+        for kind in [
+            "claim",
+            "claim.renewed",
+            "claim.expired",
+            "release",
+            "blocker",
+            "resolve",
+            "decision",
+            "artifact",
+            "handoff",
+            "risk",
+            "lesson",
+            "session",
+            "wake",
+            "presence",
+            "read",
+            "backlog-item",
+            "receipt",
+            "standby",
+            "mission",
+            "unknown",
+        ] {
+            assert!(
+                seen.binary_search(&kind).is_ok(),
+                "FactKind::ALL is missing {kind:?}; say_kinds() would omit it"
+            );
+        }
+    }
+
+    /// The two withheld kinds are withheld on purpose. Pinned so a future edit
+    /// has to restate the reason rather than quietly widen the surface.
+    #[test]
+    fn internal_kinds_stay_unadvertised() {
+        assert!(
+            !FactKind::ClaimRenewed.advertised_in_say(),
+            "claim.renewed is not parseable — advertising it hands callers a failing kind"
+        );
+        assert!(
+            !FactKind::Unknown.advertised_in_say(),
+            "unknown is the serde fallback, not a kind a caller should author"
+        );
+        let display = FactKind::say_kinds_display();
+        assert!(
+            display.contains("handoff"),
+            "expected a real kind: {display:?}"
+        );
+        assert!(
+            !display.contains("claim.renewed"),
+            "leaked internal kind: {display:?}"
+        );
     }
 }
 

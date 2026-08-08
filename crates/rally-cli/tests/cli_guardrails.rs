@@ -695,3 +695,90 @@ fn unknown_command_error_names_help() {
         "the error must tell the user how to find the command list: {msg:?}"
     );
 }
+
+/// `rally say KIND` takes a closed set, but `--help` printed a bare `KIND` and
+/// the rejection named only the bad token. With no readable list, the remaining
+/// way to learn the set is to guess — and a guess that lands on a real kind
+/// writes a durable fact into a live room. That is how `ai-brief-remediation-build`
+/// collected a `handoff` and a `decision` both subjected "test" (seq 1563-1564).
+///
+/// Asserts the two surfaces agree AND that everything they advertise is
+/// actually accepted, so the list cannot drift into promising a failing kind.
+#[test]
+fn say_help_and_rejection_both_enumerate_the_valid_kinds() {
+    let workspace = Workspace::new("rally-say-kind-enumeration");
+
+    let rejection = workspace.output(&[
+        "say",
+        "definitely-not-a-kind",
+        "--tool",
+        "claude_code",
+        "--subject",
+        "enumeration probe",
+        "--json",
+    ]);
+    let message = json_error(&rejection)["error"]
+        .as_str()
+        .expect("error envelope carries a string message")
+        .to_string();
+    assert!(
+        message.contains("definitely-not-a-kind"),
+        "the rejection must name the offending token: {message:?}"
+    );
+
+    // Match the label without its trailing space: the renderer may wrap the
+    // line immediately after the colon.
+    let listed = message
+        .split_once("valid kinds:")
+        .unwrap_or_else(|| panic!("the rejection must enumerate the valid kinds: {message:?}"))
+        .1;
+    // The renderer wraps long messages, so separators are `,` plus arbitrary
+    // whitespace rather than a literal `", "`.
+    let kinds: Vec<&str> = listed.split(',').map(str::trim).collect();
+    assert!(
+        kinds.len() > 5,
+        "expected the full kind set, got {kinds:?} from {message:?}"
+    );
+    for expected in ["handoff", "decision", "claim", "blocker"] {
+        assert!(
+            kinds.contains(&expected),
+            "the enumerated set is missing {expected:?}: {kinds:?}"
+        );
+    }
+
+    let help = workspace.output(&["say", "--help"]);
+    assert!(help.status.success(), "rally say --help must exit 0");
+    let help_text = String::from_utf8_lossy(&help.stdout).to_string();
+    for kind in &kinds {
+        assert!(
+            help_text.contains(kind),
+            "`rally say --help` must name {kind:?} — the rejection does: {help_text}"
+        );
+    }
+
+    // Advertising a kind that the parser rejects would send the caller down a
+    // path that fails. Every listed kind must clear the KIND gate; failing for
+    // some other reason (a missing --path, say) is fine and out of scope here.
+    for kind in &kinds {
+        let out = workspace.output(&[
+            "say",
+            kind,
+            "--tool",
+            "claude_code",
+            "--subject",
+            "enumeration probe",
+            "--json",
+        ]);
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !combined.contains("unsupported fact kind"),
+            "`--help` advertises {kind:?} but the parser rejects it: {combined}"
+        );
+    }
+
+    workspace.cleanup();
+}
