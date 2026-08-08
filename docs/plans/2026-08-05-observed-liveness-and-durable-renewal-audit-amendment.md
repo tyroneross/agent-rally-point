@@ -17,6 +17,11 @@ historical or presence-only identity. The remediation needs three separate contr
 This amendment adds S8-S10. It does not reopen the completed design of S1-S7 or the
 preservation-sensitive PersonalLLMWiki structural proposal.
 
+The 2026-08-07 auditability extension adds S11-S13 after S10. It preserves the same
+append-only and advisory charter while covering four gaps the first amendment did not own:
+request-versus-interpretation provenance, typed backlog closure, a compact audit projection with
+a real context ceiling, and read-only laptop-wide room inventory.
+
 ## Approach Lenses
 
 **Clean-sheet best approach:** make engagement the primary query boundary, attach stable sessions
@@ -241,6 +246,135 @@ count. Neither a sender-authored delivery receipt nor `rally ack` satisfies the 
 shipped hook and Rust path query show the same external conflicting claim, and the corresponding
 `check before-write` exits nonzero in both direct and routed store modes.
 
+## Research Context — 2026-08-07 auditability extension
+
+`depth: standard`; `workflow: general`; `blocks_final_claims: false` because the research packet
+and deterministic measurements exist at
+`/Users/tyroneross/dev/research/topics/ai-agents/ai-agents.rally-auditability-signal-and-context-cost.md`
+and `/Users/tyroneross/dev/research/analysis-runs/rally-auditability-20260807/results.json`.
+The source policy uses primary standards and official engineering guidance: W3C PROV-DM for
+agent/activity/plan provenance, OpenTelemetry for execution correlation, Azure Event Sourcing for
+append-only history plus query projections, Google SRE for actionable signal separation, and the
+peer-reviewed *Lost in the Middle* result for long-context retrieval risk.
+
+The fixed 24-hour sample found 2,556 events across 18 active rooms: 54.07% mechanical telemetry,
+33.14% lifecycle control, 12.17% mixed-origin risk, and 0.63% explicit semantic coordination. In
+this repo, 69 of 100 events were presence/read telemetry; only one of nine semantic-or-risk facts
+carried evidence, and none carried a ref, URI, scope, or run marker. On the same copied ledger,
+current source reduced system-health rows 153→4 and bytes 108,703→2,840, but the complete room still
+emitted 194,876 bytes. The extension therefore optimizes both provenance completeness and the
+consumer projection; neither metric alone is sufficient.
+
+## Auditability-extension approach lenses
+
+**Clean-sheet best approach:** keep the immutable event stream, but model a host-captured user
+request, agent-authored interpretation, decision, work span, evidence, and outcome as distinct
+linked records. Serve purpose-built read models: one compact engagement audit for an LLM, one full
+historical ledger for forensic drill-in, and one read-only global inventory for the operator.
+
+**Current-constraints approach:** reuse `Fact` plus its existing `ref`, `uri`, `evidence`, `scope`,
+engagement segment, and `run:` markers. Add kind-specific validators and append-only closure facts
+rather than widening every legacy fact or rewriting history. Build the compact view from S9's
+scoped snapshot, not a second database.
+
+**Bridge/backcast:** S11 defines and validates request→interpretation→decision→artifact lineage and
+typed backlog closure. S12 projects that lineage under a 12 KiB exact envelope with drill-in IDs.
+S13 reuses the same summaries for explicit bounded filesystem discovery without enabling or
+writing the global index.
+
+**Recommendation:** execute the bridge. A new provenance service or authenticated identity system
+would cross the settled local-first/same-UID authority boundary; structured linked facts close the
+audit gap without pretending Rally can authenticate the agent that wrote them.
+
+### S11 — Intent provenance and append-only closure · after S9-S10
+
+**Owns:** `crates/rally-cli/src/event_envelope.rs`, `crates/rally-cli/src/store.rs` fact-kind and
+projection rules, `crates/rally-cli/src/backlog.rs`, `crates/rally-cli/src/cli.rs` and
+`crates/rally-cli/src/lib.rs` provenance/closure commands only,
+`docs/schemas/agent-rally.fact.v1.json`, `docs/schemas/agent-rally.command.say.v1.json`,
+`docs/schemas/rally-protocol-events.md`, and
+`crates/rally-cli/tests/intent_provenance.rs`.
+
+Add two public kinds, `user_request` and `intent_interpretation`, plus a typed terminal backlog
+transition. A host adapter records `user_request` with a content SHA-256 and a local/private URI;
+raw user text is opt-in and never copied into repeated coordination facts. The interpreting agent
+records `intent_interpretation` with `ref=<request.event_id>`, its stable session, engagement,
+`run:<id>`, normalized goal, constraints, non-goals, acceptance criteria, and confidence. Decisions
+reference the active interpretation; artifacts reference the decision or backlog item they satisfy.
+An interpretation can supersede an earlier interpretation only through a new fact that references
+the prior one; history is never edited.
+
+Extend `rally backlog update` with a terminal `done|superseded` transition that requires
+`--ref <verified-artifact-or-decision>` and at least one resolvable evidence or URI value. The
+projection keeps the original backlog fact in history and excludes its terminal successor from
+`next` suggestions. Legacy facts and unscoped `say` commands remain valid outside strict
+provenance mode.
+
+This is provenance, not authentication. The output labels host-captured versus agent-authored
+records and preserves the existing warning that same-UID writers and tool IDs are not independently
+authenticated.
+
+**Acceptance:** one fixture captures a private request by hash/URI, records two competing
+interpretations by different sessions, supersedes one, links a decision and Git artifact to the
+survivor, and closes the matching backlog item. The audit chain reconstructs each edge without raw
+request text; the closed item disappears from `next`, while `room --include-archived` still returns
+every original record. Missing request ref, run marker, terminal evidence, or a cross-engagement
+reference fails loud and appends nothing. Pre-S11 ledger fixtures and schemas still round-trip.
+
+### S12 — Compact engagement audit and complete context limits · after S11
+
+**Owns:** new `crates/rally-cli/src/audit_view.rs`, `crates/rally-cli/src/next.rs` suggestion limits,
+`crates/rally-cli/src/cli.rs` and `crates/rally-cli/src/lib.rs` audit command integration only,
+`docs/schemas/agent-rally.command.audit.v1.json`, `hooks/rally-coordination-hook.sh`,
+`crates/rally-cli/tests/audit_view_budget.rs`, `crates/rally-cli/tests/hook_projection_parity.rs`,
+`RALLY.md`, and `skills/rally-workflows/SKILL.md`.
+
+Add `rally audit --current-engagement --run <id> --path <path> --json`, built exclusively from S9's
+scoped snapshot and S11's provenance/closure relations. The default envelope contains the current
+request hash/ref, active interpretation and acceptance criteria, unresolved decisions/blockers,
+active collision claims, unacknowledged scoped handoffs, verified artifacts, contributor state,
+suppressed counts by category, exact rendered bytes, and opaque drill-in IDs. Presence/read/session
+events never render individually. The exact pretty-printed response including the trailing newline
+must be at most 12,288 bytes; if a never-cut safety item alone exceeds the ceiling, return an explicit
+overflow error and drill-in command instead of a nominal PASS.
+
+Make limits complete: `next --limit N` caps primary alternatives and suggested backlog items, while
+separate explicit flags may widen either list. The shipped hook reads the scoped audit view and
+continues its surface-on-change behavior; it does not call the repository-wide room projection.
+Preserve full `room --json` for automation and forensic compatibility.
+
+**Acceptance:** the audited 189-squad/153-health fixture renders under 12 KiB with one task's
+contributors and zero repeated presence facts, while retaining an external overlapping claim and
+every unresolved high-severity blocker. `--limit 1` returns at most one backlog suggestion. Reverting
+engagement selection, closure filtering, presence suppression, exact envelope measurement, or the
+limit on suggestions fails a focused control. A model-facing smoke captures actual bytes and the
+3-4 bytes/token range; the gate is on bytes, not the estimate.
+
+### S13 — Explicit read-only laptop inventory · after S12 integration
+
+**Owns:** `crates/rally-cli/src/discovery.rs`, `crates/rally-cli/src/cli.rs` and
+`crates/rally-cli/src/lib.rs` inventory integration only,
+`docs/schemas/agent-rally.command.inventory.v1.json`,
+`crates/rally-cli/tests/global_inventory.rs`, and `docs/RALLY_ARCHITECTURE.md`.
+
+Add `rally inventory --root <path>... --since <duration> --json`. It performs a bounded read-only
+filesystem discovery of `.rally` rooms below explicit roots, prunes build/cache/vendor directories,
+and never creates or updates `~/.agent-rally-point/rooms/v1/index.json`. For each room it reports
+repo/worktree identity, current engagement, last ledger activity, active/expired/unknown claim counts,
+managed/unmanaged session counts, semantic artifact/decision/handoff counts, provenance coverage,
+and exact compact-view bytes. Default output suppresses individual presence identities and raw
+subjects; `--include-presence-only` and per-room drill-in restore them.
+
+The command labels activity as `recent`, `stale`, or `unknown`; filesystem presence is never reported
+as a live agent. Duplicate Git common directories and Rally manifests dedupe to one repo/worktree
+record. Unreadable or corrupt rooms become per-room warnings rather than aborting the scan.
+
+**Acceptance:** a fixture tree with an active room, presence-only dormant room, expired claims,
+duplicate worktree pointer, malformed JSONL, and unrelated cache directories returns the exact room
+set without writing any file. Before/after filesystem manifests and global-index hashes are
+byte-identical. The same fixture proves presence-only records do not create a `recent contributor`
+and that explicit drill-in can still retrieve them.
+
 ## Parallelism and integration
 
 S8 is a new lifecycle engine after S3. S9 is a composition/query tail after S4-S5. S10 is the
@@ -248,8 +382,15 @@ only integration owner for `lib.rs`, the room schema, the shipped hook, and cros
 it follows both S8 and S9. The existing uncommitted S4-S5 composition worktree is preserved and
 completed before S9 starts.
 
+S11-S13 are a second sequential tail after S10. Each segment that touches `cli.rs` or `lib.rs` runs
+in its own worktree and integrates by exact commit to avoid shared-file clobbering. S13's discovery
+logic can be drafted beside S11-S12, but its CLI integration lands after S12.
+
 `parallel_batch: S8 may run beside completion of S4-S5; S9 starts after S4-S5; S10 starts only
 after both S8 and S9 land.`
+
+`parallel_skipped_reason: S11-S13 integration serializes because each changes the public command
+surface and S12 reads S11 closure/provenance while S13 reuses S12 compact summaries.`
 
 | Lane | Order |
 |---|---|
@@ -257,6 +398,7 @@ after both S8 and S9 land.`
 | composition | S4 → S5 → S9 |
 | integration | S8 + S9 → S10 |
 | prior hook/isolated | S6 and S7 remain unchanged before S10 |
+| auditability | S10 → S11 → S12 → S13 |
 
 ## Single-Shot Build Guardrails
 
@@ -268,6 +410,11 @@ after both S8 and S9 land.`
 | Stable session and task scope remain different fields | disposable identities and cross-task attribution | S9 same-actor, two-distinct-session test |
 | Resolve alone never earns contributor status | presence noise reported as collaboration | S10 scoped-resolve-without-artifact test |
 | Rally evidence never closes its own validation gate | self-attested test success | independent verifier review in the Validation boundary |
+| Raw user text is not duplicated into the ledger | privacy leak through coordination history | S11 hash/URI fixture and raw-text absence assertion |
+| Interpretation never masquerades as the user request | agent inference presented as user intent | S11 distinct kind/ref/session chain |
+| Closed work never remains suggested | stale backlog drives duplicate work | S11 terminal successor + S12 `next --limit` controls |
+| Full history never becomes the default LLM prompt | 49k-76k estimated-token room injection | S12 exact 12 KiB audit-envelope gate |
+| Inventory never mutates discovery state | an audit changes the thing it measures | S13 before/after filesystem and index hashes |
 
 ## Read-Before-Edit Map
 
@@ -276,6 +423,9 @@ after both S8 and S9 land.`
 | S8 | `reaper.rs:155-285`, reaper concurrency tests, S1-S3 commits | preserve opt-out, observed-death bar, work cap, and existing report contract | reaper/config + engine tests |
 | S9 | `store.rs:2426-2453,2565-2572,2899-2923`, selected-segment loaders, `store_client.rs:353-357,464-485`, `store_wire.rs:46-52,141-144`, `rallyd_core.rs:568-590,689-697`, daemon handover/version controls, room budget tests | bypass the repo-wide DB for scoped participants, keep collision authority repo-wide, and cut direct/routed/archive reads to wire v3 without changing the unfiltered operation | store/wire/daemon + parity tests |
 | S10 | `lib.rs:1951-1991`, managed launch/adopt session construction, handoff prompt + `wait_for_resolution` at `lib.rs:7680-7745`, `lib.rs:4465-4498`, `rally ack` at `lib.rs:13637-13666`, room schema, hook parity, workflow skill, and user-journey consumers | preserve enter ordering, stamp launched children, persist adopted-session scope, make handoff resolve distinct from general ACK/delivery, and update every room-output consumer together | CLI/lib/schema/hook/docs + integration journeys |
+| S11 | `store.rs:434-465`, `event_envelope.rs`, `backlog.rs`, fact/say schemas, S9 engagement/run projector, and the fixed-window metadata-coverage result | reuse existing optional provenance fields without conflating user request and interpretation or breaking legacy rows | envelope/store/backlog/CLI + provenance journey |
+| S12 | `store.rs:3995-4065,4484-4523`, `next.rs` suggestion construction, hook caps/dedup, S9/S10 scoped room schema, and measured 0.2.0/0.2.1 outputs | build one bounded consumer view, preserve never-cut collision truth, and make list limits apply to every rendered list | audit module/next/CLI/hook/schema/docs + exact-byte controls |
+| S13 | `discovery.rs:116-316,592-611`, global-status tests, manifest/worktree resolution, and the 125-room filesystem scan method | preserve opt-in indexed discovery while adding an explicit read-only scan whose activity labels cannot imply process liveness | discovery/CLI/schema/docs + no-write fixture |
 
 ## API and caller audit
 
@@ -286,6 +436,12 @@ before scoped reads run. S10 adds optional room query flags and an optional scop
 unchanged. The unfiltered `rally room --json` response, existing v1 required fields, old ledger
 records, and existing `SnapshotWithArchived` operation remain valid. S9 owns the store-wire cutover;
 S10 owns the public room schema and documentation update.
+
+S11 adds optional public fact kinds and terminal backlog semantics without adding required fields to
+legacy `Fact`. S12 adds a new audit command schema and changes `next --limit` semantics so every
+consumer of suggested backlog arrays must be rerun. S13 adds a new inventory envelope; existing
+`status --global` and the opt-in global index remain compatible. The shared `Directive` and
+`Receipt` protocol stays unchanged throughout S11-S13.
 
 Callers that must be rerun are `command_room`, the shipped coordination hook,
 `tests/user_journey.rs`, `tests/snapshot_wire_internals.rs`, `tests/room_budget_scaling.rs`, and
@@ -303,6 +459,13 @@ effectiveness feature did not export a new required delivery-struct field into t
 Store-wire controls must round-trip the new op, reject a missing engagement, prove v2/v3 mismatch
 fails before snapshot dispatch, and prove a restarted v3 daemon matches the direct projector.
 
+S11-S13 callers that must be rerun are `command_say`, `command_backlog`, `command_next`,
+`command_room`, `command_status`, the shipped hook, `tests/user_journey.rs`,
+`tests/json_envelope_contract.rs`, `tests/hook_projection_parity.rs`, docs-schema parity, and every
+consumer found by project-wide grep for `suggested_backlog_items`, `RoomSnapshot`, and global-status
+envelopes. No model-facing guide may continue prescribing unfiltered `rally room --json` as the
+first read after S12.
+
 ## Validation boundary
 
 Rally facts are untrusted coordination records. A Rally claim, artifact, ACK, or receipt can
@@ -317,6 +480,12 @@ inclusion both off and on. It must also exercise the adjacent moves:
 quiet live agent, crashed fresh-heartbeat agent, ACK without work, work without ACK, and a
 cross-engagement path conflict.
 
+For S11-S13 the independent audit must also replay the fixed 24-hour shapes: repeated idle presence,
+a completed-but-planned backlog item, one evidence-rich free-text artifact with empty structured
+refs, a health-heavy room, and a 125-room discovery tree. It compares full ledger, scoped room,
+compact audit, `next --limit 1`, and inventory outputs. Git SHA/test evidence is checked outside
+Rally, and the audit records exact response bytes before interpreting token impact.
+
 ## Outcomes a user can observe
 
 | Segment | Before | After |
@@ -324,9 +493,14 @@ cross-engagement path conflict.
 | S8 | expired claims require a manual doctor command | observer-eligible dead claims drain automatically without breaking `enter` |
 | S9 | old presence makes a scoped task look multi-agent | an engagement/run view contains only matched participants while the repository default stays compatible |
 | S10 | delivery/ACK can be mistaken for collaboration | only acknowledged, in-scope output changes the collaboration state |
+| S11 | agent prose can blur user request, interpretation, and outcome; completed work can remain planned | linked immutable request/interpretation/decision/artifact records and terminal backlog successors preserve the distinction |
+| S12 | a model may consume 49k-76k estimated tokens of repository-wide room output | a scoped audit brief stays at or below 12 KiB and exposes drill-in IDs for omitted history |
+| S13 | answering “all open Rally rooms on this laptop” requires an ad hoc filesystem script | one explicit read-only command returns bounded room/activity/provenance status without mutating the global index |
 
 ## Out of scope
 
 This amendment does not authorize automatic closure of legacy `unknown` claims, make Rally a
 test runner, force multi-agent work, change the RC-063 authority decision, or move/delete any
-PersonalLLMWiki content.
+PersonalLLMWiki content. S11 does not authenticate same-UID agents or store raw user requests by
+default. S13 does not enable persistent global indexing, scan outside explicit roots, or treat a
+process/room/path observation as proof of human or agent identity.
