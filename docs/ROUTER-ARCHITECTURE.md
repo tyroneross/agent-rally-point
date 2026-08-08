@@ -5,10 +5,12 @@
 # Rally Router Architecture
 
 > **Status:** proposed architecture and incremental build contract.
-> **Source baseline:** `main` at `8aaa925` plus the working tree observed on 2026-08-08.
+> **Source baseline:** `main` at `8625be8` plus the working tree observed on 2026-08-08.
 > **Position:** Rally remains the canonical, host-neutral coordination plane. External protocols
 > are codecs at the edge. The router is deterministic infrastructure, not an agent, scheduler,
 > judge, or source of truth.
+> **Dependency map:** [`ROUTER-DEPENDENCY-MAP.md`](ROUTER-DEPENDENCY-MAP.md) maps current source,
+> reusable components, proposed changes, and the regression blast radius.
 
 ## Decision
 
@@ -16,11 +18,16 @@ Add a restartable Rally delivery router as a separate client of the canonical Ra
 router owns delivery after the sender has recorded a canonical message. It resolves a stable Rally
 recipient to live endpoints, chooses one route, records every attempt, and waits for evidence.
 
+This is a **delivery router**. Current source also calls `RoomStore::route` a router, but that code
+only chooses direct store access versus `rallyd` socket access. It never selects an agent endpoint
+or transport. Use `DeliveryRouter`/`rally-routerd` in code and documentation to prevent the two
+meanings from collapsing.
+
 Keep three responsibilities separate:
 
 | Component | Owns | Does not own |
 | --- | --- | --- |
-| `rallyd` | Per-repo ledger/cache serialization, projections, inbox/outbox state | Network delivery, PTYs, route choice, LLM judgment |
+| `rallyd` | Per-repo ledger/cache serialization, projections, canonical coordination facts, and later atomic delivery-state facts | Network delivery, PTYs, route choice, LLM judgment |
 | Rally router | Endpoint registry, deterministic route planning, attempt leases, delivery attempts, retry/fallback, monitoring | Canonical state, terminal processes, work assignment, correctness judgment |
 | `ptyd` | Terminal/process lifecycle, Rally-id-to-pane binding, stdin, capture, process liveness, low-level PTY framing | Rally ledger, cross-adapter route choice, target ACK semantics |
 
@@ -64,10 +71,13 @@ sender
   -> wait for a target-authored Rally fact when --require-ack is used
 ```
 
-The sender process owns route selection and transport execution. If it exits, no resident Rally
-component continues delivery. `rallyd` does not consume pending messages or select transports.
-`ptyd` can deliver to a pane it owns, but it cannot choose among Claude Channels, Codex app-server,
-OpenCode, A2A, and other Rally endpoints.
+The sender process owns route selection and transport execution. If it exits, no resident process
+started or supervised by Rally continues delivery. A separate `rally-termd`/`terminal-rally-point`
+binary in the sibling `ptyd` project can consume Rally's existing `FileInbox`, but Rally does not
+start it, monitor it, or use it to choose among transports. The installed `rally-termd` binary was
+not running during the 2026-08-08 assessment. `rallyd` does not consume pending messages or select
+transports. `ptyd` can deliver to a pane it owns, but it cannot choose among Claude Channels, Codex
+app-server, OpenCode, A2A, and other Rally endpoints.
 
 ## Target behavior
 
@@ -92,6 +102,10 @@ any sender or native ingress
 
 The inbox is the correctness path. Live transport reduces latency. A router or adapter failure may
 delay delivery; it must not lose the message.
+
+Rally already has the first version of this durable inbox in
+`rally_protocol::ledger::FileInbox`, with typed `Directive` and `Receipt` records. The initial
+router should consume and extend that contract instead of creating a second queue.
 
 ### Local and remote payload rules
 
@@ -230,7 +244,7 @@ The router update enables behavior current Rally cannot provide:
 
 | Capability | Current Rally | With router |
 | --- | --- | --- |
-| Delivery after sender exits | No; sender CLI performs the transport | Yes; router resumes from pending envelopes |
+| Delivery after sender exits | Partial external mechanism; `rally-termd` can consume `FileInbox` when separately deployed, but Rally does not own or supervise it | Yes; Rally starts, monitors, and resumes the router from pending envelopes |
 | Central cross-provider route choice | No; fixed managed-session backend in sender | Yes; one policy across native, A2A, PTY, and mux endpoints |
 | Live endpoint registry | Partial managed-session and host-runtime records | Typed multi-endpoint capabilities, health, version, and expiry |
 | Retry and fallback | Limited synchronous fallback inside one command | Durable attempts, deadlines, idempotent retry, ordered fallback |
@@ -267,7 +281,10 @@ Each phase keeps the current path available and produces measurable evidence bef
 
 ### Phase R0: Freeze the contract
 
-- Version the canonical delivery envelope, endpoint descriptor, route plan, attempt, and receipt.
+- Extend and version the existing `Directive`/`Receipt` contract; do not add a second delivery queue.
+- Move or merge the staged `EventEnvelope` identity, correlation, and idempotency fields into the
+  shared protocol contract.
+- Version the endpoint descriptor, route plan, and delivery attempt.
 - Specify required-field preservation and opaque extensions.
 - Add adapter conformance fixtures for `ptyd`, Claude, Codex, and A2A vocabularies.
 - Add state-transition tests that reject sender-authored ACK/completion.
@@ -283,9 +300,11 @@ Gate: schemas and round-trip fixtures pass; no runtime behavior changes.
 
 Gate: existing delivery tests remain green; shadow selection matches or explains every difference.
 
-### Phase R2: Add durable outbox, leases, and attempt history
+### Phase R2: Add durable route leases and attempt history
 
-- Record pending delivery, route plan, lease, attempt, result, and next deadline in Rally facts.
+- Reuse the existing `FileInbox` as the pending queue.
+- Record route plan, lease, attempt, result, and next deadline in additive Rally facts or a
+  versioned delivery-state side log.
 - Let the sender CLI drain the outbox inline at first; no new resident process yet.
 - Add crash tests between every state transition.
 
@@ -304,9 +323,11 @@ and the room reports router degradation.
 ### Phase R4: Dogfood `ptyd`, then native adapters
 
 1. Use the existing real `ptyd` integration as the first router adapter.
-2. Add Codex app-server and Claude Channel adapters against generated/current schemas.
-3. Add mixed Claude-to-Codex and Codex-to-Claude journeys.
-4. Add OpenCode and A2A after the first two native adapters pass the same conformance suite.
+2. Disable the autonomous `rally-termd` consumer for router-owned rooms before enabling router
+   delivery, so two consumers cannot deliver the same directive.
+3. Add Codex app-server and Claude Channel adapters against generated/current schemas.
+4. Add mixed Claude-to-Codex and Codex-to-Claude journeys.
+5. Add OpenCode and A2A after the first two native adapters pass the same conformance suite.
 
 Gate: the same Rally envelope completes through each adapter without changing ACK semantics.
 
