@@ -54,6 +54,13 @@
 #     gate, warns once per session, returns `{}`, and makes zero Rally calls;
 #     it cannot classify or safely claim the mutation. Lifecycle phases retain
 #     their fail-open enter/status behavior but cannot render model context.
+#   - NATIVE BEFORE-WRITE TRANSACTION. On binaries that provide the native
+#     `rally hook` command, the before-write transaction itself (working-state
+#     publication, deconfliction, idempotent auto-claim) runs in Rust rather
+#     than node. Node still performs the effect classification that gates it,
+#     so this narrows node's role on before-write without removing it.
+#     Start/idle/after-write remain fully on the legacy node renderer, as does
+#     before-write against an older Rally binary that lacks the subcommand.
 #   - Advisory only (default): emits `additionalContext` / `systemMessage`,
 #     never `permissionDecision: "deny"` / `decision: "block"`.
 #   - Strict mode (opt-in, RALLY_HOOK_STRICT=1): high-severity coordination
@@ -82,6 +89,7 @@
 #   RALLY_HOOK_STRICT      — "1" to enable deny/block on high-severity signals.
 #   RALLY_HOOK_DEDUPE_SECS — duplicate registration window (default 5 seconds).
 #   RALLY_HOOK_DEDUPE_DIR  — test/diagnostic override for event markers.
+#   RALLY_NATIVE_HOOK      — "off" forces the legacy shell+Node path (diagnostic).
 #
 # Exit code: 0 always (fail-open). Output goes on stdout per host hook contract.
 
@@ -1015,6 +1023,52 @@ hook_prompt_mode="${RALLY_HOOK_PROMPT:-once}"
 # Reuse the envelope read before repo/Rally resolution. Native before-write
 # classification owns path extraction; other phases only need a session id.
 paths=""
+
+# Phase 1A native fast path. A capability probe keeps the wrapper compatible
+# with an older installed Rally binary: old binaries do not advertise this
+# subcommand, so they continue through the legacy shell + Node path below.
+# The new command reads the original host envelope, resolves the session/tool,
+# runs the existing status/check/claim authorities, and emits the host envelope
+# itself.
+#
+# INTEGRATION NOTE (merge of bl/run-788004 onto the s10-o33c wrapper): the
+# envelope is already in `$input`, read once near the top of this script, so the
+# original commit's second `cat` of stdin is dropped here — stdin is drained by
+# then and re-reading yields an empty envelope. This block also now runs AFTER
+# the `_rally_native_effect` classification and the watchdog-capability gate
+# above, which are Node-backed. The native command therefore still removes Node
+# from the before-write TRANSACTION, but no longer from the whole before-write
+# path; the original commit's "no Node process runs on this path" claim does not
+# survive this merge unmodified.
+if [ "$phase" = "before-write" ] && [ "${RALLY_NATIVE_HOOK:-on}" != "off" ]; then
+  native_marker_dir="$_rally_repo_root/.rally/.hook-seen"
+  native_bin_name="${RALLY_BIN##*/}"
+  native_bin_name="$(printf '%s' "$native_bin_name" | tr -c 'A-Za-z0-9_.-' '_')"
+  native_marker="$native_marker_dir/native-hook-v1.$native_bin_name.available"
+  native_available=0
+  if [ -f "$native_marker" ]; then
+    native_available=1
+  elif rally_timeout hook --help 2>/dev/null | grep -Fq 'Native host hook'; then
+    mkdir -p "$native_marker_dir" 2>/dev/null || true
+    printf '1' > "$native_marker" 2>/dev/null || true
+    native_available=1
+  fi
+  if [ "$native_available" = "1" ]; then
+    native_output=""
+    native_rc=0
+    native_output="$(printf '%s' "$input" | rally_timeout hook before-write "$tool" 2>/dev/null)" || native_rc=$?
+    if [ "$native_rc" = "0" ]; then
+      printf '%s' "$native_output"
+      exit 0
+    fi
+    rm -f "$native_marker" 2>/dev/null || true
+    # A runtime failure is fail-open. Falling through to the established path
+    # preserves deconfliction when the installed binary advertises the command
+    # but cannot complete it for an environment-specific reason.
+  fi
+fi
+
+# Extract file_path + session_id from the host's hook input envelope.
 path=""
 session=""
 if [ "$have_node" = "1" ] && [ -n "$input" ]; then
@@ -1172,6 +1226,23 @@ _duplicate_hook_event() {
 
 if _duplicate_hook_event; then
   exit 0
+fi
+
+# A native working marker represents the last state this wrapper published.
+# Any lifecycle phase that publishes a non-working state must clear it so the
+# next edit on the same path becomes a real working transition immediately,
+# even inside the normal heartbeat refresh window.
+if [ "$phase" != "before-write" ]; then
+  native_status_session="$(printf '%s' "$session" | tr -c 'A-Za-z0-9_.:-' '_')"
+  native_status_dir="$_rally_repo_root/.rally/.hook-seen"
+  rm -f "$native_status_dir/$native_status_session.working-status" 2>/dev/null || true
+  # The host envelope may carry a better session id than this legacy phase can
+  # parse when Node is absent. Stamp the long-lived observer too, so the native
+  # command detects the transition without clearing another agent's marker.
+  native_observer="$(printf '%s' "$RALLY_OBSERVER_PID" | tr -c 'A-Za-z0-9_.:-' '_')"
+  mkdir -p "$native_status_dir" 2>/dev/null || true
+  printf '%s:%s:%s\n' "$phase" "$(date +%s 2>/dev/null || printf '0')" "$$" \
+    > "$native_status_dir/ppid-$native_observer.non-working" 2>/dev/null || true
 fi
 
 # Read hook enable/prompt settings after duplicate suppression so two host

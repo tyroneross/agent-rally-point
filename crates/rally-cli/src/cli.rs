@@ -14,6 +14,7 @@ pub(crate) enum CliCommand {
     Room(RoomArgs),
     Next(NextArgs),
     Check(CheckArgs),
+    Hook(HookArgs),
     Run(RunArgs),
     Sessions(SessionsArgs),
     Inject(InjectArgs),
@@ -336,6 +337,17 @@ pub(crate) struct CheckArgs {
     pub(crate) enforce: bool,
     /// C3 coordination merge-gate: changed files (from `git diff --name-only`).
     pub(crate) changed: Vec<String>,
+}
+
+/// Native host-hook entrypoint. It emits the host envelope directly, so the
+/// wrapper does not need Node or several child `rally` invocations.
+#[derive(Clone, Debug)]
+pub(crate) struct HookArgs {
+    pub(crate) phase: String,
+    pub(crate) host: String,
+    pub(crate) tool: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) strict: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -772,6 +784,7 @@ pub(crate) const COMMANDS: &[&str] = &[
     "room",
     "next",
     "check",
+    "hook",
     "run",
     "sessions",
     "inject",
@@ -918,6 +931,13 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("check")
         .map(CliCommand::Check);
+    let hook = hook_parser()
+        .to_options()
+        .descr(
+            "Native host hook: parse stdin, coordinate, and emit the host envelope without Node.",
+        )
+        .command("hook")
+        .map(CliCommand::Hook);
     let run = run_parser()
         .to_options()
         .command("run")
@@ -1117,6 +1137,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
         locate,
         recent,
         check,
+        hook,
         run,
         sessions,
         inject,
@@ -1595,6 +1616,25 @@ fn check_parser() -> impl Parser<CheckArgs> {
             proposed_tier,
             enforce,
             changed,
+        },
+    )
+}
+
+fn hook_parser() -> impl Parser<HookArgs> {
+    let tool = optional_string_arg("tool", "TOOL");
+    let session_id = optional_string_arg("session-id", "SESSION_ID");
+    let strict = long("strict")
+        .help("Emit the host blocking response for stop-severity findings.")
+        .switch();
+    let phase = positional::<String>("PHASE");
+    let host = positional::<String>("HOST");
+    construct!(tool, session_id, strict, phase, host).map(
+        |(tool, session_id, strict, phase, host)| HookArgs {
+            phase,
+            host,
+            tool,
+            session_id,
+            strict,
         },
     )
 }
