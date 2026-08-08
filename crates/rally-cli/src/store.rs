@@ -303,7 +303,12 @@ impl FactKind {
             "wake" => Some(Self::Wake),
             "presence" => Some(Self::Presence),
             "read" => Some(Self::Read),
-            "backlog-item" => Some(Self::BacklogItem),
+            // `as_str` renders `backlog-item`, but serde writes the variant to
+            // the ledger as `backlog_item` (the `rename_all = "snake_case"`
+            // default). A caller who reads a kind off a fact and retypes it
+            // hands us the underscore form, so accept both — same reason
+            // `claim_expired` aliases `claim.expired` above.
+            "backlog-item" | "backlog_item" => Some(Self::BacklogItem),
             "receipt" => Some(Self::Receipt),
             "standby" => Some(Self::Standby),
             "mission" => Some(Self::Mission),
@@ -361,6 +366,34 @@ mod fact_kind_say_surface_tests {
                 parsed.as_str(),
                 kind,
                 "advertised kind {kind:?} is not the canonical spelling"
+            );
+        }
+    }
+
+    /// The spelling serde writes to the ledger must be a spelling `parse`
+    /// accepts. Those are two independent tables — `rename_all = "snake_case"`
+    /// plus per-variant renames on one side, a hand-written match on the other
+    /// — and `BacklogItem` drifted across them: every backlog fact on disk
+    /// carried `backlog_item`, and `rally say backlog_item` rejected it. Round-
+    /// tripping the real serde output for every variant catches the next drift
+    /// at compile-and-test time instead of at a caller's prompt.
+    #[test]
+    fn every_wire_spelling_parses_back_to_its_variant() {
+        for kind in FactKind::ALL {
+            // `claim.renewed` is unparseable on purpose: renewals enter through
+            // `RoomStore::renew_claim_lease`, never through a caller-typed kind.
+            if matches!(kind, FactKind::ClaimRenewed) {
+                continue;
+            }
+            let wire = serde_json::to_value(kind)
+                .expect("FactKind serializes")
+                .as_str()
+                .expect("FactKind serializes to a JSON string")
+                .to_string();
+            assert_eq!(
+                FactKind::parse(&wire).as_ref(),
+                Some(kind),
+                "serde writes {kind:?} to the ledger as {wire:?}, which FactKind::parse rejects"
             );
         }
     }
