@@ -638,7 +638,61 @@ Compare at least:
 14. Using an unauthenticated discovery mechanism as authorization.
 15. Hiding permanent failures behind infinite restart loops.
 
-## 15. Authoritative references
+## 15. Academic research implications
+
+The research supports the recommended logical boundaries, but it challenges one implementation
+assumption: a logical router does **not** need to begin as a mandatory standalone daemon. The
+strongest incremental design is a pure routing and attempt-state core that can run inline, as a
+one-shot worker, or inside a resident process.
+
+| Research finding | Evidence status | Rally implication |
+| --- | --- | --- |
+| Recovery semantics can be separated from execution | Peer-reviewed: ExoFlow, OSDI 2023 | Keep canonical state and recovery independent from provider execution |
+| Orchestration can run as a library over a strong durable substrate | Peer-reviewed counter-evidence: Unum, NSDI 2023 | Build `DeliveryPlanner` and `route --once` before requiring `rally-routerd` |
+| Agent-specific interfaces materially affect coding results | Peer-reviewed: SWE-agent, NeurIPS 2024 | Optimize the host-facing Rally interface, not only the transport |
+| Concurrent coding agents need dependency-aware delegation, isolation, structured communication, integration, and tests | COLM 2026 accepted: CAID v2 | Combine claims and intent with worktrees/branches when work is sufficiently independent |
+| MCP is lighter for constrained coordination; A2A carries richer task lifecycle at higher complexity | July 2026 preprint experience report | Use both as adapters; keep task truth in Rally |
+| No one protocol is likely to maximize versatility, efficiency, and portability | June 2026 preprint taxonomy | Preserve a layered adapter architecture rather than one universal wire path |
+| Current protocols transport but do not enforce full governance semantics | June 2026 preprint gap analysis | Keep decisions, dissent, escalation, and replay above transport protocols |
+| Tool results and protocol composition are security boundaries | Peer-reviewed AgentDojo and AgentFuzz; AgentRFC preprint | Treat payloads as untrusted data; test the composed route, not only each adapter |
+| Durable agent state can resume against changed prompts, tools, models, or policies | August 2026 preprint | Record an execution manifest and revalidate bindings on long-lived resumes |
+| Multi-agent debate and judging have conditional gains and can degrade outcomes | 2025 systematic preprint | Use executable checks first and model auditors selectively; never place a judge in the router |
+| Local model placement trades latency/privacy against memory, energy, and quality | Peer-reviewed CLONE, USENIX ATC 2025 | Keep placement configurable and benchmark local, hybrid, and cloud paths |
+
+### Research-adjusted architecture decision
+
+Use **one logical coordination and routing system with three possible process hosts**:
+
+1. The CLI executes the planner inline for immediate, unambiguous delivery.
+2. A one-shot worker drains bounded pending work when a hook or scheduler already supplies the
+   trigger.
+3. A resident router worker handles retries, wakeups, warm native connections, and work that must
+   continue after the sender exits.
+
+All three hosts must call the same pure planner and attempt state machine. This structure retains a
+single semantic implementation without forcing a permanent process where the workload does not
+need one.
+
+### Research-adjusted verification
+
+Add these cases to the matrix in Section 13:
+
+- **Host equivalence:** the same envelope produces the same route plan and attempt transition when
+  run inline, one-shot, or resident.
+- **Semantic drift:** resume after an adapter, capability, policy, prompt, tool, or model version
+  changes; require explicit revalidation or an observable warning.
+- **Composition safety:** property-test every Rally/native/A2A/MCP round trip, including unknown
+  extensions, capability downgrade, identity scope, and error translation.
+- **Adversarial payload:** place instruction-like content inside messages, tool output, artifacts,
+  and receipts; deterministic infrastructure must continue treating it as data.
+- **Judge ablation:** compare no judge, deterministic verifier, same-model judge, and independent
+  model judge against executable ground truth, cost, latency, and false-confidence rates.
+
+The full 15-source evidence package, corroboration assessment, counter-evidence, and research gaps
+are stored in the central research library as
+`agent-systems.background-process-agent-runtime-architecture`.
+
+## 16. Authoritative references
 
 ### Local source
 
@@ -665,7 +719,25 @@ Compare at least:
 - OpenCode, [Server documentation](https://dev.opencode.ai/docs/server/): OpenAPI HTTP server, health, SSE events, authentication, and discovery.
 - Anthropic, [Claude Code CLI reference](https://docs.anthropic.com/en/docs/claude-code/cli-usage): process/session invocation surface. Installed `2.1.226` help was also inspected because the public page may lag the local background-agent surface.
 
-## 16. Decision checklist
+### Academic and research sources
+
+- Zhuang et al., [ExoFlow: A Universal Workflow System for Exactly-Once DAGs](https://www.usenix.org/conference/osdi23/presentation/zhuang), OSDI 2023.
+- Liu et al., [Doing More with Less: Orchestrating Serverless Applications without an Orchestrator](https://www.usenix.org/conference/nsdi23/presentation/liu-david), NSDI 2023.
+- Yang et al., [SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering](https://proceedings.neurips.cc/paper_files/paper/2024/hash/5a7c947568c1b1328ccc5230172e1e7c-Abstract-Conference.html), NeurIPS 2024.
+- Debenedetti et al., [AgentDojo](https://proceedings.neurips.cc/paper_files/paper/2024/hash/97091a5177d8dc64b1da8bf3e1f6fb54-Abstract-Datasets_and_Benchmarks_Track.html), NeurIPS 2024.
+- Liu et al., [Make Agent Defeat Agent](https://www.usenix.org/conference/usenixsecurity25/presentation/liu-fengyu), USENIX Security 2025.
+- Tian et al., [CLONE: Collaborative Learning on the Edge](https://www.usenix.org/conference/atc25/presentation/tian), USENIX ATC 2025.
+- Mei et al., [AIOS: LLM Agent Operating System](https://openreview.net/pdf?id=L4HHkCDz2x), COLM 2025.
+- Geng and Neubig, [Effective Strategies for Asynchronous Software Engineering Agents](https://arxiv.org/abs/2603.21489), COLM 2026 accepted, v2 revised 2026-07-08.
+- Predoaia et al., [A Comparative Study of MCP and A2A](https://arxiv.org/abs/2607.23884), preprint, 2026-07-26.
+- Sander et al., [A Technical Taxonomy of LLM Agent Communication Protocols](https://arxiv.org/abs/2606.19135), preprint, 2026-06-17.
+- Zhang et al., [Governance Gaps in Agent Interoperability Protocols](https://arxiv.org/abs/2606.31498), preprint, 2026-06-30.
+- Zheng and Zhang, [AgentRFC](https://arxiv.org/abs/2603.23801), preprint, 2026-03-25.
+- Mozafari, [BEGIN AI TRANSACTION](https://arxiv.org/abs/2608.05412), preprint, 2026-08-05.
+- [Revisiting Multi-Agent Debate](https://arxiv.org/abs/2505.22960), preprint, 2025-05-29.
+- OpenID Foundation, [Identity Management for Agentic AI](https://arxiv.org/abs/2510.25819), standards whitepaper, 2025-10-29.
+
+## 17. Decision checklist
 
 Before approving a new background component, require answers to all of these:
 
