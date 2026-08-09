@@ -128,7 +128,7 @@ def render_plugin_surfaces(config: dict[str, Any], version: str) -> dict[Path, s
         "repository": repository,
         "license": license_name,
         "keywords": merged_keywords(config, "codex"),
-        "skills": "./skills",
+        "skills": "./.codex-plugin/skills",
         "interface": {
             "displayName": plugin["display_name"],
             "shortDescription": interface["short_description"],
@@ -310,6 +310,42 @@ def write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def validate_codex_package_paths(plugin_root: Path) -> None:
+    """Require every manifest-declared local capability path to resolve.
+
+    Codex resolves these paths from the marketplace plugin root, not from the
+    directory containing ``plugin.json``. A package can therefore install and
+    appear enabled while exposing no skills when a declared path is wrong.
+    """
+    root = plugin_root.resolve()
+    manifest_path = plugin_root / ".codex-plugin/plugin.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GenerationError(f"cannot load {manifest_path}: {exc}") from exc
+
+    declared_paths = {"skills": manifest.get("skills")}
+    interface = manifest.get("interface") or {}
+    for key in ("composerIcon", "logo"):
+        if key in interface:
+            declared_paths[f"interface.{key}"] = interface[key]
+    for field, declared in declared_paths.items():
+        if not isinstance(declared, str) or not declared:
+            raise GenerationError(f"{manifest_path}: missing {field} path")
+        candidate = (plugin_root / declared).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise GenerationError(
+                f"{manifest_path}: {field} escapes plugin root: {declared}"
+            ) from exc
+        if not candidate.exists():
+            raise GenerationError(
+                f"{manifest_path}: {field} does not resolve from plugin root: "
+                f"{declared}"
+            )
+
+
 def validate_artifact_dest(
     dest: Path,
     source_root: Path,
@@ -376,6 +412,7 @@ def copy_codex_artifact(
             dest / "skills" / skill_id / "SKILL.md",
             render_skill(source_root, config, skill_id, "codex"),
         )
+    validate_codex_package_paths(dest.parent)
     return dest
 
 

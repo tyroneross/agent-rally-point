@@ -56,6 +56,32 @@ class GenerateHostSurfacesTests(unittest.TestCase):
             )
             self.assertFalse(any(path.is_symlink() for path in artifact.rglob("*")))
 
+    def test_codex_manifest_paths_resolve_from_marketplace_plugin_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            GEN.generate(ROOT, dest)
+            plugin_root = dest / "plugins/codex"
+            manifest = json.loads(
+                (plugin_root / ".codex-plugin/plugin.json").read_text()
+            )
+
+            declared = [
+                manifest["skills"],
+                manifest["interface"]["composerIcon"],
+                manifest["interface"]["logo"],
+            ]
+            for relative in declared:
+                resolved = (plugin_root / relative).resolve(strict=True)
+                resolved.relative_to(plugin_root.resolve())
+
+            self.assertTrue(
+                (
+                    plugin_root
+                    / manifest["skills"]
+                    / "agent-rally-point/SKILL.md"
+                ).is_file()
+            )
+
     def test_release_identity_uses_cargo_version_and_content_digest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp)
@@ -128,7 +154,8 @@ class GenerateHostSurfacesTests(unittest.TestCase):
                 }
             }
             dest = Path(dest_tmp)
-            GEN.copy_codex_artifact(source, dest, config, "{}\n")
+            manifest = json.dumps({"skills": "./.codex-plugin/skills"}) + "\n"
+            GEN.copy_codex_artifact(source, dest, config, manifest)
             artifact = dest / GEN.CODEX_ARTIFACT
             self.assertTrue((artifact / "skills/demo/reference.md").is_file())
             self.assertFalse(any(path.name == ".DS_Store" for path in artifact.rglob("*")))

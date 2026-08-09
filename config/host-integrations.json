@@ -37,8 +37,8 @@
     "codex_interface": {
       "short_description": "Coordinate Codex work through Rally, dynamic workflow task packets, and a per-task quality loop.",
       "long_description": "Agent Rally Point gives Codex a repo-local coordination surface for Rally claims, checks, artifacts, handoffs, and dynamic workflow task packets. Three skills: agent-rally-point (per-session loop), rally-workflows (fan-out + dynamic-workflows protocol), mini-loop (per-task assess/plan/execute/judge quality gate).",
-      "composer_icon": "./assets/app-icon-rally-point-v5.png",
-      "logo": "./assets/app-icon-rally-point-v5.png",
+      "composer_icon": "./.codex-plugin/assets/app-icon-rally-point-v5.png",
+      "logo": "./.codex-plugin/assets/app-icon-rally-point-v5.png",
       "capabilities": [
         "Read",
         "Write"

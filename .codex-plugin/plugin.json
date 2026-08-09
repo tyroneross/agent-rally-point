@@ -16,15 +16,15 @@
     "host-neutral",
     "codex"
   ],
-  "skills": "./skills",
+  "skills": "./.codex-plugin/skills",
   "interface": {
     "displayName": "Agent Rally Point",
     "shortDescription": "Coordinate Codex work through Rally, dynamic workflow task packets, and a per-task quality loop.",
     "longDescription": "Agent Rally Point gives Codex a repo-local coordination surface for Rally claims, checks, artifacts, handoffs, and dynamic workflow task packets. Three skills: agent-rally-point (per-session loop), rally-workflows (fan-out + dynamic-workflows protocol), mini-loop (per-task assess/plan/execute/judge quality gate).",
     "developerName": "Ross Labs",
     "category": "Coding",
-    "composerIcon": "./assets/app-icon-rally-point-v5.png",
-    "logo": "./assets/app-icon-rally-point-v5.png",
+    "composerIcon": "./.codex-plugin/assets/app-icon-rally-point-v5.png",
+    "logo": "./.codex-plugin/assets/app-icon-rally-point-v5.png",
     "capabilities": [
       "Read",
       "Write"
