@@ -3837,8 +3837,11 @@ impl DirectRoomStore {
                 code: ProjectionWarningCode::ReconcileCache,
                 message: format!("reconcile cache projection fault: {detail}"),
             });
-        } else {
-            self.refresh_reconcile_cache_after_append(fact.seq);
+        } else if let Err(error) = self.refresh_reconcile_cache_after_append(fact.seq) {
+            warnings.push(ProjectionWarning {
+                code: ProjectionWarningCode::ReconcileCache,
+                message: error.to_string(),
+            });
         }
         if let Err(error) = self.refresh_log_index() {
             warnings.push(ProjectionWarning {
@@ -3877,7 +3880,8 @@ impl DirectRoomStore {
     /// After a successful single-event append, rebuild the reconcile sidecar
     /// from measured segment + database stats and fingerprint both the main
     /// database and its WAL. If either side cannot be measured or they differ,
-    /// drop the sidecar so the next op re-scans authoritatively. Never errors.
+    /// return an error so the committed append reports an incomplete derived
+    /// projection and invalidates the sidecar before the next operation.
     ///
     /// Non-Unix note: on non-Unix platforms the mutation lock is a no-op
     /// (see store.rs `acquire_room_mutation_lock` #[cfg(not(unix))]). A concurrent
@@ -3886,39 +3890,20 @@ impl DirectRoomStore {
     /// self-corrected by a fingerprint mismatch on the next open, which triggers
     /// the authoritative full scan. No data loss is possible — the canonical
     /// JSONL segments are not affected by sidecar drift.
-    fn refresh_reconcile_cache_after_append(&self, appended_seq: i64) {
-        let (Ok(segments), Ok(archived)) = (
-            read_segment_files(&self.log_dir),
-            replay_archive_segments(&self.archive_dir),
-        ) else {
-            // Couldn't enumerate segments; drop the sidecar to force a re-scan.
-            if let Some(p) = reconcile_cache_path(&self.facts_db_path) {
-                let _ = fs::remove_file(p);
-            }
-            return;
-        };
+    fn refresh_reconcile_cache_after_append(&self, appended_seq: i64) -> Result<()> {
+        let segments = read_segment_files(&self.log_dir)?;
+        let archived = replay_archive_segments(&self.archive_dir)?;
         // Never advance counts from the previous sidecar. A lost WAL can leave
         // that sidecar internally consistent while facts.db has rewound. Re-read
         // both authoritative segments and the live SQLite view after the append;
         // only publish a fast-path cache when they still agree exactly.
-        let Ok(canonical_stats) = segment_seq_stats(&segments, &archived) else {
-            if let Some(p) = reconcile_cache_path(&self.facts_db_path) {
-                let _ = fs::remove_file(p);
-            }
-            return;
-        };
-        let Ok(db_stats) = read_db_event_stats(&self.facts_db_path, self.warm_fact_store.is_none())
-        else {
-            if let Some(p) = reconcile_cache_path(&self.facts_db_path) {
-                let _ = fs::remove_file(p);
-            }
-            return;
-        };
+        let canonical_stats = segment_seq_stats(&segments, &archived)?;
+        let db_stats = read_db_event_stats(&self.facts_db_path, self.warm_fact_store.is_none())?;
         if canonical_stats != db_stats || canonical_stats.max_seq < appended_seq {
-            if let Some(p) = reconcile_cache_path(&self.facts_db_path) {
-                let _ = fs::remove_file(p);
-            }
-            return;
+            return Err(RallyError::Message(format!(
+                "reconcile cache projection is not publishable after seq {appended_seq}: canonical count/max {}/{}, facts.db count/max {}/{}",
+                canonical_stats.count, canonical_stats.max_seq, db_stats.count, db_stats.max_seq,
+            )));
         }
         let cache = ReconcileCache {
             schema_version: RECONCILE_CACHE_SCHEMA_VERSION,
@@ -3930,7 +3915,7 @@ impl DirectRoomStore {
             db_count: db_stats.count,
             db_max_seq: db_stats.max_seq,
         };
-        let _ = write_reconcile_cache(&self.facts_db_path, &cache);
+        write_reconcile_cache(&self.facts_db_path, &cache)
     }
 
     // -------------------------------------------------------------------------
@@ -7265,8 +7250,8 @@ fn read_reconcile_cache(facts_db_path: &Path) -> Option<ReconcileCache> {
     (cache.schema_version == RECONCILE_CACHE_SCHEMA_VERSION).then_some(cache)
 }
 
-/// Write the sidecar atomically (tmp + rename). Best-effort: a write failure is
-/// swallowed by the caller — the next op simply re-scans and rewrites it.
+/// Write the sidecar atomically (tmp + rename). A failed rename is benign only
+/// when another writer published the exact cache value we intended to install.
 fn write_reconcile_cache(facts_db_path: &Path, cache: &ReconcileCache) -> Result<()> {
     let Some(path) = reconcile_cache_path(facts_db_path) else {
         return Ok(());
@@ -7278,10 +7263,20 @@ fn write_reconcile_cache(facts_db_path: &Path, cache: &ReconcileCache) -> Result
         .map_err(RallyError::io(format!("write {}", temp_path.display())))?;
     match fs::rename(&temp_path, &path) {
         Ok(()) => Ok(()),
-        // Lost a race with a peer writer; their sidecar is just as valid.
-        Err(_) => {
+        Err(error) => {
+            let exact_peer = read_reconcile_cache(facts_db_path)
+                .as_ref()
+                .is_some_and(|existing| existing == cache);
             let _ = fs::remove_file(&temp_path);
-            Ok(())
+            if exact_peer {
+                Ok(())
+            } else {
+                Err(RallyError::io(format!(
+                    "rename reconcile cache {} to {}",
+                    temp_path.display(),
+                    path.display()
+                ))(error))
+            }
         }
     }
 }
@@ -14413,6 +14408,42 @@ mod ledger_tests {
         let db = open_fact_store_lenient(&store.facts_db_path).unwrap();
         assert_eq!(
             facts_from_store(&db)
+                .unwrap()
+                .iter()
+                .filter(|fact| fact.event_id == candidate.event_id)
+                .count(),
+            1
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_real_reconcile_cache_rename_failure_is_committed_warning() {
+        let root = unique_root("o26-reconcile-cache-rename-warning");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let sidecar = root.join(".rally").join(RECONCILE_CACHE_FILENAME);
+        fs::remove_file(&sidecar).ok();
+        fs::create_dir(&sidecar).unwrap();
+        let candidate = make_fact(
+            "o26-reconcile-cache-rename-candidate",
+            FactKind::Decision,
+            "src/",
+            "derived cache rename warning",
+        );
+
+        let outcome = store.append_fact(&candidate).unwrap();
+        assert!(outcome.committed);
+        assert!(!outcome.projection_complete);
+        assert!(outcome.warnings.iter().any(|warning| {
+            warning.code == ProjectionWarningCode::ReconcileCache
+                && warning.message.contains("rename")
+        }));
+        let retry = store.append_fact(&candidate).unwrap();
+        assert!(retry.committed);
+        assert!(!retry.projection_complete);
+        assert_eq!(retry.fact.seq, outcome.fact.seq);
+        assert_eq!(
+            facts_from_segments(&store.log_dir, &store.archive_dir)
                 .unwrap()
                 .iter()
                 .filter(|fact| fact.event_id == candidate.event_id)

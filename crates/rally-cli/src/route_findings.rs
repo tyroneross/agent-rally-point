@@ -418,8 +418,15 @@ mod tests {
                 .all(|pair| pair[0].fact.seq < pair[1].fact.seq)
         );
         assert!(!outcomes[0].projection_complete);
-        assert!(outcomes[1].projection_complete);
-        assert!(outcomes[2].projection_complete);
+        for outcome in &outcomes[1..] {
+            assert!(
+                !outcome.projection_complete,
+                "canonical/DB drift must not publish a false-complete reconcile cache"
+            );
+            assert!(outcome.warnings.iter().any(|warning| {
+                warning.code == crate::store::ProjectionWarningCode::ReconcileCache
+            }));
+        }
         let mut output = crate::output::Output::new(
             true,
             "route-findings".to_string(),
