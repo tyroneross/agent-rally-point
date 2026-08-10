@@ -3707,7 +3707,11 @@ impl DirectRoomStore {
         append_canonical_line_and_readback(&active_segment, &entry, &rendered, &fact.event_id)?;
 
         let mut outcome = AppendOutcome::committed(fact.clone(), Vec::new());
+        outcome.projection_complete = false;
         crate::mark_watchdog_append_outcome(&outcome);
+        // Preserve O25's deterministic post-commit watchdog seam at O26's
+        // canonical-readback boundary, before any derived projection begins.
+        crate::block_after_watchdog_commit_for_test();
         if let Err(detail) = trigger_o26_fault(rally_dir, O26FaultPoint::AfterCanonicalReadback) {
             outcome.warnings.push(ProjectionWarning {
                 code: ProjectionWarningCode::PostCommitWork,

@@ -539,6 +539,14 @@ pub(crate) fn mark_watchdog_command_commit() {
                 };
         }
     });
+    block_after_watchdog_commit_for_test();
+}
+
+pub(crate) fn block_after_watchdog_commit_for_test() {
+    let armed = WATCHDOG_COMMIT_ARM_DEPTH.with(|depth| depth.get() > 0);
+    if !armed {
+        return;
+    }
     #[cfg(debug_assertions)]
     if let Ok(ms) = env::var("RALLY_TEST_BLOCK_AFTER_COMMIT_MS")
         && let Ok(ms) = ms.trim().parse::<u64>()
