@@ -145,10 +145,6 @@ pub enum StoreOp {
         #[serde(default)]
         expected_owner_session_id: Option<String>,
     },
-    /// `RoomStore::expire_claim_leases_at(now)` → `Vec<Fact>`.
-    /// `now` is RFC3339 (chrono is NOT a `rally-protocol` dep; the boundary
-    /// parses it back into `chrono::DateTime<Utc>`).
-    ExpireClaimLeasesAt { now_rfc3339: String },
     /// `RoomStore::session_facts_with_context_version()` →
     /// `(Vec<Fact>, Option<u64>)`.
     SessionFactsWithContextVersion,
@@ -204,8 +200,6 @@ pub enum StoreOk {
     RebuildClaimIndex,
     /// `Option<ActiveClaimRecord>`.
     RenewClaimLease { record: Option<Value> },
-    /// `Vec<Fact>`.
-    ExpireClaimLeasesAt { facts: Vec<Value> },
     /// `(Vec<Fact>, Option<u64>)`.
     SessionFactsWithContextVersion {
         facts: Vec<Value>,
@@ -326,6 +320,12 @@ mod tests {
     fn unknown_op_kind_is_rejected() {
         let bad = r#"{"wire_version":1,"engagement":null,"op":{"kind":"not_a_real_op"}}"#;
         assert!(serde_json::from_str::<StoreRequest>(bad).is_err());
+    }
+
+    #[test]
+    fn retired_lease_only_cleanup_op_is_rejected() {
+        let retired = r#"{"wire_version":3,"engagement":null,"op":{"kind":"expire_claim_leases_at","now_rfc3339":"2000-01-01T00:00:00Z"}}"#;
+        assert!(serde_json::from_str::<StoreRequest>(retired).is_err());
     }
 
     #[test]

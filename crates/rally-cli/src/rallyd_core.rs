@@ -695,20 +695,6 @@ mod imp {
                 };
                 StoreOk::RenewClaimLease { record }
             }
-            StoreOp::ExpireClaimLeasesAt { now_rfc3339 } => {
-                let now = chrono::DateTime::parse_from_rfc3339(&now_rfc3339)
-                    .map_err(|e| {
-                        StoreError::new(
-                            StoreErrorKind::Command,
-                            format!("bad rfc3339 timestamp: {e}"),
-                        )
-                    })?
-                    .with_timezone(&chrono::Utc);
-                let facts = store.expire_claim_leases_at(now).map_err(rally_to_wire)?;
-                StoreOk::ExpireClaimLeasesAt {
-                    facts: to_wire_values(&facts)?,
-                }
-            }
             StoreOp::SessionFactsWithContextVersion => {
                 let (facts, context_version) = store
                     .session_facts_with_context_version()

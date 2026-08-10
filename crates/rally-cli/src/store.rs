@@ -1206,7 +1206,6 @@ impl From<&RoomSnapshot> for RoomSummary {
 ///   facts                                → Facts
 ///   rebuild_claim_index                  → RebuildClaimIndex
 ///   renew_claim_lease                    → RenewClaimLease
-///   expire_claim_leases_at               → ExpireClaimLeasesAt
 ///   session_facts_with_context_version   → SessionFactsWithContextVersion
 ///   snapshot / snapshot_with_archived    → SnapshotWithArchived
 ///   snapshot_with_readers_archived       → SnapshotWithReadersArchived
@@ -1807,17 +1806,6 @@ impl RoomStore {
                 caller_session_id,
                 expected_owner_session_id,
             ),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn expire_claim_leases_at(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<Fact>> {
-        match self {
-            RoomStore::Direct(d) => d.expire_claim_leases_at(now),
-            RoomStore::Routed(r) => r.expire_claim_leases_at(now),
         }
     }
 
@@ -2976,50 +2964,6 @@ impl DirectRoomStore {
     #[cfg(test)]
     pub(crate) fn claim_index_path(&self) -> &Path {
         &self.claim_index_path
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn expire_claim_leases_at(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<Fact>> {
-        self.rebuild_claim_index()?;
-        let facts = self.facts()?;
-        let index = claim_authority::read_index(&self.claim_index_path)
-            .map_err(|err| RallyError::Message(format!("read claim index: {err}")))?;
-        let expired = claim_authority::expired_claims(&index, &facts, now);
-        let mut appended = Vec::new();
-        for claim in expired {
-            let fact = Fact {
-                from_session_id: None,
-                schema: FACT_SCHEMA.to_string(),
-                event_id: crate::new_id("fact"),
-                seq: 0,
-                thread_id: crate::new_id("room"),
-                kind: FactKind::ClaimExpired,
-                tool: Some("rally".to_string()),
-                role: None,
-                subject: format!("claim expired: {}", claim.claim_id),
-                scope: claim.raw_scope.clone(),
-                created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                summary: claim
-                    .lease_expires_at
-                    .as_ref()
-                    .map(|lease| format!("lease_expires_at:{lease}")),
-                evidence: vec![format!("expired_claim:{}", claim.claim_id)],
-                target: claim.owner_tool.clone(),
-                ref_id: Some(claim.claim_id.clone()),
-                status: Some("expired".to_string()),
-                severity: None,
-                uri: None,
-                session: None,
-            };
-            appended.push(self.append_fact_verified(&fact)?);
-        }
-        if !appended.is_empty() {
-            self.rebuild_claim_index()?;
-        }
-        Ok(appended)
     }
 
     pub(crate) fn session_facts_with_context_version(&self) -> Result<(Vec<Fact>, Option<u64>)> {
@@ -7357,38 +7301,6 @@ mod ledger_tests {
         assert_eq!(
             older.lease_expires_at.as_deref(),
             Some("2099-01-01T00:30:00Z")
-        );
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn claim_lease_expiry_appends_one_durable_event_and_frees_claim() {
-        let root = unique_root("claim-lease-expire");
-        let store = RoomStore::open_at(root.clone()).unwrap();
-        let claim = claim_fact(
-            "claim-expiring",
-            "tool-a",
-            "file:src/lib.rs",
-            "2000-01-01T00:00:00Z",
-        );
-        store.append_fact_verified(&claim).unwrap();
-
-        let first = store.expire_claim_leases_at(chrono::Utc::now()).unwrap();
-        let second = store.expire_claim_leases_at(chrono::Utc::now()).unwrap();
-        let snapshot = store.snapshot().unwrap();
-        let expired_count = store
-            .facts()
-            .unwrap()
-            .into_iter()
-            .filter(|fact| fact.kind == FactKind::ClaimExpired)
-            .count();
-
-        assert_eq!(first.len(), 1);
-        assert!(second.is_empty(), "expiry must be durable exactly once");
-        assert_eq!(expired_count, 1);
-        assert!(
-            snapshot.active_claims.is_empty(),
-            "expired claim must leave active ownership"
         );
         fs::remove_dir_all(&root).ok();
     }

@@ -340,10 +340,6 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
             operation: "renew_claim_lease",
             selector: Some(format!("claim_id={claim_id}")),
         }),
-        StoreOp::ExpireClaimLeasesAt { now_rfc3339 } => Some(MutationQuery {
-            operation: "expire_claim_leases_at",
-            selector: Some(format!("expiry_cutoff={now_rfc3339}")),
-        }),
         StoreOp::MaybeAppendReadCheckpoint { tool, read_seq } => Some(MutationQuery {
             operation: "maybe_append_read_checkpoint",
             selector: Some(format!("tool={tool},read_seq={read_seq}")),
@@ -509,19 +505,6 @@ impl RoutedRoomStore {
         })? {
             StoreOk::RenewClaimLease { record } => record.map(from_value).transpose(),
             _ => Err(unexpected_reply("renew_claim_lease")),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn expire_claim_leases_at(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<Fact>> {
-        match self.dispatch(StoreOp::ExpireClaimLeasesAt {
-            now_rfc3339: now.to_rfc3339(),
-        })? {
-            StoreOk::ExpireClaimLeasesAt { facts } => facts.into_iter().map(from_value).collect(),
-            _ => Err(unexpected_reply("expire_claim_leases_at")),
         }
     }
 
