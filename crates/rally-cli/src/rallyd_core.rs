@@ -994,11 +994,16 @@ mod imp {
                 }
             }
             StoreOp::SnapshotWithArchived { include_archived } => {
-                let snap = store
-                    .snapshot_with_archived(include_archived)
+                let capture = store
+                    .snapshot_cache_capture(include_archived)
                     .map_err(rally_to_wire)?;
                 StoreOk::Snapshot {
-                    snapshot: snapshot_to_wire(&snap)?,
+                    snapshot: snapshot_to_wire(&capture.snapshot)?,
+                    fingerprint: capture
+                        .fingerprint
+                        .as_ref()
+                        .map(to_wire_value)
+                        .transpose()?,
                 }
             }
             StoreOp::SnapshotScoped {
@@ -1024,6 +1029,7 @@ mod imp {
                     .map_err(rally_to_wire)?;
                 StoreOk::Snapshot {
                     snapshot: snapshot_to_wire(&snap)?,
+                    fingerprint: None,
                 }
             }
             StoreOp::SnapshotWithReadersArchived { include_archived } => {
@@ -1473,6 +1479,144 @@ mod imp {
                 }
                 other => panic!("v4 request was not rejected: {other:?}"),
             }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn o26_routed_snapshot_carries_server_captured_fingerprint() {
+            let repo_root = unique_repo_root("o26-routed-snapshot-capture");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let fact = crate::store::Fact {
+                from_session_id: None,
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o26-routed-snapshot-fact".to_string(),
+                seq: 0,
+                thread_id: "o26-routed-snapshot-thread".to_string(),
+                kind: crate::store::FactKind::Decision,
+                tool: Some("codex:test".to_string()),
+                role: None,
+                subject: "server-anchored snapshot capture".to_string(),
+                scope: Vec::new(),
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact(&fact).unwrap();
+
+            let response = dispatch_one(
+                &mut store,
+                canonical_repo_root(&repo_root).as_str(),
+                StoreRequest::new(
+                    None,
+                    StoreOp::SnapshotWithArchived {
+                        include_archived: false,
+                    },
+                ),
+            );
+            match response {
+                StoreResponse::Ok(StoreOk::Snapshot {
+                    snapshot,
+                    fingerprint: Some(fingerprint),
+                }) => {
+                    let projection_unix_sec = fingerprint["projection_unix_sec"]
+                        .as_i64()
+                        .expect("routed fingerprint must carry its projection epoch");
+                    let direct = store
+                        .test_snapshot_cache_capture_at(false, projection_unix_sec)
+                        .unwrap();
+                    assert_eq!(
+                        snapshot,
+                        crate::store::snapshot_to_wire_value(&direct.snapshot).unwrap()
+                    );
+                    assert_eq!(
+                        fingerprint,
+                        serde_json::to_value(direct.fingerprint.as_ref().unwrap()).unwrap()
+                    );
+                }
+                other => panic!("unexpected routed snapshot capture: {other:?}"),
+            }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn o26_fresh_daemon_repairs_canonical_ahead_db_before_warm_install() {
+            let repo_root = unique_repo_root("o26-fresh-daemon-repair");
+            let rally_dir = repo_root.join(".rally");
+            let seed = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let fact = crate::store::Fact {
+                from_session_id: None,
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o26-fresh-daemon-canonical".to_string(),
+                seq: 0,
+                thread_id: "o26-fresh-daemon-thread".to_string(),
+                kind: crate::store::FactKind::Decision,
+                tool: Some("codex:test".to_string()),
+                role: None,
+                subject: "canonical commit before daemon restart".to_string(),
+                scope: Vec::new(),
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            crate::store::fail_o26_once(&rally_dir, crate::store::O26FaultPoint::FactsDbProjection);
+            let degraded = seed.append_fact(&fact).unwrap();
+            assert!(degraded.committed);
+            assert!(!degraded.projection_complete);
+            drop(seed);
+
+            let mut daemon =
+                match open_direct_store_bounded(repo_root.clone(), Duration::from_secs(5)) {
+                    Ok(store) => store,
+                    Err(failure) => panic!("fresh daemon open failed: {}", failure.error),
+                };
+            let response = dispatch_one(
+                &mut daemon,
+                canonical_repo_root(&repo_root).as_str(),
+                StoreRequest::new(
+                    None,
+                    StoreOp::SnapshotWithArchived {
+                        include_archived: false,
+                    },
+                ),
+            );
+            let snapshot = match response {
+                StoreResponse::Ok(StoreOk::Snapshot {
+                    snapshot,
+                    fingerprint: Some(_),
+                }) => crate::store::snapshot_from_wire_value(snapshot).unwrap(),
+                other => panic!("unexpected fresh-daemon snapshot reply: {other:?}"),
+            };
+            assert!(
+                snapshot
+                    .current_decisions
+                    .iter()
+                    .any(|candidate| candidate.event_id == fact.event_id)
+            );
+            assert_eq!(
+                daemon
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .filter(|candidate| candidate.event_id == fact.event_id)
+                    .count(),
+                1,
+                "pre-warm reconcile must project the canonical fact exactly once"
+            );
+            daemon
+                .close_warm_fact_store_bounded(Duration::from_secs(2))
+                .unwrap();
             std::fs::remove_dir_all(repo_root).ok();
         }
 
@@ -2372,11 +2516,17 @@ mod imp {
                     ),
                 );
                 match routed {
-                    StoreResponse::Ok(StoreOk::Snapshot { snapshot }) => assert_eq!(
+                    StoreResponse::Ok(StoreOk::Snapshot {
                         snapshot,
-                        crate::store::snapshot_to_wire_value(&direct).unwrap(),
-                        "direct/routed scoped projection drifted for include_archived={include_archived}"
-                    ),
+                        fingerprint,
+                    }) => {
+                        assert!(fingerprint.is_none(), "scoped snapshots are not cacheable");
+                        assert_eq!(
+                            snapshot,
+                            crate::store::snapshot_to_wire_value(&direct).unwrap(),
+                            "direct/routed scoped projection drifted for include_archived={include_archived}"
+                        );
+                    }
                     other => panic!("unexpected scoped snapshot reply: {other:?}"),
                 }
             }
@@ -2451,7 +2601,11 @@ mod imp {
                 ),
             );
             let routed = match routed {
-                StoreResponse::Ok(StoreOk::Snapshot { snapshot }) => {
+                StoreResponse::Ok(StoreOk::Snapshot {
+                    snapshot,
+                    fingerprint,
+                }) => {
+                    assert!(fingerprint.is_none(), "scoped snapshots are not cacheable");
                     crate::store::snapshot_from_wire_value(snapshot).unwrap()
                 }
                 other => panic!("unexpected scoped snapshot reply: {other:?}"),

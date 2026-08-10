@@ -2303,6 +2303,17 @@ fn rally_dir_for_segment(path: &Path) -> Result<&Path> {
 
 fn apply_active_tail_repair(path: &Path, repair: ActiveTailRepair, event_id: &str) -> Result<()> {
     let rally_dir = rally_dir_for_segment(path)?;
+    if repair != ActiveTailRepair::None {
+        // Tail repair is the sole bounded rewrite of canonical segment bytes.
+        // Invalidate every derived view before the rewrite begins; the segment
+        // tail hash below independently prevents a stale schema-2 sidecar from
+        // matching even if a best-effort removal cannot complete.
+        invalidate_segment_fold_memo();
+        let _ = fs::remove_file(rally_dir.join(RECONCILE_CACHE_FILENAME));
+        let _ = fs::remove_file(snapshot_cache_path(rally_dir));
+        let _ = fs::remove_file(rally_dir.join(LOG_DIRNAME).join(LOG_INDEX_FILENAME));
+        let _ = fs::remove_file(rally_dir.join(claim_authority::CLAIM_INDEX_FILENAME));
+    }
     match repair {
         ActiveTailRepair::None => return Ok(()),
         ActiveTailRepair::AddNewline => {
@@ -2784,6 +2795,19 @@ impl RoomStore {
         match self {
             RoomStore::Direct(d) => d.snapshot_with_archived(include_archived),
             RoomStore::Routed(r) => r.snapshot_with_archived(include_archived),
+        }
+    }
+
+    /// Capture a snapshot together with the canonical fingerprint measured in
+    /// the same mutation epoch. Routed mode receives the pair captured by the
+    /// daemon; the client never re-fingerprints a detached snapshot.
+    pub(crate) fn snapshot_cache_capture(
+        &self,
+        include_archived: bool,
+    ) -> Result<SnapshotCacheCapture> {
+        match self {
+            RoomStore::Direct(d) => d.snapshot_cache_capture(include_archived),
+            RoomStore::Routed(r) => r.snapshot_cache_capture(include_archived),
         }
     }
 
@@ -4050,6 +4074,13 @@ impl DirectRoomStore {
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
+        self.facts_under_lock()
+    }
+
+    /// Read the reconciled fact projection while the caller already owns the
+    /// room mutation lock. Snapshot-cache capture uses this to keep projection
+    /// and canonical fingerprint inside one epoch without recursive locking.
+    fn facts_under_lock(&self) -> Result<Vec<Fact>> {
         reconcile_segments_and_db(
             &self.log_dir,
             &self.archive_dir,
@@ -4262,19 +4293,56 @@ impl DirectRoomStore {
     /// Snapshot honoring an explicit `include_archived` flag (the
     /// `rally room --include-archived` path re-includes decayed facts).
     pub(crate) fn snapshot_with_archived(&self, include_archived: bool) -> Result<RoomSnapshot> {
+        self.snapshot_cache_capture(include_archived)
+            .map(|capture| capture.snapshot)
+    }
+
+    pub(crate) fn snapshot_cache_capture(
+        &self,
+        include_archived: bool,
+    ) -> Result<SnapshotCacheCapture> {
+        self.snapshot_cache_capture_at(include_archived, projection_unix_sec())
+    }
+
+    fn snapshot_cache_capture_at(
+        &self,
+        include_archived: bool,
+        projection_unix_sec: i64,
+    ) -> Result<SnapshotCacheCapture> {
         let rally_dir = self
             .facts_db_path
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         trigger_o26_fault(rally_dir, O26FaultPoint::SnapshotPostCommit)
             .map_err(|detail| RallyError::Message(format!("snapshot fault: {detail}")))?;
-        let facts = self.facts()?;
+        let _guard = acquire_room_mutation_lock(rally_dir)?;
+        let facts = self.facts_under_lock()?;
         let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
-        Ok(snapshot_from_facts_with_policy(
+        let snapshot = snapshot_from_facts_with_policy_at(
             &facts,
             &coord,
             include_archived,
-        ))
+            projection_unix_sec,
+        );
+        let fingerprint = snapshot_cache_fingerprint_at(
+            rally_dir,
+            projection_unix_sec,
+            include_archived,
+            &coord,
+        )?;
+        Ok(SnapshotCacheCapture {
+            snapshot,
+            fingerprint: Some(fingerprint),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_snapshot_cache_capture_at(
+        &self,
+        include_archived: bool,
+        projection_unix_sec: i64,
+    ) -> Result<SnapshotCacheCapture> {
+        self.snapshot_cache_capture_at(include_archived, projection_unix_sec)
     }
 
     fn repo_wide_claim_lifecycle_facts(&self) -> Result<Vec<Fact>> {
@@ -5237,15 +5305,12 @@ fn facts_from_db_with_query_recovery(
 ///
 /// # Why the fingerprint is trusted
 ///
-/// `(name, len, mtime_ns)` per file, the SAME signal
-/// `refresh_reconcile_cache_after_full_scan` already trusts, and for the same
-/// reason: JSONL segments are append-only, so any content change also changes
-/// `len`. The one documented exception is `seed_segment_from_db`, which
-/// `truncate`s and rewrites — both of its call sites fire only when there are NO
-/// segments at all, so the fingerprint goes from empty to non-empty and the memo
-/// misses anyway. They also call [`invalidate_segment_fold_memo`] explicitly,
-/// because relying on that argument silently is how the next same-length rewrite
-/// path would break this.
+/// `(name, len, mtime_ns, tail_hash)` per file, the SAME signal
+/// `refresh_reconcile_cache_after_full_scan` already trusts. Appends move the
+/// length, while O26's bounded tail repair moves the fixed-size tail hash even
+/// if length and timestamp collide. The repair and `seed_segment_from_db` paths
+/// also call [`invalidate_segment_fold_memo`] before rewriting so the current
+/// process cannot reuse a detached fold.
 ///
 /// # What this does NOT do
 ///
@@ -5265,7 +5330,6 @@ struct SegmentFoldMemo {
 
 /// Forget the memo. Call from any path that rewrites a segment file without
 /// changing its length.
-#[cfg(test)]
 fn invalidate_segment_fold_memo() {
     if let Ok(mut memo) = SEGMENT_FOLD_MEMO.lock() {
         *memo = None;
@@ -5602,10 +5666,25 @@ fn snapshot_from_facts_with_policy(
     coord: &crate::hooks_config::CoordinationConfig,
     include_archived: bool,
 ) -> RoomSnapshot {
-    let now_secs = std::time::SystemTime::now()
+    snapshot_from_facts_with_policy_at(facts, coord, include_archived, projection_unix_sec())
+}
+
+fn projection_unix_sec() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// Deterministic projection core. Snapshot-cache capture passes the same whole
+/// second into both this projection and its freshness proof so a time-derived
+/// decision can never be stamped with a different epoch.
+fn snapshot_from_facts_with_policy_at(
+    facts: &[Fact],
+    coord: &crate::hooks_config::CoordinationConfig,
+    include_archived: bool,
+    now_secs: i64,
+) -> RoomSnapshot {
     let half_life_secs = coord.half_life_secs();
     let floor = coord.archive_floor_weight;
     let is_archived = |fact: &Fact| -> bool {
@@ -6989,17 +7068,16 @@ const RECONCILE_CACHE_FILENAME: &str = ".reconcile-cache.json";
 const RECONCILE_CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Cheap per-file fingerprint component: `(filename, byte_len, mtime_ns)` plus
-/// an optional content hash of the file's first page.
+/// optional fixed-size content hashes.
 ///
-/// For segment files only `(name, len, mtime_ns)` is used — JSONL segments are
-/// append-only, so any content change also changes `len`. (Exception: the
-/// `seed_segment_from_db` path uses `truncate(true)` and rewrites the file at a
-/// potentially equal length — this is safe ONLY because that caller drops the
-/// sidecar before returning (~store.rs `reconcile`, seed branch). Any future
-/// same-length-rewrite path such as compaction or repair MUST also drop the
-/// sidecar, or must add a content hash to segment fingerprints.) For `facts.db` the
-/// `head_hash` (hash of the first 4096 bytes, the SQLite file-format header +
-/// page 1) is ALSO populated: in-place header corruption (SQLITE_NOTADB) keeps
+/// Segment files populate `tail_hash` from their final 4096 bytes. This keeps
+/// O26's bounded tail truncation/newline repair visible even when replacement
+/// bytes preserve the prior file length and the filesystem timestamp collides.
+/// Old schema-2 sidecars deserialize the missing hash as `None`, which cannot
+/// equal a current `Some` hash and therefore fail closed without a schema bump.
+/// For `facts.db` the `head_hash` (hash of the first 4096 bytes, the SQLite
+/// file-format header + page 1) is populated: in-place header corruption
+/// (SQLITE_NOTADB) keeps
 /// the same `len` and may collide on a coarse `mtime_ns` under load, but it
 /// always changes the header bytes — so the head_hash diverges and the fast
 /// path correctly refuses to trust the corrupt db, falling through to
@@ -7012,6 +7090,8 @@ struct FileFingerprint {
     mtime_ns: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     head_hash: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tail_hash: Option<u64>,
 }
 
 /// Derived sidecar for the reconcile fast path. All fields are recomputable from
@@ -7139,8 +7219,8 @@ pub(crate) fn cold_open_count() -> u64 {
     cold_open_probe::count()
 }
 
-/// Fingerprint a single file as `(name, byte_len, mtime_ns)` with NO content
-/// hash. Used for append-only JSONL segments, where any change moves `len`.
+/// Fingerprint a single file as `(name, byte_len, mtime_ns)` with no content
+/// hash. Callers add the fixed-size hash appropriate to their file type.
 /// Returns `None` if the file is absent or its metadata can't be read — callers
 /// treat `None` as "no trustworthy signal" and fall through to the
 /// authoritative path.
@@ -7161,7 +7241,14 @@ fn fingerprint_file(path: &Path) -> Option<FileFingerprint> {
         len: meta.len(),
         mtime_ns,
         head_hash: None,
+        tail_hash: None,
     })
+}
+
+fn fingerprint_segment(path: &Path) -> Option<FileFingerprint> {
+    let mut fingerprint = fingerprint_file(path)?;
+    fingerprint.tail_hash = Some(hash_file_tail(path));
+    Some(fingerprint)
 }
 
 /// Fingerprint `facts.db` for the corruption-safe fast-path guard:
@@ -7212,6 +7299,25 @@ fn hash_file_head(path: &Path) -> u64 {
     hash_bytes_fnv1a(&[])
 }
 
+/// Hash the final 4096 bytes of a canonical segment. Fixed-cost and sensitive
+/// to the only in-place rewrite O26 permits: active-tail framing repair.
+fn hash_file_tail(path: &Path) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = fs::File::open(path) else {
+        return hash_bytes_fnv1a(&[]);
+    };
+    let length = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let start = length.saturating_sub(4096);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return hash_bytes_fnv1a(&[]);
+    }
+    let mut bytes = Vec::with_capacity(4096);
+    if file.take(4096).read_to_end(&mut bytes).is_err() {
+        return hash_bytes_fnv1a(&[]);
+    }
+    hash_bytes_fnv1a(&bytes)
+}
+
 /// FNV-1a 64-bit for persisted filenames/fingerprints. See [`hash_file_head`].
 fn hash_bytes_fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -7227,7 +7333,7 @@ fn segments_fingerprint(live: &[PathBuf], archived: &[PathBuf]) -> Vec<FileFinge
     let mut fps: Vec<FileFingerprint> = live
         .iter()
         .chain(archived.iter())
-        .filter_map(|p| fingerprint_file(p))
+        .filter_map(|p| fingerprint_segment(p))
         .collect();
     fps.sort_by(|a, b| a.name.cmp(&b.name));
     fps
@@ -8184,7 +8290,7 @@ impl DirectRoomStore {
     /// Best-effort — failure does not block reads or appends.
     ///
     /// Skip-when-fresh (Step-4): the index embeds a cheap `fingerprint`
-    /// (sorted `(name, len, mtime_ns)` over live + archive segment files,
+    /// (sorted `(name, len, mtime_ns, tail_hash)` over live + archive segment files,
     /// O(#files)). If the on-disk index's fingerprint already matches the
     /// current one, no segment changed since it was built → return early
     /// WITHOUT the O(#lines) re-read. The index is a derived cache (gitignored,
@@ -8314,25 +8420,38 @@ impl DirectRoomStore {
 // Mitigation: when the canonical ledger has not changed since the last
 // snapshot we projected, reuse that snapshot directly from a tiny on-disk
 // cache instead of reopening the database. Cache freshness is checked
-// against a fingerprint of `(facts.db mtime_ns, log/index.json mtime_ns +
-// content)`. The log-index is refreshed on every append (`refresh_log_index`
-// runs at the end of `append_fact`); a writer that mutates the room thus
-// inevitably invalidates the cache, even when it never touches the cache
-// file itself.
+// against a versioned fingerprint of the canonical live/archive segments,
+// `facts.db` mtime, and `log/index.json` content. Canonical segment length and
+// tail hash therefore invalidate the cache even when a committed append cannot
+// update either derived projection. The fingerprint also binds the exact
+// whole-second projection epoch, archive mode, and five effective coordination
+// inputs used by snapshot projection; time or policy changes therefore miss
+// even when canonical bytes do not move.
 //
 // The cache is *advisory* — a miss only costs the existing slow path; a
 // corrupt cache file is treated as a miss. Readers do NOT take the mutation
-// lock on the fast path: the cache is read-only and the underlying canonical
-// files are append-only, so a reader that observes a fingerprint can rely
-// on it being a consistent view of the ledger at that moment in time. The
-// fingerprint mechanism is the only correctness gate.
+// lock on the fast path: the captured fingerprint binds the snapshot to one
+// mutation epoch, and full equality with the current input fingerprint is the
+// correctness gate. Exact-second equality is intentionally conservative; a
+// longer TTL could cross a liveness decision boundary.
 
 const SNAPSHOT_CACHE_FILENAME: &str = "snapshot.cache.json";
+const SNAPSHOT_CACHE_GENERATION: u32 = 2;
+
+/// Snapshot and freshness proof captured while one room mutation lock is held.
+/// This pair is the only value accepted by the cache writer.
+#[derive(Clone, Debug)]
+pub(crate) struct SnapshotCacheCapture {
+    pub(crate) snapshot: RoomSnapshot,
+    /// `None` is a compatible routed reply from a peer that cannot provide a
+    /// server-anchored proof. Such a capture is usable but never cacheable.
+    pub(crate) fingerprint: Option<SnapshotCacheFingerprint>,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct SnapshotCacheEnvelope {
-    /// Fingerprint of the canonical inputs at the time of caching. A cache
-    /// is fresh iff this matches the current fingerprint exactly.
+    /// Fingerprint of the canonical and projection inputs at capture time. A
+    /// cache is fresh iff this matches the current fingerprint exactly.
     fingerprint: SnapshotCacheFingerprint,
     /// Projected `RoomSnapshot` for the fingerprinted ledger state.
     snapshot: RoomSnapshot,
@@ -8340,8 +8459,28 @@ struct SnapshotCacheEnvelope {
     cached_at: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-struct SnapshotCacheFingerprint {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct SnapshotCacheFingerprint {
+    /// Snapshot-cache contract generation. This is independent of the O29
+    /// reconcile-cache schema; older/missing generations always miss.
+    #[serde(default)]
+    generation: u32,
+    /// Canonical live+archive segment fingerprints, including fixed-size tail
+    /// hashes so canonical-only commits and tail repairs invalidate old caches.
+    #[serde(default)]
+    segments_fingerprint: Vec<FileFingerprint>,
+    /// Whole-second clock value used by the snapshot projection itself. Cache
+    /// reads require exact equality with the current second because squad
+    /// liveness and archive membership can change without a canonical write.
+    #[serde(default)]
+    projection_unix_sec: i64,
+    /// Projection mode is part of snapshot identity. The before-write cache
+    /// consumes only the default, non-archived view.
+    #[serde(default)]
+    include_archived: bool,
+    /// Exact effective inputs read by `snapshot_from_facts_with_policy_at`.
+    #[serde(default)]
+    projection_policy: SnapshotProjectionPolicyFingerprint,
     /// `facts.db` modification time in nanoseconds since the unix epoch.
     /// 0 when the db file is absent (a perfectly valid empty-room state).
     facts_db_mtime_ns: i128,
@@ -8352,6 +8491,27 @@ struct SnapshotCacheFingerprint {
     /// re-stamps `updated_at`). Bounded in size by the live segment count,
     /// not by the line count.
     log_index_text: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct SnapshotProjectionPolicyFingerprint {
+    half_life_hours_bits: u64,
+    archive_floor_weight_bits: u64,
+    default_cadence_secs: i64,
+    miss_multiplier: i64,
+    grace_secs: i64,
+}
+
+impl SnapshotProjectionPolicyFingerprint {
+    fn from_effective(coord: &crate::hooks_config::CoordinationConfig) -> Self {
+        Self {
+            half_life_hours_bits: coord.half_life_hours.to_bits(),
+            archive_floor_weight_bits: coord.archive_floor_weight.to_bits(),
+            default_cadence_secs: coord.default_cadence_secs,
+            miss_multiplier: coord.miss_multiplier,
+            grace_secs: coord.grace_secs,
+        }
+    }
 }
 
 fn snapshot_cache_path(rally_dir: &Path) -> PathBuf {
@@ -8371,25 +8531,43 @@ fn file_mtime_ns(path: &Path) -> i128 {
     }
 }
 
-fn current_fingerprint(rally_dir: &Path) -> SnapshotCacheFingerprint {
+fn snapshot_cache_fingerprint_at(
+    rally_dir: &Path,
+    projection_unix_sec: i64,
+    include_archived: bool,
+    coord: &crate::hooks_config::CoordinationConfig,
+) -> Result<SnapshotCacheFingerprint> {
     let facts_db = rally_dir.join("facts.db");
     let log_index = rally_dir.join(LOG_DIRNAME).join(LOG_INDEX_FILENAME);
-    SnapshotCacheFingerprint {
+    let live = read_segment_files(&rally_dir.join(LOG_DIRNAME))?;
+    let archived = replay_archive_segments(&rally_dir.join(ARCHIVE_DIRNAME))?;
+    Ok(SnapshotCacheFingerprint {
+        generation: SNAPSHOT_CACHE_GENERATION,
+        segments_fingerprint: segments_fingerprint(&live, &archived),
+        projection_unix_sec,
+        include_archived,
+        projection_policy: SnapshotProjectionPolicyFingerprint::from_effective(coord),
         facts_db_mtime_ns: file_mtime_ns(&facts_db),
         log_index_text: fs::read_to_string(&log_index).unwrap_or_default(),
-    }
+    })
 }
 
 /// Read-only snapshot retrieval: return the cached `RoomSnapshot` when its
-/// fingerprint matches the current canonical state. `None` when the cache is
-/// absent, unparseable, or stale. No mutation lock is acquired and no SQLite
-/// connection is opened on a hit; this is the path the before-write gate
-/// takes under sub-100ms targets.
+/// fingerprint matches the current canonical and projection inputs. `None`
+/// when the cache is absent, unparseable, or stale. No mutation lock is
+/// acquired and no SQLite connection is opened on a hit; this is the path the
+/// before-write gate takes under sub-100ms targets.
 pub(crate) fn try_load_cached_snapshot(rally_dir: &Path) -> Option<RoomSnapshot> {
+    try_load_cached_snapshot_at(rally_dir, projection_unix_sec())
+}
+
+fn try_load_cached_snapshot_at(rally_dir: &Path, projection_unix_sec: i64) -> Option<RoomSnapshot> {
     let cache_path = snapshot_cache_path(rally_dir);
     let text = fs::read_to_string(&cache_path).ok()?;
     let envelope: SnapshotCacheEnvelope = serde_json::from_str(&text).ok()?;
-    let now = current_fingerprint(rally_dir);
+    let repo_root = rally_dir.parent()?;
+    let coord = crate::hooks_config::resolve_coordination(repo_root).ok()?;
+    let now = snapshot_cache_fingerprint_at(rally_dir, projection_unix_sec, false, &coord).ok()?;
     if envelope.fingerprint == now {
         Some(envelope.snapshot)
     } else {
@@ -8397,13 +8575,17 @@ pub(crate) fn try_load_cached_snapshot(rally_dir: &Path) -> Option<RoomSnapshot>
     }
 }
 
-/// Persist `snapshot` under the current fingerprint. Atomic temp+rename; any
-/// IO error is swallowed (the cache is advisory — a failed write only forces
-/// the next reader through the slow path).
-pub(crate) fn write_snapshot_cache(rally_dir: &Path, snapshot: &RoomSnapshot) {
+/// Persist a previously captured snapshot/fingerprint pair. The writer never
+/// measures current files: doing so could stamp an old snapshot with a newer
+/// canonical generation after an intervening append. Atomic temp+rename; any
+/// IO error is swallowed because the cache is advisory.
+pub(crate) fn write_snapshot_cache(rally_dir: &Path, capture: &SnapshotCacheCapture) {
+    let Some(fingerprint) = capture.fingerprint.clone() else {
+        return;
+    };
     let envelope = SnapshotCacheEnvelope {
-        fingerprint: current_fingerprint(rally_dir),
-        snapshot: snapshot.clone(),
+        fingerprint,
+        snapshot: capture.snapshot.clone(),
         cached_at: now_string(),
     };
     let Ok(rendered) = serde_json::to_string(&envelope) else {
@@ -8436,8 +8618,8 @@ pub(crate) fn try_load_cached_snapshot_for(repo_root: &Path) -> Option<RoomSnaps
 
 /// Convenience writer keyed by `repo_root` rather than the inner `.rally`
 /// directory. Same fail-soft semantics as [`write_snapshot_cache`].
-pub(crate) fn write_snapshot_cache_for(repo_root: &Path, snapshot: &RoomSnapshot) {
-    write_snapshot_cache(&repo_root.join(".rally"), snapshot);
+pub(crate) fn write_snapshot_cache_for(repo_root: &Path, capture: &SnapshotCacheCapture) {
+    write_snapshot_cache(&repo_root.join(".rally"), capture);
 }
 
 #[cfg(test)]
@@ -14449,6 +14631,281 @@ mod ledger_tests {
                 .filter(|fact| fact.event_id == candidate.event_id)
                 .count(),
             1
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_detached_snapshot_cannot_be_stamped_with_a_new_canonical_fingerprint() {
+        let root = unique_root("o26-snapshot-cache-detached-pair");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let first = make_fact(
+            "o26-cache-first",
+            FactKind::Decision,
+            "src/",
+            "first cached fact",
+        );
+        store.append_fact(&first).unwrap();
+        let detached = store.snapshot_cache_capture(false).unwrap();
+
+        let second = make_fact(
+            "o26-cache-second",
+            FactKind::Decision,
+            "src/",
+            "intervening canonical fact",
+        );
+        store.append_fact(&second).unwrap();
+        let rally_dir = root.join(".rally");
+        write_snapshot_cache(&rally_dir, &detached);
+
+        let cached = try_load_cached_snapshot(&rally_dir);
+        assert!(
+            cached.as_ref().is_none_or(|snapshot| {
+                snapshot
+                    .current_decisions
+                    .iter()
+                    .any(|fact| fact.event_id == second.event_id)
+            }),
+            "a detached old snapshot must not be published under the intervening commit's fingerprint"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_snapshot_cache_expires_across_no_write_liveness_transition() {
+        let root = unique_root("o26-snapshot-cache-liveness-time");
+        let rally_dir = root.join(".rally");
+        fs::create_dir_all(&rally_dir).unwrap();
+        let projection_time = 2_000_000_000_i64;
+        let owner = "codex:idle-owner";
+        let created_at =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(projection_time - 1_000, 0)
+                .unwrap()
+                .to_rfc3339();
+        let prior_created_at =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(projection_time - 1_100, 0)
+                .unwrap()
+                .to_rfc3339();
+
+        let mut prior_presence = make_fact(
+            "o26-cache-presence-prior",
+            FactKind::Presence,
+            "session",
+            "prior branch position",
+        );
+        prior_presence.seq = 1;
+        prior_presence.tool = Some(owner.to_string());
+        prior_presence.created_at = prior_created_at;
+        prior_presence.evidence = vec!["branch_head_sha:aaaa".to_string()];
+
+        let mut presence = make_fact(
+            "o26-cache-presence-current",
+            FactKind::Presence,
+            "session",
+            "current branch position",
+        );
+        presence.seq = 2;
+        presence.tool = Some(owner.to_string());
+        presence.created_at = created_at.clone();
+        presence.evidence = vec!["branch_head_sha:bbbb".to_string()];
+
+        let mut handoff = make_fact(
+            "o26-cache-owner-handoff",
+            FactKind::Handoff,
+            "work",
+            "inject signal",
+        );
+        handoff.seq = 3;
+        handoff.tool = Some(owner.to_string());
+        handoff.target = Some(owner.to_string());
+        handoff.created_at = created_at.clone();
+
+        let mut claim = make_fact(
+            "o26-cache-owner-claim",
+            FactKind::Claim,
+            "file:src/shared.rs",
+            "plan signal",
+        );
+        claim.seq = 4;
+        claim.tool = Some(owner.to_string());
+        claim.created_at = created_at;
+
+        let facts = vec![prior_presence, presence, handoff, claim];
+        let coord = crate::hooks_config::CoordinationConfig::default();
+        let cached = snapshot_from_facts_with_policy_at(&facts, &coord, false, projection_time);
+        let mut cached_findings = Vec::new();
+        crate::check::check_before_write_for_test(
+            &cached,
+            "codex:contender",
+            Some("src/shared.rs"),
+            &mut cached_findings,
+        );
+        assert!(cached_findings.contains(&("stale-owner-claim", "warn")));
+
+        let later_time = projection_time + 1_000;
+        let fresh = snapshot_from_facts_with_policy_at(&facts, &coord, false, later_time);
+        let mut fresh_findings = Vec::new();
+        crate::check::check_before_write_for_test(
+            &fresh,
+            "codex:contender",
+            Some("src/shared.rs"),
+            &mut fresh_findings,
+        );
+        assert!(fresh_findings.contains(&("claimed-path", "stop")));
+
+        let fingerprint =
+            snapshot_cache_fingerprint_at(&rally_dir, projection_time, false, &coord).unwrap();
+        write_snapshot_cache(
+            &rally_dir,
+            &SnapshotCacheCapture {
+                snapshot: cached,
+                fingerprint: Some(fingerprint),
+            },
+        );
+        assert!(try_load_cached_snapshot_at(&rally_dir, projection_time).is_some());
+        assert!(
+            try_load_cached_snapshot_at(&rally_dir, later_time).is_none(),
+            "a cache captured before a no-write liveness transition must miss afterward"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_snapshot_cache_misses_when_effective_projection_policy_changes() {
+        let _env_lock = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        struct RestoreProjectionEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreProjectionEnv {
+            fn drop(&mut self) {
+                for (name, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => unsafe { std::env::set_var(name, value) },
+                        None => unsafe { std::env::remove_var(name) },
+                    }
+                }
+            }
+        }
+        let projection_env = [
+            "RALLY_HALF_LIFE_HOURS",
+            "RALLY_ARCHIVE_FLOOR",
+            "RALLY_DEFAULT_CADENCE_SECS",
+            "RALLY_MISS_MULTIPLIER",
+            "RALLY_GRACE_SECS",
+        ];
+        let _restore_env = RestoreProjectionEnv(
+            projection_env
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        );
+        for name in projection_env {
+            unsafe { std::env::remove_var(name) };
+        }
+
+        let root = unique_root("o26-snapshot-cache-policy");
+        let rally_dir = root.join(".rally");
+        fs::create_dir_all(&rally_dir).unwrap();
+        let projection_time = 2_000_000_000_i64;
+        let initial_policy = crate::hooks_config::resolve_coordination(&root).unwrap();
+        let fingerprint =
+            snapshot_cache_fingerprint_at(&rally_dir, projection_time, false, &initial_policy)
+                .unwrap();
+        write_snapshot_cache(
+            &rally_dir,
+            &SnapshotCacheCapture {
+                snapshot: RoomSnapshot::default(),
+                fingerprint: Some(fingerprint),
+            },
+        );
+        assert!(try_load_cached_snapshot_at(&rally_dir, projection_time).is_some());
+
+        let changed_cadence = if initial_policy.default_cadence_secs == 900 {
+            901
+        } else {
+            900
+        };
+        fs::write(
+            rally_dir.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "coordination": {"default_cadence_secs": changed_cadence}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            try_load_cached_snapshot_at(&rally_dir, projection_time).is_none(),
+            "a repo policy change must invalidate the cache without a canonical write"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_canonical_only_degraded_commit_invalidates_restored_old_snapshot_cache() {
+        let root = unique_root("o26-snapshot-cache-canonical-generation");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let first = make_fact(
+            "o26-cache-generation-first",
+            FactKind::Decision,
+            "src/",
+            "cached canonical generation",
+        );
+        store.append_fact(&first).unwrap();
+        let rally_dir = root.join(".rally");
+        fs::remove_file(store.log_dir.join(LOG_INDEX_FILENAME)).ok();
+        let old_capture = store.snapshot_cache_capture(false).unwrap();
+        write_snapshot_cache(&rally_dir, &old_capture);
+        let cache_path = snapshot_cache_path(&rally_dir);
+        let old_cache = fs::read(&cache_path).unwrap();
+
+        let second = make_fact(
+            "o26-cache-generation-second",
+            FactKind::Decision,
+            "src/",
+            "canonical commit without DB projection",
+        );
+        fail_o26_once(&rally_dir, O26FaultPoint::FactsDbProjection);
+        let degraded = store.append_fact(&second).unwrap();
+        assert!(degraded.committed);
+        assert!(!degraded.projection_complete);
+        fs::write(&cache_path, old_cache).unwrap();
+
+        assert!(
+            try_load_cached_snapshot(&rally_dir).is_none(),
+            "canonical segment generation must reject an old cache even when DB/index signals are unchanged"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_segment_fingerprint_hashes_tail_for_same_length_repair() {
+        let root = unique_root("o26-segment-tail-fingerprint");
+        let log_dir = root.join(".rally").join(LOG_DIRNAME);
+        fs::create_dir_all(&log_dir).unwrap();
+        let segment = log_dir.join("alpha.jsonl");
+        let mut first_bytes = vec![b'x'; 8192];
+        first_bytes.extend_from_slice(b"first-tail");
+        fs::write(&segment, &first_bytes).unwrap();
+        let first = serde_json::to_value(segments_fingerprint(std::slice::from_ref(&segment), &[]))
+            .unwrap();
+
+        let mut second_bytes = vec![b'x'; 8192];
+        second_bytes.extend_from_slice(b"other-tail");
+        assert_eq!(second_bytes.len(), first_bytes.len());
+        fs::write(&segment, &second_bytes).unwrap();
+        let second =
+            serde_json::to_value(segments_fingerprint(std::slice::from_ref(&segment), &[]))
+                .unwrap();
+
+        let first_tail = &first[0]["tail_hash"];
+        let second_tail = &second[0]["tail_hash"];
+        assert!(
+            !first_tail.is_null(),
+            "segment fingerprints need a tail hash"
+        );
+        assert_ne!(
+            first_tail, second_tail,
+            "same-length tail repair must invalidate persisted and in-process fingerprints"
         );
         fs::remove_dir_all(&root).ok();
     }

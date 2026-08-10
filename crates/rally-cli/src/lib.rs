@@ -5394,13 +5394,13 @@ fn command_check(args: CheckArgs) -> Result<Output> {
     if tool != "unknown" {
         ensure_presence(&room, &tool)?;
     }
-    let snapshot = room.snapshot()?;
-    // B-perf: refresh the snapshot cache after every successful slow-path
-    // snapshot. The next invocation that observes the same fingerprint takes
-    // the fast path above.
+    let capture = room.snapshot_cache_capture(false)?;
+    // B-perf: persist the exact snapshot/fingerprint pair captured in one
+    // mutation epoch. The writer never re-fingerprints detached state.
     if let Ok(repo_root_path) = repo_root() {
-        crate::store::write_snapshot_cache_for(&repo_root_path, &snapshot);
+        crate::store::write_snapshot_cache_for(&repo_root_path, &capture);
     }
+    let snapshot = capture.snapshot;
     let check = build_check(phase, tool, path, args.strict, &snapshot)?;
     let body = envelope("check", SCHEMA_CHECK, check.data)?;
     let text = format!("check findings={}", check.finding_count);

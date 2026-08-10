@@ -47,7 +47,7 @@ use crate::claim_authority;
 use crate::error::{RallyError, Result};
 use crate::store::{
     self, AppendOutcome, ConditionalAppendOutcome, Fact, ReadReceipt, RenewClaimLeaseOutcome,
-    RoomSnapshot,
+    RoomSnapshot, SnapshotCacheCapture, SnapshotCacheFingerprint,
 };
 
 /// Discovery pointer filename inside `.rally/` (L7/ADR-02) — the daemon's
@@ -674,8 +674,26 @@ impl RoutedRoomStore {
 
     pub(crate) fn snapshot_with_archived(&self, include_archived: bool) -> Result<RoomSnapshot> {
         match self.dispatch(StoreOp::SnapshotWithArchived { include_archived })? {
-            StoreOk::Snapshot { snapshot } => snapshot_from_value(snapshot),
+            StoreOk::Snapshot { snapshot, .. } => snapshot_from_value(snapshot),
             _ => Err(unexpected_reply("snapshot_with_archived")),
+        }
+    }
+
+    pub(crate) fn snapshot_cache_capture(
+        &self,
+        include_archived: bool,
+    ) -> Result<SnapshotCacheCapture> {
+        match self.dispatch(StoreOp::SnapshotWithArchived { include_archived })? {
+            StoreOk::Snapshot {
+                snapshot,
+                fingerprint,
+            } => Ok(SnapshotCacheCapture {
+                snapshot: snapshot_from_value(snapshot)?,
+                fingerprint: fingerprint
+                    .map(from_value::<SnapshotCacheFingerprint>)
+                    .transpose()?,
+            }),
+            _ => Err(unexpected_reply("snapshot_cache_capture")),
         }
     }
 
@@ -695,7 +713,7 @@ impl RoutedRoomStore {
             include_presence_only,
         };
         match self.dispatch_with_engagement(engagement.to_string(), op)? {
-            StoreOk::Snapshot { snapshot } => snapshot_from_value(snapshot),
+            StoreOk::Snapshot { snapshot, .. } => snapshot_from_value(snapshot),
             _ => Err(unexpected_reply("snapshot_scoped")),
         }
     }
@@ -1041,5 +1059,67 @@ mod tests {
         }))
         .expect_err("conditional wire outcome must enforce nested invariants");
         assert!(error.to_string().contains("projection_complete"));
+    }
+
+    #[test]
+    fn routed_snapshot_without_server_fingerprint_is_usable_but_not_cacheable() {
+        let socket = unique_socket("snapshot-no-fingerprint");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let expected = RoomSnapshot::default();
+        let wire_snapshot = store::snapshot_to_wire_value(&expected).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let request: StoreRequest = serde_json::from_str(request.trim()).unwrap();
+            assert!(matches!(
+                request.op,
+                StoreOp::SnapshotWithArchived {
+                    include_archived: false
+                }
+            ));
+            let response = StoreResponse::Ok(StoreOk::Snapshot {
+                snapshot: wire_snapshot,
+                fingerprint: None,
+            });
+            let mut writer = &stream;
+            writer
+                .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+                .unwrap();
+            writer.flush().unwrap();
+        });
+
+        let cache_root = std::env::temp_dir().join(format!(
+            "routed-snapshot-cache-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let routed = RoutedRoomStore {
+            socket: socket.clone(),
+            repo_root: cache_root.clone(),
+            active_engagement: "test".to_string(),
+            cursor_path: cache_root.join(".rally/cursors.json"),
+            log_dir: cache_root.join(".rally/log"),
+            claim_index_path: cache_root.join(".rally/claim-index.json"),
+        };
+        let capture = routed.snapshot_cache_capture(false).unwrap();
+        assert!(capture.fingerprint.is_none());
+        assert_eq!(
+            store::snapshot_to_wire_value(&capture.snapshot).unwrap(),
+            store::snapshot_to_wire_value(&expected).unwrap()
+        );
+        store::write_snapshot_cache_for(&cache_root, &capture);
+        assert!(!cache_root.join(".rally/snapshot.cache.json").exists());
+        assert!(
+            !cache_root.join(".rally/mutation.lock").exists(),
+            "a routed snapshot capture must not acquire a client-side mutation lock"
+        );
+
+        server.join().unwrap();
+        std::fs::remove_file(&socket).ok();
+        std::fs::remove_dir_all(&cache_root).ok();
     }
 }

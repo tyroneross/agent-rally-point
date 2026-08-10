@@ -264,8 +264,13 @@ pub enum StoreOk {
         facts: Vec<Value>,
         context_version: Option<u64>,
     },
-    /// `RoomSnapshot`.
-    Snapshot { snapshot: Value },
+    /// `RoomSnapshot` plus an optional server-captured snapshot-cache
+    /// fingerprint. `None` is compatible but never cacheable by a v5 client.
+    Snapshot {
+        snapshot: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<Value>,
+    },
     /// `RoomSnapshot` (readers projected).
     SnapshotWithReaders { snapshot: Value },
     /// `i64`.
@@ -443,6 +448,36 @@ mod tests {
             }
             other => panic!("unexpected op: {other:?}"),
         }
+
+        let fingerprint = serde_json::json!({
+            "generation": 2,
+            "segments_fingerprint": [],
+            "facts_db_mtime_ns": 0,
+            "log_index_text": ""
+        });
+        let response = StoreResponse::Ok(StoreOk::Snapshot {
+            snapshot: serde_json::json!({"max_seq": 0}),
+            fingerprint: Some(fingerprint.clone()),
+        });
+        match serde_json::from_str::<StoreResponse>(&serde_json::to_string(&response).unwrap())
+            .unwrap()
+        {
+            StoreResponse::Ok(StoreOk::Snapshot {
+                fingerprint: Some(actual),
+                ..
+            }) => assert_eq!(actual, fingerprint),
+            other => panic!("snapshot fingerprint did not round-trip: {other:?}"),
+        }
+
+        let compatible_without_fingerprint: StoreResponse =
+            serde_json::from_str(r#"{"ok":{"kind":"snapshot","snapshot":{"max_seq":0}}}"#).unwrap();
+        assert!(matches!(
+            compatible_without_fingerprint,
+            StoreResponse::Ok(StoreOk::Snapshot {
+                fingerprint: None,
+                ..
+            })
+        ));
     }
 
     #[test]
