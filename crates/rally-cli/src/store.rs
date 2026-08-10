@@ -6498,12 +6498,18 @@ mod ledger_tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    static UNIQUE_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn unique_root(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("rally-{label}-{nanos}"));
+        let counter = UNIQUE_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "rally-{label}-pid{}-{counter}-{nanos}",
+            std::process::id()
+        ));
         fs::create_dir_all(&root).unwrap();
         root
     }
