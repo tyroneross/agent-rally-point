@@ -153,7 +153,27 @@ impl Workspace {
 }
 
 fn error_text(v: &Value) -> String {
-    v["error"].as_str().unwrap_or_default().to_string()
+    if let Some(error) = v["error"].as_str() {
+        return error.to_string();
+    }
+    if let Some(message) = v["data"]["warning"]["message"].as_str() {
+        return message.to_string();
+    }
+    let warnings = v["data"]["append_outcomes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|outcome| outcome["warnings"].as_array().into_iter().flatten())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "refusal JSON must carry exactly one unambiguous append warning: {v}"
+    );
+    warnings[0]["message"]
+        .as_str()
+        .expect("the sole append warning must carry a message")
+        .to_string()
 }
 
 /// THE defect. A non-owner resolves a live claim by ref and takes the path.

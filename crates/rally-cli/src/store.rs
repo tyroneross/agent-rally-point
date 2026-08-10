@@ -1,4 +1,4 @@
-use factstr::{EventQuery as FactQuery, EventStore, EventStoreError, NewEvent};
+use factstr::{EventQuery as FactQuery, EventStore, NewEvent};
 use factstr_sqlite::SqliteStore;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -147,6 +147,16 @@ pub(crate) fn with_mutation_deadline<T>(budget: Duration, work: impl FnOnce() ->
     with_mutation_deadline_at(requested, work)
 }
 
+#[cfg(test)]
+pub(crate) fn expire_mutation_deadline_for_test() {
+    MUTATION_DEADLINE.with(|slot| slot.set(Some(Instant::now())));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_mutation_deadline_for_test() {
+    MUTATION_DEADLINE.with(|slot| slot.set(None));
+}
+
 /// Run `work` with an already-anchored monotonic deadline.
 ///
 /// Routed requests use this form so dispatcher queueing or preemption between
@@ -186,6 +196,20 @@ fn mutation_not_started_after_provisional_lock(path: &Path) -> RallyError {
     ))
 }
 
+fn mutation_start_deadline_elapsed() -> bool {
+    Instant::now() >= effective_mutation_deadline()
+}
+
+pub(crate) fn ensure_new_mutation_can_start(path: &Path) -> Result<()> {
+    if mutation_start_deadline_elapsed() {
+        return Err(RallyError::NotStarted(format!(
+            "mutation-not-started: deadline elapsed after validation but before the first durable side effect at {}; no durable mutation started and retry is safe",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 mod unix_lock {
     /// Shared (read) advisory lock — many holders coexist. Direct mode holds
@@ -211,6 +235,13 @@ mod unix_lock {
 /// whether ANY process may open facts.db directly at all.
 pub(crate) const RALLYD_OWNER_LOCK_FILENAME: &str = "rallyd.owner.lock";
 
+/// Durable fence installed by the explicit offline DB-only migration. While
+/// this marker (or its create-new staging predecessor) exists, doctor owns the
+/// only safe recovery path: an ordinary open/reconcile/append could otherwise
+/// change the marker-bound DB or its hard-linked canonical candidate.
+pub(crate) const DB_ONLY_MIGRATION_MARKER_FILENAME: &str = "db-only-migration.v1.json";
+pub(crate) const DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME: &str = "db-only-migration.v1.marker.tmp";
+
 /// Exclusive process-lifetime guard for the direct fallback. The daemon does
 /// not take this lock: it already owns [`RALLYD_OWNER_LOCK_FILENAME`] EX for
 /// its serving lifetime. A direct process takes this lock EX first and then
@@ -219,14 +250,212 @@ pub(crate) const RALLYD_OWNER_LOCK_FILENAME: &str = "rallyd.owner.lock";
 /// SH -> EX handover.
 const DIRECT_OWNER_LOCK_FILENAME: &str = "direct.owner.lock";
 
+fn ensure_no_db_only_migration_recovery(root: &Path) -> Result<()> {
+    let rally_dir = root.join(".rally");
+    for filename in [
+        DB_ONLY_MIGRATION_MARKER_FILENAME,
+        DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME,
+    ] {
+        let path = rally_dir.join(filename);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(RallyError::Usage(format!(
+                    "DB-only migration recovery is pending at {}; ordinary Rally store access is fenced to preserve marker-bound evidence. Resume with `rally doctor --migrate-db-only --engagement <label> --apply --json`",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(RallyError::io(format!(
+                    "stat DB-only migration recovery marker {}",
+                    path.display()
+                ))(error));
+            }
+        }
+    }
+    Ok(())
+}
+
 use crate::backends::ManagedSession;
 use crate::cli::RoomArgs;
 use crate::discovery::refresh_room_index;
 use crate::error::{RallyError, Result};
 use crate::store_client::{self, RoutedRoomStore};
 use std::hash::{Hash, Hasher};
+#[cfg(test)]
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+
+/// Deterministic O26 fault sites. Test controls are keyed by the exact `.rally`
+/// path, so parallel stores cannot affect one another. Production builds retain
+/// only no-op call sites; no environment variable or process-wide switch can
+/// alter storage behavior.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum O26FaultPoint {
+    BeforeCanonicalMutation,
+    TailRepairSync,
+    AfterTailRepair,
+    PartialCanonicalWrite,
+    AfterCanonicalSyncBeforeReadback,
+    AfterCanonicalReadback,
+    FactsDbProjection,
+    ReconcileCacheProjection,
+    SnapshotPostCommit,
+    DaemonReplyDrop,
+}
+
+#[cfg(test)]
+enum O26FaultAction {
+    Pass,
+    Fail,
+    Pause(Arc<O26FaultPauseState>),
+}
+
+#[cfg(test)]
+struct O26FaultPauseState {
+    phase: Mutex<u8>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+pub(crate) struct O26FaultPause {
+    state: Arc<O26FaultPauseState>,
+}
+
+#[cfg(test)]
+impl O26FaultPause {
+    pub(crate) fn wait_until_reached(&self) {
+        let mut phase = self
+            .state
+            .phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *phase == 0 {
+            phase = self
+                .state
+                .changed
+                .wait(phase)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    pub(crate) fn resume(&self) {
+        let mut phase = self
+            .state
+            .phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *phase = 2;
+        self.state.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+type O26FaultQueue = BTreeMap<(PathBuf, O26FaultPoint), VecDeque<O26FaultAction>>;
+
+#[cfg(test)]
+static O26_TEST_FAULTS: OnceLock<Mutex<O26FaultQueue>> = OnceLock::new();
+
+#[cfg(test)]
+fn o26_faults() -> &'static Mutex<O26FaultQueue> {
+    O26_TEST_FAULTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn fail_o26_once(rally_dir: &Path, point: O26FaultPoint) {
+    o26_faults()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry((rally_dir.to_path_buf(), point))
+        .or_default()
+        .push_back(O26FaultAction::Fail);
+}
+
+#[cfg(test)]
+pub(crate) fn skip_o26_once(rally_dir: &Path, point: O26FaultPoint) {
+    o26_faults()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry((rally_dir.to_path_buf(), point))
+        .or_default()
+        .push_back(O26FaultAction::Pass);
+}
+
+#[cfg(test)]
+pub(crate) fn pause_o26_once(rally_dir: &Path, point: O26FaultPoint) -> O26FaultPause {
+    let state = Arc::new(O26FaultPauseState {
+        phase: Mutex::new(0),
+        changed: Condvar::new(),
+    });
+    o26_faults()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry((rally_dir.to_path_buf(), point))
+        .or_default()
+        .push_back(O26FaultAction::Pause(Arc::clone(&state)));
+    O26FaultPause { state }
+}
+
+#[cfg(test)]
+pub(crate) fn trigger_o26_fault(
+    rally_dir: &Path,
+    point: O26FaultPoint,
+) -> std::result::Result<(), &'static str> {
+    let action = {
+        let mut faults = o26_faults()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (rally_dir.to_path_buf(), point);
+        let action = faults.get_mut(&key).and_then(VecDeque::pop_front);
+        if faults.get(&key).is_some_and(VecDeque::is_empty) {
+            faults.remove(&key);
+        }
+        action
+    };
+    match action {
+        None => Ok(()),
+        Some(O26FaultAction::Pass) => Ok(()),
+        Some(O26FaultAction::Fail) => Err("injected path-scoped O26 fault"),
+        Some(O26FaultAction::Pause(state)) => {
+            let mut phase = state
+                .phase
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *phase = 1;
+            state.changed.notify_all();
+            while *phase != 2 {
+                phase = state
+                    .changed
+                    .wait(phase)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+fn o26_fault_armed(rally_dir: &Path, point: O26FaultPoint) -> bool {
+    o26_faults()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&(rally_dir.to_path_buf(), point))
+        .is_some_and(|queue| !queue.is_empty())
+}
+
+#[cfg(not(test))]
+pub(crate) fn trigger_o26_fault(
+    _rally_dir: &Path,
+    _point: O26FaultPoint,
+) -> std::result::Result<(), &'static str> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn o26_fault_armed(_rally_dir: &Path, _point: O26FaultPoint) -> bool {
+    false
+}
 
 /// Process-global retry salt. Bumped on every SQLite-busy retry so that two
 /// retriers in the SAME process (same pid, possibly even the same thread id if
@@ -663,6 +892,129 @@ impl Fact {
             serde_json::from_value(value).map_err(RallyError::json("parse fact payload"))?;
         fact.seq = seq;
         Ok(fact)
+    }
+}
+
+/// A typed degradation that happened only after the canonical JSONL fact was
+/// synced and read back exactly. Callers must surface these warnings, but must
+/// not retry the mutation: `committed` is already true.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionWarningCode {
+    FactsDb,
+    ReconcileCache,
+    LogIndex,
+    ClaimIndex,
+    TransitionVerification,
+    PostCommitWork,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+pub(crate) struct ProjectionWarning {
+    pub(crate) code: ProjectionWarningCode,
+    pub(crate) message: String,
+}
+
+/// Successful append reply. This type is returned only after exact canonical
+/// readback, so `committed` is invariantly true; projection failures are data,
+/// not retryable append failures.
+#[must_use = "a committed append may carry projection warnings that forbid blind retry"]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct AppendOutcome {
+    pub(crate) fact: Fact,
+    pub(crate) committed: bool,
+    pub(crate) projection_complete: bool,
+    pub(crate) warnings: Vec<ProjectionWarning>,
+}
+
+#[must_use = "conditional append results distinguish no-op from committed outcomes"]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(tag = "status", content = "outcome", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ConditionalAppendOutcome {
+    NotApplied,
+    Applied(AppendOutcome),
+}
+
+#[cfg(test)]
+impl ConditionalAppendOutcome {
+    fn is_some(&self) -> bool {
+        matches!(self, Self::Applied(_))
+    }
+
+    fn is_none(&self) -> bool {
+        matches!(self, Self::NotApplied)
+    }
+}
+
+/// Result of a lease-renewal request. `append_outcome` is present exactly when
+/// this request appended or resolved its own stable canonical renewal event.
+/// A monotonic no-op or missing claim returns the observed record without
+/// pretending a write occurred.
+#[must_use = "lease renewal may have canonically committed with projection warnings"]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct RenewClaimLeaseOutcome {
+    pub(crate) record: Option<claim_authority::ActiveClaimRecord>,
+    pub(crate) append_outcome: Option<AppendOutcome>,
+}
+
+#[cfg(test)]
+impl RenewClaimLeaseOutcome {
+    pub(crate) fn unwrap(self) -> claim_authority::ActiveClaimRecord {
+        self.record.unwrap()
+    }
+
+    pub(crate) fn expect(self, message: &str) -> claim_authority::ActiveClaimRecord {
+        self.record.expect(message)
+    }
+}
+
+impl AppendOutcome {
+    fn committed(fact: Fact, warnings: Vec<ProjectionWarning>) -> Self {
+        Self {
+            fact,
+            committed: true,
+            projection_complete: warnings.is_empty(),
+            warnings,
+        }
+    }
+
+    pub(crate) fn into_fact_reporting(self) -> Fact {
+        crate::record_append_outcome(&self);
+        self.fact
+    }
+}
+
+#[derive(Deserialize)]
+struct AppendOutcomeWire {
+    fact: Fact,
+    committed: bool,
+    projection_complete: bool,
+    warnings: Vec<ProjectionWarning>,
+}
+
+impl<'de> Deserialize<'de> for AppendOutcome {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = AppendOutcomeWire::deserialize(deserializer)?;
+        if !wire.committed {
+            return Err(serde::de::Error::custom(
+                "append outcome invariant violated: successful reply must have committed=true",
+            ));
+        }
+        if wire.projection_complete != wire.warnings.is_empty() {
+            return Err(serde::de::Error::custom(
+                "append outcome invariant violated: projection_complete must equal warnings.is_empty()",
+            ));
+        }
+        Ok(Self {
+            fact: wire.fact,
+            committed: wire.committed,
+            projection_complete: wire.projection_complete,
+            warnings: wire.warnings,
+        })
     }
 }
 
@@ -1492,6 +1844,34 @@ pub(crate) enum RoomStore {
     Routed(RoutedRoomStore),
 }
 
+/// Read-only handle used while an inject command waits for a target-authored
+/// acknowledgement. Direct mode must not retain exclusive store ownership
+/// during that wait or a peer CLI cannot append the acknowledgement.
+pub(crate) enum AckPollingStore {
+    Direct {
+        room_dir: PathBuf,
+        log_dir: PathBuf,
+        archive_dir: PathBuf,
+    },
+    Routed(RoutedRoomStore),
+}
+
+impl AckPollingStore {
+    pub(crate) fn facts(&self) -> Result<Vec<Fact>> {
+        match self {
+            Self::Direct {
+                room_dir,
+                log_dir,
+                archive_dir,
+            } => {
+                let _guard = acquire_room_mutation_lock(room_dir)?;
+                facts_from_segments(log_dir, archive_dir)
+            }
+            Self::Routed(routed) => routed.facts(),
+        }
+    }
+}
+
 /// Today's in-process room store (was `RoomStore` before the router split).
 /// The `Direct` variant of [`RoomStore`]. In direct-CLI mode `warm_fact_store`
 /// is always `None`, so every hot interior open goes through
@@ -1830,6 +2210,113 @@ fn acquire_direct_owner_exclusive_nb(_rally_dir: &Path) -> Result<Option<OwnerGu
     Ok(Some(OwnerGuard))
 }
 
+/// Exclusive offline authority for the one recovery path that is allowed to
+/// inspect `facts.db` as source evidence. This deliberately does not install
+/// the guards in the process-global direct-store table and never probes or
+/// routes to rallyd: the maintenance command owns direct EX, daemon-owner SH,
+/// and the canonical mutation lock only for the duration of one invocation.
+pub(crate) struct OfflineMigrationAuthority {
+    _direct_owner: OwnerGuard,
+    _daemon_exclusion: OwnerGuard,
+    _mutation: RoomMutationLock,
+}
+
+#[cfg(unix)]
+pub(crate) fn acquire_offline_migration_authority(
+    rally_dir: &Path,
+) -> Result<OfflineMigrationAuthority> {
+    let direct_owner = acquire_direct_owner_exclusive_nb(rally_dir)?.ok_or_else(|| {
+        RallyError::Command(
+            "offline migration authority is busy: another direct Rally process owns facts.db; \
+             stop all Rally commands and run `rally daemon stop` before retrying"
+                .to_string(),
+        )
+    })?;
+    let daemon_exclusion = match acquire_owner_shared_nb(rally_dir)? {
+        Some(guard) => guard,
+        None => {
+            drop(direct_owner);
+            return Err(RallyError::Command(
+                "offline migration authority is unavailable because a live or unresponsive \
+                 daemon owns facts.db; run `rally daemon stop` and confirm it stopped before \
+                 retrying"
+                    .to_string(),
+            ));
+        }
+    };
+    let mutation = acquire_room_mutation_lock(rally_dir)?;
+    Ok(OfflineMigrationAuthority {
+        _direct_owner: direct_owner,
+        _daemon_exclusion: daemon_exclusion,
+        _mutation: mutation,
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn acquire_offline_migration_authority(
+    _rally_dir: &Path,
+) -> Result<OfflineMigrationAuthority> {
+    Err(RallyError::Usage(
+        "rally doctor --migrate-db-only is unsupported on this platform because equivalent \
+         cross-process owner locks and directory sync semantics are not implemented"
+            .to_string(),
+    ))
+}
+
+/// Optimistic, byte-inert owner observation for migration dry-run. Missing
+/// rendezvous files mean only "nothing observable"; apply creates/acquires the
+/// real lock set and revalidates from scratch before making any safety claim.
+#[cfg(unix)]
+pub(crate) fn observe_offline_migration_authority(rally_dir: &Path) -> Result<String> {
+    fn try_existing(path: &Path, operation: i32) -> Result<Option<bool>> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(RallyError::io(format!("stat {}", path.display()))(error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(RallyError::Usage(format!(
+                "offline migration lock {} must be a regular file, not a symlink or special file",
+                path.display()
+            )));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(RallyError::io(format!("open {}", path.display())))?;
+        let rc = unsafe { unix_lock::flock(file.as_raw_fd(), operation | unix_lock::LOCK_NB) };
+        if rc == 0 {
+            let _ = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_UN) };
+            return Ok(Some(true));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            Ok(Some(false))
+        } else {
+            Err(RallyError::Io {
+                context: format!("observe offline migration lock {}", path.display()),
+                source: error,
+            })
+        }
+    }
+
+    let direct = rally_dir.join(DIRECT_OWNER_LOCK_FILENAME);
+    if try_existing(&direct, unix_lock::LOCK_EX)? == Some(false) {
+        return Ok("direct_owner_busy".to_string());
+    }
+    let daemon = rally_dir.join(RALLYD_OWNER_LOCK_FILENAME);
+    if try_existing(&daemon, unix_lock::LOCK_SH)? == Some(false) {
+        return Ok("daemon_owner_busy".to_string());
+    }
+    Ok("clear_at_optimistic_inspection".to_string())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn observe_offline_migration_authority(_rally_dir: &Path) -> Result<String> {
+    Ok("unsupported_platform".to_string())
+}
+
 /// Destructive automatic cleanup fails closed on platforms without a kernel
 /// advisory lock equivalent. A process-local/no-op guard would permit two
 /// entrants to reap concurrently.
@@ -1861,6 +2348,337 @@ struct LedgerLine {
     payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     engagement: Option<String>,
+}
+
+/// Closed-DB canonical candidate used only by the explicit offline DB-only
+/// migration. `bytes` is already sorted by the logical payload sequence,
+/// fully canonical-validated, and newline framed one row per source DB row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DbOnlyMigrationSegment {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) row_count: u64,
+    pub(crate) max_seq: i64,
+}
+
+/// Raw row read through a strictly read-only SQLite connection by the offline
+/// migration command. Keeping SQLite access out of the normal fact store avoids
+/// its schema/WAL bootstrap writes while this helper retains canonical rendering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DbOnlyMigrationSourceRow {
+    pub(crate) database_seq: i64,
+    pub(crate) occurred_at: String,
+    pub(crate) event_type: String,
+    pub(crate) payload: Value,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveTailRepair {
+    None,
+    AddNewline,
+    TruncateTo(u64),
+}
+
+fn validate_canonical_line(entry: &LedgerLine) -> Result<Fact> {
+    if entry.seq <= 0 {
+        return Err(RallyError::Message(format!(
+            "canonical segment row has non-positive seq {}",
+            entry.seq
+        )));
+    }
+    let fact = Fact::from_segment_value(entry.payload.clone(), entry.seq)?;
+    if fact.schema != FACT_SCHEMA {
+        return Err(RallyError::Message(format!(
+            "canonical segment row has unsupported fact schema {:?}",
+            fact.schema
+        )));
+    }
+    if fact.event_id.trim().is_empty() {
+        return Err(RallyError::Message(
+            "canonical segment row has an empty event_id".to_string(),
+        ));
+    }
+    if entry.event_type != fact.kind.as_str() {
+        return Err(RallyError::Message(format!(
+            "canonical segment event_type {:?} does not match payload kind {:?}",
+            entry.event_type,
+            fact.kind.as_str()
+        )));
+    }
+    Ok(fact)
+}
+
+/// Validate the entire active segment without changing it and classify only
+/// the final unterminated fragment. A complete syntactic/schema error is
+/// corruption even without a newline; only serde's EOF class is truncatable.
+fn inspect_active_segment_tail(path: &Path) -> Result<ActiveTailRepair> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ActiveTailRepair::None);
+        }
+        Err(error) => return Err(RallyError::io(format!("read {}", path.display()))(error)),
+    };
+    if bytes.is_empty() {
+        return Ok(ActiveTailRepair::None);
+    }
+
+    let completed_end = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    for (index, raw) in bytes[..completed_end]
+        .split(|byte| *byte == b'\n')
+        .enumerate()
+    {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if raw.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        let entry = serde_json::from_slice::<LedgerLine>(raw).map_err(|error| {
+            RallyError::Message(format!(
+                "completed canonical segment corruption in {} at line {}: {}",
+                path.display(),
+                index + 1,
+                error
+            ))
+        })?;
+        validate_canonical_line(&entry).map_err(|error| {
+            RallyError::Message(format!(
+                "completed canonical segment corruption in {} at line {}: {}",
+                path.display(),
+                index + 1,
+                error
+            ))
+        })?;
+    }
+
+    let tail = &bytes[completed_end..];
+    if tail.is_empty() {
+        return Ok(ActiveTailRepair::None);
+    }
+    match serde_json::from_slice::<LedgerLine>(tail) {
+        Ok(entry) => {
+            validate_canonical_line(&entry).map_err(|error| {
+                RallyError::Message(format!(
+                    "unterminated canonical segment corruption in {} at line {}: {}",
+                    path.display(),
+                    bytes[..completed_end]
+                        .iter()
+                        .filter(|byte| **byte == b'\n')
+                        .count()
+                        + 1,
+                    error
+                ))
+            })?;
+            Ok(ActiveTailRepair::AddNewline)
+        }
+        Err(error) if error.is_eof() => Ok(ActiveTailRepair::TruncateTo(
+            u64::try_from(completed_end).map_err(|overflow| {
+                RallyError::Message(format!("canonical tail offset overflow: {overflow}"))
+            })?,
+        )),
+        Err(error) => Err(RallyError::Message(format!(
+            "unterminated canonical segment corruption in {}: {}; refusing mutation",
+            path.display(),
+            error
+        ))),
+    }
+}
+
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(RallyError::io(format!(
+            "fsync directory {}",
+            path.display()
+        )))
+}
+
+fn rally_dir_for_segment(path: &Path) -> Result<&Path> {
+    path.parent().and_then(Path::parent).ok_or_else(|| {
+        RallyError::Message(format!("segment path has no room root: {}", path.display()))
+    })
+}
+
+fn apply_active_tail_repair(path: &Path, repair: ActiveTailRepair, event_id: &str) -> Result<()> {
+    let rally_dir = rally_dir_for_segment(path)?;
+    if repair != ActiveTailRepair::None {
+        // Tail repair is the sole bounded rewrite of canonical segment bytes.
+        // Invalidate every derived view before the rewrite begins; the segment
+        // tail hash below independently prevents a stale schema-2 sidecar from
+        // matching even if a best-effort removal cannot complete.
+        invalidate_segment_fold_memo();
+        let _ = fs::remove_file(rally_dir.join(RECONCILE_CACHE_FILENAME));
+        let _ = fs::remove_file(snapshot_cache_path(rally_dir));
+        let _ = fs::remove_file(rally_dir.join(LOG_DIRNAME).join(LOG_INDEX_FILENAME));
+        let _ = fs::remove_file(rally_dir.join(claim_authority::CLAIM_INDEX_FILENAME));
+    }
+    match repair {
+        ActiveTailRepair::None => return Ok(()),
+        ActiveTailRepair::AddNewline => {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(path)
+                .map_err(|error| {
+                    RallyError::outcome_unknown(event_id, "tail-repair-open", error.to_string())
+                })?;
+            file.write_all(b"\n").map_err(|error| {
+                RallyError::outcome_unknown(event_id, "tail-repair-write", error.to_string())
+            })?;
+            trigger_o26_fault(rally_dir, O26FaultPoint::TailRepairSync).map_err(|detail| {
+                RallyError::outcome_unknown(event_id, "tail-repair-sync", detail)
+            })?;
+            file.sync_all().map_err(|error| {
+                RallyError::outcome_unknown(event_id, "tail-repair-sync", error.to_string())
+            })?;
+        }
+        ActiveTailRepair::TruncateTo(length) => {
+            let file = OpenOptions::new().write(true).open(path).map_err(|error| {
+                RallyError::outcome_unknown(event_id, "tail-repair-open", error.to_string())
+            })?;
+            file.set_len(length).map_err(|error| {
+                RallyError::outcome_unknown(event_id, "tail-repair-truncate", error.to_string())
+            })?;
+            trigger_o26_fault(rally_dir, O26FaultPoint::TailRepairSync).map_err(|detail| {
+                RallyError::outcome_unknown(event_id, "tail-repair-sync", detail)
+            })?;
+            file.sync_all().map_err(|error| {
+                RallyError::outcome_unknown(event_id, "tail-repair-sync", error.to_string())
+            })?;
+        }
+    }
+    match inspect_active_segment_tail(path) {
+        Ok(ActiveTailRepair::None) => Ok(()),
+        Ok(remaining) => Err(RallyError::outcome_unknown(
+            event_id,
+            "tail-repair-readback",
+            format!("tail still requires repair after sync: {remaining:?}"),
+        )),
+        Err(error) => Err(RallyError::outcome_unknown(
+            event_id,
+            "tail-repair-readback",
+            error.to_string(),
+        )),
+    }
+}
+
+fn normalized_fact_value(fact: &Fact, seq: i64) -> Result<Value> {
+    let mut normalized = fact.clone();
+    normalized.seq = seq;
+    serde_json::to_value(normalized).map_err(RallyError::json("normalize fact identity"))
+}
+
+const MAX_APPEND_EVENT_ID_BYTES: usize = 256;
+
+/// Validate identity fields that determine whether an append can ever be
+/// queried or retried. This must run before tail inspection or any filesystem
+/// mutation: an invalid stable id cannot be represented as OutcomeUnknown.
+fn validate_append_identity(fact: &Fact) -> Result<()> {
+    if fact.schema != FACT_SCHEMA {
+        return Err(RallyError::Usage(format!(
+            "append fact schema must be {FACT_SCHEMA}, got {:?}",
+            fact.schema
+        )));
+    }
+    validate_append_event_id(&fact.event_id)
+}
+
+pub(crate) fn validate_append_event_id(event_id: &str) -> Result<()> {
+    if event_id.trim().is_empty() {
+        return Err(RallyError::Usage(
+            "append event_id must not be empty".to_string(),
+        ));
+    }
+    if event_id.len() > MAX_APPEND_EVENT_ID_BYTES {
+        return Err(RallyError::Usage(format!(
+            "append event_id exceeds {MAX_APPEND_EVENT_ID_BYTES} bytes"
+        )));
+    }
+    if event_id.chars().any(char::is_control) {
+        return Err(RallyError::Usage(
+            "append event_id must not contain control characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_canonical_event_id(
+    log_dir: &Path,
+    archive_dir: &Path,
+    candidate: &Fact,
+    engagement: &str,
+) -> Result<Option<(Fact, Vec<PathBuf>)>> {
+    let live = read_segment_files(log_dir)?;
+    let archived = replay_archive_segments(archive_dir)?;
+    // Preserve O29's complete-envelope duplicate-sequence validation before
+    // using an event id for idempotency. Source-path discovery below is only a
+    // durability aid after the authoritative union has proved equality.
+    let mut matches = canonical_segment_entries(&live, &archived)?
+        .into_iter()
+        .filter(|entry| {
+            entry.payload.get("event_id").and_then(Value::as_str)
+                == Some(candidate.event_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    if matches.len() != 1 {
+        return Err(RallyError::Usage(format!(
+            "event-id identity ambiguity: {} appears in {} canonical rows; refusing retry",
+            candidate.event_id,
+            matches.len()
+        )));
+    }
+    let entry = matches.pop().expect("one checked canonical identity row");
+    let existing = validate_canonical_line(&entry)?;
+    let exact = entry.event_type == candidate.kind.as_str()
+        && entry.engagement.as_deref() == Some(engagement)
+        && normalized_fact_value(candidate, entry.seq)?
+            == normalized_fact_value(&existing, entry.seq)?;
+    if !exact {
+        return Err(RallyError::Usage(format!(
+            "event-id identity conflict: {} already names a different canonical fact",
+            candidate.event_id
+        )));
+    }
+    let mut source_paths = Vec::new();
+    for path in live.iter().chain(archived.iter()) {
+        if read_segment_entries(path)?
+            .iter()
+            .any(|observed| observed == &entry)
+        {
+            source_paths.push(path.clone());
+        }
+    }
+    if source_paths.is_empty() {
+        return Err(RallyError::Message(format!(
+            "canonical event {} lost its physical source during locked identity resolution",
+            candidate.event_id
+        )));
+    }
+    Ok(Some((existing, source_paths)))
+}
+
+fn resync_existing_canonical_fact(path: &Path, event_id: &str) -> Result<()> {
+    let file = fs::File::open(path).map_err(|error| {
+        RallyError::outcome_unknown(event_id, "retry-resync-open", error.to_string())
+    })?;
+    file.sync_all().map_err(|error| {
+        RallyError::outcome_unknown(event_id, "retry-resync-file", error.to_string())
+    })?;
+    let parent = path.parent().ok_or_else(|| {
+        RallyError::outcome_unknown(event_id, "retry-resync-parent", "segment has no parent")
+    })?;
+    sync_directory(parent).map_err(|error| {
+        RallyError::outcome_unknown(event_id, "retry-resync-parent", error.to_string())
+    })?;
+    if let Some(room_dir) = parent.parent() {
+        sync_directory(room_dir).map_err(|error| {
+            RallyError::outcome_unknown(event_id, "retry-resync-room", error.to_string())
+        })?;
+    }
+    Ok(())
 }
 
 /// One entry of `.rally/log/index.json`.
@@ -1924,6 +2742,24 @@ fn install_direct_owner_once(
         });
 }
 
+fn release_direct_owner_for_ack_poll(rally_dir: &Path) -> Result<()> {
+    let Some(table) = DIRECT_OWNER_GUARDS.get() else {
+        return Err(RallyError::Message(
+            "direct ACK polling started without process ownership".to_string(),
+        ));
+    };
+    let removed = table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&direct_owner_key(rally_dir));
+    if removed.is_none() {
+        return Err(RallyError::Message(
+            "direct ACK polling could not release process ownership".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn direct_owner_busy_unknown_error(bound: Duration) -> RallyError {
     RallyError::Command(format!(
         "direct-store-busy-unknown: could not establish exclusive direct ownership or a live \
@@ -1955,7 +2791,7 @@ fn acquire_direct_ownership_or_route_bounded(
     let deadline = Instant::now() + bound;
     loop {
         if let Some(routed) =
-            store_client::probe_live_bounded(root, rally_dir, engagement.clone(), Duration::ZERO)
+            store_client::probe_live_bounded(root, rally_dir, engagement.clone(), Duration::ZERO)?
         {
             return Ok(Some(routed));
         }
@@ -2036,6 +2872,7 @@ impl RoomStore {
     /// startup, so routing straight to `Routed` is correct without re-deriving
     /// existence locally).
     pub(crate) fn open_existing_at(root: PathBuf) -> Result<Option<Self>> {
+        ensure_no_db_only_migration_recovery(&root)?;
         let rally_dir = root.join(".rally");
         let engagement = env::var(ENGAGEMENT_ENV_VAR).ok();
         match acquire_direct_ownership_or_route(&root, &rally_dir, engagement)? {
@@ -2047,6 +2884,7 @@ impl RoomStore {
     /// The ADR-01 routing seam shared by `open_at`/`open_at_with_engagement`.
     /// See the `impl RoomStore` doc comment above for the full choreography.
     fn route(root: PathBuf, engagement: Option<String>) -> Result<Self> {
+        ensure_no_db_only_migration_recovery(&root)?;
         let rally_dir = root.join(".rally");
         match acquire_direct_ownership_or_route(&root, &rally_dir, engagement.clone())? {
             Some(routed) => Ok(RoomStore::Routed(routed)),
@@ -2061,21 +2899,27 @@ impl RoomStore {
     // transport failure there (R6) surfaces as a retryable
     // `RallyError::Command` and NEVER falls back to a direct facts.db open.
 
-    pub(crate) fn append_fact(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_fact(&self, fact: &Fact) -> Result<AppendOutcome> {
+        validate_append_identity(fact)?;
+        crate::write_authority::assert_field_bounds(fact)?;
         match self {
             RoomStore::Direct(d) => d.append_fact(fact),
             RoomStore::Routed(r) => r.append_fact(fact),
         }
     }
 
-    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<AppendOutcome> {
+        validate_append_identity(fact)?;
+        crate::write_authority::assert_field_bounds(fact)?;
         match self {
             RoomStore::Direct(d) => d.append_fact_verified(fact),
             RoomStore::Routed(r) => r.append_fact_verified(fact),
         }
     }
 
-    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<AppendOutcome> {
+        validate_append_identity(fact)?;
+        crate::write_authority::assert_field_bounds(fact)?;
         match self {
             RoomStore::Direct(d) => d.append_state_transition_verified(fact),
             RoomStore::Routed(r) => r.append_state_transition_verified(fact),
@@ -2086,7 +2930,9 @@ impl RoomStore {
         &self,
         fact: &Fact,
         expected_context_version: Option<u64>,
-    ) -> Result<Option<Fact>> {
+    ) -> Result<ConditionalAppendOutcome> {
+        validate_append_identity(fact)?;
+        crate::write_authority::assert_field_bounds(fact)?;
         match self {
             RoomStore::Direct(d) => {
                 d.append_session_fact_if_context(fact, expected_context_version)
@@ -2101,6 +2947,36 @@ impl RoomStore {
         match self {
             RoomStore::Direct(d) => d.facts(),
             RoomStore::Routed(r) => r.facts(),
+        }
+    }
+
+    /// Consume the command's general-purpose store before a bounded ACK wait.
+    /// Routed mode keeps using the daemon. Direct mode closes its store facade,
+    /// releases process ownership, and thereafter folds canonical JSONL only.
+    pub(crate) fn into_ack_polling(self) -> Result<AckPollingStore> {
+        match self {
+            Self::Routed(routed) => Ok(AckPollingStore::Routed(routed)),
+            Self::Direct(direct) => {
+                if direct.warm_fact_store.is_some() {
+                    return Err(RallyError::Message(
+                        "daemon warm store cannot enter direct ACK polling".to_string(),
+                    ));
+                }
+                let room_dir = direct
+                    .facts_db_path
+                    .parent()
+                    .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?
+                    .to_path_buf();
+                let log_dir = direct.log_dir.clone();
+                let archive_dir = direct.archive_dir.clone();
+                drop(direct);
+                release_direct_owner_for_ack_poll(&room_dir)?;
+                Ok(AckPollingStore::Direct {
+                    room_dir,
+                    log_dir,
+                    archive_dir,
+                })
+            }
         }
     }
 
@@ -2120,7 +2996,12 @@ impl RoomStore {
         caller_tool: &str,
         caller_session_id: Option<&str>,
         expected_owner_session_id: Option<&str>,
-    ) -> Result<Option<claim_authority::ActiveClaimRecord>> {
+    ) -> Result<RenewClaimLeaseOutcome> {
+        // Fix the mutation identity on the client side before choosing direct
+        // versus routed transport. A daemon never mints an unqueryable ID.
+        let event_id = crate::new_id("renew");
+        let thread_id = crate::new_id("room");
+        let created_at = now_string();
         match self {
             RoomStore::Direct(d) => d.renew_claim_lease(
                 claim_id,
@@ -2128,6 +3009,9 @@ impl RoomStore {
                 Some(caller_tool),
                 caller_session_id,
                 expected_owner_session_id,
+                &event_id,
+                &thread_id,
+                &created_at,
             ),
             RoomStore::Routed(r) => r.renew_claim_lease(
                 claim_id,
@@ -2135,6 +3019,9 @@ impl RoomStore {
                 caller_tool,
                 caller_session_id,
                 expected_owner_session_id,
+                event_id,
+                thread_id,
+                created_at,
             ),
         }
     }
@@ -2157,6 +3044,19 @@ impl RoomStore {
         match self {
             RoomStore::Direct(d) => d.snapshot_with_archived(include_archived),
             RoomStore::Routed(r) => r.snapshot_with_archived(include_archived),
+        }
+    }
+
+    /// Capture a snapshot together with the canonical fingerprint measured in
+    /// the same mutation epoch. Routed mode receives the pair captured by the
+    /// daemon; the client never re-fingerprints a detached snapshot.
+    pub(crate) fn snapshot_cache_capture(
+        &self,
+        include_archived: bool,
+    ) -> Result<SnapshotCacheCapture> {
+        match self {
+            RoomStore::Direct(d) => d.snapshot_cache_capture(include_archived),
+            RoomStore::Routed(r) => r.snapshot_cache_capture(include_archived),
         }
     }
 
@@ -2212,10 +3112,36 @@ impl RoomStore {
         &self,
         tool: &str,
         read_seq: i64,
-    ) -> Result<Option<Fact>> {
+    ) -> Result<ConditionalAppendOutcome> {
+        let checkpoint = Fact {
+            from_session_id: None,
+            schema: crate::FACT_SCHEMA.to_string(),
+            event_id: crate::new_id("read"),
+            seq: 0,
+            thread_id: format!(
+                "read-{}",
+                tool.chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect::<String>()
+            ),
+            kind: FactKind::Read,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("read-checkpoint: {tool} at seq {read_seq}"),
+            scope: Vec::new(),
+            created_at: crate::now_string(),
+            summary: Some(format!("read_seq:{read_seq}")),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
         match self {
-            RoomStore::Direct(d) => d.maybe_append_read_checkpoint(tool, read_seq),
-            RoomStore::Routed(r) => r.maybe_append_read_checkpoint(tool, read_seq),
+            RoomStore::Direct(d) => d.maybe_append_read_checkpoint(&checkpoint, read_seq),
+            RoomStore::Routed(r) => r.maybe_append_read_checkpoint(&checkpoint, read_seq),
         }
     }
 
@@ -2321,13 +3247,14 @@ impl DirectRoomStore {
     ///    events than the current `facts.db`, the db is rebuilt by replaying
     ///    every segment in seq order. The db is a pure cache — never
     ///    canonical.
-    /// 3. If no segment / monolith / archive exists but `facts.db` already
-    ///    has events, seed a single segment from the db so no history is
-    ///    lost on first upgrade.
+    /// 3. If no canonical source exists but `facts.db` has events, preserve
+    ///    the db and fail loud with the explicit offline
+    ///    `rally doctor --migrate-db-only` recovery path. Ordinary store open
+    ///    never promotes derived state into canonical history.
     /// 4. Otherwise segments and db are already in sync and we proceed.
     ///
-    /// Replay, migration, and seed are all idempotent — running them twice
-    /// on the same inputs yields identical state.
+    /// Replay and legacy-monolith migration are idempotent — running them
+    /// twice on the same inputs yields identical state.
     pub(crate) fn open_direct_at(root: PathBuf) -> Result<Self> {
         // Production path: resolve the engagement from the process-global
         // `RALLY_ENGAGEMENT` env (sound for a single CLI process).
@@ -2344,6 +3271,7 @@ impl DirectRoomStore {
         root: PathBuf,
         engagement: Option<String>,
     ) -> Result<Self> {
+        ensure_no_db_only_migration_recovery(&root)?;
         let dir = root.join(".rally");
         fs::create_dir_all(&dir).map_err(RallyError::io("create .rally"))?;
         let _guard = acquire_room_mutation_lock(&dir)?;
@@ -2362,6 +3290,10 @@ impl DirectRoomStore {
         // and closes its pool inside that ownership window.
         drop(fact_store);
         seed_segments_from_db_if_absent(&log_dir, &archive_dir, &fact_store_path)?;
+        // Repair canonical-ahead cache state before a daemon can install its
+        // warm pool. This is the fresh-process recovery path after a committed
+        // append reported a projection warning.
+        reconcile_segments_and_db(&log_dir, &archive_dir, &fact_store_path, true)?;
         let active_engagement = resolve_active_engagement_with_env(&dir, engagement);
         let store = Self {
             // Direct-CLI mode: no warm pool ⇒ per-op opens, byte-identical to
@@ -2381,6 +3313,7 @@ impl DirectRoomStore {
     }
 
     pub(crate) fn open_direct_existing_at(root: PathBuf) -> Result<Option<Self>> {
+        ensure_no_db_only_migration_recovery(&root)?;
         let dir = root.join(".rally");
         let fact_store_path = dir.join("facts.db");
         let log_dir = dir.join(LOG_DIRNAME);
@@ -2403,6 +3336,7 @@ impl DirectRoomStore {
         let fact_store = open_fact_store_lenient(&fact_store_path)?;
         drop(fact_store);
         seed_segments_from_db_if_absent(&log_dir, &archive_dir, &fact_store_path)?;
+        reconcile_segments_and_db(&log_dir, &archive_dir, &fact_store_path, true)?;
         let active_engagement = resolve_active_engagement(&dir);
         let store = Self {
             // Direct-CLI mode: no warm pool ⇒ per-op opens (G1).
@@ -2629,16 +3563,70 @@ impl DirectRoomStore {
             .map(str::trim)
     }
 
-    pub(crate) fn append_fact(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_fact(&self, fact: &Fact) -> Result<AppendOutcome> {
+        validate_append_identity(fact)?;
+        crate::write_authority::assert_field_bounds(fact)?;
         let room_dir = self
             .facts_db_path
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
-        // Warm-pool facade (L11/R1/G10): reuse the daemon's pool if installed,
-        // else open fresh lenient — byte-identical to main in direct mode (G1).
-        let fact_store = self.fact_store_handle(true)?;
+        self.append_fact_under_lock(fact)
+    }
+
+    fn append_fact_under_lock(&self, fact: &Fact) -> Result<AppendOutcome> {
+        ensure_no_db_only_migration_recovery(&self.repo_root)?;
         let mut fact = fact.clone();
+        // Only invariant input bounds precede canonical identity resolution.
+        // Stateful authority/claim/transition checks below apply solely to a
+        // genuinely new event; the exact canonical row proves a retry was
+        // already authorized before the first commit changed mutable state.
+        validate_append_identity(&fact)?;
+        crate::write_authority::assert_field_bounds(&fact)?;
+        let active_segment = self.active_segment_path();
+        let tail_repair = inspect_active_segment_tail(&active_segment)?;
+        if let Some((existing, source_paths)) = resolve_canonical_event_id(
+            &self.log_dir,
+            &self.archive_dir,
+            &fact,
+            &self.active_engagement,
+        )? {
+            let rally_dir = rally_dir_for_segment(&active_segment)?;
+            trigger_o26_fault(rally_dir, O26FaultPoint::BeforeCanonicalMutation).map_err(
+                |detail| RallyError::outcome_unknown(&fact.event_id, "retry-resync", detail),
+            )?;
+            if mutation_start_deadline_elapsed() {
+                crate::mark_watchdog_command_outcome_unknown(
+                    &fact.event_id,
+                    "retry-resync-deadline",
+                );
+                return Err(RallyError::outcome_unknown(
+                    &fact.event_id,
+                    "retry-resync-deadline",
+                    "deadline elapsed before the exact canonical row could be re-synced",
+                ));
+            }
+            if tail_repair != ActiveTailRepair::None {
+                crate::mark_watchdog_command_outcome_unknown(
+                    &fact.event_id,
+                    "canonical-tail-repair",
+                );
+                apply_active_tail_repair(&active_segment, tail_repair, &fact.event_id)?;
+                trigger_o26_fault(rally_dir, O26FaultPoint::AfterTailRepair).map_err(|detail| {
+                    RallyError::outcome_unknown(&fact.event_id, "after-tail-repair", detail)
+                })?;
+            }
+            crate::mark_watchdog_command_outcome_unknown(&fact.event_id, "retry-resync");
+            for source_path in source_paths {
+                resync_existing_canonical_fact(&source_path, &fact.event_id)?;
+            }
+            let mut outcome = AppendOutcome::committed(existing.clone(), Vec::new());
+            crate::mark_watchdog_append_outcome(&outcome);
+            outcome.warnings = self.project_canonical_fact(&existing);
+            outcome.projection_complete = outcome.warnings.is_empty();
+            crate::mark_watchdog_append_outcome(&outcome);
+            return Ok(outcome);
+        }
         // SEC-001 close: a takeover Release authorizes reclaiming a stale peer's
         // claim. Eligibility was judged on an UNLOCKED snapshot in
         // `command_release_by_path`; an owner could revive in the gap before we
@@ -2820,6 +3808,73 @@ impl DirectRoomStore {
                 )));
             }
         }
+        if matches!(fact.kind, FactKind::Release | FactKind::Resolve) {
+            let ref_id = fact.ref_id.as_deref().ok_or_else(|| {
+                RallyError::Usage(format!(
+                    "{} requires --ref <event-id> targeting a live fact; none provided",
+                    fact.kind.as_str()
+                ))
+            })?;
+            let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+            let coord =
+                crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+            let snapshot = snapshot_from_facts_with_policy(&facts, &coord, false);
+            match fact.kind {
+                FactKind::Release => {
+                    if !snapshot
+                        .active_claims
+                        .iter()
+                        .any(|claim| claim.event_id == ref_id)
+                    {
+                        return Err(RallyError::Usage(format!(
+                            "release failed: ref {ref_id} is not an active claim (already released, never existed, or invalid); nothing to release"
+                        )));
+                    }
+                }
+                FactKind::Resolve => {
+                    let open_handoff = snapshot
+                        .open_handoffs
+                        .iter()
+                        .find(|candidate| candidate.event_id == ref_id);
+                    let is_live = snapshot
+                        .active_blockers
+                        .iter()
+                        .any(|candidate| candidate.event_id == ref_id)
+                        || snapshot
+                            .active_claims
+                            .iter()
+                            .any(|candidate| candidate.event_id == ref_id)
+                        || open_handoff.is_some()
+                        || snapshot
+                            .current_risks
+                            .iter()
+                            .any(|candidate| candidate.event_id == ref_id)
+                        || snapshot
+                            .system_health
+                            .iter()
+                            .any(|candidate| candidate.event_id == ref_id)
+                        || snapshot
+                            .unconsumed_artifacts
+                            .iter()
+                            .any(|candidate| candidate.event_id == ref_id);
+                    if !is_live {
+                        return Err(RallyError::Usage(format!(
+                            "resolve failed: ref {ref_id} is not a live blocker, claim, handoff, risk, or unconsumed artifact (already resolved, never existed, or invalid); nothing to resolve"
+                        )));
+                    }
+                    if let Some(handoff) = open_handoff
+                        && !handoff_closer_matches_target(handoff, &fact)
+                    {
+                        let target = handoff.target.as_deref().unwrap_or("<untargeted>");
+                        let tool = fact.tool.as_deref().unwrap_or("<unknown>");
+                        return Err(RallyError::Usage(format!(
+                            "resolve failed: ref {ref_id} is targeted to {target}; tool {tool} cannot resolve it"
+                        )));
+                    }
+                }
+                _ => unreachable!("guarded transition kind"),
+            }
+        }
         // ---- WRITE-BOUNDARY AUTHORITY (ARP-R-01, ARP-R-02, ARP-R-04) -------
         //
         // The one gate every durable write passes, in BOTH store modes: routed
@@ -2868,86 +3923,219 @@ impl DirectRoomStore {
                 )));
             }
         }
-        let logical_seq =
-            next_canonical_seq(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
-        fact.seq = logical_seq;
-        // Defense-in-depth dup gate (2026-07-02): the allocated seq must exceed
-        // the active segment's on-disk tail. A stale cache or an old count-based
-        // allocator could hand out an already-used seq; fail LOUD here rather
-        // than write a duplicate that bricks replay for every reader.
-        if let Some(tail) = last_seq_in_segment(&self.active_segment_path())?
-            && fact.seq <= tail
-        {
-            return Err(RallyError::Message(format!(
-                "seq allocation conflict: allocated {} <= active segment tail {} — refusing to write a duplicate. Delete .rally/.reconcile-cache.json and retry.",
-                fact.seq, tail
-            )));
-        }
+        let live = read_segment_files(&self.log_dir)?;
+        let archived = replay_archive_segments(&self.archive_dir)?;
+        fact.seq = segment_seq_stats(&live, &archived)?
+            .max_seq
+            .checked_add(1)
+            .ok_or_else(|| RallyError::Message("canonical sequence overflow".to_string()))?;
         let event_type = fact.kind.as_str().to_string();
         let payload = serde_json::to_value(&fact).map_err(RallyError::json("render fact"))?;
-        // The room lock serializes Rally writers; keep a short retry for
-        // transient SQLite lock errors from readers or older Rally binaries.
-        //
-        // Budgeted against what the watchdog has LEFT, so this loop and the
-        // `open_fact_store` loop that already ran cannot jointly outlast it
-        // (they used to: 2040ms + 2720ms against 3000ms). Because each takes a
-        // fraction of the REMAINDER, the two compose without knowing about each
-        // other — see `crate::retry_budget`.
-        let result = {
-            let mut budget = RetryBudget::new(
-                crate::retry_budget::budgets_for(crate::watchdog_remaining()).retry,
-                retry_jitter_ms(),
-            );
-            loop {
-                match fact_store.append(vec![NewEvent::new(event_type.clone(), payload.clone())]) {
-                    Ok(r) => break r,
-                    Err(err) if is_transient_store_contention(&err) => {
-                        let Some(backoff) = budget.next_backoff() else {
-                            return Err(RallyError::Message(format!(
-                                "append fact: retry budget exhausted after {} attempts \
-                                 within this command's watchdog budget while the \
-                                 store stayed contended ({err}). The fact was NOT \
-                                 written. `rally doctor --reap-stale` lists holders; \
-                                 `--timeout-ms` raises this command's budget.",
-                                budget.attempts(),
-                            )));
-                        };
-                        thread::sleep(backoff);
-                    }
-                    Err(err) => return Err(RallyError::Message(format!("append fact: {err}"))),
-                }
+        let entry = LedgerLine {
+            seq: fact.seq,
+            occurred_at: now_string(),
+            event_type,
+            payload,
+            engagement: Some(self.active_engagement.clone()),
+        };
+        let mut rendered =
+            serde_json::to_vec(&entry).map_err(RallyError::json("render canonical fact"))?;
+        rendered.push(b'\n');
+
+        let rally_dir = rally_dir_for_segment(&active_segment)?;
+        trigger_o26_fault(rally_dir, O26FaultPoint::BeforeCanonicalMutation).map_err(|detail| {
+            RallyError::NotStarted(format!(
+                "mutation-not-started: {detail}; canonical append was not opened and retry is safe"
+            ))
+        })?;
+        ensure_new_mutation_can_start(&active_segment)?;
+        // From the first tail/file mutation onward NotStarted is impossible.
+        crate::mark_watchdog_command_outcome_unknown(&fact.event_id, "canonical-write");
+        apply_active_tail_repair(&active_segment, tail_repair, &fact.event_id)?;
+        if tail_repair != ActiveTailRepair::None {
+            trigger_o26_fault(rally_dir, O26FaultPoint::AfterTailRepair).map_err(|detail| {
+                RallyError::outcome_unknown(&fact.event_id, "after-tail-repair", detail)
+            })?;
+        }
+        append_canonical_line_and_readback(&active_segment, &entry, &rendered, &fact.event_id)?;
+
+        let mut outcome = AppendOutcome::committed(fact.clone(), Vec::new());
+        outcome.projection_complete = false;
+        crate::mark_watchdog_append_outcome(&outcome);
+        // Preserve O25's deterministic post-commit watchdog seam at O26's
+        // canonical-readback boundary, before any derived projection begins.
+        crate::block_after_watchdog_commit_for_test();
+        if let Err(detail) = trigger_o26_fault(rally_dir, O26FaultPoint::AfterCanonicalReadback) {
+            outcome.warnings.push(ProjectionWarning {
+                code: ProjectionWarningCode::PostCommitWork,
+                message: format!("post-readback projection seam: {detail}"),
+            });
+        }
+        outcome.warnings.extend(self.project_canonical_fact(&fact));
+        outcome.projection_complete = outcome.warnings.is_empty();
+        crate::mark_watchdog_append_outcome(&outcome);
+        Ok(outcome)
+    }
+
+    fn project_canonical_fact(&self, fact: &Fact) -> Vec<ProjectionWarning> {
+        let warnings = self.project_canonical_fact_inner(fact);
+        if !warnings.is_empty() {
+            self.invalidate_projection_sidecars();
+        }
+        warnings
+    }
+
+    fn invalidate_projection_sidecars(&self) {
+        if let Some(path) = reconcile_cache_path(&self.facts_db_path) {
+            let _ = fs::remove_file(path);
+        }
+        let rally_dir = self
+            .facts_db_path
+            .parent()
+            .unwrap_or(self.repo_root.as_path());
+        let _ = fs::remove_file(snapshot_cache_path(rally_dir));
+        let _ = fs::remove_file(self.log_dir.join(LOG_INDEX_FILENAME));
+        let _ = fs::remove_file(&self.claim_index_path);
+    }
+
+    fn project_canonical_fact_inner(&self, fact: &Fact) -> Vec<ProjectionWarning> {
+        let mut warnings = Vec::new();
+        let rally_dir = self
+            .facts_db_path
+            .parent()
+            .unwrap_or(self.repo_root.as_path());
+        if let Err(detail) = trigger_o26_fault(rally_dir, O26FaultPoint::FactsDbProjection) {
+            warnings.push(ProjectionWarning {
+                code: ProjectionWarningCode::FactsDb,
+                message: format!("facts.db projection fault: {detail}"),
+            });
+            return warnings;
+        }
+        let fact_store = match self.fact_store_handle(true) {
+            Ok(store) => store,
+            Err(error) => {
+                warnings.push(ProjectionWarning {
+                    code: ProjectionWarningCode::FactsDb,
+                    message: format!("open facts.db projection: {error}"),
+                });
+                return warnings;
             }
         };
-        let _store_seq = i64::try_from(result.last_sequence_number)
-            .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
-        append_segment_line(
-            &self.active_segment_path(),
-            &LedgerLine {
-                seq: fact.seq,
-                occurred_at: now_string(),
-                event_type,
-                payload,
-                engagement: Some(self.active_engagement.clone()),
-            },
-        )?;
-        crate::mark_watchdog_command_commit();
-        // Direct mode owns a fresh per-op pool. Close it before fingerprinting
-        // the derived cache so its final WAL checkpoint/unlink cannot make the
-        // sidecar stale immediately after this method returns. In daemon mode
-        // the handle only borrows the warm pool, so dropping it keeps that pool
-        // (and its WAL lifecycle) unchanged.
+
+        let before = match facts_from_store(&fact_store) {
+            Ok(facts) => facts,
+            Err(error) => {
+                warnings.push(ProjectionWarning {
+                    code: ProjectionWarningCode::FactsDb,
+                    message: format!("query facts.db projection: {error}"),
+                });
+                return warnings;
+            }
+        };
+        let same_id = before
+            .iter()
+            .filter(|existing| existing.event_id == fact.event_id)
+            .collect::<Vec<_>>();
+        if same_id.len() > 1 {
+            warnings.push(ProjectionWarning {
+                code: ProjectionWarningCode::FactsDb,
+                message: format!(
+                    "facts.db projection contains {} rows for event_id {}; canonical fact remains committed",
+                    same_id.len(),
+                    fact.event_id
+                ),
+            });
+            return warnings;
+        }
+        if let Some(existing) = same_id.first() {
+            let existing_value = normalized_fact_value(existing, fact.seq).ok();
+            let canonical_value = normalized_fact_value(fact, fact.seq).ok();
+            if existing_value != canonical_value {
+                warnings.push(ProjectionWarning {
+                    code: ProjectionWarningCode::FactsDb,
+                    message: format!(
+                        "facts.db event-id identity conflict for {}; canonical fact remains committed",
+                        fact.event_id
+                    ),
+                });
+                return warnings;
+            }
+        } else {
+            let payload = match serde_json::to_value(fact) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    warnings.push(ProjectionWarning {
+                        code: ProjectionWarningCode::FactsDb,
+                        message: format!("render facts.db projection: {error}"),
+                    });
+                    return warnings;
+                }
+            };
+            if let Err(error) =
+                fact_store.append(vec![NewEvent::new(fact.kind.as_str().to_string(), payload)])
+            {
+                warnings.push(ProjectionWarning {
+                    code: ProjectionWarningCode::FactsDb,
+                    message: format!("append facts.db projection: {error}"),
+                });
+                return warnings;
+            }
+        }
+
+        match facts_from_store(&fact_store) {
+            Ok(after) => {
+                let exact = after
+                    .iter()
+                    .filter(|existing| existing.event_id == fact.event_id)
+                    .filter(|existing| {
+                        normalized_fact_value(existing, fact.seq).ok()
+                            == normalized_fact_value(fact, fact.seq).ok()
+                    })
+                    .count();
+                if exact != 1 {
+                    warnings.push(ProjectionWarning {
+                        code: ProjectionWarningCode::FactsDb,
+                        message: format!(
+                            "facts.db exact readback found {exact} rows for event_id {}; canonical fact remains committed",
+                            fact.event_id
+                        ),
+                    });
+                    return warnings;
+                }
+            }
+            Err(error) => {
+                warnings.push(ProjectionWarning {
+                    code: ProjectionWarningCode::FactsDb,
+                    message: format!("read back facts.db projection: {error}"),
+                });
+                return warnings;
+            }
+        }
         drop(fact_store);
-        // Refresh the reconcile sidecar while the flock is still held so the
-        // NEXT op stays on the O(1) fast path. The db and active segment each
-        // grew by exactly one event; remeasure both counts and re-fingerprint
-        // (cheap in file count). Best-effort: a miss just means the
-        // next op does one authoritative scan and re-seeds the sidecar.
-        self.refresh_reconcile_cache_after_append(fact.seq);
-        // Both index refreshes are best-effort caches; swallow failures so a
-        // racing parallel writer never poisons the append path. Replay
-        // rebuilds them on next open from segments.
-        let _ = self.refresh_log_index();
-        let _ = self.refresh_index(fact.seq);
+
+        if let Err(detail) = trigger_o26_fault(rally_dir, O26FaultPoint::ReconcileCacheProjection) {
+            warnings.push(ProjectionWarning {
+                code: ProjectionWarningCode::ReconcileCache,
+                message: format!("reconcile cache projection fault: {detail}"),
+            });
+        } else if let Err(error) = self.refresh_reconcile_cache_after_append(fact.seq) {
+            warnings.push(ProjectionWarning {
+                code: ProjectionWarningCode::ReconcileCache,
+                message: error.to_string(),
+            });
+        }
+        if let Err(error) = self.refresh_log_index() {
+            warnings.push(ProjectionWarning {
+                code: ProjectionWarningCode::LogIndex,
+                message: error.to_string(),
+            });
+        }
+        if let Err(error) = self.refresh_index(fact.seq) {
+            warnings.push(ProjectionWarning {
+                code: ProjectionWarningCode::ReconcileCache,
+                message: error.to_string(),
+            });
+        }
         if matches!(
             fact.kind,
             FactKind::Claim
@@ -2956,17 +4144,25 @@ impl DirectRoomStore {
                 | FactKind::Resolve
                 | FactKind::ClaimExpired
         ) {
-            let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
-            claim_authority::write_index_from_facts(&self.claim_index_path, &facts)
-                .map_err(|err| RallyError::Message(format!("write claim index: {err}")))?;
+            match facts_from_segments(&self.log_dir, &self.archive_dir).and_then(|facts| {
+                claim_authority::write_index_from_facts(&self.claim_index_path, &facts)
+                    .map_err(|error| RallyError::Message(format!("write claim index: {error}")))
+            }) {
+                Ok(()) => {}
+                Err(error) => warnings.push(ProjectionWarning {
+                    code: ProjectionWarningCode::ClaimIndex,
+                    message: error.to_string(),
+                }),
+            }
         }
-        Ok(fact)
+        warnings
     }
 
     /// After a successful single-event append, rebuild the reconcile sidecar
     /// from measured segment + database stats and fingerprint both the main
     /// database and its WAL. If either side cannot be measured or they differ,
-    /// drop the sidecar so the next op re-scans authoritatively. Never errors.
+    /// return an error so the committed append reports an incomplete derived
+    /// projection and invalidates the sidecar before the next operation.
     ///
     /// Non-Unix note: on non-Unix platforms the mutation lock is a no-op
     /// (see store.rs `acquire_room_mutation_lock` #[cfg(not(unix))]). A concurrent
@@ -2975,39 +4171,20 @@ impl DirectRoomStore {
     /// self-corrected by a fingerprint mismatch on the next open, which triggers
     /// the authoritative full scan. No data loss is possible — the canonical
     /// JSONL segments are not affected by sidecar drift.
-    fn refresh_reconcile_cache_after_append(&self, appended_seq: i64) {
-        let (Ok(segments), Ok(archived)) = (
-            read_segment_files(&self.log_dir),
-            replay_archive_segments(&self.archive_dir),
-        ) else {
-            // Couldn't enumerate segments; drop the sidecar to force a re-scan.
-            if let Some(p) = reconcile_cache_path(&self.facts_db_path) {
-                let _ = fs::remove_file(p);
-            }
-            return;
-        };
+    fn refresh_reconcile_cache_after_append(&self, appended_seq: i64) -> Result<()> {
+        let segments = read_segment_files(&self.log_dir)?;
+        let archived = replay_archive_segments(&self.archive_dir)?;
         // Never advance counts from the previous sidecar. A lost WAL can leave
         // that sidecar internally consistent while facts.db has rewound. Re-read
         // both authoritative segments and the live SQLite view after the append;
         // only publish a fast-path cache when they still agree exactly.
-        let Ok(canonical_stats) = segment_seq_stats(&segments, &archived) else {
-            if let Some(p) = reconcile_cache_path(&self.facts_db_path) {
-                let _ = fs::remove_file(p);
-            }
-            return;
-        };
-        let Ok(db_stats) = read_db_event_stats(&self.facts_db_path, self.warm_fact_store.is_none())
-        else {
-            if let Some(p) = reconcile_cache_path(&self.facts_db_path) {
-                let _ = fs::remove_file(p);
-            }
-            return;
-        };
+        let canonical_stats = segment_seq_stats(&segments, &archived)?;
+        let db_stats = read_db_event_stats(&self.facts_db_path, self.warm_fact_store.is_none())?;
         if canonical_stats != db_stats || canonical_stats.max_seq < appended_seq {
-            if let Some(p) = reconcile_cache_path(&self.facts_db_path) {
-                let _ = fs::remove_file(p);
-            }
-            return;
+            return Err(RallyError::Message(format!(
+                "reconcile cache projection is not publishable after seq {appended_seq}: canonical count/max {}/{}, facts.db count/max {}/{}",
+                canonical_stats.count, canonical_stats.max_seq, db_stats.count, db_stats.max_seq,
+            )));
         }
         let cache = ReconcileCache {
             schema_version: RECONCILE_CACHE_SCHEMA_VERSION,
@@ -3019,7 +4196,7 @@ impl DirectRoomStore {
             db_count: db_stats.count,
             db_max_seq: db_stats.max_seq,
         };
-        let _ = write_reconcile_cache(&self.facts_db_path, &cache);
+        write_reconcile_cache(&self.facts_db_path, &cache)
     }
 
     // -------------------------------------------------------------------------
@@ -3043,38 +4220,11 @@ impl DirectRoomStore {
     /// Returns the verified `Fact` (with `seq` populated) on success.
     /// Returns `Err` with a clear message if the `event_id` is absent from
     /// the canonical segment record after write.
-    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<Fact> {
-        let appended = self.append_fact(fact)?;
-        let event_id = &appended.event_id;
-
-        // Fast path: the fact was JUST appended to the active segment, and it is
-        // the newest line there. Validate the whole active segment, then search
-        // its parsed entries tail-first. A valid tail must never hide completed
-        // corruption earlier in the canonical segment.
-        let active = self.active_segment_path();
-        if segment_event_id_present_tail_first(&active, event_id)? {
-            return Ok(appended);
-        }
-
-        // Slow path / true silent-drop detector: re-read EVERY canonical segment
-        // (live + archive) and scan for the exact event_id. If the active-first
-        // scan missed (e.g. the event landed in a different segment, or a silent
-        // drop occurred), this authoritative full scan is the final arbiter.
-        let live_segments = read_segment_files(&self.log_dir)?;
-        let archive_segments = read_segment_files(&self.archive_dir)?;
-
-        let found = segment_event_id_present(
-            live_segments.iter().chain(archive_segments.iter()),
-            event_id,
-        )?;
-
-        if !found {
-            return Err(RallyError::Message(format!(
-                "readback failed: {event_id} not found in canonical ledger after append"
-            )));
-        }
-
-        Ok(appended)
+    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<AppendOutcome> {
+        // O26's base append performs full event-id/seq/LedgerLine readback
+        // before it can construct AppendOutcome, so the old presence-only
+        // second pass is both weaker and redundant.
+        self.append_fact(fact)
     }
 
     /// For `release` and `resolve` facts: enforce that `--ref` names a live
@@ -3087,223 +4237,92 @@ impl DirectRoomStore {
     ///   blocker/risk/handoff/claim (no longer un-resolved after the write).
     ///
     /// Returns the verified `Fact` on success, or a loud error with the reason.
-    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<Fact> {
-        let ref_id = fact.ref_id.as_deref().ok_or_else(|| {
-            RallyError::Usage(format!(
-                "{} requires --ref <event-id> targeting a live fact; none provided",
-                fact.kind.as_str()
-            ))
-        })?;
-
-        // Assert the target is live BEFORE writing.
-        //
-        // The projection is taken INSIDE each arm that reads it, not once above
-        // the match. It used to be unconditional, so `ClaimExpired` and `Receipt`
-        // — whose arms are `_ => {}` — each paid a full `facts()` load plus the
-        // quadratic room projection TWICE per fact and used neither. That is
-        // what made the reaper unusable: 63 expired claims meant 126 discarded
-        // projections, and the pass could not finish inside the mutation
-        // watchdog. Keeping the call at its use site makes the two impossible to
-        // drift apart again (RC-058/RC-042).
-        match fact.kind {
-            FactKind::Release => {
-                let snapshot_before = self.snapshot()?;
-                // A release must reference an active claim (or resolve any fact by
-                // event_id).  We check the broader "is this event_id currently
-                // un-released" by looking at active_claims.
-                let is_live = snapshot_before
+    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<AppendOutcome> {
+        let ref_id = fact.ref_id.clone();
+        let mut outcome = self.append_fact(fact)?;
+        if !outcome.projection_complete {
+            return Ok(outcome);
+        }
+        let verification = (|| -> Result<()> {
+            let Some(ref_id) = ref_id.as_deref() else {
+                return Ok(());
+            };
+            let snapshot = self.snapshot()?;
+            let still_active = match fact.kind {
+                FactKind::Release => snapshot
                     .active_claims
                     .iter()
-                    .any(|c| c.event_id == ref_id);
-                if !is_live {
-                    return Err(RallyError::Usage(format!(
-                        "release failed: ref {ref_id} is not an active claim (already released, never existed, or invalid); nothing to release"
-                    )));
-                }
-                // ARP-R-02: the ownership gate that used to live here now runs
-                // in `write_authority::assert_claim_close_authorized`, called
-                // from `append_fact` for ALL FOUR kinds that close a claim.
-                // Two hand-copied call sites (here and the Resolve arm below)
-                // were how `Receipt` and `ClaimExpired` ended up ungated.
-            }
-            FactKind::Resolve => {
-                let snapshot_before = self.snapshot()?;
-                // Resolve must reference a live blocker, risk, handoff, claim,
-                // or an unconsumed artifact.  Artifacts are consumed by resolve
-                // (via the `consumed_refs` projection) which drops them from
-                // `unconsumed_artifacts`.
-                let open_handoff = snapshot_before
-                    .open_handoffs
-                    .iter()
-                    .find(|f| f.event_id == ref_id);
-                let is_live = snapshot_before
+                    .any(|candidate| candidate.event_id == ref_id),
+                FactKind::Resolve => snapshot
                     .active_blockers
                     .iter()
-                    .any(|f| f.event_id == ref_id)
-                    || snapshot_before
-                        .active_claims
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_before
-                        .open_handoffs
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_before
-                        .current_risks
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    // DI-1: system-health telemetry (risk-kind, split out of
-                    // current_risks) must remain resolvable by ref.
-                    || snapshot_before
-                        .system_health
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_before
-                        .unconsumed_artifacts
-                        .iter()
-                        .any(|f| f.event_id == ref_id);
-                if !is_live {
-                    return Err(RallyError::Usage(format!(
-                        "resolve failed: ref {ref_id} is not a live blocker, claim, handoff, risk, or unconsumed artifact (already resolved, never existed, or invalid); nothing to resolve"
-                    )));
-                }
-                // A Resolve naming a live CLAIM closes that claim exactly as a
-                // Release does, so it must clear the same authorization bar —
-                // and so must Receipt and ClaimExpired, which is why that bar
-                // now lives at the write boundary in `write_authority` instead
-                // of being asserted per-arm here (ARP-R-02).
-                if let Some(handoff) = open_handoff
-                    && !handoff_closer_matches_target(handoff, fact)
-                {
-                    let target = handoff.target.as_deref().unwrap_or("<untargeted>");
-                    let tool = fact.tool.as_deref().unwrap_or("<unknown>");
-                    return Err(RallyError::Usage(format!(
-                        "resolve failed: ref {ref_id} is targeted to {target}; tool {tool} cannot resolve it"
-                    )));
-                }
+                    .chain(snapshot.active_claims.iter())
+                    .chain(snapshot.open_handoffs.iter())
+                    .chain(snapshot.current_risks.iter())
+                    .chain(snapshot.system_health.iter())
+                    .chain(snapshot.unconsumed_artifacts.iter())
+                    .any(|candidate| candidate.event_id == ref_id),
+                _ => false,
+            };
+            if still_active {
+                return Err(RallyError::Message(format!(
+                    "{} projection readback left ref {ref_id} active",
+                    fact.kind.as_str()
+                )));
             }
-            _ => {}
+            Ok(())
+        })();
+        if let Err(error) = verification {
+            outcome.projection_complete = false;
+            outcome.warnings.push(ProjectionWarning {
+                code: ProjectionWarningCode::TransitionVerification,
+                message: error.to_string(),
+            });
+            crate::mark_watchdog_append_outcome(&outcome);
         }
-
-        // Write + canonical readback.
-        let appended = self.append_fact_verified(fact)?;
-
-        // Assert the projected status flipped. Same rule as above: taken inside
-        // the arms that read it.
-        match fact.kind {
-            FactKind::Release => {
-                let snapshot_after = self.snapshot()?;
-                let still_active = snapshot_after
-                    .active_claims
-                    .iter()
-                    .any(|c| c.event_id == ref_id);
-                if still_active {
-                    return Err(RallyError::Message(format!(
-                        "release readback failed: {ref_id} is still in active_claims after release — the release fact was recorded but the projection did not flip; this is a corruption signal"
-                    )));
-                }
-            }
-            FactKind::Resolve => {
-                let snapshot_after = self.snapshot()?;
-                let still_active = snapshot_after
-                    .active_blockers
-                    .iter()
-                    .any(|f| f.event_id == ref_id)
-                    || snapshot_after
-                        .active_claims
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_after
-                        .open_handoffs
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_after
-                        .current_risks
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_after
-                        .system_health
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_after
-                        .unconsumed_artifacts
-                        .iter()
-                        .any(|f| f.event_id == ref_id);
-                if still_active {
-                    return Err(RallyError::Message(format!(
-                        "resolve readback failed: {ref_id} is still active after resolve — the resolve fact was recorded but the projection did not flip; this is a corruption signal"
-                    )));
-                }
-            }
-            _ => {}
-        }
-
-        Ok(appended)
+        Ok(outcome)
     }
 
     pub(crate) fn append_session_fact_if_context(
         &self,
         fact: &Fact,
         expected_context_version: Option<u64>,
-    ) -> Result<Option<Fact>> {
+    ) -> Result<ConditionalAppendOutcome> {
+        validate_append_identity(fact)?;
+        crate::write_authority::assert_field_bounds(fact)?;
         let room_dir = self
             .facts_db_path
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
-        reconcile_segments_and_db(
+        let tail = inspect_active_segment_tail(&self.active_segment_path())?;
+        if resolve_canonical_event_id(
             &self.log_dir,
             &self.archive_dir,
-            &self.facts_db_path,
-            self.warm_fact_store.is_none(),
-        )?;
-        // Warm-pool facade (L11/R1/G10): warm reuse in daemon mode, per-op
-        // lenient open in direct mode (byte-identical to main — G1).
-        let fact_store = self.fact_store_handle(true)?;
-        let mut fact = fact.clone();
-        let logical_seq =
-            next_canonical_seq(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
-        fact.seq = logical_seq;
-        // Defense-in-depth dup gate (2026-07-02) — see append_fact.
-        if let Some(tail) = last_seq_in_segment(&self.active_segment_path())?
-            && fact.seq <= tail
+            fact,
+            &self.active_engagement,
+        )?
+        .is_some()
         {
-            return Err(RallyError::Message(format!(
-                "seq allocation conflict: allocated {} <= active segment tail {} — refusing to write a duplicate. Delete .rally/.reconcile-cache.json and retry.",
-                fact.seq, tail
-            )));
+            return self
+                .append_fact_under_lock(fact)
+                .map(ConditionalAppendOutcome::Applied);
         }
-        let payload =
-            serde_json::to_value(&fact).map_err(RallyError::json("render session fact"))?;
-        let result = fact_store.append_if(
-            vec![NewEvent::new("session", payload.clone())],
-            &FactQuery::for_event_types(["session"]),
-            expected_context_version,
-        );
-        match result {
-            Ok(result) => {
-                let _store_seq = i64::try_from(result.last_sequence_number).map_err(|err| {
-                    RallyError::Message(format!("sequence number overflow: {err}"))
-                })?;
-                append_segment_line(
-                    &self.active_segment_path(),
-                    &LedgerLine {
-                        seq: fact.seq,
-                        occurred_at: now_string(),
-                        event_type: "session".to_string(),
-                        payload,
-                        engagement: Some(self.active_engagement.clone()),
-                    },
-                )?;
-                crate::mark_watchdog_command_commit();
-                self.refresh_reconcile_cache_after_append(fact.seq);
-                let _ = self.refresh_log_index();
-                let _ = self.refresh_index(fact.seq);
-                Ok(Some(fact))
-            }
-            Err(EventStoreError::ConditionalAppendConflict { .. }) => Ok(None),
-            Err(err) => Err(RallyError::Message(format!("append session fact: {err}"))),
+        let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+        let current_context = facts
+            .iter()
+            .filter(|existing| existing.kind == FactKind::Session)
+            .map(|existing| u64::try_from(existing.seq).unwrap_or(u64::MAX))
+            .max();
+        if current_context != expected_context_version {
+            debug_assert_eq!(
+                tail,
+                inspect_active_segment_tail(&self.active_segment_path())?
+            );
+            return Ok(ConditionalAppendOutcome::NotApplied);
         }
+        self.append_fact_under_lock(fact)
+            .map(ConditionalAppendOutcome::Applied)
     }
 
     pub(crate) fn facts(&self) -> Result<Vec<Fact>> {
@@ -3312,6 +4331,13 @@ impl DirectRoomStore {
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
+        self.facts_under_lock()
+    }
+
+    /// Read the reconciled fact projection while the caller already owns the
+    /// room mutation lock. Snapshot-cache capture uses this to keep projection
+    /// and canonical fingerprint inside one epoch without recursive locking.
+    fn facts_under_lock(&self) -> Result<Vec<Fact>> {
         reconcile_segments_and_db(
             &self.log_dir,
             &self.archive_dir,
@@ -3351,6 +4377,7 @@ impl DirectRoomStore {
     }
 
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn renew_claim_lease(
         &self,
         claim_id: &str,
@@ -3358,15 +4385,80 @@ impl DirectRoomStore {
         caller_tool: Option<&str>,
         caller_session_id: Option<&str>,
         expected_owner_session_id: Option<&str>,
-    ) -> Result<Option<claim_authority::ActiveClaimRecord>> {
+        event_id: &str,
+        thread_id: &str,
+        created_at: &str,
+    ) -> Result<RenewClaimLeaseOutcome> {
         let requested = chrono::DateTime::parse_from_rfc3339(&lease_expires_at).map_err(|err| {
             RallyError::Usage(format!(
                 "renew claim lease: lease_expires_at must be RFC3339: {err}"
             ))
         })?;
-        let facts = self.facts()?;
-        let Some(current) = claim_authority::active_claim_record(&facts, claim_id) else {
-            return Ok(None);
+        validate_append_event_id(event_id)?;
+        if thread_id.trim().is_empty() || thread_id.chars().any(char::is_control) {
+            return Err(RallyError::Usage(
+                "renew claim lease: thread_id must be nonempty and contain no control characters"
+                    .to_string(),
+            ));
+        }
+        chrono::DateTime::parse_from_rfc3339(created_at).map_err(|error| {
+            RallyError::Usage(format!(
+                "renew claim lease: created_at must be RFC3339: {error}"
+            ))
+        })?;
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+        let current = claim_authority::active_claim_record(&facts, claim_id);
+        let existing = facts.iter().find(|fact| fact.event_id == event_id);
+        let scope = current
+            .as_ref()
+            .map(|record| record.raw_scope.clone())
+            .or_else(|| existing.map(|fact| fact.scope.clone()))
+            .unwrap_or_default();
+        let renewal = Fact {
+            from_session_id: caller_session_id.map(str::to_string),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: event_id.to_string(),
+            seq: 0,
+            thread_id: thread_id.to_string(),
+            kind: FactKind::ClaimRenewed,
+            tool: caller_tool.map(str::to_string),
+            role: None,
+            subject: format!("claim lease renewed: {claim_id}"),
+            scope,
+            created_at: created_at.to_string(),
+            summary: None,
+            evidence: vec![format!("lease_expires_at:{lease_expires_at}")],
+            target: None,
+            ref_id: Some(claim_id.to_string()),
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        validate_append_identity(&renewal)?;
+        crate::write_authority::assert_field_bounds(&renewal)?;
+
+        // Canonical identity precedes every stateful lease/owner check. This
+        // is the exact-retry path after a reply was lost and the first commit
+        // already advanced mutable lease state.
+        if existing.is_some() {
+            let append_outcome = self.append_fact_under_lock(&renewal)?;
+            return Ok(RenewClaimLeaseOutcome {
+                record: current,
+                append_outcome: Some(append_outcome),
+            });
+        }
+
+        let Some(mut current) = current else {
+            return Ok(RenewClaimLeaseOutcome {
+                record: None,
+                append_outcome: None,
+            });
         };
         if current.from_session_id.as_deref() != expected_owner_session_id {
             return Err(RallyError::Usage(format!(
@@ -3392,33 +4484,17 @@ impl DirectRoomStore {
         {
             // Renewal is monotonic. Equal/older retries are idempotent and
             // must never shorten the authoritative lease.
-            return Ok(Some(current));
+            return Ok(RenewClaimLeaseOutcome {
+                record: Some(current),
+                append_outcome: None,
+            });
         }
-
-        let renewal = Fact {
-            from_session_id: caller_session_id.map(str::to_string),
-            schema: FACT_SCHEMA.to_string(),
-            event_id: crate::new_id("fact"),
-            seq: 0,
-            thread_id: crate::new_id("room"),
-            kind: FactKind::ClaimRenewed,
-            tool: caller_tool.map(str::to_string),
-            role: None,
-            subject: format!("claim lease renewed: {claim_id}"),
-            scope: current.raw_scope.clone(),
-            created_at: now_string(),
-            summary: None,
-            evidence: vec![format!("lease_expires_at:{lease_expires_at}")],
-            target: None,
-            ref_id: Some(claim_id.to_string()),
-            status: None,
-            severity: None,
-            uri: None,
-            session: None,
-        };
-        self.append_fact_verified(&renewal)?;
-        let facts = self.facts()?;
-        Ok(claim_authority::active_claim_record(&facts, claim_id))
+        let append_outcome = self.append_fact_under_lock(&renewal)?;
+        current.lease_expires_at = Some(lease_expires_at);
+        Ok(RenewClaimLeaseOutcome {
+            record: Some(current),
+            append_outcome: Some(append_outcome),
+        })
     }
 
     #[cfg(test)]
@@ -3474,13 +4550,56 @@ impl DirectRoomStore {
     /// Snapshot honoring an explicit `include_archived` flag (the
     /// `rally room --include-archived` path re-includes decayed facts).
     pub(crate) fn snapshot_with_archived(&self, include_archived: bool) -> Result<RoomSnapshot> {
-        let facts = self.facts()?;
+        self.snapshot_cache_capture(include_archived)
+            .map(|capture| capture.snapshot)
+    }
+
+    pub(crate) fn snapshot_cache_capture(
+        &self,
+        include_archived: bool,
+    ) -> Result<SnapshotCacheCapture> {
+        self.snapshot_cache_capture_at(include_archived, projection_unix_sec())
+    }
+
+    fn snapshot_cache_capture_at(
+        &self,
+        include_archived: bool,
+        projection_unix_sec: i64,
+    ) -> Result<SnapshotCacheCapture> {
+        let rally_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        trigger_o26_fault(rally_dir, O26FaultPoint::SnapshotPostCommit)
+            .map_err(|detail| RallyError::Message(format!("snapshot fault: {detail}")))?;
+        let _guard = acquire_room_mutation_lock(rally_dir)?;
+        let facts = self.facts_under_lock()?;
         let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
-        Ok(snapshot_from_facts_with_policy(
+        let snapshot = snapshot_from_facts_with_policy_at(
             &facts,
             &coord,
             include_archived,
-        ))
+            projection_unix_sec,
+        );
+        let fingerprint = snapshot_cache_fingerprint_at(
+            rally_dir,
+            projection_unix_sec,
+            include_archived,
+            &coord,
+        )?;
+        Ok(SnapshotCacheCapture {
+            snapshot,
+            fingerprint: Some(fingerprint),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_snapshot_cache_capture_at(
+        &self,
+        include_archived: bool,
+        projection_unix_sec: i64,
+    ) -> Result<SnapshotCacheCapture> {
+        self.snapshot_cache_capture_at(include_archived, projection_unix_sec)
     }
 
     fn repo_wide_claim_lifecycle_facts(&self) -> Result<Vec<Fact>> {
@@ -3746,51 +4865,68 @@ impl DirectRoomStore {
     /// the tool's last recorded checkpoint (coalescing guard — no-op polls must
     /// not inflate the ledger).
     ///
-    /// Returns `Ok(Some(fact))` when a checkpoint was written, `Ok(None)` when
-    /// the read position did not advance beyond the last checkpoint.
+    /// Returns `Applied(AppendOutcome)` when this stable checkpoint request was
+    /// written/resolved, `NotApplied` when the read position did not advance.
     ///
-    /// Uses `append_fact` (not `append_fact_verified`) — a dropped checkpoint is
-    /// low-stakes metadata and must NOT trigger a second readback (which itself
-    /// would be another append and could loop). R9-readback is reserved for
-    /// load-bearing state transitions.
+    /// O26's base append performs exact canonical readback for every kind,
+    /// including low-stakes checkpoints. The conditional admission and append
+    /// both run under one mutation lock, so concurrent polls cannot pass the
+    /// coalescing guard and inflate the ledger.
     pub(crate) fn maybe_append_read_checkpoint(
         &self,
-        tool: &str,
+        checkpoint: &Fact,
         read_seq: i64,
-    ) -> Result<Option<Fact>> {
-        let last_checkpoint = self.last_checkpoint_seq(tool)?;
+    ) -> Result<ConditionalAppendOutcome> {
+        validate_append_identity(checkpoint)?;
+        crate::write_authority::assert_field_bounds(checkpoint)?;
+        if checkpoint.kind != FactKind::Read {
+            return Err(RallyError::Usage(
+                "read checkpoint request must carry kind=read".to_string(),
+            ));
+        }
+        let tool = checkpoint.tool.as_deref().ok_or_else(|| {
+            RallyError::Usage("read checkpoint request requires tool".to_string())
+        })?;
+        if checkpoint.summary.as_deref() != Some(format!("read_seq:{read_seq}").as_str()) {
+            return Err(RallyError::Usage(
+                "read checkpoint summary does not match requested read_seq".to_string(),
+            ));
+        }
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        if resolve_canonical_event_id(
+            &self.log_dir,
+            &self.archive_dir,
+            checkpoint,
+            &self.active_engagement,
+        )?
+        .is_some()
+        {
+            return self
+                .append_fact_under_lock(checkpoint)
+                .map(ConditionalAppendOutcome::Applied);
+        }
+        let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+        let last_checkpoint = facts
+            .iter()
+            .filter(|fact| fact.kind == FactKind::Read && fact.tool.as_deref() == Some(tool))
+            .filter_map(|fact| {
+                fact.summary
+                    .as_deref()
+                    .and_then(|summary| summary.strip_prefix("read_seq:"))
+                    .and_then(|raw| raw.parse::<i64>().ok())
+            })
+            .max()
+            .unwrap_or(0);
         if read_seq <= last_checkpoint {
             // No advancement — coalesce.
-            return Ok(None);
+            return Ok(ConditionalAppendOutcome::NotApplied);
         }
-        let fact = Fact {
-            from_session_id: None,
-            schema: crate::FACT_SCHEMA.to_string(),
-            event_id: crate::new_id("read"),
-            seq: 0,
-            thread_id: format!(
-                "read-{}",
-                tool.chars()
-                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-                    .collect::<String>()
-            ),
-            kind: FactKind::Read,
-            tool: Some(tool.to_string()),
-            role: None,
-            subject: format!("read-checkpoint: {tool} at seq {read_seq}"),
-            scope: Vec::new(),
-            created_at: crate::now_string(),
-            summary: Some(format!("read_seq:{read_seq}")),
-            evidence: Vec::new(),
-            target: None,
-            ref_id: None,
-            status: None,
-            severity: None,
-            uri: None,
-            session: None,
-        };
-        let appended = self.append_fact(&fact)?;
-        Ok(Some(appended))
+        self.append_fact_under_lock(checkpoint)
+            .map(ConditionalAppendOutcome::Applied)
     }
 
     /// Project per-tool read receipts from `FactKind::Read` checkpoint facts,
@@ -4426,15 +5562,12 @@ fn facts_from_db_with_query_recovery(
 ///
 /// # Why the fingerprint is trusted
 ///
-/// `(name, len, mtime_ns)` per file, the SAME signal
-/// `refresh_reconcile_cache_after_full_scan` already trusts, and for the same
-/// reason: JSONL segments are append-only, so any content change also changes
-/// `len`. The one documented exception is `seed_segment_from_db`, which
-/// `truncate`s and rewrites — both of its call sites fire only when there are NO
-/// segments at all, so the fingerprint goes from empty to non-empty and the memo
-/// misses anyway. They also call [`invalidate_segment_fold_memo`] explicitly,
-/// because relying on that argument silently is how the next same-length rewrite
-/// path would break this.
+/// `(name, len, mtime_ns, tail_hash)` per file, the SAME signal
+/// `refresh_reconcile_cache_after_full_scan` already trusts. Appends move the
+/// length, while O26's bounded tail repair moves the fixed-size tail hash even
+/// if length and timestamp collide. The repair path also calls
+/// [`invalidate_segment_fold_memo`] before rewriting so the current process
+/// cannot reuse a detached fold.
 ///
 /// # What this does NOT do
 ///
@@ -4515,27 +5648,48 @@ fn facts_from_engagement_segments(
 ) -> Result<Vec<Fact>> {
     let engagement = validate_scoped_engagement(engagement)?;
     let file_name = format!("{engagement}.jsonl");
-    let mut entries = Vec::new();
-    entries.extend(read_segment_entries(&log_dir.join(&file_name))?);
-    entries.extend(read_segment_entries(&archive_dir.join(&file_name))?);
-    entries.sort_by_key(|entry| entry.seq);
-
-    let mut facts = Vec::with_capacity(entries.len());
-    let mut seen = BTreeMap::<i64, LedgerLine>::new();
-    for entry in entries {
-        if let Some(existing) = seen.get(&entry.seq) {
-            if existing != &entry {
-                return Err(RallyError::Message(format!(
-                    "conflicting canonical rows for engagement {engagement:?} at seq {}: live/archive rows differ",
-                    entry.seq
-                )));
+    let mut by_seq = BTreeMap::<i64, (LedgerLine, bool)>::new();
+    let mut fold_source = |path: &Path, exact_legacy_name: bool| -> Result<()> {
+        for entry in read_segment_entries(path)? {
+            // A modern authoritative envelope stamp always wins. Filename
+            // fallback exists only for unstamped legacy exact-name rows.
+            let belongs_to_engagement = entry
+                .engagement
+                .as_deref()
+                .map_or(exact_legacy_name, |actual| actual == engagement);
+            if let Some((existing, existing_belongs)) = by_seq.get_mut(&entry.seq) {
+                if existing != &entry {
+                    return Err(RallyError::Message(format!(
+                        "conflicting canonical rows for engagement {engagement:?} at seq {}: live/archive rows differ",
+                        entry.seq
+                    )));
+                }
+                *existing_belongs |= belongs_to_engagement;
+                continue;
             }
+            by_seq.insert(entry.seq, (entry, belongs_to_engagement));
+        }
+        Ok(())
+    };
+
+    // The exact live path is inherently scoped by its validated filename.
+    fold_source(&log_dir.join(&file_name), true)?;
+    for path in replay_archive_segments(archive_dir)? {
+        let exact_legacy_name =
+            path.file_name().and_then(|name| name.to_str()) == Some(file_name.as_str());
+        // Decode and exact-fold every generation before selecting rows. This
+        // keeps unrelated canonical conflicts loud while preserving legacy
+        // exact-name files that predate the authoritative envelope stamp.
+        fold_source(&path, exact_legacy_name)?;
+    }
+
+    let mut facts = Vec::with_capacity(by_seq.len());
+    for (entry, belongs_to_engagement) in by_seq.into_values() {
+        if !belongs_to_engagement {
             continue;
         }
         let seq = entry.seq;
-        let payload = entry.payload.clone();
-        seen.insert(seq, entry);
-        facts.push(Fact::from_segment_value(payload, seq)?);
+        facts.push(Fact::from_segment_value(entry.payload, seq)?);
     }
     Ok(facts)
 }
@@ -4790,10 +5944,25 @@ fn snapshot_from_facts_with_policy(
     coord: &crate::hooks_config::CoordinationConfig,
     include_archived: bool,
 ) -> RoomSnapshot {
-    let now_secs = std::time::SystemTime::now()
+    snapshot_from_facts_with_policy_at(facts, coord, include_archived, projection_unix_sec())
+}
+
+fn projection_unix_sec() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// Deterministic projection core. Snapshot-cache capture passes the same whole
+/// second into both this projection and its freshness proof so a time-derived
+/// decision can never be stamped with a different epoch.
+fn snapshot_from_facts_with_policy_at(
+    facts: &[Fact],
+    coord: &crate::hooks_config::CoordinationConfig,
+    include_archived: bool,
+    now_secs: i64,
+) -> RoomSnapshot {
     let half_life_secs = coord.half_life_secs();
     let floor = coord.archive_floor_weight;
     let is_archived = |fact: &Fact| -> bool {
@@ -6141,7 +7310,7 @@ fn sanitise_engagement(value: &str) -> String {
 
 /// Validate a caller-selected segment name. Unlike append routing, a scoped
 /// read must never silently rewrite a label and select a neighboring segment.
-fn validate_scoped_engagement(value: &str) -> Result<String> {
+pub(crate) fn validate_scoped_engagement(value: &str) -> Result<String> {
     let trimmed = value.trim();
     let cleaned = sanitise_engagement(trimmed);
     if cleaned.is_empty() {
@@ -6177,17 +7346,16 @@ const RECONCILE_CACHE_FILENAME: &str = ".reconcile-cache.json";
 const RECONCILE_CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Cheap per-file fingerprint component: `(filename, byte_len, mtime_ns)` plus
-/// an optional content hash of the file's first page.
+/// optional fixed-size content hashes.
 ///
-/// For segment files only `(name, len, mtime_ns)` is used — JSONL segments are
-/// append-only, so any content change also changes `len`. (Exception: the
-/// `seed_segment_from_db` path uses `truncate(true)` and rewrites the file at a
-/// potentially equal length — this is safe ONLY because that caller drops the
-/// sidecar before returning (~store.rs `reconcile`, seed branch). Any future
-/// same-length-rewrite path such as compaction or repair MUST also drop the
-/// sidecar, or must add a content hash to segment fingerprints.) For `facts.db` the
-/// `head_hash` (hash of the first 4096 bytes, the SQLite file-format header +
-/// page 1) is ALSO populated: in-place header corruption (SQLITE_NOTADB) keeps
+/// Segment files populate `tail_hash` from their final 4096 bytes. This keeps
+/// O26's bounded tail truncation/newline repair visible even when replacement
+/// bytes preserve the prior file length and the filesystem timestamp collides.
+/// Old schema-2 sidecars deserialize the missing hash as `None`, which cannot
+/// equal a current `Some` hash and therefore fail closed without a schema bump.
+/// For `facts.db` the `head_hash` (hash of the first 4096 bytes, the SQLite
+/// file-format header + page 1) is populated: in-place header corruption
+/// (SQLITE_NOTADB) keeps
 /// the same `len` and may collide on a coarse `mtime_ns` under load, but it
 /// always changes the header bytes — so the head_hash diverges and the fast
 /// path correctly refuses to trust the corrupt db, falling through to
@@ -6200,6 +7368,8 @@ struct FileFingerprint {
     mtime_ns: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     head_hash: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tail_hash: Option<u64>,
 }
 
 /// Derived sidecar for the reconcile fast path. All fields are recomputable from
@@ -6327,8 +7497,8 @@ pub(crate) fn cold_open_count() -> u64 {
     cold_open_probe::count()
 }
 
-/// Fingerprint a single file as `(name, byte_len, mtime_ns)` with NO content
-/// hash. Used for append-only JSONL segments, where any change moves `len`.
+/// Fingerprint a single file as `(name, byte_len, mtime_ns)` with no content
+/// hash. Callers add the fixed-size hash appropriate to their file type.
 /// Returns `None` if the file is absent or its metadata can't be read — callers
 /// treat `None` as "no trustworthy signal" and fall through to the
 /// authoritative path.
@@ -6349,7 +7519,14 @@ fn fingerprint_file(path: &Path) -> Option<FileFingerprint> {
         len: meta.len(),
         mtime_ns,
         head_hash: None,
+        tail_hash: None,
     })
+}
+
+fn fingerprint_segment(path: &Path) -> Option<FileFingerprint> {
+    let mut fingerprint = fingerprint_file(path)?;
+    fingerprint.tail_hash = Some(hash_file_tail(path));
+    Some(fingerprint)
 }
 
 /// Fingerprint `facts.db` for the corruption-safe fast-path guard:
@@ -6400,6 +7577,25 @@ fn hash_file_head(path: &Path) -> u64 {
     hash_bytes_fnv1a(&[])
 }
 
+/// Hash the final 4096 bytes of a canonical segment. Fixed-cost and sensitive
+/// to the only in-place rewrite O26 permits: active-tail framing repair.
+fn hash_file_tail(path: &Path) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = fs::File::open(path) else {
+        return hash_bytes_fnv1a(&[]);
+    };
+    let length = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let start = length.saturating_sub(4096);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return hash_bytes_fnv1a(&[]);
+    }
+    let mut bytes = Vec::with_capacity(4096);
+    if file.take(4096).read_to_end(&mut bytes).is_err() {
+        return hash_bytes_fnv1a(&[]);
+    }
+    hash_bytes_fnv1a(&bytes)
+}
+
 /// FNV-1a 64-bit for persisted filenames/fingerprints. See [`hash_file_head`].
 fn hash_bytes_fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -6415,7 +7611,7 @@ fn segments_fingerprint(live: &[PathBuf], archived: &[PathBuf]) -> Vec<FileFinge
     let mut fps: Vec<FileFingerprint> = live
         .iter()
         .chain(archived.iter())
-        .filter_map(|p| fingerprint_file(p))
+        .filter_map(|p| fingerprint_segment(p))
         .collect();
     fps.sort_by(|a, b| a.name.cmp(&b.name));
     fps
@@ -6438,8 +7634,8 @@ fn read_reconcile_cache(facts_db_path: &Path) -> Option<ReconcileCache> {
     (cache.schema_version == RECONCILE_CACHE_SCHEMA_VERSION).then_some(cache)
 }
 
-/// Write the sidecar atomically (tmp + rename). Best-effort: a write failure is
-/// swallowed by the caller — the next op simply re-scans and rewrites it.
+/// Write the sidecar atomically (tmp + rename). A failed rename is benign only
+/// when another writer published the exact cache value we intended to install.
 fn write_reconcile_cache(facts_db_path: &Path, cache: &ReconcileCache) -> Result<()> {
     let Some(path) = reconcile_cache_path(facts_db_path) else {
         return Ok(());
@@ -6451,10 +7647,20 @@ fn write_reconcile_cache(facts_db_path: &Path, cache: &ReconcileCache) -> Result
         .map_err(RallyError::io(format!("write {}", temp_path.display())))?;
     match fs::rename(&temp_path, &path) {
         Ok(()) => Ok(()),
-        // Lost a race with a peer writer; their sidecar is just as valid.
-        Err(_) => {
+        Err(error) => {
+            let exact_peer = read_reconcile_cache(facts_db_path)
+                .as_ref()
+                .is_some_and(|existing| existing == cache);
             let _ = fs::remove_file(&temp_path);
-            Ok(())
+            if exact_peer {
+                Ok(())
+            } else {
+                Err(RallyError::io(format!(
+                    "rename reconcile cache {} to {}",
+                    temp_path.display(),
+                    path.display()
+                ))(error))
+            }
         }
     }
 }
@@ -6472,10 +7678,10 @@ fn seed_segments_from_db_if_absent(
 
     let db_stats = read_db_event_stats(facts_db_path, true)?;
     if db_stats.count > 0 {
-        seed_segment_from_db(log_dir, facts_db_path)?;
-        invalidate_segment_fold_memo();
-        refresh_reconcile_cache_after_full_scan(log_dir, archive_dir, facts_db_path, db_stats);
-        return Ok(());
+        return Err(RallyError::Usage(format!(
+            "current-format DB-only room detected at {}; automatic promotion is disabled. Preserve facts.db and run `rally doctor --migrate-db-only --engagement <label> --apply` while the daemon is stopped",
+            facts_db_path.display()
+        )));
     }
 
     let cache = ReconcileCache {
@@ -6500,8 +7706,8 @@ fn seed_segments_from_db_if_absent(
 /// The contract is:
 ///
 /// * Segments ahead of db (incl. db absent) → rebuild db by replaying segments.
-/// * Segments absent but db has events → seed one segment from db (first-run
-///   upgrade from a pre-R1 db that never had a ledger).
+/// * Segments absent but db has events → preserve the db and fail loud with
+///   the explicit offline `rally doctor --migrate-db-only` recovery path.
 /// * Both empty, or in sync → no-op.
 ///
 /// Fast path (Step-3): a cheap O(#segment-files) fingerprint of the segment set
@@ -6572,15 +7778,10 @@ fn reconcile_segments_and_db(
     }
 
     if canonical_stats.count == 0 && db_stats.count > 0 {
-        // No segments yet but the db has events: first-run upgrade from a
-        // pre-segment install. Seed a segment so the canonical record exists.
-        seed_segment_from_db(log_dir, facts_db_path)?;
-        invalidate_segment_fold_memo();
-        // State just changed; let the next op re-fingerprint. Drop the sidecar.
-        if let Some(p) = reconcile_cache_path(facts_db_path) {
-            let _ = fs::remove_file(p);
-        }
-        return Ok(());
+        return Err(RallyError::Usage(format!(
+            "current-format DB-only room detected at {}; automatic promotion is disabled. Preserve facts.db and run `rally doctor --migrate-db-only --engagement <label> --apply` while the daemon is stopped",
+            facts_db_path.display()
+        )));
     }
 
     if canonical_stats != db_stats {
@@ -6690,19 +7891,34 @@ fn read_segment_entries(path: &Path) -> Result<Vec<LedgerLine>> {
 /// avoid materializing unrelated rows even when one segment is large.
 fn read_segment_entries_matching(
     path: &Path,
+    include: impl FnMut(&LedgerLine) -> bool,
+) -> Result<Vec<LedgerLine>> {
+    read_segment_entries_matching_with_policy(path, true, true, include)
+}
+
+/// Rotation runs under `mutation.lock`, so a listed source cannot disappear
+/// legitimately and an incomplete final fragment must fail rather than be
+/// treated as a replay-ignorable torn append. A valid final record without a
+/// newline remains valid canonical JSON and is included.
+fn read_segment_entries_strict(path: &Path) -> Result<Vec<LedgerLine>> {
+    read_segment_entries_matching_with_policy(path, false, false, |_| true)
+}
+
+fn read_segment_entries_matching_with_policy(
+    path: &Path,
+    ignore_incomplete_tail: bool,
+    tolerate_missing: bool,
     mut include: impl FnMut(&LedgerLine) -> bool,
 ) -> Result<Vec<LedgerLine>> {
     let file = match fs::File::open(path) {
         Ok(file) => file,
-        // f4: callers list segment files via `read_segment_files` and then
-        // open each one in a SEPARATE step (exists()-then-open at some call
-        // sites, no check at all at others) — a concurrent archival/rotation
-        // can remove a listed segment in between. That is not corruption; it
-        // is a benign race with rotation. Treat it as an empty segment
-        // rather than propagating, so callers fall through to whatever else
-        // they scan instead of hard-failing. Every PARSE error below stays
-        // loud — this only widens tolerance for the file's ABSENCE.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        // f4: ordinary replay callers may list immediately before rotation
+        // moves a file, so their policy treats NotFound as a benign empty
+        // source. Rotation itself holds `mutation.lock` and disables that
+        // tolerance: a planned source disappearing under the lock is loud.
+        Err(err) if tolerate_missing && err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
         Err(err) => {
             let ctx = format!("read canonical segment {}", path.display());
             return Err(RallyError::io(ctx)(err));
@@ -6737,12 +7953,28 @@ fn read_segment_entries_matching(
         }
 
         match serde_json::from_slice::<LedgerLine>(&bytes) {
-            Ok(entry) if include(&entry) => entries.push(entry),
-            Ok(_) => {}
-            Err(_) if !had_newline => break,
+            Ok(entry) => {
+                validate_canonical_line(&entry).map_err(|error| {
+                    RallyError::Message(format!(
+                        "completed canonical segment corruption in {} at line {}: {}",
+                        path.display(),
+                        line_number,
+                        error
+                    ))
+                })?;
+                if include(&entry) {
+                    entries.push(entry);
+                }
+            }
+            Err(_) if !had_newline && ignore_incomplete_tail => break,
             Err(err) => {
+                let state = if had_newline {
+                    "completed"
+                } else {
+                    "unterminated"
+                };
                 return Err(RallyError::Message(format!(
-                    "completed canonical segment corruption in {} at line {}: {}",
+                    "{state} canonical segment corruption in {} at line {}: {}",
                     path.display(),
                     line_number,
                     err
@@ -6753,12 +7985,213 @@ fn read_segment_entries_matching(
     Ok(entries)
 }
 
+/// Normalize raw read-only SQLite rows into the exact canonical `LedgerLine`
+/// representation used by replay. Logical payload sequences win over compacted
+/// database positions, preserving sparse histories and their high-water mark.
+pub(crate) fn render_db_only_migration_segment(
+    source_rows: Vec<DbOnlyMigrationSourceRow>,
+    engagement: &str,
+) -> Result<DbOnlyMigrationSegment> {
+    let engagement = validate_scoped_engagement(engagement)?;
+    let mut rows = BTreeMap::<i64, LedgerLine>::new();
+    let mut previous_database_seq = 0;
+    for record in source_rows {
+        let database_seq = record.database_seq;
+        if database_seq <= previous_database_seq {
+            return Err(RallyError::Message(format!(
+                "DB-only source record seq {database_seq} is not strictly newer than {previous_database_seq}"
+            )));
+        }
+        previous_database_seq = database_seq;
+        let fact = Fact::from_value(record.payload.clone(), database_seq)?;
+        let logical_seq = fact.seq;
+        if logical_seq <= 0 {
+            return Err(RallyError::Message(format!(
+                "DB-only row {} has non-positive logical seq {logical_seq}",
+                fact.event_id
+            )));
+        }
+        let mut payload = record.payload;
+        let payload_object = payload.as_object_mut().ok_or_else(|| {
+            RallyError::Message(format!(
+                "DB-only row at record seq {database_seq} is not an object payload"
+            ))
+        })?;
+        payload_object.insert("seq".to_string(), json!(logical_seq));
+        let entry = LedgerLine {
+            seq: logical_seq,
+            occurred_at: record.occurred_at.to_string(),
+            event_type: record.event_type,
+            payload,
+            engagement: Some(engagement.clone()),
+        };
+        chrono::DateTime::parse_from_rfc3339(&entry.occurred_at).map_err(|error| {
+            RallyError::Message(format!(
+                "DB-only row at logical seq {logical_seq} has invalid occurred_at {:?}: {error}",
+                entry.occurred_at
+            ))
+        })?;
+        validate_canonical_line(&entry)?;
+        if rows.insert(logical_seq, entry).is_some() {
+            return Err(RallyError::Message(format!(
+                "DB-only history has more than one row at logical seq {logical_seq}; migration cannot choose canonical precedence"
+            )));
+        }
+    }
+    if rows.is_empty() {
+        return Err(RallyError::Usage(
+            "facts.db contains no rows; there is no DB-only history to migrate".to_string(),
+        ));
+    }
+
+    let row_count = u64::try_from(rows.len())
+        .map_err(|error| RallyError::Message(format!("row count overflow: {error}")))?;
+    let max_seq = rows.last_key_value().map(|(seq, _)| *seq).unwrap_or(0);
+    let mut bytes = Vec::new();
+    for entry in rows.values() {
+        serde_json::to_writer(&mut bytes, entry)
+            .map_err(RallyError::json("render DB-only canonical row"))?;
+        bytes.push(b'\n');
+    }
+    Ok(DbOnlyMigrationSegment {
+        bytes,
+        row_count,
+        max_seq,
+    })
+}
+
+/// Exact readback for marker-bound migration temp/target files. Byte equality
+/// prevents normalization drift; strict canonical parsing independently proves
+/// that every complete line remains replayable and no torn tail was accepted.
+pub(crate) fn verify_db_only_migration_segment(
+    path: &Path,
+    expected: &DbOnlyMigrationSegment,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(RallyError::io(format!(
+        "stat migration segment {}",
+        path.display()
+    )))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(RallyError::Usage(format!(
+            "migration segment {} must be a regular file, not a symlink or special file",
+            path.display()
+        )));
+    }
+    let observed = fs::read(path).map_err(RallyError::io(format!(
+        "read migration segment {}",
+        path.display()
+    )))?;
+    if observed != expected.bytes {
+        return Err(RallyError::Message(format!(
+            "migration segment {} differs from the marker-bound canonical candidate",
+            path.display()
+        )));
+    }
+    let entries = read_segment_entries_strict(path)?;
+    if entries.len() as u64 != expected.row_count
+        || entries.last().map_or(0, |entry| entry.seq) != expected.max_seq
+    {
+        return Err(RallyError::Message(format!(
+            "migration segment {} readback stats differ from the marker-bound candidate",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Verify an immutable migration receipt against a target that may have grown
+/// by later canonical appends. The receipt-bound bytes must remain the exact
+/// prefix; every extension row must be strictly newer, canonical-valid, and
+/// stamped for the same engagement. Nothing is rewritten or repaired here.
+pub(crate) fn verify_db_only_migration_extension(
+    path: &Path,
+    expected_prefix: &DbOnlyMigrationSegment,
+    expected_engagement: &str,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(RallyError::io(format!(
+        "stat migration target {}",
+        path.display()
+    )))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(RallyError::Usage(format!(
+            "migration target {} must be a regular file, not a symlink or special file",
+            path.display()
+        )));
+    }
+    let observed = fs::read(path).map_err(RallyError::io(format!(
+        "read migration target {}",
+        path.display()
+    )))?;
+    if !observed.starts_with(&expected_prefix.bytes) {
+        return Err(RallyError::Message(format!(
+            "migration target {} diverges from its immutable receipt-bound prefix",
+            path.display()
+        )));
+    }
+    let entries = read_segment_entries_strict(path)?;
+    let prefix_count = usize::try_from(expected_prefix.row_count)
+        .map_err(|error| RallyError::Message(format!("row count overflow: {error}")))?;
+    if entries.len() < prefix_count
+        || entries
+            .get(prefix_count.saturating_sub(1))
+            .map_or(0, |entry| entry.seq)
+            != expected_prefix.max_seq
+    {
+        return Err(RallyError::Message(format!(
+            "migration target {} no longer contains the receipt-bound row boundary",
+            path.display()
+        )));
+    }
+    for entry in &entries {
+        if entry.engagement.as_deref() != Some(expected_engagement) {
+            return Err(RallyError::Message(format!(
+                "migration target {} seq {} is not stamped for receipt engagement {:?}",
+                path.display(),
+                entry.seq,
+                expected_engagement
+            )));
+        }
+        chrono::DateTime::parse_from_rfc3339(&entry.occurred_at).map_err(|error| {
+            RallyError::Message(format!(
+                "migration target {} seq {} has invalid occurred_at {:?}: {error}",
+                path.display(),
+                entry.seq,
+                entry.occurred_at
+            ))
+        })?;
+    }
+    let mut previous_seq = expected_prefix.max_seq;
+    for entry in entries.iter().skip(prefix_count) {
+        if entry.seq <= previous_seq {
+            return Err(RallyError::Message(format!(
+                "migration target {} extension seq {} is not newer than {}",
+                path.display(),
+                entry.seq,
+                previous_seq
+            )));
+        }
+        previous_seq = entry.seq;
+    }
+    Ok(())
+}
+
+/// Strict, non-mutating rotation preflight over one canonical segment.
+/// Schema/kind/identity validation is shared with replay; timestamps remain
+/// strings here so rotate owns its cutoff parsing and error context.
+pub(crate) fn rotation_segment_occurred_at_values(path: &Path) -> Result<Vec<String>> {
+    Ok(read_segment_entries_strict(path)?
+        .into_iter()
+        .map(|entry| entry.occurred_at)
+        .collect())
+}
+
 /// R9-readback: scan segment files for the presence of a specific `event_id`
 /// in any `LedgerLine.payload.event_id` field.  Returns `true` if found.
 ///
 /// Reads each line of each segment file; parses as `LedgerLine`; deserializes
 /// `payload` as a minimal struct that exposes `event_id`.  Uses the segment
 /// *files* as the authoritative source — never `facts.db`.
+#[cfg(test)]
 fn segment_event_id_present<'a>(
     paths: impl Iterator<Item = &'a PathBuf>,
     event_id: &str,
@@ -6787,6 +8220,7 @@ fn segment_event_id_present<'a>(
 /// the caller falls through to the authoritative full live+archive scan. A
 /// `true` here is a genuine presence (we matched the exact `event_id`) and all
 /// completed lines in the segment passed canonical validation.
+#[cfg(test)]
 fn segment_event_id_present_tail_first(path: &Path, event_id: &str) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
@@ -6871,31 +8305,13 @@ fn segment_seq_stats(live: &[PathBuf], archived: &[PathBuf]) -> Result<SeqStats>
     })
 }
 
-fn next_canonical_seq(log_dir: &Path, archive_dir: &Path, facts_db_path: &Path) -> Result<i64> {
-    let segments = read_segment_files(log_dir)?;
-    let archived = replay_archive_segments(archive_dir)?;
-    // Fast path ONLY when the sidecar's counts AND its segment fingerprint still
-    // match the on-disk segments — so the O(1) shortcut can never hand out a
-    // stale max regardless of caller order (defense-in-depth, 2026-07-02). The
-    // fingerprint compare is O(#files) stat, cheap; the fallback already reads
-    // these segments.
-    if let Some(cache) = read_reconcile_cache(facts_db_path)
-        && cache.canonical_count == cache.db_count
-        && cache.canonical_max_seq == cache.db_max_seq
-        && cache.canonical_max_seq >= 0
-        && cache.segments_fingerprint == segments_fingerprint(&segments, &archived)
-    {
-        return Ok(cache.canonical_max_seq + 1);
-    }
-    Ok(segment_seq_stats(&segments, &archived)?.max_seq + 1)
-}
-
 /// Highest `seq` currently written to a segment file (its on-disk tail), or
 /// `None` when the segment is absent/empty. Used as a defense-in-depth dup gate:
 /// an allocated seq must always exceed the active segment's tail, else we would
 /// write a duplicate that bricks segment replay. Reads the (per-engagement,
 /// typically small) active segment and validates every completed line before
 /// trusting the last entry.
+#[cfg(test)]
 fn last_seq_in_segment(segment_path: &Path) -> Result<Option<i64>> {
     if !segment_path.exists() {
         return Ok(None);
@@ -7121,55 +8537,17 @@ fn rebuild_db_from_segments(
     Ok(())
 }
 
-/// Seed a single segment file from the existing db when no segment exists
-/// yet. Used as a forward-compat path: a pre-R1 install that only had
-/// `facts.db` still ends up with a canonical segment record.
-fn seed_segment_from_db(log_dir: &Path, facts_db_path: &Path) -> Result<()> {
-    let store = open_fact_store(facts_db_path)?;
-    let query = store
-        .query(&FactQuery::all())
-        .map_err(|err| RallyError::Message(format!("query facts: {err}")))?;
-    fs::create_dir_all(log_dir).map_err(RallyError::io(format!("create {}", log_dir.display())))?;
-    let seed_label = utc_date_label();
-    let target = log_dir.join(format!("{seed_label}.jsonl"));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&target)
-        .map_err(RallyError::io(format!("create {}", target.display())))?;
-    for record in query.event_records {
-        let seq = i64::try_from(record.sequence_number)
-            .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
-        let entry = LedgerLine {
-            seq,
-            occurred_at: record.occurred_at.to_string(),
-            event_type: record.event_type,
-            payload: record.payload,
-            engagement: Some(seed_label.clone()),
-        };
-        let line =
-            serde_json::to_string(&entry).map_err(RallyError::json("render segment line"))?;
-        writeln!(file, "{line}").map_err(RallyError::io(format!("write {}", target.display())))?;
-    }
-    file.sync_all()
-        .map_err(RallyError::io(format!("fsync {}", target.display())))?;
-    Ok(())
-}
-
 /// Append a single line to a segment file. Path/payload format identical to
 /// the R1 monolith; only the *location* moved.
+#[cfg(test)]
 fn append_segment_line(segment_path: &Path, entry: &LedgerLine) -> Result<()> {
     if let Some(parent) = segment_path.parent() {
         fs::create_dir_all(parent)
             .map_err(RallyError::io(format!("create {}", parent.display())))?;
     }
     let line = serde_json::to_string(entry).map_err(RallyError::json("render segment line"))?;
-    // Append `line\n` as a single write(2) call so that O_APPEND atomicity
-    // prevents interleaving with concurrent writers. writeln!(file, "{line}")
-    // expands to write_fmt which issues two separate write() calls (content
-    // then '\n'), allowing another process's bytes to land between them and
-    // corrupt the JSONL record. write_all issues a single syscall.
+    // Keep framing in one buffer. `write_all` may issue multiple syscalls; the
+    // O25 mutation lock, not a syscall-size assumption, serializes writers.
     let record = format!("{line}\n");
     let mut file = OpenOptions::new()
         .create(true)
@@ -7180,6 +8558,85 @@ fn append_segment_line(segment_path: &Path, entry: &LedgerLine) -> Result<()> {
         .map_err(RallyError::io(format!("write {}", segment_path.display())))?;
     file.sync_data()
         .map_err(RallyError::io(format!("fsync {}", segment_path.display())))?;
+    Ok(())
+}
+
+/// Canonical-first append boundary used by O26 mutations. The caller has
+/// already installed `OutcomeUnknown` in the watchdog before entering here.
+/// Every error therefore preserves the stable event id and query remedy.
+fn append_canonical_line_and_readback(
+    segment_path: &Path,
+    entry: &LedgerLine,
+    rendered_record: &[u8],
+    event_id: &str,
+) -> Result<()> {
+    let parent = segment_path.parent().ok_or_else(|| {
+        RallyError::outcome_unknown(event_id, "canonical-parent", "segment path has no parent")
+    })?;
+    let rally_dir = parent.parent().ok_or_else(|| {
+        RallyError::outcome_unknown(event_id, "canonical-room", "log directory has no room root")
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        RallyError::outcome_unknown(event_id, "canonical-parent-create", error.to_string())
+    })?;
+    let created = !segment_path.exists();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(segment_path)
+        .map_err(|error| {
+            RallyError::outcome_unknown(event_id, "canonical-open", error.to_string())
+        })?;
+    if o26_fault_armed(rally_dir, O26FaultPoint::PartialCanonicalWrite) {
+        let partial_len = (rendered_record.len() / 2).max(1);
+        file.write_all(&rendered_record[..partial_len])
+            .and_then(|()| file.sync_all())
+            .map_err(|error| {
+                RallyError::outcome_unknown(event_id, "canonical-partial-write", error.to_string())
+            })?;
+        let detail = trigger_o26_fault(rally_dir, O26FaultPoint::PartialCanonicalWrite)
+            .err()
+            .unwrap_or("injected pause after partial canonical write");
+        return Err(RallyError::outcome_unknown(
+            event_id,
+            "canonical-partial-write",
+            detail,
+        ));
+    }
+    file.write_all(rendered_record).map_err(|error| {
+        RallyError::outcome_unknown(event_id, "canonical-write", error.to_string())
+    })?;
+    file.sync_all().map_err(|error| {
+        RallyError::outcome_unknown(event_id, "canonical-sync", error.to_string())
+    })?;
+    if created {
+        sync_directory(parent).map_err(|error| {
+            RallyError::outcome_unknown(event_id, "canonical-parent-sync", error.to_string())
+        })?;
+    }
+    trigger_o26_fault(rally_dir, O26FaultPoint::AfterCanonicalSyncBeforeReadback).map_err(
+        |detail| RallyError::outcome_unknown(event_id, "canonical-sync-before-readback", detail),
+    )?;
+
+    let entries = read_segment_entries(segment_path).map_err(|error| {
+        RallyError::outcome_unknown(event_id, "canonical-readback", error.to_string())
+    })?;
+    let exact_matches = entries
+        .iter()
+        .filter(|observed| {
+            observed.seq == entry.seq
+                && observed.event_type == entry.event_type
+                && observed.payload == entry.payload
+                && observed.engagement == entry.engagement
+        })
+        .count();
+    if exact_matches != 1 {
+        return Err(RallyError::outcome_unknown(
+            event_id,
+            "canonical-readback",
+            format!("expected exactly one full event_id/seq row, found {exact_matches}"),
+        ));
+    }
     Ok(())
 }
 
@@ -7294,7 +8751,7 @@ impl DirectRoomStore {
     /// Best-effort — failure does not block reads or appends.
     ///
     /// Skip-when-fresh (Step-4): the index embeds a cheap `fingerprint`
-    /// (sorted `(name, len, mtime_ns)` over live + archive segment files,
+    /// (sorted `(name, len, mtime_ns, tail_hash)` over live + archive segment files,
     /// O(#files)). If the on-disk index's fingerprint already matches the
     /// current one, no segment changed since it was built → return early
     /// WITHOUT the O(#lines) re-read. The index is a derived cache (gitignored,
@@ -7424,25 +8881,38 @@ impl DirectRoomStore {
 // Mitigation: when the canonical ledger has not changed since the last
 // snapshot we projected, reuse that snapshot directly from a tiny on-disk
 // cache instead of reopening the database. Cache freshness is checked
-// against a fingerprint of `(facts.db mtime_ns, log/index.json mtime_ns +
-// content)`. The log-index is refreshed on every append (`refresh_log_index`
-// runs at the end of `append_fact`); a writer that mutates the room thus
-// inevitably invalidates the cache, even when it never touches the cache
-// file itself.
+// against a versioned fingerprint of the canonical live/archive segments,
+// `facts.db` mtime, and `log/index.json` content. Canonical segment length and
+// tail hash therefore invalidate the cache even when a committed append cannot
+// update either derived projection. The fingerprint also binds the exact
+// whole-second projection epoch, archive mode, and five effective coordination
+// inputs used by snapshot projection; time or policy changes therefore miss
+// even when canonical bytes do not move.
 //
 // The cache is *advisory* — a miss only costs the existing slow path; a
 // corrupt cache file is treated as a miss. Readers do NOT take the mutation
-// lock on the fast path: the cache is read-only and the underlying canonical
-// files are append-only, so a reader that observes a fingerprint can rely
-// on it being a consistent view of the ledger at that moment in time. The
-// fingerprint mechanism is the only correctness gate.
+// lock on the fast path: the captured fingerprint binds the snapshot to one
+// mutation epoch, and full equality with the current input fingerprint is the
+// correctness gate. Exact-second equality is intentionally conservative; a
+// longer TTL could cross a liveness decision boundary.
 
 const SNAPSHOT_CACHE_FILENAME: &str = "snapshot.cache.json";
+const SNAPSHOT_CACHE_GENERATION: u32 = 2;
+
+/// Snapshot and freshness proof captured while one room mutation lock is held.
+/// This pair is the only value accepted by the cache writer.
+#[derive(Clone, Debug)]
+pub(crate) struct SnapshotCacheCapture {
+    pub(crate) snapshot: RoomSnapshot,
+    /// `None` is a compatible routed reply from a peer that cannot provide a
+    /// server-anchored proof. Such a capture is usable but never cacheable.
+    pub(crate) fingerprint: Option<SnapshotCacheFingerprint>,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct SnapshotCacheEnvelope {
-    /// Fingerprint of the canonical inputs at the time of caching. A cache
-    /// is fresh iff this matches the current fingerprint exactly.
+    /// Fingerprint of the canonical and projection inputs at capture time. A
+    /// cache is fresh iff this matches the current fingerprint exactly.
     fingerprint: SnapshotCacheFingerprint,
     /// Projected `RoomSnapshot` for the fingerprinted ledger state.
     snapshot: RoomSnapshot,
@@ -7450,8 +8920,28 @@ struct SnapshotCacheEnvelope {
     cached_at: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-struct SnapshotCacheFingerprint {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct SnapshotCacheFingerprint {
+    /// Snapshot-cache contract generation. This is independent of the O29
+    /// reconcile-cache schema; older/missing generations always miss.
+    #[serde(default)]
+    generation: u32,
+    /// Canonical live+archive segment fingerprints, including fixed-size tail
+    /// hashes so canonical-only commits and tail repairs invalidate old caches.
+    #[serde(default)]
+    segments_fingerprint: Vec<FileFingerprint>,
+    /// Whole-second clock value used by the snapshot projection itself. Cache
+    /// reads require exact equality with the current second because squad
+    /// liveness and archive membership can change without a canonical write.
+    #[serde(default)]
+    projection_unix_sec: i64,
+    /// Projection mode is part of snapshot identity. The before-write cache
+    /// consumes only the default, non-archived view.
+    #[serde(default)]
+    include_archived: bool,
+    /// Exact effective inputs read by `snapshot_from_facts_with_policy_at`.
+    #[serde(default)]
+    projection_policy: SnapshotProjectionPolicyFingerprint,
     /// `facts.db` modification time in nanoseconds since the unix epoch.
     /// 0 when the db file is absent (a perfectly valid empty-room state).
     facts_db_mtime_ns: i128,
@@ -7462,6 +8952,27 @@ struct SnapshotCacheFingerprint {
     /// re-stamps `updated_at`). Bounded in size by the live segment count,
     /// not by the line count.
     log_index_text: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct SnapshotProjectionPolicyFingerprint {
+    half_life_hours_bits: u64,
+    archive_floor_weight_bits: u64,
+    default_cadence_secs: i64,
+    miss_multiplier: i64,
+    grace_secs: i64,
+}
+
+impl SnapshotProjectionPolicyFingerprint {
+    fn from_effective(coord: &crate::hooks_config::CoordinationConfig) -> Self {
+        Self {
+            half_life_hours_bits: coord.half_life_hours.to_bits(),
+            archive_floor_weight_bits: coord.archive_floor_weight.to_bits(),
+            default_cadence_secs: coord.default_cadence_secs,
+            miss_multiplier: coord.miss_multiplier,
+            grace_secs: coord.grace_secs,
+        }
+    }
 }
 
 fn snapshot_cache_path(rally_dir: &Path) -> PathBuf {
@@ -7481,25 +8992,43 @@ fn file_mtime_ns(path: &Path) -> i128 {
     }
 }
 
-fn current_fingerprint(rally_dir: &Path) -> SnapshotCacheFingerprint {
+fn snapshot_cache_fingerprint_at(
+    rally_dir: &Path,
+    projection_unix_sec: i64,
+    include_archived: bool,
+    coord: &crate::hooks_config::CoordinationConfig,
+) -> Result<SnapshotCacheFingerprint> {
     let facts_db = rally_dir.join("facts.db");
     let log_index = rally_dir.join(LOG_DIRNAME).join(LOG_INDEX_FILENAME);
-    SnapshotCacheFingerprint {
+    let live = read_segment_files(&rally_dir.join(LOG_DIRNAME))?;
+    let archived = replay_archive_segments(&rally_dir.join(ARCHIVE_DIRNAME))?;
+    Ok(SnapshotCacheFingerprint {
+        generation: SNAPSHOT_CACHE_GENERATION,
+        segments_fingerprint: segments_fingerprint(&live, &archived),
+        projection_unix_sec,
+        include_archived,
+        projection_policy: SnapshotProjectionPolicyFingerprint::from_effective(coord),
         facts_db_mtime_ns: file_mtime_ns(&facts_db),
         log_index_text: fs::read_to_string(&log_index).unwrap_or_default(),
-    }
+    })
 }
 
 /// Read-only snapshot retrieval: return the cached `RoomSnapshot` when its
-/// fingerprint matches the current canonical state. `None` when the cache is
-/// absent, unparseable, or stale. No mutation lock is acquired and no SQLite
-/// connection is opened on a hit; this is the path the before-write gate
-/// takes under sub-100ms targets.
+/// fingerprint matches the current canonical and projection inputs. `None`
+/// when the cache is absent, unparseable, or stale. No mutation lock is
+/// acquired and no SQLite connection is opened on a hit; this is the path the
+/// before-write gate takes under sub-100ms targets.
 pub(crate) fn try_load_cached_snapshot(rally_dir: &Path) -> Option<RoomSnapshot> {
+    try_load_cached_snapshot_at(rally_dir, projection_unix_sec())
+}
+
+fn try_load_cached_snapshot_at(rally_dir: &Path, projection_unix_sec: i64) -> Option<RoomSnapshot> {
     let cache_path = snapshot_cache_path(rally_dir);
     let text = fs::read_to_string(&cache_path).ok()?;
     let envelope: SnapshotCacheEnvelope = serde_json::from_str(&text).ok()?;
-    let now = current_fingerprint(rally_dir);
+    let repo_root = rally_dir.parent()?;
+    let coord = crate::hooks_config::resolve_coordination(repo_root).ok()?;
+    let now = snapshot_cache_fingerprint_at(rally_dir, projection_unix_sec, false, &coord).ok()?;
     if envelope.fingerprint == now {
         Some(envelope.snapshot)
     } else {
@@ -7507,13 +9036,17 @@ pub(crate) fn try_load_cached_snapshot(rally_dir: &Path) -> Option<RoomSnapshot>
     }
 }
 
-/// Persist `snapshot` under the current fingerprint. Atomic temp+rename; any
-/// IO error is swallowed (the cache is advisory — a failed write only forces
-/// the next reader through the slow path).
-pub(crate) fn write_snapshot_cache(rally_dir: &Path, snapshot: &RoomSnapshot) {
+/// Persist a previously captured snapshot/fingerprint pair. The writer never
+/// measures current files: doing so could stamp an old snapshot with a newer
+/// canonical generation after an intervening append. Atomic temp+rename; any
+/// IO error is swallowed because the cache is advisory.
+pub(crate) fn write_snapshot_cache(rally_dir: &Path, capture: &SnapshotCacheCapture) {
+    let Some(fingerprint) = capture.fingerprint.clone() else {
+        return;
+    };
     let envelope = SnapshotCacheEnvelope {
-        fingerprint: current_fingerprint(rally_dir),
-        snapshot: snapshot.clone(),
+        fingerprint,
+        snapshot: capture.snapshot.clone(),
         cached_at: now_string(),
     };
     let Ok(rendered) = serde_json::to_string(&envelope) else {
@@ -7546,8 +9079,8 @@ pub(crate) fn try_load_cached_snapshot_for(repo_root: &Path) -> Option<RoomSnaps
 
 /// Convenience writer keyed by `repo_root` rather than the inner `.rally`
 /// directory. Same fail-soft semantics as [`write_snapshot_cache`].
-pub(crate) fn write_snapshot_cache_for(repo_root: &Path, snapshot: &RoomSnapshot) {
-    write_snapshot_cache(&repo_root.join(".rally"), snapshot);
+pub(crate) fn write_snapshot_cache_for(repo_root: &Path, capture: &SnapshotCacheCapture) {
+    write_snapshot_cache(&repo_root.join(".rally"), capture);
 }
 
 #[cfg(test)]
@@ -7592,6 +9125,53 @@ mod ledger_tests {
             .expect("daemon EX acquisition must succeed");
         drop(daemon_owner);
         drop(direct_owner);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_migration_authority_orders_direct_then_daemon_then_mutation() {
+        let root = unique_root("offline-migration-authority-order");
+        let rally_dir = root.join(".rally");
+        let authority = acquire_offline_migration_authority(&rally_dir)
+            .expect("offline migration must acquire all three guards");
+
+        assert!(
+            acquire_direct_owner_exclusive_nb(&rally_dir)
+                .unwrap()
+                .is_none(),
+            "offline migration must exclude another direct facts.db owner"
+        );
+        assert!(
+            matches!(
+                acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(25)),
+                Err(RallyError::NotStarted(_))
+            ),
+            "offline migration daemon SH must exclude daemon startup"
+        );
+        assert!(
+            matches!(
+                with_mutation_deadline(Duration::from_millis(25), || {
+                    acquire_room_mutation_lock(&rally_dir)
+                }),
+                Err(RallyError::NotStarted(_))
+            ),
+            "offline migration must hold mutation.lock for its full lifetime"
+        );
+
+        drop(authority);
+        let direct = acquire_direct_owner_exclusive_nb(&rally_dir)
+            .unwrap()
+            .expect("direct ownership must recover after migration authority drops");
+        drop(direct);
+        let daemon = acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(100))
+            .expect("daemon ownership must recover after migration authority drops");
+        drop(daemon);
+        let mutation = with_mutation_deadline(Duration::from_millis(100), || {
+            acquire_room_mutation_lock(&rally_dir)
+        })
+        .expect("mutation.lock must recover after migration authority drops");
+        drop(mutation);
         fs::remove_dir_all(root).ok();
     }
 
@@ -8439,11 +10019,11 @@ mod ledger_tests {
             .snapshot_scoped("engagement-alpha", None, Some("src/lib.rs"), false, false)
             .unwrap();
         assert_eq!(renewed.active_claims[0].seq, 2, "origin seq stays stable");
-        assert_eq!(renewed.max_seq, renewal.seq);
-        assert_eq!(renewed.content_max_seq, renewal.seq);
+        assert_eq!(renewed.max_seq, renewal.fact.seq);
+        assert_eq!(renewed.content_max_seq, renewal.fact.seq);
         assert_eq!(
             renewed.last_activity_ts.as_deref(),
-            Some(renewal.created_at.as_str())
+            Some(renewal.fact.created_at.as_str())
         );
 
         let mut release = make_fact(
@@ -8467,7 +10047,7 @@ mod ledger_tests {
         unrelated.tool = Some("codex:gamma".to_string());
         unrelated.from_session_id = Some("sess:gamma".to_string());
         let unrelated = store.append_fact(&unrelated).unwrap();
-        assert!(unrelated.seq > release.seq);
+        assert!(unrelated.fact.seq > release.fact.seq);
 
         let closed = store
             .snapshot_scoped("engagement-alpha", None, Some("src/lib.rs"), false, false)
@@ -8476,11 +10056,11 @@ mod ledger_tests {
             closed.active_claims.is_empty(),
             "the path claim must be absent after its lifecycle closure"
         );
-        assert_eq!(closed.max_seq, release.seq);
-        assert_eq!(closed.content_max_seq, release.seq);
+        assert_eq!(closed.max_seq, release.fact.seq);
+        assert_eq!(closed.content_max_seq, release.fact.seq);
         assert_eq!(
             closed.last_activity_ts.as_deref(),
-            Some(release.created_at.as_str())
+            Some(release.fact.created_at.as_str())
         );
         fs::remove_dir_all(root).ok();
     }
@@ -8990,7 +10570,7 @@ mod ledger_tests {
                 "land after holder release",
             ))
             .expect("append retry must land after the holder releases");
-        assert_eq!(appended.subject, "subject-append-retry");
+        assert_eq!(appended.fact.subject, "subject-append-retry");
         assert!(
             started.elapsed() >= Duration::from_millis(375),
             "append completed before the first busy wait; control was vacuous"
@@ -9057,7 +10637,7 @@ mod ledger_tests {
         assert!(
             snap.system_health
                 .iter()
-                .any(|f| f.event_id == risk.event_id),
+                .any(|f| f.event_id == risk.fact.event_id),
             "telemetry must project into system_health"
         );
         let mut resolve = make_fact(
@@ -9066,7 +10646,7 @@ mod ledger_tests {
             "tests/",
             "drift resolved",
         );
-        resolve.ref_id = Some(risk.event_id.clone());
+        resolve.ref_id = Some(risk.fact.event_id.clone());
         store
             .append_state_transition_verified(&resolve)
             .expect("a system_health fact must be resolvable by ref");
@@ -9075,7 +10655,7 @@ mod ledger_tests {
             !after
                 .system_health
                 .iter()
-                .any(|f| f.event_id == risk.event_id),
+                .any(|f| f.event_id == risk.fact.event_id),
             "resolved telemetry must leave system_health"
         );
         fs::remove_dir_all(&root).ok();
@@ -9290,7 +10870,7 @@ mod ledger_tests {
         // What this test actually asserts is projection ORDER, not authority,
         // so it is set to a self-release and its real assertion is unchanged.
         release.tool = Some("tool-a".to_string());
-        release.ref_id = Some(old_claim.event_id);
+        release.ref_id = Some(old_claim.fact.event_id.clone());
         store.append_state_transition_verified(&release).unwrap();
         let later_claim = claim_fact(
             "claim-later",
@@ -9330,7 +10910,9 @@ mod ledger_tests {
                     "2099-01-01T00:00:00Z",
                 );
                 barrier.wait();
-                store.append_fact_verified(&fact).map(|f| f.event_id)
+                store
+                    .append_fact_verified(&fact)
+                    .map(|outcome| outcome.fact.event_id)
             }));
         }
 
@@ -9534,6 +11116,9 @@ mod ledger_tests {
                 None,
                 None,
                 None,
+                "renew-anonymous-request",
+                "renew-anonymous-thread",
+                "2026-08-10T00:00:00Z",
             )
             .expect_err("anonymous caller must not renew an anonymous claim");
         assert_eq!(store.facts().unwrap().len(), before);
@@ -9605,6 +11190,9 @@ mod ledger_tests {
                 Some("tool-a"),
                 Some("session-modern"),
                 None,
+                "renew-legacy-request",
+                "renew-legacy-thread",
+                "2026-08-10T00:00:00Z",
             )
             .expect("identified legacy owner must retain compatibility")
             .expect("legacy claim remains active");
@@ -9760,7 +11348,7 @@ mod ledger_tests {
         let c = store
             .append_fact(&make_fact("e3", FactKind::Blocker, "tests/", "blocker c"))
             .unwrap();
-        assert_eq!((a.seq, b.seq, c.seq), (1, 2, 3));
+        assert_eq!((a.fact.seq, b.fact.seq, c.fact.seq), (1, 2, 3));
 
         let before_facts = store.facts().unwrap();
         let before_snapshot = store.snapshot().unwrap();
@@ -9967,7 +11555,10 @@ mod ledger_tests {
         let d = store
             .append_fact(&make_fact("e4", FactKind::Risk, "src/", "risk d"))
             .unwrap();
-        assert_eq!((a.seq, b.seq, c.seq, d.seq), (1, 2, 3, 4));
+        assert_eq!(
+            (a.fact.seq, b.fact.seq, c.fact.seq, d.fact.seq),
+            (1, 2, 3, 4)
+        );
         let before_facts = store.facts().unwrap();
         assert_eq!(before_facts.len(), 4);
 
@@ -10127,10 +11718,12 @@ mod ledger_tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// First-run upgrade: a pre-existing room with a db but no segments
-    /// seeds a segment from the cache so no history is lost.
+    /// O26 DB-only cutover: a current-format database without canonical
+    /// segments is preserved and requires the explicit offline migration path.
+    /// The adjacent two-engagement test remains the positive control that a
+    /// room with canonical segments reconstructs after its cache is deleted.
     #[test]
-    fn seed_segment_from_existing_db() {
+    fn db_only_room_requires_explicit_offline_migration() {
         let root = unique_root("segments-bootstrap");
         let store = RoomStore::open_at(root.clone()).unwrap();
         store
@@ -10141,9 +11734,9 @@ mod ledger_tests {
             .unwrap();
         drop(store);
 
-        // Simulate "upgraded from a pre-segment version of rally": delete
-        // every segment but keep the db. Also remove the index so first-open
-        // can't accidentally short-circuit.
+        // Remove every canonical segment while preserving the derived db.
+        // Also remove the index so first-open cannot short-circuit the
+        // explicit DB-only migration requirement.
         let log_dir = root.join(".rally/log");
         if log_dir.exists() {
             for entry in fs::read_dir(&log_dir).unwrap() {
@@ -10153,24 +11746,17 @@ mod ledger_tests {
         assert!(segments_under(&root).is_empty());
         assert!(root.join(".rally/facts.db").exists());
 
-        // Reopen → reconcile seeds a segment from the db.
-        let store = RoomStore::open_at(root.clone()).unwrap();
-        let segs = segments_under(&root);
-        assert_eq!(segs.len(), 1, "exactly one seeded segment");
-        assert_eq!(count_segment_events(&segs).unwrap(), 2);
-
-        // Now delete the db and confirm the seeded segment round-trips.
-        drop(store);
         let facts_db = root.join(".rally/facts.db");
-        fs::remove_file(&facts_db).ok();
-        let _ = fs::remove_file(facts_db.with_extension("db-shm"));
-        let _ = fs::remove_file(facts_db.with_extension("db-wal"));
-
-        let store = RoomStore::open_at(root.clone()).unwrap();
-        let facts = store.facts().unwrap();
-        assert_eq!(facts.len(), 2);
-        assert_eq!(facts[0].event_id, "e1");
-        assert_eq!(facts[1].event_id, "e2");
+        let db_before = fs::read(&facts_db).unwrap();
+        let error = match RoomStore::open_at(root.clone()) {
+            Ok(_) => panic!("DB-only room must require explicit offline migration"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("current-format DB-only room detected"));
+        assert!(message.contains("rally doctor --migrate-db-only"));
+        assert!(segments_under(&root).is_empty());
+        assert_eq!(fs::read(&facts_db).unwrap(), db_before);
 
         fs::remove_dir_all(&root).ok();
     }
@@ -10206,14 +11792,16 @@ mod ledger_tests {
             ))
             .unwrap();
         let d = store
-            .append_fact(&make_fact(
-                "e4",
-                FactKind::Resolve,
-                "tests/",
-                "beta resolved",
-            ))
+            .append_fact(&{
+                let mut resolve = make_fact("e4", FactKind::Resolve, "tests/", "beta resolved");
+                resolve.ref_id = Some(c.fact.event_id.clone());
+                resolve
+            })
             .unwrap();
-        assert_eq!((a.seq, b.seq, c.seq, d.seq), (1, 2, 3, 4));
+        assert_eq!(
+            (a.fact.seq, b.fact.seq, c.fact.seq, d.fact.seq),
+            (1, 2, 3, 4)
+        );
 
         let before_facts = store.facts().unwrap();
         drop(store);
@@ -10765,7 +12353,7 @@ mod ledger_tests {
             .append_fact(&make_fact("after-oob", FactKind::Artifact, "src/", "after"))
             .unwrap();
         assert_eq!(
-            appended.seq, 8,
+            appended.fact.seq, 8,
             "fingerprint mismatch must force an authoritative scan past the out-of-band tail"
         );
         let live = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
@@ -10916,7 +12504,10 @@ mod ledger_tests {
                 match differing_field {
                     "occurred_at" => conflicting.occurred_at = "2026-05-02T00:00:07Z".to_string(),
                     "engagement" => conflicting.engagement = Some("beta".to_string()),
-                    "event_type" => conflicting.event_type = "artifact".to_string(),
+                    "event_type" => {
+                        conflicting.event_type = "artifact".to_string();
+                        conflicting.payload["kind"] = json!("artifact");
+                    }
                     "payload" => conflicting.payload["subject"] = json!("different payload"),
                     _ => unreachable!(),
                 }
@@ -11111,7 +12702,7 @@ mod ledger_tests {
             ))
             .unwrap();
         assert_eq!(
-            appended.seq, 5,
+            appended.fact.seq, 5,
             "append must allocate from canonical max seq, not db event count"
         );
 
@@ -11177,8 +12768,14 @@ mod ledger_tests {
         let fact = make_fact("ev-r9-6", FactKind::Claim, "src/", "r9 green baseline");
         let verified = store.append_fact_verified(&fact).unwrap();
 
-        assert!(verified.seq > 0, "seq must be > 0 after verified append");
-        assert_eq!(verified.event_id, "ev-r9-6", "event_id must be preserved");
+        assert!(
+            verified.fact.seq > 0,
+            "seq must be > 0 after verified append"
+        );
+        assert_eq!(
+            verified.fact.event_id, "ev-r9-6",
+            "event_id must be preserved"
+        );
         // room_id is available from the store.
         let room = store.room_id();
         assert!(!room.is_empty(), "room_id must be non-empty");
@@ -11200,7 +12797,7 @@ mod ledger_tests {
         let fact = make_fact("ev-r9-1", FactKind::Decision, "src/", "segment drop test");
         // Write normally — both db and segment get the line.
         let appended = store.append_fact(&fact).unwrap();
-        let event_id = &appended.event_id;
+        let event_id = &appended.fact.event_id;
 
         // Simulate segment drop: truncate the active segment file so the line
         // is absent from the canonical record (db still has it).
@@ -11219,8 +12816,10 @@ mod ledger_tests {
             "readback must NOT find event_id in segments after segment truncation (drop simulation)"
         );
 
-        // Confirm db still has it — proving the readback correctly targets segments.
-        let db_facts = store.facts().unwrap();
+        // Confirm the derived db still has it without invoking RoomStore's
+        // canonical reconciliation (which must reject this DB-only split).
+        let db = open_fact_store_lenient(&root.join(".rally/facts.db")).unwrap();
+        let db_facts = facts_from_store(&db).unwrap();
         let in_db = db_facts.iter().any(|f| f.event_id == *event_id);
         assert!(
             in_db,
@@ -11245,7 +12844,7 @@ mod ledger_tests {
         let verified = store.append_fact_verified(&fact).unwrap();
         let active = store.active_segment_path();
         assert!(
-            segment_event_id_present_tail_first(&active, &verified.event_id).unwrap(),
+            segment_event_id_present_tail_first(&active, &verified.fact.event_id).unwrap(),
             "tail-first scan must find the just-appended event in the active segment"
         );
 
@@ -11257,13 +12856,14 @@ mod ledger_tests {
         let appended = store.append_fact(&drop_fact).unwrap();
         fs::write(&active, b"").unwrap();
         assert!(
-            !segment_event_id_present_tail_first(&active, &appended.event_id).unwrap(),
+            !segment_event_id_present_tail_first(&active, &appended.fact.event_id).unwrap(),
             "tail-first must miss after truncation (defers to full scan)"
         );
         let live = read_segment_files(&root.join(".rally").join(LOG_DIRNAME)).unwrap();
         let arch = read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
         assert!(
-            !segment_event_id_present(live.iter().chain(arch.iter()), &appended.event_id).unwrap(),
+            !segment_event_id_present(live.iter().chain(arch.iter()), &appended.fact.event_id)
+                .unwrap(),
             "full scan must also miss the dropped event — silent drop is still caught"
         );
 
@@ -11428,40 +13028,33 @@ mod ledger_tests {
             fs::write(&sidecar, serde_json::to_vec(&legacy).unwrap()).unwrap();
 
             // Model a natural upgrade: the legacy sidecar already exists when
-            // this binary opens the room. Open must not bless or rewrite it;
-            // append must reject it and validate the canonical fold first.
-            let store = DirectRoomStore::open_direct_at_with_engagement(
-                root.clone(),
-                Some("alpha".to_string()),
-            )
-            .unwrap();
+            // this binary opens the room. O26 reconciles canonical-ahead state
+            // during open, so the corruption must fail there before any writer
+            // can enter; no cache/source/db byte may change.
             let db_before = fs::read(&facts_db).unwrap();
             let sources_before = canonical_source_snapshot(&root);
             let cache_before = fs::read(&sidecar).unwrap();
-            let append_result = store.append_fact(&make_fact(
-                "must-not-land",
-                FactKind::Decision,
-                "src/",
-                "conflicting canonical history",
-            ));
-            drop(store);
+            let error_text = match DirectRoomStore::open_direct_at_with_engagement(
+                root.clone(),
+                Some("alpha".to_string()),
+            ) {
+                Ok(store) => {
+                    drop(store);
+                    String::new()
+                }
+                Err(error) => error.to_string(),
+            };
             let db_after = fs::read(&facts_db).unwrap();
             let sources_after = canonical_source_snapshot(&root);
             let cache_after = fs::read(&sidecar).unwrap_or_default();
-            let error_text = append_result
-                .as_ref()
-                .err()
-                .map(ToString::to_string)
-                .unwrap_or_default();
 
-            if !(append_result.is_err()
-                && error_text.contains("conflicting canonical segment rows at seq 3")
+            if !(error_text.contains("conflicting canonical segment rows at seq 3")
                 && db_after == db_before
                 && sources_after == sources_before
                 && cache_after == cache_before)
             {
                 failures.push(format!(
-                    "{source_layout}: result={append_result:?}, db_changed={}, sources_changed={}, cache_changed={}, error={error_text:?}",
+                    "{source_layout}: db_changed={}, sources_changed={}, cache_changed={}, error={error_text:?}",
                     db_after != db_before,
                     sources_after != sources_before,
                     cache_after != cache_before,
@@ -11602,9 +13195,9 @@ mod ledger_tests {
         let measured: ReconcileCache =
             serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
         assert_eq!(measured.canonical_count, 2);
-        assert_eq!(measured.canonical_max_seq, appended.seq);
+        assert_eq!(measured.canonical_max_seq, appended.fact.seq);
         assert_eq!(measured.db_count, 2);
-        assert_eq!(measured.db_max_seq, appended.seq);
+        assert_eq!(measured.db_max_seq, appended.fact.seq);
         fs::remove_dir_all(&root).ok();
     }
 
@@ -11673,7 +13266,7 @@ mod ledger_tests {
             let f = store
                 .append_fact(&make_fact(&format!("e{i}"), FactKind::Claim, "src/", "f"))
                 .unwrap();
-            ids.push(f.event_id);
+            ids.push(f.fact.event_id.clone());
         }
         assert_eq!(store.facts().unwrap().len(), 4);
         drop(store);
@@ -11795,7 +13388,7 @@ mod ledger_tests {
                     &format!("fact {i} padding to force many sqlite pages"),
                 ))
                 .unwrap();
-            ids.push(fact.event_id);
+            ids.push(fact.fact.event_id.clone());
         }
         assert_eq!(store.facts().unwrap().len(), 800);
         drop(store);
@@ -11947,7 +13540,7 @@ mod ledger_tests {
 
         let fact = make_fact("ev-r9-4", FactKind::Claim, "src/", "db false-pass guard");
         let appended = store.append_fact(&fact).unwrap();
-        let event_id = &appended.event_id;
+        let event_id = &appended.fact.event_id;
 
         // Drop the segment (truncate), leaving the db intact.
         let seg_path = store.active_segment_path();
@@ -11963,8 +13556,10 @@ mod ledger_tests {
             "segment readback must return false after truncation (correct)"
         );
 
-        // Assert 2: db-based readback returns true (false-pass territory).
-        let db_facts = store.facts().unwrap();
+        // Assert 2: a raw derived-db read returns true (false-pass territory).
+        // RoomStore::facts intentionally refuses the DB-only split.
+        let db = open_fact_store_lenient(&root.join(".rally/facts.db")).unwrap();
+        let db_facts = facts_from_store(&db).unwrap();
         let db_found = db_facts.iter().any(|f| f.event_id == *event_id);
         assert!(
             db_found,
@@ -12076,7 +13671,7 @@ mod ledger_tests {
         // Write a fact to room B.
         let fact = make_fact("ev-room-b", FactKind::Artifact, "src/", "wrong room test");
         let appended_b = store_b.append_fact(&fact).unwrap();
-        let event_id = &appended_b.event_id;
+        let event_id = &appended_b.fact.event_id;
 
         // Readback against room A's segments — must return false (wrong room).
         let segs_a = read_segment_files(&root_a.join(".rally").join(LOG_DIRNAME)).unwrap();
@@ -12123,7 +13718,7 @@ mod ledger_tests {
 
         // Simulate a concurrent peer append: manually write a segment line for
         // a peer fact at a higher seq.  This is what a concurrent writer would do.
-        let peer_seq = appended_a.seq + 100; // jump to simulate concurrent write
+        let peer_seq = appended_a.fact.seq + 100; // jump to simulate concurrent write
         let peer_event_id = "ev-r9-5b-peer";
         let peer_line = LedgerLine {
             seq: peer_seq,
@@ -12155,7 +13750,8 @@ mod ledger_tests {
         let arch = read_segment_files(&root.join(".rally").join(ARCHIVE_DIRNAME)).unwrap();
 
         let found_a =
-            segment_event_id_present(segs.iter().chain(arch.iter()), &appended_a.event_id).unwrap();
+            segment_event_id_present(segs.iter().chain(arch.iter()), &appended_a.fact.event_id)
+                .unwrap();
         assert!(
             found_a,
             "exact event_id for fact-A must be found even with a concurrent peer append present"
@@ -12759,7 +14355,7 @@ mod ledger_tests {
         let c = store
             .append_fact(&make_fact("e3", FactKind::Blocker, "tests/", "blocker c"))
             .unwrap();
-        assert_eq!((a.seq, b.seq, c.seq), (1, 2, 3));
+        assert_eq!((a.fact.seq, b.fact.seq, c.fact.seq), (1, 2, 3));
 
         // Grab the segment path before drop so we can mutate it.
         let segment_path = store.active_segment_path();
@@ -12817,6 +14413,1375 @@ mod ledger_tests {
     }
 
     #[test]
+    fn o26_unmarked_db_only_room_fails_loud_and_preserves_db() {
+        let root = unique_root("o26-db-only-refusal");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        store
+            .append_fact(&make_fact(
+                "o26-db-only-seed",
+                FactKind::Decision,
+                "src/",
+                "must require explicit migration",
+            ))
+            .unwrap();
+        drop(store);
+
+        let log_dir = root.join(".rally").join(LOG_DIRNAME);
+        for path in read_segment_files(&log_dir).unwrap() {
+            fs::remove_file(path).unwrap();
+        }
+        let facts_db = root.join(".rally/facts.db");
+        let before = fs::read(&facts_db).unwrap();
+
+        let error = match DirectRoomStore::open_direct_at(root.clone()) {
+            Ok(_) => panic!("an unmarked current-format DB-only room must not auto-promote"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("rally doctor --migrate-db-only"),
+            "refusal must name the explicit recovery path: {message}"
+        );
+        assert_eq!(
+            fs::read(&facts_db).unwrap(),
+            before,
+            "refusal must preserve the only extant history byte-for-byte"
+        );
+        assert!(read_segment_files(&log_dir).unwrap().is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_invalid_event_id_is_rejected_before_canonical_io() {
+        let root = unique_root("o26-invalid-event-id");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let segment = store.active_segment_path();
+        let db_before = fs::read(&store.facts_db_path).unwrap();
+        assert!(!segment.exists());
+
+        let mut candidate = make_fact("valid-before-edit", FactKind::Decision, "src/", "invalid");
+        candidate.event_id.clear();
+        let error = store
+            .append_fact(&candidate)
+            .expect_err("empty event id must fail before canonical mutation");
+        assert!(matches!(error, RallyError::Usage(_)));
+        assert!(error.to_string().contains("event_id must not be empty"));
+        assert!(
+            !segment.exists(),
+            "invalid stable identity must not create a canonical segment"
+        );
+
+        candidate.event_id = "x".repeat(MAX_APPEND_EVENT_ID_BYTES + 1);
+        let error = store
+            .append_fact(&candidate)
+            .expect_err("oversized event id must fail before canonical mutation");
+        assert!(matches!(error, RallyError::Usage(_)));
+        assert!(!segment.exists());
+
+        candidate.event_id = "bad\nevent".to_string();
+        let error = store
+            .append_fact(&candidate)
+            .expect_err("control characters must fail before canonical mutation");
+        assert!(matches!(error, RallyError::Usage(_)));
+        assert!(!segment.exists());
+
+        candidate.event_id = "valid-schema-check".to_string();
+        candidate.schema = "agent-rally.fact.v999".to_string();
+        let error = store
+            .append_fact(&candidate)
+            .expect_err("unsupported schema must fail before canonical mutation");
+        assert!(matches!(error, RallyError::Usage(_)));
+        assert!(!segment.exists());
+        assert_eq!(fs::read(&store.facts_db_path).unwrap(), db_before);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_canonical_open_fault_is_not_started_and_leaves_db_empty() {
+        let root = unique_root("o26-canonical-open-fault");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let rally_dir = root.join(".rally");
+        fail_o26_once(&rally_dir, O26FaultPoint::BeforeCanonicalMutation);
+        let error = store
+            .append_fact(&make_fact(
+                "o26-before-open",
+                FactKind::Decision,
+                "src/",
+                "not started",
+            ))
+            .expect_err("pre-open fault must be retry-safe");
+        assert!(matches!(error, RallyError::NotStarted(_)));
+        assert!(!store.active_segment_path().exists());
+        let db = open_fact_store_lenient(&store.facts_db_path).unwrap();
+        assert!(facts_from_store(&db).unwrap().is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_projection_failure_is_committed_and_same_id_retry_repairs_once() {
+        let root = unique_root("o26-projection-degraded");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let candidate = make_fact(
+            "o26-projection-failure",
+            FactKind::Decision,
+            "src/",
+            "canonical survives projection",
+        );
+        fail_o26_once(&root.join(".rally"), O26FaultPoint::FactsDbProjection);
+        let degraded = store.append_fact(&candidate).unwrap();
+        assert!(degraded.committed);
+        assert!(!degraded.projection_complete);
+        assert_eq!(degraded.warnings[0].code, ProjectionWarningCode::FactsDb);
+        assert_eq!(
+            facts_from_segments(&store.log_dir, &store.archive_dir)
+                .unwrap()
+                .iter()
+                .filter(|fact| fact.event_id == candidate.event_id)
+                .count(),
+            1
+        );
+        let db = open_fact_store_lenient(&store.facts_db_path).unwrap();
+        assert!(facts_from_store(&db).unwrap().is_empty());
+        drop(db);
+
+        let repaired = store.append_fact(&candidate).unwrap();
+        assert!(
+            repaired.projection_complete,
+            "exact retry reprojects the row"
+        );
+        let db = open_fact_store_lenient(&store.facts_db_path).unwrap();
+        assert_eq!(
+            facts_from_store(&db)
+                .unwrap()
+                .iter()
+                .filter(|fact| fact.event_id == candidate.event_id)
+                .count(),
+            1
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_partial_write_is_unknown_then_same_id_retry_is_singleton() {
+        let root = unique_root("o26-partial-write");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let candidate = make_fact(
+            "o26-partial-event",
+            FactKind::Artifact,
+            "src/",
+            "partial then retry",
+        );
+        fail_o26_once(&root.join(".rally"), O26FaultPoint::PartialCanonicalWrite);
+        let error = store
+            .append_fact(&candidate)
+            .expect_err("partial write cannot claim NotStarted");
+        assert!(matches!(error, RallyError::OutcomeUnknown { .. }));
+        assert!(
+            !fs::read(store.active_segment_path())
+                .unwrap()
+                .ends_with(b"\n")
+        );
+
+        let retry = store.append_fact(&candidate).unwrap();
+        assert_eq!(retry.fact.seq, 1);
+        let facts = facts_from_segments(&store.log_dir, &store.archive_dir).unwrap();
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|fact| fact.event_id == candidate.event_id)
+                .count(),
+            1
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_synced_lost_reply_retry_resyncs_and_returns_original_once() {
+        let root = unique_root("o26-full-sync-unknown");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let candidate = make_fact(
+            "o26-synced-event",
+            FactKind::Artifact,
+            "src/",
+            "sync then lost certainty",
+        );
+        fail_o26_once(
+            &root.join(".rally"),
+            O26FaultPoint::AfterCanonicalSyncBeforeReadback,
+        );
+        let error = store
+            .append_fact(&candidate)
+            .expect_err("post-sync pre-readback fault is unknown");
+        assert!(matches!(error, RallyError::OutcomeUnknown { .. }));
+        let retry = store.append_fact(&candidate).unwrap();
+        assert_eq!(retry.fact.seq, 1);
+        let facts = facts_from_segments(&store.log_dir, &store.archive_dir).unwrap();
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|fact| fact.event_id == candidate.event_id)
+                .count(),
+            1
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_exact_retry_rejects_unrelated_same_sequence_conflict_before_projection() {
+        let root = unique_root("o26-retry-unrelated-seq-conflict");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let candidate = make_fact(
+            "o26-retry-before-conflict",
+            FactKind::Decision,
+            "src/",
+            "canonical candidate",
+        );
+        store.append_fact(&candidate).unwrap();
+        let live_path = store.active_segment_path();
+        let mut conflicting = read_segment_entries(&live_path).unwrap().remove(0);
+        conflicting.payload["event_id"] = json!("unrelated-at-same-seq");
+        conflicting.payload["subject"] = json!("different full ledger line");
+        fs::create_dir_all(&store.archive_dir).unwrap();
+        let archive_path = store.archive_dir.join("conflict.jsonl");
+        fs::write(
+            &archive_path,
+            format!("{}\n", serde_json::to_string(&conflicting).unwrap()),
+        )
+        .unwrap();
+        let db_before = fs::read(&store.facts_db_path).unwrap();
+        let reconcile_path = reconcile_cache_path(&store.facts_db_path).unwrap();
+        let reconcile_before = fs::read(&reconcile_path).ok();
+        let live_before = fs::read(&live_path).unwrap();
+        let archive_before = fs::read(&archive_path).unwrap();
+
+        let error = store
+            .append_fact(&candidate)
+            .expect_err("full-union conflict must precede exact-id retry projection");
+        assert!(error.to_string().contains("full LedgerLine values differ"));
+        assert_eq!(fs::read(&live_path).unwrap(), live_before);
+        assert_eq!(fs::read(&archive_path).unwrap(), archive_before);
+        assert_eq!(fs::read(&store.facts_db_path).unwrap(), db_before);
+        assert_eq!(fs::read(&reconcile_path).ok(), reconcile_before);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_exact_live_archive_copy_retry_is_accepted_and_deduped() {
+        let root = unique_root("o26-retry-exact-live-archive-copy");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let candidate = make_fact(
+            "o26-exact-copy-retry",
+            FactKind::Artifact,
+            "src/",
+            "exact copy",
+        );
+        let first = store.append_fact(&candidate).unwrap();
+        let live_path = store.active_segment_path();
+        fs::create_dir_all(&store.archive_dir).unwrap();
+        let archive_path = store.archive_dir.join("exact-copy.jsonl");
+        fs::copy(&live_path, &archive_path).unwrap();
+
+        let retry = store.append_fact(&candidate).unwrap();
+        assert_eq!(retry.fact.seq, first.fact.seq);
+        let canonical = facts_from_segments(&store.log_dir, &store.archive_dir).unwrap();
+        assert_eq!(
+            canonical
+                .iter()
+                .filter(|fact| fact.event_id == candidate.event_id)
+                .count(),
+            1,
+            "exact live/archive copies are one canonical row"
+        );
+        assert_eq!(read_segment_entries(&live_path).unwrap().len(), 1);
+        assert_eq!(read_segment_entries(&archive_path).unwrap().len(), 1);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_deadline_after_scans_stops_new_write_before_any_side_effect() {
+        let root = unique_root("o26-late-start-new");
+        let seed = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let db_before = fs::read(&seed.facts_db_path).unwrap();
+        drop(seed);
+        let pause = pause_o26_once(&root.join(".rally"), O26FaultPoint::BeforeCanonicalMutation);
+        let thread_root = root.clone();
+        let worker = thread::spawn(move || {
+            let store = DirectRoomStore::open_direct_at(thread_root).unwrap();
+            with_mutation_deadline(Duration::from_millis(40), || {
+                store.append_fact(&make_fact(
+                    "o26-late-start-new-event",
+                    FactKind::Decision,
+                    "src/",
+                    "must remain not started",
+                ))
+            })
+        });
+        pause.wait_until_reached();
+        thread::sleep(Duration::from_millis(75));
+        pause.resume();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(matches!(error, RallyError::NotStarted(_)));
+        assert!(
+            read_segment_files(&root.join(".rally/log"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(root.join(".rally/facts.db")).unwrap(), db_before);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_deadline_after_tail_scan_does_not_start_framing_repair() {
+        let root = unique_root("o26-late-start-tail");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        store
+            .append_fact(&make_fact(
+                "o26-tail-prefix",
+                FactKind::Decision,
+                "src/",
+                "prefix",
+            ))
+            .unwrap();
+        let segment = store.active_segment_path();
+        let mut tail_before = fs::read(&segment).unwrap();
+        assert_eq!(tail_before.pop(), Some(b'\n'));
+        fs::write(&segment, &tail_before).unwrap();
+        let db_before = fs::read(&store.facts_db_path).unwrap();
+        drop(store);
+
+        let pause = pause_o26_once(&root.join(".rally"), O26FaultPoint::BeforeCanonicalMutation);
+        let thread_root = root.clone();
+        let worker = thread::spawn(move || {
+            let store = DirectRoomStore::open_direct_at(thread_root).unwrap();
+            with_mutation_deadline(Duration::from_millis(40), || {
+                store.append_fact(&make_fact(
+                    "o26-after-tail-deadline",
+                    FactKind::Artifact,
+                    "src/",
+                    "must not repair or append",
+                ))
+            })
+        });
+        pause.wait_until_reached();
+        thread::sleep(Duration::from_millis(75));
+        pause.resume();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(matches!(error, RallyError::NotStarted(_)));
+        assert_eq!(fs::read(&segment).unwrap(), tail_before);
+        assert_eq!(fs::read(root.join(".rally/facts.db")).unwrap(), db_before);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_exact_retry_past_deadline_is_unknown_not_not_started() {
+        let root = unique_root("o26-retry-resync-deadline");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let candidate = make_fact(
+            "o26-retry-resync-event",
+            FactKind::Decision,
+            "src/",
+            "already canonical",
+        );
+        store.append_fact(&candidate).unwrap();
+        let segment = store.active_segment_path();
+        let segment_before = fs::read(&segment).unwrap();
+        let db_before = fs::read(&store.facts_db_path).unwrap();
+        drop(store);
+
+        let pause = pause_o26_once(&root.join(".rally"), O26FaultPoint::BeforeCanonicalMutation);
+        let thread_root = root.clone();
+        let worker = thread::spawn(move || {
+            let store = DirectRoomStore::open_direct_at(thread_root).unwrap();
+            with_mutation_deadline(Duration::from_millis(40), || store.append_fact(&candidate))
+        });
+        pause.wait_until_reached();
+        thread::sleep(Duration::from_millis(75));
+        pause.resume();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            RallyError::OutcomeUnknown { ref phase, .. } if phase == "retry-resync-deadline"
+        ));
+        assert_eq!(fs::read(&segment).unwrap(), segment_before);
+        assert_eq!(fs::read(root.join(".rally/facts.db")).unwrap(), db_before);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_complete_invalid_unterminated_tail_is_rejected_unchanged() {
+        let root = unique_root("o26-complete-invalid-tail");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        store
+            .append_fact(&make_fact(
+                "o26-valid-prefix",
+                FactKind::Decision,
+                "src/",
+                "prefix",
+            ))
+            .unwrap();
+        let segment = store.active_segment_path();
+        let mut bytes = fs::read(&segment).unwrap();
+        bytes.extend_from_slice(b"{]complete-non-eof");
+        fs::write(&segment, &bytes).unwrap();
+        let error = store
+            .append_fact(&make_fact(
+                "o26-after-invalid",
+                FactKind::Artifact,
+                "src/",
+                "must not land",
+            ))
+            .expect_err("complete invalid tail must fail loud");
+        assert!(!matches!(error, RallyError::OutcomeUnknown { .. }));
+        assert_eq!(fs::read(&segment).unwrap(), bytes);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_wrong_schema_unterminated_json_tail_is_rejected_unchanged() {
+        let root = unique_root("o26-wrong-schema-tail");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let segment = store.active_segment_path();
+        fs::create_dir_all(segment.parent().unwrap()).unwrap();
+        let mut wrong = make_fact(
+            "o26-wrong-schema-row",
+            FactKind::Decision,
+            "src/",
+            "wrong schema",
+        );
+        wrong.seq = 1;
+        wrong.schema = "agent-rally.fact.v999".to_string();
+        let entry = LedgerLine {
+            seq: 1,
+            occurred_at: now_string(),
+            event_type: "decision".to_string(),
+            payload: serde_json::to_value(wrong).unwrap(),
+            engagement: Some(store.active_engagement.clone()),
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap();
+        fs::write(&segment, &bytes).unwrap();
+        let error = store
+            .append_fact(&make_fact(
+                "o26-after-wrong-schema",
+                FactKind::Artifact,
+                "src/",
+                "must not land",
+            ))
+            .expect_err("complete wrong-schema tail must fail loud");
+        assert!(error.to_string().contains("unsupported fact schema"));
+        assert_eq!(fs::read(&segment).unwrap(), bytes);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_valid_final_record_without_newline_is_completed_before_append() {
+        let root = unique_root("o26-valid-tail-no-newline");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let first = store
+            .append_fact(&make_fact(
+                "o26-valid-tail-first",
+                FactKind::Decision,
+                "src/",
+                "valid tail",
+            ))
+            .unwrap();
+        let segment = store.active_segment_path();
+        let mut bytes = fs::read(&segment).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&segment, bytes).unwrap();
+
+        let second = store
+            .append_fact(&make_fact(
+                "o26-valid-tail-second",
+                FactKind::Artifact,
+                "src/",
+                "append after framing repair",
+            ))
+            .unwrap();
+
+        let bytes = fs::read(&segment).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        let entries = read_segment_entries(&segment).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            (entries[0].seq, entries[1].seq),
+            (first.fact.seq, second.fact.seq)
+        );
+        assert_eq!(entries[0].payload["event_id"], "o26-valid-tail-first");
+        assert_eq!(entries[1].payload["event_id"], "o26-valid-tail-second");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_incomplete_unterminated_tail_is_truncated_before_append() {
+        let root = unique_root("o26-incomplete-tail");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        store
+            .append_fact(&make_fact(
+                "o26-before-torn-tail",
+                FactKind::Decision,
+                "src/",
+                "before",
+            ))
+            .unwrap();
+        let segment = store.active_segment_path();
+        {
+            let mut file = OpenOptions::new().append(true).open(&segment).unwrap();
+            file.write_all(b"{\"seq\":2,\"occurred_at\":\"2026-08-10T00:00:00Z\",\"event_type\":\"artifact\",\"payload\":{")
+                .unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let appended = store
+            .append_fact(&make_fact(
+                "o26-after-torn-tail",
+                FactKind::Artifact,
+                "src/",
+                "after",
+            ))
+            .unwrap();
+
+        let entries = read_segment_entries(&segment).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(appended.fact.seq, 2);
+        assert_eq!(entries[1].payload["event_id"], "o26-after-torn-tail");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_tail_repair_sync_failure_is_unknown_then_retry_appends_once() {
+        let root = unique_root("o26-tail-repair-sync");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        store
+            .append_fact(&make_fact(
+                "o26-tail-sync-prefix",
+                FactKind::Decision,
+                "src/",
+                "prefix",
+            ))
+            .unwrap();
+        let segment = store.active_segment_path();
+        let mut bytes = fs::read(&segment).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&segment, bytes).unwrap();
+        let candidate = make_fact(
+            "o26-tail-sync-candidate",
+            FactKind::Artifact,
+            "src/",
+            "after repair",
+        );
+        fail_o26_once(&root.join(".rally"), O26FaultPoint::TailRepairSync);
+
+        let error = store
+            .append_fact(&candidate)
+            .expect_err("repair sync failure starts mutation and is outcome-unknown");
+        assert!(matches!(
+            error,
+            RallyError::OutcomeUnknown { ref event_id, ref phase, .. }
+                if event_id == &candidate.event_id && phase == "tail-repair-sync"
+        ));
+        let retry = store.append_fact(&candidate).unwrap();
+        assert!(retry.committed);
+        assert_eq!(retry.fact.seq, 2);
+        assert_eq!(
+            facts_from_segments(&store.log_dir, &store.archive_dir)
+                .unwrap()
+                .iter()
+                .filter(|fact| fact.event_id == candidate.event_id)
+                .count(),
+            1
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_failure_after_repair_before_append_is_unknown_then_retry_singleton() {
+        let root = unique_root("o26-after-tail-repair");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        store
+            .append_fact(&make_fact(
+                "o26-after-repair-prefix",
+                FactKind::Decision,
+                "src/",
+                "prefix",
+            ))
+            .unwrap();
+        let segment = store.active_segment_path();
+        let mut bytes = fs::read(&segment).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&segment, bytes).unwrap();
+        let candidate = make_fact(
+            "o26-after-repair-candidate",
+            FactKind::Artifact,
+            "src/",
+            "after repaired-only state",
+        );
+        fail_o26_once(&root.join(".rally"), O26FaultPoint::AfterTailRepair);
+
+        let error = store
+            .append_fact(&candidate)
+            .expect_err("failure after durable repair cannot be NotStarted");
+        assert!(matches!(
+            error,
+            RallyError::OutcomeUnknown { ref event_id, ref phase, .. }
+                if event_id == &candidate.event_id && phase == "after-tail-repair"
+        ));
+        assert!(fs::read(&segment).unwrap().ends_with(b"\n"));
+        let retry = store.append_fact(&candidate).unwrap();
+        assert_eq!(retry.fact.seq, 2);
+        assert_eq!(
+            facts_from_segments(&store.log_dir, &store.archive_dir)
+                .unwrap()
+                .iter()
+                .filter(|fact| fact.event_id == candidate.event_id)
+                .count(),
+            1
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_post_readback_failure_is_committed_warning_not_error() {
+        let root = unique_root("o26-after-readback");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let candidate = make_fact(
+            "o26-after-readback-candidate",
+            FactKind::Decision,
+            "src/",
+            "canonical certainty",
+        );
+        fail_o26_once(&root.join(".rally"), O26FaultPoint::AfterCanonicalReadback);
+
+        let outcome = store.append_fact(&candidate).unwrap();
+        assert!(outcome.committed);
+        assert!(!outcome.projection_complete);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.code == ProjectionWarningCode::PostCommitWork)
+        );
+        assert_eq!(
+            facts_from_segments(&store.log_dir, &store.archive_dir)
+                .unwrap()
+                .iter()
+                .filter(|fact| fact.event_id == candidate.event_id)
+                .count(),
+            1
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_reconcile_cache_failure_is_committed_warning_and_db_has_row() {
+        let root = unique_root("o26-reconcile-cache-warning");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let candidate = make_fact(
+            "o26-reconcile-cache-candidate",
+            FactKind::Decision,
+            "src/",
+            "derived cache warning",
+        );
+        fail_o26_once(
+            &root.join(".rally"),
+            O26FaultPoint::ReconcileCacheProjection,
+        );
+
+        let outcome = store.append_fact(&candidate).unwrap();
+        assert!(outcome.committed);
+        assert!(!outcome.projection_complete);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.code == ProjectionWarningCode::ReconcileCache)
+        );
+        let db = open_fact_store_lenient(&store.facts_db_path).unwrap();
+        assert_eq!(
+            facts_from_store(&db)
+                .unwrap()
+                .iter()
+                .filter(|fact| fact.event_id == candidate.event_id)
+                .count(),
+            1
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_real_reconcile_cache_rename_failure_is_committed_warning() {
+        let root = unique_root("o26-reconcile-cache-rename-warning");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let sidecar = root.join(".rally").join(RECONCILE_CACHE_FILENAME);
+        fs::remove_file(&sidecar).ok();
+        fs::create_dir(&sidecar).unwrap();
+        let candidate = make_fact(
+            "o26-reconcile-cache-rename-candidate",
+            FactKind::Decision,
+            "src/",
+            "derived cache rename warning",
+        );
+
+        let outcome = store.append_fact(&candidate).unwrap();
+        assert!(outcome.committed);
+        assert!(!outcome.projection_complete);
+        assert!(outcome.warnings.iter().any(|warning| {
+            warning.code == ProjectionWarningCode::ReconcileCache
+                && warning.message.contains("rename")
+        }));
+        let retry = store.append_fact(&candidate).unwrap();
+        assert!(retry.committed);
+        assert!(!retry.projection_complete);
+        assert_eq!(retry.fact.seq, outcome.fact.seq);
+        assert_eq!(
+            facts_from_segments(&store.log_dir, &store.archive_dir)
+                .unwrap()
+                .iter()
+                .filter(|fact| fact.event_id == candidate.event_id)
+                .count(),
+            1
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_detached_snapshot_cannot_be_stamped_with_a_new_canonical_fingerprint() {
+        let root = unique_root("o26-snapshot-cache-detached-pair");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let first = make_fact(
+            "o26-cache-first",
+            FactKind::Decision,
+            "src/",
+            "first cached fact",
+        );
+        store.append_fact(&first).unwrap();
+        let detached = store.snapshot_cache_capture(false).unwrap();
+
+        let second = make_fact(
+            "o26-cache-second",
+            FactKind::Decision,
+            "src/",
+            "intervening canonical fact",
+        );
+        store.append_fact(&second).unwrap();
+        let rally_dir = root.join(".rally");
+        write_snapshot_cache(&rally_dir, &detached);
+
+        let cached = try_load_cached_snapshot(&rally_dir);
+        assert!(
+            cached.as_ref().is_none_or(|snapshot| {
+                snapshot
+                    .current_decisions
+                    .iter()
+                    .any(|fact| fact.event_id == second.event_id)
+            }),
+            "a detached old snapshot must not be published under the intervening commit's fingerprint"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_snapshot_cache_expires_across_no_write_liveness_transition() {
+        let root = unique_root("o26-snapshot-cache-liveness-time");
+        let rally_dir = root.join(".rally");
+        fs::create_dir_all(&rally_dir).unwrap();
+        let projection_time = 2_000_000_000_i64;
+        let owner = "codex:idle-owner";
+        let created_at =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(projection_time - 1_000, 0)
+                .unwrap()
+                .to_rfc3339();
+        let prior_created_at =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(projection_time - 1_100, 0)
+                .unwrap()
+                .to_rfc3339();
+
+        let mut prior_presence = make_fact(
+            "o26-cache-presence-prior",
+            FactKind::Presence,
+            "session",
+            "prior branch position",
+        );
+        prior_presence.seq = 1;
+        prior_presence.tool = Some(owner.to_string());
+        prior_presence.created_at = prior_created_at;
+        prior_presence.evidence = vec!["branch_head_sha:aaaa".to_string()];
+
+        let mut presence = make_fact(
+            "o26-cache-presence-current",
+            FactKind::Presence,
+            "session",
+            "current branch position",
+        );
+        presence.seq = 2;
+        presence.tool = Some(owner.to_string());
+        presence.created_at = created_at.clone();
+        presence.evidence = vec!["branch_head_sha:bbbb".to_string()];
+
+        let mut handoff = make_fact(
+            "o26-cache-owner-handoff",
+            FactKind::Handoff,
+            "work",
+            "inject signal",
+        );
+        handoff.seq = 3;
+        handoff.tool = Some(owner.to_string());
+        handoff.target = Some(owner.to_string());
+        handoff.created_at = created_at.clone();
+
+        let mut claim = make_fact(
+            "o26-cache-owner-claim",
+            FactKind::Claim,
+            "file:src/shared.rs",
+            "plan signal",
+        );
+        claim.seq = 4;
+        claim.tool = Some(owner.to_string());
+        claim.created_at = created_at;
+
+        let facts = vec![prior_presence, presence, handoff, claim];
+        let coord = crate::hooks_config::CoordinationConfig::default();
+        let cached = snapshot_from_facts_with_policy_at(&facts, &coord, false, projection_time);
+        let mut cached_findings = Vec::new();
+        crate::check::check_before_write_for_test(
+            &cached,
+            "codex:contender",
+            Some("src/shared.rs"),
+            &mut cached_findings,
+        );
+        assert!(cached_findings.contains(&("stale-owner-claim", "warn")));
+
+        let later_time = projection_time + 1_000;
+        let fresh = snapshot_from_facts_with_policy_at(&facts, &coord, false, later_time);
+        let mut fresh_findings = Vec::new();
+        crate::check::check_before_write_for_test(
+            &fresh,
+            "codex:contender",
+            Some("src/shared.rs"),
+            &mut fresh_findings,
+        );
+        assert!(fresh_findings.contains(&("claimed-path", "stop")));
+
+        let fingerprint =
+            snapshot_cache_fingerprint_at(&rally_dir, projection_time, false, &coord).unwrap();
+        write_snapshot_cache(
+            &rally_dir,
+            &SnapshotCacheCapture {
+                snapshot: cached,
+                fingerprint: Some(fingerprint),
+            },
+        );
+        assert!(try_load_cached_snapshot_at(&rally_dir, projection_time).is_some());
+        assert!(
+            try_load_cached_snapshot_at(&rally_dir, later_time).is_none(),
+            "a cache captured before a no-write liveness transition must miss afterward"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_snapshot_cache_misses_when_effective_projection_policy_changes() {
+        let _env_lock = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        struct RestoreProjectionEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreProjectionEnv {
+            fn drop(&mut self) {
+                for (name, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => unsafe { std::env::set_var(name, value) },
+                        None => unsafe { std::env::remove_var(name) },
+                    }
+                }
+            }
+        }
+        let projection_env = [
+            "RALLY_HALF_LIFE_HOURS",
+            "RALLY_ARCHIVE_FLOOR",
+            "RALLY_DEFAULT_CADENCE_SECS",
+            "RALLY_MISS_MULTIPLIER",
+            "RALLY_GRACE_SECS",
+        ];
+        let _restore_env = RestoreProjectionEnv(
+            projection_env
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        );
+        for name in projection_env {
+            unsafe { std::env::remove_var(name) };
+        }
+
+        let root = unique_root("o26-snapshot-cache-policy");
+        let rally_dir = root.join(".rally");
+        fs::create_dir_all(&rally_dir).unwrap();
+        let projection_time = 2_000_000_000_i64;
+        let initial_policy = crate::hooks_config::resolve_coordination(&root).unwrap();
+        let fingerprint =
+            snapshot_cache_fingerprint_at(&rally_dir, projection_time, false, &initial_policy)
+                .unwrap();
+        write_snapshot_cache(
+            &rally_dir,
+            &SnapshotCacheCapture {
+                snapshot: RoomSnapshot::default(),
+                fingerprint: Some(fingerprint),
+            },
+        );
+        assert!(try_load_cached_snapshot_at(&rally_dir, projection_time).is_some());
+
+        let changed_cadence = if initial_policy.default_cadence_secs == 900 {
+            901
+        } else {
+            900
+        };
+        fs::write(
+            rally_dir.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "coordination": {"default_cadence_secs": changed_cadence}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            try_load_cached_snapshot_at(&rally_dir, projection_time).is_none(),
+            "a repo policy change must invalidate the cache without a canonical write"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_canonical_only_degraded_commit_invalidates_restored_old_snapshot_cache() {
+        let root = unique_root("o26-snapshot-cache-canonical-generation");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let first = make_fact(
+            "o26-cache-generation-first",
+            FactKind::Decision,
+            "src/",
+            "cached canonical generation",
+        );
+        store.append_fact(&first).unwrap();
+        let rally_dir = root.join(".rally");
+        fs::remove_file(store.log_dir.join(LOG_INDEX_FILENAME)).ok();
+        let old_capture = store.snapshot_cache_capture(false).unwrap();
+        write_snapshot_cache(&rally_dir, &old_capture);
+        let cache_path = snapshot_cache_path(&rally_dir);
+        let old_cache = fs::read(&cache_path).unwrap();
+
+        let second = make_fact(
+            "o26-cache-generation-second",
+            FactKind::Decision,
+            "src/",
+            "canonical commit without DB projection",
+        );
+        fail_o26_once(&rally_dir, O26FaultPoint::FactsDbProjection);
+        let degraded = store.append_fact(&second).unwrap();
+        assert!(degraded.committed);
+        assert!(!degraded.projection_complete);
+        fs::write(&cache_path, old_cache).unwrap();
+
+        assert!(
+            try_load_cached_snapshot(&rally_dir).is_none(),
+            "canonical segment generation must reject an old cache even when DB/index signals are unchanged"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_segment_fingerprint_hashes_tail_for_same_length_repair() {
+        let root = unique_root("o26-segment-tail-fingerprint");
+        let log_dir = root.join(".rally").join(LOG_DIRNAME);
+        fs::create_dir_all(&log_dir).unwrap();
+        let segment = log_dir.join("alpha.jsonl");
+        let mut first_bytes = vec![b'x'; 8192];
+        first_bytes.extend_from_slice(b"first-tail");
+        fs::write(&segment, &first_bytes).unwrap();
+        let first = serde_json::to_value(segments_fingerprint(std::slice::from_ref(&segment), &[]))
+            .unwrap();
+
+        let mut second_bytes = vec![b'x'; 8192];
+        second_bytes.extend_from_slice(b"other-tail");
+        assert_eq!(second_bytes.len(), first_bytes.len());
+        fs::write(&segment, &second_bytes).unwrap();
+        let second =
+            serde_json::to_value(segments_fingerprint(std::slice::from_ref(&segment), &[]))
+                .unwrap();
+
+        let first_tail = &first[0]["tail_hash"];
+        let second_tail = &second[0]["tail_hash"];
+        assert!(
+            !first_tail.is_null(),
+            "segment fingerprints need a tail hash"
+        );
+        assert_ne!(
+            first_tail, second_tail,
+            "same-length tail repair must invalidate persisted and in-process fingerprints"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_exact_same_event_id_retry_returns_original_sequence_once() {
+        let root = unique_root("o26-same-id-exact");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let candidate = make_fact(
+            "o26-same-id",
+            FactKind::Decision,
+            "src/",
+            "same normalized payload",
+        );
+        let first = store.append_fact(&candidate).unwrap();
+        let retry = store.append_fact(&candidate).unwrap();
+
+        assert_eq!(
+            retry.fact.seq, first.fact.seq,
+            "retry must return the original seq"
+        );
+        let entries = facts_from_segments(&store.log_dir, &store.archive_dir).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|fact| fact.event_id == candidate.event_id)
+                .count(),
+            1,
+            "same-ID retry must leave exactly one canonical event"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_same_event_id_different_payload_conflicts_without_mutation() {
+        let root = unique_root("o26-same-id-conflict");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let candidate = make_fact("o26-conflicting-id", FactKind::Decision, "src/", "original");
+        store.append_fact(&candidate).unwrap();
+        let segment = store.active_segment_path();
+        let canonical_before = fs::read(&segment).unwrap();
+        let mut conflict = candidate.clone();
+        conflict.summary = Some("different normalized payload".to_string());
+
+        let error = store
+            .append_fact(&conflict)
+            .expect_err("same event ID with different payload must fail identity validation");
+        assert!(
+            error.to_string().contains("event-id identity conflict"),
+            "identity conflict must precede mutable-state noise: {error}"
+        );
+        assert_eq!(fs::read(&segment).unwrap(), canonical_before);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_stateful_exact_retries_precede_mutable_preconditions() {
+        let root = unique_root("o26-stateful-retries");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+
+        let mut claim = make_fact(
+            "o26-state-claim",
+            FactKind::Claim,
+            "file:src/state.rs",
+            "claim",
+        );
+        claim
+            .evidence
+            .push("lease_expires_at:2030-01-01T00:00:00Z".to_string());
+        let claim_first = store.append_fact(&claim).unwrap();
+        let claim_retry = store.append_fact(&claim).unwrap();
+        assert_eq!(claim_retry.fact.seq, claim_first.fact.seq);
+        let mut claim_conflict = claim.clone();
+        claim_conflict.summary = Some("different claim payload".to_string());
+        assert!(
+            store
+                .append_fact(&claim_conflict)
+                .unwrap_err()
+                .to_string()
+                .contains("event-id identity conflict")
+        );
+
+        let mut renewal = make_fact(
+            "o26-state-renewal",
+            FactKind::ClaimRenewed,
+            "file:src/state.rs",
+            "renew",
+        );
+        renewal.ref_id = Some(claim.event_id.clone());
+        renewal.evidence = vec!["lease_expires_at:2099-01-01T00:00:00Z".to_string()];
+        let renewal_first = store.append_fact(&renewal).unwrap();
+        let renewal_retry = store.append_fact(&renewal).unwrap();
+        assert_eq!(renewal_retry.fact.seq, renewal_first.fact.seq);
+        let mut renewal_conflict = renewal.clone();
+        renewal_conflict.evidence = vec!["lease_expires_at:2000-01-01T00:00:00Z".to_string()];
+        assert!(
+            store
+                .append_fact(&renewal_conflict)
+                .unwrap_err()
+                .to_string()
+                .contains("event-id identity conflict")
+        );
+
+        let mut release = make_fact(
+            "o26-state-release",
+            FactKind::Release,
+            "file:src/state.rs",
+            "release",
+        );
+        release.ref_id = Some(claim.event_id.clone());
+        let release_first = store.append_state_transition_verified(&release).unwrap();
+        let release_retry = store.append_state_transition_verified(&release).unwrap();
+        assert_eq!(release_retry.fact.seq, release_first.fact.seq);
+        let mut release_conflict = release.clone();
+        release_conflict.summary = Some("different release payload".to_string());
+        assert!(
+            store
+                .append_state_transition_verified(&release_conflict)
+                .unwrap_err()
+                .to_string()
+                .contains("event-id identity conflict")
+        );
+
+        let blocker = make_fact(
+            "o26-state-blocker",
+            FactKind::Blocker,
+            "file:src/blocker.rs",
+            "blocker",
+        );
+        store.append_fact(&blocker).unwrap();
+        let mut resolve = make_fact(
+            "o26-state-resolve",
+            FactKind::Resolve,
+            "file:src/blocker.rs",
+            "resolve",
+        );
+        resolve.ref_id = Some(blocker.event_id.clone());
+        let resolve_first = store.append_state_transition_verified(&resolve).unwrap();
+        let resolve_retry = store.append_state_transition_verified(&resolve).unwrap();
+        assert_eq!(resolve_retry.fact.seq, resolve_first.fact.seq);
+        let mut resolve_conflict = resolve.clone();
+        resolve_conflict
+            .evidence
+            .push("different:evidence".to_string());
+        assert!(
+            store
+                .append_state_transition_verified(&resolve_conflict)
+                .unwrap_err()
+                .to_string()
+                .contains("event-id identity conflict")
+        );
+
+        let canonical = facts_from_segments(&store.log_dir, &store.archive_dir).unwrap();
+        for event_id in [
+            &claim.event_id,
+            &renewal.event_id,
+            &release.event_id,
+            &resolve.event_id,
+        ] {
+            assert_eq!(
+                canonical
+                    .iter()
+                    .filter(|fact| &fact.event_id == event_id)
+                    .count(),
+                1,
+                "stateful exact retry must be a singleton: {event_id}"
+            );
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_renewal_and_checkpoint_requests_keep_stable_identity_and_outcomes() {
+        let root = unique_root("o26-renew-checkpoint-contract");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let claim = make_fact(
+            "o26-renew-request-claim",
+            FactKind::Claim,
+            "file:src/renew.rs",
+            "claim",
+        );
+        store.append_fact(&claim).unwrap();
+        let renew_event_id = "o26-renew-request-event";
+        let renew_thread_id = "o26-renew-request-thread";
+        let renew_created_at = "2026-08-10T00:00:00Z";
+        fail_o26_once(
+            &root.join(".rally"),
+            O26FaultPoint::AfterCanonicalSyncBeforeReadback,
+        );
+        let error = store
+            .renew_claim_lease(
+                &claim.event_id,
+                "2099-01-01T00:00:00Z".to_string(),
+                Some("test"),
+                None,
+                None,
+                renew_event_id,
+                renew_thread_id,
+                renew_created_at,
+            )
+            .expect_err("renewal lost reply must be query-required");
+        assert!(matches!(
+            error,
+            RallyError::OutcomeUnknown { ref event_id, .. } if event_id == renew_event_id
+        ));
+        let retry = store
+            .renew_claim_lease(
+                &claim.event_id,
+                "2099-01-01T00:00:00Z".to_string(),
+                Some("test"),
+                None,
+                None,
+                renew_event_id,
+                renew_thread_id,
+                renew_created_at,
+            )
+            .unwrap();
+        let renewal = retry
+            .append_outcome
+            .expect("exact renewal retry returns its committed outcome");
+        assert_eq!(renewal.fact.event_id, renew_event_id);
+
+        let mut checkpoint = make_fact(
+            "o26-checkpoint-request-event",
+            FactKind::Read,
+            "",
+            "read_seq:1",
+        );
+        checkpoint.tool = Some("reader:01".to_string());
+        checkpoint.summary = Some("read_seq:1".to_string());
+        checkpoint.thread_id = "o26-checkpoint-thread".to_string();
+        checkpoint.created_at = "2026-08-10T00:00:00Z".to_string();
+        fail_o26_once(
+            &root.join(".rally"),
+            O26FaultPoint::AfterCanonicalSyncBeforeReadback,
+        );
+        let error = store
+            .maybe_append_read_checkpoint(&checkpoint, 1)
+            .expect_err("checkpoint lost reply must be query-required");
+        assert!(matches!(
+            error,
+            RallyError::OutcomeUnknown { ref event_id, .. }
+                if event_id == &checkpoint.event_id
+        ));
+        let checkpoint_retry = store.maybe_append_read_checkpoint(&checkpoint, 1).unwrap();
+        let ConditionalAppendOutcome::Applied(checkpoint_outcome) = checkpoint_retry else {
+            panic!("exact checkpoint retry must resolve its canonical request");
+        };
+        assert_eq!(checkpoint_outcome.fact.event_id, checkpoint.event_id);
+
+        let canonical = facts_from_segments(&store.log_dir, &store.archive_dir).unwrap();
+        for event_id in [renew_event_id, checkpoint.event_id.as_str()] {
+            assert_eq!(
+                canonical
+                    .iter()
+                    .filter(|fact| fact.event_id == event_id)
+                    .count(),
+                1,
+                "lost reply and exact retry must be singleton for {event_id}"
+            );
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_release_and_resolve_projection_failures_remain_committed() {
+        for (label, target_kind, close_kind) in [
+            ("release", FactKind::Claim, FactKind::Release),
+            ("resolve", FactKind::Blocker, FactKind::Resolve),
+        ] {
+            let root = unique_root(&format!("o26-{label}-projection"));
+            let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+            let target = make_fact(
+                &format!("o26-{label}-target"),
+                target_kind,
+                &format!("file:src/{label}.rs"),
+                "target",
+            );
+            store.append_fact(&target).unwrap();
+            let mut close = make_fact(
+                &format!("o26-{label}-close"),
+                close_kind,
+                &format!("file:src/{label}.rs"),
+                "close",
+            );
+            close.ref_id = Some(target.event_id.clone());
+            fail_o26_once(&root.join(".rally"), O26FaultPoint::FactsDbProjection);
+
+            let degraded = store.append_state_transition_verified(&close).unwrap();
+            assert!(degraded.committed);
+            assert!(!degraded.projection_complete);
+            assert!(
+                degraded
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.code == ProjectionWarningCode::FactsDb)
+            );
+            let retry = store.append_state_transition_verified(&close).unwrap();
+            assert_eq!(retry.fact.seq, degraded.fact.seq);
+            assert_eq!(
+                facts_from_segments(&store.log_dir, &store.archive_dir)
+                    .unwrap()
+                    .iter()
+                    .filter(|fact| fact.event_id == close.event_id)
+                    .count(),
+                1
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn o26_distinct_concurrent_closes_admit_exactly_one() {
+        for (label, target_kind, close_kind) in [
+            ("release", FactKind::Claim, FactKind::Release),
+            ("resolve", FactKind::Blocker, FactKind::Resolve),
+        ] {
+            let root = unique_root(&format!("o26-{label}-race"));
+            let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+            let target = make_fact(
+                &format!("o26-{label}-race-target"),
+                target_kind,
+                &format!("file:src/{label}-race.rs"),
+                "target",
+            );
+            store.append_fact(&target).unwrap();
+            drop(store);
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let mut workers = Vec::new();
+            for index in 0..2 {
+                let root = root.clone();
+                let barrier = Arc::clone(&barrier);
+                let target = target.clone();
+                let close_kind = close_kind.clone();
+                workers.push(thread::spawn(move || {
+                    let store = DirectRoomStore::open_direct_at(root).unwrap();
+                    let mut close = make_fact(
+                        &format!("o26-{label}-race-close-{index}"),
+                        close_kind,
+                        &format!("file:src/{label}-race.rs"),
+                        "close",
+                    );
+                    close.ref_id = Some(target.event_id);
+                    barrier.wait();
+                    store.append_state_transition_verified(&close)
+                }));
+            }
+            barrier.wait();
+            let results = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+            assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+            let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+            let close_count = facts_from_segments(&store.log_dir, &store.archive_dir)
+                .unwrap()
+                .iter()
+                .filter(|fact| {
+                    fact.kind == close_kind && fact.ref_id == Some(target.event_id.clone())
+                })
+                .count();
+            assert_eq!(close_count, 1);
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
     fn completed_segment_corruption_fails_all_canonical_readers() {
         let root = unique_root("completed-segment-corruption");
         // Direct-store internals under test; bind the DirectRoomStore directly
@@ -12856,7 +15821,7 @@ mod ledger_tests {
         assert_completed(facts_from_segments(&store.log_dir, &store.archive_dir).unwrap_err());
         assert_completed(segment_seq_stats(&live, &archived).unwrap_err());
         assert_completed(last_seq_in_segment(&segment).unwrap_err());
-        assert_completed(segment_event_id_present(live.iter(), &fact.event_id).unwrap_err());
+        assert_completed(segment_event_id_present(live.iter(), &fact.fact.event_id).unwrap_err());
         assert_completed(segment_event_id_present_tail_first(&segment, "valid-tail").unwrap_err());
         assert_completed(store.refresh_log_index().unwrap_err());
         assert_completed(rebuild_db_from_segments(&live, &archived, &facts_db).unwrap_err());

@@ -15,9 +15,11 @@
 //!   `active_claims` only surfaces claims that are not yet closed.
 //! - When `apply` is false the report describes WHAT WOULD happen (dry-run).
 
-use crate::error::Result;
-use crate::store::{Fact, FactKind, RoomStore};
-use crate::{FACT_SCHEMA, new_id, now_string};
+use crate::error::{RallyError, Result};
+#[cfg(test)]
+use crate::new_id;
+use crate::store::{AppendOutcome, Fact, FactKind, RoomStore};
+use crate::{FACT_SCHEMA, now_string};
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -75,6 +77,14 @@ pub(crate) struct ReapedHandoff {
     pub(crate) age_days: i64,
 }
 
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct ReapOutcomeUnknown {
+    pub(crate) event_id: String,
+    pub(crate) phase: String,
+    pub(crate) detail: String,
+    pub(crate) remedy: String,
+}
+
 /// Result returned by `run_reap_stale`.
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub(crate) struct ReapReport {
@@ -121,6 +131,15 @@ pub(crate) struct ReapReport {
     /// only previous signal was a stderr line nothing parses.
     #[serde(default)]
     pub(crate) write_failures: usize,
+    /// Canonical commits, including any projection degradation. These are also
+    /// registered with the command-wide aggregate so CLI JSON cannot hide them.
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) append_outcomes: Vec<AppendOutcome>,
+    /// Pre-readback uncertainty kept structured with its stable query remedy.
+    #[serde(default)]
+    pub(crate) outcome_unknowns: Vec<ReapOutcomeUnknown>,
     /// At least one write was attempted and every attempted write landed.
     ///
     /// This used to be a copy of the `--apply` argument, so `rally doctor
@@ -133,6 +152,49 @@ pub(crate) struct ReapReport {
     /// landed. False for dry runs, partial passes, and write failures.
     #[serde(default)]
     pub(crate) complete: bool,
+}
+
+fn stable_reaper_event_id(action: &str, target: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in action.bytes().chain([0]).chain(target.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("reaper-{action}-{hash:016x}")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReaperAppendDisposition {
+    Committed,
+    OutcomeUnknown,
+}
+
+fn record_reaper_result(
+    result: Result<AppendOutcome>,
+    append_outcomes: &mut Vec<AppendOutcome>,
+    outcome_unknowns: &mut Vec<ReapOutcomeUnknown>,
+) -> std::result::Result<ReaperAppendDisposition, RallyError> {
+    match result {
+        Ok(outcome) => {
+            crate::record_append_outcome(&outcome);
+            append_outcomes.push(outcome);
+            Ok(ReaperAppendDisposition::Committed)
+        }
+        Err(RallyError::OutcomeUnknown {
+            event_id,
+            phase,
+            detail,
+        }) => {
+            outcome_unknowns.push(ReapOutcomeUnknown {
+                remedy: crate::locate_remedy(&event_id),
+                event_id,
+                phase,
+                detail,
+            });
+            Ok(ReaperAppendDisposition::OutcomeUnknown)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 // =============================================================================
@@ -401,6 +463,8 @@ fn run_reap_stale_in_room_with_budget(
     let mut preserved: usize = 0;
     let mut write_failures: usize = 0;
     let mut remaining: usize = 0;
+    let mut append_outcomes = Vec::new();
+    let mut outcome_unknowns = Vec::new();
     // One counter governs the whole queue, independently of whether an append
     // succeeds. Action zero is the global forward-progress floor; every later
     // claim, handoff, or lead action observes the same elapsed-time budget.
@@ -523,12 +587,13 @@ fn run_reap_stale_in_room_with_budget(
             // For ClaimExpired we use `append_fact_verified` (no pre-condition
             // check needed beyond the claim still being live — the projection
             // already handles duplicate ClaimExpired via ref_id dedup).
+            let action_target = claim.event_id.as_str();
             let expired_fact = Fact {
                 from_session_id: None,
                 schema: FACT_SCHEMA.to_string(),
-                event_id: new_id("fact"),
+                event_id: stable_reaper_event_id("claim-expired", action_target),
                 seq: 0,
-                thread_id: new_id("room"),
+                thread_id: stable_reaper_event_id("claim-thread", action_target),
                 kind: FactKind::ClaimExpired,
                 tool: Some("rally".to_string()),
                 role: None,
@@ -565,10 +630,19 @@ fn run_reap_stale_in_room_with_budget(
                 uri: None,
                 session: None,
             };
-            // Best-effort: if the claim was concurrently closed before we got
-            // the lock, skip it silently — the room is already clean.
-            match room.append_fact_verified(&expired_fact) {
-                Ok(_) => {}
+            // The action id and payload are derived from the claim, so an
+            // uncertain first attempt can be resolved or retried without
+            // minting a second close event.
+            match record_reaper_result(
+                room.append_fact_verified(&expired_fact),
+                &mut append_outcomes,
+                &mut outcome_unknowns,
+            ) {
+                Ok(ReaperAppendDisposition::Committed) => {}
+                Ok(ReaperAppendDisposition::OutcomeUnknown) => {
+                    write_failures += 1;
+                    continue;
+                }
                 Err(e) => {
                     // Log but do not abort the whole reap run.
                     eprintln!(
@@ -599,6 +673,8 @@ fn run_reap_stale_in_room_with_budget(
             remaining,
             attempted_writes: if apply { attempted_actions } else { 0 },
             write_failures,
+            append_outcomes,
+            outcome_unknowns,
             applied: apply && attempted_actions > 0 && write_failures == 0,
             complete: apply && remaining == 0 && write_failures == 0,
         });
@@ -650,12 +726,13 @@ fn run_reap_stale_in_room_with_budget(
             };
 
             if apply {
+                let action_target = handoff.event_id.as_str();
                 let expiry_fact = Fact {
                     from_session_id: None,
                     schema: FACT_SCHEMA.to_string(),
-                    event_id: new_id("fact"),
+                    event_id: stable_reaper_event_id("handoff-expired", action_target),
                     seq: 0,
-                    thread_id: new_id("room"),
+                    thread_id: stable_reaper_event_id("handoff-thread", action_target),
                     kind: FactKind::Resolve,
                     tool: Some("rally".to_string()),
                     role: None,
@@ -681,8 +758,16 @@ fn run_reap_stale_in_room_with_budget(
                     uri: None,
                     session: None,
                 };
-                match room.append_fact_verified(&expiry_fact) {
-                    Ok(_) => {}
+                match record_reaper_result(
+                    room.append_fact_verified(&expiry_fact),
+                    &mut append_outcomes,
+                    &mut outcome_unknowns,
+                ) {
+                    Ok(ReaperAppendDisposition::Committed) => {}
+                    Ok(ReaperAppendDisposition::OutcomeUnknown) => {
+                        write_failures += 1;
+                        continue;
+                    }
                     Err(e) => {
                         eprintln!(
                             "reaper: skipping handoff {} (already closed or lock error): {}",
@@ -720,12 +805,14 @@ fn run_reap_stale_in_room_with_budget(
                 attempted_actions += 1;
                 let mut relinquish_committed = true;
                 if apply {
+                    let lead_epoch = snapshot.lead_epoch.unwrap_or_default();
+                    let action_target = format!("{lead_tool}:{lead_epoch}");
                     let relinquish_fact = Fact {
                         from_session_id: None,
                         schema: FACT_SCHEMA.to_string(),
-                        event_id: new_id("fact"),
+                        event_id: stable_reaper_event_id("lead-relinquished", &action_target),
                         seq: 0,
-                        thread_id: new_id("room"),
+                        thread_id: stable_reaper_event_id("lead-thread", &action_target),
                         kind: FactKind::Decision,
                         tool: Some("rally".to_string()),
                         role: None,
@@ -744,8 +831,16 @@ fn run_reap_stale_in_room_with_budget(
                         uri: None,
                         session: None,
                     };
-                    match room.append_fact_verified(&relinquish_fact) {
-                        Ok(_) => {}
+                    match record_reaper_result(
+                        room.append_fact_verified(&relinquish_fact),
+                        &mut append_outcomes,
+                        &mut outcome_unknowns,
+                    ) {
+                        Ok(ReaperAppendDisposition::Committed) => {}
+                        Ok(ReaperAppendDisposition::OutcomeUnknown) => {
+                            write_failures += 1;
+                            relinquish_committed = false;
+                        }
                         Err(e) => {
                             eprintln!(
                                 "reaper: keeping lead {lead_tool} (relinquish append failed): {e}"
@@ -785,6 +880,8 @@ fn run_reap_stale_in_room_with_budget(
         remaining,
         attempted_writes: if apply { attempted_actions } else { 0 },
         write_failures,
+        append_outcomes,
+        outcome_unknowns,
         applied: apply && attempted_actions > 0 && write_failures == 0,
         complete: apply && remaining == 0 && write_failures == 0,
     })
@@ -948,7 +1045,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     /// Append a small single-file claim owned by `tool` (FRESH timestamp so the
@@ -975,7 +1072,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     /// Append a Handoff `ago_secs` seconds in the past.
@@ -1001,7 +1098,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     fn append_lead(room: &RoomStore, tool: &str, ago_secs: i64) -> Fact {
@@ -1026,7 +1123,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     // -------------------------------------------------------------------------
@@ -2010,6 +2107,81 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    #[test]
+    fn o26_reaper_surfaces_committed_projection_warning() {
+        let root = unique_root("o26-projection-warning");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        append_presence(&room, "stale-tool", 3 * 60 * 60);
+        let claim = append_claim(&room, "claim-o26-projection", "stale-tool");
+        crate::store::fail_o26_once(
+            &room.rally_dir(),
+            crate::store::O26FaultPoint::FactsDbProjection,
+        );
+
+        let report = run_reap_stale_in_room(&room, true).unwrap();
+
+        assert_eq!(report.claims_reaped.len(), 1);
+        assert_eq!(report.append_outcomes.len(), 1);
+        let outcome = &report.append_outcomes[0];
+        assert!(outcome.committed);
+        assert!(!outcome.projection_complete);
+        assert!(!outcome.warnings.is_empty());
+        assert_eq!(
+            outcome.fact.ref_id.as_deref(),
+            Some(claim.event_id.as_str())
+        );
+        assert!(report.outcome_unknowns.is_empty());
+        assert_eq!(report.write_failures, 0);
+
+        let matching = room
+            .facts()
+            .unwrap()
+            .into_iter()
+            .filter(|fact| fact.event_id == outcome.fact.event_id)
+            .count();
+        assert_eq!(matching, 1, "the degraded canonical close is a singleton");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_reaper_unknown_is_queryable_and_next_pass_does_not_duplicate() {
+        let root = unique_root("o26-outcome-unknown");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        append_presence(&room, "stale-tool", 3 * 60 * 60);
+        let claim = append_claim(&room, "claim-o26-unknown", "stale-tool");
+        crate::store::fail_o26_once(
+            &room.rally_dir(),
+            crate::store::O26FaultPoint::AfterCanonicalSyncBeforeReadback,
+        );
+
+        let first = run_reap_stale_in_room(&room, true).unwrap();
+
+        assert!(first.claims_reaped.is_empty());
+        assert!(first.append_outcomes.is_empty());
+        assert_eq!(first.outcome_unknowns.len(), 1);
+        assert_eq!(first.write_failures, 1);
+        let unknown = &first.outcome_unknowns[0];
+        assert_eq!(unknown.phase, "canonical-sync-before-readback");
+        assert!(unknown.remedy.contains(&unknown.event_id));
+        assert_eq!(
+            unknown.event_id,
+            stable_reaper_event_id("claim-expired", &claim.event_id)
+        );
+
+        let second = run_reap_stale_in_room(&room, true).unwrap();
+        assert!(second.claims_reaped.is_empty());
+        assert!(second.append_outcomes.is_empty());
+        assert!(second.outcome_unknowns.is_empty());
+        let matching = room
+            .facts()
+            .unwrap()
+            .into_iter()
+            .filter(|fact| fact.event_id == unknown.event_id)
+            .count();
+        assert_eq!(matching, 1, "lost reply plus next pass must append once");
+        fs::remove_dir_all(&root).ok();
+    }
+
     // -------------------------------------------------------------------------
     // (e) Self-release in stop: only the stopping tool's claims, not peers'
     // -------------------------------------------------------------------------
@@ -2113,7 +2285,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     #[test]
@@ -2349,7 +2521,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     fn append_session_claim_with_lease(
@@ -2380,7 +2552,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     #[test]

@@ -144,7 +144,10 @@ pub(crate) fn route_findings(
                 session: None,
             };
             routed_count += 1;
-            ("handoff", room.append_fact_verified(&fact)?)
+            (
+                "handoff",
+                room.append_fact_verified(&fact)?.into_fact_reporting(),
+            )
         } else {
             // No active claim owner — emit a risk fact tagged unowned
             let fact = Fact {
@@ -175,7 +178,10 @@ pub(crate) fn route_findings(
                 session: None,
             };
             unowned_count += 1;
-            ("risk", room.append_fact_verified(&fact)?)
+            (
+                "risk",
+                room.append_fact_verified(&fact)?.into_fact_reporting(),
+            )
         };
 
         routed_findings.push(RoutedFinding {
@@ -218,7 +224,9 @@ pub(crate) fn route_findings(
         uri: None,
         session: None,
     };
-    let summary_appended = room.append_fact_verified(&summary_fact)?;
+    let summary_appended = room
+        .append_fact_verified(&summary_fact)?
+        .into_fact_reporting();
 
     Ok(RoutingSummary {
         findings_total: total,
@@ -269,7 +277,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     #[test]
@@ -361,6 +369,146 @@ mod tests {
             Some("tool-b")
         );
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn o26_route_findings_surfaces_every_outcome_in_canonical_order() {
+        let (room, root) = test_room();
+        let _ = crate::drain_pending_append_outcomes();
+        let _ = crate::drain_pending_append_issues();
+        crate::store::fail_o26_once(
+            &room.rally_dir(),
+            crate::store::O26FaultPoint::FactsDbProjection,
+        );
+        let summary = route_findings(
+            &room,
+            "scanner",
+            vec![
+                Finding {
+                    file: "src/first.rs".to_string(),
+                    severity: "error".to_string(),
+                    description: "first finding".to_string(),
+                    evidence: Vec::new(),
+                },
+                Finding {
+                    file: "src/second.rs".to_string(),
+                    severity: "warn".to_string(),
+                    description: "second finding".to_string(),
+                    evidence: Vec::new(),
+                },
+            ],
+            true,
+        )
+        .unwrap();
+        let outcomes = crate::drain_pending_append_outcomes();
+        assert_eq!(outcomes.len(), 3, "two items plus one summary outcome");
+        assert_eq!(
+            outcomes[0].fact.event_id,
+            summary.routed_findings[0].event_id
+        );
+        assert_eq!(
+            outcomes[1].fact.event_id,
+            summary.routed_findings[1].event_id
+        );
+        assert_eq!(outcomes[2].fact.event_id, summary.artifact_event_id);
+        assert!(
+            outcomes
+                .windows(2)
+                .all(|pair| pair[0].fact.seq < pair[1].fact.seq)
+        );
+        assert!(!outcomes[0].projection_complete);
+        for outcome in &outcomes[1..] {
+            assert!(
+                !outcome.projection_complete,
+                "canonical/DB drift must not publish a false-complete reconcile cache"
+            );
+            assert!(outcome.warnings.iter().any(|warning| {
+                warning.code == crate::store::ProjectionWarningCode::ReconcileCache
+            }));
+        }
+        let mut output = crate::output::Output::new(
+            true,
+            "route-findings".to_string(),
+            serde_json::json!({"data": {}}),
+        );
+        crate::attach_append_outcomes(&mut output, outcomes);
+        assert_eq!(output.body["data"]["projection_complete"], false);
+        assert_eq!(
+            output.body["data"]["append_outcomes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn o26_route_findings_later_unknown_is_a_queryable_partial_commit() {
+        let (room, root) = test_room();
+        let _ = crate::drain_pending_append_outcomes();
+        let _ = crate::drain_pending_append_issues();
+        crate::store::skip_o26_once(
+            &room.rally_dir(),
+            crate::store::O26FaultPoint::AfterCanonicalSyncBeforeReadback,
+        );
+        crate::store::fail_o26_once(
+            &room.rally_dir(),
+            crate::store::O26FaultPoint::AfterCanonicalSyncBeforeReadback,
+        );
+        let error = route_findings(
+            &room,
+            "scanner",
+            vec![
+                Finding {
+                    file: "src/first.rs".to_string(),
+                    severity: "error".to_string(),
+                    description: "first finding".to_string(),
+                    evidence: Vec::new(),
+                },
+                Finding {
+                    file: "src/second.rs".to_string(),
+                    severity: "warn".to_string(),
+                    description: "second finding".to_string(),
+                    evidence: Vec::new(),
+                },
+            ],
+            true,
+        )
+        .expect_err("second item uncertainty must stop before the summary append");
+        let unknown_event_id = match &error {
+            RallyError::OutcomeUnknown { event_id, .. } => event_id.clone(),
+            other => panic!("expected typed OutcomeUnknown, got {other}"),
+        };
+        let output = crate::output_after_committed_error(error, true).unwrap();
+        assert_eq!(output.exit_code, 1);
+        assert_eq!(output.body["command"], "partial_commit");
+        assert_eq!(
+            output.body["data"]["outcome_unknown"]["event_id"],
+            unknown_event_id
+        );
+        assert_eq!(
+            output.body["data"]["outcome_unknown"]["remedy"],
+            crate::locate_remedy(&unknown_event_id)
+        );
+        assert_eq!(
+            output.body["data"]["append_outcomes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "the first item is a proven commit"
+        );
+        let facts = room.facts().unwrap();
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|fact| fact.event_id == unknown_event_id)
+                .count(),
+            1
+        );
+        assert!(facts.iter().all(|fact| fact.kind != FactKind::Artifact));
         std::fs::remove_dir_all(root).ok();
     }
 }

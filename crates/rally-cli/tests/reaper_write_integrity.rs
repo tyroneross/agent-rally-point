@@ -343,9 +343,27 @@ fn failed_lead_relinquish_write_is_not_reported_as_applied() {
         "a relinquish whose durable append failed must NOT appear in the report; \
          got {report} (stderr={stderr})"
     );
+    let unknowns = report["outcome_unknowns"]
+        .as_array()
+        .expect("a write with uncertain canonical outcome stays structured");
+    assert_eq!(unknowns.len(), 1, "one relinquish was attempted: {report}");
+    let unknown = &unknowns[0];
+    let event_id = unknown["event_id"]
+        .as_str()
+        .filter(|event_id| !event_id.is_empty())
+        .expect("the uncertain relinquish carries its stable event id");
+    assert_eq!(unknown["phase"], "canonical-open", "{unknown}");
     assert!(
-        stderr.contains("keeping lead stale-lead:01"),
-        "a dropped relinquish must say so on stderr; stderr={stderr}"
+        unknown["detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty()),
+        "the uncertainty carries the failed canonical-open detail: {unknown}"
+    );
+    assert!(
+        unknown["remedy"]
+            .as_str()
+            .is_some_and(|remedy| remedy.contains(event_id) && remedy.starts_with("rally locate ")),
+        "the uncertainty carries an exact event-id query remedy: {unknown}"
     );
 
     // D7, second half. The item list was already honest; the SUMMARY was not.

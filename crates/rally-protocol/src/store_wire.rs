@@ -46,9 +46,10 @@
 //! variants with exit-code parity (`kind` selects the variant; `code` is the
 //! redundant exit code). TRANSPORT-layer failures — connect/read timeout,
 //! connection reset, an over-long line (> [`MAX_LINE_BYTES`]), or a
-//! `wire_version` / `repo_root` mismatch — have NO direct-path equivalent and
-//! MUST map to `RallyError::Command` (exit 1) with remedy text naming
-//! `rally daemon status` / `rally daemon stop`. These classes are therefore
+//! `repo_root` mismatch — have NO direct-path equivalent and map to
+//! `RallyError::Command` (exit 1) with a daemon-status/stop remedy. An
+//! incompatible `wire_version` instead maps to typed `IncompatibleWire` and
+//! fails before routing or direct fallback. These classes are therefore
 //! excluded from the fail-open goldens (T-04) and covered by dedicated unit
 //! assertions instead. The concrete `RallyError` conversion lives in `rally-cli`
 //! (it cannot live here — `RallyError` is `rally-cli`-private); this module
@@ -58,9 +59,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Wire protocol version. Bumped only on a breaking envelope change. The ping
-/// reply carries this; a client seeing a version it does not speak treats the
-/// daemon as not-live and lets the ownership lock decide (ADR-02 rollback note).
-pub const WIRE_VERSION: u32 = 4;
+/// reply carries this; a client seeing an incompatible version fails
+/// immediately with typed `IncompatibleWire` and never falls back to direct.
+pub const WIRE_VERSION: u32 = 5;
 
 /// Hard cap on a single request/response line. A longer line is a framing
 /// error (or an abuse) and maps to the transport-error class (R7): the daemon
@@ -125,14 +126,14 @@ impl StoreRequest {
 // …) are self-describing, so field-level docs are allowed here.
 #[allow(missing_docs)]
 pub enum StoreOp {
-    /// `RoomStore::append_fact(fact)` → `Fact`.
+    /// `RoomStore::append_fact(fact)` → `AppendOutcome`.
     AppendFact { fact: Value },
-    /// `RoomStore::append_fact_verified(fact)` → `Fact`.
+    /// `RoomStore::append_fact_verified(fact)` → `AppendOutcome`.
     AppendFactVerified { fact: Value },
-    /// `RoomStore::append_state_transition_verified(fact)` → `Fact`.
+    /// `RoomStore::append_state_transition_verified(fact)` → `AppendOutcome`.
     AppendStateTransitionVerified { fact: Value },
     /// `RoomStore::append_session_fact_if_context(fact, expected)` →
-    /// `Option<Fact>` (`None` = conditional-append conflict, NOT an error).
+    /// `ConditionalAppendOutcome` (`NotApplied` = context conflict).
     AppendSessionFactIfContext {
         fact: Value,
         expected_context_version: Option<u64>,
@@ -142,10 +143,16 @@ pub enum StoreOp {
     /// `RoomStore::rebuild_claim_index()` → `()`.
     RebuildClaimIndex,
     /// `RoomStore::renew_claim_lease(claim_id, lease_expires_at, caller, expected)` →
-    /// `Option<ActiveClaimRecord>`.
+    /// `RenewClaimLeaseOutcome` with an optional typed append outcome.
     RenewClaimLease {
         claim_id: String,
         lease_expires_at: String,
+        /// Stable client-generated mutation id used for query/remedy/retry.
+        event_id: String,
+        /// Client-generated causal thread retained across routed dispatch.
+        thread_id: String,
+        /// Client-fixed occurrence timestamp; the daemon never regenerates it.
+        created_at: String,
         /// Tool asserted by the process requesting renewal. Optional at the
         /// serde boundary so a missing field is decoded and refused by the
         /// authority check rather than synthesized from the claim.
@@ -181,9 +188,9 @@ pub enum StoreOp {
     SnapshotWithReadersArchived { include_archived: bool },
     /// `RoomStore::last_checkpoint_seq(tool)` → `i64`.
     LastCheckpointSeq { tool: String },
-    /// `RoomStore::maybe_append_read_checkpoint(tool, read_seq)` →
-    /// `Option<Fact>`.
-    MaybeAppendReadCheckpoint { tool: String, read_seq: i64 },
+    /// Stable client-built read fact plus its coalescing position →
+    /// `ConditionalAppendOutcome`.
+    MaybeAppendReadCheckpoint { fact: Value, read_seq: i64 },
     /// `RoomStore::project_read_receipts(max_seq)` → `Vec<ReadReceipt>`.
     ProjectReadReceipts { max_seq: i64 },
     /// Liveness + identity probe (NOT a `RoomStore` method). Reply is
@@ -238,33 +245,38 @@ pub enum StoreResponse {
 // Variants documented; payload fields are self-describing (see [`StoreOp`]).
 #[allow(missing_docs)]
 pub enum StoreOk {
-    /// `Fact`.
-    AppendFact { fact: Value },
-    /// `Fact`.
-    AppendFactVerified { fact: Value },
-    /// `Fact`.
-    AppendStateTransitionVerified { fact: Value },
-    /// `Option<Fact>` (`None` = conditional-append conflict).
-    AppendSessionFactIfContext { fact: Option<Value> },
+    /// Typed `AppendOutcome`.
+    AppendFact { outcome: Value },
+    /// Typed `AppendOutcome`.
+    AppendFactVerified { outcome: Value },
+    /// Typed `AppendOutcome`.
+    AppendStateTransitionVerified { outcome: Value },
+    /// Typed `ConditionalAppendOutcome` (`not_applied` or committed outcome).
+    AppendSessionFactIfContext { result: Value },
     /// `Vec<Fact>`.
     Facts { facts: Vec<Value> },
     /// `()`.
     RebuildClaimIndex,
-    /// `Option<ActiveClaimRecord>`.
-    RenewClaimLease { record: Option<Value> },
+    /// Typed `RenewClaimLeaseOutcome`.
+    RenewClaimLease { outcome: Value },
     /// `(Vec<Fact>, Option<u64>)`.
     SessionFactsWithContextVersion {
         facts: Vec<Value>,
         context_version: Option<u64>,
     },
-    /// `RoomSnapshot`.
-    Snapshot { snapshot: Value },
+    /// `RoomSnapshot` plus an optional server-captured snapshot-cache
+    /// fingerprint. `None` is compatible but never cacheable by a v5 client.
+    Snapshot {
+        snapshot: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<Value>,
+    },
     /// `RoomSnapshot` (readers projected).
     SnapshotWithReaders { snapshot: Value },
     /// `i64`.
     LastCheckpointSeq { seq: i64 },
-    /// `Option<Fact>`.
-    MaybeAppendReadCheckpoint { fact: Option<Value> },
+    /// Typed `ConditionalAppendOutcome`.
+    MaybeAppendReadCheckpoint { result: Value },
     /// `Vec<ReadReceipt>`.
     ProjectReadReceipts { receipts: Vec<Value> },
     /// Ping reply: the daemon's identity for the client's pre-route check.
@@ -287,6 +299,12 @@ pub struct StoreError {
     pub kind: StoreErrorKind,
     /// Rendered error message (the `Display` text of the original error).
     pub message: String,
+    /// Stable canonical event id for OutcomeUnknown query/retry handling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// Durable phase at which certainty was lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 /// Closed tag selecting which `RallyError` variant the boundary reconstructs.
@@ -310,6 +328,13 @@ pub enum StoreErrorKind {
     /// The request deadline elapsed before any durable side effect. A
     /// provisional mutation lock is released before this reply; safe to retry.
     NotStarted,
+    /// Canonical mutation started but exact readback did not complete.
+    /// `StoreError::event_id` and `phase` carry the structured recovery data;
+    /// the client renders the shell-safe query remedy.
+    OutcomeUnknown,
+    /// Client and daemon speak incompatible semantic reply contracts. Never
+    /// fall back to direct ownership for this error.
+    IncompatibleWire,
     /// R7 transport class (timeout / reset / oversized line / version or
     /// repo_root mismatch). No direct-path equivalent → reconstruct as
     /// `RallyError::Command` (exit 1) with remedy text.
@@ -323,7 +348,21 @@ impl StoreError {
             code: kind.exit_code(),
             kind,
             message: message.into(),
+            event_id: None,
+            phase: None,
         }
+    }
+
+    /// A typed canonical mutation whose outcome requires an event-id query.
+    pub fn outcome_unknown(
+        event_id: impl Into<String>,
+        phase: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        let mut error = Self::new(StoreErrorKind::OutcomeUnknown, message);
+        error.event_id = Some(event_id.into());
+        error.phase = Some(phase.into());
+        error
     }
 
     /// A transport-class error (R7) with the standard remedy text.
@@ -343,6 +382,8 @@ impl StoreErrorKind {
             StoreErrorKind::Command
             | StoreErrorKind::Message
             | StoreErrorKind::Internal
+            | StoreErrorKind::OutcomeUnknown
+            | StoreErrorKind::IncompatibleWire
             | StoreErrorKind::Transport => 1,
         }
     }
@@ -357,7 +398,10 @@ mod tests {
         let mut req = StoreRequest::new(
             Some("alpha".to_string()),
             StoreOp::MaybeAppendReadCheckpoint {
-                tool: "claude_code:01".to_string(),
+                fact: serde_json::json!({
+                    "event_id": "read-request",
+                    "tool": "claude_code:01"
+                }),
                 read_seq: 42,
             },
         );
@@ -377,8 +421,8 @@ mod tests {
     }
 
     #[test]
-    fn scoped_snapshot_v4_round_trips_all_query_controls() {
-        assert_eq!(WIRE_VERSION, 4);
+    fn o26_wire_v5_round_trips_all_query_controls() {
+        assert_eq!(WIRE_VERSION, 5);
         let req = StoreRequest::new(
             Some("engagement-alpha".to_string()),
             StoreOp::SnapshotScoped {
@@ -404,6 +448,36 @@ mod tests {
             }
             other => panic!("unexpected op: {other:?}"),
         }
+
+        let fingerprint = serde_json::json!({
+            "generation": 2,
+            "segments_fingerprint": [],
+            "facts_db_mtime_ns": 0,
+            "log_index_text": ""
+        });
+        let response = StoreResponse::Ok(StoreOk::Snapshot {
+            snapshot: serde_json::json!({"max_seq": 0}),
+            fingerprint: Some(fingerprint.clone()),
+        });
+        match serde_json::from_str::<StoreResponse>(&serde_json::to_string(&response).unwrap())
+            .unwrap()
+        {
+            StoreResponse::Ok(StoreOk::Snapshot {
+                fingerprint: Some(actual),
+                ..
+            }) => assert_eq!(actual, fingerprint),
+            other => panic!("snapshot fingerprint did not round-trip: {other:?}"),
+        }
+
+        let compatible_without_fingerprint: StoreResponse =
+            serde_json::from_str(r#"{"ok":{"kind":"snapshot","snapshot":{"max_seq":0}}}"#).unwrap();
+        assert!(matches!(
+            compatible_without_fingerprint,
+            StoreResponse::Ok(StoreOk::Snapshot {
+                fingerprint: None,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -428,12 +502,21 @@ mod tests {
     fn value_payload_carries_an_opaque_fact() {
         // Mirrors the rally-cli boundary: a Fact serialises to a Value here and
         // deserialises back losslessly on the other side.
-        let fact = serde_json::json!({"event_id": "fact_x", "seq": 7});
-        let ok = StoreOk::AppendFact { fact: fact.clone() };
+        let outcome = serde_json::json!({
+            "fact": {"event_id": "fact_x", "seq": 7},
+            "committed": true,
+            "projection_complete": false,
+            "warnings": [{"code": "facts_db", "message": "injected"}]
+        });
+        let ok = StoreOk::AppendFact {
+            outcome: outcome.clone(),
+        };
         let line = serde_json::to_string(&StoreResponse::Ok(ok)).unwrap();
         let back: StoreResponse = serde_json::from_str(&line).unwrap();
         match back {
-            StoreResponse::Ok(StoreOk::AppendFact { fact: f }) => assert_eq!(f, fact),
+            StoreResponse::Ok(StoreOk::AppendFact { outcome: value }) => {
+                assert_eq!(value, outcome)
+            }
             other => panic!("unexpected reply: {other:?}"),
         }
     }

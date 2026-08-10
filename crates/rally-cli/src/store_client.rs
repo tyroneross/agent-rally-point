@@ -43,9 +43,12 @@ use rally_protocol::store_wire::{
     WIRE_VERSION,
 };
 
-use crate::claim_authority::{self, ActiveClaimRecord};
+use crate::claim_authority;
 use crate::error::{RallyError, Result};
-use crate::store::{self, Fact, ReadReceipt, RoomSnapshot};
+use crate::store::{
+    self, AppendOutcome, ConditionalAppendOutcome, Fact, ReadReceipt, RenewClaimLeaseOutcome,
+    RoomSnapshot, SnapshotCacheCapture, SnapshotCacheFingerprint,
+};
 
 /// Discovery pointer filename inside `.rally/` (L7/ADR-02) — the daemon's
 /// SOLE discovery mechanism; clients never guess or hardcode the socket path.
@@ -249,37 +252,57 @@ fn round_trip(
 /// One-shot liveness probe (ADR-01 §1): read `.addr`, connect, `Ping`, verify
 /// `wire_version` + `repo_root`. `None` covers every ordinary not-live case —
 /// missing/stale `.addr`, a socket file that doesn't exist, a refused
-/// connection, a timeout, or a version/root mismatch — the router treats all
-/// of these identically ("no live daemon"), never as an error. This is
+/// connection, a timeout, or a repo-root mismatch — the router treats those as
+/// "no live daemon". A wire-version mismatch is different: it fails
+/// immediately and never falls through to direct ownership. This is
 /// deliberately narrow: it is NOT where R6's mid-command dead-socket policy
 /// lives (that's [`RoutedRoomStore::dispatch`], reached only AFTER routing
 /// has already begun).
-pub(crate) fn probe_identity(rally_dir: &Path, expected_repo_root: &str) -> Option<StoreIdentity> {
+pub(crate) fn probe_identity(
+    rally_dir: &Path,
+    expected_repo_root: &str,
+) -> Result<Option<StoreIdentity>> {
     let addr_path = rally_dir.join(ADDR_FILENAME);
-    let socket_text = std::fs::read_to_string(&addr_path).ok()?;
+    let socket_text = match std::fs::read_to_string(&addr_path) {
+        Ok(text) => text,
+        Err(_) => return Ok(None),
+    };
     let socket = PathBuf::from(socket_text.trim());
     if socket.as_os_str().is_empty() || !socket.exists() {
-        return None;
+        return Ok(None);
     }
     let req = StoreRequest::new(None, StoreOp::Ping);
-    let reply = round_trip(&socket, &req, PROBE_TIMEOUT, true).ok()?;
+    let reply = match round_trip(&socket, &req, PROBE_TIMEOUT, true) {
+        Ok(reply) => reply,
+        Err(_) => return Ok(None),
+    };
     match reply {
         StoreResponse::Ok(StoreOk::Pong {
             repo_root,
             pid,
             wire_version,
         }) => {
-            if wire_version != WIRE_VERSION || repo_root != expected_repo_root {
-                return None;
+            if wire_version != WIRE_VERSION {
+                return Err(RallyError::IncompatibleWire {
+                    detail: format!(
+                        "client speaks {WIRE_VERSION}, daemon speaks {wire_version}; run `rally daemon stop` before retrying"
+                    ),
+                });
             }
-            Some(StoreIdentity {
+            if repo_root != expected_repo_root {
+                return Ok(None);
+            }
+            Ok(Some(StoreIdentity {
                 repo_root,
                 pid,
                 wire_version,
                 socket,
-            })
+            }))
         }
-        _ => None,
+        StoreResponse::Err(error) if error.kind == StoreErrorKind::IncompatibleWire => {
+            Err(store_error_to_rally_error(error))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -293,18 +316,20 @@ pub(crate) fn probe_live(
     repo_root: &Path,
     rally_dir: &Path,
     engagement: Option<String>,
-) -> Option<RoutedRoomStore> {
+) -> Result<Option<RoutedRoomStore>> {
     let canonical = store::canonical_repo_root_string(repo_root);
-    let identity = probe_identity(rally_dir, &canonical)?;
+    let Some(identity) = probe_identity(rally_dir, &canonical)? else {
+        return Ok(None);
+    };
     let resolved_engagement = store::resolve_active_engagement_with_env(rally_dir, engagement);
-    Some(RoutedRoomStore {
+    Ok(Some(RoutedRoomStore {
         socket: identity.socket,
         repo_root: repo_root.to_path_buf(),
         active_engagement: resolved_engagement,
         cursor_path: rally_dir.join("cursors.json"),
         log_dir: rally_dir.join(store::LOG_DIRNAME),
         claim_index_path: rally_dir.join(claim_authority::CLAIM_INDEX_FILENAME),
-    })
+    }))
 }
 
 /// Bounded-block corridor (L12/ADR-01): re-probe until `bound` elapses. Used
@@ -317,15 +342,15 @@ pub(crate) fn probe_live_bounded(
     rally_dir: &Path,
     engagement: Option<String>,
     bound: Duration,
-) -> Option<RoutedRoomStore> {
+) -> Result<Option<RoutedRoomStore>> {
     let deadline = Instant::now() + bound;
     loop {
-        if let Some(routed) = probe_live(repo_root, rally_dir, engagement.clone()) {
-            return Some(routed);
+        if let Some(routed) = probe_live(repo_root, rally_dir, engagement.clone())? {
+            return Ok(Some(routed));
         }
         let now = Instant::now();
         if now >= deadline {
-            return None;
+            return Ok(None);
         }
         std::thread::sleep(CORRIDOR_RETRY_SLEEP.min(deadline.saturating_duration_since(now)));
     }
@@ -335,46 +360,61 @@ pub(crate) fn probe_live_bounded(
 struct MutationQuery {
     operation: &'static str,
     selector: Option<String>,
+    event_id: Option<String>,
 }
 
 /// Classify the closed wire operation set. This classification lives beside
 /// dispatch so adding a mutating protocol variant cannot silently inherit the
 /// old blind-retry behavior.
 fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
-    let fact_selector = |fact: &Value| {
+    let fact_event_id = |fact: &Value| {
         fact.get("event_id")
             .and_then(Value::as_str)
-            .map(|event_id| format!("event_id={event_id}"))
+            .map(str::to_string)
     };
     match op {
         StoreOp::AppendFact { fact } => Some(MutationQuery {
             operation: "append_fact",
-            selector: fact_selector(fact),
+            selector: fact_event_id(fact).map(|event_id| format!("event_id={event_id}")),
+            event_id: fact_event_id(fact),
         }),
         StoreOp::AppendFactVerified { fact } => Some(MutationQuery {
             operation: "append_fact_verified",
-            selector: fact_selector(fact),
+            selector: fact_event_id(fact).map(|event_id| format!("event_id={event_id}")),
+            event_id: fact_event_id(fact),
         }),
         StoreOp::AppendStateTransitionVerified { fact } => Some(MutationQuery {
             operation: "append_state_transition_verified",
-            selector: fact_selector(fact),
+            selector: fact_event_id(fact).map(|event_id| format!("event_id={event_id}")),
+            event_id: fact_event_id(fact),
         }),
         StoreOp::AppendSessionFactIfContext { fact, .. } => Some(MutationQuery {
             operation: "append_session_fact_if_context",
-            selector: fact_selector(fact),
+            selector: fact_event_id(fact).map(|event_id| format!("event_id={event_id}")),
+            event_id: fact_event_id(fact),
         }),
         StoreOp::RebuildClaimIndex => Some(MutationQuery {
             operation: "rebuild_claim_index",
             selector: None,
+            event_id: None,
         }),
-        StoreOp::RenewClaimLease { claim_id, .. } => Some(MutationQuery {
+        StoreOp::RenewClaimLease {
+            claim_id, event_id, ..
+        } => Some(MutationQuery {
             operation: "renew_claim_lease",
-            selector: Some(format!("claim_id={claim_id}")),
+            selector: Some(format!("event_id={event_id},claim_id={claim_id}")),
+            event_id: Some(event_id.clone()),
         }),
-        StoreOp::MaybeAppendReadCheckpoint { tool, read_seq } => Some(MutationQuery {
-            operation: "maybe_append_read_checkpoint",
-            selector: Some(format!("tool={tool},read_seq={read_seq}")),
-        }),
+        StoreOp::MaybeAppendReadCheckpoint { fact, read_seq } => {
+            let event_id = fact_event_id(fact);
+            Some(MutationQuery {
+                operation: "maybe_append_read_checkpoint",
+                selector: event_id
+                    .as_ref()
+                    .map(|event_id| format!("event_id={event_id},read_seq={read_seq}")),
+                event_id,
+            })
+        }
         StoreOp::Facts
         | StoreOp::SessionFactsWithContextVersion
         | StoreOp::SnapshotWithArchived { .. }
@@ -391,6 +431,16 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
 /// reply is lost, so its only safe result is UNKNOWN + a ledger query selector.
 fn transport_error(op: &StoreOp, io_err: &std::io::Error) -> RallyError {
     if let Some(query) = mutation_query(op) {
+        if let Some(event_id) = query.event_id.as_deref() {
+            return RallyError::outcome_unknown(
+                event_id,
+                "daemon-transport",
+                format!(
+                    "daemon transport failure during mutating operation {}: {io_err}; direct fallback is forbidden",
+                    query.operation
+                ),
+            );
+        }
         let selector = query
             .selector
             .as_deref()
@@ -415,6 +465,33 @@ fn store_error_to_rally_error(err: StoreError) -> RallyError {
         StoreErrorKind::Usage => RallyError::Usage(err.message),
         StoreErrorKind::NotFound => RallyError::NotFound(err.message),
         StoreErrorKind::NotStarted => RallyError::NotStarted(err.message),
+        StoreErrorKind::OutcomeUnknown => {
+            let Some(event_id) = err.event_id else {
+                return RallyError::IncompatibleWire {
+                    detail: "daemon returned malformed outcome_unknown without event_id"
+                        .to_string(),
+                };
+            };
+            if let Err(error) = crate::store::validate_append_event_id(&event_id) {
+                return RallyError::IncompatibleWire {
+                    detail: format!("daemon returned malformed outcome_unknown event_id: {error}"),
+                };
+            }
+            let Some(phase) = err.phase else {
+                return RallyError::IncompatibleWire {
+                    detail: "daemon returned malformed outcome_unknown without phase".to_string(),
+                };
+            };
+            if phase.trim().is_empty() || phase.chars().any(char::is_control) {
+                return RallyError::IncompatibleWire {
+                    detail: "daemon returned malformed outcome_unknown phase".to_string(),
+                };
+            }
+            RallyError::outcome_unknown(event_id, phase, err.message)
+        }
+        StoreErrorKind::IncompatibleWire => RallyError::IncompatibleWire {
+            detail: err.message,
+        },
         StoreErrorKind::Command
         | StoreErrorKind::Message
         | StoreErrorKind::Internal
@@ -449,12 +526,30 @@ fn unexpected_reply(op: &str) -> RallyError {
 }
 
 impl RoutedRoomStore {
+    #[cfg(test)]
+    pub(crate) fn for_test(socket: PathBuf, repo_root: PathBuf, engagement: &str) -> Self {
+        let rally_dir = repo_root.join(".rally");
+        Self {
+            socket,
+            repo_root,
+            active_engagement: engagement.to_string(),
+            cursor_path: rally_dir.join("cursors.json"),
+            log_dir: rally_dir.join("log"),
+            claim_index_path: rally_dir.join(claim_authority::CLAIM_INDEX_FILENAME),
+        }
+    }
+
     /// Send one op over the wire, carrying this client's already-resolved
     /// engagement label (L9) with EVERY request — the daemon's per-request
     /// `set_engagement_scope` rebind depends on it being present on every op,
     /// not just appends.
     fn dispatch(&self, op: StoreOp) -> Result<StoreOk> {
         self.dispatch_with_engagement(self.active_engagement.clone(), op)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dispatch_for_test(&self, op: StoreOp) -> Result<StoreOk> {
+        self.dispatch(op)
     }
 
     fn dispatch_with_engagement(&self, engagement: String, op: StoreOp) -> Result<StoreOk> {
@@ -473,29 +568,29 @@ impl RoutedRoomStore {
 
     // ----- ROUTED methods (one StoreOp round trip each) ----------------------
 
-    pub(crate) fn append_fact(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_fact(&self, fact: &Fact) -> Result<AppendOutcome> {
         match self.dispatch(StoreOp::AppendFact {
             fact: to_value(fact)?,
         })? {
-            StoreOk::AppendFact { fact } => from_value(fact),
+            StoreOk::AppendFact { outcome } => from_value(outcome),
             _ => Err(unexpected_reply("append_fact")),
         }
     }
 
-    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<AppendOutcome> {
         match self.dispatch(StoreOp::AppendFactVerified {
             fact: to_value(fact)?,
         })? {
-            StoreOk::AppendFactVerified { fact } => from_value(fact),
+            StoreOk::AppendFactVerified { outcome } => from_value(outcome),
             _ => Err(unexpected_reply("append_fact_verified")),
         }
     }
 
-    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<AppendOutcome> {
         match self.dispatch(StoreOp::AppendStateTransitionVerified {
             fact: to_value(fact)?,
         })? {
-            StoreOk::AppendStateTransitionVerified { fact } => from_value(fact),
+            StoreOk::AppendStateTransitionVerified { outcome } => from_value(outcome),
             _ => Err(unexpected_reply("append_state_transition_verified")),
         }
     }
@@ -504,12 +599,12 @@ impl RoutedRoomStore {
         &self,
         fact: &Fact,
         expected_context_version: Option<u64>,
-    ) -> Result<Option<Fact>> {
+    ) -> Result<ConditionalAppendOutcome> {
         match self.dispatch(StoreOp::AppendSessionFactIfContext {
             fact: to_value(fact)?,
             expected_context_version,
         })? {
-            StoreOk::AppendSessionFactIfContext { fact } => fact.map(from_value).transpose(),
+            StoreOk::AppendSessionFactIfContext { result } => from_value(result),
             _ => Err(unexpected_reply("append_session_fact_if_context")),
         }
     }
@@ -530,6 +625,7 @@ impl RoutedRoomStore {
     }
 
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn renew_claim_lease(
         &self,
         claim_id: &str,
@@ -537,15 +633,21 @@ impl RoutedRoomStore {
         caller_tool: &str,
         caller_session_id: Option<&str>,
         expected_owner_session_id: Option<&str>,
-    ) -> Result<Option<ActiveClaimRecord>> {
+        event_id: String,
+        thread_id: String,
+        created_at: String,
+    ) -> Result<RenewClaimLeaseOutcome> {
         match self.dispatch(StoreOp::RenewClaimLease {
             claim_id: claim_id.to_string(),
             lease_expires_at,
+            event_id,
+            thread_id,
+            created_at,
             caller_tool: Some(caller_tool.to_string()),
             caller_session_id: caller_session_id.map(str::to_string),
             expected_owner_session_id: expected_owner_session_id.map(str::to_string),
         })? {
-            StoreOk::RenewClaimLease { record } => record.map(from_value).transpose(),
+            StoreOk::RenewClaimLease { outcome } => from_value(outcome),
             _ => Err(unexpected_reply("renew_claim_lease")),
         }
     }
@@ -572,8 +674,26 @@ impl RoutedRoomStore {
 
     pub(crate) fn snapshot_with_archived(&self, include_archived: bool) -> Result<RoomSnapshot> {
         match self.dispatch(StoreOp::SnapshotWithArchived { include_archived })? {
-            StoreOk::Snapshot { snapshot } => snapshot_from_value(snapshot),
+            StoreOk::Snapshot { snapshot, .. } => snapshot_from_value(snapshot),
             _ => Err(unexpected_reply("snapshot_with_archived")),
+        }
+    }
+
+    pub(crate) fn snapshot_cache_capture(
+        &self,
+        include_archived: bool,
+    ) -> Result<SnapshotCacheCapture> {
+        match self.dispatch(StoreOp::SnapshotWithArchived { include_archived })? {
+            StoreOk::Snapshot {
+                snapshot,
+                fingerprint,
+            } => Ok(SnapshotCacheCapture {
+                snapshot: snapshot_from_value(snapshot)?,
+                fingerprint: fingerprint
+                    .map(from_value::<SnapshotCacheFingerprint>)
+                    .transpose()?,
+            }),
+            _ => Err(unexpected_reply("snapshot_cache_capture")),
         }
     }
 
@@ -593,7 +713,7 @@ impl RoutedRoomStore {
             include_presence_only,
         };
         match self.dispatch_with_engagement(engagement.to_string(), op)? {
-            StoreOk::Snapshot { snapshot } => snapshot_from_value(snapshot),
+            StoreOk::Snapshot { snapshot, .. } => snapshot_from_value(snapshot),
             _ => Err(unexpected_reply("snapshot_scoped")),
         }
     }
@@ -620,14 +740,14 @@ impl RoutedRoomStore {
 
     pub(crate) fn maybe_append_read_checkpoint(
         &self,
-        tool: &str,
+        checkpoint: &Fact,
         read_seq: i64,
-    ) -> Result<Option<Fact>> {
+    ) -> Result<ConditionalAppendOutcome> {
         match self.dispatch(StoreOp::MaybeAppendReadCheckpoint {
-            tool: tool.to_string(),
+            fact: to_value(checkpoint)?,
             read_seq,
         })? {
-            StoreOk::MaybeAppendReadCheckpoint { fact } => fact.map(from_value).transpose(),
+            StoreOk::MaybeAppendReadCheckpoint { result } => from_value(result),
             _ => Err(unexpected_reply("maybe_append_read_checkpoint")),
         }
     }
@@ -767,26 +887,91 @@ mod tests {
             log_dir: PathBuf::from("/repo/.rally/log"),
             claim_index_path: PathBuf::from("/repo/.rally/claim-index.json"),
         };
-        let err = routed
+        let error = routed
             .dispatch(StoreOp::AppendFact {
                 fact: serde_json::json!({"event_id": "fact-partial-control"}),
             })
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
 
         server.join().unwrap();
         std::fs::remove_file(&socket).ok();
-        assert!(err.contains("outcome unknown"), "{err}");
+        assert!(matches!(
+            error,
+            RallyError::OutcomeUnknown { ref event_id, ref phase, .. }
+                if event_id == "fact-partial-control" && phase == "daemon-transport"
+        ));
+        let remedy = crate::locate_remedy("fact-partial-control");
+        assert_eq!(
+            shlex::split(&remedy).unwrap(),
+            vec!["rally", "locate", "fact-partial-control", "--json"]
+        );
+        let err = error.to_string();
+        assert!(err.contains("mutation-outcome-unknown"), "{err}");
         assert!(err.contains("event_id=fact-partial-control"), "{err}");
-        assert!(err.contains("Query `rally room --json`"), "{err}");
         assert!(err.contains("direct fallback is forbidden"), "{err}");
         assert!(!err.contains("daemon stopped"), "{err}");
         assert!(!err.contains("; retry"), "{err}");
     }
 
     #[test]
-    fn probe_rejects_a_v3_daemon_after_mutation_deadline_changes() {
-        assert_eq!(WIRE_VERSION, 4, "this control grades the v3 to v4 cutover");
+    fn wire_rejects_unqueryable_outcome_unknown_fields() {
+        for error in [
+            StoreError {
+                code: 1,
+                kind: StoreErrorKind::OutcomeUnknown,
+                message: "missing id".to_string(),
+                event_id: None,
+                phase: Some("readback".to_string()),
+            },
+            StoreError {
+                code: 1,
+                kind: StoreErrorKind::OutcomeUnknown,
+                message: "blank id".to_string(),
+                event_id: Some("   ".to_string()),
+                phase: Some("readback".to_string()),
+            },
+            StoreError {
+                code: 1,
+                kind: StoreErrorKind::OutcomeUnknown,
+                message: "missing phase".to_string(),
+                event_id: Some("opaque id $(safe)".to_string()),
+                phase: None,
+            },
+            StoreError {
+                code: 1,
+                kind: StoreErrorKind::OutcomeUnknown,
+                message: "blank phase".to_string(),
+                event_id: Some("opaque id $(safe)".to_string()),
+                phase: Some("\t".to_string()),
+            },
+        ] {
+            assert!(matches!(
+                store_error_to_rally_error(error),
+                RallyError::IncompatibleWire { .. }
+            ));
+        }
+
+        let hostile = "opaque id 'quoted' $(touch no);$HOME";
+        let valid = store_error_to_rally_error(StoreError {
+            code: 1,
+            kind: StoreErrorKind::OutcomeUnknown,
+            message: "reply lost".to_string(),
+            event_id: Some(hostile.to_string()),
+            phase: Some("daemon-transport".to_string()),
+        });
+        assert!(matches!(
+            valid,
+            RallyError::OutcomeUnknown { ref event_id, .. } if event_id == hostile
+        ));
+        assert_eq!(
+            shlex::split(&crate::locate_remedy(hostile)).unwrap(),
+            vec!["rally", "locate", hostile, "--json"]
+        );
+    }
+
+    #[test]
+    fn probe_rejects_a_v4_daemon_after_append_outcome_cutover() {
+        assert_eq!(WIRE_VERSION, 5, "this control grades the v4 to v5 cutover");
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -807,22 +992,134 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let request: StoreRequest = serde_json::from_str(line.trim()).unwrap();
-            assert_eq!(request.wire_version, 4);
+            assert_eq!(request.wire_version, 5);
             let response = StoreResponse::Ok(StoreOk::Pong {
                 repo_root: "/expected/repo".to_string(),
                 pid: 42,
-                wire_version: 3,
+                wire_version: 4,
             });
             let mut writer = &stream;
             writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
         });
 
-        assert!(
-            probe_identity(&rally_dir, "/expected/repo").is_none(),
-            "a v3 daemon must not route a v4 client without mutation deadlines"
-        );
+        let error = probe_identity(&rally_dir, "/expected/repo")
+            .expect_err("a v4 daemon must fail a v5 client immediately");
+        assert!(matches!(error, RallyError::IncompatibleWire { .. }));
+        assert!(error.to_string().contains("client speaks 5"));
+        assert!(error.to_string().contains("daemon speaks 4"));
         server.join().unwrap();
         std::fs::remove_file(&socket).ok();
         std::fs::remove_dir_all(&rally_dir).ok();
+    }
+
+    #[test]
+    fn wire_rejects_malformed_append_outcome_invariants() {
+        let fact = serde_json::json!({
+            "schema": crate::FACT_SCHEMA,
+            "event_id": "wire-outcome",
+            "seq": 1,
+            "thread_id": "wire-thread",
+            "kind": "decision",
+            "tool": "test:01",
+            "subject": "wire outcome",
+            "scope": [],
+            "created_at": "2026-08-10T00:00:00Z",
+            "evidence": []
+        });
+        let uncommitted = serde_json::json!({
+            "fact": fact,
+            "committed": false,
+            "projection_complete": true,
+            "warnings": []
+        });
+        let error = serde_json::from_value::<AppendOutcome>(uncommitted)
+            .expect_err("wire must not construct a successful uncommitted outcome");
+        assert!(error.to_string().contains("committed=true"));
+
+        let inconsistent = serde_json::json!({
+            "fact": serde_json::json!({
+                "schema": crate::FACT_SCHEMA,
+                "event_id": "wire-outcome-2",
+                "seq": 2,
+                "thread_id": "wire-thread",
+                "kind": "decision",
+                "tool": "test:01",
+                "subject": "wire outcome",
+                "scope": [],
+                "created_at": "2026-08-10T00:00:00Z",
+                "evidence": []
+            }),
+            "committed": true,
+            "projection_complete": true,
+            "warnings": [{"code": "facts_db", "message": "degraded"}]
+        });
+        let error = serde_json::from_value::<ConditionalAppendOutcome>(serde_json::json!({
+            "status": "applied",
+            "outcome": inconsistent
+        }))
+        .expect_err("conditional wire outcome must enforce nested invariants");
+        assert!(error.to_string().contains("projection_complete"));
+    }
+
+    #[test]
+    fn routed_snapshot_without_server_fingerprint_is_usable_but_not_cacheable() {
+        let socket = unique_socket("snapshot-no-fingerprint");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let expected = RoomSnapshot::default();
+        let wire_snapshot = store::snapshot_to_wire_value(&expected).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let request: StoreRequest = serde_json::from_str(request.trim()).unwrap();
+            assert!(matches!(
+                request.op,
+                StoreOp::SnapshotWithArchived {
+                    include_archived: false
+                }
+            ));
+            let response = StoreResponse::Ok(StoreOk::Snapshot {
+                snapshot: wire_snapshot,
+                fingerprint: None,
+            });
+            let mut writer = &stream;
+            writer
+                .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+                .unwrap();
+            writer.flush().unwrap();
+        });
+
+        let cache_root = std::env::temp_dir().join(format!(
+            "routed-snapshot-cache-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let routed = RoutedRoomStore {
+            socket: socket.clone(),
+            repo_root: cache_root.clone(),
+            active_engagement: "test".to_string(),
+            cursor_path: cache_root.join(".rally/cursors.json"),
+            log_dir: cache_root.join(".rally/log"),
+            claim_index_path: cache_root.join(".rally/claim-index.json"),
+        };
+        let capture = routed.snapshot_cache_capture(false).unwrap();
+        assert!(capture.fingerprint.is_none());
+        assert_eq!(
+            store::snapshot_to_wire_value(&capture.snapshot).unwrap(),
+            store::snapshot_to_wire_value(&expected).unwrap()
+        );
+        store::write_snapshot_cache_for(&cache_root, &capture);
+        assert!(!cache_root.join(".rally/snapshot.cache.json").exists());
+        assert!(
+            !cache_root.join(".rally/mutation.lock").exists(),
+            "a routed snapshot capture must not acquire a client-side mutation lock"
+        );
+
+        server.join().unwrap();
+        std::fs::remove_file(&socket).ok();
+        std::fs::remove_dir_all(&cache_root).ok();
     }
 }

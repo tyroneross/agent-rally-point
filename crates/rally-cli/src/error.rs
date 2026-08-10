@@ -20,6 +20,19 @@ pub(crate) enum RallyError {
     /// the deadline boundary is released before this error is returned.
     #[error("{0}")]
     NotStarted(String),
+    /// A durable canonical mutation began, but the caller could not prove
+    /// whether its exact event reached the canonical readback boundary.
+    /// Retrying blindly is unsafe; callers must query by the stable event id.
+    #[error(
+        "mutation-outcome-unknown: event_id={event_id} phase={phase}: {detail}; query by the exact event id before deciding whether to rerun"
+    )]
+    OutcomeUnknown {
+        event_id: String,
+        phase: String,
+        detail: String,
+    },
+    #[error("incompatible-wire: {detail}")]
+    IncompatibleWire { detail: String },
     #[error("{context}: {source}")]
     Io {
         context: String,
@@ -40,7 +53,12 @@ impl RallyError {
             Self::Usage(_) => 2,
             Self::NotFound(_) => 3,
             Self::NotStarted(_) => 4,
-            Self::Command(_) | Self::Message(_) | Self::Io { .. } | Self::Json { .. } => 1,
+            Self::Command(_)
+            | Self::Message(_)
+            | Self::OutcomeUnknown { .. }
+            | Self::IncompatibleWire { .. }
+            | Self::Io { .. }
+            | Self::Json { .. } => 1,
         }
     }
 
@@ -52,5 +70,17 @@ impl RallyError {
     pub(crate) fn json(context: impl Into<String>) -> impl FnOnce(serde_json::Error) -> Self {
         let context = context.into();
         move |source| Self::Json { context, source }
+    }
+
+    pub(crate) fn outcome_unknown(
+        event_id: impl Into<String>,
+        phase: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::OutcomeUnknown {
+            event_id: event_id.into(),
+            phase: phase.into(),
+            detail: detail.into(),
+        }
     }
 }
