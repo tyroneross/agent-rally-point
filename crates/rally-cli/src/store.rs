@@ -190,7 +190,7 @@ fn mutation_start_deadline_elapsed() -> bool {
     Instant::now() >= effective_mutation_deadline()
 }
 
-fn ensure_new_mutation_can_start(path: &Path) -> Result<()> {
+pub(crate) fn ensure_new_mutation_can_start(path: &Path) -> Result<()> {
     if mutation_start_deadline_elapsed() {
         return Err(RallyError::NotStarted(format!(
             "mutation-not-started: deadline elapsed after validation but before the first durable side effect at {}; no durable mutation started and retry is safe",
@@ -5391,27 +5391,48 @@ fn facts_from_engagement_segments(
 ) -> Result<Vec<Fact>> {
     let engagement = validate_scoped_engagement(engagement)?;
     let file_name = format!("{engagement}.jsonl");
-    let mut entries = Vec::new();
-    entries.extend(read_segment_entries(&log_dir.join(&file_name))?);
-    entries.extend(read_segment_entries(&archive_dir.join(&file_name))?);
-    entries.sort_by_key(|entry| entry.seq);
-
-    let mut facts = Vec::with_capacity(entries.len());
-    let mut seen = BTreeMap::<i64, LedgerLine>::new();
-    for entry in entries {
-        if let Some(existing) = seen.get(&entry.seq) {
-            if existing != &entry {
-                return Err(RallyError::Message(format!(
-                    "conflicting canonical rows for engagement {engagement:?} at seq {}: live/archive rows differ",
-                    entry.seq
-                )));
+    let mut by_seq = BTreeMap::<i64, (LedgerLine, bool)>::new();
+    let mut fold_source = |path: &Path, exact_legacy_name: bool| -> Result<()> {
+        for entry in read_segment_entries(path)? {
+            // A modern authoritative envelope stamp always wins. Filename
+            // fallback exists only for unstamped legacy exact-name rows.
+            let belongs_to_engagement = entry
+                .engagement
+                .as_deref()
+                .map_or(exact_legacy_name, |actual| actual == engagement);
+            if let Some((existing, existing_belongs)) = by_seq.get_mut(&entry.seq) {
+                if existing != &entry {
+                    return Err(RallyError::Message(format!(
+                        "conflicting canonical rows for engagement {engagement:?} at seq {}: live/archive rows differ",
+                        entry.seq
+                    )));
+                }
+                *existing_belongs |= belongs_to_engagement;
+                continue;
             }
+            by_seq.insert(entry.seq, (entry, belongs_to_engagement));
+        }
+        Ok(())
+    };
+
+    // The exact live path is inherently scoped by its validated filename.
+    fold_source(&log_dir.join(&file_name), true)?;
+    for path in replay_archive_segments(archive_dir)? {
+        let exact_legacy_name =
+            path.file_name().and_then(|name| name.to_str()) == Some(file_name.as_str());
+        // Decode and exact-fold every generation before selecting rows. This
+        // keeps unrelated canonical conflicts loud while preserving legacy
+        // exact-name files that predate the authoritative envelope stamp.
+        fold_source(&path, exact_legacy_name)?;
+    }
+
+    let mut facts = Vec::with_capacity(by_seq.len());
+    for (entry, belongs_to_engagement) in by_seq.into_values() {
+        if !belongs_to_engagement {
             continue;
         }
         let seq = entry.seq;
-        let payload = entry.payload.clone();
-        seen.insert(seq, entry);
-        facts.push(Fact::from_segment_value(payload, seq)?);
+        facts.push(Fact::from_segment_value(entry.payload, seq)?);
     }
     Ok(facts)
 }
@@ -7613,19 +7634,34 @@ fn read_segment_entries(path: &Path) -> Result<Vec<LedgerLine>> {
 /// avoid materializing unrelated rows even when one segment is large.
 fn read_segment_entries_matching(
     path: &Path,
+    include: impl FnMut(&LedgerLine) -> bool,
+) -> Result<Vec<LedgerLine>> {
+    read_segment_entries_matching_with_policy(path, true, true, include)
+}
+
+/// Rotation runs under `mutation.lock`, so a listed source cannot disappear
+/// legitimately and an incomplete final fragment must fail rather than be
+/// treated as a replay-ignorable torn append. A valid final record without a
+/// newline remains valid canonical JSON and is included.
+fn read_segment_entries_strict(path: &Path) -> Result<Vec<LedgerLine>> {
+    read_segment_entries_matching_with_policy(path, false, false, |_| true)
+}
+
+fn read_segment_entries_matching_with_policy(
+    path: &Path,
+    ignore_incomplete_tail: bool,
+    tolerate_missing: bool,
     mut include: impl FnMut(&LedgerLine) -> bool,
 ) -> Result<Vec<LedgerLine>> {
     let file = match fs::File::open(path) {
         Ok(file) => file,
-        // f4: callers list segment files via `read_segment_files` and then
-        // open each one in a SEPARATE step (exists()-then-open at some call
-        // sites, no check at all at others) — a concurrent archival/rotation
-        // can remove a listed segment in between. That is not corruption; it
-        // is a benign race with rotation. Treat it as an empty segment
-        // rather than propagating, so callers fall through to whatever else
-        // they scan instead of hard-failing. Every PARSE error below stays
-        // loud — this only widens tolerance for the file's ABSENCE.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        // f4: ordinary replay callers may list immediately before rotation
+        // moves a file, so their policy treats NotFound as a benign empty
+        // source. Rotation itself holds `mutation.lock` and disables that
+        // tolerance: a planned source disappearing under the lock is loud.
+        Err(err) if tolerate_missing && err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
         Err(err) => {
             let ctx = format!("read canonical segment {}", path.display());
             return Err(RallyError::io(ctx)(err));
@@ -7673,10 +7709,15 @@ fn read_segment_entries_matching(
                     entries.push(entry);
                 }
             }
-            Err(_) if !had_newline => break,
+            Err(_) if !had_newline && ignore_incomplete_tail => break,
             Err(err) => {
+                let state = if had_newline {
+                    "completed"
+                } else {
+                    "unterminated"
+                };
                 return Err(RallyError::Message(format!(
-                    "completed canonical segment corruption in {} at line {}: {}",
+                    "{state} canonical segment corruption in {} at line {}: {}",
                     path.display(),
                     line_number,
                     err
@@ -7685,6 +7726,16 @@ fn read_segment_entries_matching(
         }
     }
     Ok(entries)
+}
+
+/// Strict, non-mutating rotation preflight over one canonical segment.
+/// Schema/kind/identity validation is shared with replay; timestamps remain
+/// strings here so rotate owns its cutoff parsing and error context.
+pub(crate) fn rotation_segment_occurred_at_values(path: &Path) -> Result<Vec<String>> {
+    Ok(read_segment_entries_strict(path)?
+        .into_iter()
+        .map(|entry| entry.occurred_at)
+        .collect())
 }
 
 /// R9-readback: scan segment files for the presence of a specific `event_id`
