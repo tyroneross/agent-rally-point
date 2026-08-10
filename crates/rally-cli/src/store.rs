@@ -1801,6 +1801,34 @@ pub(crate) enum RoomStore {
     Routed(RoutedRoomStore),
 }
 
+/// Read-only handle used while an inject command waits for a target-authored
+/// acknowledgement. Direct mode must not retain exclusive store ownership
+/// during that wait or a peer CLI cannot append the acknowledgement.
+pub(crate) enum AckPollingStore {
+    Direct {
+        room_dir: PathBuf,
+        log_dir: PathBuf,
+        archive_dir: PathBuf,
+    },
+    Routed(RoutedRoomStore),
+}
+
+impl AckPollingStore {
+    pub(crate) fn facts(&self) -> Result<Vec<Fact>> {
+        match self {
+            Self::Direct {
+                room_dir,
+                log_dir,
+                archive_dir,
+            } => {
+                let _guard = acquire_room_mutation_lock(room_dir)?;
+                facts_from_segments(log_dir, archive_dir)
+            }
+            Self::Routed(routed) => routed.facts(),
+        }
+    }
+}
+
 /// Today's in-process room store (was `RoomStore` before the router split).
 /// The `Direct` variant of [`RoomStore`]. In direct-CLI mode `warm_fact_store`
 /// is always `None`, so every hot interior open goes through
@@ -2543,6 +2571,24 @@ fn install_direct_owner_once(
         });
 }
 
+fn release_direct_owner_for_ack_poll(rally_dir: &Path) -> Result<()> {
+    let Some(table) = DIRECT_OWNER_GUARDS.get() else {
+        return Err(RallyError::Message(
+            "direct ACK polling started without process ownership".to_string(),
+        ));
+    };
+    let removed = table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&direct_owner_key(rally_dir));
+    if removed.is_none() {
+        return Err(RallyError::Message(
+            "direct ACK polling could not release process ownership".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn direct_owner_busy_unknown_error(bound: Duration) -> RallyError {
     RallyError::Command(format!(
         "direct-store-busy-unknown: could not establish exclusive direct ownership or a live \
@@ -2728,6 +2774,36 @@ impl RoomStore {
         match self {
             RoomStore::Direct(d) => d.facts(),
             RoomStore::Routed(r) => r.facts(),
+        }
+    }
+
+    /// Consume the command's general-purpose store before a bounded ACK wait.
+    /// Routed mode keeps using the daemon. Direct mode closes its store facade,
+    /// releases process ownership, and thereafter folds canonical JSONL only.
+    pub(crate) fn into_ack_polling(self) -> Result<AckPollingStore> {
+        match self {
+            Self::Routed(routed) => Ok(AckPollingStore::Routed(routed)),
+            Self::Direct(direct) => {
+                if direct.warm_fact_store.is_some() {
+                    return Err(RallyError::Message(
+                        "daemon warm store cannot enter direct ACK polling".to_string(),
+                    ));
+                }
+                let room_dir = direct
+                    .facts_db_path
+                    .parent()
+                    .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?
+                    .to_path_buf();
+                let log_dir = direct.log_dir.clone();
+                let archive_dir = direct.archive_dir.clone();
+                drop(direct);
+                release_direct_owner_for_ack_poll(&room_dir)?;
+                Ok(AckPollingStore::Direct {
+                    room_dir,
+                    log_dir,
+                    archive_dir,
+                })
+            }
         }
     }
 

@@ -28,8 +28,8 @@ fn serialize_rally_run() -> MutexGuard<'static, ()> {
 
 // ── Daemon-serving mode (BACKLOG S-P3, Chunk D / F4) ─────────────────────────
 //
-// Gated behind `RALLY_TEST_RALLYD=1`, used ONLY by the run-id reservation test
-// below. When set, a rallyd daemon serves the temp room before the parallel
+// Gated behind `RALLY_TEST_RALLYD=1`, used by the routed concurrency controls
+// below. When set, a rallyd daemon serves the temp room before parallel or
 // `rally run` subprocesses launch; each CAS reservation leg
 // (`session_facts_with_context_version` + `append_session_fact_if_context`,
 // lib.rs:4324) routes over the socket and the daemon's total order serialises
@@ -206,6 +206,23 @@ fn temp_path(name: &str) -> PathBuf {
             .unwrap()
             .as_nanos()
     ))
+}
+
+fn canonical_fact_count(cwd: &Path, kind: &str, ref_id: &str) -> usize {
+    fs::read_dir(cwd.join(".rally/log"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .flat_map(|entry| {
+            fs::read_to_string(entry.path())
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .filter(|row| row["payload"]["kind"] == kind && row["payload"]["ref"] == ref_id)
+        .count()
 }
 
 fn write_executable(path: &Path, body: &str) {
@@ -1402,6 +1419,7 @@ fn rally_entry_and_handoff_split_response_and_work_buckets() {
 fn rally_runs_and_injects_managed_tmux_sessions() {
     let _run_guard = serialize_rally_run();
     let workspace = Workspace::new("rally-run-tmux");
+    let _daemon = maybe_start_daemon(&workspace.cwd, &workspace.home);
 
     let run = workspace.json(&[
         "run",
@@ -1540,9 +1558,31 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     let resolver_handoff = handoff_id.to_string();
     let resolver = thread::spawn(move || {
         thread::sleep(Duration::from_millis(200));
+        let wrong_tool = Command::new(env!("CARGO_BIN_EXE_rally"))
+            .current_dir(&resolver_cwd)
+            .env("HOME", &resolver_home)
+            .args([
+                "say",
+                "artifact",
+                "--json",
+                "--tool",
+                "codex:other",
+                "--ref",
+                resolver_handoff.as_str(),
+                "--subject",
+                "wrong tool must not acknowledge managed handoff",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            wrong_tool.status.success(),
+            "wrong-tool filtering fixture failed to append: stderr={} stdout={}",
+            String::from_utf8_lossy(&wrong_tool.stderr),
+            String::from_utf8_lossy(&wrong_tool.stdout)
+        );
         let output = Command::new(env!("CARGO_BIN_EXE_rally"))
-            .current_dir(resolver_cwd)
-            .env("HOME", resolver_home)
+            .current_dir(&resolver_cwd)
+            .env("HOME", &resolver_home)
             .args([
                 "say",
                 "resolve",
@@ -1587,6 +1627,11 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     assert_eq!(
         acked["data"]["inject"]["ack"]["subject"],
         "managed session handoff resolved after inject"
+    );
+    assert_eq!(
+        canonical_fact_count(&workspace.cwd, "resolve", handoff_id),
+        1,
+        "concurrent ACK must append exactly one target-authored close"
     );
 
     let capture = workspace.json(&[
@@ -1878,6 +1923,7 @@ fn rally_inject_require_ack_timeout_returns_ok_with_timeout_ack() {
     // NOT an error envelope.  The message was durably recorded (content_fact
     // present) before the ack wait began — the caller must NOT re-inject.
     let workspace = Workspace::new("rally-inject-ack-timeout");
+    let _daemon = maybe_start_daemon(&workspace.cwd, &workspace.home);
 
     workspace.json(&[
         "run",
@@ -1961,6 +2007,23 @@ fn rally_inject_require_ack_timeout_returns_ok_with_timeout_ack() {
     assert_eq!(
         body["data"]["inject"]["fallback_plan"]["assumption"], "not_received",
         "timeout must return a fallback plan that treats missing ACK as not received"
+    );
+
+    workspace.json(&[
+        "say",
+        "resolve",
+        "--json",
+        "--tool",
+        "claude_code:reviewer-01",
+        "--ref",
+        handoff_id,
+        "--subject",
+        "late target ACK after sender timeout",
+    ]);
+    assert_eq!(
+        canonical_fact_count(&workspace.cwd, "resolve", handoff_id),
+        1,
+        "a late target ACK must close canonically exactly once"
     );
 
     workspace.cleanup();

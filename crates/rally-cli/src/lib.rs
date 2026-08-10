@@ -167,8 +167,8 @@ use output::{CliError, Output, RenderedOutput};
 use rallyd_core::ServeConfig;
 use route_findings::{Finding, RoutingSummary, route_findings};
 use store::{
-    ConditionalAppendOutcome, Fact, FactKind, ReadReceipt, RoomQuery, RoomSnapshot, RoomStore,
-    RoomSummary,
+    AckPollingStore, ConditionalAppendOutcome, Fact, FactKind, ReadReceipt, RoomQuery,
+    RoomSnapshot, RoomStore, RoomSummary,
 };
 // Envelope wrapper types from backends module.
 use backends::{
@@ -6810,7 +6810,7 @@ fn command_inject_managed(
     let timeout = timeout_seconds as u64;
 
     // Open the room once for all appends in this command.
-    let room = if !dry_run {
+    let mut room = if !dry_run {
         Some(RoomStore::open()?)
     } else {
         None
@@ -7045,12 +7045,15 @@ fn command_inject_managed(
     let ack = if effective_require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
         // room is always Some here (require_ack && !dry_run guards this branch).
-        let ack_room = room.as_ref().expect("room must be open for --require-ack");
+        let ack_room = room
+            .take()
+            .expect("room must be open for --require-ack")
+            .into_ack_polling()?;
         Some(wait_for_resolution(
             handoff,
             timeout,
             ack_after_seq.unwrap_or(0),
-            ack_room,
+            &ack_room,
             &session.tool,
         )?)
     } else {
@@ -7158,7 +7161,7 @@ fn command_inject_ledger(
     let effective_require_ack = require_ack || handoff.is_some();
     let timeout = timeout_seconds as u64;
 
-    let room = if !dry_run {
+    let mut room = if !dry_run {
         Some(RoomStore::open()?)
     } else {
         None
@@ -7236,12 +7239,15 @@ fn command_inject_ledger(
     }
     let ack = if effective_require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
-        let ack_room = room.as_ref().expect("room must be open for --require-ack");
+        let ack_room = room
+            .take()
+            .expect("room must be open for --require-ack")
+            .into_ack_polling()?;
         Some(wait_for_resolution(
             handoff,
             timeout,
             ack_after_seq.unwrap_or(0),
-            ack_room,
+            &ack_room,
             &agent_id,
         )?)
     } else {
@@ -8364,7 +8370,7 @@ fn wait_for_resolution(
     handoff: &str,
     timeout_seconds: u64,
     after_seq: i64,
-    room: &RoomStore,
+    room: &AckPollingStore,
     expected_tool: &str,
 ) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
@@ -9781,6 +9787,7 @@ mod tests {
         ))
         .unwrap();
 
+        let room = room.into_ack_polling().unwrap();
         let ack = wait_for_resolution(handoff_id, 0, 0, &room, expected_tool).unwrap();
 
         assert_eq!(ack["resolved"].as_bool(), Some(true));
@@ -9810,6 +9817,7 @@ mod tests {
         room.append_fact(&resolve_fact("codex:other", handoff_id, "wrong ack"))
             .unwrap();
 
+        let room = room.into_ack_polling().unwrap();
         let ack = wait_for_resolution(handoff_id, 0, 0, &room, expected_tool).unwrap();
 
         assert_eq!(ack["resolved"].as_bool(), Some(false));
@@ -9836,6 +9844,7 @@ mod tests {
         ))
         .unwrap();
 
+        let room = room.into_ack_polling().unwrap();
         let ack = wait_for_resolution(handoff_id, 0, 0, &room, expected_tool).unwrap();
 
         assert_eq!(ack["received"].as_bool(), Some(true));
@@ -9862,6 +9871,7 @@ mod tests {
         ))
         .unwrap();
 
+        let room = room.into_ack_polling().unwrap();
         let ack = wait_for_resolution(handoff_id, 0, 0, &room, expected_tool).unwrap();
 
         assert_eq!(ack["received"].as_bool(), Some(true));
