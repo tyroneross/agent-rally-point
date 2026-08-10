@@ -1447,10 +1447,7 @@ mod tests {
             &past_ts(3600),
         );
 
-        // Dry-run isolates the session-aware decision. The store mutation-lock
-        // recheck is intentionally outside this lane and still aggregates by
-        // tool until the merge seam documented in the handoff is updated.
-        let report = run_reap_stale_in_room_with_mode(&room, false, ReapMode::LeaseOnly).unwrap();
+        let report = run_reap_stale_in_room_with_mode(&room, true, ReapMode::LeaseOnly).unwrap();
         assert_eq!(
             report
                 .claims_reaped
@@ -1466,6 +1463,19 @@ mod tests {
                 .iter()
                 .all(|claim| claim.claim_id != live_claim.event_id),
             "the live sibling's own claim must survive"
+        );
+        let active = room.snapshot().unwrap().active_claims;
+        assert!(
+            active
+                .iter()
+                .all(|claim| claim.event_id != dead_claim.event_id),
+            "the exact dead session must close under the store mutation lock"
+        );
+        assert!(
+            active
+                .iter()
+                .any(|claim| claim.event_id == live_claim.event_id),
+            "the live sibling must remain active after the same applied pass"
         );
         fs::remove_dir_all(root).ok();
     }
@@ -1528,7 +1538,7 @@ mod tests {
 
         // Arm 3 — unavailable: presence with no `worktree_path:` /
         // `observer_pid:` stamps, which is every host that has not installed
-        // the coordination hook. `observe_tools` creates no entry for the tool
+        // the coordination hook. The observation index has no entry for the tool
         // and the reaper falls back to Unknown.
         append_presence(&room, "unobserved", 5);
         let unobserved_claim =

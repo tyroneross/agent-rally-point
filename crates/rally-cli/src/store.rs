@@ -2221,13 +2221,39 @@ impl DirectRoomStore {
                     crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
                 let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
                 let fresh = snapshot_from_facts_with_policy(&facts, &coord, false);
+                let owner_session_marker = Self::reaper_marker(&fact.evidence, "owner_session");
                 let active_claim = fresh
                     .active_claims
                     .iter()
                     .find(|c| c.tool.as_deref() == Some(owner) && c.event_id == ref_id);
+                if let Some(claim) = active_claim {
+                    let owner_session_matches =
+                        match (claim.from_session_id.as_deref(), owner_session_marker) {
+                            (Some(claim_session), Some(marker_session)) => {
+                                marker_session == claim_session
+                            }
+                            (None, Some("legacy") | None) => true,
+                            _ => false,
+                        };
+                    if !owner_session_matches {
+                        return Err(RallyError::Usage(format!(
+                            "reap refused: claim {ref_id} owner session does not match the reaper \
+                             evidence; not closing an active claim"
+                        )));
+                    }
+                }
+                let observed_sessions =
+                    crate::observed_liveness::observe_sessions(&self.repo_root, &facts);
                 let owner_still_stale = owner_reason
-                    && active_claim
-                        .is_some_and(|claim| fresh.claim_reclaim_eligible(claim, &coord).0);
+                    && active_claim.is_some_and(|claim| {
+                        if claim.from_session_id.is_some() {
+                            observed_sessions
+                                .for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref())
+                                == crate::observed_liveness::ObservedLiveness::Stale
+                        } else {
+                            fresh.claim_reclaim_eligible(claim, &coord).0
+                        }
+                    });
                 let lease_still_expired = lease_reason
                     && active_claim.is_some_and(|claim| {
                         claim
@@ -2239,11 +2265,11 @@ impl DirectRoomStore {
                     });
                 let observed_still_stale =
                     if Self::reaper_marker(&fact.evidence, "observed") == Some("stale") {
-                        crate::observed_liveness::observe_tools(&self.repo_root, &facts)
-                            .get(owner)
-                            .is_some_and(|verdict| {
-                                *verdict == crate::observed_liveness::ObservedLiveness::Stale
-                            })
+                        active_claim.is_some_and(|claim| {
+                            observed_sessions
+                                .for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref())
+                                == crate::observed_liveness::ObservedLiveness::Stale
+                        })
                     } else {
                         true
                     };
@@ -2275,10 +2301,15 @@ impl DirectRoomStore {
                         "renew claim lease: ref {claim_id} is not an active claim"
                     ))
                 })?;
-            if fact.tool != current.owner_tool {
+            if !claim_authority::same_session_owner(
+                fact.tool.as_deref(),
+                fact.from_session_id.as_deref(),
+                current.owner_tool.as_deref(),
+                current.from_session_id.as_deref(),
+            ) {
                 return Err(RallyError::Usage(format!(
-                    "renew claim lease: {} does not own claim {claim_id}",
-                    fact.tool.as_deref().unwrap_or("<unknown>")
+                    "renew claim lease: {} session does not own claim {claim_id}",
+                    fact.tool.as_deref().unwrap_or("<unknown>"),
                 )));
             }
             let requested_raw = fact
@@ -6995,6 +7026,60 @@ mod ledger_tests {
     }
 
     #[test]
+    fn sibling_session_renewal_is_refused_at_the_write_boundary() {
+        let root = unique_root("claim-lease-sibling-renew");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let mut claim = claim_fact(
+            "claim-session-owner",
+            "tool-a",
+            "file:src/lib.rs",
+            "2099-01-01T00:00:00Z",
+        );
+        claim.from_session_id = Some("session-owner".to_string());
+        store.append_fact_verified(&claim).unwrap();
+
+        let renewal = Fact {
+            from_session_id: Some("session-sibling".to_string()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: "renewal-sibling".to_string(),
+            seq: 0,
+            thread_id: "room-sibling-renewal".to_string(),
+            kind: FactKind::ClaimRenewed,
+            tool: Some("tool-a".to_string()),
+            role: None,
+            subject: "sibling renewal".to_string(),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: None,
+            evidence: vec!["lease_expires_at:2099-01-01T00:30:00Z".to_string()],
+            target: None,
+            ref_id: Some(claim.event_id.clone()),
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+
+        let err = store
+            .append_fact_verified(&renewal)
+            .expect_err("a same-tool sibling must not renew the owner's claim")
+            .to_string();
+        assert!(
+            err.contains("session does not own claim"),
+            "the write boundary must report session ownership: {err}"
+        );
+        assert!(
+            store
+                .facts()
+                .unwrap()
+                .iter()
+                .all(|fact| fact.event_id != renewal.event_id),
+            "a refused sibling renewal must not reach the ledger"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn claim_lease_renewal_is_monotonic_and_retry_idempotent() {
         let root = unique_root("claim-lease-renew-idempotent");
         let store = RoomStore::open_at(root.clone()).unwrap();
@@ -10610,6 +10695,44 @@ mod sec001_takeover_guard_tests {
                 .active_claims
                 .iter()
                 .any(|fact| fact.event_id == "claim-l")
+        );
+        fs::remove_dir_all(&r).ok();
+    }
+
+    #[test]
+    fn reaper_owner_session_marker_must_match_the_active_claim() {
+        let r = root("reaper-owner-session-mismatch");
+        let store = RoomStore::open_at(r.clone()).unwrap();
+        let mut claim = fact_at(
+            "claim-session-owner",
+            FactKind::Claim,
+            "shared-tool",
+            "file:src/a.rs",
+            &iso_ago(5),
+        );
+        claim.from_session_id = Some("session-owner".to_string());
+        claim
+            .evidence
+            .push(format!("lease_expires_at:{}", iso_ago(60)));
+        store.append_fact(&claim).unwrap();
+
+        let mut expired =
+            reaper_claim_expired("claim-session-owner", "shared-tool", "lease-expired");
+        expired
+            .evidence
+            .push("reaper:owner_session=session-sibling".to_string());
+        let err = store.append_fact(&expired).unwrap_err().to_string();
+        assert!(
+            err.contains("owner session does not match"),
+            "a sibling session marker must not close the owner's claim: {err}"
+        );
+        assert!(
+            store
+                .snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|active| active.event_id == claim.event_id)
         );
         fs::remove_dir_all(&r).ok();
     }

@@ -390,16 +390,6 @@ pub(crate) fn observe_sessions(room_repo_root: &Path, facts: &[Fact]) -> Observa
     }
 }
 
-/// Non-destructive compatibility view used by room diagnostics and the
-/// store's legacy under-lock guard. New destructive decisions must use
-/// [`observe_sessions`] and [`ObservationIndex::for_claim`].
-pub(crate) fn observe_tools(
-    room_repo_root: &Path,
-    facts: &[Fact],
-) -> BTreeMap<String, ObservedLiveness> {
-    observe_sessions(room_repo_root, facts).by_tool
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
