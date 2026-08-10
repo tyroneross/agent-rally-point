@@ -185,7 +185,7 @@ mod imp {
     /// `SOMAXCONN`); under a burst of concurrent client connects the kernel
     /// queue can fill between accept-loop wakes and REFUSE connects
     /// (ECONNREFUSED), which the client's fresh-connection-per-op path
-    /// misclassifies as R6's retryable "daemon stopped mid-request". A large
+    /// surfaces as R6's routed transport failure. A large
     /// backlog lets the queue hold a full burst until the next drain wake. 1024
     /// == a common `SOMAXCONN`; the kernel silently clamps to its own max.
     const LISTEN_BACKLOG: i32 = 1024;
@@ -451,8 +451,28 @@ mod imp {
         let mut line =
             serde_json::to_string(resp).map_err(|e| std::io::Error::other(e.to_string()))?;
         line.push('\n');
+        if line.len() > MAX_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "serialized daemon reply is {} bytes, exceeding protocol maximum {MAX_LINE_BYTES}",
+                    line.len()
+                ),
+            ));
+        }
         stream.write_all(line.as_bytes())?;
         stream.flush()
+    }
+
+    /// A nonblocking listener may yield an accepted stream with nonblocking
+    /// status on some Unix platforms. Per-connection handling uses blocking
+    /// framed I/O with explicit timeouts; normalize the accepted fd before any
+    /// read or write so a reply larger than the socket buffer cannot terminate
+    /// at the first `WouldBlock` boundary.
+    fn prepare_accepted_stream(stream: &UnixStream) -> std::io::Result<()> {
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(CONN_TIMEOUT))?;
+        stream.set_write_timeout(Some(CONN_TIMEOUT))
     }
 
     /// SEC-003: answer an over-cap / un-spawnable connection immediately with a
@@ -460,18 +480,21 @@ mod imp {
     /// op path maps this to R6's "retry", so a momentary reader-thread saturation
     /// sheds load gracefully instead of the accept loop dying on a `spawn` panic.
     fn respond_busy(stream: &UnixStream) {
-        let _ = stream.set_read_timeout(Some(CONN_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(CONN_TIMEOUT));
+        if let Err(e) = prepare_accepted_stream(stream) {
+            log(&format!("configure busy response stream failed: {e}"));
+            return;
+        }
         let resp = StoreResponse::Err(StoreError::transport("daemon busy; retry"));
-        let _ = write_response(stream, &resp);
+        if let Err(e) = write_response(stream, &resp) {
+            log(&format!("write busy response failed: {e}"));
+        }
     }
 
     /// Per-connection reader thread: read one request line, route it through the
     /// dispatcher, write one reply line, close. Any framing/parse failure yields
     /// a structured error reply (never a panic — falsifier B).
-    fn handle_conn(stream: UnixStream, job_tx: Sender<Job>) {
-        let _ = stream.set_read_timeout(Some(CONN_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(CONN_TIMEOUT));
+    fn handle_conn(stream: UnixStream, job_tx: Sender<Job>) -> std::io::Result<()> {
+        prepare_accepted_stream(&stream)?;
 
         let response = match read_request_line(&stream) {
             Err(e) => StoreResponse::Err(e),
@@ -515,7 +538,7 @@ mod imp {
                 }
             }
         };
-        let _ = write_response(&stream, &response);
+        write_response(&stream, &response)
     }
 
     /// Map an internal [`RallyError`] onto the frozen wire [`StoreError`] with
@@ -736,11 +759,15 @@ mod imp {
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let _ = stream.set_read_timeout(Some(CONN_TIMEOUT));
-                    let _ = stream.set_write_timeout(Some(CONN_TIMEOUT));
+                    if let Err(e) = prepare_accepted_stream(&stream) {
+                        log(&format!("configure store-open error stream failed: {e}"));
+                        continue;
+                    }
                     // Best-effort: discard the request line, then reply the error.
                     let _ = read_request_line(&stream);
-                    let _ = write_response(&stream, &resp);
+                    if let Err(e) = write_response(&stream, &resp) {
+                        log(&format!("write store-open error response failed: {e}"));
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));
@@ -867,7 +894,7 @@ mod imp {
         // side keep up with a burst: the kernel backlog holds connections that
         // arrive between wakes and this inner loop empties it fully each time,
         // so clients no longer see ECONNREFUSED (which the fresh-connect client
-        // path misreads as R6's "daemon stopped mid-request; retry"). The
+        // path surfaces as R6's routed transport failure). The
         // dispatcher stays single-threaded (total order preserved); we widen
         // ONLY accept concurrency (reader threads feeding the one mpsc).
         let _ = listener.set_nonblocking(true);
@@ -909,7 +936,9 @@ mod imp {
                         // answer with a structured error instead of panicking.
                         let busy_fallback = stream.try_clone().ok();
                         match thread::Builder::new().spawn(move || {
-                            handle_conn(stream, jt);
+                            if let Err(e) = handle_conn(stream, jt) {
+                                log(&format!("serve connection failed: {e}"));
+                            }
                             rt.fetch_sub(1, Ordering::SeqCst);
                         }) {
                             Ok(_handle) => {}
@@ -1012,6 +1041,94 @@ mod imp {
                 round_trip(socket, &req),
                 StoreResponse::Ok(StoreOk::Pong { .. })
             )
+        }
+
+        fn facts_response_with_line_len(line_len: usize) -> StoreResponse {
+            let empty = StoreResponse::Ok(StoreOk::Facts {
+                facts: vec![Value::String(String::new())],
+            });
+            let base_len = serde_json::to_string(&empty).unwrap().len();
+            assert!(line_len > base_len + 1);
+            let response = StoreResponse::Ok(StoreOk::Facts {
+                facts: vec![Value::String("x".repeat(line_len - base_len - 1))],
+            });
+            assert_eq!(
+                serde_json::to_string(&response).unwrap().len() + 1,
+                line_len,
+                "fixture must include exactly one trailing newline in its wire size"
+            );
+            response
+        }
+
+        fn assert_real_socket_response_complete(line_len: usize) {
+            let socket = std::env::temp_dir().join(format!(
+                "rallyd-large-reply-{}-{line_len}.sock",
+                now_millis()
+            ));
+            std::fs::remove_file(&socket).ok();
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let response = facts_response_with_line_len(line_len);
+            let expected = response.clone();
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            prepare_accepted_stream(&stream).unwrap();
+                            write_response(&stream, &response).unwrap();
+                            return;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "client never connected");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept large-reply client: {e}"),
+                    }
+                }
+            });
+
+            let stream = UnixStream::connect(&socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line.len(), line_len, "reply was partial or truncated");
+            assert!(line.ends_with('\n'), "reply frame is missing its newline");
+            let actual: StoreResponse = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            server.join().unwrap();
+            std::fs::remove_file(&socket).ok();
+        }
+
+        #[test]
+        fn real_socket_replies_above_buffer_and_near_protocol_max_are_complete() {
+            // The dogfood failure cut every reply at exactly 8 KiB. Exercise a
+            // comfortably larger frame and the largest legal framed reply.
+            assert_real_socket_response_complete(64 * 1024);
+            assert_real_socket_response_complete(MAX_LINE_BYTES);
+        }
+
+        #[test]
+        fn response_write_reports_a_disconnected_peer() {
+            let (server, peer) = UnixStream::pair().unwrap();
+            drop(peer);
+            let response = facts_response_with_line_len(64 * 1024);
+            let err = write_response(&server, &response).unwrap_err();
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ),
+                "disconnect must be observable, got: {err}"
+            );
         }
 
         #[test]
@@ -1198,7 +1315,26 @@ mod imp {
                 other => panic!("second append not Ok: {other:?}"),
             }
 
-            // The two appends are visible through a snapshot read (same store).
+            // Seed enough real room state to force both facts and snapshot
+            // replies past the 8 KiB socket-buffer boundary seen in dogfood.
+            for i in 0..12 {
+                let subject = format!("large-reply-{i}-{}", "x".repeat(1024));
+                match append(&subject) {
+                    StoreResponse::Ok(StoreOk::AppendFact { .. }) => {}
+                    other => panic!("large-reply append not Ok: {other:?}"),
+                }
+            }
+            let facts_reply = round_trip(&socket, &StoreRequest::new(None, StoreOp::Facts));
+            assert!(
+                serde_json::to_string(&facts_reply).unwrap().len() > 8 * 1024,
+                "fixture did not cross the historical truncation boundary"
+            );
+            assert!(
+                matches!(facts_reply, StoreResponse::Ok(StoreOk::Facts { .. })),
+                "large facts reply was incomplete: {facts_reply:?}"
+            );
+
+            // All appends are visible through a large snapshot read (same store).
             match round_trip(
                 &socket,
                 &StoreRequest::new(
@@ -1212,7 +1348,7 @@ mod imp {
                 other => panic!("unexpected snapshot reply: {other:?}"),
             }
 
-            // G10 proof (f1): the two appends + snapshot were served entirely
+            // G10 proof (f1): the appends + large facts/snapshot reads were served entirely
             // through the ONE warm pool — the hot path never cold-opened a fresh
             // facts.db pool. (Recovery/reconcile paths that open directly are not
             // routed through `fact_store_handle` and so are not counted.)

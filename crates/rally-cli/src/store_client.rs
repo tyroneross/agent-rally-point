@@ -18,15 +18,16 @@
 //! collision (`daemon_client.rs`'s `rally_owned_socket()` is a different
 //! daemon entirely; rallyd's socket lives at `.rally/rallyd.sock`).
 //!
-//! ## R6 — mid-command dead socket
+//! ## R6 — mid-command transport failure
 //!
 //! Every dispatch method funnels through [`RoutedRoomStore::dispatch`]. A
 //! transport-level failure there (connect refused, read/write timeout,
 //! connection reset) — as opposed to a well-formed `StoreResponse::Err` reply
-//! — maps to [`dead_socket_error`]: a RETRYABLE `RallyError::Command` (exit 1,
-//! "daemon stopped mid-request; retry"). The router in `store.rs` NEVER falls
-//! back to a direct facts.db open mid-command on this path; the whole command
-//! is re-run by the caller, which re-enters the router fresh.
+//! — preserves the concrete I/O cause. Read-only operations report a transport
+//! failure. Mutating operations report an UNKNOWN outcome and name the stable
+//! event/request identifier when the request carries one, so callers query the
+//! ledger before deciding what to do. The router in `store.rs` NEVER falls back
+//! to a direct facts.db open mid-command on this path.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -195,9 +196,10 @@ fn round_trip(
     // client reply read was uncapped — a wedged/hostile peer streaming an
     // unbounded line would grow this buffer without limit. Reading one extra
     // byte lets an exactly-at-limit reply through while an over-cap reply is
-    // detected and mapped to the R6 dead-socket transport error (an io::Error
-    // here; `dispatch`/`probe_identity` already treat any transport failure as
-    // the retryable dead-socket case), mirroring the daemon's own request cap.
+    // detected and mapped to an R6 transport error (an io::Error here;
+    // `dispatch` preserves its cause and mutation ambiguity while
+    // `probe_identity` treats probe failure as not-live), mirroring the daemon's
+    // own request cap.
     let mut reader = BufReader::new(stream).take(MAX_LINE_BYTES as u64 + 1);
     let mut resp = String::new();
     reader.read_line(&mut resp)?;
@@ -298,13 +300,82 @@ pub(crate) fn probe_live_bounded(
     }
 }
 
-/// R6: a Routed op that hits a closed/broken socket after routing already
-/// began. Retryable — the caller re-runs the whole command, which re-enters
-/// the router fresh (no daemon ⇒ direct; new daemon ⇒ route). NEVER a signal
-/// to fall back to a direct facts.db open mid-command (that would skip the SH
-/// choreography and void the G2 chokepoint premise).
-fn dead_socket_error() -> RallyError {
-    RallyError::Command("daemon stopped mid-request; retry".to_string())
+/// Stable query context for a mutation whose wire outcome is unknown.
+struct MutationQuery {
+    operation: &'static str,
+    selector: Option<String>,
+}
+
+/// Classify the closed wire operation set. This classification lives beside
+/// dispatch so adding a mutating protocol variant cannot silently inherit the
+/// old blind-retry behavior.
+fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
+    let fact_selector = |fact: &Value| {
+        fact.get("event_id")
+            .and_then(Value::as_str)
+            .map(|event_id| format!("event_id={event_id}"))
+    };
+    match op {
+        StoreOp::AppendFact { fact } => Some(MutationQuery {
+            operation: "append_fact",
+            selector: fact_selector(fact),
+        }),
+        StoreOp::AppendFactVerified { fact } => Some(MutationQuery {
+            operation: "append_fact_verified",
+            selector: fact_selector(fact),
+        }),
+        StoreOp::AppendStateTransitionVerified { fact } => Some(MutationQuery {
+            operation: "append_state_transition_verified",
+            selector: fact_selector(fact),
+        }),
+        StoreOp::AppendSessionFactIfContext { fact, .. } => Some(MutationQuery {
+            operation: "append_session_fact_if_context",
+            selector: fact_selector(fact),
+        }),
+        StoreOp::RebuildClaimIndex => Some(MutationQuery {
+            operation: "rebuild_claim_index",
+            selector: None,
+        }),
+        StoreOp::RenewClaimLease { claim_id, .. } => Some(MutationQuery {
+            operation: "renew_claim_lease",
+            selector: Some(format!("claim_id={claim_id}")),
+        }),
+        StoreOp::ExpireClaimLeasesAt { now_rfc3339 } => Some(MutationQuery {
+            operation: "expire_claim_leases_at",
+            selector: Some(format!("expiry_cutoff={now_rfc3339}")),
+        }),
+        StoreOp::MaybeAppendReadCheckpoint { tool, read_seq } => Some(MutationQuery {
+            operation: "maybe_append_read_checkpoint",
+            selector: Some(format!("tool={tool},read_seq={read_seq}")),
+        }),
+        StoreOp::Facts
+        | StoreOp::SessionFactsWithContextVersion
+        | StoreOp::SnapshotWithArchived { .. }
+        | StoreOp::SnapshotWithReadersArchived { .. }
+        | StoreOp::LastCheckpointSeq { .. }
+        | StoreOp::ProjectReadReceipts { .. }
+        | StoreOp::Ping => None,
+    }
+}
+
+/// R6: preserve the concrete transport cause and never imply daemon death when
+/// the daemon may still be live. A mutation may already be durable when its
+/// reply is lost, so its only safe result is UNKNOWN + a ledger query selector.
+fn transport_error(op: &StoreOp, io_err: &std::io::Error) -> RallyError {
+    if let Some(query) = mutation_query(op) {
+        let selector = query
+            .selector
+            .as_deref()
+            .map(|value| format!(" for {value}"))
+            .unwrap_or_default();
+        return RallyError::Command(format!(
+            "daemon transport failure during mutating operation {}: {io_err}; outcome unknown. Query `rally room --json`{selector} before repeating the mutation; direct fallback is forbidden",
+            query.operation
+        ));
+    }
+    RallyError::Command(format!(
+        "daemon transport failure during read-only operation: {io_err}; run `rally daemon status`"
+    ))
 }
 
 /// Reconstruct the concrete `RallyError` a wire [`StoreError`] represents
@@ -358,7 +429,7 @@ impl RoutedRoomStore {
         match round_trip(&self.socket, &req, OP_TIMEOUT, false) {
             Ok(StoreResponse::Ok(ok)) => Ok(ok),
             Ok(StoreResponse::Err(err)) => Err(store_error_to_rally_error(err)),
-            Err(_io_err) => Err(dead_socket_error()),
+            Err(io_err) => Err(transport_error(&req.op, &io_err)),
         }
     }
 
@@ -572,6 +643,61 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
     use std::thread;
+
+    fn unique_socket(tag: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tag = &tag[..tag.len().min(8)];
+        PathBuf::from("/tmp").join(format!("rsc-{tag}-{nonce:x}.sock"))
+    }
+
+    #[test]
+    fn partial_mutation_reply_is_unknown_and_queryable_by_event_id() {
+        let socket = unique_socket("partial-mutation");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            assert!(request.contains("fact-partial-control"));
+
+            // Negative control: the mutation may have committed, but its reply
+            // is cut mid-frame. The client must not call this daemon death or
+            // invite a blind retry.
+            let mut writer = &stream;
+            writer
+                .write_all(b"{\"ok\":{\"kind\":\"append_fact\",\"fact\":")
+                .unwrap();
+            writer.flush().unwrap();
+        });
+
+        let routed = RoutedRoomStore {
+            socket: socket.clone(),
+            repo_root: PathBuf::from("/repo"),
+            active_engagement: "test".to_string(),
+            cursor_path: PathBuf::from("/repo/.rally/cursors.json"),
+            log_dir: PathBuf::from("/repo/.rally/log"),
+            claim_index_path: PathBuf::from("/repo/.rally/claim-index.json"),
+        };
+        let err = routed
+            .dispatch(StoreOp::AppendFact {
+                fact: serde_json::json!({"event_id": "fact-partial-control"}),
+            })
+            .unwrap_err()
+            .to_string();
+
+        server.join().unwrap();
+        std::fs::remove_file(&socket).ok();
+        assert!(err.contains("outcome unknown"), "{err}");
+        assert!(err.contains("event_id=fact-partial-control"), "{err}");
+        assert!(err.contains("Query `rally room --json`"), "{err}");
+        assert!(err.contains("direct fallback is forbidden"), "{err}");
+        assert!(!err.contains("daemon stopped"), "{err}");
+        assert!(!err.contains("; retry"), "{err}");
+    }
 
     #[test]
     fn probe_rejects_a_v1_daemon_after_the_snapshot_wire_change() {
