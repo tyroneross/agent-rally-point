@@ -12817,6 +12817,170 @@ mod ledger_tests {
     }
 
     #[test]
+    fn o26_unmarked_db_only_room_fails_loud_and_preserves_db() {
+        let root = unique_root("o26-db-only-refusal");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        store
+            .append_fact(&make_fact(
+                "o26-db-only-seed",
+                FactKind::Decision,
+                "src/",
+                "must require explicit migration",
+            ))
+            .unwrap();
+        drop(store);
+
+        let log_dir = root.join(".rally").join(LOG_DIRNAME);
+        for path in read_segment_files(&log_dir).unwrap() {
+            fs::remove_file(path).unwrap();
+        }
+        let facts_db = root.join(".rally/facts.db");
+        let before = fs::read(&facts_db).unwrap();
+
+        let error = match DirectRoomStore::open_direct_at(root.clone()) {
+            Ok(_) => panic!("an unmarked current-format DB-only room must not auto-promote"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("rally doctor --migrate-db-only"),
+            "refusal must name the explicit recovery path: {message}"
+        );
+        assert_eq!(
+            fs::read(&facts_db).unwrap(),
+            before,
+            "refusal must preserve the only extant history byte-for-byte"
+        );
+        assert!(read_segment_files(&log_dir).unwrap().is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_valid_final_record_without_newline_is_completed_before_append() {
+        let root = unique_root("o26-valid-tail-no-newline");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let first = store
+            .append_fact(&make_fact(
+                "o26-valid-tail-first",
+                FactKind::Decision,
+                "src/",
+                "valid tail",
+            ))
+            .unwrap();
+        let segment = store.active_segment_path();
+        let mut bytes = fs::read(&segment).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&segment, bytes).unwrap();
+
+        let second = store
+            .append_fact(&make_fact(
+                "o26-valid-tail-second",
+                FactKind::Artifact,
+                "src/",
+                "append after framing repair",
+            ))
+            .unwrap();
+
+        let bytes = fs::read(&segment).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        let entries = read_segment_entries(&segment).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!((entries[0].seq, entries[1].seq), (first.seq, second.seq));
+        assert_eq!(entries[0].payload["event_id"], "o26-valid-tail-first");
+        assert_eq!(entries[1].payload["event_id"], "o26-valid-tail-second");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_incomplete_unterminated_tail_is_truncated_before_append() {
+        let root = unique_root("o26-incomplete-tail");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        store
+            .append_fact(&make_fact(
+                "o26-before-torn-tail",
+                FactKind::Decision,
+                "src/",
+                "before",
+            ))
+            .unwrap();
+        let segment = store.active_segment_path();
+        {
+            let mut file = OpenOptions::new().append(true).open(&segment).unwrap();
+            file.write_all(b"{\"seq\":2,\"occurred_at\":\"2026-08-10T00:00:00Z\",\"event_type\":\"artifact\",\"payload\":{")
+                .unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let appended = store
+            .append_fact(&make_fact(
+                "o26-after-torn-tail",
+                FactKind::Artifact,
+                "src/",
+                "after",
+            ))
+            .unwrap();
+
+        let entries = read_segment_entries(&segment).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(appended.seq, 2);
+        assert_eq!(entries[1].payload["event_id"], "o26-after-torn-tail");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_exact_same_event_id_retry_returns_original_sequence_once() {
+        let root = unique_root("o26-same-id-exact");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let candidate = make_fact(
+            "o26-same-id",
+            FactKind::Decision,
+            "src/",
+            "same normalized payload",
+        );
+        let first = store.append_fact(&candidate).unwrap();
+        let retry = store.append_fact(&candidate).unwrap();
+
+        assert_eq!(retry.seq, first.seq, "retry must return the original seq");
+        let entries = facts_from_segments(&store.log_dir, &store.archive_dir).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|fact| fact.event_id == candidate.event_id)
+                .count(),
+            1,
+            "same-ID retry must leave exactly one canonical event"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_same_event_id_different_payload_conflicts_without_mutation() {
+        let root = unique_root("o26-same-id-conflict");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let candidate = make_fact(
+            "o26-conflicting-id",
+            FactKind::Decision,
+            "src/",
+            "original",
+        );
+        store.append_fact(&candidate).unwrap();
+        let segment = store.active_segment_path();
+        let canonical_before = fs::read(&segment).unwrap();
+        let mut conflict = candidate.clone();
+        conflict.summary = Some("different normalized payload".to_string());
+
+        let error = store
+            .append_fact(&conflict)
+            .expect_err("same event ID with different payload must fail identity validation");
+        assert!(
+            error.to_string().contains("event-id identity conflict"),
+            "identity conflict must precede mutable-state noise: {error}"
+        );
+        assert_eq!(fs::read(&segment).unwrap(), canonical_before);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn completed_segment_corruption_fails_all_canonical_readers() {
         let root = unique_root("completed-segment-corruption");
         // Direct-store internals under test; bind the DirectRoomStore directly

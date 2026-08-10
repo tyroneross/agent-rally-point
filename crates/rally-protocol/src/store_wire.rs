@@ -377,8 +377,8 @@ mod tests {
     }
 
     #[test]
-    fn scoped_snapshot_v4_round_trips_all_query_controls() {
-        assert_eq!(WIRE_VERSION, 4);
+    fn o26_wire_v5_round_trips_all_query_controls() {
+        assert_eq!(WIRE_VERSION, 5);
         let req = StoreRequest::new(
             Some("engagement-alpha".to_string()),
             StoreOp::SnapshotScoped {
