@@ -1814,7 +1814,13 @@ fn renew_owned_claim_leases(room: &RoomStore, tool: &str) -> Result<usize> {
         );
         let lease_expires_at = claim_authority::lease_marker_at(now, lease_secs);
         if room
-            .renew_claim_lease(&claim.event_id, lease_expires_at)?
+            .renew_claim_lease(
+                &claim.event_id,
+                lease_expires_at,
+                tool,
+                Some(&from_session_id),
+                claim.from_session_id.as_deref(),
+            )?
             .is_some()
         {
             renewed += 1;
@@ -2684,6 +2690,9 @@ fn command_release_by_path(
     mut warnings: Vec<SayWarning>,
 ) -> Result<Output> {
     let snapshot = room.snapshot()?;
+    let caller_session = current_protocol_session(Some(tool))
+        .from_session_id()
+        .to_string();
 
     // Find this tool's open claims AND any matching by path scope (regardless
     // of owner — a lead releasing a stale-owner claim is a legitimate use).
@@ -2701,7 +2710,8 @@ fn command_release_by_path(
     }
     // A claim matches a `--path` release when its scope covers a requested
     // path AND the caller is authorized to release it. Authorization is either:
-    //   (a) the caller OWNS the claim (the original owner-self-release path), OR
+    //   (a) the exact caller session OWNS the claim (the original
+    //       owner-self-release path), OR
     //   (b) AUTHORIZED TAKEOVER — the claim's owner is takeover-eligible-stale
     //       (>2h total silence, NOT the 15-min advisory idle) so a peer/lead may
     //       reclaim it. This closes fact_182e8 gap 1: a dead owner's claims
@@ -2738,15 +2748,30 @@ fn command_release_by_path(
             })
         })
     };
+    let caller_owns_claim = |c: &&Fact| {
+        claim_authority::same_session_owner(
+            c.tool.as_deref(),
+            c.from_session_id.as_deref(),
+            Some(tool),
+            Some(&caller_session),
+        ) || (c.from_session_id.is_none() && c.tool.as_deref() == Some(tool))
+    };
     // Capture the size class of each reclaimed claim for the provenance trail.
     let mut reclaim_sizes: Vec<crate::decay::WorkSize> = Vec::new();
     let matches: Vec<&Fact> = snapshot
         .active_claims
         .iter()
         .filter(|c| {
-            let owned = c.tool.as_deref() == Some(tool);
+            let owned = caller_owns_claim(c);
             if owned {
                 return exact_scope_match(c);
+            }
+            // A sibling sharing the same display/tool id is not a takeover
+            // peer. Letting it enter the stale-owner arm would turn a shared
+            // label back into owner authority. It must use its own session's
+            // claim or coordinate with the owning session.
+            if c.tool.as_deref() == Some(tool) {
+                return false;
             }
             if !takeover_scope_match(c) {
                 return false;
@@ -2759,7 +2784,7 @@ fn command_release_by_path(
         })
         .collect();
     // Did at least one match come from a stale-owner takeover (not self)?
-    let is_takeover = matches.iter().any(|c| c.tool.as_deref() != Some(tool));
+    let is_takeover = matches.iter().any(|c| !caller_owns_claim(c));
     if matches.is_empty() {
         // Build the loud-error list: this tool's currently-open claims, plus a
         // hint about any squatting (stale-owner) claims on the wanted paths that
@@ -2768,12 +2793,19 @@ fn command_release_by_path(
         let mine: Vec<&Fact> = snapshot
             .active_claims
             .iter()
-            .filter(|c| c.tool.as_deref() == Some(tool))
+            .filter(caller_owns_claim)
             .collect();
         let blocking_live: Vec<&Fact> = snapshot
             .active_claims
             .iter()
-            .filter(|c| c.tool.as_deref() != Some(tool))
+            .filter(|c| {
+                !claim_authority::same_session_owner(
+                    c.tool.as_deref(),
+                    c.from_session_id.as_deref(),
+                    Some(tool),
+                    Some(&caller_session),
+                )
+            })
             .filter(takeover_scope_match)
             .collect();
         let listing = if mine.is_empty() {
@@ -2904,7 +2936,7 @@ fn command_release_by_path(
         }
     }
     let fact = Fact {
-        from_session_id: None,
+        from_session_id: Some(caller_session),
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -6846,7 +6878,7 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                                 && c.tool.as_deref() == Some(stopping_tool.as_str()))
                     }) {
                         let release = Fact {
-                            from_session_id: None,
+                            from_session_id: Some(stopping_session.to_string()),
                             schema: FACT_SCHEMA.to_string(),
                             event_id: new_id("fact"),
                             seq: 0,
@@ -12100,6 +12132,12 @@ mod tests {
 
         // Envelope must carry a `released-by-path` warning naming the original.
         let body: serde_json::Value = out.body.clone();
+        assert!(
+            body["data"]["say"]["fact"]["from_session_id"]
+                .as_str()
+                .is_some_and(|session| !session.is_empty()),
+            "path release must stamp the caller session: {body}"
+        );
         let warnings = body["data"]["warnings"].as_array().expect("warnings array");
         let found = warnings.iter().any(|w| {
             w["code"] == "released-by-path"

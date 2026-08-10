@@ -67,6 +67,7 @@ unsafe extern "C" {
 struct Room {
     cwd: PathBuf,
     home: PathBuf,
+    session_id: String,
 }
 
 impl Room {
@@ -80,7 +81,11 @@ impl Room {
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::create_dir_all(cwd.join(".rally")).unwrap();
         fs::create_dir_all(&home).unwrap();
-        Self { cwd, home }
+        Self {
+            cwd,
+            home,
+            session_id: format!("wadp-{name}-{nanos}"),
+        }
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -88,6 +93,7 @@ impl Room {
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env("RALLY_HOOKS", "off")
+            .env("RALLY_SESSION_ID", &self.session_id)
             .args(args)
             .output()
             .unwrap()

@@ -557,7 +557,7 @@ Suggested status shape:
 
 ```json
 {
-  "store": {"state": "live", "pid": 100, "wire_version": 2},
+  "store": {"state": "live", "pid": 100, "wire_version": 3},
   "router": {"state": "live", "mode": "active", "pending": 2, "oldest_ms": 900},
   "ptyd": {"state": "live", "managed": true, "sessions": 3},
   "delivery": {"correctness": "available", "acceleration": "degraded"}

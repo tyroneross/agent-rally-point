@@ -60,7 +60,7 @@ use serde_json::Value;
 /// Wire protocol version. Bumped only on a breaking envelope change. The ping
 /// reply carries this; a client seeing a version it does not speak treats the
 /// daemon as not-live and lets the ownership lock decide (ADR-02 rollback note).
-pub const WIRE_VERSION: u32 = 2;
+pub const WIRE_VERSION: u32 = 3;
 
 /// Hard cap on a single request/response line. A longer line is a framing
 /// error (or an abuse) and maps to the transport-error class (R7): the daemon
@@ -125,11 +125,25 @@ pub enum StoreOp {
     Facts,
     /// `RoomStore::rebuild_claim_index()` → `()`.
     RebuildClaimIndex,
-    /// `RoomStore::renew_claim_lease(claim_id, lease_expires_at)` →
+    /// `RoomStore::renew_claim_lease(claim_id, lease_expires_at, caller, expected)` →
     /// `Option<ActiveClaimRecord>`.
     RenewClaimLease {
         claim_id: String,
         lease_expires_at: String,
+        /// Tool asserted by the process requesting renewal. Optional at the
+        /// serde boundary so a missing field is decoded and refused by the
+        /// authority check rather than synthesized from the claim.
+        #[serde(default)]
+        caller_tool: Option<String>,
+        /// Protocol session asserted by the caller. `None` is valid only for a
+        /// legacy claim whose owner session is also absent.
+        #[serde(default)]
+        caller_session_id: Option<String>,
+        /// Session observed on the claim by the caller before dispatch. The
+        /// daemon verifies it still matches instead of deriving authority from
+        /// `claim_id`.
+        #[serde(default)]
+        expected_owner_session_id: Option<String>,
     },
     /// `RoomStore::expire_claim_leases_at(now)` → `Vec<Fact>`.
     /// `now` is RFC3339 (chrono is NOT a `rally-protocol` dep; the boundary
