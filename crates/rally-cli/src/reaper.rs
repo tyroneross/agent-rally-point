@@ -948,7 +948,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     /// Append a small single-file claim owned by `tool` (FRESH timestamp so the
@@ -975,7 +975,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     /// Append a Handoff `ago_secs` seconds in the past.
@@ -1001,7 +1001,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     fn append_lead(room: &RoomStore, tool: &str, ago_secs: i64) -> Fact {
@@ -1026,7 +1026,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     // -------------------------------------------------------------------------
@@ -2113,7 +2113,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     #[test]
@@ -2349,7 +2349,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     fn append_session_claim_with_lease(
@@ -2380,7 +2380,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     #[test]

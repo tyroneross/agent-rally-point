@@ -587,16 +587,26 @@ mod imp {
     /// exit-code parity (G8). `Io`/`Json` collapse to `Internal` (source dropped
     /// over the wire).
     fn rally_to_wire(err: RallyError) -> StoreError {
-        let message = err.to_string();
-        let kind = match err {
-            RallyError::Usage(_) => StoreErrorKind::Usage,
-            RallyError::NotFound(_) => StoreErrorKind::NotFound,
-            RallyError::Command(_) => StoreErrorKind::Command,
-            RallyError::Message(_) => StoreErrorKind::Message,
-            RallyError::NotStarted(_) => StoreErrorKind::NotStarted,
-            RallyError::Io { .. } | RallyError::Json { .. } => StoreErrorKind::Internal,
-        };
-        StoreError::new(kind, message)
+        match err {
+            RallyError::OutcomeUnknown {
+                event_id,
+                phase,
+                detail,
+            } => StoreError::outcome_unknown(event_id, phase, detail),
+            other => {
+                let message = other.to_string();
+                let kind = match other {
+                    RallyError::Usage(_) => StoreErrorKind::Usage,
+                    RallyError::NotFound(_) => StoreErrorKind::NotFound,
+                    RallyError::Command(_) => StoreErrorKind::Command,
+                    RallyError::Message(_) => StoreErrorKind::Message,
+                    RallyError::NotStarted(_) => StoreErrorKind::NotStarted,
+                    RallyError::Io { .. } | RallyError::Json { .. } => StoreErrorKind::Internal,
+                    RallyError::OutcomeUnknown { .. } => unreachable!("handled above"),
+                };
+                StoreError::new(kind, message)
+            }
+        }
     }
 
     fn fact_from_value(v: Value) -> Result<store::Fact, StoreError> {
@@ -661,11 +671,14 @@ mod imp {
         F: FnOnce(),
     {
         if req.wire_version != WIRE_VERSION {
-            return StoreResponse::Err(StoreError::transport(format!(
-                "wire_version mismatch: daemon speaks {WIRE_VERSION}, client sent {}; \
-                 run `rally daemon status`",
-                req.wire_version
-            )));
+            return StoreResponse::Err(StoreError::new(
+                StoreErrorKind::IncompatibleWire,
+                format!(
+                    "wire_version mismatch: daemon speaks {WIRE_VERSION}, client sent {}; \
+                 stop the incompatible daemon with `rally daemon stop` before retrying",
+                    req.wire_version
+                ),
+            ));
         }
         if matches!(req.op, StoreOp::Ping) {
             return StoreResponse::Ok(StoreOk::Pong {
@@ -896,14 +909,14 @@ mod imp {
                 let f = fact_from_value(fact)?;
                 let out = store.append_fact(&f).map_err(rally_to_wire)?;
                 StoreOk::AppendFact {
-                    fact: to_wire_value(&out)?,
+                    outcome: to_wire_value(&out)?,
                 }
             }
             StoreOp::AppendFactVerified { fact } => {
                 let f = fact_from_value(fact)?;
                 let out = store.append_fact_verified(&f).map_err(rally_to_wire)?;
                 StoreOk::AppendFactVerified {
-                    fact: to_wire_value(&out)?,
+                    outcome: to_wire_value(&out)?,
                 }
             }
             StoreOp::AppendStateTransitionVerified { fact } => {
@@ -912,7 +925,7 @@ mod imp {
                     .append_state_transition_verified(&f)
                     .map_err(rally_to_wire)?;
                 StoreOk::AppendStateTransitionVerified {
-                    fact: to_wire_value(&out)?,
+                    outcome: to_wire_value(&out)?,
                 }
             }
             StoreOp::AppendSessionFactIfContext {
@@ -923,11 +936,9 @@ mod imp {
                 let out = store
                     .append_session_fact_if_context(&f, expected_context_version)
                     .map_err(rally_to_wire)?;
-                let fact = match out {
-                    Some(x) => Some(to_wire_value(&x)?),
-                    None => None,
-                };
-                StoreOk::AppendSessionFactIfContext { fact }
+                StoreOk::AppendSessionFactIfContext {
+                    result: to_wire_value(&out)?,
+                }
             }
             StoreOp::Facts => {
                 let facts = store.facts().map_err(rally_to_wire)?;

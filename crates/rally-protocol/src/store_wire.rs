@@ -60,7 +60,7 @@ use serde_json::Value;
 /// Wire protocol version. Bumped only on a breaking envelope change. The ping
 /// reply carries this; a client seeing a version it does not speak treats the
 /// daemon as not-live and lets the ownership lock decide (ADR-02 rollback note).
-pub const WIRE_VERSION: u32 = 4;
+pub const WIRE_VERSION: u32 = 5;
 
 /// Hard cap on a single request/response line. A longer line is a framing
 /// error (or an abuse) and maps to the transport-error class (R7): the daemon
@@ -238,14 +238,14 @@ pub enum StoreResponse {
 // Variants documented; payload fields are self-describing (see [`StoreOp`]).
 #[allow(missing_docs)]
 pub enum StoreOk {
-    /// `Fact`.
-    AppendFact { fact: Value },
-    /// `Fact`.
-    AppendFactVerified { fact: Value },
-    /// `Fact`.
-    AppendStateTransitionVerified { fact: Value },
-    /// `Option<Fact>` (`None` = conditional-append conflict).
-    AppendSessionFactIfContext { fact: Option<Value> },
+    /// Typed `AppendOutcome`.
+    AppendFact { outcome: Value },
+    /// Typed `AppendOutcome`.
+    AppendFactVerified { outcome: Value },
+    /// Typed `AppendOutcome`.
+    AppendStateTransitionVerified { outcome: Value },
+    /// Typed `ConditionalAppendOutcome` (`not_applied` or committed outcome).
+    AppendSessionFactIfContext { result: Value },
     /// `Vec<Fact>`.
     Facts { facts: Vec<Value> },
     /// `()`.
@@ -287,6 +287,12 @@ pub struct StoreError {
     pub kind: StoreErrorKind,
     /// Rendered error message (the `Display` text of the original error).
     pub message: String,
+    /// Stable canonical event id for OutcomeUnknown query/retry handling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// Durable phase at which certainty was lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 /// Closed tag selecting which `RallyError` variant the boundary reconstructs.
@@ -310,6 +316,12 @@ pub enum StoreErrorKind {
     /// The request deadline elapsed before any durable side effect. A
     /// provisional mutation lock is released before this reply; safe to retry.
     NotStarted,
+    /// Canonical mutation started but exact readback did not complete. The
+    /// message carries the stable event-id query remedy.
+    OutcomeUnknown,
+    /// Client and daemon speak incompatible semantic reply contracts. Never
+    /// fall back to direct ownership for this error.
+    IncompatibleWire,
     /// R7 transport class (timeout / reset / oversized line / version or
     /// repo_root mismatch). No direct-path equivalent → reconstruct as
     /// `RallyError::Command` (exit 1) with remedy text.
@@ -323,7 +335,21 @@ impl StoreError {
             code: kind.exit_code(),
             kind,
             message: message.into(),
+            event_id: None,
+            phase: None,
         }
+    }
+
+    /// A typed canonical mutation whose outcome requires an event-id query.
+    pub fn outcome_unknown(
+        event_id: impl Into<String>,
+        phase: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        let mut error = Self::new(StoreErrorKind::OutcomeUnknown, message);
+        error.event_id = Some(event_id.into());
+        error.phase = Some(phase.into());
+        error
     }
 
     /// A transport-class error (R7) with the standard remedy text.
@@ -343,6 +369,8 @@ impl StoreErrorKind {
             StoreErrorKind::Command
             | StoreErrorKind::Message
             | StoreErrorKind::Internal
+            | StoreErrorKind::OutcomeUnknown
+            | StoreErrorKind::IncompatibleWire
             | StoreErrorKind::Transport => 1,
         }
     }
@@ -428,12 +456,21 @@ mod tests {
     fn value_payload_carries_an_opaque_fact() {
         // Mirrors the rally-cli boundary: a Fact serialises to a Value here and
         // deserialises back losslessly on the other side.
-        let fact = serde_json::json!({"event_id": "fact_x", "seq": 7});
-        let ok = StoreOk::AppendFact { fact: fact.clone() };
+        let outcome = serde_json::json!({
+            "fact": {"event_id": "fact_x", "seq": 7},
+            "committed": true,
+            "projection_complete": false,
+            "warnings": [{"code": "facts_db", "message": "injected"}]
+        });
+        let ok = StoreOk::AppendFact {
+            outcome: outcome.clone(),
+        };
         let line = serde_json::to_string(&StoreResponse::Ok(ok)).unwrap();
         let back: StoreResponse = serde_json::from_str(&line).unwrap();
         match back {
-            StoreResponse::Ok(StoreOk::AppendFact { fact: f }) => assert_eq!(f, fact),
+            StoreResponse::Ok(StoreOk::AppendFact { outcome: value }) => {
+                assert_eq!(value, outcome)
+            }
             other => panic!("unexpected reply: {other:?}"),
         }
     }

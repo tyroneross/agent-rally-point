@@ -11,10 +11,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -167,7 +164,10 @@ use next::{AttentionItem, EntryData, NextResult, build_attention, build_entry, b
 use output::{CliError, Output, RenderedOutput};
 use rallyd_core::ServeConfig;
 use route_findings::{Finding, RoutingSummary, route_findings};
-use store::{Fact, FactKind, ReadReceipt, RoomQuery, RoomSnapshot, RoomStore, RoomSummary};
+use store::{
+    ConditionalAppendOutcome, Fact, FactKind, ReadReceipt, RoomQuery, RoomSnapshot, RoomStore,
+    RoomSummary,
+};
 // Envelope wrapper types from backends module.
 use backends::{
     AdoptData, AdoptEnvelope, InjectEnvelope, RunEnvelope, SessionActionEnvelope, SessionsEnvelope,
@@ -200,7 +200,7 @@ const SCHEMA_MISSION: &str = "agent-rally.command.mission.v1";
 const SCHEMA_DAEMON: &str = "agent-rally.command.daemon.v1";
 
 thread_local! {
-    static WATCHDOG_COMMIT_SIGNAL: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    static WATCHDOG_MUTATION_SIGNAL: RefCell<Option<Arc<Mutex<WatchdogMutationState>>>> = const { RefCell::new(None) };
     static WATCHDOG_COMMIT_ARM_DEPTH: Cell<u32> = const { Cell::new(0) };
     /// Instant at which this command's watchdog fires.
     ///
@@ -209,6 +209,54 @@ thread_local! {
     /// enforce, instead of guessing with an independent constant. Retry loops
     /// read it through [`watchdog_remaining`].
     static WATCHDOG_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    static PENDING_APPEND_OUTCOMES: RefCell<Vec<store::AppendOutcome>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Debug)]
+enum WatchdogMutationState {
+    NotStarted,
+    OutcomeUnknown {
+        event_id: String,
+        phase: String,
+    },
+    Committed {
+        projection_complete: bool,
+        warnings: Vec<Value>,
+    },
+}
+
+pub(crate) fn record_append_outcome(outcome: &store::AppendOutcome) {
+    PENDING_APPEND_OUTCOMES.with(|pending| pending.borrow_mut().push(outcome.clone()));
+}
+
+fn attach_pending_append_outcomes(output: &mut Output) {
+    let outcomes =
+        PENDING_APPEND_OUTCOMES.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+    if outcomes.is_empty() {
+        return;
+    }
+    let projection_complete = outcomes.iter().all(|outcome| outcome.projection_complete);
+    let value = serde_json::to_value(&outcomes).unwrap_or_else(|error| {
+        json!([{
+            "committed": true,
+            "projection_complete": false,
+            "warnings": [{"code": "serialization", "message": error.to_string()}]
+        }])
+    });
+    if let Some(body) = output.body.as_object_mut()
+        && let Some(data) = body.get_mut("data").and_then(Value::as_object_mut)
+    {
+        data.insert("append_outcomes".to_string(), value);
+        data.insert(
+            "projection_complete".to_string(),
+            Value::Bool(projection_complete),
+        );
+    }
+    if !projection_complete && !output.json {
+        output.text.push_str(
+            "\nwarning: canonical append committed; one or more derived projections are incomplete",
+        );
+    }
 }
 
 struct WatchdogDeadlineGuard;
@@ -246,14 +294,16 @@ struct WatchdogCommitSignalGuard;
 
 impl Drop for WatchdogCommitSignalGuard {
     fn drop(&mut self) {
-        WATCHDOG_COMMIT_SIGNAL.with(|slot| {
+        WATCHDOG_MUTATION_SIGNAL.with(|slot| {
             *slot.borrow_mut() = None;
         });
     }
 }
 
-fn install_watchdog_commit_signal(signal: Arc<AtomicBool>) -> WatchdogCommitSignalGuard {
-    WATCHDOG_COMMIT_SIGNAL.with(|slot| {
+fn install_watchdog_commit_signal(
+    signal: Arc<Mutex<WatchdogMutationState>>,
+) -> WatchdogCommitSignalGuard {
+    WATCHDOG_MUTATION_SIGNAL.with(|slot| {
         *slot.borrow_mut() = Some(signal);
     });
     WatchdogCommitSignalGuard
@@ -286,9 +336,15 @@ pub(crate) fn mark_watchdog_command_commit() {
     if !armed {
         return;
     }
-    WATCHDOG_COMMIT_SIGNAL.with(|slot| {
+    WATCHDOG_MUTATION_SIGNAL.with(|slot| {
         if let Some(signal) = slot.borrow().as_ref() {
-            signal.store(true, Ordering::SeqCst);
+            *signal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                WatchdogMutationState::Committed {
+                    projection_complete: true,
+                    warnings: Vec::new(),
+                };
         }
     });
     #[cfg(debug_assertions)]
@@ -297,6 +353,51 @@ pub(crate) fn mark_watchdog_command_commit() {
     {
         thread::sleep(Duration::from_millis(ms));
     }
+}
+
+pub(crate) fn mark_watchdog_command_outcome_unknown(event_id: &str, phase: &str) {
+    let armed = WATCHDOG_COMMIT_ARM_DEPTH.with(|depth| depth.get() > 0);
+    if !armed {
+        return;
+    }
+    WATCHDOG_MUTATION_SIGNAL.with(|slot| {
+        if let Some(signal) = slot.borrow().as_ref() {
+            *signal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                WatchdogMutationState::OutcomeUnknown {
+                    event_id: event_id.to_string(),
+                    phase: phase.to_string(),
+                };
+        }
+    });
+}
+
+pub(crate) fn mark_watchdog_append_outcome(outcome: &store::AppendOutcome) {
+    let armed = WATCHDOG_COMMIT_ARM_DEPTH.with(|depth| depth.get() > 0);
+    if !armed {
+        return;
+    }
+    WATCHDOG_MUTATION_SIGNAL.with(|slot| {
+        if let Some(signal) = slot.borrow().as_ref() {
+            let warnings = outcome
+                .warnings
+                .iter()
+                .map(|warning| {
+                    serde_json::to_value(warning).unwrap_or_else(
+                        |_| json!({"code": "serialization", "message": warning.message}),
+                    )
+                })
+                .collect();
+            *signal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                WatchdogMutationState::Committed {
+                    projection_complete: outcome.projection_complete,
+                    warnings,
+                };
+        }
+    });
 }
 
 /// Default hard wall-clock budget for a single `rally` invocation, in
@@ -556,7 +657,7 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
     // one advisory), but we surface a timeout note on stderr for visibility.
 
     let (tx, rx) = std::sync::mpsc::channel::<WatchdogResult>();
-    let commit_signal = Arc::new(AtomicBool::new(false));
+    let commit_signal = Arc::new(Mutex::new(WatchdogMutationState::NotStarted));
     let worker_commit_signal = Arc::clone(&commit_signal);
     // Anchored BEFORE the spawn, so the in-process deadline is always at or
     // EARLIER than the `recv_timeout` the main thread enforces. The skew is the
@@ -570,7 +671,8 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
             let _commit_signal_guard = install_watchdog_commit_signal(worker_commit_signal);
             let _deadline_guard = install_watchdog_deadline(deadline);
             let result = match run_inner_with(&args) {
-                Ok(output) => {
+                Ok(mut output) => {
+                    attach_pending_append_outcomes(&mut output);
                     let exit_code = output.exit_code;
                     let rendered = output.render();
                     WatchdogResult {
@@ -623,12 +725,32 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
                     std::process::exit(4);
                 }
                 WatchdogPosture::ClosedMutation => {
-                    if commit_signal.load(Ordering::SeqCst) {
-                        emit_timeout_committed_mutation(wants_json, timeout);
-                        std::process::exit(0);
+                    let mutation_state = commit_signal
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    match mutation_state {
+                        WatchdogMutationState::NotStarted => {
+                            emit_timeout_fail_closed_mutation(wants_json, timeout);
+                            std::process::exit(4);
+                        }
+                        WatchdogMutationState::OutcomeUnknown { event_id, phase } => {
+                            emit_timeout_unknown_mutation(wants_json, timeout, &event_id, &phase);
+                            std::process::exit(1);
+                        }
+                        WatchdogMutationState::Committed {
+                            projection_complete,
+                            warnings,
+                        } => {
+                            emit_timeout_committed_mutation(
+                                wants_json,
+                                timeout,
+                                projection_complete,
+                                &warnings,
+                            );
+                            std::process::exit(0);
+                        }
                     }
-                    emit_timeout_fail_closed_mutation(wants_json, timeout);
-                    std::process::exit(4);
                 }
             }
         }
@@ -742,7 +864,8 @@ impl WatchdogResult {
 fn run_inline(args: Vec<String>) -> ExitCode {
     let wants_json = args.iter().any(|arg| arg == "--json");
     match run_inner_with(&args) {
-        Ok(output) => {
+        Ok(mut output) => {
+            attach_pending_append_outcomes(&mut output);
             let exit_code = output.exit_code;
             output.print();
             ExitCode::from(exit_code)
@@ -866,7 +989,44 @@ fn emit_timeout_fail_closed_mutation(wants_json: bool, timeout: Duration) {
     eprintln!("rally: {message}");
 }
 
-fn emit_timeout_committed_mutation(wants_json: bool, timeout: Duration) {
+fn emit_timeout_unknown_mutation(wants_json: bool, timeout: Duration, event_id: &str, phase: &str) {
+    let message = format!(
+        "mutating command exceeded {}ms after canonical mutation began but before exact readback; outcome is unknown",
+        timeout.as_millis()
+    );
+    if wants_json {
+        let payload = json!({
+            "ok": false,
+            "product": "rally",
+            "command": "watchdog",
+            "error": {
+                "code": "watchdog-timeout-outcome-unknown",
+                "message": message,
+            },
+            "data": {
+                "watchdog": {
+                    "committed": Value::Null,
+                    "outcome_unknown": true,
+                    "event_id": event_id,
+                    "phase": phase,
+                    "timeout_ms": timeout.as_millis(),
+                    "query_remedy": format!("rally locate {event_id} --json"),
+                }
+            }
+        });
+        crate::output::write_line_or_exit_on_broken_pipe(&payload.to_string());
+    }
+    eprintln!(
+        "rally: {message}; query `rally locate {event_id} --json` before retrying with the same event id"
+    );
+}
+
+fn emit_timeout_committed_mutation(
+    wants_json: bool,
+    timeout: Duration,
+    projection_complete: bool,
+    warnings: &[Value],
+) {
     let message = format!(
         "mutating command exceeded {}ms wall-clock budget after its primary durable append committed; projection/output was abandoned",
         timeout.as_millis()
@@ -879,7 +1039,8 @@ fn emit_timeout_committed_mutation(wants_json: bool, timeout: Duration) {
             "data": {
                 "watchdog": {
                     "committed": true,
-                    "projection_complete": false,
+                    "projection_complete": projection_complete,
+                    "warnings": warnings,
                     "timeout_ms": timeout.as_millis(),
                     "message": message,
                 }
@@ -1937,7 +2098,8 @@ fn ensure_presence_tiered_for_session(
         uri: None,
         session: None,
     };
-    room.append_fact_verified(&presence_fact)?;
+    room.append_fact_verified(&presence_fact)?
+        .into_fact_reporting();
     // First-FRONTIER-enter-is-lead: assert lead only when the seat is open AND
     // this agent is lead-eligible (frontier tier, or undeclared for back-compat).
     let lead_eligible = matches!(tier, None | Some("frontier"));
@@ -1966,7 +2128,7 @@ fn ensure_presence_tiered_for_session(
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&lead_fact)?;
+        room.append_fact_verified(&lead_fact)?.into_fact_reporting();
     }
     Ok(())
 }
@@ -2086,7 +2248,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
                 Vec::new(),
                 None,
             );
-            room.append_fact(&risk_fact)?;
+            room.append_fact(&risk_fact)?.into_fact_reporting();
         }
     }
 
@@ -2128,7 +2290,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
                     Vec::new(),
                     None,
                 );
-                room.append_fact(&risk_fact)?;
+                room.append_fact(&risk_fact)?.into_fact_reporting();
             }
         }
     }
@@ -2174,7 +2336,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
                     Vec::new(),
                     None,
                 );
-                room.append_fact(&risk_fact)?;
+                room.append_fact(&risk_fact)?.into_fact_reporting();
             }
         }
     }
@@ -2214,7 +2376,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
                     Vec::new(),
                     None,
                 );
-                room.append_fact(&risk_fact)?;
+                room.append_fact(&risk_fact)?.into_fact_reporting();
             }
         }
     }
@@ -2480,7 +2642,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
                 Vec::new(),
                 None,
             );
-            room.append_fact(&risk_fact)?;
+            room.append_fact(&risk_fact)?.into_fact_reporting();
             warnings.push(SayWarning {
                 code: "external-intake".to_string(),
                 message: risk_summary,
@@ -2534,10 +2696,12 @@ fn command_say(args: SayArgs) -> Result<Output> {
     // stricter verified path that also asserts the projection flipped.
     // All other mutating facts go through append_fact_verified (segment readback
     // only — no projection assertion needed).
-    let fact = with_watchdog_command_commit(|| match kind {
+    let append_outcome = with_watchdog_command_commit(|| match kind {
         FactKind::Release | FactKind::Resolve => room.append_state_transition_verified(&fact),
         _ => room.append_fact_verified(&fact),
     })?;
+    record_append_outcome(&append_outcome);
+    let fact = append_outcome.fact.clone();
 
     // B18: append ONE durable risk fact for each external-intake detection so
     // the contamination event is permanently auditable.  Never blocks the write.
@@ -2580,7 +2744,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
             Vec::new(),
             None,
         );
-        room.append_fact(&risk_fact)?;
+        room.append_fact(&risk_fact)?.into_fact_reporting();
         say_warnings.push(SayWarning {
             code: "external-intake".to_string(),
             message: risk_summary,
@@ -2642,7 +2806,12 @@ fn command_say(args: SayArgs) -> Result<Output> {
         "say",
         SCHEMA_SAY,
         SayData {
-            say: SayPayload { fact: fact.clone() },
+            say: SayPayload {
+                fact: fact.clone(),
+                committed: append_outcome.committed,
+                projection_complete: append_outcome.projection_complete,
+                projection_warnings: append_outcome.warnings.clone(),
+            },
             room: RoomSummary::from(&snapshot),
             warnings: say_warnings,
             verified,
@@ -2957,6 +3126,7 @@ fn command_release_by_path(
         session: None,
     };
     let appended = with_watchdog_command_commit(|| room.append_state_transition_verified(&fact))?;
+    record_append_outcome(&appended);
     for (id, subj, _sc, _owner) in &match_meta {
         let takeover_note = if is_takeover {
             " (authorized takeover of stale-owner claim)"
@@ -2971,7 +3141,13 @@ fn command_release_by_path(
             ),
         });
     }
-    let last_fact = appended;
+    for warning in &appended.warnings {
+        warnings.push(SayWarning {
+            code: format!("projection:{:?}", warning.code).to_ascii_lowercase(),
+            message: warning.message.clone(),
+        });
+    }
+    let last_fact = appended.fact.clone();
     let snapshot_after = room.snapshot()?;
     let verified = SayVerified {
         room: room.room_id().to_string(),
@@ -2983,6 +3159,9 @@ fn command_release_by_path(
         SayData {
             say: SayPayload {
                 fact: last_fact.clone(),
+                committed: appended.committed,
+                projection_complete: appended.projection_complete,
+                projection_warnings: appended.warnings.clone(),
             },
             room: RoomSummary::from(&snapshot_after),
             warnings,
@@ -4192,12 +4371,22 @@ fn command_status_post(json: bool, mut args: cli::StatusPostArgs) -> Result<Outp
         uri: None,
         session: None,
     };
-    let appended = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
+    let mut appended = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
     // The shipped coordination hook emits status posts as heartbeats. Renew
     // after the presence append so liveness and lease durability succeed or
     // fail together from the caller's perspective.
-    with_watchdog_command_commit(|| renew_owned_claim_leases(&room, &args.tool).map(|_| ()))?;
-    let state = agent_state::project_presence_to_state(&appended)
+    if let Err(error) =
+        with_watchdog_command_commit(|| renew_owned_claim_leases(&room, &args.tool).map(|_| ()))
+    {
+        appended.projection_complete = false;
+        appended.warnings.push(store::ProjectionWarning {
+            code: store::ProjectionWarningCode::PostCommitWork,
+            message: format!("status heartbeat committed but lease renewal failed: {error}"),
+        });
+        mark_watchdog_append_outcome(&appended);
+    }
+    record_append_outcome(&appended);
+    let state = agent_state::project_presence_to_state(&appended.fact)
         .unwrap_or(agent_state::AgentState::Idle { wake_after: None });
     let text = format!("status post tool={} seq={}", args.tool, appended.seq);
     let body = envelope(
@@ -4205,7 +4394,7 @@ fn command_status_post(json: bool, mut args: cli::StatusPostArgs) -> Result<Outp
         SCHEMA_STATUS_POST,
         StatusPostData {
             status_post: StatusPostResult {
-                fact: appended,
+                fact: appended.fact,
                 state,
             },
         },
@@ -4747,7 +4936,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
                         uri: None,
                         session: None,
                     };
-                    room.append_fact(&release)?;
+                    room.append_fact(&release)?.into_fact_reporting();
                     released.push(claim.event_id.clone());
                 }
                 let alert = build_risk_fact(
@@ -4765,7 +4954,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
                     vec![format!("released:{}", released.len())],
                     None,
                 );
-                room.append_fact(&alert)?;
+                room.append_fact(&alert)?.into_fact_reporting();
             }
             let reason = if args.enforce && !enforce_eligible {
                 // Conflict reported but NOT released: owner is unacknowledged +
@@ -5042,7 +5231,8 @@ fn command_run(args: RunArgs) -> Result<Output> {
                             &session,
                             "active",
                             Some(fact.event_id.clone()),
-                        ))?;
+                        ))?
+                        .into_fact_reporting();
                     }
                 }
                 Err(err) => {
@@ -5112,7 +5302,8 @@ fn command_run(args: RunArgs) -> Result<Output> {
                                 &session,
                                 "active",
                                 Some(fact.event_id.clone()),
-                            ))?;
+                            ))?
+                            .into_fact_reporting();
                         }
                     }
                     Err(err) => {
@@ -5180,7 +5371,8 @@ fn command_run(args: RunArgs) -> Result<Output> {
                     &session,
                     "active",
                     Some(fact.event_id.clone()),
-                ))?;
+                ))?
+                .into_fact_reporting();
             }
         }
 
@@ -5455,9 +5647,14 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
     let landed_fact = with_watchdog_command_commit(|| {
         room.append_session_fact_if_context(&fact, context_version)
     })?;
-    let landed_fact = landed_fact.ok_or_else(|| {
-        RallyError::Message("adopt: concurrent session-fact write detected; retry".to_string())
-    })?;
+    let landed_fact = match landed_fact {
+        ConditionalAppendOutcome::NotApplied => {
+            return Err(RallyError::Message(
+                "adopt: concurrent session-fact write detected; retry".to_string(),
+            ));
+        }
+        ConditionalAppendOutcome::Applied(outcome) => outcome.into_fact_reporting(),
+    };
     verify_session_reservation_readback(&room, &landed_fact, &session)?;
     drop(identity_guard);
 
@@ -5542,14 +5739,17 @@ fn reserve_numbered_session(
             daemon_socket: None,
         };
         let fact = session_fact(&session, "active", None);
-        if let Some(fact) = with_watchdog_command_commit(|| {
+        match with_watchdog_command_commit(|| {
             room.append_session_fact_if_context(&fact, context_version)
         })? {
-            verify_session_reservation_readback(room, &fact, &session)?;
-            return Ok(ReservedSession {
-                fact: Some(fact),
-                session,
-            });
+            ConditionalAppendOutcome::Applied(outcome) => {
+                let fact = outcome.into_fact_reporting();
+                return Ok(ReservedSession {
+                    fact: Some(fact),
+                    session,
+                });
+            }
+            ConditionalAppendOutcome::NotApplied => {}
         }
         // Back off after the first few pure yields to avoid a thundering-herd
         // where all N losers immediately re-read the same stale context version.
@@ -5900,7 +6100,7 @@ fn append_orphan_tmux_tombstone(
         uri: None,
         session: None,
     };
-    room.append_fact(&fact)?;
+    room.append_fact(&fact)?.into_fact_reporting();
     Ok(())
 }
 
@@ -7150,7 +7350,8 @@ fn remove_session_record(session_id: &str) -> Result<()> {
     else {
         return Ok(());
     };
-    room.append_fact(&session_fact(&session, "stopped", Some(fact.event_id)))?;
+    room.append_fact(&session_fact(&session, "stopped", Some(fact.event_id)))?
+        .into_fact_reporting();
     Ok(())
 }
 
@@ -7163,7 +7364,8 @@ fn append_stopped_session_record(
         session,
         "stopped",
         Some(active_fact.event_id.clone()),
-    ))?;
+    ))?
+    .into_fact_reporting();
     Ok(())
 }
 
@@ -7287,7 +7489,9 @@ fn append_next_wake_intent(
         next.target_event_id.clone(),
         Some("pending".to_string()),
     );
-    room.append_fact(&fact).map(Some)
+    room.append_fact(&fact)
+        .map(store::AppendOutcome::into_fact_reporting)
+        .map(Some)
 }
 
 /// Build the coordination fact that records inject message content.
@@ -7416,6 +7620,7 @@ fn inject_content_fact(
     // Directive append so it cannot report `committed: true` before delivery
     // intent exists in the target inbox.
     room.append_fact_verified(&fact)
+        .map(store::AppendOutcome::into_fact_reporting)
 }
 
 /// Return the content fact without appending (dry-run path).
@@ -7465,10 +7670,14 @@ fn inject_wake_intent_with_room(
     if dry_run {
         Ok(Some(fact))
     } else if let Some(r) = room {
-        r.append_fact(&fact).map(Some)
+        r.append_fact(&fact)
+            .map(store::AppendOutcome::into_fact_reporting)
+            .map(Some)
     } else {
         let r = RoomStore::open()?;
-        r.append_fact(&fact).map(Some)
+        r.append_fact(&fact)
+            .map(store::AppendOutcome::into_fact_reporting)
+            .map(Some)
     }
 }
 
@@ -9958,7 +10167,10 @@ mod tests {
         let (_facts, ctx) = room.session_facts_with_context_version().unwrap();
         let fact = session_fact(&session, "active", None);
         let written = room.append_session_fact_if_context(&fact, ctx).unwrap();
-        assert!(written.is_some(), "session fact must land");
+        assert!(
+            matches!(written, ConditionalAppendOutcome::Applied(_)),
+            "session fact must land"
+        );
 
         // Active sessions now include the adopted target.
         let active = active_session_records(&room).unwrap();
@@ -10266,7 +10478,7 @@ mod tests {
             };
             let appended = writer.append_fact(&fact).unwrap();
             assert!(appended.seq > 0, "appended {subject} must have seq > 0");
-            written.push(appended);
+            written.push(appended.fact);
         }
 
         let facts_written = kinds.len() as i64;
@@ -12089,7 +12301,7 @@ mod tests {
             session: None,
         };
         let appended = room.append_fact_verified(&fact).unwrap();
-        appended.event_id
+        appended.fact.event_id
     }
 
     #[test]
@@ -12237,7 +12449,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap().event_id
+        room.append_fact_verified(&fact).unwrap().fact.event_id
     }
 
     /// fact_182e8 gap 1 — authorized takeover. A claim whose owner has gone
@@ -12963,6 +13175,9 @@ struct SayWarning {
 #[derive(JsonSchema, Serialize)]
 struct SayPayload {
     fact: Fact,
+    committed: bool,
+    projection_complete: bool,
+    projection_warnings: Vec<store::ProjectionWarning>,
 }
 
 /// Envelope for `say`: primary result at `data.say`, shared fields as siblings.
@@ -13932,7 +14147,8 @@ fn command_ack(args: AckArgs) -> Result<Output> {
         uri: None,
         session: None,
     };
-    let fact = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
+    let fact =
+        with_watchdog_command_commit(|| room.append_fact_verified(&fact))?.into_fact_reporting();
     let text = format!("ack recorded for {} (seq {})", args.tool, fact.seq);
     let body = envelope(
         "ack",
@@ -14027,7 +14243,8 @@ fn command_lead(args: LeadArgs) -> Result<Output> {
                 uri: None,
                 session: None,
             };
-            let fact = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
+            let fact = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?
+                .into_fact_reporting();
             let text = format!(
                 "lead relinquished by {} (was {})",
                 r.tool,
@@ -14122,7 +14339,8 @@ fn set_lead(json: bool, t: &LeadTargetArgs, mode: &str) -> Result<Output> {
         uri: None,
         session: None,
     };
-    let fact = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
+    let fact =
+        with_watchdog_command_commit(|| room.append_fact_verified(&fact))?.into_fact_reporting();
     let text = format!(
         "lead {} -> {} (via {mode})",
         prior.as_deref().unwrap_or("<none>"),
@@ -14191,7 +14409,8 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
             uri: None,
             session: None,
         };
-        let appended = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
+        let appended = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?
+            .into_fact_reporting();
         let text = format!("mission envelope set agent={agent} seq={}", appended.seq);
         let body = envelope(
             "mission",
@@ -14232,7 +14451,8 @@ fn command_mission(args: MissionArgs) -> Result<Output> {
             uri: None,
             session: None,
         };
-        let appended = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
+        let appended = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?
+            .into_fact_reporting();
         let text = format!("mission set seq={}", appended.seq);
         let body = envelope(
             "mission",

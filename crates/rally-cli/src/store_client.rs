@@ -45,7 +45,9 @@ use rally_protocol::store_wire::{
 
 use crate::claim_authority::{self, ActiveClaimRecord};
 use crate::error::{RallyError, Result};
-use crate::store::{self, Fact, ReadReceipt, RoomSnapshot};
+use crate::store::{
+    self, AppendOutcome, ConditionalAppendOutcome, Fact, ReadReceipt, RoomSnapshot,
+};
 
 /// Discovery pointer filename inside `.rally/` (L7/ADR-02) — the daemon's
 /// SOLE discovery mechanism; clients never guess or hardcode the socket path.
@@ -335,45 +337,53 @@ pub(crate) fn probe_live_bounded(
 struct MutationQuery {
     operation: &'static str,
     selector: Option<String>,
+    event_id: Option<String>,
 }
 
 /// Classify the closed wire operation set. This classification lives beside
 /// dispatch so adding a mutating protocol variant cannot silently inherit the
 /// old blind-retry behavior.
 fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
-    let fact_selector = |fact: &Value| {
+    let fact_event_id = |fact: &Value| {
         fact.get("event_id")
             .and_then(Value::as_str)
-            .map(|event_id| format!("event_id={event_id}"))
+            .map(str::to_string)
     };
     match op {
         StoreOp::AppendFact { fact } => Some(MutationQuery {
             operation: "append_fact",
-            selector: fact_selector(fact),
+            selector: fact_event_id(fact).map(|event_id| format!("event_id={event_id}")),
+            event_id: fact_event_id(fact),
         }),
         StoreOp::AppendFactVerified { fact } => Some(MutationQuery {
             operation: "append_fact_verified",
-            selector: fact_selector(fact),
+            selector: fact_event_id(fact).map(|event_id| format!("event_id={event_id}")),
+            event_id: fact_event_id(fact),
         }),
         StoreOp::AppendStateTransitionVerified { fact } => Some(MutationQuery {
             operation: "append_state_transition_verified",
-            selector: fact_selector(fact),
+            selector: fact_event_id(fact).map(|event_id| format!("event_id={event_id}")),
+            event_id: fact_event_id(fact),
         }),
         StoreOp::AppendSessionFactIfContext { fact, .. } => Some(MutationQuery {
             operation: "append_session_fact_if_context",
-            selector: fact_selector(fact),
+            selector: fact_event_id(fact).map(|event_id| format!("event_id={event_id}")),
+            event_id: fact_event_id(fact),
         }),
         StoreOp::RebuildClaimIndex => Some(MutationQuery {
             operation: "rebuild_claim_index",
             selector: None,
+            event_id: None,
         }),
         StoreOp::RenewClaimLease { claim_id, .. } => Some(MutationQuery {
             operation: "renew_claim_lease",
             selector: Some(format!("claim_id={claim_id}")),
+            event_id: None,
         }),
         StoreOp::MaybeAppendReadCheckpoint { tool, read_seq } => Some(MutationQuery {
             operation: "maybe_append_read_checkpoint",
             selector: Some(format!("tool={tool},read_seq={read_seq}")),
+            event_id: None,
         }),
         StoreOp::Facts
         | StoreOp::SessionFactsWithContextVersion
@@ -391,6 +401,16 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
 /// reply is lost, so its only safe result is UNKNOWN + a ledger query selector.
 fn transport_error(op: &StoreOp, io_err: &std::io::Error) -> RallyError {
     if let Some(query) = mutation_query(op) {
+        if let Some(event_id) = query.event_id.as_deref() {
+            return RallyError::outcome_unknown(
+                event_id,
+                "daemon-transport",
+                format!(
+                    "daemon transport failure during mutating operation {}: {io_err}; direct fallback is forbidden",
+                    query.operation
+                ),
+            );
+        }
         let selector = query
             .selector
             .as_deref()
@@ -415,6 +435,15 @@ fn store_error_to_rally_error(err: StoreError) -> RallyError {
         StoreErrorKind::Usage => RallyError::Usage(err.message),
         StoreErrorKind::NotFound => RallyError::NotFound(err.message),
         StoreErrorKind::NotStarted => RallyError::NotStarted(err.message),
+        StoreErrorKind::OutcomeUnknown => RallyError::outcome_unknown(
+            err.event_id
+                .unwrap_or_else(|| "<missing-event-id>".to_string()),
+            err.phase.unwrap_or_else(|| "daemon".to_string()),
+            err.message,
+        ),
+        StoreErrorKind::IncompatibleWire => {
+            RallyError::Command(format!("incompatible-wire: {}", err.message))
+        }
         StoreErrorKind::Command
         | StoreErrorKind::Message
         | StoreErrorKind::Internal
@@ -473,29 +502,29 @@ impl RoutedRoomStore {
 
     // ----- ROUTED methods (one StoreOp round trip each) ----------------------
 
-    pub(crate) fn append_fact(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_fact(&self, fact: &Fact) -> Result<AppendOutcome> {
         match self.dispatch(StoreOp::AppendFact {
             fact: to_value(fact)?,
         })? {
-            StoreOk::AppendFact { fact } => from_value(fact),
+            StoreOk::AppendFact { outcome } => from_value(outcome),
             _ => Err(unexpected_reply("append_fact")),
         }
     }
 
-    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<AppendOutcome> {
         match self.dispatch(StoreOp::AppendFactVerified {
             fact: to_value(fact)?,
         })? {
-            StoreOk::AppendFactVerified { fact } => from_value(fact),
+            StoreOk::AppendFactVerified { outcome } => from_value(outcome),
             _ => Err(unexpected_reply("append_fact_verified")),
         }
     }
 
-    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<AppendOutcome> {
         match self.dispatch(StoreOp::AppendStateTransitionVerified {
             fact: to_value(fact)?,
         })? {
-            StoreOk::AppendStateTransitionVerified { fact } => from_value(fact),
+            StoreOk::AppendStateTransitionVerified { outcome } => from_value(outcome),
             _ => Err(unexpected_reply("append_state_transition_verified")),
         }
     }
@@ -504,12 +533,12 @@ impl RoutedRoomStore {
         &self,
         fact: &Fact,
         expected_context_version: Option<u64>,
-    ) -> Result<Option<Fact>> {
+    ) -> Result<ConditionalAppendOutcome> {
         match self.dispatch(StoreOp::AppendSessionFactIfContext {
             fact: to_value(fact)?,
             expected_context_version,
         })? {
-            StoreOk::AppendSessionFactIfContext { fact } => fact.map(from_value).transpose(),
+            StoreOk::AppendSessionFactIfContext { result } => from_value(result),
             _ => Err(unexpected_reply("append_session_fact_if_context")),
         }
     }

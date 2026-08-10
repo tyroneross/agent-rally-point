@@ -1,4 +1,4 @@
-use factstr::{EventQuery as FactQuery, EventStore, EventStoreError, NewEvent};
+use factstr::{EventQuery as FactQuery, EventStore, NewEvent};
 use factstr_sqlite::SqliteStore;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -663,6 +663,68 @@ impl Fact {
             serde_json::from_value(value).map_err(RallyError::json("parse fact payload"))?;
         fact.seq = seq;
         Ok(fact)
+    }
+}
+
+/// A typed degradation that happened only after the canonical JSONL fact was
+/// synced and read back exactly. Callers must surface these warnings, but must
+/// not retry the mutation: `committed` is already true.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionWarningCode {
+    FactsDb,
+    ReconcileCache,
+    LogIndex,
+    ClaimIndex,
+    TransitionVerification,
+    PostCommitWork,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+pub(crate) struct ProjectionWarning {
+    pub(crate) code: ProjectionWarningCode,
+    pub(crate) message: String,
+}
+
+/// Successful append reply. This type is returned only after exact canonical
+/// readback, so `committed` is invariantly true; projection failures are data,
+/// not retryable append failures.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub(crate) struct AppendOutcome {
+    pub(crate) fact: Fact,
+    pub(crate) committed: bool,
+    pub(crate) projection_complete: bool,
+    pub(crate) warnings: Vec<ProjectionWarning>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(tag = "status", content = "outcome", rename_all = "snake_case")]
+pub(crate) enum ConditionalAppendOutcome {
+    NotApplied,
+    Applied(AppendOutcome),
+}
+
+impl AppendOutcome {
+    fn committed(fact: Fact, warnings: Vec<ProjectionWarning>) -> Self {
+        Self {
+            fact,
+            committed: true,
+            projection_complete: warnings.is_empty(),
+            warnings,
+        }
+    }
+
+    pub(crate) fn into_fact_reporting(self) -> Fact {
+        crate::record_append_outcome(&self);
+        self.fact
+    }
+}
+
+impl std::ops::Deref for AppendOutcome {
+    type Target = Fact;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fact
     }
 }
 
@@ -1863,6 +1925,206 @@ struct LedgerLine {
     engagement: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveTailRepair {
+    None,
+    AddNewline,
+    TruncateTo(u64),
+}
+
+fn validate_canonical_line(entry: &LedgerLine) -> Result<Fact> {
+    if entry.seq <= 0 {
+        return Err(RallyError::Message(format!(
+            "canonical segment row has non-positive seq {}",
+            entry.seq
+        )));
+    }
+    let fact = Fact::from_segment_value(entry.payload.clone(), entry.seq)?;
+    if fact.schema != FACT_SCHEMA {
+        return Err(RallyError::Message(format!(
+            "canonical segment row has unsupported fact schema {:?}",
+            fact.schema
+        )));
+    }
+    if fact.event_id.trim().is_empty() {
+        return Err(RallyError::Message(
+            "canonical segment row has an empty event_id".to_string(),
+        ));
+    }
+    if entry.event_type != fact.kind.as_str() {
+        return Err(RallyError::Message(format!(
+            "canonical segment event_type {:?} does not match payload kind {:?}",
+            entry.event_type,
+            fact.kind.as_str()
+        )));
+    }
+    Ok(fact)
+}
+
+/// Validate the entire active segment without changing it and classify only
+/// the final unterminated fragment. A complete syntactic/schema error is
+/// corruption even without a newline; only serde's EOF class is truncatable.
+fn inspect_active_segment_tail(path: &Path) -> Result<ActiveTailRepair> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ActiveTailRepair::None);
+        }
+        Err(error) => return Err(RallyError::io(format!("read {}", path.display()))(error)),
+    };
+    if bytes.is_empty() {
+        return Ok(ActiveTailRepair::None);
+    }
+
+    let completed_end = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    for (index, raw) in bytes[..completed_end]
+        .split(|byte| *byte == b'\n')
+        .enumerate()
+    {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if raw.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        let entry = serde_json::from_slice::<LedgerLine>(raw).map_err(|error| {
+            RallyError::Message(format!(
+                "completed canonical segment corruption in {} at line {}: {}",
+                path.display(),
+                index + 1,
+                error
+            ))
+        })?;
+        validate_canonical_line(&entry).map_err(|error| {
+            RallyError::Message(format!(
+                "completed canonical segment corruption in {} at line {}: {}",
+                path.display(),
+                index + 1,
+                error
+            ))
+        })?;
+    }
+
+    let tail = &bytes[completed_end..];
+    if tail.is_empty() {
+        return Ok(ActiveTailRepair::None);
+    }
+    match serde_json::from_slice::<LedgerLine>(tail) {
+        Ok(entry) => {
+            validate_canonical_line(&entry).map_err(|error| {
+                RallyError::Message(format!(
+                    "unterminated canonical segment corruption in {} at line {}: {}",
+                    path.display(),
+                    bytes[..completed_end]
+                        .iter()
+                        .filter(|byte| **byte == b'\n')
+                        .count()
+                        + 1,
+                    error
+                ))
+            })?;
+            Ok(ActiveTailRepair::AddNewline)
+        }
+        Err(error) if error.is_eof() => Ok(ActiveTailRepair::TruncateTo(
+            u64::try_from(completed_end).map_err(|overflow| {
+                RallyError::Message(format!("canonical tail offset overflow: {overflow}"))
+            })?,
+        )),
+        Err(error) => Err(RallyError::Message(format!(
+            "unterminated canonical segment corruption in {}: {}; refusing mutation",
+            path.display(),
+            error
+        ))),
+    }
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(RallyError::io(format!(
+            "fsync directory {}",
+            path.display()
+        )))
+}
+
+fn apply_active_tail_repair(path: &Path, repair: ActiveTailRepair, event_id: &str) -> Result<()> {
+    match repair {
+        ActiveTailRepair::None => Ok(()),
+        ActiveTailRepair::AddNewline => {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(path)
+                .map_err(|error| {
+                    RallyError::outcome_unknown(event_id, "tail-repair-open", error.to_string())
+                })?;
+            file.write_all(b"\n").map_err(|error| {
+                RallyError::outcome_unknown(event_id, "tail-repair-write", error.to_string())
+            })?;
+            file.sync_all().map_err(|error| {
+                RallyError::outcome_unknown(event_id, "tail-repair-sync", error.to_string())
+            })
+        }
+        ActiveTailRepair::TruncateTo(length) => {
+            let file = OpenOptions::new().write(true).open(path).map_err(|error| {
+                RallyError::outcome_unknown(event_id, "tail-repair-open", error.to_string())
+            })?;
+            file.set_len(length).map_err(|error| {
+                RallyError::outcome_unknown(event_id, "tail-repair-truncate", error.to_string())
+            })?;
+            file.sync_all().map_err(|error| {
+                RallyError::outcome_unknown(event_id, "tail-repair-sync", error.to_string())
+            })
+        }
+    }
+}
+
+fn normalized_fact_value(fact: &Fact, seq: i64) -> Result<Value> {
+    let mut normalized = fact.clone();
+    normalized.seq = seq;
+    serde_json::to_value(normalized).map_err(RallyError::json("normalize fact identity"))
+}
+
+fn resolve_canonical_event_id(
+    log_dir: &Path,
+    archive_dir: &Path,
+    candidate: &Fact,
+    engagement: &str,
+) -> Result<Option<Fact>> {
+    let live = read_segment_files(log_dir)?;
+    let archived = replay_archive_segments(archive_dir)?;
+    let mut matches = canonical_segment_entries(&live, &archived)?
+        .into_iter()
+        .filter(|entry| {
+            entry.payload.get("event_id").and_then(Value::as_str)
+                == Some(candidate.event_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    if matches.len() != 1 {
+        return Err(RallyError::Usage(format!(
+            "event-id identity ambiguity: {} appears in {} canonical rows; refusing retry",
+            candidate.event_id,
+            matches.len()
+        )));
+    }
+    let entry = matches.pop().expect("one checked canonical identity row");
+    let existing = validate_canonical_line(&entry)?;
+    let exact = entry.event_type == candidate.kind.as_str()
+        && entry.engagement.as_deref() == Some(engagement)
+        && normalized_fact_value(candidate, entry.seq)?
+            == normalized_fact_value(&existing, entry.seq)?;
+    if !exact {
+        return Err(RallyError::Usage(format!(
+            "event-id identity conflict: {} already names a different canonical fact",
+            candidate.event_id
+        )));
+    }
+    Ok(Some(existing))
+}
+
 /// One entry of `.rally/log/index.json`.
 #[derive(Debug, Deserialize, Serialize)]
 struct SegmentIndexEntry {
@@ -2061,21 +2323,21 @@ impl RoomStore {
     // transport failure there (R6) surfaces as a retryable
     // `RallyError::Command` and NEVER falls back to a direct facts.db open.
 
-    pub(crate) fn append_fact(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_fact(&self, fact: &Fact) -> Result<AppendOutcome> {
         match self {
             RoomStore::Direct(d) => d.append_fact(fact),
             RoomStore::Routed(r) => r.append_fact(fact),
         }
     }
 
-    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<AppendOutcome> {
         match self {
             RoomStore::Direct(d) => d.append_fact_verified(fact),
             RoomStore::Routed(r) => r.append_fact_verified(fact),
         }
     }
 
-    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<AppendOutcome> {
         match self {
             RoomStore::Direct(d) => d.append_state_transition_verified(fact),
             RoomStore::Routed(r) => r.append_state_transition_verified(fact),
@@ -2086,7 +2348,7 @@ impl RoomStore {
         &self,
         fact: &Fact,
         expected_context_version: Option<u64>,
-    ) -> Result<Option<Fact>> {
+    ) -> Result<ConditionalAppendOutcome> {
         match self {
             RoomStore::Direct(d) => {
                 d.append_session_fact_if_context(fact, expected_context_version)
@@ -2362,6 +2624,10 @@ impl DirectRoomStore {
         // and closes its pool inside that ownership window.
         drop(fact_store);
         seed_segments_from_db_if_absent(&log_dir, &archive_dir, &fact_store_path)?;
+        // Repair canonical-ahead cache state before a daemon can install its
+        // warm pool. This is the fresh-process recovery path after a committed
+        // append reported a projection warning.
+        reconcile_segments_and_db(&log_dir, &archive_dir, &fact_store_path, true)?;
         let active_engagement = resolve_active_engagement_with_env(&dir, engagement);
         let store = Self {
             // Direct-CLI mode: no warm pool ⇒ per-op opens, byte-identical to
@@ -2403,6 +2669,7 @@ impl DirectRoomStore {
         let fact_store = open_fact_store_lenient(&fact_store_path)?;
         drop(fact_store);
         seed_segments_from_db_if_absent(&log_dir, &archive_dir, &fact_store_path)?;
+        reconcile_segments_and_db(&log_dir, &archive_dir, &fact_store_path, true)?;
         let active_engagement = resolve_active_engagement(&dir);
         let store = Self {
             // Direct-CLI mode: no warm pool ⇒ per-op opens (G1).
@@ -2629,16 +2896,44 @@ impl DirectRoomStore {
             .map(str::trim)
     }
 
-    pub(crate) fn append_fact(&self, fact: &Fact) -> Result<Fact> {
+    pub(crate) fn append_fact(&self, fact: &Fact) -> Result<AppendOutcome> {
         let room_dir = self
             .facts_db_path
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
-        // Warm-pool facade (L11/R1/G10): reuse the daemon's pool if installed,
-        // else open fresh lenient — byte-identical to main in direct mode (G1).
-        let fact_store = self.fact_store_handle(true)?;
+        self.append_fact_under_lock(fact)
+    }
+
+    fn append_fact_under_lock(&self, fact: &Fact) -> Result<AppendOutcome> {
         let mut fact = fact.clone();
+        // Only invariant input bounds precede canonical identity resolution.
+        // Stateful authority/claim/transition checks below apply solely to a
+        // genuinely new event; the exact canonical row proves a retry was
+        // already authorized before the first commit changed mutable state.
+        crate::write_authority::assert_field_bounds(&fact)?;
+        let active_segment = self.active_segment_path();
+        let tail_repair = inspect_active_segment_tail(&active_segment)?;
+        if let Some(existing) = resolve_canonical_event_id(
+            &self.log_dir,
+            &self.archive_dir,
+            &fact,
+            &self.active_engagement,
+        )? {
+            if tail_repair != ActiveTailRepair::None {
+                crate::mark_watchdog_command_outcome_unknown(
+                    &fact.event_id,
+                    "canonical-tail-repair",
+                );
+                apply_active_tail_repair(&active_segment, tail_repair, &fact.event_id)?;
+            }
+            let mut outcome = AppendOutcome::committed(existing.clone(), Vec::new());
+            crate::mark_watchdog_append_outcome(&outcome);
+            outcome.warnings = self.project_canonical_fact(&existing);
+            outcome.projection_complete = outcome.warnings.is_empty();
+            crate::mark_watchdog_append_outcome(&outcome);
+            return Ok(outcome);
+        }
         // SEC-001 close: a takeover Release authorizes reclaiming a stale peer's
         // claim. Eligibility was judged on an UNLOCKED snapshot in
         // `command_release_by_path`; an owner could revive in the gap before we
@@ -2820,6 +3115,73 @@ impl DirectRoomStore {
                 )));
             }
         }
+        if matches!(fact.kind, FactKind::Release | FactKind::Resolve) {
+            let ref_id = fact.ref_id.as_deref().ok_or_else(|| {
+                RallyError::Usage(format!(
+                    "{} requires --ref <event-id> targeting a live fact; none provided",
+                    fact.kind.as_str()
+                ))
+            })?;
+            let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+            let coord =
+                crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+            let snapshot = snapshot_from_facts_with_policy(&facts, &coord, false);
+            match fact.kind {
+                FactKind::Release => {
+                    if !snapshot
+                        .active_claims
+                        .iter()
+                        .any(|claim| claim.event_id == ref_id)
+                    {
+                        return Err(RallyError::Usage(format!(
+                            "release failed: ref {ref_id} is not an active claim (already released, never existed, or invalid); nothing to release"
+                        )));
+                    }
+                }
+                FactKind::Resolve => {
+                    let open_handoff = snapshot
+                        .open_handoffs
+                        .iter()
+                        .find(|candidate| candidate.event_id == ref_id);
+                    let is_live = snapshot
+                        .active_blockers
+                        .iter()
+                        .any(|candidate| candidate.event_id == ref_id)
+                        || snapshot
+                            .active_claims
+                            .iter()
+                            .any(|candidate| candidate.event_id == ref_id)
+                        || open_handoff.is_some()
+                        || snapshot
+                            .current_risks
+                            .iter()
+                            .any(|candidate| candidate.event_id == ref_id)
+                        || snapshot
+                            .system_health
+                            .iter()
+                            .any(|candidate| candidate.event_id == ref_id)
+                        || snapshot
+                            .unconsumed_artifacts
+                            .iter()
+                            .any(|candidate| candidate.event_id == ref_id);
+                    if !is_live {
+                        return Err(RallyError::Usage(format!(
+                            "resolve failed: ref {ref_id} is not a live blocker, claim, handoff, risk, or unconsumed artifact (already resolved, never existed, or invalid); nothing to resolve"
+                        )));
+                    }
+                    if let Some(handoff) = open_handoff
+                        && !handoff_closer_matches_target(handoff, &fact)
+                    {
+                        let target = handoff.target.as_deref().unwrap_or("<untargeted>");
+                        let tool = fact.tool.as_deref().unwrap_or("<unknown>");
+                        return Err(RallyError::Usage(format!(
+                            "resolve failed: ref {ref_id} is targeted to {target}; tool {tool} cannot resolve it"
+                        )));
+                    }
+                }
+                _ => unreachable!("guarded transition kind"),
+            }
+        }
         // ---- WRITE-BOUNDARY AUTHORITY (ARP-R-01, ARP-R-02, ARP-R-04) -------
         //
         // The one gate every durable write passes, in BOTH store modes: routed
@@ -2868,86 +3230,155 @@ impl DirectRoomStore {
                 )));
             }
         }
-        let logical_seq =
-            next_canonical_seq(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
-        fact.seq = logical_seq;
-        // Defense-in-depth dup gate (2026-07-02): the allocated seq must exceed
-        // the active segment's on-disk tail. A stale cache or an old count-based
-        // allocator could hand out an already-used seq; fail LOUD here rather
-        // than write a duplicate that bricks replay for every reader.
-        if let Some(tail) = last_seq_in_segment(&self.active_segment_path())?
-            && fact.seq <= tail
-        {
-            return Err(RallyError::Message(format!(
-                "seq allocation conflict: allocated {} <= active segment tail {} — refusing to write a duplicate. Delete .rally/.reconcile-cache.json and retry.",
-                fact.seq, tail
-            )));
-        }
+        let live = read_segment_files(&self.log_dir)?;
+        let archived = replay_archive_segments(&self.archive_dir)?;
+        fact.seq = segment_seq_stats(&live, &archived)?
+            .max_seq
+            .checked_add(1)
+            .ok_or_else(|| RallyError::Message("canonical sequence overflow".to_string()))?;
         let event_type = fact.kind.as_str().to_string();
         let payload = serde_json::to_value(&fact).map_err(RallyError::json("render fact"))?;
-        // The room lock serializes Rally writers; keep a short retry for
-        // transient SQLite lock errors from readers or older Rally binaries.
-        //
-        // Budgeted against what the watchdog has LEFT, so this loop and the
-        // `open_fact_store` loop that already ran cannot jointly outlast it
-        // (they used to: 2040ms + 2720ms against 3000ms). Because each takes a
-        // fraction of the REMAINDER, the two compose without knowing about each
-        // other — see `crate::retry_budget`.
-        let result = {
-            let mut budget = RetryBudget::new(
-                crate::retry_budget::budgets_for(crate::watchdog_remaining()).retry,
-                retry_jitter_ms(),
-            );
-            loop {
-                match fact_store.append(vec![NewEvent::new(event_type.clone(), payload.clone())]) {
-                    Ok(r) => break r,
-                    Err(err) if is_transient_store_contention(&err) => {
-                        let Some(backoff) = budget.next_backoff() else {
-                            return Err(RallyError::Message(format!(
-                                "append fact: retry budget exhausted after {} attempts \
-                                 within this command's watchdog budget while the \
-                                 store stayed contended ({err}). The fact was NOT \
-                                 written. `rally doctor --reap-stale` lists holders; \
-                                 `--timeout-ms` raises this command's budget.",
-                                budget.attempts(),
-                            )));
-                        };
-                        thread::sleep(backoff);
-                    }
-                    Err(err) => return Err(RallyError::Message(format!("append fact: {err}"))),
-                }
+        let entry = LedgerLine {
+            seq: fact.seq,
+            occurred_at: now_string(),
+            event_type,
+            payload,
+            engagement: Some(self.active_engagement.clone()),
+        };
+        let mut rendered =
+            serde_json::to_vec(&entry).map_err(RallyError::json("render canonical fact"))?;
+        rendered.push(b'\n');
+
+        // From the first tail/file mutation onward NotStarted is impossible.
+        crate::mark_watchdog_command_outcome_unknown(&fact.event_id, "canonical-write");
+        apply_active_tail_repair(&active_segment, tail_repair, &fact.event_id)?;
+        append_canonical_line_and_readback(&active_segment, &entry, &rendered, &fact.event_id)?;
+
+        let mut outcome = AppendOutcome::committed(fact.clone(), Vec::new());
+        crate::mark_watchdog_append_outcome(&outcome);
+        outcome.warnings = self.project_canonical_fact(&fact);
+        outcome.projection_complete = outcome.warnings.is_empty();
+        crate::mark_watchdog_append_outcome(&outcome);
+        Ok(outcome)
+    }
+
+    fn project_canonical_fact(&self, fact: &Fact) -> Vec<ProjectionWarning> {
+        let mut warnings = Vec::new();
+        let fact_store = match self.fact_store_handle(true) {
+            Ok(store) => store,
+            Err(error) => {
+                warnings.push(ProjectionWarning {
+                    code: ProjectionWarningCode::FactsDb,
+                    message: format!("open facts.db projection: {error}"),
+                });
+                return warnings;
             }
         };
-        let _store_seq = i64::try_from(result.last_sequence_number)
-            .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
-        append_segment_line(
-            &self.active_segment_path(),
-            &LedgerLine {
-                seq: fact.seq,
-                occurred_at: now_string(),
-                event_type,
-                payload,
-                engagement: Some(self.active_engagement.clone()),
-            },
-        )?;
-        crate::mark_watchdog_command_commit();
-        // Direct mode owns a fresh per-op pool. Close it before fingerprinting
-        // the derived cache so its final WAL checkpoint/unlink cannot make the
-        // sidecar stale immediately after this method returns. In daemon mode
-        // the handle only borrows the warm pool, so dropping it keeps that pool
-        // (and its WAL lifecycle) unchanged.
+
+        let before = match facts_from_store(&fact_store) {
+            Ok(facts) => facts,
+            Err(error) => {
+                warnings.push(ProjectionWarning {
+                    code: ProjectionWarningCode::FactsDb,
+                    message: format!("query facts.db projection: {error}"),
+                });
+                return warnings;
+            }
+        };
+        let same_id = before
+            .iter()
+            .filter(|existing| existing.event_id == fact.event_id)
+            .collect::<Vec<_>>();
+        if same_id.len() > 1 {
+            warnings.push(ProjectionWarning {
+                code: ProjectionWarningCode::FactsDb,
+                message: format!(
+                    "facts.db projection contains {} rows for event_id {}; canonical fact remains committed",
+                    same_id.len(),
+                    fact.event_id
+                ),
+            });
+            return warnings;
+        }
+        if let Some(existing) = same_id.first() {
+            let existing_value = normalized_fact_value(existing, fact.seq).ok();
+            let canonical_value = normalized_fact_value(fact, fact.seq).ok();
+            if existing_value != canonical_value {
+                warnings.push(ProjectionWarning {
+                    code: ProjectionWarningCode::FactsDb,
+                    message: format!(
+                        "facts.db event-id identity conflict for {}; canonical fact remains committed",
+                        fact.event_id
+                    ),
+                });
+                return warnings;
+            }
+        } else {
+            let payload = match serde_json::to_value(fact) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    warnings.push(ProjectionWarning {
+                        code: ProjectionWarningCode::FactsDb,
+                        message: format!("render facts.db projection: {error}"),
+                    });
+                    return warnings;
+                }
+            };
+            if let Err(error) =
+                fact_store.append(vec![NewEvent::new(fact.kind.as_str().to_string(), payload)])
+            {
+                warnings.push(ProjectionWarning {
+                    code: ProjectionWarningCode::FactsDb,
+                    message: format!("append facts.db projection: {error}"),
+                });
+                return warnings;
+            }
+        }
+
+        match facts_from_store(&fact_store) {
+            Ok(after) => {
+                let exact = after
+                    .iter()
+                    .filter(|existing| existing.event_id == fact.event_id)
+                    .filter(|existing| {
+                        normalized_fact_value(existing, fact.seq).ok()
+                            == normalized_fact_value(fact, fact.seq).ok()
+                    })
+                    .count();
+                if exact != 1 {
+                    warnings.push(ProjectionWarning {
+                        code: ProjectionWarningCode::FactsDb,
+                        message: format!(
+                            "facts.db exact readback found {exact} rows for event_id {}; canonical fact remains committed",
+                            fact.event_id
+                        ),
+                    });
+                    return warnings;
+                }
+            }
+            Err(error) => {
+                warnings.push(ProjectionWarning {
+                    code: ProjectionWarningCode::FactsDb,
+                    message: format!("read back facts.db projection: {error}"),
+                });
+                return warnings;
+            }
+        }
         drop(fact_store);
-        // Refresh the reconcile sidecar while the flock is still held so the
-        // NEXT op stays on the O(1) fast path. The db and active segment each
-        // grew by exactly one event; remeasure both counts and re-fingerprint
-        // (cheap in file count). Best-effort: a miss just means the
-        // next op does one authoritative scan and re-seeds the sidecar.
+
         self.refresh_reconcile_cache_after_append(fact.seq);
-        // Both index refreshes are best-effort caches; swallow failures so a
-        // racing parallel writer never poisons the append path. Replay
-        // rebuilds them on next open from segments.
-        let _ = self.refresh_log_index();
-        let _ = self.refresh_index(fact.seq);
+        if let Err(error) = self.refresh_log_index() {
+            warnings.push(ProjectionWarning {
+                code: ProjectionWarningCode::LogIndex,
+                message: error.to_string(),
+            });
+        }
+        if let Err(error) = self.refresh_index(fact.seq) {
+            warnings.push(ProjectionWarning {
+                code: ProjectionWarningCode::ReconcileCache,
+                message: error.to_string(),
+            });
+        }
         if matches!(
             fact.kind,
             FactKind::Claim
@@ -2956,11 +3387,18 @@ impl DirectRoomStore {
                 | FactKind::Resolve
                 | FactKind::ClaimExpired
         ) {
-            let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
-            claim_authority::write_index_from_facts(&self.claim_index_path, &facts)
-                .map_err(|err| RallyError::Message(format!("write claim index: {err}")))?;
+            match facts_from_segments(&self.log_dir, &self.archive_dir).and_then(|facts| {
+                claim_authority::write_index_from_facts(&self.claim_index_path, &facts)
+                    .map_err(|error| RallyError::Message(format!("write claim index: {error}")))
+            }) {
+                Ok(()) => {}
+                Err(error) => warnings.push(ProjectionWarning {
+                    code: ProjectionWarningCode::ClaimIndex,
+                    message: error.to_string(),
+                }),
+            }
         }
-        Ok(fact)
+        warnings
     }
 
     /// After a successful single-event append, rebuild the reconcile sidecar
@@ -3043,38 +3481,11 @@ impl DirectRoomStore {
     /// Returns the verified `Fact` (with `seq` populated) on success.
     /// Returns `Err` with a clear message if the `event_id` is absent from
     /// the canonical segment record after write.
-    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<Fact> {
-        let appended = self.append_fact(fact)?;
-        let event_id = &appended.event_id;
-
-        // Fast path: the fact was JUST appended to the active segment, and it is
-        // the newest line there. Validate the whole active segment, then search
-        // its parsed entries tail-first. A valid tail must never hide completed
-        // corruption earlier in the canonical segment.
-        let active = self.active_segment_path();
-        if segment_event_id_present_tail_first(&active, event_id)? {
-            return Ok(appended);
-        }
-
-        // Slow path / true silent-drop detector: re-read EVERY canonical segment
-        // (live + archive) and scan for the exact event_id. If the active-first
-        // scan missed (e.g. the event landed in a different segment, or a silent
-        // drop occurred), this authoritative full scan is the final arbiter.
-        let live_segments = read_segment_files(&self.log_dir)?;
-        let archive_segments = read_segment_files(&self.archive_dir)?;
-
-        let found = segment_event_id_present(
-            live_segments.iter().chain(archive_segments.iter()),
-            event_id,
-        )?;
-
-        if !found {
-            return Err(RallyError::Message(format!(
-                "readback failed: {event_id} not found in canonical ledger after append"
-            )));
-        }
-
-        Ok(appended)
+    pub(crate) fn append_fact_verified(&self, fact: &Fact) -> Result<AppendOutcome> {
+        // O26's base append performs full event-id/seq/LedgerLine readback
+        // before it can construct AppendOutcome, so the old presence-only
+        // second pass is both weaker and redundant.
+        self.append_fact(fact)
     }
 
     /// For `release` and `resolve` facts: enforce that `--ref` names a live
@@ -3087,223 +3498,91 @@ impl DirectRoomStore {
     ///   blocker/risk/handoff/claim (no longer un-resolved after the write).
     ///
     /// Returns the verified `Fact` on success, or a loud error with the reason.
-    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<Fact> {
-        let ref_id = fact.ref_id.as_deref().ok_or_else(|| {
-            RallyError::Usage(format!(
-                "{} requires --ref <event-id> targeting a live fact; none provided",
-                fact.kind.as_str()
-            ))
-        })?;
-
-        // Assert the target is live BEFORE writing.
-        //
-        // The projection is taken INSIDE each arm that reads it, not once above
-        // the match. It used to be unconditional, so `ClaimExpired` and `Receipt`
-        // — whose arms are `_ => {}` — each paid a full `facts()` load plus the
-        // quadratic room projection TWICE per fact and used neither. That is
-        // what made the reaper unusable: 63 expired claims meant 126 discarded
-        // projections, and the pass could not finish inside the mutation
-        // watchdog. Keeping the call at its use site makes the two impossible to
-        // drift apart again (RC-058/RC-042).
-        match fact.kind {
-            FactKind::Release => {
-                let snapshot_before = self.snapshot()?;
-                // A release must reference an active claim (or resolve any fact by
-                // event_id).  We check the broader "is this event_id currently
-                // un-released" by looking at active_claims.
-                let is_live = snapshot_before
+    pub(crate) fn append_state_transition_verified(&self, fact: &Fact) -> Result<AppendOutcome> {
+        let ref_id = fact.ref_id.clone();
+        let mut outcome = self.append_fact(fact)?;
+        if !outcome.projection_complete {
+            return Ok(outcome);
+        }
+        let verification = (|| -> Result<()> {
+            let Some(ref_id) = ref_id.as_deref() else {
+                return Ok(());
+            };
+            let snapshot = self.snapshot()?;
+            let still_active = match fact.kind {
+                FactKind::Release => snapshot
                     .active_claims
                     .iter()
-                    .any(|c| c.event_id == ref_id);
-                if !is_live {
-                    return Err(RallyError::Usage(format!(
-                        "release failed: ref {ref_id} is not an active claim (already released, never existed, or invalid); nothing to release"
-                    )));
-                }
-                // ARP-R-02: the ownership gate that used to live here now runs
-                // in `write_authority::assert_claim_close_authorized`, called
-                // from `append_fact` for ALL FOUR kinds that close a claim.
-                // Two hand-copied call sites (here and the Resolve arm below)
-                // were how `Receipt` and `ClaimExpired` ended up ungated.
-            }
-            FactKind::Resolve => {
-                let snapshot_before = self.snapshot()?;
-                // Resolve must reference a live blocker, risk, handoff, claim,
-                // or an unconsumed artifact.  Artifacts are consumed by resolve
-                // (via the `consumed_refs` projection) which drops them from
-                // `unconsumed_artifacts`.
-                let open_handoff = snapshot_before
-                    .open_handoffs
-                    .iter()
-                    .find(|f| f.event_id == ref_id);
-                let is_live = snapshot_before
+                    .any(|candidate| candidate.event_id == ref_id),
+                FactKind::Resolve => snapshot
                     .active_blockers
                     .iter()
-                    .any(|f| f.event_id == ref_id)
-                    || snapshot_before
-                        .active_claims
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_before
-                        .open_handoffs
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_before
-                        .current_risks
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    // DI-1: system-health telemetry (risk-kind, split out of
-                    // current_risks) must remain resolvable by ref.
-                    || snapshot_before
-                        .system_health
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_before
-                        .unconsumed_artifacts
-                        .iter()
-                        .any(|f| f.event_id == ref_id);
-                if !is_live {
-                    return Err(RallyError::Usage(format!(
-                        "resolve failed: ref {ref_id} is not a live blocker, claim, handoff, risk, or unconsumed artifact (already resolved, never existed, or invalid); nothing to resolve"
-                    )));
-                }
-                // A Resolve naming a live CLAIM closes that claim exactly as a
-                // Release does, so it must clear the same authorization bar —
-                // and so must Receipt and ClaimExpired, which is why that bar
-                // now lives at the write boundary in `write_authority` instead
-                // of being asserted per-arm here (ARP-R-02).
-                if let Some(handoff) = open_handoff
-                    && !handoff_closer_matches_target(handoff, fact)
-                {
-                    let target = handoff.target.as_deref().unwrap_or("<untargeted>");
-                    let tool = fact.tool.as_deref().unwrap_or("<unknown>");
-                    return Err(RallyError::Usage(format!(
-                        "resolve failed: ref {ref_id} is targeted to {target}; tool {tool} cannot resolve it"
-                    )));
-                }
+                    .chain(snapshot.active_claims.iter())
+                    .chain(snapshot.open_handoffs.iter())
+                    .chain(snapshot.current_risks.iter())
+                    .chain(snapshot.system_health.iter())
+                    .chain(snapshot.unconsumed_artifacts.iter())
+                    .any(|candidate| candidate.event_id == ref_id),
+                _ => false,
+            };
+            if still_active {
+                return Err(RallyError::Message(format!(
+                    "{} projection readback left ref {ref_id} active",
+                    fact.kind.as_str()
+                )));
             }
-            _ => {}
+            Ok(())
+        })();
+        if let Err(error) = verification {
+            outcome.projection_complete = false;
+            outcome.warnings.push(ProjectionWarning {
+                code: ProjectionWarningCode::TransitionVerification,
+                message: error.to_string(),
+            });
+            crate::mark_watchdog_append_outcome(&outcome);
         }
-
-        // Write + canonical readback.
-        let appended = self.append_fact_verified(fact)?;
-
-        // Assert the projected status flipped. Same rule as above: taken inside
-        // the arms that read it.
-        match fact.kind {
-            FactKind::Release => {
-                let snapshot_after = self.snapshot()?;
-                let still_active = snapshot_after
-                    .active_claims
-                    .iter()
-                    .any(|c| c.event_id == ref_id);
-                if still_active {
-                    return Err(RallyError::Message(format!(
-                        "release readback failed: {ref_id} is still in active_claims after release — the release fact was recorded but the projection did not flip; this is a corruption signal"
-                    )));
-                }
-            }
-            FactKind::Resolve => {
-                let snapshot_after = self.snapshot()?;
-                let still_active = snapshot_after
-                    .active_blockers
-                    .iter()
-                    .any(|f| f.event_id == ref_id)
-                    || snapshot_after
-                        .active_claims
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_after
-                        .open_handoffs
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_after
-                        .current_risks
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_after
-                        .system_health
-                        .iter()
-                        .any(|f| f.event_id == ref_id)
-                    || snapshot_after
-                        .unconsumed_artifacts
-                        .iter()
-                        .any(|f| f.event_id == ref_id);
-                if still_active {
-                    return Err(RallyError::Message(format!(
-                        "resolve readback failed: {ref_id} is still active after resolve — the resolve fact was recorded but the projection did not flip; this is a corruption signal"
-                    )));
-                }
-            }
-            _ => {}
-        }
-
-        Ok(appended)
+        Ok(outcome)
     }
 
     pub(crate) fn append_session_fact_if_context(
         &self,
         fact: &Fact,
         expected_context_version: Option<u64>,
-    ) -> Result<Option<Fact>> {
+    ) -> Result<ConditionalAppendOutcome> {
         let room_dir = self
             .facts_db_path
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
-        reconcile_segments_and_db(
+        crate::write_authority::assert_field_bounds(fact)?;
+        let tail = inspect_active_segment_tail(&self.active_segment_path())?;
+        if resolve_canonical_event_id(
             &self.log_dir,
             &self.archive_dir,
-            &self.facts_db_path,
-            self.warm_fact_store.is_none(),
-        )?;
-        // Warm-pool facade (L11/R1/G10): warm reuse in daemon mode, per-op
-        // lenient open in direct mode (byte-identical to main — G1).
-        let fact_store = self.fact_store_handle(true)?;
-        let mut fact = fact.clone();
-        let logical_seq =
-            next_canonical_seq(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
-        fact.seq = logical_seq;
-        // Defense-in-depth dup gate (2026-07-02) — see append_fact.
-        if let Some(tail) = last_seq_in_segment(&self.active_segment_path())?
-            && fact.seq <= tail
+            fact,
+            &self.active_engagement,
+        )?
+        .is_some()
         {
-            return Err(RallyError::Message(format!(
-                "seq allocation conflict: allocated {} <= active segment tail {} — refusing to write a duplicate. Delete .rally/.reconcile-cache.json and retry.",
-                fact.seq, tail
-            )));
+            return self
+                .append_fact_under_lock(fact)
+                .map(ConditionalAppendOutcome::Applied);
         }
-        let payload =
-            serde_json::to_value(&fact).map_err(RallyError::json("render session fact"))?;
-        let result = fact_store.append_if(
-            vec![NewEvent::new("session", payload.clone())],
-            &FactQuery::for_event_types(["session"]),
-            expected_context_version,
-        );
-        match result {
-            Ok(result) => {
-                let _store_seq = i64::try_from(result.last_sequence_number).map_err(|err| {
-                    RallyError::Message(format!("sequence number overflow: {err}"))
-                })?;
-                append_segment_line(
-                    &self.active_segment_path(),
-                    &LedgerLine {
-                        seq: fact.seq,
-                        occurred_at: now_string(),
-                        event_type: "session".to_string(),
-                        payload,
-                        engagement: Some(self.active_engagement.clone()),
-                    },
-                )?;
-                crate::mark_watchdog_command_commit();
-                self.refresh_reconcile_cache_after_append(fact.seq);
-                let _ = self.refresh_log_index();
-                let _ = self.refresh_index(fact.seq);
-                Ok(Some(fact))
-            }
-            Err(EventStoreError::ConditionalAppendConflict { .. }) => Ok(None),
-            Err(err) => Err(RallyError::Message(format!("append session fact: {err}"))),
+        let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+        let current_context = facts
+            .iter()
+            .filter(|existing| existing.kind == FactKind::Session)
+            .map(|existing| u64::try_from(existing.seq).unwrap_or(u64::MAX))
+            .max();
+        if current_context != expected_context_version {
+            debug_assert_eq!(
+                tail,
+                inspect_active_segment_tail(&self.active_segment_path())?
+            );
+            return Ok(ConditionalAppendOutcome::NotApplied);
         }
+        self.append_fact_under_lock(fact)
+            .map(ConditionalAppendOutcome::Applied)
     }
 
     pub(crate) fn facts(&self) -> Result<Vec<Fact>> {
@@ -3416,7 +3695,7 @@ impl DirectRoomStore {
             uri: None,
             session: None,
         };
-        self.append_fact_verified(&renewal)?;
+        self.append_fact_verified(&renewal)?.into_fact_reporting();
         let facts = self.facts()?;
         Ok(claim_authority::active_claim_record(&facts, claim_id))
     }
@@ -3789,7 +4068,7 @@ impl DirectRoomStore {
             uri: None,
             session: None,
         };
-        let appended = self.append_fact(&fact)?;
+        let appended = self.append_fact(&fact)?.into_fact_reporting();
         Ok(Some(appended))
     }
 
@@ -4454,6 +4733,7 @@ struct SegmentFoldMemo {
 
 /// Forget the memo. Call from any path that rewrites a segment file without
 /// changing its length.
+#[cfg(test)]
 fn invalidate_segment_fold_memo() {
     if let Ok(mut memo) = SEGMENT_FOLD_MEMO.lock() {
         *memo = None;
@@ -6472,10 +6752,10 @@ fn seed_segments_from_db_if_absent(
 
     let db_stats = read_db_event_stats(facts_db_path, true)?;
     if db_stats.count > 0 {
-        seed_segment_from_db(log_dir, facts_db_path)?;
-        invalidate_segment_fold_memo();
-        refresh_reconcile_cache_after_full_scan(log_dir, archive_dir, facts_db_path, db_stats);
-        return Ok(());
+        return Err(RallyError::Usage(format!(
+            "current-format DB-only room detected at {}; automatic promotion is disabled. Preserve facts.db and run `rally doctor --migrate-db-only --engagement <label> --apply` while the daemon is stopped",
+            facts_db_path.display()
+        )));
     }
 
     let cache = ReconcileCache {
@@ -6572,15 +6852,10 @@ fn reconcile_segments_and_db(
     }
 
     if canonical_stats.count == 0 && db_stats.count > 0 {
-        // No segments yet but the db has events: first-run upgrade from a
-        // pre-segment install. Seed a segment so the canonical record exists.
-        seed_segment_from_db(log_dir, facts_db_path)?;
-        invalidate_segment_fold_memo();
-        // State just changed; let the next op re-fingerprint. Drop the sidecar.
-        if let Some(p) = reconcile_cache_path(facts_db_path) {
-            let _ = fs::remove_file(p);
-        }
-        return Ok(());
+        return Err(RallyError::Usage(format!(
+            "current-format DB-only room detected at {}; automatic promotion is disabled. Preserve facts.db and run `rally doctor --migrate-db-only --engagement <label> --apply` while the daemon is stopped",
+            facts_db_path.display()
+        )));
     }
 
     if canonical_stats != db_stats {
@@ -6737,8 +7012,19 @@ fn read_segment_entries_matching(
         }
 
         match serde_json::from_slice::<LedgerLine>(&bytes) {
-            Ok(entry) if include(&entry) => entries.push(entry),
-            Ok(_) => {}
+            Ok(entry) => {
+                validate_canonical_line(&entry).map_err(|error| {
+                    RallyError::Message(format!(
+                        "completed canonical segment corruption in {} at line {}: {}",
+                        path.display(),
+                        line_number,
+                        error
+                    ))
+                })?;
+                if include(&entry) {
+                    entries.push(entry);
+                }
+            }
             Err(_) if !had_newline => break,
             Err(err) => {
                 return Err(RallyError::Message(format!(
@@ -6759,6 +7045,7 @@ fn read_segment_entries_matching(
 /// Reads each line of each segment file; parses as `LedgerLine`; deserializes
 /// `payload` as a minimal struct that exposes `event_id`.  Uses the segment
 /// *files* as the authoritative source — never `facts.db`.
+#[cfg(test)]
 fn segment_event_id_present<'a>(
     paths: impl Iterator<Item = &'a PathBuf>,
     event_id: &str,
@@ -6787,6 +7074,7 @@ fn segment_event_id_present<'a>(
 /// the caller falls through to the authoritative full live+archive scan. A
 /// `true` here is a genuine presence (we matched the exact `event_id`) and all
 /// completed lines in the segment passed canonical validation.
+#[cfg(test)]
 fn segment_event_id_present_tail_first(path: &Path, event_id: &str) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
@@ -6871,31 +7159,13 @@ fn segment_seq_stats(live: &[PathBuf], archived: &[PathBuf]) -> Result<SeqStats>
     })
 }
 
-fn next_canonical_seq(log_dir: &Path, archive_dir: &Path, facts_db_path: &Path) -> Result<i64> {
-    let segments = read_segment_files(log_dir)?;
-    let archived = replay_archive_segments(archive_dir)?;
-    // Fast path ONLY when the sidecar's counts AND its segment fingerprint still
-    // match the on-disk segments — so the O(1) shortcut can never hand out a
-    // stale max regardless of caller order (defense-in-depth, 2026-07-02). The
-    // fingerprint compare is O(#files) stat, cheap; the fallback already reads
-    // these segments.
-    if let Some(cache) = read_reconcile_cache(facts_db_path)
-        && cache.canonical_count == cache.db_count
-        && cache.canonical_max_seq == cache.db_max_seq
-        && cache.canonical_max_seq >= 0
-        && cache.segments_fingerprint == segments_fingerprint(&segments, &archived)
-    {
-        return Ok(cache.canonical_max_seq + 1);
-    }
-    Ok(segment_seq_stats(&segments, &archived)?.max_seq + 1)
-}
-
 /// Highest `seq` currently written to a segment file (its on-disk tail), or
 /// `None` when the segment is absent/empty. Used as a defense-in-depth dup gate:
 /// an allocated seq must always exceed the active segment's tail, else we would
 /// write a duplicate that bricks segment replay. Reads the (per-engagement,
 /// typically small) active segment and validates every completed line before
 /// trusting the last entry.
+#[cfg(test)]
 fn last_seq_in_segment(segment_path: &Path) -> Result<Option<i64>> {
     if !segment_path.exists() {
         return Ok(None);
@@ -7124,6 +7394,7 @@ fn rebuild_db_from_segments(
 /// Seed a single segment file from the existing db when no segment exists
 /// yet. Used as a forward-compat path: a pre-R1 install that only had
 /// `facts.db` still ends up with a canonical segment record.
+#[allow(dead_code)]
 fn seed_segment_from_db(log_dir: &Path, facts_db_path: &Path) -> Result<()> {
     let store = open_fact_store(facts_db_path)?;
     let query = store
@@ -7159,6 +7430,7 @@ fn seed_segment_from_db(log_dir: &Path, facts_db_path: &Path) -> Result<()> {
 
 /// Append a single line to a segment file. Path/payload format identical to
 /// the R1 monolith; only the *location* moved.
+#[cfg(test)]
 fn append_segment_line(segment_path: &Path, entry: &LedgerLine) -> Result<()> {
     if let Some(parent) = segment_path.parent() {
         fs::create_dir_all(parent)
@@ -7180,6 +7452,63 @@ fn append_segment_line(segment_path: &Path, entry: &LedgerLine) -> Result<()> {
         .map_err(RallyError::io(format!("write {}", segment_path.display())))?;
     file.sync_data()
         .map_err(RallyError::io(format!("fsync {}", segment_path.display())))?;
+    Ok(())
+}
+
+/// Canonical-first append boundary used by O26 mutations. The caller has
+/// already installed `OutcomeUnknown` in the watchdog before entering here.
+/// Every error therefore preserves the stable event id and query remedy.
+fn append_canonical_line_and_readback(
+    segment_path: &Path,
+    entry: &LedgerLine,
+    rendered_record: &[u8],
+    event_id: &str,
+) -> Result<()> {
+    let parent = segment_path.parent().ok_or_else(|| {
+        RallyError::outcome_unknown(event_id, "canonical-parent", "segment path has no parent")
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        RallyError::outcome_unknown(event_id, "canonical-parent-create", error.to_string())
+    })?;
+    let created = !segment_path.exists();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(segment_path)
+        .map_err(|error| {
+            RallyError::outcome_unknown(event_id, "canonical-open", error.to_string())
+        })?;
+    file.write_all(rendered_record).map_err(|error| {
+        RallyError::outcome_unknown(event_id, "canonical-write", error.to_string())
+    })?;
+    file.sync_all().map_err(|error| {
+        RallyError::outcome_unknown(event_id, "canonical-sync", error.to_string())
+    })?;
+    if created {
+        sync_directory(parent).map_err(|error| {
+            RallyError::outcome_unknown(event_id, "canonical-parent-sync", error.to_string())
+        })?;
+    }
+
+    let entries = read_segment_entries(segment_path).map_err(|error| {
+        RallyError::outcome_unknown(event_id, "canonical-readback", error.to_string())
+    })?;
+    let exact_matches = entries
+        .iter()
+        .filter(|observed| {
+            observed.seq == entry.seq
+                && observed.event_type == entry.event_type
+                && observed.payload == entry.payload
+                && observed.engagement == entry.engagement
+        })
+        .count();
+    if exact_matches != 1 {
+        return Err(RallyError::outcome_unknown(
+            event_id,
+            "canonical-readback",
+            format!("expected exactly one full event_id/seq row, found {exact_matches}"),
+        ));
+    }
     Ok(())
 }
 
@@ -9290,7 +9619,7 @@ mod ledger_tests {
         // What this test actually asserts is projection ORDER, not authority,
         // so it is set to a self-release and its real assertion is unchanged.
         release.tool = Some("tool-a".to_string());
-        release.ref_id = Some(old_claim.event_id);
+        release.ref_id = Some(old_claim.event_id.clone());
         store.append_state_transition_verified(&release).unwrap();
         let later_claim = claim_fact(
             "claim-later",
@@ -9330,7 +9659,9 @@ mod ledger_tests {
                     "2099-01-01T00:00:00Z",
                 );
                 barrier.wait();
-                store.append_fact_verified(&fact).map(|f| f.event_id)
+                store
+                    .append_fact_verified(&fact)
+                    .map(|outcome| outcome.fact.event_id)
             }));
         }
 
@@ -11673,7 +12004,7 @@ mod ledger_tests {
             let f = store
                 .append_fact(&make_fact(&format!("e{i}"), FactKind::Claim, "src/", "f"))
                 .unwrap();
-            ids.push(f.event_id);
+            ids.push(f.event_id.clone());
         }
         assert_eq!(store.facts().unwrap().len(), 4);
         drop(store);
@@ -11795,7 +12126,7 @@ mod ledger_tests {
                     &format!("fact {i} padding to force many sqlite pages"),
                 ))
                 .unwrap();
-            ids.push(fact.event_id);
+            ids.push(fact.event_id.clone());
         }
         assert_eq!(store.facts().unwrap().len(), 800);
         drop(store);
@@ -12957,12 +13288,7 @@ mod ledger_tests {
     fn o26_same_event_id_different_payload_conflicts_without_mutation() {
         let root = unique_root("o26-same-id-conflict");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
-        let candidate = make_fact(
-            "o26-conflicting-id",
-            FactKind::Decision,
-            "src/",
-            "original",
-        );
+        let candidate = make_fact("o26-conflicting-id", FactKind::Decision, "src/", "original");
         store.append_fact(&candidate).unwrap();
         let segment = store.active_segment_path();
         let canonical_before = fs::read(&segment).unwrap();

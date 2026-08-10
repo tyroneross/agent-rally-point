@@ -218,7 +218,9 @@ pub(crate) fn route_findings(
         uri: None,
         session: None,
     };
-    let summary_appended = room.append_fact_verified(&summary_fact)?;
+    let summary_appended = room
+        .append_fact_verified(&summary_fact)?
+        .into_fact_reporting();
 
     Ok(RoutingSummary {
         findings_total: total,
@@ -269,7 +271,7 @@ mod tests {
             uri: None,
             session: None,
         };
-        room.append_fact_verified(&fact).unwrap()
+        room.append_fact_verified(&fact).unwrap().fact
     }
 
     #[test]
