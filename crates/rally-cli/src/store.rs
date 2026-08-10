@@ -8432,16 +8432,33 @@ fn read_db_event_stats(facts_db_path: &Path, allow_cache_replacement: bool) -> R
 /// alone would miss them because their numeric representation is `267`,
 /// `523`, etc. (not `11`). Their messages all carry the word `"corrupt"`
 /// from SQLite's `sqlite3_errstr` table.
+///
+/// # The self-triggering hazard this guards (RC-044, second-order)
+///
+/// Every quarantine file this module writes is literally named
+/// `facts.db.corrupt.<UTC_NS>`, and SQLite/sqlx errors routinely embed the
+/// database path. A bare `msg.contains("corrupt")` therefore reads *our own
+/// quarantine filename* as a corruption report: an ordinary I/O error that
+/// merely NAMES a quarantine path — which is exactly what a process hitting
+/// leftover debris produces — self-triggers another destructive rename of a
+/// database nobody showed to be damaged. Blank the filename token before the
+/// word test so only SQLite's own wording can match. The numeric-code and
+/// human-message checks are untouched; none of them collide with a path.
 fn is_malformed_db_error(err: &impl std::fmt::Display) -> bool {
     let msg = err.to_string();
+    // Neutralize our own `.corrupt.<stamp>` quarantine filenames before the
+    // word-match below; see the doc comment. `.corrupt.` is the exact infix
+    // written by `quarantine_corrupt_db`, and SQLite never emits the word with
+    // a dot on both sides, so this cannot mask a real corruption message.
+    let scrubbed = msg.replace(".corrupt.", ".<quarantined>.");
     // Match "code: 11)" with closing paren to avoid false positive on "code: 110"
     // (SQLite does not emit code 110, but the substring "code: 11" would match it).
     // "code: 26)" is already unambiguous but gets the same treatment for consistency.
-    msg.contains("code: 11)")
-        || msg.contains("code: 26)")
-        || msg.contains("disk image is malformed")
-        || msg.contains("file is not a database")
-        || msg.contains("corrupt")
+    scrubbed.contains("code: 11)")
+        || scrubbed.contains("code: 26)")
+        || scrubbed.contains("disk image is malformed")
+        || scrubbed.contains("file is not a database")
+        || scrubbed.contains("corrupt")
 }
 
 /// Rename a corrupt `facts.db` (plus its `-shm` / `-wal` siblings) to
@@ -11510,6 +11527,46 @@ mod ledger_tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// RC-044 second-order hazard: an error that merely NAMES a quarantine file
+    /// must not be read as a corruption report.
+    ///
+    /// Every quarantine file is named `facts.db.corrupt.<stamp>`, and SQLite
+    /// errors routinely embed the database path. Under the previous bare
+    /// `contains("corrupt")` an ordinary I/O error mentioning leftover debris
+    /// triggered another destructive rename — a quarantine that manufactures the
+    /// evidence for the next quarantine. This is the one arm of the RC-044
+    /// cascade that is a self-contained defect rather than a concurrency
+    /// property, so it is fixed and tested independently of the open
+    /// architectural work.
+    #[test]
+    fn quarantine_filename_in_an_error_is_not_a_corruption_report() {
+        assert!(
+            !is_malformed_db_error(
+                &"error returned from database: (code: 522) disk I/O error while reading \
+                  /repo/.rally/facts.db.corrupt.1786158756577960000"
+                    .to_string()
+            ),
+            "an I/O error naming a quarantine file is not a corruption report"
+        );
+        assert!(
+            !is_malformed_db_error(
+                &"cannot open /repo/.rally/facts.db.corrupt.1786158756577960000-db-wal".to_string()
+            ),
+            "a quarantine sibling path is not a corruption report either"
+        );
+        // The real signals still fire, including the extended-code family
+        // (SQLITE_CORRUPT_VTAB/SEQUENCE/INDEX) whose only marker is the word.
+        assert!(is_malformed_db_error(
+            &"error returned from database: (code: 11) disk image is malformed".to_string()
+        ));
+        assert!(is_malformed_db_error(
+            &"database corruption at line 12345".to_string()
+        ));
+        assert!(is_malformed_db_error(
+            &"error returned from database: (code: 26) file is not a database".to_string()
+        ));
     }
 
     #[test]

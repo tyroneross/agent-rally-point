@@ -1373,29 +1373,84 @@ review answers the question you asked.
   buckets. Registered so the invisibility is on the record.
 - **Fix shape:** filter reserved-fixture segments on read as well as write.
 
-### RC-044 — first-run `rally enter` corrupts the fact store under 6-way concurrency
-- **State:** `observed`, with a mechanism proposed by an independent review. **NOT fixed. NOT
-  reproduced by me.**
-- **Evidence (peer-run):** 6-way concurrent first-run `rally enter` on a fresh room → 2 failures in
-  36 runs (~5%): `append fact: backend failure: error returned from database: (code: 522) disk I/O
-  error`. 2-way was 0/16. Consistent with the 35 quarantined `facts.db.corrupt.*` files present in
-  this repo.
-- **Proposed mechanism:** `acquire_room_mutation_lock` is scoped to a single call, but the SQLite
-  pools OUTLIVE it (closed at Drop, `store.rs:830-845`, whose own comment admits connections escape
-  locked windows), and the owner lock is `LOCK_SH` for direct openers so CLIs do not exclude each
-  other. Process A quarantines `facts.db` and rebuilds at the same path while process B holds the old
-  inode; SQLite resolves `-wal` BY PATH, so B's frames land in the NEW database's WAL carrying old
-  page images → `SQLITE_CORRUPT` → another quarantine → cascade. Quarantines do cluster in time
-  (Jul 26 22:09/22:15; Jul 30 15:30/16:11/16:27) and `-db-shm` siblings are present in some sets and
-  absent in others, which fits.
-- **Second-order hazard:** `is_malformed_db_error` substring-matches "corrupt" anywhere in the error
-  text, and every quarantine filename literally contains `.corrupt.` — so an error carrying a
-  quarantine path self-triggers another destructive rename.
+### RC-044 — concurrent fact-store access corrupts `facts.db`, and the recovery path is the generator
+- **State:** ⚠️ `reproduced`; mechanism confirmed against on-disk bytes. **NOT fixed** — the
+  remaining fix is an architectural decision and is escalated (see "Why this is not fixed here").
+  One arm — the self-triggering substring — is a self-contained defect and IS fixed and tested.
+- **Reproduction (2026-08-07):** `scripts/repro_facts_db_corruption.sh [TRIALS] [WAYS] [OPS]`.
+  First-run `enter` alone does NOT reproduce it: 20/20 trials clean apart from legitimate lead-seat
+  refusals, which is why the original peer-run read as ~5% noise. What reproduces it is **concurrent
+  mutation of an ESTABLISHED room** — seed ~40 facts, then 6 workers × 10 × (`say` + `room`). That
+  produces quarantines in most rounds, including the 3- and 4-in-one-round bursts matching the
+  production clusters, plus the same `(code: 522) disk I/O error` the peer-run saw.
+- **The quarantined bytes are GENUINELY corrupt — not false positives.** `PRAGMA integrity_check` on
+  production snapshots (`.rally/facts.db.corrupt.1785832195748398000`, `…1785739639550291000`,
+  `~/.rally/…1785199526792145000`) reports `2nd reference to page N`, `Rowid N out of order`,
+  `Child page depth differs`, `wrong # of entries in index idx_events_type`. A page referenced twice
+  within one b-tree is the signature of **two writers allocating the same page** — SQLite's
+  cross-process locking defeated, not media failure. Freshly-reproduced snapshots are starker: they
+  begin with a b-tree leaf page (`0a 00 00 00 …`) where page 1's file header belongs, i.e. the
+  header page was overwritten by a page belonging to a *different* database.
+- **Confirmed mechanism — recovery generates the corruption it responds to.**
+  `rebuild_db_from_segments` unlinks `facts.db`, `-wal` and `-shm` and recreates the database in
+  place (`store.rs:5559-5561`); `quarantine_corrupt_db` renames the same live path
+  (`store.rs:5484-5497`). Both mutate a path that peer processes hold open, which SQLite forbids.
+  `acquire_room_mutation_lock` cannot prevent it: the lock serializes *mutations*, but a peer merely
+  **holding an open pool** is not mutating, and `DirectRoomStore` keeps its pool alive for the whole
+  command (`store.rs:1701,1742`). SQLite resolves `-wal`/`-shm` **by path**, so once two inodes live
+  behind one path, one process's page images are checkpointed into the other's database — exactly
+  the duplicate-page damage measured above. Each recovery seeds the next corruption, which is why
+  the debris recurs weekly and each snapshot is larger than the last (3.7 MB → 6.1 MB, Jun→Aug 2026).
+  This upgrades the previously *proposed* mechanism to *confirmed*.
+- **The version-mismatch correlation is falsified as the cause.** The debris was attributed to the
+  mixed-binary window around `RALLY-VERSION-MISMATCH-ASSESSMENT-2026-07-01.md`. The repo carries
+  **18+ snapshot sets running through 2026-08-04** — long after that window closed, on one binary
+  version — and the harness reproduces it on a single freshly-built binary.
+- **Evidence (peer-run, original):** 6-way concurrent first-run `rally enter` → 2 failures in 36 runs
+  (~5%): `(code: 522) disk I/O error`. 2-way was 0/16.
+- **Second-order hazard — FIXED (this change).** `is_malformed_db_error` substring-matched "corrupt"
+  anywhere in the error text, and every quarantine filename literally contains `.corrupt.`, so an
+  ordinary I/O error naming leftover debris self-triggered another destructive rename — a quarantine
+  that manufactures the evidence for the next one. The matcher now blanks the `.corrupt.` filename
+  token before the word test; the numeric-code and human-message signals are untouched. Covered by
+  `quarantine_filename_in_an_error_is_not_a_corruption_report`.
 - **Losslessness is intact:** segments are canonical, quarantine renames rather than deletes, rebuild
-  replays from JSONL. No data-loss path found.
-- **Fix shape:** hold the mutation lock for the LIFETIME of any open pool, or make the owner lock
-  `LOCK_EX` for direct openers. **Do not claim fixed without N-consecutive evidence** — per the
-  standing rule that a flaky gate certifies failures.
+  replays from JSONL. No data-loss path found. The damage is to the derived cache and to trust in it.
+- **Measured: gating the RESPONSE does not work — do not retry this shape.** A candidate fix that
+  re-probed the database before quarantining (open + full read; destroy only on a `Corrupt` verdict,
+  never on `Unproven`) was implemented and A/B'd at 20 trials × 6-way against the same binary
+  otherwise unchanged:
+
+  | metric | baseline | with probe gate |
+  |---|---|---|
+  | dirty rounds | 13/20 | 16/20 |
+  | hard failures | 29 | 17 (−41%) |
+  | quarantine files | 20 | 26 (**+30%**) |
+
+  Quarantines — the metric the work order targets — got **worse**. The probe adds one more
+  read-write open on precisely the contended path, and by the time it runs the database really is
+  damaged, so it confirms corruption rather than declining it. Reverted. The lesson generalizes: no
+  gate on the *response* to corruption can fix the *generation* of corruption.
+- **Why this is not fixed here (escalated).** Both fix shapes are product-architecture decisions, not
+  mechanical changes:
+  1. *Serialize everything* — hold the mutation lock for the lifetime of any open pool, or make the
+     owner lock `LOCK_EX` for direct openers. Correct, and it trades away concurrent multi-agent
+     database access, which is the tool's core value proposition.
+  2. *Shared lease + exclusive recovery* — every opener holds `LOCK_SH` on a lease file for its
+     pool's lifetime; recovery takes `LOCK_EX`, which drains readers first. Preserves concurrency,
+     but requires (a) interior mutability in `DirectRoomStore` so a store can drop its own pool
+     before requesting `LOCK_EX` (today's fields sit behind `&self`), (b) a lock-ordering discipline
+     against `RoomMutationLock`, and (c) **a daemon recovery protocol** — `rallyd`'s warm pool is
+     held for its entire serving lifetime, so an exclusive lease would otherwise block recovery
+     until the daemon exits.
+  Either path rewires documented invariants (G1 byte-identity for the direct path, G7's
+  process-global SH guard, G10's cold-open probe, R1's warm pool), all of which are test-guarded.
+  Choosing between them is a product call about rally's concurrency model.
+- **Fix shape + acceptance:** whichever path is chosen, acceptance is
+  `scripts/repro_facts_db_corruption.sh 20 6 10` reporting **0 quarantine files and 0 bad
+  integrity_check**, N-consecutive. **Do not claim fixed without that evidence** — per the standing
+  rule that a flaky gate certifies failures. The harness now makes that rule enforceable; before it,
+  there was nothing to run.
 
 ### RC-045 — smaller adoption defects found in the same sweep
 - **State:** `observed`. **NOT fixed.** Grouped because each is small; none is dismissed.

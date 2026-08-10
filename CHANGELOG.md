@@ -17,6 +17,37 @@ All notable changes to Agent Rally Point are documented here.
   round-trips every variant's real serde output back through `parse`, so the next variant
   whose wire spelling and match arm disagree fails in CI rather than at a caller's prompt.
 
+### `facts.db` corruption (RC-044) — reproduced and diagnosed; one arm fixed, the rest escalated
+
+- **A quarantine no longer triggers itself.** `is_malformed_db_error` substring-matched
+  `"corrupt"` anywhere in an error, and every quarantine file is literally named
+  `facts.db.corrupt.<stamp>` — so an ordinary I/O error that merely *named* leftover debris
+  was read as a corruption report and renamed a live database out from under whoever held it
+  open. The matcher now blanks the `.corrupt.` filename token before the word test; SQLite's
+  numeric codes and human messages are matched exactly as before. (RC-044, second-order arm)
+
+- **New: `scripts/repro_facts_db_corruption.sh`** — the reproduction RC-044 lacked. First-run
+  `enter` does *not* reproduce the fault (20/20 clean); concurrent mutation of an established
+  room does, yielding the same multi-quarantine bursts and `(code: 522) disk I/O error` seen in
+  production. RC-044's standing rule — no fix claim without N-consecutive evidence — is now
+  enforceable rather than aspirational.
+
+- **Diagnosis, recorded in `docs/ROOT-CAUSE-REGISTER.md`.** `PRAGMA integrity_check` on the
+  accumulated snapshots shows genuine structural damage (`2nd reference to page N`, rowid
+  disorder, index/table divergence) — the signature of two writers allocating one page, i.e.
+  SQLite's cross-process locking defeated. The recovery path itself is the generator: unlinking
+  and renaming a live `facts.db` while peers hold it open, with `-wal`/`-shm` resolved by path,
+  cross-wires two databases through one WAL. Each recovery seeds the next corruption. The
+  previously suspected binary-version mismatch is **falsified** — the debris continues through
+  2026-08-04 on a single version.
+
+- **Not fixed, and deliberately so:** the remaining fix is a product decision about rally's
+  concurrency model (serialize all database access, versus a shared-lease/exclusive-recovery
+  scheme that additionally needs a daemon recovery protocol). A candidate response-side fix —
+  gating quarantine on a re-probe — was built and measured, made quarantines **30% worse**, and
+  was reverted; the A/B is recorded so the shape is not retried. `rally doctor --sweep-corrupt`
+  remains the supported way to clear accumulated debris in the meantime.
+
 ## v0.2.1 - 2026-08-07
 
 ### Ledger — one additive schema change, called out because the version number understates it
