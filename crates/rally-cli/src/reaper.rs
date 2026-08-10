@@ -1670,6 +1670,143 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    #[test]
+    fn expired_lease_authorizes_typed_cleanup_but_not_an_ordinary_peer_release() {
+        let root = unique_root("typed-expiry-authority");
+        init_observed_worktree(&root);
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        let expired = past_ts(3600);
+
+        // A live external observer is a veto. Lease expiry alone must not turn
+        // an ordinary peer Release into owner authority.
+        append_observed_presence_for_session(
+            &room,
+            "live-owner",
+            "session-live",
+            &root,
+            std::process::id(),
+        );
+        let live_claim = append_session_claim_with_lease(
+            &room,
+            "claim-live-expired",
+            "live-owner",
+            "session-live",
+            &expired,
+        );
+        let before_release = room.facts().unwrap().len();
+        let peer_release = Fact {
+            from_session_id: Some("session-peer".to_string()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: "release-peer-expired".to_string(),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Release,
+            tool: Some("peer".to_string()),
+            role: None,
+            subject: "ordinary peer release".to_string(),
+            scope: live_claim.scope.clone(),
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: Some(live_claim.event_id.clone()),
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&peer_release)
+            .expect_err("expired lease alone must not authorize an ordinary peer Release");
+        assert_eq!(
+            room.facts().unwrap().len(),
+            before_release,
+            "refused peer Release must not append"
+        );
+        assert!(
+            room.snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|claim| claim.event_id == live_claim.event_id),
+            "live observed claim must survive the refused peer Release"
+        );
+
+        // Full/operator mode may still emit the typed ClaimExpired transition
+        // for an expired claim whose observation is Unknown.
+        let manual_claim = append_session_claim_with_lease(
+            &room,
+            "claim-manual-expired",
+            "manual-owner",
+            "session-manual",
+            &expired,
+        );
+        let manual = run_reap_stale_in_room_with_mode(&room, true, ReapMode::Full).unwrap();
+        assert_eq!(
+            manual
+                .claims_reaped
+                .iter()
+                .map(|entry| entry.claim_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![manual_claim.event_id.as_str()]
+        );
+
+        // Automatic cleanup retains its stronger exact-Stale requirement.
+        append_observed_presence_for_session(
+            &room,
+            "dead-owner",
+            "session-dead",
+            &root,
+            2_000_000_000,
+        );
+        let dead_claim = append_session_claim_with_lease(
+            &room,
+            "claim-auto-expired",
+            "dead-owner",
+            "session-dead",
+            &expired,
+        );
+        let automatic = run_reap_stale_in_room_with_mode(&room, true, ReapMode::LeaseOnly).unwrap();
+        assert_eq!(
+            automatic
+                .claims_reaped
+                .iter()
+                .map(|entry| entry.claim_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![dead_claim.event_id.as_str()]
+        );
+
+        let facts = room.facts().unwrap();
+        for (claim_id, reason, observed) in [
+            (manual_claim.event_id.as_str(), "lease-expired", "unknown"),
+            (
+                dead_claim.event_id.as_str(),
+                "owner-stale+lease-expired",
+                "stale",
+            ),
+        ] {
+            let expiry = facts
+                .iter()
+                .find(|fact| {
+                    fact.kind == FactKind::ClaimExpired && fact.ref_id.as_deref() == Some(claim_id)
+                })
+                .expect("typed cleanup must append ClaimExpired");
+            assert_eq!(expiry.tool.as_deref(), Some("rally"));
+            assert!(
+                expiry
+                    .evidence
+                    .iter()
+                    .any(|item| item == &format!("reaper:reason={reason}"))
+            );
+            assert!(
+                expiry
+                    .evidence
+                    .iter()
+                    .any(|item| item == &format!("reaper:observed={observed}"))
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
     /// Auto-reap must be OFF unless someone opts in. It shipped on for one
     /// commit and an audit measured 8/8 concurrent `rally enter` failures plus
     /// live agents' claims being closed; flipping the default back on without

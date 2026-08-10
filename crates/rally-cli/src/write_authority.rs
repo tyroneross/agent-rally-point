@@ -83,7 +83,7 @@
 use crate::claim_authority;
 use crate::error::{RallyError, Result};
 use crate::hooks_config::CoordinationConfig;
-use crate::store::{Fact, RoomSnapshot};
+use crate::store::{Fact, FactKind, RoomSnapshot};
 
 /// Evidence marker recording a deliberate, operator-acknowledged lead seizure.
 /// See [`assert_lead_transfer_authorized`] for what this does and does not mean.
@@ -199,16 +199,12 @@ fn assert_identity_fields_are_single_line(fact: &Fact) -> Result<()> {
 ///    `last_seen_ts` is missing or unparseable is never reclaimable). This is
 ///    the same authority `command_release_by_path` already applied, reused
 ///    rather than re-implemented, so there is one policy and not two.
-/// 3. **Expired lease.** The claim's own `lease_expires_at:` marker is in the
-///    past. This arm exists because the reaper must be able to close a
-///    lease-expired claim whose owner is still live, and `claim_reclaim_eligible`
-///    measures owner silence only, so arm 2 would refuse it.
-///
-///    Note what arm 3 reads. It reads a bound the CLAIM declared about ITSELF,
-///    not an assertion by the actor closing it. That distinction is the whole
-///    reason this arm is safe: the reaper stamps `reaper:reason=` and
-///    `reaper:owner=` evidence on its closes, and if this gate honored those
-///    markers instead, a rogue would simply stamp them. It does not read them.
+/// 3. **Typed expired-lease cleanup.** Lease expiry is a cleanup signal, not
+///    peer authority. Only a `ClaimExpired` transition shaped by the reaper may
+///    use it. The transition must carry the claim ref, owner/session, reason,
+///    and external-observation verdict that the store revalidates under the
+///    mutation lock. An ordinary `Release`, `Resolve`, or `Receipt` never gains
+///    authority solely because time passed.
 ///
 /// A ref naming no active claim is not this gate's business and passes through.
 fn assert_claim_close_authorized(
@@ -237,12 +233,15 @@ fn assert_claim_close_authorized(
     ) {
         return Ok(());
     }
+    let typed_lease_expiry =
+        is_typed_reaper_lease_expiry(fact, claim) && claim_lease_expired(claim);
     // 2. Stale-owner takeover.
     let (takeover_eligible, size) = snapshot.claim_reclaim_eligible(claim, coord);
     // A sibling process sharing the same tool label is not an external peer.
     // Never let that label alias another session's ownership, even after the
     // stale/lease windows; an explicit reaper fact remains a different actor.
-    if claim.from_session_id.is_some()
+    if !typed_lease_expiry
+        && claim.from_session_id.is_some()
         && claim_authority::same_nonblank_tool(claim.tool.as_deref(), fact.tool.as_deref())
     {
         let actor = fact.tool.as_deref().unwrap_or("<unknown>");
@@ -254,8 +253,9 @@ fn assert_claim_close_authorized(
     if takeover_eligible {
         return Ok(());
     }
-    // 3. The claim's own declared lease has run out.
-    if claim_lease_expired(claim) {
+    // 3. The reaper/operator path presented a typed, under-lock-verifiable
+    // ClaimExpired transition for a lease that has actually run out.
+    if typed_lease_expiry {
         return Ok(());
     }
 
@@ -267,18 +267,49 @@ fn assert_claim_close_authorized(
     };
     Err(RallyError::Usage(format!(
         "{} failed: claim {ref_id} is owned by {owner} and {actor} is not the owner. \
-         A non-owner may only close a claim whose owner has been silent for \
-         {timeout_minutes} minutes, or whose lease has expired; {owner} is still active and \
-         its lease is live. Ask {owner} to release it, or wait out the reclaim window.",
+         An ordinary non-owner close is allowed only after the owner has been silent for \
+         {timeout_minutes} minutes; lease expiry is reserved for typed ClaimExpired cleanup. \
+         Ask {owner} to release it, wait out the reclaim window, or run the reaper/operator \
+         cleanup path.",
         fact.kind.as_str()
     )))
+}
+
+fn reaper_marker<'a>(fact: &'a Fact, key: &str) -> Option<&'a str> {
+    let prefix = format!("reaper:{key}=");
+    fact.evidence
+        .iter()
+        .find_map(|item| item.strip_prefix(&prefix))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Does this fact carry the typed evidence that routes lease expiry through
+/// the store's under-lock reaper checks?
+fn is_typed_reaper_lease_expiry(fact: &Fact, claim: &Fact) -> bool {
+    if fact.kind != FactKind::ClaimExpired || fact.tool.as_deref() != Some("rally") {
+        return false;
+    }
+    let Some(ref_id) = fact.ref_id.as_deref() else {
+        return false;
+    };
+    let expected_owner = claim.tool.as_deref().unwrap_or("unknown");
+    let expected_session = claim.from_session_id.as_deref().unwrap_or("legacy");
+    reaper_marker(fact, "ref_id") == Some(ref_id)
+        && matches!(
+            reaper_marker(fact, "reason"),
+            Some("lease-expired" | "owner-stale+lease-expired")
+        )
+        && reaper_marker(fact, "owner") == Some(expected_owner)
+        && reaper_marker(fact, "owner_session") == Some(expected_session)
+        && matches!(reaper_marker(fact, "observed"), Some("stale" | "unknown"))
 }
 
 /// Has this claim's own `lease_expires_at:` marker passed?
 ///
 /// Fail-CLOSED on an absent or unparseable marker: "I could not read the lease"
 /// must not mean "the lease is over". A claim with no lease marker is never
-/// closable by this arm — arms 1 and 2 still apply.
+/// closable by this arm — self-close and stale-owner takeover still apply.
 fn claim_lease_expired(claim: &Fact) -> bool {
     const PREFIX: &str = "lease_expires_at:";
     claim

@@ -2301,22 +2301,26 @@ impl DirectRoomStore {
                             .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
                             .is_some_and(|expires| expires <= chrono::Utc::now())
                     });
-                let observed_still_stale =
-                    if Self::reaper_marker(&fact.evidence, "observed") == Some("stale") {
-                        active_claim.is_some_and(|claim| {
-                            observed_sessions
-                                .for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref())
-                                == crate::observed_liveness::ObservedLiveness::Stale
-                        })
-                    } else {
-                        true
-                    };
+                let observation_still_permits_cleanup = active_claim.is_some_and(|claim| {
+                    let current = observed_sessions
+                        .for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref());
+                    match Self::reaper_marker(&fact.evidence, "observed") {
+                        Some("stale") => {
+                            current == crate::observed_liveness::ObservedLiveness::Stale
+                        }
+                        Some("unknown") => {
+                            current == crate::observed_liveness::ObservedLiveness::Unknown
+                        }
+                        _ => false,
+                    }
+                });
                 // If the claim is already closed, allow the append and let the
                 // projection deduplicate it. If it is still active, at least
                 // one of the reasons computed by the unlocked pass must remain
                 // true under this lock.
                 if active_claim.is_some()
-                    && ((!owner_still_stale && !lease_still_expired) || !observed_still_stale)
+                    && ((!owner_still_stale && !lease_still_expired)
+                        || !observation_still_permits_cleanup)
                 {
                     return Err(RallyError::Usage(format!(
                         "reap refused: claim {ref_id} is no longer eligible under the mutation \
@@ -10845,7 +10849,9 @@ mod sec001_takeover_guard_tests {
         f.evidence = vec![
             format!("reaper:ref_id={claim_id}"),
             format!("reaper:reason={reason}"),
+            "reaper:observed=unknown".to_string(),
             format!("reaper:owner={owner}"),
+            "reaper:owner_session=legacy".to_string(),
         ];
         f
     }
@@ -11007,6 +11013,9 @@ mod sec001_takeover_guard_tests {
             reaper_claim_expired("claim-session-owner", "shared-tool", "lease-expired");
         expired
             .evidence
+            .retain(|item| !item.starts_with("reaper:owner_session="));
+        expired
+            .evidence
             .push("reaper:owner_session=session-sibling".to_string());
         let err = store.append_fact(&expired).unwrap_err().to_string();
         assert!(
@@ -11066,6 +11075,9 @@ mod sec001_takeover_guard_tests {
             .append_fact(&observed_presence("presence-dead", 2_000_000_000))
             .unwrap();
         let mut expired = reaper_claim_expired("claim-observed", "owner", "lease-expired");
+        expired
+            .evidence
+            .retain(|item| !item.starts_with("reaper:observed="));
         expired.evidence.push("reaper:observed=stale".to_string());
 
         // The same session posts a newer stamp whose externally observed host
