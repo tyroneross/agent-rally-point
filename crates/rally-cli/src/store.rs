@@ -803,8 +803,9 @@ pub(crate) struct RoomSnapshot {
 /// byte-identical to what it was.
 ///
 /// Every field is `#[serde(default)]` for additive changes within a compatible
-/// wire version. A v1 daemon that predates this struct is rejected by the v2
-/// identity probe; it must never route a client with empty internals.
+/// wire version. The v3 identity probe rejects every older daemon before
+/// routing; that boundary both protects these internals and prevents claim
+/// renewal from falling back to a daemon that predates caller-session authority.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct SnapshotInternals {
     #[serde(default)]
@@ -896,8 +897,9 @@ pub(crate) fn snapshot_to_wire_value(
 /// Deserialize a wire snapshot, restoring [`SnapshotInternals`] if present.
 ///
 /// A payload without the key yields defaults only for additive compatibility
-/// within the current wire version. The identity probe rejects v1 daemons
-/// before this decoder runs.
+/// within wire v3. The identity probe rejects older daemons before this decoder
+/// runs, including daemons that would synthesize renewal authority from claim
+/// id.
 pub(crate) fn snapshot_from_wire_value(
     mut value: Value,
 ) -> std::result::Result<RoomSnapshot, serde_json::Error> {
@@ -1204,7 +1206,6 @@ impl From<&RoomSnapshot> for RoomSummary {
 ///   facts                                → Facts
 ///   rebuild_claim_index                  → RebuildClaimIndex
 ///   renew_claim_lease                    → RenewClaimLease
-///   expire_claim_leases_at               → ExpireClaimLeasesAt
 ///   session_facts_with_context_version   → SessionFactsWithContextVersion
 ///   snapshot / snapshot_with_archived    → SnapshotWithArchived
 ///   snapshot_with_readers_archived       → SnapshotWithReadersArchived
@@ -1356,10 +1357,10 @@ impl Drop for DirectRoomStore {
     }
 }
 
-/// RAII guard for either ownership lock. It holds a `flock` for as long as the
+/// RAII guard for a named advisory lock. It holds a `flock` for as long as the
 /// guard lives; the kernel also releases it on process death. Direct routing
 /// retains both its direct EX guard and daemon-exclusion SH guard in the
-/// process-global table.
+/// process-global table; automatic reaping holds its guard for one pass.
 ///
 /// Reuses the same hand-declared `extern "C"` flock pattern as
 /// [`RoomMutationLock`] (no `nix` crate). Constructed by Chunk C's router (SH)
@@ -1381,9 +1382,9 @@ impl Drop for OwnerGuard {
     }
 }
 
-/// Open (creating if absent) an ownership lock file at `rally_dir`.
+/// Open (creating if absent) an advisory lock file at `rally_dir`.
 #[cfg(unix)]
-fn open_named_owner_lock_file(rally_dir: &Path, filename: &str) -> Result<fs::File> {
+fn open_named_lock_file(rally_dir: &Path, filename: &str) -> Result<fs::File> {
     fs::create_dir_all(rally_dir)
         .map_err(RallyError::io(format!("create {}", rally_dir.display())))?;
     let path = rally_dir.join(filename);
@@ -1405,7 +1406,7 @@ fn open_named_owner_lock_file(rally_dir: &Path, filename: &str) -> Result<fs::Fi
 #[cfg(unix)]
 #[allow(dead_code)]
 pub(crate) fn acquire_owner_shared_nb(rally_dir: &Path) -> Result<Option<OwnerGuard>> {
-    let file = open_named_owner_lock_file(rally_dir, RALLYD_OWNER_LOCK_FILENAME)?;
+    let file = open_named_lock_file(rally_dir, RALLYD_OWNER_LOCK_FILENAME)?;
     let rc = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_SH | unix_lock::LOCK_NB) };
     if rc == 0 {
         return Ok(Some(OwnerGuard { file }));
@@ -1431,7 +1432,7 @@ pub(crate) fn acquire_owner_shared_nb(rally_dir: &Path) -> Result<Option<OwnerGu
 #[cfg(unix)]
 #[allow(dead_code)]
 pub(crate) fn acquire_owner_exclusive_blocking(rally_dir: &Path) -> Result<OwnerGuard> {
-    let file = open_named_owner_lock_file(rally_dir, RALLYD_OWNER_LOCK_FILENAME)?;
+    let file = open_named_lock_file(rally_dir, RALLYD_OWNER_LOCK_FILENAME)?;
     let rc = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX) };
     if rc != 0 {
         return Err(RallyError::Io {
@@ -1445,13 +1446,17 @@ pub(crate) fn acquire_owner_exclusive_blocking(rally_dir: &Path) -> Result<Owner
     Ok(OwnerGuard { file })
 }
 
-/// Try to become the sole direct-mode process for this room. This lock is
-/// deliberately independent from the daemon ownership lock: direct takes it
-/// EX before taking the daemon lock SH, while daemon startup only takes the
-/// daemon lock EX. That order cannot form a cycle.
+/// Try to acquire a named exclusive advisory lock without blocking.
+///
+/// The file is only a stable rendezvous point. Kernel lock ownership, not file
+/// creation or deletion, provides single-flight semantics and is released on
+/// process exit.
 #[cfg(unix)]
-fn acquire_direct_owner_exclusive_nb(rally_dir: &Path) -> Result<Option<OwnerGuard>> {
-    let file = open_named_owner_lock_file(rally_dir, DIRECT_OWNER_LOCK_FILENAME)?;
+pub(crate) fn acquire_named_exclusive_nb(
+    rally_dir: &Path,
+    filename: &str,
+) -> Result<Option<OwnerGuard>> {
+    let file = open_named_lock_file(rally_dir, filename)?;
     let rc = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX | unix_lock::LOCK_NB) };
     if rc == 0 {
         return Ok(Some(OwnerGuard { file }));
@@ -1461,12 +1466,18 @@ fn acquire_direct_owner_exclusive_nb(rally_dir: &Path) -> Result<Option<OwnerGua
         return Ok(None);
     }
     Err(RallyError::Io {
-        context: format!(
-            "lock-ex-nb {}",
-            rally_dir.join(DIRECT_OWNER_LOCK_FILENAME).display()
-        ),
+        context: format!("lock-ex-nb {}", rally_dir.join(filename).display()),
         source: err,
     })
+}
+
+/// Try to become the sole direct-mode process for this room. This lock is
+/// deliberately independent from the daemon ownership lock: direct takes it
+/// EX before taking the daemon lock SH, while daemon startup only takes the
+/// daemon lock EX. That order cannot form a cycle.
+#[cfg(unix)]
+fn acquire_direct_owner_exclusive_nb(rally_dir: &Path) -> Result<Option<OwnerGuard>> {
+    acquire_named_exclusive_nb(rally_dir, DIRECT_OWNER_LOCK_FILENAME)
 }
 
 /// Non-unix no-op mirror: no flock, so the owner lock is a no-op and the direct
@@ -1488,6 +1499,17 @@ pub(crate) fn acquire_owner_exclusive_blocking(_rally_dir: &Path) -> Result<Owne
 #[cfg(not(unix))]
 fn acquire_direct_owner_exclusive_nb(_rally_dir: &Path) -> Result<Option<OwnerGuard>> {
     Ok(Some(OwnerGuard))
+}
+
+/// Destructive automatic cleanup fails closed on platforms without a kernel
+/// advisory lock equivalent. A process-local/no-op guard would permit two
+/// entrants to reap concurrently.
+#[cfg(not(unix))]
+pub(crate) fn acquire_named_exclusive_nb(
+    _rally_dir: &Path,
+    _filename: &str,
+) -> Result<Option<OwnerGuard>> {
+    Ok(None)
 }
 
 /// One line of a segment file.
@@ -1766,21 +1788,25 @@ impl RoomStore {
         &self,
         claim_id: &str,
         lease_expires_at: String,
+        caller_tool: &str,
+        caller_session_id: Option<&str>,
+        expected_owner_session_id: Option<&str>,
     ) -> Result<Option<claim_authority::ActiveClaimRecord>> {
         match self {
-            RoomStore::Direct(d) => d.renew_claim_lease(claim_id, lease_expires_at),
-            RoomStore::Routed(r) => r.renew_claim_lease(claim_id, lease_expires_at),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn expire_claim_leases_at(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<Fact>> {
-        match self {
-            RoomStore::Direct(d) => d.expire_claim_leases_at(now),
-            RoomStore::Routed(r) => r.expire_claim_leases_at(now),
+            RoomStore::Direct(d) => d.renew_claim_lease(
+                claim_id,
+                lease_expires_at,
+                Some(caller_tool),
+                caller_session_id,
+                expected_owner_session_id,
+            ),
+            RoomStore::Routed(r) => r.renew_claim_lease(
+                claim_id,
+                lease_expires_at,
+                caller_tool,
+                caller_session_id,
+                expected_owner_session_id,
+            ),
         }
     }
 
@@ -2264,22 +2290,26 @@ impl DirectRoomStore {
                             .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
                             .is_some_and(|expires| expires <= chrono::Utc::now())
                     });
-                let observed_still_stale =
-                    if Self::reaper_marker(&fact.evidence, "observed") == Some("stale") {
-                        active_claim.is_some_and(|claim| {
-                            observed_sessions
-                                .for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref())
-                                == crate::observed_liveness::ObservedLiveness::Stale
-                        })
-                    } else {
-                        true
-                    };
+                let observation_still_permits_cleanup = active_claim.is_some_and(|claim| {
+                    let current = observed_sessions
+                        .for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref());
+                    match Self::reaper_marker(&fact.evidence, "observed") {
+                        Some("stale") => {
+                            current == crate::observed_liveness::ObservedLiveness::Stale
+                        }
+                        Some("unknown") => {
+                            current == crate::observed_liveness::ObservedLiveness::Unknown
+                        }
+                        _ => false,
+                    }
+                });
                 // If the claim is already closed, allow the append and let the
                 // projection deduplicate it. If it is still active, at least
                 // one of the reasons computed by the unlocked pass must remain
                 // true under this lock.
                 if active_claim.is_some()
-                    && ((!owner_still_stale && !lease_still_expired) || !observed_still_stale)
+                    && ((!owner_still_stale && !lease_still_expired)
+                        || !observation_still_permits_cleanup)
                 {
                     return Err(RallyError::Usage(format!(
                         "reap refused: claim {ref_id} is no longer eligible under the mutation \
@@ -2302,11 +2332,11 @@ impl DirectRoomStore {
                         "renew claim lease: ref {claim_id} is not an active claim"
                     ))
                 })?;
-            if !claim_authority::same_session_owner(
-                fact.tool.as_deref(),
-                fact.from_session_id.as_deref(),
+            if !claim_authority::claim_owner_matches_caller(
                 current.owner_tool.as_deref(),
                 current.from_session_id.as_deref(),
+                fact.tool.as_deref(),
+                fact.from_session_id.as_deref(),
             ) {
                 return Err(RallyError::Usage(format!(
                     "renew claim lease: {} session does not own claim {claim_id}",
@@ -2872,6 +2902,9 @@ impl DirectRoomStore {
         &self,
         claim_id: &str,
         lease_expires_at: String,
+        caller_tool: Option<&str>,
+        caller_session_id: Option<&str>,
+        expected_owner_session_id: Option<&str>,
     ) -> Result<Option<claim_authority::ActiveClaimRecord>> {
         let requested = chrono::DateTime::parse_from_rfc3339(&lease_expires_at).map_err(|err| {
             RallyError::Usage(format!(
@@ -2882,6 +2915,22 @@ impl DirectRoomStore {
         let Some(current) = claim_authority::active_claim_record(&facts, claim_id) else {
             return Ok(None);
         };
+        if current.from_session_id.as_deref() != expected_owner_session_id {
+            return Err(RallyError::Usage(format!(
+                "renew claim lease: expected owner session does not match active claim {claim_id}"
+            )));
+        }
+        if !claim_authority::claim_owner_matches_caller(
+            current.owner_tool.as_deref(),
+            current.from_session_id.as_deref(),
+            caller_tool,
+            caller_session_id,
+        ) {
+            return Err(RallyError::Usage(format!(
+                "renew claim lease: {} session does not own claim {claim_id}",
+                caller_tool.unwrap_or("<unknown>")
+            )));
+        }
         if current
             .lease_expires_at
             .as_deref()
@@ -2894,13 +2943,13 @@ impl DirectRoomStore {
         }
 
         let renewal = Fact {
-            from_session_id: current.from_session_id.clone(),
+            from_session_id: caller_session_id.map(str::to_string),
             schema: FACT_SCHEMA.to_string(),
             event_id: crate::new_id("fact"),
             seq: 0,
             thread_id: crate::new_id("room"),
             kind: FactKind::ClaimRenewed,
-            tool: current.owner_tool.clone(),
+            tool: caller_tool.map(str::to_string),
             role: None,
             subject: format!("claim lease renewed: {claim_id}"),
             scope: current.raw_scope.clone(),
@@ -2922,50 +2971,6 @@ impl DirectRoomStore {
     #[cfg(test)]
     pub(crate) fn claim_index_path(&self) -> &Path {
         &self.claim_index_path
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn expire_claim_leases_at(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<Fact>> {
-        self.rebuild_claim_index()?;
-        let facts = self.facts()?;
-        let index = claim_authority::read_index(&self.claim_index_path)
-            .map_err(|err| RallyError::Message(format!("read claim index: {err}")))?;
-        let expired = claim_authority::expired_claims(&index, &facts, now);
-        let mut appended = Vec::new();
-        for claim in expired {
-            let fact = Fact {
-                from_session_id: None,
-                schema: FACT_SCHEMA.to_string(),
-                event_id: crate::new_id("fact"),
-                seq: 0,
-                thread_id: crate::new_id("room"),
-                kind: FactKind::ClaimExpired,
-                tool: Some("rally".to_string()),
-                role: None,
-                subject: format!("claim expired: {}", claim.claim_id),
-                scope: claim.raw_scope.clone(),
-                created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                summary: claim
-                    .lease_expires_at
-                    .as_ref()
-                    .map(|lease| format!("lease_expires_at:{lease}")),
-                evidence: vec![format!("expired_claim:{}", claim.claim_id)],
-                target: claim.owner_tool.clone(),
-                ref_id: Some(claim.claim_id.clone()),
-                status: Some("expired".to_string()),
-                severity: None,
-                uri: None,
-                session: None,
-            };
-            appended.push(self.append_fact_verified(&fact)?);
-        }
-        if !appended.is_empty() {
-            self.rebuild_claim_index()?;
-        }
-        Ok(appended)
     }
 
     pub(crate) fn session_facts_with_context_version(&self) -> Result<(Vec<Fact>, Option<u64>)> {
@@ -7007,7 +7012,13 @@ mod ledger_tests {
         let before_count = store.facts().unwrap().len();
 
         let renewed = store
-            .renew_claim_lease("claim-renew", "2099-01-01T00:30:00Z".to_string())
+            .renew_claim_lease(
+                "claim-renew",
+                "2099-01-01T00:30:00Z".to_string(),
+                "tool-a",
+                None,
+                None,
+            )
             .unwrap()
             .unwrap();
         let facts = store.facts().unwrap();
@@ -7098,6 +7109,166 @@ mod ledger_tests {
     }
 
     #[test]
+    fn direct_renewal_requires_caller_and_expected_owner_session() {
+        let root = unique_root("claim-lease-direct-authority");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let mut claim = claim_fact(
+            "claim-direct-owner",
+            "tool-a",
+            "file:src/lib.rs",
+            "2099-01-01T00:00:00Z",
+        );
+        claim.from_session_id = Some("session-owner".to_string());
+        store.append_fact_verified(&claim).unwrap();
+
+        let sibling = store
+            .renew_claim_lease(
+                &claim.event_id,
+                "2099-01-01T00:30:00Z".to_string(),
+                "tool-a",
+                Some("session-sibling"),
+                Some("session-owner"),
+            )
+            .expect_err("same-tool sibling must not renew through the direct API")
+            .to_string();
+        assert!(sibling.contains("session does not own claim"), "{sibling}");
+
+        let stale_expectation = store
+            .renew_claim_lease(
+                &claim.event_id,
+                "2099-01-01T00:30:00Z".to_string(),
+                "tool-a",
+                Some("session-owner"),
+                Some("session-sibling"),
+            )
+            .expect_err("stale expected owner session must be rejected")
+            .to_string();
+        assert!(
+            stale_expectation.contains("expected owner session does not match"),
+            "{stale_expectation}"
+        );
+        assert!(
+            store
+                .facts()
+                .unwrap()
+                .iter()
+                .all(|fact| fact.kind != FactKind::ClaimRenewed)
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn anonymous_identity_cannot_renew_or_close_at_the_write_boundary() {
+        let root = unique_root("claim-anonymous-authority");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let mut claim = claim_fact(
+            "claim-anonymous",
+            "placeholder",
+            "file:src/lib.rs",
+            "2099-01-01T00:00:00Z",
+        );
+        claim.tool = None;
+        claim.from_session_id = None;
+        store.append_fact_verified(&claim).unwrap();
+        let before = store.facts().unwrap().len();
+
+        store
+            .renew_claim_lease(
+                &claim.event_id,
+                "2099-01-01T00:30:00Z".to_string(),
+                None,
+                None,
+                None,
+            )
+            .expect_err("anonymous caller must not renew an anonymous claim");
+        assert_eq!(store.facts().unwrap().len(), before);
+
+        let anonymous_renewal = Fact {
+            kind: FactKind::ClaimRenewed,
+            event_id: "renew-anonymous".to_string(),
+            ref_id: Some(claim.event_id.clone()),
+            tool: None,
+            from_session_id: None,
+            evidence: vec!["lease_expires_at:2099-01-01T00:30:00Z".to_string()],
+            ..claim_fact(
+                "renew-anonymous-template",
+                "placeholder",
+                "file:src/lib.rs",
+                "2099-01-01T00:30:00Z",
+            )
+        };
+        store
+            .append_fact_verified(&anonymous_renewal)
+            .expect_err("raw anonymous ClaimRenewed must fail closed");
+        assert_eq!(store.facts().unwrap().len(), before);
+
+        let anonymous_release = Fact {
+            kind: FactKind::Release,
+            event_id: "release-anonymous".to_string(),
+            ref_id: Some(claim.event_id.clone()),
+            tool: None,
+            from_session_id: None,
+            evidence: Vec::new(),
+            ..claim_fact(
+                "release-anonymous-template",
+                "placeholder",
+                "file:src/lib.rs",
+                "2099-01-01T00:30:00Z",
+            )
+        };
+        store
+            .append_fact_verified(&anonymous_release)
+            .expect_err("raw anonymous Release must fail closed");
+        assert_eq!(store.facts().unwrap().len(), before);
+        assert!(
+            store
+                .snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|active| active.event_id == claim.event_id)
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn modern_identified_caller_can_renew_a_legacy_sessionless_claim() {
+        let root = unique_root("claim-legacy-modern-renewal");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let claim = claim_fact(
+            "claim-legacy-renew",
+            "tool-a",
+            "file:src/lib.rs",
+            "2000-01-01T00:00:00Z",
+        );
+        store.append_fact_verified(&claim).unwrap();
+
+        let renewed = store
+            .renew_claim_lease(
+                &claim.event_id,
+                "2099-01-01T00:30:00Z".to_string(),
+                Some("tool-a"),
+                Some("session-modern"),
+                None,
+            )
+            .expect("identified legacy owner must retain compatibility")
+            .expect("legacy claim remains active");
+        assert_eq!(
+            renewed.lease_expires_at.as_deref(),
+            Some("2099-01-01T00:30:00Z")
+        );
+        let renewal = store
+            .facts()
+            .unwrap()
+            .into_iter()
+            .find(|fact| fact.kind == FactKind::ClaimRenewed)
+            .expect("renewal must be durable");
+        assert_eq!(renewal.tool.as_deref(), Some("tool-a"));
+        assert_eq!(renewal.from_session_id.as_deref(), Some("session-modern"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn claim_lease_renewal_is_monotonic_and_retry_idempotent() {
         let root = unique_root("claim-lease-renew-idempotent");
         let store = RoomStore::open_at(root.clone()).unwrap();
@@ -7109,16 +7280,34 @@ mod ledger_tests {
         );
         store.append_fact_verified(&claim).unwrap();
         store
-            .renew_claim_lease("claim-renew", "2099-01-01T00:30:00Z".to_string())
+            .renew_claim_lease(
+                "claim-renew",
+                "2099-01-01T00:30:00Z".to_string(),
+                "tool-a",
+                None,
+                None,
+            )
             .unwrap();
         let after_first = store.facts().unwrap().len();
 
         let equal = store
-            .renew_claim_lease("claim-renew", "2099-01-01T00:30:00Z".to_string())
+            .renew_claim_lease(
+                "claim-renew",
+                "2099-01-01T00:30:00Z".to_string(),
+                "tool-a",
+                None,
+                None,
+            )
             .unwrap()
             .unwrap();
         let older = store
-            .renew_claim_lease("claim-renew", "2099-01-01T00:15:00Z".to_string())
+            .renew_claim_lease(
+                "claim-renew",
+                "2099-01-01T00:15:00Z".to_string(),
+                "tool-a",
+                None,
+                None,
+            )
             .unwrap()
             .unwrap();
 
@@ -7130,38 +7319,6 @@ mod ledger_tests {
         assert_eq!(
             older.lease_expires_at.as_deref(),
             Some("2099-01-01T00:30:00Z")
-        );
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn claim_lease_expiry_appends_one_durable_event_and_frees_claim() {
-        let root = unique_root("claim-lease-expire");
-        let store = RoomStore::open_at(root.clone()).unwrap();
-        let claim = claim_fact(
-            "claim-expiring",
-            "tool-a",
-            "file:src/lib.rs",
-            "2000-01-01T00:00:00Z",
-        );
-        store.append_fact_verified(&claim).unwrap();
-
-        let first = store.expire_claim_leases_at(chrono::Utc::now()).unwrap();
-        let second = store.expire_claim_leases_at(chrono::Utc::now()).unwrap();
-        let snapshot = store.snapshot().unwrap();
-        let expired_count = store
-            .facts()
-            .unwrap()
-            .into_iter()
-            .filter(|fact| fact.kind == FactKind::ClaimExpired)
-            .count();
-
-        assert_eq!(first.len(), 1);
-        assert!(second.is_empty(), "expiry must be durable exactly once");
-        assert_eq!(expired_count, 1);
-        assert!(
-            snapshot.active_claims.is_empty(),
-            "expired claim must leave active ownership"
         );
         fs::remove_dir_all(&root).ok();
     }
@@ -10577,7 +10734,7 @@ mod sec001_takeover_guard_tests {
     }
 
     #[test]
-    fn ordinary_self_release_has_no_takeover_guard() {
+    fn modern_same_tool_caller_can_release_a_legacy_sessionless_claim() {
         let r = root("self-release");
         let store = RoomStore::open_at(r.clone()).unwrap();
         let claim = fact_at(
@@ -10596,10 +10753,50 @@ mod sec001_takeover_guard_tests {
             "file:src/a.rs",
             &iso_ago(0),
         );
+        release.from_session_id = Some("session-modern".to_string());
         release.ref_id = Some("claim-s".to_string());
         store.append_fact(&release).unwrap();
         let snap = store.snapshot().unwrap();
         assert!(!snap.active_claims.iter().any(|c| c.event_id == "claim-s"));
+        fs::remove_dir_all(&r).ok();
+    }
+
+    #[test]
+    fn sessionless_caller_cannot_release_a_sessionful_claim() {
+        let r = root("sessionful-claim-sessionless-release");
+        let store = RoomStore::open_at(r.clone()).unwrap();
+        let mut claim = fact_at(
+            "claim-sessionful",
+            FactKind::Claim,
+            "shared-tool",
+            "file:src/a.rs",
+            &iso_ago(5),
+        );
+        claim.from_session_id = Some("session-owner".to_string());
+        store.append_fact(&claim).unwrap();
+
+        let mut release = fact_at(
+            "release-sessionless",
+            FactKind::Release,
+            "shared-tool",
+            "file:src/a.rs",
+            &iso_ago(0),
+        );
+        release.from_session_id = None;
+        release.ref_id = Some(claim.event_id.clone());
+        let err = store
+            .append_fact(&release)
+            .expect_err("missing caller session must not close a sessionful claim")
+            .to_string();
+        assert!(err.contains("another shared-tool session"), "{err}");
+        assert!(
+            store
+                .snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|active| active.event_id == claim.event_id)
+        );
         fs::remove_dir_all(&r).ok();
     }
 
@@ -10618,7 +10815,9 @@ mod sec001_takeover_guard_tests {
         f.evidence = vec![
             format!("reaper:ref_id={claim_id}"),
             format!("reaper:reason={reason}"),
+            "reaper:observed=unknown".to_string(),
             format!("reaper:owner={owner}"),
+            "reaper:owner_session=legacy".to_string(),
         ];
         f
     }
@@ -10733,7 +10932,13 @@ mod sec001_takeover_guard_tests {
             .push(format!("lease_expires_at:{}", iso_ago(60)));
         store.append_fact(&claim).unwrap();
         store
-            .renew_claim_lease("claim-l", "2099-01-01T00:00:00Z".to_string())
+            .renew_claim_lease(
+                "claim-l",
+                "2099-01-01T00:00:00Z".to_string(),
+                "live-owner",
+                None,
+                None,
+            )
             .unwrap();
 
         let expired = reaper_claim_expired("claim-l", "live-owner", "lease-expired");
@@ -10772,6 +10977,9 @@ mod sec001_takeover_guard_tests {
 
         let mut expired =
             reaper_claim_expired("claim-session-owner", "shared-tool", "lease-expired");
+        expired
+            .evidence
+            .retain(|item| !item.starts_with("reaper:owner_session="));
         expired
             .evidence
             .push("reaper:owner_session=session-sibling".to_string());
@@ -10833,6 +11041,9 @@ mod sec001_takeover_guard_tests {
             .append_fact(&observed_presence("presence-dead", 2_000_000_000))
             .unwrap();
         let mut expired = reaper_claim_expired("claim-observed", "owner", "lease-expired");
+        expired
+            .evidence
+            .retain(|item| !item.starts_with("reaper:observed="));
         expired.evidence.push("reaper:observed=stale".to_string());
 
         // The same session posts a newer stamp whose externally observed host

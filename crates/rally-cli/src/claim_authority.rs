@@ -203,12 +203,11 @@ pub(crate) fn latest_renewed_lease(claim: &Fact, facts: &[Fact]) -> Option<Strin
         .filter(|fact| {
             fact.kind == FactKind::ClaimRenewed
                 && fact.ref_id.as_deref() == Some(claim.event_id.as_str())
-                && fact.tool == claim.tool
-                && same_session_owner(
-                    fact.tool.as_deref(),
-                    fact.from_session_id.as_deref(),
+                && claim_owner_matches_caller(
                     claim.tool.as_deref(),
                     claim.from_session_id.as_deref(),
+                    fact.tool.as_deref(),
+                    fact.from_session_id.as_deref(),
                 )
         })
         .filter_map(|fact| {
@@ -264,7 +263,7 @@ pub(crate) fn same_session_owner(
     right_tool: Option<&str>,
     right_session: Option<&str>,
 ) -> bool {
-    if left_tool != right_tool {
+    if !same_nonblank_tool(left_tool, right_tool) {
         return false;
     }
     match (left_session, right_session) {
@@ -272,6 +271,33 @@ pub(crate) fn same_session_owner(
         (None, None) => true,
         _ => false,
     }
+}
+
+/// Whether two identities assert the same present, nonblank tool exactly.
+///
+/// Absence is not an identity. In particular, `(None, None)` and two blank
+/// strings never become owner authority merely because `Option` equality says
+/// they have the same shape.
+pub(crate) fn same_nonblank_tool(left_tool: Option<&str>, right_tool: Option<&str>) -> bool {
+    matches!(
+        (left_tool, right_tool),
+        (Some(left), Some(right)) if !left.trim().is_empty() && left == right
+    )
+}
+
+/// Whether `caller` owns `claim`, including the one-way legacy fallback.
+///
+/// Session identity is exact whenever the claim carries one. A historical
+/// sessionless claim may still be acted on by a modern session that asserts the
+/// same present, nonblank tool; the converse is never allowed.
+pub(crate) fn claim_owner_matches_caller(
+    claim_tool: Option<&str>,
+    claim_session: Option<&str>,
+    caller_tool: Option<&str>,
+    caller_session: Option<&str>,
+) -> bool {
+    same_session_owner(claim_tool, claim_session, caller_tool, caller_session)
+        || (claim_session.is_none() && same_nonblank_tool(claim_tool, caller_tool))
 }
 
 /// Is this a lead-family decision (seat taken, or seat reopened)?
@@ -513,6 +539,49 @@ mod tests {
         let conflict = detect_conflict(&[existing], &incoming)
             .expect("an expired lease remains held until session-aware reaping closes it");
         assert_eq!(conflict.existing_claim_id, "claim-a");
+    }
+
+    #[test]
+    fn anonymous_or_blank_tools_are_never_the_same_owner() {
+        assert!(!same_session_owner(None, None, None, None));
+        assert!(!same_session_owner(Some(""), None, Some(""), None));
+        assert!(!same_session_owner(
+            Some("  "),
+            Some("session-a"),
+            Some("  "),
+            Some("session-a")
+        ));
+        assert!(same_session_owner(
+            Some("tool-a"),
+            None,
+            Some("tool-a"),
+            None
+        ));
+        assert!(claim_owner_matches_caller(
+            Some("tool-a"),
+            None,
+            Some("tool-a"),
+            Some("session-modern")
+        ));
+        assert!(!claim_owner_matches_caller(None, None, None, None));
+    }
+
+    #[test]
+    fn anonymous_renewal_never_projects_as_owner_activity() {
+        let mut claim = fact("claim-anonymous", "placeholder", vec!["file:src/lib.rs"]);
+        claim.tool = None;
+        claim.from_session_id = None;
+        let mut renewal = Fact {
+            kind: FactKind::ClaimRenewed,
+            event_id: "renewal-anonymous".to_string(),
+            ref_id: Some(claim.event_id.clone()),
+            from_session_id: None,
+            evidence: vec!["lease_expires_at:2099-01-01T00:00:00Z".to_string()],
+            ..fact("renewal-template", "placeholder", vec![])
+        };
+        renewal.tool = None;
+
+        assert_eq!(latest_renewed_lease(&claim, &[renewal]), None);
     }
 
     #[test]

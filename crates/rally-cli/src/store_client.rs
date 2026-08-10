@@ -340,10 +340,6 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
             operation: "renew_claim_lease",
             selector: Some(format!("claim_id={claim_id}")),
         }),
-        StoreOp::ExpireClaimLeasesAt { now_rfc3339 } => Some(MutationQuery {
-            operation: "expire_claim_leases_at",
-            selector: Some(format!("expiry_cutoff={now_rfc3339}")),
-        }),
         StoreOp::MaybeAppendReadCheckpoint { tool, read_seq } => Some(MutationQuery {
             operation: "maybe_append_read_checkpoint",
             selector: Some(format!("tool={tool},read_seq={read_seq}")),
@@ -496,26 +492,19 @@ impl RoutedRoomStore {
         &self,
         claim_id: &str,
         lease_expires_at: String,
+        caller_tool: &str,
+        caller_session_id: Option<&str>,
+        expected_owner_session_id: Option<&str>,
     ) -> Result<Option<ActiveClaimRecord>> {
         match self.dispatch(StoreOp::RenewClaimLease {
             claim_id: claim_id.to_string(),
             lease_expires_at,
+            caller_tool: Some(caller_tool.to_string()),
+            caller_session_id: caller_session_id.map(str::to_string),
+            expected_owner_session_id: expected_owner_session_id.map(str::to_string),
         })? {
             StoreOk::RenewClaimLease { record } => record.map(from_value).transpose(),
             _ => Err(unexpected_reply("renew_claim_lease")),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn expire_claim_leases_at(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<Fact>> {
-        match self.dispatch(StoreOp::ExpireClaimLeasesAt {
-            now_rfc3339: now.to_rfc3339(),
-        })? {
-            StoreOk::ExpireClaimLeasesAt { facts } => facts.into_iter().map(from_value).collect(),
-            _ => Err(unexpected_reply("expire_claim_leases_at")),
         }
     }
 
@@ -700,15 +689,15 @@ mod tests {
     }
 
     #[test]
-    fn probe_rejects_a_v1_daemon_after_the_snapshot_wire_change() {
-        assert_eq!(WIRE_VERSION, 2, "this control grades the v1 to v2 cutover");
+    fn probe_rejects_a_v2_daemon_after_the_renewal_authority_change() {
+        assert_eq!(WIRE_VERSION, 3, "this control grades the v2 to v3 cutover");
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let rally_dir = std::env::temp_dir().join(format!("rally-wire-v1-{nonce}"));
+        let rally_dir = std::env::temp_dir().join(format!("rally-wire-v2-{nonce}"));
         std::fs::create_dir_all(&rally_dir).unwrap();
-        let socket = std::env::temp_dir().join(format!("rally-wire-v1-{nonce}.sock"));
+        let socket = std::env::temp_dir().join(format!("rally-wire-v2-{nonce}.sock"));
         let listener = UnixListener::bind(&socket).unwrap();
         std::fs::write(
             rally_dir.join(ADDR_FILENAME),
@@ -722,11 +711,11 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let request: StoreRequest = serde_json::from_str(line.trim()).unwrap();
-            assert_eq!(request.wire_version, 2);
+            assert_eq!(request.wire_version, 3);
             let response = StoreResponse::Ok(StoreOk::Pong {
                 repo_root: "/expected/repo".to_string(),
                 pid: 42,
-                wire_version: 1,
+                wire_version: 2,
             });
             let mut writer = &stream;
             writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
@@ -734,7 +723,7 @@ mod tests {
 
         assert!(
             probe_identity(&rally_dir, "/expected/repo").is_none(),
-            "a v1 daemon must not route a v2 client through a reply that omits snapshot internals"
+            "a v2 daemon must not route a v3 client whose renewal authority fields it cannot enforce"
         );
         server.join().unwrap();
         std::fs::remove_file(&socket).ok();

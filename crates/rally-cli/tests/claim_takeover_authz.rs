@@ -53,12 +53,32 @@ impl Workspace {
             .unwrap()
     }
 
+    fn run_as_session(&self, session_id: &str, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_rally"))
+            .current_dir(&self.cwd)
+            .env("HOME", &self.home)
+            .env("RALLY_HOOKS", "off")
+            .env("RALLY_SESSION_ID", session_id)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
     /// Parse the command's JSON envelope. Refusals are written to STDERR (the
     /// CLI's error channel) while successes go to stdout, so a suite that
     /// asserts on rejection has to read both — reading stdout alone would make
     /// every refusal look like a crash.
     fn json(&self, args: &[&str]) -> Value {
         let out = self.run(args);
+        Self::parse_json(args, &out)
+    }
+
+    fn json_as_session(&self, session_id: &str, args: &[&str]) -> Value {
+        let out = self.run_as_session(session_id, args);
+        Self::parse_json(args, &out)
+    }
+
+    fn parse_json(args: &[&str], out: &Output) -> Value {
         let body = if out.stdout.is_empty() {
             &out.stderr
         } else {
@@ -87,6 +107,28 @@ impl Workspace {
             "owns it",
             "--json",
         ]);
+        assert_eq!(v["ok"], Value::Bool(true), "claim should succeed: {v}");
+        v["data"]["say"]["fact"]["event_id"]
+            .as_str()
+            .expect("claim fact carries an event_id")
+            .to_string()
+    }
+
+    fn claim_as_session(&self, tool: &str, session_id: &str, path: &str) -> String {
+        let v = self.json_as_session(
+            session_id,
+            &[
+                "say",
+                "claim",
+                "--tool",
+                tool,
+                "--path",
+                path,
+                "--subject",
+                "owns it",
+                "--json",
+            ],
+        );
         assert_eq!(v["ok"], Value::Bool(true), "claim should succeed: {v}");
         v["data"]["say"]["fact"]["event_id"]
             .as_str()
@@ -229,19 +271,22 @@ fn a_stripped_claim_cannot_be_seized_by_the_stripper() {
 #[test]
 fn owner_can_always_self_release_by_ref() {
     let ws = Workspace::new("self-release");
-    let claim = ws.claim("victim:01", "src/lib.rs");
+    let claim = ws.claim_as_session("victim:01", "session-owner", "src/lib.rs");
 
-    let v = ws.json(&[
-        "say",
-        "release",
-        "--tool",
-        "victim:01",
-        "--ref",
-        &claim,
-        "--subject",
-        "done with it",
-        "--json",
-    ]);
+    let v = ws.json_as_session(
+        "session-owner",
+        &[
+            "say",
+            "release",
+            "--tool",
+            "victim:01",
+            "--ref",
+            &claim,
+            "--subject",
+            "done with it",
+            "--json",
+        ],
+    );
 
     assert_eq!(
         v["ok"],
@@ -252,6 +297,97 @@ fn owner_can_always_self_release_by_ref() {
         ws.active_claim_owners().is_empty(),
         "the claim should be gone after self-release"
     );
+    ws.cleanup();
+}
+
+#[test]
+fn same_tool_sibling_cannot_release_live_claim_by_ref() {
+    let ws = Workspace::new("sibling-release-ref");
+    let claim = ws.claim_as_session("shared:01", "session-owner", "src/lib.rs");
+
+    let v = ws.json_as_session(
+        "session-sibling",
+        &[
+            "say",
+            "release",
+            "--tool",
+            "shared:01",
+            "--ref",
+            &claim,
+            "--subject",
+            "sibling must not inherit authority",
+            "--json",
+        ],
+    );
+
+    assert_eq!(
+        v["ok"],
+        Value::Bool(false),
+        "same-tool sibling must not close another session's claim by ref: {v}"
+    );
+    assert_eq!(ws.active_claim_owners(), vec!["shared:01".to_string()]);
+    ws.cleanup();
+}
+
+#[test]
+fn same_tool_sibling_cannot_release_live_claim_by_path() {
+    let ws = Workspace::new("sibling-release-path");
+    ws.claim_as_session("shared:01", "session-owner", "src/lib.rs");
+
+    let v = ws.json_as_session(
+        "session-sibling",
+        &[
+            "say",
+            "release",
+            "--tool",
+            "shared:01",
+            "--path",
+            "src/lib.rs",
+            "--subject",
+            "sibling must not inherit authority",
+            "--json",
+        ],
+    );
+
+    assert_eq!(
+        v["ok"],
+        Value::Bool(false),
+        "same-tool sibling must not close another session's claim by path: {v}"
+    );
+    assert_eq!(ws.active_claim_owners(), vec!["shared:01".to_string()]);
+    ws.cleanup();
+}
+
+#[test]
+fn exact_owner_session_can_release_live_claim_by_path() {
+    let ws = Workspace::new("owner-release-path");
+    ws.claim_as_session("shared:01", "session-owner", "src/lib.rs");
+
+    let v = ws.json_as_session(
+        "session-owner",
+        &[
+            "say",
+            "release",
+            "--tool",
+            "shared:01",
+            "--path",
+            "src/lib.rs",
+            "--subject",
+            "owner is done",
+            "--json",
+        ],
+    );
+
+    assert_eq!(
+        v["ok"],
+        Value::Bool(true),
+        "exact owner session must retain the normal path release: {v}"
+    );
+    assert_eq!(
+        v["data"]["say"]["fact"]["from_session_id"],
+        "sess:managed:session-owner#live"
+    );
+    assert!(ws.active_claim_owners().is_empty());
     ws.cleanup();
 }
 
@@ -513,19 +649,22 @@ fn a_receipt_against_a_peers_handoff_is_still_allowed() {
 #[test]
 fn the_owner_can_close_its_own_claim_with_a_receipt() {
     let ws = Workspace::new("receipt-self");
-    let claim = ws.claim("victim:01", "src/lib.rs");
+    let claim = ws.claim_as_session("victim:01", "session-owner", "src/lib.rs");
 
-    let v = ws.json(&[
-        "say",
-        "receipt",
-        "--tool",
-        "victim:01",
-        "--ref",
-        &claim,
-        "--subject",
-        "done",
-        "--json",
-    ]);
+    let v = ws.json_as_session(
+        "session-owner",
+        &[
+            "say",
+            "receipt",
+            "--tool",
+            "victim:01",
+            "--ref",
+            &claim,
+            "--subject",
+            "done",
+            "--json",
+        ],
+    );
 
     assert_eq!(
         v["ok"],

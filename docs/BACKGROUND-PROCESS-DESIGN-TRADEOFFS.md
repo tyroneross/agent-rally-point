@@ -255,7 +255,7 @@ state machines, error rules, framing, versioning, or delivery meanings differ.
 | Framing | One newline-terminated JSON request and one JSON response per connection |
 | Request | `StoreRequest { wire_version, engagement, op }` |
 | Response | `StoreResponse::Ok(StoreOk)` or `Err(StoreError)` |
-| Version | Exact `WIRE_VERSION = 2`; `Ping` returns repo root, PID, and version |
+| Version | Exact `WIRE_VERSION = 3`; `Ping` returns repo root, PID, and version. v3 binds claim renewal to caller and expected owner sessions. |
 | Payload | Closed operation enums; leaf Rally types cross as `serde_json::Value` and revalidate at CLI boundary |
 | Limits | One line capped at 8 MiB |
 | State | Canonical room JSONL plus SQLite projection; socket, PID, and log runtime files |

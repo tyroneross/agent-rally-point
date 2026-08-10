@@ -15,14 +15,11 @@
 //!   `active_claims` only surfaces claims that are not yet closed.
 //! - When `apply` is false the report describes WHAT WOULD happen (dry-run).
 
-use schemars::JsonSchema;
-use serde::Serialize;
-use std::fs::OpenOptions;
-use std::path::PathBuf;
-
 use crate::error::Result;
 use crate::store::{Fact, FactKind, RoomStore};
 use crate::{FACT_SCHEMA, new_id, now_string};
+use schemars::JsonSchema;
+use serde::Serialize;
 
 /// Default handoff expiry: 30 days.
 ///
@@ -192,40 +189,21 @@ pub(crate) const DEFAULT_AUTO_REAP_INTERVAL_SECS: i64 = 0;
 const AUTO_REAP_MARKER: &str = ".last-auto-reap";
 const AUTO_REAP_FLIGHT: &str = ".auto-reap-in-flight";
 
-struct AutoReapFlight {
-    path: PathBuf,
-}
-
-impl Drop for AutoReapFlight {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 /// Atomically admit one automatic pass across concurrent processes.
 ///
-/// `create_new` is the cross-process compare-and-set: exactly one entrant can
-/// create the file. A crashed holder leaves the automatic path fail-closed
-/// until an operator removes the diagnostic file; auto-reap remains default
-/// off, so recovery must never guess that a destructive pass is abandoned.
-fn try_auto_reap_flight(room: &RoomStore) -> Option<AutoReapFlight> {
-    let path = room.repo_root().join(".rally").join(AUTO_REAP_FLIGHT);
-    if let Some(parent) = path.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
-    {
-        eprintln!(
-            "rally: auto-reap single-flight directory unavailable ({}): {err}",
-            parent.display()
-        );
-        return None;
-    }
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(_) => Some(AutoReapFlight { path }),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => None,
+/// The same non-blocking kernel advisory lock primitive used by store
+/// ownership admits exactly one entrant. The kernel releases it on normal
+/// drop and process death; the lock file may remain forever without blocking a
+/// later pass. Platforms without this primitive fail closed and skip auto-reap.
+fn try_auto_reap_flight(room: &RoomStore) -> Option<crate::store::OwnerGuard> {
+    let rally_dir = room.repo_root().join(".rally");
+    match crate::store::acquire_named_exclusive_nb(&rally_dir, AUTO_REAP_FLIGHT) {
+        Ok(Some(guard)) => Some(guard),
+        Ok(None) => None,
         Err(err) => {
             eprintln!(
                 "rally: auto-reap single-flight unavailable ({}): {err}",
-                path.display()
+                rally_dir.join(AUTO_REAP_FLIGHT).display()
             );
             None
         }
@@ -250,8 +228,9 @@ fn try_auto_reap_flight(room: &RoomStore) -> Option<AutoReapFlight> {
 /// - **Rate-limited and single-flight by files outside the ledger.**
 ///   The marker is `.rally/.last-auto-reap`; a missing or unparseable marker
 ///   reaps (fail-toward-cleanup, since the reaper's own eligibility math is
-///   fail-closed). `.auto-reap-in-flight` uses `O_EXCL` admission so overlapping
-///   enters cannot each run a pass.
+///   fail-closed). `.auto-reap-in-flight` uses a non-blocking kernel advisory
+///   lock so overlapping enters cannot each run a pass and crashed holders
+///   recover automatically.
 /// - **Opt-out.** `RALLY_NO_AUTO_REAP=1`, or `auto_reap_interval_secs: 0`.
 ///
 /// Returns the report when a reap ran, `None` when it was skipped.
@@ -603,6 +582,26 @@ fn run_reap_stale_in_room_with_budget(
         }
 
         claims_reaped.push(reaped);
+    }
+
+    // Automatic enter cleanup has exactly one destructive responsibility:
+    // close claims whose writer-stamped lease expired and whose exact owner
+    // session is externally observed dead. Handoff expiry and lead relinquish
+    // remain deliberate operator actions in Full mode; they have different
+    // authority signals and must not consume this pass's cap or time budget.
+    if mode == ReapMode::LeaseOnly {
+        return Ok(ReapReport {
+            claims_reaped,
+            handoffs_expired: Vec::new(),
+            squads_idle_cleared: Vec::new(),
+            lead_relinquished: None,
+            preserved_future_or_active: preserved,
+            remaining,
+            attempted_writes: if apply { attempted_actions } else { 0 },
+            write_failures,
+            applied: apply && attempted_actions > 0 && write_failures == 0,
+            complete: apply && remaining == 0 && write_failures == 0,
+        });
     }
 
     // --- Handoff expiry ---
@@ -1321,7 +1320,7 @@ mod tests {
                 let room = RoomStore::open_at(root).unwrap();
                 start.wait();
                 let flight = try_auto_reap_flight(&room);
-                // Keep the winner's O_EXCL token alive until every contender
+                // Keep the winner's advisory lock alive until every contender
                 // has attempted admission; this grades overlapping enters,
                 // not sequential reuse after a completed pass.
                 hold.wait();
@@ -1334,6 +1333,23 @@ mod tests {
             .filter(|admitted| *admitted)
             .count();
         assert_eq!(admitted, 1, "exactly one overlapping enter may reap");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stale_auto_reap_lock_file_does_not_block_recovery() {
+        let root = unique_root("auto-reap-crash-recovery");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        let lock_path = root.join(".rally").join(AUTO_REAP_FLIGHT);
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, "left behind by a crashed process\n").unwrap();
+
+        let flight = try_auto_reap_flight(&room);
+        assert!(
+            flight.is_some(),
+            "file existence must not masquerade as a live holder after a crash"
+        );
+        drop(flight);
         fs::remove_dir_all(root).ok();
     }
 
@@ -1409,6 +1425,57 @@ mod tests {
                 .iter()
                 .any(|claim| claim.event_id == crashed_claim.event_id)
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn automatic_pass_only_processes_observer_eligible_expired_claims() {
+        let root = unique_root("automatic-claims-only");
+        init_observed_worktree(&root);
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        append_observed_presence(&room, "crashed", &root, 2_000_000_000);
+        let claim = append_claim_with_lease(&room, "claim-crashed-only", "crashed", &past_ts(3600));
+        let handoff = append_handoff(
+            &room,
+            "handoff-automatic-must-ignore",
+            "author",
+            DEFAULT_HANDOFF_EXPIRY_SECS + 60,
+        );
+        let stale = 3 * 60 * 60;
+        append_presence(&room, "stale-lead", stale);
+        append_lead(&room, "stale-lead", stale);
+
+        let report = run_reap_stale_in_room_with_mode(&room, true, ReapMode::LeaseOnly).unwrap();
+
+        assert_eq!(
+            report
+                .claims_reaped
+                .iter()
+                .map(|entry| entry.claim_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![claim.event_id.as_str()]
+        );
+        assert!(
+            report.handoffs_expired.is_empty(),
+            "automatic mode must never expire handoffs"
+        );
+        assert!(
+            report.lead_relinquished.is_none(),
+            "automatic mode must never relinquish the lead"
+        );
+        assert_eq!(
+            report.attempted_writes, 1,
+            "only the observer-eligible expired claim may consume the automatic budget"
+        );
+        let snapshot = room.snapshot().unwrap();
+        assert!(
+            snapshot
+                .open_handoffs
+                .iter()
+                .any(|open| open.event_id == handoff.event_id)
+        );
+        assert_eq!(snapshot.lead.as_deref(), Some("stale-lead"));
         fs::remove_dir_all(root).ok();
     }
 
@@ -1600,6 +1667,143 @@ mod tests {
              either"
         );
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn expired_lease_authorizes_typed_cleanup_but_not_an_ordinary_peer_release() {
+        let root = unique_root("typed-expiry-authority");
+        init_observed_worktree(&root);
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        let expired = past_ts(3600);
+
+        // A live external observer is a veto. Lease expiry alone must not turn
+        // an ordinary peer Release into owner authority.
+        append_observed_presence_for_session(
+            &room,
+            "live-owner",
+            "session-live",
+            &root,
+            std::process::id(),
+        );
+        let live_claim = append_session_claim_with_lease(
+            &room,
+            "claim-live-expired",
+            "live-owner",
+            "session-live",
+            &expired,
+        );
+        let before_release = room.facts().unwrap().len();
+        let peer_release = Fact {
+            from_session_id: Some("session-peer".to_string()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: "release-peer-expired".to_string(),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Release,
+            tool: Some("peer".to_string()),
+            role: None,
+            subject: "ordinary peer release".to_string(),
+            scope: live_claim.scope.clone(),
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: Some(live_claim.event_id.clone()),
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&peer_release)
+            .expect_err("expired lease alone must not authorize an ordinary peer Release");
+        assert_eq!(
+            room.facts().unwrap().len(),
+            before_release,
+            "refused peer Release must not append"
+        );
+        assert!(
+            room.snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|claim| claim.event_id == live_claim.event_id),
+            "live observed claim must survive the refused peer Release"
+        );
+
+        // Full/operator mode may still emit the typed ClaimExpired transition
+        // for an expired claim whose observation is Unknown.
+        let manual_claim = append_session_claim_with_lease(
+            &room,
+            "claim-manual-expired",
+            "manual-owner",
+            "session-manual",
+            &expired,
+        );
+        let manual = run_reap_stale_in_room_with_mode(&room, true, ReapMode::Full).unwrap();
+        assert_eq!(
+            manual
+                .claims_reaped
+                .iter()
+                .map(|entry| entry.claim_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![manual_claim.event_id.as_str()]
+        );
+
+        // Automatic cleanup retains its stronger exact-Stale requirement.
+        append_observed_presence_for_session(
+            &room,
+            "dead-owner",
+            "session-dead",
+            &root,
+            2_000_000_000,
+        );
+        let dead_claim = append_session_claim_with_lease(
+            &room,
+            "claim-auto-expired",
+            "dead-owner",
+            "session-dead",
+            &expired,
+        );
+        let automatic = run_reap_stale_in_room_with_mode(&room, true, ReapMode::LeaseOnly).unwrap();
+        assert_eq!(
+            automatic
+                .claims_reaped
+                .iter()
+                .map(|entry| entry.claim_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![dead_claim.event_id.as_str()]
+        );
+
+        let facts = room.facts().unwrap();
+        for (claim_id, reason, observed) in [
+            (manual_claim.event_id.as_str(), "lease-expired", "unknown"),
+            (
+                dead_claim.event_id.as_str(),
+                "owner-stale+lease-expired",
+                "stale",
+            ),
+        ] {
+            let expiry = facts
+                .iter()
+                .find(|fact| {
+                    fact.kind == FactKind::ClaimExpired && fact.ref_id.as_deref() == Some(claim_id)
+                })
+                .expect("typed cleanup must append ClaimExpired");
+            assert_eq!(expiry.tool.as_deref(), Some("rally"));
+            assert!(
+                expiry
+                    .evidence
+                    .iter()
+                    .any(|item| item == &format!("reaper:reason={reason}"))
+            );
+            assert!(
+                expiry
+                    .evidence
+                    .iter()
+                    .any(|item| item == &format!("reaper:observed={observed}"))
+            );
+        }
         fs::remove_dir_all(root).ok();
     }
 
@@ -1829,7 +2033,7 @@ mod tests {
             .filter(|c| c.tool.as_deref() == Some("tool-a"))
         {
             let release = Fact {
-                from_session_id: None,
+                from_session_id: Some("sess-tool-a".to_string()),
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("fact"),
                 seq: 0,
@@ -1931,11 +2135,15 @@ mod tests {
         let stopping_session = "sess-A";
         let snap = room.snapshot().unwrap();
         for c in snap.active_claims.iter().filter(|c| {
-            c.from_session_id.as_deref() == Some(stopping_session)
-                || (c.from_session_id.is_none() && c.tool.as_deref() == Some(stopping_tool))
+            crate::claim_authority::claim_owner_matches_caller(
+                c.tool.as_deref(),
+                c.from_session_id.as_deref(),
+                Some(stopping_tool),
+                Some(stopping_session),
+            )
         }) {
             let release = Fact {
-                from_session_id: None,
+                from_session_id: Some(stopping_session.to_string()),
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("fact"),
                 seq: 0,
@@ -2235,9 +2443,15 @@ mod tests {
             (Utc::now() + chrono::Duration::seconds(3600))
                 .to_rfc3339_opts(SecondsFormat::Secs, true)
         };
-        room.renew_claim_lease(&claim.event_id, renewed_until.clone())
-            .unwrap()
-            .expect("active claim must renew");
+        room.renew_claim_lease(
+            &claim.event_id,
+            renewed_until.clone(),
+            "live-owner",
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("active claim must renew");
 
         let report = run_reap_stale_in_room(&room, true).unwrap();
 
