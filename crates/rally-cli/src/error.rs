@@ -24,13 +24,15 @@ pub(crate) enum RallyError {
     /// whether its exact event reached the canonical readback boundary.
     /// Retrying blindly is unsafe; callers must query by the stable event id.
     #[error(
-        "mutation-outcome-unknown: event_id={event_id} phase={phase}: {detail}; query `rally locate {event_id} --json` before retrying with the same event id"
+        "mutation-outcome-unknown: event_id={event_id} phase={phase}: {detail}; query by the exact event id before deciding whether to rerun"
     )]
     OutcomeUnknown {
         event_id: String,
         phase: String,
         detail: String,
     },
+    #[error("incompatible-wire: {detail}")]
+    IncompatibleWire { detail: String },
     #[error("{context}: {source}")]
     Io {
         context: String,
@@ -54,6 +56,7 @@ impl RallyError {
             Self::Command(_)
             | Self::Message(_)
             | Self::OutcomeUnknown { .. }
+            | Self::IncompatibleWire { .. }
             | Self::Io { .. }
             | Self::Json { .. } => 1,
         }

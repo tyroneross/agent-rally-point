@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg_attr(test, allow(unused_must_use))]
+
 use chrono::{SecondsFormat, Utc};
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -210,6 +212,7 @@ thread_local! {
     /// read it through [`watchdog_remaining`].
     static WATCHDOG_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
     static PENDING_APPEND_OUTCOMES: RefCell<Vec<store::AppendOutcome>> = const { RefCell::new(Vec::new()) };
+    static PENDING_APPEND_ISSUES: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Clone, Debug)]
@@ -229,9 +232,80 @@ pub(crate) fn record_append_outcome(outcome: &store::AppendOutcome) {
     PENDING_APPEND_OUTCOMES.with(|pending| pending.borrow_mut().push(outcome.clone()));
 }
 
-fn attach_pending_append_outcomes(output: &mut Output) {
-    let outcomes =
-        PENDING_APPEND_OUTCOMES.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+fn record_optional_append_issue(context: &str, error: &RallyError) {
+    let issue = match error {
+        RallyError::OutcomeUnknown {
+            event_id,
+            phase,
+            detail,
+        } => json!({
+            "code": "outcome_unknown",
+            "context": context,
+            "event_id": event_id,
+            "phase": phase,
+            "detail": detail,
+            "query_remedy": locate_remedy(event_id),
+        }),
+        _ => json!({
+            "code": "optional_append_failed",
+            "context": context,
+            "detail": error.to_string(),
+        }),
+    };
+    PENDING_APPEND_ISSUES.with(|pending| pending.borrow_mut().push(issue));
+}
+
+fn consume_optional_append(result: Result<store::AppendOutcome>, context: &str) {
+    match result {
+        Ok(outcome) => record_append_outcome(&outcome),
+        Err(error) => record_optional_append_issue(context, &error),
+    }
+}
+
+fn record_conditional_append(outcome: store::ConditionalAppendOutcome) {
+    if let store::ConditionalAppendOutcome::Applied(outcome) = outcome {
+        record_append_outcome(&outcome);
+    }
+}
+
+fn consume_optional_conditional_append(
+    result: Result<store::ConditionalAppendOutcome>,
+    context: &str,
+) {
+    match result {
+        Ok(outcome) => record_conditional_append(outcome),
+        Err(error) => record_optional_append_issue(context, &error),
+    }
+}
+
+fn consume_optional_result<T>(result: Result<T>, context: &str) {
+    if let Err(error) = result {
+        record_optional_append_issue(context, &error);
+    }
+}
+
+fn update_recorded_append_outcome(outcome: &store::AppendOutcome) {
+    PENDING_APPEND_OUTCOMES.with(|pending| {
+        if let Some(existing) = pending
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|existing| existing.fact.event_id == outcome.fact.event_id)
+        {
+            *existing = outcome.clone();
+        }
+    });
+}
+
+fn drain_pending_append_outcomes() -> Vec<store::AppendOutcome> {
+    PENDING_APPEND_OUTCOMES.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
+}
+
+fn drain_pending_append_issues() -> Vec<Value> {
+    PENDING_APPEND_ISSUES.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
+}
+
+fn attach_append_outcomes(output: &mut Output, outcomes: Vec<store::AppendOutcome>) {
     if outcomes.is_empty() {
         return;
     }
@@ -257,6 +331,124 @@ fn attach_pending_append_outcomes(output: &mut Output) {
             "\nwarning: canonical append committed; one or more derived projections are incomplete",
         );
     }
+}
+
+fn attach_append_issues(output: &mut Output, issues: Vec<Value>) {
+    if issues.is_empty() {
+        return;
+    }
+    if let Some(body) = output.body.as_object_mut()
+        && let Some(data) = body.get_mut("data").and_then(Value::as_object_mut)
+    {
+        data.insert("append_issues".to_string(), Value::Array(issues));
+    }
+    if !output.json {
+        output
+            .text
+            .push_str("\nwarning: optional durable append work did not complete; inspect append_issues in JSON");
+    }
+}
+
+fn attach_pending_append_outcomes(output: &mut Output) {
+    attach_append_outcomes(output, drain_pending_append_outcomes());
+    attach_append_issues(output, drain_pending_append_issues());
+}
+
+/// Convert an error after one or more proven canonical commits into an
+/// explicit partial-commit aggregate. A later OutcomeUnknown remains
+/// query-required and retains watchdog precedence; every other later required
+/// failure is nonzero and explicitly forbids whole-command retry. Commands
+/// with genuinely optional post-commit work convert that work to warnings at
+/// their own boundary. The collector is always drained, so in-process commands
+/// cannot inherit stale outcomes.
+fn output_after_committed_error(error: RallyError, json_output: bool) -> Result<Output> {
+    let mut outcomes = drain_pending_append_outcomes();
+    let issues = drain_pending_append_issues();
+    if outcomes.is_empty() {
+        if let RallyError::OutcomeUnknown {
+            event_id,
+            phase,
+            detail,
+        } = &error
+        {
+            let remedy = locate_remedy(event_id);
+            let message = format!(
+                "canonical mutation outcome is unknown at phase {phase}; run `{remedy}` before deciding whether to rerun"
+            );
+            let body = json!({
+                "ok": false,
+                "product": "rally",
+                "command": "mutation_outcome_unknown",
+                "data": {
+                    "committed": null,
+                    "event_id": event_id,
+                    "phase": phase,
+                    "detail": detail,
+                    "query_remedy": remedy,
+                    "message": message,
+                }
+            });
+            let mut output = Output::new(json_output, message, body).with_exit_code(1);
+            attach_append_issues(&mut output, issues);
+            return Ok(output);
+        }
+        return Err(error);
+    }
+
+    let (exit_code, unknown) = match &error {
+        RallyError::OutcomeUnknown {
+            event_id,
+            phase,
+            detail,
+        } => (
+            1,
+            Some(json!({
+                "event_id": event_id,
+                "phase": phase,
+                "detail": detail,
+                "remedy": locate_remedy(event_id),
+            })),
+        ),
+        _ => (1, None),
+    };
+    let warning = store::ProjectionWarning {
+        code: store::ProjectionWarningCode::PostCommitWork,
+        message: format!("post-commit command work did not complete: {error}"),
+    };
+    if let Some(last) = outcomes.last_mut() {
+        last.projection_complete = false;
+        last.warnings.push(warning.clone());
+        if unknown.is_none() {
+            mark_watchdog_append_outcome(last);
+        }
+    }
+    let message = match &error {
+        RallyError::OutcomeUnknown {
+            event_id, phase, ..
+        } => {
+            let remedy = locate_remedy(event_id);
+            format!(
+                "one or more canonical appends committed and a later append outcome is unknown at phase {phase}; run `{remedy}` before deciding whether to resume"
+            )
+        }
+        _ => "part of this command committed canonically before a later required step failed; do not retry the whole command".to_string(),
+    };
+    let body = json!({
+        "ok": exit_code == 0,
+        "product": "rally",
+        "command": "partial_commit",
+        "data": {
+            "committed": true,
+            "projection_complete": false,
+            "warning": warning,
+            "outcome_unknown": unknown,
+            "message": message,
+        }
+    });
+    let mut output = Output::new(json_output, message, body).with_exit_code(exit_code);
+    attach_append_outcomes(&mut output, outcomes);
+    attach_append_issues(&mut output, issues);
+    Ok(output)
 }
 
 struct WatchdogDeadlineGuard;
@@ -680,13 +872,22 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
                         exit_code,
                     }
                 }
-                Err(err) => {
-                    let err = CliError::from_error(err, wants_json);
-                    WatchdogResult {
-                        rendered: err.render_err(),
-                        exit_code: err.exit_code,
+                Err(err) => match output_after_committed_error(err, wants_json) {
+                    Ok(output) => {
+                        let exit_code = output.exit_code;
+                        WatchdogResult {
+                            rendered: output.render(),
+                            exit_code,
+                        }
                     }
-                }
+                    Err(err) => {
+                        let err = CliError::from_error(err, wants_json);
+                        WatchdogResult {
+                            rendered: err.render_err(),
+                            exit_code: err.exit_code,
+                        }
+                    }
+                },
             };
             // Send may fail if the main thread already timed out and moved on;
             // that's fine — we're abandoning this worker.
@@ -870,11 +1071,18 @@ fn run_inline(args: Vec<String>) -> ExitCode {
             output.print();
             ExitCode::from(exit_code)
         }
-        Err(err) => {
-            let err = CliError::from_error(err, wants_json);
-            err.print();
-            ExitCode::from(err.exit_code)
-        }
+        Err(err) => match output_after_committed_error(err, wants_json) {
+            Ok(output) => {
+                let exit_code = output.exit_code;
+                output.print();
+                ExitCode::from(exit_code)
+            }
+            Err(err) => {
+                let err = CliError::from_error(err, wants_json);
+                err.print();
+                ExitCode::from(err.exit_code)
+            }
+        },
     }
 }
 
@@ -994,6 +1202,7 @@ fn emit_timeout_unknown_mutation(wants_json: bool, timeout: Duration, event_id: 
         "mutating command exceeded {}ms after canonical mutation began but before exact readback; outcome is unknown",
         timeout.as_millis()
     );
+    let remedy = locate_remedy(event_id);
     if wants_json {
         let payload = json!({
             "ok": false,
@@ -1010,15 +1219,13 @@ fn emit_timeout_unknown_mutation(wants_json: bool, timeout: Duration, event_id: 
                     "event_id": event_id,
                     "phase": phase,
                     "timeout_ms": timeout.as_millis(),
-                    "query_remedy": format!("rally locate {event_id} --json"),
+                    "query_remedy": remedy,
                 }
             }
         });
         crate::output::write_line_or_exit_on_broken_pipe(&payload.to_string());
     }
-    eprintln!(
-        "rally: {message}; query `rally locate {event_id} --json` before retrying with the same event id"
-    );
+    eprintln!("rally: {message}; query `{remedy}` before deciding whether to rerun");
 }
 
 fn emit_timeout_committed_mutation(
@@ -1052,6 +1259,11 @@ fn emit_timeout_committed_mutation(
 }
 
 fn run_inner_with(args: &[String]) -> Result<Output> {
+    // Each invocation owns a fresh aggregate. This is especially important for
+    // in-process tests and the no-watchdog fallback, where one OS thread can
+    // execute multiple commands sequentially.
+    let _ = drain_pending_append_outcomes();
+    let _ = drain_pending_append_issues();
     // Test-only blocking seam: simulates a command path wedged on slow/stuck
     // I/O so the watchdog can be exercised deterministically. Compiled out of
     // release builds (`debug_assertions` is false in `--release`), so the
@@ -1377,7 +1589,7 @@ fn command_daemon_start(json: bool, args: cli::DaemonStartArgs) -> Result<Output
     fs::create_dir_all(&rally_dir).map_err(RallyError::io("create .rally"))?;
     let canonical = store::canonical_repo_root_string(&root);
 
-    if let Some(identity) = store_client::probe_identity(&rally_dir, &canonical) {
+    if let Some(identity) = store_client::probe_identity(&rally_dir, &canonical)? {
         let body = daemon_envelope_body(
             "start",
             true,
@@ -1434,7 +1646,7 @@ fn command_daemon_start(json: bool, args: cli::DaemonStartArgs) -> Result<Output
 
     let deadline = Instant::now() + DAEMON_START_READY_BOUND;
     loop {
-        if let Some(identity) = store_client::probe_identity(&rally_dir, &canonical) {
+        if let Some(identity) = store_client::probe_identity(&rally_dir, &canonical)? {
             let body = daemon_envelope_body(
                 "start",
                 true,
@@ -1524,7 +1736,7 @@ fn command_daemon_stop(json: bool) -> Result<Output> {
         // SEC-001 (b): corroborate that `pid` names a REAL daemon before
         // signaling. Only two things prove a live daemon: a live ping, or a
         // held EX ownership lock.
-        if let Some(identity) = store_client::probe_identity(&rally_dir, &canonical) {
+        if let Some(identity) = store_client::probe_identity(&rally_dir, &canonical)? {
             // A ping answered: the daemon is provably real. Signal the pid the
             // daemon REPORTS (authoritative — also covers a pid file that lags a
             // restart), not the possibly-stale on-disk pid.
@@ -1619,7 +1831,7 @@ fn command_daemon_status(json: bool) -> Result<Output> {
     let root = repo_root()?;
     let rally_dir = root.join(".rally");
     let canonical = store::canonical_repo_root_string(&root);
-    let identity = store_client::probe_identity(&rally_dir, &canonical);
+    let identity = store_client::probe_identity(&rally_dir, &canonical)?;
     let pid_file = fs::read_to_string(rally_dir.join("rallyd.pid"))
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok());
@@ -1974,16 +2186,17 @@ fn renew_owned_claim_leases(room: &RoomStore, tool: &str) -> Result<usize> {
             coord.reclaim_large_minutes,
         );
         let lease_expires_at = claim_authority::lease_marker_at(now, lease_secs);
-        if room
-            .renew_claim_lease(
-                &claim.event_id,
-                lease_expires_at,
-                tool,
-                Some(&from_session_id),
-                claim.from_session_id.as_deref(),
-            )?
-            .is_some()
-        {
+        let renewal = room.renew_claim_lease(
+            &claim.event_id,
+            lease_expires_at,
+            tool,
+            Some(&from_session_id),
+            claim.from_session_id.as_deref(),
+        )?;
+        if let Some(outcome) = renewal.append_outcome.as_ref() {
+            record_append_outcome(outcome);
+        }
+        if renewal.record.is_some() {
             renewed += 1;
         }
     }
@@ -2156,19 +2369,36 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // eligibility math had been right and unused for the room's whole life.
     // Rate-limited and fail-open inside `maybe_reap_on_enter`; it never fails
     // `enter`.
-    if let Some(report) = reaper::maybe_reap_on_enter(&room)
-        && (!report.claims_reaped.is_empty() || !report.handoffs_expired.is_empty())
-    {
-        // stderr, not the JSON body: `enter`'s schema is consumed by hooks and
-        // round-trip tests, and cleanup is a side note, not a result the caller
-        // asked for. Silence would repeat the mistake this fixes, though — a
-        // reap that closes 69 claims should say so once.
-        eprintln!(
-            "rally: auto-reap closed {} stale claim(s) and {} expired handoff(s) \
-             (run `rally doctor --reap-stale` to inspect; RALLY_NO_AUTO_REAP=1 to disable)",
-            report.claims_reaped.len(),
-            report.handoffs_expired.len()
-        );
+    if let Some(report) = reaper::maybe_reap_on_enter(&room) {
+        if !report.claims_reaped.is_empty() || !report.handoffs_expired.is_empty() {
+            eprintln!(
+                "rally: auto-reap closed {} stale claim(s) and {} expired handoff(s) \
+                 (run `rally doctor --reap-stale` to inspect; RALLY_NO_AUTO_REAP=1 to disable)",
+                report.claims_reaped.len(),
+                report.handoffs_expired.len()
+            );
+        }
+        // A lost reap reply is not a successful close and must not be narrated
+        // as one. Preserve every stable id/phase/remedy in enter's command-wide
+        // append_issues instead of silently dropping an incomplete report.
+        for unknown in &report.outcome_unknowns {
+            record_optional_append_issue(
+                "auto-reap",
+                &RallyError::outcome_unknown(&unknown.event_id, &unknown.phase, &unknown.detail),
+            );
+        }
+        let non_unknown_failures = report
+            .write_failures
+            .saturating_sub(report.outcome_unknowns.len());
+        if non_unknown_failures > 0 {
+            record_optional_append_issue(
+                "auto-reap",
+                &RallyError::Message(format!(
+                    "auto-reap had {} durable write failure(s); no cleanup was claimed for them",
+                    non_unknown_failures
+                )),
+            );
+        }
     }
 
     // Snapshot BEFORE writing presence so the cursor window reflects peer work
@@ -2406,7 +2636,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // checkpoint itself from inflating the cursor on the next enter.
     // maybe_append_read_checkpoint's own guard prevents double-counting when
     // cursor_after == last_checkpoint_seq (coalesces if no advancement).
-    room.maybe_append_read_checkpoint(&tool, snapshot.content_max_seq)?;
+    record_conditional_append(room.maybe_append_read_checkpoint(&tool, snapshot.content_max_seq)?);
     let mission = snapshot.mission.clone();
     let acknowledged = snapshot
         .squads
@@ -2696,7 +2926,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
     // stricter verified path that also asserts the projection flipped.
     // All other mutating facts go through append_fact_verified (segment readback
     // only — no projection assertion needed).
-    let append_outcome = with_watchdog_command_commit(|| match kind {
+    let mut append_outcome = with_watchdog_command_commit(|| match kind {
         FactKind::Release | FactKind::Resolve => room.append_state_transition_verified(&fact),
         _ => room.append_fact_verified(&fact),
     })?;
@@ -2774,29 +3004,68 @@ fn command_say(args: SayArgs) -> Result<Output> {
                         vec![format!("artifact_ref:{}", fact.event_id)],
                         Some(fact.event_id.clone()),
                     );
-                    let _ = room.append_fact(&risk_fact);
+                    room.append_fact(&risk_fact)?.into_fact_reporting();
                 }
             }
 
             // #8 ripple: for files that CHANGED, detect pub sig changes
-            // affecting peer claims. Best-effort; never blocks.
+            // affecting peer claims. These are auditable secondary writes: a
+            // failure produces an explicit partial command result.
             let changed_files: Vec<String> = original_hashes
                 .keys()
                 .filter(|p| !unchanged.contains(p))
                 .cloned()
                 .collect();
             if !changed_files.is_empty() {
-                let snap_for_ripple = room.snapshot().unwrap_or_default();
+                let snap_for_ripple = match room.snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let warning = store::ProjectionWarning {
+                            code: store::ProjectionWarningCode::PostCommitWork,
+                            message: format!(
+                                "canonical say fact committed but ripple input snapshot failed: {error}"
+                            ),
+                        };
+                        append_outcome.projection_complete = false;
+                        append_outcome.warnings.push(warning.clone());
+                        mark_watchdog_append_outcome(&append_outcome);
+                        update_recorded_append_outcome(&append_outcome);
+                        say_warnings.push(SayWarning {
+                            code: "projection:post_commit_work".to_string(),
+                            message: warning.message,
+                        });
+                        RoomSnapshot::default()
+                    }
+                };
                 let ripple_facts =
                     ripple::build_ripple_alerts(&changed_files, root, &args.tool, &snap_for_ripple);
                 for rf in ripple_facts {
-                    let _ = room.append_fact(&rf);
+                    room.append_fact(&rf)?.into_fact_reporting();
                 }
             }
         }
     }
 
-    let snapshot = room.snapshot()?;
+    let snapshot = match room.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let warning = store::ProjectionWarning {
+                code: store::ProjectionWarningCode::PostCommitWork,
+                message: format!(
+                    "canonical say fact committed but post-commit room snapshot failed: {error}"
+                ),
+            };
+            append_outcome.projection_complete = false;
+            append_outcome.warnings.push(warning.clone());
+            mark_watchdog_append_outcome(&append_outcome);
+            update_recorded_append_outcome(&append_outcome);
+            say_warnings.push(SayWarning {
+                code: "projection:post_commit_work".to_string(),
+                message: warning.message,
+            });
+            RoomSnapshot::default()
+        }
+    };
     // R9-readback: capture verified {room, seq} from the confirmed fact.
     let verified = SayVerified {
         room: room.room_id().to_string(),
@@ -3125,7 +3394,8 @@ fn command_release_by_path(
         uri,
         session: None,
     };
-    let appended = with_watchdog_command_commit(|| room.append_state_transition_verified(&fact))?;
+    let mut appended =
+        with_watchdog_command_commit(|| room.append_state_transition_verified(&fact))?;
     record_append_outcome(&appended);
     for (id, subj, _sc, _owner) in &match_meta {
         let takeover_note = if is_takeover {
@@ -3137,7 +3407,7 @@ fn command_release_by_path(
             code: "released-by-path".to_string(),
             message: format!(
                 "released claim {} (\"{}\") via path-only resolution{}; release seq={}",
-                id, subj, takeover_note, appended.seq
+                id, subj, takeover_note, appended.fact.seq
             ),
         });
     }
@@ -3148,7 +3418,26 @@ fn command_release_by_path(
         });
     }
     let last_fact = appended.fact.clone();
-    let snapshot_after = room.snapshot()?;
+    let snapshot_after = match room.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let warning = store::ProjectionWarning {
+                code: store::ProjectionWarningCode::PostCommitWork,
+                message: format!(
+                    "canonical path release committed but post-commit room snapshot failed: {error}"
+                ),
+            };
+            appended.projection_complete = false;
+            appended.warnings.push(warning.clone());
+            mark_watchdog_append_outcome(&appended);
+            update_recorded_append_outcome(&appended);
+            warnings.push(SayWarning {
+                code: "projection:post_commit_work".to_string(),
+                message: warning.message,
+            });
+            RoomSnapshot::default()
+        }
+    };
     let verified = SayVerified {
         room: room.room_id().to_string(),
         seq: last_fact.seq,
@@ -3322,10 +3611,14 @@ fn command_next(args: NextArgs) -> Result<Output> {
     // E.g. if content_max_seq = 5 and we write a checkpoint at seq 6 recording
     // "read_seq:5", the next poll sees content_max_seq = 5 again (the checkpoint
     // at seq 6 is excluded) → last_checkpoint = 5 → no new checkpoint written.
-    // This call uses `append_fact` (not `append_fact_verified`) — read-checkpoints
-    // are low-stakes metadata and must not trigger a segment readback loop.
+    // O26's base append performs exact canonical readback. This low-stakes
+    // checkpoint remains optional to `next`, but any committed warning or
+    // query-required uncertainty is surfaced in the command aggregate.
     if !audit {
-        let _ = room.maybe_append_read_checkpoint(&tool, snapshot.content_max_seq);
+        consume_optional_conditional_append(
+            room.maybe_append_read_checkpoint(&tool, snapshot.content_max_seq),
+            "next read checkpoint",
+        );
     }
     let lead_context = build_lead_context(&snapshot, Some(&tool), role.as_deref());
     let body = envelope(
@@ -3388,21 +3681,30 @@ fn command_migrate_legacy(args: MigrateLegacyArgs) -> Result<Output> {
         .unwrap_or_else(|| root.display().to_string());
     let room = RoomStore::open()?;
     let data = discovery::migrate_legacy(&room, &repo_basename)?;
+    for outcome in &data.append_outcomes {
+        record_append_outcome(outcome);
+    }
+    let outcome_unknown_count = data.outcome_unknowns.len();
     let text = format!(
-        "migrate-legacy slugs={} facts_read={} migrated={} skipped_existing={}",
+        "migrate-legacy slugs={} facts_read={} migrated={} skipped_existing={} outcome_unknown={outcome_unknown_count}",
         data.slugs_found.len(),
         data.facts_read,
         data.facts_migrated,
         data.facts_skipped_existing,
     );
-    let body = envelope(
+    let mut body = envelope(
         "migrate-legacy",
         SCHEMA_MIGRATE_LEGACY,
         MigrateLegacyEnvelope {
             migrate_legacy: data,
         },
     )?;
-    Ok(Output::new(args.json, text, body))
+    if outcome_unknown_count > 0 {
+        body["ok"] = Value::Bool(false);
+        Ok(Output::new(args.json, text, body).with_exit_code(1))
+    } else {
+        Ok(Output::new(args.json, text, body))
+    }
 }
 
 /// Wrapper: wraps doctor result under `data.doctor`.
@@ -4372,23 +4674,30 @@ fn command_status_post(json: bool, mut args: cli::StatusPostArgs) -> Result<Outp
         session: None,
     };
     let mut appended = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
+    record_append_outcome(&appended);
     // The shipped coordination hook emits status posts as heartbeats. Renew
     // after the presence append so liveness and lease durability succeed or
     // fail together from the caller's perspective.
     if let Err(error) =
         with_watchdog_command_commit(|| renew_owned_claim_leases(&room, &args.tool).map(|_| ()))
     {
+        if matches!(error, RallyError::OutcomeUnknown { .. }) {
+            // Preserve the stable renewal event id, phase, and query remedy in
+            // the command-wide typed partial result. A string warning would
+            // invite retrying an append that may already be canonical.
+            return Err(error);
+        }
         appended.projection_complete = false;
         appended.warnings.push(store::ProjectionWarning {
             code: store::ProjectionWarningCode::PostCommitWork,
             message: format!("status heartbeat committed but lease renewal failed: {error}"),
         });
         mark_watchdog_append_outcome(&appended);
+        update_recorded_append_outcome(&appended);
     }
-    record_append_outcome(&appended);
     let state = agent_state::project_presence_to_state(&appended.fact)
         .unwrap_or(agent_state::AgentState::Idle { wake_after: None });
-    let text = format!("status post tool={} seq={}", args.tool, appended.seq);
+    let text = format!("status post tool={} seq={}", args.tool, appended.fact.seq);
     let body = envelope(
         "status_post",
         SCHEMA_STATUS_POST,
@@ -5285,6 +5594,12 @@ fn command_run(args: RunArgs) -> Result<Output> {
             &command,
         ) {
             PtydSpawnResult::Daemon => { /* session is daemon-owned + registered */ }
+            PtydSpawnResult::DurableRecordFailed(error) => {
+                // The pane is already live and registered. Preserve that
+                // external state and return the durable partial-commit error;
+                // treating this as spawn failure would reap a successful pane.
+                return Err(error);
+            }
             PtydSpawnResult::FellBackToTmux { warning } => {
                 // The ptyd pane was already reaped inside the helper. Relaunch
                 // under tmux so the agent actually runs; switch the runner +
@@ -5312,8 +5627,13 @@ fn command_run(args: RunArgs) -> Result<Output> {
                         {
                             let _ = run_worktree::cleanup(&repo, path, branch, "git");
                         }
-                        if let Some(fact) = &reservation.fact {
-                            let _ = append_stopped_session_record(&room, &session, fact);
+                        if let Some(fact) = &reservation.fact
+                            && let Err(cleanup_err) =
+                                append_stopped_session_record(&room, &session, fact)
+                        {
+                            return Err(RallyError::Message(format!(
+                                "backend start failed: {err}; additionally failed to mark managed session stopped: {cleanup_err}"
+                            )));
                         }
                         return Err(err);
                     }
@@ -5380,7 +5700,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
         // session's tmux/cmux pane with a daemon that may already own it. This
         // is the EXISTING path (detect_host_runtime candidate list); the ptyd
         // spawn path above handles its own registration. Fail-OPEN.
-        try_register_session_with_daemon(&room, &reservation.fact, &mut session);
+        try_register_session_with_daemon(&room, &reservation.fact, &mut session)?;
     }
 
     let body = envelope(
@@ -5419,11 +5739,11 @@ fn try_register_session_with_daemon(
     room: &RoomStore,
     reservation_fact: &Option<Fact>,
     session: &mut ManagedSession,
-) {
+) -> Result<()> {
     let runtime = detect_host_runtime();
     // Never guess which daemon to bind when multiple sockets are resolvable.
     let Some(socket) = daemon_client::resolve_unambiguous_socket(&runtime.sockets_found) else {
-        return;
+        return Ok(());
     };
     match daemon_client::register_agent(&socket, &session.tool, &session.target) {
         daemon_client::RegisterOutcome::Registered { pane_id } => {
@@ -5432,12 +5752,14 @@ fn try_register_session_with_daemon(
             // Refresh the durable session record so the binding survives and is
             // visible under `rally sessions`.
             let prev = reservation_fact.as_ref().map(|f| f.event_id.clone());
-            let _ = room.append_fact(&session_fact(session, "active", prev));
+            room.append_fact(&session_fact(session, "active", prev))?
+                .into_fact_reporting();
         }
         daemon_client::RegisterOutcome::Unavailable { .. } => {
             // Fall back silently — framed-tmux delivery carries the inject.
         }
     }
+    Ok(())
 }
 
 /// Result of the ptyd pane-ownership spawn path.
@@ -5451,6 +5773,9 @@ enum PtydSpawnResult {
     FellBackToTmux { warning: String },
     /// The spawn RPC itself failed — no pane exists to reap.
     Failed(RallyError),
+    /// The pane is live and registered, but its follow-up durable session
+    /// record did not complete. Do not reap the live pane or hide uncertainty.
+    DurableRecordFailed(RallyError),
 }
 
 /// Spawn a ptyd-owned agent pane and register the session's identity with the
@@ -5512,8 +5837,13 @@ fn ptyd_spawn_and_register(
             session.daemon_pane = Some(bound);
             // Refresh the durable record so the binding is visible + survives.
             let prev = reservation_fact.as_ref().map(|f| f.event_id.clone());
-            let _ = room.append_fact(&session_fact(session, "active", prev));
-            PtydSpawnResult::Daemon
+            match room.append_fact(&session_fact(session, "active", prev)) {
+                Ok(outcome) => {
+                    outcome.into_fact_reporting();
+                    PtydSpawnResult::Daemon
+                }
+                Err(error) => PtydSpawnResult::DurableRecordFailed(error),
+            }
         }
         daemon_client::RegisterOutcome::Unavailable { reason } => {
             // F2: reap the orphaned pane BEFORE falling back. [G]: reap by the
@@ -5662,7 +5992,7 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
     // `rally run`. Fail-open — an adopted tmux/cmux pane the daemon doesn't own
     // simply stays on the framed-tmux fallback.
     let mut session = session;
-    try_register_session_with_daemon(&room, &Some(landed_fact), &mut session);
+    try_register_session_with_daemon(&room, &Some(landed_fact), &mut session)?;
 
     let body = envelope(
         "adopt",
@@ -6111,9 +6441,10 @@ fn append_orphan_tmux_tombstone(
 /// a managed-session record points at, kills + tombstones each, and returns the
 /// reaped session names.
 ///
-/// BEST-EFFORT by contract: a failed kill/tombstone is skipped silently; the
-/// function never returns an error and never blocks its caller (Layer 2 wires it
-/// into the hot `enter` path, which must not stall on a tmux hiccup).
+/// BEST-EFFORT by contract: the function never returns an error to the hot
+/// `enter` path. A tombstone failure is still consumed explicitly and surfaced
+/// through command-wide `append_issues`, including OutcomeUnknown query data;
+/// it is no longer silently discarded.
 fn sweep_orphan_tmux(
     room: &RoomStore,
     tmux_bin: &str,
@@ -6129,11 +6460,14 @@ fn sweep_orphan_tmux(
             continue;
         }
         if backends::kill_tmux_session(tmux_bin, &orphan.session_name) {
-            let _ = append_orphan_tmux_tombstone(
-                room,
-                &orphan.session_name,
-                orphan.idle_secs,
-                &orphan.reason,
+            consume_optional_result(
+                append_orphan_tmux_tombstone(
+                    room,
+                    &orphan.session_name,
+                    orphan.idle_secs,
+                    &orphan.reason,
+                ),
+                "orphan tmux tombstone",
             );
             reaped.push(orphan.session_name);
         }
@@ -6616,7 +6950,7 @@ fn command_inject_managed(
         (&ptyd_delivery, directive_seq, room.as_ref())
     {
         let receipt = ptyd_receipt_fact(&sender_tool, seq, &session.tool, state);
-        let _ = r.append_fact(&receipt);
+        consume_optional_append(r.append_fact(&receipt), "ptyd delivery receipt");
     }
 
     // Legacy synchronous backend delivery — preserved for tmux/cmux backends.
@@ -7055,8 +7389,9 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                 // before removing the session record. Self-release is
                 // authoritative (bypasses the 2h reclaim bar — the owner is
                 // declaring itself done), keeps SEC-001 dormant (no stale-owner
-                // marker on the release fact), and is best-effort (never blocks
-                // the stop path).
+                // marker on the release fact). It is a required/auditable part
+                // of stop: an uncertain close returns a typed partial result
+                // instead of silently removing the session record.
                 //
                 // Goal F4: release THAT SESSION's claims, not every claim that
                 // happens to share the stopping tool. Two co-resident sessions
@@ -7083,9 +7418,15 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                         let release = Fact {
                             from_session_id: Some(stopping_session.to_string()),
                             schema: FACT_SCHEMA.to_string(),
-                            event_id: new_id("fact"),
+                            event_id: stable_operation_id(
+                                "stop-release",
+                                &format!("{}:{}", session.session_id, claim.event_id),
+                            ),
                             seq: 0,
-                            thread_id: new_id("room"),
+                            thread_id: stable_operation_id(
+                                "stop-release-thread",
+                                &format!("{}:{}", session.session_id, claim.event_id),
+                            ),
                             kind: FactKind::Release,
                             tool: Some(stopping_tool.clone()),
                             role: None,
@@ -7103,7 +7444,8 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                             uri: None,
                             session: None,
                         };
-                        let _ = room.append_state_transition_verified(&release);
+                        room.append_state_transition_verified(&release)?
+                            .into_fact_reporting();
                     }
                 }
                 remove_session_record(&session.session_id)?;
@@ -8215,6 +8557,14 @@ pub(crate) fn shell_quote(value: &str) -> String {
         .into_owned()
 }
 
+/// Render the stable-id recovery command as one shell-safe argv sequence.
+///
+/// Event ids are opaque schema strings, so callers must quote them rather than
+/// narrowing the accepted grammar or interpolating executable shell syntax.
+pub(crate) fn locate_remedy(event_id: &str) -> String {
+    format!("rally locate {} --json", shell_quote(event_id))
+}
+
 /// Crate-wide serialization lock for tests that mutate process-global env vars
 /// (`RALLY_ENGAGEMENT`, `RALLY_ROTATE_DAYS`, `RALLY_GLOBAL_INDEX`, `HOME`,
 /// `PTYD_SOCKET_PATH`, `XDG_RUNTIME_DIR`).  Every env-mutating test must acquire
@@ -9304,6 +9654,18 @@ mod tests {
         assert!(!quoted.contains('\0'));
     }
 
+    #[test]
+    fn o26_locate_remedy_preserves_hostile_opaque_event_id_as_one_argument() {
+        let event_id = "opaque id 'quoted' $(touch should-not-run);$HOME";
+        let remedy = locate_remedy(event_id);
+        assert_eq!(
+            shlex::split(&remedy).unwrap(),
+            vec!["rally", "locate", event_id, "--json"]
+        );
+        let display = RallyError::outcome_unknown(event_id, "readback", "forced").to_string();
+        assert!(!display.contains("rally locate"));
+    }
+
     /// inject content fact authored by sender, targeting recipient, with message
     /// content in subject and summary — verifiable from the ledger alone, no tmux.
     #[test]
@@ -9381,6 +9743,14 @@ mod tests {
         ref_fact(FactKind::Resolve, tool, ref_id, subject)
     }
 
+    fn handoff_under_test(event_id: &str, target: &str) -> Fact {
+        let mut fact = ref_fact(FactKind::Handoff, "sender:test", "unused", "test handoff");
+        fact.event_id = event_id.to_string();
+        fact.ref_id = None;
+        fact.target = Some(target.to_string());
+        fact
+    }
+
     #[test]
     fn wait_for_resolution_accepts_only_expected_tool() {
         let root = unique_root("ack-tool-correlation");
@@ -9389,10 +9759,19 @@ mod tests {
         let handoff_id = "handoff-under-test";
         let expected_tool = "claude_code:reviewer-01";
 
-        room.append_fact(&resolve_fact("codex:other", handoff_id, "wrong ack"))
+        room.append_fact(&handoff_under_test(handoff_id, expected_tool))
             .unwrap();
         room.append_fact(&resolve_fact(expected_tool, handoff_id, "right ack"))
             .unwrap();
+        // A later wrong-tool acknowledgement candidate must not replace the
+        // expected tool's already-recorded resolution.
+        room.append_fact(&ref_fact(
+            FactKind::Artifact,
+            "codex:other",
+            handoff_id,
+            "wrong ack",
+        ))
+        .unwrap();
 
         let ack = wait_for_resolution(handoff_id, 0, 0, &room, expected_tool).unwrap();
 
@@ -9418,6 +9797,8 @@ mod tests {
         let handoff_id = "handoff-under-test";
         let expected_tool = "claude_code:reviewer-01";
 
+        room.append_fact(&handoff_under_test(handoff_id, expected_tool))
+            .unwrap();
         room.append_fact(&resolve_fact("codex:other", handoff_id, "wrong ack"))
             .unwrap();
 
@@ -10454,8 +10835,10 @@ mod tests {
 
         let tool = "b16-test-tool";
         let mut written: Vec<store::Fact> = Vec::new();
+        let mut live_claim_id: Option<String> = None;
+        let mut live_blocker_id: Option<String> = None;
         for (subject, kind) in kinds {
-            let fact = store::Fact {
+            let mut fact = store::Fact {
                 from_session_id: None,
                 schema: FACT_SCHEMA.to_string(),
                 event_id: new_id("b16"),
@@ -10476,8 +10859,22 @@ mod tests {
                 uri: None,
                 session: None,
             };
+            match kind {
+                store::FactKind::Release => fact.ref_id = live_claim_id.clone(),
+                store::FactKind::Resolve => fact.ref_id = live_blocker_id.clone(),
+                _ => {}
+            }
             let appended = writer.append_fact(&fact).unwrap();
-            assert!(appended.seq > 0, "appended {subject} must have seq > 0");
+            assert!(
+                appended.fact.seq > 0,
+                "appended {subject} must have seq > 0"
+            );
+            if kind == &store::FactKind::Claim {
+                live_claim_id = Some(appended.fact.event_id.clone());
+            }
+            if kind == &store::FactKind::Blocker {
+                live_blocker_id = Some(appended.fact.event_id.clone());
+            }
             written.push(appended.fact);
         }
 
@@ -10805,9 +11202,9 @@ mod tests {
         // watch_read_max_seq must see the new seq from the per-repo index.
         let seq_after = watch_read_max_seq(&log_dir);
         assert_eq!(
-            seq_after, appended.seq,
+            seq_after, appended.fact.seq,
             "watch_read_max_seq must return the same seq as appended ({}) from per-repo index",
-            appended.seq
+            appended.fact.seq
         );
 
         // The log_dir path must be under the per-repo .rally/ and NOT reference
@@ -11796,9 +12193,10 @@ mod tests {
             session: None,
         };
         let appended = room.append_fact_verified(&fact).unwrap();
-        assert_eq!(appended.kind.as_str(), "standby");
+        assert_eq!(appended.fact.kind.as_str(), "standby");
         assert!(
             appended
+                .fact
                 .summary
                 .as_deref()
                 .unwrap_or("")
@@ -11812,7 +12210,7 @@ mod tests {
         let facts = reader.facts().unwrap();
         let found = facts
             .iter()
-            .find(|f| f.event_id == appended.event_id)
+            .find(|f| f.event_id == appended.fact.event_id)
             .expect("standby fact must round-trip");
         assert_eq!(found.kind.as_str(), "standby");
         assert!(
@@ -11875,7 +12273,7 @@ mod tests {
             summary: None,
             evidence: Vec::new(),
             target: None,
-            ref_id: Some(standby_fact.event_id.clone()),
+            ref_id: Some(standby_fact.fact.event_id.clone()),
             status: None,
             severity: None,
             uri: None,
@@ -11884,8 +12282,8 @@ mod tests {
         let wake_fact = room.append_fact_verified(&wake).unwrap();
 
         assert_eq!(
-            wake_fact.ref_id.as_deref(),
-            Some(standby_fact.event_id.as_str()),
+            wake_fact.fact.ref_id.as_deref(),
+            Some(standby_fact.fact.event_id.as_str()),
             "wake fact must reference the standby event_id"
         );
 
@@ -11896,7 +12294,7 @@ mod tests {
         // but we verify the woken-standby logic covers it.
         let woken_in_due = due
             .iter()
-            .any(|d| d.standby_event_id == standby_fact.event_id);
+            .any(|d| d.standby_event_id == standby_fact.fact.event_id);
         assert!(!woken_in_due, "woken standby must not appear in wake-due");
 
         std::fs::remove_dir_all(&root).ok();
@@ -12104,7 +12502,7 @@ mod tests {
         assert!(!due.is_empty(), "wake-due must surface the past standby");
         let entry = due
             .iter()
-            .find(|d| d.standby_event_id == standby_fact.event_id)
+            .find(|d| d.standby_event_id == standby_fact.fact.event_id)
             .expect("past standby must appear in wake-due");
 
         // suggested_command is a string, never executed by rally.
@@ -12776,6 +13174,366 @@ mod tests {
                 let _ = std::env::set_current_dir(prev);
             }
         }
+    }
+
+    fn o26_decision_say_args(tool: &str) -> SayArgs {
+        SayArgs {
+            json: true,
+            kind: FactKind::Decision,
+            tool: tool.to_string(),
+            subject: Some("o26 command decision".to_string()),
+            thread_id: None,
+            role: None,
+            summary: Some("o26 command contract".to_string()),
+            scopes: Vec::new(),
+            resources: Vec::new(),
+            paths: Vec::new(),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            produces: Vec::new(),
+            depends: Vec::new(),
+            run_id: None,
+            step_id: None,
+            parent_step_ids: Vec::new(),
+            reason: None,
+            wake_after: None,
+            ref_standby: None,
+        }
+    }
+
+    #[test]
+    fn o26_standalone_say_unknown_renders_queryable_json_and_text() {
+        let root = unique_root("o26-say-unknown");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let _cwd = CwdEnvGuard::enter(&root);
+        let room = RoomStore::open().unwrap();
+        ensure_presence(&room, "o26-say-tool").unwrap();
+        let _ = drain_pending_append_outcomes();
+        let _ = drain_pending_append_issues();
+        store::fail_o26_once(
+            &room.rally_dir(),
+            store::O26FaultPoint::AfterCanonicalSyncBeforeReadback,
+        );
+
+        let error = match command_say(o26_decision_say_args("o26-say-tool")) {
+            Ok(_) => panic!("post-sync pre-readback say fault must be unknown"),
+            Err(error) => error,
+        };
+        let (event_id, phase) = match &error {
+            RallyError::OutcomeUnknown {
+                event_id, phase, ..
+            } => (event_id.clone(), phase.clone()),
+            other => panic!("expected typed OutcomeUnknown, got {other}"),
+        };
+        let output = output_after_committed_error(error, true).unwrap();
+        assert_eq!(output.exit_code, 1);
+        assert_eq!(output.body["command"], "mutation_outcome_unknown");
+        assert_eq!(output.body["data"]["event_id"], event_id);
+        assert_eq!(output.body["data"]["phase"], phase);
+        assert_eq!(
+            output.body["data"]["query_remedy"],
+            locate_remedy(&event_id)
+        );
+        assert!(output.text.contains(&event_id));
+        assert!(output.text.contains(&phase));
+        assert!(output.text.contains("rally locate"));
+        assert_eq!(
+            room.facts()
+                .unwrap()
+                .iter()
+                .filter(|fact| fact.event_id == event_id)
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_say_snapshot_failure_is_committed_success_with_warning() {
+        let root = unique_root("o26-say-snapshot-warning");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let _cwd = CwdEnvGuard::enter(&root);
+        let room = RoomStore::open().unwrap();
+        ensure_presence(&room, "o26-snapshot-tool").unwrap();
+        let _ = drain_pending_append_outcomes();
+        let _ = drain_pending_append_issues();
+        store::fail_o26_once(&room.rally_dir(), store::O26FaultPoint::SnapshotPostCommit);
+
+        let mut output = command_say(o26_decision_say_args("o26-snapshot-tool"))
+            .expect("post-commit snapshot failure must not make say retryable");
+        attach_pending_append_outcomes(&mut output);
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.body["ok"], true);
+        assert_eq!(output.body["data"]["projection_complete"], false);
+        let outcomes = output.body["data"]["append_outcomes"].as_array().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0]["committed"], true);
+        assert!(
+            outcomes[0]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "post_commit_work")
+        );
+        assert_eq!(
+            room.facts()
+                .unwrap()
+                .iter()
+                .filter(|fact| fact.subject == "o26 command decision")
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_artifact_ripple_snapshot_failure_degrades_the_primary_outcome() {
+        let root = unique_root("o26-artifact-ripple-snapshot");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/grounded.rs"), "pub fn before() {}\n").unwrap();
+        let _cwd = CwdEnvGuard::enter(&root);
+
+        let mut claim_args = o26_decision_say_args("o26-artifact-tool");
+        claim_args.kind = FactKind::Claim;
+        claim_args.subject = Some("claim grounded file".to_string());
+        claim_args.paths = vec!["src/grounded.rs".to_string()];
+        let claim_output = command_say(claim_args).unwrap();
+        let claim_id = claim_output.body["data"]["say"]["fact"]["event_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(root.join("src/grounded.rs"), "pub fn after() {}\n").unwrap();
+        let room = RoomStore::open().unwrap();
+        let _ = drain_pending_append_outcomes();
+        let _ = drain_pending_append_issues();
+        store::fail_o26_once(&room.rally_dir(), store::O26FaultPoint::SnapshotPostCommit);
+
+        let mut artifact_args = o26_decision_say_args("o26-artifact-tool");
+        artifact_args.kind = FactKind::Artifact;
+        artifact_args.subject = Some("artifact for changed grounded file".to_string());
+        artifact_args.paths = vec!["src/grounded.rs".to_string()];
+        artifact_args.ref_id = Some(claim_id);
+        let mut output =
+            command_say(artifact_args).expect("ripple snapshot failure is post-commit degradation");
+        attach_pending_append_outcomes(&mut output);
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.body["data"]["say"]["committed"], true);
+        assert_eq!(output.body["data"]["say"]["projection_complete"], false);
+        assert!(
+            output.body["data"]["say"]["projection_warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| {
+                    warning["code"] == "post_commit_work"
+                        && warning["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("ripple input snapshot"))
+                })
+        );
+        assert_eq!(output.body["data"]["projection_complete"], false);
+        assert_eq!(
+            output.body["data"]["append_outcomes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let artifact_id = output.body["data"]["say"]["fact"]["event_id"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            room.facts()
+                .unwrap()
+                .iter()
+                .filter(|fact| fact.event_id == artifact_id)
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_status_post_keeps_presence_before_queryable_renewal_unknown() {
+        let root = unique_root("o26-status-renewal-unknown");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let _cwd = CwdEnvGuard::enter(&root);
+        let room = RoomStore::open().unwrap();
+        let tool = "o26-status-tool";
+        ensure_presence(&room, tool).unwrap();
+        let session_id = current_protocol_session(Some(tool))
+            .from_session_id()
+            .to_string();
+        let claim = store::Fact {
+            from_session_id: Some(session_id),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: "o26-status-renew-claim".to_string(),
+            seq: 0,
+            thread_id: "o26-status-renew-claim-thread".to_string(),
+            kind: store::FactKind::Claim,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: "claim renewed by status heartbeat".to_string(),
+            scope: vec!["file:src/status.rs".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: vec!["lease_expires_at:2000-01-01T00:00:00Z".to_string()],
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&claim).unwrap();
+        let _ = drain_pending_append_outcomes();
+        let _ = drain_pending_append_issues();
+        // The heartbeat presence append reaches this seam first; pass it, then
+        // fail the renewal after sync and before its exact readback.
+        store::skip_o26_once(
+            &room.rally_dir(),
+            store::O26FaultPoint::AfterCanonicalSyncBeforeReadback,
+        );
+        store::fail_o26_once(
+            &room.rally_dir(),
+            store::O26FaultPoint::AfterCanonicalSyncBeforeReadback,
+        );
+
+        let error = match command_status_post(
+            true,
+            cli::StatusPostArgs {
+                tool: tool.to_string(),
+                state: "working".to_string(),
+                file: Some("src/status.rs".to_string()),
+                intent: Some("prove status renewal uncertainty".to_string()),
+                blocked_ref: None,
+                wake_after: None,
+                committed_sha: None,
+                worktree_branch: None,
+            },
+        ) {
+            Ok(_) => panic!("renewal uncertainty must make status a typed partial commit"),
+            Err(error) => error,
+        };
+        let renewal_event_id = match &error {
+            RallyError::OutcomeUnknown {
+                event_id, phase, ..
+            } => {
+                assert_eq!(phase, "canonical-sync-before-readback");
+                event_id.clone()
+            }
+            other => panic!("expected renewal OutcomeUnknown, got {other}"),
+        };
+        let output = output_after_committed_error(error, true).unwrap();
+        assert_eq!(output.exit_code, 1);
+        assert_eq!(output.body["command"], "partial_commit");
+        assert_eq!(
+            output.body["data"]["outcome_unknown"]["event_id"],
+            renewal_event_id
+        );
+        assert_eq!(
+            output.body["data"]["outcome_unknown"]["remedy"],
+            locate_remedy(&renewal_event_id)
+        );
+        let outcomes = output.body["data"]["append_outcomes"].as_array().unwrap();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "presence is the one proven command append"
+        );
+        let presence_seq = outcomes[0]["fact"]["seq"].as_i64().unwrap();
+        let facts = room.facts().unwrap();
+        let renewals = facts
+            .iter()
+            .filter(|fact| {
+                fact.kind == store::FactKind::ClaimRenewed
+                    && fact.ref_id.as_deref() == Some(claim.event_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(renewals.len(), 1);
+        assert_eq!(renewals[0].event_id, renewal_event_id);
+        assert!(
+            presence_seq < renewals[0].seq,
+            "outcomes must retain commit order"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_migrate_legacy_emits_each_canonical_outcome_once() {
+        let root = unique_root("o26-migrate-command-outcomes");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let _cwd = CwdEnvGuard::enter(&root);
+        let home = root.join("test-home");
+        let repo_slug = root.file_name().unwrap().to_string_lossy().to_string();
+        let apps_dir = home.join(".agent-rally-point/apps").join(&repo_slug);
+        std::fs::create_dir_all(&apps_dir).unwrap();
+        let row = serde_json::json!({
+            "schema": FACT_SCHEMA,
+            "event_id": "o26-command-migrate-singleton",
+            "seq": 7,
+            "thread_id": "o26-command-migrate-thread",
+            "kind": "decision",
+            "tool": "legacy:test",
+            "subject": "duplicate legacy row",
+            "scope": [],
+            "created_at": "2026-08-10T00:00:00Z",
+            "evidence": []
+        })
+        .to_string();
+        std::fs::write(apps_dir.join("changes.jsonl"), format!("{row}\n{row}\n")).unwrap();
+        struct HomeGuard(Option<std::ffi::OsString>);
+        impl Drop for HomeGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(value) => env::set_var("HOME", value),
+                        None => env::remove_var("HOME"),
+                    }
+                }
+            }
+        }
+        let _home = HomeGuard(env::var_os("HOME"));
+        unsafe { env::set_var("HOME", &home) };
+        let _ = drain_pending_append_outcomes();
+        let _ = drain_pending_append_issues();
+
+        let mut output = command_migrate_legacy(MigrateLegacyArgs { json: true }).unwrap();
+        attach_pending_append_outcomes(&mut output);
+        assert_eq!(output.body["data"]["migrate-legacy"]["facts_migrated"], 1);
+        assert_eq!(
+            output.body["data"]["migrate-legacy"]["facts_skipped_existing"],
+            1
+        );
+        assert!(
+            output.body["data"]["migrate-legacy"]
+                .get("append_outcomes")
+                .is_none(),
+            "full outcomes belong only at the command-wide boundary"
+        );
+        assert_eq!(
+            output.body["data"]["append_outcomes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            RoomStore::open()
+                .unwrap()
+                .facts()
+                .unwrap()
+                .iter()
+                .filter(|fact| fact.event_id == "o26-command-migrate-singleton")
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -13726,6 +14484,15 @@ pub(crate) fn new_id(prefix: &str) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("{prefix}_{:x}_{:x}", std::process::id(), nanos)
+}
+
+fn stable_operation_id(action: &str, target: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in action.bytes().chain([0]).chain(target.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{action}-{hash:016x}")
 }
 
 pub(crate) fn now_string() -> String {

@@ -530,7 +530,11 @@ mod imp {
     /// Per-connection reader thread: read one request line, route it through the
     /// dispatcher, write one reply line, close. Any framing/parse failure yields
     /// a structured error reply (never a panic — falsifier B).
-    fn handle_conn(stream: UnixStream, job_tx: Sender<Job>) -> std::io::Result<()> {
+    fn handle_conn(
+        stream: UnixStream,
+        job_tx: Sender<Job>,
+        rally_dir: &Path,
+    ) -> std::io::Result<()> {
         prepare_accepted_stream(&stream)?;
 
         let response = match read_request_line(&stream) {
@@ -580,6 +584,9 @@ mod imp {
                 }
             }
         };
+        if store::trigger_o26_fault(rally_dir, store::O26FaultPoint::DaemonReplyDrop).is_err() {
+            return Ok(());
+        }
         write_response(&stream, &response)
     }
 
@@ -601,6 +608,7 @@ mod imp {
                     RallyError::Command(_) => StoreErrorKind::Command,
                     RallyError::Message(_) => StoreErrorKind::Message,
                     RallyError::NotStarted(_) => StoreErrorKind::NotStarted,
+                    RallyError::IncompatibleWire { .. } => StoreErrorKind::IncompatibleWire,
                     RallyError::Io { .. } | RallyError::Json { .. } => StoreErrorKind::Internal,
                     RallyError::OutcomeUnknown { .. } => unreachable!("handled above"),
                 };
@@ -953,6 +961,9 @@ mod imp {
             StoreOp::RenewClaimLease {
                 claim_id,
                 lease_expires_at,
+                event_id,
+                thread_id,
+                created_at,
                 caller_tool,
                 caller_session_id,
                 expected_owner_session_id,
@@ -964,13 +975,14 @@ mod imp {
                         caller_tool.as_deref(),
                         caller_session_id.as_deref(),
                         expected_owner_session_id.as_deref(),
+                        &event_id,
+                        &thread_id,
+                        &created_at,
                     )
                     .map_err(rally_to_wire)?;
-                let record = match record {
-                    Some(r) => Some(to_wire_value(&r)?),
-                    None => None,
-                };
-                StoreOk::RenewClaimLease { record }
+                StoreOk::RenewClaimLease {
+                    outcome: to_wire_value(&record)?,
+                }
             }
             StoreOp::SessionFactsWithContextVersion => {
                 let (facts, context_version) = store
@@ -1026,15 +1038,14 @@ mod imp {
                 let seq = store.last_checkpoint_seq(&tool).map_err(rally_to_wire)?;
                 StoreOk::LastCheckpointSeq { seq }
             }
-            StoreOp::MaybeAppendReadCheckpoint { tool, read_seq } => {
+            StoreOp::MaybeAppendReadCheckpoint { fact, read_seq } => {
+                let fact = fact_from_value(fact)?;
                 let out = store
-                    .maybe_append_read_checkpoint(&tool, read_seq)
+                    .maybe_append_read_checkpoint(&fact, read_seq)
                     .map_err(rally_to_wire)?;
-                let fact = match out {
-                    Some(x) => Some(to_wire_value(&x)?),
-                    None => None,
-                };
-                StoreOk::MaybeAppendReadCheckpoint { fact }
+                StoreOk::MaybeAppendReadCheckpoint {
+                    result: to_wire_value(&out)?,
+                }
             }
             StoreOp::ProjectReadReceipts { max_seq } => {
                 let receipts = store
@@ -1238,11 +1249,12 @@ mod imp {
                         }
                         let jt = job_tx.clone();
                         let rt = reader_threads.clone();
+                        let connection_rally_dir = rally_dir.clone();
                         // Keep a fallback handle so a `spawn` FAILURE can still
                         // answer with a structured error instead of panicking.
                         let busy_fallback = stream.try_clone().ok();
                         match thread::Builder::new().spawn(move || {
-                            if let Err(e) = handle_conn(stream, jt) {
+                            if let Err(e) = handle_conn(stream, jt, &connection_rally_dir) {
                                 log(&format!("serve connection failed: {e}"));
                             }
                             rt.fetch_sub(1, Ordering::SeqCst);
@@ -1442,12 +1454,12 @@ mod imp {
         }
 
         #[test]
-        fn daemon_rejects_v3_requests_after_mutation_deadline_changes() {
-            assert_eq!(WIRE_VERSION, 4, "this control grades the v3 to v4 cutover");
-            let repo_root = unique_repo_root("reject-v3");
+        fn daemon_rejects_v4_requests_after_append_outcome_cutover() {
+            assert_eq!(WIRE_VERSION, 5, "this control grades the v4 to v5 cutover");
+            let repo_root = unique_repo_root("reject-v4");
             let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
             let request = StoreRequest {
-                wire_version: 3,
+                wire_version: 4,
                 engagement: None,
                 deadline_unix_ms: None,
                 mutation_budget_ms: None,
@@ -1455,13 +1467,389 @@ mod imp {
             };
             match dispatch_one(&mut store, "/expected/repo", request) {
                 StoreResponse::Err(error) => {
-                    assert_eq!(error.kind, StoreErrorKind::Transport);
-                    assert!(error.message.contains("daemon speaks 4"));
-                    assert!(error.message.contains("client sent 3"));
+                    assert_eq!(error.kind, StoreErrorKind::IncompatibleWire);
+                    assert!(error.message.contains("daemon speaks 5"));
+                    assert!(error.message.contains("client sent 4"));
                 }
-                other => panic!("v3 request was not rejected: {other:?}"),
+                other => panic!("v4 request was not rejected: {other:?}"),
             }
             std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn o26_routed_lost_reply_then_same_id_retry_appends_once() {
+            let repo_root = unique_repo_root("o26-lost-reply");
+            let rally_dir = repo_root.join(".rally");
+            let socket = std::env::temp_dir().join(format!(
+                "r26-lost-{}-{}.sock",
+                std::process::id(),
+                now_millis()
+            ));
+            let listener = UnixListener::bind(&socket).unwrap();
+            let store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let canonical_root = canonical_repo_root(&repo_root);
+            let (job_tx, job_rx) = mpsc::channel::<Job>();
+            let dispatcher = thread::spawn(move || {
+                let mut store = store;
+                while let Ok(job) = job_rx.recv() {
+                    let response = dispatch_one_received(
+                        &mut store,
+                        &canonical_root,
+                        job.request,
+                        job.receipt,
+                    );
+                    job.reply.send(response).unwrap();
+                }
+                store
+            });
+            let server_tx = job_tx.clone();
+            let server_rally_dir = rally_dir.clone();
+            let server = thread::spawn(move || {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().unwrap();
+                    handle_conn(stream, server_tx.clone(), &server_rally_dir).unwrap();
+                }
+            });
+            let routed = crate::store_client::RoutedRoomStore::for_test(
+                socket.clone(),
+                repo_root.clone(),
+                "default",
+            );
+            let candidate = crate::store::Fact {
+                from_session_id: None,
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o26-routed-lost-reply-event".to_string(),
+                seq: 0,
+                thread_id: "o26-routed-lost-reply-thread".to_string(),
+                kind: crate::store::FactKind::Decision,
+                tool: Some("test:01".to_string()),
+                role: None,
+                subject: "routed lost reply".to_string(),
+                scope: vec!["file:src/routed.rs".to_string()],
+                created_at: "2026-08-10T00:00:00Z".to_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            crate::store::fail_o26_once(&rally_dir, crate::store::O26FaultPoint::DaemonReplyDrop);
+
+            let error = routed
+                .append_fact(&candidate)
+                .expect_err("dropped daemon reply must be outcome-unknown");
+            assert!(matches!(
+                error,
+                RallyError::OutcomeUnknown { ref event_id, ref phase, .. }
+                    if event_id == &candidate.event_id && phase == "daemon-transport"
+            ));
+            let retry = routed.append_fact(&candidate).unwrap();
+            assert!(retry.committed);
+            assert_eq!(retry.fact.seq, 1);
+
+            server.join().unwrap();
+            drop(job_tx);
+            let store = dispatcher.join().unwrap();
+            assert_eq!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .filter(|fact| fact.event_id == candidate.event_id)
+                    .count(),
+                1
+            );
+            drop(store);
+            std::fs::remove_file(&socket).ok();
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn o26_routed_renewal_and_checkpoint_retry_the_exact_lost_request_once() {
+            let repo_root = unique_repo_root("o26-renew-checkpoint-lost-reply");
+            let rally_dir = repo_root.join(".rally");
+            let socket = std::env::temp_dir().join(format!(
+                "r26-rc-{}-{}.sock",
+                std::process::id(),
+                now_millis()
+            ));
+            let listener = UnixListener::bind(&socket).unwrap();
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let claim = crate::store::Fact {
+                from_session_id: Some("sess:o26".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o26-routed-renew-claim".to_string(),
+                seq: 0,
+                thread_id: "o26-routed-renew-claim-thread".to_string(),
+                kind: crate::store::FactKind::Claim,
+                tool: Some("test:renew".to_string()),
+                role: None,
+                subject: "claim for routed renewal retry".to_string(),
+                scope: vec!["file:src/renew.rs".to_string()],
+                created_at: "2026-08-10T00:00:00Z".to_string(),
+                summary: None,
+                evidence: vec!["lease_expires_at:2026-08-10T00:00:01Z".to_string()],
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact(&claim).unwrap();
+            let canonical_root = canonical_repo_root(&repo_root);
+            let (job_tx, job_rx) = mpsc::channel::<Job>();
+            let dispatcher = thread::spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let response = dispatch_one_received(
+                        &mut store,
+                        &canonical_root,
+                        job.request,
+                        job.receipt,
+                    );
+                    job.reply.send(response).unwrap();
+                }
+                store
+            });
+            let server_tx = job_tx.clone();
+            let server_rally_dir = rally_dir.clone();
+            let server = thread::spawn(move || {
+                for _ in 0..4 {
+                    let (stream, _) = listener.accept().unwrap();
+                    handle_conn(stream, server_tx.clone(), &server_rally_dir).unwrap();
+                }
+            });
+            let routed = crate::store_client::RoutedRoomStore::for_test(
+                socket.clone(),
+                repo_root.clone(),
+                "default",
+            );
+
+            let renewal_event_id = "o26-routed-renew-request".to_string();
+            let renewal_op = StoreOp::RenewClaimLease {
+                claim_id: claim.event_id.clone(),
+                lease_expires_at: "2099-01-01T00:00:00Z".to_string(),
+                event_id: renewal_event_id.clone(),
+                thread_id: "o26-routed-renew-request-thread".to_string(),
+                created_at: "2026-08-10T00:00:02Z".to_string(),
+                caller_tool: Some("test:renew".to_string()),
+                caller_session_id: Some("sess:o26".to_string()),
+                expected_owner_session_id: Some("sess:o26".to_string()),
+            };
+            crate::store::fail_o26_once(&rally_dir, crate::store::O26FaultPoint::DaemonReplyDrop);
+            let renewal_error = routed
+                .dispatch_for_test(renewal_op.clone())
+                .expect_err("lost renewal reply must remain queryable");
+            assert!(matches!(
+                renewal_error,
+                RallyError::OutcomeUnknown { ref event_id, ref phase, .. }
+                    if event_id == &renewal_event_id && phase == "daemon-transport"
+            ));
+            let renewal_retry = routed.dispatch_for_test(renewal_op).unwrap();
+            match renewal_retry {
+                StoreOk::RenewClaimLease { outcome } => {
+                    let outcome: crate::store::RenewClaimLeaseOutcome =
+                        serde_json::from_value(outcome).unwrap();
+                    assert_eq!(
+                        outcome.append_outcome.unwrap().fact.event_id,
+                        renewal_event_id
+                    );
+                }
+                other => panic!("unexpected renewal retry reply: {other:?}"),
+            }
+
+            let checkpoint_event_id = "o26-routed-checkpoint-request".to_string();
+            let checkpoint = crate::store::Fact {
+                from_session_id: None,
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: checkpoint_event_id.clone(),
+                seq: 0,
+                thread_id: "read-test-renew".to_string(),
+                kind: crate::store::FactKind::Read,
+                tool: Some("test:reader".to_string()),
+                role: None,
+                subject: "read-checkpoint: test:reader at seq 2".to_string(),
+                scope: Vec::new(),
+                created_at: "2026-08-10T00:00:03Z".to_string(),
+                summary: Some("read_seq:2".to_string()),
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            let checkpoint_op = StoreOp::MaybeAppendReadCheckpoint {
+                fact: serde_json::to_value(&checkpoint).unwrap(),
+                read_seq: 2,
+            };
+            crate::store::fail_o26_once(&rally_dir, crate::store::O26FaultPoint::DaemonReplyDrop);
+            let checkpoint_error = routed
+                .dispatch_for_test(checkpoint_op.clone())
+                .expect_err("lost checkpoint reply must remain queryable");
+            assert!(matches!(
+                checkpoint_error,
+                RallyError::OutcomeUnknown { ref event_id, ref phase, .. }
+                    if event_id == &checkpoint_event_id && phase == "daemon-transport"
+            ));
+            let checkpoint_retry = routed.dispatch_for_test(checkpoint_op).unwrap();
+            match checkpoint_retry {
+                StoreOk::MaybeAppendReadCheckpoint { result } => {
+                    let outcome: crate::store::ConditionalAppendOutcome =
+                        serde_json::from_value(result).unwrap();
+                    assert!(matches!(
+                        outcome,
+                        crate::store::ConditionalAppendOutcome::Applied(ref append)
+                            if append.fact.event_id == checkpoint_event_id
+                    ));
+                }
+                other => panic!("unexpected checkpoint retry reply: {other:?}"),
+            }
+
+            server.join().unwrap();
+            drop(job_tx);
+            let store = dispatcher.join().unwrap();
+            let facts = store.facts().unwrap();
+            for event_id in [&renewal_event_id, &checkpoint_event_id] {
+                assert_eq!(
+                    facts
+                        .iter()
+                        .filter(|fact| &fact.event_id == event_id)
+                        .count(),
+                    1,
+                    "lost-reply retry must retain exactly one canonical {event_id}"
+                );
+            }
+            drop(store);
+            std::fs::remove_file(&socket).ok();
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn o26_routed_release_and_resolve_projection_warnings_do_not_retry_append() {
+            for (label, target_kind, close_kind) in [
+                (
+                    "release",
+                    crate::store::FactKind::Claim,
+                    crate::store::FactKind::Release,
+                ),
+                (
+                    "resolve",
+                    crate::store::FactKind::Blocker,
+                    crate::store::FactKind::Resolve,
+                ),
+            ] {
+                let repo_root = unique_repo_root(&format!("o26-routed-{label}"));
+                let rally_dir = repo_root.join(".rally");
+                let socket = std::env::temp_dir().join(format!(
+                    "r26-{label}-{}-{}.sock",
+                    std::process::id(),
+                    now_millis()
+                ));
+                let listener = UnixListener::bind(&socket).unwrap();
+                let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+                let target = crate::store::Fact {
+                    from_session_id: None,
+                    schema: crate::FACT_SCHEMA.to_string(),
+                    event_id: format!("o26-routed-{label}-target"),
+                    seq: 0,
+                    thread_id: format!("o26-routed-{label}-target-thread"),
+                    kind: target_kind,
+                    tool: Some("test:01".to_string()),
+                    role: None,
+                    subject: format!("routed {label} target"),
+                    scope: vec![format!("file:src/{label}.rs")],
+                    created_at: "2026-08-10T00:00:00Z".to_string(),
+                    summary: None,
+                    evidence: Vec::new(),
+                    target: None,
+                    ref_id: None,
+                    status: None,
+                    severity: None,
+                    uri: None,
+                    session: None,
+                };
+                store.append_fact(&target).unwrap();
+                let canonical_root = canonical_repo_root(&repo_root);
+                let (job_tx, job_rx) = mpsc::channel::<Job>();
+                let dispatcher = thread::spawn(move || {
+                    while let Ok(job) = job_rx.recv() {
+                        let response = dispatch_one_received(
+                            &mut store,
+                            &canonical_root,
+                            job.request,
+                            job.receipt,
+                        );
+                        job.reply.send(response).unwrap();
+                    }
+                    store
+                });
+                let server_tx = job_tx.clone();
+                let server_rally_dir = rally_dir.clone();
+                let server = thread::spawn(move || {
+                    for _ in 0..2 {
+                        let (stream, _) = listener.accept().unwrap();
+                        handle_conn(stream, server_tx.clone(), &server_rally_dir).unwrap();
+                    }
+                });
+                let routed = crate::store_client::RoutedRoomStore::for_test(
+                    socket.clone(),
+                    repo_root.clone(),
+                    "default",
+                );
+                let close = crate::store::Fact {
+                    from_session_id: None,
+                    schema: crate::FACT_SCHEMA.to_string(),
+                    event_id: format!("o26-routed-{label}-close"),
+                    seq: 0,
+                    thread_id: format!("o26-routed-{label}-close-thread"),
+                    kind: close_kind,
+                    tool: Some("test:01".to_string()),
+                    role: None,
+                    subject: format!("routed {label} close"),
+                    scope: target.scope.clone(),
+                    created_at: "2026-08-10T00:00:01Z".to_string(),
+                    summary: None,
+                    evidence: Vec::new(),
+                    target: None,
+                    ref_id: Some(target.event_id.clone()),
+                    status: None,
+                    severity: None,
+                    uri: None,
+                    session: None,
+                };
+                crate::store::fail_o26_once(
+                    &rally_dir,
+                    crate::store::O26FaultPoint::FactsDbProjection,
+                );
+
+                let degraded = routed.append_state_transition_verified(&close).unwrap();
+                assert!(degraded.committed);
+                assert!(!degraded.projection_complete);
+                assert!(!degraded.warnings.is_empty());
+                let retry = routed.append_state_transition_verified(&close).unwrap();
+                assert_eq!(retry.fact.seq, degraded.fact.seq);
+
+                server.join().unwrap();
+                drop(job_tx);
+                let store = dispatcher.join().unwrap();
+                assert_eq!(
+                    store
+                        .facts()
+                        .unwrap()
+                        .iter()
+                        .filter(|fact| fact.event_id == close.event_id)
+                        .count(),
+                    1
+                );
+                drop(store);
+                std::fs::remove_file(&socket).ok();
+                std::fs::remove_dir_all(repo_root).ok();
+            }
         }
 
         #[test]
@@ -2138,6 +2526,9 @@ mod imp {
                     StoreOp::RenewClaimLease {
                         claim_id: claim.event_id.clone(),
                         lease_expires_at: "2099-01-01T00:00:00Z".to_string(),
+                        event_id: "routed-renewal-request".to_string(),
+                        thread_id: "routed-renewal-thread".to_string(),
+                        created_at: "2026-08-10T00:00:00Z".to_string(),
                         caller_tool: Some("tool-a".to_string()),
                         caller_session_id: Some("sess:test".to_string()),
                         expected_owner_session_id: Some("sess:test".to_string()),
@@ -2148,7 +2539,7 @@ mod imp {
             assert!(
                 matches!(
                     response,
-                    StoreResponse::Ok(StoreOk::RenewClaimLease { record: Some(_) })
+                    StoreResponse::Ok(StoreOk::RenewClaimLease { outcome: _ })
                 ),
                 "routed renewal failed: {response:?}"
             );
@@ -2198,6 +2589,9 @@ mod imp {
                 "kind": "renew_claim_lease",
                 "claim_id": claim.event_id.clone(),
                 "lease_expires_at": "2099-01-01T00:00:00Z",
+                "event_id": "renew-routed-sibling",
+                "thread_id": "renew-routed-sibling-thread",
+                "created_at": "2026-08-10T00:00:00Z",
                 "caller_tool": "shared:01",
                 "caller_session_id": "session-sibling",
                 "expected_owner_session_id": "session-owner"
@@ -2225,7 +2619,10 @@ mod imp {
             let missing_caller: StoreOp = serde_json::from_value(serde_json::json!({
                 "kind": "renew_claim_lease",
                 "claim_id": claim.event_id.clone(),
-                "lease_expires_at": "2099-01-01T00:00:00Z"
+                "lease_expires_at": "2099-01-01T00:00:00Z",
+                "event_id": "renew-routed-missing-caller",
+                "thread_id": "renew-routed-missing-caller-thread",
+                "created_at": "2026-08-10T00:00:00Z"
             }))
             .unwrap();
             let missing_response = dispatch_one(
@@ -2271,7 +2668,10 @@ mod imp {
             let renew_op: StoreOp = serde_json::from_value(serde_json::json!({
                 "kind": "renew_claim_lease",
                 "claim_id": claim.event_id.clone(),
-                "lease_expires_at": "2099-01-01T00:30:00Z"
+                "lease_expires_at": "2099-01-01T00:30:00Z",
+                "event_id": "renew-routed-anonymous",
+                "thread_id": "renew-routed-anonymous-thread",
+                "created_at": "2026-08-10T00:00:00Z"
             }))
             .unwrap();
             let renew_response = dispatch_one(
@@ -2376,6 +2776,9 @@ mod imp {
                 "kind": "renew_claim_lease",
                 "claim_id": claim.event_id.clone(),
                 "lease_expires_at": "2099-01-01T00:30:00Z",
+                "event_id": "legacy-renewal-request",
+                "thread_id": "legacy-renewal-thread",
+                "created_at": "2026-08-10T00:00:00Z",
                 "caller_tool": "tool-a",
                 "caller_session_id": "session-modern",
                 "expected_owner_session_id": null
@@ -2389,7 +2792,7 @@ mod imp {
             assert!(
                 matches!(
                     response,
-                    StoreResponse::Ok(StoreOk::RenewClaimLease { record: Some(_) })
+                    StoreResponse::Ok(StoreOk::RenewClaimLease { outcome: _ })
                 ),
                 "identified caller must retain legacy renewal compatibility: {response:?}"
             );
@@ -2492,12 +2895,20 @@ mod imp {
             crate::store::watch_cold_opens_under(&repo_root);
 
             // Two consecutive engagement-scoped appends through the ONE store.
-            let append = |subject: &str| {
+            let mut append_index = 0usize;
+            let mut append = |subject: &str| {
+                append_index += 1;
                 let fact = serde_json::json!({
+                    "schema": crate::FACT_SCHEMA,
+                    "event_id": format!("rallyd-smoke-{append_index}"),
+                    "seq": 0,
+                    "thread_id": "rallyd-smoke-thread",
                     "kind": "lesson",
                     "subject": subject,
                     "tool": "claude_code:01",
                     "scope": ["rallyd-smoke"],
+                    "created_at": "2026-08-10T00:00:00Z",
+                    "evidence": [],
                 });
                 round_trip(
                     &socket,

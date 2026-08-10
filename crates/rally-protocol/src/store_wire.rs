@@ -46,9 +46,10 @@
 //! variants with exit-code parity (`kind` selects the variant; `code` is the
 //! redundant exit code). TRANSPORT-layer failures — connect/read timeout,
 //! connection reset, an over-long line (> [`MAX_LINE_BYTES`]), or a
-//! `wire_version` / `repo_root` mismatch — have NO direct-path equivalent and
-//! MUST map to `RallyError::Command` (exit 1) with remedy text naming
-//! `rally daemon status` / `rally daemon stop`. These classes are therefore
+//! `repo_root` mismatch — have NO direct-path equivalent and map to
+//! `RallyError::Command` (exit 1) with a daemon-status/stop remedy. An
+//! incompatible `wire_version` instead maps to typed `IncompatibleWire` and
+//! fails before routing or direct fallback. These classes are therefore
 //! excluded from the fail-open goldens (T-04) and covered by dedicated unit
 //! assertions instead. The concrete `RallyError` conversion lives in `rally-cli`
 //! (it cannot live here — `RallyError` is `rally-cli`-private); this module
@@ -58,8 +59,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Wire protocol version. Bumped only on a breaking envelope change. The ping
-/// reply carries this; a client seeing a version it does not speak treats the
-/// daemon as not-live and lets the ownership lock decide (ADR-02 rollback note).
+/// reply carries this; a client seeing an incompatible version fails
+/// immediately with typed `IncompatibleWire` and never falls back to direct.
 pub const WIRE_VERSION: u32 = 5;
 
 /// Hard cap on a single request/response line. A longer line is a framing
@@ -125,14 +126,14 @@ impl StoreRequest {
 // …) are self-describing, so field-level docs are allowed here.
 #[allow(missing_docs)]
 pub enum StoreOp {
-    /// `RoomStore::append_fact(fact)` → `Fact`.
+    /// `RoomStore::append_fact(fact)` → `AppendOutcome`.
     AppendFact { fact: Value },
-    /// `RoomStore::append_fact_verified(fact)` → `Fact`.
+    /// `RoomStore::append_fact_verified(fact)` → `AppendOutcome`.
     AppendFactVerified { fact: Value },
-    /// `RoomStore::append_state_transition_verified(fact)` → `Fact`.
+    /// `RoomStore::append_state_transition_verified(fact)` → `AppendOutcome`.
     AppendStateTransitionVerified { fact: Value },
     /// `RoomStore::append_session_fact_if_context(fact, expected)` →
-    /// `Option<Fact>` (`None` = conditional-append conflict, NOT an error).
+    /// `ConditionalAppendOutcome` (`NotApplied` = context conflict).
     AppendSessionFactIfContext {
         fact: Value,
         expected_context_version: Option<u64>,
@@ -142,10 +143,16 @@ pub enum StoreOp {
     /// `RoomStore::rebuild_claim_index()` → `()`.
     RebuildClaimIndex,
     /// `RoomStore::renew_claim_lease(claim_id, lease_expires_at, caller, expected)` →
-    /// `Option<ActiveClaimRecord>`.
+    /// `RenewClaimLeaseOutcome` with an optional typed append outcome.
     RenewClaimLease {
         claim_id: String,
         lease_expires_at: String,
+        /// Stable client-generated mutation id used for query/remedy/retry.
+        event_id: String,
+        /// Client-generated causal thread retained across routed dispatch.
+        thread_id: String,
+        /// Client-fixed occurrence timestamp; the daemon never regenerates it.
+        created_at: String,
         /// Tool asserted by the process requesting renewal. Optional at the
         /// serde boundary so a missing field is decoded and refused by the
         /// authority check rather than synthesized from the claim.
@@ -181,9 +188,9 @@ pub enum StoreOp {
     SnapshotWithReadersArchived { include_archived: bool },
     /// `RoomStore::last_checkpoint_seq(tool)` → `i64`.
     LastCheckpointSeq { tool: String },
-    /// `RoomStore::maybe_append_read_checkpoint(tool, read_seq)` →
-    /// `Option<Fact>`.
-    MaybeAppendReadCheckpoint { tool: String, read_seq: i64 },
+    /// Stable client-built read fact plus its coalescing position →
+    /// `ConditionalAppendOutcome`.
+    MaybeAppendReadCheckpoint { fact: Value, read_seq: i64 },
     /// `RoomStore::project_read_receipts(max_seq)` → `Vec<ReadReceipt>`.
     ProjectReadReceipts { max_seq: i64 },
     /// Liveness + identity probe (NOT a `RoomStore` method). Reply is
@@ -250,8 +257,8 @@ pub enum StoreOk {
     Facts { facts: Vec<Value> },
     /// `()`.
     RebuildClaimIndex,
-    /// `Option<ActiveClaimRecord>`.
-    RenewClaimLease { record: Option<Value> },
+    /// Typed `RenewClaimLeaseOutcome`.
+    RenewClaimLease { outcome: Value },
     /// `(Vec<Fact>, Option<u64>)`.
     SessionFactsWithContextVersion {
         facts: Vec<Value>,
@@ -263,8 +270,8 @@ pub enum StoreOk {
     SnapshotWithReaders { snapshot: Value },
     /// `i64`.
     LastCheckpointSeq { seq: i64 },
-    /// `Option<Fact>`.
-    MaybeAppendReadCheckpoint { fact: Option<Value> },
+    /// Typed `ConditionalAppendOutcome`.
+    MaybeAppendReadCheckpoint { result: Value },
     /// `Vec<ReadReceipt>`.
     ProjectReadReceipts { receipts: Vec<Value> },
     /// Ping reply: the daemon's identity for the client's pre-route check.
@@ -316,8 +323,9 @@ pub enum StoreErrorKind {
     /// The request deadline elapsed before any durable side effect. A
     /// provisional mutation lock is released before this reply; safe to retry.
     NotStarted,
-    /// Canonical mutation started but exact readback did not complete. The
-    /// message carries the stable event-id query remedy.
+    /// Canonical mutation started but exact readback did not complete.
+    /// `StoreError::event_id` and `phase` carry the structured recovery data;
+    /// the client renders the shell-safe query remedy.
     OutcomeUnknown,
     /// Client and daemon speak incompatible semantic reply contracts. Never
     /// fall back to direct ownership for this error.
@@ -385,7 +393,10 @@ mod tests {
         let mut req = StoreRequest::new(
             Some("alpha".to_string()),
             StoreOp::MaybeAppendReadCheckpoint {
-                tool: "claude_code:01".to_string(),
+                fact: serde_json::json!({
+                    "event_id": "read-request",
+                    "tool": "claude_code:01"
+                }),
                 read_seq: 42,
             },
         );

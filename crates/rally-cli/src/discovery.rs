@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{RallyError, Result};
-use crate::store::{Fact, RoomStore};
+use crate::store::{AppendOutcome, Fact, RoomStore};
 use crate::{now_string, repo_root};
 
 const ROOM_INDEX_SCHEMA: &str = "agent-rally.room-index.v1";
@@ -88,7 +88,23 @@ pub(crate) struct MigrateLegacyData {
     pub(crate) facts_migrated: usize,
     /// Records skipped because their event_id already exists in the ledger.
     pub(crate) facts_skipped_existing: usize,
+    /// Internal command aggregate. The CLI emits these once at the common
+    /// `data.append_outcomes` boundary instead of duplicating full facts here.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) append_outcomes: Vec<AppendOutcome>,
+    /// Replays whose canonical readback could not be proven. Migration stops
+    /// at the first such row so an operator can query before resuming.
+    pub(crate) outcome_unknowns: Vec<MigrationOutcomeUnknown>,
     pub(crate) warnings: Vec<DiscoveryWarning>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct MigrationOutcomeUnknown {
+    pub(crate) event_id: String,
+    pub(crate) phase: String,
+    pub(crate) detail: String,
+    pub(crate) remedy: String,
 }
 
 /// Per-repo entry in the global status rollup.
@@ -652,6 +668,8 @@ fn migrate_legacy_from(
     let mut facts_read: usize = 0;
     let mut facts_migrated: usize = 0;
     let mut facts_skipped_existing: usize = 0;
+    let mut append_outcomes = Vec::new();
+    let mut outcome_unknowns = Vec::new();
     let mut warnings: Vec<DiscoveryWarning> = Vec::new();
 
     if !apps_root.exists() {
@@ -660,13 +678,15 @@ fn migrate_legacy_from(
             facts_read,
             facts_migrated,
             facts_skipped_existing,
+            append_outcomes,
+            outcome_unknowns,
             warnings,
         });
     }
 
     // Collect the set of event_ids already present in the repo ledger for
     // idempotency checks.
-    let existing_ids: std::collections::BTreeSet<String> = room
+    let mut existing_ids: std::collections::BTreeSet<String> = room
         .facts()
         .unwrap_or_default()
         .into_iter()
@@ -687,12 +707,14 @@ fn migrate_legacy_from(
                 facts_read,
                 facts_migrated,
                 facts_skipped_existing,
+                append_outcomes,
+                outcome_unknowns,
                 warnings,
             });
         }
     };
 
-    for entry in entries.flatten() {
+    'slugs: for entry in entries.flatten() {
         let slug = entry.file_name().to_string_lossy().into_owned();
         if !slug_matches_repo(&slug, repo_basename) {
             continue;
@@ -765,7 +787,32 @@ fn migrate_legacy_from(
             // seq is reset to 0 so the store assigns the next local seq.
             let replay = Fact { seq: 0, ..fact };
             match room.append_fact(&replay) {
-                Ok(_) => facts_migrated += 1,
+                Ok(outcome) => {
+                    facts_migrated += 1;
+                    existing_ids.insert(outcome.fact.event_id.clone());
+                    append_outcomes.push(outcome);
+                }
+                Err(RallyError::OutcomeUnknown {
+                    event_id,
+                    phase,
+                    detail,
+                }) => {
+                    let remedy = crate::locate_remedy(&event_id);
+                    warnings.push(warning(
+                        "legacy_fact_replay_outcome_unknown",
+                        format!(
+                            "legacy replay outcome is unknown at {phase}; run `{remedy}` before resuming migration"
+                        ),
+                        Some(channel.clone()),
+                    ));
+                    outcome_unknowns.push(MigrationOutcomeUnknown {
+                        event_id,
+                        phase,
+                        detail,
+                        remedy,
+                    });
+                    break 'slugs;
+                }
                 Err(err) => {
                     warnings.push(warning(
                         "legacy_fact_replay_failed",
@@ -785,6 +832,8 @@ fn migrate_legacy_from(
         facts_read,
         facts_migrated,
         facts_skipped_existing,
+        append_outcomes,
+        outcome_unknowns,
         warnings,
     })
 }
@@ -1139,9 +1188,10 @@ mod tests {
         fs::write(
             &channel,
             format!(
-                "{}\n{}\n",
+                "{}\n{}\n{}\n",
                 make_rally_fact_line("evt_b17_001", "b17 migrate test decision 1"),
                 make_rally_fact_line("evt_b17_002", "b17 migrate test decision 2"),
+                make_rally_fact_line("evt_b17_001", "b17 migrate test decision 1"),
             ),
         )
         .unwrap();
@@ -1151,9 +1201,10 @@ mod tests {
         // First run: should migrate both facts.
         let result = migrate_legacy_from(&room, "my-repo", &apps_root).unwrap();
         assert_eq!(result.slugs_found, vec!["my-repo".to_string()]);
-        assert_eq!(result.facts_read, 2, "two rally facts in the channel");
+        assert_eq!(result.facts_read, 3, "three rally rows in the channel");
         assert_eq!(result.facts_migrated, 2, "both replayed on first run");
-        assert_eq!(result.facts_skipped_existing, 0);
+        assert_eq!(result.facts_skipped_existing, 1);
+        assert_eq!(result.append_outcomes.len(), 2);
 
         // Verify facts are in the ledger.
         let facts = room.facts().unwrap();
@@ -1171,8 +1222,8 @@ mod tests {
         let result2 = migrate_legacy_from(&room, "my-repo", &apps_root).unwrap();
         assert_eq!(result2.facts_migrated, 0, "second run must migrate nothing");
         assert_eq!(
-            result2.facts_skipped_existing, 2,
-            "second run must skip both as existing"
+            result2.facts_skipped_existing, 3,
+            "second run must skip every existing row"
         );
 
         // Legacy file is untouched (not deleted).
@@ -1183,6 +1234,69 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn o26_migrate_legacy_preserves_committed_warning_and_queryable_unknown() {
+        for (label, fault, expected_migrated) in [
+            (
+                "projection",
+                crate::store::O26FaultPoint::FactsDbProjection,
+                1,
+            ),
+            (
+                "unknown",
+                crate::store::O26FaultPoint::AfterCanonicalSyncBeforeReadback,
+                0,
+            ),
+        ] {
+            let root = tmp_dir(&format!("o26-migrate-{label}"));
+            let home = tmp_dir(&format!("o26-migrate-{label}-home"));
+            fs::create_dir_all(root.join(".git")).unwrap();
+            let apps_root = home.join(".agent-rally-point/apps");
+            let apps_dir = apps_root.join("my-repo");
+            fs::create_dir_all(&apps_dir).unwrap();
+            let event_id = format!("o26-migrate-{label}-event");
+            fs::write(
+                apps_dir.join("changes.jsonl"),
+                format!("{}\n", make_rally_fact_line(&event_id, label)),
+            )
+            .unwrap();
+            let room = RoomStore::open_at(root.clone()).unwrap();
+            crate::store::fail_o26_once(&room.rally_dir(), fault);
+
+            let result = migrate_legacy_from(&room, "my-repo", &apps_root).unwrap();
+            assert_eq!(result.facts_migrated, expected_migrated);
+            assert_eq!(
+                room.facts()
+                    .unwrap()
+                    .iter()
+                    .filter(|fact| fact.event_id == event_id)
+                    .count(),
+                1,
+                "canonical migration row must remain singleton"
+            );
+            if label == "projection" {
+                assert_eq!(result.append_outcomes.len(), 1);
+                assert!(!result.append_outcomes[0].projection_complete);
+                assert!(result.append_outcomes[0].warnings.iter().any(|warning| {
+                    warning.code == crate::store::ProjectionWarningCode::FactsDb
+                }));
+                assert!(result.outcome_unknowns.is_empty());
+            } else {
+                assert!(result.append_outcomes.is_empty());
+                assert_eq!(result.outcome_unknowns.len(), 1);
+                let unknown = &result.outcome_unknowns[0];
+                assert_eq!(unknown.event_id, event_id);
+                assert_eq!(
+                    shlex::split(&unknown.remedy).unwrap(),
+                    vec!["rally", "locate", event_id.as_str(), "--json"]
+                );
+            }
+            drop(room);
+            fs::remove_dir_all(&root).ok();
+            fs::remove_dir_all(&home).ok();
+        }
     }
 
     /// B17.migrate: non-rally records (build-loop phase events without rally schema)
