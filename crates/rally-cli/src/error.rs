@@ -16,7 +16,8 @@ pub(crate) enum RallyError {
     ///
     /// This is distinct from a transport timeout (outcome unknown): callers
     /// may safely retry a `NotStarted` operation because the storage boundary
-    /// proved that it never acquired the room mutation lock.
+    /// proved that no durable side effect began. A lock acquired exactly at
+    /// the deadline boundary is released before this error is returned.
     #[error("{0}")]
     NotStarted(String),
     #[error("{context}: {source}")]

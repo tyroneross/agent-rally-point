@@ -1746,6 +1746,7 @@ mod imp {
                 StoreResponse::Err(error) => {
                     assert_eq!(error.kind, StoreErrorKind::NotStarted);
                     assert_eq!(error.code, 4);
+                    assert!(error.message.contains("before acquiring"));
                 }
                 other => panic!("dispatch pause rebased the deadline: {other:?}"),
             }
@@ -1792,6 +1793,13 @@ mod imp {
                 StoreResponse::Err(error) => {
                     assert_eq!(error.kind, StoreErrorKind::NotStarted);
                     assert_eq!(error.code, 4);
+                    assert!(error.message.contains("after provisional lock acquisition"));
+                    assert!(
+                        error
+                            .message
+                            .contains("lock released before any durable mutation")
+                    );
+                    assert!(!error.message.contains("before acquiring"));
                 }
                 other => panic!("post-flock pause started routed mutation: {other:?}"),
             }

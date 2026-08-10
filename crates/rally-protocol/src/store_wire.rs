@@ -81,7 +81,8 @@ pub struct StoreRequest {
     pub engagement: Option<String>,
     /// Client wall-clock deadline for starting a mutating operation, expressed
     /// as Unix epoch milliseconds. The daemon rejects an expired mutation as
-    /// [`StoreErrorKind::NotStarted`] before it acquires `mutation.lock`.
+    /// [`StoreErrorKind::NotStarted`] before any durable side effect. A lock
+    /// acquired exactly at the boundary is released before that reply.
     /// Read-only requests leave this unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_unix_ms: Option<u64>,
@@ -306,8 +307,8 @@ pub enum StoreErrorKind {
     /// `RallyError::Io`/`Json` collapsed for the wire → reconstruct as
     /// `RallyError::Command` (exit 1, source dropped).
     Internal,
-    /// The request deadline elapsed before the daemon acquired the mutation
-    /// lock. No durable side effect started; safe to retry.
+    /// The request deadline elapsed before any durable side effect. A
+    /// provisional mutation lock is released before this reply; safe to retry.
     NotStarted,
     /// R7 transport class (timeout / reset / oversized line / version or
     /// repo_root mismatch). No direct-path equivalent → reconstruct as

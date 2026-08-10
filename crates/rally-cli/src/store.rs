@@ -183,6 +183,13 @@ fn mutation_not_started(path: &Path) -> RallyError {
     ))
 }
 
+fn mutation_not_started_after_provisional_lock(path: &Path) -> RallyError {
+    RallyError::NotStarted(format!(
+        "mutation-not-started: deadline elapsed after provisional lock acquisition at {}; lock released before any durable mutation started and retry is safe",
+        path.display()
+    ))
+}
+
 #[cfg(unix)]
 mod unix_lock {
     /// Shared (read) advisory lock — many holders coexist. Direct mode holds
@@ -1573,7 +1580,7 @@ pub(crate) fn acquire_room_mutation_lock(room_dir: &Path) -> Result<RoomMutation
                 // successful syscall. Relinquish the just-acquired lock and
                 // preserve the typed no-mutation-started contract.
                 let _ = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_UN) };
-                return Err(mutation_not_started(&path));
+                return Err(mutation_not_started_after_provisional_lock(&path));
             }
             return Ok(RoomMutationLock { file });
         }
@@ -1740,7 +1747,7 @@ pub(crate) fn acquire_owner_exclusive_bounded(
             if Instant::now() >= deadline {
                 let _ = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_UN) };
                 return Err(RallyError::NotStarted(format!(
-                    "daemon-open-not-started: deadline elapsed before acquiring {}; no daemon runtime state was published",
+                    "daemon-open-not-started: deadline elapsed after provisional lock acquisition at {}; lock released before any daemon runtime state was published and retry is safe",
                     path.display()
                 )));
             }
@@ -7688,9 +7695,13 @@ mod ledger_tests {
             completed_before_release && elapsed < Duration::from_millis(300),
             "mutation lock wait escaped its 75ms deadline: {elapsed:?}"
         );
+        let error = result
+            .as_ref()
+            .expect_err("contended mutation must return typed NotStarted");
+        assert!(matches!(error, RallyError::NotStarted(_)), "got {error:?}");
         assert!(
-            matches!(result, Err(RallyError::NotStarted(_))),
-            "contended mutation must return typed NotStarted, got {result:?}"
+            error.to_string().contains("before acquiring"),
+            "true pre-acquire expiry lost its precise diagnostic: {error}"
         );
         let reopened = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         assert!(
@@ -7722,10 +7733,12 @@ mod ledger_tests {
 
         let result = with_mutation_deadline(Duration::from_millis(20), || store.append_fact(&fact));
 
-        assert!(
-            matches!(result, Err(RallyError::NotStarted(_))),
-            "deadline elapsed after flock success but mutation started: {result:?}"
-        );
+        let error = result.expect_err("deadline elapsed after flock success but mutation started");
+        assert!(matches!(error, RallyError::NotStarted(_)), "got {error:?}");
+        let message = error.to_string();
+        assert!(message.contains("after provisional lock acquisition"));
+        assert!(message.contains("lock released before any durable mutation"));
+        assert!(!message.contains("before acquiring"));
         let reopened = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         assert!(
             reopened
@@ -7760,6 +7773,14 @@ mod ledger_tests {
             matches!(&result, Err(RallyError::NotStarted(_))),
             "contended daemon open must return typed NotStarted"
         );
+        let message = match &result {
+            Err(error) => error.to_string(),
+            Ok(_) => unreachable!("typed NotStarted assertion above"),
+        };
+        assert!(
+            message.contains("before acquiring"),
+            "true pre-acquire owner expiry lost its precise diagnostic"
+        );
         fs::remove_dir_all(root).ok();
     }
 
@@ -7772,10 +7793,17 @@ mod ledger_tests {
 
         let result = acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(20));
 
-        assert!(
-            matches!(result, Err(RallyError::NotStarted(_))),
-            "owner deadline elapsed after flock success but ownership started"
-        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_guard) => {
+                panic!("owner deadline elapsed after flock success but ownership started")
+            }
+        };
+        assert!(matches!(error, RallyError::NotStarted(_)), "got {error:?}");
+        let message = error.to_string();
+        assert!(message.contains("after provisional lock acquisition"));
+        assert!(message.contains("lock released before any daemon runtime state"));
+        assert!(!message.contains("before acquiring"));
         fs::remove_dir_all(root).ok();
     }
 
