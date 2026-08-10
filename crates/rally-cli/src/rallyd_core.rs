@@ -46,10 +46,11 @@
 //! ## Lifecycle
 //!
 //! SIGTERM/SIGINT set the shutdown flag; the accept loop drains, the dispatcher
-//! drops the store (releasing the warm pool), the runtime files are unlinked,
-//! and the EX guard is released at scope end. Optional `--idle-exit-secs N`
-//! (default off) exits after N idle seconds — test hygiene against orphaned
-//! daemons.
+//! explicitly closes the warm pool, and the runtime files are unlinked. The EX
+//! guard is released after successful close; a close timeout deliberately keeps
+//! it until process exit so detached store work cannot overlap a replacement
+//! owner. Optional `--idle-exit-secs N` (default off) exits after N idle seconds
+//! — test hygiene against orphaned daemons.
 //!
 //! ## R8 — segment-staleness refresh
 //!
@@ -147,7 +148,7 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-    use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -193,6 +194,12 @@ mod imp {
     /// Per-connection read/write timeout. Bounds a stalled client so a reader
     /// thread cannot wedge indefinitely (each connection carries one request).
     const CONN_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Daemon lifecycle waits are explicit and finite. Store-open work runs
+    /// inside this deadline; explicit warm close gets its own shorter budget.
+    const DAEMON_OPEN_BOUND: Duration = Duration::from_secs(10);
+    const DAEMON_WARM_CLOSE_BOUND: Duration = Duration::from_secs(5);
+    const DAEMON_SHUTDOWN_BOUND: Duration = Duration::from_secs(16);
 
     /// SEC-003: hard cap on concurrent per-connection reader threads. Each
     /// accepted connection spawns one short-lived reader thread that funnels its
@@ -551,6 +558,7 @@ mod imp {
             RallyError::NotFound(_) => StoreErrorKind::NotFound,
             RallyError::Command(_) => StoreErrorKind::Command,
             RallyError::Message(_) => StoreErrorKind::Message,
+            RallyError::NotStarted(_) => StoreErrorKind::NotStarted,
             RallyError::Io { .. } | RallyError::Json { .. } => StoreErrorKind::Internal,
         };
         StoreError::new(kind, message)
@@ -617,10 +625,79 @@ mod imp {
         // Per-request engagement rebind (L9/R4): safe because the dispatcher is
         // single-threaded. The daemon NEVER consults its own process env here.
         let request_engagement = req.engagement;
+        let request_deadline = req.deadline_unix_ms;
+        let op = req.op;
         store.set_engagement_scope(request_engagement.clone());
-        match run_op(store, req.op, request_engagement.as_deref()) {
+        let result = if op.is_mutating() {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis().min(i64::MAX as u128) as u64)
+                .unwrap_or(0);
+            let budget = match request_deadline {
+                Some(deadline) if deadline <= now_ms => {
+                    return StoreResponse::Err(StoreError::new(
+                        StoreErrorKind::NotStarted,
+                        "mutation-not-started: client deadline elapsed before daemon dispatch; no durable mutation started and retry is safe",
+                    ));
+                }
+                Some(deadline) => Duration::from_millis(deadline.saturating_sub(now_ms)),
+                // Compatibility for in-process constructors: still finite.
+                None => CONN_TIMEOUT.saturating_sub(Duration::from_millis(250)),
+            };
+            store::with_mutation_deadline(budget, || {
+                run_op(store, op, request_engagement.as_deref())
+            })
+        } else {
+            run_op(store, op, request_engagement.as_deref())
+        };
+        match result {
             Ok(ok) => StoreResponse::Ok(ok),
             Err(e) => StoreResponse::Err(e),
+        }
+    }
+
+    /// Open the daemon-owned direct store with an explicit mutation-lock
+    /// deadline. `daemon serve` has no command watchdog, so it must not rely on
+    /// the generic no-watchdog fallback when startup reconciliation contends.
+    fn open_direct_store_bounded(
+        repo_root: PathBuf,
+        budget: Duration,
+    ) -> Result<DirectRoomStore, RallyError> {
+        store::with_mutation_deadline(budget, || DirectRoomStore::open_direct_at(repo_root))
+    }
+
+    /// Wait for explicit dispatcher/store close without ever joining past the
+    /// deadline. On failure, deliberately retain daemon owner EX until process
+    /// exit: the detached dispatcher owns every value it can still access, and
+    /// no second daemon or direct owner may enter while it finishes or remains
+    /// wedged.
+    fn await_dispatcher_close(
+        close_rx: Receiver<Result<(), String>>,
+        dispatcher: thread::JoinHandle<()>,
+        owner: store::OwnerGuard,
+        bound: Duration,
+    ) -> Result<store::OwnerGuard, ServeError> {
+        let close_result = match close_rx.recv_timeout(bound) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(format!(
+                "daemon-close-timeout: dispatcher did not close within {}ms",
+                bound.as_millis()
+            )),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err("daemon-close-failed: dispatcher exited without close result".to_string())
+            }
+        };
+        // The completion channel is the bounded contract. Dropping a live
+        // JoinHandle detaches; the move closure owns its store and paths.
+        drop(dispatcher);
+        match close_result {
+            Ok(()) => Ok(owner),
+            Err(error) => {
+                // This is a deliberate failure-path guard leak. The OS releases
+                // the fd when the daemon process exits; until then, fail closed.
+                std::mem::forget(owner);
+                Err(ServeError::new(error))
+            }
         }
     }
 
@@ -838,7 +915,7 @@ mod imp {
             "acquiring exclusive owner lock at {}",
             rally_dir.display()
         ));
-        let _owner = store::acquire_owner_exclusive_blocking(&rally_dir)
+        let owner = store::acquire_owner_exclusive_bounded(&rally_dir, DAEMON_OPEN_BOUND)
             .map_err(|e| ServeError::new(format!("acquire owner EX lock: {e}")))?;
         if t0.elapsed() > OWNER_WAIT_LOG_THRESHOLD {
             log(&format!(
@@ -874,7 +951,7 @@ mod imp {
         // (3) Open the direct store (reconcile may take seconds; connects queue
         // in the listen backlog). On failure, drain pending connections with a
         // structured error, then exit non-zero.
-        let mut store = match DirectRoomStore::open_direct_at(repo_root.clone()) {
+        let mut store = match open_direct_store_bounded(repo_root.clone(), DAEMON_OPEN_BOUND) {
             Ok(s) => s,
             Err(e) => {
                 let err = StoreError::new(
@@ -906,6 +983,7 @@ mod imp {
         let last_activity = Arc::new(AtomicI64::new(now_millis()));
         let disp_root = canonical_root.clone();
         let disp_activity = last_activity.clone();
+        let (close_tx, close_rx) = mpsc::sync_channel(1);
         let dispatcher = thread::spawn(move || {
             let mut store = store;
             while let Ok((req, reply)) = job_rx.recv() {
@@ -913,8 +991,13 @@ mod imp {
                 disp_activity.store(now_millis(), Ordering::Relaxed);
                 let _ = reply.send(resp);
             }
-            // Channel closed (all senders dropped): drop the store here, which
-            // releases the (warm) pool before the runtime files are unlinked.
+            // Channel closed (all senders dropped): explicitly close the warm
+            // pool under mutation.lock. The caller bounds its wait on
+            // `close_rx`; DirectRoomStore::Drop is only a prompt fallback.
+            let close_result = store
+                .close_warm_fact_store_bounded(DAEMON_WARM_CLOSE_BOUND)
+                .map_err(|error| error.to_string());
+            let _ = close_tx.send(close_result);
             drop(store);
         });
 
@@ -998,13 +1081,17 @@ mod imp {
             thread::sleep(ACCEPT_POLL);
         }
 
-        // Lifecycle: drop the accept-loop sender so the dispatcher drains its
-        // queue and exits (dropping the store); join it; then unlink the runtime
-        // files. The EX guard (`_owner`) releases at scope end — AFTER unlink —
-        // so a fresh daemon sees no stale socket before it acquires EX.
+        // Lifecycle: drop the accept-loop sender so existing bounded reader
+        // threads finish and the dispatcher explicitly closes its warm store.
+        // Never join without a deadline: if close misses the bound, detach the
+        // thread, report failure, and let its mutation-lock guard protect any
+        // delayed WAL cleanup. Owner EX is released only after a successful
+        // close; a failed/expired close deliberately retains it until process
+        // exit so a detached dispatcher cannot overlap a replacement owner.
         drop(job_tx);
-        let _ = dispatcher.join();
+        let owner = await_dispatcher_close(close_rx, dispatcher, owner, DAEMON_SHUTDOWN_BOUND);
         cleanup(&socket_path, &addr_path, &pid_path);
+        let _owner = owner?;
         log("stopped");
         Ok(())
     }
@@ -1163,23 +1250,214 @@ mod imp {
         }
 
         #[test]
-        fn daemon_rejects_v2_requests_after_authority_and_scoped_snapshot_changes() {
-            assert_eq!(WIRE_VERSION, 3, "this control grades the v2 to v3 cutover");
-            let repo_root = unique_repo_root("reject-v2");
+        fn daemon_rejects_v3_requests_after_mutation_deadline_changes() {
+            assert_eq!(WIRE_VERSION, 4, "this control grades the v3 to v4 cutover");
+            let repo_root = unique_repo_root("reject-v3");
             let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
             let request = StoreRequest {
-                wire_version: 2,
+                wire_version: 3,
                 engagement: None,
+                deadline_unix_ms: None,
                 op: StoreOp::Ping,
             };
             match dispatch_one(&mut store, "/expected/repo", request) {
                 StoreResponse::Err(error) => {
                     assert_eq!(error.kind, StoreErrorKind::Transport);
-                    assert!(error.message.contains("daemon speaks 3"));
-                    assert!(error.message.contains("client sent 2"));
+                    assert!(error.message.contains("daemon speaks 4"));
+                    assert!(error.message.contains("client sent 3"));
                 }
-                other => panic!("v2 request was not rejected: {other:?}"),
+                other => panic!("v3 request was not rejected: {other:?}"),
             }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn daemon_store_open_honors_the_mutation_lock_deadline() {
+            let repo_root = unique_repo_root("bounded-store-open");
+            let rally_dir = repo_root.join(".rally");
+            let seed = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            drop(seed);
+            let held = store::acquire_room_mutation_lock(&rally_dir).unwrap();
+
+            let started = Instant::now();
+            let result = open_direct_store_bounded(repo_root.clone(), Duration::from_millis(75));
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(300),
+                "daemon store open escaped its 75ms bound: {elapsed:?}"
+            );
+            assert!(
+                matches!(result, Err(RallyError::NotStarted(_))),
+                "contended daemon store open must return typed NotStarted"
+            );
+
+            drop(held);
+            let reopened = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            drop(reopened);
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn dispatcher_close_timeout_retains_owner_until_process_exit() {
+            let repo_root = unique_repo_root("close-timeout-owner-retained");
+            let rally_dir = repo_root.join(".rally");
+            let owner =
+                store::acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(75))
+                    .unwrap();
+            let (_close_tx, close_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+            let dispatcher = thread::spawn(|| thread::sleep(Duration::from_millis(100)));
+
+            let started = Instant::now();
+            let result =
+                await_dispatcher_close(close_rx, dispatcher, owner, Duration::from_millis(25));
+            let elapsed = started.elapsed();
+            let error = match result {
+                Ok(_) => panic!("dispatcher close unexpectedly completed"),
+                Err(error) => error,
+            };
+            assert!(
+                elapsed < Duration::from_millis(150),
+                "dispatcher close wait escaped its 25ms bound: {elapsed:?}"
+            );
+            assert!(error.message().starts_with("daemon-close-timeout:"));
+            assert!(
+                store::acquire_owner_shared_nb(&rally_dir)
+                    .unwrap()
+                    .is_none(),
+                "a direct owner entered after close timeout"
+            );
+            assert!(
+                matches!(
+                    store::acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(25)),
+                    Err(RallyError::NotStarted(_))
+                ),
+                "a replacement daemon entered after close timeout"
+            );
+            // `await_dispatcher_close` intentionally leaked owner EX. Do not
+            // unlink the lock path: it remains the process-lifetime rendezvous.
+        }
+
+        #[test]
+        fn expired_routed_mutation_is_typed_not_started_and_never_appends() {
+            let repo_root = unique_repo_root("expired-routed-mutation");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let fact = crate::store::Fact {
+                from_session_id: Some("sess:o25".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o25-routed-no-late-commit".to_string(),
+                seq: 0,
+                thread_id: "thread-o25-routed".to_string(),
+                kind: crate::store::FactKind::Artifact,
+                tool: Some("codex:o25".to_string()),
+                role: None,
+                subject: "expired routed mutation".to_string(),
+                scope: Vec::new(),
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            let mut request = StoreRequest::new(
+                Some("engagement-o25".to_string()),
+                StoreOp::AppendFact {
+                    fact: serde_json::to_value(&fact).unwrap(),
+                },
+            );
+            request.deadline_unix_ms = Some(0);
+
+            let response = dispatch_one(&mut store, repo_root.to_string_lossy().as_ref(), request);
+            match response {
+                StoreResponse::Err(error) => {
+                    assert_eq!(error.kind, StoreErrorKind::NotStarted);
+                    assert_eq!(error.code, 4);
+                    assert!(error.message.contains("no durable mutation started"));
+                }
+                other => panic!("expired mutation was not rejected: {other:?}"),
+            }
+            assert!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.event_id != fact.event_id),
+                "expired routed mutation appended after NotStarted"
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn routed_lock_contention_returns_not_started_and_never_commits_late() {
+            let repo_root = unique_repo_root("routed-lock-contention");
+            let rally_dir = repo_root.join(".rally");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let held = store::acquire_room_mutation_lock(&rally_dir).unwrap();
+            let fact = crate::store::Fact {
+                from_session_id: Some("sess:o25".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o25-routed-contended-no-late-commit".to_string(),
+                seq: 0,
+                thread_id: "thread-o25-routed-contended".to_string(),
+                kind: crate::store::FactKind::Artifact,
+                tool: Some("codex:o25".to_string()),
+                role: None,
+                subject: "contended routed mutation".to_string(),
+                scope: Vec::new(),
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            let mut request = StoreRequest::new(
+                Some("engagement-o25".to_string()),
+                StoreOp::AppendFact {
+                    fact: serde_json::to_value(&fact).unwrap(),
+                },
+            );
+            let deadline = SystemTime::now() + Duration::from_millis(150);
+            request.deadline_unix_ms =
+                Some(deadline.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64);
+            let root_text = repo_root.to_string_lossy().into_owned();
+            let (tx, rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let started = Instant::now();
+                let response = dispatch_one(&mut store, &root_text, request);
+                tx.send((started.elapsed(), response)).unwrap();
+            });
+
+            let (elapsed, response) = rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("routed mutation did not return before its outer timeout");
+            drop(held);
+            worker.join().unwrap();
+            assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+            match response {
+                StoreResponse::Err(error) => {
+                    assert_eq!(error.kind, StoreErrorKind::NotStarted);
+                    assert_eq!(error.code, 4);
+                    assert!(error.message.starts_with("mutation-not-started:"));
+                }
+                other => panic!("contended routed mutation was not rejected: {other:?}"),
+            }
+
+            let reopened = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            assert!(
+                reopened
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.event_id != fact.event_id),
+                "routed NotStarted mutation committed after lock release"
+            );
             std::fs::remove_dir_all(repo_root).ok();
         }
 

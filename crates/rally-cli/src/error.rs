@@ -12,6 +12,13 @@ pub(crate) enum RallyError {
     Command(String),
     #[error("{0}")]
     Message(String),
+    /// The operation was rejected before its first durable side effect.
+    ///
+    /// This is distinct from a transport timeout (outcome unknown): callers
+    /// may safely retry a `NotStarted` operation because the storage boundary
+    /// proved that it never acquired the room mutation lock.
+    #[error("{0}")]
+    NotStarted(String),
     #[error("{context}: {source}")]
     Io {
         context: String,
@@ -31,6 +38,7 @@ impl RallyError {
         match self {
             Self::Usage(_) => 2,
             Self::NotFound(_) => 3,
+            Self::NotStarted(_) => 4,
             Self::Command(_) | Self::Message(_) | Self::Io { .. } | Self::Json { .. } => 1,
         }
     }

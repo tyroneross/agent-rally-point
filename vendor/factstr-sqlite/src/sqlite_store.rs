@@ -45,6 +45,11 @@ pub struct SqliteStore {
     subscription_registry: Arc<Mutex<SubscriptionRegistry>>,
     delivery_sender: Sender<DeliveryCommand>,
     delivery_thread: Mutex<Option<JoinHandle<()>>>,
+    /// Preserve the synchronous-close safety default for ordinary callers.
+    /// Long-lived owners may opt into explicit bounded close and make the
+    /// fallback Drop nonblocking before handing teardown to another thread.
+    blocking_drop: bool,
+    closed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -167,7 +172,64 @@ impl SqliteStore {
             subscription_registry,
             delivery_sender,
             delivery_thread: Mutex::new(Some(delivery_thread)),
+            blocking_drop: true,
+            closed: false,
         })
+    }
+
+    /// Make the fallback [`Drop`] path signal shutdown without joining worker
+    /// threads or constructing a close runtime.
+    ///
+    /// Rally's daemon calls this before an explicit, deadline-bounded close is
+    /// handed to a teardown thread. The default remains synchronous so short-
+    /// lived direct stores still finish WAL housekeeping before releasing their
+    /// caller-owned mutation lock.
+    pub fn prepare_nonblocking_drop(&mut self) {
+        self.blocking_drop = false;
+        let _ = self.delivery_sender.send(DeliveryCommand::Shutdown);
+    }
+
+    /// Finish worker delivery and close every pool connection synchronously,
+    /// returning errors instead of panicking from teardown.
+    ///
+    /// The caller chooses where this blocking work runs. Rally runs it on a
+    /// dedicated thread that also owns `mutation.lock`, then bounds its own wait
+    /// on a completion channel.
+    pub fn close_synchronously(&mut self) -> Result<(), String> {
+        self.blocking_drop = false;
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let _ = self.delivery_sender.send(DeliveryCommand::Shutdown);
+
+        let delivery_thread = match self.delivery_thread.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(delivery_thread) = delivery_thread {
+            delivery_thread
+                .join()
+                .map_err(|_| "factstr-sqlite delivery thread panicked during close".to_string())?;
+        }
+
+        let pool = self.pool.clone();
+        let close_thread = thread::Builder::new()
+            .name("factstr-sqlite-close".to_owned())
+            .spawn(move || -> Result<(), String> {
+                let runtime = Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        format!("build factstr-sqlite synchronous close runtime: {error}")
+                    })?;
+                runtime.block_on(pool.close());
+                Ok(())
+            })
+            .map_err(|error| format!("spawn factstr-sqlite close thread: {error}"))?;
+        close_thread
+            .join()
+            .map_err(|_| "factstr-sqlite synchronous close thread panicked".to_string())?
     }
 
     pub fn database_path(&self) -> &Path {
@@ -474,34 +536,13 @@ impl SqliteStore {
 
 impl Drop for SqliteStore {
     fn drop(&mut self) {
-        let _ = self.delivery_sender.send(DeliveryCommand::Shutdown);
-
-        if let Ok(mut delivery_thread) = self.delivery_thread.lock() {
-            if let Some(delivery_thread) = delivery_thread.take() {
-                let _ = delivery_thread.join();
-            }
+        if self.blocking_drop && !self.closed {
+            // Keep the established direct-store safety default, but teardown
+            // errors are best-effort here: Drop must never panic during unwind.
+            let _ = self.close_synchronously();
+        } else {
+            let _ = self.delivery_sender.send(DeliveryCommand::Shutdown);
         }
-
-        // sqlx otherwise closes the pool's SQLite worker connections in the
-        // background after this Drop returns. Rally holds its cross-process
-        // mutation lock around the store operation, so returning before the
-        // final close lets SQLite checkpoint and unlink a live WAL after the
-        // lock is released. Close on a dedicated runtime thread and join it so
-        // all WAL housekeeping completes before the caller can unlock.
-        let pool = self.pool.clone();
-        let close_thread = thread::Builder::new()
-            .name("factstr-sqlite-close".to_owned())
-            .spawn(move || {
-                let runtime = Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("factstr-sqlite synchronous close runtime");
-                runtime.block_on(pool.close());
-            })
-            .expect("factstr-sqlite synchronous close thread");
-        close_thread
-            .join()
-            .expect("factstr-sqlite synchronous close thread panicked");
     }
 }
 

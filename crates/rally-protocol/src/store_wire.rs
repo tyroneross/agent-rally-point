@@ -60,7 +60,7 @@ use serde_json::Value;
 /// Wire protocol version. Bumped only on a breaking envelope change. The ping
 /// reply carries this; a client seeing a version it does not speak treats the
 /// daemon as not-live and lets the ownership lock decide (ADR-02 rollback note).
-pub const WIRE_VERSION: u32 = 3;
+pub const WIRE_VERSION: u32 = 4;
 
 /// Hard cap on a single request/response line. A longer line is a framing
 /// error (or an abuse) and maps to the transport-error class (R7): the daemon
@@ -79,6 +79,12 @@ pub struct StoreRequest {
     /// default; the daemon never reads its own env to fill this.
     #[serde(default)]
     pub engagement: Option<String>,
+    /// Client wall-clock deadline for starting a mutating operation, expressed
+    /// as Unix epoch milliseconds. The daemon rejects an expired mutation as
+    /// [`StoreErrorKind::NotStarted`] before it acquires `mutation.lock`.
+    /// Read-only requests leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_unix_ms: Option<u64>,
     /// The store operation to perform.
     pub op: StoreOp,
 }
@@ -89,6 +95,7 @@ impl StoreRequest {
         Self {
             wire_version: WIRE_VERSION,
             engagement,
+            deadline_unix_ms: None,
             op,
         }
     }
@@ -174,6 +181,33 @@ pub enum StoreOp {
     /// [`StoreOk::Pong`]; the client verifies `repo_root` matches its own and
     /// `wire_version` is one it speaks before routing (L7, ADR-02).
     Ping,
+}
+
+impl StoreOp {
+    /// Whether dispatch can create or update durable room state.
+    ///
+    /// This closed classification is shared by the client deadline stamper and
+    /// daemon deadline enforcer so a new mutating wire operation cannot silently
+    /// bypass the O25 no-late-commit contract.
+    pub fn is_mutating(&self) -> bool {
+        match self {
+            Self::AppendFact { .. }
+            | Self::AppendFactVerified { .. }
+            | Self::AppendStateTransitionVerified { .. }
+            | Self::AppendSessionFactIfContext { .. }
+            | Self::RebuildClaimIndex
+            | Self::RenewClaimLease { .. }
+            | Self::MaybeAppendReadCheckpoint { .. } => true,
+            Self::Facts
+            | Self::SessionFactsWithContextVersion
+            | Self::SnapshotWithArchived { .. }
+            | Self::SnapshotScoped { .. }
+            | Self::SnapshotWithReadersArchived { .. }
+            | Self::LastCheckpointSeq { .. }
+            | Self::ProjectReadReceipts { .. }
+            | Self::Ping => false,
+        }
+    }
 }
 
 /// One response line on the wire: either the op succeeded ([`StoreOk`]) or it
@@ -264,6 +298,9 @@ pub enum StoreErrorKind {
     /// `RallyError::Io`/`Json` collapsed for the wire → reconstruct as
     /// `RallyError::Command` (exit 1, source dropped).
     Internal,
+    /// The request deadline elapsed before the daemon acquired the mutation
+    /// lock. No durable side effect started; safe to retry.
+    NotStarted,
     /// R7 transport class (timeout / reset / oversized line / version or
     /// repo_root mismatch). No direct-path equivalent → reconstruct as
     /// `RallyError::Command` (exit 1) with remedy text.
@@ -293,6 +330,7 @@ impl StoreErrorKind {
         match self {
             StoreErrorKind::Usage => 2,
             StoreErrorKind::NotFound => 3,
+            StoreErrorKind::NotStarted => 4,
             StoreErrorKind::Command
             | StoreErrorKind::Message
             | StoreErrorKind::Internal
@@ -307,18 +345,20 @@ mod tests {
 
     #[test]
     fn request_round_trips_through_a_single_line() {
-        let req = StoreRequest::new(
+        let mut req = StoreRequest::new(
             Some("alpha".to_string()),
             StoreOp::MaybeAppendReadCheckpoint {
                 tool: "claude_code:01".to_string(),
                 read_seq: 42,
             },
         );
+        req.deadline_unix_ms = Some(1_786_291_200_000);
         let line = serde_json::to_string(&req).unwrap();
         assert!(!line.contains('\n'));
         let back: StoreRequest = serde_json::from_str(&line).unwrap();
         assert_eq!(back.wire_version, WIRE_VERSION);
         assert_eq!(back.engagement.as_deref(), Some("alpha"));
+        assert_eq!(back.deadline_unix_ms, Some(1_786_291_200_000));
         matches!(
             back.op,
             StoreOp::MaybeAppendReadCheckpoint { read_seq: 42, .. }
@@ -326,8 +366,8 @@ mod tests {
     }
 
     #[test]
-    fn scoped_snapshot_v3_round_trips_all_query_controls() {
-        assert_eq!(WIRE_VERSION, 3);
+    fn scoped_snapshot_v4_round_trips_all_query_controls() {
+        assert_eq!(WIRE_VERSION, 4);
         let req = StoreRequest::new(
             Some("engagement-alpha".to_string()),
             StoreOp::SnapshotScoped {
@@ -415,6 +455,20 @@ mod tests {
         assert_eq!(StoreErrorKind::Message.exit_code(), 1);
         assert_eq!(StoreErrorKind::Internal.exit_code(), 1);
         assert_eq!(StoreErrorKind::Transport.exit_code(), 1);
+        assert_eq!(StoreErrorKind::NotStarted.exit_code(), 4);
         assert_eq!(StoreError::transport("gone").code, 1);
+    }
+
+    #[test]
+    fn mutation_classification_is_closed_and_deadline_eligible() {
+        assert!(
+            StoreOp::AppendFact {
+                fact: serde_json::json!({"event_id": "fact-o25"})
+            }
+            .is_mutating()
+        );
+        assert!(StoreOp::RebuildClaimIndex.is_mutating());
+        assert!(!StoreOp::Facts.is_mutating());
+        assert!(!StoreOp::Ping.is_mutating());
     }
 }
