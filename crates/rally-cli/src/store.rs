@@ -39,10 +39,6 @@ pub(crate) const LOG_INDEX_FILENAME: &str = "index.json";
 /// Same line format as live segments; replay walks here too.
 pub(crate) const ARCHIVE_DIRNAME: &str = "archive";
 
-/// Forensic holding area for canonical JSONL records that replay can safely
-/// skip while keeping the room readable.
-const QUARANTINE_DIRNAME: &str = "quarantine";
-
 /// Filename used by the R5 migration to preserve the R1 monolith verbatim.
 pub(crate) const ARCHIVED_MONOLITH_FILENAME: &str = "ledger-pre-segment.jsonl";
 
@@ -4179,17 +4175,9 @@ fn facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> 
         return Ok(facts);
     }
 
-    let mut entries: Vec<LedgerLine> = Vec::new();
-    for path in live.iter().chain(archived.iter()) {
-        entries.extend(read_segment_entries(path)?);
-    }
-    entries.sort_by_key(|entry| entry.seq);
+    let entries = canonical_segment_entries(&live, &archived)?;
     let mut facts = Vec::with_capacity(entries.len());
-    let mut seen = BTreeSet::<i64>::new();
     for entry in entries {
-        if !seen.insert(entry.seq) {
-            continue;
-        }
         facts.push(Fact::from_segment_value(entry.payload, entry.seq)?);
     }
 
@@ -6516,22 +6504,41 @@ fn replay_archive_segments(archive_dir: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-/// Sequence stats across replay sources. `count` is the number of distinct
-/// sequence numbers; `max_seq` is the canonical high-water mark. Both are
+/// Fold every repo-wide replay source into one deterministic canonical row per
+/// sequence. A repeated sequence is valid only when the complete serialized
+/// envelope is equal: timestamp, event type, payload, and engagement included.
+/// Anything else has no authoritative winner, so fail before projection or DB
+/// replacement instead of selecting whichever file happened to be read first.
+fn canonical_segment_entries(live: &[PathBuf], archived: &[PathBuf]) -> Result<Vec<LedgerLine>> {
+    let mut by_seq = BTreeMap::<i64, LedgerLine>::new();
+    for path in live.iter().chain(archived.iter()) {
+        for entry in read_segment_entries(path)? {
+            if let Some(existing) = by_seq.get(&entry.seq) {
+                if existing != &entry {
+                    return Err(RallyError::Message(format!(
+                        "conflicting canonical segment rows at seq {}: full LedgerLine values differ",
+                        entry.seq
+                    )));
+                }
+                continue;
+            }
+            by_seq.insert(entry.seq, entry);
+        }
+    }
+    Ok(by_seq.into_values().collect())
+}
+
+/// Sequence stats across replay sources. `count` is the number of exact-deduped
+/// canonical rows; `max_seq` is the canonical high-water mark. Both are
 /// required: sparse histories can have `count < max_seq`, and append must never
 /// reuse an existing canonical sequence.
 fn segment_seq_stats(live: &[PathBuf], archived: &[PathBuf]) -> Result<SeqStats> {
-    let mut seqs: BTreeSet<i64> = BTreeSet::new();
-    for path in live.iter().chain(archived.iter()) {
-        for entry in read_segment_entries(path)? {
-            seqs.insert(entry.seq);
-        }
-    }
-    let count = i64::try_from(seqs.len())
+    let entries = canonical_segment_entries(live, archived)?;
+    let count = i64::try_from(entries.len())
         .map_err(|err| RallyError::Message(format!("distinct seq count overflow: {err}")))?;
     Ok(SeqStats {
         count,
-        max_seq: seqs.iter().next_back().copied().unwrap_or(0),
+        max_seq: entries.last().map(|entry| entry.seq).unwrap_or(0),
     })
 }
 
@@ -6741,12 +6748,10 @@ fn quarantine_corrupt_db(facts_db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Rebuild the derived sqlite cache by replaying every segment line in seq
-/// order (live segments first, then archive — the union — sorted by seq).
-/// Dedup by `sequence_number` (re-running migration twice can otherwise
-/// duplicate). If two different payloads share a seq, keep the first-valid line,
-/// write the conflicting later line to `.rally/quarantine/`, and continue. One
-/// bad duplicate line must not brick every read path.
+/// Rebuild the derived sqlite cache by replaying the canonical segment fold in
+/// seq order. Exact full-envelope copies dedupe (re-running migration twice can
+/// otherwise duplicate); any non-identical row at the same seq fails before the
+/// existing cache is touched because neither row has canonical precedence.
 ///
 /// Replay is a **pure function of the deduped event set**: each surviving
 /// line is appended in seq order and factstr assigns fresh monotonic seqs
@@ -6759,31 +6764,7 @@ fn rebuild_db_from_segments(
     archived: &[PathBuf],
     facts_db_path: &Path,
 ) -> Result<()> {
-    let mut all_entries: Vec<LedgerLine> = Vec::new();
-    for path in live.iter().chain(archived.iter()) {
-        all_entries.extend(read_segment_entries(path)?);
-    }
-    all_entries.sort_by_key(|e| e.seq);
-
-    // Dedup by seq in-place (keep first occurrence); quarantine conflicting
-    // later lines so replay can project the rest of the room.
-    let mut write = 0usize;
-    for read in 0..all_entries.len() {
-        if write > 0 && all_entries[write - 1].seq == all_entries[read].seq {
-            if all_entries[write - 1].payload != all_entries[read].payload
-                || all_entries[write - 1].event_type != all_entries[read].event_type
-            {
-                quarantine_duplicate_segment_entry(facts_db_path, &all_entries[read])?;
-            }
-            // duplicate/conflict — skip
-        } else {
-            if read != write {
-                all_entries.swap(read, write);
-            }
-            write += 1;
-        }
-    }
-    all_entries.truncate(write);
+    let all_entries = canonical_segment_entries(live, archived)?;
 
     let replay_events = all_entries
         .iter()
@@ -6808,33 +6789,6 @@ fn rebuild_db_from_segments(
     store
         .append(replay_events)
         .map_err(|err| RallyError::Message(format!("replay segments: {err}")))?;
-    Ok(())
-}
-
-fn quarantine_duplicate_segment_entry(facts_db_path: &Path, entry: &LedgerLine) -> Result<()> {
-    let parent = facts_db_path
-        .parent()
-        .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
-    let quarantine_dir = parent.join(QUARANTINE_DIRNAME);
-    fs::create_dir_all(&quarantine_dir).map_err(RallyError::io(format!(
-        "create {}",
-        quarantine_dir.display()
-    )))?;
-    let line =
-        serde_json::to_string(entry).map_err(RallyError::json("render duplicate segment"))?;
-    let hash = hash_bytes_fnv1a(line.as_bytes());
-    let path = quarantine_dir.join(format!("duplicate-seq-{}-{hash:016x}.jsonl", entry.seq));
-    if path.exists() {
-        return Ok(());
-    }
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)
-        .map_err(RallyError::io(format!("create {}", path.display())))?;
-    writeln!(file, "{line}").map_err(RallyError::io(format!("write {}", path.display())))?;
-    file.sync_all()
-        .map_err(RallyError::io(format!("sync {}", path.display())))?;
     Ok(())
 }
 
@@ -9978,6 +9932,13 @@ mod ledger_tests {
         serde_json::to_string(&entry).unwrap()
     }
 
+    fn canonical_conflict_message<T>(result: Result<T>, case: &str) -> String {
+        match result {
+            Ok(_) => panic!("{case}: conflicting canonical rows must fail loud"),
+            Err(err) => err.to_string(),
+        }
+    }
+
     #[test]
     fn segment_fold_memo_is_room_scoped_and_invalidates_on_change() {
         let _guard = crate::PROCESS_ENV_LOCK
@@ -10371,78 +10332,158 @@ mod ledger_tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// A duplicate sequence number with a different event used to hard-fail
-    /// replay, which made every `room` / `recent` / `next` read unusable until
-    /// manual segment surgery. L2 graceful degradation keeps the first-valid
-    /// record, quarantines the conflicting later line, and projects the rest.
+    /// A sequence number identifies one complete canonical envelope. Any field
+    /// difference at that sequence is ambiguous storage, regardless of whether
+    /// both rows are live or one has rotated into the archive. Every repo-wide
+    /// fold must reject the ambiguity before projecting or replacing facts.db.
     #[test]
-    fn duplicate_seq_conflict_is_quarantined_and_room_stays_readable() {
-        let root = unique_root("reconcile-dup-seq-quarantine");
+    fn canonical_fold_rejects_every_ledger_line_difference_across_sources() {
+        for source_layout in ["live-live", "live-archive"] {
+            for differing_field in ["occurred_at", "engagement", "event_type", "payload"] {
+                let case = format!("{source_layout}-{differing_field}");
+                let root = unique_root(&format!("canonical-conflict-{case}"));
+                let original = ledger_line(7, "decision", "event-7", "alpha");
+                let mut conflicting: LedgerLine = serde_json::from_str(&original).unwrap();
+                match differing_field {
+                    "occurred_at" => conflicting.occurred_at = "2026-05-02T00:00:07Z".to_string(),
+                    "engagement" => conflicting.engagement = Some("beta".to_string()),
+                    "event_type" => conflicting.event_type = "artifact".to_string(),
+                    "payload" => conflicting.payload["subject"] = json!("different payload"),
+                    _ => unreachable!(),
+                }
+                let conflicting = serde_json::to_string(&conflicting).unwrap();
 
-        let lines = [
-            ledger_line(1, "decision", "e1", "alpha"),
-            ledger_line(2, "decision", "e2-first", "alpha"),
-            ledger_line(2, "blocker", "e2-duplicate", "alpha"),
-            ledger_line(3, "artifact", "e3", "alpha"),
-        ];
-        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-        write_segment(&root, "log", "alpha.jsonl", &refs);
+                write_segment(&root, "log", "a.jsonl", &[original.as_str()]);
+                let second_dir = if source_layout == "live-live" {
+                    "log"
+                } else {
+                    "archive"
+                };
+                write_segment(&root, second_dir, "z.jsonl", &[conflicting.as_str()]);
 
-        let store = RoomStore::open_at(root.clone()).unwrap();
-        let facts = store.facts().unwrap();
-        let ids: Vec<&str> = facts.iter().map(|f| f.event_id.as_str()).collect();
-        assert_eq!(
-            ids,
-            ["e1", "e2-first", "e3"],
-            "duplicate seq must not brick replay; first-valid record is kept"
+                let log_dir = root.join(".rally").join(LOG_DIRNAME);
+                let archive_dir = root.join(".rally").join(ARCHIVE_DIRNAME);
+                let live = read_segment_files(&log_dir).unwrap();
+                let archived = replay_archive_segments(&archive_dir).unwrap();
+                let source_bytes = live
+                    .iter()
+                    .chain(archived.iter())
+                    .map(|path| (path.clone(), fs::read(path).unwrap()))
+                    .collect::<Vec<_>>();
+                let facts_db = root.join(".rally/facts.db");
+                let sentinel = b"existing derived cache";
+                fs::write(&facts_db, sentinel).unwrap();
+                let expected =
+                    "conflicting canonical segment rows at seq 7: full LedgerLine values differ";
+
+                assert_eq!(
+                    canonical_conflict_message(facts_from_segments(&log_dir, &archive_dir), &case,),
+                    expected,
+                    "{case}: fact projection must use full envelope equality"
+                );
+                assert_eq!(
+                    canonical_conflict_message(segment_seq_stats(&live, &archived), &case),
+                    expected,
+                    "{case}: authoritative stats must validate before DB comparison"
+                );
+                assert_eq!(
+                    canonical_conflict_message(
+                        rebuild_db_from_segments(&live, &archived, &facts_db),
+                        &case,
+                    ),
+                    expected,
+                    "{case}: rebuild must reject before replacing facts.db"
+                );
+                assert_eq!(
+                    fs::read(&facts_db).unwrap(),
+                    sentinel,
+                    "{case}: failed validation must preserve the derived cache"
+                );
+                for (path, before) in source_bytes {
+                    assert_eq!(
+                        fs::read(&path).unwrap(),
+                        before,
+                        "{case}: canonical source changed at {}",
+                        path.display()
+                    );
+                }
+                assert!(
+                    !root.join(".rally").join("quarantine").exists(),
+                    "{case}: conflict detection must not rewrite canonical input into quarantine"
+                );
+
+                fs::remove_dir_all(&root).ok();
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_fold_conflict_is_input_order_invariant() {
+        let root = unique_root("canonical-conflict-order");
+        let original = ledger_line(11, "decision", "event-11", "alpha");
+        let mut conflicting: LedgerLine = serde_json::from_str(&original).unwrap();
+        conflicting.occurred_at = "2026-05-02T00:00:11Z".to_string();
+        let conflicting = serde_json::to_string(&conflicting).unwrap();
+        write_segment(&root, "log", "a.jsonl", &[original.as_str()]);
+        write_segment(&root, "log", "z.jsonl", &[conflicting.as_str()]);
+
+        let rally_dir = root.join(".rally");
+        let first = rally_dir.join(LOG_DIRNAME).join("a.jsonl");
+        let second = rally_dir.join(LOG_DIRNAME).join("z.jsonl");
+        let first_db = rally_dir.join("first-order.db");
+        let second_db = rally_dir.join("second-order.db");
+        fs::write(&first_db, b"first sentinel").unwrap();
+        fs::write(&second_db, b"second sentinel").unwrap();
+
+        let forward = canonical_conflict_message(
+            rebuild_db_from_segments(&[first.clone(), second.clone()], &[], &first_db),
+            "forward order",
+        );
+        let reverse = canonical_conflict_message(
+            rebuild_db_from_segments(&[second, first], &[], &second_db),
+            "reverse order",
         );
         assert_eq!(
-            store.snapshot().unwrap().max_seq,
-            3,
-            "snapshot still reports the canonical high-water mark"
+            forward, reverse,
+            "conflict result must not depend on input order"
         );
+        assert_eq!(fs::read(&first_db).unwrap(), b"first sentinel");
+        assert_eq!(fs::read(&second_db).unwrap(), b"second sentinel");
+        assert!(!rally_dir.join("quarantine").exists());
 
-        let quarantine_dir = root.join(".rally").join(QUARANTINE_DIRNAME);
-        let quarantined: Vec<PathBuf> = fs::read_dir(&quarantine_dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn canonical_fold_dedupes_only_exact_ledger_line_copies() {
+        let root = unique_root("canonical-exact-copy");
+        let exact = ledger_line(13, "decision", "event-13", "alpha");
+        write_segment(&root, "log", "alpha.jsonl", &[exact.as_str()]);
+        write_segment(&root, "archive", "alpha.jsonl", &[exact.as_str()]);
+
+        let log_dir = root.join(".rally").join(LOG_DIRNAME);
+        let archive_dir = root.join(".rally").join(ARCHIVE_DIRNAME);
+        let live = read_segment_files(&log_dir).unwrap();
+        let archived = replay_archive_segments(&archive_dir).unwrap();
         assert_eq!(
-            quarantined.len(),
-            1,
-            "conflicting duplicate line is preserved once for forensics"
+            facts_from_segments(&log_dir, &archive_dir).unwrap().len(),
+            1
         );
-        let quarantined_body = fs::read_to_string(&quarantined[0]).unwrap();
-        assert!(
-            quarantined_body.contains("e2-duplicate"),
-            "quarantine file must contain the skipped duplicate event"
-        );
-
-        let appended = store
-            .append_fact(&make_fact(
-                "after-duplicate",
-                FactKind::Decision,
-                "src/",
-                "append after duplicate quarantine",
-            ))
-            .unwrap();
         assert_eq!(
-            appended.seq, 4,
-            "append must allocate above the surviving canonical max"
+            segment_seq_stats(&live, &archived).unwrap(),
+            SeqStats {
+                count: 1,
+                max_seq: 13,
+            }
         );
 
-        drop(store);
         let facts_db = root.join(".rally/facts.db");
-        fs::remove_file(&facts_db).ok();
-        let _ = fs::remove_file(facts_db.with_extension("db-shm"));
-        let _ = fs::remove_file(facts_db.with_extension("db-wal"));
-        let store2 = RoomStore::open_at(root.clone()).unwrap();
-        assert_eq!(store2.facts().unwrap().len(), 4);
-        let quarantine_count_after_rebuild = fs::read_dir(&quarantine_dir).unwrap().count();
-        assert_eq!(
-            quarantine_count_after_rebuild, 1,
-            "deterministic quarantine filenames prevent repeated rebuild churn"
-        );
+        rebuild_db_from_segments(&live, &archived, &facts_db).unwrap();
+        let rebuilt = facts_from_store(&open_fact_store(&facts_db).unwrap()).unwrap();
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].event_id, "event-13");
+        assert_eq!(rebuilt[0].seq, 13);
+        assert!(!root.join(".rally").join("quarantine").exists());
 
         fs::remove_dir_all(&root).ok();
     }
