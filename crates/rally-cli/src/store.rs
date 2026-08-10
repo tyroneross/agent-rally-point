@@ -2448,10 +2448,16 @@ impl DirectRoomStore {
             },
         )?;
         crate::mark_watchdog_command_commit();
+        // Direct mode owns a fresh per-op pool. Close it before fingerprinting
+        // the derived cache so its final WAL checkpoint/unlink cannot make the
+        // sidecar stale immediately after this method returns. In daemon mode
+        // the handle only borrows the warm pool, so dropping it keeps that pool
+        // (and its WAL lifecycle) unchanged.
+        drop(fact_store);
         // Refresh the reconcile sidecar while the flock is still held so the
         // NEXT op stays on the O(1) fast path. The db and active segment each
-        // grew by exactly one event; carry the pre-append counts forward +1 and
-        // re-fingerprint (cheap, O(#files)). Best-effort: a miss just means the
+        // grew by exactly one event; remeasure both counts and re-fingerprint
+        // (cheap in file count). Best-effort: a miss just means the
         // next op does one authoritative scan and re-seeds the sidecar.
         self.refresh_reconcile_cache_after_append(fact.seq);
         // Both index refreshes are best-effort caches; swallow failures so a
@@ -5200,7 +5206,13 @@ fn fingerprint_db(path: &Path) -> Option<FileFingerprint> {
 /// Fingerprint the live WAL with the same fixed-cost content signal as the main
 /// database. Absence is meaningful and therefore represented as `None`.
 fn fingerprint_wal(facts_db_path: &Path) -> Option<FileFingerprint> {
-    fingerprint_db(&facts_db_path.with_extension("db-wal"))
+    let fingerprint = fingerprint_db(&facts_db_path.with_extension("db-wal"))?;
+    // SQLite can leave a zero-length WAL briefly between the synchronous pool
+    // close and the file's final unlink. It contains no committed frames, so
+    // it is equivalent to no WAL; persisting its transient inode metadata
+    // makes a freshly-written sidecar invalidate itself as soon as unlink
+    // completes. A later commit grows the WAL and is still fingerprinted.
+    (fingerprint.len > 0).then_some(fingerprint)
 }
 
 /// Hash of the first 4096 bytes of `path` (fewer if the file is shorter). Cheap,
@@ -8013,10 +8025,8 @@ mod ledger_tests {
         write_segment(&root, "log", "alpha.jsonl", &[old.as_str()]);
         let log_dir = root.join(".rally").join(LOG_DIRNAME);
         let archive_dir = root.join(".rally").join(ARCHIVE_DIRNAME);
-        assert_eq!(
-            facts_from_segments(&log_dir, &archive_dir).unwrap()[0].event_id,
-            "event-old"
-        );
+        let old_facts = facts_from_segments(&log_dir, &archive_dir).unwrap();
+        assert_eq!(old_facts[0].event_id, "event-old");
 
         fs::write(log_dir.join("alpha.jsonl"), format!("{new}\n")).unwrap();
         // Force the adversarial metadata-collision state deterministically:
@@ -8027,9 +8037,17 @@ mod ledger_tests {
         let rewritten_fingerprint = segments_fingerprint(&live, &archived);
         let cached_hit = {
             let mut memo = SEGMENT_FOLD_MEMO.lock().unwrap();
-            memo.as_mut()
-                .expect("old room fold must be cached")
-                .fingerprint = rewritten_fingerprint.clone();
+            // Another parallel test may legitimately replace the process-wide
+            // one-slot memo after our first fold. Seed this adversarial state
+            // while holding the memo lock instead of assuming our room still
+            // occupies the slot; the control is about collision handling, not
+            // cache residency across unrelated rooms.
+            *memo = Some(SegmentFoldMemo {
+                log_dir: log_dir.clone(),
+                archive_dir: archive_dir.clone(),
+                fingerprint: rewritten_fingerprint.clone(),
+                facts: std::sync::Arc::new(old_facts),
+            });
             segment_fold_memo_hit(&memo, &log_dir, &archive_dir, &rewritten_fingerprint)
                 .expect("adversarial fingerprint collision must hit the cached fold")
         };
@@ -8634,6 +8652,28 @@ mod ledger_tests {
     // Step-3 reconcile fast-path tests (O(1) happy path + corruption safety)
     // =========================================================================
 
+    #[test]
+    fn step3_zero_length_wal_is_absent_but_nonempty_wal_is_fingerprinted() {
+        let root = unique_root("step3-zero-wal");
+        let rally_dir = root.join(".rally");
+        fs::create_dir_all(&rally_dir).unwrap();
+        let facts_db = rally_dir.join("facts.db");
+        let wal = facts_db.with_extension("db-wal");
+
+        fs::write(&wal, b"").unwrap();
+        assert!(
+            fingerprint_wal(&facts_db).is_none(),
+            "an empty WAL has no committed frames and must equal an absent WAL"
+        );
+
+        fs::write(&wal, b"committed-frame-signal").unwrap();
+        assert!(
+            fingerprint_wal(&facts_db).is_some(),
+            "a nonempty WAL must remain part of the cache fingerprint"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// Call reconcile directly and report whether it took the authoritative
     /// O(N) scan path (true) or the O(1) fast path (false). Measures a DELTA on
     /// the process-global counter around exactly this call, so it is robust to
@@ -8682,24 +8722,32 @@ mod ledger_tests {
             .unwrap();
         let facts_db = root.join(".rally/facts.db");
         let sidecar = root.join(".rally").join(RECONCILE_CACHE_FILENAME);
+        let wal = facts_db.with_extension("db-wal");
         let stale_bytes = fs::read(&sidecar).expect("append writes sidecar");
         let mut stale: ReconcileCache = serde_json::from_slice(&stale_bytes).unwrap();
+        drop(store);
+
+        // Model a sidecar captured while a nonempty WAL exists, then remove
+        // that WAL before reconcile. Direct append now fingerprints only after
+        // its per-op pool closes, so relying on a transient close-time WAL here
+        // would recreate the race this test is meant to prevent.
+        fs::write(&wal, b"committed-frame-signal").unwrap();
+        stale.db_fingerprint = fingerprint_db(&facts_db);
+        stale.wal_fingerprint = fingerprint_wal(&facts_db);
         assert!(
             stale.wal_fingerprint.is_some(),
-            "open WAL must be represented in the sidecar"
+            "a nonempty WAL must be represented in the sidecar"
         );
-
-        drop(store);
+        write_reconcile_cache(&facts_db, &stale).unwrap();
+        fs::remove_file(&wal).unwrap();
         assert!(
             fingerprint_wal(&facts_db).is_none(),
-            "synchronous store close must checkpoint and remove the WAL"
+            "removed WAL must fingerprint as absent"
         );
 
-        // Make every legacy fast-path field match the post-close state while
-        // preserving the pre-close WAL fingerprint. Only WAL awareness can
-        // reject this otherwise self-consistent stale cache.
-        stale.db_fingerprint = fingerprint_db(&facts_db);
-        write_reconcile_cache(&facts_db, &stale).unwrap();
+        // Every legacy fast-path field matches the post-removal state while
+        // the cache preserves the pre-removal WAL fingerprint. Only WAL
+        // awareness can reject this otherwise self-consistent stale cache.
         assert!(
             reconcile_took_full_scan(&root),
             "WAL disappearance must invalidate the reconcile fast path"
