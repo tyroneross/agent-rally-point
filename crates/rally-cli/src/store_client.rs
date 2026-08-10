@@ -347,6 +347,7 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
         StoreOp::Facts
         | StoreOp::SessionFactsWithContextVersion
         | StoreOp::SnapshotWithArchived { .. }
+        | StoreOp::SnapshotScoped { .. }
         | StoreOp::SnapshotWithReadersArchived { .. }
         | StoreOp::LastCheckpointSeq { .. }
         | StoreOp::ProjectReadReceipts { .. }
@@ -421,7 +422,11 @@ impl RoutedRoomStore {
     /// `set_engagement_scope` rebind depends on it being present on every op,
     /// not just appends.
     fn dispatch(&self, op: StoreOp) -> Result<StoreOk> {
-        let req = StoreRequest::new(Some(self.active_engagement.clone()), op);
+        self.dispatch_with_engagement(self.active_engagement.clone(), op)
+    }
+
+    fn dispatch_with_engagement(&self, engagement: String, op: StoreOp) -> Result<StoreOk> {
+        let req = StoreRequest::new(Some(engagement), op);
         match round_trip(&self.socket, &req, OP_TIMEOUT, false) {
             Ok(StoreResponse::Ok(ok)) => Ok(ok),
             Ok(StoreResponse::Err(err)) => Err(store_error_to_rally_error(err)),
@@ -532,6 +537,27 @@ impl RoutedRoomStore {
         match self.dispatch(StoreOp::SnapshotWithArchived { include_archived })? {
             StoreOk::Snapshot { snapshot } => snapshot_from_value(snapshot),
             _ => Err(unexpected_reply("snapshot_with_archived")),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_scoped(
+        &self,
+        engagement: &str,
+        run_id: Option<&str>,
+        path: Option<&str>,
+        include_archived: bool,
+        include_presence_only: bool,
+    ) -> Result<RoomSnapshot> {
+        let op = StoreOp::SnapshotScoped {
+            run_id: run_id.map(str::to_string),
+            path: path.map(str::to_string),
+            include_archived,
+            include_presence_only,
+        };
+        match self.dispatch_with_engagement(engagement.to_string(), op)? {
+            StoreOk::Snapshot { snapshot } => snapshot_from_value(snapshot),
+            _ => Err(unexpected_reply("snapshot_scoped")),
         }
     }
 
@@ -689,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_rejects_a_v2_daemon_after_the_renewal_authority_change() {
+    fn probe_rejects_a_v2_daemon_after_authority_and_scoped_snapshot_changes() {
         assert_eq!(WIRE_VERSION, 3, "this control grades the v2 to v3 cutover");
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -723,7 +749,7 @@ mod tests {
 
         assert!(
             probe_identity(&rally_dir, "/expected/repo").is_none(),
-            "a v2 daemon must not route a v3 client whose renewal authority fields it cannot enforce"
+            "a v2 daemon must not route a v3 client without renewal authority or scoped snapshots"
         );
         server.join().unwrap();
         std::fs::remove_file(&socket).ok();

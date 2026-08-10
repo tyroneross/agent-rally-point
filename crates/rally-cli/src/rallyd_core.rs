@@ -608,16 +608,27 @@ mod imp {
                 wire_version: WIRE_VERSION,
             });
         }
+        if matches!(req.op, StoreOp::SnapshotScoped { .. }) && req.engagement.is_none() {
+            return StoreResponse::Err(StoreError::new(
+                StoreErrorKind::Usage,
+                "snapshot_scoped requires StoreRequest.engagement",
+            ));
+        }
         // Per-request engagement rebind (L9/R4): safe because the dispatcher is
         // single-threaded. The daemon NEVER consults its own process env here.
-        store.set_engagement_scope(req.engagement.clone());
-        match run_op(store, req.op) {
+        let request_engagement = req.engagement;
+        store.set_engagement_scope(request_engagement.clone());
+        match run_op(store, req.op, request_engagement.as_deref()) {
             Ok(ok) => StoreResponse::Ok(ok),
             Err(e) => StoreResponse::Err(e),
         }
     }
 
-    fn run_op(store: &mut DirectRoomStore, op: StoreOp) -> Result<StoreOk, StoreError> {
+    fn run_op(
+        store: &mut DirectRoomStore,
+        op: StoreOp,
+        request_engagement: Option<&str>,
+    ) -> Result<StoreOk, StoreError> {
         Ok(match op {
             StoreOp::Ping => {
                 // Handled in dispatch_one before engagement rebinding.
@@ -707,6 +718,31 @@ mod imp {
             StoreOp::SnapshotWithArchived { include_archived } => {
                 let snap = store
                     .snapshot_with_archived(include_archived)
+                    .map_err(rally_to_wire)?;
+                StoreOk::Snapshot {
+                    snapshot: snapshot_to_wire(&snap)?,
+                }
+            }
+            StoreOp::SnapshotScoped {
+                run_id,
+                path,
+                include_archived,
+                include_presence_only,
+            } => {
+                let engagement = request_engagement.ok_or_else(|| {
+                    StoreError::new(
+                        StoreErrorKind::Usage,
+                        "snapshot_scoped requires StoreRequest.engagement",
+                    )
+                })?;
+                let snap = store
+                    .snapshot_scoped(
+                        engagement,
+                        run_id.as_deref(),
+                        path.as_deref(),
+                        include_archived,
+                        include_presence_only,
+                    )
                     .map_err(rally_to_wire)?;
                 StoreOk::Snapshot {
                     snapshot: snapshot_to_wire(&snap)?,
@@ -1127,7 +1163,7 @@ mod imp {
         }
 
         #[test]
-        fn daemon_rejects_v2_requests_after_the_renewal_authority_change() {
+        fn daemon_rejects_v2_requests_after_authority_and_scoped_snapshot_changes() {
             assert_eq!(WIRE_VERSION, 3, "this control grades the v2 to v3 cutover");
             let repo_root = unique_repo_root("reject-v2");
             let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
@@ -1143,6 +1179,212 @@ mod imp {
                     assert!(error.message.contains("client sent 2"));
                 }
                 other => panic!("v2 request was not rejected: {other:?}"),
+            }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn scoped_snapshot_dispatch_requires_engagement_and_matches_direct_projection() {
+            let repo_root = unique_repo_root("scoped-snapshot-parity");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            store.set_engagement_scope(Some("engagement-alpha".to_string()));
+            let artifact = crate::store::Fact {
+                from_session_id: Some("sess:alpha".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "artifact-scoped-parity".to_string(),
+                seq: 0,
+                thread_id: "thread-scoped-parity".to_string(),
+                kind: crate::store::FactKind::Artifact,
+                tool: Some("codex:alpha".to_string()),
+                role: None,
+                subject: "scoped parity".to_string(),
+                scope: vec!["run:audit-run".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact(&artifact).unwrap();
+
+            let missing = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(
+                    None,
+                    StoreOp::SnapshotScoped {
+                        run_id: Some("audit-run".to_string()),
+                        path: None,
+                        include_archived: false,
+                        include_presence_only: false,
+                    },
+                ),
+            );
+            assert!(
+                matches!(missing, StoreResponse::Err(ref err) if err.kind == StoreErrorKind::Usage),
+                "missing engagement must fail as usage: {missing:?}"
+            );
+
+            let rewritten_label = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(
+                    Some("engagement-/alpha".to_string()),
+                    StoreOp::SnapshotScoped {
+                        run_id: Some("audit-run".to_string()),
+                        path: None,
+                        include_archived: false,
+                        include_presence_only: false,
+                    },
+                ),
+            );
+            assert!(
+                matches!(rewritten_label, StoreResponse::Err(ref err) if err.kind == StoreErrorKind::Usage),
+                "daemon must validate the raw label instead of silently selecting engagement-alpha: {rewritten_label:?}"
+            );
+
+            for include_archived in [false, true] {
+                let direct = store
+                    .snapshot_scoped(
+                        "engagement-alpha",
+                        Some("audit-run"),
+                        None,
+                        include_archived,
+                        false,
+                    )
+                    .unwrap();
+                let routed = dispatch_one(
+                    &mut store,
+                    repo_root.to_string_lossy().as_ref(),
+                    StoreRequest::new(
+                        Some("engagement-alpha".to_string()),
+                        StoreOp::SnapshotScoped {
+                            run_id: Some("audit-run".to_string()),
+                            path: None,
+                            include_archived,
+                            include_presence_only: false,
+                        },
+                    ),
+                );
+                match routed {
+                    StoreResponse::Ok(StoreOk::Snapshot { snapshot }) => assert_eq!(
+                        snapshot,
+                        crate::store::snapshot_to_wire_value(&direct).unwrap(),
+                        "direct/routed scoped projection drifted for include_archived={include_archived}"
+                    ),
+                    other => panic!("unexpected scoped snapshot reply: {other:?}"),
+                }
+            }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn scoped_path_collision_stops_direct_and_routed_writers_with_nonoverlap_control() {
+            let repo_root = unique_repo_root("scoped-path-collision-parity");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            store.set_engagement_scope(Some("engagement-alpha".to_string()));
+            let artifact = crate::store::Fact {
+                from_session_id: Some("sess:alpha".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "artifact-alpha-path".to_string(),
+                seq: 0,
+                thread_id: "thread-alpha-path".to_string(),
+                kind: crate::store::FactKind::Artifact,
+                tool: Some("codex:alpha".to_string()),
+                role: None,
+                subject: "alpha path work".to_string(),
+                scope: vec!["file:src/lib.rs".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact(&artifact).unwrap();
+            store.set_engagement_scope(Some("engagement-beta".to_string()));
+            let claim = crate::store::Fact {
+                from_session_id: Some("sess:beta".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "claim-beta-path".to_string(),
+                seq: 0,
+                thread_id: "thread-beta-path".to_string(),
+                kind: crate::store::FactKind::Claim,
+                tool: Some("codex:beta".to_string()),
+                role: None,
+                subject: "beta owns path".to_string(),
+                scope: vec!["file:src/lib.rs".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact(&claim).unwrap();
+
+            let direct = store
+                .snapshot_scoped("engagement-alpha", None, Some("src/lib.rs"), false, false)
+                .unwrap();
+            let routed = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(
+                    Some("engagement-alpha".to_string()),
+                    StoreOp::SnapshotScoped {
+                        run_id: None,
+                        path: Some("src/lib.rs".to_string()),
+                        include_archived: false,
+                        include_presence_only: false,
+                    },
+                ),
+            );
+            let routed = match routed {
+                StoreResponse::Ok(StoreOk::Snapshot { snapshot }) => {
+                    crate::store::snapshot_from_wire_value(snapshot).unwrap()
+                }
+                other => panic!("unexpected scoped snapshot reply: {other:?}"),
+            };
+
+            assert_eq!(
+                crate::store::snapshot_to_wire_value(&direct).unwrap(),
+                crate::store::snapshot_to_wire_value(&routed).unwrap(),
+                "direct and routed collision context must match"
+            );
+            for (mode, snapshot) in [("direct", &direct), ("routed", &routed)] {
+                let mut collision = Vec::new();
+                crate::check::check_before_write_for_test(
+                    snapshot,
+                    "codex:alpha",
+                    Some("src/lib.rs"),
+                    &mut collision,
+                );
+                assert!(
+                    collision.contains(&("claimed-path", "stop")),
+                    "{mode} path collision must stop the writer: {collision:?}"
+                );
+
+                let mut nonoverlap = Vec::new();
+                crate::check::check_before_write_for_test(
+                    snapshot,
+                    "codex:alpha",
+                    Some("src/other.rs"),
+                    &mut nonoverlap,
+                );
+                assert!(
+                    !nonoverlap.contains(&("claimed-path", "stop")),
+                    "{mode} non-overlap control must not invent a collision: {nonoverlap:?}"
+                );
             }
             std::fs::remove_dir_all(repo_root).ok();
         }
