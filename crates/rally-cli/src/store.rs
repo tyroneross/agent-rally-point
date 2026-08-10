@@ -11,8 +11,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::thread;
-#[cfg(test)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Filename of the **legacy** monolithic ledger (R1).
 ///
@@ -63,8 +62,9 @@ const ROOM_MUTATION_LOCK_FILENAME: &str = "mutation.lock";
 
 #[cfg(unix)]
 mod unix_lock {
-    /// Shared (read) advisory lock — many holders coexist. Used by direct
-    /// facts.db openers on the ownership lock (ADR-01, L1).
+    /// Shared (read) advisory lock — many holders coexist. Direct mode holds
+    /// this on the daemon-ownership lock only after it has acquired the
+    /// separate exclusive direct-owner lock.
     pub(crate) const LOCK_SH: i32 = 1;
     pub(crate) const LOCK_EX: i32 = 2;
     /// Non-blocking modifier: `flock` returns `EWOULDBLOCK` instead of blocking
@@ -84,6 +84,14 @@ mod unix_lock {
 /// lock serialises appends within the direct path; the owner lock decides
 /// whether ANY process may open facts.db directly at all.
 pub(crate) const RALLYD_OWNER_LOCK_FILENAME: &str = "rallyd.owner.lock";
+
+/// Exclusive process-lifetime guard for the direct fallback. The daemon does
+/// not take this lock: it already owns [`RALLYD_OWNER_LOCK_FILENAME`] EX for
+/// its serving lifetime. A direct process takes this lock EX first and then
+/// takes the daemon lock SH, so at most one process can retain direct
+/// `facts.db` pools while daemon startup still drains through the established
+/// SH -> EX handover.
+const DIRECT_OWNER_LOCK_FILENAME: &str = "direct.owner.lock";
 
 use crate::backends::ManagedSession;
 use crate::cli::RoomArgs;
@@ -1231,7 +1239,8 @@ impl From<&RoomSnapshot> for RoomSummary {
 // the rare, short-lived `Routed` case. Allow the lint deliberately.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum RoomStore {
-    /// Today's in-process store: opens facts.db under an owner SH lock.
+    /// In-process fallback: opens facts.db only while this process owns the
+    /// direct EX lock and holds the daemon owner lock SH.
     Direct(DirectRoomStore),
     /// Daemon-routed store (Chunk C): speaks the `store_wire` protocol over
     /// `.rally/rallyd.sock`, holds NO facts.db handle (G3). Constructed only
@@ -1245,10 +1254,6 @@ pub(crate) enum RoomStore {
 /// [`DirectRoomStore::fact_store_handle`]'s cold branch = today's per-op open,
 /// byte-identical to main (G1). Chunk B installs a warm pool for daemon mode.
 pub(crate) struct DirectRoomStore {
-    /// Room-lifetime pool used by the few direct accessors that do not open a
-    /// per-operation handle. Wrapped so Drop can close it while the room
-    /// mutation lock is still held.
-    fact_store: Option<SqliteStore>,
     /// Daemon-mode warm facts.db pool (L11/R1/G10). `Some` ⇒ the hot interior
     /// opens reuse this ONE pool instead of churning a pool per op (which
     /// factstr-sqlite 0.5.2's un-closed-on-Drop background checkpoint would race
@@ -1348,16 +1353,13 @@ impl Drop for DirectRoomStore {
         let _guard = acquire_room_mutation_lock(room_dir)
             .expect("acquire room mutation lock during store teardown");
         drop(self.warm_fact_store.take());
-        drop(self.fact_store.take());
     }
 }
 
-/// RAII guard for the ownership lock (`.rally/rallyd.owner.lock`), ADR-01/L1.
-/// Holds a `flock` (SH for direct openers, EX for the daemon) for as long as
-/// the guard lives; the kernel also releases it on any process death (crash
-/// safety — the reason a marker/pid file was rejected). The DIRECT router holds
-/// its SH guard in a process-global for the process lifetime (G7): dropping it
-/// early would reopen the factstr background-close race window.
+/// RAII guard for either ownership lock. It holds a `flock` for as long as the
+/// guard lives; the kernel also releases it on process death. Direct routing
+/// retains both its direct EX guard and daemon-exclusion SH guard in the
+/// process-global table.
 ///
 /// Reuses the same hand-declared `extern "C"` flock pattern as
 /// [`RoomMutationLock`] (no `nix` crate). Constructed by Chunk C's router (SH)
@@ -1379,12 +1381,12 @@ impl Drop for OwnerGuard {
     }
 }
 
-/// Open (creating if absent) the ownership lock file at `rally_dir`.
+/// Open (creating if absent) an ownership lock file at `rally_dir`.
 #[cfg(unix)]
-fn open_owner_lock_file(rally_dir: &Path) -> Result<fs::File> {
+fn open_named_owner_lock_file(rally_dir: &Path, filename: &str) -> Result<fs::File> {
     fs::create_dir_all(rally_dir)
         .map_err(RallyError::io(format!("create {}", rally_dir.display())))?;
-    let path = rally_dir.join(RALLYD_OWNER_LOCK_FILENAME);
+    let path = rally_dir.join(filename);
     OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1403,7 +1405,7 @@ fn open_owner_lock_file(rally_dir: &Path) -> Result<fs::File> {
 #[cfg(unix)]
 #[allow(dead_code)]
 pub(crate) fn acquire_owner_shared_nb(rally_dir: &Path) -> Result<Option<OwnerGuard>> {
-    let file = open_owner_lock_file(rally_dir)?;
+    let file = open_named_owner_lock_file(rally_dir, RALLYD_OWNER_LOCK_FILENAME)?;
     let rc = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_SH | unix_lock::LOCK_NB) };
     if rc == 0 {
         return Ok(Some(OwnerGuard { file }));
@@ -1429,7 +1431,7 @@ pub(crate) fn acquire_owner_shared_nb(rally_dir: &Path) -> Result<Option<OwnerGu
 #[cfg(unix)]
 #[allow(dead_code)]
 pub(crate) fn acquire_owner_exclusive_blocking(rally_dir: &Path) -> Result<OwnerGuard> {
-    let file = open_owner_lock_file(rally_dir)?;
+    let file = open_named_owner_lock_file(rally_dir, RALLYD_OWNER_LOCK_FILENAME)?;
     let rc = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX) };
     if rc != 0 {
         return Err(RallyError::Io {
@@ -1441,6 +1443,30 @@ pub(crate) fn acquire_owner_exclusive_blocking(rally_dir: &Path) -> Result<Owner
         });
     }
     Ok(OwnerGuard { file })
+}
+
+/// Try to become the sole direct-mode process for this room. This lock is
+/// deliberately independent from the daemon ownership lock: direct takes it
+/// EX before taking the daemon lock SH, while daemon startup only takes the
+/// daemon lock EX. That order cannot form a cycle.
+#[cfg(unix)]
+fn acquire_direct_owner_exclusive_nb(rally_dir: &Path) -> Result<Option<OwnerGuard>> {
+    let file = open_named_owner_lock_file(rally_dir, DIRECT_OWNER_LOCK_FILENAME)?;
+    let rc = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX | unix_lock::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(OwnerGuard { file }));
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::WouldBlock {
+        return Ok(None);
+    }
+    Err(RallyError::Io {
+        context: format!(
+            "lock-ex-nb {}",
+            rally_dir.join(DIRECT_OWNER_LOCK_FILENAME).display()
+        ),
+        source: err,
+    })
 }
 
 /// Non-unix no-op mirror: no flock, so the owner lock is a no-op and the direct
@@ -1457,6 +1483,11 @@ pub(crate) fn acquire_owner_shared_nb(_rally_dir: &Path) -> Result<Option<OwnerG
 #[allow(dead_code)]
 pub(crate) fn acquire_owner_exclusive_blocking(_rally_dir: &Path) -> Result<OwnerGuard> {
     Ok(OwnerGuard)
+}
+
+#[cfg(not(unix))]
+fn acquire_direct_owner_exclusive_nb(_rally_dir: &Path) -> Result<Option<OwnerGuard>> {
+    Ok(Some(OwnerGuard))
 }
 
 /// One line of a segment file.
@@ -1493,43 +1524,120 @@ struct SegmentIndexEntry {
     last_ts: Option<String>,
 }
 
-/// Process-global table of ownership-lock SH guards (ADR-01/G7), keyed by
-/// canonicalized `.rally` dir. A guard is installed the first time THIS
+/// Process-global table of direct EX + daemon-exclusion SH guard pairs, keyed
+/// by canonicalized `.rally` dir. A pair is installed the first time THIS
 /// process takes the direct branch for a given room and held until process
-/// exit — never dropped early (an early drop would reopen the factstr
-/// background-close race window the whole owner-lock design exists to
-/// close). A per-root TABLE, not a single slot, because one process can
+/// exit. A per-root TABLE, not a single slot, because one process can
 /// legitimately open MANY distinct rooms: the `rally-cli` test binary runs
 /// many `#[test]` functions (each against its own temp-dir room) as threads
 /// inside one process. A single global slot would silently drop every root's
 /// guard but the first one's.
-static OWNER_GUARDS: OnceLock<Mutex<BTreeMap<PathBuf, OwnerGuard>>> = OnceLock::new();
+struct DirectOwnershipGuards {
+    _direct_owner: OwnerGuard,
+    _daemon_exclusion: OwnerGuard,
+}
 
-/// Install `guard` for `rally_dir` in the process-global table (G7), unless
-/// this process already holds one for that exact root (in which case `guard`
-/// — a redundant, separately-acquired fd — is simply dropped, releasing only
-/// ITS OWN lock; the winning fd for this root keeps holding SH).
-fn install_owner_guard_once(rally_dir: &Path, guard: OwnerGuard) {
-    let table = OWNER_GUARDS.get_or_init(|| Mutex::new(BTreeMap::new()));
+static DIRECT_OWNER_GUARDS: OnceLock<Mutex<BTreeMap<PathBuf, DirectOwnershipGuards>>> =
+    OnceLock::new();
+
+/// Install the guard pair for `rally_dir` in the process-global table unless
+/// this process already owns that exact room.
+fn direct_owner_key(rally_dir: &Path) -> PathBuf {
+    canonical_repo_root_string(rally_dir).into()
+}
+
+fn process_owns_direct_room(rally_dir: &Path) -> bool {
+    let Some(table) = DIRECT_OWNER_GUARDS.get() else {
+        return false;
+    };
+    table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&direct_owner_key(rally_dir))
+}
+
+fn install_direct_owner_once(
+    rally_dir: &Path,
+    direct_owner: OwnerGuard,
+    daemon_exclusion: OwnerGuard,
+) {
+    let table = DIRECT_OWNER_GUARDS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut table = table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     table
-        .entry(canonical_repo_root_string(rally_dir).into())
-        .or_insert(guard);
+        .entry(direct_owner_key(rally_dir))
+        .or_insert(DirectOwnershipGuards {
+            _direct_owner: direct_owner,
+            _daemon_exclusion: daemon_exclusion,
+        });
 }
 
-/// A truly wedged daemon (ADR-01 corridor policy, L12): the SH try was
-/// refused (a daemon holds EX) and no successful `Ping` arrived within the
-/// bounded-block corridor. Actionable, and — critically — NEVER a silent
-/// fallback to a direct facts.db open (that would skip the SH choreography
-/// and void the G2 chokepoint premise); the operator must intervene.
-fn wedged_daemon_error() -> RallyError {
+fn direct_owner_busy_unknown_error(bound: Duration) -> RallyError {
     RallyError::Command(format!(
-        "rally daemon appears wedged: no successful ping within the {}s corridor bound; \
-         run `rally daemon status` to check it, or `rally daemon stop` to clear a stuck instance",
-        store_client::CORRIDOR_BOUND.as_secs()
+        "direct-store-busy-unknown: could not establish exclusive direct ownership or a live \
+         daemon route within {}ms; no facts.db write was attempted",
+        bound.as_millis()
     ))
+}
+
+fn direct_owner_wait_bound() -> Duration {
+    const WATCHDOG_RESERVE: Duration = Duration::from_millis(250);
+    crate::watchdog_remaining()
+        .map(|remaining| remaining.saturating_sub(WATCHDOG_RESERVE))
+        .unwrap_or(store_client::CORRIDOR_BOUND)
+        .min(store_client::CORRIDOR_BOUND)
+}
+
+/// Establish one safe storage owner. `Ok(Some(_))` routes to a live daemon;
+/// `Ok(None)` means this process holds both direct EX and daemon-exclusion SH
+/// guards until process exit. The retry is bounded so contention never leaks
+/// out as a misleading claim/session/domain failure.
+fn acquire_direct_ownership_or_route_bounded(
+    root: &Path,
+    rally_dir: &Path,
+    engagement: Option<String>,
+    bound: Duration,
+) -> Result<Option<RoutedRoomStore>> {
+    const RETRY_SLEEP: Duration = Duration::from_millis(10);
+    let deadline = Instant::now() + bound;
+    loop {
+        if let Some(routed) =
+            store_client::probe_live_bounded(root, rally_dir, engagement.clone(), Duration::ZERO)
+        {
+            return Ok(Some(routed));
+        }
+        if process_owns_direct_room(rally_dir) {
+            return Ok(None);
+        }
+        if let Some(direct_owner) = acquire_direct_owner_exclusive_nb(rally_dir)? {
+            match acquire_owner_shared_nb(rally_dir)? {
+                Some(daemon_exclusion) => {
+                    install_direct_owner_once(rally_dir, direct_owner, daemon_exclusion);
+                    return Ok(None);
+                }
+                None => drop(direct_owner),
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(direct_owner_busy_unknown_error(bound));
+        }
+        thread::sleep(RETRY_SLEEP.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn acquire_direct_ownership_or_route(
+    root: &Path,
+    rally_dir: &Path,
+    engagement: Option<String>,
+) -> Result<Option<RoutedRoomStore>> {
+    acquire_direct_ownership_or_route_bounded(
+        root,
+        rally_dir,
+        engagement,
+        direct_owner_wait_bound(),
+    )
 }
 
 /// The routing seam (L2/ADR-01). These are the ONLY entry points the 214 call
@@ -1537,14 +1645,10 @@ fn wedged_daemon_error() -> RallyError {
 /// `open_existing_at`) survive here as the router constructors so every caller
 /// compiles unchanged.
 ///
-/// **Chunk C:** [`RoomStore::route`] runs the full ADR-01 choreography: probe
-/// for a live daemon (`.addr` → connect → `Ping`, verifying `repo_root` +
-/// `wire_version`) → live ⇒ `Routed` (facts.db never opened, SH never taken)
-/// → not live ⇒ SH try-lock non-blocking → acquired (installed
-/// process-global, held to exit — G7) ⇒ `Direct` (today's path, byte-identical
-/// — G1) → SH refused ⇒ bounded-block corridor (re-probe up to
-/// [`store_client::CORRIDOR_BOUND`]) ⇒ live ⇒ route, else fail loud
-/// ([`wedged_daemon_error`]) naming `rally daemon status`/`stop`.
+/// [`RoomStore::route`] probes for a live daemon first. If none answers, it
+/// boundedly competes for direct EX, then daemon-exclusion SH. A successful
+/// pair is retained to process exit; contention is retried alongside daemon
+/// probes and ends only in a typed busy/unknown result.
 impl RoomStore {
     /// Router entry (was `RoomStore::open`). Resolves the repo root, then routes.
     pub(crate) fn open() -> Result<Self> {
@@ -1582,23 +1686,9 @@ impl RoomStore {
     pub(crate) fn open_existing_at(root: PathBuf) -> Result<Option<Self>> {
         let rally_dir = root.join(".rally");
         let engagement = env::var(ENGAGEMENT_ENV_VAR).ok();
-        if let Some(routed) = store_client::probe_live(&root, &rally_dir, engagement.clone()) {
-            return Ok(Some(RoomStore::Routed(routed)));
-        }
-        match acquire_owner_shared_nb(&rally_dir)? {
-            Some(guard) => {
-                install_owner_guard_once(&rally_dir, guard);
-                Ok(DirectRoomStore::open_direct_existing_at(root)?.map(RoomStore::Direct))
-            }
-            None => match store_client::probe_live_bounded(
-                &root,
-                &rally_dir,
-                engagement,
-                store_client::CORRIDOR_BOUND,
-            ) {
-                Some(routed) => Ok(Some(RoomStore::Routed(routed))),
-                None => Err(wedged_daemon_error()),
-            },
+        match acquire_direct_ownership_or_route(&root, &rally_dir, engagement)? {
+            Some(routed) => Ok(Some(RoomStore::Routed(routed))),
+            None => Ok(DirectRoomStore::open_direct_existing_at(root)?.map(RoomStore::Direct)),
         }
     }
 
@@ -1606,25 +1696,11 @@ impl RoomStore {
     /// See the `impl RoomStore` doc comment above for the full choreography.
     fn route(root: PathBuf, engagement: Option<String>) -> Result<Self> {
         let rally_dir = root.join(".rally");
-        if let Some(routed) = store_client::probe_live(&root, &rally_dir, engagement.clone()) {
-            return Ok(RoomStore::Routed(routed));
-        }
-        match acquire_owner_shared_nb(&rally_dir)? {
-            Some(guard) => {
-                install_owner_guard_once(&rally_dir, guard);
-                Ok(RoomStore::Direct(
-                    DirectRoomStore::open_direct_at_with_engagement(root, engagement)?,
-                ))
-            }
-            None => match store_client::probe_live_bounded(
-                &root,
-                &rally_dir,
-                engagement,
-                store_client::CORRIDOR_BOUND,
-            ) {
-                Some(routed) => Ok(RoomStore::Routed(routed)),
-                None => Err(wedged_daemon_error()),
-            },
+        match acquire_direct_ownership_or_route(&root, &rally_dir, engagement.clone())? {
+            Some(routed) => Ok(RoomStore::Routed(routed)),
+            None => Ok(RoomStore::Direct(
+                DirectRoomStore::open_direct_at_with_engagement(root, engagement)?,
+            )),
         }
     }
 
@@ -1898,10 +1974,13 @@ impl DirectRoomStore {
         migrate_monolith_to_segments(&legacy_ledger_path, &log_dir, &archive_dir)?;
 
         let fact_store = open_fact_store_lenient(&fact_store_path)?;
+        // Direct mode keeps no room-lifetime SQLite pool. The process-lifetime
+        // direct owner lock excludes peer processes, and each operation opens
+        // and closes its pool inside that ownership window.
+        drop(fact_store);
         seed_segments_from_db_if_absent(&log_dir, &archive_dir, &fact_store_path)?;
         let active_engagement = resolve_active_engagement_with_env(&dir, engagement);
         let store = Self {
-            fact_store: Some(fact_store),
             // Direct-CLI mode: no warm pool ⇒ per-op opens, byte-identical to
             // main (G1). Chunk B installs a warm pool for daemon mode.
             warm_fact_store: None,
@@ -1939,10 +2018,10 @@ impl DirectRoomStore {
         let _guard = acquire_room_mutation_lock(&dir)?;
         migrate_monolith_to_segments(&legacy_ledger_path, &log_dir, &archive_dir)?;
         let fact_store = open_fact_store_lenient(&fact_store_path)?;
+        drop(fact_store);
         seed_segments_from_db_if_absent(&log_dir, &archive_dir, &fact_store_path)?;
         let active_engagement = resolve_active_engagement(&dir);
         let store = Self {
-            fact_store: Some(fact_store),
             // Direct-CLI mode: no warm pool ⇒ per-op opens (G1).
             warm_fact_store: None,
             cursor_path: dir.join("cursors.json"),
@@ -2397,7 +2476,8 @@ impl DirectRoomStore {
             }
             return;
         };
-        let Ok(db_stats) = read_db_event_stats(&self.facts_db_path) else {
+        let Ok(db_stats) = read_db_event_stats(&self.facts_db_path, self.warm_fact_store.is_none())
+        else {
             if let Some(p) = reconcile_cache_path(&self.facts_db_path) {
                 let _ = fs::remove_file(p);
             }
@@ -2650,7 +2730,12 @@ impl DirectRoomStore {
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
-        reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
+        reconcile_segments_and_db(
+            &self.log_dir,
+            &self.archive_dir,
+            &self.facts_db_path,
+            self.warm_fact_store.is_none(),
+        )?;
         // Warm-pool facade (L11/R1/G10): warm reuse in daemon mode, per-op
         // lenient open in direct mode (byte-identical to main — G1).
         let fact_store = self.fact_store_handle(true)?;
@@ -2706,7 +2791,12 @@ impl DirectRoomStore {
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
-        reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
+        reconcile_segments_and_db(
+            &self.log_dir,
+            &self.archive_dir,
+            &self.facts_db_path,
+            self.warm_fact_store.is_none(),
+        )?;
         // Warm-pool facade for the READ path (snapshot's underlying read, L11/R1):
         // in daemon mode read through the ONE warm pool; on a corrupt-db error
         // fall through to the cold recovery path (quarantine + reconcile + reopen),
@@ -2715,7 +2805,9 @@ impl DirectRoomStore {
         if let Some(warm) = &self.warm_fact_store {
             match facts_from_store(warm) {
                 Ok(facts) => return Ok(facts),
-                Err(err) if is_malformed_db_error(&err) => {}
+                Err(err) if is_malformed_db_error(&err) => {
+                    return Err(live_db_recovery_required_error(&self.facts_db_path));
+                }
                 Err(err) => return Err(err),
             }
         }
@@ -2844,7 +2936,12 @@ impl DirectRoomStore {
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
-        reconcile_segments_and_db(&self.log_dir, &self.archive_dir, &self.facts_db_path)?;
+        reconcile_segments_and_db(
+            &self.log_dir,
+            &self.archive_dir,
+            &self.facts_db_path,
+            self.warm_fact_store.is_none(),
+        )?;
         // Warm-pool facade (L11/R1/G10): warm reuse in daemon mode, per-op
         // strict open in direct mode (byte-identical to main — G1).
         let fact_store = self.fact_store_handle(false)?;
@@ -2924,9 +3021,7 @@ impl DirectRoomStore {
     ///
     /// The read-seq is encoded in the fact's `summary` field as `"read_seq:<N>"`.
     pub(crate) fn last_checkpoint_seq(&self, tool: &str) -> Result<i64> {
-        let fact_store = self.fact_store.as_ref().ok_or_else(|| {
-            RallyError::Message("room fact store is unavailable during teardown".to_string())
-        })?;
+        let fact_store = self.fact_store_handle(false)?;
         let query = fact_store
             .query(&FactQuery::for_event_types(["read"]))
             .map_err(|err| RallyError::Message(format!("query read checkpoints: {err}")))?;
@@ -3129,15 +3224,37 @@ fn facts_from_db_with_query_recovery(
 ) -> Result<Vec<Fact>> {
     let fact_store = open_fact_store_lenient(facts_db_path)?;
     match facts_from_store(&fact_store) {
-        Ok(facts) => Ok(facts),
+        Ok(facts) => {
+            let stats = SeqStats {
+                count: i64::try_from(facts.len())
+                    .map_err(|err| RallyError::Message(format!("event count overflow: {err}")))?,
+                max_seq: facts.iter().map(|fact| fact.seq).max().unwrap_or(0),
+            };
+            // A cold query creates a WAL even when it only reads. Close the
+            // pool first, then fingerprint the settled files so the cache does
+            // not immediately invalidate itself on the WAL unlink.
+            drop(fact_store);
+            refresh_reconcile_cache_after_full_scan(log_dir, archive_dir, facts_db_path, stats);
+            Ok(facts)
+        }
         Err(err) if is_malformed_db_error(&err) => {
+            // Close the only direct-mode pool before moving any SQLite file.
+            drop(fact_store);
             quarantine_corrupt_db(facts_db_path)?;
             if let Some(path) = reconcile_cache_path(facts_db_path) {
                 let _ = fs::remove_file(path);
             }
-            reconcile_segments_and_db(log_dir, archive_dir, facts_db_path)?;
+            reconcile_segments_and_db(log_dir, archive_dir, facts_db_path, true)?;
             let recovered_store = open_fact_store_lenient(facts_db_path)?;
-            facts_from_store(&recovered_store)
+            let facts = facts_from_store(&recovered_store)?;
+            let stats = SeqStats {
+                count: i64::try_from(facts.len())
+                    .map_err(|err| RallyError::Message(format!("event count overflow: {err}")))?,
+                max_seq: facts.iter().map(|fact| fact.seq).max().unwrap_or(0),
+            };
+            drop(recovered_store);
+            refresh_reconcile_cache_after_full_scan(log_dir, archive_dir, facts_db_path, stats);
+            Ok(facts)
         }
         Err(err) => Err(err),
     }
@@ -5144,7 +5261,7 @@ fn seed_segments_from_db_if_absent(
         return Ok(());
     }
 
-    let db_stats = read_db_event_stats(facts_db_path)?;
+    let db_stats = read_db_event_stats(facts_db_path, true)?;
     if db_stats.count > 0 {
         seed_segment_from_db(log_dir, facts_db_path)?;
         invalidate_segment_fold_memo();
@@ -5193,6 +5310,7 @@ fn reconcile_segments_and_db(
     log_dir: &Path,
     archive_dir: &Path,
     facts_db_path: &Path,
+    allow_cache_replacement: bool,
 ) -> Result<()> {
     let segments = read_segment_files(log_dir)?;
     // Replay walks live segments + rotated archive segments, but NOT the R5
@@ -5233,7 +5351,7 @@ fn reconcile_segments_and_db(
     // It must run on the authoritative path — the fast path above only returns
     // early when the db fingerprint is unchanged (no rewrite/corruption since
     // the last successful count), so corruption can never bypass this call.
-    let db_stats = read_db_event_stats(facts_db_path)?;
+    let db_stats = read_db_event_stats(facts_db_path, allow_cache_replacement)?;
 
     if canonical_stats.count == 0 && db_stats.count == 0 {
         // Nothing to cache (no db, no segments). Drop any stale sidecar.
@@ -5256,6 +5374,9 @@ fn reconcile_segments_and_db(
     }
 
     if canonical_stats != db_stats {
+        if !allow_cache_replacement {
+            return Err(live_db_recovery_required_error(facts_db_path));
+        }
         // Segment set and cache disagree on event count or logical high-water
         // mark → cache is stale (or absent). Rebuild it from the canonical
         // segments. Replay is a pure function of the deduped segment set, so
@@ -5563,7 +5684,15 @@ fn last_seq_in_segment(segment_path: &Path) -> Result<Option<i64>> {
 ///
 /// Idempotent: a second call after quarantine sees the file absent and takes
 /// the case-(1) branch with no further quarantine churn.
-fn read_db_event_stats(facts_db_path: &Path) -> Result<SeqStats> {
+fn live_db_recovery_required_error(facts_db_path: &Path) -> RallyError {
+    RallyError::Command(format!(
+        "facts-db-recovery-required: {} needs derived-cache recovery, but a live daemon pool \
+         still owns it; stop/restart the daemon before retrying",
+        facts_db_path.display()
+    ))
+}
+
+fn read_db_event_stats(facts_db_path: &Path, allow_cache_replacement: bool) -> Result<SeqStats> {
     if !facts_db_path.exists() {
         return Ok(SeqStats::default());
     }
@@ -5578,6 +5707,9 @@ fn read_db_event_stats(facts_db_path: &Path) -> Result<SeqStats> {
     let store = match open_fact_store(facts_db_path) {
         Ok(store) => store,
         Err(err) if is_malformed_db_error(&err) => {
+            if !allow_cache_replacement {
+                return Err(live_db_recovery_required_error(facts_db_path));
+            }
             // Cache is corrupt; the canonical JSONL ledger is unaffected.
             // Move the bad bytes aside and let reconcile rebuild from segments.
             quarantine_corrupt_db(facts_db_path)?;
@@ -5592,6 +5724,12 @@ fn read_db_event_stats(facts_db_path: &Path) -> Result<SeqStats> {
     let query = match store.query(&FactQuery::all()) {
         Ok(q) => q,
         Err(err) if is_malformed_db_error(&err) => {
+            // Ensure no pool from this query path remains live before moving
+            // the database and its WAL/SHM siblings.
+            drop(store);
+            if !allow_cache_replacement {
+                return Err(live_db_recovery_required_error(facts_db_path));
+            }
             quarantine_corrupt_db(facts_db_path)?;
             return Ok(SeqStats::default());
         }
@@ -6230,6 +6368,69 @@ mod ledger_tests {
     use rusqlite::Connection;
     use std::sync::mpsc;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_then_daemon_owner_lock_order_has_no_cycle() {
+        let root = unique_root("direct-daemon-owner-lock-order");
+        let rally_dir = root.join(".rally");
+        let direct_owner = acquire_direct_owner_exclusive_nb(&rally_dir)
+            .unwrap()
+            .expect("first direct owner must acquire EX");
+        let daemon_exclusion = acquire_owner_shared_nb(&rally_dir)
+            .unwrap()
+            .expect("direct owner must acquire daemon exclusion SH");
+        assert!(
+            acquire_direct_owner_exclusive_nb(&rally_dir)
+                .unwrap()
+                .is_none(),
+            "a second direct owner must be excluded"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let daemon_dir = rally_dir.clone();
+        thread::spawn(move || {
+            tx.send(acquire_owner_exclusive_blocking(&daemon_dir))
+                .unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(75)).is_err(),
+            "daemon EX must wait while direct holds daemon exclusion SH"
+        );
+        drop(daemon_exclusion);
+        let daemon_owner = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("daemon EX must acquire after SH drains")
+            .expect("daemon EX acquisition must succeed");
+        drop(daemon_owner);
+        drop(direct_owner);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_owner_timeout_is_typed_busy_unknown() {
+        let root = unique_root("direct-owner-busy-unknown");
+        let rally_dir = root.join(".rally");
+        let _held = acquire_direct_owner_exclusive_nb(&rally_dir)
+            .unwrap()
+            .expect("test owns direct EX");
+        let result = acquire_direct_ownership_or_route_bounded(
+            &root,
+            &rally_dir,
+            None,
+            Duration::from_millis(25),
+        );
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("contended direct owner must time out"),
+        };
+        assert!(
+            err.to_string().contains("direct-store-busy-unknown:"),
+            "typed contention error must survive rendering: {err}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn fact_from_session_id_round_trips_and_defaults_none() {
@@ -8352,7 +8553,7 @@ mod ledger_tests {
         let archive_dir = dir.join(ARCHIVE_DIRNAME);
         let facts_db = dir.join("facts.db");
         let before = full_reconcile_scan_count();
-        reconcile_segments_and_db(&log_dir, &archive_dir, &facts_db).unwrap();
+        reconcile_segments_and_db(&log_dir, &archive_dir, &facts_db, true).unwrap();
         full_reconcile_scan_count() != before
     }
 
@@ -8573,7 +8774,7 @@ mod ledger_tests {
         let log_dir = root.join(".rally").join(LOG_DIRNAME);
         let archive_dir = root.join(".rally").join(ARCHIVE_DIRNAME);
         let before = full_reconcile_scan_count();
-        reconcile_segments_and_db(&log_dir, &archive_dir, &facts_db).unwrap();
+        reconcile_segments_and_db(&log_dir, &archive_dir, &facts_db, true).unwrap();
         assert!(
             full_reconcile_scan_count() != before,
             "stale sidecar must NOT short-circuit corruption detection — authoritative scan must run"
@@ -8741,11 +8942,11 @@ mod ledger_tests {
             let archive_dir = dir.join(ARCHIVE_DIRNAME);
             let facts_db = dir.join("facts.db");
             // Warm + measure the fast-path reconcile only (no projection).
-            reconcile_segments_and_db(&log_dir, &archive_dir, &facts_db).unwrap();
+            reconcile_segments_and_db(&log_dir, &archive_dir, &facts_db, true).unwrap();
             let mut best = u128::MAX;
             for _ in 0..20 {
                 let t = Instant::now();
-                reconcile_segments_and_db(&log_dir, &archive_dir, &facts_db).unwrap();
+                reconcile_segments_and_db(&log_dir, &archive_dir, &facts_db, true).unwrap();
                 best = best.min(t.elapsed().as_micros());
             }
             // Confirm we actually stayed on the fast path the whole time.

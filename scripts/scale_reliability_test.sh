@@ -1,88 +1,257 @@
 #!/usr/bin/env bash
-# Rally-workflows scale + reliability harness v2.
-# Warm room (seeded first), tier-declared fleet, per-command outcome capture.
-# Distinguishes graceful degradation (ok:false, fail-loud) from silent loss
-# (ok:true but fact absent from ledger = corruption). Isolated room (temp HOME).
+# Hard scale/reliability gate. Every reported success must exist exactly once
+# in the canonical ledger; expected shared-path claim conflicts are the only
+# accepted operation failures.
 set -uo pipefail
-RALLY="${RALLY_BIN:?set RALLY_BIN}"
 
-# Returns the ok field of a rally --json call, and records the event_id if present.
-call_ok() { python3 -c 'import sys,json
-try: d=json.load(sys.stdin)
-except: print("PARSE"); sys.exit()
-print("T" if d.get("ok") else "F")'; }
+MODE="both"
+SCALES="4,8,16,32"
+SELF_TEST=0
+INTERNAL_MUTANT="${RALLY_SCALE_MUTANT:-}"
 
-run_scale() {
-  local N="$1"
-  local TMP; TMP="$(mktemp -d)"; export HOME="$TMP"
-  local REPO="$TMP/repo"; mkdir -p "$REPO/src"; ( cd "$REPO" && git init -q ); cd "$REPO"
-  local R="$TMP/res"; mkdir -p "$R"
-  # WARM the room first (real scenario: agents join an existing room, not race genesis)
-  "$RALLY" enter --tool lead:seed --session-id seed --json >/dev/null 2>&1
-  local SHARED="src/contended.rs"
-  local t0; t0=$(python3 -c 'import time;print(time.time())')
+usage() {
+  echo "usage: RALLY_BIN=/path/to/rally $0 [--mode direct|daemon|both] [--scales 4,8,16,32] [--self-test]" >&2
+}
 
-  agent() {
-    local i="$1" tool tier
-    case $(( i % 3 )) in
-      0) tool="codex:$i";              tier="executing" ;;
-      1) tool="claude_code:sonnet-$i"; tier="executing" ;;
-      2) tool="claude_code:haiku-$i";  tier="fast" ;;
-    esac
-    local path; if (( i % 2 == 0 )); then path="$SHARED"; else path="src/uniq_$i.rs"; fi
-    local e c cl ar tf hf
-    e=$("$RALLY"  enter --tool "$tool" --session-id "$tool-s" --json 2>/dev/null | call_ok)
-    "$RALLY" next --tool "$tool" --json >/dev/null 2>&1
-    c=$("$RALLY"  check before-write --tool "$tool" --path "$path" --strict --json 2>/dev/null \
-        | python3 -c 'import sys,json
-try: print("allow" if json.load(sys.stdin)["data"]["check"]["allow"] else "deny")
-except: print("ERR")')
-    cl=$("$RALLY" say claim    --tool "$tool" --path "$path" --subject "claim $tool" --json 2>/dev/null | call_ok)
-    ar=$("$RALLY" say artifact --tool "$tool" --subject "art $i" --uri "f:$path" --evidence "work $i" --json 2>/dev/null | call_ok)
-    tf=$("$RALLY" check tier-fit --tool "$tool" --role implementer --proposed-tier "$tier" --json 2>/dev/null | call_ok)
-    hf=$("$RALLY" say handoff  --tool "$tool" --target "peer$(( (i+1)%N ))" --subject "h $i" --json 2>/dev/null | call_ok)
-    echo "$tool|$e|$c|$cl|$ar|$tf|$hf" > "$R/a_$i"
+while (($#)); do
+  case "$1" in
+    --mode) MODE="${2:-}"; shift 2 ;;
+    --scales) SCALES="${2:-}"; shift 2 ;;
+    --self-test) SELF_TEST=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 64 ;;
+  esac
+done
+
+case "$MODE" in direct|daemon|both) ;; *) usage; exit 64 ;; esac
+RALLY="${RALLY_BIN:-}"
+if [[ -z "$RALLY" || ! -x "$RALLY" ]]; then
+  echo "GATE_FAIL binary: RALLY_BIN must name an executable rally binary" >&2
+  exit 64
+fi
+
+run_case() {
+  local mode="$1" n="$2" tmp repo results daemon_pid=""
+  tmp="$(mktemp -d)" || return 1
+  repo="$tmp/repo"
+  results="$tmp/results"
+  mkdir -p "$repo/src" "$results" "$tmp/home"
+  git -C "$repo" init -q
+
+  capture() {
+    local index="$1" op="$2"
+    shift 2
+    "$RALLY" "$@" >"$results/$index.$op.json" 2>"$results/$index.$op.err"
+    printf '%s\n' "$?" >"$results/$index.$op.rc"
   }
 
-  local pids=()
-  for ((i=0;i<N;i++)); do agent "$i" & pids+=($!); done
-  for p in "${pids[@]}"; do wait "$p"; done
-  local t1; t1=$(python3 -c 'import time;print(time.time())')
-  local ledger; ledger="$(ls "$REPO"/.rally/log/*.jsonl 2>/dev/null | head -1)"
-
-  python3 - "$N" "$R" "$ledger" "$t0" "$t1" <<'PY'
-import sys,json,glob,os
-N=int(sys.argv[1]); R=sys.argv[2]; ledger=sys.argv[3]; t0=float(sys.argv[4]); t1=float(sys.argv[5])
-rows=[open(f).read().strip().split("|") for f in glob.glob(f"{R}/a_*")]
-# row = tool,enter,check,claim,artifact,tierfit,handoff
-tools=[r[0] for r in rows]
-def okc(idx): return sum(1 for r in rows if r[idx]=="T")
-enter_ok,claim_ok,art_ok,tf_ok,hand_ok = okc(1),okc(3),okc(4),okc(5),okc(6)
-allow=sum(1 for r in rows if r[2]=="allow"); deny=sum(1 for r in rows if r[2]=="deny"); cerr=sum(1 for r in rows if r[2]=="ERR")
-# ledger truth
-facts=[]
-if ledger and os.path.exists(ledger):
-    for line in open(ledger):
-        try: facts.append(json.loads(line)["payload"])
-        except: pass
-def K(k,tool=None):
-    return [f for f in facts if f.get("kind")==k and (tool is None or f.get("tool")==tool)]
-claim_tools_ok=set(r[0] for r in rows if r[3]=="T")
-claim_in_ledger=set(f.get("tool") for f in K("claim"))
-# SILENT LOSS = said ok:true but no claim fact in ledger for that tool
-silent_loss=sorted(claim_tools_ok - claim_in_ledger)
-out={
- "scale":N, "wall_s":round(t1-t0,2),
- "enter_ok":f"{enter_ok}/{N}", "claim_ok":f"{claim_ok}/{N}", "artifact_ok":f"{art_ok}/{N}",
- "tierfit_ok":f"{tf_ok}/{N}", "handoff_ok":f"{hand_ok}/{N}",
- "dup_ids": len(tools)-len(set(tools)),
- "check_allow":allow, "check_deny":deny, "check_err":cerr,
- "ledger_claims":len(K("claim")), "ledger_artifacts":len(K("artifact")), "ledger_handoffs":len(K("handoff")),
- "SILENT_LOSS": len(silent_loss),     # ok:true but absent from ledger — must be 0
-}
-print(json.dumps(out))
+  if [[ "$mode" == "daemon" ]]; then
+    (
+      cd "$repo" || exit 1
+      HOME="$tmp/home" "$RALLY" enter --tool lead:seed --session-id seed --json --timeout-ms 60000
+    ) >"$results/seed.json" 2>"$results/seed.err"
+    if [[ $? -ne 0 ]]; then
+      echo "GATE_FAIL mode=$mode scale=$n daemon seed failed" >&2
+      return 1
+    fi
+    (
+      cd "$repo" || exit 1
+      HOME="$tmp/home" "$RALLY" daemon serve --idle-exit-secs 180
+    ) >"$results/daemon.out" 2>"$results/daemon.err" &
+    daemon_pid=$!
+    local ready=0
+    for _ in {1..300}; do
+      if (
+        cd "$repo" || exit 1
+        HOME="$tmp/home" "$RALLY" daemon status --json
+      ) >"$results/status.json" 2>"$results/status.err" &&
+        python3 - "$results/status.json" <<'PY'
+import json,sys
+try:
+    data=json.load(open(sys.argv[1]))
+    raise SystemExit(0 if data.get("ok") and data.get("data",{}).get("daemon",{}).get("live") is True else 1)
+except Exception:
+    raise SystemExit(1)
 PY
-  cd /; rm -rf "$TMP"
+      then
+        ready=1
+        break
+      fi
+      sleep 0.05
+    done
+    if [[ $ready -ne 1 ]]; then
+      echo "GATE_FAIL mode=$mode scale=$n daemon did not become ready" >&2
+      kill "$daemon_pid" 2>/dev/null || true
+      wait "$daemon_pid" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  agent() {
+    local i="$1" tool path tier
+    tool="codex:scale-$i"
+    if ((i % 3 == 2)); then tier="fast"; else tier="executing"; fi
+    if ((i % 2 == 0)); then path="src/contended.rs"; else path="src/unique-$i.rs"; fi
+    (
+      cd "$repo" || exit 1
+      export HOME="$tmp/home"
+      capture "$i" enter enter --tool "$tool" --session-id "scale-$i" --json --timeout-ms 60000
+      capture "$i" next next --tool "$tool" --json --timeout-ms 60000
+      capture "$i" check check before-write --tool "$tool" --path "$path" --strict --json --timeout-ms 60000
+      capture "$i" claim say claim --tool "$tool" --path "$path" --subject "scale-$mode-$n-claim-$i" --json --timeout-ms 60000
+      capture "$i" artifact say artifact --tool "$tool" --subject "scale-$mode-$n-artifact-$i" --uri "file:$path" --evidence "scale gate $i" --json --timeout-ms 60000
+      capture "$i" tierfit check tier-fit --tool "$tool" --role implementer --proposed-tier "$tier" --json --timeout-ms 60000
+      capture "$i" handoff say handoff --tool "$tool" --target "peer-$i" --subject "scale-$mode-$n-handoff-$i" --json --timeout-ms 60000
+    )
+  }
+
+  local pids=() start end
+  start="$(python3 -c 'import time; print(time.monotonic())')"
+  for ((i=0; i<n; i++)); do agent "$i" & pids+=("$!"); done
+  for pid in "${pids[@]}"; do wait "$pid" || true; done
+  end="$(python3 -c 'import time; print(time.monotonic())')"
+
+  if [[ "$INTERNAL_MUTANT" == "op-failure" ]]; then
+    printf '%s\n' '{"ok":false,"error":{"code":"forced-mutant"}}' >"$results/0.artifact.json"
+    printf '%s\n' '9' >"$results/0.artifact.rc"
+  elif [[ "$INTERNAL_MUTANT" == "silent-loss" ]]; then
+    python3 - "$repo" "scale-$mode-$n-artifact-0" <<'PY'
+import glob,json,os,sys
+repo,subject=sys.argv[1],sys.argv[2]
+for path in glob.glob(os.path.join(repo,".rally","log","*.jsonl")):
+    lines=open(path).readlines()
+    kept=[]
+    removed=False
+    for line in lines:
+        row=json.loads(line)
+        if not removed and row.get("payload",{}).get("subject")==subject:
+            removed=True
+            continue
+        kept.append(line)
+    if removed:
+        open(path,"w").writelines(kept)
+        break
+PY
+  fi
+
+  python3 - "$mode" "$n" "$repo" "$results" "$start" "$end" "$INTERNAL_MUTANT" <<'PY'
+import glob,json,os,sqlite3,sys
+mode,n,repo,res,start,end,mutant=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4],float(sys.argv[5]),float(sys.argv[6]),sys.argv[7]
+failures=[]
+docs={}
+def load(i,op):
+    key=(i,op)
+    try:
+        raw=open(f"{res}/{i}.{op}.json").read()
+        if not raw.strip(): raw=open(f"{res}/{i}.{op}.err").read()
+        docs[key]=json.loads(raw)
+    except Exception as exc:
+        failures.append(f"parse {i}.{op}: {exc}")
+        docs[key]={}
+    try: rc=int(open(f"{res}/{i}.{op}.rc").read().strip())
+    except Exception as exc:
+        failures.append(f"missing rc {i}.{op}: {exc}"); rc=999
+    return docs[key],rc
+
+for i in range(n):
+    for op in ("enter","next","check","claim","artifact","tierfit","handoff"):
+        doc,rc=load(i,op)
+        if op in ("enter","next","artifact","tierfit","handoff"):
+            if rc != 0 or doc.get("ok") is not True:
+                failures.append(f"unexpected op failure {i}.{op}: rc={rc} ok={doc.get('ok')}")
+        elif op == "check":
+            allow=doc.get("data",{}).get("check",{}).get("allow")
+            if not isinstance(allow,bool):
+                failures.append(f"check outcome missing {i}: rc={rc}")
+        elif i % 2:
+            if rc != 0 or doc.get("ok") is not True:
+                failures.append(f"unique claim failed {i}: rc={rc} ok={doc.get('ok')}")
+
+shared_success=[]
+for i in range(0,n,2):
+    doc,rc=docs[(i,"claim")],int(open(f"{res}/{i}.claim.rc").read())
+    if rc == 0 and doc.get("ok") is True:
+        shared_success.append(i)
+    else:
+        rendered=json.dumps(doc).lower()
+        if rc == 0 or doc.get("ok") is not False or not any(token in rendered for token in ("claim conflict","overlap")):
+            failures.append(f"unexpected shared claim failure {i}: rc={rc} body={rendered[:160]}")
+if len(shared_success) != 1:
+    failures.append(f"expected exactly one shared claim success, got {shared_success}")
+
+facts=[]
+for path in glob.glob(os.path.join(repo,".rally","log","*.jsonl")):
+    for lineno,line in enumerate(open(path),1):
+        try: facts.append(json.loads(line)["payload"])
+        except Exception as exc: failures.append(f"ledger parse {path}:{lineno}: {exc}")
+def count(kind,subject): return sum(f.get("kind")==kind and f.get("subject")==subject for f in facts)
+for i in range(n):
+    for kind in ("artifact","handoff"):
+        subject=f"scale-{mode}-{n}-{kind}-{i}"
+        if count(kind,subject) != 1:
+            failures.append(f"command/ledger mismatch {kind} {i}: count={count(kind,subject)}")
+    if i % 2 or i in shared_success:
+        subject=f"scale-{mode}-{n}-claim-{i}"
+        if count("claim",subject) != 1:
+            failures.append(f"command/ledger mismatch claim {i}: count={count('claim',subject)}")
+quarantine=glob.glob(os.path.join(repo,".rally","facts.db.corrupt.*"))
+if quarantine: failures.append(f"quarantine files present: {quarantine}")
+db_path=os.path.join(repo,".rally","facts.db")
+try:
+    check=sqlite3.connect(db_path).execute("PRAGMA integrity_check").fetchone()[0]
+    if check != "ok": failures.append(f"integrity failure: {check}")
+except Exception as exc: failures.append(f"integrity check failed: {exc}")
+
+summary={"mode":mode,"scale":n,"wall_s":round(end-start,2),"shared_claim_winner":shared_success,"failures":failures}
+print(json.dumps(summary,sort_keys=True))
+raise SystemExit(1 if failures else 0)
+PY
+  local gate_rc=$?
+
+  if [[ -n "$daemon_pid" ]]; then
+    kill "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+  fi
+  return "$gate_rc"
 }
-echo "=== rally-workflows scale + reliability v2 (warm room) ==="
-for N in 4 8 16 32; do run_scale "$N"; done
+
+run_self_test() {
+  local failures=0 rc
+  set +e
+  RALLY_SCALE_MUTANT=op-failure RALLY_BIN="$RALLY" "$0" --mode direct --scales 2 >/dev/null 2>&1
+  rc=$?; [[ $rc -ne 0 ]] || { echo "SELF_TEST_FAIL forced operation failure passed" >&2; failures=$((failures+1)); }
+  RALLY_SCALE_MUTANT=silent-loss RALLY_BIN="$RALLY" "$0" --mode direct --scales 2 >/dev/null 2>&1
+  rc=$?; [[ $rc -ne 0 ]] || { echo "SELF_TEST_FAIL forced silent loss passed" >&2; failures=$((failures+1)); }
+  RALLY_BIN="/definitely/missing/rally" "$0" --mode direct --scales 2 >/dev/null 2>&1
+  rc=$?; [[ $rc -ne 0 ]] || { echo "SELF_TEST_FAIL missing binary passed" >&2; failures=$((failures+1)); }
+  RALLY_BIN="/usr/bin/true" "$0" --mode direct --scales 2 >/dev/null 2>&1
+  rc=$?; [[ $rc -ne 0 ]] || { echo "SELF_TEST_FAIL wrong binary passed" >&2; failures=$((failures+1)); }
+  set -e
+  if [[ $failures -eq 0 ]]; then
+    echo '{"self_test":"pass","mutants_rejected":["operation-failure","silent-loss","missing-binary","wrong-binary"]}'
+    return 0
+  fi
+  return 1
+}
+
+if [[ $SELF_TEST -eq 1 ]]; then
+  run_self_test
+  exit $?
+fi
+
+IFS=',' read -r -a scale_values <<<"$SCALES"
+overall=0
+for scale in "${scale_values[@]}"; do
+  if [[ ! "$scale" =~ ^[1-9][0-9]*$ ]]; then
+    echo "GATE_FAIL invalid scale: $scale" >&2
+    overall=1
+    continue
+  fi
+  if [[ "$MODE" == "direct" || "$MODE" == "both" ]]; then
+    run_case direct "$scale" || overall=1
+  fi
+  if [[ "$MODE" == "daemon" || "$MODE" == "both" ]]; then
+    run_case daemon "$scale" || overall=1
+  fi
+done
+exit "$overall"
