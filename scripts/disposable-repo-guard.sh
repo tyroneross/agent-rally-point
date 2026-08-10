@@ -61,8 +61,8 @@ rally_assert_disposable_repo() {
   # worktree pointer could therefore pass the cwd/root checks above and still
   # append to the source room. Disposable mutation fixtures must own their git
   # directory outright, and their common dir must be exactly that local `.git`.
-  if [ ! -d "$fixture_abs/.git" ]; then
-    echo "disposable-repo-guard: linked or external git directory is forbidden: $fixture_abs/.git" >&2
+  if [ ! -d "$fixture_abs/.git" ] || [ -L "$fixture_abs/.git" ]; then
+    echo "disposable-repo-guard: linked, symlinked, or external git directory is forbidden: $fixture_abs/.git" >&2
     return 70
   fi
   fixture_git_abs="$(cd "$fixture_abs/.git" 2>/dev/null && pwd -P)" || return 70
