@@ -75,6 +75,7 @@ historical presence.
 | Rally did not independently prove tests | true boundary, not a claim defect | validation text must forbid self-reported Rally evidence from closing a test gate |
 | Path filtering exists but the engagement view is still repository-wide | real | partial: fact buckets filter; squads and system health explicitly do not (`crates/rally-cli/src/store.rs:791-840`) |
 | A read-only workstream packet still emits an unscoped `claim` and later `release` | real | not covered by S8-S13; `dynamic-workflows/core/packet.mjs:162-192` treats an empty owns list as a claim with no path |
+| Dynamic-workflow Node tests are not continuously gated and the real-CLI fixtures can skip without a release binary | real | O33-B evidence is local/manual only; the combined O33 activation gate must build the current release CLI and run the Node suite with zero skips before integration |
 | Codex invokes the before-write wrapper for path-bearing reads and opaque shell tools | real | O33-A classifies the native effect before the wrapper's repo walk or Rally resolution; launcher cost and host matcher narrowing remain O33-D evidence gates |
 | A reader can inspect a file while another agent edits it but cannot bind its conclusion to the bytes/context it saw | real | O33-C after S9/S10; reading remains parallel and the evidence is provisional until token revalidation |
 
@@ -96,7 +97,8 @@ historical presence.
 | Shared daemon protocol source compatibility | S10 | public `Directive` Rust literals exist in sibling `ptyd` | `crates/rally-protocol/src/lib.rs:6-18`; `../ptyd/Cargo.toml:32-35` |
 | Native PreToolUse tool/effect name | O33-A/D | Codex 0.144.3 source proves `apply_patch` uses `tool_input.command`; synthetic replay exists, while live matcher invocation and other-host captures remain absent | `config/host-integrations.json`; [Codex 0.144.3 source lines 479-483](https://github.com/openai/codex/blob/rust-v0.144.3/codex-rs/core/src/tools/handlers/apply_patch.rs#L479-L483); `.codex/hooks.json` deliberately has no matcher |
 | Native hook schema and timeout units | O33-A | Codex 0.144.3 accepts only `description` plus `hooks`; Claude and Codex handler timeouts are seconds, not milliseconds | [Codex hook config source](https://github.com/openai/codex/blob/rust-v0.144.3/codex-rs/config/src/hook_config.rs#L9-L17); [Codex command runner](https://github.com/openai/codex/blob/rust-v0.144.3/codex-rs/hooks/src/engine/command_runner.rs#L98-L103); [Claude common hook fields](https://code.claude.com/docs/en/hooks#common-fields); `scripts/generate_host_surfaces.py` |
-| Nonexclusive durable read signal | O33-B | existing `FactKind::Read` is excluded from active claims and ignores non-`read_seq:` summaries in receipt projection | `store.rs:285-295,3820-3837,12449-12484` |
+| Nonexclusive durable task-activity signal | O33-B | public `FactKind::Presence` accepts run/step lineage through `say` and only claim facts project into `active_claims` | `store.rs:283-295,4834-4839`; `cli.rs:182-190`; `lib.rs:2353-2370` |
+| Dynamic-workflow continuous gate | O33 combined activation | absent: current CI dispatches the Rust quality/release scripts, while neither runs the Node suite | `.github/workflows/ci.yml:85-89`; `scripts/run-quality-gate.sh:1-79`; `docs/security/ISSUE-52-DISPOSITION-2026-08-06.md:405-428` |
 | Engagement/run/path-scoped writer view | O33-C | S9/S10 target; do not implement a second projector | S9/S10 ownership and acceptance below |
 
 ## Capability Gap Map
@@ -114,7 +116,7 @@ historical presence.
 - S8 auto-reap — trigger: existing `command_enter` call site at `crates/rally-cli/src/lib.rs:1965-1987` after S10 moves it outside the primary enter commit path — verified-live: pending; S10's concurrent-enter journey and a live fixture must verify it before Report.
 - S9/S10 room projection — trigger: `rally room` command dispatch through `RoomQuery::from` at `crates/rally-cli/src/store.rs:864-875` — verified-live: pending; the four-view fixture must verify it before Report.
 - O33-A operation wrapper — trigger: native `PreToolUse` envelope enters `hooks/rally-coordination-hook.sh` — verified-live: pending; the source-proven Codex 0.144.3 command carrier and synthetic replay are verified, but live matcher invocation and Claude/Cursor captures remain O33-D. A stays on its isolated branch; B builds on top, and no central/local-main/install/push/user-active integration occurs before post-O26 C and the combined A+B+C gate.
-- O33-B read-only activity — trigger: `owns: "read-only"` packet generation — verified-live: pending; packet execution must create one nonexclusive `read` activity and zero claim/release facts.
+- O33-B read-only activity — trigger: `owns: "read-only"` packet generation — verified-live: the isolated release-binary temp-room journey passed locally on 2026-08-10 with one run/step-scoped nonexclusive `presence` activity, one linked artifact, and zero active claims; packet assertions prove zero claim/check/release commands. This is manual evidence, not continuous CI coverage. A+B stay branch-held and inactive until C supplies the active-writer and run-scoped activity projections and the combined gate builds the current release CLI and runs the Node suite with zero skips.
 - O33-C reader revalidation — trigger: consequential path read/final conclusion — verified-live: pending; blocked on S9/S10 stable scope until the active-writer journey passes.
 
 ## Security and permission boundary
@@ -546,33 +548,48 @@ sessions, so a local-main merge would activate A's read bypass while its turn-le
 can still be stale or omit a path. C supplies the path-scoped writer view, source token, and final
 revalidation contract required by the user outcome.
 
-### O33-B — Nonexclusive read-only task activity · after O33-A and O26 read-signal audit
+### O33-B — Nonexclusive read-only task activity · after O33-A
 
-**Owns:** `dynamic-workflows/core/packet.mjs`,
-`dynamic-workflows/tests/injection.test.mjs`,
-`dynamic-workflows/tests/packet-empirical.test.mjs`, `skills/rally-workflows/SKILL.md`, and
-`dynamic-workflows/PROTOCOL.md`. It does not edit `store.rs`, the read-receipt projector, or O26
-storage/wire paths.
+**Owns:** `dynamic-workflows/core/packet.mjs`, `dynamic-workflows/core/workstream-status.mjs`,
+their focused and empirical tests, `skills/rally-workflows/SKILL.md`,
+`dynamic-workflows/PROTOCOL.md`, and `dynamic-workflows/README.md`. It does not edit `store.rs`,
+the read-receipt projector, or O26 storage/wire paths.
 
 An `owns: "read-only"` packet emits no `claim`, no before-write check, and no `release`. Reuse the
-existing public `read` fact as the minimum nonexclusive signal:
+existing public `presence` fact as the minimum nonexclusive task-activity signal:
 
 ```text
-rally say read --tool <tool> --subject <intent> --summary activity:working \
+rally say presence --tool <tool> --subject "<step>: <intent>" --summary activity:read-only \
   --status working --run <run> --step <step> [--parent-step <dep>...]
 ```
 
-The completion artifact references that activity event. `summary=read_seq:<N>` remains reserved for
-O26/R10 cursor checkpoints; the existing receipt projector ignores other summaries, and all `read`
-facts remain excluded from `active_claims`. The working activity is historical, not a lease: a
-crashed reader owns nothing and needs no reap. S10's engagement/session projection may show a live,
-unclosed activity and suppress it when the session is stale or a referenced terminal artifact
-exists; that visibility enhancement can land later without restoring ownership.
+Read-only prohibits intentional changes to task/domain resources. The generated Rally coordination
+records and ordinary transient tool state created by verification are the only permitted writes;
+neither is task output or ownership. This distinction keeps the packet internally satisfiable when
+a named verifier such as `cargo-clippy` creates a cache or build artifact.
+
+The completion artifact references that activity event and uses the same run/step. Presence is
+already excluded from `active_claims`; the activity is historical, not a lease, so a crashed reader
+owns nothing and needs no reap. This also avoids overloading O26/R10's `FactKind::Read` cursor
+checkpoint and `read_seq:<N>` summary contract.
+
+Before O33-C exposes `active_activities`, `workstream-status.mjs` uses a transitional exact
+`<tool-prefix>:<task.id>` plus `squads[].status == "active"` heuristic for read-only tasks only. It
+returns that state in a separate `active[]` collection; it never reports the task as `claimed`,
+never lets a legacy read-only claim hold the task, and never lets write-task presence replace a
+claim. The heuristic is not run-scoped, so no A+B activation is allowed. O33-C replaces it with the
+engagement/run-bound projection before the combined A+B+C gate.
 
 **RED controls:** `read_only_packet_emits_activity_and_zero_claim_release`,
-`read_only_packet_runtime_creates_zero_active_claims`, and adjacent positive
+`read_only_packet_allows_only_coordination_and_transient_verifier_writes`,
+`read_only_packet_runtime_creates_zero_active_claims`,
+`read_only_active_exact_task_tool_is_nonexclusive_and_not_redispatched`, and adjacent positive
 `write_packet_still_claims_checks_and_releases_every_owned_path`. The runtime fixture asserts one
-run/step-qualified `read` activity, zero claim/release facts, and one linked completion artifact.
+run/step-qualified presence activity, feeds the real post-Presence room into `workstreamStatus`,
+reports the task as nonexclusive `active`, leaves zero active claims, and creates one linked
+completion artifact. The resume controls reject idle, other-prefix, and substring task tools,
+legacy read-only claims, write-task presence without a claim, and false completion for the legal
+task ids `__proto__`, `constructor`, and `prototype`.
 
 ### O33-C — Active-writer reader context and source-token revalidation · after S9 and S10
 
@@ -643,9 +660,10 @@ S11-S13 are a second sequential tail after S10. Each segment that touches `cli.r
 in its own worktree and integrates by exact commit to avoid shared-file clobbering. S13's discovery
 logic can be drafted beside S11-S12, but its CLI integration lands after S12.
 
-O33-A is isolated hook/generator work and may commit only on its branch. O33-B can remove read-only
-claim/release emission after O33-A and the O26 audit confirms reuse of `FactKind::Read`; B is built
-on top of A in isolation. O33-C waits for both S9 and S10 because its correctness depends on their
+O33-A is isolated hook/generator work and may commit only on its branch. O33-B removes read-only
+claim/release emission after O33-A by reusing Presence, leaving O26's `FactKind::Read` contract
+untouched; B is built on top of A in isolation. O33-C waits for both S9 and S10 because its
+correctness depends on their
 path projection and stable task/session binding. No A-only or A+B central integration, local-main
 checkout, install, user-active checkout, push, or O33-complete claim is allowed; after post-O26 C is
 complete, the activation gate runs A+B+C together and only the combined chain integrates. O33-D's
@@ -685,6 +703,7 @@ surface and S12 reads S11 closure/provenance while S13 reuses S12 compact summar
 | Inventory never mutates discovery state | an audit changes the thing it measures | S13 before/after filesystem and index hashes |
 | A time/statistical claim never hides its clock or denominator | a retrospective slice is reported as observation time or duplicate groups as duplicate events | S13 timestamp/formula/reconciliation gates |
 | A read operation never creates exclusive ownership | parallel readers block writers or create stuck claims | O33-A zero-Rally-subprocess fixtures + O33-B zero-claim runtime journey |
+| Dynamic-workflow regressions cannot pass through an unarmed suite | a missing/stale release binary skips the real-CLI journey and CI reports green | combined O33 activation builds the current release CLI and requires the full Node suite to report zero skips |
 | An opaque shell command is never guessed into a typed write path | command parsing gives false deconfliction confidence | O33-A exact `{}`/zero-Rally fixture plus explicit shell-mutation protocol |
 | One malformed patch target invalidates the whole automatic check | partial target coverage hides an outside-repo or omitted mutation | O33-A malformed/escape atomic rejection fixture |
 | A timeout never converts a proven denial into silence | a later invalid check erases an earlier active-writer conflict | O33-A conflict-then-timeout strict-denial fixture |
@@ -703,7 +722,7 @@ surface and S12 reads S11 closure/provenance while S13 reuses S12 compact summar
 | S12 | `store.rs:3995-4065,4484-4523`, `next.rs` suggestion construction, `hooks/rally-coordination-hook.sh:1373-1379`, hook caps/dedup, S9/S10 scoped room schema, measured 0.2.0/0.2.1 outputs, AHRQ SBAR/check-back, FAA readback, USMC O-SMEAC, and Google SRE handoff/state-document guidance | build one bounded consumer view, preserve never-cut collision truth, make omissions explicit, close the communication loop, and make list limits apply to every rendered list | audit module/next/CLI/hook/schema/docs + exact-byte/adjacent-move/ACK controls |
 | S13 | `discovery.rs:116-316,592-611`, global-status tests, manifest/worktree resolution, and `research/analysis-runs/rally-auditability-20260807/rally_audit.py` plus its original/current result artifacts | preserve opt-in indexed discovery while adding an explicit read-only scan whose activity labels cannot imply process liveness, and make clock/scope/formula provenance mandatory | discovery/CLI/schema/docs + no-write/time/math fixtures |
 | O33-A | generated host matchers/launcher, the wrapper's generic path extraction, Codex 0.144.3 `command` source, hook/install/generator/no-node tests, and native tool envelopes available in fixtures | classify effect before wrapper repo/Rally work, preserve every accepted mutation target as an all-or-none transaction, and keep matcher/Windows uncertainty explicit | hook/config/generator/docs + subprocess-count/timeout/containment fixtures |
-| O33-B | `packet.mjs:150-194`, `FactKind::Read` exclusion and receipt-summary parser, protocol/skill packet examples | replace the unscoped read-only claim/release lifecycle with nonexclusive run/step activity without editing O26 storage | packet/protocol/skill + CLI runtime journey |
+| O33-B | `packet.mjs:150-215`, `workstream-status.mjs`, public Presence lineage, protocol/skill packet examples | replace the unscoped read-only claim/release lifecycle with nonexclusive run/step activity and keep transitional resume state distinct from claims without editing O26 storage | packet/status/protocol/skill + CLI runtime journey |
 | O33-C | S9 path projector, S10 engagement/session binding and hook context, file/git digest inputs | bind consequential reader evidence to exact bytes and overlapping writer state without waiting or creating a claim | new read-context command/schema/journey + hook/skill guidance |
 | O33-D | installed host versions/configs, real redacted envelopes, pre-O33 hook, CPU/process state | prove native routing and cost with captured inputs and scripted clocks/statistics | replay + quiesced benchmark artifacts only |
 
@@ -723,8 +742,8 @@ consumer of suggested backlog arrays must be rerun. S13 adds a new inventory env
 `status --global` and the opt-in global index remain compatible. The shared `Directive` and
 `Receipt` protocol stays unchanged throughout S11-S13.
 
-O33-A and O33-B add no Rust API or wire field. O33-B reuses an advertised `read` kind with a
-non-`read_seq:` summary that the receipt projector already ignores. O33-C adds a public
+O33-A and O33-B add no Rust API or wire field. O33-B reuses advertised `presence` with existing
+lineage fields and keeps `FactKind::Read` reserved for O26/R10 cursor checkpoints. O33-C adds a public
 `read-context` command/envelope only after S9/S10, using their existing scoped read operation; it
 does not bump the store wire or add a fact kind. O33-D adds no API.
 

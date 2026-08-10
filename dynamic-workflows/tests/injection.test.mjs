@@ -400,14 +400,17 @@ test("intent/output: quoting keeps an awkward-but-legal value one shell token (i
 
   const claimLine = p.split("\n").find((l) => l.startsWith("rally say claim"));
   const artifactLine = p.split("\n").find((l) => l.startsWith("rally say artifact"));
-  for (const [label, line] of [["claim", claimLine], ["artifact", artifactLine]]) {
+  for (const [label, line, subject] of [
+    ["claim", claimLine, awkward],
+    ["artifact", artifactLine, `x: ${awkward}`],
+  ]) {
     assert.ok(line, `sanity: expected a ${label} line`);
     // Assert on the exact rendered bytes: the value appears only inside a
     // single-quoted span.
-    const expected = `--subject ${shellQuote(awkward)}`;
+    const expected = `--subject ${shellQuote(subject)}`;
     assert.ok(line.includes(expected), `${label} line must carry the quoted subject; got:\n${line}`);
     assert.ok(
-      !line.includes(`--subject "${awkward}"`),
+      !line.includes(`--subject "${subject}"`),
       `${label} line must not carry the value inside double quotes; got:\n${line}`,
     );
   }

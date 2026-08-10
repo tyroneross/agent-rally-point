@@ -150,6 +150,7 @@ export function recipeArgvFor(task) {
 function renderRallyLoop({ task, runId, tool, recipeArgv }) {
   const q = shellQuote;
   const owns = ownedPaths(task.owns);
+  const readOnly = task.owns === "read-only";
   // CLI flag-arity asymmetry: `rally say` (the claim line below) ACCEPTS repeated
   // --path, so we join all owned paths into ONE claim. `rally check before-write`
   // REJECTS repeated --path, so checkLine emits one line per path instead. Same
@@ -163,11 +164,10 @@ function renderRallyLoop({ task, runId, tool, recipeArgv }) {
   // `rally check before-write` rejects repeated --path ("argument --path cannot be
   // used multiple times"), so emit ONE before-write line per owned path — unlike the
   // claim line above, where --path IS repeatable.
-  const checkLine = owns.length
-    ? owns.map((p) => `rally check before-write --tool ${q(tool)} --path ${q(p)} --strict`).join("\n")
-    : `# read-only task — no before-write check required`;
+  const checkLine = owns.map((p) => `rally check before-write --tool ${q(tool)} --path ${q(p)} --strict`).join("\n");
   const artifactUri = owns.length ? q(owns[0]) : "<artifact-uri>";
   const stepMarkers = `--run ${q(runId)} --step ${q(task.id)}${parentSteps ? " " + parentSteps : ""}`;
+  const artifactRef = readOnly ? ` --ref <activity-event-id>` : "";
 
   // The verify step. A named recipe resolves to argv from the LOCAL registry, so it
   // is safe to print as a command. A descriptor's free-text `validation` is not a
@@ -177,19 +177,32 @@ function renderRallyLoop({ task, runId, tool, recipeArgv }) {
     : [`# verify — see "How to verify" below. Translate the description into a command`,
        `# YOU choose and take responsibility for, under this host's approval policy.`];
 
+  const startLines = readOnly
+    ? [
+        `rally say presence --tool ${q(tool)} --subject ${q(`${task.id}: ${task.intent}`)} --summary activity:read-only --status working \\`,
+        `  ${stepMarkers}`,
+        `# keep the returned event_id as <activity-event-id>; this is context, never ownership`,
+      ]
+    : [
+        `rally say claim --tool ${q(tool)} --subject ${q(task.intent)}${claimPath} \\`,
+        `  ${stepMarkers}`,
+        checkLine,
+        `# blocking finding → stop; resolve or pick a non-overlapping task`,
+      ];
+  const finishLines = readOnly
+    ? []
+    : [`rally say release --tool ${q(tool)} --ref <claim-id> --subject ${q("done")}`];
+
   return [
     `rally enter --tool ${q(tool)}`,
-    `rally say claim --tool ${q(tool)} --subject ${q(task.intent)}${claimPath} \\`,
-    `  ${stepMarkers}`,
-    checkLine,
-    `# blocking finding → stop; resolve or pick a non-overlapping task`,
+    ...startLines,
     ``,
     `# do the work, then verify`,
     ...verifyLines,
     ``,
-    `rally say artifact --tool ${q(tool)} --subject ${q(task.output)} --uri ${artifactUri} \\`,
-    `  --evidence ${q("<verbatim verification output>")} --run ${q(runId)} --step ${q(task.id)}`,
-    `rally say release --tool ${q(tool)} --ref <claim-id> --subject ${q("done")}`,
+    `rally say artifact --tool ${q(tool)} --subject ${q(`${task.id}: ${task.output}`)} --uri ${artifactUri} \\`,
+    `  --evidence ${q("<verbatim verification output>")}${artifactRef} --run ${q(runId)} --step ${q(task.id)}`,
+    ...finishLines,
     `rally next --tool ${q(tool)}`,
   ].join("\n");
 }
@@ -276,6 +289,18 @@ function renderVerification({ task, recipeArgv }) {
 }
 
 function renderPacketBody({ task, runId, tool, owns, ownsList, depsLine, recipeArgv }) {
+  const boundaryInstruction = task.owns === "read-only"
+    ? [
+        `This task is read-only with respect to task and domain state.`,
+        `Do not intentionally change task or domain resources.`,
+        `The only permitted writes are the generated Rally coordination records and ordinary`,
+        `transient tool state created while verifying this task; neither grants ownership or`,
+        `counts as task output.`,
+      ].join("\n")
+    : `You may write ONLY these paths. Touching any other path is a boundary violation —\nstop and re-claim instead.`;
+  const lineageExplanation = task.owns === "read-only"
+    ? `The \`--run\`/\`--step\`/\`--parent-step\` markers bind the activity and artifact to this\nfan-out. Until O33-C exposes run-scoped active activities, in-flight resume uses only the exact\nactive task-tool identity; completion is reconstructed from this task's artifact.`
+    : `The \`--run\`/\`--step\`/\`--parent-step\` markers are what let the orchestrator\nreconstruct the fan-out with \`rally dag --run ${shellQuote(runId)}\`. Do not drop them.`;
   return `# Task packet — ${task.id}
 
 You are one agent in a rally-coordinated fan-out (run_id: \`${runId}\`). Do exactly
@@ -288,8 +313,7 @@ ${task.intent}
 
 ## Write boundary (owns)
 
-You may write ONLY these paths. Touching any other path is a boundary violation —
-stop and re-claim instead.
+${boundaryInstruction}
 
 ${ownsList}
 
@@ -304,8 +328,7 @@ value in it is shell-quoted. Run them as they stand.
 ${renderRallyLoop({ task, runId, tool, recipeArgv })}
 \`\`\`
 
-The \`--run\`/\`--step\`/\`--parent-step\` markers are what let the orchestrator
-reconstruct the fan-out with \`rally dag --run ${shellQuote(runId)}\`. Do not drop them.
+${lineageExplanation}
 
 ## How to verify (must pass before you post the artifact)
 

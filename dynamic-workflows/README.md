@@ -30,7 +30,7 @@ in full.
 | `MODEL-TIERS.md` | Host-neutral model-tier taxonomy (frontier/executing/fast) + the empirical A/B verdict |
 | `core/workstream-lint.mjs` | Zero-dependency linter — structure, determinism, MECE boundaries, dependency integrity, and command-charset limits (exits 0/1/2). Also holds `VALIDATION_RECIPES`, the local registry of named commands a descriptor may ask for by name |
 | `core/packet.mjs` | Renders a ready-to-paste prompt packet per task. Shell-quotes every value; only the rally loop and a named recipe reach a ```` ```bash ```` block |
-| `core/workstream-status.mjs` | **Resume helper** — derives done/claimed/pending + the `to_dispatch` set from a `rally room` snapshot (the durable counterpart to pi's in-memory progress) |
+| `core/workstream-status.mjs` | **Resume helper** — derives done/claimed/read-active/pending + the `to_dispatch` set from a `rally room` snapshot without treating nonexclusive reads as claims |
 | `core/route.mjs` | **Deterministic routing** (ported host-neutral from pi): `parallel`/`pipeline`/`budget` + onError/abort failure-visibility |
 | `core/limiter.mjs` | Bounded-concurrency helper hosts can use to cap their own Tier-1 fan-out |
 | [`../skills/rally-workflows/SKILL.md`](../skills/rally-workflows/SKILL.md) | Host-neutral Rally Flow skill (moved out of this module) mapping a workstream onto rally primitives; references `PROTOCOL.md` |
@@ -51,8 +51,16 @@ node core/workstream-lint.mjs examples/audit-repo.workstream.json
 npm test
 
 # Resume a long-running workstream — what's left to dispatch?
-rally room --json > room.json && node core/workstream-status.mjs my.workstream.json room.json
+rally room --json > room.json && node core/workstream-status.mjs my.workstream.json room.json --tool-prefix agent
 ```
+
+Use the same tool prefix passed to `packet.mjs` (default `agent`). Until the combined O33-A+B+C
+activation, read-active resume is a documented exact active-squad/task-tool heuristic; it is not a
+run-scoped liveness proof and does not create ownership.
+
+`owns: "read-only"` prohibits intentional changes to task/domain resources, not the generated Rally
+coordination records or ordinary transient tool state created by verification. Neither exception
+creates task ownership or counts as task output.
 
 No `npm install` required — `"dependencies": {}`.
 

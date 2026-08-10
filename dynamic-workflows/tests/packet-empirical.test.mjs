@@ -16,9 +16,10 @@
 //
 // Determinism + self-containment: the room is a fresh mktemp dir, git-init'd, torn
 // down after. No network, no shared state, no wall-clock in assertions. If the
-// release binary is absent (e.g. a JS-only CI lane that never ran `cargo build`),
-// the gate is skipped with a clear reason rather than failing spuriously — build
-// the binary to arm it.
+// release binary is absent, the gate is skipped with a clear reason rather than
+// failing spuriously — build the binary to arm it. As of 2026-08-10 the repo's
+// CI gate does not invoke this Node suite; the combined O33 activation gate must
+// add a current release build plus a zero-skip npm test before rollout.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -28,14 +29,14 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { renderPacket } from "../core/packet.mjs";
+import { workstreamStatus } from "../core/workstream-status.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // dynamic-workflows/tests -> repo root -> target/release/rally
 // NOTE: this binary must be REBUILT after any rally-cli change for this gate to
 // test current behavior — a stale binary would assert against old flag arity.
-// CI guarantees freshness: .github/workflows/rally-gate.yml runs
-// `cargo build --release -p rally-cli` before the node test suite, so the gate
-// is always ARMED (not skipped) and always tests the just-built CLI.
+// Local/manual evidence must name that build and report zero skipped tests; CI
+// does not currently guarantee either property.
 const RALLY = join(here, "..", "..", "target", "release", "rally");
 
 const DESCRIPTOR = {
@@ -55,6 +56,14 @@ const DESCRIPTOR = {
   ],
 };
 const RUN = "run-empirical-001";
+
+const READ_ONLY_TASK = {
+  id: "review",
+  intent: "review the implementation",
+  owns: "read-only",
+  validation: "true",
+  output: "review notes",
+};
 
 /** Split a `rally ...` line into argv.
  *
@@ -129,6 +138,59 @@ test("empirical: emitted claim + before-write lines execute against the real bin
       ["a", "b"],
       "both a and b must edge into c",
     );
+  } finally {
+    rmSync(room, { recursive: true, force: true });
+  }
+});
+
+test("read_only_packet_runtime_creates_zero_active_claims", { skip: armed ? false : `release binary not built at ${RALLY} — run \`cargo build --release -p rally-cli\` to arm` }, () => {
+  const room = mkdtempSync(join(tmpdir(), "rally-packet-read-only-"));
+  try {
+    execFileSync("git", ["init", "-q", room], { stdio: "ignore" });
+    const run = (argv) =>
+      execFileSync(RALLY, argv, { cwd: room, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    const packet = renderPacket({ task: READ_ONLY_TASK, runId: RUN, toolPrefix: "agent" });
+    const lines = packet.split("\n");
+    const tool = "agent:review";
+
+    run(["enter", "--tool", tool]);
+
+    const activityIdx = lines.findIndex((line) => line.startsWith("rally say presence"));
+    assert.notEqual(activityIdx, -1, "packet must emit a nonexclusive activity command");
+    const activityFull = `${lines[activityIdx].replace(/\\\s*$/, "").trim()} ${lines[activityIdx + 1].trim()}`;
+    const activity = JSON.parse(run([...railsToArgv(activityFull), "--json"])).data.say.fact;
+    assert.equal(activity.kind, "presence");
+    assert.equal(activity.status, "working");
+    assert.equal(activity.summary, "activity:read-only");
+    assert.ok(activity.scope.includes(`run:${RUN}`));
+    assert.ok(activity.scope.includes("step:review"));
+
+    const beforeArtifact = JSON.parse(run(["room", "--json"])).data.room;
+    assert.deepEqual(beforeArtifact.active_claims, [], "read activity must create zero active claims");
+    const resume = workstreamStatus(
+      { workstream: "empirical-read", tasks: [READ_ONLY_TASK] },
+      beforeArtifact,
+      { toolPrefix: "agent" },
+    );
+    assert.deepEqual(resume.active, ["review"]);
+    assert.deepEqual(resume.claimed, []);
+    assert.deepEqual(resume.to_dispatch, []);
+
+    const artifactIdx = lines.findIndex((line) => line.startsWith("rally say artifact"));
+    const artifactFull = `${lines[artifactIdx].replace(/\\\s*$/, "").trim()} ${lines[artifactIdx + 1].trim()}`
+      .replace("<artifact-uri>", "review-notes.md")
+      .replace("<verbatim verification output>", "true")
+      .replace("<activity-event-id>", activity.event_id);
+    const artifact = JSON.parse(run([...railsToArgv(artifactFull), "--json"])).data.say.fact;
+    assert.equal(artifact.kind, "artifact");
+    assert.equal(artifact.subject, "review: review notes");
+    assert.equal(artifact.ref, activity.event_id);
+    assert.ok(artifact.scope.includes(`run:${RUN}`));
+    assert.ok(artifact.scope.includes("step:review"));
+
+    const afterArtifact = JSON.parse(run(["room", "--json"])).data.room;
+    assert.deepEqual(afterArtifact.active_claims, [], "terminal artifact must not leave ownership behind");
+    assert.ok(afterArtifact.recent_artifacts.some((fact) => fact.event_id === artifact.event_id));
   } finally {
     rmSync(room, { recursive: true, force: true });
   }
