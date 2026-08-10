@@ -73,6 +73,23 @@ thread_local! {
     /// the client deadline here for one dispatch; direct CLI calls derive from
     /// the command watchdog instead.
     static MUTATION_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    #[cfg(test)]
+    static FORCE_WARM_CLOSE_SPAWN_FAILURE: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+fn force_next_warm_close_spawn_failure() {
+    FORCE_WARM_CLOSE_SPAWN_FAILURE.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+fn warm_close_spawn_failure_requested() -> bool {
+    FORCE_WARM_CLOSE_SPAWN_FAILURE.with(|flag| flag.replace(false))
+}
+
+#[cfg(not(test))]
+fn warm_close_spawn_failure_requested() -> bool {
+    false
 }
 
 struct MutationDeadlineGuard {
@@ -88,7 +105,10 @@ impl Drop for MutationDeadlineGuard {
 /// Run `work` with a deadline for starting any nested room mutation.
 /// Nested callers can only shorten an existing deadline.
 pub(crate) fn with_mutation_deadline<T>(budget: Duration, work: impl FnOnce() -> T) -> T {
-    let requested = Instant::now() + budget;
+    let now = Instant::now();
+    let requested = now
+        .checked_add(budget)
+        .unwrap_or(now + MUTATION_LOCK_FALLBACK_BOUND);
     let previous = MUTATION_DEADLINE.with(|slot| {
         let previous = slot.get();
         slot.set(Some(
@@ -156,7 +176,7 @@ use crate::error::{RallyError, Result};
 use crate::store_client::{self, RoutedRoomStore};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Process-global retry salt. Bumped on every SQLite-busy retry so that two
 /// retriers in the SAME process (same pid, possibly even the same thread id if
@@ -2396,24 +2416,55 @@ impl DirectRoomStore {
         // stay prompt rather than re-entering its synchronous Drop path.
         warm.prepare_nonblocking_drop();
 
+        // Retain both resources outside the closure until the OS has actually
+        // created the worker. `Builder::spawn` consumes and drops its closure on
+        // failure, so capturing these values directly would release the lock
+        // and pool at the exact failure boundary this method must fail closed.
+        let retained = Arc::new(Mutex::new(Some((warm, guard))));
+        let worker_retained = Arc::clone(&retained);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-        let worker = thread::Builder::new()
-            .name("rally-warm-store-close".to_string())
-            .spawn(move || {
-                let result = warm.close_synchronously();
-                if result.is_ok() {
-                    drop(warm);
-                } else {
-                    std::mem::forget(warm);
-                }
-                drop(guard);
-                let _ = done_tx.send(result);
-            })
-            .map_err(|error| {
-                RallyError::Command(format!(
-                    "daemon-close-not-started: could not spawn warm-store close worker: {error}"
-                ))
-            })?;
+        let spawn_result = if warm_close_spawn_failure_requested() {
+            Err(io::Error::other("injected warm-close worker spawn failure"))
+        } else {
+            thread::Builder::new()
+                .name("rally-warm-store-close".to_string())
+                .spawn(move || {
+                    let resources = match worker_retained.lock() {
+                        Ok(mut slot) => slot.take(),
+                        Err(poisoned) => poisoned.into_inner().take(),
+                    };
+                    let Some((mut warm, guard)) = resources else {
+                        let _ =
+                            done_tx
+                                .send(Err("warm-close worker started without retained resources"
+                                    .to_string()));
+                        return;
+                    };
+                    let result = warm.close_synchronously();
+                    if result.is_ok() {
+                        drop(warm);
+                    } else {
+                        std::mem::forget(warm);
+                    }
+                    drop(guard);
+                    let _ = done_tx.send(result);
+                })
+        };
+        let worker = match spawn_result {
+            Ok(worker) => {
+                // The live worker owns the remaining Arc and takes both values.
+                drop(retained);
+                worker
+            }
+            Err(error) => {
+                // Preserve pool + mutation.lock until process exit. The daemon
+                // also retains owner EX after this loud close failure.
+                std::mem::forget(retained);
+                return Err(RallyError::Command(format!(
+                    "daemon-close-not-started: could not spawn warm-store close worker: {error}; warm pool and mutation.lock retained until process exit"
+                )));
+            }
+        };
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         let result = match done_rx.recv_timeout(remaining) {
@@ -7651,6 +7702,32 @@ mod ledger_tests {
         );
         assert!(outcome.is_ok(), "DirectRoomStore::drop panicked");
         fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_close_spawn_failure_retains_mutation_lock_until_process_exit() {
+        let root = unique_root("warm-close-spawn-failure");
+        let rally_dir = root.join(".rally");
+        let mut store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        store.install_warm_fact_store().unwrap();
+        force_next_warm_close_spawn_failure();
+
+        let close = store.close_warm_fact_store_bounded(Duration::from_millis(100));
+        assert!(
+            matches!(close, Err(RallyError::Command(ref message)) if message.starts_with("daemon-close-not-started:")),
+            "injected spawn failure must fail loud: {close:?}"
+        );
+        let reacquire = with_mutation_deadline(Duration::from_millis(40), || {
+            acquire_room_mutation_lock(&rally_dir)
+        });
+        assert!(
+            matches!(reacquire, Err(RallyError::NotStarted(_))),
+            "spawn failure released mutation.lock before process exit"
+        );
+        // The repaired path deliberately retains the warm pool and lock until
+        // process exit. Do not unlink their rendezvous path in this test.
+        drop(store);
     }
 
     #[test]

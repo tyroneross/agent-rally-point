@@ -85,6 +85,13 @@ pub struct StoreRequest {
     /// Read-only requests leave this unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_unix_ms: Option<u64>,
+    /// Client-relative mutation start budget in milliseconds. The daemon takes
+    /// the minimum of this budget, the absolute deadline, its own connection
+    /// bound, and monotonic time elapsed since request receipt. Paired with the
+    /// absolute field so queue delay is consumed without letting a backward
+    /// wall-clock step extend work already accepted by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_budget_ms: Option<u64>,
     /// The store operation to perform.
     pub op: StoreOp,
 }
@@ -96,6 +103,7 @@ impl StoreRequest {
             wire_version: WIRE_VERSION,
             engagement,
             deadline_unix_ms: None,
+            mutation_budget_ms: None,
             op,
         }
     }
@@ -353,12 +361,14 @@ mod tests {
             },
         );
         req.deadline_unix_ms = Some(1_786_291_200_000);
+        req.mutation_budget_ms = Some(2_750);
         let line = serde_json::to_string(&req).unwrap();
         assert!(!line.contains('\n'));
         let back: StoreRequest = serde_json::from_str(&line).unwrap();
         assert_eq!(back.wire_version, WIRE_VERSION);
         assert_eq!(back.engagement.as_deref(), Some("alpha"));
         assert_eq!(back.deadline_unix_ms, Some(1_786_291_200_000));
+        assert_eq!(back.mutation_budget_ms, Some(2_750));
         matches!(
             back.op,
             StoreOp::MaybeAppendReadCheckpoint { read_seq: 42, .. }

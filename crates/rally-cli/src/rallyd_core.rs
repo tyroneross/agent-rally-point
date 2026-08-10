@@ -194,6 +194,8 @@ mod imp {
     /// Per-connection read/write timeout. Bounds a stalled client so a reader
     /// thread cannot wedge indefinitely (each connection carries one request).
     const CONN_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Preserve reply time after a mutation start deadline expires.
+    const MUTATION_REPLY_RESERVE: Duration = Duration::from_millis(250);
 
     /// Daemon lifecycle waits are explicit and finite. Store-open work runs
     /// inside this deadline; explicit warm close gets its own shorter budget.
@@ -262,9 +264,37 @@ mod imp {
         }
     }
 
-    /// One job on the dispatcher channel: a parsed request + the oneshot reply
-    /// channel back to the connection's reader thread.
-    type Job = (StoreRequest, Sender<StoreResponse>);
+    /// Receipt timing is captured before a request enters the single dispatcher
+    /// queue. Queue delay is then subtracted with the daemon's monotonic clock,
+    /// so a wall-clock rollback after receipt cannot extend mutation work.
+    #[derive(Clone, Copy)]
+    struct RequestReceipt {
+        monotonic: Instant,
+        unix_ms: u64,
+    }
+
+    impl RequestReceipt {
+        fn now() -> Self {
+            Self {
+                monotonic: Instant::now(),
+                unix_ms: unix_now_ms(),
+            }
+        }
+    }
+
+    /// One parsed request plus receipt timing and its oneshot reply channel.
+    struct Job {
+        request: StoreRequest,
+        reply: Sender<StoreResponse>,
+        receipt: RequestReceipt,
+    }
+
+    fn unix_now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0)
+    }
 
     fn now_millis() -> i64 {
         SystemTime::now()
@@ -517,7 +547,12 @@ mod imp {
                         )),
                         Ok(req) => {
                             let (reply_tx, reply_rx) = mpsc::channel();
-                            if job_tx.send((req, reply_tx)).is_err() {
+                            let job = Job {
+                                request: req,
+                                reply: reply_tx,
+                                receipt: RequestReceipt::now(),
+                            };
+                            if job_tx.send(job).is_err() {
                                 StoreResponse::Err(StoreError::transport(
                                     "daemon dispatcher stopped; retry",
                                 ))
@@ -597,10 +632,20 @@ mod imp {
 
     /// Dispatch one request against the single-owner store. Applies the request's
     /// engagement BEFORE the op (L9/R4); answers `Ping` directly.
+    #[cfg(test)]
     fn dispatch_one(
         store: &mut DirectRoomStore,
         repo_root: &str,
         req: StoreRequest,
+    ) -> StoreResponse {
+        dispatch_one_received(store, repo_root, req, RequestReceipt::now())
+    }
+
+    fn dispatch_one_received(
+        store: &mut DirectRoomStore,
+        repo_root: &str,
+        req: StoreRequest,
+        receipt: RequestReceipt,
     ) -> StoreResponse {
         if req.wire_version != WIRE_VERSION {
             return StoreResponse::Err(StoreError::transport(format!(
@@ -626,23 +671,24 @@ mod imp {
         // single-threaded. The daemon NEVER consults its own process env here.
         let request_engagement = req.engagement;
         let request_deadline = req.deadline_unix_ms;
+        let request_budget_ms = req.mutation_budget_ms;
         let op = req.op;
         store.set_engagement_scope(request_engagement.clone());
         let result = if op.is_mutating() {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_millis().min(i64::MAX as u128) as u64)
-                .unwrap_or(0);
-            let budget = match request_deadline {
-                Some(deadline) if deadline <= now_ms => {
+            let budget = match bounded_mutation_budget(
+                request_deadline,
+                request_budget_ms,
+                receipt.unix_ms,
+                unix_now_ms(),
+                receipt.monotonic.elapsed(),
+            ) {
+                None => {
                     return StoreResponse::Err(StoreError::new(
                         StoreErrorKind::NotStarted,
                         "mutation-not-started: client deadline elapsed before daemon dispatch; no durable mutation started and retry is safe",
                     ));
                 }
-                Some(deadline) => Duration::from_millis(deadline.saturating_sub(now_ms)),
-                // Compatibility for in-process constructors: still finite.
-                None => CONN_TIMEOUT.saturating_sub(Duration::from_millis(250)),
+                Some(budget) => budget,
             };
             store::with_mutation_deadline(budget, || {
                 run_op(store, op, request_engagement.as_deref())
@@ -656,14 +702,127 @@ mod imp {
         }
     }
 
-    /// Open the daemon-owned direct store with an explicit mutation-lock
-    /// deadline. `daemon serve` has no command watchdog, so it must not rely on
-    /// the generic no-watchdog fallback when startup reconciliation contends.
+    /// Translate untrusted dual wire timing into one bounded monotonic budget.
+    /// The absolute deadline consumes normal connect/read delay. The relative
+    /// budget caps rollback before receipt, and elapsed daemon `Instant` time
+    /// consumes dispatcher queue delay without trusting later wall-clock motion.
+    /// A rollback that occurs entirely before receipt cannot be measured across
+    /// processes; taking the relative minimum bounds that residual to the
+    /// client's original budget instead of the 64-bit absolute delta.
+    fn bounded_mutation_budget(
+        deadline_unix_ms: Option<u64>,
+        mutation_budget_ms: Option<u64>,
+        receipt_unix_ms: u64,
+        dispatch_unix_ms: u64,
+        queue_elapsed: Duration,
+    ) -> Option<Duration> {
+        let cap = CONN_TIMEOUT.saturating_sub(MUTATION_REPLY_RESERVE);
+        let requested = mutation_budget_ms
+            .map(Duration::from_millis)
+            .unwrap_or(cap)
+            .min(cap);
+        if requested.is_zero() {
+            return None;
+        }
+        let absolute_remaining = |now_unix_ms| match deadline_unix_ms {
+            Some(deadline) if deadline <= now_unix_ms => None,
+            Some(deadline) => {
+                Some(Duration::from_millis(deadline.saturating_sub(now_unix_ms)).min(cap))
+            }
+            None => Some(cap),
+        };
+        let at_receipt = requested.min(absolute_remaining(receipt_unix_ms)?);
+        let after_queue = at_receipt.checked_sub(queue_elapsed)?;
+        let remaining = after_queue.min(absolute_remaining(dispatch_unix_ms)?);
+        if remaining.is_zero() {
+            None
+        } else {
+            Some(remaining)
+        }
+    }
+
+    struct StoreOpenFailure {
+        error: RallyError,
+        retain_owner_until_exit: bool,
+    }
+
+    /// Open and warm the daemon-owned store on an owned worker. The caller waits
+    /// only until the absolute total deadline; a timed-out worker is detached,
+    /// and `serve_unix` retains owner EX until process exit before returning the
+    /// loud failure.
     fn open_direct_store_bounded(
         repo_root: PathBuf,
         budget: Duration,
-    ) -> Result<DirectRoomStore, RallyError> {
-        store::with_mutation_deadline(budget, || DirectRoomStore::open_direct_at(repo_root))
+    ) -> Result<DirectRoomStore, StoreOpenFailure> {
+        open_direct_store_bounded_with(repo_root, budget, || {})
+    }
+
+    fn open_direct_store_bounded_with<F>(
+        repo_root: PathBuf,
+        budget: Duration,
+        after_open: F,
+    ) -> Result<DirectRoomStore, StoreOpenFailure>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let budget = budget.min(DAEMON_OPEN_BOUND);
+        let deadline = Instant::now() + budget;
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("rally-daemon-store-open".to_string())
+            .spawn(move || {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let reply_reserve = MUTATION_REPLY_RESERVE.min(remaining / 4);
+                let lock_budget = remaining.saturating_sub(reply_reserve);
+                let result = store::with_mutation_deadline(lock_budget, || {
+                    let mut store = DirectRoomStore::open_direct_at(repo_root)?;
+                    after_open();
+                    store.install_warm_fact_store()?;
+                    Ok(store)
+                });
+                let _ = result_tx.send(result);
+            })
+            .map_err(|error| StoreOpenFailure {
+                error: RallyError::Command(format!(
+                    "daemon-open-not-started: could not spawn store-open worker: {error}"
+                )),
+                retain_owner_until_exit: false,
+            })?;
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = match result_rx.recv_timeout(remaining) {
+            Ok(result) => result.map_err(|error| StoreOpenFailure {
+                error,
+                retain_owner_until_exit: false,
+            }),
+            Err(RecvTimeoutError::Timeout) => Err(StoreOpenFailure {
+                error: RallyError::Command(format!(
+                    "daemon-open-timeout: store open did not finish within {}ms; startup worker remains isolated under owner lock until process exit",
+                    budget.as_millis()
+                )),
+                retain_owner_until_exit: true,
+            }),
+            Err(RecvTimeoutError::Disconnected) => Err(StoreOpenFailure {
+                error: RallyError::Command(
+                    "daemon-open-failed: store-open worker exited without a result; owner lock retained until process exit"
+                        .to_string(),
+                ),
+                retain_owner_until_exit: true,
+            }),
+        };
+        drop(worker);
+        result
+    }
+
+    fn retain_owner_after_open_failure(
+        owner: &mut Option<store::OwnerGuard>,
+        failure: &StoreOpenFailure,
+    ) {
+        if failure.retain_owner_until_exit
+            && let Some(owner) = owner.take()
+        {
+            std::mem::forget(owner);
+        }
     }
 
     /// Wait for explicit dispatcher/store close without ever joining past the
@@ -871,8 +1030,12 @@ mod imp {
                         log(&format!("configure store-open error stream failed: {e}"));
                         continue;
                     }
-                    // Best-effort: discard the request line, then reply the error.
-                    let _ = read_request_line(&stream);
+                    let remaining = deadline
+                        .saturating_duration_since(Instant::now())
+                        .max(Duration::from_millis(1));
+                    let _ = stream.set_write_timeout(Some(remaining));
+                    // Reply immediately. Waiting to consume a stalled request
+                    // would let one client outlive the bounded drain window.
                     if let Err(e) = write_response(&stream, &resp) {
                         log(&format!("write store-open error response failed: {e}"));
                     }
@@ -915,8 +1078,10 @@ mod imp {
             "acquiring exclusive owner lock at {}",
             rally_dir.display()
         ));
-        let owner = store::acquire_owner_exclusive_bounded(&rally_dir, DAEMON_OPEN_BOUND)
-            .map_err(|e| ServeError::new(format!("acquire owner EX lock: {e}")))?;
+        let mut owner = Some(
+            store::acquire_owner_exclusive_bounded(&rally_dir, DAEMON_OPEN_BOUND)
+                .map_err(|e| ServeError::new(format!("acquire owner EX lock: {e}")))?,
+        );
         if t0.elapsed() > OWNER_WAIT_LOG_THRESHOLD {
             log(&format!(
                 "waited {:?} for direct writers to drain",
@@ -951,30 +1116,26 @@ mod imp {
         // (3) Open the direct store (reconcile may take seconds; connects queue
         // in the listen backlog). On failure, drain pending connections with a
         // structured error, then exit non-zero.
-        let mut store = match open_direct_store_bounded(repo_root.clone(), DAEMON_OPEN_BOUND) {
+        let store = match open_direct_store_bounded(repo_root.clone(), DAEMON_OPEN_BOUND) {
             Ok(s) => s,
-            Err(e) => {
+            Err(failure) => {
+                retain_owner_after_open_failure(&mut owner, &failure);
+                let error = failure.error;
                 let err = StoreError::new(
                     StoreErrorKind::Internal,
-                    format!("daemon store open failed: {e}"),
+                    format!("daemon store open failed: {error}"),
                 );
-                log(&format!("store open failed: {e}; draining pending clients"));
+                log(&format!(
+                    "store open failed: {error}; draining pending clients"
+                ));
                 respond_all_with_error(&listener, &err, STORE_OPEN_FAIL_DRAIN);
                 cleanup(&socket_path, &addr_path, &pid_path);
-                return Err(ServeError::new(format!("store open failed: {e}")));
+                return Err(ServeError::new(format!("store open failed: {error}")));
             }
         };
-
-        // ==== G10/R1 WARM-POOL INSTALL (A-amendment landed) ====
-        // Install the ONE warm facts.db pool so the hot interior ops
-        // (append/query/snapshot) reuse it via fact_store_handle() instead of
-        // churning a pool per request — the in-process re-creation of #50
-        // (factstr-sqlite 0.5.2's un-closed-on-Drop background checkpoint racing
-        // the next open) that R1 exists to prevent. Single writer, total order,
-        // and now a single warm pool: G10 satisfied.
-        store
-            .install_warm_fact_store()
-            .map_err(|e| ServeError::new(format!("install warm pool: {e}")))?;
+        let owner = owner.take().ok_or_else(|| {
+            ServeError::new("daemon owner lock missing after successful store open")
+        })?;
 
         let canonical_root = Arc::new(canonical_repo_root(&repo_root));
 
@@ -986,10 +1147,11 @@ mod imp {
         let (close_tx, close_rx) = mpsc::sync_channel(1);
         let dispatcher = thread::spawn(move || {
             let mut store = store;
-            while let Ok((req, reply)) = job_rx.recv() {
-                let resp = dispatch_one(&mut store, disp_root.as_str(), req);
+            while let Ok(job) = job_rx.recv() {
+                let resp =
+                    dispatch_one_received(&mut store, disp_root.as_str(), job.request, job.receipt);
                 disp_activity.store(now_millis(), Ordering::Relaxed);
-                let _ = reply.send(resp);
+                let _ = job.reply.send(resp);
             }
             // Channel closed (all senders dropped): explicitly close the warm
             // pool under mutation.lock. The caller bounds its wait on
@@ -1258,6 +1420,7 @@ mod imp {
                 wire_version: 3,
                 engagement: None,
                 deadline_unix_ms: None,
+                mutation_budget_ms: None,
                 op: StoreOp::Ping,
             };
             match dispatch_one(&mut store, "/expected/repo", request) {
@@ -1286,15 +1449,66 @@ mod imp {
                 elapsed < Duration::from_millis(300),
                 "daemon store open escaped its 75ms bound: {elapsed:?}"
             );
-            assert!(
-                matches!(result, Err(RallyError::NotStarted(_))),
-                "contended daemon store open must return typed NotStarted"
-            );
+            let failure = match result {
+                Ok(_) => panic!("contended daemon store open unexpectedly succeeded"),
+                Err(failure) => failure,
+            };
+            assert!(matches!(failure.error, RallyError::NotStarted(_)));
+            assert!(!failure.retain_owner_until_exit);
 
             drop(held);
             let reopened = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
             drop(reopened);
             std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn daemon_store_total_open_timeout_retains_owner_for_late_worker() {
+            let repo_root = unique_repo_root("total-open-timeout-owner-retained");
+            let rally_dir = repo_root.join(".rally");
+            let mut owner = Some(
+                store::acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(75))
+                    .unwrap(),
+            );
+
+            let started = Instant::now();
+            let result =
+                open_direct_store_bounded_with(repo_root, Duration::from_millis(50), || {
+                    thread::sleep(Duration::from_millis(250))
+                });
+            let elapsed = started.elapsed();
+            let failure = match result {
+                Ok(_) => panic!("delayed daemon store open unexpectedly completed"),
+                Err(failure) => failure,
+            };
+            assert!(
+                elapsed < Duration::from_millis(150),
+                "total daemon store open escaped its 50ms bound: {elapsed:?}"
+            );
+            assert!(failure.retain_owner_until_exit);
+            assert!(
+                failure
+                    .error
+                    .to_string()
+                    .starts_with("daemon-open-timeout:")
+            );
+            retain_owner_after_open_failure(&mut owner, &failure);
+            assert!(owner.is_none());
+            assert!(
+                store::acquire_owner_shared_nb(&rally_dir)
+                    .unwrap()
+                    .is_none(),
+                "direct ownership entered while timed-out open worker remained live"
+            );
+            assert!(
+                matches!(
+                    store::acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(25)),
+                    Err(RallyError::NotStarted(_))
+                ),
+                "replacement daemon entered while timed-out open worker remained live"
+            );
+            // The worker and owner guard are intentionally process-lifetime on
+            // timeout. Do not unlink the lock rendezvous in this test.
         }
 
         #[test]
@@ -1335,6 +1549,74 @@ mod imp {
             );
             // `await_dispatcher_close` intentionally leaked owner EX. Do not
             // unlink the lock path: it remains the process-lifetime rendezvous.
+        }
+
+        #[test]
+        fn raw_far_future_mutation_deadline_is_capped_without_panic() {
+            let cap = CONN_TIMEOUT.saturating_sub(MUTATION_REPLY_RESERVE);
+            assert_eq!(
+                bounded_mutation_budget(Some(u64::MAX), Some(u64::MAX), 1, 1, Duration::ZERO),
+                Some(cap)
+            );
+            assert_eq!(
+                bounded_mutation_budget(
+                    Some(2_000),
+                    Some(1_000),
+                    1_000,
+                    1_400,
+                    Duration::from_millis(400)
+                ),
+                Some(Duration::from_millis(600))
+            );
+            assert_eq!(
+                bounded_mutation_budget(
+                    Some(2_000),
+                    Some(1_000),
+                    1_000,
+                    900,
+                    Duration::from_millis(400)
+                ),
+                Some(Duration::from_millis(600)),
+                "wall-clock rollback after receipt extended the monotonic budget"
+            );
+            assert_eq!(
+                bounded_mutation_budget(Some(2_000), Some(1_000), 900, 900, Duration::ZERO),
+                Some(Duration::from_millis(1_000)),
+                "pre-receipt rollback escaped the client-relative cap"
+            );
+            assert_eq!(
+                bounded_mutation_budget(
+                    Some(2_000),
+                    Some(1_000),
+                    1_000,
+                    2_100,
+                    Duration::from_millis(100)
+                ),
+                None,
+                "forward clock step did not expire the request"
+            );
+            assert_eq!(
+                bounded_mutation_budget(Some(1_000), Some(1_000), 1_000, 1_000, Duration::ZERO),
+                None
+            );
+            assert_eq!(
+                bounded_mutation_budget(Some(2_000), Some(0), 1_000, 1_000, Duration::ZERO),
+                None
+            );
+
+            let repo_root = unique_repo_root("far-future-mutation-deadline");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut request = StoreRequest::new(None, StoreOp::RebuildClaimIndex);
+            request.deadline_unix_ms = Some(u64::MAX);
+            request.mutation_budget_ms = Some(u64::MAX);
+            let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                dispatch_one(&mut store, repo_root.to_string_lossy().as_ref(), request)
+            }));
+            assert!(
+                matches!(response, Ok(StoreResponse::Ok(StoreOk::RebuildClaimIndex))),
+                "far-future raw deadline panicked or failed: {response:?}"
+            );
+            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]

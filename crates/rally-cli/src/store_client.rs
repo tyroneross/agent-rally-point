@@ -74,16 +74,19 @@ const OP_TIMEOUT: Duration = Duration::from_secs(10);
 /// socket write, client parse, and outer CLI watchdog rendering.
 const MUTATION_DEADLINE_RESERVE: Duration = Duration::from_millis(250);
 
-fn mutation_deadline_unix_ms() -> u64 {
+fn mutation_deadline() -> (u64, u64) {
     let outer = crate::watchdog_remaining().unwrap_or(OP_TIMEOUT);
     let budget = outer
         .min(OP_TIMEOUT)
         .saturating_sub(MUTATION_DEADLINE_RESERVE);
-    let deadline = SystemTime::now() + budget;
-    deadline
+    let now = SystemTime::now();
+    let deadline = now.checked_add(budget).unwrap_or(now);
+    let deadline_unix_ms = deadline
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let budget_ms = budget.as_millis().min(u128::from(u64::MAX)) as u64;
+    (deadline_unix_ms, budget_ms)
 }
 
 /// Bounded-block corridor total budget (L12/ADR-01): once the SH try-lock is
@@ -445,7 +448,9 @@ impl RoutedRoomStore {
     fn dispatch_with_engagement(&self, engagement: String, op: StoreOp) -> Result<StoreOk> {
         let mut req = StoreRequest::new(Some(engagement), op);
         if req.op.is_mutating() {
-            req.deadline_unix_ms = Some(mutation_deadline_unix_ms());
+            let (deadline_unix_ms, mutation_budget_ms) = mutation_deadline();
+            req.deadline_unix_ms = Some(deadline_unix_ms);
+            req.mutation_budget_ms = Some(mutation_budget_ms);
         }
         match round_trip(&self.socket, &req, OP_TIMEOUT, false) {
             Ok(StoreResponse::Ok(ok)) => Ok(ok),

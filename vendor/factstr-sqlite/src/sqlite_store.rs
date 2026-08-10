@@ -37,6 +37,16 @@ struct CommittedAppend {
 enum DeliveryCommand {
     Deliver(Vec<PendingDelivery>),
     Shutdown,
+    #[cfg(test)]
+    PanicForTest,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum CloseFailureForTest {
+    Spawn,
+    Runtime,
+    Panic,
 }
 
 pub struct SqliteStore {
@@ -50,6 +60,11 @@ pub struct SqliteStore {
     /// fallback Drop nonblocking before handing teardown to another thread.
     blocking_drop: bool,
     closed: bool,
+    close_error: Option<String>,
+    #[cfg(test)]
+    close_failure_for_test: Option<CloseFailureForTest>,
+    #[cfg(test)]
+    pool_retained_after_close_failure: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +189,11 @@ impl SqliteStore {
             delivery_thread: Mutex::new(Some(delivery_thread)),
             blocking_drop: true,
             closed: false,
+            close_error: None,
+            #[cfg(test)]
+            close_failure_for_test: None,
+            #[cfg(test)]
+            pool_retained_after_close_failure: false,
         })
     }
 
@@ -198,38 +218,87 @@ impl SqliteStore {
     pub fn close_synchronously(&mut self) -> Result<(), String> {
         self.blocking_drop = false;
         if self.closed {
-            return Ok(());
+            return self.close_error.clone().map_or(Ok(()), Err);
         }
-        self.closed = true;
         let _ = self.delivery_sender.send(DeliveryCommand::Shutdown);
+        let mut errors = self.close_error.take().into_iter().collect::<Vec<_>>();
 
         let delivery_thread = match self.delivery_thread.lock() {
             Ok(mut slot) => slot.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         };
         if let Some(delivery_thread) = delivery_thread {
-            delivery_thread
-                .join()
-                .map_err(|_| "factstr-sqlite delivery thread panicked during close".to_string())?;
+            if delivery_thread.join().is_err() {
+                errors.push("factstr-sqlite delivery thread panicked during close".to_string());
+            }
         }
 
         let pool = self.pool.clone();
-        let close_thread = thread::Builder::new()
-            .name("factstr-sqlite-close".to_owned())
-            .spawn(move || -> Result<(), String> {
-                let runtime = Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| {
-                        format!("build factstr-sqlite synchronous close runtime: {error}")
-                    })?;
-                runtime.block_on(pool.close());
-                Ok(())
-            })
-            .map_err(|error| format!("spawn factstr-sqlite close thread: {error}"))?;
-        close_thread
-            .join()
-            .map_err(|_| "factstr-sqlite synchronous close thread panicked".to_string())?
+        #[cfg(test)]
+        let close_failure = self.close_failure_for_test.take();
+        #[cfg(test)]
+        let force_spawn_failure = matches!(close_failure, Some(CloseFailureForTest::Spawn));
+        #[cfg(not(test))]
+        let force_spawn_failure = false;
+        let close_thread = if force_spawn_failure {
+            Err(io::Error::other("injected factstr-sqlite close spawn failure"))
+        } else {
+            thread::Builder::new()
+                .name("factstr-sqlite-close".to_owned())
+                .spawn(move || -> Result<(), String> {
+                    #[cfg(test)]
+                    match close_failure {
+                        Some(CloseFailureForTest::Runtime) => {
+                            return Err(
+                                "injected factstr-sqlite close runtime failure".to_string()
+                            );
+                        }
+                        Some(CloseFailureForTest::Panic) => {
+                            panic!("injected factstr-sqlite close thread panic");
+                        }
+                        Some(CloseFailureForTest::Spawn) | None => {}
+                    }
+                    let runtime = Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| {
+                            format!("build factstr-sqlite synchronous close runtime: {error}")
+                        })?;
+                    runtime.block_on(pool.close());
+                    Ok(())
+                })
+        };
+        let pool_close = close_thread
+            .map_err(|error| format!("spawn factstr-sqlite close thread: {error}"))
+            .and_then(|close_thread| {
+                close_thread
+                    .join()
+                    .map_err(|_| "factstr-sqlite synchronous close thread panicked".to_string())?
+            });
+        match pool_close {
+            Ok(()) => self.closed = true,
+            Err(error) => {
+                // Never let field Drop become the last Arc and schedule delayed
+                // SQLite cleanup after the caller releases its mutation lock.
+                // A final-close infrastructure failure retains one pool handle
+                // until process exit; a later explicit retry may still close it.
+                std::mem::forget(self.pool.clone());
+                #[cfg(test)]
+                {
+                    self.pool_retained_after_close_failure = true;
+                }
+                errors.push(error);
+            }
+        }
+
+        if errors.is_empty() {
+            self.close_error = None;
+            Ok(())
+        } else {
+            let error = errors.join("; ");
+            self.close_error = Some(error.clone());
+            Err(error)
+        }
     }
 
     pub fn database_path(&self) -> &Path {
@@ -847,6 +916,78 @@ mod timeout_composition_tests {
             "elapsed {elapsed:?} did not include both the delayed pool checkout and SQLite busy wait"
         );
     }
+
+    #[test]
+    fn ordinary_drop_closes_pool_even_when_delivery_thread_panics() {
+        let path = std::env::temp_dir().join(format!(
+            "factstr-drop-delivery-panic-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = SqliteStore::open(&path).unwrap();
+        let pool = store.pool.clone();
+        store
+            .delivery_sender
+            .send(DeliveryCommand::PanicForTest)
+            .unwrap();
+
+        let drop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(store)));
+        assert!(drop_result.is_ok(), "ordinary SqliteStore::drop panicked");
+        assert!(
+            pool.is_closed(),
+            "delivery join failure skipped synchronous pool close"
+        );
+        drop(pool);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn final_pool_close_failures_retain_then_retry_the_pool() {
+        for (index, failure) in [
+            CloseFailureForTest::Spawn,
+            CloseFailureForTest::Runtime,
+            CloseFailureForTest::Panic,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = std::env::temp_dir().join(format!(
+                "factstr-close-failure-{index}-{}-{}.db",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let mut store = SqliteStore::open(&path).unwrap();
+            store.close_failure_for_test = Some(failure);
+
+            let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                store.close_synchronously()
+            }));
+            assert!(matches!(first, Ok(Err(_))), "failure={failure:?}");
+            assert!(!store.closed, "failed pool close was marked complete");
+            assert!(
+                store.pool_retained_after_close_failure,
+                "failed pool close did not retain a process-lifetime handle"
+            );
+
+            let second = store.close_synchronously();
+            assert!(
+                second.is_err(),
+                "retry must preserve the original close error for observability"
+            );
+            assert!(store.closed, "retry did not complete pool close");
+            assert!(store.pool.is_closed(), "retry left pool open");
+            let drop_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(store)));
+            assert!(drop_result.is_ok(), "Drop panicked after retry");
+            std::fs::remove_file(path).ok();
+        }
+    }
 }
 
 async fn append_batch(
@@ -1370,6 +1511,10 @@ fn run_delivery_thread(
 
     while let Ok(delivery_command) = delivery_receiver.recv() {
         match delivery_command {
+            #[cfg(test)]
+            DeliveryCommand::PanicForTest => {
+                panic!("injected factstr-sqlite delivery failure");
+            }
             DeliveryCommand::Deliver(pending_deliveries) => {
                 for pending_delivery in pending_deliveries {
                     match pending_delivery.deliver(&runtime) {
