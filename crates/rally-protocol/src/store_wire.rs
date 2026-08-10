@@ -60,7 +60,7 @@ use serde_json::Value;
 /// Wire protocol version. Bumped only on a breaking envelope change. The ping
 /// reply carries this; a client seeing a version it does not speak treats the
 /// daemon as not-live and lets the ownership lock decide (ADR-02 rollback note).
-pub const WIRE_VERSION: u32 = 2;
+pub const WIRE_VERSION: u32 = 3;
 
 /// Hard cap on a single request/response line. A longer line is a framing
 /// error (or an abuse) and maps to the transport-error class (R7): the daemon
@@ -141,6 +141,15 @@ pub enum StoreOp {
     /// `RoomStore::snapshot()` (== `snapshot_with_archived(false)`) and
     /// `RoomStore::snapshot_with_archived(include_archived)` → `RoomSnapshot`.
     SnapshotWithArchived { include_archived: bool },
+    /// Engagement-selected snapshot. `StoreRequest::engagement` is required;
+    /// run/path narrowing happens before projection, while a path separately
+    /// joins repository-wide live collision claims.
+    SnapshotScoped {
+        run_id: Option<String>,
+        path: Option<String>,
+        include_archived: bool,
+        include_presence_only: bool,
+    },
     /// `RoomStore::snapshot_with_readers_archived(include_archived)` →
     /// `RoomSnapshot` (with reader receipts projected).
     SnapshotWithReadersArchived { include_archived: bool },
@@ -306,6 +315,36 @@ mod tests {
             back.op,
             StoreOp::MaybeAppendReadCheckpoint { read_seq: 42, .. }
         );
+    }
+
+    #[test]
+    fn scoped_snapshot_v3_round_trips_all_query_controls() {
+        assert_eq!(WIRE_VERSION, 3);
+        let req = StoreRequest::new(
+            Some("engagement-alpha".to_string()),
+            StoreOp::SnapshotScoped {
+                run_id: Some("audit-run".to_string()),
+                path: Some("crates/rally-cli/src/store.rs".to_string()),
+                include_archived: true,
+                include_presence_only: false,
+            },
+        );
+        let back: StoreRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        match back.op {
+            StoreOp::SnapshotScoped {
+                run_id,
+                path,
+                include_archived,
+                include_presence_only,
+            } => {
+                assert_eq!(run_id.as_deref(), Some("audit-run"));
+                assert_eq!(path.as_deref(), Some("crates/rally-cli/src/store.rs"));
+                assert!(include_archived);
+                assert!(!include_presence_only);
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
     }
 
     #[test]

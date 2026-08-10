@@ -351,6 +351,7 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
         StoreOp::Facts
         | StoreOp::SessionFactsWithContextVersion
         | StoreOp::SnapshotWithArchived { .. }
+        | StoreOp::SnapshotScoped { .. }
         | StoreOp::SnapshotWithReadersArchived { .. }
         | StoreOp::LastCheckpointSeq { .. }
         | StoreOp::ProjectReadReceipts { .. }
@@ -425,7 +426,11 @@ impl RoutedRoomStore {
     /// `set_engagement_scope` rebind depends on it being present on every op,
     /// not just appends.
     fn dispatch(&self, op: StoreOp) -> Result<StoreOk> {
-        let req = StoreRequest::new(Some(self.active_engagement.clone()), op);
+        self.dispatch_with_engagement(self.active_engagement.clone(), op)
+    }
+
+    fn dispatch_with_engagement(&self, engagement: String, op: StoreOp) -> Result<StoreOk> {
+        let req = StoreRequest::new(Some(engagement), op);
         match round_trip(&self.socket, &req, OP_TIMEOUT, false) {
             Ok(StoreResponse::Ok(ok)) => Ok(ok),
             Ok(StoreResponse::Err(err)) => Err(store_error_to_rally_error(err)),
@@ -543,6 +548,27 @@ impl RoutedRoomStore {
         match self.dispatch(StoreOp::SnapshotWithArchived { include_archived })? {
             StoreOk::Snapshot { snapshot } => snapshot_from_value(snapshot),
             _ => Err(unexpected_reply("snapshot_with_archived")),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_scoped(
+        &self,
+        engagement: &str,
+        run_id: Option<&str>,
+        path: Option<&str>,
+        include_archived: bool,
+        include_presence_only: bool,
+    ) -> Result<RoomSnapshot> {
+        let op = StoreOp::SnapshotScoped {
+            run_id: run_id.map(str::to_string),
+            path: path.map(str::to_string),
+            include_archived,
+            include_presence_only,
+        };
+        match self.dispatch_with_engagement(engagement.to_string(), op)? {
+            StoreOk::Snapshot { snapshot } => snapshot_from_value(snapshot),
+            _ => Err(unexpected_reply("snapshot_scoped")),
         }
     }
 
@@ -700,15 +726,15 @@ mod tests {
     }
 
     #[test]
-    fn probe_rejects_a_v1_daemon_after_the_snapshot_wire_change() {
-        assert_eq!(WIRE_VERSION, 2, "this control grades the v1 to v2 cutover");
+    fn probe_rejects_a_v2_daemon_after_the_scoped_snapshot_wire_change() {
+        assert_eq!(WIRE_VERSION, 3, "this control grades the v2 to v3 cutover");
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let rally_dir = std::env::temp_dir().join(format!("rally-wire-v1-{nonce}"));
+        let rally_dir = std::env::temp_dir().join(format!("rally-wire-v2-{nonce}"));
         std::fs::create_dir_all(&rally_dir).unwrap();
-        let socket = std::env::temp_dir().join(format!("rally-wire-v1-{nonce}.sock"));
+        let socket = std::env::temp_dir().join(format!("rally-wire-v2-{nonce}.sock"));
         let listener = UnixListener::bind(&socket).unwrap();
         std::fs::write(
             rally_dir.join(ADDR_FILENAME),
@@ -722,11 +748,11 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let request: StoreRequest = serde_json::from_str(line.trim()).unwrap();
-            assert_eq!(request.wire_version, 2);
+            assert_eq!(request.wire_version, 3);
             let response = StoreResponse::Ok(StoreOk::Pong {
                 repo_root: "/expected/repo".to_string(),
                 pid: 42,
-                wire_version: 1,
+                wire_version: 2,
             });
             let mut writer = &stream;
             writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
@@ -734,7 +760,7 @@ mod tests {
 
         assert!(
             probe_identity(&rally_dir, "/expected/repo").is_none(),
-            "a v1 daemon must not route a v2 client through a reply that omits snapshot internals"
+            "a v2 daemon must not route a v3 client through a reply that lacks scoped snapshots"
         );
         server.join().unwrap();
         std::fs::remove_file(&socket).ok();

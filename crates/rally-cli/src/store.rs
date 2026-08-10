@@ -803,7 +803,7 @@ pub(crate) struct RoomSnapshot {
 /// byte-identical to what it was.
 ///
 /// Every field is `#[serde(default)]` for additive changes within a compatible
-/// wire version. A v1 daemon that predates this struct is rejected by the v2
+/// wire version. A daemon that predates this struct is rejected by the current
 /// identity probe; it must never route a client with empty internals.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct SnapshotInternals {
@@ -896,7 +896,7 @@ pub(crate) fn snapshot_to_wire_value(
 /// Deserialize a wire snapshot, restoring [`SnapshotInternals`] if present.
 ///
 /// A payload without the key yields defaults only for additive compatibility
-/// within the current wire version. The identity probe rejects v1 daemons
+/// within the current wire version. The identity probe rejects incompatible daemons
 /// before this decoder runs.
 pub(crate) fn snapshot_from_wire_value(
     mut value: Value,
@@ -1147,6 +1147,108 @@ impl RoomQuery {
     }
 }
 
+/// Durable association between one stable protocol session and its task
+/// engagement. S9 owns the deterministic resolver; S10 owns the writers and
+/// CLI surfaces that persist and consume these records.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct EngagementBinding {
+    pub(crate) session_id: String,
+    pub(crate) tool: String,
+    pub(crate) engagement: String,
+    pub(crate) active: bool,
+    /// Monotonic record order. The newest record for a session supersedes its
+    /// prior binding without minting a new actor identity for the task.
+    pub(crate) seq: i64,
+}
+
+/// Resolve the engagement for a scoped read or write without consulting the
+/// caller process id or guessing between concurrent sessions.
+///
+/// Priority is explicit process/CLI engagement, explicit managed session,
+/// unique active binding for the tool, then the legacy room-wide fallback.
+/// Ambiguity fails closed before the legacy fallback can relabel either task.
+#[allow(dead_code)]
+pub(crate) fn resolve_current_engagement(
+    explicit_engagement: Option<&str>,
+    explicit_session_id: Option<&str>,
+    tool: Option<&str>,
+    bindings: &[EngagementBinding],
+    legacy_fallback: Option<&str>,
+) -> Result<String> {
+    if let Some(engagement) = explicit_engagement {
+        return validate_scoped_engagement(engagement);
+    }
+
+    let mut latest_by_session = BTreeMap::<&str, &EngagementBinding>::new();
+    for binding in bindings {
+        match latest_by_session.get(binding.session_id.as_str()) {
+            Some(current) if current.seq > binding.seq => {}
+            Some(current)
+                if current.seq == binding.seq
+                    && (current.engagement != binding.engagement
+                        || current.tool != binding.tool
+                        || current.active != binding.active) =>
+            {
+                return Err(RallyError::Usage(format!(
+                    "ambiguous engagement binding for session {:?} at seq {}",
+                    binding.session_id, binding.seq
+                )));
+            }
+            _ => {
+                latest_by_session.insert(binding.session_id.as_str(), binding);
+            }
+        }
+    }
+
+    if let Some(session_id) = explicit_session_id {
+        let binding = latest_by_session
+            .get(session_id)
+            .copied()
+            .filter(|binding| binding.active)
+            .ok_or_else(|| {
+                RallyError::Usage(format!(
+                    "no active engagement binding for explicit session {session_id:?}"
+                ))
+            })?;
+        if tool.is_some_and(|tool| tool != binding.tool) {
+            return Err(RallyError::Usage(format!(
+                "explicit session {session_id:?} is bound to tool {:?}, not {:?}",
+                binding.tool,
+                tool.unwrap_or_default()
+            )));
+        }
+        return validate_scoped_engagement(&binding.engagement);
+    }
+
+    if let Some(tool) = tool {
+        let matches = latest_by_session
+            .values()
+            .copied()
+            .filter(|binding| binding.active && binding.tool == tool)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [binding] => return validate_scoped_engagement(&binding.engagement),
+            [] => {}
+            _ => {
+                return Err(RallyError::Usage(format!(
+                    "ambiguous current engagement for tool {tool:?}: {} active session bindings; provide a managed session id or explicit engagement",
+                    matches.len()
+                )));
+            }
+        }
+    }
+
+    if let Some(engagement) = legacy_fallback {
+        return validate_scoped_engagement(engagement);
+    }
+
+    Err(RallyError::Usage(
+        "current engagement is unknown; provide an explicit engagement or enter/adopt a managed session"
+            .to_string(),
+    ))
+}
+
 #[derive(JsonSchema, Serialize)]
 pub(crate) struct RoomSummary {
     pub(crate) max_seq: i64,
@@ -1207,6 +1309,7 @@ impl From<&RoomSnapshot> for RoomSummary {
 ///   expire_claim_leases_at               → ExpireClaimLeasesAt
 ///   session_facts_with_context_version   → SessionFactsWithContextVersion
 ///   snapshot / snapshot_with_archived    → SnapshotWithArchived
+///   snapshot_scoped                      → SnapshotScoped
 ///   snapshot_with_readers_archived       → SnapshotWithReadersArchived
 ///   last_checkpoint_seq                  → LastCheckpointSeq
 ///   maybe_append_read_checkpoint         → MaybeAppendReadCheckpoint
@@ -1801,6 +1904,33 @@ impl RoomStore {
         match self {
             RoomStore::Direct(d) => d.snapshot_with_archived(include_archived),
             RoomStore::Routed(r) => r.snapshot_with_archived(include_archived),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_scoped(
+        &self,
+        engagement: &str,
+        run_id: Option<&str>,
+        path: Option<&str>,
+        include_archived: bool,
+        include_presence_only: bool,
+    ) -> Result<RoomSnapshot> {
+        match self {
+            RoomStore::Direct(d) => d.snapshot_scoped(
+                engagement,
+                run_id,
+                path,
+                include_archived,
+                include_presence_only,
+            ),
+            RoomStore::Routed(r) => r.snapshot_scoped(
+                engagement,
+                run_id,
+                path,
+                include_archived,
+                include_presence_only,
+            ),
         }
     }
 
@@ -3018,6 +3148,139 @@ impl DirectRoomStore {
         ))
     }
 
+    fn repo_wide_claim_lifecycle_facts(&self) -> Result<Vec<Fact>> {
+        if let Some(warm) = &self.warm_fact_store {
+            return match claim_lifecycle_facts_from_store(warm) {
+                Ok(facts) => Ok(facts),
+                Err(err) if is_malformed_db_error(&err) => {
+                    Err(live_db_recovery_required_error(&self.facts_db_path))
+                }
+                Err(err) => Err(err),
+            };
+        }
+
+        let fact_store = open_fact_store_lenient(&self.facts_db_path)?;
+        match claim_lifecycle_facts_from_store(&fact_store) {
+            Ok(facts) => Ok(facts),
+            Err(err) if is_malformed_db_error(&err) => {
+                drop(fact_store);
+                quarantine_corrupt_db(&self.facts_db_path)?;
+                if let Some(path) = reconcile_cache_path(&self.facts_db_path) {
+                    let _ = fs::remove_file(path);
+                }
+                reconcile_segments_and_db(
+                    &self.log_dir,
+                    &self.archive_dir,
+                    &self.facts_db_path,
+                    true,
+                )?;
+                let recovered_store = open_fact_store_lenient(&self.facts_db_path)?;
+                claim_lifecycle_facts_from_store(&recovered_store)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Project one engagement/run/path without folding repository-wide facts.
+    /// A path adds only repository-wide live collision claims after the scoped
+    /// participant and health projection is complete.
+    pub(crate) fn snapshot_scoped(
+        &self,
+        engagement: &str,
+        run_id: Option<&str>,
+        path: Option<&str>,
+        include_archived: bool,
+        include_presence_only: bool,
+    ) -> Result<RoomSnapshot> {
+        let engagement = validate_scoped_engagement(engagement)?;
+        let run_marker = run_id
+            .map(str::trim)
+            .map(|run_id| {
+                if run_id.is_empty() {
+                    Err(RallyError::Usage(
+                        "scoped snapshot run id cannot be empty".to_string(),
+                    ))
+                } else {
+                    Ok(format!("run:{run_id}"))
+                }
+            })
+            .transpose()?;
+        let normalized_path = path
+            .map(str::trim)
+            .map(|path| {
+                if path.is_empty() {
+                    Err(RallyError::Usage(
+                        "scoped snapshot path cannot be empty".to_string(),
+                    ))
+                } else {
+                    Ok(normalize_paths(vec![path.to_string()])
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| path.to_string()))
+                }
+            })
+            .transpose()?;
+
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        let engagement_facts =
+            facts_from_engagement_segments(&self.log_dir, &self.archive_dir, &engagement)?;
+        let scoped_facts = select_scoped_facts(
+            &engagement_facts,
+            run_marker.as_deref(),
+            normalized_path.as_deref(),
+        );
+        let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+        let mut snapshot = snapshot_from_facts_with_policy(&scoped_facts, &coord, include_archived);
+
+        if include_presence_only {
+            let engagement_snapshot =
+                snapshot_from_facts_with_policy(&engagement_facts, &coord, include_archived);
+            snapshot.squads = engagement_snapshot.squads;
+            snapshot.stale_authors = engagement_snapshot.stale_authors;
+        } else {
+            let contributors = scoped_contributor_tools(&scoped_facts);
+            snapshot
+                .squads
+                .retain(|squad| contributors.contains(&squad.tool));
+            snapshot
+                .stale_authors
+                .retain(|tool| contributors.contains(tool));
+        }
+
+        if let Some(path) = normalized_path.as_deref() {
+            let lifecycle = self.repo_wide_claim_lifecycle_facts()?;
+            let mut external_claims = lifecycle
+                .iter()
+                .filter(|fact| claim_authority::is_active_claim_fact(fact, &lifecycle))
+                .map(|fact| claim_authority::project_effective_claim(fact, &lifecycle))
+                .filter(|claim| {
+                    claim
+                        .scope
+                        .iter()
+                        .any(|scope| path_matches_scope(scope, path))
+                })
+                .collect::<Vec<_>>();
+            external_claims.sort_by_key(|fact| fact.seq);
+            for claim in external_claims {
+                if !snapshot
+                    .active_claims
+                    .iter()
+                    .any(|existing| existing.event_id == claim.event_id)
+                {
+                    snapshot.active_claims.push(claim);
+                }
+            }
+            snapshot.active_claims.sort_by_key(|fact| fact.seq);
+        }
+
+        refresh_snapshot_totals(&mut snapshot);
+        Ok(snapshot)
+    }
+
     /// Return the current read cursor for `tool`.
     ///
     /// R10 ledger-first: if the ledger contains a `FactKind::Read` checkpoint
@@ -3233,10 +3496,148 @@ fn filter_facts(facts: Vec<Fact>, query: &RoomQuery) -> Vec<Fact> {
         .collect()
 }
 
+fn fact_matches_scoped_selection(
+    fact: &Fact,
+    run_marker: Option<&str>,
+    path: Option<&str>,
+) -> bool {
+    let run_matches = run_marker
+        .map(|marker| fact.scope.iter().any(|scope| scope == marker))
+        .unwrap_or(true);
+    let path_matches = path
+        .map(|path| {
+            fact.scope
+                .iter()
+                .any(|scope| path_matches_scope(scope, path))
+        })
+        .unwrap_or(true);
+    run_matches && path_matches
+}
+
+/// Select task facts before projection, then close the small referential
+/// neighborhood needed to project claim/handoff lifecycle correctly. This
+/// never expands beyond the already-selected engagement segment pair.
+fn select_scoped_facts(
+    engagement_facts: &[Fact],
+    run_marker: Option<&str>,
+    path: Option<&str>,
+) -> Vec<Fact> {
+    if run_marker.is_none() && path.is_none() {
+        return engagement_facts.to_vec();
+    }
+
+    let mut selected = engagement_facts
+        .iter()
+        .filter(|fact| fact_matches_scoped_selection(fact, run_marker, path))
+        .map(|fact| fact.seq)
+        .collect::<BTreeSet<_>>();
+
+    loop {
+        let selected_event_ids = engagement_facts
+            .iter()
+            .filter(|fact| selected.contains(&fact.seq))
+            .map(|fact| fact.event_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let selected_refs = engagement_facts
+            .iter()
+            .filter(|fact| selected.contains(&fact.seq))
+            .filter_map(|fact| fact.ref_id.as_deref())
+            .collect::<BTreeSet<_>>();
+        let selected_claim_scopes = engagement_facts
+            .iter()
+            .filter(|fact| selected.contains(&fact.seq) && fact.kind == FactKind::Claim)
+            .flat_map(|fact| fact.scope.iter().map(String::as_str))
+            .collect::<BTreeSet<_>>();
+
+        let mut changed = false;
+        for fact in engagement_facts {
+            if selected.contains(&fact.seq) {
+                continue;
+            }
+            let references_selected = fact
+                .ref_id
+                .as_deref()
+                .is_some_and(|ref_id| selected_event_ids.contains(ref_id));
+            let is_referenced = selected_refs.contains(fact.event_id.as_str());
+            let overlapping_release = fact.kind == FactKind::Release
+                && fact
+                    .scope
+                    .iter()
+                    .any(|scope| selected_claim_scopes.contains(scope.as_str()));
+            if references_selected || is_referenced || overlapping_release {
+                changed |= selected.insert(fact.seq);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    engagement_facts
+        .iter()
+        .filter(|fact| selected.contains(&fact.seq))
+        .cloned()
+        .collect()
+}
+
+fn scoped_contributor_tools(facts: &[Fact]) -> BTreeSet<String> {
+    facts
+        .iter()
+        .filter(|fact| {
+            !matches!(
+                fact.kind,
+                FactKind::Presence | FactKind::Session | FactKind::Read | FactKind::ClaimRenewed
+            )
+        })
+        .filter_map(|fact| fact.tool.clone())
+        .filter(|tool| tool != "rally")
+        .collect()
+}
+
+fn refresh_snapshot_totals(snapshot: &mut RoomSnapshot) {
+    snapshot.totals = RoomTotals {
+        active_claims: snapshot.active_claims.len(),
+        active_blockers: snapshot.active_blockers.len(),
+        open_handoffs: snapshot.open_handoffs.len(),
+        current_decisions: snapshot.current_decisions.len(),
+        current_risks: snapshot.current_risks.len(),
+        system_health: snapshot.system_health.len(),
+        recent_artifacts: snapshot.recent_artifacts.len(),
+        unconsumed_artifacts: snapshot.unconsumed_artifacts.len(),
+        stale_facts: snapshot.stale_facts.len(),
+        squads: snapshot.squads.len(),
+    };
+}
+
 fn facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
     let query = store
         .query(&FactQuery::all())
         .map_err(|err| RallyError::Message(format!("query facts: {err}")))?;
+    query
+        .event_records
+        .into_iter()
+        .map(|record| {
+            let seq = i64::try_from(record.sequence_number)
+                .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
+            Fact::from_value(record.payload, seq)
+        })
+        .collect()
+}
+
+/// Query only claim-lifecycle rows. This is the repository-wide collision
+/// seam for a path-scoped view; it deliberately does not load unrelated
+/// ledger facts, squads, health, or contributor activity.
+fn claim_lifecycle_facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
+    let query = store
+        .query(&FactQuery::for_event_types([
+            "claim",
+            "claim.renewed",
+            "claim.expired",
+            "release",
+            "resolve",
+            "receipt",
+        ]))
+        .map_err(|err| RallyError::Message(format!("query claim lifecycle facts: {err}")))?;
     query
         .event_records
         .into_iter()
@@ -3395,6 +3796,39 @@ fn facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> 
             fingerprint,
             facts: std::sync::Arc::new(facts.clone()),
         });
+    }
+    Ok(facts)
+}
+
+/// Read exactly one engagement's live and archive segments. Rotation moves a
+/// segment between these directories, so both locations are always unioned;
+/// `include_archived` is a projection policy, not a storage-location switch.
+fn facts_from_engagement_segments(
+    log_dir: &Path,
+    archive_dir: &Path,
+    engagement: &str,
+) -> Result<Vec<Fact>> {
+    let engagement = validate_scoped_engagement(engagement)?;
+    let file_name = format!("{engagement}.jsonl");
+    let mut entries = Vec::new();
+    entries.extend(read_segment_entries(&log_dir.join(&file_name))?);
+    entries.extend(read_segment_entries(&archive_dir.join(&file_name))?);
+    entries.sort_by_key(|entry| entry.seq);
+
+    let mut facts = Vec::with_capacity(entries.len());
+    let mut seen = BTreeMap::<i64, Value>::new();
+    for entry in entries {
+        if let Some(existing) = seen.get(&entry.seq) {
+            if existing != &entry.payload {
+                return Err(RallyError::Message(format!(
+                    "conflicting canonical rows for engagement {engagement:?} at seq {}: live/archive payloads differ",
+                    entry.seq
+                )));
+            }
+            continue;
+        }
+        seen.insert(entry.seq, entry.payload.clone());
+        facts.push(Fact::from_value(entry.payload, entry.seq)?);
     }
     Ok(facts)
 }
@@ -4998,6 +5432,24 @@ fn sanitise_engagement(value: &str) -> String {
         .collect()
 }
 
+/// Validate a caller-selected segment name. Unlike append routing, a scoped
+/// read must never silently rewrite a label and select a neighboring segment.
+fn validate_scoped_engagement(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    let cleaned = sanitise_engagement(trimmed);
+    if cleaned.is_empty() {
+        return Err(RallyError::Usage(
+            "scoped snapshot requires a non-empty engagement".to_string(),
+        ));
+    }
+    if value != trimmed || cleaned != trimmed {
+        return Err(RallyError::Usage(format!(
+            "invalid engagement label {value:?}: leading/trailing whitespace, path separators, and NUL bytes are not allowed"
+        )));
+    }
+    Ok(cleaned)
+}
+
 /// UTC date `YYYY-MM-DD` from `chrono::Utc::now()`.
 fn utc_date_label() -> String {
     // chrono::Utc is already a dep (lib.rs uses it for `now_string`); avoid
@@ -6567,6 +7019,328 @@ mod ledger_tests {
             uri: None,
             session: None,
         }
+    }
+
+    fn scoped_presence(event_id: &str, tool: &str) -> Fact {
+        Fact {
+            from_session_id: Some(format!("sess:{tool}")),
+            schema: fact_schema(),
+            event_id: event_id.to_string(),
+            seq: 0,
+            thread_id: format!("t-{event_id}"),
+            kind: FactKind::Presence,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("agent presence: {tool}"),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        }
+    }
+
+    /// S9 RED control: an engagement/run read must derive participation from
+    /// the selected segment instead of inheriting every repository squad.
+    #[test]
+    fn scoped_snapshot_suppresses_presence_noise_and_never_reads_other_segment() {
+        let root = unique_root("scoped-snapshot-audited-shape");
+        let mut store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+
+        for index in 1..=12 {
+            let tool = format!("codex:{index:02}");
+            store
+                .append_fact(&scoped_presence(&format!("presence-{index}"), &tool))
+                .unwrap();
+        }
+        let mut matched = make_fact(
+            "artifact-matched",
+            FactKind::Artifact,
+            "run:audit-run",
+            "matched",
+        );
+        matched.tool = Some("codex:01".to_string());
+        store.append_fact(&matched).unwrap();
+
+        store.set_active_engagement_for_test("engagement-beta");
+        let mut sentinel = make_fact(
+            "artifact-other-segment",
+            FactKind::Artifact,
+            "run:audit-run",
+            "must stay out",
+        );
+        sentinel.tool = Some("codex:99".to_string());
+        store.append_fact(&sentinel).unwrap();
+
+        let scoped = store
+            .snapshot_scoped("engagement-alpha", Some("audit-run"), None, false, false)
+            .unwrap();
+        assert_eq!(scoped.squads.len(), 1, "{:#?}", scoped.squads);
+        assert_eq!(scoped.squads[0].tool, "codex:01");
+        assert!(
+            scoped
+                .recent_artifacts
+                .iter()
+                .any(|fact| fact.event_id == "artifact-matched")
+        );
+        assert!(
+            scoped
+                .recent_artifacts
+                .iter()
+                .all(|fact| fact.event_id != "artifact-other-segment"),
+            "a selected-segment read leaked another engagement"
+        );
+
+        let with_presence = store
+            .snapshot_scoped("engagement-alpha", Some("audit-run"), None, false, true)
+            .unwrap();
+        assert_eq!(with_presence.squads.len(), 12);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scoped_path_joins_external_claim_without_external_contributor_credit() {
+        let root = unique_root("scoped-snapshot-external-claim");
+        let mut store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        let mut artifact = make_fact(
+            "artifact-alpha",
+            FactKind::Artifact,
+            "file:crates/rally-cli/src/store.rs",
+            "alpha work",
+        );
+        artifact.tool = Some("codex:alpha".to_string());
+        store.append_fact(&artifact).unwrap();
+
+        store.set_active_engagement_for_test("engagement-beta");
+        let mut external_claim = make_fact(
+            "claim-beta",
+            FactKind::Claim,
+            "file:crates/rally-cli/src/store.rs",
+            "beta collision claim",
+        );
+        external_claim.tool = Some("codex:beta".to_string());
+        external_claim.from_session_id = Some("sess:beta".to_string());
+        store.append_fact(&external_claim).unwrap();
+
+        let scoped = store
+            .snapshot_scoped(
+                "engagement-alpha",
+                None,
+                Some("crates/rally-cli/src/store.rs"),
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(
+            scoped
+                .active_claims
+                .iter()
+                .any(|fact| fact.event_id == "claim-beta"),
+            "the repo-wide collision claim must survive display scoping"
+        );
+        assert!(
+            scoped
+                .squads
+                .iter()
+                .any(|squad| squad.tool == "codex:alpha")
+        );
+        assert!(
+            scoped.squads.iter().all(|squad| squad.tool != "codex:beta"),
+            "an external collision claim must not add contributor credit"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scoped_snapshot_is_location_invariant_and_dedupes_live_archive_overlap() {
+        let root = unique_root("scoped-snapshot-location-invariant");
+        let store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        let artifact = make_fact(
+            "artifact-alpha",
+            FactKind::Artifact,
+            "run:audit-run",
+            "alpha work",
+        );
+        store.append_fact(&artifact).unwrap();
+
+        let live_path = store.active_segment_path();
+        let archive_path = store.archive_dir.join("engagement-alpha.jsonl");
+        fs::create_dir_all(&store.archive_dir).unwrap();
+        fs::copy(&live_path, &archive_path).unwrap();
+        let overlap = store
+            .snapshot_scoped("engagement-alpha", Some("audit-run"), None, false, false)
+            .unwrap();
+        assert_eq!(
+            overlap
+                .recent_artifacts
+                .iter()
+                .filter(|fact| fact.event_id == "artifact-alpha")
+                .count(),
+            1,
+            "live/archive overlap must dedupe by canonical sequence"
+        );
+
+        fs::remove_file(&archive_path).unwrap();
+        let before = store
+            .snapshot_scoped("engagement-alpha", Some("audit-run"), None, false, false)
+            .unwrap();
+        fs::rename(&live_path, &archive_path).unwrap();
+        let after = store
+            .snapshot_scoped("engagement-alpha", Some("audit-run"), None, false, false)
+            .unwrap();
+        assert_eq!(
+            snapshot_to_wire_value(&before).unwrap(),
+            snapshot_to_wire_value(&after).unwrap(),
+            "rotation must not change a non-decayed scoped snapshot"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scoped_snapshot_rejects_conflicting_live_archive_payload_at_same_sequence() {
+        let root = unique_root("scoped-snapshot-seq-conflict");
+        let store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        let artifact = make_fact(
+            "artifact-alpha",
+            FactKind::Artifact,
+            "run:audit-run",
+            "alpha work",
+        );
+        store.append_fact(&artifact).unwrap();
+
+        let live_path = store.active_segment_path();
+        let mut live_entry = read_segment_entries(&live_path).unwrap().remove(0);
+        live_entry.payload["subject"] = Value::String("conflicting payload".to_string());
+        fs::create_dir_all(&store.archive_dir).unwrap();
+        let archive_path = store.archive_dir.join("engagement-alpha.jsonl");
+        fs::write(
+            &archive_path,
+            format!("{}\n", serde_json::to_string(&live_entry).unwrap()),
+        )
+        .unwrap();
+
+        let err = store
+            .snapshot_scoped("engagement-alpha", Some("audit-run"), None, false, false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("conflicting canonical rows")
+                && err.to_string().contains("seq 1"),
+            "same-seq payload divergence must fail loudly: {err}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn current_engagement_binding_prefers_session_and_fails_closed_on_tool_ambiguity() {
+        let bindings = vec![
+            EngagementBinding {
+                session_id: "sess:alpha".to_string(),
+                tool: "codex:01".to_string(),
+                engagement: "engagement-alpha".to_string(),
+                active: true,
+                seq: 10,
+            },
+            EngagementBinding {
+                session_id: "sess:beta".to_string(),
+                tool: "codex:01".to_string(),
+                engagement: "engagement-beta".to_string(),
+                active: true,
+                seq: 11,
+            },
+        ];
+        assert_eq!(
+            resolve_current_engagement(
+                None,
+                Some("sess:alpha"),
+                Some("codex:01"),
+                &bindings,
+                Some("legacy-shared")
+            )
+            .unwrap(),
+            "engagement-alpha"
+        );
+        let err = resolve_current_engagement(
+            None,
+            None,
+            Some("codex:01"),
+            &bindings,
+            Some("legacy-shared"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        assert!(!err.to_string().contains("legacy-shared"), "{err}");
+
+        assert_eq!(
+            resolve_current_engagement(
+                None,
+                None,
+                Some("codex:01"),
+                &bindings[..1],
+                Some("legacy-shared"),
+            )
+            .unwrap(),
+            "engagement-alpha",
+            "a unique adopted-session binding must beat the shared legacy file"
+        );
+
+        let missing_session = resolve_current_engagement(
+            None,
+            Some("sess:missing"),
+            Some("codex:01"),
+            &bindings[..1],
+            Some("legacy-shared"),
+        )
+        .unwrap_err();
+        assert!(
+            missing_session.to_string().contains("explicit session"),
+            "{missing_session}"
+        );
+
+        let wrong_tool = resolve_current_engagement(
+            None,
+            Some("sess:alpha"),
+            Some("codex:02"),
+            &bindings[..1],
+            Some("legacy-shared"),
+        )
+        .unwrap_err();
+        assert!(wrong_tool.to_string().contains("not \"codex:02\""));
+
+        let inactive = EngagementBinding {
+            active: false,
+            seq: 12,
+            ..bindings[0].clone()
+        };
+        let inactive_err = resolve_current_engagement(
+            None,
+            Some("sess:alpha"),
+            Some("codex:01"),
+            &[bindings[0].clone(), inactive],
+            Some("legacy-shared"),
+        )
+        .unwrap_err();
+        assert!(inactive_err.to_string().contains("no active"));
     }
 
     /// The process-level contention controls acquire the database lock before
