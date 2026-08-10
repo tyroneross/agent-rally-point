@@ -61,6 +61,39 @@ struct ObservationStamp {
     seq: i64,
 }
 
+/// One probe pass indexed both by exact protocol session and by legacy tool.
+/// Destructive callers must use [`Self::for_claim`], never the tool aggregate
+/// directly: the aggregate exists only for claims that lack session identity.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ObservationIndex {
+    by_session: BTreeMap<(String, String), ObservedLiveness>,
+    by_tool: BTreeMap<String, ObservedLiveness>,
+}
+
+impl ObservationIndex {
+    pub(crate) fn for_claim(
+        &self,
+        tool: Option<&str>,
+        from_session_id: Option<&str>,
+    ) -> ObservedLiveness {
+        let Some(tool) = tool else {
+            return ObservedLiveness::Unknown;
+        };
+        match from_session_id {
+            Some(session_id) => self
+                .by_session
+                .get(&(tool.to_string(), session_id.to_string()))
+                .copied()
+                .unwrap_or(ObservedLiveness::Unknown),
+            None => self
+                .by_tool
+                .get(tool)
+                .copied()
+                .unwrap_or(ObservedLiveness::Unknown),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct WorktreeProbe {
     readable: bool,
@@ -310,15 +343,13 @@ fn aggregate(verdicts: impl IntoIterator<Item = ObservedLiveness>) -> ObservedLi
     }
 }
 
-/// Probe each latest stamped session and aggregate by tool. Any live sibling
-/// protects the tool; all known siblings must be stale before the tool is
-/// observed stale. Missing evidence does not create a map entry.
-pub(crate) fn observe_tools(
-    room_repo_root: &Path,
-    facts: &[Fact],
-) -> BTreeMap<String, ObservedLiveness> {
+/// Probe each latest stamped session once and retain both exact-session and
+/// tool-aggregate views. Sessionful claims use only the exact-session view;
+/// the tool aggregate is the explicit compatibility fallback for legacy,
+/// sessionless claims.
+pub(crate) fn observe_sessions(room_repo_root: &Path, facts: &[Fact]) -> ObservationIndex {
     let Some(expected_common_dir) = git_common_dir(room_repo_root) else {
-        return BTreeMap::new();
+        return ObservationIndex::default();
     };
     let mut latest: BTreeMap<(String, String), ObservationStamp> = BTreeMap::new();
     for stamp in facts.iter().filter_map(stamp_from_fact) {
@@ -332,6 +363,7 @@ pub(crate) fn observe_tools(
     }
 
     let mut worktrees: BTreeMap<PathBuf, WorktreeProbe> = BTreeMap::new();
+    let mut by_session = BTreeMap::new();
     let mut per_tool: BTreeMap<String, Vec<ObservedLiveness>> = BTreeMap::new();
     for stamp in latest.into_values() {
         let worktree = worktrees
@@ -341,15 +373,31 @@ pub(crate) fn observe_tools(
             worktree: worktree.clone(),
             pid_alive: stamp.observer_pid.and_then(process_alive),
         };
+        let verdict = grade_observation(&stamp, &sample);
+        by_session.insert((stamp.tool.clone(), stamp.session_key.clone()), verdict);
         per_tool
             .entry(stamp.tool.clone())
             .or_default()
-            .push(grade_observation(&stamp, &sample));
+            .push(verdict);
     }
-    per_tool
+    let by_tool = per_tool
         .into_iter()
         .map(|(tool, verdicts)| (tool, aggregate(verdicts)))
-        .collect()
+        .collect();
+    ObservationIndex {
+        by_session,
+        by_tool,
+    }
+}
+
+/// Non-destructive compatibility view used by room diagnostics and the
+/// store's legacy under-lock guard. New destructive decisions must use
+/// [`observe_sessions`] and [`ObservationIndex::for_claim`].
+pub(crate) fn observe_tools(
+    room_repo_root: &Path,
+    facts: &[Fact],
+) -> BTreeMap<String, ObservedLiveness> {
+    observe_sessions(room_repo_root, facts).by_tool
 }
 
 #[cfg(test)]
@@ -430,6 +478,39 @@ mod tests {
         assert_eq!(
             aggregate([ObservedLiveness::Stale, ObservedLiveness::Stale]),
             ObservedLiveness::Stale
+        );
+    }
+
+    #[test]
+    fn claim_observation_is_exact_session_with_legacy_tool_fallback() {
+        let index = ObservationIndex {
+            by_session: BTreeMap::from([
+                (
+                    ("agent".to_string(), "dead-owner".to_string()),
+                    ObservedLiveness::Stale,
+                ),
+                (
+                    ("agent".to_string(), "live-sibling".to_string()),
+                    ObservedLiveness::Live,
+                ),
+            ]),
+            by_tool: BTreeMap::from([("agent".to_string(), ObservedLiveness::Live)]),
+        };
+
+        assert_eq!(
+            index.for_claim(Some("agent"), Some("dead-owner")),
+            ObservedLiveness::Stale,
+            "a live sibling must not protect the dead claim owner"
+        );
+        assert_eq!(
+            index.for_claim(Some("agent"), Some("missing-session")),
+            ObservedLiveness::Unknown,
+            "missing exact-session evidence must fail closed"
+        );
+        assert_eq!(
+            index.for_claim(Some("agent"), None),
+            ObservedLiveness::Live,
+            "only a sessionless legacy claim may use the tool aggregate"
         );
     }
 

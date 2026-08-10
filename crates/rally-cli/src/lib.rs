@@ -1772,30 +1772,35 @@ fn hooks_prompt_mode(mode: HooksPromptModeArg) -> hooks_config::PromptMode {
 /// state (`say`, `check`, `next`, `enter`, …) so that an agent that skips an
 /// explicit `rally enter` still appears in `room.squads[]`.
 ///
-/// Idempotent: if a presence fact for `tool` already exists in this engagement
-/// (i.e. the tool already appears in `snapshot.squads`), this is a no-op.
-/// If no presence exists, writes exactly one `presence` fact, and if no
-/// `role:lead` decision exists yet, also writes one `decision` fact asserting
-/// `tool` as lead (first-enter-is-lead).
+/// Idempotent per protocol session: an existing presence for the same tool and
+/// `from_session_id` is a no-op. A sibling session sharing the tool writes its
+/// own presence. If no lead decision exists, the first eligible session also
+/// writes one decision asserting `tool` as lead (first-enter-is-lead).
 fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
     ensure_presence_tiered(room, tool, None)
 }
 
-/// Durably extend every active claim owned by `tool` from a self-authored
-/// heartbeat. The lease window stays size-scaled by the same policy used when
-/// the claim was acquired. A failure is returned to the heartbeat caller: a
-/// successful self-report must not claim renewal when the durable ledger did
-/// not advance.
+/// Durably extend every active claim owned by this exact tool session from a
+/// self-authored heartbeat. A same-tool sibling cannot renew it. The lease
+/// window stays size-scaled by the same policy used when the claim was
+/// acquired. A failure is returned to the heartbeat caller: a successful
+/// self-report must not claim renewal when the durable ledger did not advance.
 fn renew_owned_claim_leases(room: &RoomStore, tool: &str) -> Result<usize> {
     let snapshot = room.snapshot()?;
+    let from_session_id = current_protocol_session(Some(tool))
+        .from_session_id()
+        .to_string();
     let coord = hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
     let now = chrono::Utc::now();
     let mut renewed = 0;
-    for claim in snapshot
-        .active_claims
-        .iter()
-        .filter(|claim| claim.tool.as_deref() == Some(tool))
-    {
+    for claim in snapshot.active_claims.iter().filter(|claim| {
+        claim_authority::same_session_owner(
+            claim.tool.as_deref(),
+            claim.from_session_id.as_deref(),
+            Some(tool),
+            Some(&from_session_id),
+        )
+    }) {
         let resource_scopes = claim
             .scope
             .iter()
@@ -1870,20 +1875,36 @@ fn presence_signal_evidence(room: &RoomStore) -> Vec<String> {
 /// the lead seat — it stays open until a frontier agent (or user-designated
 /// lead) joins. See docs/SPEC-lead-agent.md.
 fn ensure_presence_tiered(room: &RoomStore, tool: &str, tier: Option<&str>) -> Result<()> {
-    let snapshot = room.snapshot()?;
-    // Already in the room — nothing to do.
-    if snapshot.squads.iter().any(|s| s.tool == tool) {
+    let from_session_id = current_protocol_session(Some(tool))
+        .from_session_id()
+        .to_string();
+    ensure_presence_tiered_for_session(room, tool, tier, &from_session_id)
+}
+
+fn ensure_presence_tiered_for_session(
+    room: &RoomStore,
+    tool: &str,
+    tier: Option<&str>,
+    from_session_id: &str,
+) -> Result<()> {
+    let facts = room.facts()?;
+    if facts.iter().any(|fact| {
+        fact.kind == FactKind::Presence
+            && claim_authority::same_session_owner(
+                fact.tool.as_deref(),
+                fact.from_session_id.as_deref(),
+                Some(tool),
+                Some(from_session_id),
+            )
+    }) {
         return Ok(());
     }
+    let snapshot = room.snapshot()?;
     // R9 stale-binary guard: embed the build-id in the presence fact's summary
     // so that `command_enter` can detect when different builds are writing to
     // the same room.  Format: "build_id:<BUILD_ID>" — minimal, no schema bump.
     let presence_fact = Fact {
-        from_session_id: Some(
-            current_protocol_session(Some(tool))
-                .from_session_id()
-                .to_string(),
-        ),
+        from_session_id: Some(from_session_id.to_string()),
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
@@ -3594,7 +3615,23 @@ fn command_version(args: VersionArgs) -> Result<Output> {
 /// session_id is stable across CLI invocations from the same endpoint until a
 /// registry-backed lease exists.
 fn current_protocol_session(tool: Option<&str>) -> session_identity::ProtocolSessionIdentity {
-    let endpoint = session_identity::derive_endpoint(&session_identity::EndpointInputs::from_env());
+    let mut inputs = session_identity::EndpointInputs::from_env();
+    // In hook/non-interactive invocations the short-lived `rally` child pid is
+    // not a stable session endpoint. The host-supplied observer pid identifies
+    // the long-lived agent process and therefore keeps presence, claims, and
+    // renewal on one lease across CLI invocations. Higher-fidelity managed,
+    // tmux, and terminal identities retain their normal precedence.
+    if inputs.managed_session_id.is_none()
+        && inputs.tmux_pane.is_none()
+        && inputs.term_session_id.is_none()
+        && inputs.tty.is_none()
+        && let Ok(raw) = env::var("RALLY_OBSERVER_PID")
+        && let Ok(pid) = raw.parse::<u32>()
+        && pid > 1
+    {
+        inputs.pid = Some(pid);
+    }
+    let endpoint = session_identity::derive_endpoint(&inputs);
     let raw_tool = tool.unwrap_or("unknown");
     let (tool_type, actor) = match raw_tool.split_once(':') {
         Some((t, a)) if !a.is_empty() => (t, Some(a)),
@@ -8348,7 +8385,11 @@ mod tests {
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         ensure_presence(&room, "tool-x").unwrap();
         let claim = store::Fact {
-            from_session_id: None,
+            from_session_id: Some(
+                current_protocol_session(Some("tool-x"))
+                    .from_session_id()
+                    .to_string(),
+            ),
             schema: FACT_SCHEMA.to_string(),
             event_id: "claim-heartbeat-renew".to_string(),
             seq: 0,
@@ -8379,6 +8420,45 @@ mod tests {
         assert_eq!(
             facts.last().unwrap().ref_id.as_deref(),
             Some("claim-heartbeat-renew")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn heartbeat_does_not_renew_same_tool_sibling_claim() {
+        let root = unique_root("heartbeat-session-owner");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let claim = store::Fact {
+            from_session_id: Some("sess:sibling".to_string()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: "claim-sibling".to_string(),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Claim,
+            tool: Some("tool-x".to_string()),
+            role: None,
+            subject: "sibling claim".to_string(),
+            scope: vec!["file:src/sibling.rs".to_string()],
+            created_at: now_string(),
+            summary: None,
+            evidence: vec!["lease_expires_at:2000-01-01T00:00:00Z".to_string()],
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&claim).unwrap();
+
+        assert_eq!(renew_owned_claim_leases(&room, "tool-x").unwrap(), 0);
+        assert!(
+            room.facts()
+                .unwrap()
+                .iter()
+                .all(|fact| fact.kind != store::FactKind::ClaimRenewed),
+            "a same-tool sibling heartbeat must not renew the claim"
         );
         std::fs::remove_dir_all(root).ok();
     }
@@ -8452,6 +8532,28 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ensure_presence_registers_same_tool_sibling_session() {
+        let root = unique_root("ensure-presence-sibling");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+
+        ensure_presence_tiered_for_session(&room, "tool-x", None, "session-a").unwrap();
+        ensure_presence_tiered_for_session(&room, "tool-x", None, "session-b").unwrap();
+
+        let sessions = room
+            .facts()
+            .unwrap()
+            .into_iter()
+            .filter(|fact| {
+                fact.kind == store::FactKind::Presence && fact.tool.as_deref() == Some("tool-x")
+            })
+            .filter_map(|fact| fact.from_session_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(sessions.len(), 2, "each sibling session needs presence");
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// Component B acceptance test 3: a second tool auto-enters but lead stays

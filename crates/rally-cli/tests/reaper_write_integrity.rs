@@ -10,10 +10,9 @@
 //! guard against by counting a failed append as `preserved` and omitting the
 //! entry.
 //!
-//! D8: the auto-reap rate limiter is a plain read-then-write with no lock, so
-//! its bound is SEQUENTIAL ONLY. These tests grade the bound the code actually
-//! delivers (one pass per interval when enters do not overlap) rather than the
-//! concurrent bound the old comment claimed and the code never had.
+//! D8: the auto-reap interval marker is guarded by an atomic single-flight
+//! token. These process-level tests grade interval behavior; the deterministic
+//! overlapping-admission test lives next to the token in `reaper.rs`.
 //!
 //! Failure injection is filesystem-level: `.rally/log/` is made read-only, so
 //! the canonical segment append fails while every read path (snapshot,
@@ -508,21 +507,19 @@ fn failed_claim_expiry_write_is_not_reported_as_reaped() {
 }
 
 // =============================================================================
-// D8 — the rate limiter's real bound is sequential, and only sequential
+// D8 — process-level interval behavior (single-flight is unit-graded)
 // =============================================================================
 
-/// D8, option (b): the marker is a read-then-write with no lock, so it bounds
-/// how OFTEN a pass runs, never how MANY run concurrently. This grades the
-/// guarantee the code actually delivers — a second `enter` inside the interval
-/// runs no pass — and deliberately asserts nothing about N overlapping enters,
-/// because the code establishes no such bound and the comment no longer claims
-/// one.
+/// The interval marker bounds how often completed passes run. Atomic admission
+/// for overlapping enters is tested directly in `reaper.rs`, where a barrier
+/// can keep the winning token alive until every contender has attempted it.
 #[test]
-fn auto_reap_interval_gate_holds_for_sequential_enters_only() {
+fn auto_reap_interval_gate_holds_between_completed_enters() {
     let room = TempRoom::new("d8-sequential-gate");
     room.init_observed_worktree();
     let owner_enter = room
         .rally()
+        .env("RALLY_SESSION_ID", "owner-session")
         .env("RALLY_OBSERVER_PID", "2000000000")
         .args([
             "enter",
@@ -540,21 +537,31 @@ fn auto_reap_interval_gate_holds_for_sequential_enters_only() {
         String::from_utf8_lossy(&owner_enter.stderr)
     );
     let seed_claim = |subject: &str, path: &str| {
-        room.run_ok(&[
-            "say",
-            "claim",
-            "--tool",
-            "owner:01",
-            "--subject",
-            subject,
-            "--scope",
-            path,
-            "--evidence",
-            "lease_expires_at:2000-01-01T00:00:00Z",
-            "--json",
-            "--timeout-ms",
-            TIMEOUT_MS,
-        ]);
+        let out = room
+            .rally()
+            .env("RALLY_SESSION_ID", "owner-session")
+            .args([
+                "say",
+                "claim",
+                "--tool",
+                "owner:01",
+                "--subject",
+                subject,
+                "--scope",
+                path,
+                "--evidence",
+                "lease_expires_at:2000-01-01T00:00:00Z",
+                "--json",
+                "--timeout-ms",
+                TIMEOUT_MS,
+            ])
+            .output()
+            .expect("spawn owner claim");
+        assert!(
+            out.status.success(),
+            "owner claim must succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     seed_claim("claim-a", "file:src/a.rs");
 

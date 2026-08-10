@@ -204,6 +204,12 @@ pub(crate) fn latest_renewed_lease(claim: &Fact, facts: &[Fact]) -> Option<Strin
             fact.kind == FactKind::ClaimRenewed
                 && fact.ref_id.as_deref() == Some(claim.event_id.as_str())
                 && fact.tool == claim.tool
+                && same_session_owner(
+                    fact.tool.as_deref(),
+                    fact.from_session_id.as_deref(),
+                    claim.tool.as_deref(),
+                    claim.from_session_id.as_deref(),
+                )
         })
         .filter_map(|fact| {
             let lease = lease_expires_at(fact)?;
@@ -222,7 +228,12 @@ pub(crate) fn detect_conflict(facts: &[Fact], incoming: &Fact) -> Option<ClaimCo
     }
     let incoming = active_claim_record_from_fact(incoming)?;
     for existing in active_claim_records(facts) {
-        if existing.owner_tool == incoming.owner_tool {
+        if same_session_owner(
+            existing.owner_tool.as_deref(),
+            existing.from_session_id.as_deref(),
+            incoming.owner_tool.as_deref(),
+            incoming.from_session_id.as_deref(),
+        ) {
             continue;
         }
         for new_scope in &incoming.resource_scopes {
@@ -239,6 +250,28 @@ pub(crate) fn detect_conflict(facts: &[Fact], incoming: &Fact) -> Option<ClaimCo
         }
     }
     None
+}
+
+/// Whether two facts belong to the same lease owner.
+///
+/// Session identity is authoritative when present. Tool-only equality is an
+/// explicit compatibility fallback only when both facts predate session
+/// stamping. A sessionful fact never aliases a sessionless fact, and sibling
+/// sessions of one tool never inherit each other's authority.
+pub(crate) fn same_session_owner(
+    left_tool: Option<&str>,
+    left_session: Option<&str>,
+    right_tool: Option<&str>,
+    right_session: Option<&str>,
+) -> bool {
+    if left_tool != right_tool {
+        return false;
+    }
+    match (left_session, right_session) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Is this a lead-family decision (seat taken, or seat reopened)?
@@ -467,6 +500,40 @@ mod tests {
         let conflict = detect_conflict(&[existing], &incoming).unwrap();
         assert_eq!(conflict.existing_claim_id, "claim-a");
         assert_eq!(conflict.scope, "file:src/lib.rs");
+    }
+
+    #[test]
+    fn same_tool_sibling_session_cannot_bypass_claim_conflict() {
+        let mut existing = fact("claim-a", "tool-a", vec!["file:src/lib.rs"]);
+        existing.from_session_id = Some("session-a".to_string());
+        existing.evidence = vec!["lease_expires_at:2000-01-01T00:00:00Z".to_string()];
+        let mut incoming = fact("claim-b", "tool-a", vec!["file:src/lib.rs"]);
+        incoming.from_session_id = Some("session-b".to_string());
+
+        let conflict = detect_conflict(&[existing], &incoming)
+            .expect("an expired lease remains held until session-aware reaping closes it");
+        assert_eq!(conflict.existing_claim_id, "claim-a");
+    }
+
+    #[test]
+    fn sibling_renewal_does_not_extend_claim_lease() {
+        let mut claim = fact("claim-a", "tool-a", vec!["file:src/lib.rs"]);
+        claim.from_session_id = Some("session-a".to_string());
+        claim.evidence = vec!["lease_expires_at:2026-01-01T00:00:00Z".to_string()];
+        let renewal = Fact {
+            kind: FactKind::ClaimRenewed,
+            event_id: "renewal-b".to_string(),
+            ref_id: Some(claim.event_id.clone()),
+            from_session_id: Some("session-b".to_string()),
+            evidence: vec!["lease_expires_at:2099-01-01T00:00:00Z".to_string()],
+            ..fact("renewal-template", "tool-a", vec![])
+        };
+
+        assert_eq!(
+            latest_renewed_lease(&claim, &[renewal]),
+            None,
+            "a same-tool sibling must not renew another session's lease"
+        );
     }
 
     fn lead_decision(tool: &str, seq: i64) -> Fact {

@@ -4352,6 +4352,49 @@ fn rally_owners_dirty_maps_dirty_path_to_claim_session() {
     workspace.cleanup();
 }
 
+#[test]
+fn same_tool_sibling_session_cannot_claim_owned_path() {
+    let workspace = Workspace::new("session-scoped-claim-admission");
+    let claim = |session: &str, subject: &str| {
+        Command::new(env!("CARGO_BIN_EXE_rally"))
+            .current_dir(&workspace.cwd)
+            .env("HOME", &workspace.home)
+            .env("RALLY_NO_WORKTREE", "1")
+            .env("RALLY_SESSION_ID", session)
+            .args([
+                "say",
+                "claim",
+                "--json",
+                "--tool",
+                "codex:shared",
+                "--subject",
+                subject,
+                "--path",
+                "src/session-owned.rs",
+            ])
+            .output()
+            .expect("spawn rally claim")
+    };
+
+    let owner = claim("session-owner", "owner claim");
+    assert!(
+        owner.status.success(),
+        "owner claim failed: {}",
+        String::from_utf8_lossy(&owner.stderr)
+    );
+    let sibling = claim("session-sibling", "sibling claim");
+    assert!(
+        !sibling.status.success(),
+        "same-tool sibling must not bypass exclusive claim authority"
+    );
+    assert!(
+        String::from_utf8_lossy(&sibling.stderr).contains("claim conflict"),
+        "failure must identify the existing claim: {}",
+        String::from_utf8_lossy(&sibling.stderr)
+    );
+    workspace.cleanup();
+}
+
 // =============================================================================
 // Rank-11: rally mission — room north-star + per-agent autonomy envelope
 // =============================================================================

@@ -17,6 +17,8 @@
 
 use schemars::JsonSchema;
 use serde::Serialize;
+use std::fs::OpenOptions;
+use std::path::PathBuf;
 
 use crate::error::Result;
 use crate::store::{Fact, FactKind, RoomStore};
@@ -178,16 +180,57 @@ pub(crate) fn run_reap_stale(apply: bool) -> Result<ReapReport> {
 ///    store-corruption path. Adding a mutation-heavy pass to it widened a known
 ///    defect without a control.
 ///
-/// Durable renewal and observed-dead corroboration now close the live-claim
-/// safety defect. The call site stays opt-in because the interval marker still
-/// has no cross-process compare-and-swap (concurrent enters may each run a
-/// pass), legacy claims have no observer stamp, and changing a destructive
-/// default remains an operator decision. The evidence supports "safe when
-/// opted in for stamped sessions," not a default flip.
+/// Durable renewal and observed-dead corroboration now make the unlocked
+/// decision session-specific. The call site stays opt-in because the store's
+/// under-lock recheck must receive the same session key after this lane merges,
+/// legacy claims have no session-specific observer stamp, and storage/transport
+/// scale gates remain open. Single-flight and bounds are necessary rather than
+/// sufficient for a default flip.
 pub(crate) const DEFAULT_AUTO_REAP_INTERVAL_SECS: i64 = 0;
 
 /// Marker recording the last auto-reap, relative to `.rally/`.
 const AUTO_REAP_MARKER: &str = ".last-auto-reap";
+const AUTO_REAP_FLIGHT: &str = ".auto-reap-in-flight";
+
+struct AutoReapFlight {
+    path: PathBuf,
+}
+
+impl Drop for AutoReapFlight {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Atomically admit one automatic pass across concurrent processes.
+///
+/// `create_new` is the cross-process compare-and-set: exactly one entrant can
+/// create the file. A crashed holder leaves the automatic path fail-closed
+/// until an operator removes the diagnostic file; auto-reap remains default
+/// off, so recovery must never guess that a destructive pass is abandoned.
+fn try_auto_reap_flight(room: &RoomStore) -> Option<AutoReapFlight> {
+    let path = room.repo_root().join(".rally").join(AUTO_REAP_FLIGHT);
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "rally: auto-reap single-flight directory unavailable ({}): {err}",
+            parent.display()
+        );
+        return None;
+    }
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(_) => Some(AutoReapFlight { path }),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => None,
+        Err(err) => {
+            eprintln!(
+                "rally: auto-reap single-flight unavailable ({}): {err}",
+                path.display()
+            );
+            None
+        }
+    }
+}
 
 /// Run the reaper from `rally enter`, at most once per interval.
 ///
@@ -204,12 +247,11 @@ const AUTO_REAP_MARKER: &str = ".last-auto-reap";
 /// Three properties this must not violate:
 /// - **Never fails `enter`.** Any error is reported to stderr and swallowed.
 ///   Cleanup is not worth blocking an agent's session start.
-/// - **Rate-limited by a file marker, not by the ledger — SEQUENTIALLY only.**
+/// - **Rate-limited and single-flight by files outside the ledger.**
 ///   The marker is `.rally/.last-auto-reap`; a missing or unparseable marker
 ///   reaps (fail-toward-cleanup, since the reaper's own eligibility math is
-///   fail-closed). This bounds how OFTEN a pass may run, not how MANY may run
-///   at once: see D8 at the marker write below for the concurrent bound the
-///   check-and-set does not deliver.
+///   fail-closed). `.auto-reap-in-flight` uses `O_EXCL` admission so overlapping
+///   enters cannot each run a pass.
 /// - **Opt-out.** `RALLY_NO_AUTO_REAP=1`, or `auto_reap_interval_secs: 0`.
 ///
 /// Returns the report when a reap ran, `None` when it was skipped.
@@ -222,6 +264,8 @@ pub(crate) fn maybe_reap_on_enter(room: &RoomStore) -> Option<ReapReport> {
     if interval <= 0 {
         return None;
     }
+
+    let _flight = try_auto_reap_flight(room)?;
 
     let marker = room.repo_root().join(".rally").join(AUTO_REAP_MARKER);
     let now = chrono::Utc::now();
@@ -239,31 +283,8 @@ pub(crate) fn maybe_reap_on_enter(room: &RoomStore) -> Option<ReapReport> {
         }
     }
 
-    // Stamp the interval BEFORE reaping.
-    //
-    // D8 — THE BOUND THIS DOES NOT DELIVER. The comment here used to claim "at
-    // most one extra pass runs instead of one per agent". It does not. The read
-    // above and the write below are two separate syscalls with no lock, no
-    // `O_EXCL`, and no compare-and-swap, so N processes that all read the stale
-    // marker before any of them writes it ALL proceed: under N concurrent
-    // `rally enter` calls, N passes fire. The honest bound is:
-    //
-    // - **Sequential:** at most one pass per `interval` — the age check above
-    //   is a real gate once a previous pass's marker is visible.
-    // - **Concurrent:** UNBOUNDED in the number of overlapping enters. Nothing
-    //   here serialises them.
-    //
-    // Why the racy version stays rather than growing a lock here: the correct
-    // primitive already exists as `store::acquire_room_mutation_lock`, and it
-    // is private to `store.rs`. A second, differently-shaped lock in this file
-    // would be the divergence, not the fix — the fix is to export that one.
-    // Meanwhile the exposure is capped from the other side: auto-reap is OFF by
-    // default (`DEFAULT_AUTO_REAP_INTERVAL_SECS`), each pass is
-    // `ReapMode::LeaseOnly` and capped at `AUTO_REAP_MAX_FACTS`, and the reap
-    // is idempotent, so a duplicated pass wastes work rather than corrupting
-    // state. That is a cost argument, not a bound, and it is the reason the
-    // "concurrent enter is bounded" gate on turning this default back on is
-    // still OPEN.
+    // Stamp the interval BEFORE reaping while the cross-process flight token is
+    // held. Concurrent enters cannot pass this marker check-and-set together.
     if let Some(parent) = marker.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -329,6 +350,10 @@ pub(crate) enum ReapMode {
 /// resumes on the next interval instead; the reaper is idempotent, so a partial
 /// pass is a shorter pass, not a broken one.
 const AUTO_REAP_MAX_FACTS: usize = 200;
+
+fn auto_candidate_limit_reached(mode: ReapMode, attempted_actions: usize) -> bool {
+    mode == ReapMode::LeaseOnly && attempted_actions >= AUTO_REAP_MAX_FACTS
+}
 
 /// Wall-clock budget one `--apply` pass may spend appending, in milliseconds.
 ///
@@ -402,9 +427,9 @@ fn run_reap_stale_in_room_with_budget(
     // claim, handoff, or lead action observes the same elapsed-time budget.
     let mut attempted_actions: usize = 0;
 
-    // Identify the stale-owner set at snapshot time (squad-level, 2h bar).
-    // Used for the lead relinquish decision; claim eligibility is per-claim
-    // (size-scaled via claim_reclaim_eligible, which composes the same logic).
+    // Identify the legacy stale-owner set at snapshot time (squad-level, 2h
+    // bar). Lead relinquish still uses this tool-scoped projection. Sessionful
+    // claim eligibility below instead requires the exact observed session.
     let stale_owners = snapshot.takeover_eligible_owners();
 
     // Compute the lease-expired claim_id set: claims whose OWN lease timestamp
@@ -412,7 +437,7 @@ fn run_reap_stale_in_room_with_budget(
     // fail-closed: expired_claims only includes claims with a parseable
     // lease_expires_at <= now; unparseable or missing lease → not included.
     let facts = room.facts()?;
-    let observed_tools = crate::observed_liveness::observe_tools(room.repo_root(), &facts);
+    let observed_sessions = crate::observed_liveness::observe_sessions(room.repo_root(), &facts);
     let claim_index = crate::claim_authority::index_from_facts(&facts);
     let lease_expired_ids: std::collections::BTreeSet<String> =
         crate::claim_authority::expired_claims(&claim_index, &facts, chrono::Utc::now())
@@ -422,13 +447,19 @@ fn run_reap_stale_in_room_with_budget(
 
     // --- Evaluate each active claim ---
     for claim in &snapshot.active_claims {
-        let (owner_eligible, _size) = snapshot.claim_reclaim_eligible(claim, &coord);
+        let (legacy_owner_eligible, _size) = snapshot.claim_reclaim_eligible(claim, &coord);
         let lease_eligible = lease_expired_ids.contains(&claim.event_id);
-        let observed = claim
-            .tool
-            .as_deref()
-            .and_then(|tool| observed_tools.get(tool).copied())
-            .unwrap_or(crate::observed_liveness::ObservedLiveness::Unknown);
+        let observed =
+            observed_sessions.for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref());
+        // A sessionful claim never falls back to tool-wide activity. Exact
+        // observed death is its owner-stale authority; Unknown stays closed.
+        // Only legacy claims without a session id retain the historical squad
+        // timestamp predicate because no more precise owner exists for them.
+        let owner_eligible = if claim.from_session_id.is_some() {
+            observed == crate::observed_liveness::ObservedLiveness::Stale
+        } else {
+            legacy_owner_eligible
+        };
         let observed_verdict = crate::liveness::is_live(
             &crate::liveness::LivenessSignals {
                 observed_alive: observed.as_signal(),
@@ -446,8 +477,10 @@ fn run_reap_stale_in_room_with_budget(
             continue;
         }
 
-        // A claim is reaped when EITHER its owner-squad is >timeout stale OR
-        // its own lease has provably expired. Both signals are fail-closed.
+        // A claim is reaped when EITHER its owner is provably stale OR its own
+        // lease has provably expired. Sessionful owners require exact observed
+        // death; only sessionless legacy owners use squad age. Both signals are
+        // fail-closed.
         //
         // ReapMode::LeaseOnly drops the owner-stale signal. `last_seen_ts` is
         // the `created_at` of the highest-seq fact naming that tool, written
@@ -466,16 +499,16 @@ fn run_reap_stale_in_room_with_budget(
             preserved += 1;
             continue;
         }
-        if mode == ReapMode::LeaseOnly && claims_reaped.len() >= AUTO_REAP_MAX_FACTS {
-            preserved += 1;
+        if auto_candidate_limit_reached(mode, attempted_actions) {
+            remaining += 1;
             continue;
         }
-        // Guaranteed forward progress: the FIRST eligible action is always
-        // attempted, even when the opening projection already spent the budget.
-        // Without this floor a ledger slow enough to exhaust the budget before
-        // the loop starts would return `remaining: N` forever and never shrink,
-        // which is the failure this budget exists to end.
-        if attempted_actions > 0 && budget.is_some_and(|b| started.elapsed() >= b) {
+        // Automatic enter cleanup never starts a destructive action after its
+        // budget is spent. A deliberate Full pass retains the historical
+        // one-action progress floor so a slow ledger can still be drained.
+        if budget.is_some_and(|b| started.elapsed() >= b)
+            && (mode == ReapMode::LeaseOnly || attempted_actions > 0)
+        {
             remaining += 1;
             continue;
         }
@@ -541,6 +574,10 @@ fn run_reap_stale_in_room_with_budget(
                         "reaper:owner={}",
                         claim.tool.as_deref().unwrap_or("unknown")
                     ),
+                    format!(
+                        "reaper:owner_session={}",
+                        claim.from_session_id.as_deref().unwrap_or("legacy")
+                    ),
                 ],
                 target: None,
                 ref_id: Some(claim.event_id.clone()),
@@ -593,7 +630,13 @@ fn run_reap_stale_in_room_with_budget(
                 preserved += 1;
                 continue;
             }
-            if attempted_actions > 0 && budget.is_some_and(|b| started.elapsed() >= b) {
+            if auto_candidate_limit_reached(mode, attempted_actions) {
+                remaining += 1;
+                continue;
+            }
+            if budget.is_some_and(|b| started.elapsed() >= b)
+                && (mode == ReapMode::LeaseOnly || attempted_actions > 0)
+            {
                 remaining += 1;
                 continue;
             }
@@ -669,7 +712,9 @@ fn run_reap_stale_in_room_with_budget(
     // log, count as preserved, omit from the report.
     let lead_relinquished: Option<String> = if let Some(lead_tool) = &snapshot.lead {
         if stale_owners.contains(lead_tool.as_str()) {
-            if attempted_actions > 0 && budget.is_some_and(|b| started.elapsed() >= b) {
+            let budget_spent = budget.is_some_and(|b| started.elapsed() >= b)
+                && (mode == ReapMode::LeaseOnly || attempted_actions > 0);
+            if auto_candidate_limit_reached(mode, attempted_actions) || budget_spent {
                 remaining += 1;
                 None
             } else {
@@ -821,10 +866,26 @@ mod tests {
         worktree: &std::path::Path,
         pid: u32,
     ) {
+        append_observed_presence_for_session(
+            room,
+            tool,
+            &format!("sess:test:{tool}"),
+            worktree,
+            pid,
+        );
+    }
+
+    fn append_observed_presence_for_session(
+        room: &RoomStore,
+        tool: &str,
+        from_session_id: &str,
+        worktree: &std::path::Path,
+        pid: u32,
+    ) {
         let head = crate::observed_liveness::current_head_sha(worktree).expect("fixture HEAD");
         let worktree = fs::canonicalize(worktree).unwrap();
         let fact = Fact {
-            from_session_id: Some(format!("sess:test:{tool}")),
+            from_session_id: Some(from_session_id.to_string()),
             schema: FACT_SCHEMA.to_string(),
             event_id: new_id("fact"),
             seq: 0,
@@ -1246,6 +1307,81 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_auto_reap_admission_is_single_flight() {
+        let root = unique_root("auto-reap-single-flight");
+        let contenders = 12;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(contenders));
+        let hold = std::sync::Arc::new(std::sync::Barrier::new(contenders));
+        let mut joins = Vec::new();
+        for _ in 0..contenders {
+            let root = root.clone();
+            let start = start.clone();
+            let hold = hold.clone();
+            joins.push(std::thread::spawn(move || {
+                let room = RoomStore::open_at(root).unwrap();
+                start.wait();
+                let flight = try_auto_reap_flight(&room);
+                // Keep the winner's O_EXCL token alive until every contender
+                // has attempted admission; this grades overlapping enters,
+                // not sequential reuse after a completed pass.
+                hold.wait();
+                flight.is_some()
+            }));
+        }
+        let admitted = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, 1, "exactly one overlapping enter may reap");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn automatic_candidate_limit_counts_attempts_not_successes() {
+        assert!(!auto_candidate_limit_reached(
+            ReapMode::LeaseOnly,
+            AUTO_REAP_MAX_FACTS - 1
+        ));
+        assert!(auto_candidate_limit_reached(
+            ReapMode::LeaseOnly,
+            AUTO_REAP_MAX_FACTS
+        ));
+        assert!(
+            !auto_candidate_limit_reached(ReapMode::Full, usize::MAX),
+            "the operator-invoked mode is governed by its wall-clock budget"
+        );
+    }
+
+    #[test]
+    fn automatic_pass_starts_no_action_after_budget_is_spent() {
+        let root = unique_root("auto-reap-zero-budget");
+        init_observed_worktree(&root);
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        append_observed_presence(&room, "owner", &root, 2_000_000_000);
+        let claim = append_claim_with_lease(&room, "claim-zero-budget", "owner", &past_ts(3600));
+
+        let report = run_reap_stale_in_room_with_budget(
+            &room,
+            true,
+            ReapMode::LeaseOnly,
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+        assert_eq!(report.attempted_writes, 0);
+        assert_eq!(report.remaining, 1);
+        assert!(
+            room.snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|active| active.event_id == claim.event_id),
+            "budget exhaustion must preserve the claim"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn automatic_pass_preserves_quiet_live_agent_and_reaps_crashed_agent() {
         let root = unique_root("observed-live-and-crashed");
         init_observed_worktree(&root);
@@ -1272,6 +1408,64 @@ mod tests {
             !active
                 .iter()
                 .any(|claim| claim.event_id == crashed_claim.event_id)
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn live_same_tool_sibling_does_not_protect_dead_claim_owner() {
+        let root = unique_root("session-observed-sibling");
+        init_observed_worktree(&root);
+        let room = RoomStore::open_at(root.clone()).unwrap();
+
+        append_observed_presence_for_session(
+            &room,
+            "shared-tool",
+            "session-dead",
+            &root,
+            2_000_000_000,
+        );
+        append_observed_presence_for_session(
+            &room,
+            "shared-tool",
+            "session-live",
+            &root,
+            std::process::id(),
+        );
+        let dead_claim = append_session_claim_with_lease(
+            &room,
+            "claim-dead-session",
+            "shared-tool",
+            "session-dead",
+            &past_ts(3600),
+        );
+        let live_claim = append_session_claim_with_lease(
+            &room,
+            "claim-live-session",
+            "shared-tool",
+            "session-live",
+            &past_ts(3600),
+        );
+
+        // Dry-run isolates the session-aware decision. The store mutation-lock
+        // recheck is intentionally outside this lane and still aggregates by
+        // tool until the merge seam documented in the handoff is updated.
+        let report = run_reap_stale_in_room_with_mode(&room, false, ReapMode::LeaseOnly).unwrap();
+        assert_eq!(
+            report
+                .claims_reaped
+                .iter()
+                .map(|claim| claim.claim_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![dead_claim.event_id.as_str()],
+            "the exact dead session is eligible even while its sibling is live"
+        );
+        assert!(
+            report
+                .claims_reaped
+                .iter()
+                .all(|claim| claim.claim_id != live_claim.event_id),
+            "the live sibling's own claim must survive"
         );
         fs::remove_dir_all(root).ok();
     }
@@ -1927,6 +2121,37 @@ mod tests {
                 format!("file:src/a_{event_id}.rs"),
                 format!("file:src/b_{event_id}.rs"),
             ],
+            created_at: now_string(),
+            summary: None,
+            evidence: vec![format!("lease_expires_at:{lease_ts}")],
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&fact).unwrap()
+    }
+
+    fn append_session_claim_with_lease(
+        room: &RoomStore,
+        event_id: &str,
+        tool: &str,
+        from_session_id: &str,
+        lease_ts: &str,
+    ) -> Fact {
+        let fact = Fact {
+            from_session_id: Some(from_session_id.to_string()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: event_id.to_string(),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Claim,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("claim: {tool}/{from_session_id}"),
+            scope: vec![format!("file:src/session_{event_id}.rs")],
             created_at: now_string(),
             summary: None,
             evidence: vec![format!("lease_expires_at:{lease_ts}")],
