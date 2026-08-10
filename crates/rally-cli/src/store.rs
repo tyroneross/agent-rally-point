@@ -75,7 +75,45 @@ thread_local! {
     static MUTATION_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
     #[cfg(test)]
     static FORCE_WARM_CLOSE_SPAWN_FAILURE: Cell<bool> = const { Cell::new(false) };
+    #[cfg(test)]
+    static FORCE_ROOM_LOCK_POST_FLOCK_PAUSE: Cell<Option<Duration>> = const { Cell::new(None) };
+    #[cfg(test)]
+    static FORCE_OWNER_LOCK_POST_FLOCK_PAUSE: Cell<Option<Duration>> = const { Cell::new(None) };
 }
+
+#[cfg(test)]
+pub(crate) fn force_next_room_lock_post_flock_pause(pause: Duration) {
+    FORCE_ROOM_LOCK_POST_FLOCK_PAUSE.with(|slot| slot.set(Some(pause)));
+}
+
+#[cfg(test)]
+fn pause_after_room_lock_flock_for_test() {
+    FORCE_ROOM_LOCK_POST_FLOCK_PAUSE.with(|slot| {
+        if let Some(pause) = slot.take() {
+            thread::sleep(pause);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn pause_after_room_lock_flock_for_test() {}
+
+#[cfg(test)]
+fn force_next_owner_lock_post_flock_pause(pause: Duration) {
+    FORCE_OWNER_LOCK_POST_FLOCK_PAUSE.with(|slot| slot.set(Some(pause)));
+}
+
+#[cfg(test)]
+fn pause_after_owner_lock_flock_for_test() {
+    FORCE_OWNER_LOCK_POST_FLOCK_PAUSE.with(|slot| {
+        if let Some(pause) = slot.take() {
+            thread::sleep(pause);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn pause_after_owner_lock_flock_for_test() {}
 
 #[cfg(test)]
 fn force_next_warm_close_spawn_failure() {
@@ -104,11 +142,20 @@ impl Drop for MutationDeadlineGuard {
 
 /// Run `work` with a deadline for starting any nested room mutation.
 /// Nested callers can only shorten an existing deadline.
+#[cfg(test)]
 pub(crate) fn with_mutation_deadline<T>(budget: Duration, work: impl FnOnce() -> T) -> T {
     let now = Instant::now();
     let requested = now
         .checked_add(budget)
         .unwrap_or(now + MUTATION_LOCK_FALLBACK_BOUND);
+    with_mutation_deadline_at(requested, work)
+}
+
+/// Run `work` with an already-anchored monotonic deadline.
+///
+/// Routed requests use this form so dispatcher queueing or preemption between
+/// deadline calculation and installation cannot add elapsed time back.
+pub(crate) fn with_mutation_deadline_at<T>(requested: Instant, work: impl FnOnce() -> T) -> T {
     let previous = MUTATION_DEADLINE.with(|slot| {
         let previous = slot.get();
         slot.set(Some(
@@ -1520,6 +1567,14 @@ pub(crate) fn acquire_room_mutation_lock(room_dir: &Path) -> Result<RoomMutation
         let rc =
             unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX | unix_lock::LOCK_NB) };
         if rc == 0 {
+            pause_after_room_lock_flock_for_test();
+            if Instant::now() >= deadline {
+                // A process can be descheduled between the pre-check and the
+                // successful syscall. Relinquish the just-acquired lock and
+                // preserve the typed no-mutation-started contract.
+                let _ = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_UN) };
+                return Err(mutation_not_started(&path));
+            }
             return Ok(RoomMutationLock { file });
         }
         let source = io::Error::last_os_error();
@@ -1667,7 +1722,10 @@ pub(crate) fn acquire_owner_exclusive_bounded(
 ) -> Result<OwnerGuard> {
     let path = rally_dir.join(RALLYD_OWNER_LOCK_FILENAME);
     let file = open_named_lock_file(rally_dir, RALLYD_OWNER_LOCK_FILENAME)?;
-    let deadline = Instant::now() + budget;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(budget)
+        .unwrap_or(now + MUTATION_LOCK_FALLBACK_BOUND);
     loop {
         if Instant::now() >= deadline {
             return Err(RallyError::NotStarted(format!(
@@ -1678,6 +1736,14 @@ pub(crate) fn acquire_owner_exclusive_bounded(
         let rc =
             unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX | unix_lock::LOCK_NB) };
         if rc == 0 {
+            pause_after_owner_lock_flock_for_test();
+            if Instant::now() >= deadline {
+                let _ = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_UN) };
+                return Err(RallyError::NotStarted(format!(
+                    "daemon-open-not-started: deadline elapsed before acquiring {}; no daemon runtime state was published",
+                    path.display()
+                )));
+            }
             return Ok(OwnerGuard { file });
         }
         let source = io::Error::last_os_error();
@@ -2407,8 +2473,11 @@ impl DirectRoomStore {
             .facts_db_path
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
-        let deadline = Instant::now() + budget;
-        let guard = with_mutation_deadline(budget, || acquire_room_mutation_lock(room_dir))?;
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(budget)
+            .unwrap_or(now + MUTATION_LOCK_FALLBACK_BOUND);
+        let guard = with_mutation_deadline_at(deadline, || acquire_room_mutation_lock(room_dir))?;
         let Some(mut warm) = self.warm_fact_store.take() else {
             return Ok(());
         };
@@ -7637,6 +7706,40 @@ mod ledger_tests {
 
     #[cfg(unix)]
     #[test]
+    fn direct_mutation_rechecks_deadline_after_flock_success() {
+        let root = unique_root("mutation-lock-post-flock-deadline");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let fact = Fact {
+            schema: crate::FACT_SCHEMA.to_string(),
+            event_id: "o25-direct-post-flock-no-late-commit".to_string(),
+            thread_id: "thread-o25-direct-post-flock".to_string(),
+            kind: FactKind::Artifact,
+            subject: "must not commit after post-flock deadline".to_string(),
+            created_at: crate::now_string(),
+            ..Fact::default()
+        };
+        force_next_room_lock_post_flock_pause(Duration::from_millis(60));
+
+        let result = with_mutation_deadline(Duration::from_millis(20), || store.append_fact(&fact));
+
+        assert!(
+            matches!(result, Err(RallyError::NotStarted(_))),
+            "deadline elapsed after flock success but mutation started: {result:?}"
+        );
+        let reopened = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        assert!(
+            reopened
+                .facts()
+                .unwrap()
+                .iter()
+                .all(|row| row.event_id != fact.event_id),
+            "direct mutation committed after its post-flock deadline"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn daemon_owner_open_deadline_is_typed_not_started() {
         let root = unique_root("daemon-owner-open-deadline");
         let rally_dir = root.join(".rally");
@@ -7656,6 +7759,22 @@ mod ledger_tests {
         assert!(
             matches!(&result, Err(RallyError::NotStarted(_))),
             "contended daemon open must return typed NotStarted"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_owner_rechecks_deadline_after_flock_success() {
+        let root = unique_root("daemon-owner-post-flock-deadline");
+        let rally_dir = root.join(".rally");
+        force_next_owner_lock_post_flock_pause(Duration::from_millis(60));
+
+        let result = acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(20));
+
+        assert!(
+            matches!(result, Err(RallyError::NotStarted(_))),
+            "owner deadline elapsed after flock success but ownership started"
         );
         fs::remove_dir_all(root).ok();
     }

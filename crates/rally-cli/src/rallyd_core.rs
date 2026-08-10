@@ -647,6 +647,19 @@ mod imp {
         req: StoreRequest,
         receipt: RequestReceipt,
     ) -> StoreResponse {
+        dispatch_one_received_with_hook(store, repo_root, req, receipt, || {})
+    }
+
+    fn dispatch_one_received_with_hook<F>(
+        store: &mut DirectRoomStore,
+        repo_root: &str,
+        req: StoreRequest,
+        receipt: RequestReceipt,
+        before_deadline_install: F,
+    ) -> StoreResponse
+    where
+        F: FnOnce(),
+    {
         if req.wire_version != WIRE_VERSION {
             return StoreResponse::Err(StoreError::transport(format!(
                 "wire_version mismatch: daemon speaks {WIRE_VERSION}, client sent {}; \
@@ -675,12 +688,14 @@ mod imp {
         let op = req.op;
         store.set_engagement_scope(request_engagement.clone());
         let result = if op.is_mutating() {
-            let budget = match bounded_mutation_budget(
+            let dispatch_monotonic = Instant::now();
+            let dispatch_unix_ms = unix_now_ms();
+            let deadline = match bounded_mutation_deadline(
                 request_deadline,
                 request_budget_ms,
-                receipt.unix_ms,
-                unix_now_ms(),
-                receipt.monotonic.elapsed(),
+                receipt,
+                dispatch_unix_ms,
+                dispatch_monotonic,
             ) {
                 None => {
                     return StoreResponse::Err(StoreError::new(
@@ -688,9 +703,10 @@ mod imp {
                         "mutation-not-started: client deadline elapsed before daemon dispatch; no durable mutation started and retry is safe",
                     ));
                 }
-                Some(budget) => budget,
+                Some(deadline) => deadline,
             };
-            store::with_mutation_deadline(budget, || {
+            before_deadline_install();
+            store::with_mutation_deadline_at(deadline, || {
                 run_op(store, op, request_engagement.as_deref())
             })
         } else {
@@ -702,20 +718,21 @@ mod imp {
         }
     }
 
-    /// Translate untrusted dual wire timing into one bounded monotonic budget.
+    /// Translate untrusted dual wire timing into one anchored monotonic deadline.
     /// The absolute deadline consumes normal connect/read delay. The relative
-    /// budget caps rollback before receipt, and elapsed daemon `Instant` time
-    /// consumes dispatcher queue delay without trusting later wall-clock motion.
+    /// budget caps rollback before receipt. Anchoring the result to the receipt
+    /// `Instant` consumes dispatcher queueing and preemption without ever
+    /// subtracting elapsed time and then adding the remainder to a newer clock.
     /// A rollback that occurs entirely before receipt cannot be measured across
     /// processes; taking the relative minimum bounds that residual to the
     /// client's original budget instead of the 64-bit absolute delta.
-    fn bounded_mutation_budget(
+    fn bounded_mutation_deadline(
         deadline_unix_ms: Option<u64>,
         mutation_budget_ms: Option<u64>,
-        receipt_unix_ms: u64,
+        receipt: RequestReceipt,
         dispatch_unix_ms: u64,
-        queue_elapsed: Duration,
-    ) -> Option<Duration> {
+        dispatch_monotonic: Instant,
+    ) -> Option<Instant> {
         let cap = CONN_TIMEOUT.saturating_sub(MUTATION_REPLY_RESERVE);
         let requested = mutation_budget_ms
             .map(Duration::from_millis)
@@ -731,13 +748,15 @@ mod imp {
             }
             None => Some(cap),
         };
-        let at_receipt = requested.min(absolute_remaining(receipt_unix_ms)?);
-        let after_queue = at_receipt.checked_sub(queue_elapsed)?;
-        let remaining = after_queue.min(absolute_remaining(dispatch_unix_ms)?);
-        if remaining.is_zero() {
+        let at_receipt = requested.min(absolute_remaining(receipt.unix_ms)?);
+        let receipt_deadline = receipt.monotonic.checked_add(at_receipt)?;
+        let dispatch_deadline =
+            dispatch_monotonic.checked_add(absolute_remaining(dispatch_unix_ms)?)?;
+        let deadline = receipt_deadline.min(dispatch_deadline);
+        if deadline <= dispatch_monotonic {
             None
         } else {
-            Some(remaining)
+            Some(deadline)
         }
     }
 
@@ -773,8 +792,8 @@ mod imp {
             .spawn(move || {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 let reply_reserve = MUTATION_REPLY_RESERVE.min(remaining / 4);
-                let lock_budget = remaining.saturating_sub(reply_reserve);
-                let result = store::with_mutation_deadline(lock_budget, || {
+                let lock_deadline = deadline.checked_sub(reply_reserve).unwrap_or(deadline);
+                let result = store::with_mutation_deadline_at(lock_deadline, || {
                     let mut store = DirectRoomStore::open_direct_at(repo_root)?;
                     after_open();
                     store.install_warm_fact_store()?;
@@ -1554,12 +1573,31 @@ mod imp {
         #[test]
         fn raw_far_future_mutation_deadline_is_capped_without_panic() {
             let cap = CONN_TIMEOUT.saturating_sub(MUTATION_REPLY_RESERVE);
+            let remaining = |deadline_unix_ms: Option<u64>,
+                             mutation_budget_ms: Option<u64>,
+                             receipt_unix_ms: u64,
+                             dispatch_unix_ms: u64,
+                             queue_elapsed: Duration| {
+                let receipt_monotonic = Instant::now();
+                let dispatch_monotonic = receipt_monotonic + queue_elapsed;
+                bounded_mutation_deadline(
+                    deadline_unix_ms,
+                    mutation_budget_ms,
+                    RequestReceipt {
+                        monotonic: receipt_monotonic,
+                        unix_ms: receipt_unix_ms,
+                    },
+                    dispatch_unix_ms,
+                    dispatch_monotonic,
+                )
+                .map(|deadline| deadline.saturating_duration_since(dispatch_monotonic))
+            };
             assert_eq!(
-                bounded_mutation_budget(Some(u64::MAX), Some(u64::MAX), 1, 1, Duration::ZERO),
+                remaining(Some(u64::MAX), Some(u64::MAX), 1, 1, Duration::ZERO),
                 Some(cap)
             );
             assert_eq!(
-                bounded_mutation_budget(
+                remaining(
                     Some(2_000),
                     Some(1_000),
                     1_000,
@@ -1569,7 +1607,7 @@ mod imp {
                 Some(Duration::from_millis(600))
             );
             assert_eq!(
-                bounded_mutation_budget(
+                remaining(
                     Some(2_000),
                     Some(1_000),
                     1_000,
@@ -1580,12 +1618,12 @@ mod imp {
                 "wall-clock rollback after receipt extended the monotonic budget"
             );
             assert_eq!(
-                bounded_mutation_budget(Some(2_000), Some(1_000), 900, 900, Duration::ZERO),
+                remaining(Some(2_000), Some(1_000), 900, 900, Duration::ZERO),
                 Some(Duration::from_millis(1_000)),
                 "pre-receipt rollback escaped the client-relative cap"
             );
             assert_eq!(
-                bounded_mutation_budget(
+                remaining(
                     Some(2_000),
                     Some(1_000),
                     1_000,
@@ -1596,11 +1634,11 @@ mod imp {
                 "forward clock step did not expire the request"
             );
             assert_eq!(
-                bounded_mutation_budget(Some(1_000), Some(1_000), 1_000, 1_000, Duration::ZERO),
+                remaining(Some(1_000), Some(1_000), 1_000, 1_000, Duration::ZERO),
                 None
             );
             assert_eq!(
-                bounded_mutation_budget(Some(2_000), Some(0), 1_000, 1_000, Duration::ZERO),
+                remaining(Some(2_000), Some(0), 1_000, 1_000, Duration::ZERO),
                 None
             );
 
@@ -1668,6 +1706,102 @@ mod imp {
                     .iter()
                     .all(|row| row.event_id != fact.event_id),
                 "expired routed mutation appended after NotStarted"
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn routed_dispatch_pause_does_not_rebase_receipt_deadline() {
+            let repo_root = unique_repo_root("dispatch-pause-deadline-anchor");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let fact = crate::store::Fact {
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o25-routed-dispatch-pause-no-late-commit".to_string(),
+                thread_id: "thread-o25-routed-dispatch-pause".to_string(),
+                kind: crate::store::FactKind::Artifact,
+                subject: "dispatch pause must consume request deadline".to_string(),
+                created_at: crate::now_string(),
+                ..crate::store::Fact::default()
+            };
+            let mut request = StoreRequest::new(
+                None,
+                StoreOp::AppendFact {
+                    fact: serde_json::to_value(&fact).unwrap(),
+                },
+            );
+            let deadline = SystemTime::now() + Duration::from_millis(30);
+            request.deadline_unix_ms =
+                Some(deadline.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64);
+            request.mutation_budget_ms = Some(30);
+
+            let response = dispatch_one_received_with_hook(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                request,
+                RequestReceipt::now(),
+                || thread::sleep(Duration::from_millis(70)),
+            );
+
+            match response {
+                StoreResponse::Err(error) => {
+                    assert_eq!(error.kind, StoreErrorKind::NotStarted);
+                    assert_eq!(error.code, 4);
+                }
+                other => panic!("dispatch pause rebased the deadline: {other:?}"),
+            }
+            assert!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.event_id != fact.event_id),
+                "routed mutation committed after its receipt-anchored deadline"
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn routed_mutation_rechecks_deadline_after_flock_success() {
+            let repo_root = unique_repo_root("routed-post-flock-deadline");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let fact = crate::store::Fact {
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o25-routed-post-flock-no-late-commit".to_string(),
+                thread_id: "thread-o25-routed-post-flock".to_string(),
+                kind: crate::store::FactKind::Artifact,
+                subject: "routed post-flock pause must consume deadline".to_string(),
+                created_at: crate::now_string(),
+                ..crate::store::Fact::default()
+            };
+            let mut request = StoreRequest::new(
+                None,
+                StoreOp::AppendFact {
+                    fact: serde_json::to_value(&fact).unwrap(),
+                },
+            );
+            let deadline = SystemTime::now() + Duration::from_millis(30);
+            request.deadline_unix_ms =
+                Some(deadline.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64);
+            request.mutation_budget_ms = Some(30);
+            store::force_next_room_lock_post_flock_pause(Duration::from_millis(70));
+
+            let response = dispatch_one(&mut store, repo_root.to_string_lossy().as_ref(), request);
+
+            match response {
+                StoreResponse::Err(error) => {
+                    assert_eq!(error.kind, StoreErrorKind::NotStarted);
+                    assert_eq!(error.code, 4);
+                }
+                other => panic!("post-flock pause started routed mutation: {other:?}"),
+            }
+            assert!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.event_id != fact.event_id),
+                "routed mutation committed after its post-flock deadline"
             );
             std::fs::remove_dir_all(repo_root).ok();
         }

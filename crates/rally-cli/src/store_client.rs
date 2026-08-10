@@ -75,11 +75,23 @@ const OP_TIMEOUT: Duration = Duration::from_secs(10);
 const MUTATION_DEADLINE_RESERVE: Duration = Duration::from_millis(250);
 
 fn mutation_deadline() -> (u64, u64) {
+    mutation_deadline_with_hook(|| {})
+}
+
+fn mutation_deadline_with_hook<F>(between_clock_samples: F) -> (u64, u64)
+where
+    F: FnOnce(),
+{
+    // Sample wall time before the watchdog's monotonic remainder. If this
+    // thread is preempted between the two reads, adding the later/smaller
+    // remainder to the earlier wall sample is conservative; the inverse order
+    // would rebase that pause beyond the outer watchdog.
+    let now = SystemTime::now();
+    between_clock_samples();
     let outer = crate::watchdog_remaining().unwrap_or(OP_TIMEOUT);
     let budget = outer
         .min(OP_TIMEOUT)
         .saturating_sub(MUTATION_DEADLINE_RESERVE);
-    let now = SystemTime::now();
     let deadline = now.checked_add(budget).unwrap_or(now);
     let deadline_unix_ms = deadline
         .duration_since(UNIX_EPOCH)
@@ -690,6 +702,29 @@ mod tests {
         ));
         assert!(matches!(error, RallyError::NotStarted(_)));
         assert_eq!(error.exit_code(), 4);
+    }
+
+    #[test]
+    fn wire_deadline_consumes_preemption_between_clock_samples() {
+        let _guard = crate::install_watchdog_deadline(
+            Instant::now()
+                .checked_add(Duration::from_millis(500))
+                .unwrap(),
+        );
+
+        let (_deadline_unix_ms, budget_ms) = mutation_deadline_with_hook(|| {
+            thread::sleep(Duration::from_millis(300));
+        });
+        let allowed_after_pause = crate::watchdog_remaining()
+            .unwrap()
+            .min(OP_TIMEOUT)
+            .saturating_sub(MUTATION_DEADLINE_RESERVE)
+            .as_millis() as u64;
+
+        assert!(
+            budget_ms <= allowed_after_pause.saturating_add(5),
+            "wire budget rebased preemption beyond the outer watchdog: wire={budget_ms}ms allowed={allowed_after_pause}ms"
+        );
     }
     use std::os::unix::net::UnixListener;
     use std::thread;
