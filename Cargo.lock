@@ -1429,6 +1429,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rally-router-core"
+version = "0.1.0"
+dependencies = [
+ "rally-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rally-ui"
 version = "0.1.0"
 dependencies = [

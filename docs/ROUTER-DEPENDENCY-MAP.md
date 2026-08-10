@@ -4,13 +4,13 @@
 
 # Rally Delivery Router Dependency Map
 
-> **Status:** proposed change map, not an implementation commitment.
-> **Rally baseline:** `8625be8` on 2026-08-08; unrelated working-tree changes were excluded from
-> source conclusions.
-> **NavGator baseline:** full scan labeled `8625be8`; 621 components, 457 detected connections,
-> 60% file-to-component coverage, 0.71 overall confidence. The scan observed the working tree even
-> though its freshness stamp reported zero dirty files, so counts are discovery evidence rather
-> than a clean-commit attestation.
+> **Status (2026-08-10):** R0 shared contracts and the R1 pure planner are implemented in this
+> change set; integration, runtime activation, and route cutover remain pending.
+> **Rally baseline:** local `main` `8d21f2c`; `origin/main` `3d27f28`. Unrelated working-tree changes
+> were excluded from source conclusions.
+> **NavGator baseline:** refreshed full scan labeled `8d21f2c`; 621 components, 457 detected
+> connections, 176 files, and no scan warnings. Direct Rust references remain authoritative where
+> NavGator lacks dependency edges.
 > **Companion decision:** [`ROUTER-ARCHITECTURE.md`](ROUTER-ARCHITECTURE.md).
 > **Detailed process contracts:**
 > [`DAEMON-AND-TRANSPORT-ARCHITECTURE.md`](DAEMON-AND-TRANSPORT-ARCHITECTURE.md).
@@ -32,6 +32,18 @@ The smallest useful change is smaller than the original clean-sheet proposal:
 
 This sequence delivers the main new capability—delivery that survives sender exit—without first
 rewriting the ledger, merging daemons, or building every provider adapter.
+
+## Implementation status
+
+| Slice | Status | What exists now | What remains |
+| --- | --- | --- | --- |
+| R0 common contract | Implemented and tested in this change set | Flat backward-compatible delivery/receipt envelopes; stable logical dedupe key; unique attempt IDs; endpoint capability descriptors; asserted-versus-verified evidence | No live `FileInbox` format change; no authenticated principal verification |
+| R1 pure planner | Implemented and tested in this change set | Deterministic target-first selection, typed rejection reasons, safe fallback rules, provider-neutral policy, and a pure shadow comparator | Convert live session records into endpoint descriptors and call the comparator from `command_inject` |
+| R1 live shadow activation | Pending | Existing `BackendRunner` remains authoritative, so current delivery behavior and latency are unchanged | Add one observation-only call at the coordinated `crates/rally-cli/src/lib.rs` send boundary |
+| R2+ resident routing | Not started | Contracts make later attempt persistence explicit | Leases, deadlines, durable retry, endpoint probes, worker loop, adapters, and `rally-routerd` |
+
+The current build therefore creates an independently testable policy seam without inserting a
+process hop or changing a user's delivery route. It does not yet provide post-sender-exit delivery.
 
 ## NavGator findings and limit
 
@@ -167,7 +179,9 @@ The sibling `ptyd` repository implements this path. The installed `rally-termd` 
 currently discover, start, configure, or monitor it. On 2026-08-08, `ptyd server` was running but
 `rally-termd` was not. Its execute-then-receipt-then-high-water order also leaves a crash window in
 which a PTY action may be repeated; exact-once delivery requires endpoint idempotency that PTY input
-cannot generally provide.
+cannot generally provide. The R1 planner therefore permits an uncertain-send retry only through the
+same endpoint when that endpoint advertises stable-key deduplication. It refuses cross-endpoint
+fallback until a later contract can prove that both endpoints share one target-wide dedupe domain.
 
 #### 5. Target ACK and completion
 

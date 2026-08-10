@@ -4,8 +4,10 @@
 
 # Rally Router Architecture
 
-> **Status:** proposed architecture and incremental build contract.
-> **Source baseline:** `main` at `8625be8` plus the working tree observed on 2026-08-08.
+> **Status:** target architecture and incremental build contract. R0 shared contracts and the R1
+> pure planner are implemented; live shadow activation and route cutover remain pending.
+> **Source baseline:** local `main` at `8d21f2c` and `origin/main` at `3d27f28`, verified on
+> 2026-08-10.
 > **Position:** Rally remains the canonical, host-neutral coordination plane. External protocols
 > are codecs at the edge. The router is deterministic infrastructure, not an agent, scheduler,
 > judge, or source of truth.
@@ -160,7 +162,7 @@ repo_id              exact Rally room scope
 host_id              machine/runtime boundary
 endpoint_id          adapter-specific address, never the Rally identity
 adapter              claude-channel | codex-app-server | opencode | a2a | ptyd | tmux | cmux
-capabilities         deliver, interrupt, capture, stop, positive_ack, completion_events
+capabilities         deliver, interrupt, capture, stop, positive_ack, idempotent_delivery
 last_verified_at     last observation by the adapter or host integration
 inactive_after       adaptive expiry, not proof of abandonment
 build_id             Rally/adapter protocol compatibility
@@ -180,9 +182,12 @@ The router applies one policy in one place:
 4. Prefer a structured native endpoint over terminal injection.
 5. Prefer an endpoint capable of positive ACK over one that only proves bytes were sent.
 6. Lease the envelope before attempting delivery.
-7. Use the envelope event ID plus attempt number as the idempotency key.
+7. Keep one stable delivery dedupe key for `(event, repository, target)` across retries; give each
+   attempt a separate unique ID and monotonic attempt number.
 8. Record the route, reason, attempt, timing, and exact evidence returned.
-9. Retry or select the next allowed endpoint after a typed failure or deadline.
+9. Select another endpoint only after a proved pre-send failure. After an uncertain send, retry
+   only the same endpoint when it advertises stable-key deduplication; otherwise leave the message
+   queued. Cross-endpoint retry requires a future verified shared dedupe-domain identity.
 10. Leave the envelope queued when no safe route exists.
 
 Default preference:
@@ -194,6 +199,10 @@ structured native endpoint
   > explicitly bound tmux/cmux pane
   > queued inbox / receiver pull
 ```
+
+Reliability precedes adapter preference: a ready endpoint outranks a degraded or unknown endpoint.
+The adapter order above applies within the same health tier, and positive ACK support then breaks
+same-adapter ties before stable endpoint ID.
 
 Repository or message policy may constrain this order, but an adapter cannot override it.
 `ptyd` may choose paste framing versus raw PTY input after the router selects `ptyd`; it must not
@@ -351,7 +360,7 @@ captured by a verified host integration or reported as outside Rally.
 | --- | --- | --- |
 | Higher send latency | Durable append plus router hop | Measure p50/p95; inline drain until resident router is faster; keep local sockets |
 | Router becomes a single point of failure | Correctness depends on push | Inbox and host pull remain authoritative; router failure changes latency only |
-| Duplicate delivery | CLI and router both send, or retry races | Exclusive attempt lease, event-id idempotency, explicit cutover flag, mutation tests |
+| Duplicate delivery | CLI and router both send, retry races, or unsafe cross-endpoint fallback | Exclusive attempt lease, stable delivery key, same-endpoint retry after uncertain sends, explicit cutover flag, mutation tests |
 | Out-of-order messages | Multiple routes or concurrent retries | Per-recipient/thread sequence and ordered lease policy |
 | Wrong session receives work | Stale or guessed endpoint | Exact Rally identity, fresh observed registration, ambiguity refusal, endpoint echo check |
 | Payload or metadata loss | Codec cannot represent a required field | Round-trip conformance, digest verification, opaque extensions, fail instead of downgrade |
