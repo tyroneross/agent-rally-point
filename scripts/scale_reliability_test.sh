@@ -4,6 +4,11 @@
 # accepted operation failures.
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SOURCE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+# shellcheck disable=SC1090,SC1091
+source "$SCRIPT_DIR/disposable-repo-guard.sh"
+
 MODE="both"
 SCALES="4,8,16,32"
 SELF_TEST=0
@@ -29,6 +34,11 @@ if [[ -z "$RALLY" || ! -x "$RALLY" ]]; then
   echo "GATE_FAIL binary: RALLY_BIN must name an executable rally binary" >&2
   exit 64
 fi
+if [[ "$RALLY" == */* ]]; then
+  RALLY="$(cd "$(dirname "$RALLY")" && pwd -P)/$(basename "$RALLY")"
+else
+  RALLY="$(command -v "$RALLY")"
+fi
 
 run_case() {
   local mode="$1" n="$2" tmp repo results daemon_pid=""
@@ -48,6 +58,7 @@ run_case() {
   if [[ "$mode" == "daemon" ]]; then
     (
       cd "$repo" || exit 1
+      rally_assert_disposable_repo "$repo" "$tmp" "$SOURCE_ROOT" || exit 70
       HOME="$tmp/home" "$RALLY" enter --tool lead:seed --session-id seed --json --timeout-ms 60000
     ) >"$results/seed.json" 2>"$results/seed.err"
     if [[ $? -ne 0 ]]; then
@@ -56,6 +67,7 @@ run_case() {
     fi
     (
       cd "$repo" || exit 1
+      rally_assert_disposable_repo "$repo" "$tmp" "$SOURCE_ROOT" || exit 70
       HOME="$tmp/home" "$RALLY" daemon serve --idle-exit-secs 180
     ) >"$results/daemon.out" 2>"$results/daemon.err" &
     daemon_pid=$!
@@ -94,6 +106,7 @@ PY
     if ((i % 2 == 0)); then path="src/contended.rs"; else path="src/unique-$i.rs"; fi
     (
       cd "$repo" || exit 1
+      rally_assert_disposable_repo "$repo" "$tmp" "$SOURCE_ROOT" || exit 70
       export HOME="$tmp/home"
       capture "$i" enter enter --tool "$tool" --session-id "scale-$i" --json --timeout-ms 60000
       capture "$i" next next --tool "$tool" --json --timeout-ms 60000

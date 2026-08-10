@@ -18,21 +18,34 @@
 #   RALLY_BIN=./target/debug/rally bash scripts/coordination-smoke.sh
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SOURCE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+# shellcheck disable=SC1090,SC1091
+source "$SCRIPT_DIR/disposable-repo-guard.sh"
+
 RALLY="${RALLY_BIN:-}"
 if [ -z "$RALLY" ]; then
   if [ -x "./target/debug/rally" ]; then RALLY="./target/debug/rally"
   elif command -v rally >/dev/null 2>&1; then RALLY="rally"
   else echo "SKIP: no rally binary (set RALLY_BIN or build crates/rally-cli)"; exit 0; fi
 fi
+if [[ "$RALLY" == */* ]]; then
+  RALLY="$(cd "$(dirname "$RALLY")" && pwd -P)/$(basename "$RALLY")"
+else
+  RALLY="$(command -v "$RALLY")"
+fi
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf 'ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf 'FAIL %s\n' "$1"; [ -n "${2:-}" ] && printf '     %s\n' "$2"; }
 
-ROOM="$(mktemp -d)/coord-smoke"; mkdir -p "$ROOM"
-trap 'rm -rf "$(dirname "$ROOM")"' EXIT
+SCRATCH_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rally-coordination-smoke.XXXXXX")"
+ROOM="$SCRATCH_ROOT/coord-smoke"
+mkdir -p "$ROOM"
+trap 'rm -rf "$SCRATCH_ROOT"' EXIT
 cd "$ROOM"
 git init -q; git config user.email t@t.co; git config user.name t; git commit -q --allow-empty -m init
+rally_assert_disposable_repo "$ROOM" "$SCRATCH_ROOT" "$SOURCE_ROOT"
 "$RALLY" init >/dev/null 2>&1 || true
 
 # jq-free extractors over rally --json output.
