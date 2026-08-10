@@ -222,6 +222,11 @@ enum WatchdogMutationState {
         event_id: String,
         phase: String,
     },
+    DbOnlyMigrationOutcomeUnknown {
+        migration_id: String,
+        phase: String,
+        retry_command: String,
+    },
     Committed {
         projection_complete: bool,
         warnings: Vec<Value>,
@@ -568,6 +573,29 @@ pub(crate) fn mark_watchdog_command_outcome_unknown(event_id: &str, phase: &str)
                 WatchdogMutationState::OutcomeUnknown {
                     event_id: event_id.to_string(),
                     phase: phase.to_string(),
+                };
+        }
+    });
+}
+
+pub(crate) fn mark_watchdog_db_only_migration_outcome_unknown(
+    migration_id: &str,
+    phase: &str,
+    retry_command: &str,
+) {
+    let armed = WATCHDOG_COMMIT_ARM_DEPTH.with(|depth| depth.get() > 0);
+    if !armed {
+        return;
+    }
+    WATCHDOG_MUTATION_SIGNAL.with(|slot| {
+        if let Some(signal) = slot.borrow().as_ref() {
+            *signal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                WatchdogMutationState::DbOnlyMigrationOutcomeUnknown {
+                    migration_id: migration_id.to_string(),
+                    phase: phase.to_string(),
+                    retry_command: retry_command.to_string(),
                 };
         }
     });
@@ -947,6 +975,20 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
                             emit_timeout_unknown_mutation(wants_json, timeout, &event_id, &phase);
                             std::process::exit(1);
                         }
+                        WatchdogMutationState::DbOnlyMigrationOutcomeUnknown {
+                            migration_id,
+                            phase,
+                            retry_command,
+                        } => {
+                            emit_timeout_unknown_db_only_migration(
+                                wants_json,
+                                timeout,
+                                &migration_id,
+                                &phase,
+                                &retry_command,
+                            );
+                            std::process::exit(1);
+                        }
                         WatchdogMutationState::Committed {
                             projection_complete,
                             warnings,
@@ -1234,6 +1276,45 @@ fn emit_timeout_unknown_mutation(wants_json: bool, timeout: Duration, event_id: 
         crate::output::write_line_or_exit_on_broken_pipe(&payload.to_string());
     }
     eprintln!("rally: {message}; query `{remedy}` before deciding whether to rerun");
+}
+
+fn emit_timeout_unknown_db_only_migration(
+    wants_json: bool,
+    timeout: Duration,
+    migration_id: &str,
+    phase: &str,
+    retry_command: &str,
+) {
+    let message = format!(
+        "DB-only migration exceeded {}ms after durable recovery state began at phase {phase}; outcome is unknown",
+        timeout.as_millis()
+    );
+    if wants_json {
+        let payload = json!({
+            "ok": false,
+            "product": "rally",
+            "command": "watchdog",
+            "error": {
+                "code": "watchdog-timeout-db-only-migration-outcome-unknown",
+                "message": message,
+            },
+            "data": {
+                "watchdog": {
+                    "committed": Value::Null,
+                    "outcome_unknown": true,
+                    "migration_id": migration_id,
+                    "phase": phase,
+                    "retry_safe": false,
+                    "timeout_ms": timeout.as_millis(),
+                    "retry_command": retry_command,
+                }
+            }
+        });
+        crate::output::write_line_or_exit_on_broken_pipe(&payload.to_string());
+    }
+    eprintln!(
+        "rally: {message}; inspect the marker-bound artifacts and resume with `{retry_command}`"
+    );
 }
 
 fn emit_timeout_committed_mutation(
@@ -3722,6 +3803,87 @@ struct DoctorEnvelope<T: Serialize + schemars::JsonSchema> {
 }
 
 fn command_doctor(args: DoctorArgs) -> Result<Output> {
+    let existing_modes = [
+        args.canonical_paths,
+        args.prune_rooms,
+        args.reap_stale,
+        args.sweep_corrupt,
+        args.compact_log,
+        args.binary_skew,
+    ];
+    if args.migrate_db_only && existing_modes.into_iter().any(|enabled| enabled) {
+        return Err(RallyError::Usage(
+            "--migrate-db-only cannot be combined with another rally doctor mode".to_string(),
+        ));
+    }
+    if !args.migrate_db_only && args.engagement.is_some() {
+        return Err(RallyError::Usage(
+            "--engagement is accepted only with --migrate-db-only".to_string(),
+        ));
+    }
+    if args.migrate_db_only {
+        let engagement = args.engagement.as_deref().ok_or_else(|| {
+            RallyError::Usage(
+                "rally doctor --migrate-db-only requires --engagement <label>".to_string(),
+            )
+        })?;
+        let result = if args.apply {
+            with_watchdog_command_commit(|| doctor::run_db_only_migration(engagement, true))
+        } else {
+            doctor::run_db_only_migration(engagement, false)
+        };
+        return match result {
+            Ok(data) => {
+                let text = format!(
+                    "doctor migrate-db-only: state={:?} rows={:?} max_seq={:?} applied={} revalidation_required={}",
+                    data.state,
+                    data.row_count,
+                    data.max_seq,
+                    data.applied,
+                    data.apply_requires_revalidation,
+                );
+                let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
+                Ok(Output::new(args.json, text, body))
+            }
+            Err(doctor::DbOnlyMigrationRunError::Interrupted(interruption))
+                if interruption.state
+                    == doctor::DbOnlyMigrationInterruptionState::OutcomeUnknown =>
+            {
+                let text = format!(
+                    "DB-only migration outcome is unknown at phase {}; inspect the marker-bound artifacts and resume with `{}`",
+                    interruption.phase, interruption.retry_command
+                );
+                let body = json!({
+                    "ok": false,
+                    "product": "rally",
+                    "command": "db_only_migration_outcome_unknown",
+                    "data": {
+                        "migration": interruption,
+                    }
+                });
+                Ok(Output::new(args.json, text, body).with_exit_code(1))
+            }
+            Err(doctor::DbOnlyMigrationRunError::Interrupted(interruption))
+                if interruption.state
+                    == doctor::DbOnlyMigrationInterruptionState::CommittedCleanupPending =>
+            {
+                mark_watchdog_command_commit();
+                let text = format!(
+                    "doctor migrate-db-only: canonical target committed; cleanup remains at phase {}; resume with `{}`",
+                    interruption.phase, interruption.retry_command
+                );
+                let body = envelope(
+                    "doctor",
+                    SCHEMA_DOCTOR,
+                    DoctorEnvelope {
+                        doctor: interruption,
+                    },
+                )?;
+                Ok(Output::new(args.json, text, body))
+            }
+            Err(error) => Err(error.into_rally_error()),
+        };
+    }
     if args.canonical_paths {
         let data = doctor::run_canonical_paths()?;
         let text = format!(
@@ -3801,7 +3963,7 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
         return Ok(Output::new(args.json, text, body));
     }
     Err(RallyError::Usage(
-        "rally doctor requires --canonical-paths, --prune-rooms, --reap-stale, --sweep-corrupt, --compact-log, or --binary-skew"
+        "rally doctor requires --canonical-paths, --prune-rooms, --reap-stale, --sweep-corrupt, --compact-log, --binary-skew, or --migrate-db-only"
             .to_string(),
     ))
 }
@@ -8887,6 +9049,13 @@ mod tests {
             argv(&["lead", "assign", "--tool", "lead"]),
             argv(&["mission", "--set", "north star"]),
             argv(&["check", "liveness", "--enforce"]),
+            argv(&[
+                "doctor",
+                "--migrate-db-only",
+                "--engagement",
+                "alpha",
+                "--apply",
+            ]),
         ] {
             assert_eq!(
                 resolve_watchdog_posture(&cmd, false),
@@ -8905,6 +9074,13 @@ mod tests {
             argv(&["check", "before-write", "--tool", "codex", "--json"]),
             argv(&["check", "coordination", "--strict", "--json"]),
             argv(&["sessions", "--json"]),
+            argv(&[
+                "doctor",
+                "--migrate-db-only",
+                "--engagement",
+                "alpha",
+                "--json",
+            ]),
         ] {
             assert_eq!(
                 resolve_watchdog_posture(&cmd, false),
@@ -13192,6 +13368,158 @@ mod tests {
                 let _ = std::env::set_current_dir(prev);
             }
         }
+    }
+
+    fn o26_db_only_command_root(label: &str) -> PathBuf {
+        let root = unique_root(label);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let store = store::DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("seed".to_string()),
+        )
+        .unwrap();
+        let fact = store::Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: format!("db-only-command-{label}"),
+            seq: 0,
+            thread_id: format!("thread-db-only-command-{label}"),
+            kind: FactKind::Decision,
+            tool: Some("codex:migration-command-test".to_string()),
+            role: None,
+            subject: "DB-only command source".to_string(),
+            scope: vec!["src/".to_string()],
+            created_at: "2026-08-10T00:00:00Z".to_string(),
+            summary: Some("DB-only command source".to_string()),
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+            from_session_id: None,
+        };
+        store.append_fact(&fact).unwrap();
+        drop(store);
+        for entry in std::fs::read_dir(root.join(".rally/log")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        root
+    }
+
+    #[test]
+    fn o26_doctor_migration_rejects_missing_engagement_and_mixed_modes() {
+        let error =
+            match run_inner_with(&argv(&["doctor", "--migrate-db-only", "--apply", "--json"])) {
+                Ok(_) => panic!("missing migration engagement must fail"),
+                Err(error) => error,
+            };
+        assert!(matches!(error, RallyError::Usage(_)));
+        assert!(error.to_string().contains("requires --engagement"));
+
+        let error = match run_inner_with(&argv(&[
+            "doctor",
+            "--migrate-db-only",
+            "--engagement",
+            "alpha",
+            "--canonical-paths",
+            "--json",
+        ])) {
+            Ok(_) => panic!("mixed doctor modes must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, RallyError::Usage(_)));
+        assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn o26_doctor_migration_unknown_is_structured_and_resumable() {
+        let root = o26_db_only_command_root("unknown").canonicalize().unwrap();
+        let _cwd = CwdEnvGuard::enter(&root);
+        doctor::arm_db_only_migration_fault(
+            &root.join(".rally"),
+            doctor::DbOnlyMigrationFaultPoint::AfterTargetInstallBeforeDirectorySync,
+        );
+        let args = argv(&[
+            "doctor",
+            "--migrate-db-only",
+            "--engagement",
+            "alpha",
+            "--apply",
+            "--json",
+        ]);
+        let output = run_inner_with(&args).expect("migration uncertainty renders typed output");
+        assert_eq!(output.exit_code, 1, "{}", output.body);
+        assert_eq!(output.body["command"], "db_only_migration_outcome_unknown");
+        let migration = &output.body["data"]["migration"];
+        assert!(
+            migration["migration_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("dbmig-")
+        );
+        assert_eq!(migration["state"], "outcome_unknown");
+        assert_eq!(migration["retry_safe"], false);
+        assert_eq!(migration["phase"], "target-installed-before-directory-sync");
+        assert_eq!(
+            migration["retry_command"],
+            "rally doctor --migrate-db-only --engagement alpha --apply --json"
+        );
+        assert!(
+            !migration["retry_command"]
+                .as_str()
+                .unwrap()
+                .contains("locate")
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join(".rally/log"))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
+                })
+                .count(),
+            1
+        );
+
+        let retry = run_inner_with(&args).expect("same migration recovery converges");
+        assert_eq!(retry.exit_code, 0);
+        assert_eq!(retry.body["data"]["doctor"]["state"], "committed");
+        drop(_cwd);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn o26_doctor_migration_watchdog_tracks_unknown_then_commit() {
+        let signal = Arc::new(Mutex::new(WatchdogMutationState::NotStarted));
+        let _signal_guard = install_watchdog_commit_signal(Arc::clone(&signal));
+        let _arm_guard = arm_watchdog_command_commit();
+        mark_watchdog_db_only_migration_outcome_unknown(
+            "dbmig-test",
+            "target-file-sync",
+            "rally doctor --migrate-db-only --engagement alpha --apply --json",
+        );
+        assert!(matches!(
+            &*signal.lock().unwrap(),
+            WatchdogMutationState::DbOnlyMigrationOutcomeUnknown {
+                migration_id,
+                phase,
+                retry_command,
+            } if migration_id == "dbmig-test"
+                && phase == "target-file-sync"
+                && retry_command.contains("--migrate-db-only")
+        ));
+        mark_watchdog_command_commit();
+        assert!(matches!(
+            &*signal.lock().unwrap(),
+            WatchdogMutationState::Committed {
+                projection_complete: true,
+                warnings,
+            } if warnings.is_empty()
+        ));
     }
 
     fn o26_decision_say_args(tool: &str) -> SayArgs {

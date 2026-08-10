@@ -147,6 +147,16 @@ pub(crate) fn with_mutation_deadline<T>(budget: Duration, work: impl FnOnce() ->
     with_mutation_deadline_at(requested, work)
 }
 
+#[cfg(test)]
+pub(crate) fn expire_mutation_deadline_for_test() {
+    MUTATION_DEADLINE.with(|slot| slot.set(Some(Instant::now())));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_mutation_deadline_for_test() {
+    MUTATION_DEADLINE.with(|slot| slot.set(None));
+}
+
 /// Run `work` with an already-anchored monotonic deadline.
 ///
 /// Routed requests use this form so dispatcher queueing or preemption between
@@ -225,6 +235,13 @@ mod unix_lock {
 /// whether ANY process may open facts.db directly at all.
 pub(crate) const RALLYD_OWNER_LOCK_FILENAME: &str = "rallyd.owner.lock";
 
+/// Durable fence installed by the explicit offline DB-only migration. While
+/// this marker (or its create-new staging predecessor) exists, doctor owns the
+/// only safe recovery path: an ordinary open/reconcile/append could otherwise
+/// change the marker-bound DB or its hard-linked canonical candidate.
+pub(crate) const DB_ONLY_MIGRATION_MARKER_FILENAME: &str = "db-only-migration.v1.json";
+pub(crate) const DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME: &str = "db-only-migration.v1.marker.tmp";
+
 /// Exclusive process-lifetime guard for the direct fallback. The daemon does
 /// not take this lock: it already owns [`RALLYD_OWNER_LOCK_FILENAME`] EX for
 /// its serving lifetime. A direct process takes this lock EX first and then
@@ -232,6 +249,32 @@ pub(crate) const RALLYD_OWNER_LOCK_FILENAME: &str = "rallyd.owner.lock";
 /// `facts.db` pools while daemon startup still drains through the established
 /// SH -> EX handover.
 const DIRECT_OWNER_LOCK_FILENAME: &str = "direct.owner.lock";
+
+fn ensure_no_db_only_migration_recovery(root: &Path) -> Result<()> {
+    let rally_dir = root.join(".rally");
+    for filename in [
+        DB_ONLY_MIGRATION_MARKER_FILENAME,
+        DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME,
+    ] {
+        let path = rally_dir.join(filename);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(RallyError::Usage(format!(
+                    "DB-only migration recovery is pending at {}; ordinary Rally store access is fenced to preserve marker-bound evidence. Resume with `rally doctor --migrate-db-only --engagement <label> --apply --json`",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(RallyError::io(format!(
+                    "stat DB-only migration recovery marker {}",
+                    path.display()
+                ))(error));
+            }
+        }
+    }
+    Ok(())
+}
 
 use crate::backends::ManagedSession;
 use crate::cli::RoomArgs;
@@ -2167,6 +2210,113 @@ fn acquire_direct_owner_exclusive_nb(_rally_dir: &Path) -> Result<Option<OwnerGu
     Ok(Some(OwnerGuard))
 }
 
+/// Exclusive offline authority for the one recovery path that is allowed to
+/// inspect `facts.db` as source evidence. This deliberately does not install
+/// the guards in the process-global direct-store table and never probes or
+/// routes to rallyd: the maintenance command owns direct EX, daemon-owner SH,
+/// and the canonical mutation lock only for the duration of one invocation.
+pub(crate) struct OfflineMigrationAuthority {
+    _direct_owner: OwnerGuard,
+    _daemon_exclusion: OwnerGuard,
+    _mutation: RoomMutationLock,
+}
+
+#[cfg(unix)]
+pub(crate) fn acquire_offline_migration_authority(
+    rally_dir: &Path,
+) -> Result<OfflineMigrationAuthority> {
+    let direct_owner = acquire_direct_owner_exclusive_nb(rally_dir)?.ok_or_else(|| {
+        RallyError::Command(
+            "offline migration authority is busy: another direct Rally process owns facts.db; \
+             stop all Rally commands and run `rally daemon stop` before retrying"
+                .to_string(),
+        )
+    })?;
+    let daemon_exclusion = match acquire_owner_shared_nb(rally_dir)? {
+        Some(guard) => guard,
+        None => {
+            drop(direct_owner);
+            return Err(RallyError::Command(
+                "offline migration authority is unavailable because a live or unresponsive \
+                 daemon owns facts.db; run `rally daemon stop` and confirm it stopped before \
+                 retrying"
+                    .to_string(),
+            ));
+        }
+    };
+    let mutation = acquire_room_mutation_lock(rally_dir)?;
+    Ok(OfflineMigrationAuthority {
+        _direct_owner: direct_owner,
+        _daemon_exclusion: daemon_exclusion,
+        _mutation: mutation,
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn acquire_offline_migration_authority(
+    _rally_dir: &Path,
+) -> Result<OfflineMigrationAuthority> {
+    Err(RallyError::Usage(
+        "rally doctor --migrate-db-only is unsupported on this platform because equivalent \
+         cross-process owner locks and directory sync semantics are not implemented"
+            .to_string(),
+    ))
+}
+
+/// Optimistic, byte-inert owner observation for migration dry-run. Missing
+/// rendezvous files mean only "nothing observable"; apply creates/acquires the
+/// real lock set and revalidates from scratch before making any safety claim.
+#[cfg(unix)]
+pub(crate) fn observe_offline_migration_authority(rally_dir: &Path) -> Result<String> {
+    fn try_existing(path: &Path, operation: i32) -> Result<Option<bool>> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(RallyError::io(format!("stat {}", path.display()))(error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(RallyError::Usage(format!(
+                "offline migration lock {} must be a regular file, not a symlink or special file",
+                path.display()
+            )));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(RallyError::io(format!("open {}", path.display())))?;
+        let rc = unsafe { unix_lock::flock(file.as_raw_fd(), operation | unix_lock::LOCK_NB) };
+        if rc == 0 {
+            let _ = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_UN) };
+            return Ok(Some(true));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            Ok(Some(false))
+        } else {
+            Err(RallyError::Io {
+                context: format!("observe offline migration lock {}", path.display()),
+                source: error,
+            })
+        }
+    }
+
+    let direct = rally_dir.join(DIRECT_OWNER_LOCK_FILENAME);
+    if try_existing(&direct, unix_lock::LOCK_EX)? == Some(false) {
+        return Ok("direct_owner_busy".to_string());
+    }
+    let daemon = rally_dir.join(RALLYD_OWNER_LOCK_FILENAME);
+    if try_existing(&daemon, unix_lock::LOCK_SH)? == Some(false) {
+        return Ok("daemon_owner_busy".to_string());
+    }
+    Ok("clear_at_optimistic_inspection".to_string())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn observe_offline_migration_authority(_rally_dir: &Path) -> Result<String> {
+    Ok("unsupported_platform".to_string())
+}
+
 /// Destructive automatic cleanup fails closed on platforms without a kernel
 /// advisory lock equivalent. A process-local/no-op guard would permit two
 /// entrants to reap concurrently.
@@ -2198,6 +2348,27 @@ struct LedgerLine {
     payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     engagement: Option<String>,
+}
+
+/// Closed-DB canonical candidate used only by the explicit offline DB-only
+/// migration. `bytes` is already sorted by the logical payload sequence,
+/// fully canonical-validated, and newline framed one row per source DB row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DbOnlyMigrationSegment {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) row_count: u64,
+    pub(crate) max_seq: i64,
+}
+
+/// Raw row read through a strictly read-only SQLite connection by the offline
+/// migration command. Keeping SQLite access out of the normal fact store avoids
+/// its schema/WAL bootstrap writes while this helper retains canonical rendering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DbOnlyMigrationSourceRow {
+    pub(crate) database_seq: i64,
+    pub(crate) occurred_at: String,
+    pub(crate) event_type: String,
+    pub(crate) payload: Value,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2314,7 +2485,7 @@ fn inspect_active_segment_tail(path: &Path) -> Result<ActiveTailRepair> {
     }
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(RallyError::io(format!(
@@ -2701,6 +2872,7 @@ impl RoomStore {
     /// startup, so routing straight to `Routed` is correct without re-deriving
     /// existence locally).
     pub(crate) fn open_existing_at(root: PathBuf) -> Result<Option<Self>> {
+        ensure_no_db_only_migration_recovery(&root)?;
         let rally_dir = root.join(".rally");
         let engagement = env::var(ENGAGEMENT_ENV_VAR).ok();
         match acquire_direct_ownership_or_route(&root, &rally_dir, engagement)? {
@@ -2712,6 +2884,7 @@ impl RoomStore {
     /// The ADR-01 routing seam shared by `open_at`/`open_at_with_engagement`.
     /// See the `impl RoomStore` doc comment above for the full choreography.
     fn route(root: PathBuf, engagement: Option<String>) -> Result<Self> {
+        ensure_no_db_only_migration_recovery(&root)?;
         let rally_dir = root.join(".rally");
         match acquire_direct_ownership_or_route(&root, &rally_dir, engagement.clone())? {
             Some(routed) => Ok(RoomStore::Routed(routed)),
@@ -3074,13 +3247,14 @@ impl DirectRoomStore {
     ///    events than the current `facts.db`, the db is rebuilt by replaying
     ///    every segment in seq order. The db is a pure cache — never
     ///    canonical.
-    /// 3. If no segment / monolith / archive exists but `facts.db` already
-    ///    has events, seed a single segment from the db so no history is
-    ///    lost on first upgrade.
+    /// 3. If no canonical source exists but `facts.db` has events, preserve
+    ///    the db and fail loud with the explicit offline
+    ///    `rally doctor --migrate-db-only` recovery path. Ordinary store open
+    ///    never promotes derived state into canonical history.
     /// 4. Otherwise segments and db are already in sync and we proceed.
     ///
-    /// Replay, migration, and seed are all idempotent — running them twice
-    /// on the same inputs yields identical state.
+    /// Replay and legacy-monolith migration are idempotent — running them
+    /// twice on the same inputs yields identical state.
     pub(crate) fn open_direct_at(root: PathBuf) -> Result<Self> {
         // Production path: resolve the engagement from the process-global
         // `RALLY_ENGAGEMENT` env (sound for a single CLI process).
@@ -3097,6 +3271,7 @@ impl DirectRoomStore {
         root: PathBuf,
         engagement: Option<String>,
     ) -> Result<Self> {
+        ensure_no_db_only_migration_recovery(&root)?;
         let dir = root.join(".rally");
         fs::create_dir_all(&dir).map_err(RallyError::io("create .rally"))?;
         let _guard = acquire_room_mutation_lock(&dir)?;
@@ -3138,6 +3313,7 @@ impl DirectRoomStore {
     }
 
     pub(crate) fn open_direct_existing_at(root: PathBuf) -> Result<Option<Self>> {
+        ensure_no_db_only_migration_recovery(&root)?;
         let dir = root.join(".rally");
         let fact_store_path = dir.join("facts.db");
         let log_dir = dir.join(LOG_DIRNAME);
@@ -3399,6 +3575,7 @@ impl DirectRoomStore {
     }
 
     fn append_fact_under_lock(&self, fact: &Fact) -> Result<AppendOutcome> {
+        ensure_no_db_only_migration_recovery(&self.repo_root)?;
         let mut fact = fact.clone();
         // Only invariant input bounds precede canonical identity resolution.
         // Stateful authority/claim/transition checks below apply solely to a
@@ -5388,9 +5565,9 @@ fn facts_from_db_with_query_recovery(
 /// `(name, len, mtime_ns, tail_hash)` per file, the SAME signal
 /// `refresh_reconcile_cache_after_full_scan` already trusts. Appends move the
 /// length, while O26's bounded tail repair moves the fixed-size tail hash even
-/// if length and timestamp collide. The repair and `seed_segment_from_db` paths
-/// also call [`invalidate_segment_fold_memo`] before rewriting so the current
-/// process cannot reuse a detached fold.
+/// if length and timestamp collide. The repair path also calls
+/// [`invalidate_segment_fold_memo`] before rewriting so the current process
+/// cannot reuse a detached fold.
 ///
 /// # What this does NOT do
 ///
@@ -7133,7 +7310,7 @@ fn sanitise_engagement(value: &str) -> String {
 
 /// Validate a caller-selected segment name. Unlike append routing, a scoped
 /// read must never silently rewrite a label and select a neighboring segment.
-fn validate_scoped_engagement(value: &str) -> Result<String> {
+pub(crate) fn validate_scoped_engagement(value: &str) -> Result<String> {
     let trimmed = value.trim();
     let cleaned = sanitise_engagement(trimmed);
     if cleaned.is_empty() {
@@ -7529,8 +7706,8 @@ fn seed_segments_from_db_if_absent(
 /// The contract is:
 ///
 /// * Segments ahead of db (incl. db absent) → rebuild db by replaying segments.
-/// * Segments absent but db has events → seed one segment from db (first-run
-///   upgrade from a pre-R1 db that never had a ledger).
+/// * Segments absent but db has events → preserve the db and fail loud with
+///   the explicit offline `rally doctor --migrate-db-only` recovery path.
 /// * Both empty, or in sync → no-op.
 ///
 /// Fast path (Step-3): a cheap O(#segment-files) fingerprint of the segment set
@@ -7806,6 +7983,196 @@ fn read_segment_entries_matching_with_policy(
         }
     }
     Ok(entries)
+}
+
+/// Normalize raw read-only SQLite rows into the exact canonical `LedgerLine`
+/// representation used by replay. Logical payload sequences win over compacted
+/// database positions, preserving sparse histories and their high-water mark.
+pub(crate) fn render_db_only_migration_segment(
+    source_rows: Vec<DbOnlyMigrationSourceRow>,
+    engagement: &str,
+) -> Result<DbOnlyMigrationSegment> {
+    let engagement = validate_scoped_engagement(engagement)?;
+    let mut rows = BTreeMap::<i64, LedgerLine>::new();
+    let mut previous_database_seq = 0;
+    for record in source_rows {
+        let database_seq = record.database_seq;
+        if database_seq <= previous_database_seq {
+            return Err(RallyError::Message(format!(
+                "DB-only source record seq {database_seq} is not strictly newer than {previous_database_seq}"
+            )));
+        }
+        previous_database_seq = database_seq;
+        let fact = Fact::from_value(record.payload.clone(), database_seq)?;
+        let logical_seq = fact.seq;
+        if logical_seq <= 0 {
+            return Err(RallyError::Message(format!(
+                "DB-only row {} has non-positive logical seq {logical_seq}",
+                fact.event_id
+            )));
+        }
+        let mut payload = record.payload;
+        let payload_object = payload.as_object_mut().ok_or_else(|| {
+            RallyError::Message(format!(
+                "DB-only row at record seq {database_seq} is not an object payload"
+            ))
+        })?;
+        payload_object.insert("seq".to_string(), json!(logical_seq));
+        let entry = LedgerLine {
+            seq: logical_seq,
+            occurred_at: record.occurred_at.to_string(),
+            event_type: record.event_type,
+            payload,
+            engagement: Some(engagement.clone()),
+        };
+        chrono::DateTime::parse_from_rfc3339(&entry.occurred_at).map_err(|error| {
+            RallyError::Message(format!(
+                "DB-only row at logical seq {logical_seq} has invalid occurred_at {:?}: {error}",
+                entry.occurred_at
+            ))
+        })?;
+        validate_canonical_line(&entry)?;
+        if rows.insert(logical_seq, entry).is_some() {
+            return Err(RallyError::Message(format!(
+                "DB-only history has more than one row at logical seq {logical_seq}; migration cannot choose canonical precedence"
+            )));
+        }
+    }
+    if rows.is_empty() {
+        return Err(RallyError::Usage(
+            "facts.db contains no rows; there is no DB-only history to migrate".to_string(),
+        ));
+    }
+
+    let row_count = u64::try_from(rows.len())
+        .map_err(|error| RallyError::Message(format!("row count overflow: {error}")))?;
+    let max_seq = rows.last_key_value().map(|(seq, _)| *seq).unwrap_or(0);
+    let mut bytes = Vec::new();
+    for entry in rows.values() {
+        serde_json::to_writer(&mut bytes, entry)
+            .map_err(RallyError::json("render DB-only canonical row"))?;
+        bytes.push(b'\n');
+    }
+    Ok(DbOnlyMigrationSegment {
+        bytes,
+        row_count,
+        max_seq,
+    })
+}
+
+/// Exact readback for marker-bound migration temp/target files. Byte equality
+/// prevents normalization drift; strict canonical parsing independently proves
+/// that every complete line remains replayable and no torn tail was accepted.
+pub(crate) fn verify_db_only_migration_segment(
+    path: &Path,
+    expected: &DbOnlyMigrationSegment,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(RallyError::io(format!(
+        "stat migration segment {}",
+        path.display()
+    )))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(RallyError::Usage(format!(
+            "migration segment {} must be a regular file, not a symlink or special file",
+            path.display()
+        )));
+    }
+    let observed = fs::read(path).map_err(RallyError::io(format!(
+        "read migration segment {}",
+        path.display()
+    )))?;
+    if observed != expected.bytes {
+        return Err(RallyError::Message(format!(
+            "migration segment {} differs from the marker-bound canonical candidate",
+            path.display()
+        )));
+    }
+    let entries = read_segment_entries_strict(path)?;
+    if entries.len() as u64 != expected.row_count
+        || entries.last().map_or(0, |entry| entry.seq) != expected.max_seq
+    {
+        return Err(RallyError::Message(format!(
+            "migration segment {} readback stats differ from the marker-bound candidate",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Verify an immutable migration receipt against a target that may have grown
+/// by later canonical appends. The receipt-bound bytes must remain the exact
+/// prefix; every extension row must be strictly newer, canonical-valid, and
+/// stamped for the same engagement. Nothing is rewritten or repaired here.
+pub(crate) fn verify_db_only_migration_extension(
+    path: &Path,
+    expected_prefix: &DbOnlyMigrationSegment,
+    expected_engagement: &str,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(RallyError::io(format!(
+        "stat migration target {}",
+        path.display()
+    )))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(RallyError::Usage(format!(
+            "migration target {} must be a regular file, not a symlink or special file",
+            path.display()
+        )));
+    }
+    let observed = fs::read(path).map_err(RallyError::io(format!(
+        "read migration target {}",
+        path.display()
+    )))?;
+    if !observed.starts_with(&expected_prefix.bytes) {
+        return Err(RallyError::Message(format!(
+            "migration target {} diverges from its immutable receipt-bound prefix",
+            path.display()
+        )));
+    }
+    let entries = read_segment_entries_strict(path)?;
+    let prefix_count = usize::try_from(expected_prefix.row_count)
+        .map_err(|error| RallyError::Message(format!("row count overflow: {error}")))?;
+    if entries.len() < prefix_count
+        || entries
+            .get(prefix_count.saturating_sub(1))
+            .map_or(0, |entry| entry.seq)
+            != expected_prefix.max_seq
+    {
+        return Err(RallyError::Message(format!(
+            "migration target {} no longer contains the receipt-bound row boundary",
+            path.display()
+        )));
+    }
+    for entry in &entries {
+        if entry.engagement.as_deref() != Some(expected_engagement) {
+            return Err(RallyError::Message(format!(
+                "migration target {} seq {} is not stamped for receipt engagement {:?}",
+                path.display(),
+                entry.seq,
+                expected_engagement
+            )));
+        }
+        chrono::DateTime::parse_from_rfc3339(&entry.occurred_at).map_err(|error| {
+            RallyError::Message(format!(
+                "migration target {} seq {} has invalid occurred_at {:?}: {error}",
+                path.display(),
+                entry.seq,
+                entry.occurred_at
+            ))
+        })?;
+    }
+    let mut previous_seq = expected_prefix.max_seq;
+    for entry in entries.iter().skip(prefix_count) {
+        if entry.seq <= previous_seq {
+            return Err(RallyError::Message(format!(
+                "migration target {} extension seq {} is not newer than {}",
+                path.display(),
+                entry.seq,
+                previous_seq
+            )));
+        }
+        previous_seq = entry.seq;
+    }
+    Ok(())
 }
 
 /// Strict, non-mutating rotation preflight over one canonical segment.
@@ -8167,43 +8534,6 @@ fn rebuild_db_from_segments(
     store
         .append(replay_events)
         .map_err(|err| RallyError::Message(format!("replay segments: {err}")))?;
-    Ok(())
-}
-
-/// Seed a single segment file from the existing db when no segment exists
-/// yet. Used as a forward-compat path: a pre-R1 install that only had
-/// `facts.db` still ends up with a canonical segment record.
-#[allow(dead_code)]
-fn seed_segment_from_db(log_dir: &Path, facts_db_path: &Path) -> Result<()> {
-    let store = open_fact_store(facts_db_path)?;
-    let query = store
-        .query(&FactQuery::all())
-        .map_err(|err| RallyError::Message(format!("query facts: {err}")))?;
-    fs::create_dir_all(log_dir).map_err(RallyError::io(format!("create {}", log_dir.display())))?;
-    let seed_label = utc_date_label();
-    let target = log_dir.join(format!("{seed_label}.jsonl"));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&target)
-        .map_err(RallyError::io(format!("create {}", target.display())))?;
-    for record in query.event_records {
-        let seq = i64::try_from(record.sequence_number)
-            .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
-        let entry = LedgerLine {
-            seq,
-            occurred_at: record.occurred_at.to_string(),
-            event_type: record.event_type,
-            payload: record.payload,
-            engagement: Some(seed_label.clone()),
-        };
-        let line =
-            serde_json::to_string(&entry).map_err(RallyError::json("render segment line"))?;
-        writeln!(file, "{line}").map_err(RallyError::io(format!("write {}", target.display())))?;
-    }
-    file.sync_all()
-        .map_err(RallyError::io(format!("fsync {}", target.display())))?;
     Ok(())
 }
 
@@ -8795,6 +9125,53 @@ mod ledger_tests {
             .expect("daemon EX acquisition must succeed");
         drop(daemon_owner);
         drop(direct_owner);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_migration_authority_orders_direct_then_daemon_then_mutation() {
+        let root = unique_root("offline-migration-authority-order");
+        let rally_dir = root.join(".rally");
+        let authority = acquire_offline_migration_authority(&rally_dir)
+            .expect("offline migration must acquire all three guards");
+
+        assert!(
+            acquire_direct_owner_exclusive_nb(&rally_dir)
+                .unwrap()
+                .is_none(),
+            "offline migration must exclude another direct facts.db owner"
+        );
+        assert!(
+            matches!(
+                acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(25)),
+                Err(RallyError::NotStarted(_))
+            ),
+            "offline migration daemon SH must exclude daemon startup"
+        );
+        assert!(
+            matches!(
+                with_mutation_deadline(Duration::from_millis(25), || {
+                    acquire_room_mutation_lock(&rally_dir)
+                }),
+                Err(RallyError::NotStarted(_))
+            ),
+            "offline migration must hold mutation.lock for its full lifetime"
+        );
+
+        drop(authority);
+        let direct = acquire_direct_owner_exclusive_nb(&rally_dir)
+            .unwrap()
+            .expect("direct ownership must recover after migration authority drops");
+        drop(direct);
+        let daemon = acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(100))
+            .expect("daemon ownership must recover after migration authority drops");
+        drop(daemon);
+        let mutation = with_mutation_deadline(Duration::from_millis(100), || {
+            acquire_room_mutation_lock(&rally_dir)
+        })
+        .expect("mutation.lock must recover after migration authority drops");
+        drop(mutation);
         fs::remove_dir_all(root).ok();
     }
 
@@ -11346,7 +11723,7 @@ mod ledger_tests {
     /// The adjacent two-engagement test remains the positive control that a
     /// room with canonical segments reconstructs after its cache is deleted.
     #[test]
-    fn seed_segment_from_existing_db() {
+    fn db_only_room_requires_explicit_offline_migration() {
         let root = unique_root("segments-bootstrap");
         let store = RoomStore::open_at(root.clone()).unwrap();
         store
@@ -11357,9 +11734,9 @@ mod ledger_tests {
             .unwrap();
         drop(store);
 
-        // Simulate "upgraded from a pre-segment version of rally": delete
-        // every segment but keep the db. Also remove the index so first-open
-        // can't accidentally short-circuit.
+        // Remove every canonical segment while preserving the derived db.
+        // Also remove the index so first-open cannot short-circuit the
+        // explicit DB-only migration requirement.
         let log_dir = root.join(".rally/log");
         if log_dir.exists() {
             for entry in fs::read_dir(&log_dir).unwrap() {

@@ -276,6 +276,10 @@ pub(crate) struct OwnersArgs {
 #[derive(Clone, Debug)]
 pub(crate) struct DoctorArgs {
     pub(crate) json: bool,
+    /// Inspect or explicitly migrate a repository whose only durable history is facts.db.
+    pub(crate) migrate_db_only: bool,
+    /// Validated canonical engagement that receives a DB-only migration segment.
+    pub(crate) engagement: Option<String>,
     /// Report non-canonical and suffix-colliding claim scopes in the current room.
     pub(crate) canonical_paths: bool,
     /// Classify rooms registry entries as live/stale; with --apply, rewrite the index.
@@ -960,7 +964,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .map(CliCommand::MigrateLegacy);
     let doctor = doctor_parser()
         .to_options()
-        .descr("Diagnostics + remediation: path hygiene (--canonical-paths), room registry pruning (--prune-rooms), stale-claim/lease reaping (--reap-stale), corrupt-snapshot sweeping (--sweep-corrupt). Read-only unless --apply.")
+        .descr("Diagnostics + remediation: path hygiene, room pruning, stale-state reaping, corrupt-snapshot sweeping, and explicit offline DB-only migration. Read-only unless --apply.")
         .command("doctor")
         .map(CliCommand::Doctor);
     let claims_refresh = claims_refresh_parser()
@@ -1494,6 +1498,10 @@ fn migrate_legacy_parser() -> impl Parser<MigrateLegacyArgs> {
 
 fn doctor_parser() -> impl Parser<DoctorArgs> {
     let json = json_flag();
+    let migrate_db_only = long("migrate-db-only")
+        .help("Inspect DB-only history; add --apply to install one canonical segment offline")
+        .switch();
+    let engagement = optional_string_arg("engagement", "LABEL");
     let canonical_paths = long("canonical-paths")
         .help("Report non-canonical scopes and suffix collisions in active claims")
         .switch();
@@ -1522,6 +1530,8 @@ fn doctor_parser() -> impl Parser<DoctorArgs> {
         .switch();
     construct!(DoctorArgs {
         json,
+        migrate_db_only,
+        engagement,
         canonical_paths,
         prune_rooms,
         reap_stale,
@@ -2331,4 +2341,32 @@ fn daemon_parser() -> impl Parser<DaemonArgs> {
     let json = json_flag();
     let subcommand = construct!([serve, start, stop, status]);
     construct!(json, subcommand).map(|(json, subcommand)| DaemonArgs { json, subcommand })
+}
+
+#[cfg(test)]
+mod o26_db_only_migration_cli_tests {
+    use super::*;
+
+    #[test]
+    fn doctor_parses_explicit_db_only_migration_contract() {
+        let args = [
+            "doctor",
+            "--migrate-db-only",
+            "--engagement",
+            "alpha",
+            "--apply",
+            "--json",
+        ]
+        .map(str::to_string);
+        let CliParse::Command(command) = parse_cli(&args).expect("migration command parses") else {
+            panic!("doctor migration must parse as a command");
+        };
+        let CliCommand::Doctor(doctor) = *command else {
+            panic!("migration flags must route to doctor");
+        };
+        assert!(doctor.migrate_db_only);
+        assert_eq!(doctor.engagement.as_deref(), Some("alpha"));
+        assert!(doctor.apply);
+        assert!(doctor.json);
+    }
 }

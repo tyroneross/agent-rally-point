@@ -3,30 +3,56 @@
 
 //! `rally doctor` — diagnostics and remediation for path hygiene, room registry, and stale state.
 //!
-//! Six independent modes:
+//! Seven independent modes:
 //!   --canonical-paths  scan active claims for non-canonical scopes and suffix collisions
 //!   --prune-rooms      classify registry entries as live/stale; remove stale ones with --apply
 //!   --reap-stale       reap over-TTL in-room claims and stale lead leases (dry-run; commit with --apply)
 //!   --sweep-corrupt    sweep disposable facts.db.corrupt.* snapshots (dry-run; remove with --apply)
 //!   --compact-log      render a diagnostic log with presence/heartbeat runs collapsed into counts
 //!   --binary-skew      compare the RUNNING binary's build stamp against this repo's HEAD
+//!   --migrate-db-only  inspect or explicitly migrate a current-format DB-only room offline
 
+#[cfg(unix)]
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use schemars::JsonSchema;
-use serde::Serialize;
-use std::fs;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::discovery::{
     DiscoveryWarning, KnownRoom, RoomIndex, read_room_index_at, room_index_path,
     write_room_index_at,
 };
-use crate::error::Result;
-use crate::store::RoomStore;
-use crate::{normalize_path, paths_suffix_collide};
+use crate::error::{RallyError, Result};
+use crate::store::{
+    ARCHIVE_DIRNAME, DB_ONLY_MIGRATION_MARKER_FILENAME, DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME,
+    DbOnlyMigrationSegment, DbOnlyMigrationSourceRow, LEDGER_FILENAME, LOG_DIRNAME, RoomStore,
+    acquire_offline_migration_authority, canonical_repo_root_string, ensure_new_mutation_can_start,
+    is_reserved_fixture_engagement, observe_offline_migration_authority,
+    render_db_only_migration_segment, sync_directory, validate_scoped_engagement,
+    verify_db_only_migration_extension, verify_db_only_migration_segment,
+};
+use crate::{
+    mark_watchdog_command_commit, mark_watchdog_db_only_migration_outcome_unknown, normalize_path,
+    now_string, paths_suffix_collide, shell_quote,
+};
 
 /// Prefix of every quarantined snapshot the store writes on corrupt-db detection.
 const CORRUPT_PREFIX: &str = "facts.db.corrupt.";
+pub(crate) const DB_ONLY_MIGRATION_RECEIPT_FILENAME: &str = "db-only-migration.v1.receipt.json";
+const DB_ONLY_MIGRATION_RECEIPT_STAGE_FILENAME: &str = "db-only-migration.v1.receipt.tmp";
+const DB_ONLY_MIGRATION_MARKER_SCHEMA: &str = "agent-rally.db-only-migration.v1";
+const DB_ONLY_MIGRATION_RECEIPT_SCHEMA: &str = "agent-rally.db-only-migration-receipt.v1";
 /// Default number of newest corrupt snapshots to retain for forensics.
 pub(crate) const SWEEP_DEFAULT_KEEP: i64 = 1;
 /// Default: also retain any snapshot newer than this many days.
@@ -81,6 +107,197 @@ pub(crate) struct PruneRoomsReport {
     /// Whether the index was actually rewritten.
     pub(crate) applied: bool,
     pub(crate) warnings: Vec<DiscoveryWarning>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DbOnlyMigrationState {
+    DryRun,
+    Committed,
+    AlreadyCommitted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub(crate) struct DbOnlyMigrationDbBinding {
+    pub(crate) sha256: String,
+    pub(crate) byte_len: u64,
+    pub(crate) row_count: u64,
+    pub(crate) logical_max_seq: i64,
+    pub(crate) normalized_rows_sha256: String,
+    pub(crate) normalized_rows_len: u64,
+    pub(crate) wal_present: bool,
+    pub(crate) wal_len: u64,
+    pub(crate) shm_present: bool,
+    pub(crate) shm_len: u64,
+    pub(crate) shm_sha256: Option<String>,
+    pub(crate) journal_present: bool,
+    pub(crate) journal_len: u64,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct DbOnlyMigrationReport {
+    pub(crate) state: DbOnlyMigrationState,
+    pub(crate) applied: bool,
+    pub(crate) apply_requires_revalidation: bool,
+    pub(crate) repo_root: PathBuf,
+    pub(crate) engagement: String,
+    pub(crate) migration_id: Option<String>,
+    pub(crate) source_token: Option<String>,
+    pub(crate) observed_blockers: Vec<String>,
+    pub(crate) owner_observation: String,
+    pub(crate) target_path: PathBuf,
+    pub(crate) marker_path: PathBuf,
+    pub(crate) receipt_path: PathBuf,
+    pub(crate) row_count: Option<u64>,
+    pub(crate) max_seq: Option<i64>,
+    pub(crate) db_sha256: Option<String>,
+    pub(crate) normalized_rows_sha256: Option<String>,
+    pub(crate) warnings: Vec<DiscoveryWarning>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DbOnlyMigrationInterruptionState {
+    Prepared,
+    OutcomeUnknown,
+    CommittedCleanupPending,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct DbOnlyMigrationInterruption {
+    pub(crate) state: DbOnlyMigrationInterruptionState,
+    pub(crate) migration_id: String,
+    pub(crate) phase: String,
+    pub(crate) retry_safe: bool,
+    pub(crate) retry_command: String,
+    pub(crate) detail: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum DbOnlyMigrationRunError {
+    Interrupted(DbOnlyMigrationInterruption),
+    Other(RallyError),
+}
+
+impl DbOnlyMigrationRunError {
+    pub(crate) fn into_rally_error(self) -> RallyError {
+        match self {
+            Self::Interrupted(interruption) => RallyError::Command(interruption.to_string()),
+            Self::Other(error) => error,
+        }
+    }
+}
+
+impl fmt::Display for DbOnlyMigrationRunError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Interrupted(interruption) => interruption.fmt(formatter),
+            Self::Other(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for DbOnlyMigrationRunError {}
+
+impl fmt::Display for DbOnlyMigrationInterruption {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = match self.state {
+            DbOnlyMigrationInterruptionState::Prepared => "prepared",
+            DbOnlyMigrationInterruptionState::OutcomeUnknown => "outcome unknown",
+            DbOnlyMigrationInterruptionState::CommittedCleanupPending => {
+                "committed cleanup pending"
+            }
+        };
+        write!(
+            formatter,
+            "db-only migration {state}: migration_id={} phase={} retry_safe={} {}; {}",
+            self.migration_id, self.phase, self.retry_safe, self.detail, self.retry_command
+        )
+    }
+}
+
+impl From<RallyError> for DbOnlyMigrationRunError {
+    fn from(error: RallyError) -> Self {
+        Self::Other(error)
+    }
+}
+
+type DbOnlyMigrationResult<T> = std::result::Result<T, DbOnlyMigrationRunError>;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DbOnlyMigrationMarker {
+    schema: String,
+    migration_id: String,
+    created_at: String,
+    canonical_repo_root: String,
+    engagement: String,
+    target_relative_path: String,
+    temp_relative_path: String,
+    db: DbOnlyMigrationDbBinding,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DbOnlyMigrationReceipt {
+    schema: String,
+    completed_at: String,
+    marker: DbOnlyMigrationMarker,
+    target_sha256: String,
+    target_len: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum DbOnlyMigrationFaultPoint {
+    MutateShmAfterDbRead,
+    #[cfg(test)]
+    ExpireDeadlineBeforeMarker,
+    AfterMarkerSync,
+    AfterTempSync,
+    AfterTempReadback,
+    AfterDbRevalidation,
+    AfterTargetInstallBeforeDirectorySync,
+    AfterTargetDirectorySync,
+    AfterReceiptSync,
+    AfterMarkerRemoval,
+}
+
+#[cfg(test)]
+fn db_only_migration_faults()
+-> &'static Mutex<BTreeMap<(PathBuf, DbOnlyMigrationFaultPoint), usize>> {
+    static FAULTS: OnceLock<Mutex<BTreeMap<(PathBuf, DbOnlyMigrationFaultPoint), usize>>> =
+        OnceLock::new();
+    FAULTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn arm_db_only_migration_fault(rally_dir: &Path, point: DbOnlyMigrationFaultPoint) {
+    *db_only_migration_faults()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry((rally_dir.to_path_buf(), point))
+        .or_default() += 1;
+}
+
+#[cfg(test)]
+fn take_db_only_migration_fault(rally_dir: &Path, point: DbOnlyMigrationFaultPoint) -> bool {
+    let mut faults = db_only_migration_faults()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = (rally_dir.to_path_buf(), point);
+    let Some(count) = faults.get_mut(&key) else {
+        return false;
+    };
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        faults.remove(&key);
+    }
+    true
+}
+
+#[cfg(not(test))]
+fn take_db_only_migration_fault(_rally_dir: &Path, _point: DbOnlyMigrationFaultPoint) -> bool {
+    false
 }
 
 // =============================================================================
@@ -153,6 +370,1624 @@ pub(crate) fn run_canonical_paths() -> Result<CanonicalPathsReport> {
         suffix_collisions,
         warnings: Vec::new(),
     })
+}
+
+// =============================================================================
+// Explicit offline DB-only migration
+// =============================================================================
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PhysicalDbToken {
+    sha256: String,
+    byte_len: u64,
+    wal_present: bool,
+    wal_len: u64,
+    shm_present: bool,
+    shm_len: u64,
+    shm_sha256: Option<String>,
+    journal_present: bool,
+    journal_len: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SidecarToken {
+    present: bool,
+    byte_len: u64,
+    sha256: Option<String>,
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn safe_file_bytes(path: &Path, label: &str) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(RallyError::io(format!("stat {label} {}", path.display())))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(RallyError::Usage(format!(
+            "{label} {} must be a regular file, not a symlink or special file",
+            path.display()
+        )));
+    }
+    fs::read(path).map_err(RallyError::io(format!("read {label} {}", path.display())))
+}
+
+fn ensure_regular_or_missing(path: &Path, label: &str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(RallyError::Usage(format!(
+            "{label} {} is a symlink; migration refuses to follow it",
+            path.display()
+        ))),
+        Ok(_) => Err(RallyError::Usage(format!(
+            "{label} {} must be a regular file",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(RallyError::io(format!("stat {label} {}", path.display()))(
+            error,
+        )),
+    }
+}
+
+fn ensure_real_directory(path: &Path, label: &str, required: bool) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(RallyError::Usage(format!(
+            "{label} {} is a symlink; migration refuses to follow it",
+            path.display()
+        ))),
+        Ok(_) => Err(RallyError::Usage(format!(
+            "{label} {} must be a directory",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !required => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(RallyError::Usage(format!(
+            "required {label} {} does not exist",
+            path.display()
+        ))),
+        Err(error) => Err(RallyError::io(format!("stat {label} {}", path.display()))(
+            error,
+        )),
+    }
+}
+
+fn inspect_sidecar(path: &Path, label: &str, allow_nonempty: bool) -> Result<SidecarToken> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let bytes = fs::read(path).map_err(RallyError::io(format!(
+                "read SQLite {label} {}",
+                path.display()
+            )))?;
+            let len = u64::try_from(bytes.len()).map_err(|error| {
+                RallyError::Message(format!("SQLite {label} length overflow: {error}"))
+            })?;
+            let metadata_after = fs::symlink_metadata(path).map_err(RallyError::io(format!(
+                "restat SQLite {label} {}",
+                path.display()
+            )))?;
+            if metadata_after.file_type().is_symlink()
+                || !metadata_after.file_type().is_file()
+                || metadata_after.len() != len
+            {
+                return Err(RallyError::Command(format!(
+                    "SQLite {label} {} changed while its migration identity was read; no migration state was published",
+                    path.display()
+                )));
+            }
+            if len > 0 && !allow_nonempty {
+                return Err(RallyError::Usage(format!(
+                    "offline DB-only migration refuses nonempty SQLite WAL/rollback recovery sidecar {label} {} ({len} bytes); preserve it and close/checkpoint SQLite before retrying",
+                    path.display()
+                )));
+            }
+            Ok(SidecarToken {
+                present: true,
+                byte_len: len,
+                sha256: Some(sha256_bytes(&bytes)),
+            })
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(RallyError::Usage(format!(
+            "SQLite {label} {} is a symlink; migration refuses to follow it",
+            path.display()
+        ))),
+        Ok(_) => Err(RallyError::Usage(format!(
+            "SQLite {label} {} must be a regular file",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(SidecarToken {
+            present: false,
+            byte_len: 0,
+            sha256: None,
+        }),
+        Err(error) => Err(RallyError::io(format!(
+            "stat SQLite {label} {}",
+            path.display()
+        ))(error)),
+    }
+}
+
+fn inspect_physical_db(facts_db_path: &Path) -> Result<PhysicalDbToken> {
+    let bytes = safe_file_bytes(facts_db_path, "facts.db")?;
+    let byte_len = u64::try_from(bytes.len())
+        .map_err(|error| RallyError::Message(format!("facts.db length overflow: {error}")))?;
+    let metadata_after = fs::symlink_metadata(facts_db_path).map_err(RallyError::io(format!(
+        "restat facts.db {}",
+        facts_db_path.display()
+    )))?;
+    if metadata_after.file_type().is_symlink()
+        || !metadata_after.file_type().is_file()
+        || metadata_after.len() != byte_len
+    {
+        return Err(RallyError::Command(
+            "facts.db changed while its migration source token was being read; no migration state was published"
+                .to_string(),
+        ));
+    }
+    let wal = inspect_sidecar(
+        &facts_db_path.with_extension("db-wal"),
+        "facts.db-wal",
+        false,
+    )?;
+    let shm = inspect_sidecar(
+        &facts_db_path.with_extension("db-shm"),
+        "facts.db-shm",
+        true,
+    )?;
+    let journal = inspect_sidecar(
+        &facts_db_path.with_extension("db-journal"),
+        "facts.db-journal",
+        false,
+    )?;
+    Ok(PhysicalDbToken {
+        sha256: sha256_bytes(&bytes),
+        byte_len,
+        wal_present: wal.present,
+        wal_len: wal.byte_len,
+        shm_present: shm.present,
+        shm_len: shm.byte_len,
+        shm_sha256: shm.sha256,
+        journal_present: journal.present,
+        journal_len: journal.byte_len,
+    })
+}
+
+fn sqlite_read_error(context: &str, error: rusqlite::Error) -> RallyError {
+    RallyError::Message(format!("{context}: {error}"))
+}
+
+#[cfg(unix)]
+fn immutable_sqlite_uri(path: &Path) -> String {
+    let mut encoded = String::from("file:");
+    for byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'/' | b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(*byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded.push_str("?mode=ro&immutable=1");
+    encoded
+}
+
+#[cfg(not(unix))]
+fn immutable_sqlite_uri(_path: &Path) -> String {
+    String::new()
+}
+
+/// Read the current-format source without invoking the ordinary store open.
+/// The normal store bootstrap is intentionally read-write: it enables WAL and
+/// runs schema DDL. Migration inspection must instead leave every source byte
+/// and sidecar identity unchanged.
+#[cfg(unix)]
+fn read_db_only_rows(facts_db_path: &Path) -> Result<Vec<DbOnlyMigrationSourceRow>> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_URI;
+    let connection = Connection::open_with_flags(immutable_sqlite_uri(facts_db_path), flags)
+        .map_err(|error| sqlite_read_error("open facts.db read-only", error))?;
+    connection
+        .pragma_update(None, "query_only", true)
+        .map_err(|error| sqlite_read_error("set facts.db query_only", error))?;
+
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|error| sqlite_read_error("run facts.db integrity_check", error))?;
+    if integrity != "ok" {
+        return Err(RallyError::Usage(format!(
+            "facts.db integrity_check returned {integrity:?}; migration preserves the DB and refuses to quarantine or rewrite it"
+        )));
+    }
+    let store_format: Option<String> = connection
+        .query_row(
+            "SELECT value FROM store_metadata WHERE key = 'store_format_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| sqlite_read_error("read facts.db store format", error))?;
+    if store_format.as_deref() != Some("1") {
+        return Err(RallyError::Usage(format!(
+            "facts.db has unsupported store_format_version {store_format:?}; expected current format 1"
+        )));
+    }
+
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence_number, occurred_at, event_type, payload \
+             FROM events ORDER BY sequence_number ASC",
+        )
+        .map_err(|error| sqlite_read_error("prepare facts.db event scan", error))?;
+    let mapped = statement
+        .query_map([], |row| {
+            let payload_text: String = row.get(3)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                payload_text,
+            ))
+        })
+        .map_err(|error| sqlite_read_error("query facts.db events", error))?;
+    let mut rows = Vec::new();
+    for mapped_row in mapped {
+        let (database_seq, occurred_at, event_type, payload_text) =
+            mapped_row.map_err(|error| sqlite_read_error("decode facts.db event row", error))?;
+        let payload = serde_json::from_str(&payload_text).map_err(RallyError::json(format!(
+            "parse facts.db payload at seq {database_seq}"
+        )))?;
+        rows.push(DbOnlyMigrationSourceRow {
+            database_seq,
+            occurred_at,
+            event_type,
+            payload,
+        });
+    }
+    drop(statement);
+    connection
+        .close()
+        .map_err(|(_, error)| sqlite_read_error("close facts.db read-only", error))?;
+    Ok(rows)
+}
+
+#[cfg(not(unix))]
+fn read_db_only_rows(_facts_db_path: &Path) -> Result<Vec<DbOnlyMigrationSourceRow>> {
+    Err(RallyError::Usage(
+        "rally doctor --migrate-db-only is unsupported on this platform".to_string(),
+    ))
+}
+
+fn inspect_closed_db_candidate(
+    facts_db_path: &Path,
+    engagement: &str,
+) -> Result<(DbOnlyMigrationSegment, DbOnlyMigrationDbBinding)> {
+    let before = inspect_physical_db(facts_db_path)?;
+    let rows = read_db_only_rows(facts_db_path)?;
+    if take_db_only_migration_fault(
+        facts_db_path.parent().unwrap_or_else(|| Path::new(".")),
+        DbOnlyMigrationFaultPoint::MutateShmAfterDbRead,
+    ) {
+        let shm_path = facts_db_path.with_extension("db-shm");
+        fs::write(&shm_path, b"changed during read").map_err(RallyError::io(format!(
+            "inject SHM mutation {}",
+            shm_path.display()
+        )))?;
+    }
+    let candidate = render_db_only_migration_segment(rows, engagement)?;
+    let after = inspect_physical_db(facts_db_path)?;
+    if before != after {
+        return Err(RallyError::Command(format!(
+            "facts.db changed across the closed migration row read (before {}/{}, after {}/{}); no marker was published",
+            before.sha256, before.byte_len, after.sha256, after.byte_len
+        )));
+    }
+    let binding = DbOnlyMigrationDbBinding {
+        sha256: after.sha256,
+        byte_len: after.byte_len,
+        row_count: candidate.row_count,
+        logical_max_seq: candidate.max_seq,
+        normalized_rows_sha256: sha256_bytes(&candidate.bytes),
+        normalized_rows_len: u64::try_from(candidate.bytes.len()).map_err(|error| {
+            RallyError::Message(format!("normalized row length overflow: {error}"))
+        })?,
+        wal_present: after.wal_present,
+        wal_len: after.wal_len,
+        shm_present: after.shm_present,
+        shm_len: after.shm_len,
+        shm_sha256: after.shm_sha256,
+        journal_present: after.journal_present,
+        journal_len: after.journal_len,
+    };
+    Ok((candidate, binding))
+}
+
+fn source_token(binding: &DbOnlyMigrationDbBinding) -> Result<String> {
+    let rendered =
+        serde_json::to_vec(binding).map_err(RallyError::json("render DB-only source token"))?;
+    Ok(format!("db-only-v1:{}", sha256_bytes(&rendered)))
+}
+
+fn migration_id(binding: &DbOnlyMigrationDbBinding, engagement: &str) -> String {
+    let identity = format!(
+        "{}:{}:{}:{}",
+        binding.sha256, binding.normalized_rows_sha256, binding.row_count, engagement
+    );
+    format!("dbmig-{}", &sha256_bytes(identity.as_bytes())[..24])
+}
+
+fn migration_remedy(engagement: &str) -> String {
+    format!(
+        "rally doctor --migrate-db-only --engagement {} --apply --json",
+        shell_quote(engagement)
+    )
+}
+
+fn mark_migration_watchdog(marker: &DbOnlyMigrationMarker, phase: &str) {
+    mark_watchdog_db_only_migration_outcome_unknown(
+        &marker.migration_id,
+        phase,
+        &migration_remedy(&marker.engagement),
+    );
+}
+
+fn interruption(
+    marker: &DbOnlyMigrationMarker,
+    state: DbOnlyMigrationInterruptionState,
+    phase: &str,
+    detail: impl Into<String>,
+) -> DbOnlyMigrationRunError {
+    DbOnlyMigrationRunError::Interrupted(DbOnlyMigrationInterruption {
+        state,
+        migration_id: marker.migration_id.clone(),
+        phase: phase.to_string(),
+        retry_safe: state != DbOnlyMigrationInterruptionState::OutcomeUnknown,
+        retry_command: migration_remedy(&marker.engagement),
+        detail: detail.into(),
+    })
+}
+
+fn classify_interruption(
+    error: DbOnlyMigrationRunError,
+    marker: &DbOnlyMigrationMarker,
+    state: DbOnlyMigrationInterruptionState,
+    phase: &str,
+) -> DbOnlyMigrationRunError {
+    match error {
+        DbOnlyMigrationRunError::Interrupted(_) => error,
+        DbOnlyMigrationRunError::Other(error) => {
+            interruption(marker, state, phase, error.to_string())
+        }
+    }
+}
+
+fn maybe_fault(
+    rally_dir: &Path,
+    marker: &DbOnlyMigrationMarker,
+    point: DbOnlyMigrationFaultPoint,
+    state: DbOnlyMigrationInterruptionState,
+    phase: &str,
+) -> DbOnlyMigrationResult<()> {
+    if take_db_only_migration_fault(rally_dir, point) {
+        return Err(interruption(
+            marker,
+            state,
+            phase,
+            "injected path-scoped migration interruption",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_migration_topology(root: &Path) -> Result<()> {
+    let rally_dir = root.join(".rally");
+    ensure_real_directory(&rally_dir, ".rally directory", true)?;
+    ensure_real_directory(
+        &rally_dir.join(LOG_DIRNAME),
+        "canonical log directory",
+        false,
+    )?;
+    ensure_real_directory(
+        &rally_dir.join(ARCHIVE_DIRNAME),
+        "canonical archive directory",
+        false,
+    )?;
+    ensure_regular_or_missing(&rally_dir.join("facts.db"), "facts.db")?
+        .then_some(())
+        .ok_or_else(|| {
+            RallyError::Usage(
+                "facts.db does not exist; there is no DB-only history to migrate".to_string(),
+            )
+        })?;
+    for (filename, label) in [
+        (DB_ONLY_MIGRATION_MARKER_FILENAME, "migration marker"),
+        (
+            DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME,
+            "migration marker staging file",
+        ),
+        (DB_ONLY_MIGRATION_RECEIPT_FILENAME, "migration receipt"),
+        (
+            DB_ONLY_MIGRATION_RECEIPT_STAGE_FILENAME,
+            "migration receipt staging file",
+        ),
+        ("direct.owner.lock", "direct-owner lock"),
+        ("rallyd.owner.lock", "daemon-owner lock"),
+        ("mutation.lock", "mutation lock"),
+    ] {
+        ensure_regular_or_missing(&rally_dir.join(filename), label)?;
+    }
+    Ok(())
+}
+
+fn canonical_jsonl_paths(dir: &Path, label: &str) -> Result<Vec<PathBuf>> {
+    if !ensure_real_directory(dir, label, false)? {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir).map_err(RallyError::io(format!("read_dir {}", dir.display())))? {
+        let entry = entry.map_err(RallyError::io(format!("read entry {}", dir.display())))?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(RallyError::io(format!(
+            "stat canonical source {}",
+            path.display()
+        )))?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(RallyError::Usage(format!(
+                "canonical source {} must be a regular file; migration refuses symlinks and special files",
+                path.display()
+            )));
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn validate_canonical_source_set(root: &Path, allowed_target: Option<&Path>) -> Result<()> {
+    let rally_dir = root.join(".rally");
+    let legacy = rally_dir.join(LEDGER_FILENAME);
+    match fs::symlink_metadata(&legacy) {
+        Ok(_) => {
+            return Err(RallyError::Usage(format!(
+                "canonical source {} already exists; DB-only migration requires no legacy ledger",
+                legacy.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(RallyError::io(format!(
+                "stat legacy canonical source {}",
+                legacy.display()
+            ))(error));
+        }
+    }
+    let archive = canonical_jsonl_paths(
+        &rally_dir.join(ARCHIVE_DIRNAME),
+        "canonical archive directory",
+    )?;
+    if let Some(path) = archive.first() {
+        return Err(RallyError::Usage(format!(
+            "canonical source {} already exists; DB-only migration refuses mixed history",
+            path.display()
+        )));
+    }
+    for path in canonical_jsonl_paths(&rally_dir.join(LOG_DIRNAME), "canonical log directory")? {
+        if allowed_target.is_some_and(|allowed| allowed == path) {
+            continue;
+        }
+        return Err(RallyError::Usage(format!(
+            "canonical source {} already exists; DB-only migration refuses mixed history",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T> {
+    let bytes = safe_file_bytes(path, label)?;
+    serde_json::from_slice(&bytes).map_err(RallyError::json(format!(
+        "parse {label} {}",
+        path.display()
+    )))
+}
+
+fn write_new_synced(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(RallyError::io(format!("create {label} {}", path.display())))?;
+    file.write_all(bytes)
+        .map_err(RallyError::io(format!("write {label} {}", path.display())))?;
+    file.sync_all()
+        .map_err(RallyError::io(format!("sync {label} {}", path.display())))?;
+    let observed = safe_file_bytes(path, label)?;
+    if observed != bytes {
+        return Err(RallyError::Message(format!(
+            "{label} {} failed exact readback",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn install_no_clobber(staging: &Path, target: &Path, expected: &[u8], label: &str) -> Result<()> {
+    match fs::hard_link(staging, target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let observed = safe_file_bytes(target, label)?;
+            if observed != expected {
+                return Err(RallyError::Usage(format!(
+                    "existing {label} {} differs from the marker-bound content; evidence was preserved",
+                    target.display()
+                )));
+            }
+        }
+        Err(error) => {
+            return Err(RallyError::io(format!(
+                "install {label} {} without clobber",
+                target.display()
+            ))(error));
+        }
+    }
+    let observed = safe_file_bytes(target, label)?;
+    if observed != expected {
+        return Err(RallyError::Message(format!(
+            "installed {label} {} failed exact readback",
+            target.display()
+        )));
+    }
+    let file = fs::File::open(target)
+        .map_err(RallyError::io(format!("open {label} {}", target.display())))?;
+    file.sync_all()
+        .map_err(RallyError::io(format!("sync {label} {}", target.display())))?;
+    Ok(())
+}
+
+fn validate_marker(marker: &DbOnlyMigrationMarker, expected: &DbOnlyMigrationMarker) -> Result<()> {
+    if marker.schema != DB_ONLY_MIGRATION_MARKER_SCHEMA {
+        return Err(RallyError::Usage(format!(
+            "migration marker has unsupported schema {:?}; evidence was preserved",
+            marker.schema
+        )));
+    }
+    chrono::DateTime::parse_from_rfc3339(&marker.created_at).map_err(|error| {
+        RallyError::Usage(format!(
+            "migration marker has invalid created_at {:?}: {error}; evidence was preserved",
+            marker.created_at
+        ))
+    })?;
+    let mut expected = expected.clone();
+    expected.created_at.clone_from(&marker.created_at);
+    if marker != &expected {
+        return Err(RallyError::Usage(format!(
+            "migration marker binding mismatch for migration {}; DB, engagement, target, counts, or checksums changed; evidence was preserved",
+            marker.migration_id
+        )));
+    }
+    Ok(())
+}
+
+fn expected_marker(
+    root: &Path,
+    engagement: &str,
+    binding: DbOnlyMigrationDbBinding,
+) -> DbOnlyMigrationMarker {
+    let id = migration_id(&binding, engagement);
+    DbOnlyMigrationMarker {
+        schema: DB_ONLY_MIGRATION_MARKER_SCHEMA.to_string(),
+        migration_id: id.clone(),
+        created_at: now_string(),
+        canonical_repo_root: canonical_repo_root_string(root),
+        engagement: engagement.to_string(),
+        target_relative_path: format!(".rally/{LOG_DIRNAME}/{engagement}.jsonl"),
+        temp_relative_path: format!(".rally/{LOG_DIRNAME}/.db-only-migration.v1-{id}.segment.tmp"),
+        db: binding,
+    }
+}
+
+fn load_or_publish_marker(
+    rally_dir: &Path,
+    expected: &DbOnlyMigrationMarker,
+) -> DbOnlyMigrationResult<DbOnlyMigrationMarker> {
+    let marker_path = rally_dir.join(DB_ONLY_MIGRATION_MARKER_FILENAME);
+    let stage_path = rally_dir.join(DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME);
+    if ensure_regular_or_missing(&marker_path, "migration marker")? {
+        let marker: DbOnlyMigrationMarker = read_json_file(&marker_path, "migration marker")?;
+        validate_marker(&marker, expected)?;
+        if ensure_regular_or_missing(&stage_path, "migration marker staging file")? {
+            let staged: DbOnlyMigrationMarker =
+                read_json_file(&stage_path, "migration marker staging file")?;
+            if staged != marker {
+                return Err(RallyError::Usage(
+                    "migration marker staging file differs from the installed marker; evidence was preserved"
+                        .to_string(),
+                )
+                .into());
+            }
+        }
+        let file = fs::File::open(&marker_path).map_err(RallyError::io(format!(
+            "open migration marker {}",
+            marker_path.display()
+        )))?;
+        file.sync_all().map_err(RallyError::io(format!(
+            "sync migration marker {}",
+            marker_path.display()
+        )))?;
+        sync_directory(rally_dir)?;
+        return Ok(marker);
+    }
+
+    let marker = if ensure_regular_or_missing(&stage_path, "migration marker staging file")? {
+        let staged: DbOnlyMigrationMarker =
+            read_json_file(&stage_path, "migration marker staging file")?;
+        validate_marker(&staged, expected)?;
+        staged
+    } else {
+        let rendered = serde_json::to_vec_pretty(expected)
+            .map_err(RallyError::json("render migration marker"))?;
+        write_new_synced(&stage_path, &rendered, "migration marker staging file")?;
+        expected.clone()
+    };
+    let staged_bytes = safe_file_bytes(&stage_path, "migration marker staging file")?;
+    install_no_clobber(&stage_path, &marker_path, &staged_bytes, "migration marker")?;
+    sync_directory(rally_dir)?;
+    let installed: DbOnlyMigrationMarker = read_json_file(&marker_path, "migration marker")?;
+    if installed != marker {
+        return Err(RallyError::Usage(
+            "installed migration marker differs from its create-new staging file; evidence was preserved"
+                .to_string(),
+        )
+        .into());
+    }
+    Ok(marker)
+}
+
+fn ensure_candidate_temp(
+    root: &Path,
+    rally_dir: &Path,
+    marker: &DbOnlyMigrationMarker,
+    candidate: &DbOnlyMigrationSegment,
+    allow_prefix_repair: bool,
+) -> DbOnlyMigrationResult<PathBuf> {
+    let log_dir = rally_dir.join(LOG_DIRNAME);
+    if !ensure_real_directory(&log_dir, "canonical log directory", false)? {
+        fs::create_dir(&log_dir).map_err(RallyError::io(format!(
+            "create canonical log directory {}",
+            log_dir.display()
+        )))?;
+        sync_directory(rally_dir)?;
+    }
+    let temp_path = root.join(&marker.temp_relative_path);
+    if temp_path.parent() != Some(log_dir.as_path()) {
+        return Err(RallyError::Usage(
+            "migration marker temp path escapes the canonical log directory; evidence was preserved"
+                .to_string(),
+        )
+        .into());
+    }
+    if ensure_regular_or_missing(&temp_path, "marker-bound migration temp")? {
+        let observed = safe_file_bytes(&temp_path, "marker-bound migration temp")?;
+        if observed != candidate.bytes {
+            if !allow_prefix_repair || !candidate.bytes.starts_with(&observed) {
+                return Err(RallyError::Usage(format!(
+                    "existing migration temp {} cannot be repaired: the canonical target is already present or its bytes are not an exact prefix of the marker-bound candidate; evidence was preserved",
+                    temp_path.display(),
+                ))
+                .into());
+            }
+            let mut file =
+                OpenOptions::new()
+                    .append(true)
+                    .open(&temp_path)
+                    .map_err(RallyError::io(format!(
+                        "open migration temp {}",
+                        temp_path.display()
+                    )))?;
+            file.write_all(&candidate.bytes[observed.len()..])
+                .map_err(RallyError::io(format!(
+                    "complete migration temp {}",
+                    temp_path.display()
+                )))?;
+            file.sync_all().map_err(RallyError::io(format!(
+                "sync migration temp {}",
+                temp_path.display()
+            )))?;
+        } else {
+            let file = fs::File::open(&temp_path).map_err(RallyError::io(format!(
+                "open migration temp {}",
+                temp_path.display()
+            )))?;
+            file.sync_all().map_err(RallyError::io(format!(
+                "sync migration temp {}",
+                temp_path.display()
+            )))?;
+        }
+    } else {
+        write_new_synced(&temp_path, &candidate.bytes, "marker-bound migration temp")?;
+    }
+    sync_directory(&log_dir)?;
+    Ok(temp_path)
+}
+
+fn validate_receipt_static(
+    receipt: &DbOnlyMigrationReceipt,
+    root: &Path,
+    engagement: &str,
+) -> Result<()> {
+    if receipt.schema != DB_ONLY_MIGRATION_RECEIPT_SCHEMA {
+        return Err(RallyError::Usage(format!(
+            "migration receipt has unsupported schema {:?}; evidence was preserved",
+            receipt.schema
+        )));
+    }
+    let expected_migration_id = migration_id(&receipt.marker.db, engagement);
+    let expected_target = format!(".rally/{LOG_DIRNAME}/{engagement}.jsonl");
+    let expected_temp =
+        format!(".rally/{LOG_DIRNAME}/.db-only-migration.v1-{expected_migration_id}.segment.tmp");
+    if receipt.marker.schema != DB_ONLY_MIGRATION_MARKER_SCHEMA
+        || receipt.marker.canonical_repo_root != canonical_repo_root_string(root)
+        || receipt.marker.engagement != engagement
+        || receipt.marker.target_relative_path != expected_target
+        || receipt.marker.temp_relative_path != expected_temp
+        || receipt.marker.migration_id != expected_migration_id
+        || receipt.target_len == 0
+        || receipt.target_sha256.len() != 64
+        || receipt.target_sha256 != receipt.marker.db.normalized_rows_sha256
+        || receipt.target_len != receipt.marker.db.normalized_rows_len
+        || receipt.marker.db.wal_len != 0
+        || receipt.marker.db.journal_len != 0
+        || receipt.marker.db.shm_present != receipt.marker.db.shm_sha256.is_some()
+    {
+        return Err(RallyError::Usage(
+            "migration receipt binding mismatch for repo, engagement, target, or checksum; evidence was preserved"
+                .to_string(),
+        ));
+    }
+    chrono::DateTime::parse_from_rfc3339(&receipt.completed_at).map_err(|error| {
+        RallyError::Usage(format!(
+            "migration receipt has invalid completed_at {:?}: {error}; evidence was preserved",
+            receipt.completed_at
+        ))
+    })?;
+    chrono::DateTime::parse_from_rfc3339(&receipt.marker.created_at).map_err(|error| {
+        RallyError::Usage(format!(
+            "migration receipt has invalid marker created_at {:?}: {error}; evidence was preserved",
+            receipt.marker.created_at
+        ))
+    })?;
+    let temp = Path::new(&receipt.marker.temp_relative_path);
+    let expected_parent = Path::new(".rally").join(LOG_DIRNAME);
+    if temp.is_absolute()
+        || temp.parent() != Some(expected_parent.as_path())
+        || temp.file_name().and_then(|value| value.to_str()).is_none()
+    {
+        return Err(RallyError::Usage(
+            "migration receipt contains an unsafe temp path; evidence was preserved".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn publish_receipt(
+    rally_dir: &Path,
+    marker: &DbOnlyMigrationMarker,
+    candidate: &DbOnlyMigrationSegment,
+) -> DbOnlyMigrationResult<DbOnlyMigrationReceipt> {
+    let receipt_path = rally_dir.join(DB_ONLY_MIGRATION_RECEIPT_FILENAME);
+    let stage_path = rally_dir.join(DB_ONLY_MIGRATION_RECEIPT_STAGE_FILENAME);
+    let expected = DbOnlyMigrationReceipt {
+        schema: DB_ONLY_MIGRATION_RECEIPT_SCHEMA.to_string(),
+        completed_at: now_string(),
+        marker: marker.clone(),
+        target_sha256: sha256_bytes(&candidate.bytes),
+        target_len: u64::try_from(candidate.bytes.len())
+            .map_err(|error| RallyError::Message(format!("target length overflow: {error}")))?,
+    };
+    if ensure_regular_or_missing(&receipt_path, "migration receipt")? {
+        let receipt: DbOnlyMigrationReceipt = read_json_file(&receipt_path, "migration receipt")?;
+        let mut expected_same_time = expected.clone();
+        expected_same_time
+            .completed_at
+            .clone_from(&receipt.completed_at);
+        if receipt != expected_same_time {
+            return Err(RallyError::Usage(
+                "existing migration receipt differs from the committed marker/target binding; evidence was preserved"
+                    .to_string(),
+            )
+            .into());
+        }
+        return Ok(receipt);
+    }
+    let receipt = if ensure_regular_or_missing(&stage_path, "migration receipt staging file")? {
+        let staged: DbOnlyMigrationReceipt =
+            read_json_file(&stage_path, "migration receipt staging file")?;
+        let mut expected_same_time = expected.clone();
+        expected_same_time
+            .completed_at
+            .clone_from(&staged.completed_at);
+        if staged != expected_same_time {
+            return Err(RallyError::Usage(
+                "migration receipt staging file differs from the committed marker/target binding; evidence was preserved"
+                    .to_string(),
+            )
+            .into());
+        }
+        staged
+    } else {
+        let rendered = serde_json::to_vec_pretty(&expected)
+            .map_err(RallyError::json("render migration receipt"))?;
+        write_new_synced(&stage_path, &rendered, "migration receipt staging file")?;
+        expected
+    };
+    let staged_bytes = safe_file_bytes(&stage_path, "migration receipt staging file")?;
+    install_no_clobber(
+        &stage_path,
+        &receipt_path,
+        &staged_bytes,
+        "migration receipt",
+    )?;
+    sync_directory(rally_dir)?;
+    Ok(receipt)
+}
+
+fn migration_report(
+    state: DbOnlyMigrationState,
+    applied: bool,
+    apply_requires_revalidation: bool,
+    root: &Path,
+    marker: &DbOnlyMigrationMarker,
+    owner_observation: String,
+    observed_blockers: Vec<String>,
+) -> Result<DbOnlyMigrationReport> {
+    Ok(DbOnlyMigrationReport {
+        state,
+        applied,
+        apply_requires_revalidation,
+        repo_root: root.to_path_buf(),
+        engagement: marker.engagement.clone(),
+        migration_id: Some(marker.migration_id.clone()),
+        source_token: Some(source_token(&marker.db)?),
+        observed_blockers,
+        owner_observation,
+        target_path: root.join(&marker.target_relative_path),
+        marker_path: root.join(".rally").join(DB_ONLY_MIGRATION_MARKER_FILENAME),
+        receipt_path: root.join(".rally").join(DB_ONLY_MIGRATION_RECEIPT_FILENAME),
+        row_count: Some(marker.db.row_count),
+        max_seq: Some(marker.db.logical_max_seq),
+        db_sha256: Some(marker.db.sha256.clone()),
+        normalized_rows_sha256: Some(marker.db.normalized_rows_sha256.clone()),
+        warnings: Vec::new(),
+    })
+}
+
+fn blocked_dry_run_report(
+    root: &Path,
+    engagement: &str,
+    owner_observation: String,
+    observed_blockers: Vec<String>,
+) -> DbOnlyMigrationReport {
+    let rally_dir = root.join(".rally");
+    DbOnlyMigrationReport {
+        state: DbOnlyMigrationState::DryRun,
+        applied: false,
+        apply_requires_revalidation: true,
+        repo_root: root.to_path_buf(),
+        engagement: engagement.to_string(),
+        migration_id: None,
+        source_token: None,
+        observed_blockers,
+        owner_observation,
+        target_path: rally_dir
+            .join(LOG_DIRNAME)
+            .join(format!("{engagement}.jsonl")),
+        marker_path: rally_dir.join(DB_ONLY_MIGRATION_MARKER_FILENAME),
+        receipt_path: rally_dir.join(DB_ONLY_MIGRATION_RECEIPT_FILENAME),
+        row_count: None,
+        max_seq: None,
+        db_sha256: None,
+        normalized_rows_sha256: None,
+        warnings: Vec::new(),
+    }
+}
+
+fn receipt_prefix_candidate(
+    root: &Path,
+    receipt: &DbOnlyMigrationReceipt,
+) -> Result<DbOnlyMigrationSegment> {
+    let target = root.join(&receipt.marker.target_relative_path);
+    let bytes = safe_file_bytes(&target, "migration target")?;
+    let prefix_len = usize::try_from(receipt.target_len)
+        .map_err(|error| RallyError::Message(format!("receipt target length overflow: {error}")))?;
+    if bytes.len() < prefix_len {
+        return Err(RallyError::Usage(format!(
+            "migration target {} is shorter than its immutable receipt; evidence was preserved",
+            target.display()
+        )));
+    }
+    let prefix = bytes[..prefix_len].to_vec();
+    if sha256_bytes(&prefix) != receipt.target_sha256 || prefix.last() != Some(&b'\n') {
+        return Err(RallyError::Usage(format!(
+            "migration target {} diverges from its immutable receipt-bound prefix; evidence was preserved",
+            target.display()
+        )));
+    }
+    let candidate = DbOnlyMigrationSegment {
+        bytes: prefix,
+        row_count: receipt.marker.db.row_count,
+        max_seq: receipt.marker.db.logical_max_seq,
+    };
+    verify_db_only_migration_extension(&target, &candidate, &receipt.marker.engagement)?;
+    Ok(candidate)
+}
+
+fn remove_regular_file(path: &Path, label: &str) -> Result<()> {
+    if !ensure_regular_or_missing(path, label)? {
+        return Ok(());
+    }
+    fs::remove_file(path).map_err(RallyError::io(format!("remove {label} {}", path.display())))
+}
+
+fn same_file_identity(left: &Path, right: &Path) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let left_metadata = fs::symlink_metadata(left).map_err(RallyError::io(format!(
+            "stat migration temp {}",
+            left.display()
+        )))?;
+        let right_metadata = fs::symlink_metadata(right).map_err(RallyError::io(format!(
+            "stat migration target {}",
+            right.display()
+        )))?;
+        Ok(left_metadata.dev() == right_metadata.dev()
+            && left_metadata.ino() == right_metadata.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        Ok(false)
+    }
+}
+
+fn verify_committed_cleanup_temp(
+    root: &Path,
+    receipt: &DbOnlyMigrationReceipt,
+    candidate: &DbOnlyMigrationSegment,
+    temp_path: &Path,
+) -> Result<()> {
+    let temp_bytes = safe_file_bytes(temp_path, "marker-bound migration temp")?;
+    if temp_bytes == candidate.bytes {
+        return verify_db_only_migration_segment(temp_path, candidate);
+    }
+
+    let target_path = root.join(&receipt.marker.target_relative_path);
+    let aliases_target = same_file_identity(temp_path, &target_path)?;
+    if !aliases_target {
+        let target_bytes = safe_file_bytes(&target_path, "migration target")?;
+        if temp_bytes != target_bytes {
+            return Err(RallyError::Usage(format!(
+                "marker-bound migration temp {} differs from both the immutable receipt prefix and committed target {}; evidence was preserved",
+                temp_path.display(),
+                target_path.display()
+            )));
+        }
+    }
+
+    verify_db_only_migration_extension(
+        temp_path,
+        candidate,
+        &receipt.marker.engagement,
+    )
+    .map_err(|error| {
+        RallyError::Usage(format!(
+            "marker-bound migration temp {} is not a valid receipt-bound canonical extension: {error}; evidence was preserved",
+            temp_path.display()
+        ))
+    })
+}
+
+fn cleanup_committed_migration(
+    root: &Path,
+    receipt: &DbOnlyMigrationReceipt,
+    candidate: &DbOnlyMigrationSegment,
+) -> DbOnlyMigrationResult<()> {
+    let rally_dir = root.join(".rally");
+    let log_dir = rally_dir.join(LOG_DIRNAME);
+    let marker = &receipt.marker;
+    let temp_path = root.join(&marker.temp_relative_path);
+    if ensure_regular_or_missing(&temp_path, "marker-bound migration temp")? {
+        verify_committed_cleanup_temp(root, receipt, candidate, &temp_path)?;
+        remove_regular_file(&temp_path, "marker-bound migration temp").map_err(|error| {
+            interruption(
+                marker,
+                DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+                "temp-cleanup",
+                error.to_string(),
+            )
+        })?;
+        sync_directory(&log_dir).map_err(|error| {
+            interruption(
+                marker,
+                DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+                "temp-cleanup-sync",
+                error.to_string(),
+            )
+        })?;
+    }
+
+    let marker_stage = rally_dir.join(DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME);
+    if ensure_regular_or_missing(&marker_stage, "migration marker staging file")? {
+        let staged: DbOnlyMigrationMarker =
+            read_json_file(&marker_stage, "migration marker staging file")?;
+        if staged != *marker {
+            return Err(RallyError::Usage(
+                "migration marker staging file differs during committed cleanup; evidence was preserved"
+                    .to_string(),
+            )
+            .into());
+        }
+        remove_regular_file(&marker_stage, "migration marker staging file").map_err(|error| {
+            interruption(
+                marker,
+                DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+                "marker-stage-cleanup",
+                error.to_string(),
+            )
+        })?;
+    }
+
+    let receipt_stage = rally_dir.join(DB_ONLY_MIGRATION_RECEIPT_STAGE_FILENAME);
+    if ensure_regular_or_missing(&receipt_stage, "migration receipt staging file")? {
+        let staged: DbOnlyMigrationReceipt =
+            read_json_file(&receipt_stage, "migration receipt staging file")?;
+        if staged != *receipt {
+            return Err(RallyError::Usage(
+                "migration receipt staging file differs during committed cleanup; evidence was preserved"
+                    .to_string(),
+            )
+            .into());
+        }
+        remove_regular_file(&receipt_stage, "migration receipt staging file").map_err(|error| {
+            interruption(
+                marker,
+                DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+                "receipt-stage-cleanup",
+                error.to_string(),
+            )
+        })?;
+    }
+    sync_directory(&rally_dir).map_err(|error| {
+        interruption(
+            marker,
+            DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+            "staging-cleanup-sync",
+            error.to_string(),
+        )
+    })?;
+
+    let marker_path = rally_dir.join(DB_ONLY_MIGRATION_MARKER_FILENAME);
+    if ensure_regular_or_missing(&marker_path, "migration marker")? {
+        let installed: DbOnlyMigrationMarker = read_json_file(&marker_path, "migration marker")?;
+        if installed != *marker {
+            return Err(RallyError::Usage(
+                "installed marker differs during committed cleanup; evidence was preserved"
+                    .to_string(),
+            )
+            .into());
+        }
+        remove_regular_file(&marker_path, "migration marker").map_err(|error| {
+            interruption(
+                marker,
+                DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+                "marker-cleanup",
+                error.to_string(),
+            )
+        })?;
+        maybe_fault(
+            &rally_dir,
+            marker,
+            DbOnlyMigrationFaultPoint::AfterMarkerRemoval,
+            DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+            "after-marker-removal-before-parent-sync",
+        )?;
+        sync_directory(&rally_dir).map_err(|error| {
+            interruption(
+                marker,
+                DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+                "marker-cleanup-sync",
+                error.to_string(),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn recover_from_receipt(
+    root: &Path,
+    engagement: &str,
+    apply: bool,
+    owner_observation: String,
+) -> DbOnlyMigrationResult<DbOnlyMigrationReport> {
+    let rally_dir = root.join(".rally");
+    let receipt_path = rally_dir.join(DB_ONLY_MIGRATION_RECEIPT_FILENAME);
+    let receipt: DbOnlyMigrationReceipt = read_json_file(&receipt_path, "migration receipt")?;
+    validate_receipt_static(&receipt, root, engagement)?;
+    if apply {
+        mark_migration_watchdog(&receipt.marker, "receipt-recovery-validation");
+    }
+    let target = root.join(&receipt.marker.target_relative_path);
+    validate_canonical_source_set(root, Some(&target))?;
+    let candidate = receipt_prefix_candidate(root, &receipt)?;
+
+    let marker_path = rally_dir.join(DB_ONLY_MIGRATION_MARKER_FILENAME);
+    if ensure_regular_or_missing(&marker_path, "migration marker")? {
+        let marker: DbOnlyMigrationMarker = read_json_file(&marker_path, "migration marker")?;
+        if marker != receipt.marker {
+            return Err(RallyError::Usage(
+                "migration marker differs from the immutable receipt; evidence was preserved"
+                    .to_string(),
+            )
+            .into());
+        }
+    }
+    let receipt_stage = rally_dir.join(DB_ONLY_MIGRATION_RECEIPT_STAGE_FILENAME);
+    if ensure_regular_or_missing(&receipt_stage, "migration receipt staging file")? {
+        let staged: DbOnlyMigrationReceipt =
+            read_json_file(&receipt_stage, "migration receipt staging file")?;
+        if staged != receipt {
+            return Err(RallyError::Usage(
+                "migration receipt staging file differs from the immutable receipt; evidence was preserved"
+                    .to_string(),
+            )
+            .into());
+        }
+    }
+
+    if apply {
+        let classify_committed = |error: RallyError, phase: &str| {
+            interruption(
+                &receipt.marker,
+                DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+                phase,
+                error.to_string(),
+            )
+        };
+        let target_file = fs::File::open(&target)
+            .map_err(RallyError::io(format!(
+                "open migration target {}",
+                target.display()
+            )))
+            .map_err(|error| classify_committed(error, "receipt-recovery-target-open"))?;
+        target_file
+            .sync_all()
+            .map_err(RallyError::io(format!(
+                "sync migration target {}",
+                target.display()
+            )))
+            .map_err(|error| classify_committed(error, "receipt-recovery-target-sync"))?;
+        sync_directory(&rally_dir.join(LOG_DIRNAME))
+            .map_err(|error| classify_committed(error, "receipt-recovery-log-sync"))?;
+        let receipt_file = fs::File::open(&receipt_path)
+            .map_err(RallyError::io(format!(
+                "open migration receipt {}",
+                receipt_path.display()
+            )))
+            .map_err(|error| classify_committed(error, "receipt-recovery-receipt-open"))?;
+        receipt_file
+            .sync_all()
+            .map_err(RallyError::io(format!(
+                "sync migration receipt {}",
+                receipt_path.display()
+            )))
+            .map_err(|error| classify_committed(error, "receipt-recovery-receipt-sync"))?;
+        sync_directory(&rally_dir)
+            .map_err(|error| classify_committed(error, "receipt-recovery-rally-sync"))?;
+        mark_watchdog_command_commit();
+        cleanup_committed_migration(root, &receipt, &candidate).map_err(|error| {
+            classify_interruption(
+                error,
+                &receipt.marker,
+                DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+                "receipt-recovery-cleanup",
+            )
+        })?;
+    }
+    migration_report(
+        DbOnlyMigrationState::AlreadyCommitted,
+        apply,
+        !apply,
+        root,
+        &receipt.marker,
+        owner_observation,
+        Vec::new(),
+    )
+    .map_err(Into::into)
+}
+
+fn install_migration_target(
+    root: &Path,
+    rally_dir: &Path,
+    marker: &DbOnlyMigrationMarker,
+    temp_path: &Path,
+    candidate: &DbOnlyMigrationSegment,
+) -> DbOnlyMigrationResult<PathBuf> {
+    let target = root.join(&marker.target_relative_path);
+    let existed = ensure_regular_or_missing(&target, "migration target")?;
+    if existed {
+        verify_db_only_migration_segment(&target, candidate)?;
+    } else {
+        mark_migration_watchdog(marker, "target-hard-link");
+        match fs::hard_link(temp_path, &target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                verify_db_only_migration_segment(&target, candidate)?;
+            }
+            Err(error) => {
+                return Err(interruption(
+                    marker,
+                    DbOnlyMigrationInterruptionState::OutcomeUnknown,
+                    "target-install",
+                    format!(
+                        "atomic no-clobber target publication returned {error}; inspect the marker-bound target before deciding whether to rerun"
+                    ),
+                ));
+            }
+        }
+    }
+    mark_migration_watchdog(marker, "target-file-sync");
+    let target_file = fs::File::open(&target).map_err(|error| {
+        interruption(
+            marker,
+            DbOnlyMigrationInterruptionState::OutcomeUnknown,
+            "target-sync-open",
+            error.to_string(),
+        )
+    })?;
+    target_file.sync_all().map_err(|error| {
+        interruption(
+            marker,
+            DbOnlyMigrationInterruptionState::OutcomeUnknown,
+            "target-sync",
+            error.to_string(),
+        )
+    })?;
+    if !existed {
+        maybe_fault(
+            rally_dir,
+            marker,
+            DbOnlyMigrationFaultPoint::AfterTargetInstallBeforeDirectorySync,
+            DbOnlyMigrationInterruptionState::OutcomeUnknown,
+            "target-installed-before-directory-sync",
+        )?;
+    }
+    mark_migration_watchdog(marker, "target-directory-sync");
+    sync_directory(&rally_dir.join(LOG_DIRNAME)).map_err(|error| {
+        interruption(
+            marker,
+            DbOnlyMigrationInterruptionState::OutcomeUnknown,
+            "target-directory-sync",
+            error.to_string(),
+        )
+    })?;
+    mark_watchdog_command_commit();
+    verify_db_only_migration_segment(&target, candidate).map_err(|error| {
+        interruption(
+            marker,
+            DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+            "committed-target-readback",
+            error.to_string(),
+        )
+    })?;
+    maybe_fault(
+        rally_dir,
+        marker,
+        DbOnlyMigrationFaultPoint::AfterTargetDirectorySync,
+        DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+        "target-directory-synced",
+    )?;
+    Ok(target)
+}
+
+/// Explicit DB-only recovery entry point. Dry-run is intentionally optimistic
+/// and byte-inert; apply acquires the full offline authority set and repeats
+/// every source, sidecar, canonical, marker, and checksum check before writing.
+pub(crate) fn run_db_only_migration_at(
+    root: &Path,
+    engagement: &str,
+    apply: bool,
+) -> DbOnlyMigrationResult<DbOnlyMigrationReport> {
+    let engagement = validate_scoped_engagement(engagement)?;
+    if is_reserved_fixture_engagement(&engagement) {
+        return Err(RallyError::Usage(format!(
+            "engagement label {engagement:?} is reserved for committed test fixtures and cannot receive migrated history"
+        ))
+        .into());
+    }
+    validate_migration_topology(root)?;
+    let rally_dir = root.join(".rally");
+    let owner_observation = observe_offline_migration_authority(&rally_dir)?;
+
+    // Apply authority is deliberately acquired before any DB open/hash or
+    // receipt cleanup. Dry-run performs only the optimistic observation above.
+    let _authority = if apply {
+        Some(acquire_offline_migration_authority(&rally_dir)?)
+    } else {
+        None
+    };
+
+    let receipt_path = rally_dir.join(DB_ONLY_MIGRATION_RECEIPT_FILENAME);
+    if ensure_regular_or_missing(&receipt_path, "migration receipt")? {
+        return recover_from_receipt(
+            root,
+            &engagement,
+            apply,
+            if apply {
+                "exclusive_offline_authority_acquired".to_string()
+            } else {
+                owner_observation
+            },
+        );
+    }
+
+    let marker_path = rally_dir.join(DB_ONLY_MIGRATION_MARKER_FILENAME);
+    let marker_exists = ensure_regular_or_missing(&marker_path, "migration marker")?;
+    let marker_stage = rally_dir.join(DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME);
+    let marker_stage_exists =
+        ensure_regular_or_missing(&marker_stage, "migration marker staging file")?;
+    if apply && (marker_exists || marker_stage_exists) {
+        let recovery_marker: DbOnlyMigrationMarker = if marker_exists {
+            read_json_file(&marker_path, "migration marker")?
+        } else {
+            read_json_file(&marker_stage, "migration marker staging file")?
+        };
+        mark_watchdog_db_only_migration_outcome_unknown(
+            &recovery_marker.migration_id,
+            "recovery-source-revalidation",
+            &migration_remedy(&engagement),
+        );
+    }
+    let target = rally_dir
+        .join(LOG_DIRNAME)
+        .join(format!("{engagement}.jsonl"));
+    let canonical_blocker =
+        match validate_canonical_source_set(root, marker_exists.then_some(target.as_path())) {
+            Ok(()) => None,
+            Err(error) if apply => return Err(error.into()),
+            Err(error) => Some(error.to_string()),
+        };
+
+    let facts_db_path = rally_dir.join("facts.db");
+    let (candidate, binding) = match inspect_closed_db_candidate(&facts_db_path, &engagement) {
+        Ok(inspected) => inspected,
+        Err(error) if !apply => {
+            let mut blockers = Vec::new();
+            if owner_observation != "clear_at_optimistic_inspection" {
+                blockers.push(owner_observation.clone());
+            }
+            if let Some(canonical) = canonical_blocker {
+                blockers.push(canonical);
+            }
+            blockers.push(error.to_string());
+            return Ok(blocked_dry_run_report(
+                root,
+                &engagement,
+                owner_observation,
+                blockers,
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let expected = expected_marker(root, &engagement, binding);
+
+    if !apply {
+        let marker = if marker_exists {
+            let marker: DbOnlyMigrationMarker = read_json_file(&marker_path, "migration marker")?;
+            validate_marker(&marker, &expected)?;
+            marker
+        } else if marker_stage_exists {
+            let marker: DbOnlyMigrationMarker =
+                read_json_file(&marker_stage, "migration marker staging file")?;
+            validate_marker(&marker, &expected)?;
+            marker
+        } else {
+            expected
+        };
+        return migration_report(
+            DbOnlyMigrationState::DryRun,
+            false,
+            true,
+            root,
+            &marker,
+            owner_observation.clone(),
+            {
+                let mut blockers = Vec::new();
+                if owner_observation != "clear_at_optimistic_inspection" {
+                    blockers.push(owner_observation);
+                }
+                if let Some(canonical) = canonical_blocker {
+                    blockers.push(canonical);
+                }
+                blockers
+            },
+        )
+        .map_err(Into::into);
+    }
+
+    if !marker_exists && !marker_stage_exists {
+        #[cfg(test)]
+        if take_db_only_migration_fault(
+            &rally_dir,
+            DbOnlyMigrationFaultPoint::ExpireDeadlineBeforeMarker,
+        ) {
+            crate::store::expire_mutation_deadline_for_test();
+        }
+        ensure_new_mutation_can_start(&marker_path)?;
+    }
+    mark_migration_watchdog(&expected, "marker-publication");
+    let marker = load_or_publish_marker(&rally_dir, &expected).map_err(|error| {
+        classify_interruption(
+            error,
+            &expected,
+            DbOnlyMigrationInterruptionState::Prepared,
+            "marker-publication",
+        )
+    })?;
+    maybe_fault(
+        &rally_dir,
+        &marker,
+        DbOnlyMigrationFaultPoint::AfterMarkerSync,
+        DbOnlyMigrationInterruptionState::Prepared,
+        "marker-synced",
+    )?;
+    let marker_target = root.join(&marker.target_relative_path);
+    validate_canonical_source_set(root, Some(&marker_target)).map_err(|error| {
+        interruption(
+            &marker,
+            DbOnlyMigrationInterruptionState::Prepared,
+            "post-marker-canonical-validation",
+            error.to_string(),
+        )
+    })?;
+
+    let marker_target_exists = ensure_regular_or_missing(&marker_target, "migration target")
+        .map_err(|error| {
+            interruption(
+                &marker,
+                DbOnlyMigrationInterruptionState::Prepared,
+                "target-preflight",
+                error.to_string(),
+            )
+        })?;
+    if marker_target_exists {
+        verify_db_only_migration_segment(&marker_target, &candidate).map_err(|error| {
+            interruption(
+                &marker,
+                DbOnlyMigrationInterruptionState::Prepared,
+                "target-preflight",
+                error.to_string(),
+            )
+        })?;
+    }
+    mark_migration_watchdog(&marker, "temp-preparation");
+    let temp_path =
+        ensure_candidate_temp(root, &rally_dir, &marker, &candidate, !marker_target_exists)
+            .map_err(|error| match error {
+                DbOnlyMigrationRunError::Interrupted(_) => error,
+                DbOnlyMigrationRunError::Other(error) => interruption(
+                    &marker,
+                    DbOnlyMigrationInterruptionState::Prepared,
+                    "temp-prepare",
+                    error.to_string(),
+                ),
+            })?;
+    maybe_fault(
+        &rally_dir,
+        &marker,
+        DbOnlyMigrationFaultPoint::AfterTempSync,
+        DbOnlyMigrationInterruptionState::Prepared,
+        "temp-synced",
+    )?;
+    verify_db_only_migration_segment(&temp_path, &candidate).map_err(|error| {
+        interruption(
+            &marker,
+            DbOnlyMigrationInterruptionState::Prepared,
+            "temp-readback",
+            error.to_string(),
+        )
+    })?;
+    maybe_fault(
+        &rally_dir,
+        &marker,
+        DbOnlyMigrationFaultPoint::AfterTempReadback,
+        DbOnlyMigrationInterruptionState::Prepared,
+        "temp-readback",
+    )?;
+
+    mark_migration_watchdog(&marker, "db-revalidation");
+    let (revalidated_candidate, revalidated_binding) =
+        inspect_closed_db_candidate(&facts_db_path, &engagement).map_err(|error| {
+            interruption(
+                &marker,
+                DbOnlyMigrationInterruptionState::Prepared,
+                "db-revalidation",
+                error.to_string(),
+            )
+        })?;
+    if revalidated_binding != marker.db || revalidated_candidate != candidate {
+        return Err(interruption(
+            &marker,
+            DbOnlyMigrationInterruptionState::Prepared,
+            "db-revalidation-mismatch",
+            "facts.db binding mismatch after temp preparation; marker, temp, DB, and sidecars were preserved",
+        ));
+    }
+    maybe_fault(
+        &rally_dir,
+        &marker,
+        DbOnlyMigrationFaultPoint::AfterDbRevalidation,
+        DbOnlyMigrationInterruptionState::Prepared,
+        "db-revalidated",
+    )?;
+
+    mark_migration_watchdog(&marker, "target-publication");
+    install_migration_target(root, &rally_dir, &marker, &temp_path, &candidate).map_err(
+        |error| {
+            classify_interruption(
+                error,
+                &marker,
+                DbOnlyMigrationInterruptionState::Prepared,
+                "target-publication",
+            )
+        },
+    )?;
+    mark_watchdog_command_commit();
+    let receipt =
+        publish_receipt(&rally_dir, &marker, &candidate).map_err(|error| match error {
+            DbOnlyMigrationRunError::Interrupted(_) => error,
+            DbOnlyMigrationRunError::Other(error) => interruption(
+                &marker,
+                DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+                "receipt-publication",
+                error.to_string(),
+            ),
+        })?;
+    maybe_fault(
+        &rally_dir,
+        &marker,
+        DbOnlyMigrationFaultPoint::AfterReceiptSync,
+        DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+        "receipt-synced",
+    )?;
+    cleanup_committed_migration(root, &receipt, &candidate).map_err(|error| {
+        classify_interruption(
+            error,
+            &marker,
+            DbOnlyMigrationInterruptionState::CommittedCleanupPending,
+            "committed-cleanup",
+        )
+    })?;
+    migration_report(
+        DbOnlyMigrationState::Committed,
+        true,
+        false,
+        root,
+        &marker,
+        "exclusive_offline_authority_acquired".to_string(),
+        Vec::new(),
+    )
+    .map_err(Into::into)
+}
+
+pub(crate) fn run_db_only_migration(
+    engagement: &str,
+    apply: bool,
+) -> DbOnlyMigrationResult<DbOnlyMigrationReport> {
+    let root = crate::repo_root().map_err(DbOnlyMigrationRunError::from)?;
+    run_db_only_migration_at(&root, engagement, apply)
 }
 
 // =============================================================================
@@ -1506,5 +3341,879 @@ mod sweep_tests {
         );
         assert_eq!(snapshot_stamp("facts.db"), None);
         assert_eq!(snapshot_stamp("facts.db-wal"), None);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod o26_db_only_migration_tests {
+    use super::*;
+    use crate::FACT_SCHEMA;
+    use crate::store::{
+        DirectRoomStore, Fact, FactKind, acquire_named_exclusive_nb,
+        acquire_owner_exclusive_blocking,
+    };
+    use std::collections::BTreeMap;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    fn unique_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "rally-o26-db-only-{label}-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn fact(event_id: &str, seq_hint: i64) -> Fact {
+        Fact {
+            schema: FACT_SCHEMA.to_string(),
+            event_id: event_id.to_string(),
+            seq: seq_hint,
+            thread_id: format!("thread-{event_id}"),
+            kind: FactKind::Decision,
+            tool: Some("codex:migration-test".to_string()),
+            role: None,
+            subject: format!("decision {event_id}"),
+            scope: vec!["src/".to_string()],
+            created_at: format!("2026-08-10T00:00:0{seq_hint}Z"),
+            summary: Some(format!("summary {event_id}")),
+            evidence: vec![format!("evidence:{event_id}")],
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+            from_session_id: None,
+        }
+    }
+
+    fn db_only_room(label: &str) -> (PathBuf, Vec<Fact>) {
+        let root = unique_root(label);
+        let store =
+            DirectRoomStore::open_direct_at_with_engagement(root.clone(), Some("seed".to_string()))
+                .unwrap();
+        let expected = vec![fact("db-only-a", 0), fact("db-only-b", 0)];
+        for item in &expected {
+            store.append_fact(item).unwrap();
+        }
+        drop(store);
+        let log_dir = root.join(".rally/log");
+        for entry in fs::read_dir(&log_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        assert!(root.join(".rally/facts.db").is_file());
+        (root, expected)
+    }
+
+    fn file_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(base: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            if !path.exists() {
+                return;
+            }
+            for entry in fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(base, &path, out);
+                } else {
+                    out.insert(
+                        path.strip_prefix(base).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    fn jsonl_files(root: &Path) -> Vec<PathBuf> {
+        let mut files = fs::read_dir(root.join(".rally/log"))
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    fn append_valid_canonical_extension(target: &Path, event_id: &str) -> Vec<u8> {
+        let existing = fs::read_to_string(target).unwrap();
+        let mut extension: serde_json::Value =
+            serde_json::from_str(existing.lines().last().unwrap()).unwrap();
+        let next_seq = extension["seq"].as_i64().unwrap() + 1;
+        extension["seq"] = serde_json::json!(next_seq);
+        extension["occurred_at"] = serde_json::json!("2026-08-10T00:01:00Z");
+        extension["payload"]["seq"] = serde_json::json!(next_seq);
+        extension["payload"]["event_id"] = serde_json::json!(event_id);
+        extension["payload"]["thread_id"] = serde_json::json!(format!("thread-{event_id}"));
+        extension["payload"]["created_at"] = serde_json::json!("2026-08-10T00:01:00Z");
+        extension["payload"]["subject"] = serde_json::json!("post migration append");
+        let mut bytes = serde_json::to_vec(&extension).unwrap();
+        bytes.push(b'\n');
+        OpenOptions::new()
+            .append(true)
+            .open(target)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        fs::read(target).unwrap()
+    }
+
+    #[test]
+    fn db_only_migration_dry_run_writes_nothing() {
+        let (root, _) = db_only_room("dry-run");
+        let before = file_tree(&root);
+        let report = run_db_only_migration_at(&root, "alpha", false).unwrap();
+        assert_eq!(report.state, DbOnlyMigrationState::DryRun);
+        assert!(!report.applied);
+        assert_eq!(report.row_count, Some(2));
+        assert_eq!(file_tree(&root), before, "dry-run must be byte-inert");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn db_only_migration_dry_run_surfaces_owner_and_unsafe_source_blockers() {
+        let (owned_root, _) = db_only_room("dry-owner-observation");
+        let owned_rally = owned_root.join(".rally");
+        let daemon_owner = acquire_owner_exclusive_blocking(&owned_rally).unwrap();
+        let before = file_tree(&owned_root);
+        let report = run_db_only_migration_at(&owned_root, "alpha", false).unwrap();
+        assert_eq!(report.state, DbOnlyMigrationState::DryRun);
+        assert!(report.source_token.is_some());
+        assert_eq!(report.observed_blockers, vec!["daemon_owner_busy"]);
+        assert_eq!(file_tree(&owned_root), before);
+        drop(daemon_owner);
+
+        let (wal_root, _) = db_only_room("dry-wal-blocker");
+        let wal = wal_root.join(".rally/facts.db-wal");
+        fs::write(&wal, b"uncheckpointed WAL evidence").unwrap();
+        let before = file_tree(&wal_root);
+        let report = run_db_only_migration_at(&wal_root, "alpha", false).unwrap();
+        assert_eq!(report.state, DbOnlyMigrationState::DryRun);
+        assert!(report.source_token.is_none());
+        assert!(
+            report
+                .observed_blockers
+                .iter()
+                .any(|blocker| blocker.contains("WAL"))
+        );
+        assert_eq!(file_tree(&wal_root), before);
+
+        fs::remove_dir_all(owned_root).ok();
+        fs::remove_dir_all(wal_root).ok();
+    }
+
+    #[test]
+    fn db_only_migration_apply_installs_one_exact_canonical_segment() {
+        let (root, _) = db_only_room("apply");
+        let db = root.join(".rally/facts.db");
+        let db_before = fs::read(&db).unwrap();
+        let report = run_db_only_migration_at(&root, "alpha", true).unwrap();
+        assert_eq!(report.state, DbOnlyMigrationState::Committed);
+        assert!(report.applied);
+        assert_eq!(report.row_count, Some(2));
+        assert_eq!(jsonl_files(&root), vec![report.target_path.clone()]);
+        assert!(
+            !report.marker_path.exists(),
+            "verified commit consumes marker"
+        );
+        assert!(
+            report.receipt_path.is_file(),
+            "verified commit retains receipt"
+        );
+        assert_eq!(fs::read(&db).unwrap(), db_before, "facts.db is preserved");
+        let lines = fs::read_to_string(&report.target_path).unwrap();
+        assert_eq!(lines.lines().count(), 2);
+        assert!(lines.ends_with('\n'));
+        for line in lines.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(row["engagement"], "alpha");
+        }
+        let retry = run_db_only_migration_at(&root, "alpha", true).unwrap();
+        assert_eq!(retry.state, DbOnlyMigrationState::AlreadyCommitted);
+        assert_eq!(jsonl_files(&root).len(), 1, "successful retry is singleton");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn db_only_migration_receipt_accepts_only_valid_append_only_extension() {
+        let (root, _) = db_only_room("receipt-extension");
+        let committed = run_db_only_migration_at(&root, "alpha", true).unwrap();
+        let mut lines = fs::read_to_string(&committed.target_path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut extension: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        let committed_max = committed
+            .max_seq
+            .expect("committed migration reports max seq");
+        extension["seq"] = serde_json::json!(committed_max + 1);
+        extension["occurred_at"] = serde_json::json!("2026-08-10T00:01:00Z");
+        extension["payload"]["seq"] = serde_json::json!(committed_max + 1);
+        extension["payload"]["event_id"] = serde_json::json!("post-migration-append");
+        extension["payload"]["thread_id"] = serde_json::json!("thread-post-migration-append");
+        extension["payload"]["created_at"] = serde_json::json!("2026-08-10T00:01:00Z");
+        extension["payload"]["subject"] = serde_json::json!("post migration append");
+        lines.push(serde_json::to_string(&extension).unwrap());
+        let extended = format!("{}\n", lines.join("\n")).into_bytes();
+        fs::write(&committed.target_path, &extended).unwrap();
+
+        let retry = run_db_only_migration_at(&root, "alpha", true).unwrap();
+        assert_eq!(retry.state, DbOnlyMigrationState::AlreadyCommitted);
+        assert_eq!(fs::read(&committed.target_path).unwrap(), extended);
+        assert_eq!(jsonl_files(&root).len(), 1);
+
+        let (divergent_root, _) = db_only_room("receipt-divergent");
+        let divergent = run_db_only_migration_at(&divergent_root, "alpha", true).unwrap();
+        let mut divergent_bytes = fs::read(&divergent.target_path).unwrap();
+        divergent_bytes[0] = if divergent_bytes[0] == b'{' {
+            b'['
+        } else {
+            b'{'
+        };
+        fs::write(&divergent.target_path, &divergent_bytes).unwrap();
+        let receipt_before = fs::read(&divergent.receipt_path).unwrap();
+        let error = run_db_only_migration_at(&divergent_root, "alpha", true).unwrap_err();
+        assert!(
+            error.to_string().contains("receipt-bound prefix"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&divergent.target_path).unwrap(), divergent_bytes);
+        assert_eq!(fs::read(&divergent.receipt_path).unwrap(), receipt_before);
+
+        let (missing_root, _) = db_only_room("receipt-missing-target");
+        let missing = run_db_only_migration_at(&missing_root, "alpha", true).unwrap();
+        fs::remove_file(&missing.target_path).unwrap();
+        let receipt_before = fs::read(&missing.receipt_path).unwrap();
+        let error = run_db_only_migration_at(&missing_root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("migration target"), "{error}");
+        assert!(!missing.target_path.exists());
+        assert_eq!(fs::read(&missing.receipt_path).unwrap(), receipt_before);
+
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(divergent_root).ok();
+        fs::remove_dir_all(missing_root).ok();
+    }
+
+    #[test]
+    fn db_only_migration_cleanup_accepts_hardlinked_temp_with_valid_target_extension() {
+        let (root, _) = db_only_room("receipt-hardlink-extension");
+        let rally = root.join(".rally");
+        let db = rally.join("facts.db");
+        let db_before = fs::read(&db).unwrap();
+        arm_db_only_migration_fault(&rally, DbOnlyMigrationFaultPoint::AfterReceiptSync);
+        let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("committed"), "{error}");
+
+        let marker_path = rally.join(DB_ONLY_MIGRATION_MARKER_FILENAME);
+        let receipt_path = rally.join(DB_ONLY_MIGRATION_RECEIPT_FILENAME);
+        let marker: DbOnlyMigrationMarker =
+            read_json_file(&marker_path, "migration marker").unwrap();
+        let temp = root.join(&marker.temp_relative_path);
+        let target = root.join(&marker.target_relative_path);
+        assert!(temp.is_file());
+        assert!(target.is_file());
+        let receipt_before = fs::read(&receipt_path).unwrap();
+
+        let extended = append_valid_canonical_extension(&target, "post-receipt-append");
+        assert_eq!(
+            fs::read(&temp).unwrap(),
+            extended,
+            "the post-receipt append reaches the hard-linked temp inode"
+        );
+
+        let retry = run_db_only_migration_at(&root, "alpha", true).unwrap();
+        assert_eq!(retry.state, DbOnlyMigrationState::AlreadyCommitted);
+        assert_eq!(fs::read(&target).unwrap(), extended);
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+        assert_eq!(fs::read(&db).unwrap(), db_before);
+        assert!(!marker_path.exists());
+        assert!(!temp.exists());
+        assert_eq!(jsonl_files(&root), vec![target]);
+        fs::remove_dir_all(root).ok();
+
+        let (divergent_root, _) = db_only_room("receipt-divergent-temp");
+        let divergent_rally = divergent_root.join(".rally");
+        arm_db_only_migration_fault(
+            &divergent_rally,
+            DbOnlyMigrationFaultPoint::AfterReceiptSync,
+        );
+        run_db_only_migration_at(&divergent_root, "alpha", true).unwrap_err();
+        let divergent_marker_path = divergent_rally.join(DB_ONLY_MIGRATION_MARKER_FILENAME);
+        let divergent_receipt_path = divergent_rally.join(DB_ONLY_MIGRATION_RECEIPT_FILENAME);
+        let divergent_marker: DbOnlyMigrationMarker =
+            read_json_file(&divergent_marker_path, "migration marker").unwrap();
+        let divergent_temp = divergent_root.join(&divergent_marker.temp_relative_path);
+        let divergent_target = divergent_root.join(&divergent_marker.target_relative_path);
+        fs::remove_file(&divergent_temp).unwrap();
+        fs::write(&divergent_temp, b"divergent temp evidence").unwrap();
+        let target_before = fs::read(&divergent_target).unwrap();
+        let receipt_before = fs::read(&divergent_receipt_path).unwrap();
+        let error = run_db_only_migration_at(&divergent_root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("migration temp"), "{error}");
+        assert_eq!(
+            fs::read(&divergent_temp).unwrap(),
+            b"divergent temp evidence"
+        );
+        assert_eq!(fs::read(&divergent_target).unwrap(), target_before);
+        assert_eq!(fs::read(&divergent_receipt_path).unwrap(), receipt_before);
+        assert!(divergent_marker_path.is_file());
+        fs::remove_dir_all(divergent_root).ok();
+    }
+
+    #[test]
+    fn db_only_migration_refuses_live_or_unresponsive_owners_without_canonical_write() {
+        let (live_root, _) = db_only_room("live-owner");
+        let live_rally = live_root.join(".rally");
+        let daemon = acquire_owner_exclusive_blocking(&live_rally).unwrap();
+        let error = run_db_only_migration_at(&live_root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("rally daemon stop"));
+        assert!(jsonl_files(&live_root).is_empty());
+        assert!(!live_rally.join(DB_ONLY_MIGRATION_MARKER_FILENAME).exists());
+        drop(daemon);
+
+        let (busy_root, _) = db_only_room("busy-owner");
+        let busy_rally = busy_root.join(".rally");
+        let direct = acquire_named_exclusive_nb(&busy_rally, "direct.owner.lock")
+            .unwrap()
+            .expect("test owns direct lock");
+        let error = run_db_only_migration_at(&busy_root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("offline migration authority"));
+        assert!(jsonl_files(&busy_root).is_empty());
+        assert!(!busy_rally.join(DB_ONLY_MIGRATION_MARKER_FILENAME).exists());
+        drop(direct);
+        fs::remove_dir_all(live_root).ok();
+        fs::remove_dir_all(busy_root).ok();
+    }
+
+    #[test]
+    fn db_only_migration_expired_prepublication_deadline_is_not_started() {
+        let (root, _) = db_only_room("deadline-before-marker");
+        let rally = root.join(".rally");
+        let db_before = fs::read(rally.join("facts.db")).unwrap();
+        arm_db_only_migration_fault(
+            &rally,
+            DbOnlyMigrationFaultPoint::ExpireDeadlineBeforeMarker,
+        );
+        let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+        crate::store::clear_mutation_deadline_for_test();
+        assert!(
+            matches!(
+                error,
+                DbOnlyMigrationRunError::Other(RallyError::NotStarted(_))
+            ),
+            "{error}"
+        );
+        assert_eq!(fs::read(rally.join("facts.db")).unwrap(), db_before);
+        assert!(!rally.join(DB_ONLY_MIGRATION_MARKER_FILENAME).exists());
+        assert!(!rally.join(DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME).exists());
+        assert!(jsonl_files(&root).is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn db_only_migration_refuses_wal_or_any_canonical_source() {
+        let (wal_root, _) = db_only_room("wal");
+        let wal = wal_root.join(".rally/facts.db-wal");
+        fs::write(&wal, b"pending sqlite commit").unwrap();
+        let wal_before = fs::read(&wal).unwrap();
+        let error = run_db_only_migration_at(&wal_root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("WAL"));
+        assert_eq!(fs::read(&wal).unwrap(), wal_before);
+        assert!(jsonl_files(&wal_root).is_empty());
+
+        let (canonical_root, _) = db_only_room("canonical");
+        let existing = canonical_root.join(".rally/log/existing.jsonl");
+        fs::write(&existing, b"canonical evidence\n").unwrap();
+        let before = fs::read(&existing).unwrap();
+        let error = run_db_only_migration_at(&canonical_root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("canonical source"));
+        assert_eq!(fs::read(&existing).unwrap(), before);
+        assert!(
+            !canonical_root
+                .join(".rally")
+                .join(DB_ONLY_MIGRATION_MARKER_FILENAME)
+                .exists()
+        );
+        fs::remove_dir_all(wal_root).ok();
+        fs::remove_dir_all(canonical_root).ok();
+    }
+
+    #[test]
+    fn db_only_migration_rejects_invalid_or_reserved_engagement_before_io() {
+        for (case, engagement) in [
+            ("empty", ""),
+            ("parent", "../escape"),
+            ("separator", "alpha/beta"),
+            ("whitespace", " alpha"),
+            ("reserved", "test"),
+        ] {
+            let root = unique_root(case);
+            let error = run_db_only_migration_at(&root, engagement, true).unwrap_err();
+            assert!(error.to_string().contains("engagement"), "{case}: {error}");
+            assert!(
+                !root.join(".rally").exists(),
+                "{case}: invalid identity must fail before creating migration state"
+            );
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn db_only_migration_refuses_nonempty_wal_and_rollback_journal() {
+        for suffix in ["db-wal", "db-journal"] {
+            let (root, _) = db_only_room(suffix);
+            let sidecar = root.join(".rally/facts.db").with_extension(suffix);
+            fs::write(&sidecar, format!("pending {suffix}")).unwrap();
+            let before = fs::read(&sidecar).unwrap();
+            let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+            assert!(error.to_string().contains(suffix), "{suffix}: {error}");
+            assert_eq!(fs::read(&sidecar).unwrap(), before);
+            assert!(jsonl_files(&root).is_empty());
+            assert!(
+                !root
+                    .join(".rally")
+                    .join(DB_ONLY_MIGRATION_MARKER_FILENAME)
+                    .exists()
+            );
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn db_only_migration_allows_stable_shm_but_rejects_change_or_symlink() {
+        let (stable_root, _) = db_only_room("stable-shm");
+        let stable_shm = stable_root.join(".rally/facts.db-shm");
+        fs::write(&stable_shm, b"stable standalone wal index").unwrap();
+        let before = fs::read(&stable_shm).unwrap();
+        let report = run_db_only_migration_at(&stable_root, "alpha", true).unwrap();
+        assert_eq!(report.state, DbOnlyMigrationState::Committed);
+        assert_eq!(fs::read(&stable_shm).unwrap(), before);
+
+        let (changing_root, _) = db_only_room("changing-shm");
+        let changing_rally = changing_root.join(".rally");
+        let changing_shm = changing_rally.join("facts.db-shm");
+        fs::write(&changing_shm, b"before").unwrap();
+        arm_db_only_migration_fault(
+            &changing_rally,
+            DbOnlyMigrationFaultPoint::MutateShmAfterDbRead,
+        );
+        let error = run_db_only_migration_at(&changing_root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("changed across"), "{error}");
+        assert!(jsonl_files(&changing_root).is_empty());
+
+        let (symlink_root, _) = db_only_room("symlink-shm");
+        let external = unique_root("symlink-shm-external").join("shm");
+        fs::write(&external, b"external shm").unwrap();
+        std::os::unix::fs::symlink(&external, symlink_root.join(".rally/facts.db-shm")).unwrap();
+        let external_before = fs::read(&external).unwrap();
+        let error = run_db_only_migration_at(&symlink_root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert_eq!(fs::read(&external).unwrap(), external_before);
+        assert!(jsonl_files(&symlink_root).is_empty());
+
+        fs::remove_dir_all(stable_root).ok();
+        fs::remove_dir_all(changing_root).ok();
+        fs::remove_dir_all(symlink_root).ok();
+        fs::remove_dir_all(external.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn db_only_migration_rejects_symlinked_authority_and_evidence_paths() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_root("rally-symlink");
+        let external = unique_root("rally-symlink-external");
+        symlink(&external, root.join(".rally")).unwrap();
+        let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        assert!(file_tree(&external).is_empty());
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(external).ok();
+
+        let (root, _) = db_only_room("log-symlink");
+        let external = unique_root("log-symlink-external");
+        let log = root.join(".rally/log");
+        fs::remove_dir_all(&log).unwrap();
+        symlink(&external, &log).unwrap();
+        let before = file_tree(&external);
+        let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(file_tree(&external), before);
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(external).ok();
+
+        let (root, _) = db_only_room("db-symlink");
+        let db = root.join(".rally/facts.db");
+        let external = unique_root("db-symlink-external").join("preserved.db");
+        fs::rename(&db, &external).unwrap();
+        symlink(&external, &db).unwrap();
+        let before = fs::read(&external).unwrap();
+        let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(fs::read(&external).unwrap(), before);
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(external.parent().unwrap()).ok();
+
+        for filename in [
+            DB_ONLY_MIGRATION_MARKER_FILENAME,
+            DB_ONLY_MIGRATION_RECEIPT_FILENAME,
+        ] {
+            let (root, _) = db_only_room(filename);
+            let external = unique_root("metadata-symlink-external").join("evidence");
+            fs::write(&external, b"external evidence").unwrap();
+            symlink(&external, root.join(".rally").join(filename)).unwrap();
+            let before = fs::read(&external).unwrap();
+            let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+            assert!(error.to_string().contains("symlink"));
+            assert_eq!(fs::read(&external).unwrap(), before);
+            fs::remove_dir_all(root).ok();
+            fs::remove_dir_all(external.parent().unwrap()).ok();
+        }
+
+        let (root, _) = db_only_room("target-symlink");
+        let external = unique_root("target-symlink-external").join("target");
+        fs::write(&external, b"external target").unwrap();
+        symlink(&external, root.join(".rally/log/alpha.jsonl")).unwrap();
+        let before = fs::read(&external).unwrap();
+        let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(fs::read(&external).unwrap(), before);
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(external.parent().unwrap()).ok();
+
+        let (root, _) = db_only_room("temp-symlink");
+        let rally = root.join(".rally");
+        arm_db_only_migration_fault(&rally, DbOnlyMigrationFaultPoint::AfterMarkerSync);
+        run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+        let marker: serde_json::Value = serde_json::from_slice(
+            &fs::read(rally.join(DB_ONLY_MIGRATION_MARKER_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        let temp = root.join(marker["temp_relative_path"].as_str().unwrap());
+        let external = unique_root("temp-symlink-external").join("temp");
+        fs::write(&external, b"external temp").unwrap();
+        symlink(&external, &temp).unwrap();
+        let before = fs::read(&external).unwrap();
+        let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(fs::read(&external).unwrap(), before);
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(external.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn db_only_migration_rejects_marker_collision_or_binding_mismatch() {
+        let (root, _) = db_only_room("marker-collision");
+        let marker = root.join(".rally").join(DB_ONLY_MIGRATION_MARKER_FILENAME);
+        fs::write(&marker, br#"{"schema":"unknown.migration.v9"}"#).unwrap();
+        let marker_before = fs::read(&marker).unwrap();
+        let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("marker"));
+        assert_eq!(fs::read(&marker).unwrap(), marker_before);
+        assert!(jsonl_files(&root).is_empty());
+        fs::remove_dir_all(root).ok();
+
+        let (root, _) = db_only_room("marker-binding");
+        arm_db_only_migration_fault(
+            &root.join(".rally"),
+            DbOnlyMigrationFaultPoint::AfterMarkerSync,
+        );
+        run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+        let marker = root.join(".rally").join(DB_ONLY_MIGRATION_MARKER_FILENAME);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        value["db"]["sha256"] = serde_json::Value::String("00".repeat(32));
+        fs::write(&marker, serde_json::to_vec(&value).unwrap()).unwrap();
+        let altered = fs::read(&marker).unwrap();
+        let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("binding mismatch"));
+        assert_eq!(fs::read(&marker).unwrap(), altered);
+        assert!(jsonl_files(&root).is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn db_only_migration_retries_prepared_marker_and_temp_idempotently() {
+        for (label, point) in [
+            ("after-marker", DbOnlyMigrationFaultPoint::AfterMarkerSync),
+            ("after-temp", DbOnlyMigrationFaultPoint::AfterTempSync),
+            ("after-verify", DbOnlyMigrationFaultPoint::AfterTempReadback),
+            (
+                "after-revalidate",
+                DbOnlyMigrationFaultPoint::AfterDbRevalidation,
+            ),
+        ] {
+            let (root, _) = db_only_room(label);
+            let rally = root.join(".rally");
+            arm_db_only_migration_fault(&rally, point);
+            let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+            assert!(error.to_string().contains("prepared"));
+            assert!(rally.join(DB_ONLY_MIGRATION_MARKER_FILENAME).is_file());
+            assert!(jsonl_files(&root).is_empty());
+            let report = run_db_only_migration_at(&root, "alpha", true).unwrap();
+            assert_eq!(report.state, DbOnlyMigrationState::Committed);
+            assert_eq!(jsonl_files(&root).len(), 1);
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn db_only_migration_repairs_only_unpublished_marker_bound_temp_prefix() {
+        let (root, _) = db_only_room("temp-prefix-repair");
+        let rally = root.join(".rally");
+        arm_db_only_migration_fault(&rally, DbOnlyMigrationFaultPoint::AfterMarkerSync);
+        run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+        let marker: DbOnlyMigrationMarker = read_json_file(
+            &rally.join(DB_ONLY_MIGRATION_MARKER_FILENAME),
+            "migration marker",
+        )
+        .unwrap();
+        let (candidate, _) = inspect_closed_db_candidate(&rally.join("facts.db"), "alpha").unwrap();
+        let temp = root.join(&marker.temp_relative_path);
+        let prefix_len = candidate.bytes.len() / 2;
+        fs::write(&temp, &candidate.bytes[..prefix_len]).unwrap();
+        let report = run_db_only_migration_at(&root, "alpha", true).unwrap();
+        assert_eq!(report.state, DbOnlyMigrationState::Committed);
+        assert_eq!(fs::read(&report.target_path).unwrap(), candidate.bytes);
+
+        let (linked_root, _) = db_only_room("linked-temp-no-repair");
+        let linked_rally = linked_root.join(".rally");
+        arm_db_only_migration_fault(
+            &linked_rally,
+            DbOnlyMigrationFaultPoint::AfterTargetInstallBeforeDirectorySync,
+        );
+        run_db_only_migration_at(&linked_root, "alpha", true).unwrap_err();
+        let marker: DbOnlyMigrationMarker = read_json_file(
+            &linked_rally.join(DB_ONLY_MIGRATION_MARKER_FILENAME),
+            "migration marker",
+        )
+        .unwrap();
+        let temp = linked_root.join(&marker.temp_relative_path);
+        let target = linked_root.join(&marker.target_relative_path);
+        let shortened = fs::metadata(&temp).unwrap().len() - 1;
+        OpenOptions::new()
+            .write(true)
+            .open(&temp)
+            .unwrap()
+            .set_len(shortened)
+            .unwrap();
+        let before = fs::read(&target).unwrap();
+        let error = run_db_only_migration_at(&linked_root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("target"), "{error}");
+        assert_eq!(fs::read(&target).unwrap(), before);
+        assert_eq!(fs::read(&temp).unwrap(), before);
+
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(linked_root).ok();
+    }
+
+    #[test]
+    fn db_only_migration_recovers_unknown_target_install_exactly_once() {
+        let (root, _) = db_only_room("after-target");
+        let rally = root.join(".rally");
+        arm_db_only_migration_fault(
+            &rally,
+            DbOnlyMigrationFaultPoint::AfterTargetInstallBeforeDirectorySync,
+        );
+        let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("outcome unknown"));
+        assert_eq!(jsonl_files(&root).len(), 1);
+        assert!(rally.join(DB_ONLY_MIGRATION_MARKER_FILENAME).is_file());
+        let first = fs::read(&jsonl_files(&root)[0]).unwrap();
+        let report = run_db_only_migration_at(&root, "alpha", true).unwrap();
+        assert_eq!(report.state, DbOnlyMigrationState::Committed);
+        assert_eq!(jsonl_files(&root).len(), 1);
+        assert_eq!(fs::read(&report.target_path).unwrap(), first);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn db_only_migration_recovers_committed_cleanup_pending() {
+        for (label, point) in [
+            (
+                "after-dir-sync",
+                DbOnlyMigrationFaultPoint::AfterTargetDirectorySync,
+            ),
+            ("after-receipt", DbOnlyMigrationFaultPoint::AfterReceiptSync),
+            (
+                "after-marker-remove",
+                DbOnlyMigrationFaultPoint::AfterMarkerRemoval,
+            ),
+        ] {
+            let (root, _) = db_only_room(label);
+            let rally = root.join(".rally");
+            arm_db_only_migration_fault(&rally, point);
+            let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+            assert!(error.to_string().contains("committed"));
+            assert_eq!(jsonl_files(&root).len(), 1);
+            let report = run_db_only_migration_at(&root, "alpha", true).unwrap();
+            let expected_state = if point == DbOnlyMigrationFaultPoint::AfterTargetDirectorySync {
+                DbOnlyMigrationState::Committed
+            } else {
+                DbOnlyMigrationState::AlreadyCommitted
+            };
+            assert_eq!(report.state, expected_state);
+            assert!(!report.marker_path.exists());
+            assert!(report.receipt_path.is_file());
+            assert_eq!(jsonl_files(&root).len(), 1);
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn db_only_migration_marker_fences_direct_open_until_doctor_recovers() {
+        for (label, point) in [
+            (
+                "direct-fence-pre-receipt",
+                DbOnlyMigrationFaultPoint::AfterTargetDirectorySync,
+            ),
+            (
+                "direct-fence-cleanup-pending",
+                DbOnlyMigrationFaultPoint::AfterReceiptSync,
+            ),
+        ] {
+            let (root, _) = db_only_room(label);
+            let rally = root.join(".rally");
+            arm_db_only_migration_fault(&rally, point);
+            run_db_only_migration_at(&root, "alpha", true).unwrap_err();
+            let before = file_tree(&root);
+
+            let error = match DirectRoomStore::open_direct_at_with_engagement(
+                root.clone(),
+                Some("alpha".to_string()),
+            ) {
+                Ok(_) => panic!("ordinary direct open must defer to doctor while a marker exists"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("migrate-db-only"), "{error}");
+            assert_eq!(
+                file_tree(&root),
+                before,
+                "the fenced direct open must not reconcile or mutate any migration evidence"
+            );
+
+            let recovered = run_db_only_migration_at(&root, "alpha", true).unwrap();
+            let expected_state = if point == DbOnlyMigrationFaultPoint::AfterTargetDirectorySync {
+                DbOnlyMigrationState::Committed
+            } else {
+                DbOnlyMigrationState::AlreadyCommitted
+            };
+            assert_eq!(recovered.state, expected_state);
+            assert!(!recovered.marker_path.exists());
+
+            let direct = DirectRoomStore::open_direct_at_with_engagement(
+                root.clone(),
+                Some("alpha".to_string()),
+            )
+            .unwrap();
+            let appended = direct
+                .append_fact(&fact(&format!("after-recovery-{label}"), 3))
+                .unwrap();
+            assert!(appended.committed);
+            drop(direct);
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn db_only_migration_marker_or_stage_fences_direct_open() {
+        let root = unique_root("malformed-marker-fence");
+        let store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("alpha".to_string()),
+        )
+        .unwrap();
+        store.append_fact(&fact("marker-fence-seed", 1)).unwrap();
+        drop(store);
+        let marker = root.join(".rally").join(DB_ONLY_MIGRATION_MARKER_FILENAME);
+        fs::write(&marker, b"not valid marker JSON").unwrap();
+        let before = file_tree(&root);
+        let error = match DirectRoomStore::open_direct_at(root.clone()) {
+            Ok(_) => panic!("malformed marker must fence direct open"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("migrate-db-only"), "{error}");
+        assert_eq!(file_tree(&root), before);
+
+        fs::remove_file(&marker).unwrap();
+        let outside = root.join("outside-marker");
+        fs::write(&outside, b"external evidence").unwrap();
+        std::os::unix::fs::symlink(&outside, &marker).unwrap();
+        let before = file_tree(&root);
+        let error = match DirectRoomStore::open_direct_at(root.clone()) {
+            Ok(_) => panic!("symlink marker must fence direct open"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("migrate-db-only"), "{error}");
+        assert_eq!(file_tree(&root), before);
+        assert_eq!(fs::read(&outside).unwrap(), b"external evidence");
+
+        fs::remove_file(&marker).unwrap();
+        let marker_stage = root
+            .join(".rally")
+            .join(DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME);
+        fs::write(&marker_stage, b"prepared marker staging evidence").unwrap();
+        let before = file_tree(&root);
+        let error = match DirectRoomStore::open_direct_at(root.clone()) {
+            Ok(_) => panic!("marker staging evidence must fence direct open"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("migrate-db-only"), "{error}");
+        assert_eq!(
+            file_tree(&root),
+            before,
+            "the stage-file fence must not reconcile the DB or mutate recovery evidence"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn db_only_migration_preserves_mismatched_temp_and_receipt_evidence() {
+        let (temp_root, _) = db_only_room("temp-mismatch");
+        let rally = temp_root.join(".rally");
+        arm_db_only_migration_fault(&rally, DbOnlyMigrationFaultPoint::AfterMarkerSync);
+        run_db_only_migration_at(&temp_root, "alpha", true).unwrap_err();
+        let marker: serde_json::Value = serde_json::from_slice(
+            &fs::read(rally.join(DB_ONLY_MIGRATION_MARKER_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        let temp = temp_root.join(marker["temp_relative_path"].as_str().unwrap());
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .unwrap();
+        file.write_all(b"wrong temp evidence").unwrap();
+        file.sync_all().unwrap();
+        let error = run_db_only_migration_at(&temp_root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("temp"));
+        assert_eq!(fs::read(&temp).unwrap(), b"wrong temp evidence");
+        assert!(jsonl_files(&temp_root).is_empty());
+        fs::remove_dir_all(temp_root).ok();
+
+        let (receipt_root, _) = db_only_room("receipt-mismatch");
+        let rally = receipt_root.join(".rally");
+        arm_db_only_migration_fault(&rally, DbOnlyMigrationFaultPoint::AfterTargetDirectorySync);
+        run_db_only_migration_at(&receipt_root, "alpha", true).unwrap_err();
+        let receipt = rally.join(DB_ONLY_MIGRATION_RECEIPT_FILENAME);
+        fs::write(&receipt, br#"{"schema":"wrong.receipt.v9"}"#).unwrap();
+        let before = fs::read(&receipt).unwrap();
+        let error = run_db_only_migration_at(&receipt_root, "alpha", true).unwrap_err();
+        assert!(error.to_string().contains("receipt"));
+        assert_eq!(fs::read(&receipt).unwrap(), before);
+        assert_eq!(jsonl_files(&receipt_root).len(), 1);
+        fs::remove_dir_all(receipt_root).ok();
     }
 }

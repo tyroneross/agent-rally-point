@@ -23,6 +23,7 @@ factstr-sqlite.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 shlex.workspace = true
 thiserror.workspace = true
 
@@ -31,6 +32,7 @@ thiserror.workspace = true
 # dependencies (the H4 architectural lint asserts rally-cli does not depend
 # on `ptyd` either directly or transitively).
 rally-protocol = { version = "0.1.0", path = "../rally-protocol" }
+rusqlite.workspace = true
 
 [dev-dependencies]
 # TEST-ONLY. `retry_budget_watchdog.rs` needs to hold a GENUINE SQLite write
@@ -41,4 +43,3 @@ rally-protocol = { version = "0.1.0", path = "../rally-protocol" }
 #
 # Dev-only: it is absent from the shipped `rally` binary's dependency graph, so
 # the H4 architectural lint above is unaffected.
-rusqlite.workspace = true

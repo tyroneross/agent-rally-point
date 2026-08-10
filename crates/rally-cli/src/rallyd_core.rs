@@ -2971,6 +2971,121 @@ mod imp {
         }
 
         #[test]
+        fn o26_routed_mutations_are_fenced_until_db_only_marker_removal() {
+            let repo_root = unique_repo_root("o26-routed-migration-fence");
+            let rally_dir = repo_root.join(".rally");
+            let mut store = DirectRoomStore::open_direct_at_with_engagement(
+                repo_root.clone(),
+                Some("alpha".to_string()),
+            )
+            .unwrap();
+            store.install_warm_fact_store().unwrap();
+
+            let request = |event_id: &str| {
+                StoreRequest::new(
+                    Some("alpha".to_string()),
+                    StoreOp::AppendFact {
+                        fact: serde_json::json!({
+                            "schema": crate::FACT_SCHEMA,
+                            "event_id": event_id,
+                            "seq": 0,
+                            "thread_id": format!("thread-{event_id}"),
+                            "kind": "decision",
+                            "subject": "migration fence control",
+                            "tool": "codex:test",
+                            "scope": [],
+                            "created_at": "2026-08-10T00:00:00Z",
+                            "evidence": [],
+                        }),
+                    },
+                )
+            };
+            let marker = rally_dir.join(crate::store::DB_ONLY_MIGRATION_MARKER_FILENAME);
+            let marker_stage =
+                rally_dir.join(crate::store::DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME);
+            let receipt = rally_dir.join("db-only-migration.v1.receipt.json");
+            let db_before = std::fs::read(rally_dir.join("facts.db")).unwrap();
+
+            std::fs::write(&marker_stage, b"prepared marker staging evidence").unwrap();
+            let stage_before = std::fs::read(&marker_stage).unwrap();
+            let response = dispatch_one(
+                &mut store,
+                canonical_repo_root(&repo_root).as_str(),
+                request("routed-fenced-marker-stage"),
+            );
+            match response {
+                StoreResponse::Err(error) => {
+                    assert!(error.message.contains("migrate-db-only"), "{error:?}");
+                }
+                other => panic!("routed append bypassed migration marker stage: {other:?}"),
+            }
+            assert_eq!(std::fs::read(&marker_stage).unwrap(), stage_before);
+            assert_eq!(
+                std::fs::read(rally_dir.join("facts.db")).unwrap(),
+                db_before
+            );
+            assert!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .all(|fact| fact.event_id != "routed-fenced-marker-stage")
+            );
+            std::fs::remove_file(&marker_stage).unwrap();
+
+            std::fs::write(&marker, b"prepared marker evidence").unwrap();
+
+            for (event_id, cleanup_pending) in [
+                ("routed-fenced-pre-receipt", false),
+                ("routed-fenced-cleanup-pending", true),
+            ] {
+                if cleanup_pending {
+                    std::fs::write(&receipt, b"immutable receipt evidence").unwrap();
+                }
+                let response = dispatch_one(
+                    &mut store,
+                    canonical_repo_root(&repo_root).as_str(),
+                    request(event_id),
+                );
+                match response {
+                    StoreResponse::Err(error) => {
+                        assert!(error.message.contains("migrate-db-only"), "{error:?}");
+                    }
+                    other => panic!("routed append bypassed migration marker: {other:?}"),
+                }
+                assert_eq!(
+                    std::fs::read(rally_dir.join("facts.db")).unwrap(),
+                    db_before
+                );
+                assert!(
+                    store
+                        .facts()
+                        .unwrap()
+                        .iter()
+                        .all(|fact| fact.event_id != event_id)
+                );
+            }
+
+            std::fs::remove_file(&marker).unwrap();
+            match dispatch_one(
+                &mut store,
+                canonical_repo_root(&repo_root).as_str(),
+                request("routed-after-marker-removal"),
+            ) {
+                StoreResponse::Ok(StoreOk::AppendFact { .. }) => {}
+                other => panic!("marker removal must reopen ordinary routed writes: {other:?}"),
+            }
+            assert!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .any(|fact| fact.event_id == "routed-after-marker-removal")
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
         fn daemon_serve_rejects_an_armed_command_watchdog() {
             let repo_root = unique_repo_root("armed-watchdog");
             let _deadline =
