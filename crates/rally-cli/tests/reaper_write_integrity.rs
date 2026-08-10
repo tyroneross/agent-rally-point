@@ -354,7 +354,9 @@ fn failed_lead_relinquish_write_is_not_reported_as_applied() {
         .expect("the uncertain relinquish carries its stable event id");
     assert_eq!(unknown["phase"], "canonical-open", "{unknown}");
     assert!(
-        unknown["detail"].as_str().is_some_and(|detail| !detail.is_empty()),
+        unknown["detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty()),
         "the uncertainty carries the failed canonical-open detail: {unknown}"
     );
     assert!(
