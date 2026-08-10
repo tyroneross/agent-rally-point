@@ -123,14 +123,47 @@ impl Workspace {
     /// deserves its own assertion rather than being inferred from a test that
     /// no longer runs.
     fn say_refused(&self, args: &[&str]) -> String {
-        let out = self.run_with_engagement(None, args);
+        let mut json_args = args.to_vec();
+        json_args.push("--json");
+        let out = self.run_with_engagement(None, &json_args);
         assert!(
             !out.status.success(),
             "the write boundary must refuse `rally say {args:?}` — if this now \
              SUCCEEDS, ARP-R-04's field bounds regressed and the renderer is \
              load-bearing alone again"
         );
-        String::from_utf8_lossy(&out.stderr).to_string()
+        let bytes = if out.stdout.is_empty() {
+            &out.stderr
+        } else {
+            &out.stdout
+        };
+        let body: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_else(|error| {
+            panic!(
+                "the refusal must stay machine-readable ({error})\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            )
+        });
+        if let Some(error) = body["error"].as_str() {
+            return error.to_string();
+        }
+        assert_eq!(body["command"], "partial_commit", "typed refusal: {body}");
+        let warning = body["data"]["warning"]["message"]
+            .as_str()
+            .expect("partial commit must name the required work that failed");
+        let append_warnings = body["data"]["append_outcomes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|outcome| outcome["warnings"].as_array().into_iter().flatten())
+            .filter_map(|warning| warning["message"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            append_warnings,
+            vec![warning],
+            "the partial refusal must carry one unambiguous append warning: {body}"
+        );
+        warning.to_string()
     }
 
     /// Append a fact by writing the canonical segment line DIRECTLY, with no
@@ -158,7 +191,7 @@ impl Workspace {
         let log_dir = self.cwd.join(".rally").join("log");
         fs::create_dir_all(&log_dir).unwrap();
         let mut payload = serde_json::json!({
-            "schema": "rally.fact.v1",
+            "schema": "agent-rally.fact.v1",
             "event_id": format!("fact_raw_{seq}"),
             "seq": seq,
             "thread_id": "room_raw",
