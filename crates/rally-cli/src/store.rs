@@ -2698,6 +2698,7 @@ impl DirectRoomStore {
             return;
         }
         let cache = ReconcileCache {
+            schema_version: RECONCILE_CACHE_SCHEMA_VERSION,
             segments_fingerprint: segments_fingerprint(&segments, &archived),
             db_fingerprint: fingerprint_db(&self.facts_db_path),
             wal_fingerprint: fingerprint_wal(&self.facts_db_path),
@@ -5858,6 +5859,11 @@ fn utc_date_label() -> String {
 /// Lives under `.rally/`, already gitignored by the `.rally/*` whitelist rule.
 const RECONCILE_CACHE_FILENAME: &str = ".reconcile-cache.json";
 
+/// Schema for sidecars written only after the complete canonical `LedgerLine`
+/// fold has verified every duplicate sequence. Unversioned and older caches
+/// predate that invariant and must never authorize a reconcile/append fast path.
+const RECONCILE_CACHE_SCHEMA_VERSION: u32 = 2;
+
 /// Cheap per-file fingerprint component: `(filename, byte_len, mtime_ns)` plus
 /// an optional content hash of the file's first page.
 ///
@@ -5888,6 +5894,11 @@ struct FileFingerprint {
 /// the canonical ledger + facts.db; this file is never authoritative.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct ReconcileCache {
+    /// Generation of the validation contract that produced this cache.
+    /// Missing legacy fields deserialize as zero and are rejected by
+    /// [`read_reconcile_cache`].
+    #[serde(default)]
+    schema_version: u32,
     /// Sorted fingerprint of every live + archive (replayable) segment file.
     segments_fingerprint: Vec<FileFingerprint>,
     /// `facts.db` fingerprint at the moment counts were last verified equal.
@@ -6104,12 +6115,15 @@ fn reconcile_cache_path(facts_db_path: &Path) -> Option<PathBuf> {
         .map(|p| p.join(RECONCILE_CACHE_FILENAME))
 }
 
-/// Read the sidecar, returning `None` on absent/unparseable (never errors — the
-/// sidecar is disposable and must never override the canonical ledger).
+/// Read the sidecar, returning `None` on absent/unparseable/unsupported schema
+/// (never errors — the sidecar is disposable and must never override the
+/// canonical ledger). Legacy sidecars have no schema field and deserialize as
+/// version zero, so upgrades fail closed into one authoritative scan.
 fn read_reconcile_cache(facts_db_path: &Path) -> Option<ReconcileCache> {
     let path = reconcile_cache_path(facts_db_path)?;
     let text = fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&text).ok()
+    let cache: ReconcileCache = serde_json::from_str(&text).ok()?;
+    (cache.schema_version == RECONCILE_CACHE_SCHEMA_VERSION).then_some(cache)
 }
 
 /// Write the sidecar atomically (tmp + rename). Best-effort: a write failure is
@@ -6153,6 +6167,7 @@ fn seed_segments_from_db_if_absent(
     }
 
     let cache = ReconcileCache {
+        schema_version: RECONCILE_CACHE_SCHEMA_VERSION,
         segments_fingerprint: segments_fingerprint(&segments, &archived),
         db_fingerprint: fingerprint_db(facts_db_path),
         wal_fingerprint: fingerprint_wal(facts_db_path),
@@ -6279,6 +6294,7 @@ fn reconcile_segments_and_db(
     // canonical_stats == db_stats > 0 → cache is fresh; leave the db untouched
     // and refresh the sidecar so subsequent ops take the O(1) fast path.
     let cache = ReconcileCache {
+        schema_version: RECONCILE_CACHE_SCHEMA_VERSION,
         segments_fingerprint: seg_fp,
         db_fingerprint: fingerprint_db(facts_db_path),
         wal_fingerprint: fingerprint_wal(facts_db_path),
@@ -6309,6 +6325,7 @@ fn refresh_reconcile_cache_after_full_scan(
         return;
     };
     let cache = ReconcileCache {
+        schema_version: RECONCILE_CACHE_SCHEMA_VERSION,
         segments_fingerprint: segments_fingerprint(&segments, &archived),
         db_fingerprint: fingerprint_db(facts_db_path),
         wal_fingerprint: fingerprint_wal(facts_db_path),
@@ -9932,6 +9949,23 @@ mod ledger_tests {
         serde_json::to_string(&entry).unwrap()
     }
 
+    fn canonical_source_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>, usize)> {
+        let mut paths = segments_under(root);
+        paths.extend(archive_under(root));
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                let line_count = bytes
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .count();
+                (path, bytes, line_count)
+            })
+            .collect()
+    }
+
     fn canonical_conflict_message<T>(result: Result<T>, case: &str) -> String {
         match result {
             Ok(_) => panic!("{case}: conflicting canonical rows must fail loud"),
@@ -10706,6 +10740,208 @@ mod ledger_tests {
     // =========================================================================
 
     #[test]
+    fn step3_reconcile_cache_current_schema_is_stamped_and_required() {
+        let root = unique_root("step3-cache-schema");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        store
+            .append_fact(&make_fact(
+                "schema-seed",
+                FactKind::Decision,
+                "src/",
+                "seed current cache",
+            ))
+            .unwrap();
+
+        let facts_db = root.join(".rally/facts.db");
+        let sidecar = root.join(".rally").join(RECONCILE_CACHE_FILENAME);
+        let fresh: Value = serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+        let fresh_schema = fresh.get("schema_version").and_then(Value::as_u64);
+
+        let mut current = fresh.clone();
+        current.as_object_mut().unwrap().insert(
+            "schema_version".to_string(),
+            json!(RECONCILE_CACHE_SCHEMA_VERSION),
+        );
+        fs::write(&sidecar, serde_json::to_vec(&current).unwrap()).unwrap();
+        let current_is_accepted = read_reconcile_cache(&facts_db).is_some();
+
+        let mut absent = current.clone();
+        absent.as_object_mut().unwrap().remove("schema_version");
+        fs::write(&sidecar, serde_json::to_vec(&absent).unwrap()).unwrap();
+        let absent_is_rejected = read_reconcile_cache(&facts_db).is_none();
+
+        let mut old = current.clone();
+        old.as_object_mut()
+            .unwrap()
+            .insert("schema_version".to_string(), json!(1));
+        fs::write(&sidecar, serde_json::to_vec(&old).unwrap()).unwrap();
+        let old_is_rejected = read_reconcile_cache(&facts_db).is_none();
+
+        let mut unknown = current;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("schema_version".to_string(), json!(999));
+        fs::write(&sidecar, serde_json::to_vec(&unknown).unwrap()).unwrap();
+        let unknown_is_rejected = read_reconcile_cache(&facts_db).is_none();
+
+        assert!(
+            fresh_schema == Some(u64::from(RECONCILE_CACHE_SCHEMA_VERSION))
+                && current_is_accepted
+                && absent_is_rejected
+                && old_is_rejected
+                && unknown_is_rejected,
+            "cache schema contract failed: fresh={fresh_schema:?}, current accepted={current_is_accepted}, absent rejected={absent_is_rejected}, old rejected={old_is_rejected}, unknown rejected={unknown_is_rejected}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn step3_old_cache_schema_forces_one_scan_then_current_cache_is_fast() {
+        let root = unique_root("step3-cache-schema-upgrade");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        for i in 0..3u32 {
+            store
+                .append_fact(&make_fact(
+                    &format!("schema-upgrade-{i}"),
+                    FactKind::Decision,
+                    "src/",
+                    "schema upgrade seed",
+                ))
+                .unwrap();
+        }
+
+        let rally_dir = root.join(".rally");
+        let log_dir = rally_dir.join(LOG_DIRNAME);
+        let archive_dir = rally_dir.join(ARCHIVE_DIRNAME);
+        let facts_db = rally_dir.join("facts.db");
+        let sidecar = rally_dir.join(RECONCILE_CACHE_FILENAME);
+        let mut legacy: Value = serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert("schema_version".to_string(), json!(1));
+        fs::write(&sidecar, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let before = full_reconcile_scan_count();
+        reconcile_segments_and_db(&log_dir, &archive_dir, &facts_db, true).unwrap();
+        let after_upgrade = full_reconcile_scan_count();
+        let refreshed: Value = serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+        let refreshed_schema = refreshed.get("schema_version").and_then(Value::as_u64);
+        reconcile_segments_and_db(&log_dir, &archive_dir, &facts_db, true).unwrap();
+        let after_fast_path = full_reconcile_scan_count();
+
+        assert_eq!(
+            after_upgrade,
+            before + 1,
+            "an old cache schema must force exactly one authoritative scan"
+        );
+        assert_eq!(
+            refreshed_schema,
+            Some(u64::from(RECONCILE_CACHE_SCHEMA_VERSION))
+        );
+        assert_eq!(
+            after_fast_path, after_upgrade,
+            "the current cache written by that scan must permit the next O(1) fast path"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn legacy_reconcile_cache_never_allows_conflicting_append_to_mutate_storage() {
+        let mut failures = Vec::new();
+        for source_layout in ["live-live", "live-archive"] {
+            let root = unique_root(&format!("legacy-cache-conflict-{source_layout}"));
+            let store = DirectRoomStore::open_direct_at_with_engagement(
+                root.clone(),
+                Some("alpha".to_string()),
+            )
+            .unwrap();
+            for seq in 1..=3 {
+                store
+                    .append_fact(&make_fact(
+                        &format!("seed-{seq}"),
+                        FactKind::Decision,
+                        "src/",
+                        "legacy cache seed",
+                    ))
+                    .unwrap();
+            }
+            drop(store);
+
+            let conflicting = ledger_line(3, "artifact", "conflicting-3", "beta");
+            let second_dir = if source_layout == "live-live" {
+                LOG_DIRNAME
+            } else {
+                ARCHIVE_DIRNAME
+            };
+            write_segment(&root, second_dir, "beta.jsonl", &[conflicting.as_str()]);
+
+            let facts_db = root.join(".rally/facts.db");
+            let sidecar = root.join(".rally").join(RECONCILE_CACHE_FILENAME);
+            let live = segments_under(&root);
+            let archived = archive_under(&root);
+            let legacy = json!({
+                "segments_fingerprint": segments_fingerprint(&live, &archived),
+                "db_fingerprint": fingerprint_db(&facts_db),
+                "wal_fingerprint": fingerprint_wal(&facts_db),
+                "canonical_count": 3,
+                "canonical_max_seq": 3,
+                "db_count": 3,
+                "db_max_seq": 3,
+            });
+            fs::write(&sidecar, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+            // Model a natural upgrade: the legacy sidecar already exists when
+            // this binary opens the room. Open must not bless or rewrite it;
+            // append must reject it and validate the canonical fold first.
+            let store = DirectRoomStore::open_direct_at_with_engagement(
+                root.clone(),
+                Some("alpha".to_string()),
+            )
+            .unwrap();
+            let db_before = fs::read(&facts_db).unwrap();
+            let sources_before = canonical_source_snapshot(&root);
+            let cache_before = fs::read(&sidecar).unwrap();
+            let append_result = store.append_fact(&make_fact(
+                "must-not-land",
+                FactKind::Decision,
+                "src/",
+                "conflicting canonical history",
+            ));
+            drop(store);
+            let db_after = fs::read(&facts_db).unwrap();
+            let sources_after = canonical_source_snapshot(&root);
+            let cache_after = fs::read(&sidecar).unwrap_or_default();
+            let error_text = append_result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+
+            if !(append_result.is_err()
+                && error_text.contains("conflicting canonical segment rows at seq 3")
+                && db_after == db_before
+                && sources_after == sources_before
+                && cache_after == cache_before)
+            {
+                failures.push(format!(
+                    "{source_layout}: result={append_result:?}, db_changed={}, sources_changed={}, cache_changed={}, error={error_text:?}",
+                    db_after != db_before,
+                    sources_after != sources_before,
+                    cache_after != cache_before,
+                ));
+            }
+            fs::remove_dir_all(&root).ok();
+        }
+        assert!(
+            failures.is_empty(),
+            "conflicting append was not atomic:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
     fn step3_zero_length_wal_is_absent_but_nonempty_wal_is_fingerprinted() {
         let root = unique_root("step3-zero-wal");
         let rally_dir = root.join(".rally");
@@ -11064,6 +11300,7 @@ mod ledger_tests {
         let archived = archive_under(&root);
         let canonical_stats = segment_seq_stats(&segments, &archived).unwrap();
         let adversarial_cache = ReconcileCache {
+            schema_version: RECONCILE_CACHE_SCHEMA_VERSION,
             segments_fingerprint: segments_fingerprint(&segments, &archived),
             db_fingerprint: fingerprint_db(&facts_db),
             wal_fingerprint: fingerprint_wal(&facts_db),
