@@ -1576,7 +1576,8 @@ fn install_direct_owner_once(
 fn direct_owner_busy_unknown_error(bound: Duration) -> RallyError {
     RallyError::Command(format!(
         "direct-store-busy-unknown: could not establish exclusive direct ownership or a live \
-         daemon route within {}ms; no facts.db write was attempted",
+         daemon route within {}ms; no facts.db write was attempted. Run `rally daemon status`; \
+         if the daemon is wedged, run `rally daemon stop` before retrying",
         bound.as_millis()
     ))
 }
@@ -6471,6 +6472,11 @@ mod ledger_tests {
         assert!(
             err.to_string().contains("direct-store-busy-unknown:"),
             "typed contention error must survive rendering: {err}"
+        );
+        assert!(
+            err.to_string().contains("rally daemon status")
+                && err.to_string().contains("rally daemon stop"),
+            "typed contention error must include the safe recovery commands: {err}"
         );
         fs::remove_dir_all(root).ok();
     }
