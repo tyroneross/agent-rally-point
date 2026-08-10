@@ -1288,6 +1288,113 @@ mod imp {
         }
 
         #[test]
+        fn scoped_path_collision_stops_direct_and_routed_writers_with_nonoverlap_control() {
+            let repo_root = unique_repo_root("scoped-path-collision-parity");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            store.set_engagement_scope(Some("engagement-alpha".to_string()));
+            let artifact = crate::store::Fact {
+                from_session_id: Some("sess:alpha".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "artifact-alpha-path".to_string(),
+                seq: 0,
+                thread_id: "thread-alpha-path".to_string(),
+                kind: crate::store::FactKind::Artifact,
+                tool: Some("codex:alpha".to_string()),
+                role: None,
+                subject: "alpha path work".to_string(),
+                scope: vec!["file:src/lib.rs".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact(&artifact).unwrap();
+            store.set_engagement_scope(Some("engagement-beta".to_string()));
+            let claim = crate::store::Fact {
+                from_session_id: Some("sess:beta".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "claim-beta-path".to_string(),
+                seq: 0,
+                thread_id: "thread-beta-path".to_string(),
+                kind: crate::store::FactKind::Claim,
+                tool: Some("codex:beta".to_string()),
+                role: None,
+                subject: "beta owns path".to_string(),
+                scope: vec!["file:src/lib.rs".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact(&claim).unwrap();
+
+            let direct = store
+                .snapshot_scoped("engagement-alpha", None, Some("src/lib.rs"), false, false)
+                .unwrap();
+            let routed = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(
+                    Some("engagement-alpha".to_string()),
+                    StoreOp::SnapshotScoped {
+                        run_id: None,
+                        path: Some("src/lib.rs".to_string()),
+                        include_archived: false,
+                        include_presence_only: false,
+                    },
+                ),
+            );
+            let routed = match routed {
+                StoreResponse::Ok(StoreOk::Snapshot { snapshot }) => {
+                    crate::store::snapshot_from_wire_value(snapshot).unwrap()
+                }
+                other => panic!("unexpected scoped snapshot reply: {other:?}"),
+            };
+
+            assert_eq!(
+                crate::store::snapshot_to_wire_value(&direct).unwrap(),
+                crate::store::snapshot_to_wire_value(&routed).unwrap(),
+                "direct and routed collision context must match"
+            );
+            for (mode, snapshot) in [("direct", &direct), ("routed", &routed)] {
+                let mut collision = Vec::new();
+                crate::check::check_before_write_for_test(
+                    snapshot,
+                    "codex:alpha",
+                    Some("src/lib.rs"),
+                    &mut collision,
+                );
+                assert!(
+                    collision.contains(&("claimed-path", "stop")),
+                    "{mode} path collision must stop the writer: {collision:?}"
+                );
+
+                let mut nonoverlap = Vec::new();
+                crate::check::check_before_write_for_test(
+                    snapshot,
+                    "codex:alpha",
+                    Some("src/other.rs"),
+                    &mut nonoverlap,
+                );
+                assert!(
+                    !nonoverlap.contains(&("claimed-path", "stop")),
+                    "{mode} non-overlap control must not invent a collision: {nonoverlap:?}"
+                );
+            }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
         fn routed_renewal_appends_the_same_durable_fact_as_direct_mode() {
             let repo_root = unique_repo_root("renewal-parity");
             let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();

@@ -3,7 +3,7 @@ use factstr_sqlite::SqliteStore;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -520,9 +520,22 @@ impl Fact {
     fn from_value(value: Value, seq: i64) -> Result<Self> {
         let mut fact: Self =
             serde_json::from_value(value).map_err(RallyError::json("parse fact payload"))?;
+        // factstr compacts record sequence numbers when rebuilding a sparse
+        // canonical ledger. Its normalized payload seq therefore carries the
+        // canonical high-water; legacy payloads without one fall back to the
+        // database record sequence.
         if fact.seq == 0 {
             fact.seq = seq;
         }
+        Ok(fact)
+    }
+
+    /// Decode a canonical JSONL row. Unlike a derived-database read, the
+    /// LedgerLine envelope owns the sequence and always overwrites payload seq.
+    fn from_segment_value(value: Value, seq: i64) -> Result<Self> {
+        let mut fact: Self =
+            serde_json::from_value(value).map_err(RallyError::json("parse fact payload"))?;
+        fact.seq = seq;
         Ok(fact)
     }
 }
@@ -1605,7 +1618,7 @@ fn acquire_direct_owner_exclusive_nb(_rally_dir: &Path) -> Result<Option<OwnerGu
 /// the R1 monolith may carry the UTC date that the row was first observed (no
 /// tag was recorded pre-R5). `serde(default)` keeps the format
 /// forward-compatible — readers that don't know the field treat it as absent.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 struct LedgerLine {
     seq: i64,
     occurred_at: String,
@@ -3149,6 +3162,17 @@ impl DirectRoomStore {
     }
 
     fn repo_wide_claim_lifecycle_facts(&self) -> Result<Vec<Fact>> {
+        // facts.db is derived from the canonical segment set. Validate that
+        // relationship before asking it a safety-bearing collision question.
+        // Cold/direct mode may rebuild the cache; a warm daemon pool must fail
+        // loud and restart rather than replace a database it still owns.
+        reconcile_segments_and_db(
+            &self.log_dir,
+            &self.archive_dir,
+            &self.facts_db_path,
+            self.warm_fact_store.is_none(),
+        )?;
+
         if let Some(warm) = &self.warm_fact_store {
             return match claim_lifecycle_facts_from_store(warm) {
                 Ok(facts) => Ok(facts),
@@ -3159,7 +3183,10 @@ impl DirectRoomStore {
             };
         }
 
-        let fact_store = open_fact_store_lenient(&self.facts_db_path)?;
+        // Reconcile above has already repaired/quarantined a malformed cold
+        // cache. Opening leniently here could quarantine and then query a new,
+        // empty database before canonical replay, falsely reporting no claim.
+        let fact_store = open_fact_store(&self.facts_db_path)?;
         match claim_lifecycle_facts_from_store(&fact_store) {
             Ok(facts) => Ok(facts),
             Err(err) if is_malformed_db_error(&err) => {
@@ -3174,7 +3201,7 @@ impl DirectRoomStore {
                     &self.facts_db_path,
                     true,
                 )?;
-                let recovered_store = open_fact_store_lenient(&self.facts_db_path)?;
+                let recovered_store = open_fact_store(&self.facts_db_path)?;
                 claim_lifecycle_facts_from_store(&recovered_store)
             }
             Err(err) => Err(err),
@@ -3225,9 +3252,22 @@ impl DirectRoomStore {
             .facts_db_path
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
-        let _guard = acquire_room_mutation_lock(room_dir)?;
-        let engagement_facts =
-            facts_from_engagement_segments(&self.log_dir, &self.archive_dir, &engagement)?;
+        // Capture both canonical inputs under one mutation epoch, then release
+        // the cross-process lock before CPU-only closure/projection/sorting.
+        let (engagement_facts, claim_lifecycle_facts) = {
+            let _guard = acquire_room_mutation_lock(room_dir)?;
+            let engagement_facts =
+                facts_from_engagement_segments(&self.log_dir, &self.archive_dir, &engagement)?;
+            let claim_lifecycle_facts = normalized_path
+                .as_ref()
+                .map(|_| self.repo_wide_claim_lifecycle_facts())
+                .transpose()?;
+            (engagement_facts, claim_lifecycle_facts)
+        };
+
+        #[cfg(test)]
+        pause_scoped_projection_after_capture(room_dir);
+
         let scoped_facts = select_scoped_facts(
             &engagement_facts,
             run_marker.as_deref(),
@@ -3252,17 +3292,16 @@ impl DirectRoomStore {
         }
 
         if let Some(path) = normalized_path.as_deref() {
-            let lifecycle = self.repo_wide_claim_lifecycle_facts()?;
-            let mut external_claims = lifecycle
+            let lifecycle = claim_lifecycle_facts.as_deref().ok_or_else(|| {
+                RallyError::Message(
+                    "path-scoped snapshot captured no claim lifecycle input".to_string(),
+                )
+            })?;
+            let collision_lifecycle = claim_lifecycle_relevant_to_path(lifecycle, path);
+            let mut external_claims = collision_lifecycle
                 .iter()
-                .filter(|fact| claim_authority::is_active_claim_fact(fact, &lifecycle))
-                .map(|fact| claim_authority::project_effective_claim(fact, &lifecycle))
-                .filter(|claim| {
-                    claim
-                        .scope
-                        .iter()
-                        .any(|scope| path_matches_scope(scope, path))
-                })
+                .filter(|fact| claim_authority::is_active_claim_fact(fact, &collision_lifecycle))
+                .map(|fact| claim_authority::project_effective_claim(fact, &collision_lifecycle))
                 .collect::<Vec<_>>();
             external_claims.sort_by_key(|fact| fact.seq);
             for claim in external_claims {
@@ -3275,6 +3314,19 @@ impl DirectRoomStore {
                 }
             }
             snapshot.active_claims.sort_by_key(|fact| fact.seq);
+
+            // The collision answer is derived from lifecycle inputs, not only
+            // the claims it emits. A newer renewal changes the projected lease;
+            // a newer close can remove the claim entirely. Advance the cursor
+            // to the newest path-relevant source even when its origin claim is
+            // older or the projection emits no claim.
+            if let Some(latest_source) = collision_lifecycle.iter().max_by_key(|fact| fact.seq)
+                && latest_source.seq > snapshot.max_seq
+            {
+                snapshot.max_seq = latest_source.seq;
+                snapshot.content_max_seq = snapshot.content_max_seq.max(latest_source.seq);
+                snapshot.last_activity_ts = Some(latest_source.created_at.clone());
+            }
         }
 
         refresh_snapshot_totals(&mut snapshot);
@@ -3522,35 +3574,116 @@ fn select_scoped_facts(
     run_marker: Option<&str>,
     path: Option<&str>,
 ) -> Vec<Fact> {
-    if run_marker.is_none() && path.is_none() {
-        return engagement_facts.to_vec();
-    }
+    let (facts, stats) = select_scoped_facts_with_stats(engagement_facts, run_marker, path);
+    debug_assert!(stats.facts_indexed >= facts.len());
+    facts
+}
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ScopedSelectionStats {
+    facts_indexed: usize,
+    initial_match_checks: usize,
+    queue_pops: usize,
+    adjacency_visits: usize,
+    scope_visits: usize,
+    ref_buckets_processed: usize,
+    scope_buckets_processed: usize,
+}
+
+impl ScopedSelectionStats {
+    #[cfg(test)]
+    fn work_units(self) -> usize {
+        self.facts_indexed
+            + self.initial_match_checks
+            + self.queue_pops
+            + self.adjacency_visits
+            + self.scope_visits
+    }
+}
+
+#[cfg(test)]
+struct ScopedCapturePause {
+    room_dir: PathBuf,
+    captured: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static SCOPED_CAPTURE_PAUSE: Mutex<Option<ScopedCapturePause>> = Mutex::new(None);
+
+/// Test seam at the exact ownership boundary: selected canonical inputs have
+/// been captured, and the mutation lock must already be available to a peer.
+#[cfg(test)]
+fn pause_scoped_projection_after_capture(room_dir: &Path) {
+    let pause = {
+        let mut slot = SCOPED_CAPTURE_PAUSE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|pause| pause.room_dir == room_dir)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(pause) = pause {
+        pause.captured.send(()).unwrap();
+        pause
+            .resume
+            .recv_timeout(Duration::from_secs(5))
+            .expect("scoped projection test did not release its capture pause");
+    }
+}
+
+/// Test-only copy of the pre-index closure's segment-inspection count. It is
+/// retained as measurement evidence, not as a product fallback.
+#[cfg(test)]
+fn legacy_scoped_selection_work_count(
+    engagement_facts: &[Fact],
+    run_marker: Option<&str>,
+    path: Option<&str>,
+) -> usize {
+    let mut inspections = 0;
     let mut selected = engagement_facts
         .iter()
-        .filter(|fact| fact_matches_scoped_selection(fact, run_marker, path))
+        .filter(|fact| {
+            inspections += 1;
+            fact_matches_scoped_selection(fact, run_marker, path)
+        })
         .map(|fact| fact.seq)
         .collect::<BTreeSet<_>>();
 
     loop {
         let selected_event_ids = engagement_facts
             .iter()
-            .filter(|fact| selected.contains(&fact.seq))
+            .filter(|fact| {
+                inspections += 1;
+                selected.contains(&fact.seq)
+            })
             .map(|fact| fact.event_id.as_str())
             .collect::<BTreeSet<_>>();
         let selected_refs = engagement_facts
             .iter()
-            .filter(|fact| selected.contains(&fact.seq))
+            .filter(|fact| {
+                inspections += 1;
+                selected.contains(&fact.seq)
+            })
             .filter_map(|fact| fact.ref_id.as_deref())
             .collect::<BTreeSet<_>>();
         let selected_claim_scopes = engagement_facts
             .iter()
-            .filter(|fact| selected.contains(&fact.seq) && fact.kind == FactKind::Claim)
+            .filter(|fact| {
+                inspections += 1;
+                selected.contains(&fact.seq) && fact.kind == FactKind::Claim
+            })
             .flat_map(|fact| fact.scope.iter().map(String::as_str))
             .collect::<BTreeSet<_>>();
 
         let mut changed = false;
         for fact in engagement_facts {
+            inspections += 1;
             if selected.contains(&fact.seq) {
                 continue;
             }
@@ -3572,12 +3705,118 @@ fn select_scoped_facts(
             break;
         }
     }
+    inspections
+}
 
-    engagement_facts
+/// Indexed closure over the selected engagement. Event/ref adjacency and
+/// claim/release scope buckets are each expanded at most once, so a long
+/// reference chain grows with its rows/edges instead of triggering repeated
+/// full-segment scans.
+fn select_scoped_facts_with_stats(
+    engagement_facts: &[Fact],
+    run_marker: Option<&str>,
+    path: Option<&str>,
+) -> (Vec<Fact>, ScopedSelectionStats) {
+    let mut stats = ScopedSelectionStats {
+        facts_indexed: engagement_facts.len(),
+        ..ScopedSelectionStats::default()
+    };
+    if run_marker.is_none() && path.is_none() {
+        stats.initial_match_checks = engagement_facts.len();
+        stats.queue_pops = engagement_facts.len();
+        return (engagement_facts.to_vec(), stats);
+    }
+
+    let mut facts_by_event_id = BTreeMap::<&str, Vec<usize>>::new();
+    let mut facts_by_ref_id = BTreeMap::<&str, Vec<usize>>::new();
+    let mut releases_by_scope = BTreeMap::<&str, Vec<usize>>::new();
+    for (index, fact) in engagement_facts.iter().enumerate() {
+        facts_by_event_id
+            .entry(fact.event_id.as_str())
+            .or_default()
+            .push(index);
+        if let Some(ref_id) = fact.ref_id.as_deref() {
+            facts_by_ref_id.entry(ref_id).or_default().push(index);
+        }
+        if fact.kind == FactKind::Release {
+            for scope in &fact.scope {
+                releases_by_scope
+                    .entry(scope.as_str())
+                    .or_default()
+                    .push(index);
+            }
+        }
+    }
+
+    let mut selected = vec![false; engagement_facts.len()];
+    let mut queue = VecDeque::new();
+    for (index, fact) in engagement_facts.iter().enumerate() {
+        stats.initial_match_checks += 1;
+        if fact_matches_scoped_selection(fact, run_marker, path) {
+            selected[index] = true;
+            queue.push_back(index);
+        }
+    }
+
+    let mut processed_event_ids = BTreeSet::new();
+    let mut processed_ref_ids = BTreeSet::new();
+    let mut processed_claim_scopes = BTreeSet::new();
+    let enqueue = |index: usize, selected: &mut [bool], queue: &mut VecDeque<usize>| {
+        if !selected[index] {
+            selected[index] = true;
+            queue.push_back(index);
+        }
+    };
+
+    while let Some(index) = queue.pop_front() {
+        stats.queue_pops += 1;
+        let fact = &engagement_facts[index];
+
+        if processed_event_ids.insert(fact.event_id.as_str()) {
+            stats.ref_buckets_processed += 1;
+            if let Some(neighbors) = facts_by_ref_id.get(fact.event_id.as_str()) {
+                for &neighbor in neighbors {
+                    stats.adjacency_visits += 1;
+                    enqueue(neighbor, &mut selected, &mut queue);
+                }
+            }
+        }
+
+        if let Some(ref_id) = fact.ref_id.as_deref()
+            && processed_ref_ids.insert(ref_id)
+        {
+            stats.ref_buckets_processed += 1;
+            if let Some(neighbors) = facts_by_event_id.get(ref_id) {
+                for &neighbor in neighbors {
+                    stats.adjacency_visits += 1;
+                    enqueue(neighbor, &mut selected, &mut queue);
+                }
+            }
+        }
+
+        if fact.kind == FactKind::Claim {
+            for scope in &fact.scope {
+                if processed_claim_scopes.insert(scope.as_str()) {
+                    stats.scope_buckets_processed += 1;
+                    if let Some(releases) = releases_by_scope.get(scope.as_str()) {
+                        for &release in releases {
+                            stats.scope_visits += 1;
+                            enqueue(release, &mut selected, &mut queue);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let facts = engagement_facts
         .iter()
-        .filter(|fact| selected.contains(&fact.seq))
+        .enumerate()
+        .filter(|(index, _)| selected[*index])
+        .map(|(_, fact)| fact)
         .cloned()
-        .collect()
+        .collect();
+    (facts, stats)
 }
 
 fn scoped_contributor_tools(facts: &[Fact]) -> BTreeSet<String> {
@@ -3646,6 +3885,48 @@ fn claim_lifecycle_facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
                 .map_err(|err| RallyError::Message(format!("sequence number overflow: {err}")))?;
             Fact::from_value(record.payload, seq)
         })
+        .collect()
+}
+
+/// Reduce the typed repository-wide lifecycle query to the facts that can
+/// change the collision answer for one requested path. The origin claims name
+/// the relevant ids/scopes; renewals and id-based closers reference those ids,
+/// while an atomic Release may close by exact scope without a ref.
+fn claim_lifecycle_relevant_to_path(facts: &[Fact], path: &str) -> Vec<Fact> {
+    let relevant_claims = facts
+        .iter()
+        .filter(|fact| {
+            fact.kind == FactKind::Claim
+                && fact
+                    .scope
+                    .iter()
+                    .any(|scope| path_matches_scope(scope, path))
+        })
+        .collect::<Vec<_>>();
+    let claim_ids = relevant_claims
+        .iter()
+        .map(|claim| claim.event_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let claim_scopes = relevant_claims
+        .iter()
+        .flat_map(|claim| claim.scope.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+
+    facts
+        .iter()
+        .filter(|fact| {
+            (fact.kind == FactKind::Claim && claim_ids.contains(fact.event_id.as_str()))
+                || fact
+                    .ref_id
+                    .as_deref()
+                    .is_some_and(|ref_id| claim_ids.contains(ref_id))
+                || (fact.kind == FactKind::Release
+                    && fact
+                        .scope
+                        .iter()
+                        .any(|scope| claim_scopes.contains(scope.as_str())))
+        })
+        .cloned()
         .collect()
 }
 
@@ -3786,7 +4067,7 @@ fn facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> 
         if !seen.insert(entry.seq) {
             continue;
         }
-        facts.push(Fact::from_value(entry.payload, entry.seq)?);
+        facts.push(Fact::from_segment_value(entry.payload, entry.seq)?);
     }
 
     if let Ok(mut memo) = SEGMENT_FOLD_MEMO.lock() {
@@ -3816,19 +4097,21 @@ fn facts_from_engagement_segments(
     entries.sort_by_key(|entry| entry.seq);
 
     let mut facts = Vec::with_capacity(entries.len());
-    let mut seen = BTreeMap::<i64, Value>::new();
+    let mut seen = BTreeMap::<i64, LedgerLine>::new();
     for entry in entries {
         if let Some(existing) = seen.get(&entry.seq) {
-            if existing != &entry.payload {
+            if existing != &entry {
                 return Err(RallyError::Message(format!(
-                    "conflicting canonical rows for engagement {engagement:?} at seq {}: live/archive payloads differ",
+                    "conflicting canonical rows for engagement {engagement:?} at seq {}: live/archive rows differ",
                     entry.seq
                 )));
             }
             continue;
         }
-        seen.insert(entry.seq, entry.payload.clone());
-        facts.push(Fact::from_value(entry.payload, entry.seq)?);
+        let seq = entry.seq;
+        let payload = entry.payload.clone();
+        seen.insert(seq, entry);
+        facts.push(Fact::from_segment_value(payload, seq)?);
     }
     Ok(facts)
 }
@@ -6948,6 +7231,26 @@ mod ledger_tests {
         assert_eq!(f.subject, "old");
     }
 
+    #[test]
+    fn fact_from_segment_value_overwrites_spoofed_payload_sequence() {
+        let fact = Fact::from_segment_value(
+            json!({
+                "schema": fact_schema(),
+                "event_id": "spoofed-seq",
+                "seq": 9_999,
+                "kind": "artifact",
+                "subject": "canonical envelope wins"
+            }),
+            7,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fact.seq, 7,
+            "the canonical envelope/database sequence must overwrite payload seq"
+        );
+    }
+
     /// f4 (2026-07-09): callers list segment files via `read_segment_files`
     /// then open each one separately — a concurrent archival/rotation can
     /// remove a listed segment in between (TOCTOU). That is a benign race
@@ -7133,6 +7436,7 @@ mod ledger_tests {
         );
         external_claim.tool = Some("codex:beta".to_string());
         external_claim.from_session_id = Some("sess:beta".to_string());
+        external_claim.created_at = "2099-01-01T00:00:02Z".to_string();
         store.append_fact(&external_claim).unwrap();
 
         let scoped = store
@@ -7161,6 +7465,481 @@ mod ledger_tests {
             scoped.squads.iter().all(|squad| squad.tool != "codex:beta"),
             "an external collision claim must not add contributor credit"
         );
+        let external = scoped
+            .active_claims
+            .iter()
+            .find(|fact| fact.event_id == "claim-beta")
+            .unwrap();
+        assert!(
+            scoped.max_seq >= external.seq && scoped.content_max_seq >= external.seq,
+            "snapshot high-water must cover every emitted external claim: {scoped:#?}"
+        );
+        assert_eq!(
+            scoped.last_activity_ts.as_deref(),
+            Some(external.created_at.as_str()),
+            "the highest emitted external claim must own last_activity_ts"
+        );
+
+        let mut findings = Vec::new();
+        crate::check::check_before_write_for_test(
+            &scoped,
+            "codex:alpha",
+            Some("crates/rally-cli/src/store.rs"),
+            &mut findings,
+        );
+        assert!(
+            findings.contains(&("claimed-path", "stop")),
+            "path-scoped collision context must still stop a conflicting writer: {findings:?}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scoped_path_repairs_corrupt_cold_cache_before_collision_query() {
+        let root = unique_root("scoped-snapshot-cold-cache-repair");
+        let mut store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        store
+            .append_fact(&make_fact(
+                "artifact-alpha",
+                FactKind::Artifact,
+                "file:src/lib.rs",
+                "selected work",
+            ))
+            .unwrap();
+        store.set_active_engagement_for_test("engagement-beta");
+        let mut claim = make_fact(
+            "claim-beta",
+            FactKind::Claim,
+            "file:src/lib.rs",
+            "must survive derived-cache quarantine",
+        );
+        claim.tool = Some("codex:beta".to_string());
+        claim.from_session_id = Some("sess:beta".to_string());
+        store.append_fact(&claim).unwrap();
+
+        let facts_db = root.join(".rally/facts.db");
+        remove_fact_store_journals(&facts_db);
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&facts_db)
+                .unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(b"NOT A SQLITE DB!").unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let scoped = store
+            .snapshot_scoped("engagement-alpha", None, Some("src/lib.rs"), false, false)
+            .unwrap();
+        assert!(
+            scoped
+                .active_claims
+                .iter()
+                .any(|fact| fact.event_id == "claim-beta"),
+            "cold direct mode must rebuild from canonical segments before the collision query"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scoped_path_repairs_spoofed_derived_db_sequence_before_collision_query() {
+        let root = unique_root("scoped-snapshot-db-seq-spoof");
+        let mut store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        store
+            .append_fact(&make_fact(
+                "artifact-alpha-db-spoof",
+                FactKind::Artifact,
+                "file:src/lib.rs",
+                "selected work",
+            ))
+            .unwrap();
+        store.set_active_engagement_for_test("engagement-beta");
+        let mut claim = make_fact(
+            "claim-beta-db-spoof",
+            FactKind::Claim,
+            "file:src/lib.rs",
+            "canonical seq is two",
+        );
+        claim.tool = Some("codex:beta".to_string());
+        claim.from_session_id = Some("sess:beta".to_string());
+        store.append_fact(&claim).unwrap();
+
+        let facts_db = root.join(".rally/facts.db");
+        remove_fact_store_journals(&facts_db);
+        let connection = Connection::open(&facts_db).unwrap();
+        let raw: String = connection
+            .query_row(
+                "SELECT payload FROM events WHERE event_type = 'claim'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut payload: Value = serde_json::from_str(&raw).unwrap();
+        payload["seq"] = json!(9_999);
+        connection
+            .execute(
+                "UPDATE events SET payload = ?1 WHERE event_type = 'claim'",
+                [serde_json::to_string(&payload).unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .ok();
+        drop(connection);
+
+        let scoped = store
+            .snapshot_scoped("engagement-alpha", None, Some("src/lib.rs"), false, false)
+            .unwrap();
+        let projected = scoped
+            .active_claims
+            .iter()
+            .find(|fact| fact.event_id == "claim-beta-db-spoof")
+            .expect("canonical collision claim must survive DB repair");
+        assert_eq!(projected.seq, 2, "canonical segment seq must win");
+        assert_eq!(scoped.max_seq, 2);
+        assert_eq!(scoped.content_max_seq, 2);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scoped_collision_cursor_advances_for_renewal_and_zero_claim_closure() {
+        let root = unique_root("scoped-snapshot-lifecycle-cursor");
+        let mut store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        store
+            .append_fact(&make_fact(
+                "artifact-alpha",
+                FactKind::Artifact,
+                "file:src/lib.rs",
+                "selected work",
+            ))
+            .unwrap();
+        store.set_active_engagement_for_test("engagement-beta");
+        let mut claim = make_fact(
+            "claim-beta-cursor",
+            FactKind::Claim,
+            "file:src/lib.rs",
+            "collision origin",
+        );
+        claim.tool = Some("codex:beta".to_string());
+        claim.from_session_id = Some("sess:beta".to_string());
+        store.append_fact(&claim).unwrap();
+        let mut renewal = make_fact(
+            "renew-beta-cursor",
+            FactKind::ClaimRenewed,
+            "file:src/lib.rs",
+            "renewal advances collision source cursor",
+        );
+        renewal.tool = Some("codex:beta".to_string());
+        renewal.from_session_id = Some("sess:beta".to_string());
+        renewal.ref_id = Some("claim-beta-cursor".to_string());
+        renewal.evidence = vec!["lease_expires_at:2099-01-01T00:00:03Z".to_string()];
+        let renewal = store.append_fact(&renewal).unwrap();
+
+        let renewed = store
+            .snapshot_scoped("engagement-alpha", None, Some("src/lib.rs"), false, false)
+            .unwrap();
+        assert_eq!(renewed.active_claims[0].seq, 2, "origin seq stays stable");
+        assert_eq!(renewed.max_seq, renewal.seq);
+        assert_eq!(renewed.content_max_seq, renewal.seq);
+        assert_eq!(
+            renewed.last_activity_ts.as_deref(),
+            Some(renewal.created_at.as_str())
+        );
+
+        let mut release = make_fact(
+            "release-beta-cursor",
+            FactKind::Release,
+            "file:src/lib.rs",
+            "zero emitted claims still advances source cursor",
+        );
+        release.tool = Some("codex:beta".to_string());
+        release.from_session_id = Some("sess:beta".to_string());
+        release.ref_id = Some("claim-beta-cursor".to_string());
+        release.created_at = "2099-01-01T00:00:04Z".to_string();
+        let release = store.append_fact(&release).unwrap();
+
+        let mut unrelated = make_fact(
+            "claim-unrelated-newer",
+            FactKind::Claim,
+            "file:src/other.rs",
+            "must not inflate another path cursor",
+        );
+        unrelated.tool = Some("codex:gamma".to_string());
+        unrelated.from_session_id = Some("sess:gamma".to_string());
+        let unrelated = store.append_fact(&unrelated).unwrap();
+        assert!(unrelated.seq > release.seq);
+
+        let closed = store
+            .snapshot_scoped("engagement-alpha", None, Some("src/lib.rs"), false, false)
+            .unwrap();
+        assert!(
+            closed.active_claims.is_empty(),
+            "the path claim must be absent after its lifecycle closure"
+        );
+        assert_eq!(closed.max_seq, release.seq);
+        assert_eq!(closed.content_max_seq, release.seq);
+        assert_eq!(
+            closed.last_activity_ts.as_deref(),
+            Some(release.created_at.as_str())
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scoped_segment_projection_overwrites_spoofed_nonzero_payload_sequence() {
+        let root = unique_root("scoped-snapshot-spoofed-seq");
+        let store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        store
+            .append_fact(&make_fact(
+                "artifact-spoofed",
+                FactKind::Artifact,
+                "run:audit-run",
+                "canonical seq wins",
+            ))
+            .unwrap();
+
+        let segment = store.active_segment_path();
+        let mut entry = read_segment_entries(&segment).unwrap().remove(0);
+        entry.payload["seq"] = json!(9_999);
+        fs::write(
+            &segment,
+            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+        )
+        .unwrap();
+
+        let scoped = store
+            .snapshot_scoped("engagement-alpha", Some("audit-run"), None, false, false)
+            .unwrap();
+        assert_eq!(scoped.max_seq, 1);
+        assert_eq!(scoped.content_max_seq, 1);
+        assert_eq!(scoped.recent_artifacts[0].seq, 1);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scoped_path_warm_cache_drift_fails_loud_instead_of_returning_empty_success() {
+        let root = unique_root("scoped-snapshot-warm-cache-drift");
+        let mut store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        store
+            .append_fact(&make_fact(
+                "artifact-alpha",
+                FactKind::Artifact,
+                "file:src/lib.rs",
+                "selected work",
+            ))
+            .unwrap();
+        store.install_warm_fact_store().unwrap();
+
+        let out_of_band = ledger_line(2, "claim", "claim-out-of-band", "engagement-beta");
+        write_segment(
+            &root,
+            LOG_DIRNAME,
+            "engagement-beta.jsonl",
+            &[out_of_band.as_str()],
+        );
+
+        let err = store
+            .snapshot_scoped("engagement-alpha", None, Some("src/lib.rs"), false, false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("facts-db-recovery-required"),
+            "a daemon-owned derived cache must fail loud on canonical drift: {err}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scoped_reference_closure_has_near_linear_deterministic_work() {
+        let mut chain = Vec::with_capacity(2_000);
+        for index in 0_usize..2_000 {
+            let mut fact = make_fact(
+                &format!("chain-{index}"),
+                FactKind::Artifact,
+                if index == 0 {
+                    "run:scaling-control"
+                } else {
+                    "run:unselected"
+                },
+                "reference-chain scaling control",
+            );
+            fact.seq = i64::try_from(index + 1).unwrap();
+            if index > 0 {
+                fact.ref_id = Some(format!("chain-{}", index - 1));
+            }
+            chain.push(fact);
+        }
+
+        let mut rows = Vec::new();
+        for size in [500_usize, 1_000, 2_000] {
+            let facts = &chain[..size];
+            let legacy_started = Instant::now();
+            let legacy_work =
+                legacy_scoped_selection_work_count(facts, Some("run:scaling-control"), None);
+            let legacy_elapsed = legacy_started.elapsed();
+            let indexed_started = Instant::now();
+            let (selected, stats) =
+                select_scoped_facts_with_stats(facts, Some("run:scaling-control"), None);
+            let indexed_elapsed = indexed_started.elapsed();
+            let indexed_work = stats.work_units();
+
+            assert_eq!(selected.len(), size, "reference closure lost chain rows");
+            assert!(
+                indexed_work <= size * 6,
+                "indexed closure exceeded a linear work bound at {size}: {stats:?}"
+            );
+            println!(
+                "SCOPED_SCALING rows={size} legacy_work={legacy_work} indexed_work={indexed_work} legacy_us={} indexed_us={} ref_buckets={} scope_buckets={}",
+                legacy_elapsed.as_micros(),
+                indexed_elapsed.as_micros(),
+                stats.ref_buckets_processed,
+                stats.scope_buckets_processed,
+            );
+            rows.push((size, legacy_work, indexed_work));
+        }
+
+        assert!(
+            rows[1].2 <= rows[0].2 * 3 && rows[2].2 <= rows[1].2 * 3,
+            "indexed deterministic work must scale near-linearly: {rows:?}"
+        );
+        assert!(
+            rows[1].1 > rows[0].1 * 3 && rows[2].1 > rows[1].1 * 3,
+            "the retained pre-index measurement must expose its repeated-scan growth: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_indexed_closure_preserves_reverse_refs_and_claim_scope_releases() {
+        let mut parent = make_fact(
+            "parent",
+            FactKind::Decision,
+            "run:unselected",
+            "selected fact points backward to this row",
+        );
+        parent.seq = 1;
+        let mut claim = make_fact(
+            "claim",
+            FactKind::Claim,
+            "run:audit-run",
+            "initial selection",
+        );
+        claim.seq = 2;
+        claim.ref_id = Some("parent".to_string());
+        claim.scope.push("file:src/lib.rs".to_string());
+        let mut release = make_fact(
+            "release",
+            FactKind::Release,
+            "file:src/lib.rs",
+            "scope-only lifecycle closure",
+        );
+        release.seq = 3;
+        let mut successor = make_fact(
+            "successor",
+            FactKind::Receipt,
+            "run:unselected",
+            "forward reference closure",
+        );
+        successor.seq = 4;
+        successor.ref_id = Some("claim".to_string());
+        let facts = vec![parent, claim, release, successor];
+
+        let (selected, stats) = select_scoped_facts_with_stats(&facts, Some("run:audit-run"), None);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|fact| fact.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parent", "claim", "release", "successor"]
+        );
+        assert_eq!(stats.queue_pops, facts.len());
+        assert_eq!(stats.scope_buckets_processed, 2);
+    }
+
+    #[test]
+    fn scoped_capture_releases_mutation_lock_before_large_projection() {
+        let root = unique_root("scoped-snapshot-short-lock");
+        let store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        let lines = (1..=1_500)
+            .map(|seq| {
+                ledger_line(
+                    seq,
+                    "artifact",
+                    &format!("artifact-{seq}"),
+                    "engagement-alpha",
+                )
+            })
+            .collect::<Vec<_>>();
+        let body = format!("{}\n", lines.join("\n"));
+        fs::create_dir_all(root.join(".rally").join(LOG_DIRNAME)).unwrap();
+        fs::write(store.active_segment_path(), body).unwrap();
+
+        let room_dir = root.join(".rally");
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        {
+            let mut pause = SCOPED_CAPTURE_PAUSE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            assert!(pause.is_none(), "another scoped capture test is active");
+            *pause = Some(ScopedCapturePause {
+                room_dir: room_dir.clone(),
+                captured: captured_tx,
+                resume: resume_rx,
+            });
+        }
+
+        let query = thread::spawn(move || {
+            store.snapshot_scoped("engagement-alpha", None, None, false, false)
+        });
+        captured_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("1500-row query did not finish its locked capture");
+
+        let (lock_tx, lock_rx) = mpsc::channel();
+        let lock_dir = room_dir.clone();
+        let holder = thread::spawn(move || {
+            let started = Instant::now();
+            let guard = acquire_room_mutation_lock(&lock_dir).unwrap();
+            lock_tx.send(started.elapsed()).unwrap();
+            drop(guard);
+        });
+        let lock_wait = lock_rx.recv_timeout(Duration::from_secs(2)).expect(
+            "a peer lock holder was starved while scoped projection was paused after capture",
+        );
+        println!(
+            "SCOPED_LOCK rows=1500 peer_lock_wait_us={}",
+            lock_wait.as_micros()
+        );
+        resume_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let snapshot = query.join().unwrap().unwrap();
+        assert_eq!(snapshot.max_seq, 1_500);
         fs::remove_dir_all(root).ok();
     }
 
@@ -7247,6 +8026,46 @@ mod ledger_tests {
             err.to_string().contains("conflicting canonical rows")
                 && err.to_string().contains("seq 1"),
             "same-seq payload divergence must fail loudly: {err}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scoped_snapshot_rejects_same_payload_with_conflicting_envelope_at_same_sequence() {
+        let root = unique_root("scoped-snapshot-seq-envelope-conflict");
+        let store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        store
+            .append_fact(&make_fact(
+                "artifact-alpha-envelope",
+                FactKind::Artifact,
+                "run:audit-run",
+                "alpha work",
+            ))
+            .unwrap();
+
+        let live_path = store.active_segment_path();
+        let mut archive_entry = read_segment_entries(&live_path).unwrap().remove(0);
+        archive_entry.occurred_at = "2099-01-01T00:00:00Z".to_string();
+        fs::create_dir_all(&store.archive_dir).unwrap();
+        let archive_path = store.archive_dir.join("engagement-alpha.jsonl");
+        fs::write(
+            &archive_path,
+            format!("{}\n", serde_json::to_string(&archive_entry).unwrap()),
+        )
+        .unwrap();
+
+        let err = store
+            .snapshot_scoped("engagement-alpha", Some("audit-run"), None, false, false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("conflicting canonical rows")
+                && err.to_string().contains("seq 1")
+                && err.to_string().contains("rows differ"),
+            "same payload with divergent envelope metadata must fail loudly: {err}"
         );
         fs::remove_dir_all(root).ok();
     }
