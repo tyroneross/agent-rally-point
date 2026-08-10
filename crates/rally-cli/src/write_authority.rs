@@ -226,10 +226,10 @@ fn assert_claim_close_authorized(
         return Ok(());
     };
 
-    // 1. Self-close. Session identity is authoritative when present; tool-only
-    // equality is a compatibility fallback only when both ledger rows are
-    // legacy/sessionless.
-    if claim_authority::same_session_owner(
+    // 1. Self-close. Session identity is authoritative when present. A modern
+    // stamped caller retains one-way compatibility with a historical
+    // sessionless claim only when both name the same present, nonblank tool.
+    if claim_authority::claim_owner_matches_caller(
         claim.tool.as_deref(),
         claim.from_session_id.as_deref(),
         fact.tool.as_deref(),
@@ -237,19 +237,14 @@ fn assert_claim_close_authorized(
     ) {
         return Ok(());
     }
-    // A historical claim has no session lease to compare. Preserve its
-    // one-way tool-owner compatibility for a modern stamped caller. The
-    // converse is forbidden below: a missing/sessionless caller never gains
-    // authority over a sessionful claim.
-    if claim.from_session_id.is_none() && claim.tool == fact.tool {
-        return Ok(());
-    }
     // 2. Stale-owner takeover.
     let (takeover_eligible, size) = snapshot.claim_reclaim_eligible(claim, coord);
     // A sibling process sharing the same tool label is not an external peer.
     // Never let that label alias another session's ownership, even after the
     // stale/lease windows; an explicit reaper fact remains a different actor.
-    if claim.from_session_id.is_some() && claim.tool == fact.tool {
+    if claim.from_session_id.is_some()
+        && claim_authority::same_nonblank_tool(claim.tool.as_deref(), fact.tool.as_deref())
+    {
         let actor = fact.tool.as_deref().unwrap_or("<unknown>");
         return Err(RallyError::Usage(format!(
             "{} failed: claim {ref_id} belongs to another {actor} session; shared tool labels do not confer claim authority. Ask the owning session to release it.",

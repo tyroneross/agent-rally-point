@@ -1998,8 +1998,12 @@ mod tests {
         let stopping_session = "sess-A";
         let snap = room.snapshot().unwrap();
         for c in snap.active_claims.iter().filter(|c| {
-            c.from_session_id.as_deref() == Some(stopping_session)
-                || (c.from_session_id.is_none() && c.tool.as_deref() == Some(stopping_tool))
+            crate::claim_authority::claim_owner_matches_caller(
+                c.tool.as_deref(),
+                c.from_session_id.as_deref(),
+                Some(stopping_tool),
+                Some(stopping_session),
+            )
         }) {
             let release = Fact {
                 from_session_id: Some(stopping_session.to_string()),

@@ -1794,7 +1794,7 @@ fn renew_owned_claim_leases(room: &RoomStore, tool: &str) -> Result<usize> {
     let now = chrono::Utc::now();
     let mut renewed = 0;
     for claim in snapshot.active_claims.iter().filter(|claim| {
-        claim_authority::same_session_owner(
+        claim_authority::claim_owner_matches_caller(
             claim.tool.as_deref(),
             claim.from_session_id.as_deref(),
             Some(tool),
@@ -2749,12 +2749,12 @@ fn command_release_by_path(
         })
     };
     let caller_owns_claim = |c: &&Fact| {
-        claim_authority::same_session_owner(
+        claim_authority::claim_owner_matches_caller(
             c.tool.as_deref(),
             c.from_session_id.as_deref(),
             Some(tool),
             Some(&caller_session),
-        ) || (c.from_session_id.is_none() && c.tool.as_deref() == Some(tool))
+        )
     };
     // Capture the size class of each reclaimed claim for the provenance trail.
     let mut reclaim_sizes: Vec<crate::decay::WorkSize> = Vec::new();
@@ -2799,7 +2799,7 @@ fn command_release_by_path(
             .active_claims
             .iter()
             .filter(|c| {
-                !claim_authority::same_session_owner(
+                !claim_authority::claim_owner_matches_caller(
                     c.tool.as_deref(),
                     c.from_session_id.as_deref(),
                     Some(tool),
@@ -6873,9 +6873,12 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                     let stopping_tool = &session.tool;
                     let stopping_session = session.session_id.as_str();
                     for claim in snap.active_claims.iter().filter(|c| {
-                        c.from_session_id.as_deref() == Some(stopping_session)
-                            || (c.from_session_id.is_none()
-                                && c.tool.as_deref() == Some(stopping_tool.as_str()))
+                        claim_authority::claim_owner_matches_caller(
+                            c.tool.as_deref(),
+                            c.from_session_id.as_deref(),
+                            Some(stopping_tool.as_str()),
+                            Some(stopping_session),
+                        )
                     }) {
                         let release = Fact {
                             from_session_id: Some(stopping_session.to_string()),

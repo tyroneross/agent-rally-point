@@ -1300,6 +1300,179 @@ mod imp {
         }
 
         #[test]
+        fn raw_routed_anonymous_identity_cannot_renew_or_append_owner_transitions() {
+            let repo_root = unique_repo_root("renewal-anonymous-auth");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let claim = crate::store::Fact {
+                from_session_id: None,
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "claim-routed-anonymous".to_string(),
+                seq: 0,
+                thread_id: crate::new_id("room"),
+                kind: crate::store::FactKind::Claim,
+                tool: None,
+                role: None,
+                subject: "anonymous routed authority claim".to_string(),
+                scope: vec!["file:src/anonymous.rs".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: vec!["lease_expires_at:2099-01-01T00:00:00Z".to_string()],
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact_verified(&claim).unwrap();
+            let before = store.facts().unwrap().len();
+
+            let renew_op: StoreOp = serde_json::from_value(serde_json::json!({
+                "kind": "renew_claim_lease",
+                "claim_id": claim.event_id.clone(),
+                "lease_expires_at": "2099-01-01T00:30:00Z"
+            }))
+            .unwrap();
+            let renew_response = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(None, renew_op),
+            );
+            assert!(
+                matches!(renew_response, StoreResponse::Err(_)),
+                "anonymous routed renewal must fail closed: {renew_response:?}"
+            );
+            assert_eq!(store.facts().unwrap().len(), before);
+
+            for (kind, event_id) in [
+                (crate::store::FactKind::ClaimRenewed, "renew-raw-anonymous"),
+                (crate::store::FactKind::Release, "release-raw-anonymous"),
+            ] {
+                let transition = crate::store::Fact {
+                    from_session_id: None,
+                    schema: crate::FACT_SCHEMA.to_string(),
+                    event_id: event_id.to_string(),
+                    seq: 0,
+                    thread_id: crate::new_id("room"),
+                    kind: kind.clone(),
+                    tool: None,
+                    role: None,
+                    subject: event_id.to_string(),
+                    scope: claim.scope.clone(),
+                    created_at: crate::now_string(),
+                    summary: None,
+                    evidence: if kind == crate::store::FactKind::ClaimRenewed {
+                        vec!["lease_expires_at:2099-01-01T00:30:00Z".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    target: None,
+                    ref_id: Some(claim.event_id.clone()),
+                    status: None,
+                    severity: None,
+                    uri: None,
+                    session: None,
+                };
+                let append_op: StoreOp = serde_json::from_value(serde_json::json!({
+                    "kind": "append_fact_verified",
+                    "fact": serde_json::to_value(&transition).unwrap()
+                }))
+                .unwrap();
+                let response = dispatch_one(
+                    &mut store,
+                    repo_root.to_string_lossy().as_ref(),
+                    StoreRequest::new(None, append_op),
+                );
+                assert!(
+                    matches!(response, StoreResponse::Err(_)),
+                    "anonymous raw {kind:?} must fail closed: {response:?}"
+                );
+                assert_eq!(
+                    store.facts().unwrap().len(),
+                    before,
+                    "refused raw {kind:?} must not append"
+                );
+            }
+            assert!(
+                store
+                    .snapshot()
+                    .unwrap()
+                    .active_claims
+                    .iter()
+                    .any(|active| active.event_id == claim.event_id)
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn raw_routed_modern_caller_can_renew_a_legacy_sessionless_claim() {
+            let repo_root = unique_repo_root("renewal-legacy-modern");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let claim = crate::store::Fact {
+                from_session_id: None,
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "claim-routed-legacy".to_string(),
+                seq: 0,
+                thread_id: crate::new_id("room"),
+                kind: crate::store::FactKind::Claim,
+                tool: Some("tool-a".to_string()),
+                role: None,
+                subject: "legacy routed authority claim".to_string(),
+                scope: vec!["file:src/legacy.rs".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: vec!["lease_expires_at:2000-01-01T00:00:00Z".to_string()],
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact_verified(&claim).unwrap();
+
+            let op: StoreOp = serde_json::from_value(serde_json::json!({
+                "kind": "renew_claim_lease",
+                "claim_id": claim.event_id.clone(),
+                "lease_expires_at": "2099-01-01T00:30:00Z",
+                "caller_tool": "tool-a",
+                "caller_session_id": "session-modern",
+                "expected_owner_session_id": null
+            }))
+            .unwrap();
+            let response = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(None, op),
+            );
+            assert!(
+                matches!(
+                    response,
+                    StoreResponse::Ok(StoreOk::RenewClaimLease { record: Some(_) })
+                ),
+                "identified caller must retain legacy renewal compatibility: {response:?}"
+            );
+            assert_eq!(
+                crate::claim_authority::active_claim_record(
+                    &store.facts().unwrap(),
+                    &claim.event_id
+                )
+                .and_then(|record| record.lease_expires_at)
+                .as_deref(),
+                Some("2099-01-01T00:30:00Z")
+            );
+            let renewal = store
+                .facts()
+                .unwrap()
+                .into_iter()
+                .find(|fact| fact.kind == crate::store::FactKind::ClaimRenewed)
+                .expect("routed renewal must append");
+            assert_eq!(renewal.tool.as_deref(), Some("tool-a"));
+            assert_eq!(renewal.from_session_id.as_deref(), Some("session-modern"));
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
         fn daemon_serve_rejects_an_armed_command_watchdog() {
             let repo_root = unique_repo_root("armed-watchdog");
             let _deadline =

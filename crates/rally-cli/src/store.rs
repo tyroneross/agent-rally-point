@@ -2339,11 +2339,11 @@ impl DirectRoomStore {
                         "renew claim lease: ref {claim_id} is not an active claim"
                     ))
                 })?;
-            if !claim_authority::same_session_owner(
-                fact.tool.as_deref(),
-                fact.from_session_id.as_deref(),
+            if !claim_authority::claim_owner_matches_caller(
                 current.owner_tool.as_deref(),
                 current.from_session_id.as_deref(),
+                fact.tool.as_deref(),
+                fact.from_session_id.as_deref(),
             ) {
                 return Err(RallyError::Usage(format!(
                     "renew claim lease: {} session does not own claim {claim_id}",
@@ -2921,7 +2921,7 @@ impl DirectRoomStore {
                 "renew claim lease: expected owner session does not match active claim {claim_id}"
             )));
         }
-        if !claim_authority::same_session_owner(
+        if !claim_authority::claim_owner_matches_caller(
             current.owner_tool.as_deref(),
             current.from_session_id.as_deref(),
             caller_tool,
@@ -7188,6 +7188,117 @@ mod ledger_tests {
                 .iter()
                 .all(|fact| fact.kind != FactKind::ClaimRenewed)
         );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn anonymous_identity_cannot_renew_or_close_at_the_write_boundary() {
+        let root = unique_root("claim-anonymous-authority");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let mut claim = claim_fact(
+            "claim-anonymous",
+            "placeholder",
+            "file:src/lib.rs",
+            "2099-01-01T00:00:00Z",
+        );
+        claim.tool = None;
+        claim.from_session_id = None;
+        store.append_fact_verified(&claim).unwrap();
+        let before = store.facts().unwrap().len();
+
+        store
+            .renew_claim_lease(
+                &claim.event_id,
+                "2099-01-01T00:30:00Z".to_string(),
+                None,
+                None,
+                None,
+            )
+            .expect_err("anonymous caller must not renew an anonymous claim");
+        assert_eq!(store.facts().unwrap().len(), before);
+
+        let anonymous_renewal = Fact {
+            kind: FactKind::ClaimRenewed,
+            event_id: "renew-anonymous".to_string(),
+            ref_id: Some(claim.event_id.clone()),
+            tool: None,
+            from_session_id: None,
+            evidence: vec!["lease_expires_at:2099-01-01T00:30:00Z".to_string()],
+            ..claim_fact(
+                "renew-anonymous-template",
+                "placeholder",
+                "file:src/lib.rs",
+                "2099-01-01T00:30:00Z",
+            )
+        };
+        store
+            .append_fact_verified(&anonymous_renewal)
+            .expect_err("raw anonymous ClaimRenewed must fail closed");
+        assert_eq!(store.facts().unwrap().len(), before);
+
+        let anonymous_release = Fact {
+            kind: FactKind::Release,
+            event_id: "release-anonymous".to_string(),
+            ref_id: Some(claim.event_id.clone()),
+            tool: None,
+            from_session_id: None,
+            evidence: Vec::new(),
+            ..claim_fact(
+                "release-anonymous-template",
+                "placeholder",
+                "file:src/lib.rs",
+                "2099-01-01T00:30:00Z",
+            )
+        };
+        store
+            .append_fact_verified(&anonymous_release)
+            .expect_err("raw anonymous Release must fail closed");
+        assert_eq!(store.facts().unwrap().len(), before);
+        assert!(
+            store
+                .snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|active| active.event_id == claim.event_id)
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn modern_identified_caller_can_renew_a_legacy_sessionless_claim() {
+        let root = unique_root("claim-legacy-modern-renewal");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let claim = claim_fact(
+            "claim-legacy-renew",
+            "tool-a",
+            "file:src/lib.rs",
+            "2000-01-01T00:00:00Z",
+        );
+        store.append_fact_verified(&claim).unwrap();
+
+        let renewed = store
+            .renew_claim_lease(
+                &claim.event_id,
+                "2099-01-01T00:30:00Z".to_string(),
+                Some("tool-a"),
+                Some("session-modern"),
+                None,
+            )
+            .expect("identified legacy owner must retain compatibility")
+            .expect("legacy claim remains active");
+        assert_eq!(
+            renewed.lease_expires_at.as_deref(),
+            Some("2099-01-01T00:30:00Z")
+        );
+        let renewal = store
+            .facts()
+            .unwrap()
+            .into_iter()
+            .find(|fact| fact.kind == FactKind::ClaimRenewed)
+            .expect("renewal must be durable");
+        assert_eq!(renewal.tool.as_deref(), Some("tool-a"));
+        assert_eq!(renewal.from_session_id.as_deref(), Some("session-modern"));
         fs::remove_dir_all(&root).ok();
     }
 
