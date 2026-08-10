@@ -328,9 +328,46 @@ fn coarse_claim_does_not_lock_the_room_out_of_claiming() {
         "--subject",
         "collide",
     ]);
-    assert_eq!(colliding.status.code(), Some(2));
-    let body: Value = serde_json::from_slice(&colliding.stderr).unwrap();
-    let message = body["error"].as_str().unwrap();
+    // O26 makes the command boundary honest about auto-presence: this process
+    // committed its presence before claim admission rejected the conflicting
+    // required append. The response must therefore be a non-retryable typed
+    // partial commit, not the old usage-only exit.
+    assert_eq!(colliding.status.code(), Some(1));
+    let body: Value = serde_json::from_slice(&colliding.stdout).unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["command"], "partial_commit");
+    assert_eq!(body["data"]["committed"], true);
+    assert_eq!(body["data"]["projection_complete"], false);
+    assert!(
+        body["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("do not retry the whole command")
+    );
+    let outcomes = body["data"]["append_outcomes"].as_array().unwrap();
+    assert_eq!(outcomes.len(), 1, "auto-presence must be reported once");
+    let presence = &outcomes[0];
+    assert_eq!(presence["committed"], true);
+    assert_eq!(presence["projection_complete"], false);
+    assert_eq!(presence["fact"]["kind"], "presence");
+    assert_eq!(presence["fact"]["tool"], "rogue");
+    let presence_seq = presence["fact"]["seq"].as_i64().unwrap();
+    assert!(presence_seq > 0);
+    let presence_id = presence["fact"]["event_id"].as_str().unwrap();
+    let canonical_presence = workspace
+        .log_events()
+        .into_iter()
+        .filter(|event| event["payload"]["event_id"] == presence_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        canonical_presence.len(),
+        1,
+        "reported presence must be a canonical singleton"
+    );
+    assert_eq!(canonical_presence[0]["seq"], presence_seq);
+    assert_eq!(presence["warnings"].as_array().unwrap().len(), 1);
+    assert_eq!(presence["warnings"][0]["code"], "post_commit_work");
+    let message = presence["warnings"][0]["message"].as_str().unwrap();
     assert!(
         message.contains("lead_agent holds file:src/lib.rs"),
         "the rejection must name the real owner and the scope it really holds; got: {message}"
@@ -349,10 +386,21 @@ fn coarse_claim_does_not_lock_the_room_out_of_claiming() {
         "--subject",
         "room-wide grab",
     ]);
-    assert_eq!(rogue_wildcard.status.code(), Some(2));
-    let body: Value = serde_json::from_slice(&rogue_wildcard.stderr).unwrap();
+    assert_eq!(rogue_wildcard.status.code(), Some(1));
+    let body: Value = serde_json::from_slice(&rogue_wildcard.stdout).unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["command"], "partial_commit");
+    assert_eq!(body["data"]["committed"], true);
+    assert_eq!(body["data"]["projection_complete"], false);
+    let wildcard_outcomes = body["data"]["append_outcomes"].as_array().unwrap();
+    assert_eq!(wildcard_outcomes.len(), 1);
+    assert_eq!(wildcard_outcomes[0]["fact"]["kind"], "presence");
+    assert_eq!(
+        wildcard_outcomes[0]["warnings"][0]["code"],
+        "post_commit_work"
+    );
     assert!(
-        body["error"]
+        wildcard_outcomes[0]["warnings"][0]["message"]
             .as_str()
             .unwrap()
             .contains("only the lead may hold it")
