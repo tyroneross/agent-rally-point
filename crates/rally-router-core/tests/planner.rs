@@ -39,6 +39,7 @@ fn target() -> DeliveryTarget {
     DeliveryTarget {
         repository_id: "repo-rally".into(),
         agent_id: "codex:worker".into(),
+        session_id: "session-target".into(),
         pinned_endpoint_id: None,
     }
 }
@@ -48,7 +49,7 @@ fn endpoint(id: &str, adapter: &str) -> EndpointDescriptorV1 {
         endpoint_schema: ENDPOINT_SCHEMA_V1.into(),
         repository_id: "repo-rally".into(),
         agent_id: "codex:worker".into(),
-        session_id: Some(format!("session-{id}")),
+        session_id: "session-target".into(),
         endpoint_id: id.into(),
         adapter: AdapterKind::from(adapter),
         capabilities: AdapterCapabilities {
@@ -61,7 +62,7 @@ fn endpoint(id: &str, adapter: &str) -> EndpointDescriptorV1 {
         health: EndpointHealth::Ready,
         ambiguous: false,
         observed_at: NOW - 1.0,
-        expires_at: Some(NOW + 60.0),
+        expires_at: NOW + 60.0,
         accepted_schemas: BTreeSet::from([DELIVERY_SCHEMA_V1.into()]),
         principal_id: None,
         extensions: BTreeMap::new(),
@@ -143,6 +144,59 @@ fn target_mismatch_queues_without_evaluating_endpoints() {
 }
 
 #[test]
+fn target_session_is_required_before_evaluating_endpoints() {
+    let mut encoded = serde_json::to_value(target()).unwrap();
+    encoded.as_object_mut().unwrap().remove("session_id");
+    assert!(serde_json::from_value::<DeliveryTarget>(encoded).is_err());
+
+    let mut missing_session = target();
+    missing_session.session_id = "  ".into();
+    let plan = DeliveryPlanner.plan(
+        NOW,
+        &envelope(),
+        &missing_session,
+        &[endpoint("native", "codex-app-server")],
+        &RoutePolicy::default(),
+        &[],
+    );
+    assert_eq!(
+        plan.decision,
+        RouteDecisionV1::Queued {
+            reason: RouteHoldReason::InvalidTargetSession
+        }
+    );
+    assert!(plan.candidates.is_empty());
+}
+
+#[test]
+fn missing_or_wrong_endpoint_session_fails_closed() {
+    let mut missing = endpoint("missing-session", "codex-app-server");
+    missing.session_id.clear();
+    let mut wrong = endpoint("wrong-session", "ptyd");
+    wrong.session_id = "session-other".into();
+    let plan = DeliveryPlanner.plan(
+        NOW,
+        &envelope(),
+        &target(),
+        &[missing, wrong],
+        &RoutePolicy::default(),
+        &[],
+    );
+    assert_eq!(
+        plan.decision,
+        RouteDecisionV1::Queued {
+            reason: RouteHoldReason::NoEligibleEndpoint
+        }
+    );
+    for endpoint_id in ["missing-session", "wrong-session"] {
+        assert_eq!(
+            rejection(&plan, endpoint_id),
+            &RouteRejectionReason::SessionMismatch
+        );
+    }
+}
+
+#[test]
 fn pinned_endpoint_wins_without_reordering_policy() {
     let mut pinned = target();
     pinned.pinned_endpoint_id = Some("ptyd".into());
@@ -169,7 +223,7 @@ fn ambiguous_expired_and_duplicate_endpoints_fail_closed() {
     let mut ambiguous = endpoint("ambiguous", "codex-app-server");
     ambiguous.ambiguous = true;
     let mut expired = endpoint("expired", "codex-app-server");
-    expired.expires_at = Some(NOW);
+    expired.expires_at = NOW;
     let duplicate_a = endpoint("duplicate", "codex-app-server");
     let duplicate_b = endpoint("duplicate", "ptyd");
     let plan = DeliveryPlanner.plan(
@@ -224,7 +278,7 @@ fn invalid_planner_and_endpoint_times_fail_closed() {
     let mut invalid_observation = endpoint("nan-observation", "codex-app-server");
     invalid_observation.observed_at = f64::NAN;
     let mut invalid_expiry = endpoint("nan-expiry", "codex-app-server");
-    invalid_expiry.expires_at = Some(f64::INFINITY);
+    invalid_expiry.expires_at = f64::INFINITY;
     let plan = DeliveryPlanner.plan(
         NOW,
         &envelope(),
@@ -486,6 +540,35 @@ fn forged_attempt_identity_cannot_suppress_or_redirect_delivery() {
 }
 
 #[test]
+fn endpoint_tampering_invalidates_attempt_identity() {
+    let message = envelope();
+    let mut attempt = DeliveryAttemptV1::new(
+        "event-1",
+        message.delivery_dedupe_key().unwrap(),
+        1,
+        "native-original",
+        DeliveryAttemptOutcome::FailedBeforeSend,
+        false,
+    );
+    attempt.endpoint_id = "native-tampered".into();
+    let attempt_id = attempt.attempt_id.clone();
+    let plan = DeliveryPlanner.plan(
+        NOW,
+        &message,
+        &target(),
+        &[endpoint("native-tampered", "codex-app-server")],
+        &RoutePolicy::default(),
+        &[attempt],
+    );
+    assert_eq!(
+        plan.decision,
+        RouteDecisionV1::Queued {
+            reason: RouteHoldReason::InvalidAttemptIdentity(attempt_id)
+        }
+    );
+}
+
+#[test]
 fn duplicate_or_illegal_attempt_history_fails_closed_in_any_order() {
     let message = envelope();
     let first = DeliveryAttemptV1::new(
@@ -496,8 +579,14 @@ fn duplicate_or_illegal_attempt_history_fails_closed_in_any_order() {
         DeliveryAttemptOutcome::FailedBeforeSend,
         false,
     );
-    let mut duplicate_number = first.clone();
-    duplicate_number.endpoint_id = "native-b".into();
+    let duplicate_number = DeliveryAttemptV1::new(
+        "event-1",
+        message.delivery_dedupe_key().unwrap(),
+        1,
+        "native-b",
+        DeliveryAttemptOutcome::FailedBeforeSend,
+        false,
+    );
     let mut conflicting_outcome = first.clone();
     conflicting_outcome.outcome = DeliveryAttemptOutcome::Completed;
     let second_after_terminal = DeliveryAttemptV1::new(
@@ -728,6 +817,7 @@ fn dogfood_common_agent_paths_use_one_planner_and_fallback_chain() {
             let route_target = DeliveryTarget {
                 repository_id: "repo-rally".into(),
                 agent_id: receiver.into(),
+                session_id: "session-target".into(),
                 pinned_endpoint_id: None,
             };
             let mut terminal = endpoint("terminal-fallback", "ptyd");

@@ -34,14 +34,6 @@ fn default_delivery_schema() -> String {
     DELIVERY_SCHEMA_V1.to_string()
 }
 
-fn default_evidence_schema() -> String {
-    DELIVERY_EVIDENCE_SCHEMA_V1.to_string()
-}
-
-fn default_endpoint_schema() -> String {
-    ENDPOINT_SCHEMA_V1.to_string()
-}
-
 fn default_attempt_schema() -> String {
     DELIVERY_ATTEMPT_SCHEMA_V1.to_string()
 }
@@ -72,13 +64,22 @@ pub fn stable_delivery_dedupe_key(
     )
 }
 
-/// Build a unique attempt ID without changing the logical-delivery dedupe key.
-pub fn stable_attempt_id(delivery_dedupe_key: &str, attempt_number: u32) -> String {
+/// Build a unique attempt ID bound to the endpoint selected for that attempt.
+///
+/// The endpoint uses the same length-prefixing as the logical delivery key so
+/// mutating an attempt's selected endpoint cannot preserve its identity.
+pub fn stable_attempt_id(
+    delivery_dedupe_key: &str,
+    attempt_number: u32,
+    endpoint_id: &str,
+) -> String {
     format!(
-        "a1|{}:{}|{}",
+        "a1|{}:{}|{}|{}:{}",
         delivery_dedupe_key.len(),
         delivery_dedupe_key,
-        attempt_number
+        attempt_number,
+        endpoint_id.len(),
+        endpoint_id,
     )
 }
 
@@ -261,6 +262,19 @@ pub struct EnvelopeError {
 }
 
 impl ProtocolEventKind {
+    /// Whether this event answers one exact prior event.
+    pub fn is_reply(self) -> bool {
+        matches!(
+            self,
+            Self::HandoffAcked
+                | Self::HandoffAccepted
+                | Self::HandoffRejected
+                | Self::WorkResolved
+                | Self::WorkSuperseded
+                | Self::ConflictResolved
+        )
+    }
+
     fn is_brainstem(self) -> bool {
         matches!(
             self,
@@ -630,8 +644,7 @@ pub enum EvidenceValidationError {
 /// Versioned semantic evidence returned through Rally.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryEvidenceV1 {
-    /// Evidence schema.
-    #[serde(default = "default_evidence_schema")]
+    /// Required evidence schema. Typed evidence has no schema-less legacy form.
     pub delivery_evidence_schema: String,
     /// Canonical event this evidence describes.
     pub event_id: String,
@@ -839,16 +852,14 @@ pub enum EndpointHealth {
 /// Versioned endpoint registry snapshot.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EndpointDescriptorV1 {
-    /// Endpoint schema.
-    #[serde(default = "default_endpoint_schema")]
+    /// Required endpoint schema. Endpoint records have no schema-less legacy form.
     pub endpoint_schema: String,
     /// Repository/room identity.
     pub repository_id: String,
     /// Exact logical Rally agent identity.
     pub agent_id: String,
-    /// Live session lease when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    /// Exact live session lease addressed by this endpoint.
+    pub session_id: String,
     /// Stable addressable endpoint identity.
     pub endpoint_id: String,
     /// Adapter used to reach the endpoint.
@@ -863,9 +874,8 @@ pub struct EndpointDescriptorV1 {
     pub ambiguous: bool,
     /// Observation timestamp supplied by the registry.
     pub observed_at: f64,
-    /// Soft expiry; the planner rejects endpoints at or past this timestamp.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<f64>,
+    /// Required soft expiry; the planner rejects endpoints at or past this timestamp.
+    pub expires_at: f64,
     /// Delivery schemas this endpoint can decode without semantic loss.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub accepted_schemas: BTreeSet<String>,
@@ -900,8 +910,7 @@ pub enum DeliveryAttemptOutcome {
 /// Versioned immutable attempt identity plus its latest coarse outcome.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeliveryAttemptV1 {
-    /// Attempt schema.
-    #[serde(default = "default_attempt_schema")]
+    /// Required attempt schema. Attempt records have no schema-less legacy form.
     pub delivery_attempt_schema: String,
     /// Canonical event being delivered.
     pub event_id: String,
@@ -936,13 +945,14 @@ impl DeliveryAttemptV1 {
         idempotent_delivery: bool,
     ) -> Self {
         let delivery_dedupe_key = delivery_dedupe_key.into();
+        let endpoint_id = endpoint_id.into();
         Self {
             delivery_attempt_schema: default_attempt_schema(),
             event_id: event_id.into(),
-            attempt_id: stable_attempt_id(&delivery_dedupe_key, attempt_number),
+            attempt_id: stable_attempt_id(&delivery_dedupe_key, attempt_number, &endpoint_id),
             delivery_dedupe_key,
             attempt_number,
-            endpoint_id: endpoint_id.into(),
+            endpoint_id,
             outcome,
             idempotent_delivery,
             extensions: BTreeMap::new(),

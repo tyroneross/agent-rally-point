@@ -7,8 +7,9 @@ use rally_protocol::delivery::{
     AdapterCapabilities, AdapterKind, AuthContext, CAPABILITY_IDEMPOTENT_DELIVERY,
     CAPABILITY_POSITIVE_ACK, CompatMode, Deduper, DeliveryAttemptOutcome, DeliveryAttemptV1,
     DeliveryContractError, DeliveryEnvelopeV1, DeliveryEvidenceV1, DeliveryReceiptV1,
-    DeliveryState, EnvelopeError, EventEnvelope, EvidenceExpectation, EvidenceSource,
-    EvidenceValidationError, ProtocolEventKind, RequiredId, Role, stable_delivery_dedupe_key,
+    DeliveryState, EndpointDescriptorV1, EnvelopeError, EventEnvelope, EvidenceExpectation,
+    EvidenceSource, EvidenceValidationError, ProtocolEventKind, RequiredId, Role,
+    stable_delivery_dedupe_key,
 };
 use rally_protocol::{DeliveryStatus, Directive, DirectiveKind, InterruptType, Receipt};
 use serde::Deserialize;
@@ -207,6 +208,55 @@ fn opaque_extensions_and_unknown_capabilities_survive_round_trip() {
 }
 
 #[test]
+fn new_typed_records_require_schemas_session_and_expiry() {
+    let mut evidence_value = serde_json::to_value(evidence(
+        EvidenceSource::VerifiedTarget,
+        DeliveryState::TargetAcknowledged,
+    ))
+    .unwrap();
+    evidence_value
+        .as_object_mut()
+        .unwrap()
+        .remove("delivery_evidence_schema");
+    assert!(serde_json::from_value::<DeliveryEvidenceV1>(evidence_value).is_err());
+
+    let endpoint = json!({
+        "endpoint_schema": "rally.endpoint.v1",
+        "repository_id": "repo-agent-rally-point",
+        "agent_id": "codex:worker-01",
+        "session_id": "sess:codex-01",
+        "endpoint_id": "codex-native-01",
+        "adapter": "codex-app-server",
+        "health": "ready",
+        "observed_at": 1_786_300_000.0,
+        "expires_at": 1_786_300_060.0
+    });
+    for required in ["endpoint_schema", "session_id", "expires_at"] {
+        let mut missing = endpoint.clone();
+        missing.as_object_mut().unwrap().remove(required);
+        assert!(
+            serde_json::from_value::<EndpointDescriptorV1>(missing).is_err(),
+            "endpoint accepted missing required field {required}"
+        );
+    }
+
+    let attempt = DeliveryAttemptV1::new(
+        "event-01",
+        "dedupe-01",
+        1,
+        "codex-native-01",
+        DeliveryAttemptOutcome::Planned,
+        false,
+    );
+    let mut attempt_value = serde_json::to_value(attempt).unwrap();
+    attempt_value
+        .as_object_mut()
+        .unwrap()
+        .remove("delivery_attempt_schema");
+    assert!(serde_json::from_value::<DeliveryAttemptV1>(attempt_value).is_err());
+}
+
+#[test]
 fn reserved_capabilities_use_typed_truth_and_expose_conflicts() {
     let mut capabilities = AdapterCapabilities {
         supports_positive_ack: true,
@@ -286,8 +336,17 @@ fn logical_dedupe_key_is_stable_while_attempt_ids_change() {
         DeliveryAttemptOutcome::Planned,
         false,
     );
+    let same_number_other_endpoint = DeliveryAttemptV1::new(
+        "event-01",
+        dedupe.clone(),
+        1,
+        "endpoint-b|with:delimiters",
+        DeliveryAttemptOutcome::FailedBeforeSend,
+        false,
+    );
     assert_eq!(first.delivery_dedupe_key, second.delivery_dedupe_key);
     assert_ne!(first.attempt_id, second.attempt_id);
+    assert_ne!(first.attempt_id, same_number_other_endpoint.attempt_id);
     assert!(first.permits_same_endpoint_retry());
     assert!(!second.permits_same_endpoint_retry());
 }
@@ -517,6 +576,9 @@ fn moved_event_validation_preserves_cli_semantics() {
             },
         ]
     );
+    assert!(ProtocolEventKind::HandoffAcked.is_reply());
+    assert!(ProtocolEventKind::WorkResolved.is_reply());
+    assert!(!ProtocolEventKind::HandoffRequested.is_reply());
 
     let strict = ProtocolEventKind::DecisionRecorded
         .validate(&EventEnvelope::default(), CompatMode::Strict)

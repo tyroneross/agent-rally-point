@@ -29,6 +29,8 @@ pub struct DeliveryTarget {
     pub repository_id: String,
     /// Stable Rally agent identity, not a terminal or provider address.
     pub agent_id: String,
+    /// Exact receiver session lease. Planning never guesses between sessions.
+    pub session_id: String,
     /// Optional exact endpoint selected by the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_endpoint_id: Option<String>,
@@ -111,6 +113,8 @@ pub enum RouteHoldReason {
     RepositoryMismatch,
     /// The requested Rally agent does not match the directive recipient.
     RecipientMismatch,
+    /// The caller did not supply an exact receiver session.
+    InvalidTargetSession,
     /// A matching attempt carried inconsistent event or dedupe identity.
     InvalidAttemptIdentity(String),
     /// Attempt numbers, uniqueness, or state progression are inconsistent.
@@ -160,6 +164,8 @@ pub enum RouteRejectionReason {
     RepositoryMismatch,
     /// Endpoint belongs to another Rally agent.
     RecipientMismatch,
+    /// Endpoint belongs to another or no receiver session.
+    SessionMismatch,
     /// Caller pinned a different endpoint.
     PinnedEndpointMismatch,
     /// Registry returned the same endpoint ID more than once.
@@ -284,6 +290,15 @@ impl DeliveryPlanner {
                 },
             );
         }
+        if target.session_id.trim().is_empty() {
+            return RoutePlanV1::held(
+                envelope,
+                target.clone(),
+                RouteDecisionV1::Queued {
+                    reason: RouteHoldReason::InvalidTargetSession,
+                },
+            );
+        }
 
         let event_id = envelope.event_id.as_deref().expect("validated event_id");
         let dedupe_key = envelope
@@ -303,7 +318,11 @@ impl DeliveryPlanner {
                 && (attempt.delivery_attempt_schema != DELIVERY_ATTEMPT_SCHEMA_V1
                     || attempt.attempt_number == 0
                     || attempt.attempt_id
-                        != stable_attempt_id(&attempt.delivery_dedupe_key, attempt.attempt_number)
+                        != stable_attempt_id(
+                            &attempt.delivery_dedupe_key,
+                            attempt.attempt_number,
+                            &attempt.endpoint_id,
+                        )
                     || attempt.endpoint_id.trim().is_empty());
             if event_matches != dedupe_matches || invalid_matching_attempt {
                 return RoutePlanV1::held(
@@ -566,11 +585,7 @@ fn reject_candidate(
     if endpoint.endpoint_id.trim().is_empty() {
         return Some(RouteRejectionReason::EmptyEndpointId);
     }
-    if !endpoint.observed_at.is_finite()
-        || endpoint
-            .expires_at
-            .is_some_and(|expires_at| !expires_at.is_finite())
-    {
+    if !endpoint.observed_at.is_finite() || !endpoint.expires_at.is_finite() {
         return Some(RouteRejectionReason::InvalidObservationTime);
     }
     if endpoint.repository_id != target.repository_id {
@@ -578,6 +593,9 @@ fn reject_candidate(
     }
     if endpoint.agent_id != target.agent_id {
         return Some(RouteRejectionReason::RecipientMismatch);
+    }
+    if endpoint.session_id != target.session_id {
+        return Some(RouteRejectionReason::SessionMismatch);
     }
     if target
         .pinned_endpoint_id
@@ -592,10 +610,7 @@ fn reject_candidate(
     if endpoint.ambiguous {
         return Some(RouteRejectionReason::AmbiguousEndpoint);
     }
-    if endpoint
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= now)
-    {
+    if endpoint.expires_at <= now {
         return Some(RouteRejectionReason::Expired);
     }
     match endpoint.health {

@@ -8,9 +8,9 @@
 > change set; integration, runtime activation, and route cutover remain pending.
 > **Rally baseline:** local `main` `8d21f2c`; `origin/main` `3d27f28`. Unrelated working-tree changes
 > were excluded from source conclusions.
-> **NavGator baseline:** refreshed full scan labeled `8d21f2c`; 621 components, 457 detected
-> connections, 176 files, and no scan warnings. Direct Rust references remain authoritative where
-> NavGator lacks dependency edges.
+> **NavGator status:** no refreshed scan artifact accompanies this change. Earlier discovery output
+> missed source-proven Rust edges and did not attest worktree cleanliness, so direct source, Cargo
+> metadata, and executable tests are authoritative here.
 > **Companion decision:** [`ROUTER-ARCHITECTURE.md`](ROUTER-ARCHITECTURE.md).
 > **Detailed process contracts:**
 > [`DAEMON-AND-TRANSPORT-ARCHITECTURE.md`](DAEMON-AND-TRANSPORT-ARCHITECTURE.md).
@@ -45,24 +45,25 @@ rewriting the ledger, merging daemons, or building every provider adapter.
 The current build therefore creates an independently testable policy seam without inserting a
 process hop or changing a user's delivery route. It does not yet provide post-sender-exit delivery.
 
-## NavGator findings and limit
+## Historical NavGator findings and limit
 
-NavGator correctly located the relevant components and source positions, including:
+The earlier recorded NavGator pass located these components, but it is discovery evidence rather
+than verification of this change:
 
 - `RoomStore` at `crates/rally-cli/src/store.rs:1200`.
 - `ManagedSession` at `crates/rally-cli/src/backends.rs:56`.
 - `BackendRunner` at `crates/rally-cli/src/backends.rs:396`.
-- `Directive` at `crates/rally-protocol/src/lib.rs:71`.
+- `Directive` at `crates/rally-protocol/src/lib.rs:73`.
 - `EndpointResolution` at `crates/rally-cli/src/session_identity.rs:109`.
 - `Adapter`, `Supervisor`, `ClaudeAdapter`, and `CodexAdapter` in `cockpitd`.
 
-Its impact, connection, trace, and focused-diagram commands returned zero edges for `RoomStore`,
+That pass's impact, connection, trace, and focused-diagram commands returned zero edges for `RoomStore`,
 `BackendRunner`, `ManagedSession`, and `Directive`, even though direct source references prove those
-call paths. Its coverage report also maps only 99 of 165 files. Therefore:
+call paths, and its reported source coverage was incomplete. Therefore:
 
-- NavGator evidence is authoritative for discovered component locations and the measured coverage
-  limitation.
-- Direct Rust references and Cargo metadata are authoritative for the dependency edges below.
+- Direct Rust references and Cargo metadata are authoritative for the component locations and
+  dependency edges below.
+- Historical NavGator output is supplementary discovery evidence only.
 - NavGator's `HIGH` severity with zero affected files is not used as a risk score; that combination
   is internally inconsistent for this repository.
 - NavGator's zero-dirty freshness result is not used as worktree evidence; `git status` is the
@@ -428,9 +429,10 @@ remote-auth, payload-classification, and full-envelope transfer requirements.
 | Provider combinations work | Terminal route integration tests | Claude→Claude, Claude→Codex, Codex→Claude, Codex→Codex |
 | Offline remains correct | Ledger-only inject path | Router absent, receiver pull still observes the canonical event |
 
-After each code slice, run a new NavGator full scan and `navgator arch-diff` against `8625be8`.
-Treat new dependencies from `rallyd` to provider, network, process, `ptyd`, or `cockpitd` code as a
-blocking architecture regression.
+After each code slice, run the direct dependency, architecture, and integration gates above. A
+persisted NavGator scan may supplement that evidence, but cannot replace it while known source edges
+remain absent. Treat source-proven new dependencies from `rallyd` to provider, network, process,
+`ptyd`, or `cockpitd` code as a blocking architecture regression.
 
 ## Challenges to the original proposal
 
