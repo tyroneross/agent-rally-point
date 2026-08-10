@@ -111,6 +111,41 @@
     }
   },
   "hooks": {
+    "native_effects": {
+      "pure_read": [
+        "view_image",
+        "Read",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "WebSearch",
+        "read_file",
+        "list_dir",
+        "list_directory",
+        "codebase_search",
+        "grep_search"
+      ],
+      "opaque_shell": [
+        "exec_command",
+        "write_stdin",
+        "Bash",
+        "Shell",
+        "run_terminal_cmd"
+      ],
+      "mutation": [
+        "apply_patch",
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "write_file",
+        "edit_file",
+        "delete_file",
+        "move_file",
+        "create_file",
+        "search_replace"
+      ]
+    },
     "phases": [
       {
         "phase": "start",

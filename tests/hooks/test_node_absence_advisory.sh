@@ -64,6 +64,7 @@ STUB_DIR="$TMPDIR_ROOT/stub"
 mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/rally" <<'EOF'
 #!/usr/bin/env bash
+[ -z "${CALLS:-}" ] || printf '%s\n' "$*" >> "$CALLS"
 exit 0
 EOF
 chmod +x "$STUB_DIR/rally"
@@ -102,28 +103,38 @@ if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "SessionStart must say node is mi
 
 # ----------------------------------------------------------------------
 # Test 2: before-write, node absent, rally present, FRESH session (no prior
-# SessionStart in this session) -> the PreToolUse/before-write path also
-# surfaces the degradation on its own, same as SessionStart above.
+# SessionStart in this session) -> the PreToolUse/before-write path surfaces
+# the degradation but performs zero Rally work. Without JSON parsing, neither
+# a named Read nor a named Write has a trustworthy effect/path classification.
 # ----------------------------------------------------------------------
-T="node-absent before-write (first phase in session): advisory names node, exits 0"
+T="node-absent named Read and Write: advisory plus exact empty JSON and zero Rally calls"
 (
   repo="$(new_repo before-write-first-repo)"
   cd "$repo" || exit 1
-  err="$TMPDIR_ROOT/t2.stderr"
-  out=$(PATH="$NO_NODE_PATH" RALLY_SESSION_ID="t2-session" \
-    "$HOOK" before-write claude_code <<<'{"tool_input":{"file_path":"src/lib.rs"}}' 2>"$err")
-  rc=$?
-  if [ "$rc" != "0" ]; then
-    printf 'rc=%s out=[%s] err=[%s]\n' "$rc" "$out" "$(cat "$err")" >&2
-    exit 1
-  fi
-  if ! grep -qi "node" "$err"; then
-    printf 'stderr does not name node: [%s]\n' "$(cat "$err")" >&2
-    exit 1
-  fi
+  for tool_name in Read Write; do
+    err="$TMPDIR_ROOT/t2.$tool_name.stderr"
+    calls="$TMPDIR_ROOT/t2.$tool_name.calls"
+    : > "$calls"
+    envelope=$(printf '{"tool_name":"%s","tool_input":{"file_path":"src/lib.rs"}}' "$tool_name")
+    out=$(PATH="$NO_NODE_PATH" CALLS="$calls" RALLY_SESSION_ID="t2-$tool_name-session" \
+      "$HOOK" before-write claude_code <<<"$envelope" 2>"$err")
+    rc=$?
+    if [ "$rc" != "0" ] || [ "$out" != "{}" ]; then
+      printf 'tool=%s rc=%s out=[%s] err=[%s]\n' "$tool_name" "$rc" "$out" "$(cat "$err")" >&2
+      exit 1
+    fi
+    if ! grep -qi "node" "$err"; then
+      printf 'tool=%s stderr does not name node: [%s]\n' "$tool_name" "$(cat "$err")" >&2
+      exit 1
+    fi
+    if [ -s "$calls" ]; then
+      printf 'tool=%s invoked Rally without a parser: [%s]\n' "$tool_name" "$(cat "$calls")" >&2
+      exit 1
+    fi
+  done
   exit 0
 )
-if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "before-write must not rely on SessionStart having already fired"; fi
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "no-node before-write cannot make an honest scoped check"; fi
 
 # ----------------------------------------------------------------------
 # Test 3: IMPLEMENTED BEHAVIOUR IS ONCE-PER-SESSION ACROSS PHASES. When

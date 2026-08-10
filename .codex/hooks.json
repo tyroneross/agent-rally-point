@@ -1,11 +1,12 @@
 {
+  "description": "GENERATED from config/host-integrations.json. Codex PreToolUse has no matcher until captured native matcher evidence proves a stable filter. The wrapper classifies 27 named tools before repo or Rally resolution: pure reads and opaque shell tools return {}, while mutations receive path-scoped checks. See docs/AUTO-COORDINATION-HOOKS.md.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "timeout": 5000,
+            "timeout": 5,
             "command": "RALLY_HOOK_SOURCE=project bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" start codex"
           }
         ]
@@ -16,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 5000,
+            "timeout": 5,
             "command": "RALLY_HOOK_SOURCE=project bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" idle codex"
           }
         ]
@@ -27,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 10000,
+            "timeout": 10,
             "command": "RALLY_HOOK_SOURCE=project bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" before-write codex"
           }
         ]
@@ -38,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 5000,
+            "timeout": 5,
             "command": "RALLY_HOOK_SOURCE=project bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" after-write codex"
           }
         ]

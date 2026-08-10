@@ -25,6 +25,15 @@ projection a typed critical-operations brief rather than a blind character cut, 
 time/statistical claim to carry machine-checked scope, clock, formula, denominator, and validation
 provenance.
 
+The 2026-08-10 read-deconfliction extension adds O33-A through O33-D. It separates
+nonexclusive reading/activity from exclusive ownership: pure reads run in parallel with zero
+claims, mutations keep exact path checks, and a reader of actively changing bytes carries a
+provisional source token and revalidates before a decision. O33-A may commit on its isolated branch,
+and O33-B is then built on top of that branch, but neither enters central integration, local main,
+an installed plugin, a pushed ref, or a user-active worktree before post-O26 O33-C is complete and
+the combined A+B+C gate passes. Engagement-bound reader context waits for S9/S10 rather than
+recreating their storage or identity work.
+
 ## Approach Lenses
 
 **Clean-sheet best approach:** make engagement the primary query boundary, attach stable sessions
@@ -65,6 +74,9 @@ historical presence.
 | Managed handoffs did not contribute | real adoption/effectiveness gap | partial: delivery and ACK exist, but engagement contribution does not depend on them |
 | Rally did not independently prove tests | true boundary, not a claim defect | validation text must forbid self-reported Rally evidence from closing a test gate |
 | Path filtering exists but the engagement view is still repository-wide | real | partial: fact buckets filter; squads and system health explicitly do not (`crates/rally-cli/src/store.rs:791-840`) |
+| A read-only workstream packet still emits an unscoped `claim` and later `release` | real | not covered by S8-S13; `dynamic-workflows/core/packet.mjs:162-192` treats an empty owns list as a claim with no path |
+| Codex invokes the before-write wrapper for path-bearing reads and opaque shell tools | real | O33-A classifies the native effect before the wrapper's repo walk or Rally resolution; launcher cost and host matcher narrowing remain O33-D evidence gates |
+| A reader can inspect a file while another agent edits it but cannot bind its conclusion to the bytes/context it saw | real | O33-C after S9/S10; reading remains parallel and the evidence is provisional until token revalidation |
 
 ## Depends-on (reads-from)
 
@@ -82,6 +94,10 @@ historical presence.
 | Handoff task scope | S10 | engagement segment and `run:<id>` fact marker exist; inject does not require or echo them | `crates/rally-cli/src/cli.rs:1309-1390`; `lib.rs:2300-2360` |
 | Target-authored handoff ACK | S10 | `rally say resolve --ref ... --run ...`; distinct from coordination `rally ack` and delivery receipt | `crates/rally-cli/src/lib.rs:7695-7745,13637-13666` |
 | Shared daemon protocol source compatibility | S10 | public `Directive` Rust literals exist in sibling `ptyd` | `crates/rally-protocol/src/lib.rs:6-18`; `../ptyd/Cargo.toml:32-35` |
+| Native PreToolUse tool/effect name | O33-A/D | Codex 0.144.3 source proves `apply_patch` uses `tool_input.command`; synthetic replay exists, while live matcher invocation and other-host captures remain absent | `config/host-integrations.json`; [Codex 0.144.3 source lines 479-483](https://github.com/openai/codex/blob/rust-v0.144.3/codex-rs/core/src/tools/handlers/apply_patch.rs#L479-L483); `.codex/hooks.json` deliberately has no matcher |
+| Native hook schema and timeout units | O33-A | Codex 0.144.3 accepts only `description` plus `hooks`; Claude and Codex handler timeouts are seconds, not milliseconds | [Codex hook config source](https://github.com/openai/codex/blob/rust-v0.144.3/codex-rs/config/src/hook_config.rs#L9-L17); [Codex command runner](https://github.com/openai/codex/blob/rust-v0.144.3/codex-rs/hooks/src/engine/command_runner.rs#L98-L103); [Claude common hook fields](https://code.claude.com/docs/en/hooks#common-fields); `scripts/generate_host_surfaces.py` |
+| Nonexclusive durable read signal | O33-B | existing `FactKind::Read` is excluded from active claims and ignores non-`read_seq:` summaries in receipt projection | `store.rs:285-295,3820-3837,12449-12484` |
+| Engagement/run/path-scoped writer view | O33-C | S9/S10 target; do not implement a second projector | S9/S10 ownership and acceptance below |
 
 ## Capability Gap Map
 
@@ -90,11 +106,16 @@ historical presence.
 | Expired-claim lifecycle | reaper eligibility + disabled interval | observed-dead claims drain automatically | safe machinery is not activated; enter contention is unbounded | S8 engine + S10 activation | concurrent-enter and quiet-live controls |
 | Task-scoped room | engagement segments + fact-only `RoomQuery` | engagement/run/path view derives its own contributors and health | squads/health remain repository-wide | S9 | audited one-plus-eleven replay |
 | Collaboration state | scoped handoff/resolve/artifact facts and repo-wide coordination gate | collaboration requires a target-authored scoped resolve plus in-scope output | presence/general ACK can overstate contribution | S10 | handoff, resolve, and artifact state-transition journey |
+| Read/write operation boundary | generic path extraction and read-only packet claims | pure reads/activity create zero ownership; typed mutations check every target | read tools can become claims; opaque shell cannot declare an honest effect/path | O33-A/B | zero-Rally-subprocess hook fixtures + zero-claim packet journey |
+| Provisional reader evidence | turn-level status/claim context | reader gets active writer/intent, a path source token, and deterministic revalidation without waiting | no byte/context binding at final conclusion | O33-C after S9/S10 | active-writer adjacent-change journey |
 
 ## Activation Map
 
 - S8 auto-reap — trigger: existing `command_enter` call site at `crates/rally-cli/src/lib.rs:1965-1987` after S10 moves it outside the primary enter commit path — verified-live: pending; S10's concurrent-enter journey and a live fixture must verify it before Report.
 - S9/S10 room projection — trigger: `rally room` command dispatch through `RoomQuery::from` at `crates/rally-cli/src/store.rs:864-875` — verified-live: pending; the four-view fixture must verify it before Report.
+- O33-A operation wrapper — trigger: native `PreToolUse` envelope enters `hooks/rally-coordination-hook.sh` — verified-live: pending; the source-proven Codex 0.144.3 command carrier and synthetic replay are verified, but live matcher invocation and Claude/Cursor captures remain O33-D. A stays on its isolated branch; B builds on top, and no central/local-main/install/push/user-active integration occurs before post-O26 C and the combined A+B+C gate.
+- O33-B read-only activity — trigger: `owns: "read-only"` packet generation — verified-live: pending; packet execution must create one nonexclusive `read` activity and zero claim/release facts.
+- O33-C reader revalidation — trigger: consequential path read/final conclusion — verified-live: pending; blocked on S9/S10 stable scope until the active-writer journey passes.
 
 ## Security and permission boundary
 
@@ -102,6 +123,8 @@ historical presence.
 external call, credential, or permission grant. It preserves the existing session identity and
 same-UID local ledger boundary. Threat model: `docs/security/TRUST-MODEL.md`; S8 must preserve its
 fail-closed destructive-action bar, and S9 must keep untrusted fact text out of control fields.
+O33's effect registry is routing metadata, not authority: opaque shell and unknown tools receive no
+automatic claim, so any shell mutation still requires the explicit strict before-write protocol.
 
 ## Segments
 
@@ -447,16 +470,186 @@ duration, percentage, and duplicate formulas. The last fixture must report three
 repeated group but only two events repeating a prior key. Removing any root, input hash, denominator,
 formula, capture clock, or validation result fails schema parity.
 
+### O33-A — Native operation classification and zero-cost Rally reads · branch-held before S10
+
+**Owns:** `hooks/rally-coordination-hook.sh`, `tests/hooks/test_rally_coordination_hook.sh`,
+`config/host-integrations.json`, `scripts/generate_host_surfaces.py`,
+`tests/scripts/test_generate_host_surfaces.py`, `tests/hooks/test_install_rally_hooks.sh`,
+`tests/hooks/test_node_absence_advisory.sh`, generated Claude/Codex/Cursor hook surfaces and release
+identities, `docs/AUTO-COORDINATION-HOOKS.md`, and `docs/security/TRUST-MODEL.md`.
+
+Classify a named native tool before generic path extraction, the wrapper's repo walk, or any Rally
+subprocess. `pure_read` and `opaque_shell` return exact `{}` and create no status/check/claim; the
+generated launcher may still run `git rev-parse` to locate the wrapper, which O33-D measures.
+`mutation` parses declared targets. Native `file_path` values may be absolute only when physical
+containment resolves them inside the Rally root. `apply_patch` accepts only cwd-relative
+add/update/delete/move directive headers, using Codex 0.144.3's source-proven `tool_input.command`
+carrier plus an explicitly legacy `tool_input.patch` adapter. It rejects empty, identity-whitespace,
+malformed, root-equal, outside-root, or symlink-escaping targets as one atomic envelope. Only a truly
+new target resolves its missing suffix from the nearest physical existing ancestor; any unresolved
+suffix containing `..` rejects atomically. Only a truly
+absent tool-name key receives legacy extraction; present null, blank, non-string, or unknown values
+make zero Rally calls after the self-gate. Only an absent target alias is optional; a present
+null/blank target invalidates a multi-target mutation. A present canonical or alternate tool-input
+carrier must be an object and never falls back to an outer-envelope path when malformed. The direct
+native hooks-enabled projection preserves default→user→repo→session precedence, including
+`RALLY_HOOKS=on` overriding a repo-level off value. Every path-bearing Rally call uses attached
+`--name=value` arguments so a valid filename beginning with `-` cannot be reparsed as an option.
+Generated Codex hook JSON uses only its 0.144.3-supported `description` and `hooks` top-level keys.
+Claude and Codex hook timeouts are rendered in seconds, converting the canonical 5,000/10,000 ms
+values to 5/10 rather than silently creating multi-hour host ceilings.
+
+At most 16 mutation targets enter the automatic route. Seventeen or more reject atomically with a
+diagnostic and zero Rally calls; the agent must strict-check and claim every exact target manually.
+This is a degraded-mode ceiling pending a batch CLI primitive, not a measured optimum. For accepted
+targets, post one working status, complete every check, read ownership once, then create one atomic
+aggregate repeated-path claim for targets not already covered by the agent's own claim. A denial,
+timeout, invalid response, or ownership-read failure creates zero claims; an earlier proven denial
+remains visible if a later check times out. An `allow: true` warning remains visible and does not
+become a conflict. The Rally call budget is bounded at 400 + 400 + 4,000 + 400 + 1,000 = 6,200 ms,
+leaving 3,800 ms under the generated 10-second host timeout; at 16 targets, checks receive 250 ms
+each. The outer guard sends immediate `KILL` at the millisecond deadline rather than adding a
+per-call TERM grace; without a millisecond-capable `timeout`/`gtimeout` or high-resolution Perl
+guard, the classified mutation degrades before any Rally call. This proves an arithmetic ceiling,
+not successful real-host latency. Native Windows drive/backslash containment remains `UNKNOWN`
+outside the proven macOS/Linux wrapper.
+
+Do not narrow Codex's matcher from another host's documentation. Keep it unset until O33-D captures
+a real installed matcher result. The `command` payload carrier is source-proven and replayed, but
+that does not prove matcher invocation. The wrapper is the correctness boundary; a native matcher
+is only a process-launch optimization.
+
+**RED controls:** `O33-A: path-bearing pure read returns exact empty JSON before Rally resolution`,
+`O33-A: opaque shell read returns exact empty JSON without unscoped check`, `O33-A: unknown native
+tool fails open once with bounded diagnostic and no claim`, `O33-A: named local write preserves
+path-scoped check and auto-claim`, `O33-A: Codex 0.144.3 command patch checks every target and claims
+once`, `O33-A: leading or trailing target whitespace rejects without Rally`, `O33-A: one empty
+apply_patch directive rejects the whole mixed target set`, `O33-A: apply_patch target ceiling
+rejects the whole envelope before Rally`, `O33-A: timeout after prior checks creates zero claims`,
+`O33-A: timeout after a proven conflict preserves the strict denial`, `O33-A: allow-plus-warning
+still produces one aggregate claim`, and `O33-A: an existing coarse own claim prevents a redundant
+aggregate claim`. Adjacent fixtures cover a blank move destination versus a valid two-target move,
+malformed tool-input carriers with an outer path, session-on/repo-off precedence, Claude
+absolute-inside/outside paths, a root filename beginning with `-`, cwd-relative parent segments,
+symlink-plus-parent traversal, a nested-new target beneath the nearest physical ancestor,
+self-gated diagnostics, explicit null/blank/non-string tool names, zero-Rally no-node reads/writes,
+an ignored-TERM child under the aggregate deadline, and a missing millisecond watchdog that
+degrades before Rally. Each read/unknown/rejected fixture asserts an empty Rally subprocess log. Generator
+tests pin registry parity, the evidence-gated absent Codex matcher, Codex's exact top-level schema,
+and second-based Claude/Codex timeouts.
+
+O33-A may commit only on its isolated branch. It must not be merged, cherry-picked, or checked out
+into central integration, local main, an installed plugin, a pushed ref, or a user-active worktree.
+Build O33-B on top of A in isolation; integrate the combined chain only after post-O26 O33-C is
+complete and the A+B+C gate passes. The project Codex and Claude hooks are already active for new
+sessions, so a local-main merge would activate A's read bypass while its turn-level writer context
+can still be stale or omit a path. C supplies the path-scoped writer view, source token, and final
+revalidation contract required by the user outcome.
+
+### O33-B — Nonexclusive read-only task activity · after O33-A and O26 read-signal audit
+
+**Owns:** `dynamic-workflows/core/packet.mjs`,
+`dynamic-workflows/tests/injection.test.mjs`,
+`dynamic-workflows/tests/packet-empirical.test.mjs`, `skills/rally-workflows/SKILL.md`, and
+`dynamic-workflows/PROTOCOL.md`. It does not edit `store.rs`, the read-receipt projector, or O26
+storage/wire paths.
+
+An `owns: "read-only"` packet emits no `claim`, no before-write check, and no `release`. Reuse the
+existing public `read` fact as the minimum nonexclusive signal:
+
+```text
+rally say read --tool <tool> --subject <intent> --summary activity:working \
+  --status working --run <run> --step <step> [--parent-step <dep>...]
+```
+
+The completion artifact references that activity event. `summary=read_seq:<N>` remains reserved for
+O26/R10 cursor checkpoints; the existing receipt projector ignores other summaries, and all `read`
+facts remain excluded from `active_claims`. The working activity is historical, not a lease: a
+crashed reader owns nothing and needs no reap. S10's engagement/session projection may show a live,
+unclosed activity and suppress it when the session is stale or a referenced terminal artifact
+exists; that visibility enhancement can land later without restoring ownership.
+
+**RED controls:** `read_only_packet_emits_activity_and_zero_claim_release`,
+`read_only_packet_runtime_creates_zero_active_claims`, and adjacent positive
+`write_packet_still_claims_checks_and_releases_every_owned_path`. The runtime fixture asserts one
+run/step-qualified `read` activity, zero claim/release facts, and one linked completion artifact.
+
+### O33-C — Active-writer reader context and source-token revalidation · after S9 and S10
+
+**Owns:** a new `crates/rally-cli/src/read_context.rs`, `cli.rs`/`lib.rs` command integration only,
+`docs/schemas/agent-rally.command.read-context.v1.json`,
+`crates/rally-cli/tests/read_context_journey.rs`, the O33 reader guidance in
+`skills/agent-rally-point/SKILL.md`, and the shipped hook's S10 turn-level context integration. It
+consumes S9's scoped projector and S10's stable session/engagement binding; it does not add another
+store op, fact kind, cursor, or claim index.
+
+`permission_tier: not-applicable` — this is a local read-only CLI projection with no external
+service, credential, or new host permission; it cannot authorize a filesystem mutation.
+
+Add a read-only `rally read-context --tool <tool> --current-engagement --run <run> --path <path>
+--json`. It reports active overlapping writers with sanitized tool, intent, claim ref, effective
+renewal sequence, and observed session state. It also hashes a canonical source tuple: repo/worktree
+identity, normalized path, current file SHA-256, Git HEAD, path-scoped fact maximum, active claim and
+renewal refs/sequences, writer-status sequence, engagement, and run. `captured_at` and unrelated room
+facts are excluded from the hash. The response includes `source_token`, `provisional`, and an exact
+revalidation command.
+
+A reader never waits merely because a writer is active. It may inspect current bytes, but any audit
+finding, decision, or final conclusion derived from those bytes is provisional. Immediately before
+the conclusion it reruns with `--source-token <token>`: `unchanged` permits the conclusion;
+`changed` requires reread/recompute; `writer_active` keeps the disclosure provisional even when the
+bytes are unchanged. A read-before-write then obtains the normal exclusive claim/check and repeats
+the read if its token changed.
+
+**RED controls:** `active_writer_marks_read_provisional_without_blocking`,
+`file_or_overlapping_writer_change_invalidates_source_token`,
+`unrelated_room_fact_does_not_invalidate_source_token`,
+`writer_completion_then_reread_closes_provisional_state`, and
+`direct_and_routed_read_context_are_byte_identical`. The adjacent-move test changes an uncommitted
+file without moving HEAD; the token must still change.
+
+### O33-D — Native-envelope and quiesced performance proof · A synthetic gate now, full gate after S10
+
+**Owns:** `tests/hooks/test_native_hook_envelopes.sh`,
+`scripts/bench_hook_operations.py`, and captured results under
+`research/analysis-runs/rally-read-deconfliction-<date>/`. It changes no production policy.
+
+Capture real envelopes from each installed host/version before adding or changing a matcher. Store
+only redacted tool/effect/path shape, host version, config hash, and expected classification. Codex
+0.144.3's `apply_patch` `command` carrier already has source-level proof and synthetic replay; its
+live matcher invocation still needs capture. Replay every capture through the wrapper and assert
+exact output plus Rally subprocess count. A host without captured evidence keeps the wrapper-only
+path and is labelled `UNKNOWN`, not inferred from Claude, Codex, or Cursor examples.
+
+The benchmark script records UTC capture time, monotonic per-sample durations, iteration count,
+machine/host versions, input hashes, output bytes, Rally subprocess counts, load average, and top CPU
+consumers. It refuses to publish a comparison while the host is non-quiescent or orphaned test/agent
+processes exceed the declared CPU bound. On the reference Mac, 200 warm alternating samples must
+keep a named pure-read response at exactly two bytes, zero Rally subprocesses, and p95 at or below
+75 ms; it also reports median/p95 versus the pre-O33 unscoped-check path rather than using hand math.
+Mutation gates grade correctness by per-target counts and report latency separately; they do not
+trade away one check per target to hit the read budget.
+
 ## Parallelism and integration
 
 S8 is a new lifecycle engine after S3. S9 is a composition/query tail after S4-S5. S10 is the
-only integration owner for `lib.rs`, the room schema, the shipped hook, and cross-segment journeys;
-it follows both S8 and S9. The existing uncommitted S4-S5 composition worktree is preserved and
-completed before S9 starts.
+only integration owner for `lib.rs`, the room schema, and cross-segment journeys; it follows both
+S8 and S9. O33-A may commit on an isolated branch because it has no S9/S10 dependency, but it stays
+branch-held. O33-B builds on top of that exact commit; the chain does not enter central integration
+or local main until post-O26 O33-C is complete and the combined A+B+C gate passes. The existing
+uncommitted S4-S5 composition worktree is preserved and completed before S9 starts.
 
 S11-S13 are a second sequential tail after S10. Each segment that touches `cli.rs` or `lib.rs` runs
 in its own worktree and integrates by exact commit to avoid shared-file clobbering. S13's discovery
 logic can be drafted beside S11-S12, but its CLI integration lands after S12.
+
+O33-A is isolated hook/generator work and may commit only on its branch. O33-B can remove read-only
+claim/release emission after O33-A and the O26 audit confirms reuse of `FactKind::Read`; B is built
+on top of A in isolation. O33-C waits for both S9 and S10 because its correctness depends on their
+path projection and stable task/session binding. No A-only or A+B central integration, local-main
+checkout, install, user-active checkout, push, or O33-complete claim is allowed; after post-O26 C is
+complete, the activation gate runs A+B+C together and only the combined chain integrates. O33-D's
+synthetic replay and benchmark can run after A; native engagement-context proof completes after C.
 
 `parallel_batch: S8 may run beside completion of S4-S5; S9 starts after S4-S5; S10 starts only
 after both S8 and S9 land.`
@@ -471,6 +664,7 @@ surface and S12 reads S11 closure/provenance while S13 reuses S12 compact summar
 | integration | S8 + S9 → S10 |
 | prior hook/isolated | S6 and S7 remain unchanged before S10 |
 | auditability | S10 → S11 → S12 → S13 |
+| read/write boundary | O33-A → O33-B; S9 + S10 → O33-C; O33-D brackets A and C |
 
 ## Single-Shot Build Guardrails
 
@@ -490,6 +684,13 @@ surface and S12 reads S11 closure/provenance while S13 reuses S12 compact summar
 | A handoff is never assumed understood because it was delivered | receiver acts on a different interpretation | S12 hash/source-sequence check-back ACK |
 | Inventory never mutates discovery state | an audit changes the thing it measures | S13 before/after filesystem and index hashes |
 | A time/statistical claim never hides its clock or denominator | a retrospective slice is reported as observation time or duplicate groups as duplicate events | S13 timestamp/formula/reconciliation gates |
+| A read operation never creates exclusive ownership | parallel readers block writers or create stuck claims | O33-A zero-Rally-subprocess fixtures + O33-B zero-claim runtime journey |
+| An opaque shell command is never guessed into a typed write path | command parsing gives false deconfliction confidence | O33-A exact `{}`/zero-Rally fixture plus explicit shell-mutation protocol |
+| One malformed patch target invalidates the whole automatic check | partial target coverage hides an outside-repo or omitted mutation | O33-A malformed/escape atomic rejection fixture |
+| A timeout never converts a proven denial into silence | a later invalid check erases an earlier active-writer conflict | O33-A conflict-then-timeout strict-denial fixture |
+| A target ceiling is explicit and never truncates ownership | a large patch mutates an unchecked or unclaimed suffix | O33-A 17-target zero-Rally rejection plus documented manual strict fallback |
+| A reader never finalizes against silently changed bytes | active writer changes an uncommitted file after the read | O33-C file-digest adjacent-move token test |
+| Native matcher policy never comes from cross-host analogy | a host silently stops invoking mutation hooks | O33-D captured-envelope/version gate |
 
 ## Read-Before-Edit Map
 
@@ -501,6 +702,10 @@ surface and S12 reads S11 closure/provenance while S13 reuses S12 compact summar
 | S11 | `store.rs:434-465`, `event_envelope.rs`, `backlog.rs`, fact/say schemas, S9 engagement/run projector, and the historical/current metadata-coverage results | reuse existing optional provenance fields without conflating user request and interpretation or breaking legacy rows | envelope/store/backlog/CLI + provenance journey |
 | S12 | `store.rs:3995-4065,4484-4523`, `next.rs` suggestion construction, `hooks/rally-coordination-hook.sh:1373-1379`, hook caps/dedup, S9/S10 scoped room schema, measured 0.2.0/0.2.1 outputs, AHRQ SBAR/check-back, FAA readback, USMC O-SMEAC, and Google SRE handoff/state-document guidance | build one bounded consumer view, preserve never-cut collision truth, make omissions explicit, close the communication loop, and make list limits apply to every rendered list | audit module/next/CLI/hook/schema/docs + exact-byte/adjacent-move/ACK controls |
 | S13 | `discovery.rs:116-316,592-611`, global-status tests, manifest/worktree resolution, and `research/analysis-runs/rally-auditability-20260807/rally_audit.py` plus its original/current result artifacts | preserve opt-in indexed discovery while adding an explicit read-only scan whose activity labels cannot imply process liveness, and make clock/scope/formula provenance mandatory | discovery/CLI/schema/docs + no-write/time/math fixtures |
+| O33-A | generated host matchers/launcher, the wrapper's generic path extraction, Codex 0.144.3 `command` source, hook/install/generator/no-node tests, and native tool envelopes available in fixtures | classify effect before wrapper repo/Rally work, preserve every accepted mutation target as an all-or-none transaction, and keep matcher/Windows uncertainty explicit | hook/config/generator/docs + subprocess-count/timeout/containment fixtures |
+| O33-B | `packet.mjs:150-194`, `FactKind::Read` exclusion and receipt-summary parser, protocol/skill packet examples | replace the unscoped read-only claim/release lifecycle with nonexclusive run/step activity without editing O26 storage | packet/protocol/skill + CLI runtime journey |
+| O33-C | S9 path projector, S10 engagement/session binding and hook context, file/git digest inputs | bind consequential reader evidence to exact bytes and overlapping writer state without waiting or creating a claim | new read-context command/schema/journey + hook/skill guidance |
+| O33-D | installed host versions/configs, real redacted envelopes, pre-O33 hook, CPU/process state | prove native routing and cost with captured inputs and scripted clocks/statistics | replay + quiesced benchmark artifacts only |
 
 ## API and caller audit
 
@@ -517,6 +722,11 @@ legacy `Fact`. S12 adds a new audit command schema and changes `next --limit` se
 consumer of suggested backlog arrays must be rerun. S13 adds a new inventory envelope; existing
 `status --global` and the opt-in global index remain compatible. The shared `Directive` and
 `Receipt` protocol stays unchanged throughout S11-S13.
+
+O33-A and O33-B add no Rust API or wire field. O33-B reuses an advertised `read` kind with a
+non-`read_seq:` summary that the receipt projector already ignores. O33-C adds a public
+`read-context` command/envelope only after S9/S10, using their existing scoped read operation; it
+does not bump the store wire or add a fact kind. O33-D adds no API.
 
 Callers that must be rerun are `command_room`, the shipped coordination hook,
 `tests/user_journey.rs`, `tests/snapshot_wire_internals.rs`, `tests/room_budget_scaling.rs`, and
@@ -541,6 +751,11 @@ consumer found by project-wide grep for `suggested_backlog_items`, `RoomSnapshot
 envelopes. No model-facing guide may continue prescribing unfiltered `rally room --json` as the
 first read after S12.
 
+O33 callers that must be rerun are every generated host hook surface, the global hook installer,
+the native wrapper, dynamic-workflow packet rendering/lint/injection tests, the rally-workflows and
+agent-rally-point skills, S10 hook projection parity, and direct/routed room/read-context journeys.
+The pre-O33 write packet and Claude edit matcher remain adjacent compatibility controls.
+
 ## Validation boundary
 
 Rally facts are untrusted coordination records. A Rally claim, artifact, ACK, or receipt can
@@ -564,6 +779,12 @@ Rally. The audit script records exact roots, UTC clock, interval duration, input
 denominators, reconciliation verdicts, and response bytes before interpreting time, percentage,
 duplicate, or token impact.
 
+For O33 the independent audit must compare five operation classes: pure read, consequential read,
+read-before-write, mutation, and destructive/admin mutation. It records native envelope hash,
+effect class, normalized targets, exact hook bytes, subprocess counts, source token, revalidation
+verdict, monotonic timing samples, UTC capture clock, formulas, and machine/process quiescence. Rally
+facts may prove that an activity/claim was recorded; they do not prove file bytes or test success.
+
 ## Outcomes a user can observe
 
 | Segment | Before | After |
@@ -574,6 +795,10 @@ duplicate, or token impact.
 | S11 | agent prose can blur user request, interpretation, and outcome; completed work can remain planned | linked immutable request/interpretation/decision/artifact records and terminal backlog successors preserve the distinction |
 | S12 | a model may consume 49k-76k estimated tokens, while a blind 4,000-character cut can drop a late critical fact | a deterministic priority brief fits its transport, exposes omissions/drill-in IDs, and requires hash-bound receiver acknowledgement |
 | S13 | answering “all open Rally rooms on this laptop” requires an ad hoc scan whose time and root scope can be misunderstood | one explicit read-only command returns bounded room/activity/provenance status with checked clock, scope, formulas, and no global-index mutation |
+| O33-A | a path-bearing read or opaque shell call can run an unscoped before-write check and create noise | internal prerequisite: named reads/shell return `{}` with zero Rally calls, while accepted typed mutation targets check completely before one aggregate claim; activation waits for A+B+C |
+| O33-B | `owns: read-only` creates an unscoped exclusive claim that can outlive the reader | the packet records nonexclusive activity and completion with zero claim/release facts |
+| O33-C | a reader must either wait for a writer or risk finalizing against moving bytes | it reads in parallel with writer/intent context, marks evidence provisional, and revalidates an exact source token before conclusions |
+| O33-D | hook cost and matcher safety are inferred from synthetic examples or noisy hosts | redacted native captures and a quiesced scripted benchmark report exact routing, bytes, calls, and statistics |
 
 ## Out of scope
 
@@ -581,4 +806,8 @@ This amendment does not authorize automatic closure of legacy `unknown` claims, 
 test runner, force multi-agent work, change the RC-063 authority decision, or move/delete any
 PersonalLLMWiki content. S11 does not authenticate same-UID agents or store raw user requests by
 default. S13 does not enable persistent global indexing, scan outside explicit roots, or treat a
-process/room/path observation as proof of human or agent identity.
+process/room/path observation as proof of human or agent identity. O33 does not serialize pure
+reads, parse arbitrary shell text into authority, infer native matcher support, make read activity a
+claim, or let read context authorize a destructive/admin action. O33-A/B do not duplicate O26
+storage work; O33-C does not land before S9/S10 stable scope exists. O33-A does not claim native
+Windows support, eliminate the temporary 16-target ceiling, or activate the read bypass alone.
