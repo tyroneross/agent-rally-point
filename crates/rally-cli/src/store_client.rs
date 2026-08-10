@@ -70,6 +70,37 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// misclassify a merely-slow reply as R6's dead-socket case.
 const OP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Leave enough wall-clock after a not-started reply for the daemon reader,
+/// socket write, client parse, and outer CLI watchdog rendering.
+const MUTATION_DEADLINE_RESERVE: Duration = Duration::from_millis(250);
+
+fn mutation_deadline() -> (u64, u64) {
+    mutation_deadline_with_hook(|| {})
+}
+
+fn mutation_deadline_with_hook<F>(between_clock_samples: F) -> (u64, u64)
+where
+    F: FnOnce(),
+{
+    // Sample wall time before the watchdog's monotonic remainder. If this
+    // thread is preempted between the two reads, adding the later/smaller
+    // remainder to the earlier wall sample is conservative; the inverse order
+    // would rebase that pause beyond the outer watchdog.
+    let now = SystemTime::now();
+    between_clock_samples();
+    let outer = crate::watchdog_remaining().unwrap_or(OP_TIMEOUT);
+    let budget = outer
+        .min(OP_TIMEOUT)
+        .saturating_sub(MUTATION_DEADLINE_RESERVE);
+    let deadline = now.checked_add(budget).unwrap_or(now);
+    let deadline_unix_ms = deadline
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
+    let budget_ms = budget.as_millis().min(u128::from(u64::MAX)) as u64;
+    (deadline_unix_ms, budget_ms)
+}
+
 /// Bounded-block corridor total budget (L12/ADR-01): once the SH try-lock is
 /// refused (a daemon holds EX but hadn't answered a ping yet — a cold-start
 /// reconcile can take seconds on a real room), the router re-probes up to this
@@ -383,6 +414,7 @@ fn store_error_to_rally_error(err: StoreError) -> RallyError {
     match err.kind {
         StoreErrorKind::Usage => RallyError::Usage(err.message),
         StoreErrorKind::NotFound => RallyError::NotFound(err.message),
+        StoreErrorKind::NotStarted => RallyError::NotStarted(err.message),
         StoreErrorKind::Command
         | StoreErrorKind::Message
         | StoreErrorKind::Internal
@@ -426,7 +458,12 @@ impl RoutedRoomStore {
     }
 
     fn dispatch_with_engagement(&self, engagement: String, op: StoreOp) -> Result<StoreOk> {
-        let req = StoreRequest::new(Some(engagement), op);
+        let mut req = StoreRequest::new(Some(engagement), op);
+        if req.op.is_mutating() {
+            let (deadline_unix_ms, mutation_budget_ms) = mutation_deadline();
+            req.deadline_unix_ms = Some(deadline_unix_ms);
+            req.mutation_budget_ms = Some(mutation_budget_ms);
+        }
         match round_trip(&self.socket, &req, OP_TIMEOUT, false) {
             Ok(StoreResponse::Ok(ok)) => Ok(ok),
             Ok(StoreResponse::Err(err)) => Err(store_error_to_rally_error(err)),
@@ -656,6 +693,39 @@ impl RoutedRoomStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_not_started_reconstructs_the_direct_error_class() {
+        let error = store_error_to_rally_error(StoreError::new(
+            StoreErrorKind::NotStarted,
+            "mutation-not-started: no durable mutation started",
+        ));
+        assert!(matches!(error, RallyError::NotStarted(_)));
+        assert_eq!(error.exit_code(), 4);
+    }
+
+    #[test]
+    fn wire_deadline_consumes_preemption_between_clock_samples() {
+        let _guard = crate::install_watchdog_deadline(
+            Instant::now()
+                .checked_add(Duration::from_millis(500))
+                .unwrap(),
+        );
+
+        let (_deadline_unix_ms, budget_ms) = mutation_deadline_with_hook(|| {
+            thread::sleep(Duration::from_millis(300));
+        });
+        let allowed_after_pause = crate::watchdog_remaining()
+            .unwrap()
+            .min(OP_TIMEOUT)
+            .saturating_sub(MUTATION_DEADLINE_RESERVE)
+            .as_millis() as u64;
+
+        assert!(
+            budget_ms <= allowed_after_pause.saturating_add(5),
+            "wire budget rebased preemption beyond the outer watchdog: wire={budget_ms}ms allowed={allowed_after_pause}ms"
+        );
+    }
     use std::os::unix::net::UnixListener;
     use std::thread;
 
@@ -715,8 +785,8 @@ mod tests {
     }
 
     #[test]
-    fn probe_rejects_a_v2_daemon_after_authority_and_scoped_snapshot_changes() {
-        assert_eq!(WIRE_VERSION, 3, "this control grades the v2 to v3 cutover");
+    fn probe_rejects_a_v3_daemon_after_mutation_deadline_changes() {
+        assert_eq!(WIRE_VERSION, 4, "this control grades the v3 to v4 cutover");
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -737,11 +807,11 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let request: StoreRequest = serde_json::from_str(line.trim()).unwrap();
-            assert_eq!(request.wire_version, 3);
+            assert_eq!(request.wire_version, 4);
             let response = StoreResponse::Ok(StoreOk::Pong {
                 repo_root: "/expected/repo".to_string(),
                 pid: 42,
-                wire_version: 2,
+                wire_version: 3,
             });
             let mut writer = &stream;
             writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
@@ -749,7 +819,7 @@ mod tests {
 
         assert!(
             probe_identity(&rally_dir, "/expected/repo").is_none(),
-            "a v2 daemon must not route a v3 client without renewal authority or scoped snapshots"
+            "a v3 daemon must not route a v4 client without mutation deadlines"
         );
         server.join().unwrap();
         std::fs::remove_file(&socket).ok();

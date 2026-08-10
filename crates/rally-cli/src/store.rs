@@ -3,6 +3,7 @@ use factstr_sqlite::SqliteStore;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -60,6 +61,135 @@ pub(crate) const ACTIVE_ENGAGEMENT_FILENAME: &str = "active-engagement";
 /// canonical JSONL segments in lock-step.
 const ROOM_MUTATION_LOCK_FILENAME: &str = "mutation.lock";
 
+/// Finite fallback for callers without a command/request deadline (principally
+/// in-process use and tests). Real direct commands use the shorter watchdog
+/// deadline, while routed requests install the shorter client deadline.
+const MUTATION_LOCK_FALLBACK_BOUND: Duration = Duration::from_secs(5);
+const MUTATION_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
+const MUTATION_LOCK_WATCHDOG_RESERVE: Duration = Duration::from_millis(150);
+
+thread_local! {
+    /// Optional caller-provided start deadline. Routed daemon requests install
+    /// the client deadline here for one dispatch; direct CLI calls derive from
+    /// the command watchdog instead.
+    static MUTATION_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    #[cfg(test)]
+    static FORCE_WARM_CLOSE_SPAWN_FAILURE: Cell<bool> = const { Cell::new(false) };
+    #[cfg(test)]
+    static FORCE_ROOM_LOCK_POST_FLOCK_PAUSE: Cell<Option<Duration>> = const { Cell::new(None) };
+    #[cfg(test)]
+    static FORCE_OWNER_LOCK_POST_FLOCK_PAUSE: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_next_room_lock_post_flock_pause(pause: Duration) {
+    FORCE_ROOM_LOCK_POST_FLOCK_PAUSE.with(|slot| slot.set(Some(pause)));
+}
+
+#[cfg(test)]
+fn pause_after_room_lock_flock_for_test() {
+    FORCE_ROOM_LOCK_POST_FLOCK_PAUSE.with(|slot| {
+        if let Some(pause) = slot.take() {
+            thread::sleep(pause);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn pause_after_room_lock_flock_for_test() {}
+
+#[cfg(test)]
+fn force_next_owner_lock_post_flock_pause(pause: Duration) {
+    FORCE_OWNER_LOCK_POST_FLOCK_PAUSE.with(|slot| slot.set(Some(pause)));
+}
+
+#[cfg(test)]
+fn pause_after_owner_lock_flock_for_test() {
+    FORCE_OWNER_LOCK_POST_FLOCK_PAUSE.with(|slot| {
+        if let Some(pause) = slot.take() {
+            thread::sleep(pause);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn pause_after_owner_lock_flock_for_test() {}
+
+#[cfg(test)]
+fn force_next_warm_close_spawn_failure() {
+    FORCE_WARM_CLOSE_SPAWN_FAILURE.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+fn warm_close_spawn_failure_requested() -> bool {
+    FORCE_WARM_CLOSE_SPAWN_FAILURE.with(|flag| flag.replace(false))
+}
+
+#[cfg(not(test))]
+fn warm_close_spawn_failure_requested() -> bool {
+    false
+}
+
+struct MutationDeadlineGuard {
+    previous: Option<Instant>,
+}
+
+impl Drop for MutationDeadlineGuard {
+    fn drop(&mut self) {
+        MUTATION_DEADLINE.with(|slot| slot.set(self.previous));
+    }
+}
+
+/// Run `work` with a deadline for starting any nested room mutation.
+/// Nested callers can only shorten an existing deadline.
+#[cfg(test)]
+pub(crate) fn with_mutation_deadline<T>(budget: Duration, work: impl FnOnce() -> T) -> T {
+    let now = Instant::now();
+    let requested = now
+        .checked_add(budget)
+        .unwrap_or(now + MUTATION_LOCK_FALLBACK_BOUND);
+    with_mutation_deadline_at(requested, work)
+}
+
+/// Run `work` with an already-anchored monotonic deadline.
+///
+/// Routed requests use this form so dispatcher queueing or preemption between
+/// deadline calculation and installation cannot add elapsed time back.
+pub(crate) fn with_mutation_deadline_at<T>(requested: Instant, work: impl FnOnce() -> T) -> T {
+    let previous = MUTATION_DEADLINE.with(|slot| {
+        let previous = slot.get();
+        slot.set(Some(
+            previous.map_or(requested, |prior| prior.min(requested)),
+        ));
+        previous
+    });
+    let _guard = MutationDeadlineGuard { previous };
+    work()
+}
+
+fn effective_mutation_deadline() -> Instant {
+    let now = Instant::now();
+    MUTATION_DEADLINE.with(Cell::get).unwrap_or_else(|| {
+        crate::watchdog_remaining().map_or(now + MUTATION_LOCK_FALLBACK_BOUND, |remaining| {
+            now + remaining.saturating_sub(MUTATION_LOCK_WATCHDOG_RESERVE)
+        })
+    })
+}
+
+fn mutation_not_started(path: &Path) -> RallyError {
+    RallyError::NotStarted(format!(
+        "mutation-not-started: deadline elapsed before acquiring {}; no durable mutation started and retry is safe",
+        path.display()
+    ))
+}
+
+fn mutation_not_started_after_provisional_lock(path: &Path) -> RallyError {
+    RallyError::NotStarted(format!(
+        "mutation-not-started: deadline elapsed after provisional lock acquisition at {}; lock released before any durable mutation started and retry is safe",
+        path.display()
+    ))
+}
+
 #[cfg(unix)]
 mod unix_lock {
     /// Shared (read) advisory lock — many holders coexist. Direct mode holds
@@ -100,7 +230,7 @@ use crate::error::{RallyError, Result};
 use crate::store_client::{self, RoutedRoomStore};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Process-global retry salt. Bumped on every SQLite-busy retry so that two
 /// retriers in the SAME process (same pid, possibly even the same thread id if
@@ -911,9 +1041,9 @@ pub(crate) fn snapshot_to_wire_value(
 /// Deserialize a wire snapshot, restoring [`SnapshotInternals`] if present.
 ///
 /// A payload without the key yields defaults only for additive compatibility
-/// within wire v3. The identity probe rejects older daemons before this decoder
-/// runs, including daemons that lack scoped snapshots or would synthesize
-/// renewal authority from claim id.
+/// within the current wire version. The identity probe rejects older daemons
+/// before this decoder runs, including daemons that lack scoped snapshots or
+/// would synthesize renewal authority from claim id.
 pub(crate) fn snapshot_from_wire_value(
     mut value: Value,
 ) -> std::result::Result<RoomSnapshot, serde_json::Error> {
@@ -1417,15 +1547,15 @@ impl std::ops::Deref for FactStoreHandle<'_> {
 }
 
 #[cfg(unix)]
-struct RoomMutationLock {
+pub(crate) struct RoomMutationLock {
     file: fs::File,
 }
 
 #[cfg(not(unix))]
-struct RoomMutationLock;
+pub(crate) struct RoomMutationLock;
 
 #[cfg(unix)]
-fn acquire_room_mutation_lock(room_dir: &Path) -> Result<RoomMutationLock> {
+pub(crate) fn acquire_room_mutation_lock(room_dir: &Path) -> Result<RoomMutationLock> {
     fs::create_dir_all(room_dir)
         .map_err(RallyError::io(format!("create {}", room_dir.display())))?;
     let path = room_dir.join(ROOM_MUTATION_LOCK_FILENAME);
@@ -1436,18 +1566,41 @@ fn acquire_room_mutation_lock(room_dir: &Path) -> Result<RoomMutationLock> {
         .write(true)
         .open(&path)
         .map_err(RallyError::io(format!("open {}", path.display())))?;
-    let rc = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX) };
-    if rc != 0 {
-        return Err(RallyError::Io {
-            context: format!("lock {}", path.display()),
-            source: io::Error::last_os_error(),
-        });
+    let deadline = effective_mutation_deadline();
+    loop {
+        if Instant::now() >= deadline {
+            return Err(mutation_not_started(&path));
+        }
+        let rc =
+            unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX | unix_lock::LOCK_NB) };
+        if rc == 0 {
+            pause_after_room_lock_flock_for_test();
+            if Instant::now() >= deadline {
+                // A process can be descheduled between the pre-check and the
+                // successful syscall. Relinquish the just-acquired lock and
+                // preserve the typed no-mutation-started contract.
+                let _ = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_UN) };
+                return Err(mutation_not_started_after_provisional_lock(&path));
+            }
+            return Ok(RoomMutationLock { file });
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() != io::ErrorKind::WouldBlock {
+            return Err(RallyError::Io {
+                context: format!("lock {}", path.display()),
+                source,
+            });
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(mutation_not_started(&path));
+        }
+        thread::sleep(MUTATION_LOCK_RETRY_DELAY.min(remaining));
     }
-    Ok(RoomMutationLock { file })
 }
 
 #[cfg(not(unix))]
-fn acquire_room_mutation_lock(_room_dir: &Path) -> Result<RoomMutationLock> {
+pub(crate) fn acquire_room_mutation_lock(_room_dir: &Path) -> Result<RoomMutationLock> {
     Ok(RoomMutationLock)
 }
 
@@ -1460,17 +1613,21 @@ impl Drop for RoomMutationLock {
 
 impl Drop for DirectRoomStore {
     fn drop(&mut self) {
-        let room_dir = self
-            .facts_db_path
-            .parent()
-            .expect("facts db path must have a parent during store teardown");
-        // factstr-sqlite's vendored Drop closes the sqlx pool synchronously.
-        // Take every room-owned pool while holding the same cross-process lock
-        // used by append/reconcile so SQLite's final WAL checkpoint/unlink
-        // cannot escape into a peer process's mutation window.
-        let _guard = acquire_room_mutation_lock(room_dir)
-            .expect("acquire room mutation lock during store teardown");
-        drop(self.warm_fact_store.take());
+        // The daemon closes its warm pool explicitly through
+        // `close_warm_fact_store_bounded`, under `mutation.lock`. Drop is only
+        // the emergency/failure path: it must never wait for a contended lock or
+        // panic while unwinding. Tell the vendored store not to synchronously
+        // join its workers; the failure-only branch below preserves the inert
+        // pool until process exit rather than scheduling an unguarded close.
+        if let Some(mut warm) = self.warm_fact_store.take() {
+            warm.prepare_nonblocking_drop();
+            // An unexpected Drop cannot safely close without the room lock and
+            // cannot wait for that lock. Keep the inert pool process-local;
+            // daemon process exit reclaims it. Normal lifecycle always uses the
+            // explicit bounded close above, so this is a failure-only tradeoff
+            // that prevents delayed unguarded WAL housekeeping.
+            std::mem::forget(warm);
+        }
     }
 }
 
@@ -1563,6 +1720,57 @@ pub(crate) fn acquire_owner_exclusive_blocking(rally_dir: &Path) -> Result<Owner
     Ok(OwnerGuard { file })
 }
 
+/// Acquire daemon ownership within `budget`, returning a typed not-started
+/// result when direct owners do not drain in time.
+#[cfg(unix)]
+pub(crate) fn acquire_owner_exclusive_bounded(
+    rally_dir: &Path,
+    budget: Duration,
+) -> Result<OwnerGuard> {
+    let path = rally_dir.join(RALLYD_OWNER_LOCK_FILENAME);
+    let file = open_named_lock_file(rally_dir, RALLYD_OWNER_LOCK_FILENAME)?;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(budget)
+        .unwrap_or(now + MUTATION_LOCK_FALLBACK_BOUND);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(RallyError::NotStarted(format!(
+                "daemon-open-not-started: deadline elapsed before acquiring {}; no daemon runtime state was published",
+                path.display()
+            )));
+        }
+        let rc =
+            unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX | unix_lock::LOCK_NB) };
+        if rc == 0 {
+            pause_after_owner_lock_flock_for_test();
+            if Instant::now() >= deadline {
+                let _ = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_UN) };
+                return Err(RallyError::NotStarted(format!(
+                    "daemon-open-not-started: deadline elapsed after provisional lock acquisition at {}; lock released before any daemon runtime state was published and retry is safe",
+                    path.display()
+                )));
+            }
+            return Ok(OwnerGuard { file });
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() != io::ErrorKind::WouldBlock {
+            return Err(RallyError::Io {
+                context: format!("lock-ex {}", path.display()),
+                source,
+            });
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(RallyError::NotStarted(format!(
+                "daemon-open-not-started: deadline elapsed before acquiring {}; no daemon runtime state was published",
+                path.display()
+            )));
+        }
+        thread::sleep(MUTATION_LOCK_RETRY_DELAY.min(remaining));
+    }
+}
+
 /// Try to acquire a named exclusive advisory lock without blocking.
 ///
 /// The file is only a stable rendezvous point. Kernel lock ownership, not file
@@ -1610,6 +1818,14 @@ pub(crate) fn acquire_owner_shared_nb(_rally_dir: &Path) -> Result<Option<OwnerG
 #[cfg(not(unix))]
 #[allow(dead_code)]
 pub(crate) fn acquire_owner_exclusive_blocking(_rally_dir: &Path) -> Result<OwnerGuard> {
+    Ok(OwnerGuard)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn acquire_owner_exclusive_bounded(
+    _rally_dir: &Path,
+    _budget: Duration,
+) -> Result<OwnerGuard> {
     Ok(OwnerGuard)
 }
 
@@ -2247,6 +2463,102 @@ impl DirectRoomStore {
     pub(crate) fn install_warm_fact_store(&mut self) -> Result<()> {
         self.warm_fact_store = Some(open_fact_store_lenient(&self.facts_db_path)?);
         Ok(())
+    }
+
+    /// Explicitly close the daemon's warm SQLite pool within `budget`.
+    ///
+    /// Teardown runs on a dedicated thread that owns `mutation.lock` until the
+    /// vendored store has joined delivery and completed its final pool close.
+    /// If the caller's wait expires, the teardown thread continues holding the
+    /// lock; no peer mutation can race the delayed WAL checkpoint. The store's
+    /// fallback [`Drop`] is nonblocking and nonpanicking.
+    pub(crate) fn close_warm_fact_store_bounded(&mut self, budget: Duration) -> Result<()> {
+        if self.warm_fact_store.is_none() {
+            return Ok(());
+        }
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(budget)
+            .unwrap_or(now + MUTATION_LOCK_FALLBACK_BOUND);
+        let guard = with_mutation_deadline_at(deadline, || acquire_room_mutation_lock(room_dir))?;
+        let Some(mut warm) = self.warm_fact_store.take() else {
+            return Ok(());
+        };
+        // If spawning the close worker fails, dropping the captured store must
+        // stay prompt rather than re-entering its synchronous Drop path.
+        warm.prepare_nonblocking_drop();
+
+        // Retain both resources outside the closure until the OS has actually
+        // created the worker. `Builder::spawn` consumes and drops its closure on
+        // failure, so capturing these values directly would release the lock
+        // and pool at the exact failure boundary this method must fail closed.
+        let retained = Arc::new(Mutex::new(Some((warm, guard))));
+        let worker_retained = Arc::clone(&retained);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let spawn_result = if warm_close_spawn_failure_requested() {
+            Err(io::Error::other("injected warm-close worker spawn failure"))
+        } else {
+            thread::Builder::new()
+                .name("rally-warm-store-close".to_string())
+                .spawn(move || {
+                    let resources = match worker_retained.lock() {
+                        Ok(mut slot) => slot.take(),
+                        Err(poisoned) => poisoned.into_inner().take(),
+                    };
+                    let Some((mut warm, guard)) = resources else {
+                        let _ =
+                            done_tx
+                                .send(Err("warm-close worker started without retained resources"
+                                    .to_string()));
+                        return;
+                    };
+                    let result = warm.close_synchronously();
+                    if result.is_ok() {
+                        drop(warm);
+                    } else {
+                        std::mem::forget(warm);
+                    }
+                    drop(guard);
+                    let _ = done_tx.send(result);
+                })
+        };
+        let worker = match spawn_result {
+            Ok(worker) => {
+                // The live worker owns the remaining Arc and takes both values.
+                drop(retained);
+                worker
+            }
+            Err(error) => {
+                // Preserve pool + mutation.lock until process exit. The daemon
+                // also retains owner EX after this loud close failure.
+                std::mem::forget(retained);
+                return Err(RallyError::Command(format!(
+                    "daemon-close-not-started: could not spawn warm-store close worker: {error}; warm pool and mutation.lock retained until process exit"
+                )));
+            }
+        };
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = match done_rx.recv_timeout(remaining) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(RallyError::Command(format!("daemon-close-failed: {error}"))),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(RallyError::Command(format!(
+                "daemon-close-timeout: warm store did not close within {}ms; teardown continues while holding mutation.lock",
+                budget.as_millis()
+            ))),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(RallyError::Command(
+                "daemon-close-failed: warm-store close worker exited without a result".to_string(),
+            )),
+        };
+        // Detach rather than joining: the completion channel is the bounded
+        // close contract, and a join after its deadline would reintroduce an
+        // unbounded teardown edge.
+        drop(worker);
+        result
     }
 
     /// Rebind the active engagement (and its derived active-segment path) for
@@ -7340,6 +7652,229 @@ mod ledger_tests {
             "typed contention error must include the safe recovery commands: {err}"
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_lock_deadline_returns_not_started_and_never_commits_late() {
+        let root = unique_root("mutation-lock-deadline");
+        let rally_dir = root.join(".rally");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let held = acquire_room_mutation_lock(&rally_dir).unwrap();
+        let mut fact = Fact {
+            schema: crate::FACT_SCHEMA.to_string(),
+            event_id: "o25-direct-no-late-commit".to_string(),
+            thread_id: "thread-o25-direct".to_string(),
+            kind: FactKind::Artifact,
+            subject: "must never commit after lock deadline".to_string(),
+            created_at: crate::now_string(),
+            ..Fact::default()
+        };
+        fact.tool = Some("codex:o25".to_string());
+
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let started = Instant::now();
+            let result =
+                with_mutation_deadline(Duration::from_millis(75), || store.append_fact(&fact));
+            tx.send((started.elapsed(), result)).unwrap();
+        });
+
+        let prompt = rx.recv_timeout(Duration::from_millis(300));
+        let completed_before_release = prompt.is_ok();
+        drop(held);
+        let (elapsed, result) = match prompt {
+            Ok(result) => result,
+            Err(_) => rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("legacy blocking lock did not return after release"),
+        };
+        worker.join().unwrap();
+
+        assert!(
+            completed_before_release && elapsed < Duration::from_millis(300),
+            "mutation lock wait escaped its 75ms deadline: {elapsed:?}"
+        );
+        let error = result
+            .as_ref()
+            .expect_err("contended mutation must return typed NotStarted");
+        assert!(matches!(error, RallyError::NotStarted(_)), "got {error:?}");
+        assert!(
+            error.to_string().contains("before acquiring"),
+            "true pre-acquire expiry lost its precise diagnostic: {error}"
+        );
+        let reopened = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        assert!(
+            reopened
+                .facts()
+                .unwrap()
+                .iter()
+                .all(|row| row.event_id != "o25-direct-no-late-commit"),
+            "a not-started mutation committed after its caller returned"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_mutation_rechecks_deadline_after_flock_success() {
+        let root = unique_root("mutation-lock-post-flock-deadline");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let fact = Fact {
+            schema: crate::FACT_SCHEMA.to_string(),
+            event_id: "o25-direct-post-flock-no-late-commit".to_string(),
+            thread_id: "thread-o25-direct-post-flock".to_string(),
+            kind: FactKind::Artifact,
+            subject: "must not commit after post-flock deadline".to_string(),
+            created_at: crate::now_string(),
+            ..Fact::default()
+        };
+        force_next_room_lock_post_flock_pause(Duration::from_millis(60));
+
+        let result = with_mutation_deadline(Duration::from_millis(20), || store.append_fact(&fact));
+
+        let error = result.expect_err("deadline elapsed after flock success but mutation started");
+        assert!(matches!(error, RallyError::NotStarted(_)), "got {error:?}");
+        let message = error.to_string();
+        assert!(message.contains("after provisional lock acquisition"));
+        assert!(message.contains("lock released before any durable mutation"));
+        assert!(!message.contains("before acquiring"));
+        let reopened = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        assert!(
+            reopened
+                .facts()
+                .unwrap()
+                .iter()
+                .all(|row| row.event_id != fact.event_id),
+            "direct mutation committed after its post-flock deadline"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_owner_open_deadline_is_typed_not_started() {
+        let root = unique_root("daemon-owner-open-deadline");
+        let rally_dir = root.join(".rally");
+        let held = acquire_owner_shared_nb(&rally_dir)
+            .unwrap()
+            .expect("test holds daemon exclusion SH");
+
+        let started = Instant::now();
+        let result = acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(75));
+        let elapsed = started.elapsed();
+
+        drop(held);
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "daemon owner open escaped its 75ms deadline: {elapsed:?}"
+        );
+        assert!(
+            matches!(&result, Err(RallyError::NotStarted(_))),
+            "contended daemon open must return typed NotStarted"
+        );
+        let message = match &result {
+            Err(error) => error.to_string(),
+            Ok(_) => unreachable!("typed NotStarted assertion above"),
+        };
+        assert!(
+            message.contains("before acquiring"),
+            "true pre-acquire owner expiry lost its precise diagnostic"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_owner_rechecks_deadline_after_flock_success() {
+        let root = unique_root("daemon-owner-post-flock-deadline");
+        let rally_dir = root.join(".rally");
+        force_next_owner_lock_post_flock_pause(Duration::from_millis(60));
+
+        let result = acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(20));
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_guard) => {
+                panic!("owner deadline elapsed after flock success but ownership started")
+            }
+        };
+        assert!(matches!(error, RallyError::NotStarted(_)), "got {error:?}");
+        let message = error.to_string();
+        assert!(message.contains("after provisional lock acquisition"));
+        assert!(message.contains("lock released before any daemon runtime state"));
+        assert!(!message.contains("before acquiring"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_warm_close_is_bounded_and_drop_is_prompt_nonpanicking() {
+        let root = unique_root("bounded-warm-close");
+        let rally_dir = root.join(".rally");
+        let mut store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        store.install_warm_fact_store().unwrap();
+        let held = acquire_room_mutation_lock(&rally_dir).unwrap();
+
+        let started = Instant::now();
+        let close = store.close_warm_fact_store_bounded(Duration::from_millis(75));
+        let close_elapsed = started.elapsed();
+        assert!(
+            close_elapsed < Duration::from_millis(300),
+            "explicit warm close escaped its 75ms deadline: {close_elapsed:?}"
+        );
+        assert!(
+            matches!(close, Err(RallyError::NotStarted(_))),
+            "close that cannot acquire the mutation lock must be NotStarted: {close:?}"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(store)));
+            tx.send(result).unwrap();
+        });
+        let prompt = rx.recv_timeout(Duration::from_millis(150));
+        let completed_before_release = prompt.is_ok();
+        drop(held);
+        let outcome = match prompt {
+            Ok(outcome) => outcome,
+            Err(_) => rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("legacy blocking Drop did not return after lock release"),
+        };
+        dropper.join().unwrap();
+        assert!(
+            completed_before_release,
+            "DirectRoomStore::drop blocked on mutation.lock"
+        );
+        assert!(outcome.is_ok(), "DirectRoomStore::drop panicked");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_close_spawn_failure_retains_mutation_lock_until_process_exit() {
+        let root = unique_root("warm-close-spawn-failure");
+        let rally_dir = root.join(".rally");
+        let mut store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        store.install_warm_fact_store().unwrap();
+        force_next_warm_close_spawn_failure();
+
+        let close = store.close_warm_fact_store_bounded(Duration::from_millis(100));
+        assert!(
+            matches!(close, Err(RallyError::Command(ref message)) if message.starts_with("daemon-close-not-started:")),
+            "injected spawn failure must fail loud: {close:?}"
+        );
+        let reacquire = with_mutation_deadline(Duration::from_millis(40), || {
+            acquire_room_mutation_lock(&rally_dir)
+        });
+        assert!(
+            matches!(reacquire, Err(RallyError::NotStarted(_))),
+            "spawn failure released mutation.lock before process exit"
+        );
+        // The repaired path deliberately retains the warm pool and lock until
+        // process exit. Do not unlink their rendezvous path in this test.
+        drop(store);
     }
 
     #[test]
