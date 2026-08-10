@@ -3173,24 +3173,33 @@ impl DirectRoomStore {
             self.warm_fact_store.is_none(),
         )?;
 
+        // Count/max and file fingerprints prove shape and change detection,
+        // not content identity. A derived row can retain the same canonical
+        // seq while changing a safety-bearing claim scope. Load only canonical
+        // lifecycle rows and compare their normalized Facts before allowing
+        // the path-collision join to trust the derived database.
+        let canonical = claim_lifecycle_facts_from_segments(&self.log_dir, &self.archive_dir)?;
+
         if let Some(warm) = &self.warm_fact_store {
-            return match claim_lifecycle_facts_from_store(warm) {
-                Ok(facts) => Ok(facts),
+            let derived = match claim_lifecycle_facts_from_store(warm) {
+                Ok(facts) => facts,
                 Err(err) if is_malformed_db_error(&err) => {
-                    Err(live_db_recovery_required_error(&self.facts_db_path))
+                    return Err(live_db_recovery_required_error(&self.facts_db_path));
                 }
-                Err(err) => Err(err),
+                Err(err) => return Err(err),
             };
+            if !claim_lifecycle_content_equivalent(&canonical, &derived)? {
+                return Err(live_db_recovery_required_error(&self.facts_db_path));
+            }
+            return Ok(canonical);
         }
 
         // Reconcile above has already repaired/quarantined a malformed cold
         // cache. Opening leniently here could quarantine and then query a new,
         // empty database before canonical replay, falsely reporting no claim.
-        let fact_store = open_fact_store(&self.facts_db_path)?;
-        match claim_lifecycle_facts_from_store(&fact_store) {
-            Ok(facts) => Ok(facts),
+        let derived = match claim_lifecycle_facts_from_db_path(&self.facts_db_path) {
+            Ok(facts) => facts,
             Err(err) if is_malformed_db_error(&err) => {
-                drop(fact_store);
                 quarantine_corrupt_db(&self.facts_db_path)?;
                 if let Some(path) = reconcile_cache_path(&self.facts_db_path) {
                     let _ = fs::remove_file(path);
@@ -3201,11 +3210,31 @@ impl DirectRoomStore {
                     &self.facts_db_path,
                     true,
                 )?;
-                let recovered_store = open_fact_store(&self.facts_db_path)?;
-                claim_lifecycle_facts_from_store(&recovered_store)
+                claim_lifecycle_facts_from_db_path(&self.facts_db_path)?
             }
-            Err(err) => Err(err),
+            Err(err) => return Err(err),
+        };
+        if claim_lifecycle_content_equivalent(&canonical, &derived)? {
+            return Ok(canonical);
         }
+
+        // Same-shape content drift bypasses the global count/max reconcile.
+        // Direct mode owns no warm pool, so rebuild the disposable cache from
+        // canonical segments, then re-read and prove byte-normalized Fact
+        // equivalence before returning any collision context.
+        force_rebuild_db_from_canonical_segments(
+            &self.log_dir,
+            &self.archive_dir,
+            &self.facts_db_path,
+        )?;
+        let repaired = claim_lifecycle_facts_from_db_path(&self.facts_db_path)?;
+        if !claim_lifecycle_content_equivalent(&canonical, &repaired)? {
+            return Err(RallyError::Message(format!(
+                "facts-db-recovery-required: {} lifecycle content still differs from canonical segments after direct rebuild",
+                self.facts_db_path.display()
+            )));
+        }
+        Ok(canonical)
     }
 
     /// Project one engagement/run/path without folding repository-wide facts.
@@ -3863,19 +3892,25 @@ fn facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
         .collect()
 }
 
+const CLAIM_LIFECYCLE_EVENT_TYPES: [&str; 6] = [
+    "claim",
+    "claim.renewed",
+    "claim.expired",
+    "release",
+    "resolve",
+    "receipt",
+];
+
+fn is_claim_lifecycle_event_type(event_type: &str) -> bool {
+    CLAIM_LIFECYCLE_EVENT_TYPES.contains(&event_type)
+}
+
 /// Query only claim-lifecycle rows. This is the repository-wide collision
 /// seam for a path-scoped view; it deliberately does not load unrelated
 /// ledger facts, squads, health, or contributor activity.
 fn claim_lifecycle_facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
     let query = store
-        .query(&FactQuery::for_event_types([
-            "claim",
-            "claim.renewed",
-            "claim.expired",
-            "release",
-            "resolve",
-            "receipt",
-        ]))
+        .query(&FactQuery::for_event_types(CLAIM_LIFECYCLE_EVENT_TYPES))
         .map_err(|err| RallyError::Message(format!("query claim lifecycle facts: {err}")))?;
     query
         .event_records
@@ -3886,6 +3921,81 @@ fn claim_lifecycle_facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
             Fact::from_value(record.payload, seq)
         })
         .collect()
+}
+
+fn claim_lifecycle_facts_from_db_path(path: &Path) -> Result<Vec<Fact>> {
+    let store = open_fact_store(path)?;
+    claim_lifecycle_facts_from_store(&store)
+}
+
+/// Load canonical claim lifecycle content without accumulating unrelated room
+/// history. Each segment is parsed independently and non-lifecycle rows are
+/// discarded before the next segment is opened. Exact live/archive copies
+/// dedupe; conflicting canonical envelopes at one seq fail loud.
+fn claim_lifecycle_facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> {
+    let live = read_segment_files(log_dir)?;
+    let archived = replay_archive_segments(archive_dir)?;
+    let mut entries = Vec::new();
+    for path in live.iter().chain(archived.iter()) {
+        entries.extend(read_segment_entries_matching(path, |entry| {
+            is_claim_lifecycle_event_type(&entry.event_type)
+        })?);
+    }
+    entries.sort_by_key(|entry| entry.seq);
+
+    let mut facts = Vec::with_capacity(entries.len());
+    let mut seen = BTreeMap::<i64, LedgerLine>::new();
+    for entry in entries {
+        if let Some(existing) = seen.get(&entry.seq) {
+            if existing != &entry {
+                return Err(RallyError::Message(format!(
+                    "conflicting canonical claim lifecycle rows at seq {}: live/archive rows differ",
+                    entry.seq
+                )));
+            }
+            continue;
+        }
+        let seq = entry.seq;
+        let payload = entry.payload.clone();
+        seen.insert(seq, entry);
+        facts.push(Fact::from_segment_value(payload, seq)?);
+    }
+    Ok(facts)
+}
+
+/// Canonical and derived facts use different physical record sequences after
+/// sparse replay. Both decoders normalize them onto the canonical payload seq;
+/// sorting full serialized Facts then compares every collision-bearing field
+/// while retaining duplicate rows as a mismatch.
+fn normalized_claim_lifecycle_content(facts: &[Fact]) -> Result<Vec<(i64, String)>> {
+    let mut rows = facts
+        .iter()
+        .map(|fact| {
+            serde_json::to_string(fact)
+                .map(|serialized| (fact.seq, serialized))
+                .map_err(RallyError::json("normalize claim lifecycle fact"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    rows.sort();
+    Ok(rows)
+}
+
+fn claim_lifecycle_content_equivalent(canonical: &[Fact], derived: &[Fact]) -> Result<bool> {
+    Ok(normalized_claim_lifecycle_content(canonical)?
+        == normalized_claim_lifecycle_content(derived)?)
+}
+
+fn force_rebuild_db_from_canonical_segments(
+    log_dir: &Path,
+    archive_dir: &Path,
+    facts_db_path: &Path,
+) -> Result<()> {
+    let live = read_segment_files(log_dir)?;
+    let archived = replay_archive_segments(archive_dir)?;
+    let canonical_stats = segment_seq_stats(&live, &archived)?;
+    rebuild_db_from_segments(&live, &archived, facts_db_path)?;
+    refresh_reconcile_cache_after_full_scan(log_dir, archive_dir, facts_db_path, canonical_stats);
+    Ok(())
 }
 
 /// Reduce the typed repository-wide lifecycle query to the facts that can
@@ -6237,6 +6347,15 @@ fn read_segment_files(dir: &Path) -> Result<Vec<PathBuf>> {
 /// loudly with path and line evidence. A valid final record is accepted even
 /// when it lacks a newline.
 fn read_segment_entries(path: &Path) -> Result<Vec<LedgerLine>> {
+    read_segment_entries_matching(path, |_| true)
+}
+
+/// Apply `include` as each canonical row is decoded so bounded projections can
+/// avoid materializing unrelated rows even when one segment is large.
+fn read_segment_entries_matching(
+    path: &Path,
+    mut include: impl FnMut(&LedgerLine) -> bool,
+) -> Result<Vec<LedgerLine>> {
     let file = match fs::File::open(path) {
         Ok(file) => file,
         // f4: callers list segment files via `read_segment_files` and then
@@ -6282,7 +6401,8 @@ fn read_segment_entries(path: &Path) -> Result<Vec<LedgerLine>> {
         }
 
         match serde_json::from_slice::<LedgerLine>(&bytes) {
-            Ok(entry) => entries.push(entry),
+            Ok(entry) if include(&entry) => entries.push(entry),
+            Ok(_) => {}
             Err(_) if !had_newline => break,
             Err(err) => {
                 return Err(RallyError::Message(format!(
@@ -7609,6 +7729,141 @@ mod ledger_tests {
         assert_eq!(projected.seq, 2, "canonical segment seq must win");
         assert_eq!(scoped.max_seq, 2);
         assert_eq!(scoped.content_max_seq, 2);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scoped_path_repairs_same_shape_db_content_drift_before_collision_query() {
+        let root = unique_root("scoped-snapshot-db-content-drift");
+        let mut store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        store
+            .append_fact(&make_fact(
+                "artifact-alpha-db-content",
+                FactKind::Artifact,
+                "file:src/lib.rs",
+                "selected work",
+            ))
+            .unwrap();
+        store.set_active_engagement_for_test("engagement-beta");
+        let mut claim = make_fact(
+            "claim-beta-db-content",
+            FactKind::Claim,
+            "file:src/lib.rs",
+            "canonical collision claim",
+        );
+        claim.tool = Some("codex:beta".to_string());
+        claim.from_session_id = Some("sess:beta".to_string());
+        claim.created_at = "2099-01-01T00:00:02Z".to_string();
+        store.append_fact(&claim).unwrap();
+
+        // Preserve row count and canonical high-water while changing the
+        // safety-bearing scope only in the derived cache. Count/max reconcile
+        // cannot distinguish this stale row from canonical truth.
+        let facts_db = root.join(".rally/facts.db");
+        remove_fact_store_journals(&facts_db);
+        let connection = Connection::open(&facts_db).unwrap();
+        let raw: String = connection
+            .query_row(
+                "SELECT payload FROM events WHERE event_type = 'claim'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut payload: Value = serde_json::from_str(&raw).unwrap();
+        payload["scope"] = json!(["file:src/other.rs"]);
+        connection
+            .execute(
+                "UPDATE events SET payload = ?1 WHERE event_type = 'claim'",
+                [serde_json::to_string(&payload).unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .ok();
+        drop(connection);
+
+        let scoped = store
+            .snapshot_scoped("engagement-alpha", None, Some("src/lib.rs"), false, false)
+            .unwrap();
+        let projected = scoped
+            .active_claims
+            .iter()
+            .find(|fact| fact.event_id == "claim-beta-db-content")
+            .expect("cold direct mode must repair same-shape DB content drift");
+        assert_eq!(projected.scope, ["file:src/lib.rs"]);
+        assert_eq!(projected.seq, 2);
+        assert_eq!(scoped.max_seq, 2);
+        assert_eq!(scoped.content_max_seq, 2);
+
+        let repaired = open_fact_store(&facts_db).unwrap();
+        let repaired_claims = claim_lifecycle_facts_from_store(&repaired).unwrap();
+        assert_eq!(
+            repaired_claims
+                .iter()
+                .find(|fact| fact.event_id == "claim-beta-db-content")
+                .unwrap()
+                .scope,
+            ["file:src/lib.rs"],
+            "the derived cache must be rebuilt, not bypassed for one response"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scoped_path_warm_same_shape_content_drift_fails_loud() {
+        let root = unique_root("scoped-snapshot-warm-content-drift");
+        let mut store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        store
+            .append_fact(&make_fact(
+                "artifact-alpha-warm-content",
+                FactKind::Artifact,
+                "file:src/new.rs",
+                "selected work",
+            ))
+            .unwrap();
+        store.set_active_engagement_for_test("engagement-beta");
+        let mut claim = make_fact(
+            "claim-beta-warm-content",
+            FactKind::Claim,
+            "file:src/old.rs",
+            "derived cache will retain this old scope",
+        );
+        claim.tool = Some("codex:beta".to_string());
+        claim.from_session_id = Some("sess:beta".to_string());
+        store.append_fact(&claim).unwrap();
+        store.install_warm_fact_store().unwrap();
+
+        // Rewrite canonical content without changing row count or logical
+        // high-water. The daemon-owned DB still contains src/old.rs.
+        let segment = store.active_segment_path();
+        let mut entries = read_segment_entries(&segment).unwrap();
+        let claim_entry = entries
+            .iter_mut()
+            .find(|entry| entry.event_type == "claim")
+            .unwrap();
+        claim_entry.payload["scope"] = json!(["file:src/new.rs"]);
+        let rendered = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&segment, format!("{rendered}\n")).unwrap();
+
+        let err = store
+            .snapshot_scoped("engagement-alpha", None, Some("src/new.rs"), false, false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("facts-db-recovery-required"),
+            "a daemon-owned same-shape content mismatch must fail loud: {err}"
+        );
         fs::remove_dir_all(root).ok();
     }
 
