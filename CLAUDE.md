@@ -25,6 +25,14 @@ This repo coordinates parallel coding agents via **agent-rally-point** (per-repo
 - **Handoffs & launching agents (Claude+Codex):** [docs/HANDOFFS-AND-LAUNCHING-AGENTS.md](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md)
 <!-- rally:end -->
 
+## Performance claims (working agreement, set 2026-08-11)
+
+Absolute latency and token thresholds — 20 ms `before-write`, 150 ms `start`, 60 tokens per prompt — are **reference points, not pass conditions**. Round numbers invite optimizing the number instead of the product.
+
+If you claim a cost improvement, record three things: a **before** on the same build id from a disposable fixture, a **component attribution** for the delta (spawn count, ledger work, render, interpreter), and an **invariant re-check**. A headline win that raises spawn count, unattributed time, or output bytes is not a win. Full rule: `.build-loop/goal.md` criteria 12-14.
+
+Known measured mechanism, so you do not re-derive it: hook cost scales with ledger size and each hook fire writes ~14 ledger lines back into that ledger (O39). Node is ~5-10 % of hook cost, not the bottleneck (O36).
+
 ## Status heartbeats (working agreement)
 
 During any operation expected to exceed ~10 minutes (long implementations, renders, big test runs, orchestration waits), post a brief status to the room every ~10 minutes:
