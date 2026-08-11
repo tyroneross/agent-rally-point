@@ -376,10 +376,19 @@ T="UserPromptSubmit prompt includes peer status changes"
   rc=$?
   if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
   printf '%s' "$out" | grep -q "UserPromptSubmit" || { printf 'missing UserPromptSubmit envelope: %s\n' "$out" >&2; exit 1; }
-  printf '%s' "$out" | grep -q "Agent status:" || { printf 'missing status header: %s\n' "$out" >&2; exit 1; }
+  # Smart-brevity shape: the roster now hangs off a `Next:` line instead of an
+  # `Agent status:` label.
+  printf '%s' "$out" | grep -q "Next:" || { printf 'missing Next line: %s\n' "$out" >&2; exit 1; }
   printf '%s' "$out" | grep -q "claude_code:lead: working on crates/rally-cli («engine dispatch»)" || { printf 'missing working peer: %s\n' "$out" >&2; exit 1; }
-  # Quoted for the same ARP-R-08 reason as the SessionStart case above.
-  printf '%s' "$out" | grep -q "«gemini:qa»: idle, next check-in 2999-01-01T00:05:00Z" || { printf 'missing peer next check-in: %s\n' "$out" >&2; exit 1; }
+  # Quoted for the same ARP-R-08 reason as the SessionStart case above. The peer
+  # id and its quoting are the security-bearing part and must survive; only the
+  # next-check-in timestamp was dropped.
+  printf '%s' "$out" | grep -q "«gemini:qa»: idle" || { printf 'missing idle peer id: %s\n' "$out" >&2; exit 1; }
+  # Regression guard for the change itself: timestamps must NOT come back.
+  if printf '%s' "$out" | grep -q "next check-in"; then
+    printf 'next-check-in timestamp reappeared in the per-turn advisory: %s\n' "$out" >&2
+    exit 1
+  fi
   if printf '%s' "$out" | grep -q "codex:observer: idle"; then
     printf 'per-turn prompt should omit self-only status noise: %s\n' "$out" >&2
     exit 1

@@ -1318,7 +1318,10 @@ function statusSummaryLines(selfTool) {
     if (!s || !s.tool || s.tool === "rally" || s.stale || s.tool === selfTool) return null;
     const who = ident(s.tool, 60);
     if (s.state === "working") return `${who}: working on ${ident(s.file || "?", 120)}${s.intent ? ` (${prose(s.intent, 80)})` : ""}`;
-    if (s.state === "idle") return `${who}: idle${s.wake_after ? `, next check-in ${ident(s.wake_after, 40)}` : ""}`;
+    // Next-check-in timestamps were dropped deliberately: they are the largest
+    // recurring token cost in the roster and no reader acts on them. The id is
+    // what affects your edits. `rally room --json` still carries wake_after.
+    if (s.state === "idle") return `${who}: idle`;
     if (s.state === "blocked") {
       const ref = s.ref || s.ref_id || "";
       return `${who}: blocked${ref ? ` on ${ident(ref, 60)}` : ""}`;
@@ -1338,23 +1341,47 @@ if ((!visible || !visible.present) && next?.actionable) {
   const subject = next?.fact?.subject
     ? prose(next.fact.subject, 120)
     : (next?.reason ? prose(next.reason, 120) : prose("see rally next", 120));
+  // Smart-brevity shape: what happened, why it matters, what to do. The old
+  // single run-on line buried the action behind an id and a label. Peer-authored
+  // spans still go through prose()/ident(), so the untrusted-data handling is
+  // unchanged — only the ordering and the volume around it changed.
+  const ACTION_PHRASE = {
+    review_artifact: "1 item needs review",
+    respond_to_handoff: "1 handoff needs a reply",
+    update_plan_status: "1 plan needs a status update",
+    continue_or_release_claim: "1 claim needs continue-or-release",
+  };
+  const actionRaw = String(next?.action || "");
+  const what = ACTION_PHRASE[actionRaw] || prose(actionRaw || "coordination work", 60);
+  const filedBy = next?.fact?.tool ? ident(next.fact.tool, 60) : null;
   visible = {
     present: true,
     severity: next?.requires_human ? "stop" : "warn",
-    message: `Rally has actionable coordination work: ${prose(next.action, 120)}. Item [${factId}] subject ${subject}.`
+    message: `Rally: ${what} — ${subject}.`,
+    why: `${filedBy ? `${filedBy} filed it. ` : ""}Item [${factId}].`,
   };
   hasLedgerData = true;
 }
 
-if (visible?.present && peerStatusLines.length) {
-  const suffix = `Agent status: ${peerStatusLines.slice(0, 8).join("; ")}${peerStatusLines.length > 8 ? ` (+${peerStatusLines.length - 8} more)` : ""}.`;
-  visible = {...visible, message: `${visible.message || ""} ${suffix}`.trim()};
-  hasLedgerData = true;
-} else if ((!visible || !visible.present) && peerStatusLines.length) {
+function rosterLine(lines) {
+  if (!lines.length) return "";
+  const shown = lines.slice(0, 8).join("; ");
+  return `${shown}${lines.length > 8 ? ` (+${lines.length - 8} more)` : ""}`;
+}
+
+if (visible?.present) {
+  const roster = rosterLine(peerStatusLines);
+  const nextCmd = `rally next --tool ${ident(tool || "<you>", 60)}`;
+  const parts = [visible.message];
+  if (visible.why) parts.push(`  Why: ${visible.why}`);
+  parts.push(`  Next: ${nextCmd}${roster ? ` · ${roster}` : ""}`);
+  visible = { ...visible, message: parts.join("\n") };
+  if (peerStatusLines.length) hasLedgerData = true;
+} else if (peerStatusLines.length) {
   visible = {
     present: true,
     severity: "info",
-    message: `Agent status: ${peerStatusLines.slice(0, 8).join("; ")}${peerStatusLines.length > 8 ? ` (+${peerStatusLines.length - 8} more)` : ""}.`
+    message: `Rally: no action needed.\n  Next: ${rosterLine(peerStatusLines)}`,
   };
   hasLedgerData = true;
 }
