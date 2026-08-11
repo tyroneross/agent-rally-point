@@ -4,13 +4,13 @@
 
 # Rally Delivery Router Dependency Map
 
-> **Status:** proposed change map, not an implementation commitment.
-> **Rally baseline:** `8625be8` on 2026-08-08; unrelated working-tree changes were excluded from
-> source conclusions.
-> **NavGator baseline:** full scan labeled `8625be8`; 621 components, 457 detected connections,
-> 60% file-to-component coverage, 0.71 overall confidence. The scan observed the working tree even
-> though its freshness stamp reported zero dirty files, so counts are discovery evidence rather
-> than a clean-commit attestation.
+> **Status (2026-08-10):** R0 shared contracts and the R1 pure planner are implemented in this
+> change set; integration, runtime activation, and route cutover remain pending.
+> **Rally baseline:** local `main` `8d21f2c`; `origin/main` `3d27f28`. Unrelated working-tree changes
+> were excluded from source conclusions.
+> **NavGator status:** no refreshed scan artifact accompanies this change. Earlier discovery output
+> missed source-proven Rust edges and did not attest worktree cleanliness, so direct source, Cargo
+> metadata, and executable tests are authoritative here.
 > **Companion decision:** [`ROUTER-ARCHITECTURE.md`](ROUTER-ARCHITECTURE.md).
 > **Detailed process contracts:**
 > [`DAEMON-AND-TRANSPORT-ARCHITECTURE.md`](DAEMON-AND-TRANSPORT-ARCHITECTURE.md).
@@ -33,24 +33,37 @@ The smallest useful change is smaller than the original clean-sheet proposal:
 This sequence delivers the main new capability—delivery that survives sender exit—without first
 rewriting the ledger, merging daemons, or building every provider adapter.
 
-## NavGator findings and limit
+## Implementation status
 
-NavGator correctly located the relevant components and source positions, including:
+| Slice | Status | What exists now | What remains |
+| --- | --- | --- | --- |
+| R0 common contract | Implemented and tested in this change set | Flat backward-compatible delivery/receipt envelopes; stable logical dedupe key; unique attempt IDs; endpoint capability descriptors; asserted-versus-verified evidence | No live `FileInbox` format change; no authenticated principal verification |
+| R1 pure planner | Implemented and tested in this change set | Deterministic target-first selection, typed rejection reasons, safe fallback rules, provider-neutral policy, and a pure shadow comparator | Convert live session records into endpoint descriptors and call the comparator from `command_inject` |
+| R1 live shadow activation | Pending | Existing `BackendRunner` remains authoritative, so current delivery behavior and latency are unchanged | Add one observation-only call at the coordinated `crates/rally-cli/src/lib.rs` send boundary |
+| R2+ resident routing | Not started | Contracts make later attempt persistence explicit | Leases, deadlines, durable retry, endpoint probes, worker loop, adapters, and `rally-routerd` |
+
+The current build therefore creates an independently testable policy seam without inserting a
+process hop or changing a user's delivery route. It does not yet provide post-sender-exit delivery.
+
+## Historical NavGator findings and limit
+
+The earlier recorded NavGator pass located these components, but it is discovery evidence rather
+than verification of this change:
 
 - `RoomStore` at `crates/rally-cli/src/store.rs:1200`.
 - `ManagedSession` at `crates/rally-cli/src/backends.rs:56`.
 - `BackendRunner` at `crates/rally-cli/src/backends.rs:396`.
-- `Directive` at `crates/rally-protocol/src/lib.rs:71`.
+- `Directive` at `crates/rally-protocol/src/lib.rs:73`.
 - `EndpointResolution` at `crates/rally-cli/src/session_identity.rs:109`.
 - `Adapter`, `Supervisor`, `ClaudeAdapter`, and `CodexAdapter` in `cockpitd`.
 
-Its impact, connection, trace, and focused-diagram commands returned zero edges for `RoomStore`,
+That pass's impact, connection, trace, and focused-diagram commands returned zero edges for `RoomStore`,
 `BackendRunner`, `ManagedSession`, and `Directive`, even though direct source references prove those
-call paths. Its coverage report also maps only 99 of 165 files. Therefore:
+call paths, and its reported source coverage was incomplete. Therefore:
 
-- NavGator evidence is authoritative for discovered component locations and the measured coverage
-  limitation.
-- Direct Rust references and Cargo metadata are authoritative for the dependency edges below.
+- Direct Rust references and Cargo metadata are authoritative for the component locations and
+  dependency edges below.
+- Historical NavGator output is supplementary discovery evidence only.
 - NavGator's `HIGH` severity with zero affected files is not used as a risk score; that combination
   is internally inconsistent for this repository.
 - NavGator's zero-dirty freshness result is not used as worktree evidence; `git status` is the
@@ -167,7 +180,9 @@ The sibling `ptyd` repository implements this path. The installed `rally-termd` 
 currently discover, start, configure, or monitor it. On 2026-08-08, `ptyd server` was running but
 `rally-termd` was not. Its execute-then-receipt-then-high-water order also leaves a crash window in
 which a PTY action may be repeated; exact-once delivery requires endpoint idempotency that PTY input
-cannot generally provide.
+cannot generally provide. The R1 planner therefore permits an uncertain-send retry only through the
+same endpoint when that endpoint advertises stable-key deduplication. It refuses cross-endpoint
+fallback until a later contract can prove that both endpoints share one target-wide dedupe domain.
 
 #### 5. Target ACK and completion
 
@@ -414,9 +429,10 @@ remote-auth, payload-classification, and full-envelope transfer requirements.
 | Provider combinations work | Terminal route integration tests | Claude→Claude, Claude→Codex, Codex→Claude, Codex→Codex |
 | Offline remains correct | Ledger-only inject path | Router absent, receiver pull still observes the canonical event |
 
-After each code slice, run a new NavGator full scan and `navgator arch-diff` against `8625be8`.
-Treat new dependencies from `rallyd` to provider, network, process, `ptyd`, or `cockpitd` code as a
-blocking architecture regression.
+After each code slice, run the direct dependency, architecture, and integration gates above. A
+persisted NavGator scan may supplement that evidence, but cannot replace it while known source edges
+remain absent. Treat source-proven new dependencies from `rallyd` to provider, network, process,
+`ptyd`, or `cockpitd` code as a blocking architecture regression.
 
 ## Challenges to the original proposal
 

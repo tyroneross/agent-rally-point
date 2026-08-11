@@ -21,6 +21,7 @@
 //! the pinned budget (200ms) sits well below the induced block (800ms), so
 //! the assertions are falsifiable rather than a function of host speed.
 
+use rusqlite::Connection;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -210,6 +211,107 @@ fn unique_subject(label: &str, index: usize) -> String {
             .unwrap()
             .as_nanos()
     )
+}
+
+#[test]
+fn thirty_two_cold_direct_commands_are_lossless_and_integral() {
+    const N: usize = 32;
+    const BOUNDED_WAIT_MS: &str = "60000";
+    let room = TempRoom::new("cold-direct-32");
+    let mut subjects = Vec::with_capacity(N);
+    let mut handles = Vec::with_capacity(N);
+
+    // Do not seed or start a daemon: all 32 processes race the same cold room
+    // and must serialize through direct.owner.lock within the declared bound.
+    for i in 0..N {
+        let subject = unique_subject("cold-direct", i);
+        subjects.push(subject.clone());
+        let cwd = room.cwd.clone();
+        let home = room.home.clone();
+        handles.push(thread::spawn(move || {
+            Command::new(env!("CARGO_BIN_EXE_rally"))
+                .current_dir(cwd)
+                .env("HOME", home)
+                .args([
+                    "say",
+                    "artifact",
+                    "--tool",
+                    &format!("codex:cold-{i}"),
+                    "--subject",
+                    &subject,
+                    "--uri",
+                    &format!("file:src/cold-{i}.rs"),
+                    "--json",
+                    "--timeout-ms",
+                    BOUNDED_WAIT_MS,
+                ])
+                .output()
+                .expect("spawn cold direct command")
+        }));
+    }
+
+    let outputs: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("cold direct thread must not panic"))
+        .collect();
+    for (subject, output) in subjects.iter().zip(&outputs) {
+        assert!(
+            output.status.success(),
+            "{subject} exceeded bounded ownership wait or failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload = stdout_json(output);
+        assert_eq!(payload["ok"], true, "{subject} returned ambiguous success");
+    }
+
+    let mut observed = std::collections::BTreeMap::<String, usize>::new();
+    for entry in fs::read_dir(room.cwd.join(".rally/log")).expect("read canonical log dir") {
+        let path = entry.expect("read log entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        for line in fs::read_to_string(path)
+            .expect("read canonical segment")
+            .lines()
+        {
+            let row: Value = serde_json::from_str(line).expect("canonical row must parse");
+            if row["payload"]["kind"] == "artifact"
+                && let Some(subject) = row["payload"]["subject"].as_str()
+                && subjects.iter().any(|expected| expected == subject)
+            {
+                *observed.entry(subject.to_string()).or_default() += 1;
+            }
+        }
+    }
+    for subject in &subjects {
+        assert_eq!(
+            observed.get(subject),
+            Some(&1),
+            "success/ledger mismatch for {subject}: silent loss or duplicate"
+        );
+    }
+
+    let quarantine: Vec<_> = fs::read_dir(room.cwd.join(".rally"))
+        .expect("read .rally")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains("facts.db.corrupt")
+        })
+        .collect();
+    assert!(
+        quarantine.is_empty(),
+        "cold direct run quarantined facts.db"
+    );
+
+    let db = Connection::open(room.cwd.join(".rally/facts.db")).expect("open facts.db");
+    let integrity: String = db
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .expect("run sqlite integrity_check");
+    assert_eq!(integrity, "ok", "facts.db integrity failure");
 }
 
 /// The overrun budget for the uncommitted-timeout group: well below the

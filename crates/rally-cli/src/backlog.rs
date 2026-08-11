@@ -228,6 +228,7 @@ pub(crate) fn add_backlog_item(
         expected_by,
     );
     room.append_fact_verified(&fact)
+        .map(crate::store::AppendOutcome::into_fact_reporting)
 }
 
 /// Update an existing backlog item by appending a same-id fact. Omitted fields
@@ -273,6 +274,7 @@ pub(crate) fn update_backlog_item(
         expected_by,
     );
     room.append_fact_verified(&fact)
+        .map(crate::store::AppendOutcome::into_fact_reporting)
 }
 
 /// Mark an existing backlog item `done` by appending a same-id status fact
@@ -299,6 +301,7 @@ pub(crate) fn mark_backlog_done(room: &RoomStore, tool: &str, id: &str) -> Resul
         existing.expected_by.as_deref(),
     );
     room.append_fact_verified(&fact)
+        .map(crate::store::AppendOutcome::into_fact_reporting)
 }
 
 /// Return all backlog items for this room, ordered by seq ascending.

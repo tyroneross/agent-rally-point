@@ -941,7 +941,7 @@ mod tests {
         blocker.severity = Some("medium".to_string());
         store.append_fact(&blocker).unwrap();
         let mut resolve = make_fact("e5", FactKind::Resolve, "src/y.rs", "beta resolved");
-        resolve.ref_id = Some("fact_blocker".to_string());
+        resolve.ref_id = Some(blocker.event_id.clone());
         store.append_fact(&resolve).unwrap();
         let mut artifact = make_fact("e6", FactKind::Artifact, "src/y.rs", "beta artifact");
         artifact.uri = Some("docs/output.md".to_string());

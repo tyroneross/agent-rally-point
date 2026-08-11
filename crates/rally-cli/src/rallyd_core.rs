@@ -46,10 +46,11 @@
 //! ## Lifecycle
 //!
 //! SIGTERM/SIGINT set the shutdown flag; the accept loop drains, the dispatcher
-//! drops the store (releasing the warm pool), the runtime files are unlinked,
-//! and the EX guard is released at scope end. Optional `--idle-exit-secs N`
-//! (default off) exits after N idle seconds — test hygiene against orphaned
-//! daemons.
+//! explicitly closes the warm pool, and the runtime files are unlinked. The EX
+//! guard is released after successful close; a close timeout deliberately keeps
+//! it until process exit so detached store work cannot overlap a replacement
+//! owner. Optional `--idle-exit-secs N` (default off) exits after N idle seconds
+//! — test hygiene against orphaned daemons.
 //!
 //! ## R8 — segment-staleness refresh
 //!
@@ -147,7 +148,7 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-    use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -185,7 +186,7 @@ mod imp {
     /// `SOMAXCONN`); under a burst of concurrent client connects the kernel
     /// queue can fill between accept-loop wakes and REFUSE connects
     /// (ECONNREFUSED), which the client's fresh-connection-per-op path
-    /// misclassifies as R6's retryable "daemon stopped mid-request". A large
+    /// surfaces as R6's routed transport failure. A large
     /// backlog lets the queue hold a full burst until the next drain wake. 1024
     /// == a common `SOMAXCONN`; the kernel silently clamps to its own max.
     const LISTEN_BACKLOG: i32 = 1024;
@@ -193,6 +194,14 @@ mod imp {
     /// Per-connection read/write timeout. Bounds a stalled client so a reader
     /// thread cannot wedge indefinitely (each connection carries one request).
     const CONN_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Preserve reply time after a mutation start deadline expires.
+    const MUTATION_REPLY_RESERVE: Duration = Duration::from_millis(250);
+
+    /// Daemon lifecycle waits are explicit and finite. Store-open work runs
+    /// inside this deadline; explicit warm close gets its own shorter budget.
+    const DAEMON_OPEN_BOUND: Duration = Duration::from_secs(10);
+    const DAEMON_WARM_CLOSE_BOUND: Duration = Duration::from_secs(5);
+    const DAEMON_SHUTDOWN_BOUND: Duration = Duration::from_secs(16);
 
     /// SEC-003: hard cap on concurrent per-connection reader threads. Each
     /// accepted connection spawns one short-lived reader thread that funnels its
@@ -255,9 +264,37 @@ mod imp {
         }
     }
 
-    /// One job on the dispatcher channel: a parsed request + the oneshot reply
-    /// channel back to the connection's reader thread.
-    type Job = (StoreRequest, Sender<StoreResponse>);
+    /// Receipt timing is captured before a request enters the single dispatcher
+    /// queue. Queue delay is then subtracted with the daemon's monotonic clock,
+    /// so a wall-clock rollback after receipt cannot extend mutation work.
+    #[derive(Clone, Copy)]
+    struct RequestReceipt {
+        monotonic: Instant,
+        unix_ms: u64,
+    }
+
+    impl RequestReceipt {
+        fn now() -> Self {
+            Self {
+                monotonic: Instant::now(),
+                unix_ms: unix_now_ms(),
+            }
+        }
+    }
+
+    /// One parsed request plus receipt timing and its oneshot reply channel.
+    struct Job {
+        request: StoreRequest,
+        reply: Sender<StoreResponse>,
+        receipt: RequestReceipt,
+    }
+
+    fn unix_now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0)
+    }
 
     fn now_millis() -> i64 {
         SystemTime::now()
@@ -451,8 +488,28 @@ mod imp {
         let mut line =
             serde_json::to_string(resp).map_err(|e| std::io::Error::other(e.to_string()))?;
         line.push('\n');
+        if line.len() > MAX_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "serialized daemon reply is {} bytes, exceeding protocol maximum {MAX_LINE_BYTES}",
+                    line.len()
+                ),
+            ));
+        }
         stream.write_all(line.as_bytes())?;
         stream.flush()
+    }
+
+    /// A nonblocking listener may yield an accepted stream with nonblocking
+    /// status on some Unix platforms. Per-connection handling uses blocking
+    /// framed I/O with explicit timeouts; normalize the accepted fd before any
+    /// read or write so a reply larger than the socket buffer cannot terminate
+    /// at the first `WouldBlock` boundary.
+    fn prepare_accepted_stream(stream: &UnixStream) -> std::io::Result<()> {
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(CONN_TIMEOUT))?;
+        stream.set_write_timeout(Some(CONN_TIMEOUT))
     }
 
     /// SEC-003: answer an over-cap / un-spawnable connection immediately with a
@@ -460,18 +517,25 @@ mod imp {
     /// op path maps this to R6's "retry", so a momentary reader-thread saturation
     /// sheds load gracefully instead of the accept loop dying on a `spawn` panic.
     fn respond_busy(stream: &UnixStream) {
-        let _ = stream.set_read_timeout(Some(CONN_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(CONN_TIMEOUT));
+        if let Err(e) = prepare_accepted_stream(stream) {
+            log(&format!("configure busy response stream failed: {e}"));
+            return;
+        }
         let resp = StoreResponse::Err(StoreError::transport("daemon busy; retry"));
-        let _ = write_response(stream, &resp);
+        if let Err(e) = write_response(stream, &resp) {
+            log(&format!("write busy response failed: {e}"));
+        }
     }
 
     /// Per-connection reader thread: read one request line, route it through the
     /// dispatcher, write one reply line, close. Any framing/parse failure yields
     /// a structured error reply (never a panic — falsifier B).
-    fn handle_conn(stream: UnixStream, job_tx: Sender<Job>) {
-        let _ = stream.set_read_timeout(Some(CONN_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(CONN_TIMEOUT));
+    fn handle_conn(
+        stream: UnixStream,
+        job_tx: Sender<Job>,
+        rally_dir: &Path,
+    ) -> std::io::Result<()> {
+        prepare_accepted_stream(&stream)?;
 
         let response = match read_request_line(&stream) {
             Err(e) => StoreResponse::Err(e),
@@ -487,7 +551,12 @@ mod imp {
                         )),
                         Ok(req) => {
                             let (reply_tx, reply_rx) = mpsc::channel();
-                            if job_tx.send((req, reply_tx)).is_err() {
+                            let job = Job {
+                                request: req,
+                                reply: reply_tx,
+                                receipt: RequestReceipt::now(),
+                            };
+                            if job_tx.send(job).is_err() {
                                 StoreResponse::Err(StoreError::transport(
                                     "daemon dispatcher stopped; retry",
                                 ))
@@ -515,22 +584,37 @@ mod imp {
                 }
             }
         };
-        let _ = write_response(&stream, &response);
+        if store::trigger_o26_fault(rally_dir, store::O26FaultPoint::DaemonReplyDrop).is_err() {
+            return Ok(());
+        }
+        write_response(&stream, &response)
     }
 
     /// Map an internal [`RallyError`] onto the frozen wire [`StoreError`] with
     /// exit-code parity (G8). `Io`/`Json` collapse to `Internal` (source dropped
     /// over the wire).
     fn rally_to_wire(err: RallyError) -> StoreError {
-        let message = err.to_string();
-        let kind = match err {
-            RallyError::Usage(_) => StoreErrorKind::Usage,
-            RallyError::NotFound(_) => StoreErrorKind::NotFound,
-            RallyError::Command(_) => StoreErrorKind::Command,
-            RallyError::Message(_) => StoreErrorKind::Message,
-            RallyError::Io { .. } | RallyError::Json { .. } => StoreErrorKind::Internal,
-        };
-        StoreError::new(kind, message)
+        match err {
+            RallyError::OutcomeUnknown {
+                event_id,
+                phase,
+                detail,
+            } => StoreError::outcome_unknown(event_id, phase, detail),
+            other => {
+                let message = other.to_string();
+                let kind = match other {
+                    RallyError::Usage(_) => StoreErrorKind::Usage,
+                    RallyError::NotFound(_) => StoreErrorKind::NotFound,
+                    RallyError::Command(_) => StoreErrorKind::Command,
+                    RallyError::Message(_) => StoreErrorKind::Message,
+                    RallyError::NotStarted(_) => StoreErrorKind::NotStarted,
+                    RallyError::IncompatibleWire { .. } => StoreErrorKind::IncompatibleWire,
+                    RallyError::Io { .. } | RallyError::Json { .. } => StoreErrorKind::Internal,
+                    RallyError::OutcomeUnknown { .. } => unreachable!("handled above"),
+                };
+                StoreError::new(kind, message)
+            }
+        }
     }
 
     fn fact_from_value(v: Value) -> Result<store::Fact, StoreError> {
@@ -566,17 +650,43 @@ mod imp {
 
     /// Dispatch one request against the single-owner store. Applies the request's
     /// engagement BEFORE the op (L9/R4); answers `Ping` directly.
+    #[cfg(test)]
     fn dispatch_one(
         store: &mut DirectRoomStore,
         repo_root: &str,
         req: StoreRequest,
     ) -> StoreResponse {
+        dispatch_one_received(store, repo_root, req, RequestReceipt::now())
+    }
+
+    fn dispatch_one_received(
+        store: &mut DirectRoomStore,
+        repo_root: &str,
+        req: StoreRequest,
+        receipt: RequestReceipt,
+    ) -> StoreResponse {
+        dispatch_one_received_with_hook(store, repo_root, req, receipt, || {})
+    }
+
+    fn dispatch_one_received_with_hook<F>(
+        store: &mut DirectRoomStore,
+        repo_root: &str,
+        req: StoreRequest,
+        receipt: RequestReceipt,
+        before_deadline_install: F,
+    ) -> StoreResponse
+    where
+        F: FnOnce(),
+    {
         if req.wire_version != WIRE_VERSION {
-            return StoreResponse::Err(StoreError::transport(format!(
-                "wire_version mismatch: daemon speaks {WIRE_VERSION}, client sent {}; \
-                 run `rally daemon status`",
-                req.wire_version
-            )));
+            return StoreResponse::Err(StoreError::new(
+                StoreErrorKind::IncompatibleWire,
+                format!(
+                    "wire_version mismatch: daemon speaks {WIRE_VERSION}, client sent {}; \
+                 stop the incompatible daemon with `rally daemon stop` before retrying",
+                    req.wire_version
+                ),
+            ));
         }
         if matches!(req.op, StoreOp::Ping) {
             return StoreResponse::Ok(StoreOk::Pong {
@@ -585,16 +695,216 @@ mod imp {
                 wire_version: WIRE_VERSION,
             });
         }
+        if matches!(req.op, StoreOp::SnapshotScoped { .. }) && req.engagement.is_none() {
+            return StoreResponse::Err(StoreError::new(
+                StoreErrorKind::Usage,
+                "snapshot_scoped requires StoreRequest.engagement",
+            ));
+        }
         // Per-request engagement rebind (L9/R4): safe because the dispatcher is
         // single-threaded. The daemon NEVER consults its own process env here.
-        store.set_engagement_scope(req.engagement.clone());
-        match run_op(store, req.op) {
+        let request_engagement = req.engagement;
+        let request_deadline = req.deadline_unix_ms;
+        let request_budget_ms = req.mutation_budget_ms;
+        let op = req.op;
+        store.set_engagement_scope(request_engagement.clone());
+        let result = if op.is_mutating() {
+            let dispatch_monotonic = Instant::now();
+            let dispatch_unix_ms = unix_now_ms();
+            let deadline = match bounded_mutation_deadline(
+                request_deadline,
+                request_budget_ms,
+                receipt,
+                dispatch_unix_ms,
+                dispatch_monotonic,
+            ) {
+                None => {
+                    return StoreResponse::Err(StoreError::new(
+                        StoreErrorKind::NotStarted,
+                        "mutation-not-started: client deadline elapsed before daemon dispatch; no durable mutation started and retry is safe",
+                    ));
+                }
+                Some(deadline) => deadline,
+            };
+            before_deadline_install();
+            store::with_mutation_deadline_at(deadline, || {
+                run_op(store, op, request_engagement.as_deref())
+            })
+        } else {
+            run_op(store, op, request_engagement.as_deref())
+        };
+        match result {
             Ok(ok) => StoreResponse::Ok(ok),
             Err(e) => StoreResponse::Err(e),
         }
     }
 
-    fn run_op(store: &mut DirectRoomStore, op: StoreOp) -> Result<StoreOk, StoreError> {
+    /// Translate untrusted dual wire timing into one anchored monotonic deadline.
+    /// The absolute deadline consumes normal connect/read delay. The relative
+    /// budget caps rollback before receipt. Anchoring the result to the receipt
+    /// `Instant` consumes dispatcher queueing and preemption without ever
+    /// subtracting elapsed time and then adding the remainder to a newer clock.
+    /// A rollback that occurs entirely before receipt cannot be measured across
+    /// processes; taking the relative minimum bounds that residual to the
+    /// client's original budget instead of the 64-bit absolute delta.
+    fn bounded_mutation_deadline(
+        deadline_unix_ms: Option<u64>,
+        mutation_budget_ms: Option<u64>,
+        receipt: RequestReceipt,
+        dispatch_unix_ms: u64,
+        dispatch_monotonic: Instant,
+    ) -> Option<Instant> {
+        let cap = CONN_TIMEOUT.saturating_sub(MUTATION_REPLY_RESERVE);
+        let requested = mutation_budget_ms
+            .map(Duration::from_millis)
+            .unwrap_or(cap)
+            .min(cap);
+        if requested.is_zero() {
+            return None;
+        }
+        let absolute_remaining = |now_unix_ms| match deadline_unix_ms {
+            Some(deadline) if deadline <= now_unix_ms => None,
+            Some(deadline) => {
+                Some(Duration::from_millis(deadline.saturating_sub(now_unix_ms)).min(cap))
+            }
+            None => Some(cap),
+        };
+        let at_receipt = requested.min(absolute_remaining(receipt.unix_ms)?);
+        let receipt_deadline = receipt.monotonic.checked_add(at_receipt)?;
+        let dispatch_deadline =
+            dispatch_monotonic.checked_add(absolute_remaining(dispatch_unix_ms)?)?;
+        let deadline = receipt_deadline.min(dispatch_deadline);
+        if deadline <= dispatch_monotonic {
+            None
+        } else {
+            Some(deadline)
+        }
+    }
+
+    struct StoreOpenFailure {
+        error: RallyError,
+        retain_owner_until_exit: bool,
+    }
+
+    /// Open and warm the daemon-owned store on an owned worker. The caller waits
+    /// only until the absolute total deadline; a timed-out worker is detached,
+    /// and `serve_unix` retains owner EX until process exit before returning the
+    /// loud failure.
+    fn open_direct_store_bounded(
+        repo_root: PathBuf,
+        budget: Duration,
+    ) -> Result<DirectRoomStore, StoreOpenFailure> {
+        open_direct_store_bounded_with(repo_root, budget, || {})
+    }
+
+    fn open_direct_store_bounded_with<F>(
+        repo_root: PathBuf,
+        budget: Duration,
+        after_open: F,
+    ) -> Result<DirectRoomStore, StoreOpenFailure>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let budget = budget.min(DAEMON_OPEN_BOUND);
+        let deadline = Instant::now() + budget;
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("rally-daemon-store-open".to_string())
+            .spawn(move || {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let reply_reserve = MUTATION_REPLY_RESERVE.min(remaining / 4);
+                let lock_deadline = deadline.checked_sub(reply_reserve).unwrap_or(deadline);
+                let result = store::with_mutation_deadline_at(lock_deadline, || {
+                    let mut store = DirectRoomStore::open_direct_at(repo_root)?;
+                    after_open();
+                    store.install_warm_fact_store()?;
+                    Ok(store)
+                });
+                let _ = result_tx.send(result);
+            })
+            .map_err(|error| StoreOpenFailure {
+                error: RallyError::Command(format!(
+                    "daemon-open-not-started: could not spawn store-open worker: {error}"
+                )),
+                retain_owner_until_exit: false,
+            })?;
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = match result_rx.recv_timeout(remaining) {
+            Ok(result) => result.map_err(|error| StoreOpenFailure {
+                error,
+                retain_owner_until_exit: false,
+            }),
+            Err(RecvTimeoutError::Timeout) => Err(StoreOpenFailure {
+                error: RallyError::Command(format!(
+                    "daemon-open-timeout: store open did not finish within {}ms; startup worker remains isolated under owner lock until process exit",
+                    budget.as_millis()
+                )),
+                retain_owner_until_exit: true,
+            }),
+            Err(RecvTimeoutError::Disconnected) => Err(StoreOpenFailure {
+                error: RallyError::Command(
+                    "daemon-open-failed: store-open worker exited without a result; owner lock retained until process exit"
+                        .to_string(),
+                ),
+                retain_owner_until_exit: true,
+            }),
+        };
+        drop(worker);
+        result
+    }
+
+    fn retain_owner_after_open_failure(
+        owner: &mut Option<store::OwnerGuard>,
+        failure: &StoreOpenFailure,
+    ) {
+        if failure.retain_owner_until_exit
+            && let Some(owner) = owner.take()
+        {
+            std::mem::forget(owner);
+        }
+    }
+
+    /// Wait for explicit dispatcher/store close without ever joining past the
+    /// deadline. On failure, deliberately retain daemon owner EX until process
+    /// exit: the detached dispatcher owns every value it can still access, and
+    /// no second daemon or direct owner may enter while it finishes or remains
+    /// wedged.
+    fn await_dispatcher_close(
+        close_rx: Receiver<Result<(), String>>,
+        dispatcher: thread::JoinHandle<()>,
+        owner: store::OwnerGuard,
+        bound: Duration,
+    ) -> Result<store::OwnerGuard, ServeError> {
+        let close_result = match close_rx.recv_timeout(bound) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(format!(
+                "daemon-close-timeout: dispatcher did not close within {}ms",
+                bound.as_millis()
+            )),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err("daemon-close-failed: dispatcher exited without close result".to_string())
+            }
+        };
+        // The completion channel is the bounded contract. Dropping a live
+        // JoinHandle detaches; the move closure owns its store and paths.
+        drop(dispatcher);
+        match close_result {
+            Ok(()) => Ok(owner),
+            Err(error) => {
+                // This is a deliberate failure-path guard leak. The OS releases
+                // the fd when the daemon process exits; until then, fail closed.
+                std::mem::forget(owner);
+                Err(ServeError::new(error))
+            }
+        }
+    }
+
+    fn run_op(
+        store: &mut DirectRoomStore,
+        op: StoreOp,
+        request_engagement: Option<&str>,
+    ) -> Result<StoreOk, StoreError> {
         Ok(match op {
             StoreOp::Ping => {
                 // Handled in dispatch_one before engagement rebinding.
@@ -607,14 +917,14 @@ mod imp {
                 let f = fact_from_value(fact)?;
                 let out = store.append_fact(&f).map_err(rally_to_wire)?;
                 StoreOk::AppendFact {
-                    fact: to_wire_value(&out)?,
+                    outcome: to_wire_value(&out)?,
                 }
             }
             StoreOp::AppendFactVerified { fact } => {
                 let f = fact_from_value(fact)?;
                 let out = store.append_fact_verified(&f).map_err(rally_to_wire)?;
                 StoreOk::AppendFactVerified {
-                    fact: to_wire_value(&out)?,
+                    outcome: to_wire_value(&out)?,
                 }
             }
             StoreOp::AppendStateTransitionVerified { fact } => {
@@ -623,7 +933,7 @@ mod imp {
                     .append_state_transition_verified(&f)
                     .map_err(rally_to_wire)?;
                 StoreOk::AppendStateTransitionVerified {
-                    fact: to_wire_value(&out)?,
+                    outcome: to_wire_value(&out)?,
                 }
             }
             StoreOp::AppendSessionFactIfContext {
@@ -634,11 +944,9 @@ mod imp {
                 let out = store
                     .append_session_fact_if_context(&f, expected_context_version)
                     .map_err(rally_to_wire)?;
-                let fact = match out {
-                    Some(x) => Some(to_wire_value(&x)?),
-                    None => None,
-                };
-                StoreOk::AppendSessionFactIfContext { fact }
+                StoreOk::AppendSessionFactIfContext {
+                    result: to_wire_value(&out)?,
+                }
             }
             StoreOp::Facts => {
                 let facts = store.facts().map_err(rally_to_wire)?;
@@ -653,28 +961,27 @@ mod imp {
             StoreOp::RenewClaimLease {
                 claim_id,
                 lease_expires_at,
+                event_id,
+                thread_id,
+                created_at,
+                caller_tool,
+                caller_session_id,
+                expected_owner_session_id,
             } => {
                 let record = store
-                    .renew_claim_lease(&claim_id, lease_expires_at)
+                    .renew_claim_lease(
+                        &claim_id,
+                        lease_expires_at,
+                        caller_tool.as_deref(),
+                        caller_session_id.as_deref(),
+                        expected_owner_session_id.as_deref(),
+                        &event_id,
+                        &thread_id,
+                        &created_at,
+                    )
                     .map_err(rally_to_wire)?;
-                let record = match record {
-                    Some(r) => Some(to_wire_value(&r)?),
-                    None => None,
-                };
-                StoreOk::RenewClaimLease { record }
-            }
-            StoreOp::ExpireClaimLeasesAt { now_rfc3339 } => {
-                let now = chrono::DateTime::parse_from_rfc3339(&now_rfc3339)
-                    .map_err(|e| {
-                        StoreError::new(
-                            StoreErrorKind::Command,
-                            format!("bad rfc3339 timestamp: {e}"),
-                        )
-                    })?
-                    .with_timezone(&chrono::Utc);
-                let facts = store.expire_claim_leases_at(now).map_err(rally_to_wire)?;
-                StoreOk::ExpireClaimLeasesAt {
-                    facts: to_wire_values(&facts)?,
+                StoreOk::RenewClaimLease {
+                    outcome: to_wire_value(&record)?,
                 }
             }
             StoreOp::SessionFactsWithContextVersion => {
@@ -687,11 +994,42 @@ mod imp {
                 }
             }
             StoreOp::SnapshotWithArchived { include_archived } => {
+                let capture = store
+                    .snapshot_cache_capture(include_archived)
+                    .map_err(rally_to_wire)?;
+                StoreOk::Snapshot {
+                    snapshot: snapshot_to_wire(&capture.snapshot)?,
+                    fingerprint: capture
+                        .fingerprint
+                        .as_ref()
+                        .map(to_wire_value)
+                        .transpose()?,
+                }
+            }
+            StoreOp::SnapshotScoped {
+                run_id,
+                path,
+                include_archived,
+                include_presence_only,
+            } => {
+                let engagement = request_engagement.ok_or_else(|| {
+                    StoreError::new(
+                        StoreErrorKind::Usage,
+                        "snapshot_scoped requires StoreRequest.engagement",
+                    )
+                })?;
                 let snap = store
-                    .snapshot_with_archived(include_archived)
+                    .snapshot_scoped(
+                        engagement,
+                        run_id.as_deref(),
+                        path.as_deref(),
+                        include_archived,
+                        include_presence_only,
+                    )
                     .map_err(rally_to_wire)?;
                 StoreOk::Snapshot {
                     snapshot: snapshot_to_wire(&snap)?,
+                    fingerprint: None,
                 }
             }
             StoreOp::SnapshotWithReadersArchived { include_archived } => {
@@ -706,15 +1044,14 @@ mod imp {
                 let seq = store.last_checkpoint_seq(&tool).map_err(rally_to_wire)?;
                 StoreOk::LastCheckpointSeq { seq }
             }
-            StoreOp::MaybeAppendReadCheckpoint { tool, read_seq } => {
+            StoreOp::MaybeAppendReadCheckpoint { fact, read_seq } => {
+                let fact = fact_from_value(fact)?;
                 let out = store
-                    .maybe_append_read_checkpoint(&tool, read_seq)
+                    .maybe_append_read_checkpoint(&fact, read_seq)
                     .map_err(rally_to_wire)?;
-                let fact = match out {
-                    Some(x) => Some(to_wire_value(&x)?),
-                    None => None,
-                };
-                StoreOk::MaybeAppendReadCheckpoint { fact }
+                StoreOk::MaybeAppendReadCheckpoint {
+                    result: to_wire_value(&out)?,
+                }
             }
             StoreOp::ProjectReadReceipts { max_seq } => {
                 let receipts = store
@@ -736,11 +1073,19 @@ mod imp {
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let _ = stream.set_read_timeout(Some(CONN_TIMEOUT));
-                    let _ = stream.set_write_timeout(Some(CONN_TIMEOUT));
-                    // Best-effort: discard the request line, then reply the error.
-                    let _ = read_request_line(&stream);
-                    let _ = write_response(&stream, &resp);
+                    if let Err(e) = prepare_accepted_stream(&stream) {
+                        log(&format!("configure store-open error stream failed: {e}"));
+                        continue;
+                    }
+                    let remaining = deadline
+                        .saturating_duration_since(Instant::now())
+                        .max(Duration::from_millis(1));
+                    let _ = stream.set_write_timeout(Some(remaining));
+                    // Reply immediately. Waiting to consume a stalled request
+                    // would let one client outlive the bounded drain window.
+                    if let Err(e) = write_response(&stream, &resp) {
+                        log(&format!("write store-open error response failed: {e}"));
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));
@@ -780,8 +1125,10 @@ mod imp {
             "acquiring exclusive owner lock at {}",
             rally_dir.display()
         ));
-        let _owner = store::acquire_owner_exclusive_blocking(&rally_dir)
-            .map_err(|e| ServeError::new(format!("acquire owner EX lock: {e}")))?;
+        let mut owner = Some(
+            store::acquire_owner_exclusive_bounded(&rally_dir, DAEMON_OPEN_BOUND)
+                .map_err(|e| ServeError::new(format!("acquire owner EX lock: {e}")))?,
+        );
         if t0.elapsed() > OWNER_WAIT_LOG_THRESHOLD {
             log(&format!(
                 "waited {:?} for direct writers to drain",
@@ -816,30 +1163,26 @@ mod imp {
         // (3) Open the direct store (reconcile may take seconds; connects queue
         // in the listen backlog). On failure, drain pending connections with a
         // structured error, then exit non-zero.
-        let mut store = match DirectRoomStore::open_direct_at(repo_root.clone()) {
+        let store = match open_direct_store_bounded(repo_root.clone(), DAEMON_OPEN_BOUND) {
             Ok(s) => s,
-            Err(e) => {
+            Err(failure) => {
+                retain_owner_after_open_failure(&mut owner, &failure);
+                let error = failure.error;
                 let err = StoreError::new(
                     StoreErrorKind::Internal,
-                    format!("daemon store open failed: {e}"),
+                    format!("daemon store open failed: {error}"),
                 );
-                log(&format!("store open failed: {e}; draining pending clients"));
+                log(&format!(
+                    "store open failed: {error}; draining pending clients"
+                ));
                 respond_all_with_error(&listener, &err, STORE_OPEN_FAIL_DRAIN);
                 cleanup(&socket_path, &addr_path, &pid_path);
-                return Err(ServeError::new(format!("store open failed: {e}")));
+                return Err(ServeError::new(format!("store open failed: {error}")));
             }
         };
-
-        // ==== G10/R1 WARM-POOL INSTALL (A-amendment landed) ====
-        // Install the ONE warm facts.db pool so the hot interior ops
-        // (append/query/snapshot) reuse it via fact_store_handle() instead of
-        // churning a pool per request — the in-process re-creation of #50
-        // (factstr-sqlite 0.5.2's un-closed-on-Drop background checkpoint racing
-        // the next open) that R1 exists to prevent. Single writer, total order,
-        // and now a single warm pool: G10 satisfied.
-        store
-            .install_warm_fact_store()
-            .map_err(|e| ServeError::new(format!("install warm pool: {e}")))?;
+        let owner = owner.take().ok_or_else(|| {
+            ServeError::new("daemon owner lock missing after successful store open")
+        })?;
 
         let canonical_root = Arc::new(canonical_repo_root(&repo_root));
 
@@ -848,15 +1191,22 @@ mod imp {
         let last_activity = Arc::new(AtomicI64::new(now_millis()));
         let disp_root = canonical_root.clone();
         let disp_activity = last_activity.clone();
+        let (close_tx, close_rx) = mpsc::sync_channel(1);
         let dispatcher = thread::spawn(move || {
             let mut store = store;
-            while let Ok((req, reply)) = job_rx.recv() {
-                let resp = dispatch_one(&mut store, disp_root.as_str(), req);
+            while let Ok(job) = job_rx.recv() {
+                let resp =
+                    dispatch_one_received(&mut store, disp_root.as_str(), job.request, job.receipt);
                 disp_activity.store(now_millis(), Ordering::Relaxed);
-                let _ = reply.send(resp);
+                let _ = job.reply.send(resp);
             }
-            // Channel closed (all senders dropped): drop the store here, which
-            // releases the (warm) pool before the runtime files are unlinked.
+            // Channel closed (all senders dropped): explicitly close the warm
+            // pool under mutation.lock. The caller bounds its wait on
+            // `close_rx`; DirectRoomStore::Drop is only a prompt fallback.
+            let close_result = store
+                .close_warm_fact_store_bounded(DAEMON_WARM_CLOSE_BOUND)
+                .map_err(|error| error.to_string());
+            let _ = close_tx.send(close_result);
             drop(store);
         });
 
@@ -867,7 +1217,7 @@ mod imp {
         // side keep up with a burst: the kernel backlog holds connections that
         // arrive between wakes and this inner loop empties it fully each time,
         // so clients no longer see ECONNREFUSED (which the fresh-connect client
-        // path misreads as R6's "daemon stopped mid-request; retry"). The
+        // path surfaces as R6's routed transport failure). The
         // dispatcher stays single-threaded (total order preserved); we widen
         // ONLY accept concurrency (reader threads feeding the one mpsc).
         let _ = listener.set_nonblocking(true);
@@ -905,11 +1255,14 @@ mod imp {
                         }
                         let jt = job_tx.clone();
                         let rt = reader_threads.clone();
+                        let connection_rally_dir = rally_dir.clone();
                         // Keep a fallback handle so a `spawn` FAILURE can still
                         // answer with a structured error instead of panicking.
                         let busy_fallback = stream.try_clone().ok();
                         match thread::Builder::new().spawn(move || {
-                            handle_conn(stream, jt);
+                            if let Err(e) = handle_conn(stream, jt, &connection_rally_dir) {
+                                log(&format!("serve connection failed: {e}"));
+                            }
                             rt.fetch_sub(1, Ordering::SeqCst);
                         }) {
                             Ok(_handle) => {}
@@ -938,13 +1291,17 @@ mod imp {
             thread::sleep(ACCEPT_POLL);
         }
 
-        // Lifecycle: drop the accept-loop sender so the dispatcher drains its
-        // queue and exits (dropping the store); join it; then unlink the runtime
-        // files. The EX guard (`_owner`) releases at scope end — AFTER unlink —
-        // so a fresh daemon sees no stale socket before it acquires EX.
+        // Lifecycle: drop the accept-loop sender so existing bounded reader
+        // threads finish and the dispatcher explicitly closes its warm store.
+        // Never join without a deadline: if close misses the bound, detach the
+        // thread, report failure, and let its mutation-lock guard protect any
+        // delayed WAL cleanup. Owner EX is released only after a successful
+        // close; a failed/expired close deliberately retains it until process
+        // exit so a detached dispatcher cannot overlap a replacement owner.
         drop(job_tx);
-        let _ = dispatcher.join();
+        let owner = await_dispatcher_close(close_rx, dispatcher, owner, DAEMON_SHUTDOWN_BOUND);
         cleanup(&socket_path, &addr_path, &pid_path);
+        let _owner = owner?;
         log("stopped");
         Ok(())
     }
@@ -1014,23 +1371,1275 @@ mod imp {
             )
         }
 
+        fn facts_response_with_line_len(line_len: usize) -> StoreResponse {
+            let empty = StoreResponse::Ok(StoreOk::Facts {
+                facts: vec![Value::String(String::new())],
+            });
+            let base_len = serde_json::to_string(&empty).unwrap().len();
+            assert!(line_len > base_len + 1);
+            let response = StoreResponse::Ok(StoreOk::Facts {
+                facts: vec![Value::String("x".repeat(line_len - base_len - 1))],
+            });
+            assert_eq!(
+                serde_json::to_string(&response).unwrap().len() + 1,
+                line_len,
+                "fixture must include exactly one trailing newline in its wire size"
+            );
+            response
+        }
+
+        fn assert_real_socket_response_complete(line_len: usize) {
+            let socket = std::env::temp_dir().join(format!(
+                "rallyd-large-reply-{}-{line_len}.sock",
+                now_millis()
+            ));
+            std::fs::remove_file(&socket).ok();
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let response = facts_response_with_line_len(line_len);
+            let expected = response.clone();
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            prepare_accepted_stream(&stream).unwrap();
+                            write_response(&stream, &response).unwrap();
+                            return;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "client never connected");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept large-reply client: {e}"),
+                    }
+                }
+            });
+
+            let stream = UnixStream::connect(&socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line.len(), line_len, "reply was partial or truncated");
+            assert!(line.ends_with('\n'), "reply frame is missing its newline");
+            let actual: StoreResponse = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            server.join().unwrap();
+            std::fs::remove_file(&socket).ok();
+        }
+
         #[test]
-        fn daemon_rejects_v1_requests_after_the_snapshot_wire_change() {
-            assert_eq!(WIRE_VERSION, 2, "this control grades the v1 to v2 cutover");
-            let repo_root = unique_repo_root("reject-v1");
+        fn real_socket_replies_above_buffer_and_near_protocol_max_are_complete() {
+            // The dogfood failure cut every reply at exactly 8 KiB. Exercise a
+            // comfortably larger frame and the largest legal framed reply.
+            assert_real_socket_response_complete(64 * 1024);
+            assert_real_socket_response_complete(MAX_LINE_BYTES);
+        }
+
+        #[test]
+        fn response_write_reports_a_disconnected_peer() {
+            let (server, peer) = UnixStream::pair().unwrap();
+            drop(peer);
+            let response = facts_response_with_line_len(64 * 1024);
+            let err = write_response(&server, &response).unwrap_err();
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ),
+                "disconnect must be observable, got: {err}"
+            );
+        }
+
+        #[test]
+        fn daemon_rejects_v4_requests_after_append_outcome_cutover() {
+            assert_eq!(WIRE_VERSION, 5, "this control grades the v4 to v5 cutover");
+            let repo_root = unique_repo_root("reject-v4");
             let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
             let request = StoreRequest {
-                wire_version: 1,
+                wire_version: 4,
                 engagement: None,
+                deadline_unix_ms: None,
+                mutation_budget_ms: None,
                 op: StoreOp::Ping,
             };
             match dispatch_one(&mut store, "/expected/repo", request) {
                 StoreResponse::Err(error) => {
-                    assert_eq!(error.kind, StoreErrorKind::Transport);
-                    assert!(error.message.contains("daemon speaks 2"));
-                    assert!(error.message.contains("client sent 1"));
+                    assert_eq!(error.kind, StoreErrorKind::IncompatibleWire);
+                    assert!(error.message.contains("daemon speaks 5"));
+                    assert!(error.message.contains("client sent 4"));
                 }
-                other => panic!("v1 request was not rejected: {other:?}"),
+                other => panic!("v4 request was not rejected: {other:?}"),
+            }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn o26_routed_snapshot_carries_server_captured_fingerprint() {
+            let repo_root = unique_repo_root("o26-routed-snapshot-capture");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let fact = crate::store::Fact {
+                from_session_id: None,
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o26-routed-snapshot-fact".to_string(),
+                seq: 0,
+                thread_id: "o26-routed-snapshot-thread".to_string(),
+                kind: crate::store::FactKind::Decision,
+                tool: Some("codex:test".to_string()),
+                role: None,
+                subject: "server-anchored snapshot capture".to_string(),
+                scope: Vec::new(),
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact(&fact).unwrap();
+
+            let response = dispatch_one(
+                &mut store,
+                canonical_repo_root(&repo_root).as_str(),
+                StoreRequest::new(
+                    None,
+                    StoreOp::SnapshotWithArchived {
+                        include_archived: false,
+                    },
+                ),
+            );
+            match response {
+                StoreResponse::Ok(StoreOk::Snapshot {
+                    snapshot,
+                    fingerprint: Some(fingerprint),
+                }) => {
+                    let projection_unix_sec = fingerprint["projection_unix_sec"]
+                        .as_i64()
+                        .expect("routed fingerprint must carry its projection epoch");
+                    let direct = store
+                        .test_snapshot_cache_capture_at(false, projection_unix_sec)
+                        .unwrap();
+                    assert_eq!(
+                        snapshot,
+                        crate::store::snapshot_to_wire_value(&direct.snapshot).unwrap()
+                    );
+                    assert_eq!(
+                        fingerprint,
+                        serde_json::to_value(direct.fingerprint.as_ref().unwrap()).unwrap()
+                    );
+                }
+                other => panic!("unexpected routed snapshot capture: {other:?}"),
+            }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn o26_fresh_daemon_repairs_canonical_ahead_db_before_warm_install() {
+            let repo_root = unique_repo_root("o26-fresh-daemon-repair");
+            let rally_dir = repo_root.join(".rally");
+            let seed = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let fact = crate::store::Fact {
+                from_session_id: None,
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o26-fresh-daemon-canonical".to_string(),
+                seq: 0,
+                thread_id: "o26-fresh-daemon-thread".to_string(),
+                kind: crate::store::FactKind::Decision,
+                tool: Some("codex:test".to_string()),
+                role: None,
+                subject: "canonical commit before daemon restart".to_string(),
+                scope: Vec::new(),
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            crate::store::fail_o26_once(&rally_dir, crate::store::O26FaultPoint::FactsDbProjection);
+            let degraded = seed.append_fact(&fact).unwrap();
+            assert!(degraded.committed);
+            assert!(!degraded.projection_complete);
+            drop(seed);
+
+            let mut daemon =
+                match open_direct_store_bounded(repo_root.clone(), Duration::from_secs(5)) {
+                    Ok(store) => store,
+                    Err(failure) => panic!("fresh daemon open failed: {}", failure.error),
+                };
+            let response = dispatch_one(
+                &mut daemon,
+                canonical_repo_root(&repo_root).as_str(),
+                StoreRequest::new(
+                    None,
+                    StoreOp::SnapshotWithArchived {
+                        include_archived: false,
+                    },
+                ),
+            );
+            let snapshot = match response {
+                StoreResponse::Ok(StoreOk::Snapshot {
+                    snapshot,
+                    fingerprint: Some(_),
+                }) => crate::store::snapshot_from_wire_value(snapshot).unwrap(),
+                other => panic!("unexpected fresh-daemon snapshot reply: {other:?}"),
+            };
+            assert!(
+                snapshot
+                    .current_decisions
+                    .iter()
+                    .any(|candidate| candidate.event_id == fact.event_id)
+            );
+            assert_eq!(
+                daemon
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .filter(|candidate| candidate.event_id == fact.event_id)
+                    .count(),
+                1,
+                "pre-warm reconcile must project the canonical fact exactly once"
+            );
+            daemon
+                .close_warm_fact_store_bounded(Duration::from_secs(2))
+                .unwrap();
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn o26_routed_lost_reply_then_same_id_retry_appends_once() {
+            let repo_root = unique_repo_root("o26-lost-reply");
+            let rally_dir = repo_root.join(".rally");
+            let socket = std::env::temp_dir().join(format!(
+                "r26-lost-{}-{}.sock",
+                std::process::id(),
+                now_millis()
+            ));
+            let listener = UnixListener::bind(&socket).unwrap();
+            let store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let canonical_root = canonical_repo_root(&repo_root);
+            let (job_tx, job_rx) = mpsc::channel::<Job>();
+            let dispatcher = thread::spawn(move || {
+                let mut store = store;
+                while let Ok(job) = job_rx.recv() {
+                    let response = dispatch_one_received(
+                        &mut store,
+                        &canonical_root,
+                        job.request,
+                        job.receipt,
+                    );
+                    job.reply.send(response).unwrap();
+                }
+                store
+            });
+            let server_tx = job_tx.clone();
+            let server_rally_dir = rally_dir.clone();
+            let server = thread::spawn(move || {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().unwrap();
+                    handle_conn(stream, server_tx.clone(), &server_rally_dir).unwrap();
+                }
+            });
+            let routed = crate::store_client::RoutedRoomStore::for_test(
+                socket.clone(),
+                repo_root.clone(),
+                "default",
+            );
+            let candidate = crate::store::Fact {
+                from_session_id: None,
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o26-routed-lost-reply-event".to_string(),
+                seq: 0,
+                thread_id: "o26-routed-lost-reply-thread".to_string(),
+                kind: crate::store::FactKind::Decision,
+                tool: Some("test:01".to_string()),
+                role: None,
+                subject: "routed lost reply".to_string(),
+                scope: vec!["file:src/routed.rs".to_string()],
+                created_at: "2026-08-10T00:00:00Z".to_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            crate::store::fail_o26_once(&rally_dir, crate::store::O26FaultPoint::DaemonReplyDrop);
+
+            let error = routed
+                .append_fact(&candidate)
+                .expect_err("dropped daemon reply must be outcome-unknown");
+            assert!(matches!(
+                error,
+                RallyError::OutcomeUnknown { ref event_id, ref phase, .. }
+                    if event_id == &candidate.event_id && phase == "daemon-transport"
+            ));
+            let retry = routed.append_fact(&candidate).unwrap();
+            assert!(retry.committed);
+            assert_eq!(retry.fact.seq, 1);
+
+            server.join().unwrap();
+            drop(job_tx);
+            let store = dispatcher.join().unwrap();
+            assert_eq!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .filter(|fact| fact.event_id == candidate.event_id)
+                    .count(),
+                1
+            );
+            drop(store);
+            std::fs::remove_file(&socket).ok();
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn o26_routed_renewal_and_checkpoint_retry_the_exact_lost_request_once() {
+            let repo_root = unique_repo_root("o26-renew-checkpoint-lost-reply");
+            let rally_dir = repo_root.join(".rally");
+            let socket = std::env::temp_dir().join(format!(
+                "r26-rc-{}-{}.sock",
+                std::process::id(),
+                now_millis()
+            ));
+            let listener = UnixListener::bind(&socket).unwrap();
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let claim = crate::store::Fact {
+                from_session_id: Some("sess:o26".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o26-routed-renew-claim".to_string(),
+                seq: 0,
+                thread_id: "o26-routed-renew-claim-thread".to_string(),
+                kind: crate::store::FactKind::Claim,
+                tool: Some("test:renew".to_string()),
+                role: None,
+                subject: "claim for routed renewal retry".to_string(),
+                scope: vec!["file:src/renew.rs".to_string()],
+                created_at: "2026-08-10T00:00:00Z".to_string(),
+                summary: None,
+                evidence: vec!["lease_expires_at:2026-08-10T00:00:01Z".to_string()],
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact(&claim).unwrap();
+            let canonical_root = canonical_repo_root(&repo_root);
+            let (job_tx, job_rx) = mpsc::channel::<Job>();
+            let dispatcher = thread::spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let response = dispatch_one_received(
+                        &mut store,
+                        &canonical_root,
+                        job.request,
+                        job.receipt,
+                    );
+                    job.reply.send(response).unwrap();
+                }
+                store
+            });
+            let server_tx = job_tx.clone();
+            let server_rally_dir = rally_dir.clone();
+            let server = thread::spawn(move || {
+                for _ in 0..4 {
+                    let (stream, _) = listener.accept().unwrap();
+                    handle_conn(stream, server_tx.clone(), &server_rally_dir).unwrap();
+                }
+            });
+            let routed = crate::store_client::RoutedRoomStore::for_test(
+                socket.clone(),
+                repo_root.clone(),
+                "default",
+            );
+
+            let renewal_event_id = "o26-routed-renew-request".to_string();
+            let renewal_op = StoreOp::RenewClaimLease {
+                claim_id: claim.event_id.clone(),
+                lease_expires_at: "2099-01-01T00:00:00Z".to_string(),
+                event_id: renewal_event_id.clone(),
+                thread_id: "o26-routed-renew-request-thread".to_string(),
+                created_at: "2026-08-10T00:00:02Z".to_string(),
+                caller_tool: Some("test:renew".to_string()),
+                caller_session_id: Some("sess:o26".to_string()),
+                expected_owner_session_id: Some("sess:o26".to_string()),
+            };
+            crate::store::fail_o26_once(&rally_dir, crate::store::O26FaultPoint::DaemonReplyDrop);
+            let renewal_error = routed
+                .dispatch_for_test(renewal_op.clone())
+                .expect_err("lost renewal reply must remain queryable");
+            assert!(matches!(
+                renewal_error,
+                RallyError::OutcomeUnknown { ref event_id, ref phase, .. }
+                    if event_id == &renewal_event_id && phase == "daemon-transport"
+            ));
+            let renewal_retry = routed.dispatch_for_test(renewal_op).unwrap();
+            match renewal_retry {
+                StoreOk::RenewClaimLease { outcome } => {
+                    let outcome: crate::store::RenewClaimLeaseOutcome =
+                        serde_json::from_value(outcome).unwrap();
+                    assert_eq!(
+                        outcome.append_outcome.unwrap().fact.event_id,
+                        renewal_event_id
+                    );
+                }
+                other => panic!("unexpected renewal retry reply: {other:?}"),
+            }
+
+            let checkpoint_event_id = "o26-routed-checkpoint-request".to_string();
+            let checkpoint = crate::store::Fact {
+                from_session_id: None,
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: checkpoint_event_id.clone(),
+                seq: 0,
+                thread_id: "read-test-renew".to_string(),
+                kind: crate::store::FactKind::Read,
+                tool: Some("test:reader".to_string()),
+                role: None,
+                subject: "read-checkpoint: test:reader at seq 2".to_string(),
+                scope: Vec::new(),
+                created_at: "2026-08-10T00:00:03Z".to_string(),
+                summary: Some("read_seq:2".to_string()),
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            let checkpoint_op = StoreOp::MaybeAppendReadCheckpoint {
+                fact: serde_json::to_value(&checkpoint).unwrap(),
+                read_seq: 2,
+            };
+            crate::store::fail_o26_once(&rally_dir, crate::store::O26FaultPoint::DaemonReplyDrop);
+            let checkpoint_error = routed
+                .dispatch_for_test(checkpoint_op.clone())
+                .expect_err("lost checkpoint reply must remain queryable");
+            assert!(matches!(
+                checkpoint_error,
+                RallyError::OutcomeUnknown { ref event_id, ref phase, .. }
+                    if event_id == &checkpoint_event_id && phase == "daemon-transport"
+            ));
+            let checkpoint_retry = routed.dispatch_for_test(checkpoint_op).unwrap();
+            match checkpoint_retry {
+                StoreOk::MaybeAppendReadCheckpoint { result } => {
+                    let outcome: crate::store::ConditionalAppendOutcome =
+                        serde_json::from_value(result).unwrap();
+                    assert!(matches!(
+                        outcome,
+                        crate::store::ConditionalAppendOutcome::Applied(ref append)
+                            if append.fact.event_id == checkpoint_event_id
+                    ));
+                }
+                other => panic!("unexpected checkpoint retry reply: {other:?}"),
+            }
+
+            server.join().unwrap();
+            drop(job_tx);
+            let store = dispatcher.join().unwrap();
+            let facts = store.facts().unwrap();
+            for event_id in [&renewal_event_id, &checkpoint_event_id] {
+                assert_eq!(
+                    facts
+                        .iter()
+                        .filter(|fact| &fact.event_id == event_id)
+                        .count(),
+                    1,
+                    "lost-reply retry must retain exactly one canonical {event_id}"
+                );
+            }
+            drop(store);
+            std::fs::remove_file(&socket).ok();
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn o26_routed_release_and_resolve_projection_warnings_do_not_retry_append() {
+            for (label, target_kind, close_kind) in [
+                (
+                    "release",
+                    crate::store::FactKind::Claim,
+                    crate::store::FactKind::Release,
+                ),
+                (
+                    "resolve",
+                    crate::store::FactKind::Blocker,
+                    crate::store::FactKind::Resolve,
+                ),
+            ] {
+                let repo_root = unique_repo_root(&format!("o26-routed-{label}"));
+                let rally_dir = repo_root.join(".rally");
+                let socket = std::env::temp_dir().join(format!(
+                    "r26-{label}-{}-{}.sock",
+                    std::process::id(),
+                    now_millis()
+                ));
+                let listener = UnixListener::bind(&socket).unwrap();
+                let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+                let target = crate::store::Fact {
+                    from_session_id: None,
+                    schema: crate::FACT_SCHEMA.to_string(),
+                    event_id: format!("o26-routed-{label}-target"),
+                    seq: 0,
+                    thread_id: format!("o26-routed-{label}-target-thread"),
+                    kind: target_kind,
+                    tool: Some("test:01".to_string()),
+                    role: None,
+                    subject: format!("routed {label} target"),
+                    scope: vec![format!("file:src/{label}.rs")],
+                    created_at: "2026-08-10T00:00:00Z".to_string(),
+                    summary: None,
+                    evidence: Vec::new(),
+                    target: None,
+                    ref_id: None,
+                    status: None,
+                    severity: None,
+                    uri: None,
+                    session: None,
+                };
+                store.append_fact(&target).unwrap();
+                let canonical_root = canonical_repo_root(&repo_root);
+                let (job_tx, job_rx) = mpsc::channel::<Job>();
+                let dispatcher = thread::spawn(move || {
+                    while let Ok(job) = job_rx.recv() {
+                        let response = dispatch_one_received(
+                            &mut store,
+                            &canonical_root,
+                            job.request,
+                            job.receipt,
+                        );
+                        job.reply.send(response).unwrap();
+                    }
+                    store
+                });
+                let server_tx = job_tx.clone();
+                let server_rally_dir = rally_dir.clone();
+                let server = thread::spawn(move || {
+                    for _ in 0..2 {
+                        let (stream, _) = listener.accept().unwrap();
+                        handle_conn(stream, server_tx.clone(), &server_rally_dir).unwrap();
+                    }
+                });
+                let routed = crate::store_client::RoutedRoomStore::for_test(
+                    socket.clone(),
+                    repo_root.clone(),
+                    "default",
+                );
+                let close = crate::store::Fact {
+                    from_session_id: None,
+                    schema: crate::FACT_SCHEMA.to_string(),
+                    event_id: format!("o26-routed-{label}-close"),
+                    seq: 0,
+                    thread_id: format!("o26-routed-{label}-close-thread"),
+                    kind: close_kind,
+                    tool: Some("test:01".to_string()),
+                    role: None,
+                    subject: format!("routed {label} close"),
+                    scope: target.scope.clone(),
+                    created_at: "2026-08-10T00:00:01Z".to_string(),
+                    summary: None,
+                    evidence: Vec::new(),
+                    target: None,
+                    ref_id: Some(target.event_id.clone()),
+                    status: None,
+                    severity: None,
+                    uri: None,
+                    session: None,
+                };
+                crate::store::fail_o26_once(
+                    &rally_dir,
+                    crate::store::O26FaultPoint::FactsDbProjection,
+                );
+
+                let degraded = routed.append_state_transition_verified(&close).unwrap();
+                assert!(degraded.committed);
+                assert!(!degraded.projection_complete);
+                assert!(!degraded.warnings.is_empty());
+                let retry = routed.append_state_transition_verified(&close).unwrap();
+                assert_eq!(retry.fact.seq, degraded.fact.seq);
+
+                server.join().unwrap();
+                drop(job_tx);
+                let store = dispatcher.join().unwrap();
+                assert_eq!(
+                    store
+                        .facts()
+                        .unwrap()
+                        .iter()
+                        .filter(|fact| fact.event_id == close.event_id)
+                        .count(),
+                    1
+                );
+                drop(store);
+                std::fs::remove_file(&socket).ok();
+                std::fs::remove_dir_all(repo_root).ok();
+            }
+        }
+
+        #[test]
+        fn daemon_store_open_honors_the_mutation_lock_deadline() {
+            let repo_root = unique_repo_root("bounded-store-open");
+            let rally_dir = repo_root.join(".rally");
+            let seed = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            drop(seed);
+            let held = store::acquire_room_mutation_lock(&rally_dir).unwrap();
+
+            let started = Instant::now();
+            let result = open_direct_store_bounded(repo_root.clone(), Duration::from_millis(75));
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(300),
+                "daemon store open escaped its 75ms bound: {elapsed:?}"
+            );
+            let failure = match result {
+                Ok(_) => panic!("contended daemon store open unexpectedly succeeded"),
+                Err(failure) => failure,
+            };
+            assert!(matches!(failure.error, RallyError::NotStarted(_)));
+            assert!(!failure.retain_owner_until_exit);
+
+            drop(held);
+            let reopened = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            drop(reopened);
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn daemon_store_total_open_timeout_retains_owner_for_late_worker() {
+            let repo_root = unique_repo_root("total-open-timeout-owner-retained");
+            let rally_dir = repo_root.join(".rally");
+            let mut owner = Some(
+                store::acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(75))
+                    .unwrap(),
+            );
+
+            let started = Instant::now();
+            let result =
+                open_direct_store_bounded_with(repo_root, Duration::from_millis(50), || {
+                    thread::sleep(Duration::from_millis(250))
+                });
+            let elapsed = started.elapsed();
+            let failure = match result {
+                Ok(_) => panic!("delayed daemon store open unexpectedly completed"),
+                Err(failure) => failure,
+            };
+            assert!(
+                elapsed < Duration::from_millis(150),
+                "total daemon store open escaped its 50ms bound: {elapsed:?}"
+            );
+            assert!(failure.retain_owner_until_exit);
+            assert!(
+                failure
+                    .error
+                    .to_string()
+                    .starts_with("daemon-open-timeout:")
+            );
+            retain_owner_after_open_failure(&mut owner, &failure);
+            assert!(owner.is_none());
+            assert!(
+                store::acquire_owner_shared_nb(&rally_dir)
+                    .unwrap()
+                    .is_none(),
+                "direct ownership entered while timed-out open worker remained live"
+            );
+            assert!(
+                matches!(
+                    store::acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(25)),
+                    Err(RallyError::NotStarted(_))
+                ),
+                "replacement daemon entered while timed-out open worker remained live"
+            );
+            // The worker and owner guard are intentionally process-lifetime on
+            // timeout. Do not unlink the lock rendezvous in this test.
+        }
+
+        #[test]
+        fn dispatcher_close_timeout_retains_owner_until_process_exit() {
+            let repo_root = unique_repo_root("close-timeout-owner-retained");
+            let rally_dir = repo_root.join(".rally");
+            let owner =
+                store::acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(75))
+                    .unwrap();
+            let (_close_tx, close_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+            let dispatcher = thread::spawn(|| thread::sleep(Duration::from_millis(100)));
+
+            let started = Instant::now();
+            let result =
+                await_dispatcher_close(close_rx, dispatcher, owner, Duration::from_millis(25));
+            let elapsed = started.elapsed();
+            let error = match result {
+                Ok(_) => panic!("dispatcher close unexpectedly completed"),
+                Err(error) => error,
+            };
+            assert!(
+                elapsed < Duration::from_millis(150),
+                "dispatcher close wait escaped its 25ms bound: {elapsed:?}"
+            );
+            assert!(error.message().starts_with("daemon-close-timeout:"));
+            assert!(
+                store::acquire_owner_shared_nb(&rally_dir)
+                    .unwrap()
+                    .is_none(),
+                "a direct owner entered after close timeout"
+            );
+            assert!(
+                matches!(
+                    store::acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(25)),
+                    Err(RallyError::NotStarted(_))
+                ),
+                "a replacement daemon entered after close timeout"
+            );
+            // `await_dispatcher_close` intentionally leaked owner EX. Do not
+            // unlink the lock path: it remains the process-lifetime rendezvous.
+        }
+
+        #[test]
+        fn raw_far_future_mutation_deadline_is_capped_without_panic() {
+            let cap = CONN_TIMEOUT.saturating_sub(MUTATION_REPLY_RESERVE);
+            let remaining = |deadline_unix_ms: Option<u64>,
+                             mutation_budget_ms: Option<u64>,
+                             receipt_unix_ms: u64,
+                             dispatch_unix_ms: u64,
+                             queue_elapsed: Duration| {
+                let receipt_monotonic = Instant::now();
+                let dispatch_monotonic = receipt_monotonic + queue_elapsed;
+                bounded_mutation_deadline(
+                    deadline_unix_ms,
+                    mutation_budget_ms,
+                    RequestReceipt {
+                        monotonic: receipt_monotonic,
+                        unix_ms: receipt_unix_ms,
+                    },
+                    dispatch_unix_ms,
+                    dispatch_monotonic,
+                )
+                .map(|deadline| deadline.saturating_duration_since(dispatch_monotonic))
+            };
+            assert_eq!(
+                remaining(Some(u64::MAX), Some(u64::MAX), 1, 1, Duration::ZERO),
+                Some(cap)
+            );
+            assert_eq!(
+                remaining(
+                    Some(2_000),
+                    Some(1_000),
+                    1_000,
+                    1_400,
+                    Duration::from_millis(400)
+                ),
+                Some(Duration::from_millis(600))
+            );
+            assert_eq!(
+                remaining(
+                    Some(2_000),
+                    Some(1_000),
+                    1_000,
+                    900,
+                    Duration::from_millis(400)
+                ),
+                Some(Duration::from_millis(600)),
+                "wall-clock rollback after receipt extended the monotonic budget"
+            );
+            assert_eq!(
+                remaining(Some(2_000), Some(1_000), 900, 900, Duration::ZERO),
+                Some(Duration::from_millis(1_000)),
+                "pre-receipt rollback escaped the client-relative cap"
+            );
+            assert_eq!(
+                remaining(
+                    Some(2_000),
+                    Some(1_000),
+                    1_000,
+                    2_100,
+                    Duration::from_millis(100)
+                ),
+                None,
+                "forward clock step did not expire the request"
+            );
+            assert_eq!(
+                remaining(Some(1_000), Some(1_000), 1_000, 1_000, Duration::ZERO),
+                None
+            );
+            assert_eq!(
+                remaining(Some(2_000), Some(0), 1_000, 1_000, Duration::ZERO),
+                None
+            );
+
+            let repo_root = unique_repo_root("far-future-mutation-deadline");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut request = StoreRequest::new(None, StoreOp::RebuildClaimIndex);
+            request.deadline_unix_ms = Some(u64::MAX);
+            request.mutation_budget_ms = Some(u64::MAX);
+            let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                dispatch_one(&mut store, repo_root.to_string_lossy().as_ref(), request)
+            }));
+            assert!(
+                matches!(response, Ok(StoreResponse::Ok(StoreOk::RebuildClaimIndex))),
+                "far-future raw deadline panicked or failed: {response:?}"
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn expired_routed_mutation_is_typed_not_started_and_never_appends() {
+            let repo_root = unique_repo_root("expired-routed-mutation");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let fact = crate::store::Fact {
+                from_session_id: Some("sess:o25".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o25-routed-no-late-commit".to_string(),
+                seq: 0,
+                thread_id: "thread-o25-routed".to_string(),
+                kind: crate::store::FactKind::Artifact,
+                tool: Some("codex:o25".to_string()),
+                role: None,
+                subject: "expired routed mutation".to_string(),
+                scope: Vec::new(),
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            let mut request = StoreRequest::new(
+                Some("engagement-o25".to_string()),
+                StoreOp::AppendFact {
+                    fact: serde_json::to_value(&fact).unwrap(),
+                },
+            );
+            request.deadline_unix_ms = Some(0);
+
+            let response = dispatch_one(&mut store, repo_root.to_string_lossy().as_ref(), request);
+            match response {
+                StoreResponse::Err(error) => {
+                    assert_eq!(error.kind, StoreErrorKind::NotStarted);
+                    assert_eq!(error.code, 4);
+                    assert!(error.message.contains("no durable mutation started"));
+                }
+                other => panic!("expired mutation was not rejected: {other:?}"),
+            }
+            assert!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.event_id != fact.event_id),
+                "expired routed mutation appended after NotStarted"
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn routed_dispatch_pause_does_not_rebase_receipt_deadline() {
+            let repo_root = unique_repo_root("dispatch-pause-deadline-anchor");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let fact = crate::store::Fact {
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o25-routed-dispatch-pause-no-late-commit".to_string(),
+                thread_id: "thread-o25-routed-dispatch-pause".to_string(),
+                kind: crate::store::FactKind::Artifact,
+                subject: "dispatch pause must consume request deadline".to_string(),
+                created_at: crate::now_string(),
+                ..crate::store::Fact::default()
+            };
+            let mut request = StoreRequest::new(
+                None,
+                StoreOp::AppendFact {
+                    fact: serde_json::to_value(&fact).unwrap(),
+                },
+            );
+            let deadline = SystemTime::now() + Duration::from_millis(30);
+            request.deadline_unix_ms =
+                Some(deadline.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64);
+            request.mutation_budget_ms = Some(30);
+
+            let response = dispatch_one_received_with_hook(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                request,
+                RequestReceipt::now(),
+                || thread::sleep(Duration::from_millis(70)),
+            );
+
+            match response {
+                StoreResponse::Err(error) => {
+                    assert_eq!(error.kind, StoreErrorKind::NotStarted);
+                    assert_eq!(error.code, 4);
+                    assert!(error.message.contains("before acquiring"));
+                }
+                other => panic!("dispatch pause rebased the deadline: {other:?}"),
+            }
+            assert!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.event_id != fact.event_id),
+                "routed mutation committed after its receipt-anchored deadline"
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn routed_mutation_rechecks_deadline_after_flock_success() {
+            let repo_root = unique_repo_root("routed-post-flock-deadline");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let fact = crate::store::Fact {
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o25-routed-post-flock-no-late-commit".to_string(),
+                thread_id: "thread-o25-routed-post-flock".to_string(),
+                kind: crate::store::FactKind::Artifact,
+                subject: "routed post-flock pause must consume deadline".to_string(),
+                created_at: crate::now_string(),
+                ..crate::store::Fact::default()
+            };
+            let mut request = StoreRequest::new(
+                None,
+                StoreOp::AppendFact {
+                    fact: serde_json::to_value(&fact).unwrap(),
+                },
+            );
+            let deadline = SystemTime::now() + Duration::from_millis(30);
+            request.deadline_unix_ms =
+                Some(deadline.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64);
+            request.mutation_budget_ms = Some(30);
+            store::force_next_room_lock_post_flock_pause(Duration::from_millis(70));
+
+            let response = dispatch_one(&mut store, repo_root.to_string_lossy().as_ref(), request);
+
+            match response {
+                StoreResponse::Err(error) => {
+                    assert_eq!(error.kind, StoreErrorKind::NotStarted);
+                    assert_eq!(error.code, 4);
+                    assert!(error.message.contains("after provisional lock acquisition"));
+                    assert!(
+                        error
+                            .message
+                            .contains("lock released before any durable mutation")
+                    );
+                    assert!(!error.message.contains("before acquiring"));
+                }
+                other => panic!("post-flock pause started routed mutation: {other:?}"),
+            }
+            assert!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.event_id != fact.event_id),
+                "routed mutation committed after its post-flock deadline"
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn routed_lock_contention_returns_not_started_and_never_commits_late() {
+            let repo_root = unique_repo_root("routed-lock-contention");
+            let rally_dir = repo_root.join(".rally");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let held = store::acquire_room_mutation_lock(&rally_dir).unwrap();
+            let fact = crate::store::Fact {
+                from_session_id: Some("sess:o25".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "o25-routed-contended-no-late-commit".to_string(),
+                seq: 0,
+                thread_id: "thread-o25-routed-contended".to_string(),
+                kind: crate::store::FactKind::Artifact,
+                tool: Some("codex:o25".to_string()),
+                role: None,
+                subject: "contended routed mutation".to_string(),
+                scope: Vec::new(),
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            let mut request = StoreRequest::new(
+                Some("engagement-o25".to_string()),
+                StoreOp::AppendFact {
+                    fact: serde_json::to_value(&fact).unwrap(),
+                },
+            );
+            let deadline = SystemTime::now() + Duration::from_millis(150);
+            request.deadline_unix_ms =
+                Some(deadline.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64);
+            let root_text = repo_root.to_string_lossy().into_owned();
+            let (tx, rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let started = Instant::now();
+                let response = dispatch_one(&mut store, &root_text, request);
+                tx.send((started.elapsed(), response)).unwrap();
+            });
+
+            let (elapsed, response) = rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("routed mutation did not return before its outer timeout");
+            drop(held);
+            worker.join().unwrap();
+            assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+            match response {
+                StoreResponse::Err(error) => {
+                    assert_eq!(error.kind, StoreErrorKind::NotStarted);
+                    assert_eq!(error.code, 4);
+                    assert!(error.message.starts_with("mutation-not-started:"));
+                }
+                other => panic!("contended routed mutation was not rejected: {other:?}"),
+            }
+
+            let reopened = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            assert!(
+                reopened
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.event_id != fact.event_id),
+                "routed NotStarted mutation committed after lock release"
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn scoped_snapshot_dispatch_requires_engagement_and_matches_direct_projection() {
+            let repo_root = unique_repo_root("scoped-snapshot-parity");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            store.set_engagement_scope(Some("engagement-alpha".to_string()));
+            let artifact = crate::store::Fact {
+                from_session_id: Some("sess:alpha".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "artifact-scoped-parity".to_string(),
+                seq: 0,
+                thread_id: "thread-scoped-parity".to_string(),
+                kind: crate::store::FactKind::Artifact,
+                tool: Some("codex:alpha".to_string()),
+                role: None,
+                subject: "scoped parity".to_string(),
+                scope: vec!["run:audit-run".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact(&artifact).unwrap();
+
+            let missing = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(
+                    None,
+                    StoreOp::SnapshotScoped {
+                        run_id: Some("audit-run".to_string()),
+                        path: None,
+                        include_archived: false,
+                        include_presence_only: false,
+                    },
+                ),
+            );
+            assert!(
+                matches!(missing, StoreResponse::Err(ref err) if err.kind == StoreErrorKind::Usage),
+                "missing engagement must fail as usage: {missing:?}"
+            );
+
+            let rewritten_label = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(
+                    Some("engagement-/alpha".to_string()),
+                    StoreOp::SnapshotScoped {
+                        run_id: Some("audit-run".to_string()),
+                        path: None,
+                        include_archived: false,
+                        include_presence_only: false,
+                    },
+                ),
+            );
+            assert!(
+                matches!(rewritten_label, StoreResponse::Err(ref err) if err.kind == StoreErrorKind::Usage),
+                "daemon must validate the raw label instead of silently selecting engagement-alpha: {rewritten_label:?}"
+            );
+
+            for include_archived in [false, true] {
+                let direct = store
+                    .snapshot_scoped(
+                        "engagement-alpha",
+                        Some("audit-run"),
+                        None,
+                        include_archived,
+                        false,
+                    )
+                    .unwrap();
+                let routed = dispatch_one(
+                    &mut store,
+                    repo_root.to_string_lossy().as_ref(),
+                    StoreRequest::new(
+                        Some("engagement-alpha".to_string()),
+                        StoreOp::SnapshotScoped {
+                            run_id: Some("audit-run".to_string()),
+                            path: None,
+                            include_archived,
+                            include_presence_only: false,
+                        },
+                    ),
+                );
+                match routed {
+                    StoreResponse::Ok(StoreOk::Snapshot {
+                        snapshot,
+                        fingerprint,
+                    }) => {
+                        assert!(fingerprint.is_none(), "scoped snapshots are not cacheable");
+                        assert_eq!(
+                            snapshot,
+                            crate::store::snapshot_to_wire_value(&direct).unwrap(),
+                            "direct/routed scoped projection drifted for include_archived={include_archived}"
+                        );
+                    }
+                    other => panic!("unexpected scoped snapshot reply: {other:?}"),
+                }
+            }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn scoped_path_collision_stops_direct_and_routed_writers_with_nonoverlap_control() {
+            let repo_root = unique_repo_root("scoped-path-collision-parity");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            store.set_engagement_scope(Some("engagement-alpha".to_string()));
+            let artifact = crate::store::Fact {
+                from_session_id: Some("sess:alpha".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "artifact-alpha-path".to_string(),
+                seq: 0,
+                thread_id: "thread-alpha-path".to_string(),
+                kind: crate::store::FactKind::Artifact,
+                tool: Some("codex:alpha".to_string()),
+                role: None,
+                subject: "alpha path work".to_string(),
+                scope: vec!["file:src/lib.rs".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact(&artifact).unwrap();
+            store.set_engagement_scope(Some("engagement-beta".to_string()));
+            let claim = crate::store::Fact {
+                from_session_id: Some("sess:beta".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "claim-beta-path".to_string(),
+                seq: 0,
+                thread_id: "thread-beta-path".to_string(),
+                kind: crate::store::FactKind::Claim,
+                tool: Some("codex:beta".to_string()),
+                role: None,
+                subject: "beta owns path".to_string(),
+                scope: vec!["file:src/lib.rs".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: Vec::new(),
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact(&claim).unwrap();
+
+            let direct = store
+                .snapshot_scoped("engagement-alpha", None, Some("src/lib.rs"), false, false)
+                .unwrap();
+            let routed = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(
+                    Some("engagement-alpha".to_string()),
+                    StoreOp::SnapshotScoped {
+                        run_id: None,
+                        path: Some("src/lib.rs".to_string()),
+                        include_archived: false,
+                        include_presence_only: false,
+                    },
+                ),
+            );
+            let routed = match routed {
+                StoreResponse::Ok(StoreOk::Snapshot {
+                    snapshot,
+                    fingerprint,
+                }) => {
+                    assert!(fingerprint.is_none(), "scoped snapshots are not cacheable");
+                    crate::store::snapshot_from_wire_value(snapshot).unwrap()
+                }
+                other => panic!("unexpected scoped snapshot reply: {other:?}"),
+            };
+
+            assert_eq!(
+                crate::store::snapshot_to_wire_value(&direct).unwrap(),
+                crate::store::snapshot_to_wire_value(&routed).unwrap(),
+                "direct and routed collision context must match"
+            );
+            for (mode, snapshot) in [("direct", &direct), ("routed", &routed)] {
+                let mut collision = Vec::new();
+                crate::check::check_before_write_for_test(
+                    snapshot,
+                    "codex:alpha",
+                    Some("src/lib.rs"),
+                    &mut collision,
+                );
+                assert!(
+                    collision.contains(&("claimed-path", "stop")),
+                    "{mode} path collision must stop the writer: {collision:?}"
+                );
+
+                let mut nonoverlap = Vec::new();
+                crate::check::check_before_write_for_test(
+                    snapshot,
+                    "codex:alpha",
+                    Some("src/other.rs"),
+                    &mut nonoverlap,
+                );
+                assert!(
+                    !nonoverlap.contains(&("claimed-path", "stop")),
+                    "{mode} non-overlap control must not invent a collision: {nonoverlap:?}"
+                );
             }
             std::fs::remove_dir_all(repo_root).ok();
         }
@@ -1071,6 +2680,12 @@ mod imp {
                     StoreOp::RenewClaimLease {
                         claim_id: claim.event_id.clone(),
                         lease_expires_at: "2099-01-01T00:00:00Z".to_string(),
+                        event_id: "routed-renewal-request".to_string(),
+                        thread_id: "routed-renewal-thread".to_string(),
+                        created_at: "2026-08-10T00:00:00Z".to_string(),
+                        caller_tool: Some("tool-a".to_string()),
+                        caller_session_id: Some("sess:test".to_string()),
+                        expected_owner_session_id: Some("sess:test".to_string()),
                     },
                 ),
             );
@@ -1078,7 +2693,7 @@ mod imp {
             assert!(
                 matches!(
                     response,
-                    StoreResponse::Ok(StoreOk::RenewClaimLease { record: Some(_) })
+                    StoreResponse::Ok(StoreOk::RenewClaimLease { outcome: _ })
                 ),
                 "routed renewal failed: {response:?}"
             );
@@ -1091,6 +2706,381 @@ mod imp {
             assert_eq!(
                 facts.last().unwrap().ref_id.as_deref(),
                 Some(claim.event_id.as_str())
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn raw_routed_sibling_cannot_renew_another_sessions_claim() {
+            let repo_root = unique_repo_root("renewal-sibling-auth");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let claim = crate::store::Fact {
+                from_session_id: Some("session-owner".to_string()),
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "claim-routed-sibling".to_string(),
+                seq: 0,
+                thread_id: crate::new_id("room"),
+                kind: crate::store::FactKind::Claim,
+                tool: Some("shared:01".to_string()),
+                role: None,
+                subject: "routed sibling authority claim".to_string(),
+                scope: vec!["file:src/lib.rs".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: vec!["lease_expires_at:2000-01-01T00:00:00Z".to_string()],
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact_verified(&claim).unwrap();
+
+            // Decode a raw wire payload instead of constructing StoreOp so this
+            // remains a compatibility control when authority fields are added.
+            let op: StoreOp = serde_json::from_value(serde_json::json!({
+                "kind": "renew_claim_lease",
+                "claim_id": claim.event_id.clone(),
+                "lease_expires_at": "2099-01-01T00:00:00Z",
+                "event_id": "renew-routed-sibling",
+                "thread_id": "renew-routed-sibling-thread",
+                "created_at": "2026-08-10T00:00:00Z",
+                "caller_tool": "shared:01",
+                "caller_session_id": "session-sibling",
+                "expected_owner_session_id": "session-owner"
+            }))
+            .unwrap();
+            let response = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(None, op),
+            );
+
+            assert!(
+                matches!(response, StoreResponse::Err(_)),
+                "raw routed sibling renewal must be refused: {response:?}"
+            );
+            assert!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .all(|fact| fact.kind != crate::store::FactKind::ClaimRenewed),
+                "a refused raw renewal must not synthesize owner authority from claim_id"
+            );
+
+            let missing_caller: StoreOp = serde_json::from_value(serde_json::json!({
+                "kind": "renew_claim_lease",
+                "claim_id": claim.event_id.clone(),
+                "lease_expires_at": "2099-01-01T00:00:00Z",
+                "event_id": "renew-routed-missing-caller",
+                "thread_id": "renew-routed-missing-caller-thread",
+                "created_at": "2026-08-10T00:00:00Z"
+            }))
+            .unwrap();
+            let missing_response = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(None, missing_caller),
+            );
+            assert!(
+                matches!(missing_response, StoreResponse::Err(_)),
+                "a legacy wire request with no caller authority must fail closed: {missing_response:?}"
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn raw_routed_anonymous_identity_cannot_renew_or_append_owner_transitions() {
+            let repo_root = unique_repo_root("renewal-anonymous-auth");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let claim = crate::store::Fact {
+                from_session_id: None,
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "claim-routed-anonymous".to_string(),
+                seq: 0,
+                thread_id: crate::new_id("room"),
+                kind: crate::store::FactKind::Claim,
+                tool: None,
+                role: None,
+                subject: "anonymous routed authority claim".to_string(),
+                scope: vec!["file:src/anonymous.rs".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: vec!["lease_expires_at:2099-01-01T00:00:00Z".to_string()],
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact_verified(&claim).unwrap();
+            let before = store.facts().unwrap().len();
+
+            let renew_op: StoreOp = serde_json::from_value(serde_json::json!({
+                "kind": "renew_claim_lease",
+                "claim_id": claim.event_id.clone(),
+                "lease_expires_at": "2099-01-01T00:30:00Z",
+                "event_id": "renew-routed-anonymous",
+                "thread_id": "renew-routed-anonymous-thread",
+                "created_at": "2026-08-10T00:00:00Z"
+            }))
+            .unwrap();
+            let renew_response = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(None, renew_op),
+            );
+            assert!(
+                matches!(renew_response, StoreResponse::Err(_)),
+                "anonymous routed renewal must fail closed: {renew_response:?}"
+            );
+            assert_eq!(store.facts().unwrap().len(), before);
+
+            for (kind, event_id) in [
+                (crate::store::FactKind::ClaimRenewed, "renew-raw-anonymous"),
+                (crate::store::FactKind::Release, "release-raw-anonymous"),
+            ] {
+                let transition = crate::store::Fact {
+                    from_session_id: None,
+                    schema: crate::FACT_SCHEMA.to_string(),
+                    event_id: event_id.to_string(),
+                    seq: 0,
+                    thread_id: crate::new_id("room"),
+                    kind: kind.clone(),
+                    tool: None,
+                    role: None,
+                    subject: event_id.to_string(),
+                    scope: claim.scope.clone(),
+                    created_at: crate::now_string(),
+                    summary: None,
+                    evidence: if kind == crate::store::FactKind::ClaimRenewed {
+                        vec!["lease_expires_at:2099-01-01T00:30:00Z".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    target: None,
+                    ref_id: Some(claim.event_id.clone()),
+                    status: None,
+                    severity: None,
+                    uri: None,
+                    session: None,
+                };
+                let append_op: StoreOp = serde_json::from_value(serde_json::json!({
+                    "kind": "append_fact_verified",
+                    "fact": serde_json::to_value(&transition).unwrap()
+                }))
+                .unwrap();
+                let response = dispatch_one(
+                    &mut store,
+                    repo_root.to_string_lossy().as_ref(),
+                    StoreRequest::new(None, append_op),
+                );
+                assert!(
+                    matches!(response, StoreResponse::Err(_)),
+                    "anonymous raw {kind:?} must fail closed: {response:?}"
+                );
+                assert_eq!(
+                    store.facts().unwrap().len(),
+                    before,
+                    "refused raw {kind:?} must not append"
+                );
+            }
+            assert!(
+                store
+                    .snapshot()
+                    .unwrap()
+                    .active_claims
+                    .iter()
+                    .any(|active| active.event_id == claim.event_id)
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn raw_routed_modern_caller_can_renew_a_legacy_sessionless_claim() {
+            let repo_root = unique_repo_root("renewal-legacy-modern");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let claim = crate::store::Fact {
+                from_session_id: None,
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "claim-routed-legacy".to_string(),
+                seq: 0,
+                thread_id: crate::new_id("room"),
+                kind: crate::store::FactKind::Claim,
+                tool: Some("tool-a".to_string()),
+                role: None,
+                subject: "legacy routed authority claim".to_string(),
+                scope: vec!["file:src/legacy.rs".to_string()],
+                created_at: crate::now_string(),
+                summary: None,
+                evidence: vec!["lease_expires_at:2000-01-01T00:00:00Z".to_string()],
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            store.append_fact_verified(&claim).unwrap();
+
+            let op: StoreOp = serde_json::from_value(serde_json::json!({
+                "kind": "renew_claim_lease",
+                "claim_id": claim.event_id.clone(),
+                "lease_expires_at": "2099-01-01T00:30:00Z",
+                "event_id": "legacy-renewal-request",
+                "thread_id": "legacy-renewal-thread",
+                "created_at": "2026-08-10T00:00:00Z",
+                "caller_tool": "tool-a",
+                "caller_session_id": "session-modern",
+                "expected_owner_session_id": null
+            }))
+            .unwrap();
+            let response = dispatch_one(
+                &mut store,
+                repo_root.to_string_lossy().as_ref(),
+                StoreRequest::new(None, op),
+            );
+            assert!(
+                matches!(
+                    response,
+                    StoreResponse::Ok(StoreOk::RenewClaimLease { outcome: _ })
+                ),
+                "identified caller must retain legacy renewal compatibility: {response:?}"
+            );
+            assert_eq!(
+                crate::claim_authority::active_claim_record(
+                    &store.facts().unwrap(),
+                    &claim.event_id
+                )
+                .and_then(|record| record.lease_expires_at)
+                .as_deref(),
+                Some("2099-01-01T00:30:00Z")
+            );
+            let renewal = store
+                .facts()
+                .unwrap()
+                .into_iter()
+                .find(|fact| fact.kind == crate::store::FactKind::ClaimRenewed)
+                .expect("routed renewal must append");
+            assert_eq!(renewal.tool.as_deref(), Some("tool-a"));
+            assert_eq!(renewal.from_session_id.as_deref(), Some("session-modern"));
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn o26_routed_mutations_are_fenced_until_db_only_marker_removal() {
+            let repo_root = unique_repo_root("o26-routed-migration-fence");
+            let rally_dir = repo_root.join(".rally");
+            let mut store = DirectRoomStore::open_direct_at_with_engagement(
+                repo_root.clone(),
+                Some("alpha".to_string()),
+            )
+            .unwrap();
+            store.install_warm_fact_store().unwrap();
+
+            let request = |event_id: &str| {
+                StoreRequest::new(
+                    Some("alpha".to_string()),
+                    StoreOp::AppendFact {
+                        fact: serde_json::json!({
+                            "schema": crate::FACT_SCHEMA,
+                            "event_id": event_id,
+                            "seq": 0,
+                            "thread_id": format!("thread-{event_id}"),
+                            "kind": "decision",
+                            "subject": "migration fence control",
+                            "tool": "codex:test",
+                            "scope": [],
+                            "created_at": "2026-08-10T00:00:00Z",
+                            "evidence": [],
+                        }),
+                    },
+                )
+            };
+            let marker = rally_dir.join(crate::store::DB_ONLY_MIGRATION_MARKER_FILENAME);
+            let marker_stage =
+                rally_dir.join(crate::store::DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME);
+            let receipt = rally_dir.join("db-only-migration.v1.receipt.json");
+            let db_before = std::fs::read(rally_dir.join("facts.db")).unwrap();
+
+            std::fs::write(&marker_stage, b"prepared marker staging evidence").unwrap();
+            let stage_before = std::fs::read(&marker_stage).unwrap();
+            let response = dispatch_one(
+                &mut store,
+                canonical_repo_root(&repo_root).as_str(),
+                request("routed-fenced-marker-stage"),
+            );
+            match response {
+                StoreResponse::Err(error) => {
+                    assert!(error.message.contains("migrate-db-only"), "{error:?}");
+                }
+                other => panic!("routed append bypassed migration marker stage: {other:?}"),
+            }
+            assert_eq!(std::fs::read(&marker_stage).unwrap(), stage_before);
+            assert_eq!(
+                std::fs::read(rally_dir.join("facts.db")).unwrap(),
+                db_before
+            );
+            assert!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .all(|fact| fact.event_id != "routed-fenced-marker-stage")
+            );
+            std::fs::remove_file(&marker_stage).unwrap();
+
+            std::fs::write(&marker, b"prepared marker evidence").unwrap();
+
+            for (event_id, cleanup_pending) in [
+                ("routed-fenced-pre-receipt", false),
+                ("routed-fenced-cleanup-pending", true),
+            ] {
+                if cleanup_pending {
+                    std::fs::write(&receipt, b"immutable receipt evidence").unwrap();
+                }
+                let response = dispatch_one(
+                    &mut store,
+                    canonical_repo_root(&repo_root).as_str(),
+                    request(event_id),
+                );
+                match response {
+                    StoreResponse::Err(error) => {
+                        assert!(error.message.contains("migrate-db-only"), "{error:?}");
+                    }
+                    other => panic!("routed append bypassed migration marker: {other:?}"),
+                }
+                assert_eq!(
+                    std::fs::read(rally_dir.join("facts.db")).unwrap(),
+                    db_before
+                );
+                assert!(
+                    store
+                        .facts()
+                        .unwrap()
+                        .iter()
+                        .all(|fact| fact.event_id != event_id)
+                );
+            }
+
+            std::fs::remove_file(&marker).unwrap();
+            match dispatch_one(
+                &mut store,
+                canonical_repo_root(&repo_root).as_str(),
+                request("routed-after-marker-removal"),
+            ) {
+                StoreResponse::Ok(StoreOk::AppendFact { .. }) => {}
+                other => panic!("marker removal must reopen ordinary routed writes: {other:?}"),
+            }
+            assert!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .any(|fact| fact.event_id == "routed-after-marker-removal")
             );
             std::fs::remove_dir_all(repo_root).ok();
         }
@@ -1174,12 +3164,20 @@ mod imp {
             crate::store::watch_cold_opens_under(&repo_root);
 
             // Two consecutive engagement-scoped appends through the ONE store.
-            let append = |subject: &str| {
+            let mut append_index = 0usize;
+            let mut append = |subject: &str| {
+                append_index += 1;
                 let fact = serde_json::json!({
+                    "schema": crate::FACT_SCHEMA,
+                    "event_id": format!("rallyd-smoke-{append_index}"),
+                    "seq": 0,
+                    "thread_id": "rallyd-smoke-thread",
                     "kind": "lesson",
                     "subject": subject,
                     "tool": "claude_code:01",
                     "scope": ["rallyd-smoke"],
+                    "created_at": "2026-08-10T00:00:00Z",
+                    "evidence": [],
                 });
                 round_trip(
                     &socket,
@@ -1198,7 +3196,26 @@ mod imp {
                 other => panic!("second append not Ok: {other:?}"),
             }
 
-            // The two appends are visible through a snapshot read (same store).
+            // Seed enough real room state to force both facts and snapshot
+            // replies past the 8 KiB socket-buffer boundary seen in dogfood.
+            for i in 0..12 {
+                let subject = format!("large-reply-{i}-{}", "x".repeat(1024));
+                match append(&subject) {
+                    StoreResponse::Ok(StoreOk::AppendFact { .. }) => {}
+                    other => panic!("large-reply append not Ok: {other:?}"),
+                }
+            }
+            let facts_reply = round_trip(&socket, &StoreRequest::new(None, StoreOp::Facts));
+            assert!(
+                serde_json::to_string(&facts_reply).unwrap().len() > 8 * 1024,
+                "fixture did not cross the historical truncation boundary"
+            );
+            assert!(
+                matches!(facts_reply, StoreResponse::Ok(StoreOk::Facts { .. })),
+                "large facts reply was incomplete: {facts_reply:?}"
+            );
+
+            // All appends are visible through a large snapshot read (same store).
             match round_trip(
                 &socket,
                 &StoreRequest::new(
@@ -1212,7 +3229,7 @@ mod imp {
                 other => panic!("unexpected snapshot reply: {other:?}"),
             }
 
-            // G10 proof (f1): the two appends + snapshot were served entirely
+            // G10 proof (f1): the appends + large facts/snapshot reads were served entirely
             // through the ONE warm pool — the hot path never cold-opened a fresh
             // facts.db pool. (Recovery/reconcile paths that open directly are not
             // routed through `fact_store_handle` and so are not counted.)

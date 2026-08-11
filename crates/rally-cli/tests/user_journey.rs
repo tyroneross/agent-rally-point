@@ -28,8 +28,8 @@ fn serialize_rally_run() -> MutexGuard<'static, ()> {
 
 // ── Daemon-serving mode (BACKLOG S-P3, Chunk D / F4) ─────────────────────────
 //
-// Gated behind `RALLY_TEST_RALLYD=1`, used ONLY by the run-id reservation test
-// below. When set, a rallyd daemon serves the temp room before the parallel
+// Gated behind `RALLY_TEST_RALLYD=1`, used by the routed concurrency controls
+// below. When set, a rallyd daemon serves the temp room before parallel or
 // `rally run` subprocesses launch; each CAS reservation leg
 // (`session_facts_with_context_version` + `append_session_fact_if_context`,
 // lib.rs:4324) routes over the socket and the daemon's total order serialises
@@ -174,6 +174,27 @@ impl Workspace {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
+    fn json_with_session(&self, session_id: &str, args: &[&str]) -> Value {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
+        cmd.current_dir(&self.cwd)
+            .env("HOME", &self.home)
+            .env("RALLY_SESSION_ID", session_id);
+        if self.global_index {
+            cmd.env("RALLY_GLOBAL_INDEX", "1");
+        }
+        if self.suppress_worktree {
+            cmd.env("RALLY_NO_WORKTREE", "1");
+        }
+        let output = cmd.args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
     fn json_with_status(&self, args: &[&str]) -> (Value, Output) {
         let output = self.output(args);
         let value = serde_json::from_slice(&output.stdout).unwrap();
@@ -206,6 +227,23 @@ fn temp_path(name: &str) -> PathBuf {
             .unwrap()
             .as_nanos()
     ))
+}
+
+fn canonical_fact_count(cwd: &Path, kind: &str, ref_id: &str) -> usize {
+    fs::read_dir(cwd.join(".rally/log"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .flat_map(|entry| {
+            fs::read_to_string(entry.path())
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .filter(|row| row["payload"]["kind"] == kind && row["payload"]["ref"] == ref_id)
+        .count()
 }
 
 fn write_executable(path: &Path, body: &str) {
@@ -559,9 +597,10 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
     //   8: Read checkpoint (first enter's maybe_append_read_checkpoint at content_max=7)
     //   9: B11 risk fact (second enter's duplicate-active-squad detection;
     //      the unmanaged-agent risk dedups via already_recorded check)
-    // cursor_after = snapshot.max_seq = 9.
+    //   10: Read checkpoint (second enter records content_max_seq=9)
+    // cursor_after = snapshot.max_seq = 10.
     assert_eq!(enter_again["data"]["enter"]["cursor"]["before"], 7);
-    assert_eq!(enter_again["data"]["enter"]["cursor"]["after"], 9);
+    assert_eq!(enter_again["data"]["enter"]["cursor"]["after"], 10);
     assert_eq!(enter_again["data"]["enter"]["cursor"]["advanced"], true);
 
     let (check, check_output) = workspace.json_with_status(&[
@@ -1402,6 +1441,7 @@ fn rally_entry_and_handoff_split_response_and_work_buckets() {
 fn rally_runs_and_injects_managed_tmux_sessions() {
     let _run_guard = serialize_rally_run();
     let workspace = Workspace::new("rally-run-tmux");
+    let _daemon = maybe_start_daemon(&workspace.cwd, &workspace.home);
 
     let run = workspace.json(&[
         "run",
@@ -1540,9 +1580,31 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     let resolver_handoff = handoff_id.to_string();
     let resolver = thread::spawn(move || {
         thread::sleep(Duration::from_millis(200));
+        let wrong_tool = Command::new(env!("CARGO_BIN_EXE_rally"))
+            .current_dir(&resolver_cwd)
+            .env("HOME", &resolver_home)
+            .args([
+                "say",
+                "artifact",
+                "--json",
+                "--tool",
+                "codex:other",
+                "--ref",
+                resolver_handoff.as_str(),
+                "--subject",
+                "wrong tool must not acknowledge managed handoff",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            wrong_tool.status.success(),
+            "wrong-tool filtering fixture failed to append: stderr={} stdout={}",
+            String::from_utf8_lossy(&wrong_tool.stderr),
+            String::from_utf8_lossy(&wrong_tool.stdout)
+        );
         let output = Command::new(env!("CARGO_BIN_EXE_rally"))
-            .current_dir(resolver_cwd)
-            .env("HOME", resolver_home)
+            .current_dir(&resolver_cwd)
+            .env("HOME", &resolver_home)
             .args([
                 "say",
                 "resolve",
@@ -1587,6 +1649,11 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     assert_eq!(
         acked["data"]["inject"]["ack"]["subject"],
         "managed session handoff resolved after inject"
+    );
+    assert_eq!(
+        canonical_fact_count(&workspace.cwd, "resolve", handoff_id),
+        1,
+        "concurrent ACK must append exactly one target-authored close"
     );
 
     let capture = workspace.json(&[
@@ -1878,6 +1945,7 @@ fn rally_inject_require_ack_timeout_returns_ok_with_timeout_ack() {
     // NOT an error envelope.  The message was durably recorded (content_fact
     // present) before the ack wait began — the caller must NOT re-inject.
     let workspace = Workspace::new("rally-inject-ack-timeout");
+    let _daemon = maybe_start_daemon(&workspace.cwd, &workspace.home);
 
     workspace.json(&[
         "run",
@@ -1961,6 +2029,23 @@ fn rally_inject_require_ack_timeout_returns_ok_with_timeout_ack() {
     assert_eq!(
         body["data"]["inject"]["fallback_plan"]["assumption"], "not_received",
         "timeout must return a fallback plan that treats missing ACK as not received"
+    );
+
+    workspace.json(&[
+        "say",
+        "resolve",
+        "--json",
+        "--tool",
+        "claude_code:reviewer-01",
+        "--ref",
+        handoff_id,
+        "--subject",
+        "late target ACK after sender timeout",
+    ]);
+    assert_eq!(
+        canonical_fact_count(&workspace.cwd, "resolve", handoff_id),
+        1,
+        "a late target ACK must close canonically exactly once"
     );
 
     workspace.cleanup();
@@ -3108,39 +3193,46 @@ fn rally_check_covers_completion_boundaries() {
 #[test]
 fn rally_supports_all_required_fact_kinds() {
     let workspace = Workspace::new("rally-facts");
+    let session_id = "rally-facts-session";
 
     // R9-readback: release requires --ref <live-claim> and resolve requires
     // --ref <live-target>.  Write prerequisite facts first, then use their
     // event_ids for the state-transition facts.
 
     // Write a claim to release (also triggers presence+lead on first say).
-    let pre_claim = workspace.json(&[
-        "say",
-        "claim",
-        "--json",
-        "--tool",
-        "codex",
-        "--subject",
-        "pre-claim for release test",
-        "--path",
-        "src/lib.rs",
-    ]);
+    let pre_claim = workspace.json_with_session(
+        session_id,
+        &[
+            "say",
+            "claim",
+            "--json",
+            "--tool",
+            "codex",
+            "--subject",
+            "pre-claim for release test",
+            "--path",
+            "src/lib.rs",
+        ],
+    );
     let pre_claim_id = pre_claim["data"]["say"]["fact"]["event_id"]
         .as_str()
         .unwrap();
 
     // Write a blocker to resolve.
-    let pre_blocker = workspace.json(&[
-        "say",
-        "blocker",
-        "--json",
-        "--tool",
-        "codex",
-        "--subject",
-        "pre-blocker for resolve test",
-        "--path",
-        "src/lib.rs",
-    ]);
+    let pre_blocker = workspace.json_with_session(
+        session_id,
+        &[
+            "say",
+            "blocker",
+            "--json",
+            "--tool",
+            "codex",
+            "--subject",
+            "pre-blocker for resolve test",
+            "--path",
+            "src/lib.rs",
+        ],
+    );
     let pre_blocker_id = pre_blocker["data"]["say"]["fact"]["event_id"]
         .as_str()
         .unwrap();
@@ -3148,19 +3240,22 @@ fn rally_supports_all_required_fact_kinds() {
     // Kinds that don't need a ref.
     let simple_kinds = ["decision", "artifact", "handoff", "risk", "lesson"];
     for kind in simple_kinds {
-        let fact = workspace.json(&[
-            "say",
-            kind,
-            "--json",
-            "--tool",
-            "codex",
-            "--subject",
-            kind,
-            "--path",
-            "src/lib.rs",
-            "--evidence",
-            "observed",
-        ]);
+        let fact = workspace.json_with_session(
+            session_id,
+            &[
+                "say",
+                kind,
+                "--json",
+                "--tool",
+                "codex",
+                "--subject",
+                kind,
+                "--path",
+                "src/lib.rs",
+                "--evidence",
+                "observed",
+            ],
+        );
         assert_eq!(
             fact["data"]["say"]["fact"]["kind"], kind,
             "kind mismatch for {kind}"
@@ -3172,19 +3267,22 @@ fn rally_supports_all_required_fact_kinds() {
     }
 
     // R9: release --ref <live-claim>.
-    let release_fact = workspace.json(&[
-        "say",
-        "release",
-        "--json",
-        "--tool",
-        "codex",
-        "--subject",
-        "release",
-        "--path",
-        "src/lib.rs",
-        "--ref",
-        pre_claim_id,
-    ]);
+    let release_fact = workspace.json_with_session(
+        session_id,
+        &[
+            "say",
+            "release",
+            "--json",
+            "--tool",
+            "codex",
+            "--subject",
+            "release",
+            "--path",
+            "src/lib.rs",
+            "--ref",
+            pre_claim_id,
+        ],
+    );
     assert_eq!(release_fact["data"]["say"]["fact"]["kind"], "release");
     assert_eq!(
         release_fact["data"]["say"]["fact"]["schema"],
@@ -3211,19 +3309,22 @@ fn rally_supports_all_required_fact_kinds() {
     );
 
     // R9: resolve --ref <live-blocker>.
-    let resolve_fact = workspace.json(&[
-        "say",
-        "resolve",
-        "--json",
-        "--tool",
-        "codex",
-        "--subject",
-        "resolve",
-        "--path",
-        "src/lib.rs",
-        "--ref",
-        pre_blocker_id,
-    ]);
+    let resolve_fact = workspace.json_with_session(
+        session_id,
+        &[
+            "say",
+            "resolve",
+            "--json",
+            "--tool",
+            "codex",
+            "--subject",
+            "resolve",
+            "--path",
+            "src/lib.rs",
+            "--ref",
+            pre_blocker_id,
+        ],
+    );
     assert_eq!(resolve_fact["data"]["say"]["fact"]["kind"], "resolve");
     assert_eq!(
         resolve_fact["data"]["say"]["fact"]["schema"],
@@ -4349,6 +4450,55 @@ fn rally_owners_dirty_maps_dirty_path_to_claim_session() {
     assert_eq!(row["lease_expired"], false);
     assert_eq!(row["is_owner_live"], true);
 
+    workspace.cleanup();
+}
+
+#[test]
+fn same_tool_sibling_session_cannot_claim_owned_path() {
+    let workspace = Workspace::new("session-scoped-claim-admission");
+    let claim = |session: &str, subject: &str| {
+        Command::new(env!("CARGO_BIN_EXE_rally"))
+            .current_dir(&workspace.cwd)
+            .env("HOME", &workspace.home)
+            .env("RALLY_NO_WORKTREE", "1")
+            .env("RALLY_SESSION_ID", session)
+            .args([
+                "say",
+                "claim",
+                "--json",
+                "--tool",
+                "codex:shared",
+                "--subject",
+                subject,
+                "--path",
+                "src/session-owned.rs",
+            ])
+            .output()
+            .expect("spawn rally claim")
+    };
+
+    let owner = claim("session-owner", "owner claim");
+    assert!(
+        owner.status.success(),
+        "owner claim failed: {}",
+        String::from_utf8_lossy(&owner.stderr)
+    );
+    let sibling = claim("session-sibling", "sibling claim");
+    assert!(
+        !sibling.status.success(),
+        "same-tool sibling must not bypass exclusive claim authority"
+    );
+    let body: Value = serde_json::from_slice(&sibling.stdout)
+        .expect("claim conflict must use the typed JSON error envelope");
+    assert_eq!(body["command"], "partial_commit");
+    assert_eq!(body["ok"], false);
+    let warning = body["data"]["warning"]["message"]
+        .as_str()
+        .expect("partial commit must expose its warning message");
+    assert!(
+        warning.contains("claim conflict"),
+        "failure must identify the existing claim: {body:#}"
+    );
     workspace.cleanup();
 }
 

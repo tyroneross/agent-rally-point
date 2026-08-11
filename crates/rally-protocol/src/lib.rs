@@ -17,11 +17,12 @@
 //! file-backed implementation [`ledger::FileInbox`]. Everything else is
 //! private to each binary.
 //!
-//! ## Why the surface is this small
-//! The types are deliberately ~2 structs + 3 enums + 1 trait. The whole
-//! point of the inverted dependency is to minimise schema-drift risk
-//! (H1 in the F plan). The shared crate IS the contract; the H1
-//! contract round-trip test in `tests/contract_roundtrip.rs` enforces it.
+//! ## Why the legacy surface stays small
+//! The active inbox types remain deliberately ~2 structs + 3 enums + 1 trait.
+//! The additive [`delivery`] module freezes the future cross-adapter contract
+//! without changing the current FileInbox wire or breaking sibling Rust
+//! consumers. The shared crate IS the contract; round-trip and frozen-reader
+//! tests enforce both surfaces.
 //!
 //! ## Wire format
 //! Directives + Receipts are JSON, one record per line, appended via
@@ -51,6 +52,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod delivery;
 pub mod ledger;
 pub mod store_wire;
 

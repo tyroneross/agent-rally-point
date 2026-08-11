@@ -1416,6 +1416,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "shlex",
  "thiserror 2.0.18",
 ]
@@ -1424,6 +1425,15 @@ dependencies = [
 name = "rally-protocol"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rally-router-core"
+version = "0.1.0"
+dependencies = [
+ "rally-protocol",
  "serde",
  "serde_json",
 ]

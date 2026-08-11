@@ -1927,12 +1927,9 @@ D6 are below.
      own. And `append_fact` rewrites the sidecar from facts after every `Claim | Release | Resolve |
      ClaimExpired` append (`store.rs:1849-1856`), so a renewal survives only until the next
      claim-class write by anyone in the room.
-  3. Neither expiry path can see it. The reaper does `let facts = room.facts()?;` then
+  3. The production expiry path cannot see it. The reaper does `let facts = room.facts()?;` then
      `index_from_facts(&facts)` (`reaper.rs:285-286`) and passes that to
-     `claim_authority::expired_claims` — the sidecar is never opened. `expire_claim_leases_at`
-     (`store.rs:2237-2247`) does read the sidecar, but calls `rebuild_claim_index()` on the line
-     before, destroying the renewal it is about to read. That function is also `#[allow(dead_code)]`
-     with no CLI caller, which the register already records.
+     `claim_authority::expired_claims` — the sidecar is never opened.
 - **Consequence:** every claim expires at `claim_time + lease`, unconditionally, no matter what any
   renewal caller does. RC-051's stated precondition for re-enabling auto-reap ("add a renewal
   caller") is therefore satisfiable without changing behaviour, which is why it is corrected in
@@ -2344,14 +2341,11 @@ D6 are below.
   fact is already durable. The comment says so plainly ("Advisory... never blocks"), so this is not
   a misrepresentation — it is an ordering worth stating, because a reader auditing "does Rally
   validate its protocol envelopes" finds a yes that is post-hoc.
-- **Why this belongs on the register even though the code is honest about it:** it is the third
-  named instance of the register's own "computed then discarded" pattern. The other two, both
-  already recorded in the third-pattern table: `expire_claim_leases_at` implements lease expiry and
-  is `#[allow(dead_code)]` with zero production callers, and the reaper itself was correct and
-  reachable only through `doctor --reap-stale --apply` with nothing invoking it (which is what
+- **Why this belongs on the register even though the code is honest about it:** it is another
+  instance of the register's own "computed then discarded" pattern. The reaper itself was correct
+  and reachable only through `doctor --reap-stale --apply` with nothing invoking it (which is what
   RC-051's call site was added to fix, and what RC-053 now shows was fixed on the wrong side).
-  RC-030 is the same pattern from the writer's side. The pattern is not one subsystem's habit; it
-  is now four subsystems.
+  RC-030 is the same pattern from the writer's side. The pattern spans multiple subsystems.
 - **The question to ask, restated from the working hypothesis:** not "is this policy correct" but
   "who invokes it, and has anyone measured that they do". `authorize` answers the first and fails
   the second.
@@ -2753,7 +2747,6 @@ Rally computes a correct adaptive verdict and then does not act on it.**
 | facts below the archive floor are partitioned out of active buckets, "losslessly" | serialized in full anyway | 1,308,136 of 1,553,233 bytes — 84% of the room payload |
 | claims are lease- and owner-staleness eligible for reaping | the reaper is reachable only via `rally doctor --reap-stale --apply`; nothing invokes it | `--reap-stale` dry-run: **69 of 69 active claims already eligible** |
 | squads prove `Stale` and should be dropped from the room | the verdict is unreachable because signal (c) has no writer (RC-030) | distinct tools 32 → 78 → 147 → 155, never shrinking |
-| `expire_claim_leases_at` implements lease expiry | `#[allow(dead_code)]`; no CLI command reaches it | zero production callers |
 | handoffs have no verdict at all | immortal in `open_handoffs`; only a 24 h de-prioritization in `next` | 42 of 51 open handoffs older than 30 days |
 
 This is distinguishable from the first pattern. Pattern one is *an ack for the wrong step* — the
@@ -2762,7 +2755,7 @@ does the analysis correctly, writes it down, and then takes the other branch. RC
 the watcher tailed correctly and reported health, and the pipeline it read had already moved.
 
 The practical consequence is that **auditing this codebase by reading the policy is misleading.**
-Every one of the five verdicts above is implemented correctly, documented accurately, and covered by
+Every one of the four verdicts above is implemented correctly, documented accurately, and covered by
 tests of the policy itself. What is missing in each case is the call site. The register's existing
 advice — grade the claim against the code — is not sufficient here; the question to ask is *who
 invokes this, and has anyone measured that they do.* RC-030 is the sharpest case: a reader's doc

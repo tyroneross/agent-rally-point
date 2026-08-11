@@ -40,6 +40,7 @@ impl Workspace {
         Command::new(env!("CARGO_BIN_EXE_rally"))
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
+            .env("RALLY_SESSION_ID", "claims-refresh-test-session")
             .args(args)
             .output()
             .unwrap()

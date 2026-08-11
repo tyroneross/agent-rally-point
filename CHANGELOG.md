@@ -7,6 +7,16 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Fixed — a kind read off the ledger can now be typed back into `rally say`
+
+- **`rally say backlog_item` is accepted.** `FactKind::BacklogItem` reaches disk as
+  `backlog_item` (serde's `rename_all = "snake_case"`), but `FactKind::parse` matched only
+  `backlog-item`, so the one spelling a caller could observe was the one spelling the CLI
+  refused. Both are accepted now, the same way `claim_expired` already aliases
+  `claim.expired`; `backlog-item` stays canonical in `--help` and in `as_str`. A unit test
+  round-trips every variant's real serde output back through `parse`, so the next variant
+  whose wire spelling and match arm disagree fails in CI rather than at a caller's prompt.
+
 ## v0.2.1 - 2026-08-07
 
 ### Ledger — one additive schema change, called out because the version number understates it
