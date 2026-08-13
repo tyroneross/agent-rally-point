@@ -13,15 +13,17 @@
 
 /**
  * Given a workstream descriptor and a `rally room --json` snapshot, classify each
- * task as done | claimed | pending and compute the resume set (pending tasks whose
+ * task as done | claimed | active | pending and compute the resume set (pending tasks whose
  * dependencies are all done).
  *
  * Convention (documented in PROTOCOL.md "Durable fan-out & resume"):
  *   - a task is DONE when a rally artifact's subject names the task id
  *     (recommended: `rally say artifact --subject "<task.id>: <result>" ...`)
  *   - a task is CLAIMED when an active claim names the task id or overlaps its `owns`
+ *   - a READ-ONLY task is ACTIVE when the room's transitional squad projection has
+ *     the exact active task tool `<tool-prefix>:<task-id>`
  *
- * Usage:  node workstream-status.mjs <descriptor.json> <rally-room.json|->
+ * Usage:  node workstream-status.mjs <descriptor.json> <rally-room.json|-> [--tool-prefix <prefix>]
  * Exit:   0 = complete (nothing left to dispatch) · 3 = work remains · 2 = usage/parse error
  */
 
@@ -62,14 +64,20 @@ function scopesOverlap(scope, owns) {
   return scope.some((s) => owns.some((o) => norm(s) === norm(o)));
 }
 
-export function workstreamStatus(descriptor, room) {
+export function workstreamStatus(descriptor, room, { toolPrefix = "agent" } = {}) {
   if (!descriptor || !Array.isArray(descriptor.tasks)) {
     throw new Error("descriptor must have a tasks array");
   }
+  if (typeof toolPrefix !== "string" || !/^[A-Za-z0-9._-]+$/.test(toolPrefix)) {
+    throw new Error("toolPrefix must match /^[A-Za-z0-9._-]+$/");
+  }
   const artifacts = Array.isArray(room.recent_artifacts) ? room.recent_artifacts : [];
   const claims = Array.isArray(room.active_claims) ? room.active_claims : [];
+  const squads = Array.isArray(room.squads) ? room.squads : [];
 
-  const status = {}; // id -> 'done' | 'claimed' | 'pending'
+  // Task ids may legally be `__proto__`, so a normal object would invoke its
+  // inherited setter instead of recording that task and could false-complete.
+  const status = Object.create(null); // id -> 'done' | 'claimed' | 'active' | 'pending'
   for (const t of descriptor.tasks) {
     if (!t || !t.id) continue;
     const done = artifacts.some((a) => mentions(a.subject, t.id));
@@ -77,8 +85,18 @@ export function workstreamStatus(descriptor, room) {
       status[t.id] = "done";
       continue;
     }
-    const claimed = claims.some((c) => mentions(c.subject, t.id) || scopesOverlap(c.scope, t.owns));
-    status[t.id] = claimed ? "claimed" : "pending";
+    const readOnly = t.owns === "read-only";
+    const claimed = !readOnly && claims.some((c) => mentions(c.subject, t.id) || scopesOverlap(c.scope, t.owns));
+    if (claimed) {
+      status[t.id] = "claimed";
+      continue;
+    }
+    // Transitional O33-B heuristic: default room snapshots do not expose the
+    // run/step-scoped presence fact. Until O33-C adds active_activities, only an
+    // exact, fresh task-tool identity can hold a read-only task in-flight.
+    const taskTool = `${toolPrefix}:${t.id}`;
+    const active = readOnly && squads.some((s) => s?.tool === taskTool && s?.status === "active");
+    status[t.id] = active ? "active" : "pending";
   }
 
   const isDone = (id) => status[id] === "done";
@@ -90,6 +108,7 @@ export function workstreamStatus(descriptor, room) {
   const ids = descriptor.tasks.filter((t) => t && t.id).map((t) => t.id);
   const done = ids.filter((id) => status[id] === "done");
   const claimedList = ids.filter((id) => status[id] === "claimed");
+  const active = ids.filter((id) => status[id] === "active");
   const pending = ids.filter((id) => status[id] === "pending");
 
   return {
@@ -98,9 +117,10 @@ export function workstreamStatus(descriptor, room) {
     total: ids.length,
     done,
     claimed: claimedList,
+    active,
     pending,
     to_dispatch: toDispatch, // pending AND deps satisfied → resume here
-    complete: pending.length === 0 && claimedList.length === 0,
+    complete: pending.length === 0 && claimedList.length === 0 && active.length === 0,
     status,
   };
 }
@@ -109,8 +129,17 @@ export function workstreamStatus(descriptor, room) {
 function main(argv) {
   const [descPath, roomPath] = [argv[2], argv[3]];
   if (!descPath || !roomPath) {
-    process.stderr.write("usage: node workstream-status.mjs <descriptor.json> <rally-room.json|->\n");
+    process.stderr.write("usage: node workstream-status.mjs <descriptor.json> <rally-room.json|-> [--tool-prefix <prefix>]\n");
     return 2;
+  }
+  let toolPrefix = "agent";
+  const rest = argv.slice(4);
+  if (rest.length > 0) {
+    if (rest.length !== 2 || rest[0] !== "--tool-prefix") {
+      process.stderr.write(`unexpected arguments: ${rest.join(" ")}\n`);
+      return 2;
+    }
+    toolPrefix = rest[1];
   }
   let descriptor, room;
   try {
@@ -128,7 +157,7 @@ function main(argv) {
   }
   let out;
   try {
-    out = workstreamStatus(descriptor, room);
+    out = workstreamStatus(descriptor, room, { toolPrefix });
   } catch (e) {
     process.stderr.write(`${e.message}\n`);
     return 2;
@@ -139,7 +168,7 @@ function main(argv) {
     return 0;
   }
   process.stderr.write(
-    `… ${out.done.length}/${out.total} done · ${out.claimed.length} in-flight · ${out.pending.length} pending · dispatch now: [${out.to_dispatch.join(", ")}]\n`,
+    `… ${out.done.length}/${out.total} done · ${out.claimed.length} claimed · ${out.active.length} read-active · ${out.pending.length} pending · dispatch now: [${out.to_dispatch.join(", ")}]\n`,
   );
   return 3; // work remains — host re-dispatches the to_dispatch set
 }

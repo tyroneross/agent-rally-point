@@ -153,15 +153,66 @@ test("renderAll refuses a descriptor that fails the linter", () => {
   assert.throws(() => renderAll({ doc: bad, runId: RUN, toolPrefix: "agent" }), /workstream-lint/);
 });
 
-test("read-only task renders no before-write check and a placeholder uri", () => {
+test("read_only_packet_emits_activity_and_zero_claim_release", () => {
   const doc = {
     workstream: "ro",
     description: "read-only review",
-    tasks: [{ id: "r1", intent: "review", owns: "read-only", validation: "true", output: "notes" }],
+    tasks: [{
+      id: "r1",
+      intent: "review",
+      owns: "read-only",
+      validation: "true",
+      output: "notes",
+      depends_on: ["source"],
+    }],
   };
   const p = renderPacket({ task: doc.tasks[0], runId: RUN, toolPrefix: "agent" });
   assert.ok(/read-only/i.test(p), "expected read-only language");
-  assert.ok(!p.includes("before-write --tool agent:r1 --path"), "read-only task claims no path");
+  assert.ok(p.includes("rally say presence --tool agent:r1"), "read-only task emits nonexclusive activity");
+  assert.ok(p.includes("--summary activity:read-only"), "activity is typed without using a read receipt");
+  assert.ok(p.includes("--status working"), "activity reports its lifecycle state");
+  assert.ok(p.includes(`--run ${RUN}`), "activity carries the run marker");
+  assert.ok(p.includes("--step r1"), "activity carries the step marker");
+  assert.ok(p.includes("--parent-step source"), "activity preserves dependency lineage");
+  assert.ok(p.includes("--ref <activity-event-id>"), "terminal artifact links to the activity");
+  assert.ok(p.includes("--subject 'r1: notes'"), "terminal artifact names the task for resume");
+  assert.ok(!p.includes("rally say claim"), "read-only task must not create exclusive ownership");
+  assert.ok(!p.includes("rally check before-write"), "read-only task must not run a write guard");
+  assert.ok(!p.includes("rally say release"), "read-only task has no ownership to release");
+});
+
+test("read_only_packet_allows_only_coordination_and_transient_verifier_writes", () => {
+  const task = {
+    id: "review",
+    intent: "review",
+    owns: "read-only",
+    validation: "clippy is clean",
+    validation_recipe: "cargo-clippy",
+    output: "notes",
+  };
+  const p = renderPacket({ task, runId: RUN, toolPrefix: "agent" });
+  assert.ok(
+    p.includes("Do not intentionally change task or domain resources"),
+    "read-only must prohibit intentional domain mutation",
+  );
+  assert.ok(
+    p.includes("generated Rally coordination records"),
+    "read-only must permit its required Rally metadata writes",
+  );
+  assert.ok(
+    /ordinary\s+transient tool state created while verifying this task/.test(p),
+    "read-only must permit ordinary verifier caches/build state",
+  );
+  assert.ok(p.includes("cargo clippy"), "the named verifier still renders");
+});
+
+test("write_packet_still_claims_checks_and_releases_every_owned_path", () => {
+  const p = renderPacket({ task: MULTI.tasks[2], runId: RUN, toolPrefix: "agent" });
+  assert.equal(p.split("\n").filter((line) => line.startsWith("rally say claim")).length, 1);
+  assert.equal(p.split("\n").filter((line) => line.startsWith("rally check before-write")).length, 2);
+  assert.equal(p.split("\n").filter((line) => line.startsWith("rally say release")).length, 1);
+  assert.ok(p.includes("--subject 'c: c'"), "write artifact also names the task for resume");
+  assert.ok(!p.includes("rally say presence --tool agent:c"), "write task keeps the exclusive lifecycle");
 });
 
 test("determinism: identical inputs yield byte-identical packets", () => {

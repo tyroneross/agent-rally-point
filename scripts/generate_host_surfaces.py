@@ -194,7 +194,7 @@ def claude_hook_group(
         "command": command_for("claude_code", source, phase["phase"]),
     }
     if include_timeout:
-        hook["timeout"] = phase["timeout_ms"]
+        hook["timeout"] = hook_timeout_seconds(phase)
     group: dict[str, Any] = {"hooks": [hook]}
     matcher = phase.get("matchers", {}).get("claude_code")
     if matcher:
@@ -206,7 +206,7 @@ def codex_hook_group(phase: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     event = phase["events"]["codex"]
     hook = {
         "type": "command",
-        "timeout": phase["timeout_ms"],
+        "timeout": hook_timeout_seconds(phase),
         "command": command_for("codex", "project", phase["phase"]),
     }
     group: dict[str, Any] = {"hooks": [hook]}
@@ -216,8 +216,55 @@ def codex_hook_group(phase: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return event, group
 
 
+def hook_timeout_seconds(phase: dict[str, Any]) -> int:
+    """Convert the canonical millisecond value to exact host-schema seconds."""
+    timeout_ms = phase.get("timeout_ms")
+    if (
+        isinstance(timeout_ms, bool)
+        or not isinstance(timeout_ms, int)
+        or timeout_ms <= 0
+        or timeout_ms % 1000 != 0
+    ):
+        raise GenerationError(
+            f"hook phase {phase.get('phase')!r} timeout_ms must be a positive whole second"
+        )
+    return timeout_ms // 1000
+
+
+def native_effects(config: dict[str, Any]) -> dict[str, list[str]]:
+    """Validate and return the wrapper's named native-tool effect registry."""
+
+    effects = config.get("hooks", {}).get("native_effects")
+    required = ("pure_read", "opaque_shell", "mutation")
+    if not isinstance(effects, dict) or set(effects) != set(required):
+        raise GenerationError(
+            "hooks.native_effects must define exactly pure_read, opaque_shell, mutation"
+        )
+
+    normalized: dict[str, list[str]] = {}
+    seen: dict[str, str] = {}
+    for effect in required:
+        tools = effects.get(effect)
+        if not isinstance(tools, list) or not tools:
+            raise GenerationError(f"hooks.native_effects.{effect} must be a non-empty list")
+        if any(not isinstance(tool, str) or not tool.strip() for tool in tools):
+            raise GenerationError(
+                f"hooks.native_effects.{effect} contains an empty or non-string tool"
+            )
+        normalized[effect] = list(tools)
+        for tool in tools:
+            key = tool.lower()
+            if key in seen:
+                raise GenerationError(
+                    f"native tool {tool!r} appears in both {seen[key]} and {effect}"
+                )
+            seen[key] = effect
+    return normalized
+
+
 def render_hook_surfaces(config: dict[str, Any]) -> dict[Path, str]:
     phases = config["hooks"]["phases"]
+    effects = native_effects(config)
     claude_plugin_hooks: dict[str, list[dict[str, Any]]] = {}
     claude_project_hooks: dict[str, list[dict[str, Any]]] = {}
     codex_hooks: dict[str, list[dict[str, Any]]] = {}
@@ -237,7 +284,7 @@ def render_hook_surfaces(config: dict[str, Any]) -> dict[Path, str]:
             cursor_event = events["cursor"]
             entry: dict[str, Any] = {
                 "command": command_for("cursor", "project", phase["phase"]),
-                "timeout": phase["timeout_ms"] // 1000,
+                "timeout": hook_timeout_seconds(phase),
             }
             matcher = phase.get("matchers", {}).get("cursor")
             if matcher:
@@ -249,15 +296,26 @@ def render_hook_surfaces(config: dict[str, Any]) -> dict[Path, str]:
         "auto-loaded at this standard path. Project and plugin registration may "
         "both be active; the canonical hook counts registration sources for an "
         "identical event while preserving same-source repeats. Claude keeps edit-scoped "
-        "PreToolUse while Codex intentionally checks every PreToolUse event."
+        "PreToolUse. Codex keeps its matcher unset pending captured native matcher "
+        "evidence; the wrapper classifies named reads, opaque shell tools, and mutations "
+        "before repo or Rally resolution."
     )
     project_comment = (
         "GENERATED from config/host-integrations.json. Portable project hooks "
         "work without global settings. Project and installed-plugin registration "
         "may overlap; the canonical hook counts registration sources for an "
         "identical event while preserving same-source repeats. "
-        "Claude keeps edit-scoped PreToolUse while Codex intentionally checks "
-        "every PreToolUse event. See docs/AUTO-COORDINATION-HOOKS.md."
+        "Claude keeps edit-scoped PreToolUse. Codex keeps its matcher unset pending "
+        "captured native matcher evidence; the wrapper classifies named reads, opaque "
+        "shell tools, and mutations before repo or Rally resolution. See "
+        "docs/AUTO-COORDINATION-HOOKS.md."
+    )
+    codex_comment = (
+        "GENERATED from config/host-integrations.json. Codex PreToolUse has no matcher "
+        "until captured native matcher evidence proves a stable filter. The wrapper "
+        f"classifies {sum(len(tools) for tools in effects.values())} named tools before "
+        "repo or Rally resolution: pure reads and opaque shell tools return {}, while "
+        "mutations receive path-scoped checks. See docs/AUTO-COORDINATION-HOOKS.md."
     )
     cursor_comment = (
         "GENERATED from config/host-integrations.json. Cursor schema v1 has no "
@@ -271,7 +329,9 @@ def render_hook_surfaces(config: dict[str, Any]) -> dict[Path, str]:
         Path(".claude/settings.json"): json_text(
             {"$comment": project_comment, "hooks": claude_project_hooks}
         ),
-        Path(".codex/hooks.json"): json_text({"hooks": codex_hooks}),
+        Path(".codex/hooks.json"): json_text(
+            {"description": codex_comment, "hooks": codex_hooks}
+        ),
         Path(".cursor/hooks.json"): json_text(
             {"$comment": cursor_comment, "version": 1, "hooks": cursor_hooks}
         ),

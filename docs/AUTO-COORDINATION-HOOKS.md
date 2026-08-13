@@ -5,8 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # Auto-Coordination Hooks
 
-Make rally presence + before-write deconfliction **automatic** for coding
-agents (Claude Code, Codex, Gemini) without per-repo setup. Other agents can
+Make Rally presence and mutation deconfliction **automatic** for coding
+agents (Claude Code, Codex, Gemini) without serializing parallel reads. Other agents can
 still participate manually through the same Rally contract; see
 [`ANY-AGENT-ONBOARDING.md`](ANY-AGENT-ONBOARDING.md). Closes backlog
 **B19-(a)** ("Claude PreToolUse hook — land separately") and the recurrence
@@ -64,7 +64,7 @@ the portable project config is already committed.
 
 `config/host-integrations.json` is the host-neutral contract. It defines plugin
 identity, provider IDs, host-specific descriptions and keywords, hook cadence,
-event matchers, timeouts, and skill-frontmatter overlays. The CLI version remains
+event matchers, native-tool effect classes, timeouts, and skill-frontmatter overlays. The CLI version remains
 canonical in `crates/rally-cli/Cargo.toml`; the generator reads it rather than
 duplicating it in the contract.
 
@@ -122,11 +122,97 @@ and release jobs.
 |------|--------|
 | `SessionStart` | Resolves `rally hooks status`, calls `rally enter` when hooks are enabled, posts `state=idle` with a next check-in, and surfaces a short context line from `rally room` / `rally next` / `rally status read` (active peers, claimed paths, suggested next, agent status). Even in a quiet room, the default prompt tells the user Rally is active and shows the session/repo off commands. |
 | `UserPromptSubmit` | Per-turn presence refresh (hook phase `idle`). Posts `state=idle`, then re-surfaces actionable `rally next` work plus peer status from `rally status read` when another live agent is working/idle/blocked/done. Advisory `additionalContext`; emits `{}` when the room is quiet or unchanged. This is the cadence parity fix for Claude and Codex. |
-| `PreToolUse(Edit\|Write\|MultiEdit)` | Extracts the target file path from the tool input envelope, posts `state=working` with file + intent, calls `rally check before-write --path <p>`, and (when the path is unclaimed and the check allows) auto-claims it. On a conflict, surfaces a host-valid warning to the agent: Claude receives `permissionDecision` plus `systemMessage`; Codex receives `systemMessage` only because it rejects Claude's `permissionDecision` field. `rally check` already records the durable audit fact. |
+| `PreToolUse` — named pure read | Returns exactly `{}` before the wrapper's repo walk or Rally binary resolution. It posts no status, performs no check, and creates no claim. The generated Codex launcher still runs `git rev-parse` to locate the wrapper; O33-D measures that installed envelope separately. Read tool names come from `hooks.native_effects.pure_read`; generator tests require byte-for-byte parity with the wrapper registry. |
+| `PreToolUse` — opaque shell | Returns exactly `{}` with zero Rally calls because command text is not a trustworthy effect or path declaration. A shell command that will mutate files must use the explicit agent loop: claim the exact target and run `rally check before-write --strict` before the mutation. |
+| `PreToolUse` — named mutation | Extracts and canonicalizes every declared target against the validated event `cwd` and physical Rally root. It posts `state=working` once, checks every target before any claim, reads room ownership once, and then creates one aggregate repeated-path claim for the targets not already covered by that agent's claim. If any target denies, times out, errors, or escapes the root, the whole automatic claim is skipped; no prefix is claimed. Advisory `allow: true` warnings remain visible and do not turn into a denial. |
+| `PreToolUse` — unknown or malformed | Inside an enabled Rally repo, fails open with exact `{}`, one bounded rate-limited stderr diagnostic, and zero Rally status/check/claim calls. Outside a Rally repo or when hooks are disabled, it is silent. It never treats an arbitrary `path` field as write ownership. |
 | `Stop` | At turn end (hook phase `after-write`), posts `state=idle` with a next check-in, runs `rally next`, and surfaces any pending coordination obligation or peer status change as an advisory `systemMessage`. Parity with Codex's `Stop` hook; never blocks turn completion (strict mode is the only path that can emit `decision: block`). |
 
+**Why the Codex matcher remains unset.** Claude's documented matcher keeps its
+hook edit-scoped. OpenAI's Codex 0.144.3 source proves that `apply_patch` sends
+patch text as `tool_input.command`, and the wrapper replays that exact shape;
+`tool_input.patch` remains a named legacy-adapter carrier. That source does not
+prove which matcher names and combinations an installed Codex host accepts, so
+the generator deliberately emits no Codex matcher. The wrapper classifies the
+native envelope before its repo walk or any Rally subprocess. Known reads still
+pay for the host launcher plus one shell/JSON parse, but no Rally process or
+ledger write. Narrowing the host matcher remains an O33-D optimization after a
+live captured matcher test; it is not assumed from another host's vocabulary.
+[Codex 0.144.3 source evidence](https://github.com/openai/codex/blob/rust-v0.144.3/codex-rs/core/src/tools/handlers/apply_patch.rs#L479-L483).
+The generated Codex file uses only its accepted top-level `description` and
+`hooks` keys. Claude and Codex handler timeouts are whole seconds, so the
+generator converts the canonical 5,000/10,000 millisecond values to 5/10 before
+rendering either host surface.
 
-**Why PreToolUse stays edit-scoped for Claude (deliberate).** Codex's `.codex/hooks.json` wires PreToolUse with *no matcher*, so it fires `before-write` on every tool call — consistent, but it spawns the hook + watchdog on reads/bash/etc. that have no file path and no-op. Claude keeps the `Edit|Write|MultiEdit|NotebookEdit` matcher for `before-write`; both hosts get continuous awareness from the cheaper `UserPromptSubmit` (idle) refresh plus `Stop` (after-write).
+**Mutation targets are all-or-none.** `apply_patch` reads only `Add File`,
+`Update File`, `Delete File`, and `Move to/from` directives, and those directive
+paths must be relative to the validated event `cwd`. Other named mutation
+envelopes such as Claude `Write`/`Edit` may carry an absolute `file_path`; the
+wrapper accepts it only when physical containment resolves it inside the Rally
+root. One identity-whitespace, empty, malformed, root-equal, outside-root, or
+symlink-escaping target rejects the entire automatic route before Rally runs.
+For a new path whose parent directories do not exist yet, containment starts at
+the nearest physical existing ancestor and appends the unresolved suffix. An
+unresolved suffix containing `..` rejects atomically rather than guessing
+through a path that does not yet exist.
+Only an absent target alias is optional: a present null/blank move destination
+invalidates the whole mutation. A present `tool_input`, `toolInput`, or `input`
+carrier must be an object and never falls back to an outer-envelope `path` when
+malformed.
+Native Windows drive/backslash paths are not proven on the supported
+macOS/Linux wrapper and fail open as an explicit `UNKNOWN` platform case.
+Rally path, file, intent, and claim-subject option values use attached
+`--name=value` arguments, so a valid root filename such as `--evil` cannot be
+reparsed as a CLI option.
+
+The current wrapper accepts at most 16 mutation targets. A 17-target envelope
+is rejected atomically with a diagnostic and zero Rally calls; it is never
+silently truncated. This is a documented degraded-mode ceiling, not evidence
+that 16 is an optimal product limit. For a larger mutation, the agent must
+strict-check and claim every exact target explicitly before running it; a
+future batch CLI primitive can remove the ceiling. The configured worst-case
+Rally budget is 400 ms for hook settings, 400 ms for one working status,
+at most 4,000 ms across all path checks, 400 ms for one room read, and 1,000 ms
+for one claim: at most 6,200 ms, leaving 3,800 ms of orchestration margin under
+the generated 10-second host timeout. At 16 targets each check receives 250 ms.
+The outer watchdog sends immediate `KILL` at each millisecond deadline; it does
+not add a per-call TERM grace period. If neither a millisecond-capable
+`timeout`/`gtimeout` nor high-resolution Perl guard is available, a classified
+mutation degrades before any Rally subprocess and creates no automatic claim.
+These numbers prove a configured bound, not that a real host completes within
+it; O33-D's quiesced installed-surface benchmark decides whether they should
+change.
+
+## Read versus write operation policy
+
+Reads do not own a resource. They can run concurrently, including when another
+agent is editing the same file. The reader needs writer context and a recheck,
+not a lock.
+
+| Operation | Claim or lock | Context and validation contract |
+|---|---|---|
+| Pure read | None | Use the latest turn-level active-writer context. If the path has an active writer, treat the bytes as provisional and do not wait merely for ownership. |
+| Read for a decision, audit finding, or final conclusion | None | Capture the file digest plus Rally source sequence/active-claim reference. Re-run the scoped path read immediately before the conclusion; reread and recompute if either token changed. The automated source-token projection lands after the engagement/session work in S9/S10; until then this is an explicit agent obligation. |
+| Read before write | No claim for the read; exact path claim and strict check before mutation | Revalidate after acquiring the write claim when the earlier read was provisional or its token changed. |
+| Mutation | One aggregate exclusive claim after one before-write check for every target | Never substitute opaque shell text or a generic `path` field for declared targets. A multi-file patch checks all paths even when an earlier path conflicts; any denial or check failure creates zero claims. |
+| Destructive or administrative mutation | Exact targets, explicit authority, recovery evidence, then the mutation checks above | Read-only context never authorizes deletion, migration, rotation, or room-wide cleanup. |
+
+Turn-level context remains important even though per-read hooks bypass Rally:
+`SessionStart` and `UserPromptSubmit` surface live writers, files, and intents.
+The follow-on reader-context segment will bind that context to a stable
+engagement/run, add a source token, and require final revalidation without
+making the reader wait for the writer to finish.
+
+**Activation hold:** O33-A may be committed only on its isolated branch. It must
+not be merged, cherry-picked, or checked out into central integration, local
+main, an installed plugin, a pushed ref, or any user-active worktree until
+O33-B and O33-C are ready and the combined A+B+C gate passes. Build O33-B on top
+of A in isolation; integrate the combined chain only after post-O26 O33-C is
+complete. This hold is necessary because the project Codex and Claude hook
+files are already active for new sessions, while turn-level writer context can
+be stale or omit a relevant path. O33-C supplies the path-scoped active-writer
+context, source token, and final revalidation that make the read bypass safe
+for consequential work.
 
 **Duplicate registration is safe.** Claude Code can load both the installed
 plugin hooks and this repo's project hooks. Identical event envelopes share a

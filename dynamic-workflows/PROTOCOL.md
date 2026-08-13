@@ -137,24 +137,27 @@ Rally facilitates; it does not vouch.
 
 | Tier | When | Mechanism | Rally's role |
 |------|------|-----------|--------------|
-| **host-native** (default) | Single host, agents share one machine/session | Host's own fan-out — Claude `Agent`/`Task`, Codex delegation, Pi children | Records claims/handoffs/artifacts; checks boundaries |
+| **host-native** (default) | Single host, agents share one machine/session | Host's own fan-out — Claude `Agent`/`Task`, Codex delegation, Pi children | Records write claims or read activity, handoffs, and artifacts; checks write boundaries |
 | **cross-host** | Work spans hosts/terminals/machines | `rally run` a managed session, `rally inject` the task packet | Same — plus carries the packet across the host boundary |
 
 Tier is a hint on the task; the host decides how to actually run. Rally behaves identically either way.
 
 ## 3. The agent loop (per task)
 
+Every task enters, does the work, verifies, posts `<task.id>: <task.output>` as an artifact, and
+calls `rally next`. Its coordination lifecycle depends on `owns`:
+
+- A write task posts one path-scoped `claim`, runs strict `before-write` once per owned path, and
+  releases the claim after its artifact.
+- An `owns: "read-only"` task posts one run/step-scoped `presence` with
+  `summary=activity:read-only` and `status=working`. It posts no claim, runs no before-write check,
+  and posts no release. It must not intentionally change task/domain resources; its only permitted
+  writes are the generated Rally coordination records and ordinary transient tool state created
+  during verification. Its terminal artifact references the activity event id.
+
 ```text
-rally enter --tool <you>
-  → claim:   rally say claim --tool <you> --subject "<task.intent>" --path <owns...>
-  → guard:   rally check before-write --tool <you> --path <owns...> --strict
-             (blocking finding → stop, resolve, or pick a non-overlapping task)
-  → do the work (host-native or via rally run/inject)
-  → verify:  run task.validation_recipe if it names one; otherwise read task.validation,
-             decide the command yourself, and run it under this host's approval policy
-  → record:  rally say artifact --tool <you> --subject "<task.output>" --uri <path> --evidence "<validation result>"
-  → release: rally say release --tool <you> --ref <claim-id> --subject "done"
-  → rally next --tool <you>
+write:     enter → claim → before-write → work → verify → artifact → release → next
+read-only: enter → presence(activity:read-only) → work → verify → artifact(ref=activity) → next
 ```
 
 **Aggregate**: the coordinating agent reads `rally room` and confirms every task posted an artifact
@@ -170,11 +173,15 @@ in one parent process's memory (`RuntimeState`). If that process dies — or the
 hosts, or hours — everything is lost; there is no resume. This module keeps the same fan-out shape
 but **checkpoints every task to Rally**, so progress is durable and any fresh agent can resume.
 
-**Checkpoint convention** — a task is *started* by a claim and *done* by an artifact naming the id:
+**Checkpoint convention** — a write task starts with a claim, a read-only task starts with
+nonexclusive activity, and both finish with an artifact whose subject names the task id:
 
 ```bash
 rally say claim    --tool <you> --subject "<task.id>" --path <owns...>
-rally say artifact --tool <you> --subject "<task.id>: <result>" --uri <path> --evidence "<validation>"
+rally say presence --tool <you> --subject "<task.id>: <intent>" --summary activity:read-only \
+  --status working --run <run_id> --step <task.id>
+rally say artifact --tool <you> --subject "<task.id>: <result>" --uri <path> --evidence "<validation>" \
+  --run <run_id> --step <task.id>
 ```
 
 **Resume** (after a crash, a new session, or on a different host) — re-derive the remaining work from
@@ -182,15 +189,22 @@ Rally instead of memory:
 
 ```bash
 rally room --json > room.json
-node core/workstream-status.mjs my.workstream.json room.json
-# → per-task done|claimed|pending + `to_dispatch` (pending tasks whose deps are done)
+node core/workstream-status.mjs my.workstream.json room.json --tool-prefix agent
+# → per-task done|claimed|active|pending + `to_dispatch` (pending tasks whose deps are done)
 # exit 0 = complete · exit 3 = work remains
 ```
+
+`claimed` remains exclusive write ownership. `active` is nonexclusive read-only work. Before
+O33-C's run-scoped `active_activities` projection exists, `active` uses only an exact fresh squad
+tool match, `<tool-prefix>:<task.id>`; a differently prefixed, idle, or substring-matching tool does
+not hold the task. Pass the same prefix used by `packet.mjs` (both default to `agent`). This is a
+transitional resume heuristic, not proof that a particular run is live, and the A+B branch stays
+inactive until O33-C replaces it in the combined activation gate.
 
 Re-dispatch ONLY the `to_dispatch` set; tasks with a done-artifact are skipped. A resumable host loop:
 
 ```bash
-while ! node core/workstream-status.mjs ws.json <(rally room --json); do
+while ! node core/workstream-status.mjs ws.json <(rally room --json) --tool-prefix agent; do
   : # spawn host-native agents for each id in to_dispatch (Tier 1), or rally run/inject (Tier 2)
 done
 ```
@@ -201,7 +215,7 @@ stopped. Bounded concurrency (`core/limiter.mjs`, lifted from pi) still caps in-
 
 **Lineage from the .mjs path.** `core/route.mjs` owns concurrency/ordering only — it does **not**
 shell out to `rally`; the host supplies each task body as a thunk. So the lineage markers
-(`--run`/`--step`, §1) are emitted **inside that host thunk** — the same `rally say claim/artifact`
+(`--run`/`--step`, §1) are emitted **inside that host thunk** — the same `rally say claim/presence/artifact`
 calls the SKILL §4 loop documents — not by `route.mjs`. Stamping them there is what makes a
 `route.mjs`-driven fan-out visible to `rally dag --run <run_id>`. The thunk *is* the integration
 point; `route.mjs` needs no change.

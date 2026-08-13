@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +43,76 @@ class GenerateHostSurfacesTests(unittest.TestCase):
 
     def test_repository_surfaces_are_current(self) -> None:
         self.assertEqual(GEN.check(ROOT), [])
+
+    def test_native_effect_registry_matches_hook_classifier(self) -> None:
+        config = GEN.load_config(ROOT)
+        registry = GEN.native_effects(config)
+        hook = (ROOT / "hooks/rally-coordination-hook.sh").read_text(encoding="utf-8")
+        shell_names = {
+            "pure_read": "_RALLY_NATIVE_PURE_READ_TOOLS",
+            "opaque_shell": "_RALLY_NATIVE_OPAQUE_SHELL_TOOLS",
+            "mutation": "_RALLY_NATIVE_MUTATION_TOOLS",
+        }
+        seen: set[str] = set()
+        for effect, shell_name in shell_names.items():
+            match = re.search(
+                rf"^{re.escape(shell_name)}='([^']+)'$",
+                hook,
+                flags=re.MULTILINE,
+            )
+            self.assertIsNotNone(match, f"hook is missing {shell_name}")
+            hook_tools = json.loads(match.group(1))
+            self.assertEqual(hook_tools, registry[effect])
+            lowered = {tool.lower() for tool in hook_tools}
+            self.assertTrue(seen.isdisjoint(lowered), f"overlapping effect tools: {effect}")
+            seen.update(lowered)
+
+    def test_codex_before_write_uses_wrapper_until_native_matcher_is_proven(self) -> None:
+        config = GEN.load_config(ROOT)
+        codex = json.loads(GEN.render_hook_surfaces(config)[Path(".codex/hooks.json")])
+        description = codex.get("description", "")
+        self.assertIn("native matcher evidence", description)
+        self.assertIn("wrapper classifies", description)
+        groups = codex["hooks"]["PreToolUse"]
+        before_write = [
+            group
+            for group in groups
+            if any("before-write codex" in hook.get("command", "") for hook in group["hooks"])
+        ]
+        self.assertEqual(len(before_write), 1)
+        self.assertNotIn("matcher", before_write[0])
+
+    def test_codex_hook_surface_matches_01443_schema_and_timeout_units(self) -> None:
+        config = GEN.load_config(ROOT)
+        codex = json.loads(GEN.render_hook_surfaces(config)[Path(".codex/hooks.json")])
+        self.assertEqual(set(codex), {"description", "hooks"})
+
+        expected = {
+            phase["events"]["codex"]: phase["timeout_ms"] // 1000
+            for phase in config["hooks"]["phases"]
+            if "codex" in phase["events"]
+        }
+        actual = {
+            event: groups[0]["hooks"][0]["timeout"]
+            for event, groups in codex["hooks"].items()
+        }
+        self.assertEqual(actual, expected)
+
+    def test_claude_hook_surfaces_use_documented_second_timeouts(self) -> None:
+        config = GEN.load_config(ROOT)
+        surfaces = GEN.render_hook_surfaces(config)
+        expected = {
+            phase["events"]["claude_code"]: phase["timeout_ms"] // 1000
+            for phase in config["hooks"]["phases"]
+            if "claude_code" in phase["events"]
+        }
+        for path in (Path("hooks/hooks.json"), Path(".claude/settings.json")):
+            surface = json.loads(surfaces[path])
+            actual = {
+                event: groups[0]["hooks"][0]["timeout"]
+                for event, groups in surface["hooks"].items()
+            }
+            self.assertEqual(actual, expected, str(path))
 
     def test_generation_is_deterministic_and_artifact_is_self_contained(self) -> None:
         with tempfile.TemporaryDirectory() as first_tmp, tempfile.TemporaryDirectory() as second_tmp:

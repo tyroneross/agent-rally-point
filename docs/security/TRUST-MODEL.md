@@ -12,7 +12,7 @@ place — a comment in `crates/rally-protocol/src/ledger.rs` — and nowhere a u
 An independent audit (issue #52) found seven findings, and several of them were not bugs so
 much as an unstated assumption meeting a reader who did not share it.
 
-Last reviewed: 2026-08-02, against commit `fdfc750` plus the fixes from that audit.
+Last reviewed: 2026-08-10, against base `61e4a789` plus the O33-A changes committed with this document.
 
 ## Who Rally assumes you are
 
@@ -165,7 +165,10 @@ What the hooks do, after the issue #52 fixes:
 | Event | Action |
 |-------|--------|
 | SessionStart | Register presence in the room. Read room/next/status. Emit a sanitized advisory message. If `rally` is missing, print how to install it. |
-| PreToolUse (edits) | Check whether the path you are about to write is claimed by another live agent. Advisory by default. |
+| PreToolUse (named pure read) | Return `{}` before the wrapper's repo walk or Rally resolution. No status, check, claim, or Rally subprocess. The generated Codex launcher may first run `git rev-parse` to locate the wrapper. |
+| PreToolUse (opaque shell) | Return `{}` with no Rally call; command text is not accepted as proof of a read or a write target. |
+| PreToolUse (named mutation) | Validate every declared target, complete every path check, then create one all-or-none aggregate repeated-path claim. A denial, timeout, invalid response, or containment failure creates zero claims. Advisory by default. |
+| PreToolUse (unknown/malformed) | In an enabled Rally repo, return `{}` plus one bounded atomically rate-limited diagnostic; no Rally status, check, or claim. Outside Rally or when hooks are disabled, return silently. |
 | UserPromptSubmit | Refresh idle status. |
 | Stop | Record the write completed. |
 
@@ -173,11 +176,82 @@ What the hooks no longer do, as of this audit's fixes: download a binary, `chmod
 run `cargo install`, execute a repo-shipped binary to probe it, or write to `~/.local/bin`.
 Provisioning moved out of the hook path entirely. See RC-013.
 
-**The hooks fail open by default, and three opt-in switches make them fail closed.** In the
-default posture PreToolUse returns `permissionDecision: "allow"` with a warning, so the edit
-goes through, and every hook exits 0 even when Rally is broken. The exit code stays 0 in every
-posture — a refusal travels in the hook's JSON, not its exit status. Each switch below is off
-unless you set it:
+**Native effect classification is routing, not authorization.** The hook trusts
+the host envelope only enough to choose whether automatic deconfliction is
+possible. A name in `pure_read` does not grant filesystem authority, and a tool
+or plugin that lies about its name/effect can still mutate with the operator's
+UID. Opaque shell tools are intentionally not parsed: `rg` and `rm` share the
+same command carrier, and shell text is not a typed resource declaration. An
+agent using shell for a mutation must make the exact claim and strict
+before-write check explicitly. The registry prevents accidental read claims; it
+does not sandbox tools.
+
+`apply_patch` target extraction reads directive headers only. It never scans
+added/deleted body text for path-like strings. Codex 0.144.3's source-proven
+carrier is `tool_input.command`; `tool_input.patch` is retained only for named
+legacy adapters. Add/update/delete/move directive paths must be relative to the
+validated event `cwd`. Other named mutation envelopes such as Claude
+`Write`/`Edit` may carry an absolute `file_path`, accepted only when physical
+containment resolves it inside the Rally root. One identity-whitespace, empty,
+malformed, root-equal, outside-root, or symlink-escaping target rejects the
+entire automatic check before Rally runs. Only an absent target alias is
+optional; a present null/blank move destination invalidates the transaction. A
+new nested path resolves from the nearest physical existing ancestor; an
+unresolved suffix containing `..` rejects atomically rather than relying on
+lexical normalization through missing directories. A
+present `tool_input`, `toolInput`, or `input` carrier must be an object and never
+falls back to an outer-envelope `path` when malformed. Unknown tool names and
+malformed envelopes never inherit the old generic `path` fallback. Their
+rate-limit marker under `.rally/.hook-seen` is created atomically only after the
+Rally self-gate and hooks-enabled check.
+Path-bearing Rally arguments use attached `--name=value` form, so a valid
+filename beginning with `-` cannot be reparsed as a CLI option.
+
+The wrapper rejects more than 16 declared mutation targets atomically, emits a
+bounded diagnostic, and makes zero Rally calls. It never claims a checked
+prefix. Larger mutations require an explicit strict check and exact manual
+claim for every target; a future batch primitive should remove this degraded
+mode. The current worst-case Rally budget is 400 ms hook settings + 400 ms
+working status + at most 4,000 ms total path checks + 400 ms room + 1,000 ms
+aggregate claim = 6,200 ms, leaving 3,800 ms under the generated 10-second host
+timeout. At the 16-target ceiling, each check receives 250 ms. This arithmetic
+is enforced by immediate `KILL` at each millisecond deadline; no per-call TERM
+grace is added. Without a millisecond-capable `timeout`/`gtimeout` or
+high-resolution Perl guard, classified mutation coordination degrades before
+Rally and creates no automatic claim. The arithmetic proves the configured
+bound, not real-host latency; O33-D owns quiesced installed-surface measurement.
+Native Windows drive/backslash containment is `UNKNOWN` and unsupported by the
+currently proven macOS/Linux wrapper.
+
+The classifier and rendered coordination output require `node`. When `node` is
+absent during `PreToolUse`, the hook first applies the Rally self-gate, emits a
+once-per-session mutation degradation warning, returns exact `{}`, and makes no
+Rally status/check/claim call. It cannot prove a native effect from JSON, so a
+successful no-node hook exit is not deconfliction evidence. Lifecycle phases
+retain their separate fail-open status behavior.
+
+Pure reads receive active-writer context at SessionStart/UserPromptSubmit, not
+through a per-read Rally call. Until the planned engagement-bound source-token
+projection lands, a reader who uses a file for a decision must treat it as
+provisional when a writer is active and re-read/revalidate immediately before
+the conclusion. Parallel reading is allowed; stale evidence is not.
+
+O33-A is therefore a branch-held prerequisite, not a safe standalone
+activation. It may be committed only on its isolated branch and must not be
+merged, cherry-picked, or checked out into central integration, local main, an
+installed plugin, a pushed ref, or any user-active worktree until O33-B and
+O33-C also pass the combined A+B+C gate. Build B on top of A in isolation and
+integrate the combined chain only after post-O26 C is complete. The project
+Codex and Claude hooks are already active for new sessions, so a local-main
+merge would itself activate A's read bypass. O33-C supplies path-scoped writer
+context, a source token, and deterministic final revalidation; turn-level
+context alone can be stale or omit the relevant path.
+
+**The hooks fail open by default, and three opt-in switches make mutation checks fail closed.**
+Known reads, opaque shell tools, and unknown/malformed operations return `{}` before that gate.
+For a named mutation, the default posture surfaces a warning while the edit goes through, and
+every hook exits 0 even when Rally is broken. The exit code stays 0 in every posture — a refusal
+travels in the hook's JSON, not its exit status. Each switch below is off unless you set it:
 
 | Switch | What it does |
 |--------|--------------|

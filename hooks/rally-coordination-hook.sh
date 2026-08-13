@@ -24,8 +24,10 @@
 #   STDIN: the host's hook input envelope (JSON). Optional.
 #
 # Behavior:
-#   - Self-gate: if no .rally/ is found walking up from cwd, exit 0 with no
-#     output. Safe to install globally; only acts in rally repos.
+#   - Self-gate: if no .rally/ is found walking up from cwd, lifecycle and
+#     mutation diagnostics exit 0 with no output. Known pure-read and opaque-
+#     shell PreToolUse envelopes return the host-valid `{}` before that walk;
+#     they still make no Rally call or ledger write.
 #   - Fail-open: any rally CLI error / timeout / missing binary → exit 0.
 #   - NO PROVISIONING (ARP-001). This hook never downloads, chmods, builds,
 #     copies, or executes a candidate binary to probe it. Starting a session,
@@ -48,11 +50,10 @@
 #     "UNTRUSTED-DATA BOUNDARY" block in each node renderer below.
 #   - NODE REQUIRED FOR HOOK OUTPUT. Every rendered advisory (room awareness,
 #     PreToolUse deconfliction warnings) is built by parsing rally's JSON in
-#     node. Without node on PATH, rally CLI calls above still run (enter,
-#     status, claims), but no advisory can be built. The hook says so once
-#     per session on stderr (see `_rally_advise_node_missing`) and still
-#     exits 0 — silence would make "node missing" indistinguishable from
-#     "nothing to report".
+#     node. Without node on PATH, native before-write applies the repo self-
+#     gate, warns once per session, returns `{}`, and makes zero Rally calls;
+#     it cannot classify or safely claim the mutation. Lifecycle phases retain
+#     their fail-open enter/status behavior but cannot render model context.
 #   - Advisory only (default): emits `additionalContext` / `systemMessage`,
 #     never `permissionDecision: "deny"` / `decision: "block"`.
 #   - Strict mode (opt-in, RALLY_HOOK_STRICT=1): high-severity coordination
@@ -60,7 +61,9 @@
 #     Off-charter; documented as an escape hatch.
 #
 # Env:
-#   RALLY_HOOK_TIMEOUT_MS  — wall-clock budget for each rally call (default 5000).
+#   RALLY_HOOK_TIMEOUT_MS  — default wall-clock budget for lifecycle and legacy
+#                            Rally calls (default 5000). Classified mutations use
+#                            fixed documented sub-budgets under the host timeout.
 #   RALLY_BIN              — dev override for the rally binary. Must be an
 #                            ABSOLUTE path outside the scanned repo. A relative
 #                            path, or any path that resolves inside the repo, is
@@ -114,7 +117,358 @@ find_rally_root() {
   return 1
 }
 
-if ! find_rally_root >/dev/null 2>&1; then
+# O33-A native effect registry. Host matchers are an optimization only; this
+# classifier is the correctness boundary when a host sends every PreToolUse
+# event to the hook. Keep these JSON arrays in parity with
+# config/host-integrations.json (generator tests pin that relationship).
+_RALLY_NATIVE_PURE_READ_TOOLS='["view_image","Read","Glob","Grep","WebFetch","WebSearch","read_file","list_dir","list_directory","codebase_search","grep_search"]'
+_RALLY_NATIVE_OPAQUE_SHELL_TOOLS='["exec_command","write_stdin","Bash","Shell","run_terminal_cmd"]'
+_RALLY_NATIVE_MUTATION_TOOLS='["apply_patch","Write","Edit","MultiEdit","NotebookEdit","write_file","edit_file","delete_file","move_file","create_file","search_replace"]'
+_RALLY_NATIVE_MAX_TARGETS=16
+
+phase="${1:-idle}"
+tool="${2:-claude_code}"
+
+# A session opt-out precedes even envelope classification: off means no output
+# and no filesystem/Rally work from this hook.
+case "$(printf '%s' "${RALLY_HOOKS:-}" | tr '[:upper:]' '[:lower:]')" in
+  0|off|false|no|disabled) exit 0 ;;
+esac
+
+# Read the native envelope once. Classification happens before walking the repo
+# or resolving/running the Rally binary, so a known read pays only JSON parsing
+# and returns the host's exact empty-object response.
+input=""
+if [ ! -t 0 ]; then
+  input="$(cat || true)"
+fi
+have_node=0
+if command -v node >/dev/null 2>&1; then have_node=1; fi
+
+native_meta='{}'
+native_class_rc=0
+if [ "$phase" = "before-write" ] && [ "$have_node" = "1" ] && [ -n "$input" ]; then
+  # The single-quoted body is JavaScript, not shell expansion.
+  # shellcheck disable=SC2016
+  if native_meta="$({ printf '%s' "$input" | \
+    RALLY_NATIVE_PURE_READ_TOOLS="$_RALLY_NATIVE_PURE_READ_TOOLS" \
+    RALLY_NATIVE_OPAQUE_SHELL_TOOLS="$_RALLY_NATIVE_OPAQUE_SHELL_TOOLS" \
+    RALLY_NATIVE_MUTATION_TOOLS="$_RALLY_NATIVE_MUTATION_TOOLS" \
+    RALLY_NATIVE_MAX_TARGETS="$_RALLY_NATIVE_MAX_TARGETS" \
+    node -e '
+const fs = require("fs");
+
+function registry(name) {
+  try { return new Set(JSON.parse(process.env[name] || "[]").map(v => String(v).toLowerCase())); }
+  catch (_) { return new Set(); }
+}
+function finish(code, value) {
+  process.stdout.write(JSON.stringify(value));
+  process.exit(code);
+}
+function validateTarget(raw, options = {}) {
+  const {allowAbsolute = true} = options;
+  if (typeof raw !== "string") return { error: "target is not a string" };
+  const value = raw.trim();
+  if (raw !== value) return { error: "target has leading or trailing whitespace" };
+  if (!value) return { error: "target is empty" };
+  if (value.length > 4096) return { error: "target exceeds 4096 characters" };
+  if (/[\u0000-\u001f\u007f]/.test(value)) return { error: "target contains a control character" };
+  const windowsAbsolute = /^[A-Za-z]:[\\/]/.test(value);
+  const posixAbsolute = value.startsWith("/");
+  if (value.startsWith("~")) return { error: "target uses an unexpanded home shortcut" };
+  if (value.includes("\\") && !windowsAbsolute) return { error: "relative target uses a backslash" };
+  if (!allowAbsolute && (posixAbsolute || windowsAbsolute)) {
+    return { error: "patch target is not cwd-relative" };
+  }
+  return { value };
+}
+function uniqueValidated(rawPaths, options = {}) {
+  const {skipMissing = true, allowAbsolute = true} = options;
+  const paths = [];
+  const seen = new Set();
+  for (const raw of rawPaths) {
+    // Only an absent alias is optional. A present null/blank target is a
+    // malformed declared target and must invalidate the whole transaction.
+    if (skipMissing && raw === undefined) continue;
+    const result = validateTarget(raw, {allowAbsolute});
+    if (result.error) return { error: result.error };
+    if (!seen.has(result.value)) {
+      seen.add(result.value);
+      paths.push(result.value);
+    }
+  }
+  return { paths };
+}
+
+let value;
+try { value = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); }
+catch (_) { finish(14, {effect:"malformed", tool:"unknown", session:"", diagnostic:"invalid JSON envelope"}); }
+if (!value || typeof value !== "object" || Array.isArray(value)) {
+  finish(14, {effect:"malformed", tool:"unknown", session:"", diagnostic:"hook envelope is not an object"});
+}
+const session = String(value.session_id || value.sessionId || "");
+const hasToolName = Object.prototype.hasOwnProperty.call(value, "tool_name") || Object.prototype.hasOwnProperty.call(value, "toolName");
+const rawTool = Object.prototype.hasOwnProperty.call(value, "tool_name") ? value.tool_name : value.toolName;
+const cwd = typeof value.cwd === "string"
+  ? value.cwd
+  : (typeof value.working_directory === "string" ? value.working_directory : (typeof value.workingDirectory === "string" ? value.workingDirectory : ""));
+let toolInput=value;
+for (const key of ["tool_input", "toolInput", "input"]) {
+  if (!Object.prototype.hasOwnProperty.call(value,key)) continue;
+  const candidate=value[key];
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    const named=typeof rawTool === "string" && rawTool.trim() ? rawTool.trim() : "unknown";
+    finish(14, {effect:"malformed", tool:named, session, cwd, paths:[], diagnostic:`${key} is not an object`});
+  }
+  toolInput=candidate;
+  break;
+}
+
+// Older fixtures/hosts omitted tool_name. Preserve their legacy path extraction
+// after binary resolution; a present null, blank, non-string, or named unknown
+// tool never receives this fallback.
+if (!hasToolName) {
+  const legacy = uniqueValidated([
+    toolInput.file_path, toolInput.filePath, toolInput.path,
+    toolInput.notebook_path, toolInput.notebookPath,
+  ]);
+  finish(0, {
+    effect:"legacy", tool:"", session, cwd,
+    paths: legacy.error ? [] : legacy.paths,
+  });
+}
+if (typeof rawTool !== "string") {
+  finish(14, {effect:"malformed", tool:"unknown", session, cwd, paths:[], diagnostic:"tool_name is not a string"});
+}
+if (!rawTool.trim()) {
+  finish(14, {effect:"malformed", tool:"unknown", session, cwd, paths:[], diagnostic:"tool_name is blank"});
+}
+
+const tool = rawTool.trim();
+const key = tool.toLowerCase();
+const pureReads = registry("RALLY_NATIVE_PURE_READ_TOOLS");
+const opaqueShell = registry("RALLY_NATIVE_OPAQUE_SHELL_TOOLS");
+const mutations = registry("RALLY_NATIVE_MUTATION_TOOLS");
+if (pureReads.has(key)) finish(10, {effect:"pure_read", tool, session, cwd, paths:[]});
+if (opaqueShell.has(key)) finish(11, {effect:"opaque_shell", tool, session, cwd, paths:[]});
+if (!mutations.has(key)) finish(13, {effect:"unknown", tool, session, cwd, paths:[], diagnostic:"tool has no declared effect"});
+
+let rawPaths = [];
+if (key === "apply_patch") {
+  // Codex 0.144.3 emits `command`. `patch` remains a legacy adapter carrier.
+  const patch = typeof toolInput.command === "string" ? toolInput.command : toolInput.patch;
+  if (typeof patch !== "string") {
+    finish(14, {effect:"malformed", tool, session, cwd, paths:[], diagnostic:"apply_patch is missing command text"});
+  }
+  for (const line of patch.split(/\r?\n/)) {
+    let match = line.match(/^\*\*\* (?:Add|Update|Delete) File:\s*(.*)$/);
+    if (!match) match = line.match(/^\*\*\* Move (?:to|from):\s*(.*)$/);
+    if (match) rawPaths.push(match[1]);
+  }
+  if (!rawPaths.length) {
+    finish(14, {effect:"malformed", tool, session, cwd, paths:[], diagnostic:"apply_patch has no file directives"});
+  }
+} else {
+  rawPaths = [
+    toolInput.file_path, toolInput.filePath, toolInput.notebook_path,
+    toolInput.notebookPath, toolInput.path, toolInput.source,
+    toolInput.src, toolInput.from, toolInput.destination,
+    toolInput.dest, toolInput.to, toolInput.new_path, toolInput.newPath,
+  ];
+}
+const validated = uniqueValidated(rawPaths, {
+  skipMissing: key !== "apply_patch",
+  allowAbsolute: key !== "apply_patch",
+});
+if (validated.error) {
+  finish(14, {effect:"malformed", tool, session, cwd, paths:[], diagnostic:validated.error});
+}
+if (!validated.paths.length) {
+  finish(14, {effect:"malformed", tool, session, cwd, paths:[], diagnostic:"mutation has no target"});
+}
+const maxTargets = Number(process.env.RALLY_NATIVE_MAX_TARGETS || "16");
+if (validated.paths.length > maxTargets) {
+  finish(14, {effect:"malformed", tool, session, cwd, paths:[], diagnostic:`mutation exceeds ${maxTargets} targets`});
+}
+finish(12, {
+  effect:"mutation", tool, session, cwd, paths:validated.paths,
+  carrier:key === "apply_patch" && typeof toolInput.command === "string" ? "command" : "legacy",
+});
+'; } 2>/dev/null)"; then
+    native_class_rc=0
+  else
+    native_class_rc=$?
+  fi
+fi
+
+_rally_native_meta_field() {
+  printf '%s' "$native_meta" | node -e '
+const fs=require("fs");
+try {
+  const value=JSON.parse(fs.readFileSync(0,"utf8")||"{}");
+  const field=process.argv[1];
+  const found=value[field];
+  if (Array.isArray(found)) process.stdout.write(found.join("\n"));
+  else if (found !== undefined && found !== null) process.stdout.write(String(found));
+} catch (_) {}
+' "$1" 2>/dev/null || true
+}
+
+_rally_advise_native_skip() {
+  local kind="$1" raw_name="$2" raw_reason="$3" raw_session="$4" root="$5"
+  local marker_dir marker safe_name safe_reason safe_session message
+  [ -n "$root" ] || return 0
+  safe_name="$(printf '%s' "${raw_name:-unknown}" | tr -c 'A-Za-z0-9_.:-' '_' | cut -c1-80)"
+  safe_reason="$(printf '%s' "$raw_reason" | tr -c 'A-Za-z0-9 ._:-' '_' | cut -c1-120)"
+  safe_session="$(printf '%s' "${raw_session:-${RALLY_SESSION_ID:-anon}}" | tr -c 'A-Za-z0-9_.:-' '_' | cut -c1-80)"
+  marker_dir="$root/.rally/.hook-seen"
+  marker="$marker_dir/$safe_session.native-$kind-$safe_name.seen"
+  mkdir -p "$marker_dir" 2>/dev/null || return 0
+  # noclobber creates the marker atomically. Plugin + project registrations can
+  # race; exactly one wins and owns the single diagnostic.
+  ( set -C; : > "$marker" ) 2>/dev/null || return 0
+  if [ "$kind" = "unknown" ]; then
+    message="rally-hook: unclassified PreToolUse tool $safe_name; skipped Rally because no trustworthy write effect/path was available."
+  else
+    message="rally-hook: rejected PreToolUse mutation $safe_name ($safe_reason); skipped Rally and made no claim."
+  fi
+  printf '%s\n' "$message" >&2
+}
+
+_rally_advise_node_missing() {
+  local root="$1" raw_session="$2" mode="${3:-render}"
+  local marker_dir marker safe_session message
+  [ -n "$root" ] || return 0
+  safe_session="$(printf '%s' "${raw_session:-anon}" | tr -c 'A-Za-z0-9_.:-' '_')"
+  marker_dir="$root/.rally/.hook-seen"
+  marker="$marker_dir/$safe_session.node-missing.seen"
+  mkdir -p "$marker_dir" 2>/dev/null || return 0
+  ( set -C; : > "$marker" ) 2>/dev/null || return 0
+  if [ "$mode" = "before-write" ]; then
+    message="rally-hook: node is not on PATH — before-write input cannot be classified safely, so this tool call skipped every Rally status/check/claim operation and is proceeding uncoordinated. Install node to restore scoped deconfliction."
+  else
+    message="rally-hook: node is not on PATH — coordination output is disabled this session. Rally lifecycle calls may still run, but the hook cannot render their context. Install node to restore output."
+  fi
+  printf '%s This notice is once per session; see %s.\n' "$message" "$marker" >&2
+}
+
+_rally_normalize_native_meta() {
+  local root="$1"
+  # The single-quoted body is JavaScript, not shell expansion.
+  # shellcheck disable=SC2016
+  printf '%s' "$native_meta" | RALLY_NATIVE_ROOT="$root" RALLY_NATIVE_MAX_TARGETS="$_RALLY_NATIVE_MAX_TARGETS" node -e '
+const fs=require("fs");
+const path=require("path");
+function finish(code,value){ process.stdout.write(JSON.stringify(value)); process.exit(code); }
+let meta={};
+try { meta=JSON.parse(fs.readFileSync(0,"utf8")||"{}"); }
+catch (_) { finish(14,{effect:"malformed",tool:"unknown",session:"",paths:[],diagnostic:"classifier metadata is invalid"}); }
+function fail(message){ finish(14,{...meta,paths:[],diagnostic:message}); }
+function isWindowsAbsolute(value){ return /^[A-Za-z]:[\\/]/.test(value); }
+function nativePath(value,label){
+  if (isWindowsAbsolute(value) && process.platform !== "win32") fail(`${label} uses an unsupported Windows path on this host`);
+  return value;
+}
+function physicalCandidate(candidate){
+  const nativeCandidate=process.platform === "win32" ? candidate.replace(/\//g,"\\") : candidate;
+  const parsed=path.parse(nativeCandidate);
+  if (!parsed.root) fail("target is not absolute after cwd resolution");
+  const segments=nativeCandidate.slice(parsed.root.length).split(/[\\/]+/);
+  let current=parsed.root;
+  for (let index=0; index<segments.length; index += 1) {
+    const segment=segments[index];
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      current=path.dirname(current);
+      continue;
+    }
+    const next=path.join(current,segment);
+    let stat;
+    try { stat=fs.lstatSync(next); }
+    catch (error) {
+      if (error && error.code !== "ENOENT") fail(`cannot inspect target path: ${error.code || "error"}`);
+      // The existing prefix is already physical. Permit a lexical suffix for
+      // a new directory tree, but never interpret `..` after the first missing
+      // component: no filesystem object exists there to prove its semantics.
+      const suffix=segments.slice(index).filter(value => value && value !== ".");
+      if (suffix.some(value => value === "..")) fail("unresolved target suffix contains parent traversal");
+      for (const value of suffix) current=path.join(current,value);
+      return current;
+    }
+    if (stat.isSymbolicLink()) {
+      try { current=fs.realpathSync(next); }
+      catch (_) { fail("target crosses an unresolved symlink"); }
+    } else {
+      current=next;
+    }
+  }
+  return current;
+}
+let root;
+try { root=fs.realpathSync(nativePath(process.env.RALLY_NATIVE_ROOT || "","Rally root")); }
+catch (_) { fail("Rally root cannot be canonicalized"); }
+const rawCwd=meta.cwd || process.cwd();
+let cwd;
+try { cwd=fs.realpathSync(path.resolve(nativePath(rawCwd,"cwd"))); }
+catch (_) { fail("native cwd cannot be canonicalized"); }
+const cwdRel=path.relative(root,cwd);
+if (cwdRel === ".." || cwdRel.startsWith(`..${path.sep}`) || path.isAbsolute(cwdRel)) fail("native cwd is outside the Rally root");
+const normalized=[];
+const seen=new Set();
+for (const raw of Array.isArray(meta.paths) ? meta.paths : []) {
+  const target=nativePath(String(raw),"target");
+  const lexical=path.isAbsolute(target) || isWindowsAbsolute(target) ? target : `${cwd}${path.sep}${target}`;
+  const physical=physicalCandidate(lexical);
+  const relative=path.relative(root,physical);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) fail("target resolves outside the Rally root");
+  const portable=relative.split(path.sep).join("/");
+  if (!seen.has(portable)) { seen.add(portable); normalized.push(portable); }
+}
+if (!normalized.length) fail("mutation has no contained target");
+const maxTargets=Number(process.env.RALLY_NATIVE_MAX_TARGETS || "16");
+if (normalized.length > maxTargets) fail(`mutation exceeds ${maxTargets} targets`);
+finish(0,{...meta,cwd,paths:normalized});
+' 2>/dev/null
+}
+
+_rally_native_hooks_enabled() {
+  local root="$1"
+  RALLY_NATIVE_ROOT="$root" node -e '
+const fs=require("fs");
+const path=require("path");
+function configured(file){
+  try {
+    const value=JSON.parse(fs.readFileSync(file,"utf8"));
+    return typeof value?.hooks?.enabled === "boolean" ? value.hooks.enabled : undefined;
+  } catch (_) { return undefined; }
+}
+let enabled=true;
+const home=process.env.HOME || "";
+if (home) {
+  const user=configured(path.join(home,".config","rally","config.json"));
+  if (user !== undefined) enabled=user;
+}
+const repo=configured(path.join(process.env.RALLY_NATIVE_ROOT || "",".rally","config.json"));
+if (repo !== undefined) enabled=repo;
+const session=String(process.env.RALLY_HOOKS || "").trim().toLowerCase();
+if (["1","on","true","yes","enabled"].includes(session)) enabled=true;
+if (["0","off","false","no","disabled"].includes(session)) enabled=false;
+process.exit(enabled ? 0 : 1);
+' >/dev/null 2>&1
+}
+
+# Pure reads and opaque shell tools are the only classifications that may exit
+# before this wrapper's repo discovery. Unknown/malformed diagnostics wait for
+# the self-gate.
+case "$native_class_rc" in
+  10|11) printf '{}'; exit 0 ;;
+  0|12|13|14) ;;
+  *) native_class_rc=14; native_meta='{"effect":"malformed","tool":"unknown","session":"","paths":[],"diagnostic":"classifier failed"}' ;;
+esac
+
+_rally_native_root="$(find_rally_root 2>/dev/null || true)"
+if [ -z "$_rally_native_root" ]; then
   # Not a rally repo. For the start phase only, offer one-time setup advice if
   # we're inside a git work tree. All other phases: silent no-op.
   if [ "${1:-idle}" = "start" ]; then
@@ -172,9 +526,58 @@ process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:"SessionS
   exit 0
 fi
 
-case "$(printf '%s' "${RALLY_HOOKS:-}" | tr '[:upper:]' '[:lower:]')" in
-  0|off|false|no|disabled) exit 0 ;;
+# Unknown/malformed events must also honor the zero-Rally repo/user opt-out.
+# Read the same two config files and precedence as `rally hooks status` before
+# emitting a diagnostic or resolving the binary.
+if [ "$phase" = "before-write" ] && [ "$have_node" = "1" ] && ! _rally_native_hooks_enabled "$_rally_native_root"; then
+  exit 0
+fi
+
+case "$native_class_rc" in
+  13|14)
+    _rally_advise_native_skip \
+      "$([ "$native_class_rc" = "13" ] && printf unknown || printf malformed)" \
+      "$(_rally_native_meta_field tool)" \
+      "$(_rally_native_meta_field diagnostic)" \
+      "$(_rally_native_meta_field session)" \
+      "$_rally_native_root"
+    printf '{}'
+    exit 0
+    ;;
 esac
+
+# Without node, a native before-write envelope cannot be classified honestly.
+# Stop before binary discovery and ledger work: one advisory, exact host no-op,
+# zero status/check/claim calls for both reads and writes.
+if [ "$phase" = "before-write" ] && [ "$have_node" != "1" ]; then
+  _rally_advise_node_missing "$_rally_native_root" "${RALLY_SESSION_ID:-anon}" before-write
+  printf '{}'
+  exit 0
+fi
+
+# Resolve mutation paths against the envelope cwd (or current cwd), follow the
+# nearest existing ancestor physically, reject symlink/outside/root targets,
+# and return canonical repo-relative paths before any Rally subprocess.
+_rally_native_effect="$(_rally_native_meta_field effect)"
+if [ "$phase" = "before-write" ] && { [ "$_rally_native_effect" = "mutation" ] || [ "$_rally_native_effect" = "legacy" ]; }; then
+  _rally_normalized_meta=''
+  if _rally_normalized_meta="$(_rally_normalize_native_meta "$_rally_native_root")"; then
+    native_meta="$_rally_normalized_meta"
+  else
+    if [ -n "$_rally_normalized_meta" ]; then
+      native_meta="$_rally_normalized_meta"
+    else
+      native_meta='{"effect":"malformed","tool":"unknown","session":"","paths":[],"diagnostic":"path normalization failed"}'
+    fi
+    _rally_advise_native_skip malformed \
+      "$(_rally_native_meta_field tool)" \
+      "$(_rally_native_meta_field diagnostic)" \
+      "$(_rally_native_meta_field session)" \
+      "$_rally_native_root"
+    printf '{}'
+    exit 0
+  fi
+fi
 
 # --- Defense-in-depth wall-clock guard ------------------------------------
 # The `rally` binary self-bounds via an internal watchdog (default 3s), but a
@@ -356,13 +759,67 @@ else
     wait "$pid"
   }
 fi
+
+# Millisecond guard for the bounded multi-target transaction. The CLI receives
+# the same explicit watchdog value, while the outer guard still kills an old or
+# wedged binary that ignores it. Appending the global flag preserves subcommand
+# position for older wrappers and test doubles.
+if command -v timeout >/dev/null 2>&1; then
+  _rally_timeout_ms_capable=1
+  rally_timeout_ms() {
+    local budget_ms="$1" whole rem duration
+    shift
+    whole=$((budget_ms / 1000)); rem=$((budget_ms % 1000))
+    duration="${whole}.$(printf '%03d' "$rem")s"
+    timeout -s KILL "$duration" "$RALLY_BIN" "$@" --timeout-ms "$budget_ms"
+  }
+elif command -v gtimeout >/dev/null 2>&1; then
+  _rally_timeout_ms_capable=1
+  rally_timeout_ms() {
+    local budget_ms="$1" whole rem duration
+    shift
+    whole=$((budget_ms / 1000)); rem=$((budget_ms % 1000))
+    duration="${whole}.$(printf '%03d' "$rem")s"
+    gtimeout -s KILL "$duration" "$RALLY_BIN" "$@" --timeout-ms "$budget_ms"
+  }
+elif command -v perl >/dev/null 2>&1; then
+  _rally_timeout_ms_capable=1
+  rally_timeout_ms() {
+    local budget_ms="$1"
+    shift
+    perl -MTime::HiRes=ualarm -e '
+      use POSIX qw(setsid);
+      my $ms = shift;
+      my $pid = fork();
+      die "fork failed" unless defined $pid;
+      if ($pid == 0) {
+        setsid();
+        exec @ARGV or exit 127;
+      }
+      $SIG{ALRM} = sub {
+        kill "-KILL", $pid;
+        waitpid($pid, 0);
+        exit 124;
+      };
+      ualarm($ms * 1000);
+      waitpid($pid, 0);
+      exit($? >> 8);
+    ' "$budget_ms" "$RALLY_BIN" "$@" --timeout-ms "$budget_ms"
+  }
+else
+  _rally_timeout_ms_capable=0
+  rally_timeout_ms() {
+    # Classified mutation coordination cannot use the whole-second bash
+    # fallback without violating its aggregate deadline. The caller degrades
+    # before Rally; retain a defensive non-executing return here.
+    return 125
+  }
+fi
 # --------------------------------------------------------------------------
 
-# Optional node detection — used only for parsing host hook envelopes and
-# rally JSON output. If node is missing, we still emit basic output (we just
-# can't extract file_path from PreToolUse input).
-have_node=0
-if command -v node >/dev/null 2>&1; then have_node=1; fi
+# Node availability was detected before native effect classification. Native
+# before-write already returned above when it was absent; lifecycle phases keep
+# their historical fail-open behavior below.
 
 _rally_id_segment() {
   # Keep ids readable and safe for JSON, filenames, and shell display.
@@ -393,9 +850,116 @@ _rally_status_idle() {
   fi
 }
 
-_rally_status_working() {
-  [ -z "${path:-}" ] && return 0
-  rally_timeout status post --tool "$tool" --state working --file "$path" --intent "editing $path" --json >/dev/null 2>&1 || true
+_rally_status_working_bounded() {
+  local first_path="$1" target_count="$2" budget_ms="$3" intent
+  [ -n "$first_path" ] || return 1
+  if [ "$target_count" = "1" ]; then
+    intent="editing $first_path"
+  else
+    intent="editing $target_count validated paths"
+  fi
+  # Attach path/prose option values so a valid filename such as `--evil` is
+  # never reparsed by the CLI as a new option.
+  rally_timeout_ms "$budget_ms" status post --tool "$tool" --state working \
+    "--file=$first_path" "--intent=$intent" --json >/dev/null 2>&1
+}
+
+# Preserve every path-level judgment from a multi-file mutation while keeping
+# the existing renderer contract (`data.check`). One visible conflict is useful;
+# silently dropping the other paths in the same apply_patch is not.
+_rally_add_check_output() {
+  local current="$1" candidate="$2" candidate_path="$3"
+  printf '%s' "$candidate" | \
+    RALLY_CHECK_ACC="$current" RALLY_CHECK_PATH="$candidate_path" node -e '
+const fs = require("fs");
+function parse(raw) { try { return JSON.parse(raw || "{}"); } catch (_) { return {}; } }
+const acc = parse(process.env.RALLY_CHECK_ACC || "{}");
+const candidate = parse(fs.readFileSync(0, "utf8"));
+const path = process.env.RALLY_CHECK_PATH || "?";
+const prior = Array.isArray(acc?.data?.check?.targets) ? acc.data.check.targets : [];
+const check = candidate?.data?.check || {};
+const targets = prior.concat([{path, allow:check.allow, agent_visible:check.agent_visible || null}]);
+const visibleTargets = targets.filter(t => t?.agent_visible?.present === true);
+const severityRank = {info:0, warn:1, stop:2};
+let severity = "info";
+for (const target of visibleTargets) {
+  const next = String(target.agent_visible.severity || "warn");
+  if ((severityRank[next] ?? 1) > (severityRank[severity] ?? 0)) severity = next;
+}
+const combined = {
+  allow: targets.every(t => t.allow !== false),
+  targets,
+};
+if (visibleTargets.length) {
+  combined.agent_visible = {
+    present: true,
+    severity,
+    // Paths are untrusted repo data. The renderer sanitizes CLI messages, but
+    // a prose-shaped filename must never become readable model instructions.
+    message: visibleTargets.map((t, i) => "target " + String(i + 1) + ": " + String(t.agent_visible.message || "Rally reported a coordination conflict.")).join(" | "),
+  };
+}
+process.stdout.write(JSON.stringify({data:{check:combined}}));
+' 2>/dev/null || printf '%s' "$current"
+}
+
+_rally_check_state() {
+  printf '%s' "$1" | node -e '
+const fs=require("fs");
+try {
+  const check=JSON.parse(fs.readFileSync(0,"utf8")||"{}")?.data?.check;
+  if (!check || typeof check.allow !== "boolean") process.stdout.write("invalid");
+  else if (check.allow === false) process.stdout.write("conflict");
+  else process.stdout.write("allow");
+} catch (_) { process.stdout.write("invalid"); }
+' 2>/dev/null || printf invalid
+}
+
+_rally_unowned_paths() {
+  local room_json="$1" all_paths="$2"
+  printf '%s' "$room_json" | RALLY_MUTATION_PATHS="$all_paths" node -e '
+const fs=require("fs");
+const tool=process.argv[1] || "";
+let parsed;
+try { parsed=JSON.parse(fs.readFileSync(0,"utf8")||"{}"); }
+catch (_) { process.exit(2); }
+const room=parsed?.data?.room;
+if (!room || !Array.isArray(room.active_claims)) process.exit(2);
+const claims=room.active_claims;
+const paths=String(process.env.RALLY_MUTATION_PATHS || "").split("\n").filter(Boolean);
+function clean(value) {
+  let out=String(value || "").trim();
+  if (out.startsWith("file:")) out=out.slice(5);
+  if (out.startsWith("./")) out=out.slice(2);
+  return out.replace(/\/+$/, "");
+}
+function covers(scope, target) {
+  const held=clean(scope);
+  const path=clean(target);
+  return Boolean(held) && (held === path || path.startsWith(held + "/"));
+}
+for (const path of paths) {
+  const owned=claims.some(claim => {
+    const owner=claim?.owner?.tool || claim?.tool || "";
+    const claimScopes=Array.isArray(claim?.scope) ? claim.scope : [];
+    return owner === tool && claimScopes.some(scope => covers(scope, path));
+  });
+  if (!owned) process.stdout.write(path + "\n");
+}
+' "$tool" 2>/dev/null
+}
+
+_rally_advise_mutation_abort() {
+  local raw_reason="$1" root="$2" raw_session="$3"
+  local marker_dir marker safe_reason safe_session
+  [ -n "$root" ] || return 0
+  safe_reason="$(printf '%s' "$raw_reason" | tr -c 'A-Za-z0-9 ._:-' '_' | cut -c1-120)"
+  safe_session="$(printf '%s' "${raw_session:-anon}" | tr -c 'A-Za-z0-9_.:-' '_' | cut -c1-80)"
+  marker_dir="$root/.rally/.hook-seen"
+  marker="$marker_dir/$safe_session.mutation-abort.seen"
+  mkdir -p "$marker_dir" 2>/dev/null || return 0
+  ( set -C; : > "$marker" ) 2>/dev/null || return 0
+  printf 'rally-hook: mutation coordination aborted (%s); no automatic claim was created and the edit is proceeding unclaimed.\n' "$safe_reason" >&2
 }
 
 # RC-037: report a failed auto-claim instead of swallowing it.
@@ -430,34 +994,43 @@ _rally_advise_claim_failed() {
   return 0
 }
 
-phase="${1:-idle}"
-tool="${2:-claude_code}"
+# An arithmetic transaction bound is meaningful only when the outer watchdog
+# enforces each millisecond sub-deadline. GNU/BSD timeout and the high-resolution
+# Perl guard kill immediately; the whole-second bash fallback is too coarse.
+# Degrade before any Rally subprocess instead of risking prefix-only state or a
+# host-level kill that erases an earlier proven conflict.
+if [ "$phase" = "before-write" ] && \
+   { [ "$_rally_native_effect" = "mutation" ] || [ "$_rally_native_effect" = "legacy" ]; } && \
+   [ "$_rally_timeout_ms_capable" != "1" ]; then
+  _rally_advise_mutation_abort \
+    "millisecond watchdog unavailable" \
+    "$_rally_native_root" \
+    "$(_rally_native_meta_field session)"
+  printf '{}'
+  exit 0
+fi
 
 hook_prompt_mode="${RALLY_HOOK_PROMPT:-once}"
 
-# Read stdin envelope if present; do not block if empty.
-input=""
-if [ ! -t 0 ]; then
-  input="$(cat || true)"
-fi
-
-# Extract file_path + session_id from the host's hook input envelope.
+# Reuse the envelope read before repo/Rally resolution. Native before-write
+# classification owns path extraction; other phases only need a session id.
+paths=""
 path=""
 session=""
 if [ "$have_node" = "1" ] && [ -n "$input" ]; then
-  meta="$({ printf '%s' "$input" | node -e '
-let data=""; process.stdin.on("data", c => data += c); process.stdin.on("end", () => {
-  try {
-    const value = JSON.parse(data || "{}");
-    const toolInput = value.tool_input || value.toolInput || value.input || value;
-    const path = toolInput.file_path || toolInput.filePath || toolInput.path || toolInput.notebook_path || "";
-    const session = value.session_id || value.sessionId || "";
-    process.stdout.write(JSON.stringify({path, session}));
-  } catch (_) { process.stdout.write("{}"); }
-});
+  if [ "$phase" = "before-write" ]; then
+    paths="$(_rally_native_meta_field paths)"
+    path="$(printf '%s\n' "$paths" | sed -n '1p')"
+    session="$(_rally_native_meta_field session)"
+  else
+    session="$({ printf '%s' "$input" | node -e '
+const fs=require("fs");
+try {
+  const value=JSON.parse(fs.readFileSync(0,"utf8")||"{}");
+  process.stdout.write(String(value.session_id || value.sessionId || ""));
+} catch (_) {}
 ' ; } 2>/dev/null)"
-  path="$({ printf '%s' "$meta" | node -e 'const fs=require("fs"); try { const v=JSON.parse(fs.readFileSync(0,"utf8")||"{}"); process.stdout.write(v.path||""); } catch (_) {}' ; } 2>/dev/null)"
-  session="$({ printf '%s' "$meta" | node -e 'const fs=require("fs"); try { const v=JSON.parse(fs.readFileSync(0,"utf8")||"{}"); process.stdout.write(v.session||""); } catch (_) {}' ; } 2>/dev/null)"
+  fi
 fi
 if [ -z "$session" ]; then
   if [ -n "${RALLY_SESSION_ID:-}" ]; then
@@ -604,21 +1177,33 @@ fi
 # Read hook enable/prompt settings after duplicate suppression so two host
 # registrations produce one complete Rally interaction, not merely one message.
 if [ "$have_node" = "1" ]; then
-  hooks_status="$(rally_timeout hooks status --json 2>/dev/null || true)"
+  hooks_status_rc=0
+  if [ "$phase" = "before-write" ] && { [ "$_rally_native_effect" = "mutation" ] || [ "$_rally_native_effect" = "legacy" ]; }; then
+    hooks_status="$(rally_timeout_ms 400 hooks status --json 2>/dev/null)" || hooks_status_rc=$?
+  else
+    hooks_status="$(rally_timeout hooks status --json 2>/dev/null)" || hooks_status_rc=$?
+  fi
   hooks_meta="$({ printf '%s' "$hooks_status" | node -e '
 const fs = require("fs");
 try {
   const parsed = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
   const hooks = parsed?.data?.hooks || {};
+  if (typeof hooks.enabled !== "boolean") throw new Error("missing enabled");
   const enabled = hooks.enabled === false ? "0" : "1";
   const prompt = ["once", "always", "off"].includes(hooks.prompt) ? hooks.prompt : "once";
-  process.stdout.write(enabled + "\n" + prompt);
+  process.stdout.write(enabled + "\n" + prompt + "\n1");
 } catch (_) {
-  process.stdout.write("1\nonce");
+  process.stdout.write("1\nonce\n0");
 }
 ' ; } 2>/dev/null)"
   hook_enabled="$(printf '%s\n' "$hooks_meta" | sed -n '1p')"
   hook_prompt_mode="$(printf '%s\n' "$hooks_meta" | sed -n '2p')"
+  if [ "$phase" = "before-write" ] && { [ "$_rally_native_effect" = "mutation" ] || [ "$_rally_native_effect" = "legacy" ]; } && \
+      [ "$hooks_status_rc" != "0" ]; then
+    _rally_advise_mutation_abort "hook settings unavailable" "$_rally_native_root" "$(_rally_native_meta_field session)"
+    printf '{}'
+    exit 0
+  fi
   if [ "$hook_enabled" = "0" ]; then
     exit 0
   fi
@@ -949,71 +1534,89 @@ process.stdout.write(JSON.stringify({ agent_visible: { present: true, severity: 
 ' ; } 2>/dev/null)"
   fi
 elif [ "$phase" = "before-write" ]; then
-  _rally_status_working
-  if [ -n "$path" ]; then
-    rally_output="$(rally_timeout check before-write --tool "$tool" --path "$path" --json 2>/dev/null || true)"
-  else
+  checked_paths="$(printf '%s\n' "$paths" | sed '/^$/d' | wc -l | tr -d ' ')"
+  case "$checked_paths" in ''|*[!0-9]*) checked_paths=0 ;; esac
+
+  # Truly legacy empty envelopes retain the historical fail-open unscoped
+  # check. Every classified mutation has one or more contained paths.
+  if [ "$checked_paths" = "0" ]; then
+    path=""
     rally_output="$(rally_timeout check before-write --tool "$tool" --json 2>/dev/null || true)"
-  fi
+  else
+    # Budget proof: hook settings 400ms + status 400ms + checks <=4000ms +
+    # room 400ms + one atomic claim 1000ms = <=6200ms of Rally wall time.
+    # At the explicit 16-target ceiling, each check gets 250ms. Node/shell
+    # orchestration retains 3.8s beneath the generated 10s host timeout.
+    check_budget_ms=$((4000 / checked_paths))
+    [ "$check_budget_ms" -gt 750 ] && check_budget_ms=750
+    [ "$check_budget_ms" -lt 250 ] && check_budget_ms=250
 
-  # Auto-claim if the check allowed it and the path isn't already claimed by us.
-  if [ "$have_node" = "1" ] && [ -n "$path" ]; then
-    should_claim="$({ printf '%s' "$rally_output" | node -e '
-const fs = require("fs");
-try {
-  const parsed = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
-  process.stdout.write(parsed?.data?.check?.allow === true ? "yes" : "no");
-} catch (_) {
-  process.stdout.write("no");
-}
-' ; } 2>/dev/null)"
+    first_path="$(printf '%s\n' "$paths" | sed -n '1p')"
+    if ! _rally_status_working_bounded "$first_path" "$checked_paths" 400; then
+      _rally_advise_mutation_abort "working status timed out" "$_rally_native_root" "$session"
+      printf '{}'
+      exit 0
+    fi
 
-    if [ "$should_claim" = "yes" ]; then
-      room_output="$(rally_timeout room --json 2>/dev/null || true)"
-      already_claimed="$({ printf '%s' "$room_output" | node -e '
-const fs = require("fs");
-const tool = process.argv[1] || "";
-const path = process.argv[2] || "";
-function clean(value) {
-  let out = String(value || "");
-  if (out.startsWith("file:")) out = out.slice(5);
-  if (out.startsWith("./")) out = out.slice(2);
-  const cwd = process.cwd();
-  if (out.startsWith(cwd + "/")) out = out.slice(cwd.length + 1);
-  return out.replace(/\/+/g, "/").replace(/\/$/, "");
-}
-function matches(scope, candidate) {
-  const s = clean(scope);
-  const p = clean(candidate);
-  return Boolean(s) && (s === p || p.startsWith(s + "/"));
-}
-try {
-  const parsed = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
-  const claims = parsed?.data?.room?.active_claims || [];
-  const found = claims.some((fact) =>
-    fact?.tool === tool && Array.isArray(fact?.scope) && fact.scope.some((scope) => matches(scope, path))
-  );
-  process.stdout.write(found ? "yes" : "no");
-} catch (_) {
-  process.stdout.write("no");
-}
-' "$tool" "$path" ; } 2>/dev/null)"
-      if [ "$already_claimed" != "yes" ]; then
-        # RC-037: this used to end in `|| true`, discarding both the exit code
-        # and stderr. When claim registration broke room-wide — one coarse
-        # claim was enough — every edit still proceeded, no claim was ever
-        # recorded, and nothing said so. Deconfliction degraded to nothing
-        # while the hook reported healthy, which is the register's first
-        # pattern: an ack for a step nobody asked about.
-        #
-        # Still non-fatal by design (this hook is advisory and must never
-        # break someone's edit), but no longer silent: the failure goes to
-        # stderr with the CLI's own message, once per session per reason, via
-        # the same `.rally/.hook-seen` marker the node-absence advisory uses.
-        _claim_err="$(rally_timeout say claim --tool "$tool" --path "$path" --subject "auto-claim $path" --json 2>&1 >/dev/null)" || _claim_failed=1
-        if [ "${_claim_failed:-0}" = "1" ]; then
-          _rally_advise_claim_failed "$path" "$_claim_err"
-          _claim_failed=0
+    mutation_abort=""
+    mutation_conflict=0
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      path_output=""
+      path_rc=0
+      path_output="$(rally_timeout_ms "$check_budget_ms" check before-write --tool "$tool" "--path=$path" --json 2>/dev/null)" || path_rc=$?
+      path_state="$(_rally_check_state "$path_output")"
+      if [ "$path_state" = "invalid" ]; then
+        mutation_abort="path check failed rc=$path_rc"
+        break
+      fi
+      rally_output="$(_rally_add_check_output "$rally_output" "$path_output" "$path")"
+      if [ "$path_state" = "conflict" ]; then mutation_conflict=1; fi
+    done <<< "$paths"
+
+    if [ -n "$mutation_abort" ]; then
+      _rally_advise_mutation_abort "$mutation_abort" "$_rally_native_root" "$session"
+      # A later invalid/timeout response must not erase an earlier proven
+      # denial. Preserve the accumulated conflict so strict mode still denies
+      # and advisory mode still surfaces the writer; no claim is attempted.
+      if [ "$mutation_conflict" = "0" ]; then
+        printf '{}'
+        exit 0
+      fi
+    fi
+
+    # A denied path makes the aggregate mutation unclaimable. Render every
+    # completed judgment, but create no partial claim.
+    if [ "$mutation_conflict" = "0" ]; then
+      room_output=""
+      room_rc=0
+      room_output="$(rally_timeout_ms 400 room --json 2>/dev/null)" || room_rc=$?
+      claimable_paths=""
+      if [ "$room_rc" = "0" ]; then
+        claimable_paths="$(_rally_unowned_paths "$room_output" "$paths")" || room_rc=$?
+      fi
+      if [ "$room_rc" != "0" ]; then
+        _rally_advise_mutation_abort "room ownership unavailable rc=$room_rc" "$_rally_native_root" "$session"
+        printf '{}'
+        exit 0
+      fi
+
+      if [ -n "$claimable_paths" ]; then
+        claim_args=(say claim --tool "$tool")
+        while IFS= read -r path; do
+          [ -n "$path" ] || continue
+          claim_args+=("--path=$path")
+        done <<< "$claimable_paths"
+        if [ "$checked_paths" = "1" ]; then
+          claim_subject="auto-claim $first_path"
+        else
+          claim_subject="auto-claim $checked_paths validated paths"
+        fi
+        claim_args+=("--subject=$claim_subject" --json)
+        _claim_failed=0
+        _claim_err="$(rally_timeout_ms 1000 "${claim_args[@]}" 2>&1 >/dev/null)" || _claim_failed=1
+        if [ "$_claim_failed" = "1" ]; then
+          _rally_advise_claim_failed "$checked_paths validated path(s)" "$_claim_err"
         fi
       fi
     fi
@@ -1027,42 +1630,12 @@ else
   rally_output="$(rally_timeout next --tool "$tool" --audit --json 2>/dev/null || true)"
 fi
 
-# --- Node-absence advisory (BLOCKER 2, RC-027 shape) ------------------------
-# Every render path below needs node to parse rally's JSON and build the
-# host's hook envelope. Before this function existed, a missing node meant a
-# silent `exit 0` here: `rally enter` / `status post` / `check before-write`
-# above still ran and the ledger still looked healthy, but the PreToolUse
-# deconfliction warning — this tool's headline feature — never reached the
-# agent, and nothing said why. "Absent" and "healthy" were indistinguishable
-# from the consumer's side, the same shape RC-027 names for the watcher.
-#
-# Stdout stays reserved for the host's JSON hook contract, which we cannot
-# build without node, so this goes on stderr — the channel the SEC-001
-# RALLY_BIN/PATH-containment refusals above already use for hook-authored
-# diagnostics that sit outside that contract. Once per session: reuse the
-# `.rally/.hook-seen` marker directory the anti-spam JSON renderer below
-# already owns for its own one-time notices, so whichever phase (SessionStart
-# or PreToolUse) fires first suppresses the identical notice on every later
-# phase in the same session instead of repeating on every tool call.
-_rally_advise_node_missing() {
-  local root marker_dir marker safe_session
-  root="$(find_rally_root 2>/dev/null || pwd)"
-  safe_session="$(printf '%s' "${session:-anon}" | tr -c 'A-Za-z0-9_.:-' '_')"
-  marker_dir="$root/.rally/.hook-seen"
-  marker="$marker_dir/$safe_session.node-missing.seen"
-  [ -f "$marker" ] && return 0
-  printf 'rally-hook: node is not on PATH — coordination output is DISABLED this session (SessionStart room-awareness, PreToolUse deconfliction warnings). rally CLI calls (enter/status/claims) above still ran silently. Install node to restore hook output. This notice is once per session; see %s.\n' \
-    "$marker" >&2
-  mkdir -p "$marker_dir" 2>/dev/null || true
-  printf '1' > "$marker" 2>/dev/null || true
-  return 0
-}
-
 # Render the host-specific output envelope from rally's JSON output.
 # Without node we can't parse rally JSON — say why (once per session, on
-# stderr) and stay fail-open.
+# stderr) and stay fail-open. Native before-write returned before all Rally
+# calls above; this branch now serves lifecycle phases only.
 if [ "$have_node" != "1" ]; then
-  _rally_advise_node_missing
+  _rally_advise_node_missing "$_rally_native_root" "$session" render
   exit 0
 fi
 

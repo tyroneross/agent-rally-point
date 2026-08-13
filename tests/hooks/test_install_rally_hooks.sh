@@ -93,6 +93,33 @@ for event, phase in [
 ]:
     require(codex, codex_path, event, phase, "codex")
     require(claude, claude_path, event, phase, "claude_code")
+
+if set(codex) != {"description", "hooks"}:
+    raise AssertionError(f"{codex_path}: unsupported Codex 0.144.3 top-level keys {sorted(codex)}")
+codex_description = codex.get("description", "")
+if "native matcher evidence" not in codex_description or "wrapper classifies" not in codex_description:
+    raise AssertionError(f"{codex_path}: missing explicit Codex matcher uncertainty")
+expected_timeouts = {
+    "SessionStart": 5,
+    "UserPromptSubmit": 5,
+    "PreToolUse": 10,
+    "Stop": 5,
+}
+for event, timeout_sec in expected_timeouts.items():
+    groups = codex.get("hooks", {}).get(event, [])
+    if len(groups) != 1 or len(groups[0].get("hooks", [])) != 1:
+        raise AssertionError(f"{codex_path}: unexpected {event} handler shape")
+    if groups[0]["hooks"][0].get("timeout") != timeout_sec:
+        raise AssertionError(f"{codex_path}: {event} timeout is not {timeout_sec} seconds")
+    claude_groups = claude.get("hooks", {}).get(event, [])
+    if len(claude_groups) != 1 or len(claude_groups[0].get("hooks", [])) != 1:
+        raise AssertionError(f"{claude_path}: unexpected {event} handler shape")
+    if claude_groups[0]["hooks"][0].get("timeout") != timeout_sec:
+        raise AssertionError(f"{claude_path}: {event} timeout is not {timeout_sec} seconds")
+for group in codex.get("hooks", {}).get("PreToolUse", []):
+    if any("before-write codex" in hook.get("command", "") for hook in group.get("hooks", [])):
+        if "matcher" in group:
+            raise AssertionError(f"{codex_path}: Codex matcher narrowed without captured native evidence")
 PY
 then
   ok "$T"
