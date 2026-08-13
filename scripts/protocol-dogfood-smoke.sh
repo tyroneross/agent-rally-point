@@ -29,20 +29,30 @@ set -euo pipefail
 # --- resolve the rally binary (repo-local debug build by default) ------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck disable=SC1090,SC1091
+source "$SCRIPT_DIR/disposable-repo-guard.sh"
 RALLY="${RALLY:-$REPO_ROOT/target/debug/rally}"
 if [ ! -x "$RALLY" ]; then
   echo "FATAL: rally binary not found/executable at: $RALLY" >&2
   echo "       build it (cargo build -p rally-cli) or set RALLY=/path/to/rally" >&2
   exit 2
 fi
+if [[ "$RALLY" == */* ]]; then
+  RALLY="$(cd "$(dirname "$RALLY")" && pwd -P)/$(basename "$RALLY")"
+else
+  RALLY="$(command -v "$RALLY")"
+fi
 
 # --- isolated room -----------------------------------------------------------
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/rally-dogfood.XXXXXX")"
-cleanup() { rm -rf "$WORK"; }
+SCRATCH_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rally-dogfood.XXXXXX")"
+WORK="$SCRATCH_ROOT/repo"
+mkdir -p "$WORK"
+cleanup() { rm -rf "$SCRATCH_ROOT"; }
 trap cleanup EXIT
 cd "$WORK"
 git init -q
 git commit -q --allow-empty -m "dogfood room init"
+rally_assert_disposable_repo "$WORK" "$SCRATCH_ROOT" "$REPO_ROOT"
 
 # Two distinct host sessions + one bystander, mirroring the Claude/Codex split.
 A="codex:dogfood-author"     # poses the handoff (Codex implementer)

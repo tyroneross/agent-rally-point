@@ -22,8 +22,8 @@
 //!   next client fails open; facts.db rebuilds from the ledger.
 //! * T-08 — wedged corridor: SH refused AND no ping within the corridor bound
 //!   fails LOUD naming the remedy, and NEVER writes directly.
-//! * T-09 — mid-command death: killing the daemon mid-command yields the
-//!   retryable "daemon stopped mid-request; retry" error (exit 1), never a
+//! * T-09 — mid-command disconnect: losing the routed transport yields a
+//!   concrete transport error (exit 1), never a false daemon-death claim or a
 //!   direct facts.db open.
 //!
 //! These run on macOS locally (the owner-lock handover is flock-based; the
@@ -676,10 +676,10 @@ fn t08_wedged_daemon_fails_loud_never_direct() {
     );
 }
 
-// ── T-09 — mid-command daemon death (R6): a routed op whose socket answered the
-//    liveness probe but then DIED before dispatch must fail fast with the
-//    retryable "daemon stopped mid-request; retry" error (exit 1), and never
-//    open facts.db directly.
+// ── T-09 — mid-command transport loss (R6): a routed op whose socket answered
+//    the liveness probe but then disconnected before dispatch must fail fast
+//    with the concrete transport cause (exit 1), never assert that the daemon
+//    died, and never open facts.db directly.
 //
 //    We reproduce that exact interleaving deterministically with a fake socket
 //    the TEST controls: it answers ONE `Ping` with a valid `Pong` (so the
@@ -687,7 +687,7 @@ fn t08_wedged_daemon_fails_loud_never_direct() {
 //    then stops accepting — so the FIRST dispatch connect is refused, which is
 //    precisely the mid-command dead-socket case (R6). No real daemon and no
 //    30s corridor: the router already committed to the routed path on the
-//    probe, so a refused dispatch is `dead_socket_error`, not a re-probe.
+//    probe, so a refused dispatch is a routed transport error, not a re-probe.
 
 /// Spawn a fake rallyd socket that answers exactly one `Ping` with a valid
 /// `Pong` for `canonical_repo_root`, then drops its listener so the next
@@ -739,7 +739,7 @@ fn spawn_one_ping_then_die(
 }
 
 #[test]
-fn t09_mid_command_death_retryable_never_direct() {
+fn t09_mid_command_transport_failure_never_direct() {
     let room = TempRoom::new("t09-middeath");
     let canonical = fs::canonicalize(&room.cwd)
         .unwrap()
@@ -749,7 +749,7 @@ fn t09_mid_command_death_retryable_never_direct() {
     let server = spawn_one_ping_then_die(&room.rally_dir(), &canonical);
 
     // The routed op: probe succeeds (fake Pong), the router commits to routing,
-    // then the FIRST dispatch connect is refused → dead_socket_error (exit 1).
+    // then the FIRST dispatch connect is refused → transport error (exit 1).
     let out = room
         .rally()
         .args([
@@ -768,7 +768,7 @@ fn t09_mid_command_death_retryable_never_direct() {
 
     server.join().ok();
 
-    // Exit 1 with the retryable remedy text (R6).
+    // Exit 1 with the concrete transport classification (R6).
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -781,8 +781,16 @@ fn t09_mid_command_death_retryable_never_direct() {
         String::from_utf8_lossy(&out.stdout)
     );
     assert!(
-        combined.contains("daemon stopped mid-request; retry"),
-        "must carry the retryable dead-socket message; got: {combined}"
+        combined.contains("daemon transport failure"),
+        "must carry the routed transport failure; got: {combined}"
+    );
+    assert!(
+        !combined.contains("daemon stopped"),
+        "a disconnect must not be misreported as proven daemon death: {combined}"
+    );
+    assert!(
+        !combined.contains("; retry"),
+        "a routed transport loss must not invite a blind retry: {combined}"
     );
 
     // And it NEVER fell back to a direct facts.db write mid-command (G2/R6): no

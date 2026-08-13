@@ -363,7 +363,10 @@ criteria; (3) current phase, accountable owner, and changes since the last ackno
 trigger/due condition, and stop condition; (6) verification artifacts with external refs; (7)
 handoffs and their target-authored ACK state; and (8) suppressed counts plus opaque drill-in IDs.
 The receiver acknowledges `brief_sha256` and `source_seq`; a general presence ACK does not close the
-handoff. Same input state produces byte-identical field order, content, and hash.
+handoff. `generated_at` is not sampled during rendering: it is the explicit UTC capture/as-of value
+that selected the source snapshot and is included in the brief-hash inputs. The same source state,
+source sequence, and capture/as-of value therefore produce byte-identical field order, content, and
+hash; a newly captured clock intentionally produces a different brief.
 
 The 4,000-character hook boundary remains defense in depth against unbounded untrusted ledger text,
 but blind tail clipping is not the composition strategy. The hook serializes a smaller
@@ -396,7 +399,7 @@ next action, evidence ref, and unacknowledged handoff. Today's blind `line(messa
 dropping at least one late field. The typed brief passes only if all mandatory fields survive,
 optional omissions carry exact counts/drill-in IDs, the serialized hook output stays within 4,000
 characters, and the recipient's ACK references the exact brief hash and source sequence. Permuting
-input iteration order produces the same bytes and hash.
+input iteration order at one pinned capture/as-of value produces the same bytes and hash.
 
 ### S13 — Explicit read-only room inventory · after S12 integration
 

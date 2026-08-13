@@ -104,7 +104,27 @@ fn ok(v: &Value) -> bool {
 }
 
 fn error_text(v: &Value) -> String {
-    v["error"].as_str().unwrap_or_default().to_string()
+    if let Some(error) = v["error"].as_str() {
+        return error.to_string();
+    }
+    if let Some(message) = v["data"]["warning"]["message"].as_str() {
+        return message.to_string();
+    }
+    let warnings = v["data"]["append_outcomes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|outcome| outcome["warnings"].as_array().into_iter().flatten())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "lead-seat refusal must carry exactly one unambiguous append warning: {v}"
+    );
+    warnings[0]["message"]
+        .as_str()
+        .expect("the sole append warning must carry a message")
+        .to_string()
 }
 
 /// THE defect. A non-incumbent takes the seat under its own name.
@@ -324,7 +344,7 @@ fn a_legacy_lead_fact_still_projects_to_the_same_lead() {
         "occurred_at": "2026-05-30T00:00:00Z",
         "event_type": "decision",
         "payload": {
-            "schema": "rally.fact.v1",
+            "schema": "agent-rally.fact.v1",
             "event_id": "fact_legacy_lead",
             "seq": 1,
             "thread_id": "room_legacy",
