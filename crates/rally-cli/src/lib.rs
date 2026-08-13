@@ -125,7 +125,6 @@ mod discovery;
 mod doctor;
 mod error;
 mod event_envelope;
-mod hook_runtime;
 mod hooks_config;
 mod init;
 mod liveness;
@@ -1394,7 +1393,6 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::Locate(args) => command_locate(args),
         CliCommand::Recent(args) => command_recent(args),
         CliCommand::Check(args) => command_check(args),
-        CliCommand::Hook(args) => command_hook(args),
         CliCommand::Run(args) => command_run(args),
         CliCommand::Sessions(args) => command_sessions(args),
         CliCommand::Inject(args) => command_inject(args),
@@ -5577,181 +5575,6 @@ fn command_check(args: CheckArgs) -> Result<Output> {
     let body = envelope("check", SCHEMA_CHECK, check.data)?;
     let text = format!("check findings={}", check.finding_count);
     Ok(Output::new(args.json, text, body).with_exit_code(check.exit_code))
-}
-
-/// One native before-write transaction from host stdin to host stdout.
-///
-/// The wrapper used to launch `status post`, `check`, `room`, and `say claim`
-/// as separate processes and then launch Node several times to parse and
-/// translate their JSON. This command keeps the existing command authorities
-/// intact while collapsing that orchestration into one Rust process. Storage
-/// calls remain deliberately routed through their canonical implementations;
-/// the next optimization can therefore target measured store work without
-/// changing host-envelope behavior at the same time.
-fn command_hook(args: HookArgs) -> Result<Output> {
-    if args.phase != "before-write" {
-        return Err(RallyError::Usage(format!(
-            "rally hook currently supports phase before-write; got {}",
-            args.phase
-        )));
-    }
-    if !matches!(
-        hook_runtime::host_family(&args.host),
-        "claude_code" | "codex" | "gemini" | "cursor"
-    ) {
-        return Err(RallyError::Usage(format!(
-            "rally hook supports hosts claude_code, codex, gemini, and cursor; got {}",
-            args.host
-        )));
-    }
-
-    use std::io::Read as _;
-    let mut raw = String::new();
-    // Hook stdin may be empty. A read error is equivalent to an empty envelope:
-    // the coordination path stays fail-open and emits a valid empty object.
-    let _ = std::io::stdin().read_to_string(&mut raw);
-    let input = hook_runtime::parse_input(&raw);
-    let session = hook_runtime::resolve_session(args.session_id, &input);
-    let tool = hook_runtime::resolve_tool(&args.host, args.tool, &session);
-    let root = match repo_root() {
-        Ok(root) => root,
-        Err(_) => return Ok(Output::new(true, String::new(), json!({}))),
-    };
-    let enabled = hooks_config::resolve(&root)
-        .map(|hooks| hooks.enabled)
-        .unwrap_or(true);
-    if !enabled || hook_runtime::duplicate_event(&root, &raw, &session, &args.phase) {
-        return Ok(Output::new(true, String::new(), json!({})));
-    }
-
-    let strict = args.strict || env::var("RALLY_HOOK_STRICT").as_deref() == Ok("1");
-    let host_can_block = hook_runtime::host_family(&args.host) != "codex";
-    let blocking = strict && host_can_block;
-    let path = input.path.map(normalize_path);
-
-    // Working-state publication is advisory. Preserve the wrapper's fail-open
-    // behavior: a heartbeat failure must not prevent the actual deconfliction
-    // check from running.
-    if let Some(path) = path.as_deref()
-        && hook_runtime::working_status_due(&root, &session, path)
-    {
-        let posted = command_status_post(
-            true,
-            cli::StatusPostArgs {
-                tool: tool.clone(),
-                state: "working".to_string(),
-                file: Some(path.to_string()),
-                intent: Some(format!("editing {path}")),
-                blocked_ref: None,
-                wake_after: None,
-                committed_sha: None,
-                worktree_branch: None,
-            },
-        );
-        if posted.is_ok() {
-            hook_runtime::mark_working_status(&root, &session, path);
-        }
-    }
-
-    let check = match command_check(cli::CheckArgs {
-        json: true,
-        phase: "before-write".to_string(),
-        tool: Some(tool.clone()),
-        path: path.clone(),
-        strict,
-        role: None,
-        proposed_tier: None,
-        enforce: false,
-        changed: Vec::new(),
-    }) {
-        Ok(output) => output,
-        Err(error) => {
-            eprintln!("rally-hook: before-write check failed open: {error}");
-            return Ok(Output::new(true, String::new(), json!({})));
-        }
-    };
-
-    let allow = check.body["data"]["check"]["allow"]
-        .as_bool()
-        .unwrap_or(true);
-    let mut message = hook_runtime::conflict_message(&check.body, path.as_deref(), blocking);
-
-    if allow && let Some(path) = path.as_deref() {
-        // Match the legacy wrapper's idempotency rule: do not append another
-        // claim when this tool already owns an overlapping scope.
-        let index_path = root
-            .join(".rally")
-            .join(claim_authority::CLAIM_INDEX_FILENAME);
-        let authoritative_own_claim = || {
-            RoomStore::open()
-                .and_then(|room| room.snapshot())
-                .map(|snapshot| {
-                    snapshot.active_claims.iter().any(|claim| {
-                        claim.tool.as_deref() == Some(tool.as_str())
-                            && claim
-                                .scope
-                                .iter()
-                                .any(|scope| path_matches_scope(scope, path))
-                    })
-                })
-                .unwrap_or(false)
-        };
-        let already_claimed = if index_path.exists() {
-            claim_authority::read_index(&index_path).map_or_else(
-                |_| authoritative_own_claim(),
-                |index| {
-                    index.claims.values().any(|claim| {
-                        claim.owner_tool.as_deref() == Some(tool.as_str())
-                            && claim
-                                .raw_scope
-                                .iter()
-                                .any(|scope| path_matches_scope(scope, path))
-                    })
-                },
-            )
-        } else {
-            // A missing/corrupt legacy index must not cause duplicate claims.
-            // Fall back to the authoritative projection only on this exceptional path.
-            authoritative_own_claim()
-        };
-        if !already_claimed {
-            let claim = SayArgs {
-                json: true,
-                kind: FactKind::Claim,
-                tool: tool.clone(),
-                subject: Some(format!("auto-claim {path}")),
-                thread_id: None,
-                role: None,
-                summary: Some("native-hook:before-write".to_string()),
-                scopes: Vec::new(),
-                resources: Vec::new(),
-                paths: vec![path.to_string()],
-                evidence: Vec::new(),
-                target: None,
-                ref_id: None,
-                status: None,
-                severity: None,
-                uri: None,
-                produces: Vec::new(),
-                depends: Vec::new(),
-                run_id: None,
-                step_id: None,
-                parent_step_ids: Vec::new(),
-                reason: None,
-                wake_after: None,
-                ref_standby: None,
-            };
-            if let Err(error) = command_say(claim) {
-                message = Some(hook_runtime::claim_failure_message(
-                    path,
-                    &error.to_string(),
-                ));
-            }
-        }
-    }
-
-    let body = hook_runtime::render_before_write(&args.host, message.as_deref(), allow, strict);
-    Ok(Output::new(true, String::new(), body))
 }
 
 fn command_run(args: RunArgs) -> Result<Output> {
@@ -15845,7 +15668,6 @@ fn help_text() -> String {
         "Usage:",
         "  rally init [--json]",
         "  rally hooks status [--json]",
-        "  rally hook before-write <claude_code|codex|gemini|cursor> [--tool <tool>] [--session-id <id>] [--strict]  # native host envelope; reads stdin JSON",
         "  rally hooks on|off [--scope <repo|user>] [--json]",
         "  rally hooks prompt (--once|--always|--off) [--scope <repo|user>] [--json]",
         "  rally retrospective [--engagement <label>] [--out <path>] [--json]",
