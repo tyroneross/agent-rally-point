@@ -48,6 +48,21 @@ All notable changes to Agent Rally Point are documented here.
   was reverted; the A/B is recorded so the shape is not retried. `rally doctor --sweep-corrupt`
   remains the supported way to clear accumulated debris in the meantime.
 
+### Added — wrong facts can finally be withdrawn
+
+- **`rally retract <fact-id> --tool <tool> --reason <why> [--superseded-by <fact-id>]`** appends
+  a retraction naming the target's event id; the ledger is never rewritten. Read paths —
+  `rally room`, `rally next`, `rally recent`, and the session-start hook that shells to them —
+  stop surfacing the withdrawn fact while the retraction itself stays visible and auditable.
+  The wire shape is cross-store on purpose (kind `artifact`, subject `retract: <event-id>`,
+  `ref` = target, `retracts=<id>[ superseded_by=<id>]` summary tokens), so build-loop's
+  existing resolver in `scripts/rally_point/retraction.py` honors rally-written retractions
+  and vice versa — including under older binaries that remap unknown kinds to `artifact`.
+  Guardrails: an unknown target id is rejected before anything is posted, a second retraction
+  of the same fact is a reported no-op that points at the prior retraction (and where the
+  correction lives), and retracting a retraction is refused so the correction trail cannot
+  be erased.
+
 ## v0.2.1 - 2026-08-07
 
 ### Ledger — one additive schema change, called out because the version number understates it

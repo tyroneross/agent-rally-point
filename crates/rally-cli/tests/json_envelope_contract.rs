@@ -197,6 +197,40 @@ fn envelope_say() {
     ws.cleanup();
 }
 
+/// `retract` — withdraws a posted fact, so it needs a real target id first.
+/// The ledger is append-only: the retraction is a new fact naming the target.
+#[test]
+fn envelope_retract() {
+    let ws = Workspace::new("retract");
+    let posted = ws.json(&[
+        "say",
+        "artifact",
+        "--json",
+        "--tool",
+        "test-agent",
+        "--subject",
+        "fact posted in error",
+    ]);
+    let target = posted["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .expect("say envelope must carry the posted fact's event_id")
+        .to_string();
+    let body = ws.json(&[
+        "retract",
+        &target,
+        "--json",
+        "--tool",
+        "test-agent",
+        "--reason",
+        "posted against the wrong engagement",
+    ]);
+    assert_envelope_contract("retract", &body);
+    assert_eq!(body["schema"], "agent-rally.command.retract.v1");
+    assert_eq!(body["data"]["retract"]["target"], target);
+    assert_eq!(body["data"]["retract"]["status"], "retracted");
+    ws.cleanup();
+}
+
 /// `room` — reads room state; no required args (opens current repo room).
 #[test]
 fn envelope_ack() {

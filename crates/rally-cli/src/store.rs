@@ -5963,6 +5963,34 @@ fn snapshot_from_facts_with_policy_at(
     include_archived: bool,
     now_secs: i64,
 ) -> RoomSnapshot {
+    // Retraction resolution (read-time, append-only): a fact withdrawn by a
+    // `retract: <event-id>` fact is dropped from EVERY projection bucket here,
+    // while the retraction fact itself survives (it is an artifact, so peers
+    // see the correction in recent_artifacts instead of the withdrawn claim).
+    // The retraction is always appended after its target, so `max_seq` and
+    // read-checkpoint positions never regress. Presence intentionally uses the
+    // resolved slice too: a withdrawn fact should not count as evidence of
+    // anything, including liveness.
+    //
+    // PLACEMENT (integration of feat/fact-retraction onto the O02-O31 store):
+    // this filter was authored at the top of `snapshot_from_facts_with_policy`,
+    // which the stabilization work has since reduced to a thin wrapper over this
+    // deterministic core. It belongs in the CORE, not the wrapper: the
+    // snapshot-cache capture path calls `snapshot_from_facts_with_policy_at`
+    // directly, so filtering in the wrapper alone would let a cached snapshot
+    // keep showing facts that a freshly-computed one had already dropped.
+    let retracted = crate::retraction::retracted_ids(facts);
+    let resolved_facts: Vec<Fact>;
+    let facts: &[Fact] = if retracted.is_empty() {
+        facts
+    } else {
+        resolved_facts = facts
+            .iter()
+            .filter(|f| !retracted.contains(&f.event_id))
+            .cloned()
+            .collect();
+        &resolved_facts
+    };
     let half_life_secs = coord.half_life_secs();
     let floor = coord.archive_floor_weight;
     let is_archived = |fact: &Fact| -> bool {

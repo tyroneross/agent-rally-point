@@ -65,6 +65,10 @@ pub(crate) enum CliCommand {
     /// multi-lane run). Renews own claims, reclaims stale/expired ones, reports
     /// live peer conflicts without blocking the rest of the manifest.
     ClaimsRefresh(ClaimsRefreshArgs),
+    /// Append-only withdrawal of a posted fact: `rally retract <fact-id>`.
+    /// Read paths (room/next/recent + the session-start hook that shells to
+    /// them) stop surfacing the withdrawn fact; the retraction itself stays.
+    Retract(RetractArgs),
 }
 
 pub(crate) enum CliParse {
@@ -196,6 +200,20 @@ pub(crate) struct SayArgs {
     // B1 wake-specific args (only meaningful when kind == wake)
     /// Wake: event-id of the standby fact being acknowledged. Stored in ref_id.
     pub(crate) ref_standby: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RetractArgs {
+    pub(crate) json: bool,
+    /// Event id of the fact being withdrawn. Validated against the ledger —
+    /// an unknown id is rejected before anything is posted.
+    pub(crate) fact_id: String,
+    pub(crate) tool: String,
+    /// Why the fact is withdrawn. Required: a retraction without a why is the
+    /// same auditability hole the retraction exists to close.
+    pub(crate) reason: String,
+    /// Optional event id of the corrected fact that replaces the target.
+    pub(crate) superseded_by: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -821,6 +839,8 @@ pub(crate) const COMMANDS: &[&str] = &[
     "daemon",
     // One-shot lane-claim refresh (retro §11 / enforce-candidate #3)
     "claims-refresh",
+    // Append-only withdrawal of a posted fact
+    "retract",
 ];
 
 /// Flag spellings people reach for that mean an existing subcommand.
@@ -910,6 +930,11 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("locate")
         .map(CliCommand::Locate);
+    let retract = retract_parser()
+        .to_options()
+        .descr("Withdraw a posted fact by appending a retraction naming its event id. The ledger is never rewritten; room/next/recent stop surfacing the withdrawn fact while the retraction stays visible.")
+        .command("retract")
+        .map(CliCommand::Retract);
     let recent = recent_parser()
         .to_options()
         .command("recent")
@@ -1149,7 +1174,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         worktree_gc,
         self_exit_check,
         daemon,
-        claims_refresh
+        claims_refresh,
+        retract
     ])
     .to_options()
 }
@@ -1468,6 +1494,28 @@ fn next_parser() -> impl Parser<NextArgs> {
         paths,
         limit
     })
+}
+
+fn retract_parser() -> impl Parser<RetractArgs> {
+    let json = json_flag();
+    let tool = string_arg("tool", "TOOL");
+    let reason = long("reason")
+        .help("why the fact is withdrawn (required; recorded verbatim)")
+        .argument::<String>("WHY");
+    let superseded_by = long("superseded-by")
+        .help("event id of the corrected fact that replaces the withdrawn one")
+        .argument::<String>("FACT_ID")
+        .optional();
+    let fact_id = positional::<String>("FACT_ID");
+    construct!(json, tool, reason, superseded_by, fact_id).map(
+        |(json, tool, reason, superseded_by, fact_id)| RetractArgs {
+            json,
+            fact_id,
+            tool,
+            reason,
+            superseded_by,
+        },
+    )
 }
 
 fn locate_parser() -> impl Parser<LocateArgs> {

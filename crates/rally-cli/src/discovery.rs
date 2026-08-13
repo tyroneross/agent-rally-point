@@ -473,9 +473,13 @@ fn recent_in_room(
         .unwrap_or(0);
     let half_life_secs = coord.half_life_secs();
     let floor = coord.archive_floor_weight;
-    let rows = store
-        .facts()?
+    let facts = store.facts()?;
+    // Retraction resolution: drop withdrawn facts from the listing; the
+    // retraction fact itself is kept so the correction stays visible.
+    let retracted = crate::retraction::retracted_ids(&facts);
+    let rows = facts
         .into_iter()
+        .filter(|fact| !retracted.contains(&fact.event_id))
         .filter(|fact| {
             if include_archived {
                 return true;

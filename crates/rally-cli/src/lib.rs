@@ -35,6 +35,7 @@ const SCHEMA_ROOM: &str = "agent-rally.command.room.v1";
 const SCHEMA_NEXT: &str = "agent-rally.command.next.v1";
 const SCHEMA_LOCATE: &str = "agent-rally.command.locate.v1";
 const SCHEMA_RECENT: &str = "agent-rally.command.recent.v1";
+const SCHEMA_RETRACT: &str = "agent-rally.command.retract.v1";
 const SCHEMA_CHECK: &str = "agent-rally.command.check.v1";
 const SCHEMA_RUN: &str = "agent-rally.command.run.v1";
 const SCHEMA_SESSIONS: &str = "agent-rally.command.sessions.v1";
@@ -135,6 +136,7 @@ pub mod rallyd_core;
 mod reaper;
 mod relevance;
 mod resource_scope;
+mod retraction;
 mod retrospective;
 mod retry_budget;
 mod ripple;
@@ -1433,6 +1435,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         // BACKLOG S-P3, Chunk C: rallyd store daemon lifecycle
         CliCommand::Daemon(args) => command_daemon(args),
         CliCommand::ClaimsRefresh(args) => command_claims_refresh(args),
+        CliCommand::Retract(args) => command_retract(args),
     }
 }
 
@@ -3752,6 +3755,167 @@ fn command_recent(args: RecentArgs) -> Result<Output> {
     let count = data.rows.len();
     let body = envelope("recent", SCHEMA_RECENT, RecentEnvelope { recent: data })?;
     let text = format!("recent rows={count}");
+    Ok(Output::new(args.json, text, body))
+}
+
+// =============================================================================
+// rally retract — append-only withdrawal of a posted fact
+// =============================================================================
+
+/// Wrapper: wraps retract result under `data.retract`.
+#[derive(JsonSchema, Serialize)]
+struct RetractEnvelope {
+    retract: RetractData,
+}
+
+#[derive(Debug, JsonSchema, Serialize)]
+struct RetractData {
+    /// Event id of the withdrawn fact.
+    target: String,
+    /// `retracted` on a fresh withdrawal; `noop_already_retracted` when the
+    /// target was already withdrawn (nothing new is posted).
+    status: String,
+    reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
+    /// The appended retraction fact (fresh withdrawal only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fact: Option<Fact>,
+    /// Event id of the pre-existing retraction (no-op only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prior_retraction: Option<String>,
+    /// Replacement fact the pre-existing retraction pointed at (no-op only) —
+    /// tells the caller where the correction already lives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prior_superseded_by: Option<String>,
+}
+
+/// Guardrailed core of `rally retract` (see `crate::retraction` for the wire
+/// shape and read-side resolution). Separated from `command_retract` so tests
+/// can drive it against a fixture room.
+///
+/// Guardrails, in check order — nothing is posted unless all pass:
+/// 1. unknown target id → usage error (a typo must not mint a dangling
+///    retraction that silently withdraws nothing);
+/// 2. target is itself a retraction → refused (the correction trail cannot
+///    be erased);
+/// 3. `--superseded-by` must name an existing fact other than the target;
+/// 4. target already retracted → reported no-op, no second fact appended.
+fn retract_in_room(
+    room: &RoomStore,
+    tool: &str,
+    target: &str,
+    reason: &str,
+    superseded_by: Option<&str>,
+) -> Result<RetractData> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(RallyError::Usage(
+            "--reason must not be empty — a withdrawal has to say why".to_string(),
+        ));
+    }
+    let facts = room.facts()?;
+    let target_fact = facts.iter().find(|f| f.event_id == target).ok_or_else(|| {
+        RallyError::Usage(format!(
+            "unknown fact id {target} — nothing was posted. Find the id with `rally locate {target}` or `rally recent`."
+        ))
+    })?;
+    if retraction::is_retraction(target_fact) {
+        return Err(RallyError::Usage(format!(
+            "refusing to retract retraction {target} — the correction trail cannot be erased. To restore the withdrawn fact, post it again as a new fact."
+        )));
+    }
+    if let Some(by) = superseded_by {
+        if by == target {
+            return Err(RallyError::Usage(format!(
+                "--superseded-by must name the corrected fact, not the withdrawn one ({target})"
+            )));
+        }
+        if !facts.iter().any(|f| f.event_id == by) {
+            return Err(RallyError::Usage(format!(
+                "unknown --superseded-by fact id {by} — post the corrected fact first, then retract with its event id. Nothing was posted."
+            )));
+        }
+    }
+    if let Some(prior) = retraction::index(&facts).get(target) {
+        return Ok(RetractData {
+            target: target.to_string(),
+            status: "noop_already_retracted".to_string(),
+            reason: reason.to_string(),
+            superseded_by: superseded_by.map(str::to_string),
+            fact: None,
+            prior_retraction: Some(prior.event_id.clone()),
+            prior_superseded_by: prior.superseded_by.clone(),
+        });
+    }
+    let fact = Fact {
+        from_session_id: Some(
+            current_protocol_session(Some(tool))
+                .from_session_id()
+                .to_string(),
+        ),
+        schema: FACT_SCHEMA.to_string(),
+        event_id: new_id("fact"),
+        seq: 0,
+        thread_id: new_id("room"),
+        // Artifact + the `retract: <id>` subject is the cross-store shape:
+        // build-loop's resolver and older rally binaries (which remap unknown
+        // kinds) both honor it. See `crate::retraction`.
+        kind: FactKind::Artifact,
+        tool: Some(tool.to_string()),
+        role: None,
+        subject: retraction::subject_for(target),
+        scope: Vec::new(),
+        created_at: now_string(),
+        summary: Some(retraction::summary_for(target, reason, superseded_by)),
+        evidence: Vec::new(),
+        target: None,
+        ref_id: Some(target.to_string()),
+        status: Some("retraction".to_string()),
+        severity: None,
+        uri: None,
+        session: None,
+    };
+    // `append_fact_verified` returns an `AppendOutcome` on the stabilized store
+    // (it did not when this command was written). `into_fact_reporting` is the
+    // canonical unwrap: it records the outcome's projection warnings before
+    // handing back the Fact, so a retraction that commits with an incomplete
+    // projection is reported like every other append rather than silently
+    // dropping that signal.
+    let fact = room.append_fact_verified(&fact)?.into_fact_reporting();
+    Ok(RetractData {
+        target: target.to_string(),
+        status: "retracted".to_string(),
+        reason: reason.to_string(),
+        superseded_by: superseded_by.map(str::to_string),
+        fact: Some(fact),
+        prior_retraction: None,
+        prior_superseded_by: None,
+    })
+}
+
+fn command_retract(args: RetractArgs) -> Result<Output> {
+    let room = RoomStore::open()?;
+    ensure_presence(&room, &args.tool)?;
+    let data = with_watchdog_command_commit(|| {
+        retract_in_room(
+            &room,
+            &args.tool,
+            &args.fact_id,
+            &args.reason,
+            args.superseded_by.as_deref(),
+        )
+    })?;
+    let text = format!(
+        "retract target={} status={}{}",
+        data.target,
+        data.status,
+        data.fact
+            .as_ref()
+            .map(|f| format!(" fact={}", f.event_id))
+            .unwrap_or_default(),
+    );
+    let body = envelope("retract", SCHEMA_RETRACT, RetractEnvelope { retract: data })?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -8785,6 +8949,192 @@ mod tests {
              help_text() for each — a command users cannot discover is a command they \
              will not use."
         );
+    }
+
+    // ---- rally retract — guardrails + read-side resolution ----------------
+
+    /// Append a plain artifact fact to a fixture room and return it (with the
+    /// store-assigned seq), so retraction tests have a real target to withdraw.
+    fn seed_artifact(room: &store::RoomStore, subject: &str) -> Fact {
+        let fact = Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Artifact,
+            tool: Some("tool-x".to_string()),
+            role: None,
+            subject: subject.to_string(),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&fact)
+            .unwrap()
+            .into_fact_reporting()
+    }
+
+    #[test]
+    fn retract_unknown_target_is_rejected_and_nothing_is_posted() {
+        let root = unique_root("retract-unknown-target");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        seed_artifact(&room, "real fact");
+        let before = room.facts().unwrap().len();
+
+        let err = retract_in_room(&room, "tool-x", "fact_nope_123", "typo", None).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown fact id fact_nope_123"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            room.facts().unwrap().len(),
+            before,
+            "a rejected retraction must not mint a dangling fact"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn retract_drops_target_from_room_projections_but_keeps_the_retraction() {
+        let root = unique_root("retract-resolves-room");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let target = seed_artifact(&room, "wrong port number");
+        let snap_before = room.snapshot().unwrap();
+        assert!(
+            snap_before
+                .recent_artifacts
+                .iter()
+                .any(|f| f.event_id == target.event_id),
+            "target must surface before retraction"
+        );
+
+        let data = retract_in_room(&room, "tool-x", &target.event_id, "wrong port", None).unwrap();
+        assert_eq!(data.status, "retracted");
+        let retraction = data.fact.expect("fresh retraction appends a fact");
+        assert_eq!(retraction.subject, format!("retract: {}", target.event_id));
+
+        let snap = room.snapshot().unwrap();
+        assert!(
+            !snap
+                .recent_artifacts
+                .iter()
+                .any(|f| f.event_id == target.event_id),
+            "withdrawn fact must stop surfacing in room projections"
+        );
+        assert!(
+            snap.recent_artifacts
+                .iter()
+                .any(|f| f.event_id == retraction.event_id),
+            "the retraction itself must stay visible"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn second_retraction_of_same_fact_is_a_reported_noop() {
+        let root = unique_root("retract-noop-second");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let target = seed_artifact(&room, "flaky claim");
+        let replacement = seed_artifact(&room, "corrected claim");
+
+        let first = retract_in_room(
+            &room,
+            "tool-x",
+            &target.event_id,
+            "wrong",
+            Some(&replacement.event_id),
+        )
+        .unwrap();
+        let first_id = first.fact.unwrap().event_id;
+        let count_after_first = room.facts().unwrap().len();
+
+        let second =
+            retract_in_room(&room, "tool-y", &target.event_id, "also wrong", None).unwrap();
+        assert_eq!(second.status, "noop_already_retracted");
+        assert!(second.fact.is_none(), "no-op must not append a second fact");
+        assert_eq!(second.prior_retraction.as_deref(), Some(first_id.as_str()));
+        assert_eq!(
+            second.prior_superseded_by.as_deref(),
+            Some(replacement.event_id.as_str()),
+            "no-op must point at where the correction already lives"
+        );
+        assert_eq!(room.facts().unwrap().len(), count_after_first);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn retracting_a_retraction_is_refused() {
+        let root = unique_root("retract-of-retraction");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let target = seed_artifact(&room, "withdrawn claim");
+        let data = retract_in_room(&room, "tool-x", &target.event_id, "wrong", None).unwrap();
+        let retraction_id = data.fact.unwrap().event_id;
+
+        let err = retract_in_room(&room, "tool-x", &retraction_id, "undo", None).unwrap_err();
+        assert!(
+            err.to_string().contains("correction trail"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn retract_superseded_by_must_name_an_existing_other_fact() {
+        let root = unique_root("retract-superseded-guardrails");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let target = seed_artifact(&room, "claim");
+
+        let err = retract_in_room(
+            &room,
+            "tool-x",
+            &target.event_id,
+            "wrong",
+            Some(&target.event_id),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not the withdrawn one"));
+
+        let err = retract_in_room(
+            &room,
+            "tool-x",
+            &target.event_id,
+            "wrong",
+            Some("fact_missing_9"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown --superseded-by"));
+
+        let err = retract_in_room(&room, "tool-x", &target.event_id, "   ", None).unwrap_err();
+        assert!(err.to_string().contains("--reason must not be empty"));
+
+        // All three rejections above must leave the ledger untouched: the
+        // target still surfaces.
+        let snap = room.snapshot().unwrap();
+        assert!(
+            snap.recent_artifacts
+                .iter()
+                .any(|f| f.event_id == target.event_id),
+            "guardrail rejections must not withdraw the target"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     // ---- P1c: session liveness — real pane probe beats presence TTL -------
@@ -15674,6 +16024,8 @@ fn help_text() -> String {
         "  rally rotate [--days <n>] [--dry-run] [--json]",
         "  rally enter --tool <tool> [--engagement <label>] [--path <path>] [--role <role>] [--json]",
         "  rally say <kind> --tool <tool> --subject <subject> [--path <path>] [--json]",
+        "  rally retract <fact-id> --tool <tool> --reason <why> [--superseded-by <fact-id>] [--json]",
+        "    append-only withdrawal: room/next/recent stop surfacing the fact; the retraction itself stays visible and auditable",
         "  rally room [--tool <tool>] [--role <role>] [--path <path>] [--since <seq>] [--json]",
         "  rally next --tool <tool> [--path <path>] [--role <role>] [--limit <n>] [--json]",
         "  rally locate <event-id> [--json]",
