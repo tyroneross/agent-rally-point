@@ -2863,3 +2863,70 @@ claim and asks the implementation whether it is true. See
   (`scripts/rule_check_golden.py:157` currently pins the deny behavior).
 - **Blast radius:** 56 repositories under `~/dev/git-folder` contain `.rally/`; each is exposed on
   any host running that consumer whenever Rally is briefly unresponsive.
+
+### RC-071 — the release scope-sweep: authorization and effect were keyed off two different fields (fifth instance of the class)
+
+- **State:** `fixed` 2026-08-14, with an exhaustive class test. Found by a judged six-way debate
+  plus an independent Fable audit, alongside R1–R4 (see `CHANGELOG.md`, Unreleased).
+- **The mechanism, composed.** `claim_authority::later_release_overlaps_claim_scope` closes EVERY
+  active claim whose scope overlaps a release's own free-text `fact.scope`.
+  `write_authority::assert_claim_close_authorized` authorized only the claim named by `ref_id`,
+  and never read `fact.scope` at all. So the field that decided WHO was allowed and the field that
+  decided WHAT was closed were different fields, and naming your own claim satisfied a gate that
+  had nothing to do with the claim being taken:
+
+  ```text
+  rally say release --tool rogue --ref <rogue's own claim> --path <victim's path>
+  ```
+
+  Arm 1 (self-close) passed on the rogue's own claim; the victim's live claim was swept.
+- **Why the existing note said this was safe, and why it was wrong.** The doc comment on the sweep
+  carried an independent-auditor scope note (MED, 2026-06-09): over-close cannot happen on a normal
+  ledger, because same-scope different-owner claims are rejected at append time, so two live claims
+  never share a scope. **The premise is true and the conclusion does not follow.** Claim-conflict
+  detection runs on CLAIMS. A release is not a claim, so nothing ever checked that a release's
+  `--scope` named a scope its author had claimed. The audit reasoned about claims colliding with
+  claims and the attack came from a release naming a scope it had never held.
+- **This is the register's own "grade the claim against the code" rule failing on a note that
+  was itself the output of a grading pass.** The note was accurate about the invariant it cited
+  and silent about whether that invariant covered the path in question. Worth generalizing: a
+  safety note should name the paths it examined, not only the invariant it relied on.
+- **Fix.** Every claim the sweep would take is now checked under the same three-arm policy
+  (`write_authority::assert_release_sweep_authorized`), by CALLING
+  `later_release_overlaps_claim_scope` rather than restating it — sweep and authorization read one
+  rule from one place, so they cannot drift the way ARP-R-02's two lists did. The stale scope note
+  is corrected in place rather than deleted, next to the code it misdescribed.
+- **Class fix, and the reason for it.** This is the FIFTH instance of one defect in this codebase:
+  RC-029 (`--ref` walked past the takeover gate), ARP-R-01 (`set_lead` gated nothing), ARP-R-02
+  (four closing kinds, two gated), R1 (retraction removed a claim through a path the gate never
+  saw), and RC-071. Every one was a correct rule guarding one SPELLING while the ledger accepted
+  the ACTION, and every one was fixed by covering the spelling that got through — which is why
+  there were five. `store.rs::every_kind_that_can_remove_a_claim_is_authorized` now enumerates
+  `FactKind` with no wildcard arm and, for each of the three ways a fact can remove a live claim
+  (`ref_id`, scope repeat, retraction), projects the room and asserts that any fact which actually
+  removed the claim was refused by the gate AND selected by `needs_authority_check`. The oracle is
+  the projection, not a maintained list, so a new removal path fails the test without anyone
+  remembering it exists. Mutation-checked against all three gate arms independently.
+- **What is NOT claimed.** Every check here reads `fact.tool`, which is self-asserted and bound to
+  nothing. This makes the act a forgery rather than a permitted operation and it is attributable
+  as one. It is not an authorization boundary. RC-063 bounds this and `docs/security/TRUST-MODEL.md`
+  records the one claim of this shape that already had to be retracted.
+
+#### RC-071a — open: `breadth_violation` reads the lead off unresolved facts
+
+- **State:** `observed` 2026-08-14, **not fixed**, deliberately. Same class, adjacent surface,
+  found while fixing R3.
+- **The gap.** `store::append_fact` calls `claim_authority::breadth_violation` on RAW facts, so
+  `lead_from_facts` still counts a lead decision that has been RETRACTED. `rally room` reports no
+  lead; the room-wide claim gate still reports one. The two disagree, exactly as `detect_conflict`
+  and the projection did before R3.
+- **Why it was left.** Resolving it can only DENY — the no-lead arm already refuses room-wide
+  claims — so the inconsistency currently costs a legitimate lead nothing, while fixing it would
+  let anyone retract the seat-holding decision and strip the lead's room-wide capability.
+  Retraction of a lead decision is UNGATED: the judged ruling scoped ungated retraction to
+  "non-claim facts" and did not consider that the lead seat is a non-claim fact carrying authority.
+- **What is owed.** A decision, not a patch: either the lead decision joins the gated set (making
+  `is_lead_decision` a removal-relevant target for `assert_retraction_authorized`), or the room-wide
+  gate is documented as deliberately reading unresolved facts and why. The class test does not
+  cover this because its subject is claim removal; extending it to seat removal is the natural
+  follow-on.

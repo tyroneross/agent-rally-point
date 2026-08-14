@@ -119,16 +119,34 @@ fn later_fact_refs_claim(fact: &Fact, claim_id: &str) -> bool {
 /// multi-claim atomic-release contract (`command_release_by_path` writes ONE
 /// release carrying the union of matched scopes and relies on this sweep).
 ///
-/// Scope note (independent-auditor MED, 2026-06-09): on a NORMAL ledger this
-/// cannot over-close a foreign claim, because same-scope different-owner claims
-/// are rejected at append time (`store::append_fact` claim-conflict detection),
-/// so two live claims never share a scope. The over-close risk is latent only
-/// for an imported / hand-edited / corrupt ledger that already violates that
-/// invariant — in which case the projection faithfully reflects the (already
-/// inconsistent) ledger rather than masking it. The authorization gate that
-/// decides WHO may write a takeover release lives in `command_release_by_path`
-/// (2h stale-owner bar); this projection is downstream of that decision.
-fn later_release_overlaps_claim_scope(fact: &Fact, claim: &Fact) -> bool {
+/// # R5 — the scope note that used to live here was wrong, and how
+///
+/// It read: on a NORMAL ledger this cannot over-close a foreign claim, because
+/// same-scope different-owner claims are rejected at append time
+/// (`store::append_fact` claim-conflict detection), so two live claims never
+/// share a scope; the over-close risk is latent only for an imported or corrupt
+/// ledger.
+///
+/// The premise is true and the conclusion does not follow. Claim-conflict
+/// detection runs on CLAIMS. A release is not a claim, so nothing ever checked
+/// that a release's free-text `--scope` was a scope its author had claimed. A
+/// rogue could name the victim's path directly:
+///
+/// ```text
+/// rally say release --tool rogue --ref <rogue's own claim> --scope file:<victim's path>
+/// ```
+///
+/// `assert_claim_close_authorized` authorized the claim named by `ref_id` —
+/// the rogue's own, so arm 1 passed — and never read `fact.scope` at all,
+/// while this sweep closed the victim's claim on the scope match. The
+/// authorization and the effect were keyed off two different fields.
+///
+/// The gate now checks every claim this predicate would sweep, by CALLING this
+/// predicate rather than restating it (`write_authority::assert_release_sweep_authorized`).
+/// Sweep and authorization read the same rule from the same place, so the two
+/// cannot drift the way the four closing kinds and their two-kind gate did in
+/// ARP-R-02.
+pub(crate) fn later_release_overlaps_claim_scope(fact: &Fact, claim: &Fact) -> bool {
     fact.kind == FactKind::Release
         && fact.scope.iter().any(|release_scope| {
             claim
@@ -221,10 +239,43 @@ pub(crate) fn latest_renewed_lease(claim: &Fact, facts: &[Fact]) -> Option<Strin
         .map(|(_, lease)| lease)
 }
 
+/// R3. Retraction resolution, applied over the caller's in-memory `facts`.
+///
+/// The room projection drops retracted facts BEFORE projecting active claims
+/// (`store::snapshot_from_facts_with_policy_at`); this function reads raw
+/// facts. Without the same resolution the two disagree, and the disagreement
+/// has a direction: a retracted claim is invisible in `rally room` and in
+/// `check before-write`, yet still refuses every later claim on its scope. The
+/// owner is told to negotiate with a claim nobody can see.
+///
+/// Resolved by REUSING the projection's own filter rather than special-casing
+/// claims, so the two answers agree by construction. That also covers the
+/// second-order case: a `release` that was itself retracted no longer closes
+/// the claim it named, exactly as the projection already has it.
+///
+/// Cost: one pass over facts the caller already holds, and the clone only when
+/// the room actually contains a retraction. No additional ledger read — the
+/// same pattern and the same reasoning as the snapshot core.
+fn resolve_retractions(facts: &[Fact]) -> Option<Vec<Fact>> {
+    let retracted = crate::retraction::retracted_ids(facts);
+    if retracted.is_empty() {
+        return None;
+    }
+    Some(
+        facts
+            .iter()
+            .filter(|f| !retracted.contains(&f.event_id))
+            .cloned()
+            .collect(),
+    )
+}
+
 pub(crate) fn detect_conflict(facts: &[Fact], incoming: &Fact) -> Option<ClaimConflict> {
     if incoming.kind != FactKind::Claim {
         return None;
     }
+    let resolved = resolve_retractions(facts);
+    let facts: &[Fact] = resolved.as_deref().unwrap_or(facts);
     let incoming = active_claim_record_from_fact(incoming)?;
     for existing in active_claim_records(facts) {
         if same_session_owner(
@@ -526,6 +577,79 @@ mod tests {
         let conflict = detect_conflict(&[existing], &incoming).unwrap();
         assert_eq!(conflict.existing_claim_id, "claim-a");
         assert_eq!(conflict.scope, "file:src/lib.rs");
+    }
+
+    /// A retraction exactly as `rally retract` writes it.
+    fn retraction(id: &str, target: &str, seq: i64) -> Fact {
+        let mut f = fact(id, "retractor", vec![]);
+        f.kind = FactKind::Artifact;
+        f.seq = seq;
+        f.subject = crate::retraction::subject_for(target);
+        f.ref_id = Some(target.to_string());
+        f
+    }
+
+    /// R3, THE defect. `rally room` filters retracted facts before projecting
+    /// active claims; `detect_conflict` read raw facts. A retracted claim was
+    /// therefore invisible in the room and in `check before-write`, yet still
+    /// refused every later claim on its scope — the owner was told to negotiate
+    /// with a claim nobody could see.
+    #[test]
+    fn a_retracted_claim_no_longer_blocks_its_scope() {
+        let existing = fact("claim-a", "tool-a", vec!["file:src/lib.rs"]);
+        let incoming = fact("claim-b", "tool-b", vec!["file:src/lib.rs"]);
+        assert!(
+            detect_conflict(std::slice::from_ref(&existing), &incoming).is_some(),
+            "baseline: a live claim must still block"
+        );
+
+        let withdrawn = retraction("r-1", "claim-a", 900);
+        assert!(
+            detect_conflict(&[existing, withdrawn], &incoming).is_none(),
+            "a withdrawn claim must stop blocking, matching what `rally room` shows"
+        );
+    }
+
+    /// Second order, and the reason this reuses the projection's own filter
+    /// rather than special-casing claims: a `release` that was ITSELF retracted
+    /// no longer closes the claim it named, so the claim is live again and
+    /// blocks again — exactly as the projection already has it.
+    #[test]
+    fn a_retracted_release_leaves_its_claim_blocking_again() {
+        let existing = fact("claim-a", "tool-a", vec!["file:src/lib.rs"]);
+        let mut release = fact("rel-1", "tool-a", vec![]);
+        release.kind = FactKind::Release;
+        release.ref_id = Some("claim-a".to_string());
+        release.seq = 800;
+        let incoming = fact("claim-b", "tool-b", vec!["file:src/lib.rs"]);
+
+        assert!(
+            detect_conflict(&[existing.clone(), release.clone()], &incoming).is_none(),
+            "baseline: a released claim does not block"
+        );
+
+        let undo = retraction("r-1", "rel-1", 900);
+        let conflict = detect_conflict(&[existing, release, undo], &incoming)
+            .expect("withdrawing the release must revive the claim it closed");
+        assert_eq!(conflict.existing_claim_id, "claim-a");
+    }
+
+    /// The token carrier is gone (R2), so a summary token cannot silently
+    /// un-block a scope its author does not own.
+    #[test]
+    fn a_summary_token_does_not_unblock_a_scope() {
+        let existing = fact("claim-a", "tool-a", vec!["file:src/lib.rs"]);
+        let mut noise = fact("n-1", "tool-b", vec![]);
+        noise.kind = FactKind::Artifact;
+        noise.seq = 900;
+        noise.subject = "just a note".to_string();
+        noise.summary = Some("[retracts=claim-a]".to_string());
+        let incoming = fact("claim-b", "tool-b", vec!["file:src/lib.rs"]);
+
+        assert!(
+            detect_conflict(&[existing, noise], &incoming).is_some(),
+            "a token-only fact withdraws nothing, so the claim must still block"
+        );
     }
 
     #[test]

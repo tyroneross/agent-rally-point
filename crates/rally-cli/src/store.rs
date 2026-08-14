@@ -9629,6 +9629,219 @@ mod ledger_tests {
         }
     }
 
+    // ---- THE CLASS TEST: every way a fact can remove an active claim -------
+    //
+    // Five cycles of one defect (RC-029, ARP-R-01, ARP-R-02, R1, R5) share a
+    // shape: a correct rule guarding one SPELLING of an action, while the
+    // ledger accepts the ACTION. Each was fixed by covering the spelling that
+    // got through. This is the attempt to fail the whole class instead.
+
+    /// Can a fact of this kind remove an active claim from the room?
+    ///
+    /// EXHAUSTIVE, with NO wildcard arm on purpose: a new `FactKind` cannot
+    /// compile until someone decides this question about it. That is the
+    /// compile-time half of the lock. The runtime half is
+    /// `every_kind_that_can_remove_a_claim_is_authorized`, which does not trust
+    /// this declaration — it asks the PROJECTION and cross-checks.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ClaimRemoval {
+        /// Closes an active claim it names in `ref_id`.
+        Closes,
+        /// Cannot close a claim by naming it. (Any fact can still MASK one by
+        /// being a retraction — that is a property of the FACT, not the kind,
+        /// which is exactly why R1 was invisible to a kind-keyed gate.)
+        Inert,
+    }
+
+    const fn declared_removal(kind: &FactKind) -> ClaimRemoval {
+        match kind {
+            // The four closing kinds (ARP-R-02).
+            FactKind::Release | FactKind::Resolve | FactKind::Receipt | FactKind::ClaimExpired => {
+                ClaimRemoval::Closes
+            }
+            FactKind::Claim
+            | FactKind::ClaimRenewed
+            | FactKind::Blocker
+            | FactKind::Decision
+            | FactKind::Artifact
+            | FactKind::Handoff
+            | FactKind::Risk
+            | FactKind::Lesson
+            | FactKind::Session
+            | FactKind::Wake
+            | FactKind::Presence
+            | FactKind::Read
+            | FactKind::BacklogItem
+            | FactKind::Standby
+            | FactKind::Mission
+            | FactKind::Unknown => ClaimRemoval::Inert,
+        }
+    }
+
+    /// The declaration above and `closes_active_claim` must be the same list.
+    /// Adding a kind to one and not the other is precisely ARP-R-02.
+    #[test]
+    fn the_declared_closing_kinds_are_the_projections_closing_kinds() {
+        for kind in FactKind::ALL {
+            let declared = declared_removal(kind) == ClaimRemoval::Closes;
+            assert_eq!(
+                declared,
+                crate::claim_authority::closes_active_claim(kind),
+                "{kind:?}: the exhaustive declaration and `closes_active_claim` disagree; \
+                 a kind that closes a claim must also be a kind that must be authorized to"
+            );
+        }
+    }
+
+    /// THE class assertion. For EVERY `FactKind`, and for every way a fact can
+    /// remove a live claim — naming it in `ref_id`, repeating its scope, or
+    /// retracting it — if a non-owner's fact actually removes the claim from
+    /// the projection, the write gate must have refused that fact.
+    ///
+    /// The oracle is the PROJECTION, not a list. So a future change that gives
+    /// some kind a new way to close a claim fails here without anyone
+    /// remembering to update a table — which is the failure mode all five
+    /// instances of this class had in common.
+    #[test]
+    fn every_kind_that_can_remove_a_claim_is_authorized() {
+        let coord = crate::hooks_config::CoordinationConfig::default();
+
+        let mut victim = make_fact("claim-victim", FactKind::Claim, "file:src/a.rs", "owns it");
+        victim.seq = 1;
+        victim.tool = Some("victim:01".to_string());
+        victim.from_session_id = Some("sess:victim".to_string());
+
+        // The victim is LIVE: seen a minute ago, far inside the 30-minute
+        // small-work window, so no takeover arm can legitimately apply.
+        let before = RoomSnapshot {
+            active_claims: vec![victim.clone()],
+            squads: vec![Squad {
+                tool: "victim:01".to_string(),
+                last_seen_seq: 1,
+                last_seen_ts: now_string(),
+                status: "active".to_string(),
+                acknowledged: false,
+            }],
+            ..Default::default()
+        };
+
+        // Every spelling of "remove the victim's claim" a rogue could type.
+        type Attack = (&'static str, fn(&mut Fact));
+        let attacks: [Attack; 3] = [
+            ("names the claim in ref_id", |f: &mut Fact| {
+                f.ref_id = Some("claim-victim".to_string());
+            }),
+            ("repeats the claim's scope", |f: &mut Fact| {
+                f.scope = vec!["file:src/a.rs".to_string()];
+            }),
+            ("retracts the claim", |f: &mut Fact| {
+                f.subject = crate::retraction::subject_for("claim-victim");
+                f.ref_id = Some("claim-victim".to_string());
+            }),
+        ];
+
+        for kind in FactKind::ALL {
+            for (label, shape) in &attacks {
+                let mut hostile = make_fact("hostile", kind.clone(), "", "take it");
+                hostile.scope.clear();
+                hostile.seq = 2;
+                hostile.tool = Some("codex:rogue".to_string());
+                hostile.from_session_id = Some("sess:rogue".to_string());
+                shape(&mut hostile);
+
+                let after = snapshot_from_facts_with_policy(
+                    &[victim.clone(), hostile.clone()],
+                    &coord,
+                    false,
+                );
+                let removed = !after
+                    .active_claims
+                    .iter()
+                    .any(|c| c.event_id == "claim-victim");
+                if !removed {
+                    continue;
+                }
+                let verdict = crate::write_authority::assert_write_authorized(
+                    &hostile,
+                    std::slice::from_ref(&victim),
+                    &before,
+                    &coord,
+                );
+                assert!(
+                    verdict.is_err(),
+                    "{kind:?} {label}: this removes victim:01's live claim from the \
+                     projection and the write gate ALLOWED it. Every path that removes a \
+                     claim must go through the authorization gate — that is the whole \
+                     lesson of RC-029, ARP-R-01, ARP-R-02, R1, and R5."
+                );
+                assert!(
+                    crate::write_authority::needs_authority_check(&hostile),
+                    "{kind:?} {label}: removes a claim but `needs_authority_check` says \
+                     this fact needs no check, so in production the gate never runs"
+                );
+            }
+        }
+    }
+
+    /// S3 salvage. Retraction resolution lives in the deterministic CORE
+    /// (`snapshot_from_facts_with_policy_at`), not in the thin
+    /// `snapshot_from_facts_with_policy` wrapper, because the snapshot-CACHE
+    /// capture path calls the core directly. Filtering in the wrapper alone
+    /// would let a cached snapshot keep serving a fact a freshly-computed one
+    /// had already dropped.
+    ///
+    /// That placement was reasoned about in a comment and asserted nowhere: the
+    /// core path had zero direct coverage. This drives the cache capture
+    /// specifically, so moving the filter back up to the wrapper fails here
+    /// instead of in an audit.
+    #[test]
+    fn the_snapshot_cache_capture_path_drops_a_retracted_fact() {
+        let root = unique_root("cache-capture-retraction");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+
+        let mut claim = make_fact("claim-cached", FactKind::Claim, "file:src/a.rs", "owns it");
+        claim.tool = Some("victim:01".to_string());
+        claim.from_session_id = Some("sess:victim".to_string());
+        store.append_fact(&claim).unwrap();
+
+        let before = store.snapshot_cache_capture(false).unwrap().snapshot;
+        assert!(
+            before
+                .active_claims
+                .iter()
+                .any(|c| c.event_id == "claim-cached"),
+            "precondition: the capture path sees the live claim"
+        );
+
+        // The OWNER withdraws it, so this exercises the projection rather than
+        // the R1 authority gate.
+        let mut withdrawal = make_fact("retract-cached", FactKind::Artifact, "", "withdrawn");
+        withdrawal.scope.clear();
+        withdrawal.tool = Some("victim:01".to_string());
+        withdrawal.from_session_id = Some("sess:victim".to_string());
+        withdrawal.subject = crate::retraction::subject_for("claim-cached");
+        withdrawal.ref_id = Some("claim-cached".to_string());
+        store.append_fact(&withdrawal).unwrap();
+
+        let after = store.snapshot_cache_capture(false).unwrap().snapshot;
+        assert!(
+            after
+                .active_claims
+                .iter()
+                .all(|c| c.event_id != "claim-cached"),
+            "the capture path must drop the withdrawn claim: {:#?}",
+            after.active_claims
+        );
+        assert!(
+            after
+                .recent_artifacts
+                .iter()
+                .any(|f| f.event_id == "retract-cached"),
+            "the retraction itself must survive so the correction stays visible"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
     /// S9 RED control: an engagement/run read must derive participation from
     /// the selected segment instead of inheriting every repository squad.
     #[test]
