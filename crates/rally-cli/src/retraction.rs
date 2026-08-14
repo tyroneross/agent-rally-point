@@ -20,10 +20,31 @@
 //! summary : "<reason> [retracts=<id>[ superseded_by=<id>]]"
 //! ```
 //!
-//! Detection reads the same three carriers in order: the anchored subject,
-//! the `ref` field on a `retract:`-subject fact, and the `retracts=<id>`
-//! summary token. A fact merely *discussing* retraction ("how do we retract:
-//! a design note") never matches — the subject target must be one bare token.
+//! Detection reads TWO carriers, in order: the anchored subject, and the `ref`
+//! field on a `retract:`-subject fact. A fact merely *discussing* retraction
+//! ("how do we retract: a design note") never matches — the subject target must
+//! be one bare token.
+//!
+//! # Why the `retracts=` summary token is emitted but NOT read (R2)
+//!
+//! It used to be a third detection carrier, and that made every gate that has
+//! to reason about retraction cover three spellings of one act. This module's
+//! defect class — a correct rule guarding one spelling while the ledger accepts
+//! another (RC-029, ARP-R-01, ARP-R-02, RC-071) — gets worse with every extra
+//! spelling, and the third one earned nothing: build-loop's resolver
+//! (`scripts/rally_point/retraction.py`) writes the anchored subject
+//! REDUNDANTLY alongside the token and checks the subject FIRST, so carrier 1
+//! already catches every build-loop record. No sync path writes the token into
+//! the native store without also writing the subject.
+//!
+//! The token stays in [`summary_for`] on purpose, for two reasons that are
+//! about the OTHER store, not this one. build-loop's `superseded_by_of` reads
+//! `superseded_by=` out of the same bracket block, and its `_clean_reason`
+//! strips exactly `[retracts=...]` off the end of a reason before surfacing it
+//! — so emitting `[superseded_by=x]` without the leading `retracts=` would
+//! leave the wire marker in build-loop's human-facing prose. Emission is a
+//! carrier for a peer reader; detection is a spelling this codebase's gates
+//! must cover. They are allowed to differ, and here they should.
 //!
 //! `superseded_by` is additive: a retraction may simply withdraw a fact, or
 //! withdraw it AND point at the corrected fact that replaces it.
@@ -43,8 +64,11 @@ pub(crate) fn subject_for(target: &str) -> String {
     format!("retract: {target}")
 }
 
-/// Free-text summary that survives any store round-trip (the machine marker
-/// block is the last-resort detection carrier).
+/// Free-text summary carrying the machine marker block.
+///
+/// The `retracts=` half is written for build-loop's resolver and for
+/// [`superseded_by_of`]'s bracket parse; it is NOT a detection carrier here.
+/// See the module header for why emission and detection differ.
 pub(crate) fn summary_for(target: &str, reason: &str, superseded_by: Option<&str>) -> String {
     let reason = reason.trim();
     let reason = if reason.is_empty() {
@@ -67,8 +91,10 @@ fn subject_target(subject: &str) -> Option<&str> {
 
 /// Extract the token following `marker=` in `text`, honoring a word boundary
 /// before the marker and terminating at the first character outside the event
-/// id charset (`[A-Za-z0-9_-]`) — so `[retracts=fact_a]` and `(retracts=fact_a)`
-/// both yield the bare id regardless of which wrapper a writer used.
+/// id charset (`[A-Za-z0-9_-]`) — so `superseded_by=fact_b]` and
+/// `superseded_by=fact_b)` both yield the bare id regardless of which wrapper a
+/// writer used. The word boundary is what keeps `contrasuperseded_by=x` from
+/// matching.
 fn token_after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
     let mut search_from = 0;
     while let Some(rel) = text[search_from..].find(marker) {
@@ -95,8 +121,12 @@ fn token_after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
 
 /// The event id this fact retracts, or `None` if it is not a retraction.
 ///
-/// Carriers, in order: anchored subject; `ref` on a `retract:`-subject fact;
-/// `retracts=<id>` summary token.
+/// TWO carriers, in order: the anchored subject, then `ref` on a
+/// `retract:`-subject fact. Both require the `retract:` subject prefix, so the
+/// whole predicate short-circuits on one string comparison for the ordinary
+/// fact — which matters because [`crate::write_authority::needs_authority_check`]
+/// calls this on every artifact append. The `retracts=` summary token is
+/// deliberately NOT read; see the module header.
 pub(crate) fn target_of(fact: &Fact) -> Option<String> {
     if let Some(target) = subject_target(&fact.subject) {
         return Some(target.to_string());
@@ -110,10 +140,7 @@ pub(crate) fn target_of(fact: &Fact) -> Option<String> {
     {
         return Some(ref_id.to_string());
     }
-    fact.summary
-        .as_deref()
-        .and_then(|s| token_after(s, "retracts="))
-        .map(str::to_string)
+    None
 }
 
 /// True when `fact` is a retraction record (regardless of its wire kind).
@@ -206,34 +233,62 @@ mod tests {
         assert_eq!(target_of(&f).as_deref(), Some("fact_abc"));
     }
 
+    /// R2. The `retracts=` summary token is NOT a detection carrier. A fact
+    /// whose ONLY retraction-shaped signal is that token withdraws nothing, so
+    /// every gate reasoning about retraction has two spellings to cover rather
+    /// than three. Emission is unchanged — this asserts the read side only.
     #[test]
-    fn summary_token_carrier_detects_target_and_superseded_by() {
+    fn summary_token_alone_is_not_a_retraction() {
         let f = fact(
             "r3",
             "correction posted",
             Some("wrong port number [retracts=fact_a superseded_by=fact_b]"),
             None,
         );
-        assert_eq!(target_of(&f).as_deref(), Some("fact_a"));
+        assert_eq!(target_of(&f), None);
+        assert!(!is_retraction(&f));
+        // The bracket block is still PARSED for `superseded_by` — it is read
+        // off a real retraction, it just cannot mint one.
         assert_eq!(superseded_by_of(&f).as_deref(), Some("fact_b"));
     }
 
     #[test]
-    fn summary_token_requires_word_boundary() {
-        let f = fact("a3", "x", Some("contretracts=fact_a"), None);
-        assert_eq!(target_of(&f), None);
-        let f = fact("a4", "x", Some("(retracts=fact_a)"), None);
-        assert_eq!(target_of(&f).as_deref(), Some("fact_a"));
+    fn superseded_by_token_requires_word_boundary() {
+        let f = fact("a3", "x", Some("contrasuperseded_by=fact_b"), None);
+        assert_eq!(superseded_by_of(&f), None);
+        let f = fact("a4", "x", Some("(superseded_by=fact_b)"), None);
+        assert_eq!(superseded_by_of(&f).as_deref(), Some("fact_b"));
     }
 
+    /// What `rally retract` actually writes: the anchored subject carries the
+    /// target, the summary carries `superseded_by`. Both halves of a real
+    /// emitted record, read back.
     #[test]
-    fn summary_for_round_trips_through_token_detection() {
+    fn emitted_record_round_trips_subject_target_and_superseded_by() {
         let s = summary_for("fact_a", "wrong port", Some("fact_b"));
-        let f = fact("r4", "unrelated subject", Some(&s), None);
+        let f = fact("r4", &subject_for("fact_a"), Some(&s), Some("fact_a"));
         assert_eq!(target_of(&f).as_deref(), Some("fact_a"));
         assert_eq!(superseded_by_of(&f).as_deref(), Some("fact_b"));
         let s = summary_for("fact_a", "  ", None);
         assert!(s.starts_with("retracted "));
+    }
+
+    /// The `retracts=` token stays on the wire even though nothing here reads
+    /// it: build-loop's resolver parses `superseded_by` out of the same bracket
+    /// block, and its `_clean_reason` strips exactly `[retracts=...]` off a
+    /// surfaced reason. Dropping the emission would leave the wire marker in
+    /// that peer's human-facing prose. Pinned so a future cleanup of the
+    /// now-unread token has to read this first.
+    #[test]
+    fn summary_emission_keeps_the_cross_store_marker_block() {
+        assert_eq!(
+            summary_for("fact_a", "wrong port", Some("fact_b")),
+            "wrong port [retracts=fact_a superseded_by=fact_b]"
+        );
+        assert_eq!(
+            summary_for("fact_a", "wrong port", None),
+            "wrong port [retracts=fact_a]"
+        );
     }
 
     #[test]
@@ -259,10 +314,13 @@ mod tests {
         let facts = vec![
             fact("r1", "retract: fact_a", None, None),
             fact("f2", "plain artifact", None, None),
-            fact("r2", "x", Some("[retracts=fact_b]"), None),
+            fact("r2", "retract: the flaky one", None, Some("fact_b")),
+            // R2: token-only, so it withdraws nothing.
+            fact("f3", "x", Some("[retracts=fact_c]"), None),
         ];
         let ids = retracted_ids(&facts);
         assert!(ids.contains("fact_a") && ids.contains("fact_b"));
+        assert!(!ids.contains("fact_c"));
         assert_eq!(ids.len(), 2);
     }
 }
