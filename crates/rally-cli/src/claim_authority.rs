@@ -376,16 +376,6 @@ pub(crate) fn lead_beneficiary(fact: &Fact) -> Option<String> {
     fact.target.clone().or_else(|| fact.tool.clone())
 }
 
-/// The tool holding the lead seat, derived from the ledger.
-///
-/// Mirrors the projection in `store::snapshot_from_facts_with_policy`: the
-/// latest lead-family decision wins, and a `role:lead:relinquished` reopens the
-/// seat. Lifted out so the claim-breadth gate can answer "is this agent the
-/// lead" without building a full room snapshot on every claim append.
-pub(crate) fn lead_from_facts(facts: &[Fact]) -> Option<String> {
-    lead_as_of(facts, i64::MAX)
-}
-
 /// The tool holding the lead seat AS OF `seq` — that is, considering only
 /// lead-family decisions at or before `seq`.
 ///
@@ -405,12 +395,61 @@ pub(crate) fn lead_from_facts(facts: &[Fact]) -> Option<String> {
 /// Authority is a property of the moment a fact was written. A fact carries its
 /// own `seq`, so ask the question at that point.
 pub(crate) fn lead_as_of(facts: &[Fact], seq: i64) -> Option<String> {
+    lead_of(facts.iter().filter(move |fact| fact.seq <= seq))
+}
+
+/// The seat derivation itself: latest lead-family decision wins, and a
+/// `role:lead:relinquished` reopens the seat.
+///
+/// ONE body, three entry points ([`lead_as_of`], [`projected_lead`],
+/// [`projected_lead_with_retraction`]) for the same reason
+/// `write_authority::authorize_claim_removal` is one body: ARP-R-01 was two
+/// projections of one fact drifting apart, and the answer to that is not a
+/// third copy written more carefully.
+fn lead_of<'a>(facts: impl Iterator<Item = &'a Fact>) -> Option<String> {
     facts
-        .iter()
-        .filter(|fact| is_lead_decision(fact) && fact.seq <= seq)
+        .filter(|fact| is_lead_decision(fact))
         .max_by_key(|fact| fact.seq)
         .filter(|fact| fact.subject == LEAD_SUBJECT)
         .and_then(lead_beneficiary)
+}
+
+/// The tool holding the lead seat, as the ROOM PROJECTION reports it —
+/// retraction-resolved, and the answer every gate outside the projection should
+/// be asking for. Lets a gate answer "is this agent the lead" without building
+/// a full room snapshot on every append.
+///
+/// RC-071a. The predecessor of this function (`lead_from_facts`) read RAW
+/// facts, so it counted a lead decision that had been WITHDRAWN.
+/// `store::snapshot_from_facts_with_policy_at` drops
+/// retracted facts from every bucket before deriving the seat, so the two
+/// disagreed the moment any lead decision was retracted: `rally room` reported
+/// no lead while [`breadth_violation`] still reported one. That is the same
+/// projection-vs-gate split R3 fixed for claims, on the seat instead.
+///
+/// Resolution reuses [`crate::retraction::retracted_ids`] — the projection's
+/// own filter — rather than restating it, so the two answers agree by
+/// construction. That includes agreeing where the filter is BLUNT: resolution
+/// is flat, so retracting a retraction does not restore its target, here or in
+/// `rally room`.
+pub(crate) fn projected_lead(facts: &[Fact]) -> Option<String> {
+    projected_lead_with_retraction(facts, None)
+}
+
+/// [`projected_lead`], evaluated as if `also_retracted` were withdrawn too.
+///
+/// This is how the write gate asks the question it actually needs answered —
+/// "does admitting this retraction MOVE the seat?" — without predicting which
+/// spellings can move it. The oracle is the projection, run twice.
+pub(crate) fn projected_lead_with_retraction(
+    facts: &[Fact],
+    also_retracted: Option<&str>,
+) -> Option<String> {
+    let mut retracted = crate::retraction::retracted_ids(facts);
+    if let Some(target) = also_retracted {
+        retracted.insert(target.to_string());
+    }
+    lead_of(facts.iter().filter(|f| !retracted.contains(&f.event_id)))
 }
 
 /// RC-037, second half: who may hold a ROOM-WIDE claim.
@@ -427,6 +466,22 @@ pub(crate) fn lead_as_of(facts: &[Fact], seq: i64) -> Option<String> {
 /// fix those no longer swallow the room.
 ///
 /// Returns the refusal message when the claim must be rejected.
+///
+/// # RC-071a: which lead this reads, and why that changed
+///
+/// This used to call [`lead_from_facts`] on RAW facts, so a lead decision that
+/// had been retracted still conferred room-wide capability here while
+/// `rally room` already reported no lead. That was left open deliberately and
+/// recorded as owed, because resolving it in isolation would have been the
+/// worse defect: retraction of a lead decision was UNGATED, so reading the
+/// resolved seat would have let any agent strip the lead's room-wide authority
+/// with one `rally retract`.
+///
+/// The seat's own removal is gated now
+/// (`write_authority::assert_lead_retraction_authorized`), so the reason to
+/// keep the disagreement is gone and this reads [`projected_lead`] — the same
+/// seat `rally room` shows. A legitimately withdrawn lead decision now costs
+/// the room-wide capability it should never have kept conferring.
 pub(crate) fn breadth_violation(incoming: &Fact, facts: &[Fact]) -> Option<String> {
     let record = active_claim_record_from_fact(incoming)?;
     let wildcard = record.resource_scopes.iter().find(|scope| {
@@ -434,7 +489,7 @@ pub(crate) fn breadth_violation(incoming: &Fact, facts: &[Fact]) -> Option<Strin
             && scope.identifier == crate::resource_scope::WILDCARD_IDENTIFIER
     })?;
 
-    let lead = lead_from_facts(facts);
+    let lead = projected_lead(facts);
     let claimer = record.owner_tool.as_deref().unwrap_or("<unknown tool>");
     match lead.as_deref() {
         Some(lead_tool) if lead_tool == claimer => None,
@@ -800,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn lead_from_facts_reopens_the_seat_on_relinquish() {
+    fn projected_lead_reopens_the_seat_on_relinquish() {
         let claimed = lead_decision("tool-lead", 1);
         let relinquished = Fact {
             subject: "role:lead:relinquished".to_string(),
@@ -808,10 +863,51 @@ mod tests {
             ..lead_decision("tool-lead", 2)
         };
         assert_eq!(
-            lead_from_facts(std::slice::from_ref(&claimed)).as_deref(),
+            projected_lead(std::slice::from_ref(&claimed)).as_deref(),
             Some("tool-lead")
         );
-        assert_eq!(lead_from_facts(&[claimed, relinquished]), None);
+        assert_eq!(projected_lead(&[claimed, relinquished]), None);
+    }
+
+    /// RC-071a, the register entry's own subject. The room projection drops a
+    /// retracted lead decision before deriving the seat; this gate read raw
+    /// facts, so `rally room` reported no lead while the room-wide claim gate
+    /// still reported one. Revert `breadth_violation` to the raw derivation and
+    /// this fails: the withdrawn seat keeps conferring room-wide authority.
+    #[test]
+    fn a_retracted_lead_decision_no_longer_confers_room_wide_authority() {
+        let seat = lead_decision("tool-lead", 1);
+        let incoming = fact("claim-lead", "tool-lead", vec!["workspace:*"]);
+        assert!(
+            breadth_violation(&incoming, std::slice::from_ref(&seat)).is_none(),
+            "baseline: the seated lead may hold a room-wide claim"
+        );
+
+        let withdrawn = retraction("r-1", &seat.event_id, 900);
+        let facts = [seat, withdrawn];
+        assert_eq!(
+            projected_lead(&facts),
+            None,
+            "precondition: the projection reports no lead once the seat decision is withdrawn"
+        );
+        let refusal = breadth_violation(&incoming, &facts)
+            .expect("a withdrawn seat confers no room-wide authority");
+        assert!(
+            refusal.contains("no lead"),
+            "the refusal must report the room the projection actually shows; got: {refusal}"
+        );
+    }
+
+    /// Resolution is FLAT — `retracted_ids` collects every target in one pass —
+    /// so retracting the retraction does not restore the seat. Pinned because
+    /// this function's entire correctness argument is "the same answer
+    /// `rally room` gives", and that has to include the blunt cases.
+    #[test]
+    fn retraction_resolution_does_not_nest() {
+        let seat = lead_decision("tool-lead", 1);
+        let withdrawn = retraction("r-1", &seat.event_id, 900);
+        let undo = retraction("r-2", "r-1", 901);
+        assert_eq!(projected_lead(&[seat, withdrawn, undo]), None);
     }
 
     #[test]

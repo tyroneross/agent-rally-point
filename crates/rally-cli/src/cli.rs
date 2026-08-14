@@ -940,7 +940,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .map(CliCommand::Locate);
     let retract = retract_parser()
         .to_options()
-        .descr("Withdraw a posted fact by appending a retraction naming its event id. The ledger is never rewritten; room/next/recent stop surfacing the withdrawn fact while the retraction stays visible. Retracting a fact that closes or withdraws another agent's active claim follows the same rules as `release`: the owner, a takeover after the owner's size-scaled silence window, or an expired lease. Like every Rally rule, this stops accidents and honest mistakes — identity is self-asserted and unsigned, so it is not a security boundary and cannot stop an agent that lies about its name. Retracting anything else is open to anyone.")
+        .descr("Withdraw a posted fact by appending a retraction naming its event id. The ledger is never rewritten; room/next/recent stop surfacing the withdrawn fact while the retraction stays visible. Authority-carrying facts are gated; prose is free. Withdrawing another agent's active claim follows the same rules as `release`: the owner, a takeover after the owner's size-scaled silence window, or an expired lease. Withdrawing the decision the lead seat rests on moves the seat, so it follows the same rules as `lead handoff`: the holder, or a takeover after the holder's silence window. Like every Rally rule, this stops accidents and honest mistakes — identity is self-asserted and unsigned, so it is not a security boundary and cannot stop an agent that lies about its name. Retracting anything else — an artifact, an ordinary decision, a risk — is open to anyone.")
         .command("retract")
         .map(CliCommand::Retract);
     let recent = recent_parser()

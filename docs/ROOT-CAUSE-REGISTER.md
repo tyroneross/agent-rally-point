@@ -2912,21 +2912,69 @@ claim and asks the implementation whether it is true. See
   as one. It is not an authorization boundary. RC-063 bounds this and `docs/security/TRUST-MODEL.md`
   records the one claim of this shape that already had to be retracted.
 
-#### RC-071a — open: `breadth_violation` reads the lead off unresolved facts
+#### RC-071a — the lead seat could be moved by retraction, and the room-wide gate read a seat the room did not show
 
-- **State:** `observed` 2026-08-14, **not fixed**, deliberately. Same class, adjacent surface,
-  found while fixing R3.
-- **The gap.** `store::append_fact` calls `claim_authority::breadth_violation` on RAW facts, so
-  `lead_from_facts` still counts a lead decision that has been RETRACTED. `rally room` reports no
-  lead; the room-wide claim gate still reports one. The two disagree, exactly as `detect_conflict`
-  and the projection did before R3.
-- **Why it was left.** Resolving it can only DENY — the no-lead arm already refuses room-wide
-  claims — so the inconsistency currently costs a legitimate lead nothing, while fixing it would
-  let anyone retract the seat-holding decision and strip the lead's room-wide capability.
-  Retraction of a lead decision is UNGATED: the judged ruling scoped ungated retraction to
-  "non-claim facts" and did not consider that the lead seat is a non-claim fact carrying authority.
-- **What is owed.** A decision, not a patch: either the lead decision joins the gated set (making
-  `is_lead_decision` a removal-relevant target for `assert_retraction_authorized`), or the room-wide
-  gate is documented as deliberately reading unresolved facts and why. The class test does not
-  cover this because its subject is claim removal; extending it to seat removal is the natural
-  follow-on.
+- **State:** `fixed` 2026-08-14, with an exhaustive class test on the seat. Filed `observed`
+  earlier the same day while fixing R3, deliberately unfixed pending an operator ruling; the
+  ruling came back **gate it**, and this is that.
+- **The gap, as filed.** `store::append_fact` called `claim_authority::breadth_violation` on RAW
+  facts, so the lead derivation still counted a lead decision that had been RETRACTED. `rally room`
+  reported no lead; the room-wide claim gate still reported one. The two disagreed, exactly as
+  `detect_conflict` and the projection did before R3.
+- **Why it was left, and why that reasoning was right at the time.** Resolving the disagreement in
+  isolation would have been the WORSE defect. Retraction of a lead decision was ungated, so reading
+  the resolved seat would have let any agent strip the lead's room-wide capability with one
+  `rally retract`. The honest move was to name the missing decision rather than patch the symptom.
+- **The deeper defect the filing exposed.** The lead seat is a NON-CLAIM fact that CARRIES
+  AUTHORITY, and R1's judged ruling scoped ungated retraction to "non-claim facts". Every control
+  in the room hangs off the seat — RC-037's room-wide claim gate and RC-038's room-freeze both read
+  "is this agent the lead" — and `lead handoff`, `lead assign`, and `lead relinquish` were all gated
+  for that reason, while retraction of the decision underneath the seat walked straight past. That
+  is the SIXTH appearance of one defect here (RC-029, ARP-R-01, ARP-R-02, R1, RC-071, this): a
+  correct rule guarding one SPELLING while the ledger accepts the ACT.
+- **The ruling, and the rule it encodes.** Operator ruling, 2026-08-14: gate it, same policy as
+  claim-close. The line is no longer "is the target a claim" but:
+
+  > **Authority-carrying facts are gated. Prose is free.**
+
+  Retracting an artifact, a risk, a lesson, or an ordinary decision stays open to anyone — an
+  honest mistake has to stay fixable without asking permission.
+- **Fix, mechanism.** `write_authority::assert_lead_retraction_authorized` does NOT ask "is the
+  target a lead decision". It asks the room: derive the seat from the admission-time slice, derive
+  it again with the target withdrawn, and gate only when the two answers differ. Every way a
+  retraction can move the seat is covered by construction, including the ones nobody enumerated —
+  withdrawing the seated decision, and withdrawing a decision that falls the room BACK to an
+  earlier lead. A superseded lead decision moves nothing and stays ungated, which a
+  `is_lead_decision`-keyed gate would have refused wrongly. Listing spellings is the defect;
+  asking the projection is the fix.
+- **Fix, policy.** The three arms are the seat's existing ones, shared through
+  `write_authority::lead_seat_change_allowed` rather than copied: the holder, a takeover after the
+  holder's large-work silence window, or an acknowledged `--force` seizure. One body, two entry
+  points — the same treatment `authorize_claim_removal` gets, and for the same reason ARP-R-02
+  happened. Claim-close's arm 3 (typed `ClaimExpired` lease cleanup) has no analogue: the seat
+  carries no lease.
+- **Fix, the filed half.** With the seat's removal gated, the reason to keep the disagreement is
+  gone, so `breadth_violation` now reads `claim_authority::projected_lead` — the same
+  retraction-resolved seat `rally room` shows. `assert_lead_transfer_authorized` moved to the same
+  derivation in the same change, and that was not optional: a lead may legitimately withdraw its
+  own seat decision, and a transfer gate still reading the raw ledger would have kept refusing
+  every later `lead assign`, wedging shut a seat the room reports as empty. Gating the seat without
+  that half converts a security fix into an availability defect;
+  `a_seat_the_lead_withdrew_can_be_taken_by_the_next_agent` is the control that holds it.
+- **Class test.** `store.rs::every_kind_that_can_move_the_lead_seat_is_authorized` — the sibling
+  the filing predicted. For every `FactKind` and every shape that could move the seat (retract the
+  seat decision, take it by decision, vacate it, name it in `ref_id`), it projects the room and
+  asserts that any fact which actually changed `RoomSnapshot::lead` was refused by the gate AND
+  selected by `needs_authority_check`. The oracle is the lead projection, not a maintained list.
+  Mutation-checked: disabling the new arm turns this test and three named unit tests red; reverting
+  either `projected_lead` call site turns its own named control red.
+- **What is NOT claimed.** Every check here reads `fact.tool`, which is self-asserted and bound to
+  nothing. This makes the act a forgery rather than a permitted operation, and attributable as one.
+  It is not an authorization boundary. RC-063 bounds this and `docs/security/TRUST-MODEL.md`
+  records the one claim of this shape that already had to be retracted.
+- **Residual, deliberate.** Retraction resolution is FLAT (`retraction::retracted_ids` collects
+  every target in one pass), so retracting a retraction does not restore its target — in the
+  projection or in this gate. The gate agrees with the room by construction, which is the property
+  that matters here; whether flat resolution is the right projection semantic is a separate
+  question, pinned by `the_gate_and_the_projection_agree_on_flat_retraction_resolution` so any
+  future change to it has to come through this gate.

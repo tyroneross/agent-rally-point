@@ -236,15 +236,23 @@ itself an appended record naming the fact it withdraws: `rally room`, `next`, an
 see the correction, and `rally locate` still finds both. Use `--superseded-by` to
 point at the corrected fact that replaces the wrong one.
 
-Retracting a fact that closes or withdraws another agent's active claim follows
-the same rules as `release`: the owner, a takeover after the owner's size-scaled
-silence window, or an expired lease. Like every Rally rule, this stops accidents
-and honest mistakes — identity is self-asserted and unsigned, so it is not a
-security boundary and cannot stop an agent that lies about its name.
+**Authority-carrying facts are gated; prose is free.** Withdrawing a fact that
+moves authority follows the same rule as the command that would move it:
 
-Retracting anything else — an artifact, a decision, a risk, your own wrong note —
-is open to anyone, on purpose. A mistake has to stay fixable without asking
-permission.
+- **Another agent's active claim** behaves like `release` — the owner, a takeover
+  after the owner's size-scaled silence window, or an expired lease.
+- **The decision the lead seat rests on** behaves like `lead handoff` — the
+  holder, or a takeover after the holder has been silent past the reclaim window.
+  Withdrawing it moves the seat, so it is the holder's call, exactly as
+  `lead handoff`, `lead assign`, and `lead relinquish` already were.
+
+Like every Rally rule, this stops accidents and honest mistakes — identity is
+self-asserted and unsigned, so it is not a security boundary and cannot stop an
+agent that lies about its name.
+
+Retracting anything else — an artifact, an ordinary decision, a risk, your own
+wrong note — is open to anyone, on purpose. A mistake has to stay fixable without
+asking permission.
 
 ## Lead & Backlog
 

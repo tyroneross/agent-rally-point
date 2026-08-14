@@ -9783,6 +9783,108 @@ mod ledger_tests {
         }
     }
 
+    /// RC-071a. The same class assertion, on the LEAD SEAT.
+    ///
+    /// The claim test above could not have caught RC-071a: its subject is claim
+    /// removal, and the seat is not a claim. It is a non-claim fact that
+    /// CARRIES AUTHORITY — RC-037's room-wide claim gate and RC-038's
+    /// room-freeze both read "is this agent the lead" — and R1's ruling scoped
+    /// ungated retraction to "non-claim facts", so `rally retract` moved the
+    /// room's authority root while `lead handoff`, `lead assign`, and
+    /// `lead relinquish` were all gated.
+    ///
+    /// The oracle here is `RoomSnapshot::lead`, not a list of spellings: for
+    /// EVERY `FactKind`, and every shape that could move the seat, if the
+    /// projection's lead actually changes then the write gate must have refused
+    /// the fact AND `needs_authority_check` must have selected it. A future
+    /// change that invents a new way to move the seat fails here without anyone
+    /// remembering this test exists — which is the property all six instances
+    /// of this class were missing.
+    #[test]
+    fn every_kind_that_can_move_the_lead_seat_is_authorized() {
+        let coord = crate::hooks_config::CoordinationConfig::default();
+
+        // `lead assign` stamps the ACTOR in `tool` and the BENEFICIARY in
+        // `target` (ARP-R-01's attribution half).
+        let mut seat = make_fact("seat", FactKind::Decision, "", "holds the seat");
+        seat.seq = 1;
+        seat.subject = crate::claim_authority::LEAD_SUBJECT.to_string();
+        seat.tool = Some("incumbent:01".to_string());
+        seat.target = Some("incumbent:01".to_string());
+        seat.from_session_id = Some("sess:incumbent".to_string());
+
+        // The incumbent is LIVE: seen now, far inside the 120-minute large-work
+        // window, so no takeover arm can legitimately apply.
+        let before = RoomSnapshot {
+            lead: Some("incumbent:01".to_string()),
+            squads: vec![Squad {
+                tool: "incumbent:01".to_string(),
+                last_seen_seq: 1,
+                last_seen_ts: now_string(),
+                status: "active".to_string(),
+                acknowledged: false,
+            }],
+            ..Default::default()
+        };
+
+        // Every spelling of "move the seat out from under the incumbent".
+        type Attack = (&'static str, fn(&mut Fact));
+        let attacks: [Attack; 4] = [
+            ("retracts the seat decision", |f: &mut Fact| {
+                f.subject = crate::retraction::subject_for("seat");
+                f.ref_id = Some("seat".to_string());
+            }),
+            ("takes the seat by decision", |f: &mut Fact| {
+                f.subject = crate::claim_authority::LEAD_SUBJECT.to_string();
+                f.target = Some("codex:rogue".to_string());
+            }),
+            ("vacates the seat", |f: &mut Fact| {
+                f.subject = crate::claim_authority::LEAD_RELINQUISHED_SUBJECT.to_string();
+            }),
+            ("names the seat decision in ref_id", |f: &mut Fact| {
+                f.ref_id = Some("seat".to_string());
+            }),
+        ];
+
+        for kind in FactKind::ALL {
+            for (label, shape) in &attacks {
+                let mut hostile = make_fact("hostile", kind.clone(), "", "take it");
+                hostile.scope.clear();
+                hostile.seq = 2;
+                hostile.tool = Some("codex:rogue".to_string());
+                hostile.from_session_id = Some("sess:rogue".to_string());
+                shape(&mut hostile);
+
+                let after = snapshot_from_facts_with_policy(
+                    &[seat.clone(), hostile.clone()],
+                    &coord,
+                    false,
+                );
+                if after.lead.as_deref() == Some("incumbent:01") {
+                    continue;
+                }
+                let verdict = crate::write_authority::assert_write_authorized(
+                    &hostile,
+                    std::slice::from_ref(&seat),
+                    &before,
+                    &coord,
+                );
+                assert!(
+                    verdict.is_err(),
+                    "{kind:?} {label}: this moves the seat off incumbent:01 (now {:?}) and the \
+                     write gate ALLOWED it. The seat is this room's authority root; every path \
+                     that moves it must be authorized — RC-071a is what one unguarded path costs.",
+                    after.lead
+                );
+                assert!(
+                    crate::write_authority::needs_authority_check(&hostile),
+                    "{kind:?} {label}: moves the seat but `needs_authority_check` says this \
+                     fact needs no check, so in production the gate never runs"
+                );
+            }
+        }
+    }
+
     /// S3 salvage. Retraction resolution lives in the deterministic CORE
     /// (`snapshot_from_facts_with_policy_at`), not in the thin
     /// `snapshot_from_facts_with_policy` wrapper, because the snapshot-CACHE
