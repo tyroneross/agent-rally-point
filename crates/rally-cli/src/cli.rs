@@ -307,11 +307,19 @@ pub(crate) struct DoctorArgs {
     /// Apply the prune (rewrite index); only meaningful with --prune-rooms.
     /// Also activates writes for --reap-stale.
     pub(crate) apply: bool,
-    /// Sweep quarantined `facts.db.corrupt.*` snapshots from the store dir
-    /// (dry-run by default; remove with --apply). facts.db is a disposable
-    /// derived cache — the canonical record is the JSONL ledger — so these
-    /// snapshots are pure debris once triaged.
+    /// Sweep quarantined `facts.db.corrupt.*` snapshots out of the live store
+    /// dir (dry-run by default; move with --apply). They are MOVED into
+    /// `.rally/archive/swept/<stamp>/`, never deleted — a corrupt snapshot is
+    /// the forensic record of the incident that produced it.
     pub(crate) sweep_corrupt: bool,
+    /// Read the JSONL ledger as raw text and report its health. Never opens the
+    /// store or the derived DB, so it still works when every other command is
+    /// failing. This is the default when `rally doctor` is given no mode.
+    pub(crate) ledger_health: bool,
+    /// Renumber ledger rows to strictly increasing unique seqs, in file order
+    /// (dry-run by default; write with --apply). Originals are copied into
+    /// `.rally/archive/pre-repair/<stamp>/` before anything is written.
+    pub(crate) repair_ledger: bool,
     /// Retention for --sweep-corrupt: keep the newest N corrupt snapshots for
     /// forensics; older ones are swept. Default 1.
     pub(crate) keep: Option<i64>,
@@ -1562,10 +1570,16 @@ fn doctor_parser() -> impl Parser<DoctorArgs> {
         )
         .switch();
     let apply = long("apply")
-        .help("Apply the prune: rewrite the registry index, keeping only live entries; also commits --reap-stale writes; also removes swept --sweep-corrupt snapshots")
+        .help("Commit the change: rewrite the registry index for --prune-rooms, commit --reap-stale writes, archive --sweep-corrupt snapshots, write --repair-ledger renumbering")
         .switch();
     let sweep_corrupt = long("sweep-corrupt")
-        .help("Sweep quarantined facts.db.corrupt.* snapshots (dry-run by default; remove with --apply)")
+        .help("Move quarantined facts.db.corrupt.* snapshots into .rally/archive/swept/ (dry-run by default; never deletes)")
+        .switch();
+    let ledger_health = long("ledger-health")
+        .help("Report JSONL ledger health without opening the store (default when no mode is given; works on a store too corrupt to open)")
+        .switch();
+    let repair_ledger = long("repair-ledger")
+        .help("Renumber ledger rows to unique increasing seqs (dry-run by default; archives originals before writing)")
         .switch();
     let keep = optional_i64_arg("keep", "N");
     let max_age_days = optional_i64_arg("max-age-days", "N");
@@ -1585,6 +1599,8 @@ fn doctor_parser() -> impl Parser<DoctorArgs> {
         reap_stale,
         apply,
         sweep_corrupt,
+        ledger_health,
+        repair_ledger,
         keep,
         max_age_days,
         compact_log,

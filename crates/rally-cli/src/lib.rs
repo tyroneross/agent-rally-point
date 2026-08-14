@@ -3974,6 +3974,8 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
         args.sweep_corrupt,
         args.compact_log,
         args.binary_skew,
+        args.ledger_health,
+        args.repair_ledger,
     ];
     if args.migrate_db_only && existing_modes.into_iter().any(|enabled| enabled) {
         return Err(RallyError::Usage(
@@ -4105,11 +4107,12 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
     if args.sweep_corrupt {
         let data = doctor::run_sweep_corrupt(args.keep, args.max_age_days, args.apply)?;
         let text = format!(
-            "doctor sweep-corrupt: swept={} kept={} bytes_reclaimable={} applied={}",
+            "doctor sweep-corrupt: archived={} kept={} bytes_moved={} applied={} archive_dir={}",
             data.swept.len(),
             data.kept.len(),
             data.bytes_reclaimable,
             data.applied,
+            data.archived_dir.display(),
         );
         let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
         return Ok(Output::new(args.json, text, body));
@@ -4126,10 +4129,106 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
         let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
         return Ok(Output::new(args.json, text, body));
     }
-    Err(RallyError::Usage(
-        "rally doctor requires --canonical-paths, --prune-rooms, --reap-stale, --sweep-corrupt, --compact-log, --binary-skew, or --migrate-db-only"
-            .to_string(),
-    ))
+    if args.ledger_health {
+        let data = doctor::run_ledger_health()?;
+        let text = render_ledger_health_text(&data);
+        let healthy = data.healthy;
+        let mut body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
+        if !healthy {
+            body["ok"] = Value::Bool(false);
+            return Ok(Output::new(args.json, text, body).with_exit_code(1));
+        }
+        return Ok(Output::new(args.json, text, body));
+    }
+    if args.repair_ledger {
+        let data = doctor::run_repair_ledger(args.apply)?;
+        let text = render_repair_ledger_text(&data);
+        let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
+        return Ok(Output::new(args.json, text, body));
+    }
+    // Bare `rally doctor` diagnoses. It used to be a usage error, which meant the
+    // first command anyone types when the room is broken refused to do anything —
+    // and every mode that WOULD have helped opened the store and died with the
+    // same error the operator was already staring at. Ledger health reads raw
+    // files only, so it is the one mode guaranteed to answer.
+    let data = doctor::run_ledger_health()?;
+    let text = render_ledger_health_text(&data);
+    // Read the verdict off the struct, not back out of the serialized envelope —
+    // the envelope nests under its schema key, so introspecting it silently found
+    // nothing and every broken store still exited 0.
+    let healthy = data.healthy;
+    let mut body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
+    if !healthy {
+        body["ok"] = Value::Bool(false);
+        return Ok(Output::new(args.json, text, body).with_exit_code(1));
+    }
+    Ok(Output::new(args.json, text, body))
+}
+
+/// Human rendering for `doctor` / `doctor --ledger-health`: the verdict, then one
+/// line per finding with the command that addresses it.
+fn render_ledger_health_text(data: &doctor::LedgerHealthReport) -> String {
+    let rows: usize = data.segments.iter().map(|s| s.rows).sum();
+    let mut out = format!(
+        "doctor ledger-health: {} segment(s), {} row(s), verdict={}",
+        data.segments.len(),
+        rows,
+        if data.healthy { "healthy" } else { "BROKEN" },
+    );
+    for f in &data.findings {
+        out.push_str(&format!("\n  [{}] {}: {}", f.severity, f.code, f.message));
+        if let Some(remedy) = &f.remedy {
+            out.push_str(&format!("\n      fix: {remedy}"));
+        }
+    }
+    for seg in &data.segments {
+        if !seg.unparseable_lines.is_empty() || !seg.duplicate_seqs.is_empty() {
+            out.push_str(&format!(
+                "\n  {}: rows={} duplicate_seqs={:?} unparseable_lines={:?}",
+                seg.path.display(),
+                seg.rows,
+                seg.duplicate_seqs,
+                seg.unparseable_lines,
+            ));
+        }
+    }
+    if !data.healthy && data.repairable {
+        out.push_str("\n  repairable: run `rally doctor --repair-ledger` then add --apply");
+    }
+    out
+}
+
+/// Human rendering for `doctor --repair-ledger`.
+fn render_repair_ledger_text(data: &doctor::RepairLedgerReport) -> String {
+    let mut out = format!(
+        "doctor repair-ledger: {} row(s) renumbered across {} segment(s), applied={}",
+        data.rows_renumbered,
+        data.segments.len(),
+        data.applied,
+    );
+    if data.applied && data.rows_renumbered > 0 {
+        out.push_str(&format!(
+            "\n  originals archived to {}",
+            data.archive_dir.display()
+        ));
+    } else if data.rows_renumbered > 0 {
+        out.push_str("\n  dry run — nothing written. Re-run with --apply to commit.");
+    }
+    for seg in &data.segments {
+        if seg.rows_renumbered > 0 {
+            out.push_str(&format!(
+                "\n  {}: {}/{} row(s) renumbered from line {}",
+                seg.path.display(),
+                seg.rows_renumbered,
+                seg.rows,
+                seg.first_change_line.unwrap_or(0),
+            ));
+        }
+    }
+    for w in &data.warnings {
+        out.push_str(&format!("\n  [warn] {}: {}", w.code, w.message));
+    }
+    out
 }
 
 /// Human rendering for `doctor --compact-log`: header with compaction stats,

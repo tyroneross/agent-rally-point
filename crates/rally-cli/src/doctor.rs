@@ -3,21 +3,43 @@
 
 //! `rally doctor` — diagnostics and remediation for path hygiene, room registry, and stale state.
 //!
-//! Seven independent modes:
+//! Nine independent modes:
+//!   (no mode)          ledger-health — the default; see below
+//!   --ledger-health    read the JSONL ledger as raw text and report its health
+//!   --repair-ledger    renumber rows to unique increasing seqs (dry-run; write with --apply)
 //!   --canonical-paths  scan active claims for non-canonical scopes and suffix collisions
 //!   --prune-rooms      classify registry entries as live/stale; remove stale ones with --apply
 //!   --reap-stale       reap over-TTL in-room claims and stale lead leases (dry-run; commit with --apply)
-//!   --sweep-corrupt    sweep disposable facts.db.corrupt.* snapshots (dry-run; remove with --apply)
+//!   --sweep-corrupt    move facts.db.corrupt.* snapshots to the archive (dry-run; move with --apply)
 //!   --compact-log      render a diagnostic log with presence/heartbeat runs collapsed into counts
 //!   --binary-skew      compare the RUNNING binary's build stamp against this repo's HEAD
 //!   --migrate-db-only  inspect or explicitly migrate a current-format DB-only room offline
+//!
+//! # Two rules this module exists under
+//!
+//! **Doctor must work ON a broken store.** Corruption is doctor's trigger
+//! condition, not an excuse to bail. Every mode that only needs a path resolves
+//! it from `repo_root()` rather than opening a `RoomStore` — `run_sweep_corrupt`
+//! used to open one purely to learn `repo_root/.rally`, which meant a ledger with
+//! two rows at one seq took down the repair tool with the same error the operator
+//! was already staring at. `--ledger-health` reads raw files and touches neither
+//! the store nor the derived DB, so it is the mode guaranteed to answer; bare
+//! `rally doctor` runs it, because it is what a human types first when the room
+//! is broken.
+//!
+//! **Doctor never deletes.** Anything taken out of the live store is MOVED under
+//! `.rally/archive/` — swept snapshots to `archive/swept/<stamp>/`, pre-repair
+//! segments to `archive/pre-repair/<stamp>/` — and the move happens before any
+//! rewrite. A quarantined `facts.db.corrupt.*` file is the forensic record of the
+//! incident that produced it; deleting it as "cleanup" destroys the evidence
+//! needed to explain the outage. Retiring anything from the archive is a human
+//! decision made elsewhere.
 
 #[cfg(unix)]
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-#[cfg(test)]
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -44,11 +66,20 @@ use crate::store::{
 };
 use crate::{
     mark_watchdog_command_commit, mark_watchdog_db_only_migration_outcome_unknown, normalize_path,
-    now_string, paths_suffix_collide, shell_quote,
+    now_string, paths_suffix_collide, repo_root, shell_quote,
 };
 
 /// Prefix of every quarantined snapshot the store writes on corrupt-db detection.
 const CORRUPT_PREFIX: &str = "facts.db.corrupt.";
+
+/// Subdirectory of `.rally/archive/` where doctor parks anything it takes out of
+/// the live store. Doctor ARCHIVES; it never deletes. Whatever lands here stays
+/// until a human decides otherwise.
+const SWEPT_SUBDIR: &str = "swept";
+
+/// seq -> the full serialized row that claimed it. Full-line equality is the
+/// store's own rule for whether a repeated seq is benign.
+type SeqRows = BTreeMap<i64, String>;
 pub(crate) const DB_ONLY_MIGRATION_RECEIPT_FILENAME: &str = "db-only-migration.v1.receipt.json";
 const DB_ONLY_MIGRATION_RECEIPT_STAGE_FILENAME: &str = "db-only-migration.v1.receipt.tmp";
 const DB_ONLY_MIGRATION_MARKER_SCHEMA: &str = "agent-rally.db-only-migration.v1";
@@ -2014,11 +2045,17 @@ pub(crate) struct SweepCorruptReport {
     pub(crate) rally_dir: PathBuf,
     /// Snapshots retained (newest --keep, or newer than --max-age-days).
     pub(crate) kept: Vec<CorruptSnapshot>,
-    /// Snapshots swept (removed with --apply; listed only in dry-run).
+    /// Snapshots swept — **moved** into `archived_dir` with --apply, listed only
+    /// in dry-run. Never deleted: see `archived_dir`.
     pub(crate) swept: Vec<CorruptSnapshot>,
-    /// Bytes reclaimed (--apply) or reclaimable (dry-run) by the swept set.
+    /// Where swept snapshots are moved to. Sweeping ARCHIVES; it never deletes,
+    /// so the forensic record of a past corruption survives the cleanup that
+    /// followed it. Removing anything from here is a human decision.
+    pub(crate) archived_dir: PathBuf,
+    /// Bytes moved out of the live store (--apply) or movable (dry-run). Not
+    /// "reclaimed" — the bytes still exist under `archived_dir`.
     pub(crate) bytes_reclaimable: u64,
-    /// Whether files were actually removed (`--apply`).
+    /// Whether files were actually moved (`--apply`).
     pub(crate) applied: bool,
     pub(crate) keep: i64,
     pub(crate) max_age_days: i64,
@@ -2117,17 +2154,61 @@ pub(crate) fn sweep_corrupt_in_dir(
 
     let bytes_reclaimable: u64 = swept.iter().map(|s| s.bytes).sum();
 
+    // ARCHIVE, NEVER DELETE. A quarantined `facts.db.corrupt.*` snapshot is the
+    // forensic record of a corruption event — the single most valuable artifact
+    // to still have when diagnosing why a store broke. Sweeping used to
+    // `fs::remove_file` it, which destroyed that evidence as part of "cleanup".
+    // Doctor now moves it under `.rally/archive/swept/<stamp>/`; deciding it is
+    // finally disposable is a human call, made somewhere else.
+    let archived_dir = dir.join(ARCHIVE_DIRNAME).join(SWEPT_SUBDIR);
     if apply {
         for snap in &swept {
+            let dest_dir = archived_dir.join(&snap.stamp);
+            if let Err(e) = fs::create_dir_all(&dest_dir) {
+                warnings.push(DiscoveryWarning {
+                    code: "sweep_archive_mkdir_failed".to_string(),
+                    message: format!("cannot create {}: {e}", dest_dir.display()),
+                    path: Some(dest_dir.clone()),
+                    count: None,
+                });
+                continue;
+            }
             for name in &snap.files {
-                let path = dir.join(name);
-                if let Err(e) = fs::remove_file(&path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
+                let src = dir.join(name);
+                let dest = dest_dir.join(name);
+                if !src.exists() {
+                    continue;
+                }
+                // Same filesystem in the normal case; fall back to copy+remove
+                // only when rename cannot cross the boundary, and only after the
+                // copy has succeeded, so no path loses the file.
+                let moved = match fs::rename(&src, &dest) {
+                    Ok(()) => true,
+                    Err(_) => match fs::copy(&src, &dest) {
+                        Ok(_) => fs::remove_file(&src).is_ok(),
+                        Err(e) => {
+                            warnings.push(DiscoveryWarning {
+                                code: "sweep_archive_failed".to_string(),
+                                message: format!(
+                                    "cannot archive {} to {}: {e}",
+                                    src.display(),
+                                    dest.display()
+                                ),
+                                path: Some(src.clone()),
+                                count: None,
+                            });
+                            false
+                        }
+                    },
+                };
+                if !moved && src.exists() {
                     warnings.push(DiscoveryWarning {
-                        code: "sweep_remove_failed".to_string(),
-                        message: format!("cannot remove {}: {e}", path.display()),
-                        path: Some(path.clone()),
+                        code: "sweep_archive_incomplete".to_string(),
+                        message: format!(
+                            "{} was left in place; nothing was deleted",
+                            src.display()
+                        ),
+                        path: Some(src.clone()),
                         count: None,
                     });
                 }
@@ -2139,12 +2220,466 @@ pub(crate) fn sweep_corrupt_in_dir(
         rally_dir: dir.to_path_buf(),
         kept,
         swept,
+        archived_dir,
         bytes_reclaimable,
         applied: apply,
         keep,
         max_age_days,
         warnings,
     }
+}
+
+// =============================================================================
+// ledger-health logic
+// =============================================================================
+//
+// The mode that has to work when nothing else does. It reads the JSONL segments
+// as raw text, pulls only `seq` out of each line, and never opens the store or
+// the derived DB — so a ledger that fails canonical validation, a half-written
+// segment, or a missing facts.db all still produce a report instead of the same
+// hard error every other command returns.
+//
+// Read-only, always. Repair lives in `run_repair_ledger`, is dry-run by default,
+// and archives before it writes.
+
+/// One finding about the ledger, with the command that addresses it.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct LedgerFinding {
+    pub(crate) code: String,
+    /// `error` blocks every store-opening command; `warn` is degraded but usable;
+    /// `info` is context.
+    pub(crate) severity: String,
+    pub(crate) message: String,
+    /// The exact command that fixes this, when one exists.
+    pub(crate) remedy: Option<String>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct LedgerSegmentHealth {
+    pub(crate) path: PathBuf,
+    pub(crate) rows: usize,
+    /// 1-based line numbers that are not valid JSON.
+    pub(crate) unparseable_lines: Vec<usize>,
+    /// 1-based line numbers whose object carries no integer `seq`.
+    pub(crate) missing_seq_lines: Vec<usize>,
+    pub(crate) duplicate_seqs: Vec<i64>,
+    pub(crate) min_seq: Option<i64>,
+    pub(crate) max_seq: Option<i64>,
+    /// 1-based line numbers where seq goes backwards relative to the line before.
+    pub(crate) out_of_order_lines: Vec<usize>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct LedgerHealthReport {
+    pub(crate) rally_dir: PathBuf,
+    pub(crate) rally_dir_exists: bool,
+    pub(crate) segments: Vec<LedgerSegmentHealth>,
+    /// Seqs claimed by more than one row across all segments — the class that
+    /// makes `canonical_segment_entries` refuse, taking every command with it.
+    pub(crate) conflicting_seqs: Vec<i64>,
+    pub(crate) derived_db_present: bool,
+    pub(crate) quarantined_snapshots: usize,
+    pub(crate) findings: Vec<LedgerFinding>,
+    /// True when nothing at `error` severity was found.
+    pub(crate) healthy: bool,
+    /// True when `--repair-ledger` can mechanically resolve what was found.
+    pub(crate) repairable: bool,
+}
+
+fn segment_paths_raw(rally_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for sub in [LOG_DIRNAME, ARCHIVE_DIRNAME] {
+        let dir = rally_dir.join(sub);
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    let monolith = rally_dir.join(LEDGER_FILENAME);
+    if monolith.is_file() {
+        out.push(monolith);
+    }
+    out.sort();
+    out
+}
+
+/// Pure core so tests can point it at a fixture directory.
+pub(crate) fn ledger_health_in_dir(rally_dir: &Path) -> LedgerHealthReport {
+    let mut findings: Vec<LedgerFinding> = Vec::new();
+    let rally_dir_exists = rally_dir.is_dir();
+    let mut segments: Vec<LedgerSegmentHealth> = Vec::new();
+
+    if !rally_dir_exists {
+        findings.push(LedgerFinding {
+            code: "no_rally_dir".to_string(),
+            severity: "info".to_string(),
+            message: format!("{} does not exist — this repo has no room", rally_dir.display()),
+            remedy: Some("rally init".to_string()),
+        });
+    }
+
+    for path in segment_paths_raw(rally_dir) {
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                findings.push(LedgerFinding {
+                    code: "segment_unreadable".to_string(),
+                    severity: "error".to_string(),
+                    message: format!("cannot read {}: {e}", path.display()),
+                    remedy: None,
+                });
+                continue;
+            }
+        };
+        let mut health = LedgerSegmentHealth {
+            path: path.clone(),
+            rows: 0,
+            unparseable_lines: Vec::new(),
+            missing_seq_lines: Vec::new(),
+            duplicate_seqs: Vec::new(),
+            min_seq: None,
+            max_seq: None,
+            out_of_order_lines: Vec::new(),
+        };
+        let mut seen_in_segment: SeqRows = SeqRows::new();
+        let mut prev: Option<i64> = None;
+        for (idx, line) in text.lines().enumerate() {
+            let lineno = idx + 1;
+            if line.trim().is_empty() {
+                continue;
+            }
+            health.rows += 1;
+            let value: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => {
+                    health.unparseable_lines.push(lineno);
+                    continue;
+                }
+            };
+            let Some(seq) = value.get("seq").and_then(|s| s.as_i64()) else {
+                health.missing_seq_lines.push(lineno);
+                continue;
+            };
+            health.min_seq = Some(health.min_seq.map_or(seq, |m: i64| m.min(seq)));
+            health.max_seq = Some(health.max_seq.map_or(seq, |m: i64| m.max(seq)));
+            if prev.is_some_and(|p| seq < p) {
+                health.out_of_order_lines.push(lineno);
+            }
+            prev = Some(seq);
+            if seen_in_segment.insert(seq, line.to_string()).is_some() {
+                health.duplicate_seqs.push(seq);
+            }
+        }
+        health.duplicate_seqs.sort_unstable();
+        health.duplicate_seqs.dedup();
+        segments.push(health);
+    }
+
+    // Recompute conflicts across every segment with full-line equality, matching
+    // the store's own rule: a repeated seq is fine only if the rows are identical.
+    let mut conflicting: Vec<i64> = Vec::new();
+    let mut by_seq: SeqRows = SeqRows::new();
+    for path in segment_paths_raw(rally_dir) {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(seq) = value.get("seq").and_then(|s| s.as_i64()) else {
+                continue;
+            };
+            match by_seq.get(&seq) {
+                Some(existing) if existing != line => conflicting.push(seq),
+                Some(_) => {}
+                None => {
+                    by_seq.insert(seq, line.to_string());
+                }
+            }
+        }
+    }
+    conflicting.sort_unstable();
+    conflicting.dedup();
+
+    if !conflicting.is_empty() {
+        findings.push(LedgerFinding {
+            code: "conflicting_seqs".to_string(),
+            severity: "error".to_string(),
+            message: format!(
+                "{} sequence number(s) carry two different rows: {}. Canonical folding \
+                 refuses to pick a winner, so EVERY store-opening command fails with the \
+                 same error until this is resolved.",
+                conflicting.len(),
+                conflicting
+                    .iter()
+                    .take(8)
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            remedy: Some("rally doctor --repair-ledger        # then --apply".to_string()),
+        });
+    }
+
+    let unparseable: usize = segments.iter().map(|s| s.unparseable_lines.len()).sum();
+    if unparseable > 0 {
+        findings.push(LedgerFinding {
+            code: "unparseable_lines".to_string(),
+            severity: "error".to_string(),
+            message: format!("{unparseable} line(s) are not valid JSON"),
+            remedy: Some(
+                "inspect the reported lines; repair does not rewrite unparseable rows".to_string(),
+            ),
+        });
+    }
+    let out_of_order: usize = segments.iter().map(|s| s.out_of_order_lines.len()).sum();
+    if out_of_order > 0 {
+        findings.push(LedgerFinding {
+            code: "out_of_order_rows".to_string(),
+            severity: "warn".to_string(),
+            message: format!("{out_of_order} row(s) have a seq lower than the row before them"),
+            remedy: Some("rally doctor --repair-ledger        # renumbers in file order".to_string()),
+        });
+    }
+
+    let derived_db_present = rally_dir.join("facts.db").is_file();
+    let quarantined = fs::read_dir(rally_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(CORRUPT_PREFIX)
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    if quarantined > 0 {
+        findings.push(LedgerFinding {
+            code: "quarantined_snapshots".to_string(),
+            severity: "info".to_string(),
+            message: format!(
+                "{quarantined} quarantined facts.db.corrupt.* snapshot(s) — evidence of an \
+                 earlier corruption, kept on purpose"
+            ),
+            remedy: Some(
+                "rally doctor --sweep-corrupt --apply   # archives them, never deletes".to_string(),
+            ),
+        });
+    }
+    if !derived_db_present && rally_dir_exists {
+        findings.push(LedgerFinding {
+            code: "no_derived_db".to_string(),
+            severity: "info".to_string(),
+            message: "facts.db is absent; it is a disposable cache and will be rebuilt \
+                      from the JSONL ledger on the next successful open"
+                .to_string(),
+            remedy: None,
+        });
+    }
+
+    let healthy = !findings.iter().any(|f| f.severity == "error");
+    let repairable = !conflicting.is_empty() || out_of_order > 0;
+    LedgerHealthReport {
+        rally_dir: rally_dir.to_path_buf(),
+        rally_dir_exists,
+        segments,
+        conflicting_seqs: conflicting,
+        derived_db_present,
+        quarantined_snapshots: quarantined,
+        findings,
+        healthy,
+        repairable,
+    }
+}
+
+pub(crate) fn run_ledger_health() -> Result<LedgerHealthReport> {
+    Ok(ledger_health_in_dir(&repo_root()?.join(".rally")))
+}
+
+// =============================================================================
+// repair-ledger logic
+// =============================================================================
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct RepairedSegment {
+    pub(crate) path: PathBuf,
+    pub(crate) rows: usize,
+    pub(crate) rows_renumbered: usize,
+    pub(crate) first_change_line: Option<usize>,
+    pub(crate) archived_to: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct RepairLedgerReport {
+    pub(crate) rally_dir: PathBuf,
+    pub(crate) segments: Vec<RepairedSegment>,
+    pub(crate) rows_renumbered: usize,
+    pub(crate) applied: bool,
+    /// Where the untouched originals were copied before any rewrite.
+    pub(crate) archive_dir: PathBuf,
+    pub(crate) warnings: Vec<DiscoveryWarning>,
+}
+
+/// Assign strictly increasing, unique seqs across every live segment in file
+/// order, preserving each row's content otherwise.
+///
+/// Order is what carries meaning here, not the absolute numbers: seq is a log
+/// ordinal, and cursors that point past a shifted row re-read at most the rows
+/// that moved. Every original is copied into `.rally/archive/pre-repair/<stamp>/`
+/// BEFORE the first byte is written, and nothing is ever deleted.
+pub(crate) fn repair_ledger_in_dir(
+    rally_dir: &Path,
+    apply: bool,
+    stamp: &str,
+) -> Result<RepairLedgerReport> {
+    let archive_dir = rally_dir
+        .join(ARCHIVE_DIRNAME)
+        .join("pre-repair")
+        .join(stamp);
+    let mut warnings: Vec<DiscoveryWarning> = Vec::new();
+    let mut segments: Vec<RepairedSegment> = Vec::new();
+    let mut total_renumbered = 0usize;
+
+    // Only the live log directory is renumbered. Archived segments are history
+    // and are never rewritten.
+    let live_dir = rally_dir.join(LOG_DIRNAME);
+    let mut paths: Vec<PathBuf> = fs::read_dir(&live_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+                .collect()
+        })
+        .unwrap_or_default();
+    paths.sort();
+
+    let mut next_seq: i64 = 1;
+    for path in paths {
+        let text = fs::read_to_string(&path)
+            .map_err(RallyError::io(format!("read segment {}", path.display())))?;
+        let mut rows = 0usize;
+        let mut renumbered = 0usize;
+        let mut first_change: Option<usize> = None;
+        let mut out_lines: Vec<String> = Vec::new();
+        let mut unparseable = false;
+
+        for (idx, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            rows += 1;
+            let mut value: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => {
+                    // Never rewrite a line we cannot parse — copy it through
+                    // untouched and refuse to renumber this segment.
+                    unparseable = true;
+                    out_lines.push(line.to_string());
+                    continue;
+                }
+            };
+            let current = value.get("seq").and_then(|s| s.as_i64());
+            if current != Some(next_seq)
+                && let Some(obj) = value.as_object_mut()
+            {
+                obj.insert("seq".to_string(), serde_json::json!(next_seq));
+                renumbered += 1;
+                if first_change.is_none() {
+                    first_change = Some(idx + 1);
+                }
+            }
+            next_seq += 1;
+            out_lines.push(
+                serde_json::to_string(&value)
+                    .map_err(|e| RallyError::Message(format!("reserialize row: {e}")))?,
+            );
+        }
+
+        if unparseable {
+            warnings.push(DiscoveryWarning {
+                code: "repair_skipped_unparseable".to_string(),
+                message: format!(
+                    "{} contains unparseable line(s); left completely untouched",
+                    path.display()
+                ),
+                path: Some(path.clone()),
+                count: None,
+            });
+            segments.push(RepairedSegment {
+                path,
+                rows,
+                rows_renumbered: 0,
+                first_change_line: None,
+                archived_to: None,
+            });
+            continue;
+        }
+
+        let mut archived_to = None;
+        if apply && renumbered > 0 {
+            // Archive BEFORE writing. If this fails, the rewrite does not happen.
+            fs::create_dir_all(&archive_dir).map_err(RallyError::io(format!(
+                "create archive dir {}",
+                archive_dir.display()
+            )))?;
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "segment.jsonl".to_string());
+            let dest = archive_dir.join(&name);
+            fs::copy(&path, &dest).map_err(RallyError::io(format!(
+                "archive {} to {}",
+                path.display(),
+                dest.display()
+            )))?;
+            archived_to = Some(dest);
+
+            let body = format!("{}\n", out_lines.join("\n"));
+            let tmp = path.with_extension("jsonl.repair-tmp");
+            fs::write(&tmp, &body)
+                .map_err(RallyError::io(format!("write {}", tmp.display())))?;
+            fs::rename(&tmp, &path)
+                .map_err(RallyError::io(format!("replace {}", path.display())))?;
+        }
+
+        total_renumbered += renumbered;
+        segments.push(RepairedSegment {
+            path,
+            rows,
+            rows_renumbered: renumbered,
+            first_change_line: first_change,
+            archived_to,
+        });
+    }
+
+    Ok(RepairLedgerReport {
+        rally_dir: rally_dir.to_path_buf(),
+        segments,
+        rows_renumbered: total_renumbered,
+        applied: apply,
+        archive_dir,
+        warnings,
+    })
+}
+
+pub(crate) fn run_repair_ledger(apply: bool) -> Result<RepairLedgerReport> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        .to_string();
+    repair_ledger_in_dir(&repo_root()?.join(".rally"), apply, &stamp)
 }
 
 /// `rally doctor --sweep-corrupt`: resolve the current room's `.rally` dir and
@@ -2154,8 +2689,12 @@ pub(crate) fn run_sweep_corrupt(
     max_age_days: Option<i64>,
     apply: bool,
 ) -> Result<SweepCorruptReport> {
-    let room = RoomStore::open()?;
-    let dir = room.rally_dir();
+    // Deliberately NOT `RoomStore::open()`. This mode exists for a store that is
+    // too damaged to open, and it opened one only to learn `repo_root/.rally` —
+    // a path it can compute directly. That single call made the repair tool fail
+    // on precisely the input it exists to repair: a ledger with two rows at the
+    // same seq took down `--sweep-corrupt` with the same error as `rally room`.
+    let dir = repo_root()?.join(".rally");
     let now_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -3213,6 +3752,191 @@ mod compact_log_tests {
 }
 
 #[cfg(test)]
+mod ledger_health_tests {
+    use super::*;
+
+    fn fixture(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rally-ledger-{label}-{nanos}"));
+        fs::create_dir_all(dir.join(LOG_DIRNAME)).unwrap();
+        dir
+    }
+
+    fn row(seq: i64, subject: &str) -> String {
+        format!(
+            r#"{{"seq":{seq},"event_type":"artifact","payload":{{"subject":"{subject}"}}}}"#
+        )
+    }
+
+    fn write_segment(dir: &Path, name: &str, rows: &[String]) {
+        fs::write(
+            dir.join(LOG_DIRNAME).join(name),
+            format!("{}\n", rows.join("\n")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn clean_ledger_is_healthy() {
+        let dir = fixture("clean");
+        write_segment(&dir, "a.jsonl", &[row(1, "one"), row(2, "two"), row(3, "three")]);
+        let report = ledger_health_in_dir(&dir);
+        assert!(report.healthy, "findings: {:?}", report.findings);
+        assert!(report.conflicting_seqs.is_empty());
+        assert_eq!(report.segments[0].rows, 3);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The exact shape that bricked a real room: two DIFFERENT rows at one seq.
+    #[test]
+    fn divergent_rows_at_one_seq_are_an_error_with_a_remedy() {
+        let dir = fixture("conflict");
+        write_segment(&dir, "a.jsonl", &[row(1, "one"), row(2, "two"), row(2, "DIVERGENT")]);
+        let report = ledger_health_in_dir(&dir);
+        assert!(!report.healthy);
+        assert_eq!(report.conflicting_seqs, vec![2]);
+        assert!(report.repairable);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.code == "conflicting_seqs")
+            .expect("conflicting_seqs finding");
+        assert_eq!(finding.severity, "error");
+        assert!(
+            finding.remedy.as_deref().unwrap_or("").contains("--repair-ledger"),
+            "the finding must hand over the fixing command"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An IDENTICAL repeated row is benign — the store's own rule. Flagging it
+    /// would send operators rewriting a ledger that is fine.
+    #[test]
+    fn identical_repeated_row_is_not_a_conflict() {
+        let dir = fixture("identical");
+        write_segment(&dir, "a.jsonl", &[row(1, "one"), row(2, "two"), row(2, "two")]);
+        let report = ledger_health_in_dir(&dir);
+        assert!(report.conflicting_seqs.is_empty(), "{:?}", report.findings);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unparseable_line_is_reported_not_swallowed() {
+        let dir = fixture("unparseable");
+        write_segment(&dir, "a.jsonl", &[row(1, "one"), "{not json".to_string()]);
+        let report = ledger_health_in_dir(&dir);
+        assert!(!report.healthy);
+        assert_eq!(report.segments[0].unparseable_lines, vec![2]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole point: this mode must answer without opening the store or the
+    /// derived DB, so it still works when every other command is failing.
+    #[test]
+    fn works_with_no_derived_db_present() {
+        let dir = fixture("nodb");
+        write_segment(&dir, "a.jsonl", &[row(1, "one")]);
+        assert!(!dir.join("facts.db").exists());
+        let report = ledger_health_in_dir(&dir);
+        assert!(report.healthy);
+        assert!(!report.derived_db_present);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_rally_dir_reports_instead_of_erroring() {
+        let dir = std::env::temp_dir().join("rally-ledger-absent-xyz-does-not-exist");
+        let report = ledger_health_in_dir(&dir);
+        assert!(!report.rally_dir_exists);
+        assert!(report.findings.iter().any(|f| f.code == "no_rally_dir"));
+    }
+
+    #[test]
+    fn repair_dry_run_writes_nothing() {
+        let dir = fixture("dryrun");
+        write_segment(&dir, "a.jsonl", &[row(1, "one"), row(2, "two"), row(2, "DIVERGENT")]);
+        let before = fs::read_to_string(dir.join(LOG_DIRNAME).join("a.jsonl")).unwrap();
+        let report = repair_ledger_in_dir(&dir, false, "stamp").unwrap();
+        assert!(!report.applied);
+        assert_eq!(report.rows_renumbered, 1);
+        assert_eq!(
+            before,
+            fs::read_to_string(dir.join(LOG_DIRNAME).join("a.jsonl")).unwrap(),
+            "dry run must not touch the segment"
+        );
+        assert!(!report.archive_dir.exists(), "dry run creates no archive");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn repair_apply_archives_the_original_before_rewriting() {
+        let dir = fixture("apply");
+        write_segment(&dir, "a.jsonl", &[row(1, "one"), row(2, "two"), row(2, "DIVERGENT")]);
+        let before = fs::read_to_string(dir.join(LOG_DIRNAME).join("a.jsonl")).unwrap();
+
+        let report = repair_ledger_in_dir(&dir, true, "stamp").unwrap();
+        assert!(report.applied);
+        assert_eq!(report.rows_renumbered, 1);
+
+        // The pre-repair original survives, byte for byte. Nothing is deleted.
+        let archived = report.archive_dir.join("a.jsonl");
+        assert!(archived.is_file(), "{} archived", archived.display());
+        assert_eq!(before, fs::read_to_string(&archived).unwrap());
+
+        // And the live segment now has unique, strictly increasing seqs.
+        let after = fs::read_to_string(dir.join(LOG_DIRNAME).join("a.jsonl")).unwrap();
+        let seqs: Vec<i64> = after
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["seq"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+
+        // Repair is idempotent: re-running finds nothing left to do.
+        let again = repair_ledger_in_dir(&dir, true, "stamp2").unwrap();
+        assert_eq!(again.rows_renumbered, 0);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Content other than `seq` must survive the rewrite untouched.
+    #[test]
+    fn repair_preserves_every_other_field() {
+        let dir = fixture("preserve");
+        write_segment(&dir, "a.jsonl", &[row(9, "keep-me"), row(9, "and-me")]);
+        repair_ledger_in_dir(&dir, true, "s").unwrap();
+        let after = fs::read_to_string(dir.join(LOG_DIRNAME).join("a.jsonl")).unwrap();
+        assert!(after.contains("keep-me"));
+        assert!(after.contains("and-me"));
+        assert!(after.contains("\"event_type\":\"artifact\""));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A segment we cannot fully parse is left completely alone. Renumbering
+    /// around a row we do not understand risks writing a worse file than we found.
+    #[test]
+    fn repair_refuses_a_segment_with_unparseable_rows() {
+        let dir = fixture("refuse");
+        write_segment(&dir, "a.jsonl", &[row(1, "one"), "{broken".to_string(), row(1, "dup")]);
+        let before = fs::read_to_string(dir.join(LOG_DIRNAME).join("a.jsonl")).unwrap();
+        let report = repair_ledger_in_dir(&dir, true, "s").unwrap();
+        assert_eq!(report.rows_renumbered, 0);
+        assert!(report.warnings.iter().any(|w| w.code == "repair_skipped_unparseable"));
+        assert_eq!(
+            before,
+            fs::read_to_string(dir.join(LOG_DIRNAME).join("a.jsonl")).unwrap()
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
 mod sweep_tests {
     use super::*;
 
@@ -3260,7 +3984,7 @@ mod sweep_tests {
     /// PASSING case: `--apply` actually removes the swept set, keeping newest-1
     /// plus anything inside the age window.
     #[test]
-    fn sweep_dry_run_reports_then_apply_removes() {
+    fn sweep_dry_run_reports_then_apply_archives() {
         let dir = unique_dir("mixed");
         // now = 100 days after epoch, in ns.
         let now_ns: u128 = 100 * DAY_NS;
@@ -3300,7 +4024,67 @@ mod sweep_tests {
         );
         assert!(applied.warnings.is_empty());
 
+        // THE INVARIANT: sweeping ARCHIVES, it never deletes. Every file that
+        // left the live directory must be present, byte for byte, under the
+        // archive — a quarantined snapshot is the forensic record of the
+        // corruption that produced it.
+        let archived: Vec<PathBuf> = walk_files(&applied.archived_dir);
+        assert_eq!(
+            archived.len(),
+            6,
+            "the two swept groups (3 files each) are all under {}",
+            applied.archived_dir.display()
+        );
+        for stamp in [mid, old] {
+            let base = applied
+                .archived_dir
+                .join(stamp.to_string())
+                .join(format!("{CORRUPT_PREFIX}{stamp}"));
+            assert!(base.is_file(), "{} archived", base.display());
+            assert_eq!(
+                fs::read(&base).unwrap().len(),
+                if stamp == mid { 20 } else { 30 },
+                "archived bytes are the original bytes"
+            );
+        }
+
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// No file may vanish. Counting live + archived before and after is the
+    /// cheapest statement of "doctor never deletes" that cannot be satisfied by
+    /// a partial move.
+    #[test]
+    fn sweep_conserves_every_file() {
+        let dir = unique_dir("conserve");
+        let now_ns: u128 = 100 * DAY_NS;
+        for age in [1u128, 20, 40, 60] {
+            plant(&dir, now_ns - age * DAY_NS, 8);
+        }
+        let before = walk_files(&dir).len();
+        let report = sweep_corrupt_in_dir(&dir, 1, 7, true, now_ns);
+        let after = walk_files(&dir).len();
+        assert_eq!(before, after, "sweep deleted {} file(s)", before - after);
+        assert!(report.swept.len() >= 2);
+        assert!(report.warnings.is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Recursive file list, so archived files under subdirectories are counted.
+    fn walk_files(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(root) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk_files(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
     }
 
     /// Age-window override: a snapshot older than the --keep rank is still

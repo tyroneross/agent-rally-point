@@ -3201,9 +3201,15 @@ impl RoomStore {
         }
     }
 
-    /// The `.rally` state directory backing this room — the parent of `facts.db`
-    /// and the location where quarantined `facts.db.corrupt.*` snapshots land.
-    /// Used by `rally doctor --sweep-corrupt` to locate disposable debris.
+    /// The `.rally` state directory backing this room.
+    ///
+    /// Test-only since 2026-08-14. Its one production caller was
+    /// `doctor::run_sweep_corrupt`, which opened a full `RoomStore` purely to
+    /// learn `repo_root/.rally` — and that open is exactly what made
+    /// `--sweep-corrupt` fail on the corrupt stores it exists to clean up.
+    /// Production callers that need the path and not the store compute it from
+    /// `repo_root()` directly; do not reintroduce a store open to get a path.
+    #[cfg(test)]
     pub(crate) fn rally_dir(&self) -> PathBuf {
         self.repo_root().join(".rally")
     }
