@@ -1,69 +1,94 @@
 # Agent Rally Point
 
-**Run several coding agents in one repo without them overwriting each other. No server, no scheduler.**
+**Rally Point solves multi-agent coordination in local repos. Every agent shares who it is, what it is working on, and its status on one shared ledger per repo, so any agent from any LLM can talk to any other agent in that repo.**
 
-Rally is a coordination room that lives in your checkout. Agents — Claude Code, Codex, Gemini, Cursor — enter the room, claim the files they are about to touch, hand work off with receipts, and read shared state through one CLI (`rally`) backed by an append-only log in `.rally/`. Nothing to host, nothing to reach over the network.
+Rally Point works across terminals and LLMs, so multiple Claude and Codex agents can collaborate or work independently on the same repo and the same file. The ledger and the protocol work with any LLM and any coding harness, including local models, Cursor, Herdr, and Ghostty.
 
-Apache-2.0. CLI version 0.2.0.
+## The problem
 
-## The problem it solves
+Working with more than one coding agent means moving between them by hand. A shared memory store and handoff docs help, but the process stays manual and the work stays sequential: Claude works, then you hand off to Codex.
 
-Two agents editing one checkout overwrite each other's uncommitted work, redo the same task, and lose the record of who decided what. The usual answers are a human babysitting a queue or an orchestration server. Rally is a third option: a durable, git-friendly record of who is doing what right now, that any agent reads and writes in one command.
+Run them at the same time instead and they overwrite each other's uncommitted work, so you go back to taking turns.
 
-Rally **advises by default; three opt-in switches make it block.** In the default posture a failing hook still lets your edit through — PreToolUse returns `permissionDecision: "allow"` with a warning, and every hook exits 0 even when Rally is broken. Setting `RALLY_HOOK_STRICT=1` turns a high-severity collision into a hard deny, `rally check before-write --strict` exits 4 on a stop finding, and `RALLY_BEFORE_WRITE_FAILCLOSED=1` makes that same check exit 4 when it times out. Each is off unless you turn it on. Full list and blast radius: [`docs/AUTO-COORDINATION-HOOKS.md`](docs/AUTO-COORDINATION-HOOKS.md) and [`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md).
+## How it works
 
-## What you get
+Every terminal session gets a unique ID and writes to the rally when it starts working, naming the file, the task, and its state. An agent that joins later sees what is already being worked on, and claims the files it will edit. An agent that wants a claimed file can ask the owner to release it, or message that agent directly.
 
-- **Deconfliction before an edit.** `rally check before-write` warns when another live agent has claimed the file you are about to touch. A PreToolUse hook fires it automatically.
-- **Handoffs with proof of receipt.** A handoff waits for the receiver to write its own acknowledgement. Text landing in a terminal pane is not proof; an unacknowledged handoff returns `ack_state: "timeout"` and a fallback plan.
-- **Room state on demand.** `rally room`, `rally risks`, and `rally next` project current claims, decisions, risks, and a recommended next action from the log.
-- **One room, any host.** Claude Code, Codex, Gemini, and Cursor share a room; each agent passes its own `--tool` id.
+Each rally also has a lead, usually the first frontier agent to join. The lead resolves conflicts between the others.
 
-## Prerequisites
+- **A claim covers more than a file.** It can name the dev database, a port, a branch, or a task.
+- **The check runs automatically before an edit.** It warns by default; three opt-in switches make it block instead.
+- **The ledger commits with your code**, so an agent that restarts reads back what was already decided instead of asking you.
+- **Agents that leave don't hold the repo hostage.** Claims decay on a lease, and leftover work is isolated in its own worktree.
 
-| Tool | Required for | Without it |
-|------|---------------|------------|
-| `git` | Cloning the repo; `.rally/log/` is committed, append-only content. | No repo, no ledger. |
-| `tmux` | The default backend for `rally run` / `rally inject` (`--backend auto` falls back to tmux when no `ptyd` socket is live — see `crates/rally-cli/src/backends.rs`). | Managed sessions cannot launch or receive injected messages, unless you configure `cmux` or a live `ptyd` daemon instead. |
-| `node` | Rendering the committed hooks' JSON output — SessionStart's room summary, PreToolUse's deconfliction warning (`hooks/rally-coordination-hook.sh`). | Hooks still run their Rally side effects (enter, status, claims) but print no warning text; a one-line stderr notice names the gap once per session, and hooks still exit 0. |
-| `python3` | `scripts/generate_host_surfaces.py --check` and `scripts/sync_host_integrations.py`, the host-surface drift checks under "Keeping hosts on one release" below. | Those two scripts don't run; the CLI and hooks are unaffected. |
-| `gh` (GitHub CLI) | `scripts/install-rally.sh` only — it requires `gh attestation verify` (build-provenance check) before making the downloaded binary executable. | The installer refuses to install rather than fall back to an unverified download. Not needed for `cargo install --path crates/rally-cli`. |
-| `jq` | ⚠️ Uncertain / optional — appears only in dev-facing scripts (`scripts/coordination-smoke.sh`, `scripts/check-release-parity.sh`, `scripts/install_rally_hooks.sh`), not in the documented install or `rally` CLI paths. | Those specific scripts fail if run directly; nothing else is affected. |
+Agents also hand work to each other, and a handoff is complete only when the receiving agent writes its own acknowledgement.
+
+## What people use it for
+
+- Run Claude on the UI and Codex on the database at the same time, with more agents reviewing the work and fixing bugs behind them.
+- Dispatch a Claude agent from a Codex terminal, or the reverse.
+- Run several read-only agents as different personas, all feeding one orchestrator.
+- Assign work by model capability: one model judges, one orchestrates, others write the code.
+- Split a feature across models, frontend on one and backend on another, then let them integrate and flag the decisions that need you.
 
 ## Install
 
-**As a Claude Code plugin:**
+**1. Get the CLI.**
+
+```bash
+git clone https://github.com/tyroneross/agent-rally-point.git
+cd agent-rally-point
+./scripts/install-rally.sh          # --dry-run prints the plan and writes nothing
+```
+
+The installer checks a SHA256 and a build-provenance attestation before it makes the
+downloaded file executable, and refuses rather than falling back to an unverified download.
+To build it yourself instead, run `cargo install --path crates/rally-cli` (needs Rust 1.89+).
+
+**2. Turn it on in the repo your agents share.**
+
+```bash
+cd your-repo
+rally init
+```
+
+That creates `.rally/` and writes a pointer into your `CLAUDE.md` and `AGENTS.md`, so any
+agent that opens the repo knows how to join.
+
+**3. Wire your host, so agents join and deconflict without being told.**
+
+```bash
+./scripts/install_rally_hooks.sh --global
+```
+
+Claude Code users can install the plugin instead, which brings the same hooks plus three
+skills:
 
 ```bash
 claude plugin marketplace add tyroneross/agent-rally-point
 claude plugin install agent-rally-point@agent-rally-point
 ```
 
-That installs the hooks and three skills (`agent-rally-point`, `rally-workflows`, `mini-loop`). Install the CLI yourself, as a separate deliberate step:
+Codex, Cursor, and Gemini read the hook registrations this repo already commits, at
+`.codex/hooks.json`, `.cursor/hooks.json`, and `hooks/hooks.json`. Any other agent that can
+run a shell command participates through the `rally` CLI, with no hooks at all.
+
+**Check it:**
 
 ```bash
-scripts/install-rally.sh          # --dry-run prints the plan and writes nothing
+rally whoami --json
 ```
 
-The installer verifies a SHA256 **and** a build-provenance attestation (`gh attestation verify`, pinned to the release workflow) before it makes the downloaded file executable. If either check cannot complete — no `gh`, no network, no published checksum — it refuses and prints why. It never falls back to an unverified download.
+## Optional tools
 
-**From source:**
+Rally needs `git`. Everything else is per-feature.
 
-```bash
-git clone https://github.com/tyroneross/agent-rally-point.git
-cd agent-rally-point
-cargo install --path crates/rally-cli
-```
-
-Building from source needs Rust 1.89 or newer — the MSRV pinned in `Cargo.toml`'s `rust-version`. For a reproducible build (matching `rustfmt`/`clippy` output), use the exact toolchain `rust-toolchain.toml` pins (currently 1.95.0); `rustup` picks it up automatically inside this checkout.
-
-Hooks also need `node` on PATH to render their output — SessionStart's room summary and PreToolUse's deconfliction warning are both built by parsing `rally`'s JSON in a small Node script. Without `node`, the hooks still run their Rally side effects (enter, status, claims), but no warning text is produced; they print a one-line notice naming the gap once per session (on stderr) and still exit 0.
-
-**Check either path:**
-
-```bash
-rally whoami --tool codex --json    # host runtime, room, lead, mission, ack status
-```
+| Tool | Needed for | Without it |
+|------|------------|------------|
+| `tmux` | `rally run` and `rally inject`, which launch and message managed sessions | Agents still coordinate through the ledger; you launch them yourself |
+| `node` | Rendering the hooks' warning text | Hooks still register presence and claims, and print a one-line notice instead |
+| `gh` | `scripts/install-rally.sh`, which verifies the build attestation | Use `cargo install` instead |
+| `python3` | Host-surface drift checks for contributors | Nothing user-facing |
 
 ## Opening this repo runs its hooks
 
@@ -86,11 +111,13 @@ The hooks **do not download, build, `chmod`, or install anything**. Provisioning
 | This repo | `rally hooks off --scope repo` |
 | Check current state | `rally hooks status` |
 
+Rally **advises by default; three opt-in switches make it block.** In the default posture a failing hook still lets your edit through — PreToolUse returns `permissionDecision: "allow"` with a warning, and every hook exits 0 even when Rally is broken. Setting `RALLY_HOOK_STRICT=1` turns a high-severity collision into a hard deny, `rally check before-write --strict` exits 4 on a stop finding, and `RALLY_BEFORE_WRITE_FAILCLOSED=1` makes that same check exit 4 when it times out. Each is off unless you turn it on.
+
 What the hooks do and what Rally does not defend: [`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md).
 
-## The loop
+## How to use it
 
-What an agent does each turn:
+Each agent runs the same short loop every turn: join, ask what to do next, claim what it will touch, work, then record what it produced.
 
 ```text
 whoami → enter → ack → next → (if actionable) claim → check before-write → edit
@@ -115,6 +142,22 @@ The `--strict` on `check before-write` above is one of the three blocking switch
 
 Resolve handoff targets from live room state (`rally whoami`, `rally lead show`, `rally room --json`), never from examples or old logs.
 
+## What a claim can cover
+
+A claim scope is `type:identifier` with an optional access prefix. Eleven resource types: `workspace`, `repo`, `file`, `dir`, `branch`, `commit`, `port`, `process`, `service`, `task`, `cross-repo`. Four access modes: `exclusive`, `shared_read`, `advisory`, `namespace` — `exclusive` is the default for most types; `dir`, `repo`, and `workspace` default to `namespace` (source: `crates/rally-cli/src/resource_scope.rs`). So an agent about to reset the shared database claims the service, not a file:
+
+```bash
+rally say claim --tool claude_code --subject "resetting dev db" --scope service:postgres-dev --json
+```
+
+While that claim is live, another agent's overlapping claim is refused at write time — the append fails with exit 2:
+
+```text
+claim conflict: claude_code holds service:postgres-dev (claim fact_...), which overlaps the scope you requested
+```
+
+**The boundary:** `rally check before-write` is path-based — it takes `--path` and builds a `file:` scope — so the automatic PreToolUse hook deconflicts files only. A non-file resource is protected at claim time: the competing claim is refused, and the refusal names the holder, so an agent that claims before acting backs off. An agent that touches the database without claiming it is not checked by anything.
+
 ## Room signal
 
 `rally room` shows **human coordination risks only**. System telemetry — `unmanaged-agent`, `duplicate-active-squad-id`, `binary-drift`, `external-intake` — projects into a separate subject-deduped `system_health` bucket (surfaced as `system_health=N`), so the risk view stays worth reading. Read one kind at a time instead of hand-parsing JSON:
@@ -136,7 +179,7 @@ rally inject <session|name|tool> --handoff <event-id> --json
 
 **`rally inject` returns `ok: true` when a message is enqueued, which is not the same as delivered.** The receive side has no resident owner yet (RC-001 in the register). Treat the target's own ACK as proof, not the inject's exit code.
 
-## How it works
+## Where the record lives
 
 - **One repo, one rally point.** Coordination lives at `<repo_root>/.rally/`, never co-mingled across repos. Linked git worktrees share one room through the git common dir.
 - **`.rally/log/<engagement>.jsonl` is canonical** — append-only, committed, `merge=union`. `.rally/facts.db` is a derived SQLite cache, rebuilt by replaying the log when it is missing or behind.
