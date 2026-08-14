@@ -119,16 +119,34 @@ fn later_fact_refs_claim(fact: &Fact, claim_id: &str) -> bool {
 /// multi-claim atomic-release contract (`command_release_by_path` writes ONE
 /// release carrying the union of matched scopes and relies on this sweep).
 ///
-/// Scope note (independent-auditor MED, 2026-06-09): on a NORMAL ledger this
-/// cannot over-close a foreign claim, because same-scope different-owner claims
-/// are rejected at append time (`store::append_fact` claim-conflict detection),
-/// so two live claims never share a scope. The over-close risk is latent only
-/// for an imported / hand-edited / corrupt ledger that already violates that
-/// invariant — in which case the projection faithfully reflects the (already
-/// inconsistent) ledger rather than masking it. The authorization gate that
-/// decides WHO may write a takeover release lives in `command_release_by_path`
-/// (2h stale-owner bar); this projection is downstream of that decision.
-fn later_release_overlaps_claim_scope(fact: &Fact, claim: &Fact) -> bool {
+/// # R5 — the scope note that used to live here was wrong, and how
+///
+/// It read: on a NORMAL ledger this cannot over-close a foreign claim, because
+/// same-scope different-owner claims are rejected at append time
+/// (`store::append_fact` claim-conflict detection), so two live claims never
+/// share a scope; the over-close risk is latent only for an imported or corrupt
+/// ledger.
+///
+/// The premise is true and the conclusion does not follow. Claim-conflict
+/// detection runs on CLAIMS. A release is not a claim, so nothing ever checked
+/// that a release's free-text `--scope` was a scope its author had claimed. A
+/// rogue could name the victim's path directly:
+///
+/// ```text
+/// rally say release --tool rogue --ref <rogue's own claim> --scope file:<victim's path>
+/// ```
+///
+/// `assert_claim_close_authorized` authorized the claim named by `ref_id` —
+/// the rogue's own, so arm 1 passed — and never read `fact.scope` at all,
+/// while this sweep closed the victim's claim on the scope match. The
+/// authorization and the effect were keyed off two different fields.
+///
+/// The gate now checks every claim this predicate would sweep, by CALLING this
+/// predicate rather than restating it (`write_authority::assert_release_sweep_authorized`).
+/// Sweep and authorization read the same rule from the same place, so the two
+/// cannot drift the way the four closing kinds and their two-kind gate did in
+/// ARP-R-02.
+pub(crate) fn later_release_overlaps_claim_scope(fact: &Fact, claim: &Fact) -> bool {
     fact.kind == FactKind::Release
         && fact.scope.iter().any(|release_scope| {
             claim

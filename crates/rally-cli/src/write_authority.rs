@@ -132,8 +132,49 @@ pub(crate) fn assert_write_authorized(
 ) -> Result<()> {
     assert_field_bounds(fact)?;
     assert_claim_close_authorized(fact, snapshot, coord)?;
+    assert_release_sweep_authorized(fact, snapshot, coord)?;
     assert_retraction_authorized(fact, snapshot, coord)?;
     assert_lead_transfer_authorized(fact, facts_before, snapshot, coord)?;
+    Ok(())
+}
+
+/// R5. Who may write a release whose SCOPE sweeps somebody else's live claim.
+///
+/// `claim_authority::later_release_overlaps_claim_scope` closes EVERY active
+/// claim whose scope overlaps the release's own free-text `fact.scope`. The
+/// close gate authorized only the claim named by `ref_id` and never read
+/// `fact.scope`, so authorization and effect were keyed off two different
+/// fields — and naming your own claim in `--ref` satisfied a gate that had
+/// nothing to do with the claims actually being closed:
+///
+/// ```text
+/// rally say release --tool rogue --ref <rogue's own claim> --scope file:<victim's path>
+/// ```
+///
+/// Arm 1 passed on the rogue's own claim; the victim's claim was swept.
+///
+/// Every claim the sweep would take is now checked under the same three-arm
+/// policy, so the rogue's own claim passes on arm 1 and the victim's does not
+/// pass at all unless its owner is genuinely stale. `command_release_by_path`'s
+/// legitimate multi-claim atomic release is unaffected: it already applies the
+/// stale-owner bar before writing, so each swept claim clears arm 1 or arm 2.
+///
+/// The swept set is decided by CALLING the projection's predicate, not by
+/// restating it. ARP-R-02 is what restating costs. This rides the snapshot the
+/// gate already loaded for closing kinds — no extra read.
+fn assert_release_sweep_authorized(
+    fact: &Fact,
+    snapshot: &RoomSnapshot,
+    coord: &CoordinationConfig,
+) -> Result<()> {
+    if fact.kind != FactKind::Release || fact.scope.is_empty() {
+        return Ok(());
+    }
+    for claim in &snapshot.active_claims {
+        if claim_authority::later_release_overlaps_claim_scope(fact, claim) {
+            authorize_claim_removal(fact, claim, "release", snapshot, coord)?;
+        }
+    }
     Ok(())
 }
 
@@ -648,6 +689,105 @@ mod tests {
             err.contains("another victim:01 session"),
             "the refusal must say the label is not the identity; got: {err}"
         );
+    }
+
+    /// Two live claims on different paths: `victim:01` owns the victim path,
+    /// `codex:rogue` owns its own. `owner_silent_secs` ages ONLY the victim.
+    fn room_with_two_claims(owner_silent_secs: i64) -> RoomSnapshot {
+        let mk = |id: &str, tool: &str, path: &str| Fact {
+            event_id: id.to_string(),
+            kind: FactKind::Claim,
+            tool: Some(tool.to_string()),
+            from_session_id: Some(format!("sess:{tool}")),
+            scope: vec![format!("file:{path}")],
+            subject: "owns it".to_string(),
+            created_at: iso_ago(0),
+            ..Fact::default()
+        };
+        RoomSnapshot {
+            active_claims: vec![
+                mk("claim-victim", "victim:01", "src/victim.rs"),
+                mk("claim-rogue", "codex:rogue", "src/rogue.rs"),
+            ],
+            squads: vec![
+                squad("victim:01", owner_silent_secs),
+                squad("codex:rogue", 0),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// A release naming the actor's OWN claim in `--ref` while carrying the
+    /// VICTIM's path in `--scope`.
+    fn sweeping_release(tool: &str, own_claim: &str, swept_path: &str) -> Fact {
+        Fact {
+            event_id: "rel-1".to_string(),
+            kind: FactKind::Release,
+            tool: Some(tool.to_string()),
+            from_session_id: Some(format!("sess:{tool}")),
+            ref_id: Some(own_claim.to_string()),
+            scope: vec![format!("file:{swept_path}")],
+            subject: "done".to_string(),
+            created_at: iso_ago(0),
+            ..Fact::default()
+        }
+    }
+
+    /// R5, THE defect. `later_release_overlaps_claim_scope` closes every active
+    /// claim whose scope overlaps the release's free-text `--scope`, while the
+    /// close gate authorized only the claim named by `--ref` and never read
+    /// `fact.scope`. Authorization and effect were keyed off two different
+    /// fields, so naming your own claim satisfied a gate that had nothing to do
+    /// with the claim actually being closed.
+    #[test]
+    fn a_release_cannot_sweep_a_live_peers_claim_by_scope() {
+        // Victim seen 1 minute ago — nowhere near the 30-minute small window.
+        let snapshot = room_with_two_claims(60);
+        let fact = sweeping_release("codex:rogue", "claim-rogue", "src/victim.rs");
+
+        assert!(
+            claim_authority::later_release_overlaps_claim_scope(&fact, &snapshot.active_claims[0]),
+            "precondition: this release DOES sweep the victim's claim"
+        );
+        let err = refusal(&fact, &snapshot);
+        assert!(
+            err.contains("release failed") && err.contains("victim:01"),
+            "the refusal must name the claim the SWEEP would take, not the ref; got: {err}"
+        );
+    }
+
+    /// The takeover arm still works through the sweep path — the size-scaled
+    /// silence window is the same one `release --ref` uses, because it is the
+    /// same policy body.
+    #[test]
+    fn a_release_may_sweep_a_stale_owners_claim() {
+        let fact = sweeping_release("codex:rogue", "claim-rogue", "src/victim.rs");
+        assert!(
+            refusal(&fact, &room_with_two_claims(29 * 60)).contains("not the owner"),
+            "29 minutes is inside the small window and must still refuse"
+        );
+        authorized(&fact, &room_with_two_claims(31 * 60));
+    }
+
+    /// Releasing your own claim by scope is the ordinary path and stays free.
+    #[test]
+    fn a_release_may_sweep_its_own_claim_by_scope() {
+        let snapshot = room_with_two_claims(60);
+        authorized(
+            &sweeping_release("codex:rogue", "claim-rogue", "src/rogue.rs"),
+            &snapshot,
+        );
+    }
+
+    /// A release carrying no scope sweeps nothing, so the sweep arm must not
+    /// invent a refusal for it — `release --ref <own-claim>` with no `--scope`
+    /// is the most common release there is.
+    #[test]
+    fn a_scopeless_release_is_untouched_by_the_sweep_arm() {
+        let snapshot = room_with_two_claims(60);
+        let mut fact = sweeping_release("codex:rogue", "claim-rogue", "src/victim.rs");
+        fact.scope.clear();
+        authorized(&fact, &snapshot);
     }
 
     /// R2 + R1 together. The `retracts=` summary token is no longer a detection

@@ -310,3 +310,86 @@ fn the_owner_may_retract_its_own_claim() {
     );
     ws.cleanup();
 }
+
+// ---------------------------------------------------------------- R5 --------
+
+/// R5, THE defect, through the shipped command. A release closes every active
+/// claim whose scope overlaps its own free-text `--scope`, while the close gate
+/// authorized only the claim named by `--ref` and never read `fact.scope`. So
+/// naming your OWN claim in `--ref` satisfied a gate that had nothing to do
+/// with the claim actually being closed.
+#[test]
+fn a_release_cannot_sweep_a_live_peers_claim_by_scope() {
+    let ws = Workspace::new("release-sweep");
+    let _victim = ws.claim("victim:01", "src/victim.rs");
+    let rogue_claim = ws.claim_as("codex:rogue", "sess:test:rogue", "src/rogue.rs");
+
+    let v = ws.json_as_session(
+        "sess:test:rogue",
+        &[
+            "say",
+            "release",
+            "--tool",
+            "codex:rogue",
+            "--ref",
+            &rogue_claim,
+            "--path",
+            "src/victim.rs",
+            "--subject",
+            "done",
+            "--json",
+        ],
+    );
+
+    assert_eq!(
+        v["ok"],
+        Value::Bool(false),
+        "a release sweeping a live peer's claim by scope must be REFUSED, got: {v}"
+    );
+    let err = error_text(&v);
+    assert!(
+        err.contains("victim:01"),
+        "the refusal must name the claim the SWEEP would take, not the one in --ref; got: {err}"
+    );
+
+    let owners = ws.active_claim_owners();
+    assert!(
+        owners.contains(&"victim:01".to_string()),
+        "the victim must still own its claim; owners: {owners:?}"
+    );
+    ws.cleanup();
+}
+
+/// The ordinary release — your own claim, by ref — must be untouched by the
+/// sweep gate. Without this, the R5 fix could pass by refusing everything.
+#[test]
+fn the_ordinary_release_of_your_own_claim_still_works() {
+    let ws = Workspace::new("release-self");
+    let owner = "sess:test:owner-one";
+    let claim = ws.claim_as("worker:01", owner, "src/mine.rs");
+
+    let v = ws.json_as_session(
+        owner,
+        &[
+            "say",
+            "release",
+            "--tool",
+            "worker:01",
+            "--ref",
+            &claim,
+            "--subject",
+            "done",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        v["ok"],
+        Value::Bool(true),
+        "releasing your own claim must still work, got: {v}"
+    );
+    assert!(
+        ws.active_claim_owners().is_empty(),
+        "the released claim must leave the active set"
+    );
+    ws.cleanup();
+}
