@@ -119,8 +119,11 @@ Rally behavior is identical either way — it stays a facilitator regardless of 
 
 ## 4 · Per-task rally loop
 
-Each agent executes this loop for its assigned task. The `--run`/`--step`/`--parent-step` markers
-are what make the fan-out **observable** — drop them and `rally dag` reconstructs nothing:
+Each agent executes one of two loops. The `--run`/`--step`/`--parent-step` markers bind facts to the
+fan-out. Claims and artifacts feed the current DAG; read-only in-flight resume temporarily uses the
+exact active task-tool heuristic described in §5 until O33-C adds `active_activities`.
+
+Write tasks use exclusive path coordination:
 
 ```bash
 rally enter --tool <TOOL>
@@ -135,9 +138,26 @@ rally check before-write --tool <TOOL> --path <owns...> --strict
 # If the task names a validation_recipe, the packet already carries its argv.
 <verify per task.validation / the emitted recipe>
 
-rally say artifact --tool <TOOL> --subject "<task.output>" --uri <path> --evidence "<validation result>" \
+rally say artifact --tool <TOOL> --subject "<task.id>: <task.output>" --uri <path> --evidence "<validation result>" \
   --run <run_id> --step <task.id>
 rally say release --tool <TOOL> --ref <claim-id> --subject "done"
+rally next --tool <TOOL>
+```
+
+An `owns: "read-only"` task uses nonexclusive activity instead. Save the returned presence
+`event_id` as `<activity-event-id>` for the terminal artifact. It must emit zero claim,
+before-write, release, and path ownership. Read-only prohibits intentional task/domain changes;
+the generated Rally coordination records and ordinary transient tool state created during
+verification are the only permitted writes:
+
+```bash
+rally enter --tool <TOOL>
+rally say presence --tool <TOOL> --subject "<task.id>: <task.intent>" \
+  --summary activity:read-only --status working \
+  --run <run_id> --step <task.id> --parent-step <dep>
+# read/analyze without intentionally changing task/domain resources, then verify
+rally say artifact --tool <TOOL> --subject "<task.id>: <task.output>" --uri <artifact-uri> \
+  --evidence "<validation result>" --ref <activity-event-id> --run <run_id> --step <task.id>
 rally next --tool <TOOL>
 ```
 
@@ -172,6 +192,11 @@ rally room --tool <TOOL> --json
 
 Confirm every task posted an artifact **with evidence** before declaring the workstream done.
 Re-run `task.validation` for any change with shared impact. Never auto-trust a subagent result.
+
+For resume, run `workstream-status.mjs` with the same `--tool-prefix` used to generate packets.
+Before O33-C exposes run-scoped `active_activities`, its `active` state is only a transitional
+exact `<tool-prefix>:<task.id>` plus fresh-squad heuristic. It never becomes `claimed`; A+B remain
+branch-held and inactive until the combined A+B+C gate passes.
 
 ## 6 · Stop conditions
 
