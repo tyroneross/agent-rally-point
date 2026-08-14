@@ -2858,7 +2858,7 @@ claim and asks the implementation whether it is true. See
      stubbed-unresponsive CLI and asserts the write is still permitted absent an opt-in switch.
   3. State in `TRUST-MODEL.md` that the advisory guarantee covers Rally's own hook and not
      arbitrary consumers, so the README claim stops over-promising.
-- **Consumer-side entry:** `RossLabs-AI-Assistant/.build-loop/issues/rally-check-unavailable-denies-every-write.md`
+- **Consumer-side entry:** `RossLabs-AI-Assistant/docs/RCA-2026-08-14-rally-check-unavailable-denies-writes.md`
   carries the mechanism, the fix ladder, and the golden-test actuator
   (`scripts/rule_check_golden.py:157` currently pins the deny behavior).
 - **Blast radius:** 56 repositories under `~/dev/git-folder` contain `.rally/`; each is exposed on
