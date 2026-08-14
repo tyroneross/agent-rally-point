@@ -2317,7 +2317,10 @@ pub(crate) fn ledger_health_in_dir(rally_dir: &Path) -> LedgerHealthReport {
         findings.push(LedgerFinding {
             code: "no_rally_dir".to_string(),
             severity: "info".to_string(),
-            message: format!("{} does not exist — this repo has no room", rally_dir.display()),
+            message: format!(
+                "{} does not exist — this repo has no room",
+                rally_dir.display()
+            ),
             remedy: Some("rally init".to_string()),
         });
     }
@@ -2446,7 +2449,9 @@ pub(crate) fn ledger_health_in_dir(rally_dir: &Path) -> LedgerHealthReport {
             code: "out_of_order_rows".to_string(),
             severity: "warn".to_string(),
             message: format!("{out_of_order} row(s) have a seq lower than the row before them"),
-            remedy: Some("rally doctor --repair-ledger        # renumbers in file order".to_string()),
+            remedy: Some(
+                "rally doctor --repair-ledger        # renumbers in file order".to_string(),
+            ),
         });
     }
 
@@ -2455,11 +2460,7 @@ pub(crate) fn ledger_health_in_dir(rally_dir: &Path) -> LedgerHealthReport {
         .map(|entries| {
             entries
                 .flatten()
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .starts_with(CORRUPT_PREFIX)
-                })
+                .filter(|e| e.file_name().to_string_lossy().starts_with(CORRUPT_PREFIX))
                 .count()
         })
         .unwrap_or(0);
@@ -2647,8 +2648,7 @@ pub(crate) fn repair_ledger_in_dir(
 
             let body = format!("{}\n", out_lines.join("\n"));
             let tmp = path.with_extension("jsonl.repair-tmp");
-            fs::write(&tmp, &body)
-                .map_err(RallyError::io(format!("write {}", tmp.display())))?;
+            fs::write(&tmp, &body).map_err(RallyError::io(format!("write {}", tmp.display())))?;
             fs::rename(&tmp, &path)
                 .map_err(RallyError::io(format!("replace {}", path.display())))?;
         }
@@ -3766,9 +3766,7 @@ mod ledger_health_tests {
     }
 
     fn row(seq: i64, subject: &str) -> String {
-        format!(
-            r#"{{"seq":{seq},"event_type":"artifact","payload":{{"subject":"{subject}"}}}}"#
-        )
+        format!(r#"{{"seq":{seq},"event_type":"artifact","payload":{{"subject":"{subject}"}}}}"#)
     }
 
     fn write_segment(dir: &Path, name: &str, rows: &[String]) {
@@ -3782,7 +3780,11 @@ mod ledger_health_tests {
     #[test]
     fn clean_ledger_is_healthy() {
         let dir = fixture("clean");
-        write_segment(&dir, "a.jsonl", &[row(1, "one"), row(2, "two"), row(3, "three")]);
+        write_segment(
+            &dir,
+            "a.jsonl",
+            &[row(1, "one"), row(2, "two"), row(3, "three")],
+        );
         let report = ledger_health_in_dir(&dir);
         assert!(report.healthy, "findings: {:?}", report.findings);
         assert!(report.conflicting_seqs.is_empty());
@@ -3794,7 +3796,11 @@ mod ledger_health_tests {
     #[test]
     fn divergent_rows_at_one_seq_are_an_error_with_a_remedy() {
         let dir = fixture("conflict");
-        write_segment(&dir, "a.jsonl", &[row(1, "one"), row(2, "two"), row(2, "DIVERGENT")]);
+        write_segment(
+            &dir,
+            "a.jsonl",
+            &[row(1, "one"), row(2, "two"), row(2, "DIVERGENT")],
+        );
         let report = ledger_health_in_dir(&dir);
         assert!(!report.healthy);
         assert_eq!(report.conflicting_seqs, vec![2]);
@@ -3806,7 +3812,11 @@ mod ledger_health_tests {
             .expect("conflicting_seqs finding");
         assert_eq!(finding.severity, "error");
         assert!(
-            finding.remedy.as_deref().unwrap_or("").contains("--repair-ledger"),
+            finding
+                .remedy
+                .as_deref()
+                .unwrap_or("")
+                .contains("--repair-ledger"),
             "the finding must hand over the fixing command"
         );
         fs::remove_dir_all(&dir).ok();
@@ -3817,7 +3827,11 @@ mod ledger_health_tests {
     #[test]
     fn identical_repeated_row_is_not_a_conflict() {
         let dir = fixture("identical");
-        write_segment(&dir, "a.jsonl", &[row(1, "one"), row(2, "two"), row(2, "two")]);
+        write_segment(
+            &dir,
+            "a.jsonl",
+            &[row(1, "one"), row(2, "two"), row(2, "two")],
+        );
         let report = ledger_health_in_dir(&dir);
         assert!(report.conflicting_seqs.is_empty(), "{:?}", report.findings);
         fs::remove_dir_all(&dir).ok();
@@ -3857,7 +3871,11 @@ mod ledger_health_tests {
     #[test]
     fn repair_dry_run_writes_nothing() {
         let dir = fixture("dryrun");
-        write_segment(&dir, "a.jsonl", &[row(1, "one"), row(2, "two"), row(2, "DIVERGENT")]);
+        write_segment(
+            &dir,
+            "a.jsonl",
+            &[row(1, "one"), row(2, "two"), row(2, "DIVERGENT")],
+        );
         let before = fs::read_to_string(dir.join(LOG_DIRNAME).join("a.jsonl")).unwrap();
         let report = repair_ledger_in_dir(&dir, false, "stamp").unwrap();
         assert!(!report.applied);
@@ -3874,7 +3892,11 @@ mod ledger_health_tests {
     #[test]
     fn repair_apply_archives_the_original_before_rewriting() {
         let dir = fixture("apply");
-        write_segment(&dir, "a.jsonl", &[row(1, "one"), row(2, "two"), row(2, "DIVERGENT")]);
+        write_segment(
+            &dir,
+            "a.jsonl",
+            &[row(1, "one"), row(2, "two"), row(2, "DIVERGENT")],
+        );
         let before = fs::read_to_string(dir.join(LOG_DIRNAME).join("a.jsonl")).unwrap();
 
         let report = repair_ledger_in_dir(&dir, true, "stamp").unwrap();
@@ -3923,11 +3945,20 @@ mod ledger_health_tests {
     #[test]
     fn repair_refuses_a_segment_with_unparseable_rows() {
         let dir = fixture("refuse");
-        write_segment(&dir, "a.jsonl", &[row(1, "one"), "{broken".to_string(), row(1, "dup")]);
+        write_segment(
+            &dir,
+            "a.jsonl",
+            &[row(1, "one"), "{broken".to_string(), row(1, "dup")],
+        );
         let before = fs::read_to_string(dir.join(LOG_DIRNAME).join("a.jsonl")).unwrap();
         let report = repair_ledger_in_dir(&dir, true, "s").unwrap();
         assert_eq!(report.rows_renumbered, 0);
-        assert!(report.warnings.iter().any(|w| w.code == "repair_skipped_unparseable"));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.code == "repair_skipped_unparseable")
+        );
         assert_eq!(
             before,
             fs::read_to_string(dir.join(LOG_DIRNAME).join("a.jsonl")).unwrap()
