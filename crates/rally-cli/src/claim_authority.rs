@@ -401,17 +401,40 @@ pub(crate) fn lead_as_of(facts: &[Fact], seq: i64) -> Option<String> {
 /// The seat derivation itself: latest lead-family decision wins, and a
 /// `role:lead:relinquished` reopens the seat.
 ///
-/// ONE body, three entry points ([`lead_as_of`], [`projected_lead`],
-/// [`projected_lead_with_retraction`]) for the same reason
+/// ONE body, FOUR entry points — [`lead_as_of`], [`projected_lead`],
+/// [`projected_lead_with_retraction`], and the room projection itself via
+/// [`lead_and_epoch_of`] — for the same reason
 /// `write_authority::authorize_claim_removal` is one body: ARP-R-01 was two
 /// projections of one fact drifting apart, and the answer to that is not a
 /// third copy written more carefully.
+///
+/// The fourth entry point is the load-bearing one. RC-071a's whole correctness
+/// argument is "the gate reads the same seat the room shows", and until the
+/// projection called this, that agreement was held by a hand-copy in
+/// `store::snapshot_from_facts_with_policy_at` — the literal shape of ARP-R-01,
+/// sitting underneath the gate that cites ARP-R-01 as its reason to share.
 fn lead_of<'a>(facts: impl Iterator<Item = &'a Fact>) -> Option<String> {
     facts
         .filter(|fact| is_lead_decision(fact))
         .max_by_key(|fact| fact.seq)
         .filter(|fact| fact.subject == LEAD_SUBJECT)
         .and_then(lead_beneficiary)
+}
+
+/// The seat AND its epoch, for the room projection.
+///
+/// The epoch is the latest lead-family decision's `seq` — a cheap staleness
+/// handle for agents — and it is a property of the FACT rather than of the
+/// seat, which is why the projection computed it locally and ended up
+/// re-deriving the seat alongside it. Both come from one pass here now, so the
+/// projection and the gates cannot answer differently.
+pub(crate) fn lead_and_epoch_of(facts: &[Fact]) -> (Option<String>, Option<i64>) {
+    let epoch = facts
+        .iter()
+        .filter(|fact| is_lead_decision(fact))
+        .map(|fact| fact.seq)
+        .max();
+    (lead_of(facts.iter()), epoch)
 }
 
 /// The tool holding the lead seat, as the ROOM PROJECTION reports it —

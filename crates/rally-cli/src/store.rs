@@ -6309,17 +6309,13 @@ fn snapshot_from_facts_with_policy_at(
     // projections of one fact is the same defect shape as the two hand-copied
     // claim-close gates in ARP-R-02, so it gets the same treatment.
     //
-    // Both now share `is_lead_decision` and `lead_beneficiary`. Only the epoch
-    // (the seq, for cheap staleness detection) is computed locally, because it
-    // is a property of the fact rather than of the seat.
-    let latest_lead_fact = facts
-        .iter()
-        .filter(|f| claim_authority::is_lead_decision(f))
-        .max_by_key(|f| f.seq);
-    let lead_epoch = latest_lead_fact.map(|f| f.seq);
-    let lead = latest_lead_fact
-        .filter(|f| f.subject == claim_authority::LEAD_SUBJECT)
-        .and_then(claim_authority::lead_beneficiary);
+    // RC-071a. Sharing the two PREDICATES was not enough: the derivation itself
+    // was still written out here and again in `claim_authority`, and the seat
+    // gates are correct only insofar as they answer what this line answers. A
+    // reviewed agreement between two copies is exactly what ARP-R-01 was. Both
+    // the seat and its epoch now come from `claim_authority::lead_and_epoch_of`,
+    // so the projection and every gate share one body by construction.
+    let (lead, lead_epoch) = claim_authority::lead_and_epoch_of(facts);
 
     // The authorized room-wide freeze, decided ADMISSION-TIME (see the field's
     // doc on `RoomSnapshot`). An unscoped blocker freezes the room only if its
@@ -9740,6 +9736,11 @@ mod ledger_tests {
             }),
         ];
 
+        // A skip-only run would pass while asserting nothing — and it would do
+        // so for exactly the defect this test exists to catch, since a broken
+        // removal path stops removing and every iteration skips. Counted and
+        // floored below.
+        let mut exercised = 0usize;
         for kind in FactKind::ALL {
             for (label, shape) in &attacks {
                 let mut hostile = make_fact("hostile", kind.clone(), "", "take it");
@@ -9761,6 +9762,7 @@ mod ledger_tests {
                 if !removed {
                     continue;
                 }
+                exercised += 1;
                 let verdict = crate::write_authority::assert_write_authorized(
                     &hostile,
                     std::slice::from_ref(&victim),
@@ -9781,6 +9783,12 @@ mod ledger_tests {
                 );
             }
         }
+        assert!(
+            exercised >= FactKind::ALL.len(),
+            "the class test skipped nearly every iteration ({exercised} exercised): claim \
+             removal is no longer detected by the projection, which is the defect this test \
+             exists to catch. A green run here would have meant nothing."
+        );
     }
 
     /// RC-071a. The same class assertion, on the LEAD SEAT.
@@ -9846,6 +9854,9 @@ mod ledger_tests {
             }),
         ];
 
+        // See the sibling test: an all-skip run passes while asserting nothing,
+        // and it does so precisely when seat movement stops being detected.
+        let mut exercised = 0usize;
         for kind in FactKind::ALL {
             for (label, shape) in &attacks {
                 let mut hostile = make_fact("hostile", kind.clone(), "", "take it");
@@ -9863,6 +9874,7 @@ mod ledger_tests {
                 if after.lead.as_deref() == Some("incumbent:01") {
                     continue;
                 }
+                exercised += 1;
                 let verdict = crate::write_authority::assert_write_authorized(
                     &hostile,
                     std::slice::from_ref(&seat),
@@ -9883,6 +9895,16 @@ mod ledger_tests {
                 );
             }
         }
+        // The retraction shape is kind-agnostic, so it moves the seat for every
+        // kind; the two decision shapes move it once each. A floor at the kind
+        // count catches a broken `retraction::target_of` — which would otherwise
+        // turn this test green while it asserted nothing at all.
+        assert!(
+            exercised >= FactKind::ALL.len(),
+            "the class test skipped nearly every iteration ({exercised} exercised): seat \
+             movement is no longer detected by the projection, which is the defect this test \
+             exists to catch. A green run here would have meant nothing."
+        );
     }
 
     /// S3 salvage. Retraction resolution lives in the deterministic CORE

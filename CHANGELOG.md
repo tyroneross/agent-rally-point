@@ -96,7 +96,21 @@ The rule now, operator-ruled: **authority-carrying facts are gated; prose is fre
 - **New: an exhaustive seat-movement test.** For every `FactKind` and every shape that could
   move the seat, the room is projected and any fact that actually changed the lead must have
   been refused by the gate. The oracle is the lead projection, not a maintained list, so the
-  next way to move the seat fails this test without anyone remembering it exists.
+  next single-fact way to move the seat fails this test without anyone remembering it exists.
+  Both class tests now also assert they were not skipped end to end — a removal path that stops
+  being detected used to turn them green while they asserted nothing.
+
+- **Known limit, recorded rather than implied.** This covers every way a SINGLE retraction can
+  move the seat. It does not cover a SEQUENCE that first moves the seat's authorization input:
+  the stale-owner arms authorize against a liveness projection that ungated retractions can
+  regress. That is filed as RC-071b with the owed decision, and it affects claim takeover the
+  same way — it predates this change on both arms.
+
+- **Upgrade note.** A ledger that already contains a retraction of its seated lead decision will
+  report no lead after upgrading, and the seat becomes takeable. Before this change that same
+  ledger was worse off, not better: the room showed no lead while every `lead assign` was
+  refused and `rally enter` failed outright. This repo's ledger contains no retractions at all;
+  a deployment with retraction traffic should check before upgrading.
 
 ### Fixed — a kind read off the ledger can now be typed back into `rally say`
 

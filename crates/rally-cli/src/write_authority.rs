@@ -546,9 +546,9 @@ fn assert_lead_transfer_authorized(
 ///
 /// This arm does not ask "is the target a lead decision". It asks the room:
 /// derive the seat from `facts_before`, derive it again with the target
-/// withdrawn, and gate only when the two answers differ. Every way a retraction
-/// can move the seat is covered by construction, including the ones nobody
-/// enumerated:
+/// withdrawn, and gate only when the two answers differ. Every way a SINGLE
+/// retraction can move the seat is covered by construction, including the ones
+/// nobody enumerated:
 ///
 /// * withdrawing the seated `role:lead` decision (the seat empties, or falls
 ///   back to an earlier lead — either way it moves);
@@ -561,23 +561,40 @@ fn assert_lead_transfer_authorized(
 /// arm for every future spelling. Listing spellings is the defect this class
 /// keeps re-teaching; asking the projection is the fix.
 ///
+/// **The word SINGLE is load-bearing.** A SEQUENCE that first moves the seat's
+/// authorization INPUT is not covered: arm 3 reads a liveness projection that
+/// ungated retractions can regress. See RC-071b in
+/// `docs/ROOT-CAUSE-REGISTER.md` — the residual is named there rather than
+/// implied absent here.
+///
 /// # Arms
 ///
 /// Same policy as every other seat change, through
 /// [`lead_seat_change_allowed`] — one body, two entry points, for the reason
 /// [`authorize_claim_removal`] is one body. A retraction that leaves the seat
-/// where it is never reaches the arms at all, and a LEADERLESS room is ungated
-/// (arm 1 of the transfer gate: anyone may take an empty seat, so reviving a
-/// former lead is strictly weaker than what is already permitted).
+/// where it is never reaches the arms at all, and a LEADERLESS room is ungated:
+/// arm 1 of the transfer gate already lets ANY agent seat ANY tool in an empty
+/// room (`rally lead assign --tool rogue --to <former lead>` succeeds today —
+/// measured, not assumed), so reviving a former lead by retraction grants no
+/// capability that is not already one typed command away. That equivalence is
+/// about CAPABILITY only: installing an absent lead in an empty room is a
+/// denial vector, and it is arm 1's, documented in
+/// `docs/security/TRUST-MODEL.md` as the first-join weakness.
 ///
 /// Arm 4 (`--force`) is reachable here even though `rally retract` never writes
-/// the marker, and that is deliberate. Making the retraction spelling STRICTER
-/// than `lead assign --force` would buy nothing — the actor would simply use
-/// the typed command, which is more legible — while costing a second policy
-/// body to keep in sync. The claim-close policy's arm 3 (typed `ClaimExpired`
-/// lease cleanup) has no analogue here, exactly as it has none for claim
-/// retraction: the seat carries no lease, and its liveness bar is
-/// [`lead_is_stale`].
+/// the marker, so reaching it takes a hand-built fact. Keeping it costs one
+/// policy body instead of two, and an actor who can hand-build a marker can
+/// equally run `lead assign --force`, so it widens no capability. It is NOT
+/// equally auditable, and the honest statement of the difference is: `set_lead`
+/// records `assigned:`, `from:`, `displaced:` and a seizure summary on a
+/// `decision`, while a marker-bearing retraction records a withdrawal on an
+/// `artifact` and names no displaced incumbent. A seizure should be typed.
+/// RC-071b carries the owed decision on whether this arm should require a
+/// validated `displaced:` entry.
+///
+/// The claim-close policy's arm 3 (typed `ClaimExpired` lease cleanup) has no
+/// analogue here, exactly as it has none for claim retraction: the seat carries
+/// no lease, and its liveness bar is [`lead_is_stale`].
 fn assert_lead_retraction_authorized(
     fact: &Fact,
     facts_before: &[Fact],
@@ -627,6 +644,16 @@ fn assert_lead_retraction_authorized(
 ///
 /// (Arm 1, the leaderless room, is decided by each caller before it gets here:
 /// an absent incumbent is not a seat change to authorize.)
+///
+/// Arm 2 compares TOOL only, with no session check — deliberately asymmetric
+/// with [`authorize_claim_removal`], which refuses a sibling session wearing the
+/// owner's label. The seat is a tool-level concept: `projected_lead` yields a
+/// tool name, `set_lead` writes `from_session_id: None`, and there is no session
+/// on the incumbent side to compare against. A sibling shell running
+/// `--tool <incumbent>` therefore can move the seat. That is the same residual
+/// the module header names — `tool` is self-asserted — and not a second one.
+///
+/// Arm 3's input is a projection an ungated retraction can regress: see RC-071b.
 fn lead_seat_change_allowed(
     fact: &Fact,
     incumbent: &str,

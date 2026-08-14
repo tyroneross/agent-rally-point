@@ -2942,11 +2942,15 @@ claim and asks the implementation whether it is true. See
 - **Fix, mechanism.** `write_authority::assert_lead_retraction_authorized` does NOT ask "is the
   target a lead decision". It asks the room: derive the seat from the admission-time slice, derive
   it again with the target withdrawn, and gate only when the two answers differ. Every way a
-  retraction can move the seat is covered by construction, including the ones nobody enumerated —
-  withdrawing the seated decision, and withdrawing a decision that falls the room BACK to an
-  earlier lead. A superseded lead decision moves nothing and stays ungated, which a
+  SINGLE retraction can move the seat is covered by construction, including the ones nobody
+  enumerated — withdrawing the seated decision, and withdrawing a decision that falls the room BACK
+  to an earlier lead. A superseded lead decision moves nothing and stays ungated, which a
   `is_lead_decision`-keyed gate would have refused wrongly. Listing spellings is the defect;
   asking the projection is the fix.
+
+  **"Single" is a scope, not a flourish.** A SEQUENCE that first moves the seat's authorization
+  INPUT is not covered by this mechanism and is not covered by the class test, whose oracle ranges
+  over a two-fact universe. That gap is RC-071b, filed below rather than left implied.
 - **Fix, policy.** The three arms are the seat's existing ones, shared through
   `write_authority::lead_seat_change_allowed` rather than copied: the holder, a takeover after the
   holder's large-work silence window, or an acknowledged `--force` seizure. One body, two entry
@@ -2978,3 +2982,77 @@ claim and asks the implementation whether it is true. See
   that matters here; whether flat resolution is the right projection semantic is a separate
   question, pinned by `the_gate_and_the_projection_agree_on_flat_retraction_resolution` so any
   future change to it has to come through this gate.
+- **Residual, named not fixed.** Arm 3's liveness input is itself writable by ungated retraction —
+  RC-071b. Arm 4 is reachable through the retraction spelling and records LESS than
+  `lead assign --force` does; the owed decision on requiring a validated `displaced:` entry is also
+  in RC-071b.
+- **Upgrade note.** The `projected_lead` swap is retroactive over facts admitted while seat
+  retraction was ungated: a ledger that ALREADY contains a retraction of its seated lead decision
+  reports leaderless on upgrade, and arm 1 then admits anyone to the seat. Before the swap that
+  same ledger had the opposite failure — `rally room` showed no lead while the gate refused every
+  `lead assign`, wedging the seat shut and, per `ensure_presence`, failing `rally enter` outright.
+  Checked on this repo's own ledger at fix time: 10,227 rows, 17 lead-family decisions, **zero
+  retractions of any kind**, so the condition is absent here. A deployment with retraction traffic
+  should run the same scan before upgrading.
+- **Adjacent, out of scope, filed.** `rally lead show` (`lib.rs`) reads `current` from the
+  retraction-resolved snapshot but `tier`/`assigned` from RAW facts, so after a legitimate seat
+  retraction it prints provenance sourced from a withdrawn fact. Same projection-vs-reader split
+  this entry closes for `breadth_violation`; this reader was not swept. Carried in RC-071b.
+- **Adjacent, out of scope, filed.** "One liveness policy" holds at DEFAULT configuration only:
+  `lead_is_stale` reads the configurable `reclaim_large_minutes` while the reaper's eligibility set
+  uses the hard constant `TAKEOVER_STALE_SECS`. Raise the config above 120 minutes and the reaper
+  selects a lead as stale, appends the relinquish, and has it refused — failing loud
+  (`write_failures`), not silently. Pre-existing; carried in RC-071b.
+
+#### RC-071b — open: the takeover arms authorize against a liveness projection that ungated retraction can regress
+
+- **State:** `observed` 2026-08-14, **not fixed**, deliberately — same posture, and for the same
+  reason, RC-071a itself was filed in. Found by two independent adversarial reviews of the RC-071a
+  fix, which converged on it separately. Mechanism confirmed by code read; not reproduced end to
+  end (the reproduction needs a ledger whose incumbent has both old and recent facts).
+- **The mechanism, composed.** `store::snapshot_from_facts_with_policy_at` shadows `facts` with the
+  retraction-RESOLVED slice before it builds anything, and the presence projection takes each
+  tool's highest-seq SURVIVING fact as its `last_seen_ts`. The store says so out loud: *"Presence
+  intentionally uses the resolved slice too: a withdrawn fact should not count as evidence of
+  anything, including liveness."* Both takeover arms read that field —
+  `write_authority::lead_is_stale` (the seat) and `RoomSnapshot::claim_reclaim_eligible` (claims).
+  Retracting a presence or artifact fact is UNGATED: it closes no claim and moves no seat, so
+  neither retraction arm fires. So a rogue withdraws the incumbent's facts inside the reclaim
+  window, leaves one older fact standing (withdrawing them all makes the squad lookup miss and
+  fails closed), and the incumbent projects as stale. Arm 3 then authorizes the seat move, under
+  the rogue's own honest name, with no `--force` and no impersonation.
+- **Why this is in scope for the trust model rather than excused by it.** RC-063 and
+  `docs/security/TRUST-MODEL.md` bound what these gates claim: they stop an agent acting under its
+  own name, not one that lies about its name. This attack needs no lie. It is squarely inside the
+  half the gates DO claim to close, which is why it is filed at this severity instead of folded
+  into the self-asserted-identity residual.
+- **The accident is as likely as the attack.** A well-meaning ledger-hygiene script batch-retracting
+  stale presence rows regresses the same timestamps. The repo's own framing of these gates is that
+  they stop accidents and honest mistakes; this is an accident that walks straight through.
+- **Blast radius is wider than the seat.** `claim_reclaim_eligible` reads the same field, so the
+  same sequence forges claim-takeover eligibility. That arm predates RC-071a by two cycles.
+- **Not introduced by RC-071a — but newly load-bearing because of it.** The seat's arm 3 and the
+  claim takeover arm both read this oracle already. What RC-071a changed is that
+  `breadth_violation` now DEPENDS on the seat gate being sound, so a forged seat takeover reaches
+  further than it did.
+- **What is owed.** A decision, not a patch, and it is not local to the seat:
+  1. **Fix the oracle.** Have `lead_is_stale` (and possibly `claim_reclaim_eligible`) read the
+     ADAPTIVE multi-signal liveness verdict rather than the single retraction-sensitive heartbeat.
+     The four-signal machinery already exists in the projection and is harder to forge, because
+     inject/ack and code-progress ages do not collapse when presence rows are withdrawn.
+  2. **Or gate the input.** Treat liveness-bearing facts as authority-carrying under RC-071a's own
+     rule, which would narrow "prose is free" — presence is not prose, it is evidence an
+     authorization arm reads.
+  3. **Or compute staleness over the RAW slice**, so a third party cannot withdraw another agent's
+     liveness evidence. This trades one property for another and should be argued explicitly.
+  Whichever is chosen, the class test needs a COMPOSED-sequence oracle: today both class tests
+  project a two-fact universe, so no sequence attack is representable in them, and that — not the
+  single-fact coverage — is the honest limit of the RC-071a proof.
+- **Carried with it, both pre-existing and both low.** (a) `rally lead show` reads seat provenance
+  (`tier`, `assigned`) off RAW facts while reading `current` off the resolved snapshot, so after a
+  legitimate retraction it prints provenance from a withdrawn fact. (b) `lead_is_stale` uses the
+  configurable `reclaim_large_minutes` while the reaper uses the hard constant
+  `TAKEOVER_STALE_SECS`, so a non-default config makes the reaper's stale-lead relinquish fail
+  loudly at the gate. (c) A seat seizure via a hand-built marker-bearing retraction records less
+  than `lead assign --force` does — decide whether arm 4 should require a `displaced:<incumbent>`
+  entry the gate validates.
