@@ -105,6 +105,10 @@ pub(crate) const LEAD_FORCE_MARKER: &str = "lead-seizure-acknowledged";
 /// keyed off the ACT instead, and [`crate::retraction::target_of`] short-
 /// circuits on the `retract:` subject prefix, so an ordinary fact pays one
 /// string comparison for it.
+///
+/// That same call selects for BOTH retraction arms — the claim one (R1) and the
+/// lead-seat one (RC-071a) — so gating the seat's removal added no new
+/// admission cost and no new spelling to remember.
 pub(crate) fn needs_authority_check(fact: &Fact) -> bool {
     claim_authority::closes_active_claim(&fact.kind)
         || claim_authority::is_lead_decision(fact)
@@ -134,6 +138,7 @@ pub(crate) fn assert_write_authorized(
     assert_claim_close_authorized(fact, snapshot, coord)?;
     assert_release_sweep_authorized(fact, snapshot, coord)?;
     assert_retraction_authorized(fact, snapshot, coord)?;
+    assert_lead_retraction_authorized(fact, facts_before, snapshot, coord)?;
     assert_lead_transfer_authorized(fact, facts_before, snapshot, coord)?;
     Ok(())
 }
@@ -279,10 +284,14 @@ fn assert_claim_close_authorized(
 /// unreachable for a retraction, which is correct — a retraction is a
 /// correction, not reaper cleanup.
 ///
-/// Retraction of anything that is NOT an active claim stays ungated. That is
-/// the deliberate ruling, not an oversight: the whole point of retraction is
-/// that an honest mistake stays fixable without asking permission, and a wrong
-/// artifact, decision, or risk harms nobody's write safety by being withdrawn.
+/// Retraction of anything that is neither an active claim nor the seated lead
+/// decision stays ungated. That is the deliberate ruling, not an oversight: the
+/// whole point of retraction is that an honest mistake stays fixable without
+/// asking permission, and a wrong artifact, ordinary decision, or risk harms
+/// nobody's write safety by being withdrawn. The lead seat is the one non-claim
+/// exception, and it has its own arm — see
+/// [`assert_lead_retraction_authorized`] for why the line is drawn at
+/// "authority-carrying facts are gated, prose is free" rather than at "claims".
 fn assert_retraction_authorized(
     fact: &Fact,
     snapshot: &RoomSnapshot,
@@ -478,27 +487,21 @@ fn assert_lead_transfer_authorized(
     // it yields is the one holding the seat at the moment this fact was
     // offered. See `assert_write_authorized` for why the cutoff is the slice
     // and not `fact.seq`.
-    let incumbent = claim_authority::lead_from_facts(facts_before);
+    //
+    // RC-071a: `projected_lead`, not the raw derivation. A lead decision the
+    // incumbent has legitimately retracted leaves the room leaderless in every
+    // projection, and a gate that still saw an incumbent there would refuse the
+    // next honest `lead assign` — wedging the seat shut in a room that reports
+    // it empty.
+    let incumbent = claim_authority::projected_lead(facts_before);
 
     // 1. Leaderless.
     let Some(incumbent) = incumbent else {
         return Ok(());
     };
     let actor = fact.tool.as_deref().unwrap_or("<unknown>");
-    // 2. Genuine handoff / self-relinquish.
-    if actor == incumbent {
-        return Ok(());
-    }
-    // 3. Stale incumbent.
-    if lead_is_stale(snapshot, &incumbent, coord) {
-        return Ok(());
-    }
-    // 4. Acknowledged seizure.
-    if fact
-        .evidence
-        .iter()
-        .any(|item| item.trim() == LEAD_FORCE_MARKER)
-    {
+    // Arms 2-4.
+    if lead_seat_change_allowed(fact, &incumbent, snapshot, coord) {
         return Ok(());
     }
 
@@ -516,6 +519,160 @@ fn assert_lead_transfer_authorized(
          from a live lead, say so on the record with `--force`, which writes the seizure and the \
          displaced incumbent into the ledger."
     )))
+}
+
+/// RC-071a. Who may retract the decision the LEAD SEAT rests on.
+///
+/// The judged ruling behind R1 scoped ungated retraction to "non-claim facts",
+/// and the lead seat fell through that scoping: it is a non-claim fact that
+/// CARRIES AUTHORITY. Every control in this room hangs off the seat — RC-037's
+/// room-wide claim gate and RC-038's room-freeze both read "is this agent the
+/// lead", and [`assert_lead_transfer_authorized`] gates `lead handoff`,
+/// `lead assign`, and `lead relinquish` for exactly that reason. Retraction
+/// reached the same effect by the path that gate never saw. That is the sixth
+/// appearance of one defect (RC-029, ARP-R-01, ARP-R-02, R1, RC-071, this): a
+/// correct rule guarding one SPELLING while the ledger accepts the ACT.
+///
+/// The operator's ruling, and the rule this arm encodes:
+///
+/// > **Authority-carrying facts are gated. Prose is free.**
+///
+/// So the boundary is no longer "is the target a claim" but "does withdrawing
+/// the target move authority". Retracting an artifact, a risk, a lesson, or an
+/// ordinary decision stays open to anyone — an honest mistake has to stay
+/// fixable without asking permission.
+///
+/// # The oracle is the projection, run twice — not a list of spellings
+///
+/// This arm does not ask "is the target a lead decision". It asks the room:
+/// derive the seat from `facts_before`, derive it again with the target
+/// withdrawn, and gate only when the two answers differ. Every way a SINGLE
+/// retraction can move the seat is covered by construction, including the ones
+/// nobody enumerated:
+///
+/// * withdrawing the seated `role:lead` decision (the seat empties, or falls
+///   back to an earlier lead — either way it moves);
+/// * withdrawing a `role:lead:relinquished` that had reopened the seat, which
+///   REVIVES the lead it vacated (ungated in practice, because a reopened seat
+///   has no incumbent to authorize against — see the arms below).
+///
+/// Keying off `is_lead_decision` alone would answer "yes, gate it" for a
+/// SUPERSEDED lead decision that moves nothing, and would have to grow a new
+/// arm for every future spelling. Listing spellings is the defect this class
+/// keeps re-teaching; asking the projection is the fix.
+///
+/// **The word SINGLE is load-bearing.** A SEQUENCE that first moves the seat's
+/// authorization INPUT is not covered: arm 3 reads a liveness projection that
+/// ungated retractions can regress. See RC-071b in
+/// `docs/ROOT-CAUSE-REGISTER.md` — the residual is named there rather than
+/// implied absent here.
+///
+/// # Arms
+///
+/// Same policy as every other seat change, through
+/// [`lead_seat_change_allowed`] — one body, two entry points, for the reason
+/// [`authorize_claim_removal`] is one body. A retraction that leaves the seat
+/// where it is never reaches the arms at all, and a LEADERLESS room is ungated:
+/// arm 1 of the transfer gate already lets ANY agent seat ANY tool in an empty
+/// room (`rally lead assign --tool rogue --to <former lead>` succeeds today —
+/// measured, not assumed), so reviving a former lead by retraction grants no
+/// capability that is not already one typed command away. That equivalence is
+/// about CAPABILITY only: installing an absent lead in an empty room is a
+/// denial vector, and it is arm 1's, documented in
+/// `docs/security/TRUST-MODEL.md` as the first-join weakness.
+///
+/// Arm 4 (`--force`) is reachable here even though `rally retract` never writes
+/// the marker, so reaching it takes a hand-built fact. Keeping it costs one
+/// policy body instead of two, and an actor who can hand-build a marker can
+/// equally run `lead assign --force`, so it widens no capability. It is NOT
+/// equally auditable, and the honest statement of the difference is: `set_lead`
+/// records `assigned:`, `from:`, `displaced:` and a seizure summary on a
+/// `decision`, while a marker-bearing retraction records a withdrawal on an
+/// `artifact` and names no displaced incumbent. A seizure should be typed.
+/// RC-071b carries the owed decision on whether this arm should require a
+/// validated `displaced:` entry.
+///
+/// The claim-close policy's arm 3 (typed `ClaimExpired` lease cleanup) has no
+/// analogue here, exactly as it has none for claim retraction: the seat carries
+/// no lease, and its liveness bar is [`lead_is_stale`].
+fn assert_lead_retraction_authorized(
+    fact: &Fact,
+    facts_before: &[Fact],
+    snapshot: &RoomSnapshot,
+    coord: &CoordinationConfig,
+) -> Result<()> {
+    let Some(target) = crate::retraction::target_of(fact) else {
+        return Ok(());
+    };
+    // ADMISSION-TIME (D9), same slice and same reasoning as the transfer arm.
+    let Some(incumbent) = claim_authority::projected_lead(facts_before) else {
+        return Ok(());
+    };
+    let after = claim_authority::projected_lead_with_retraction(facts_before, Some(&target));
+    if after.as_deref() == Some(incumbent.as_str()) {
+        return Ok(());
+    }
+    if lead_seat_change_allowed(fact, &incumbent, snapshot, coord) {
+        return Ok(());
+    }
+
+    let actor = fact.tool.as_deref().unwrap_or("<unknown>");
+    let outcome = match after.as_deref() {
+        Some(next) => format!("hands the seat to {next}"),
+        None => "vacates the seat".to_string(),
+    };
+    Err(RallyError::Usage(format!(
+        "retract failed: {incumbent} holds the lead seat by {target}, and withdrawing it \
+         {outcome}. {actor} is not {incumbent}, so this is a seat change and follows the same \
+         rule as `rally lead handoff`: the holder withdraws it, or the holder has been silent \
+         past the reclaim window. Retracting a fact that carries no authority is still open to \
+         anyone. If you are deliberately taking the seat from a live lead, use \
+         `rally lead assign --force`, which records the seizure and the incumbent it displaced."
+    )))
+}
+
+/// The seat-change policy, shared by every path that moves the lead seat.
+///
+/// Arms, in the order they are usually the real answer:
+///
+/// 2. **Genuine handoff.** The ACTOR is the incumbent. Handing off your own
+///    seat, vacating it, or withdrawing the decision you hold it by.
+/// 3. **Stale incumbent.** The incumbent has been silent past the large-work
+///    reclaim window, measured from the squad projection exactly as claim
+///    takeover is, so there is one liveness policy.
+/// 4. **Acknowledged seizure.** The fact carries [`LEAD_FORCE_MARKER`].
+///
+/// (Arm 1, the leaderless room, is decided by each caller before it gets here:
+/// an absent incumbent is not a seat change to authorize.)
+///
+/// Arm 2 compares TOOL only, with no session check — deliberately asymmetric
+/// with [`authorize_claim_removal`], which refuses a sibling session wearing the
+/// owner's label. The seat is a tool-level concept: `projected_lead` yields a
+/// tool name, `set_lead` writes `from_session_id: None`, and there is no session
+/// on the incumbent side to compare against. A sibling shell running
+/// `--tool <incumbent>` therefore can move the seat. That is the same residual
+/// the module header names — `tool` is self-asserted — and not a second one.
+///
+/// Arm 3's input is a projection an ungated retraction can regress: see RC-071b.
+fn lead_seat_change_allowed(
+    fact: &Fact,
+    incumbent: &str,
+    snapshot: &RoomSnapshot,
+    coord: &CoordinationConfig,
+) -> bool {
+    // 2. Genuine handoff / self-relinquish / self-correction. Absence is not
+    // identity: a fact carrying no `tool` never matches the incumbent.
+    if fact.tool.as_deref() == Some(incumbent) {
+        return true;
+    }
+    // 3. Stale incumbent.
+    if lead_is_stale(snapshot, incumbent, coord) {
+        return true;
+    }
+    // 4. Acknowledged seizure.
+    fact.evidence
+        .iter()
+        .any(|item| item.trim() == LEAD_FORCE_MARKER)
 }
 
 /// Has the incumbent lead been silent past the large-work reclaim window?
@@ -601,18 +758,26 @@ mod tests {
         }
     }
 
-    fn refusal(fact: &Fact, snapshot: &RoomSnapshot) -> String {
+    fn refusal_with(fact: &Fact, facts_before: &[Fact], snapshot: &RoomSnapshot) -> String {
         let coord = CoordinationConfig::default();
-        match assert_write_authorized(fact, &[], snapshot, &coord) {
+        match assert_write_authorized(fact, facts_before, snapshot, &coord) {
             Ok(()) => panic!("expected a refusal, the write was authorized"),
             Err(err) => err.to_string(),
         }
     }
 
-    fn authorized(fact: &Fact, snapshot: &RoomSnapshot) {
+    fn authorized_with(fact: &Fact, facts_before: &[Fact], snapshot: &RoomSnapshot) {
         let coord = CoordinationConfig::default();
-        assert_write_authorized(fact, &[], snapshot, &coord)
+        assert_write_authorized(fact, facts_before, snapshot, &coord)
             .unwrap_or_else(|err| panic!("expected authorization, got refusal: {err}"));
+    }
+
+    fn refusal(fact: &Fact, snapshot: &RoomSnapshot) -> String {
+        refusal_with(fact, &[], snapshot)
+    }
+
+    fn authorized(fact: &Fact, snapshot: &RoomSnapshot) {
+        authorized_with(fact, &[], snapshot)
     }
 
     /// R1, THE defect. A retraction drops its target from every projection, so
@@ -816,6 +981,250 @@ mod tests {
             !crate::retraction::retracted_ids(std::slice::from_ref(&smuggled))
                 .contains(&claim.event_id),
             "the claim must remain live"
+        );
+    }
+
+    // ---- RC-071a: retracting the fact the lead seat rests on ---------------
+
+    /// A `role:lead` decision as `rally lead assign` writes it: `tool` = the
+    /// ACTOR, `target` = the BENEFICIARY (ARP-R-01's attribution half).
+    fn lead_decision(id: &str, actor: &str, beneficiary: &str, seq: i64) -> Fact {
+        Fact {
+            event_id: id.to_string(),
+            kind: FactKind::Decision,
+            subject: claim_authority::LEAD_SUBJECT.to_string(),
+            tool: Some(actor.to_string()),
+            target: Some(beneficiary.to_string()),
+            from_session_id: Some(format!("sess:{actor}")),
+            seq,
+            created_at: iso_ago(0),
+            ..Fact::default()
+        }
+    }
+
+    /// A room seated by `lead`, who has been silent for `lead_silent_secs`.
+    /// The seat uses the LARGE (120 min) window — the coarsest thing in the
+    /// room gets the most patient timeout.
+    fn room_with_lead(lead: &str, lead_silent_secs: i64) -> (Vec<Fact>, RoomSnapshot) {
+        let seat = lead_decision("lead-1", lead, lead, 1);
+        let snapshot = RoomSnapshot {
+            lead: Some(lead.to_string()),
+            squads: vec![squad(lead, lead_silent_secs)],
+            ..Default::default()
+        };
+        (vec![seat], snapshot)
+    }
+
+    /// RC-071a, THE defect. The lead seat is a non-claim fact that CARRIES
+    /// AUTHORITY, and R1's ruling scoped ungated retraction to "non-claim
+    /// facts". `lead handoff`/`assign`/`relinquish` were gated while the
+    /// retraction of the decision underneath the seat walked straight past —
+    /// one command, and RC-037's room-wide claim gate plus RC-038's room-freeze
+    /// both re-open. Disable `assert_lead_retraction_authorized` and this test
+    /// is the one that goes red.
+    #[test]
+    fn a_non_owner_cannot_retract_the_decision_the_lead_seat_rests_on() {
+        // Lead seen a minute ago: nowhere near the 120-minute large window.
+        let (facts, snapshot) = room_with_lead("lead:01", 60);
+        let fact = retraction_by("codex:rogue", "lead-1");
+
+        assert!(
+            needs_authority_check(&fact),
+            "a seat-targeting retraction must reach the authority gate at all"
+        );
+        let err = refusal_with(&fact, &facts, &snapshot);
+        assert!(
+            err.contains("retract failed") && err.contains("lead seat"),
+            "the refusal must name the act and what it would move; got: {err}"
+        );
+        assert!(
+            err.contains("lead:01"),
+            "the refusal must name the incumbent so the caller knows who to ask; got: {err}"
+        );
+    }
+
+    /// Arm 2. Withdrawing the decision you hold the seat by is the ordinary
+    /// self-correction path — the same authority `lead relinquish` already has.
+    #[test]
+    fn the_lead_can_retract_the_decision_it_holds_the_seat_by() {
+        let (facts, snapshot) = room_with_lead("lead:01", 60);
+        authorized_with(&retraction_by("lead:01", "lead-1"), &facts, &snapshot);
+    }
+
+    /// Arm 3. Same large-work silence window `lead assign` takes over on,
+    /// reused rather than restated, so a crashed lead never freezes the seat.
+    #[test]
+    fn a_stale_leads_seat_decision_can_be_retracted_by_a_peer() {
+        let fact = retraction_by("codex:peer", "lead-1");
+
+        let (facts, fresh) = room_with_lead("lead:01", 119 * 60);
+        assert!(
+            refusal_with(&fact, &facts, &fresh).contains("retract failed"),
+            "119 minutes of silence is inside the large window and must still refuse"
+        );
+
+        let (facts, stale) = room_with_lead("lead:01", 121 * 60);
+        authorized_with(&fact, &facts, &stale);
+    }
+
+    /// Arm 4. An acknowledged seizure is reachable through this spelling too.
+    /// Making retraction STRICTER than `lead assign --force` would buy nothing
+    /// — the actor would use the typed command, which is more legible — while
+    /// costing a second policy body to keep in sync.
+    #[test]
+    fn an_acknowledged_seizure_marker_authorizes_the_seat_retraction() {
+        let (facts, snapshot) = room_with_lead("lead:01", 60);
+        let mut fact = retraction_by("codex:rogue", "lead-1");
+        fact.evidence.push(LEAD_FORCE_MARKER.to_string());
+        authorized_with(&fact, &facts, &snapshot);
+    }
+
+    /// The invariant that keeps this fix from making the room brittle, and the
+    /// operator's ruling in one line: authority-carrying facts are gated, prose
+    /// is free. A live seat does not gate the withdrawal of an unrelated note.
+    #[test]
+    fn retracting_a_fact_that_carries_no_authority_stays_ungated() {
+        let (facts, snapshot) = room_with_lead("lead:01", 60);
+        authorized_with(
+            &retraction_by("codex:rogue", "some-artifact-id"),
+            &facts,
+            &snapshot,
+        );
+    }
+
+    /// A SUPERSEDED lead decision carries no authority — the seat does not rest
+    /// on it — so withdrawing it moves nothing and stays open. The gate asks
+    /// "does the seat move", not "is the target a lead decision", and this is
+    /// the difference showing up.
+    #[test]
+    fn retracting_a_superseded_lead_decision_stays_ungated() {
+        let facts = vec![
+            lead_decision("lead-1", "lead:01", "lead:01", 1),
+            lead_decision("lead-2", "lead:01", "lead:02", 2),
+        ];
+        let snapshot = RoomSnapshot {
+            lead: Some("lead:02".to_string()),
+            squads: vec![squad("lead:02", 60), squad("lead:01", 60)],
+            ..Default::default()
+        };
+        authorized_with(&retraction_by("codex:rogue", "lead-1"), &facts, &snapshot);
+    }
+
+    /// The case a spelling-keyed gate would still have missed after the obvious
+    /// fix: withdrawing the CURRENT seat decision does not empty the seat here,
+    /// it falls the room back to the EARLIER lead. Authority still moves, so it
+    /// is still the incumbent's call, and the refusal says where the seat would
+    /// have gone.
+    #[test]
+    fn a_retraction_that_falls_the_seat_back_to_an_earlier_lead_is_gated() {
+        let facts = vec![
+            lead_decision("lead-1", "lead:01", "lead:01", 1),
+            lead_decision("lead-2", "lead:01", "lead:02", 2),
+        ];
+        let snapshot = RoomSnapshot {
+            lead: Some("lead:02".to_string()),
+            squads: vec![squad("lead:02", 60), squad("lead:01", 60)],
+            ..Default::default()
+        };
+        let err = refusal_with(&retraction_by("codex:rogue", "lead-2"), &facts, &snapshot);
+        assert!(
+            err.contains("lead:02") && err.contains("hands the seat to lead:01"),
+            "the refusal must name the incumbent and where the seat would land; got: {err}"
+        );
+    }
+
+    /// A LEADERLESS room is ungated, matching arm 1 of the transfer gate:
+    /// anyone may take an empty seat, so restoring a former lead by withdrawing
+    /// the relinquish is strictly weaker than the `lead assign` that is already
+    /// permitted there.
+    #[test]
+    fn reviving_the_seat_in_a_leaderless_room_stays_ungated() {
+        let relinquish = Fact {
+            event_id: "lead-2".to_string(),
+            subject: claim_authority::LEAD_RELINQUISHED_SUBJECT.to_string(),
+            seq: 2,
+            ..lead_decision("lead-2", "lead:01", "lead:01", 2)
+        };
+        let facts = vec![lead_decision("lead-1", "lead:01", "lead:01", 1), relinquish];
+        let snapshot = RoomSnapshot {
+            squads: vec![squad("lead:01", 60)],
+            ..Default::default()
+        };
+        assert_eq!(
+            claim_authority::projected_lead(&facts),
+            None,
+            "precondition: the relinquish left the room leaderless"
+        );
+        authorized_with(&retraction_by("codex:rogue", "lead-2"), &facts, &snapshot);
+    }
+
+    /// The availability half of RC-071a, and the reason the TRANSFER gate had
+    /// to move to `projected_lead` in the same change.
+    ///
+    /// A lead may legitimately withdraw the decision it holds the seat by. The
+    /// room then reports no lead — and a transfer gate still reading the RAW
+    /// ledger would keep refusing every later `lead assign`, wedging a seat the
+    /// room says is empty. Gating the seat's removal without this makes a
+    /// security fix into an availability defect; revert `projected_lead` to the
+    /// raw derivation in `assert_lead_transfer_authorized` and this goes red.
+    #[test]
+    fn a_seat_the_lead_withdrew_can_be_taken_by_the_next_agent() {
+        let seat = lead_decision("lead-1", "lead:01", "lead:01", 1);
+        let withdrawn = Fact {
+            seq: 2,
+            ..retraction_by("lead:01", "lead-1")
+        };
+        let facts = vec![seat, withdrawn];
+        let snapshot = RoomSnapshot {
+            squads: vec![squad("lead:01", 60)],
+            ..Default::default()
+        };
+        assert_eq!(
+            claim_authority::projected_lead(&facts),
+            None,
+            "precondition: the room reports no lead once the seat decision is withdrawn"
+        );
+        authorized_with(
+            &lead_decision("lead-3", "codex:peer", "codex:peer", 3),
+            &facts,
+            &snapshot,
+        );
+    }
+
+    /// Retraction resolution is FLAT, in the projection and therefore in this
+    /// gate: `retraction::retracted_ids` collects every target in one pass, so
+    /// retracting a retraction does not un-retract its target ("a fact a peer
+    /// already consumed cannot be un-read"). Pinned because the gate's whole
+    /// correctness argument is that it reads the seat the room shows — if that
+    /// semantic ever changes, this gate has to change with it, and this test is
+    /// where that conversation starts.
+    #[test]
+    fn the_gate_and_the_projection_agree_on_flat_retraction_resolution() {
+        let seat = lead_decision("lead-1", "lead:01", "lead:01", 1);
+        let withdrawn = Fact {
+            seq: 2,
+            ..retraction_by("lead:01", "lead-1")
+        };
+        let undo = Fact {
+            event_id: "r-2".to_string(),
+            seq: 3,
+            ..retraction_by("lead:01", "r-1")
+        };
+        let facts = vec![seat, withdrawn, undo];
+        let snapshot = RoomSnapshot {
+            squads: vec![squad("lead:01", 60)],
+            ..Default::default()
+        };
+        assert_eq!(
+            claim_authority::projected_lead(&facts),
+            None,
+            "the seat stays withdrawn — retraction resolution does not nest"
+        );
+        // And the gate agrees: no incumbent, so nothing to authorize against.
+        authorized_with(
+            &lead_decision("lead-3", "codex:peer", "codex:peer", 4),
+            &facts,
+            &snapshot,
         );
     }
 }

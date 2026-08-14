@@ -150,6 +150,20 @@ impl Room {
             .as_str()
             .map(str::to_string)
     }
+
+    /// The highest-seq `role:lead` decision — the fact the seat is derived
+    /// from, read out of the projection the same way the gate derives it.
+    fn seat_decision_id(&self) -> String {
+        self.json(&["room", "--json"])["data"]["room"]["current_decisions"]
+            .as_array()
+            .expect("current_decisions is an array")
+            .iter()
+            .filter(|d| d["subject"].as_str() == Some("role:lead"))
+            .max_by_key(|d| d["seq"].as_i64().unwrap_or(0))
+            .and_then(|d| d["event_id"].as_str())
+            .expect("the room must carry a seated lead decision")
+            .to_string()
+    }
 }
 
 impl Drop for Room {
@@ -311,6 +325,37 @@ fn lead_seat_authorization_is_identical_in_direct_and_routed_mode() {
             "lead", "handoff", "--tool", "victim", "--to", "helper", "--json",
         ]);
         (seize, vacate, handoff, room.lead())
+    });
+}
+
+/// RC-071a on both store modes.
+///
+/// This one is not covered by the lead-transfer case above even though both
+/// move the same seat. A retraction is neither a claim-closing kind nor a lead
+/// decision, so it reaches the gate through a THIRD selector
+/// (`retraction::target_of`) — and "the seat is gated" was true of the transfer
+/// spelling while being false of this one, which is the whole of RC-071a. A
+/// selector that ran only in the client process would leave the seat movable
+/// through rallyd.
+#[test]
+fn lead_seat_retraction_authorization_is_identical_in_direct_and_routed_mode() {
+    assert_parity("lead-seat-retract", |room| {
+        // First frontier to enter takes the open seat.
+        assert!(room.ok(&["enter", "--tool", "victim", "--json"]));
+        let seat = room.seat_decision_id();
+        let seized = room.ok(&[
+            "retract", &seat, "--tool", "rogue", "--reason", "take it", "--json",
+        ]);
+        let withdrawn = room.ok(&[
+            "retract",
+            &seat,
+            "--tool",
+            "victim",
+            "--reason",
+            "assigned in error",
+            "--json",
+        ]);
+        (seized, withdrawn, room.lead())
     });
 }
 

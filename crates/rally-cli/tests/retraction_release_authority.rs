@@ -393,3 +393,160 @@ fn the_ordinary_release_of_your_own_claim_still_works() {
     );
     ws.cleanup();
 }
+
+// ------------------------------------------------------------ RC-071a -------
+
+/// Read the seat and the id of the decision it rests on, straight from the
+/// room the way any agent would.
+fn seated_lead(ws: &Workspace) -> Option<String> {
+    ws.json(&["room", "--json"])["data"]["room"]["lead"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The highest-seq `role:lead` decision in the room — the fact the seat is
+/// derived from. Read from the projection rather than reconstructed, for the
+/// same reason the gate reads it there.
+fn seat_decision_id(ws: &Workspace) -> String {
+    let room = ws.json(&["room", "--json"]);
+    let decisions = room["data"]["room"]["current_decisions"]
+        .as_array()
+        .expect("current_decisions is an array")
+        .clone();
+    decisions
+        .iter()
+        .filter(|d| d["subject"].as_str() == Some("role:lead"))
+        .max_by_key(|d| d["seq"].as_i64().unwrap_or(0))
+        .and_then(|d| d["event_id"].as_str())
+        .expect("the room must carry a seated lead decision")
+        .to_string()
+}
+
+/// RC-071a, THE defect, through the shipped command. The lead seat is a
+/// NON-CLAIM fact that carries authority: RC-037's room-wide claim gate and
+/// RC-038's room-freeze both read it, and `lead handoff`/`assign`/`relinquish`
+/// are all gated. R1's ruling scoped ungated retraction to "non-claim facts",
+/// so `rally retract <seat decision>` moved the room's authority root by the
+/// one path nothing checked.
+#[test]
+fn a_non_owner_cannot_retract_the_decision_the_lead_seat_rests_on() {
+    let ws = Workspace::new("retract-seat");
+    // First frontier to enter takes the open seat.
+    ws.json(&["enter", "--tool", "lead:01", "--json"]);
+    assert_eq!(seated_lead(&ws).as_deref(), Some("lead:01"));
+    let seat = seat_decision_id(&ws);
+
+    let v = ws.json(&[
+        "retract",
+        &seat,
+        "--tool",
+        "codex:rogue",
+        "--reason",
+        "take the room",
+        "--json",
+    ]);
+
+    assert_eq!(
+        v["ok"],
+        Value::Bool(false),
+        "a non-owner retracting the seated lead decision must be REFUSED, got: {v}"
+    );
+    let err = error_text(&v);
+    assert!(
+        err.contains("lead:01") && err.contains("lead seat"),
+        "the refusal must name the incumbent and the thing being moved; got: {err}"
+    );
+    assert_eq!(
+        seated_lead(&ws).as_deref(),
+        Some("lead:01"),
+        "the incumbent must still hold the seat"
+    );
+    ws.cleanup();
+}
+
+/// The negative control, and the one that keeps the fix from replacing a
+/// security defect with an availability one: the holder may still withdraw the
+/// decision it holds the seat by, and the room then reports an open seat that
+/// the next agent can actually take.
+#[test]
+fn the_lead_can_retract_the_decision_it_holds_the_seat_by() {
+    let ws = Workspace::new("retract-seat-self");
+    ws.json(&["enter", "--tool", "lead:01", "--json"]);
+    let seat = seat_decision_id(&ws);
+
+    let v = ws.json(&[
+        "retract",
+        &seat,
+        "--tool",
+        "lead:01",
+        "--reason",
+        "assigned in error",
+        "--json",
+    ]);
+    assert_eq!(
+        v["ok"],
+        Value::Bool(true),
+        "the holder must be able to withdraw its own seat decision, got: {v}"
+    );
+    assert_eq!(
+        seated_lead(&ws),
+        None,
+        "the room must report an open seat once the decision is withdrawn"
+    );
+
+    let v = ws.json(&[
+        "lead",
+        "assign",
+        "--tool",
+        "codex:peer",
+        "--to",
+        "codex:peer",
+        "--json",
+    ]);
+    assert_eq!(
+        v["ok"],
+        Value::Bool(true),
+        "an open seat must be takeable — a gate reading the raw ledger would wedge it shut: {v}"
+    );
+    assert_eq!(seated_lead(&ws).as_deref(), Some("codex:peer"));
+    ws.cleanup();
+}
+
+/// The ruling in one line: authority-carrying facts are gated, prose is free.
+/// A live seat does not make every retraction in the room somebody else's
+/// business — an honest mistake stays fixable without asking permission.
+#[test]
+fn a_live_seat_does_not_gate_the_retraction_of_ordinary_prose() {
+    let ws = Workspace::new("retract-prose");
+    ws.json(&["enter", "--tool", "lead:01", "--json"]);
+    let note = ws.json(&[
+        "say",
+        "artifact",
+        "--tool",
+        "worker:02",
+        "--subject",
+        "wrong port number",
+        "--json",
+    ]);
+    let note_id = note["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .expect("the artifact carries an event_id")
+        .to_string();
+
+    let v = ws.json(&[
+        "retract",
+        &note_id,
+        "--tool",
+        "codex:peer",
+        "--reason",
+        "wrong, superseded",
+        "--json",
+    ]);
+    assert_eq!(
+        v["ok"],
+        Value::Bool(true),
+        "retracting a fact that carries no authority must stay open to anyone, got: {v}"
+    );
+    assert_eq!(seated_lead(&ws).as_deref(), Some("lead:01"));
+    ws.cleanup();
+}

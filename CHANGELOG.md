@@ -60,6 +60,58 @@ rather than another instance of it.
   and, if it can, routes it through the authorization gate. The class of "a correct rule
   guarding one spelling" now fails at compile time rather than in the next audit.
 
+### Fixed — `rally retract` could move the lead seat (RC-071a)
+
+The R1 ruling gated retraction of an active CLAIM and left everything else open. The lead
+seat fell through that line: it is a non-claim fact that carries authority. Every control in
+the room hangs off the seat — the room-wide claim gate and the room freeze both read "is this
+agent the lead" — and `lead handoff`, `lead assign`, and `lead relinquish` were all gated for
+exactly that reason, while `rally retract <the seat's decision>` moved the room's authority
+root by the one path nothing checked. Sixth instance of this codebase's oldest defect: a
+correct rule guarding one spelling while the ledger accepts the act.
+
+The rule now, operator-ruled: **authority-carrying facts are gated; prose is free.**
+
+- **The seat's removal follows the seat's own policy.** Withdrawing the decision the lead seat
+  rests on moves the seat, so it needs what `lead handoff` needs: the holder, a takeover after
+  the holder's silence window, or an acknowledged `--force` seizure. One policy body, two entry
+  points — the gate and the transfer command cannot drift apart. Retracting an artifact, a risk,
+  or an ordinary decision stays open to anyone: an honest mistake has to stay fixable without
+  asking permission.
+
+- **The gate asks the room, not a list of spellings.** It does not test "is this a lead
+  decision". It derives the seat, derives it again with the target withdrawn, and gates only
+  when the two answers differ. That covers the case a spelling-keyed gate would still have
+  missed — withdrawing the current decision so the seat falls BACK to an earlier lead — and
+  correctly leaves a superseded lead decision open, because withdrawing it moves nothing.
+
+- **The room-wide claim gate now reads the seat the room actually shows.** It read the raw
+  ledger, so a retracted lead decision still conferred room-wide capability while `rally room`
+  already reported no lead. That disagreement was filed and deliberately left, because
+  resolving it while retraction was ungated would have let anyone strip the lead's authority.
+  With the seat gated, both halves land together — including for the transfer gate, so a lead
+  that legitimately withdraws its own seat decision leaves a seat the next agent can take
+  rather than one wedged shut.
+
+- **New: an exhaustive seat-movement test.** For every `FactKind` and every shape that could
+  move the seat, the room is projected and any fact that actually changed the lead must have
+  been refused by the gate. The oracle is the lead projection, not a maintained list, so the
+  next single-fact way to move the seat fails this test without anyone remembering it exists.
+  Both class tests now also assert they were not skipped end to end — a removal path that stops
+  being detected used to turn them green while they asserted nothing.
+
+- **Known limit, recorded rather than implied.** This covers every way a SINGLE retraction can
+  move the seat. It does not cover a SEQUENCE that first moves the seat's authorization input:
+  the stale-owner arms authorize against a liveness projection that ungated retractions can
+  regress. That is filed as RC-071b with the owed decision, and it affects claim takeover the
+  same way — it predates this change on both arms.
+
+- **Upgrade note.** A ledger that already contains a retraction of its seated lead decision will
+  report no lead after upgrading, and the seat becomes takeable. Before this change that same
+  ledger was worse off, not better: the room showed no lead while every `lead assign` was
+  refused and `rally enter` failed outright. This repo's ledger contains no retractions at all;
+  a deployment with retraction traffic should check before upgrading.
+
 ### Fixed — a kind read off the ledger can now be typed back into `rally say`
 
 - **`rally say backlog_item` is accepted.** `FactKind::BacklogItem` reaches disk as
