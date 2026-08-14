@@ -94,9 +94,21 @@ pub(crate) const LEAD_FORCE_MARKER: &str = "lead-seizure-acknowledged";
 ///
 /// Kept as one predicate so the cost is paid by the writes that change who may
 /// do what, and by nothing else. Ordinary traffic (presence, read, artifact,
-/// handoff, risk) pays one `matches!` and the field bounds.
+/// handoff, risk) pays one `matches!`, one string-prefix test, and the field
+/// bounds.
+///
+/// The retraction arm (R1) is deliberately NOT gated on `fact.kind`. A
+/// retraction's wire kind is whatever the writing binary happened to accept —
+/// `artifact` from this CLI, and an unknown-kind remap from a peer that types
+/// build-loop's `retract` kind directly — so keying the check off any of those
+/// spellings would rebuild the exact defect this module exists to close. It is
+/// keyed off the ACT instead, and [`crate::retraction::target_of`] short-
+/// circuits on the `retract:` subject prefix, so an ordinary fact pays one
+/// string comparison for it.
 pub(crate) fn needs_authority_check(fact: &Fact) -> bool {
-    claim_authority::closes_active_claim(&fact.kind) || claim_authority::is_lead_decision(fact)
+    claim_authority::closes_active_claim(&fact.kind)
+        || claim_authority::is_lead_decision(fact)
+        || crate::retraction::target_of(fact).is_some()
 }
 
 /// Assert `fact` may be written, given the room as it stands immediately before
@@ -120,6 +132,7 @@ pub(crate) fn assert_write_authorized(
 ) -> Result<()> {
     assert_field_bounds(fact)?;
     assert_claim_close_authorized(fact, snapshot, coord)?;
+    assert_retraction_authorized(fact, snapshot, coord)?;
     assert_lead_transfer_authorized(fact, facts_before, snapshot, coord)?;
     Ok(())
 }
@@ -190,23 +203,9 @@ fn assert_identity_fields_are_single_line(fact: &Fact) -> Result<()> {
 /// that close a claim and the set that must be authorized to close one are the
 /// same list by construction. A fifth closing kind cannot add a fifth bypass.
 ///
-/// Three ways past, in order of how often they are the real answer:
-///
-/// 1. **Self-close.** The actor owns the claim. Always allowed, no time bar —
-///    releasing your own work is the normal path and most closes are this.
-/// 2. **Stale-owner takeover.** The owner has been silent past the size-scaled
-///    reclaim timeout (`claim_reclaim_eligible`, fail-closed: an owner whose
-///    `last_seen_ts` is missing or unparseable is never reclaimable). This is
-///    the same authority `command_release_by_path` already applied, reused
-///    rather than re-implemented, so there is one policy and not two.
-/// 3. **Typed expired-lease cleanup.** Lease expiry is a cleanup signal, not
-///    peer authority. Only a `ClaimExpired` transition shaped by the reaper may
-///    use it. The transition must carry the claim ref, owner/session, reason,
-///    and external-observation verdict that the store revalidates under the
-///    mutation lock. An ordinary `Release`, `Resolve`, or `Receipt` never gains
-///    authority solely because time passed.
-///
-/// A ref naming no active claim is not this gate's business and passes through.
+/// The policy itself lives in [`authorize_claim_removal`], which retraction
+/// (R1) also calls. A ref naming no active claim is not this gate's business
+/// and passes through.
 fn assert_claim_close_authorized(
     fact: &Fact,
     snapshot: &RoomSnapshot,
@@ -221,7 +220,74 @@ fn assert_claim_close_authorized(
     let Some(claim) = snapshot.active_claims.iter().find(|c| c.event_id == ref_id) else {
         return Ok(());
     };
+    authorize_claim_removal(fact, claim, fact.kind.as_str(), snapshot, coord)
+}
 
+/// R1. Who may retract a fact that WITHDRAWS somebody else's live claim.
+///
+/// A retraction drops its target from every projection bucket
+/// (`store::snapshot_from_facts_with_policy_at`). Point one at an active claim
+/// and the claim is gone from `rally room`, from `check before-write`, and from
+/// every peer's session-start context — the same observable effect a `release`
+/// has, reached by a path the close gate never saw because a retraction is not
+/// one of the four closing kinds.
+///
+/// Same three-arm policy as [`assert_claim_close_authorized`], reused rather
+/// than restated: one authority policy, two entry points. Arm 3 (typed reaper
+/// lease expiry) requires `FactKind::ClaimExpired` and so is structurally
+/// unreachable for a retraction, which is correct — a retraction is a
+/// correction, not reaper cleanup.
+///
+/// Retraction of anything that is NOT an active claim stays ungated. That is
+/// the deliberate ruling, not an oversight: the whole point of retraction is
+/// that an honest mistake stays fixable without asking permission, and a wrong
+/// artifact, decision, or risk harms nobody's write safety by being withdrawn.
+fn assert_retraction_authorized(
+    fact: &Fact,
+    snapshot: &RoomSnapshot,
+    coord: &CoordinationConfig,
+) -> Result<()> {
+    let Some(target) = crate::retraction::target_of(fact) else {
+        return Ok(());
+    };
+    let Some(claim) = snapshot.active_claims.iter().find(|c| c.event_id == target) else {
+        return Ok(());
+    };
+    authorize_claim_removal(fact, claim, "retract", snapshot, coord)
+}
+
+/// The three-arm policy itself, shared by every path that removes an active
+/// claim from the room.
+///
+/// Three ways past, in order of how often they are the real answer:
+///
+/// 1. **Self-close.** The actor owns the claim. Always allowed, no time bar —
+///    releasing your own work is the normal path and most closes are this.
+/// 2. **Stale-owner takeover.** The owner has been silent past the size-scaled
+///    reclaim timeout (`claim_reclaim_eligible`, fail-closed: an owner whose
+///    `last_seen_ts` is missing or unparseable is never reclaimable). This is
+///    the same authority `command_release_by_path` already applied, reused
+///    rather than re-implemented, so there is one policy and not two.
+/// 3. **Typed expired-lease cleanup.** Lease expiry is a cleanup signal, not
+///    peer authority. Only a `ClaimExpired` transition shaped by the reaper may
+///    use it. The transition must carry the claim ref, owner/session, reason,
+///    and external-observation verdict that the store revalidates under the
+///    mutation lock. An ordinary `Release`, `Resolve`, `Receipt`, or retraction
+///    never gains authority solely because time passed.
+///
+/// `action` names the act in the refusal, because the caller knows the spelling
+/// and this function should not have to. Keeping the policy in ONE body is the
+/// whole point: ARP-R-02 happened because the closing-kind list and the
+/// authorized-kind list were maintained separately and drifted, and R1 happened
+/// because a second removal path never reached the list at all.
+fn authorize_claim_removal(
+    fact: &Fact,
+    claim: &Fact,
+    action: &str,
+    snapshot: &RoomSnapshot,
+    coord: &CoordinationConfig,
+) -> Result<()> {
+    let claim_id = claim.event_id.as_str();
     // 1. Self-close. Session identity is authoritative when present. A modern
     // stamped caller retains one-way compatibility with a historical
     // sessionless claim only when both name the same present, nonblank tool.
@@ -246,8 +312,7 @@ fn assert_claim_close_authorized(
     {
         let actor = fact.tool.as_deref().unwrap_or("<unknown>");
         return Err(RallyError::Usage(format!(
-            "{} failed: claim {ref_id} belongs to another {actor} session; shared tool labels do not confer claim authority. Ask the owning session to release it.",
-            fact.kind.as_str()
+            "{action} failed: claim {claim_id} belongs to another {actor} session; shared tool labels do not confer claim authority. Ask the owning session to release it."
         )));
     }
     if takeover_eligible {
@@ -266,12 +331,11 @@ fn assert_claim_close_authorized(
         crate::decay::WorkSize::Large => coord.reclaim_large_minutes,
     };
     Err(RallyError::Usage(format!(
-        "{} failed: claim {ref_id} is owned by {owner} and {actor} is not the owner. \
+        "{action} failed: claim {claim_id} is owned by {owner} and {actor} is not the owner. \
          An ordinary non-owner close is allowed only after the owner has been silent for \
          {timeout_minutes} minutes; lease expiry is reserved for typed ClaimExpired cleanup. \
          Ask {owner} to release it, wait out the reclaim window, or run the reaper/operator \
-         cleanup path.",
-        fact.kind.as_str()
+         cleanup path."
     )))
 }
 
@@ -435,4 +499,183 @@ fn lead_is_stale(snapshot: &RoomSnapshot, incumbent: &str, coord: &CoordinationC
                 .map(|dt| now_secs - dt.timestamp() > timeout)
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Squad;
+    use chrono::{Duration, SecondsFormat, Utc};
+
+    fn iso_ago(secs: i64) -> String {
+        (Utc::now() - Duration::seconds(secs)).to_rfc3339_opts(SecondsFormat::Secs, true)
+    }
+
+    fn squad(tool: &str, silent_secs: i64) -> Squad {
+        Squad {
+            tool: tool.to_string(),
+            last_seen_seq: 1,
+            last_seen_ts: iso_ago(silent_secs),
+            status: "idle".to_string(),
+            acknowledged: false,
+        }
+    }
+
+    /// One live single-file claim owned by `owner`, whose owner has been silent
+    /// for `owner_silent_secs`. Single-file scope means the SMALL (30 min)
+    /// reclaim window applies.
+    fn room_with_claim(owner: &str, owner_silent_secs: i64) -> (Fact, RoomSnapshot) {
+        let claim = Fact {
+            event_id: "claim-1".to_string(),
+            kind: FactKind::Claim,
+            tool: Some(owner.to_string()),
+            from_session_id: Some(format!("sess:{owner}")),
+            scope: vec!["file:src/a.rs".to_string()],
+            subject: "owns it".to_string(),
+            created_at: iso_ago(0),
+            ..Fact::default()
+        };
+        let snapshot = RoomSnapshot {
+            active_claims: vec![claim.clone()],
+            squads: vec![squad(owner, owner_silent_secs)],
+            ..Default::default()
+        };
+        (claim, snapshot)
+    }
+
+    /// A retraction exactly as `rally retract` writes it: artifact kind, the
+    /// anchored `retract: <id>` subject, `ref` naming the target.
+    fn retraction_by(tool: &str, target: &str) -> Fact {
+        Fact {
+            event_id: "r-1".to_string(),
+            kind: FactKind::Artifact,
+            tool: Some(tool.to_string()),
+            from_session_id: Some(format!("sess:{tool}")),
+            subject: crate::retraction::subject_for(target),
+            summary: Some(crate::retraction::summary_for(target, "withdrawn", None)),
+            ref_id: Some(target.to_string()),
+            status: Some("retraction".to_string()),
+            created_at: iso_ago(0),
+            ..Fact::default()
+        }
+    }
+
+    fn refusal(fact: &Fact, snapshot: &RoomSnapshot) -> String {
+        let coord = CoordinationConfig::default();
+        match assert_write_authorized(fact, &[], snapshot, &coord) {
+            Ok(()) => panic!("expected a refusal, the write was authorized"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    fn authorized(fact: &Fact, snapshot: &RoomSnapshot) {
+        let coord = CoordinationConfig::default();
+        assert_write_authorized(fact, &[], snapshot, &coord)
+            .unwrap_or_else(|err| panic!("expected authorization, got refusal: {err}"));
+    }
+
+    /// R1, THE defect. A retraction drops its target from every projection, so
+    /// pointing one at a live claim strips the claim exactly as a `release`
+    /// does — and `needs_authority_check` never saw it, because a retraction is
+    /// not one of the four closing kinds.
+    #[test]
+    fn non_owner_cannot_retract_a_live_claim() {
+        // Owner seen 1 minute ago: nowhere near the 30-minute small window.
+        let (claim, snapshot) = room_with_claim("victim:01", 60);
+        let fact = retraction_by("codex:rogue", &claim.event_id);
+
+        assert!(
+            needs_authority_check(&fact),
+            "a claim-targeting retraction must reach the authority gate at all"
+        );
+        let err = refusal(&fact, &snapshot);
+        assert!(
+            err.contains("retract failed"),
+            "the refusal must name the act the caller attempted; got: {err}"
+        );
+        assert!(
+            err.contains("victim:01") && err.contains("not the owner"),
+            "the refusal must name the owner so the caller knows who to ask; got: {err}"
+        );
+    }
+
+    /// Arm 1. Withdrawing your own claim is the normal path and stays free.
+    #[test]
+    fn the_owner_can_retract_its_own_claim() {
+        let (claim, snapshot) = room_with_claim("victim:01", 60);
+        authorized(&retraction_by("victim:01", &claim.event_id), &snapshot);
+    }
+
+    /// Arm 2. Same size-scaled silence window as `release`, reused rather than
+    /// restated — a single-file claim opens at 30 minutes.
+    #[test]
+    fn a_stale_owners_claim_can_be_retracted_by_a_peer() {
+        let (claim, fresh) = room_with_claim("victim:01", 29 * 60);
+        let fact = retraction_by("codex:peer", &claim.event_id);
+        assert!(
+            refusal(&fact, &fresh).contains("not the owner"),
+            "29 minutes of silence is inside the small window and must still refuse"
+        );
+
+        let (claim, stale) = room_with_claim("victim:01", 31 * 60);
+        authorized(&retraction_by("codex:peer", &claim.event_id), &stale);
+    }
+
+    /// The judged ruling's invariant 3: retraction of a NON-claim fact stays
+    /// ungated, so an honest mistake stays fixable without asking permission.
+    /// This is the arm that keeps R1's fix from making the room brittle.
+    #[test]
+    fn retracting_a_non_claim_fact_stays_ungated() {
+        let (_claim, snapshot) = room_with_claim("victim:01", 60);
+        // Targets a fact that is not an active claim.
+        let fact = retraction_by("codex:peer", "some-artifact-id");
+        assert!(
+            needs_authority_check(&fact),
+            "the gate still LOOKS at every retraction"
+        );
+        authorized(&fact, &snapshot);
+    }
+
+    /// A sibling process wearing the owner's tool label is not the owner. Same
+    /// rule the close path applies, reached through the retraction entry point.
+    #[test]
+    fn a_sibling_session_sharing_the_tool_label_cannot_retract_the_claim() {
+        let (claim, snapshot) = room_with_claim("victim:01", 60);
+        let mut fact = retraction_by("victim:01", &claim.event_id);
+        fact.from_session_id = Some("sess:victim:01:OTHER".to_string());
+        let err = refusal(&fact, &snapshot);
+        assert!(
+            err.contains("another victim:01 session"),
+            "the refusal must say the label is not the identity; got: {err}"
+        );
+    }
+
+    /// R2 + R1 together. The `retracts=` summary token is no longer a detection
+    /// carrier, so it cannot be used to smuggle a claim strip past the gate
+    /// under an innocuous subject — the act has exactly two spellings and the
+    /// gate covers both.
+    #[test]
+    fn a_summary_token_cannot_smuggle_a_claim_strip_past_the_gate() {
+        let (claim, snapshot) = room_with_claim("victim:01", 60);
+        let smuggled = Fact {
+            event_id: "s-1".to_string(),
+            kind: FactKind::Artifact,
+            tool: Some("codex:rogue".to_string()),
+            subject: "just a note".to_string(),
+            summary: Some(format!("nothing to see [retracts={}]", claim.event_id)),
+            created_at: iso_ago(0),
+            ..Fact::default()
+        };
+        assert!(
+            crate::retraction::target_of(&smuggled).is_none(),
+            "the token carrier is gone, so this withdraws nothing"
+        );
+        // It reaches the ledger — and, withdrawing nothing, leaves the claim up.
+        authorized(&smuggled, &snapshot);
+        assert!(
+            !crate::retraction::retracted_ids(std::slice::from_ref(&smuggled))
+                .contains(&claim.event_id),
+            "the claim must remain live"
+        );
+    }
 }
