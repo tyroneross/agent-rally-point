@@ -598,9 +598,14 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
     //   9: B11 risk fact (second enter's duplicate-active-squad detection;
     //      the unmanaged-agent risk dedups via already_recorded check)
     //   10: Read checkpoint (second enter records content_max_seq=9)
-    // cursor_after = snapshot.max_seq = 10.
+    // cursor_after = snapshot.max_seq = 9. The cursor is the seq this tool has
+    // READ up to, and the snapshot behind it is taken before the checkpoint is
+    // appended — so it is the value the checkpoint RECORDS (9), never the
+    // checkpoint's own seq (10). A cursor that counted its own checkpoint would
+    // claim the tool had read a fact written after it stopped reading. The
+    // first enter above is the same rule: checkpoint at seq 8, cursor 7.
     assert_eq!(enter_again["data"]["enter"]["cursor"]["before"], 7);
-    assert_eq!(enter_again["data"]["enter"]["cursor"]["after"], 10);
+    assert_eq!(enter_again["data"]["enter"]["cursor"]["after"], 9);
     assert_eq!(enter_again["data"]["enter"]["cursor"]["advanced"], true);
 
     let (check, check_output) = workspace.json_with_status(&[

@@ -275,7 +275,26 @@ fn unscoped_blocker_from_a_non_lead_does_not_deny_every_write() {
 /// presence. The rejection also named a file the coarse claimant did not own.
 ///
 /// Revert `resource_scope::root_contains` and the first assertion fails;
-/// revert `claim_authority::breadth_violation` and the third fails.
+/// revert `claim_authority::breadth_violation` and the fourth fails.
+///
+/// A refused claim reports one of TWO honest shapes, and which one you get
+/// depends on `ensure_presence` being idempotent per protocol session (see
+/// `lib.rs` — an existing presence for the same tool and `from_session_id` is a
+/// no-op, made deliberate by "Scope lifecycle authority to protocol sessions"):
+///
+/// * A caller that ALREADY has presence (it ran `enter`, or said anything
+///   earlier) appends nothing before admission refuses the claim. Nothing
+///   committed, so the honest answer is a plain refusal — exit 2 — and the
+///   ledger must be byte-for-byte unchanged across the command.
+/// * A caller with NO prior presence commits its auto-presence first, and only
+///   then does admission refuse the claim. Something DID commit, so O26 requires
+///   the non-retryable typed partial commit — exit 1 — naming exactly that one
+///   append.
+///
+/// Both shapes are asserted below. Collapsing them into one expectation is how
+/// this test went stale: it asserted the partial commit for a caller that had
+/// already entered, which stopped committing presence and started returning the
+/// cleaner exit 2.
 #[test]
 fn coarse_claim_does_not_lock_the_room_out_of_claiming() {
     let workspace = Workspace::new("rally-rc037-coarse-claim");
@@ -314,9 +333,13 @@ fn coarse_claim_does_not_lock_the_room_out_of_claiming() {
         String::from_utf8_lossy(&peer_claim.stderr)
     );
 
-    // 2. A genuine same-path conflict is still rejected, and the message now
-    //    names the scope the OWNER holds rather than the one the claimant asked
-    //    for.
+    // 2. A genuine same-path conflict is still rejected, and the message names
+    //    the scope the OWNER holds rather than the one the claimant asked for.
+    //    `rogue` entered at the top of this test, so its presence is already
+    //    canonical and this command appends NOTHING before admission refuses
+    //    it. Nothing committed means the honest response is the plain refusal,
+    //    not a partial commit that would claim a write that never happened.
+    let events_before = workspace.log_events().len();
     let colliding = workspace.output(&[
         "say",
         "claim",
@@ -328,12 +351,62 @@ fn coarse_claim_does_not_lock_the_room_out_of_claiming() {
         "--subject",
         "collide",
     ]);
-    // O26 makes the command boundary honest about auto-presence: this process
-    // committed its presence before claim admission rejected the conflicting
-    // required append. The response must therefore be a non-retryable typed
-    // partial commit, not the old usage-only exit.
-    assert_eq!(colliding.status.code(), Some(1));
-    let body: Value = serde_json::from_slice(&colliding.stdout).unwrap();
+    assert_eq!(
+        colliding.status.code(),
+        Some(2),
+        "a refusal that committed nothing must exit 2, not report a partial commit; stdout: {}",
+        String::from_utf8_lossy(&colliding.stdout)
+    );
+    assert!(
+        colliding.stdout.is_empty(),
+        "a refusal that committed nothing must not print a result envelope on stdout; got: {}",
+        String::from_utf8_lossy(&colliding.stdout)
+    );
+    let body: Value = serde_json::from_slice(&colliding.stderr).unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["exit_code"], 2);
+    assert_eq!(
+        body["command"],
+        Value::Null,
+        "a clean refusal carries no partial-commit envelope; got: {body}"
+    );
+    let refusal = body["error"].as_str().unwrap();
+    assert!(
+        refusal.contains("lead_agent holds file:src/lib.rs"),
+        "the rejection must name the real owner and the scope it really holds; got: {refusal}"
+    );
+    assert!(
+        refusal.contains("overlaps the scope you requested"),
+        "the rejection must say the incoming scope overlapped; got: {refusal}"
+    );
+    assert_eq!(
+        workspace.log_events().len(),
+        events_before,
+        "a refused claim by an already-present caller must not append a single canonical event"
+    );
+
+    // 2b. The O26 partial commit is still the answer when something DID commit
+    //     first. A caller with no prior presence writes its auto-presence, and
+    //     only then does admission refuse the claim — so the command must own
+    //     up to the write it made rather than exit as if it had made none.
+    let newcomer = workspace.output(&[
+        "say",
+        "claim",
+        "--json",
+        "--tool",
+        "newcomer",
+        "--path",
+        "src/lib.rs",
+        "--subject",
+        "collide",
+    ]);
+    assert_eq!(
+        newcomer.status.code(),
+        Some(1),
+        "a refusal that already committed auto-presence must report a partial commit; stdout: {}",
+        String::from_utf8_lossy(&newcomer.stdout)
+    );
+    let body: Value = serde_json::from_slice(&newcomer.stdout).unwrap();
     assert_eq!(body["ok"], false);
     assert_eq!(body["command"], "partial_commit");
     assert_eq!(body["data"]["committed"], true);
@@ -350,7 +423,7 @@ fn coarse_claim_does_not_lock_the_room_out_of_claiming() {
     assert_eq!(presence["committed"], true);
     assert_eq!(presence["projection_complete"], false);
     assert_eq!(presence["fact"]["kind"], "presence");
-    assert_eq!(presence["fact"]["tool"], "rogue");
+    assert_eq!(presence["fact"]["tool"], "newcomer");
     let presence_seq = presence["fact"]["seq"].as_i64().unwrap();
     assert!(presence_seq > 0);
     let presence_id = presence["fact"]["event_id"].as_str().unwrap();
@@ -374,7 +447,10 @@ fn coarse_claim_does_not_lock_the_room_out_of_claiming() {
     );
 
     // 3. Room-wide breadth is still expressible, and still gated: the lead may
-    //    take it, a peer may not.
+    //    take it, a peer may not. `rogue` is present here too, so the breadth
+    //    refusal is the same clean exit-2 shape as case 2 — the gate fires
+    //    before any append, and the ledger must not move.
+    let events_before = workspace.log_events().len();
     let rogue_wildcard = workspace.output(&[
         "say",
         "claim",
@@ -386,24 +462,33 @@ fn coarse_claim_does_not_lock_the_room_out_of_claiming() {
         "--subject",
         "room-wide grab",
     ]);
-    assert_eq!(rogue_wildcard.status.code(), Some(1));
-    let body: Value = serde_json::from_slice(&rogue_wildcard.stdout).unwrap();
-    assert_eq!(body["ok"], false);
-    assert_eq!(body["command"], "partial_commit");
-    assert_eq!(body["data"]["committed"], true);
-    assert_eq!(body["data"]["projection_complete"], false);
-    let wildcard_outcomes = body["data"]["append_outcomes"].as_array().unwrap();
-    assert_eq!(wildcard_outcomes.len(), 1);
-    assert_eq!(wildcard_outcomes[0]["fact"]["kind"], "presence");
     assert_eq!(
-        wildcard_outcomes[0]["warnings"][0]["code"],
-        "post_commit_work"
+        rogue_wildcard.status.code(),
+        Some(2),
+        "the breadth gate refuses before any append; stdout: {}",
+        String::from_utf8_lossy(&rogue_wildcard.stdout)
     );
     assert!(
-        wildcard_outcomes[0]["warnings"][0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("only the lead may hold it")
+        rogue_wildcard.stdout.is_empty(),
+        "the breadth refusal must not print a result envelope on stdout; got: {}",
+        String::from_utf8_lossy(&rogue_wildcard.stdout)
+    );
+    let body: Value = serde_json::from_slice(&rogue_wildcard.stderr).unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["exit_code"], 2);
+    let refusal = body["error"].as_str().unwrap();
+    assert!(
+        refusal.contains("only the lead may hold it"),
+        "the breadth refusal must say the seat is what gates it; got: {refusal}"
+    );
+    assert!(
+        refusal.contains("lead_agent holds the lead seat, not rogue"),
+        "the breadth refusal must name who holds the seat and who asked; got: {refusal}"
+    );
+    assert_eq!(
+        workspace.log_events().len(),
+        events_before,
+        "a refused room-wide grab must not append a single canonical event"
     );
 
     workspace.cleanup();
