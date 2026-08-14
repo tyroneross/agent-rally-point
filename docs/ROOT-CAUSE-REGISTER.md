@@ -2823,3 +2823,43 @@ hooks" (contradicted by four committed hook-registration files) were all self-as
 strengthened over time, and none ever graded against the code. Nothing in the pipeline reads a
 claim and asks the implementation whether it is true. See
 [`rca-2026-08-02-security-findings-escaped.md`](rca-2026-08-02-security-findings-escaped.md) RC-C.
+
+### RC-070 — "advises by default" is a claim about Rally's own hook only; a consumer converts an unanswered check into a hard deny
+
+- **State:** `observed` in a consumer, 2026-08-14. **Not a Rally code defect. Not fixed.**
+- **The claim.** `README` and [`docs/security/TRUST-MODEL.md`](security/TRUST-MODEL.md) state that
+  Rally advises by default and that blocking is reachable only through three opt-in switches
+  (`RALLY_HOOK_STRICT=1`, `check before-write --strict` exit 4, `RALLY_BEFORE_WRITE_FAILCLOSED=1`).
+  `hooks/rally-coordination-hook.sh:29` honors that: any CLI error, timeout, or missing binary
+  exits 0.
+- **What actually happened.** In `ross-labs-astro` on 2026-08-14, every `Write`/`Edit` was denied
+  for ~15 minutes with `RULE: rally-before-write blocked this edit: coordination check unavailable:
+  Rally returned no valid allow decision`. No `RALLY_*` variable was set in the environment. The
+  deny came from a consumer, RossLabs-AI-Assistant's router (`core/router_core.py:2133-2156`),
+  which runs its own `rally check before-write --strict` and treats a non-answer (`allow is None`,
+  produced by a timeout, empty stdout, or unparseable output alike) as `allow: false`.
+- **Why Rally's own fail-open hook did not cover it.** The consumer defers to Rally's hook only
+  when `rally hooks status --json` reports enabled (`router_core.py:1101`). A failed status read
+  returns `{}`, `.get("enabled")` is falsy, and the consumer concludes hooks are OFF and enforces
+  locally. A Rally outage is therefore the exact condition that disables deference to the
+  fail-open path.
+- **The Rally-side gap, stated plainly: nothing in this repo verifies that a consumer honors the
+  advisory-by-default posture.** The three opt-in switches are enforced inside our hook, and our
+  hook alone. Any host integration that shells `rally check` and reads `allow` is free to invert
+  the default, and the contract has no conformance test, no `rally doctor` probe, and no schema
+  affordance that distinguishes "denied" from "could not answer."
+- **The distinction the JSON does not make.** `check.allow` is a bool on success and absent on
+  failure. A consumer that reads `allow != true` cannot tell refusal from unavailability without
+  also inspecting `ok` and the process exit code. That ambiguity is what the consumer collapsed.
+- **Corrective options, Rally side:**
+  1. Emit an explicit tri-state in the check envelope (`decision: allow | deny | unavailable`)
+     so a consumer cannot reach "deny" by reading a missing field.
+  2. Add a host-conformance check to `rally doctor` that shells each registered integration with a
+     stubbed-unresponsive CLI and asserts the write is still permitted absent an opt-in switch.
+  3. State in `TRUST-MODEL.md` that the advisory guarantee covers Rally's own hook and not
+     arbitrary consumers, so the README claim stops over-promising.
+- **Consumer-side entry:** `RossLabs-AI-Assistant/.build-loop/issues/rally-check-unavailable-denies-every-write.md`
+  carries the mechanism, the fix ladder, and the golden-test actuator
+  (`scripts/rule_check_golden.py:157` currently pins the deny behavior).
+- **Blast radius:** 56 repositories under `~/dev/git-folder` contain `.rally/`; each is exposed on
+  any host running that consumer whenever Rally is briefly unresponsive.
