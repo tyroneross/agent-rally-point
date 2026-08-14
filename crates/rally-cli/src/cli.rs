@@ -940,7 +940,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .map(CliCommand::Locate);
     let retract = retract_parser()
         .to_options()
-        .descr("Withdraw a posted fact by appending a retraction naming its event id. The ledger is never rewritten; room/next/recent stop surfacing the withdrawn fact while the retraction stays visible.")
+        .descr("Withdraw a posted fact by appending a retraction naming its event id. The ledger is never rewritten; room/next/recent stop surfacing the withdrawn fact while the retraction stays visible. Retracting a fact that closes or withdraws another agent's active claim follows the same rules as `release`: the owner, a takeover after the owner's size-scaled silence window, or an expired lease. Like every Rally rule, this stops accidents and honest mistakes — identity is self-asserted and unsigned, so it is not a security boundary and cannot stop an agent that lies about its name. Retracting anything else is open to anyone.")
         .command("retract")
         .map(CliCommand::Retract);
     let recent = recent_parser()

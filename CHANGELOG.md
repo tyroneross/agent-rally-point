@@ -7,6 +7,59 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Fixed — retraction and release could close a claim through spellings the write gate did not check
+
+One defect wearing five names (R1–R5): the write-authority gate asserted a correct rule
+on the paths it knew, and the ledger accepted the same EFFECT through paths it did not.
+This is the fifth cycle of that class here (RC-029, ARP-R-01, ARP-R-02, retraction, and
+now the release scope-sweep), so the last change is a test that enumerates the class
+rather than another instance of it.
+
+- **A non-owner could strip a live claim with `rally retract` (R1).** A retraction drops
+  its target from every projection bucket, so pointing one at an active claim removed it
+  from `rally room`, from `check before-write`, and from every peer's session-start
+  context — the same observable effect a `release` has, reached by a path the gate never
+  saw, because a retraction is not one of the four kinds `closes_active_claim` lists.
+  Claim-targeting retractions now run the SAME three-arm policy as claim-close (owner,
+  stale-owner takeover, typed expired-lease cleanup), sharing one policy body rather than
+  a second copy. Retraction of a non-claim fact stays open to anyone, on purpose: an
+  honest mistake has to stay fixable without asking permission.
+
+- **A release could sweep a peer's claim through `--scope` (R5).** A release closes every
+  active claim whose scope overlaps its own free-text `fact.scope`, while the gate
+  authorized only the claim named by `ref_id` and never read `fact.scope`. Authorization
+  and effect were keyed off two different fields, so
+  `rally say release --ref <your own claim> --path <victim's path>` passed a gate that
+  had nothing to do with the claim being closed. Every claim the sweep would take is now
+  checked, by calling the projection's own predicate rather than restating it.
+
+- **A retracted claim still blocked its own scope (R3).** The room projection filters
+  retracted facts before projecting active claims; `detect_conflict` read raw facts. A
+  withdrawn claim was therefore invisible in `rally room` yet still refused every later
+  claim on its scope, and no surface could explain the refusal. Conflict detection now
+  reuses the projection's own retraction filter, so both answers agree by construction —
+  including the second-order case, where a retracted RELEASE revives the claim it closed.
+
+- **Retraction detection lost a carrier (R2).** The `retracts=<id>` summary token was a
+  third spelling of one act, and every gate reasoning about retraction had to cover all
+  three. build-loop's resolver already writes the anchored `retract: <id>` subject
+  redundantly and checks it first, so the token caught nothing the subject missed. It is
+  still EMITTED — build-loop parses `superseded_by` out of the same bracket block, and
+  strips exactly `[retracts=...]` off a surfaced reason — but it is no longer read here.
+
+- **The docs said something untrue, and now do not (R4).** `RALLY.md`'s "Nothing is ever
+  dropped silently" described budget truncation only. Retraction is a second removal path
+  with a different signal: truncation reports itself through `totals` and `composition`,
+  retraction removes by design and leaves the retraction record behind. Both are named
+  now, and `RALLY.md` plus `rally retract --help` state the claim-close rule and its
+  limit — identity is self-asserted and unsigned, so this stops accidents and honest
+  mistakes, not an agent that lies about its name.
+
+- **New: an exhaustive closing-effects test.** `FactKind` is matched with no wildcard arm,
+  so a new kind cannot compile until someone decides whether it can close or mask a claim
+  and, if it can, routes it through the authorization gate. The class of "a correct rule
+  guarding one spelling" now fails at compile time rather than in the next audit.
+
 ### Fixed — a kind read off the ledger can now be typed back into `rally say`
 
 - **`rally say backlog_item` is accepted.** `FactKind::BacklogItem` reaches disk as

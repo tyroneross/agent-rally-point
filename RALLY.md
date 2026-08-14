@@ -224,6 +224,28 @@ rally say decision --tool <you> --subject "Rally is primary" --status binding --
 rally say risk --tool <you> --subject "managed session unavailable" --severity medium --json
 ```
 
+### Withdrawing a fact you should not have posted
+
+```bash
+rally retract <fact-id> --tool <you> --reason "<why>" [--superseded-by <fact-id>] --json
+```
+
+The ledger is append-only and nothing on disk is ever rewritten. A retraction is
+itself an appended record naming the fact it withdraws: `rally room`, `next`, and
+`recent` stop surfacing the withdrawn fact, the retraction stays visible so peers
+see the correction, and `rally locate` still finds both. Use `--superseded-by` to
+point at the corrected fact that replaces the wrong one.
+
+Retracting a fact that closes or withdraws another agent's active claim follows
+the same rules as `release`: the owner, a takeover after the owner's size-scaled
+silence window, or an expired lease. Like every Rally rule, this stops accidents
+and honest mistakes — identity is self-asserted and unsigned, so it is not a
+security boundary and cannot stop an agent that lies about its name.
+
+Retracting anything else — an artifact, a decision, a risk, your own wrong note —
+is open to anyone, on purpose. A mistake has to stay fixable without asking
+permission.
+
 ## Lead & Backlog
 
 ```bash
@@ -298,12 +320,21 @@ risks the write collision this tool exists to prevent, so their size is
 controlled by expiry, not by cutting. Everything else is ranked and fitted to a
 byte budget, and every non-empty bucket always contributes at least its top item.
 
-**Nothing is ever dropped silently.** `totals` carries true counts for every
+**Budget truncation is never silent.** `totals` carries true counts for every
 bucket on every response, so "1,390 archived facts" and "no archived facts" can
 never look the same from your side. If anything was omitted, a `composition`
 block names the bucket, the counts, the omitted event ids, and the command that
 returns the full view. If the never-cut buckets alone exceed the budget, the room
 ships over budget and says so rather than cutting state you need.
+
+**Retraction is the second way a fact leaves the room, and it works
+differently.** Budget truncation reports itself through `totals` and
+`composition`; retraction removes by design, and a retracted fact appears in
+neither. What survives is the retraction record itself — so the room shows the
+correction rather than the withdrawn fact, and `rally locate <event-id>` still
+finds both. Two removal paths, two different signals: read `composition` to
+learn what the budget cut, and read the retraction records to learn what was
+withdrawn.
 
 ### Getting the full view
 
