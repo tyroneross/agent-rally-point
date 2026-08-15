@@ -3140,4 +3140,11 @@ claim and asks the implementation whether it is true. See
   `permissionDecision: "allow"` on Claude, which is a grant and carries the same charter smell
   this entry rejected for the abort path; (b) the pre-Rally rejection paths (unknown tool,
   malformed envelope, path outside root, target ceiling, node absent) also print an exact `{}`
-  — same fail-loud class, wider blast radius.
+  — same fail-loud class, wider blast radius. (c) **The RC-040 GAP 2A guard has a
+  blind spot this change walked into from the other side.** Its sink detector matches
+  `key: identifier` in the node emitters, so a `printf '{"systemMessage":"%s"}'` emitter in
+  shell is invisible to it; what actually caught `_rally_abort_envelope` was an unrelated
+  collision — a local named `msg`, the same name the allowlist greps for, which made the
+  allowlist's "hook-authored" claim ungradable. The local was renamed to `abort_advisory` and
+  the reason for the name is recorded at the definition. The guard found a real problem for
+  the wrong reason, and its shell-emitter gap is still open.
