@@ -3056,3 +3056,88 @@ claim and asks the implementation whether it is true. See
   loudly at the gate. (c) A seat seizure via a hand-built marker-bearing retraction records less
   than `lead assign --force` does — decide whether arm 4 should require a `displaced:<incumbent>`
   entry the gate validates.
+
+### RC-072 — the release gate was flaky because the harness paid a macOS first-exec tax inside a production budget, and a missed budget was invisible on the only channel the host reads
+
+- **State:** `controlled` — the mechanism is measured, the fix landed, and the control was
+  validated by mutation in both directions.
+- **Symptom:** `scripts/check-release-parity.sh` failed. Its only failing component was
+  `tests/hooks/test_rally_coordination_hook.sh`, and the FAILING SET CHANGED between runs —
+  5, then 4, then a different 8 of 68 cases. Three separate sessions read this as "a few bad
+  tests" and as "the machine is loaded."
+- **Both readings were wrong, and the second one was mine.** I opened this entry believing the
+  cause was CPU load against the hook's per-call millisecond budgets. That hypothesis survived
+  one bad measurement (a timing loop that spawned `python3` twice per sample, producing a 741ms
+  outlier that was python startup, not the thing being timed) and died on the next: the perl
+  `Time::HiRes::ualarm` watchdog production uses, wrapped around an already-executed stub,
+  measures **p50 17ms / p99 22ms / max 22ms, 0 of 100 over the 400ms budget at load-avg 10.8**.
+  The failing case also would not reproduce standalone — **0 failures in 60 attempts at
+  load-avg 10.4** — while the full suite failed reliably.
+- **Mechanism, established by instrumenting every abort site and re-running the suite:** 16
+  aborts per run, 14 of them `hook settings unavailable`, all carrying **RC=124** — the watchdog
+  genuinely firing on `rally_timeout_ms 400 hooks status --json`
+  (`hooks/rally-coordination-hook.sh`, the `before-write` mutation branch). What actually
+  consumed the 400ms was **macOS first-execution evaluation** (Gatekeeper / `syspolicyd` /
+  XProtect plus code-signing evaluation of an unsigned ad-hoc script). The harness mints a NEW
+  stub executable per test case, so nearly every case paid that tax inside a production budget.
+  Measured over 12 freshly created `#!/usr/bin/env bash` scripts, first exec vs second exec of
+  the same file:
+
+  | | ms |
+  |---|---|
+  | first exec | 356 411 445 452 453 456 476 481 485 491 504 953 → p50 **476**, **11/12 over 400ms** |
+  | second exec | 6 6 6 6 6 6 6 7 7 7 7 7 → p50 **6**, **0/12 over 400ms** |
+
+  This is why the failing set wandered, why isolation with 1.2s spacing passed 10/10 (same stub
+  file, warm after the first run), and why load appeared to correlate — load modulates the tax
+  without being the tax.
+- **The second defect, which the first one exposed:** on a missed budget every abort path printed
+  a bare `{}` on stdout and put its explanation on stderr. Hosts do not surface hook stderr, and
+  on stdout `{}` from an aborted coordination call is **byte-identical to `{}` from a clean
+  check**. The agent then edited **unclaimed while believing it had been deconflicted** — a
+  silent violation of the `NORTH_STAR.md` fail-loud invariant, in the one place where a
+  coordination substrate must not be silent. The stderr note was additionally suppressed after
+  its first occurrence by a `.rally/.hook-seen/<session>.mutation-abort.seen` marker that
+  outlives the session, so a repeat abort was silent on **both** channels. Confirmed directly:
+  a reproduced abort emitted `{}` with completely empty stderr.
+- **Fix, in the order the causes were established:**
+  1. `tests/hooks/test_rally_coordination_hook.sh` — `install_stub()` replaces every bare
+     `chmod +x` on a stub (21 sites) and pays the OS evaluation up front, untimed. Production
+     never pays this tax: the real `rally` binary is executed repeatedly and evaluated once, at
+     install time. **Aborts per suite run fell 16 → 6, and `hook settings unavailable` 14 → 1.**
+  2. `hooks/rally-coordination-hook.sh` — `_rally_abort_envelope()` makes all five abort paths
+     advise on stdout. It deliberately carries **no permission field at all**: `deny` would gate
+     the edit and `allow` would GRANT it, and the charter says rally does neither. An abort is
+     not a judgment about the edit; it is a report that no judgment was made.
+  3. `RALLY_HOOK_MS_BUDGET_SCALE` (integer 1–16, **production default 1, unchanged**) multiplies
+     both the outer guard and the `--timeout-ms` the CLI is told, so the two can never disagree.
+     The harness sets 8. This is the residual only: after (1), a warm stub measures p50 20ms /
+     p99 36ms / max 52ms with 0 of 200 over the 250ms floor at load-avg 8.6, but at load-avg 18
+     the 400ms budget was still missed twice in one run. At pathological load a correct
+     implementation SHOULD abort — and after (2) that abort is visible, which is the designed
+     behavior rather than the bug.
+- **What was deliberately NOT done:** the production budgets were not raised. The first-exec tax
+  is an artifact of the harness, and relaxing a production bound to accommodate a cost production
+  does not pay would have hidden the real mechanism behind a number that looked tuned. No retry
+  was added either — Rally never retries, and a retry would have re-spent the same budget while
+  hiding the tail.
+- **Control (validated by mutation, both directions):** a new case,
+  `fail-loud: a missed budget advises on stdout and neither gates nor grants`, drives a stub that
+  sleeps past the `hooks status` budget and asserts exit 0 (fail open), a visible stdout
+  advisory, the word UNCLAIMED, valid JSON, and the ABSENCE of `permissionDecision` and
+  `decision`. Reverting `_rally_abort_envelope` turns it **red** along with two sibling
+  assertions; restoring it turns them **green**. The warming fix was validated the same way:
+  first real exec of a fresh stub measured **4–5ms warmed vs 421–1881ms cold**.
+- **Why this belongs in this register and not in a commit message:** it is the same shape as
+  RC-001 and RC-037 — *an operation reported success while its effect was silently lost.* A
+  coordination check that aborts and prints `{}` is the hook-layer instance of the class this
+  register exists to count. It is also the second time a **verification apparatus** was the thing
+  at fault rather than the code under test, and a flaky gate does not merely fail to catch
+  defects: it **certifies** them, because the next red run is read as noise.
+- **First seen:** flake observed across sessions before 2026-08-15; mechanism established
+  2026-08-15.
+- **Residual, recorded and NOT fixed here:** (a) the pre-existing conflict advisory still sends
+  `permissionDecision: "allow"` on Claude, which is a grant and carries the same charter smell
+  this entry rejected for the abort path; (b) the pre-Rally rejection paths (unknown tool,
+  malformed envelope, path outside root, target ceiling, node absent) also print an exact `{}`
+  — same fail-loud class, wider blast radius.

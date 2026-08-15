@@ -760,6 +760,32 @@ else
   }
 fi
 
+# RALLY_HOOK_MS_BUDGET_SCALE — integer 1..16, default 1, anything else 1.
+#
+# Multiplies every millisecond budget below, and the `--timeout-ms` the CLI is
+# told, so the outer guard and the CLI's own bound never disagree. PRODUCTION
+# DEFAULT IS 1: these budgets are tuned for the real `rally` binary and are
+# NOT relaxed here.
+#
+# It exists because a wall-clock budget is not a property of rally alone. Two
+# measurements on this repo's development host, both against an ALREADY-WARM
+# stub through the same perl watchdog production uses:
+#   load-avg  8.6: p50 20ms, p99 36ms, max 52ms, 0/200 over the 250ms floor
+#   load-avg 18  : the 400ms `hooks status` budget was missed twice in one
+#                  suite run
+# So at ordinary load the budgets have ~10x headroom, and at pathological load
+# a correct implementation still aborts — which is now VISIBLE (see
+# `_rally_abort_envelope`) and is the designed behavior, not a bug. The test
+# harness raises the scale so it can exercise the non-abort paths without
+# racing the host scheduler; an operator on a heavily loaded or slow machine
+# can do the same. Raising it never hides a failure: it moves the point at
+# which the hook reports one.
+_rally_ms_scale="${RALLY_HOOK_MS_BUDGET_SCALE:-1}"
+case "$_rally_ms_scale" in
+  ''|*[!0-9]*|0) _rally_ms_scale=1 ;;
+  *) [ "$_rally_ms_scale" -gt 16 ] && _rally_ms_scale=16 ;;
+esac
+
 # Millisecond guard for the bounded multi-target transaction. The CLI receives
 # the same explicit watchdog value, while the outer guard still kills an old or
 # wedged binary that ignores it. Appending the global flag preserves subcommand
@@ -767,7 +793,7 @@ fi
 if command -v timeout >/dev/null 2>&1; then
   _rally_timeout_ms_capable=1
   rally_timeout_ms() {
-    local budget_ms="$1" whole rem duration
+    local budget_ms=$(( $1 * _rally_ms_scale )) whole rem duration
     shift
     whole=$((budget_ms / 1000)); rem=$((budget_ms % 1000))
     duration="${whole}.$(printf '%03d' "$rem")s"
@@ -776,7 +802,7 @@ if command -v timeout >/dev/null 2>&1; then
 elif command -v gtimeout >/dev/null 2>&1; then
   _rally_timeout_ms_capable=1
   rally_timeout_ms() {
-    local budget_ms="$1" whole rem duration
+    local budget_ms=$(( $1 * _rally_ms_scale )) whole rem duration
     shift
     whole=$((budget_ms / 1000)); rem=$((budget_ms % 1000))
     duration="${whole}.$(printf '%03d' "$rem")s"
@@ -785,7 +811,7 @@ elif command -v gtimeout >/dev/null 2>&1; then
 elif command -v perl >/dev/null 2>&1; then
   _rally_timeout_ms_capable=1
   rally_timeout_ms() {
-    local budget_ms="$1"
+    local budget_ms=$(( $1 * _rally_ms_scale ))
     shift
     perl -MTime::HiRes=ualarm -e '
       use POSIX qw(setsid);
@@ -962,6 +988,43 @@ _rally_advise_mutation_abort() {
   printf 'rally-hook: mutation coordination aborted (%s); no automatic claim was created and the edit is proceeding unclaimed.\n' "$safe_reason" >&2
 }
 
+# Fail-loud on the channel the host actually reads (NORTH_STAR invariant 4).
+#
+# Every coordination abort above used to print a bare `{}` on stdout and put
+# its explanation on stderr. Hosts do not surface hook stderr, and on stdout
+# `{}` is BYTE-IDENTICAL to "checked, no conflict" — so a coordination outage
+# and a clean room looked the same to the agent, which then edited unclaimed
+# believing it had been deconflicted. The stderr note was additionally
+# suppressed after its first occurrence by a `.rally/.hook-seen` marker that
+# outlives the session, so a repeat abort was silent on BOTH channels.
+#
+# This emits the same fact on stdout, as an ADVISORY. It deliberately carries
+# NO `permissionDecision`: `deny` would gate the edit, and `allow` would GRANT
+# it — the charter says rally never gates and never grants. An abort is not a
+# judgment about the edit at all; it is a report that no judgment was made.
+#
+# `reason` arrives already reduced to [A-Za-z0-9 ._:-] by the caller, and the
+# tool id is reduced the same way here, so neither can carry a quote, a
+# backslash, or a control character into the JSON, and neither can open a
+# forged instruction line in the host context (ARP-R-08).
+_rally_abort_envelope() {
+  local raw_reason="$1" safe_reason safe_tool msg
+  safe_reason="$(printf '%s' "$raw_reason" | tr -c 'A-Za-z0-9 ._:-' '_' | cut -c1-120)"
+  safe_tool="$(printf '%s' "${tool:-the agent}" | tr -c 'A-Za-z0-9_.:-' '_' | cut -c1-80)"
+  msg="rally coordination skipped ($safe_reason): this edit is proceeding UNCLAIMED. No claim was created, so peers will not see this path as yours. This is not a block - rally never gates an edit. Re-check with: rally check before-write --tool $safe_tool --path <path>"
+  case "${tool:-}" in
+    cursor|cursor:*)
+      # Cursor's preToolUse schema has no "no opinion" option; the permission
+      # field is required. "allow" here is the schema's neutral value and
+      # matches the advisory contract the conflict path already uses.
+      printf '{"permission":"allow","agent_message":"%s"}' "$msg"
+      ;;
+    *)
+      printf '{"systemMessage":"%s"}' "$msg"
+      ;;
+  esac
+}
+
 # RC-037: report a failed auto-claim instead of swallowing it.
 #
 # The auto-claim is best-effort and must never block an edit, so this stays
@@ -1006,7 +1069,7 @@ if [ "$phase" = "before-write" ] && \
     "millisecond watchdog unavailable" \
     "$_rally_native_root" \
     "$(_rally_native_meta_field session)"
-  printf '{}'
+  _rally_abort_envelope "millisecond watchdog unavailable"
   exit 0
 fi
 
@@ -1201,7 +1264,7 @@ try {
   if [ "$phase" = "before-write" ] && { [ "$_rally_native_effect" = "mutation" ] || [ "$_rally_native_effect" = "legacy" ]; } && \
       [ "$hooks_status_rc" != "0" ]; then
     _rally_advise_mutation_abort "hook settings unavailable" "$_rally_native_root" "$(_rally_native_meta_field session)"
-    printf '{}'
+    _rally_abort_envelope "hook settings unavailable"
     exit 0
   fi
   if [ "$hook_enabled" = "0" ]; then
@@ -1554,7 +1617,7 @@ elif [ "$phase" = "before-write" ]; then
     first_path="$(printf '%s\n' "$paths" | sed -n '1p')"
     if ! _rally_status_working_bounded "$first_path" "$checked_paths" 400; then
       _rally_advise_mutation_abort "working status timed out" "$_rally_native_root" "$session"
-      printf '{}'
+      _rally_abort_envelope "working status timed out"
       exit 0
     fi
 
@@ -1580,7 +1643,7 @@ elif [ "$phase" = "before-write" ]; then
       # denial. Preserve the accumulated conflict so strict mode still denies
       # and advisory mode still surfaces the writer; no claim is attempted.
       if [ "$mutation_conflict" = "0" ]; then
-        printf '{}'
+        _rally_abort_envelope "$mutation_abort"
         exit 0
       fi
     fi
@@ -1597,7 +1660,7 @@ elif [ "$phase" = "before-write" ]; then
       fi
       if [ "$room_rc" != "0" ]; then
         _rally_advise_mutation_abort "room ownership unavailable rc=$room_rc" "$_rally_native_root" "$session"
-        printf '{}'
+        _rally_abort_envelope "room ownership unavailable rc=$room_rc"
         exit 0
       fi
 
