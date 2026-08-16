@@ -311,13 +311,10 @@ is not for you, and that is a legitimate position.
 
 ## What a control here means
 
-The register (`docs/ROOT-CAUSE-REGISTER.md`) uses `controlled` to mean one specific thing: an
-adversarial test exists that rejects the hostile input, and that test fails when the fix is
-reverted. Not "we changed the code". Not "we updated the docs". A control that has never been
-exercised against a real attack string is a hypothesis.
-
-Findings closed as `controlled` in this audit cycle have that evidence recorded in their register
-entry, including the mutation result — failed before the fix, passed after.
+A control is supported by an adversarial test that rejects the hostile input and
+fails when the control is reverted. A code change or documentation statement alone
+does not establish that evidence. The repository's security and protocol suites are
+the inspectable public proof for current controls.
 
 ## Maturity
 

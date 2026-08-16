@@ -8,10 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 Make Rally presence and mutation deconfliction **automatic** for coding
 agents (Claude Code, Codex, Cursor) without serializing parallel reads. Other agents can
 still participate manually through the same Rally contract; see
-[`ANY-AGENT-ONBOARDING.md`](ANY-AGENT-ONBOARDING.md). Closes backlog
-**B19-(a)** ("Claude PreToolUse hook — land separately") and the recurrence
-risk documented in
-[`assessment-2026-05-31-codex-hook-desync.md`](assessment-2026-05-31-codex-hook-desync.md).
+[`ANY-AGENT-ONBOARDING.md`](ANY-AGENT-ONBOARDING.md).
 
 ## Install — portable, ships in the repo (no global config)
 
@@ -300,9 +297,8 @@ RALLY_HOOKS=off
 # Install for Claude Code user-wide (writes ~/.claude/settings.json)
 scripts/install_rally_hooks.sh --global
 
-# Also repoint ~/.codex/rally-hook.sh at the in-repo versioned script (opt-in)
-# This is the durable fix for "loose-file desync" — closes the recurrence risk
-# called out in docs/assessment-2026-05-31-codex-hook-desync.md.
+# Also repoint ~/.codex/rally-hook.sh at the in-repo versioned script (opt-in).
+# This keeps the user-level shim aligned with the version-controlled hook.
 scripts/install_rally_hooks.sh --global --repoint-codex
 
 # Show what would change without writing
@@ -382,27 +378,12 @@ for orchestration paths where the operator wants hard gates. Use sparingly.
 
 ## Why a hook (vs. lazy auto-enter)?
 
-The lazy-auto-enter direction (every `rally check before-write` call auto-
-registers presence with no bespoke hook) remains the long-term goal — see
-`assessment-2026-05-31-codex-hook-desync.md` § "Lazy auto-enter (no hook)".
-Until that lands as the agent's default reflex, host hooks close the gap for
-**Claude Code and Codex today**: agents do not reliably self-invoke skill or CLI
-patterns mid-task (memory: `feedback_subagent_skill_reactivity`), so the host
-hook mechanism is the deterministic surface.
-
-## Recurrence risk closure
-
-`docs/assessment-2026-05-31-codex-hook-desync.md` flagged that the loose
-`~/.codex/rally-hook.sh` desynced from the CLI when `0d5024b` removed the
-`hook` subcommand. That file lived outside the repo, so it could not be
-caught by tests. **This document's hook lives in-repo**, is exercised by
-`cargo test --workspace` adjacent tests in `tests/hooks/`, and is the single
-source of truth that `~/.codex/rally-hook.sh` delegates to when
-`--repoint-codex` is used. The desync can no longer happen silently.
+Host hooks close the gap for **Claude Code and Codex today** because agents do
+not reliably self-invoke skill or CLI patterns mid-task. The version-controlled
+hook is exercised by the adjacent suites in `tests/hooks/`; the optional Codex
+shim delegates to that same file so the installed path stays aligned.
 
 ## Cross-refs
 
-- [`assessment-2026-05-31-codex-hook-desync.md`](assessment-2026-05-31-codex-hook-desync.md) — recurrence-risk source.
 - [`../NORTH_STAR.md`](../NORTH_STAR.md) — durable vision + never-block charter.
 - [`../RALLY.md`](../RALLY.md) — 60-second guide.
-- [`../BACKLOG.md`](../BACKLOG.md) — B19-(a) close-out anchor.

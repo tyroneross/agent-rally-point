@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Concurrency invariant for the mutation watchdog (PLAN-D §6).
+//! Concurrency invariant for the mutation watchdog.
 //!
 //! N parallel `rally say handoff` invocations race against ONE temp rally
 //! room. A pinned-low subset is forced to overrun the watchdog budget
@@ -455,11 +455,7 @@ fn parallel_say_invocations_never_drop_or_duplicate_facts() {
         });
     }
 
-    assert_eq!(
-        handles.len(),
-        8,
-        "N must sit in the 6-8 range per PLAN-D §6"
-    );
+    assert_eq!(handles.len(), 8, "N must sit in the validated 6-8 range");
     assert_eq!(invocations.len(), handles.len());
 
     let outputs: Vec<Output> = handles

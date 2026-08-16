@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Ten golden tests for `rally hook before-write`, per
-//! `docs/plans/2026-08-15-native-before-write-option-a.md`'s C2 table with
+//! The native before-write contract's C2 table with
 //! the binding plan-critic revisions (R2, R4, R5, R7, R8) folded in.
 //!
 //! Exactly ten `#[test]` fns. The operator's contract is FEW AND FLAWLESS: a

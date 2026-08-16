@@ -574,8 +574,8 @@ fn rc041_3d_the_python_wake_path_sanitizes_to_the_same_rule() {
 ///
 /// Run from here ON PURPOSE. `scripts/check-release-parity.sh` executes a
 /// hardcoded list of `tests/scripts/test_*.py`, so a suite that is not on
-/// somebody's list is a control nobody runs — a hypothesis, not a gate
-/// (docs/ROOT-CAUSE-REGISTER.md). `cargo test` already runs this file, and the
+/// somebody's list is a control nobody runs — a hypothesis, not a gate.
+/// `cargo test` already runs this file, and the
 /// invariant is the same one this file exists to defend: the wake path obeys
 /// the inject chokepoint's rules.
 #[test]

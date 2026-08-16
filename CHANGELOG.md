@@ -188,8 +188,7 @@ transaction's and then renewed every claim the session owned, so cost scaled
 with claims accumulated. The transaction now captures one snapshot and hands it
 down, and skips renewal with a stderr note when the budget is nearly spent.
 `RALLY_HOOK_TRACE=1` reports per-stage timings; on a fresh store everything that
-is not the ledger totals under a fifth of a millisecond. Details in
-`docs/perf/2026-08-15-before-write-hook-latency.md`.
+is not the ledger totals under a fifth of a millisecond.
 
 Host envelopes are unchanged, verified by running both paths side by side and
 diffing bytes. Codex still never receives a `permissionDecision`. Every abort
@@ -366,7 +365,7 @@ The rule now, operator-ruled: **authority-carrying facts are gated; prose is fre
   production. RC-044's standing rule — no fix claim without N-consecutive evidence — is now
   enforceable rather than aspirational.
 
-- **Diagnosis, recorded in `docs/ROOT-CAUSE-REGISTER.md`.** `PRAGMA integrity_check` on the
+- **Diagnosis.** `PRAGMA integrity_check` on the
   accumulated snapshots shows genuine structural damage (`2nd reference to page N`, rowid
   disorder, index/table divergence) — the signature of two writers allocating one page, i.e.
   SQLite's cross-process locking defeated. The recovery path itself is the generator: unlinking
@@ -610,7 +609,7 @@ The rule now, operator-ruled: **authority-carrying facts are gated; prose is fre
   audit D10) was misattributed: `rally doctor --reap-stale` failed 3/3 with a
   watchdog timeout under contention and completed in 1.43s once uncontended.
   The projection cost is real and still worth fixing; it is not why the reaper
-  timed out. See RC-067 in `docs/ROOT-CAUSE-REGISTER.md`.
+  timed out.
 
 ### Fixed — verdicts that nothing acted on
 
@@ -821,9 +820,9 @@ authorization boundary. See [`docs/security/TRUST-MODEL.md`](docs/security/TRUST
 
 Seven findings from the first genuinely independent security review of this repo:
 3 Critical, 1 High, 2 Medium, 1 Low. Six are fixed with adversarial tests; one
-(ARP-003) has a fail-safe and a registered redesign. Per-finding triage:
-[`docs/security/AUDIT-2026-08-02-issue-52-triage.md`](docs/security/AUDIT-2026-08-02-issue-52-triage.md).
-Register entries RC-013..RC-019.
+(ARP-003) has a fail-safe and a registered redesign. The current public
+boundary is documented in `docs/security/TRUST-MODEL.md` and enforced by the
+repository's adversarial security tests.
 
 **This supersedes the 0.1.2 "Binary auto-provision" behaviour below.** Lifecycle
 hooks no longer provision anything.
@@ -893,9 +892,7 @@ hooks no longer provision anything.
 - **New docs.** [`docs/DESIGN-TRADEOFFS.md`](docs/DESIGN-TRADEOFFS.md) (why hooks,
   why agents self-manage, why push-then-pull, and what is actually proven),
   [`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md) (what is and is
-  not defended), and
-  [`docs/rca-2026-08-02-security-findings-escaped.md`](docs/rca-2026-08-02-security-findings-escaped.md)
-  (why every gate stayed dormant). `skills/agent-rally-point/SKILL.md` no longer
+  not defended). `skills/agent-rally-point/SKILL.md` no longer
   claims Rally does not install host hooks — four committed registration files do,
   and the docs now say so plainly along with every off switch.
 
@@ -1266,13 +1263,9 @@ Fixes the long-recurring "inject delivered but never ACKed" signature (L5 /
   `RALLY_HOOK_TIMEOUT_MS` override still wins (clamped to the hook band); all
   other (hook-invoked) commands keep the 3s default unchanged.
 
-Follow-up (spec only): [`docs/PLAN-daemon-first-inject-routing.md`](docs/PLAN-daemon-first-inject-routing.md)
-describes the daemon-first routing this framed tmux write is the fallback for.
-
 ### Reliability & performance — store durability for scale (2026-06-04)
 
 Foundation for durable coordination at thousands of agents. Commits `5c68dac`..`32d21be`.
-See [`docs/SCALE-ROADMAP.md`](docs/SCALE-ROADMAP.md) for the measured roadmap.
 
 - **facts.db corruption is now a non-event.** A malformed/missing `facts.db` is quarantined
   (`facts.db.corrupt.<ts>`) and the derived cache is rebuilt from the canonical JSONL ledger —

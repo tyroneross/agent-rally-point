@@ -74,9 +74,8 @@
 //! bar from any writer to the first writer" retraction). Do not restate it.
 //!
 //! Closing the impersonation path requires a minted session lease that `tool`
-//! and `role` are DERIVED from rather than asserted alongside — see the
-//! authority-model entry in `docs/ROOT-CAUSE-REGISTER.md`. That choice is owed
-//! and unmade. `crates/rally-cli/tests/lead_seat_authz.rs` contains a live
+//! and `role` are DERIVED from rather than asserted alongside. That choice is
+//! owed and unmade. `crates/rally-cli/tests/lead_seat_authz.rs` contains a live
 //! impersonation test that documents the residual by asserting what actually
 //! happens, so the gap stays visible instead of being remembered.
 
@@ -563,9 +562,8 @@ fn assert_lead_transfer_authorized(
 ///
 /// **The word SINGLE is load-bearing.** A SEQUENCE that first moves the seat's
 /// authorization INPUT is not covered: arm 3 reads a liveness projection that
-/// ungated retractions can regress. See RC-071b in
-/// `docs/ROOT-CAUSE-REGISTER.md` — the residual is named there rather than
-/// implied absent here.
+/// ungated retractions can regress. The residual is named here rather than
+/// implied absent.
 ///
 /// # Arms
 ///

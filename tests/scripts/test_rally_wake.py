@@ -13,7 +13,7 @@ here needs a tmux server or a live pane.
   D4  the STRUCTURAL check that replaced a source grep: every process this
       script runs comes out of the one chokepoint function. `test_analyzer_*`
       are the negative controls for that check itself — a gate nobody has seen
-      fail is a hypothesis (docs/ROOT-CAUSE-REGISTER.md).
+      fail is a hypothesis.
 
 Run: python3 -m unittest tests/scripts/test_rally_wake.py
 Also runs from `cargo test -p rally-cli --test inject_security`, which is what

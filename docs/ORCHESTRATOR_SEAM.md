@@ -5,8 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Orchestrator Seam — Event Vocabulary and Lineage Contract
 
-> **B0 gate document.** All chunks B1–B5 reference this spec.
-> Source decision: `docs/pi-dynamic-assessment-handoff.md §5–6`.
+> Current event-vocabulary and runner-boundary contract.
 
 ---
 

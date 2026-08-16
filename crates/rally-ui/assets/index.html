@@ -405,7 +405,7 @@
       container.appendChild(h("div", { className: "health-reason", text: snapshot.health_reason }));
     }
 
-    // Seq freshness — the PLAN-D failure telemetry: a room whose ledger seq
+    // Seq freshness — a room whose ledger seq
     // stops advancing while agents report working is the write-drop signature.
     if (snapshot.max_seq != null) {
       var prev = state.seqSeen[snapshot.id];

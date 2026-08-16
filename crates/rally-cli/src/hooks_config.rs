@@ -701,7 +701,7 @@ mod coordination_tests {
     // env reads in other tests (busy_but_quiet, status_post, retrospective) — and
     // Rust's set/remove_var corrupts the WHOLE environ during a concurrent read,
     // not just the one key. One lock = all env mutators/readers serialize.
-    // See docs/ISSUES-2026-07-07-test-flakes.md.
+    // Keep hook fixtures isolated from inherited Git process scope.
     fn env_lock() -> &'static Mutex<()> {
         &crate::PROCESS_ENV_LOCK
     }
@@ -710,7 +710,7 @@ mod coordination_tests {
     /// test panics between set and cleanup, the value LEAKS into later tests —
     /// e.g. a leaked `RALLY_RECLAIM_*` shrinks the takeover window and flips
     /// `busy_but_quiet_owner_is_warnable_but_not_takeover_eligible`. See
-    /// docs/ISSUES-2026-07-07-test-flakes.md.
+    /// This prevents inherited Git process scope from leaking into fixtures.
     const CONFIG_ENV_VARS: &[&str] = &[
         "RALLY_HALF_LIFE_HOURS",
         "RALLY_ARCHIVE_FLOOR",

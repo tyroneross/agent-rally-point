@@ -10,9 +10,7 @@
 # paths that want hard gates; off by default.
 #
 # This file is the SINGLE SOURCE OF TRUTH for both Claude Code and Codex (and
-# Gemini) rally hooks. The desync incident documented in
-# docs/assessment-2026-05-31-codex-hook-desync.md ("Recurrence risk — wrapper
-# is not version-controlled") is the reason this file lives in-repo. Any
+# Gemini) rally hooks. Any
 # host-side wrapper (e.g. ~/.codex/rally-hook.sh) should be a thin shim that
 # `exec`s this script; see scripts/install_rally_hooks.sh.
 #

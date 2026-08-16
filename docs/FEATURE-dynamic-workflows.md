@@ -238,8 +238,7 @@ remain — durable resume with no in-memory state.
 ## 4. The non-negotiable charter
 
 > **Rally RECORDS and DERIVES; it NEVER EXECUTES.**
-> (`RUST_GREENFIELD_ARCHITECTURE.md §85–94, 105, 504`; restated in `docs/ORCHESTRATOR_SEAM.md §0`
-> and `docs/PLAN-pi-dynamic-seam.md §0`.)
+> (restated in `docs/ORCHESTRATOR_SEAM.md §0`.)
 
 Every piece above either adds *facts* (`rally say …`) or returns *read-only projections* (`rally dag`,
 `rally wake-due`, `workstream-status.mjs`). None of them start, resume, retry, or schedule work.
@@ -256,7 +255,6 @@ cannot conscript a peer's compute without trust.
 ## See also
 
 - `docs/ORCHESTRATOR_SEAM.md` — event vocabulary, lineage encoding, standby/wake, and the runner-split contract (the seam's source of truth).
-- `docs/PLAN-pi-dynamic-seam.md` — the build plan that produced the seam (chunks B0–B6, the hard rule, the 30-min idle heartbeat).
 - `skills/rally-workflows/SKILL.md` — the host-neutral orchestration skill (decompose → lint → fan out → per-task loop → observe & resume).
 - `dynamic-workflows/PROTOCOL.md` · `COORDINATION.md` · `MODEL-TIERS.md` — descriptor wire spec, multi-agent doctrine, model tiers.
 - `skills/mini-loop/SKILL.md` — the per-task quality wrapper.

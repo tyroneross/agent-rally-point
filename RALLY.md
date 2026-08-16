@@ -107,7 +107,7 @@ Claude has finished planning a refactor and wants Codex to implement:
 # Claude:
 rally say handoff --tool claude_code \
   --target codex \
-  --subject "implement the auth refactor from docs/plans/auth-v2.md" \
+  --subject "implement the auth refactor from issue AUTH-42" \
   --summary "tests in tests/auth_test.rs should still pass" \
   --json
 
@@ -119,7 +119,7 @@ rally next --tool codex --json
 # ... claims/checks, does the work, verifies ...
 rally say artifact --tool codex \
   --subject "auth refactor implemented" \
-  --uri docs/plans/auth-v2.md \
+  --uri src/auth.rs \
   --evidence "cargo test" \
   --json
 rally next --tool codex --json

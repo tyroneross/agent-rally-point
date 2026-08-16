@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Hook-wrapper contract for fail-closed mutation timeouts (PLAN-D §6).
+//! Hook-wrapper contract for fail-closed mutation timeouts.
 //!
 //! e1c1383 made timed-out uncommitted mutations exit 4 with
 //! `watchdog-timeout-uncommitted-mutation` instead of the old bare `ok:true`.

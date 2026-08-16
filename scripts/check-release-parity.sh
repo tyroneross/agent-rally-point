@@ -178,7 +178,7 @@ fi
 # This was a hardcoded list of three files. Four suites existed that it never
 # ran — including test_no_autoprovision.sh and test_context_sanitization.sh, the
 # adversarial controls that close RC-013 and RC-016. A control no gate executes
-# is a hypothesis (see docs/ROOT-CAUSE-REGISTER.md), and a list someone must
+# is a hypothesis, and a list someone must
 # remember to extend will drift again the next time a suite is added. Globbing
 # removes the remembering.
 #

@@ -373,10 +373,9 @@ fn a_legacy_lead_fact_still_projects_to_the_same_lead() {
 /// asserts what ACTUALLY happens today, so the gap is visible in the test
 /// output instead of living only in a comment somebody has to remember.
 ///
-/// If a session-lease model ever lands (see the authority-model entry in
-/// `docs/ROOT-CAUSE-REGISTER.md`), this test FAILS — and that failure is the
-/// signal to flip the assertion and mark ARP-R-01 controlled. Until then,
-/// ARP-R-01 is `mitigated`, not `controlled`, and this is why.
+/// If a session-lease model ever lands, this test FAILS — and that failure is
+/// the signal to flip the assertion. Until then,
+/// impersonation remains a documented residual, and this is why.
 #[test]
 fn impersonation_is_not_stopped_and_this_test_says_so() {
     let ws = Workspace::new("impersonation");

@@ -12,7 +12,7 @@
 //! Grep invariant (checked by charter_test):
 //!   `SEAM_NO_EXEC: dag.rs contains zero calls to Command/spawn/schedule/exec`
 //!
-//! Litmus from PLAN-pi-dynamic-seam.md §0:
+//! Runner-boundary litmus:
 //!   "Does this make Rally start, resume, retry, or schedule work?" → NO.
 //!   This module only reads facts and derives a graph structure.
 

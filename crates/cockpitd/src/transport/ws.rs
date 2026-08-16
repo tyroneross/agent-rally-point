@@ -935,7 +935,7 @@ async fn run_pump(
                             // about the decision and may already have run the
                             // tool, so this is advisory, not enforcement. The
                             // `kind` stays `tool_blocked` for wire compatibility
-                            // (docs/plans/COCKPIT-WIRE.md); the honest semantics
+                            // The honest wire semantics
                             // ride in the metadata flags and the content string.
                             let denial_reason = resolution.as_deref().unwrap_or("denied");
                             let mut blocked_evt = Event {

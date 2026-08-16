@@ -13901,7 +13901,7 @@ mod tests {
         // single-file reclaim boundary — `command_release_by_path` checks
         // `age > reclaim_timeout`, so second-truncation + slow execution under
         // full-suite load flipped the takeover-refusal ~7% of runs. This is the
-        // real root cause of this test's flake (docs/ISSUES-2026-07-07-test-flakes.md),
+        // real root cause of this test's flake,
         // not env/CWD races.
         let stale_ts = (chrono::Utc::now() - chrono::Duration::minutes(22))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -14052,7 +14052,7 @@ mod tests {
     /// previous CWD on drop — including on an assertion panic — so a failing test
     /// cannot leave a dangling/deleted CWD (or a poisoned lock) that cascades into
     /// every later test in the binary. Fixes the `--workspace` flake cluster
-    /// documented in docs/ISSUES-2026-07-07-test-flakes.md (Signature A).
+    /// observed when inherited Git scope escapes the fixture (Signature A).
     struct CwdEnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         prev: Option<std::path::PathBuf>,
@@ -15972,7 +15972,7 @@ fn command_route_findings(args: RouteFindingsArgs) -> Result<Output> {
 //
 // CHARTER ASSERTION: this command path never calls Command/spawn/schedule/exec.
 // It reads facts from the store and derives a graph struct.
-// Litmus from PLAN-pi-dynamic-seam.md §0:
+// Runner-boundary litmus:
 //   "Does this make Rally start, resume, retry, or schedule work?" → NO.
 
 /// Envelope for `dag`: result under `data.dag`.

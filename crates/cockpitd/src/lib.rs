@@ -8,7 +8,7 @@
 //! `cockpit-cli` phone stand-in) over a WebSocket bound to the loopback /
 //! tailnet interface.
 //!
-//! Module map (built chunk-by-chunk per docs/plans/2026-05-31-ios-agent-cockpit-PLAN.md):
+//! Module map:
 //! - `protocol`   — wire envelope + schema (A1)
 //! - `model`      — Session / Event / Approval domain types (A1)
 //! - `store`      — SQLite event store with replay-from-seq (A2)

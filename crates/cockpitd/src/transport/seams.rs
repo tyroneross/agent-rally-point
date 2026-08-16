@@ -6,7 +6,7 @@
 //! cannot verify. These keep the architecture honest — the extension points
 //! exist and compile — without claiming the gated functionality works.
 //!
-//! See `docs/plans/DEFERRED.md` for the human step that finishes each.
+//! Each seam remains explicit until its platform integration is complete.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 

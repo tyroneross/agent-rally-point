@@ -145,22 +145,8 @@ That is the extent of the evidence. Specifically not proven:
 - Any deployment where the ledger crosses a machine boundary. Network transport is explicitly out
   of scope; Rally defines what the bytes mean, not how they move.
 
-Expect edge cases outside that envelope. The root-cause register
-([`ROOT-CAUSE-REGISTER.md`](ROOT-CAUSE-REGISTER.md)) is the current list of known defects and is
-kept honest on purpose — an entry closes only when an adversarial test proves the control fires,
-not when the symptom stops.
-
-## 5. Why the register works this way
-
-Not a design tradeoff so much as a working rule, but it explains the shape of the other four
-sections.
-
-Three defects surfaced in one release session on 2026-07-30 and every one had the same shape: an
-operation reported success while its effect was silently lost. They had been handled as unrelated
-one-offs. Separately, one entry had been closed as root-caused twice and came back a third time.
-
-The rule that came out: **every issue gets a register entry, and only a proven adversarial
-control closes it.** `fixed` means the code changed. `controlled` means someone tried to break it
-and failed, and the test that proves it fails when the fix is reverted.
+Expect edge cases outside that envelope. The repository's executable tests are
+the public evidence for current controls; release-session diagnostics and incident
+records remain maintainer material.
 
 A root cause that does not survive contact with recurrence was a hypothesis, not a cause.

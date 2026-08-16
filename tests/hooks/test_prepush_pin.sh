@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 # SPDX-License-Identifier: Apache-2.0
 #
-# ARP-R-05 adversarial control (docs/ROOT-CAUSE-REGISTER.md).
+# Adversarial control for trusted pre-push pinning.
 #
 # An independent security re-assessment found .githooks/pre-push reporting
 # success on a path that reviewed nothing. Three defects, three controls here.
@@ -34,8 +34,8 @@
 #   execute.
 #
 # Fixture shape follows tests/hooks/test_prepush_pinned_gate.sh: a throwaway
-# `git init` repo with trivial stubs for the quality, release-parity, and
-# identity gates, driving the REAL .githooks/pre-push. The parity stub here
+# `git init` repo with trivial stubs for the quality and release-parity gates,
+# driving the REAL .githooks/pre-push. The parity stub here
 # executes hooks/ensure-rally-binary.sh the way the real host tests do, so
 # "did the unreviewed engine run" is a marker-file question and not an
 # inspection.
@@ -97,14 +97,6 @@ cp "$PARSER" "$FIXTURE/scripts/prepush-ref-updates.sh"
 cp "$PREPUSH_HOOK" "$FIXTURE/.githooks/pre-push"
 chmod +x "$FIXTURE/scripts/prepush-ref-updates.sh" "$FIXTURE/.githooks/pre-push"
 
-# This suite grades pin trust and execution order, not identity policy. Keep
-# the real hook dependency in the fixture while making it a neutral pass-through
-# so it cannot short-circuit the D1-D3 assertions.
-cat > "$FIXTURE/scripts/check-git-identity.sh" <<'STUB'
-#!/bin/sh
-exit 0
-STUB
-
 # Honest stub gate — records the SHA it ran against. This is the TRUSTED copy
 # committed on `main` and pinned.
 cat > "$FIXTURE/scripts/run-quality-gate.sh" <<'STUB'
@@ -135,8 +127,7 @@ cat > "$FIXTURE/hooks/ensure-rally-binary.sh" <<STUB
 touch "$ENGINE_MARKER"
 exit 0
 STUB
-chmod +x "$FIXTURE/scripts/check-git-identity.sh" \
-         "$FIXTURE/scripts/run-quality-gate.sh" \
+chmod +x "$FIXTURE/scripts/run-quality-gate.sh" \
          "$FIXTURE/scripts/check-release-parity.sh" \
          "$FIXTURE/hooks/ensure-rally-binary.sh"
 

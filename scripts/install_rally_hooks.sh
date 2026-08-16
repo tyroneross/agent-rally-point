@@ -21,9 +21,8 @@
 #
 # Optional (Codex parity):
 #   With --repoint-codex, backs up ~/.codex/rally-hook.sh to .bak and replaces
-#   it with a thin shim that exec's the in-repo versioned hook. Closes the
-#   "loose file desyncs from CLI" recurrence risk documented in
-#   docs/assessment-2026-05-31-codex-hook-desync.md.
+#   it with a thin shim that exec's the in-repo versioned hook, keeping the
+#   user-level path aligned with the version-controlled implementation.
 #
 # Idempotent:
 #   - A re-run with no changes prints "no change."

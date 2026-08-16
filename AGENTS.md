@@ -20,7 +20,7 @@ This repo coordinates parallel coding agents via **agent-rally-point** (per-repo
 - **Guide (60-second):** [RALLY.md](RALLY.md)
 - **Doctrine (Rally Flow):** [dynamic-workflows/COORDINATION.md](dynamic-workflows/COORDINATION.md)
 - **Wire protocol:** [dynamic-workflows/PROTOCOL.md](dynamic-workflows/PROTOCOL.md)
-- **Board / current lanes:** [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md)
+- **Room and board projections:** [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md)
 - **Any-agent onboarding contract:** [docs/ANY-AGENT-ONBOARDING.md](docs/ANY-AGENT-ONBOARDING.md)
 - **Handoffs & managed agents:** [docs/HANDOFFS-AND-LAUNCHING-AGENTS.md](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md)
 <!-- rally:end -->

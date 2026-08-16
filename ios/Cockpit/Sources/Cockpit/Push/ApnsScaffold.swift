@@ -7,7 +7,7 @@ import Foundation
 // events. This is a COMPILING STUB that documents the payload + registration
 // shape. It is intentionally non-functional — real delivery needs an Apple
 // Developer account, an APNs key, the push entitlement, and a physical device.
-// See docs/plans/DEFERRED.md.
+// APNs registration remains intentionally scaffolded until the runtime path is wired.
 //
 // TAG:UNTESTED — APNs end-to-end cannot be verified in the autonomous build.
 

@@ -111,7 +111,7 @@ A receiver that has all 11 fields never needs to ask "what next?".
 | 1 | **ref + action** | target fact/backlog-id + verb: `fix \| review \| audit \| build \| wire` |
 | 2 | **priority** | `P0 \| P1 \| P2` |
 | 3 | **owns / no-touch** | canonical paths owned + explicit no-touch (e.g. another lane's files) |
-| 4 | **authority** | `read-only \| edit \| commit \| merge \| push` — **commit + merge are delegated to frontier agents**; the lead **audits post-hoc** (source-verify + test-evidence) and reverts only on a failed audit, rather than pre-gating. **Each merge to `main` posts a merge artifact with evidence AND appends a context entry to `docs/MERGES.md`** (what/why/evidence/audit/reversibility) — a merge without that entry is incomplete. |
+| 4 | **authority** | `read-only \| edit \| commit \| merge \| push` — **commit + merge are delegated to frontier agents**; the lead **audits post-hoc** (source-verify + test-evidence) and reverts only on a failed audit, rather than pre-gating. Each merge posts a durable Rally artifact with evidence. |
 | 5 | **base** | branch + worktree (default: your **own worktree off `main`**; canonical paths) |
 | 6 | **mode** | `fix` vs `review-only` (resolve the issue, or only report risks) |
 | 7 | **model/tier + fan-out** | host-relative tier (cheapest sufficient, your own family) + parallel cap |

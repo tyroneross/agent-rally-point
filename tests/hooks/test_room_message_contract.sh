@@ -525,7 +525,7 @@ fs.writeFileSync(process.argv[1], JSON.stringify({ data: { next: {
   fact: {
     event_id: "fact_4fdf_18c8d972c6d44588",
     tool: "@SELF@",
-    scope: ["file:hooks", "file:crates/rally-cli/tests", "file:docs/plans"]
+    scope: ["file:hooks", "file:crates/rally-cli/tests", "file:docs/schemas"]
   },
   suggested_commands: [
     "rally say release --tool @SELF@ --ref fact_4fdf_18c8d972c6d44588 --subject \"done\" --json"
@@ -730,7 +730,7 @@ fs.writeFileSync(process.argv[1], JSON.stringify({ data: { next: {
   action: "respond_to_handoff",
   fact: { event_id: "fact_charter_1", tool: "codex:reviewer", subject: "take this over" },
   suggested_commands: [
-    "rally say claim --tool @SELF@ --subject \"act on next\" --path docs/plans --json"
+    "rally say claim --tool @SELF@ --subject \"act on next\" --path docs/schemas --json"
   ]
 }}}));
 ' "$sb/next.json"

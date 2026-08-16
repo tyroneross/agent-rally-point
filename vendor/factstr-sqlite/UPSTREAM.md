@@ -25,7 +25,7 @@ the lock error for 5s while rally's watchdog killed the process at 3s, so
 rally's own lock-retry loops never executed a single iteration. Measured against
 a genuine `BEGIN EXCLUSIVE` holder, `rally say claim` exited 4 at 3.036s with
 `watchdog-timeout-uncommitted-mutation`, every time, regardless of how rally
-configured its retries. See RC-067 in `docs/ROOT-CAUSE-REGISTER.md`.
+configured its retries.
 
 The delta adds `SqliteStore::open_with_busy_timeout` and leaves
 `SqliteStore::open` delegating to it with `DEFAULT_BUSY_TIMEOUT` (upstream's 5s),

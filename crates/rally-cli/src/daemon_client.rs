@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Minimal client for the rally-termd (ptyd) daemon — daemon-first inject
-//! routing (move 2, `docs/PLAN-daemon-first-inject-routing.md`).
+//! routing through the daemon before terminal fallback.
 //!
 //! This is the CLI side of the two-tier inject design: when the rally-termd
 //! daemon is reachable, `rally run`/`rally adopt` register the launched pane's

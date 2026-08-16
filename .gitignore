@@ -129,6 +129,32 @@ archive/
 agent-rally-point.worktrees/
 RALLY-VERSION-MISMATCH-ASSESSMENT-*.md
 
+# Maintainer-specific build records belong in private build-loop-memory.
+# Public docs should support installing, using, operating, or extending Rally.
+/BACKLOG.md
+/LESSONS.md
+docs/cockpit/
+docs/perf/
+docs/plans/
+docs/superpowers/
+docs/*RCA*.md
+docs/*rca*.md
+docs/*ROOT-CAUSE*.md
+docs/*ASSESSMENT*.md
+docs/*assessment*.md
+docs/*AUDIT*.md
+docs/*audit*.md
+docs/*PLAN*.md
+docs/*PROPOSAL*.md
+docs/*ROADMAP*.md
+docs/*RETRO*.md
+docs/*ISSUES*.md
+docs/*HANDOFF-*.md
+docs/*-handoff.md
+docs/*DRAFT*.md
+docs/*draft*.md
+scripts/bench_*.py
+
 # Vendored [patch] crates resolve through the workspace's root Cargo.lock, so a
 # lock generated inside the vendored dir governs nothing and only churns.
 vendor/*/Cargo.lock

@@ -36,8 +36,8 @@ the work. A feature that gates or executes work is off-charter.
 
 ## Scale
 
-Durable and correct at **thousands of agents and many terminals**. Measured state + remaining
-bottlenecks: [`docs/SCALE-ROADMAP.md`](docs/SCALE-ROADMAP.md).
+Durable and correct at **thousands of agents and many terminals**. Public claims
+must follow measured behavior in the current implementation and its tests.
 
 ## Non-goals
 

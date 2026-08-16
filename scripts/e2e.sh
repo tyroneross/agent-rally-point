@@ -11,7 +11,7 @@
 #      `cockpit-cli` (the phone stand-in) doing hello + list over the wire.
 #
 # The iOS *app* ↔ daemon UI-level E2E (simulator driving the live daemon) is a
-# DEFERRED manual step — see docs/plans/DEFERRED.md — because a reliable XCUITest
+# deferred manual step because a reliable XCUITest
 # against a live socket needs hand-tuning the app's connect config; cockpit-cli is
 # the verified phone stand-in here.
 set -euo pipefail

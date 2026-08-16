@@ -353,7 +353,7 @@ rally sessions --json
 
 Use `--shared` or `--no-worktree` only when you deliberately want a shared checkout. Agents still claim and check files before editing, and a receiver's own ACK—not a successful `rally inject` exit code—proves a handoff was received.
 
-**`rally inject` returns `ok: true` when a message is enqueued, which is not the same as delivered.** The receive side has no resident owner yet (RC-001 in the register). Treat the target's own ACK as proof, not the inject's exit code.
+**`rally inject` returns `ok: true` when a message is enqueued, which is not the same as delivered.** Treat the target's own ACK as proof, not the inject's exit code.
 
 ## Where the record lives
 
@@ -376,7 +376,7 @@ Rally assumes **one operator, on one machine, running agents you started yoursel
 
 If a second contributor can land commits in your repo, read the trust model first. If you choose to commit `.rally/log/*.jsonl`, those facts replay on clone and carry no signature, so review them as agent-steering content just as you review code. Rally's own release repo keeps live logs local; fresh clones start with its manifest and an empty room.
 
-An independent audit (issue #52) produced seven findings in August 2026: three Critical, one High, two Medium, one Low. Six are closed with tests that fail when the fix is reverted. One — Cockpit's approval gate, which observes tool calls but does not stop them — has a documented fail-safe and an open redesign. Per-finding disposition: [`docs/security/AUDIT-2026-08-02-issue-52-triage.md`](docs/security/AUDIT-2026-08-02-issue-52-triage.md). Known open defects live in [`docs/ROOT-CAUSE-REGISTER.md`](docs/ROOT-CAUSE-REGISTER.md), where an entry closes only once an adversarial test proves the control fires.
+The [trust model](docs/security/TRUST-MODEL.md) documents the concrete boundary: Rally coordinates trusted local processes and does not turn same-UID agents into mutually isolated principals. Security-sensitive behavior is covered by executable tests in the repository so contributors can inspect and extend the controls.
 
 **Maturity, stated plainly:** Rally runs daily on a small number of fresh macOS installs driven by one operator. It is not proven on Linux beyond CI, on hosts other than the four wired here, or with more than one human. Expect edge cases outside that envelope.
 
@@ -401,7 +401,7 @@ python3 scripts/sync_host_integrations.py --apply --json  # reconcile installed 
 
 The reconciler requires exactly one enabled provider per host. It removes stale duplicates, updates from the canonical marketplace, and reports when Claude Code or Codex must restart to load new content. It changes nothing without `--apply`.
 
-The public `v0.2.1` release remains immutable; `v0.2.5` is prepared as its replacement release. The [release playbook](docs/RELEASING.md) separates GitHub Release assets, generated host marketplace surfaces, and any legacy GitHub Package that needs a separate update.
+Published releases remain immutable. New versions reconcile the CLI, generated host surfaces, and marketplace artifacts from the same canonical integration configuration.
 
 ## Verification
 
@@ -415,10 +415,6 @@ git diff --check
 ```
 
 Primary code must compile on Rust 1.89 (the MSRV in `Cargo.toml`). These verification commands themselves run under the exact toolchain `rust-toolchain.toml` pins (1.95.0) — `cargo fmt --check` needs a matching `rustfmt` build or its diff is meaningless.
-
-### Commit identity
-
-`.githooks/pre-commit` and `.githooks/pre-push` refuse a commit whose author or committer is not on `config/git-identity-allowlist.txt`. Both stay silent when your identity is correct, and they read only the author and committer fields — a `Co-Authored-By:` trailer naming an AI model is the documented convention here and passes untouched. Set your identity globally and add yourself to the allowlist in your PR; [`CONTRIBUTING.md`](CONTRIBUTING.md) has the four rejected address shapes and the one-line fix for a repo-local override. The defect that motivated the gate is [`docs/ROOT-CAUSE-REGISTER.md`](docs/ROOT-CAUSE-REGISTER.md) RC-064.
 
 ## License
 

@@ -159,7 +159,7 @@ pub(crate) struct SessionsData {
 /// Envelope for `sessions`: result under `data.sessions`.
 /// NOTE: the `data.sessions.sessions` double-nest is a known wart; flattening it
 /// is a breaking wire change to the shipped `agent-rally.command.sessions.v1`
-/// schema and is deferred to a proper v2 bump (see docs/ISSUES-2026-07-06-hooks.md).
+/// schema and is deferred to a proper v2 bump.
 #[derive(JsonSchema, Serialize)]
 pub(crate) struct SessionsEnvelope {
     pub(crate) sessions: SessionsData,

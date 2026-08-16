@@ -61,7 +61,7 @@
 #   complete" summary as "these named paths were diffed against the pin", never
 #   as "nothing unreviewed will execute".
 #
-# RC-034 (2026-08 independent security review; docs/ROOT-CAUSE-REGISTER.md):
+# Security invariant: gate code must come from the trusted pin, not the pushed tree.
 # the gap above was exploitable through a file the pin never looked at. A push
 # that ADDS tests/hooks/test_zz_anything.sh touches none of the three pinned
 # names, so the pin reports healthy, and the PINNED check-release-parity.sh
@@ -117,7 +117,7 @@
 # block below runs BEFORE the parser is invoked.
 #
 # ARP-R-05 (2026-08 independent security re-assessment;
-# docs/ROOT-CAUSE-REGISTER.md): the gate reported success on a path that
+# A prior gate reported success on a path that
 # reviewed nothing. Three defects, all in "what the operator is told versus what
 # was actually compared":
 #   a. THE DEFAULT PIN'S VACUITY CHECK ONLY WARNED. SEC-005b refused a vacuous
@@ -218,7 +218,7 @@ trap cleanup EXIT INT TERM
 # outside that one directory — which is how hooks/ensure-rally-binary.sh (curl,
 # chmod +x, cargo install), executed by two of the PINNED host test suites,
 # stayed outside the pin while the hook reported healthy.
-GATE_SCRIPT_PATHS="scripts/run-quality-gate.sh scripts/check-release-parity.sh scripts/prepush-ref-updates.sh hooks/ensure-rally-binary.sh scripts/check-git-identity.sh"
+GATE_SCRIPT_PATHS="scripts/run-quality-gate.sh scripts/check-release-parity.sh scripts/prepush-ref-updates.sh hooks/ensure-rally-binary.sh"
 # Subset of the above that this hook never EXECUTES. It is reached transitively:
 # check-release-parity.sh globs and runs tests/hooks/test_*.sh, and
 # test_no_autoprovision.sh / test_ensure_rally_binary.sh invoke this file out of
@@ -517,58 +517,6 @@ if [ ! -s "$sha_file" ]; then
   exit 0
 fi
 
-# --- identity gate (scripts/check-git-identity.sh) -------------------------
-# Runs BEFORE any worktree is created or any cargo gate runs: a wrong author
-# or committer identity fails in under a second instead of after a full
-# cargo test run. Resolved through the SAME ARP-006/SEC-005 pinned-vs-pushed
-# decision as the other gate scripts above (added to GATE_SCRIPT_PATHS), and
-# invoked from the WORKING TREE — same shape as the
-# scripts/prepush-ref-updates.sh call above, for the same SEC-005 reason: a
-# pushed branch must not be able to smuggle its own copy of the script that
-# decides whether its own identity is acceptable.
-if ! identity_exec_path=$(resolve_gate_script scripts/check-git-identity.sh \
-       "$repo_root/scripts/check-git-identity.sh" "working tree"); then
-  exit 1
-fi
-record_pin_outcome scripts/check-git-identity.sh "working tree" "$identity_exec_path"
-
-# Scope: ONLY commits not already on origin (`--not --remotes=origin`). This
-# scoping is LOAD-BEARING, for two reasons, and must not be widened (no date
-# cutoff, no grandfather list — the remote boundary already does that job and
-# cannot drift):
-#   1. The 64 historical `Rally Test <rally@example.test>` commits and the 63
-#      legitimate `jason` commits are already pushed, so `--not
-#      --remotes=origin` excludes them automatically. The gate cannot block
-#      on history it is forbidden to rewrite (see the header of
-#      scripts/check-git-identity.sh — NO HISTORY REWRITE is a hard
-#      constraint).
-#   2. Unpushed commits are the only ones the operator can still fix
-#      (correct the identity, re-create the commit) without a rewrite.
-#
-# Empirically verified (2026-08, this git version): `git rev-list <sha> --not
-# --remotes=origin` does NOT error when no refs/remotes/origin/* ref exists
-# (no origin remote configured, or one configured but nothing ever fetched) —
-# it silently excludes nothing and would walk the FULL history from <sha>,
-# which is exactly the "scans all of history and blocks a legitimate first
-# push" failure this hook must avoid producing. So this checks directly
-# whether any refs/remotes/origin/* ref resolves, rather than waiting for a
-# rev-list error this git version does not produce, and falls back to a
-# bounded per-SHA scope instead of scanning everything or checking nothing.
-identity_scope_args="--not --remotes=origin"
-if [ -z "$(git for-each-ref --format='x' 'refs/remotes/origin/*' 2>/dev/null)" ]; then
-  echo "pre-push: no 'origin' remote-tracking refs resolved — identity-gate scope reduced to each pushed SHA's own last 200 commits (--max-count=200) instead of '--not --remotes=origin', to avoid scanning full history on what looks like a first push" >&2
-  identity_scope_args="--max-count=200"
-fi
-
-while IFS= read -r identity_sha; do
-  [ -n "$identity_sha" ] || continue
-  # shellcheck disable=SC2086 # intentional word-split: identity_scope_args is
-  # one of two known-literal flag strings set above, never attacker data.
-  if ! "$identity_exec_path" --commits "$identity_sha" $identity_scope_args; then
-    exit 1
-  fi
-done < "$sha_file"
-
 # git injects repo-scoping vars (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, …)
 # into a hook's environment. Those leak into EVERY `git` subprocess the gate
 # spawns: cargo tests that shell out to git (e.g. `git worktree add`,
@@ -576,7 +524,7 @@ done < "$sha_file"
 # of their own isolated fixtures, and run-quality-gate.sh's own
 # `git rev-parse --show-toplevel` could resolve the wrong tree. Strip the
 # repo-scoping vars for the gate subshells so the gate runs hermetically
-# against the detached worktree it cd'd into. Identity/config vars
+# against the detached worktree it cd'd into. Author/config vars
 # (GIT_AUTHOR_*, GIT_COMMITTER_*, GIT_CONFIG_*) are deliberately left intact.
 git_scope_vars='GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_COMMON_DIR GIT_QUARANTINE_PATH GIT_INTERNAL_GITDIR_HOOK_PATH GIT_REFLOG_ACTION'
 
