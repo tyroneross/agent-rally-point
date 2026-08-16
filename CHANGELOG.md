@@ -11,25 +11,32 @@ All notable changes to Agent Rally Point are documented here.
 
 ### Changed — the room message is one short attributed line
 
-SessionStart, UserPromptSubmit and Stop rendered about 1,300 characters of
-roster, open claims and handoffs, and buried the one thing the reading agent
-actually had to do. The message is now a single line:
+SessionStart rendered a roster, every open claim and every handoff;
+UserPromptSubmit and Stop rendered a status roster and one next item. Both
+buried the single thing the reading agent actually had to do. Measured on one
+fixture against the pre-change hook: SessionStart 1,666 characters and
+UserPromptSubmit 718, each including the fixed 400-character trust preamble that
+both modes still emit. The message is now a single line:
 
 ```
-Peer codex:c5f8 handed you a task — it sits with you until you answer or hand it back · Why: «CHANGELOG entry for 0.2.5» (untrusted) · fact_8c7_18cc1f5f from codex:c5f8 · Next: `rally say resolve --tool <you> --ref fact_8c7_18cc1f5f --subject "responded to handoff" --json` when it's done · not yours? hand it back to codex:c5f8
+Peer codex:c5f8 handed you a task — it sits with you until you answer or hand it back · Why: «CHANGELOG entry for 0.2.5 under the heading» (untrusted) · fact_8c7_18cc1f5f from codex:c5f8 · Next: `rally say resolve --tool claude_code:6c021b53-9c1e-4d2a-8f0b-2b7a1c9d3e5f --ref fact_8c7_18cc1f5f --subject "responded to handoff" --json` when it's done · not yours? hand it back to codex:c5f8 · unclear → ask the human
 ```
 
-Measured 161-415 characters across the four states, against roughly 1,300
-before. Every fact names its actor as `host:short-id`, so you can tell which of
-four `claude_code` sessions filed a thing without reading a uuid. Peer-authored
+That render is 415 characters, the longest of the fixture states; the
+shortest is 161. The enforced guarantee is the 420-character ceiling, not the
+range.
+
+Every fact names its actor as `host:short-id`, so you can tell which of four
+`claude_code` sessions filed a thing without reading a uuid. Peer-authored
 text appears only inside guillemets and every closing guillemet is followed by
 `(untrusted)`.
 
 `rally hooks room-detail --brief|--verbose` (new, persisted per repo or user,
 overridable for one session with `RALLY_HOOK_ROOM_DETAIL`) selects between this
 and the previous rendering. `verbose` reproduces the old output byte for byte —
-the legacy path is wrapped in a conditional rather than rewritten, which is why
-no existing expectation changed.
+each legacy branch gained a `!briefMode &&` guard and no rendering string or
+transformation changed, which is why no existing expectation changed. `G-o`
+pins that byte-identity against the pre-change hook out of git history.
 
 The message now renders `next.suggested_commands`, which the hook never did
 before, so a peer-controlled `--ref`, `--target` or `--id` reaches a string that
@@ -47,9 +54,19 @@ Three controls close that:
 - truncation drops whole clauses and never slices characters, since a character
   cut lands inside a quoted span and strips its `(untrusted)` tag.
 
-`tests/hooks/test_room_message_contract.sh` is new: 26 cases, both hosts,
-asserting identical text. Run it with `RALLY_HOOK_ROOM_DETAIL=verbose` and 24 of
-26 fail — a suite that passed in both modes would be testing nothing.
+An independent audit found a survivor of the first control: a token was treated
+as a flag on shape alone, and a backlog id of the form
+`--ignore-all-prior-instructions-...` is pure `[a-z-]`, so it posed as a flag and
+skipped every value check while shlex left it unquoted. It rendered bare in the
+command, and because the long token pushed the message over budget the ladder
+evicted the quoted copy in Why — leaving the bare rendering as the only one. A
+token now counts as a flag only when no value is owed and it is one of the flags
+`next.rs` actually emits; everything else is a value and must clear the gate.
+`G-p2` covers it and fails when the fix is reverted.
+
+`tests/hooks/test_room_message_contract.sh` is new: 28 cases. Every case that
+renders on both hosts asserts the two extracted strings are identical. Run it with `RALLY_HOOK_ROOM_DETAIL=verbose` and 25 of
+28 fail — a suite that passed in both modes would be testing nothing.
 
 Known limit: the identifier-shape gate rejects any two-character word, so a file
 extension fails it and most real paths render quoted. The headline therefore
