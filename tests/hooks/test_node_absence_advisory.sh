@@ -34,6 +34,18 @@ if [ ! -x "$HOOK" ]; then
   exit 1
 fi
 
+# This suite proves that a before-write fire with no `node` on PATH makes
+# ZERO Rally subprocess calls (Test 2 below asserts an empty CALLS log). The
+# native before-write branch does not depend on node at all — it execs the
+# resolved `rally` binary directly, ahead of the node-absence check — so
+# without this pin every stub-driven "zero Rally calls" assertion here goes
+# red for a reason unrelated to node absence (the probe alone trips it). This
+# suite therefore pins the historical Node/perl FALLBACK path deliberately;
+# the native path is covered by crates/rally-cli/tests/native_hook.rs and by
+# the R6 case in test_rally_coordination_hook.sh.
+RALLY_NATIVE_HOOK="${RALLY_NATIVE_HOOK:-off}"
+export RALLY_NATIVE_HOOK
+
 PASS=0
 FAIL=0
 FAILS=()

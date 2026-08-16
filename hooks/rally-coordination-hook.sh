@@ -261,16 +261,38 @@ _rally_resolve_bin() {
 # RALLY_NATIVE_HOOK in {0,off,false,no,disabled} forces the historical
 # path; the fallback-mode test suites export it so their stubs (which pin
 # Node behaviour) stay exercised.
+#
+# CACHE FRESHNESS IS BY RECORDED IDENTITY, NOT BY `-nt`. The obvious
+# implementation -- write the marker, then trust it while `[ "$marker" -nt
+# "$bin" ]` -- silently never caches here. macOS ships bash 3.2.57 as
+# /bin/bash, and its `-nt` compares whole-second mtimes; the probe writes its
+# marker in the same second the binary was installed often enough that the
+# comparison ties and returns false, so every fire re-probed. Measured on this
+# machine while the R6 case was failing:
+#   bin_mtime=1786848777.082970865  marker_mtime=1786848777.748299517  -nt=no
+# The marker instead records the binary's size and FRACTIONAL mtime next to
+# the verdict, and any mismatch invalidates it. Whole seconds are not enough
+# for the same reason `-nt` was not: a rebuild inside one second leaves %m
+# unchanged and the stale verdict would survive. `stat -f '%z:%Fm'` (BSD) and
+# `stat -c '%s:%.9Y'` (GNU) both carry nanoseconds; if neither is available
+# the id is empty, which re-probes every fire -- slower, never wrong.
 _rally_native_capable() {  # $1=root $2=absolute resolved binary path
   local root="$1" bin="$2" marker_dir marker safe_bin verdict out tmp
+  local bin_id cached_verdict cached_id
   safe_bin="${bin//[^A-Za-z0-9._-]/_}"
   marker_dir="$root/.rally/.hook-seen"
   marker="$marker_dir/native-probe.$safe_bin.seen"
-  if [ -f "$marker" ] && [ "$marker" -nt "$bin" ]; then
-    verdict=""
-    read -r verdict < "$marker" 2>/dev/null || true
-    [ "$verdict" = "native" ]
-    return $?
+  # BSD stat (macOS) and GNU stat (Linux) disagree on flags; try both and fall
+  # back to an empty id, which simply forces a re-probe rather than wedging.
+  bin_id="$(stat -f '%z:%Fm' "$bin" 2>/dev/null || stat -c '%s:%.9Y' "$bin" 2>/dev/null || true)"
+  if [ -f "$marker" ] && [ -n "$bin_id" ]; then
+    cached_verdict=""
+    cached_id=""
+    { read -r cached_verdict; read -r cached_id; } < "$marker" 2>/dev/null || true
+    if [ "$cached_id" = "$bin_id" ]; then
+      [ "$cached_verdict" = "native" ]
+      return $?
+    fi
   fi
   out="$("$bin" hook capabilities --json 2>/dev/null || true)"
   case "$out" in
@@ -282,7 +304,7 @@ _rally_native_capable() {  # $1=root $2=absolute resolved binary path
   # landed.
   mkdir -p "$marker_dir" 2>/dev/null || return 1
   tmp="$(mktemp "$marker.XXXXXX" 2>/dev/null)" || return 1
-  if ! printf '%s\n' "$verdict" > "$tmp" 2>/dev/null; then
+  if ! printf '%s\n%s\n' "$verdict" "$bin_id" > "$tmp" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null || true
     return 1
   fi
