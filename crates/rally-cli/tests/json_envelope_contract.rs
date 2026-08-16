@@ -358,6 +358,27 @@ fn envelope_daemon_status() {
     ws.cleanup();
 }
 
+/// `hook capabilities` — the probe sentinel a wrapper reads to decide
+/// whether this binary serves a phase natively or must fall back (checklist
+/// Item 4 / plan revision R7: `hook before-write --json` is a DELIBERATE
+/// exception — a host envelope, no `ok`/`data` — so no envelope test exists
+/// for it; only `capabilities` follows the standard contract).
+#[test]
+fn envelope_hook_capabilities() {
+    let ws = Workspace::new("hook-capabilities");
+    let body = ws.json(&["hook", "capabilities", "--json"]);
+    assert_envelope_contract("hook", &body);
+    assert_eq!(body["schema"], "agent-rally.command.hook.v1");
+    let phases = body["data"]["hook"]["phases"]
+        .as_array()
+        .expect("data.hook.phases must be an array");
+    assert!(
+        phases.iter().any(|p| p == "before-write"),
+        "data.hook.phases must contain before-write; got {phases:?}"
+    );
+    ws.cleanup();
+}
+
 /// `migrate-legacy` — no required args; idempotent read-then-write.
 #[test]
 fn envelope_migrate_legacy() {
