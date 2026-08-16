@@ -18,27 +18,55 @@ process, under one deadline. The shell wrapper shrank to opt-out, SEC-001
 containment, a cached capability probe, and `exec`. A binary without the
 subcommand keeps the existing Node path, so older installs are unaffected.
 
-Nine `node` spawns and one perl watchdog per edit became zero. Median wall time
-fell from 608 ms to 89 ms for a single-path Claude edit.
+Nine `node` spawns and one perl watchdog per edit became zero. Measured with
+`scripts/bench_hook_latency.py --repeat 20`, at load averages 8-9 before and 6.4
+after:
 
-The tail moved the other way and that is not yet fixed: p95 rose from 752 ms to
-3969 ms, because `renew_owned_claim_leases` takes its own full snapshot and
-appends one renewal per claim the session owns, on every fire. On a store where
-the tool held ~35 claims, the native path measured 1875 ms against the Node
-fallback's 709 ms — both completing the claim. Details, traces and the next
-lever are in `docs/perf/2026-08-15-before-write-hook-latency.md`.
+| Scenario | before p50 | after p50 | before p95 | after p95 |
+|---|---|---|---|---|
+| Claude, 1 path | 608.4 ms | 59.9 ms | 752.4 ms | 70.1 ms |
+| Codex, 4 paths (apply_patch) | 798.5 ms | 65.3 ms | 821.9 ms | 107.7 ms |
+| Claude, pure read | 28.1 ms | 20.0 ms | 28.9 ms | 20.9 ms |
+
+Removing the interpreters was not most of that. An intermediate build with every
+node spawn already gone measured p95 3969 ms — five times worse than the shell —
+because `renew_owned_claim_leases` took its own full snapshot on top of the
+transaction's and then renewed every claim the session owned, so cost scaled
+with claims accumulated. The transaction now captures one snapshot and hands it
+down, and skips renewal with a stderr note when the budget is nearly spent.
+`RALLY_HOOK_TRACE=1` reports per-stage timings; on a fresh store everything that
+is not the ledger totals under a fifth of a millisecond. Details in
+`docs/perf/2026-08-15-before-write-hook-latency.md`.
 
 Host envelopes are unchanged, verified by running both paths side by side and
 diffing bytes. Codex still never receives a `permissionDecision`. Every abort
 still returns the fail-loud "coordination skipped, proceeding UNCLAIMED"
 advisory on stdout rather than a bare `{}`, and still carries no
 `permissionDecision` at all — a deny would gate the edit and an allow would
-grant it, and rally does neither. `RALLY_NATIVE_HOOK=off` forces the Node path;
-`RALLY_HOOK_TRACE=1` emits one line of per-stage timings.
+grant it, and rally does neither. `RALLY_NATIVE_HOOK=off` forces the Node path.
 
-A pure read now costs 48 ms rather than 28 ms: the native branch runs before the
-envelope is read, so it resolves the binary and consults the cached probe before
-reaching the short-circuit.
+### Fixed — three ways a coordination failure could look like a clean check
+
+A hostile repo could turn a failure into silence. When a target crossed a
+symlink, escaped the Rally root, or traversed a parent, the transaction returned
+a bare `{}` — byte-identical to "checked, no conflict" — so a repo that commits
+a symlink at an ancestor of a path the agent is about to edit produced a
+clean-looking envelope while no deconfliction had happened. Those now emit the
+fail-loud advisory. Malformed HOST input still returns `{}` plus stderr: that is
+the agent's own tool call, not a repo-controlled condition.
+
+The capability probe discarded a verdict it had already computed whenever its
+marker could not be written, so a read-only `.rally/.hook-seen` meant the native
+path was never taken. The probe also inherited the host's stdin, which a
+stdin-reading binary on `$RALLY_BIN` would consume, leaving the transaction an
+empty envelope — demonstrated, not assumed. The probe cache also never cached:
+it compared marker and binary with `[ -nt ]`, and macOS bash 3.2 compares whole
+seconds, so a marker written in the same second as the binary tied and every
+fire re-probed.
+
+A `rally hook before-write` argument error exited 2, which Claude Code treats as
+a blocking hook error — a gate, which the charter forbids. It now emits the
+advisory and exits 0.
 
 ### Fixed — the hook could execute a `rally` it had just refused (SEC-001)
 
