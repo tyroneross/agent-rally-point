@@ -873,6 +873,18 @@ fn backend_auto_without_live_socket_uses_tmux() {
             "auto",
             "--tmux-bin",
             tmux_spy.to_str().unwrap(),
+            // Hermetic guard against the hook-safety watchdog's 3s default
+            // budget (src/lib.rs `DEFAULT_WATCHDOG_TIMEOUT_MS`): under a
+            // parallel `cargo test` run competing for CPU with sibling
+            // integration tests, a perfectly correct `rally run` can exceed
+            // 3s wall-clock and hit the watchdog's fail-open path, which
+            // emits the neutral `{"ok": true, "product": "rally"}` envelope
+            // (no `data.run.session`) and exits 0 — indistinguishable from
+            // a real backend-selection bug from this test's assertion alone.
+            // Widen this test's budget well above plausible contention so
+            // it asserts backend selection, not host scheduling latency.
+            "--timeout-ms",
+            "20000",
         ])
         .current_dir(&cwd)
         .env("HOME", &home)
