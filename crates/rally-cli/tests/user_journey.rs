@@ -538,16 +538,19 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
         "src/room.rs",
     ]);
 
-    let enter = workspace.json(&[
-        "enter",
-        "--json",
-        "--tool",
-        "codex",
-        "--session-id",
+    let enter = workspace.json_with_session(
         "codex-main",
-        "--path",
-        "src/room.rs",
-    ]);
+        &[
+            "enter",
+            "--json",
+            "--tool",
+            "codex",
+            "--session-id",
+            "codex-main",
+            "--path",
+            "src/room.rs",
+        ],
+    );
     assert_eq!(enter["schema"], "agent-rally.command.enter.v1");
     assert_matches_schema("agent-rally.command.enter.v1.json", &enter);
     assert_eq!(enter["data"]["enter"]["cursor"]["before"], 0);
@@ -574,16 +577,19 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
             .iter()
             .any(|item| item["subject"] == "Rally uses enter/say/room/check")
     );
-    let enter_again = workspace.json(&[
-        "enter",
-        "--json",
-        "--tool",
-        "codex",
-        "--session-id",
+    let enter_again = workspace.json_with_session(
         "codex-main",
-        "--path",
-        "src/room.rs",
-    ]);
+        &[
+            "enter",
+            "--json",
+            "--tool",
+            "codex",
+            "--session-id",
+            "codex-main",
+            "--path",
+            "src/room.rs",
+        ],
+    );
     // R10/cursor: second enter's cursor_before = 7 (ledger-derived from the
     // Read checkpoint written by the first enter, which recorded
     // content_max_seq=7). The second enter detects codex as already active

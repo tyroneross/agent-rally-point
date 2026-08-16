@@ -15,11 +15,10 @@
 // does the test.
 //
 // Determinism + self-containment: the room is a fresh mktemp dir, git-init'd, torn
-// down after. No network, no shared state, no wall-clock in assertions. If the
-// release binary is absent, the gate is skipped with a clear reason rather than
-// failing spuriously — build the binary to arm it. As of 2026-08-10 the repo's
-// CI gate does not invoke this Node suite; the combined O33 activation gate must
-// add a current release build plus a zero-skip npm test before rollout.
+// down after. No network, no shared state, no wall-clock in assertions. The
+// release auxiliary gate builds the current binary and supplies its exact path
+// through RALLY_PACKET_EMPIRICAL_BIN. Direct local runs retain the conventional
+// target/release/rally fallback and skip clearly when no binary is available.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -32,12 +31,11 @@ import { renderPacket } from "../core/packet.mjs";
 import { workstreamStatus } from "../core/workstream-status.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-// dynamic-workflows/tests -> repo root -> target/release/rally
-// NOTE: this binary must be REBUILT after any rally-cli change for this gate to
-// test current behavior — a stale binary would assert against old flag arity.
-// Local/manual evidence must name that build and report zero skipped tests; CI
-// does not currently guarantee either property.
-const RALLY = join(here, "..", "..", "target", "release", "rally");
+// dynamic-workflows/tests -> repo root -> target/release/rally. The fallback is
+// only for direct local runs; release gates set the override to the executable
+// path reported by the current Cargo build, including isolated target dirs.
+const RALLY = process.env.RALLY_PACKET_EMPIRICAL_BIN
+  || join(here, "..", "..", "target", "release", "rally");
 
 const DESCRIPTOR = {
   workstream: "empirical 2-path/2-dep gate",

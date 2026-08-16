@@ -152,7 +152,44 @@
   var API = { rooms: "/api/rooms", room: function (id) { return "/api/room/" + encodeURIComponent(id); } };
   var REFRESH_MS = 5000;
 
-  var state = { rooms: [], selectedId: null, timer: null, showStale: false, seqSeen: {} };
+  var state = {
+    rooms: [],
+    selectedId: null,
+    timer: null,
+    showStale: false,
+    seqSeen: {},
+    selectionGeneration: 0,
+    reloadRoomsPending: false,
+  };
+
+  function createCoalescedRunner(run) {
+    var active = null;
+    var queued = false;
+
+    function finish(result) {
+      active = null;
+      if (queued) {
+        queued = false;
+        return request();
+      }
+      if (!result.ok) throw result.error;
+      return result.value;
+    }
+
+    function request() {
+      if (active) {
+        queued = true;
+        return active;
+      }
+      active = Promise.resolve().then(run).then(
+        function (value) { return finish({ ok: true, value: value }); },
+        function (error) { return finish({ ok: false, error: error }); }
+      );
+      return active;
+    }
+
+    return request;
+  }
 
   function h(tag, opts, children) {
     var el = document.createElement(tag);
@@ -248,8 +285,9 @@
       ]);
       row.addEventListener("click", function () {
         state.selectedId = room.id;
+        state.selectionGeneration += 1;
         renderRoomsList();
-        loadRoomDetail(room.id);
+        requestViewLoad(false);
       });
       list.appendChild(row);
     });
@@ -308,7 +346,7 @@
       });
       toggle.addEventListener("click", function () {
         state.showStale = !state.showStale;
-        if (state.selectedId) loadRoomDetail(state.selectedId);
+        if (state.selectedId) requestViewLoad(false);
       });
       card.appendChild(toggle);
     }
@@ -405,22 +443,42 @@
   function loadRooms() {
     return fetch(API.rooms).then(function (r) { return r.json(); }).then(function (rooms) {
       state.rooms = rooms;
-      if (!state.selectedId && rooms.length > 0) state.selectedId = rooms[0].id;
-      if (state.selectedId && !rooms.some(function (r) { return r.id === state.selectedId; })) {
-        state.selectedId = rooms.length > 0 ? rooms[0].id : null;
+      var selectedId = state.selectedId;
+      if (!selectedId && rooms.length > 0) selectedId = rooms[0].id;
+      if (selectedId && !rooms.some(function (r) { return r.id === selectedId; })) {
+        selectedId = rooms.length > 0 ? rooms[0].id : null;
+      }
+      if (state.selectedId !== selectedId) {
+        state.selectedId = selectedId;
+        state.selectionGeneration += 1;
       }
       renderRoomsList();
       if (state.selectedId) {
-        return loadRoomDetail(state.selectedId);
+        return loadRoomDetail(state.selectedId, state.selectionGeneration);
       }
       document.getElementById("room-detail").innerHTML = "";
     });
   }
 
-  function loadRoomDetail(id) {
+  function loadRoomDetail(id, generation) {
     return fetch(API.room(id)).then(function (r) { return r.json(); }).then(function (snapshot) {
-      if (state.selectedId === id) renderRoomDetail(snapshot);
+      if (state.selectedId === id && state.selectionGeneration === generation) {
+        renderRoomDetail(snapshot);
+      }
     });
+  }
+
+  var runViewLoad = createCoalescedRunner(function () {
+    var reloadRooms = state.reloadRoomsPending;
+    var generation = state.selectionGeneration;
+    state.reloadRoomsPending = false;
+    if (reloadRooms) return loadRooms();
+    if (state.selectedId) return loadRoomDetail(state.selectedId, generation);
+  });
+
+  function requestViewLoad(reloadRooms) {
+    state.reloadRoomsPending = state.reloadRoomsPending || reloadRooms;
+    return runViewLoad();
   }
 
   function addRoom() {
@@ -443,7 +501,7 @@
         return;
       }
       pathInput.value = "";
-      return loadRooms();
+      return requestViewLoad(true);
     }).catch(function (err) {
       errorBox.textContent = String(err);
       errorBox.hidden = false;
@@ -453,8 +511,11 @@
   function removeRoom(id) {
     if (!window.confirm("Remove this room from rally-ui? (does not touch the repo itself)")) return;
     fetch(API.room(id).replace("/api/room/", "/api/rooms/"), { method: "DELETE" }).then(function () {
-      if (state.selectedId === id) state.selectedId = null;
-      return loadRooms();
+      if (state.selectedId === id) {
+        state.selectedId = null;
+        state.selectionGeneration += 1;
+      }
+      return requestViewLoad(true);
     });
   }
 
@@ -464,19 +525,21 @@
   document.getElementById("add-path").addEventListener("keydown", function (e) {
     if (e.key === "Enter") addRoom();
   });
-  document.getElementById("refresh-btn").addEventListener("click", loadRooms);
+  document.getElementById("refresh-btn").addEventListener("click", function () {
+    requestViewLoad(true);
+  });
 
   var toggle = document.getElementById("auto-refresh-toggle");
   function scheduleRefresh() {
     if (state.timer) clearInterval(state.timer);
     state.timer = setInterval(function () {
-      if (toggle.checked) loadRooms();
+      if (toggle.checked) requestViewLoad(true);
     }, REFRESH_MS);
   }
   toggle.addEventListener("change", scheduleRefresh);
 
   scheduleRefresh();
-  loadRooms();
+  requestViewLoad(true);
 })();
 </script>
 </body>

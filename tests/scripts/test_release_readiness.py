@@ -40,6 +40,10 @@ class ReleaseReadinessTests(unittest.TestCase):
             "#!/usr/bin/env bash\nprintf 'quality:%s\\n' \"${CARGO_TARGET_DIR:-}\" >> \"$RELEASE_READINESS_LOG\"\n",
         )
         make_executable(
+            self.root / "scripts/run-release-auxiliary-gate.sh",
+            "#!/usr/bin/env bash\nprintf 'auxiliary:%s\\n' \"${CARGO_TARGET_DIR:-}\" >> \"$RELEASE_READINESS_LOG\"\n",
+        )
+        make_executable(
             self.root / "scripts/check-release-parity.sh",
             "#!/usr/bin/env bash\nprintf 'parity:%s\\n' \"${RALLY_RELEASE_TAG:-}\" >> \"$RELEASE_READINESS_LOG\"\nexit \"${RELEASE_READINESS_PARITY_EXIT:-0}\"\n",
         )
@@ -58,6 +62,8 @@ class ReleaseReadinessTests(unittest.TestCase):
         (self.root / "dynamic-workflows").mkdir()
         (self.root / "dynamic-workflows/package.json").write_text("{}\n", encoding="utf-8")
         (self.root / "CHANGELOG.md").write_text("# Changelog\n\n## v1.2.3\n", encoding="utf-8")
+        (self.root / "tracked.txt").write_text("tracked candidate\n", encoding="utf-8")
+        (self.root / "untracked.txt").write_text("untracked candidate\n", encoding="utf-8")
 
         make_executable(
             self.bin / "git",
@@ -91,6 +97,14 @@ if [ "$1" = "status" ]; then
   printf '%s' "${RELEASE_READINESS_GIT_STATUS:-}"
   exit 0
 fi
+if [ "$1" = "ls-files" ] && [ "$2" = "--stage" ]; then
+  printf '100644 deadbeef 0\ttracked.txt\\0'
+  exit 0
+fi
+if [ "$1" = "ls-files" ]; then
+  printf 'tracked.txt\\0untracked.txt\\0'
+  exit 0
+fi
 if [ "$1" = "diff" ]; then
   printf 'git:%s\\n' "$*" >> "$RELEASE_READINESS_LOG"
   exit 0
@@ -113,7 +127,13 @@ printf '%s\\n' "$target"
         )
         make_executable(
             self.bin / "actionlint",
-            "#!/usr/bin/env bash\nprintf 'actionlint:%s\\n' \"$*\" >> \"$RELEASE_READINESS_LOG\"\n",
+            """#!/usr/bin/env bash
+set -euo pipefail
+if [ -n "${RELEASE_READINESS_MUTATE_PATH:-}" ]; then
+  printf 'changed during gate\n' > "$RELEASE_READINESS_ROOT/$RELEASE_READINESS_MUTATE_PATH"
+fi
+printf 'actionlint:%s\n' "$*" >> "$RELEASE_READINESS_LOG"
+""",
         )
 
     def tearDown(self) -> None:
@@ -211,9 +231,7 @@ printf '%s\\n' "$target"
                 "git:diff --check",
                 "git:diff --cached --check",
                 f"quality:{self.root / 'isolated-target'}",
-                "prepush:alpha",
-                "prepush:beta",
-                "npm:--prefix dynamic-workflows test",
+                f"auxiliary:{self.root / 'isolated-target'}",
                 "actionlint:",
             ],
         )
@@ -227,6 +245,7 @@ printf '%s\\n' "$target"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"quality:{explicit_target}", self.commands())
+        self.assertIn(f"auxiliary:{explicit_target}", self.commands())
         self.assertTrue(explicit_target.exists())
 
     def test_full_rejects_a_changed_head(self) -> None:
@@ -240,6 +259,22 @@ printf '%s\\n' "$target"
     def test_full_rejects_a_changed_worktree(self) -> None:
         result = self.run_script(
             "--full", extra_env={"RELEASE_READINESS_GIT_STATUS_DRIFTS": "1"}
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("candidate worktree changed during --full", result.stderr)
+        self.assertIn("actionlint:", self.commands())
+
+    def test_full_rejects_tracked_content_drift_with_stable_status(self) -> None:
+        result = self.run_script(
+            "--full", extra_env={"RELEASE_READINESS_MUTATE_PATH": "tracked.txt"}
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("candidate worktree changed during --full", result.stderr)
+        self.assertIn("actionlint:", self.commands())
+
+    def test_full_rejects_untracked_content_drift_with_stable_status(self) -> None:
+        result = self.run_script(
+            "--full", extra_env={"RELEASE_READINESS_MUTATE_PATH": "untracked.txt"}
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("candidate worktree changed during --full", result.stderr)

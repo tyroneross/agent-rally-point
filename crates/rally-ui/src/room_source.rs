@@ -116,6 +116,12 @@ struct Inner {
     health_reason: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ResponseHealthIssue {
+    health: &'static str,
+    reason: String,
+}
+
 /// Fetch a full snapshot for one room, bounded by a 25s outer timeout.
 pub async fn fetch_snapshot(room_path: &Path, rally_bin: &str) -> RoomSnapshot {
     let path_str = room_path.to_string_lossy().to_string();
@@ -213,15 +219,30 @@ async fn fetch_inner(room_path: &Path, rally_bin: &str) -> Inner {
     let agents = parse_agents(&status_value);
     let (handoffs, claims, max_seq) = parse_room(&room_value);
 
-    if is_stub_response(&status_value) || is_stub_response(&room_value) {
+    let response_issues: Vec<ResponseHealthIssue> = [&status_value, &room_value]
+        .into_iter()
+        .filter_map(response_health_issue)
+        .collect();
+    if !response_issues.is_empty() {
+        let health = if response_issues.iter().any(|issue| issue.health == "error") {
+            "error"
+        } else {
+            "degraded"
+        };
         return Inner {
             agents,
             handoffs,
             events,
             claims,
             max_seq,
-            health: "degraded",
-            health_reason: Some("watchdog stub response — writes may be dropping".to_string()),
+            health,
+            health_reason: Some(
+                response_issues
+                    .into_iter()
+                    .map(|issue| issue.reason)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
         };
     }
 
@@ -255,26 +276,86 @@ async fn run_rally(room_path: &Path, rally_bin: &str, args: &[&str]) -> Result<V
         .await
         .map_err(|e| format!("failed to spawn `{rally_bin}`: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str::<Value>(&stdout).map_err(|e| {
+    let value = serde_json::from_str::<Value>(&stdout).map_err(|e| {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let joined_args = args.join(" ");
         format!(
-            "failed to parse JSON from `{rally_bin} {joined_args}`: {e}; stderr={}",
+            "failed to parse JSON from `{rally_bin} {joined_args}` ({}): {e}; stderr={}",
+            output.status,
             stderr.trim()
         )
-    })
+    })?;
+    if !output.status.success() {
+        let joined_args = args.join(" ");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = response_health_issue(&value)
+            .map(|issue| issue.reason)
+            .filter(|reason| !reason.trim().is_empty())
+            .or_else(|| {
+                let stderr = stderr.trim();
+                (!stderr.is_empty()).then(|| stderr.to_string())
+            })
+            .unwrap_or_else(|| "Rally returned no error detail".to_string());
+        return Err(format!(
+            "`{rally_bin} {joined_args}` exited unsuccessfully ({}): {detail}",
+            output.status
+        ));
+    }
+    Ok(value)
 }
 
-/// Detect the degraded "watchdog stub" shape: `{"ok":true,"product":"rally"}`
-/// with no `data` key at all (a healthy response always carries `data`).
-fn is_stub_response(v: &Value) -> bool {
-    let Some(obj) = v.as_object() else {
-        return false;
-    };
-    obj.len() <= 2
-        && obj.get("ok").and_then(Value::as_bool) == Some(true)
-        && obj.get("product").and_then(Value::as_str) == Some("rally")
-        && !obj.contains_key("data")
+/// Map structured Rally failures to an operator-visible health issue instead
+/// of treating their absent room data as a healthy empty snapshot.
+fn response_health_issue(v: &Value) -> Option<ResponseHealthIssue> {
+    let obj = v.as_object()?;
+    let is_rally = obj.get("product").and_then(Value::as_str) == Some("rally");
+    let ok = obj.get("ok").and_then(Value::as_bool);
+    let is_watchdog = obj.get("command").and_then(Value::as_str) == Some("watchdog")
+        || v.pointer("/data/watchdog_timeout").and_then(Value::as_bool) == Some(true)
+        || v.pointer("/data/watchdog").is_some();
+    let retry =
+        "Retry this room refresh; if it persists, run `rally doctor --reap-stale` in the room.";
+
+    if is_rally && ok == Some(true) && !obj.contains_key("data") {
+        return Some(ResponseHealthIssue {
+            health: "degraded",
+            reason: format!("Rally returned a legacy watchdog stub without room data. {retry}"),
+        });
+    }
+
+    if ok == Some(false) {
+        let detail = response_error_detail(v).unwrap_or(if is_watchdog {
+            "the watchdog expired before room data was returned"
+        } else {
+            "the command failed before room data was returned"
+        });
+        return Some(ResponseHealthIssue {
+            health: "error",
+            reason: format!("Rally returned an error: {detail}. {retry}"),
+        });
+    }
+
+    if is_watchdog {
+        let detail = response_error_detail(v)
+            .unwrap_or("the watchdog returned before the room response completed");
+        return Some(ResponseHealthIssue {
+            health: "degraded",
+            reason: format!("Rally returned an incomplete watchdog response: {detail}. {retry}"),
+        });
+    }
+
+    None
+}
+
+fn response_error_detail(v: &Value) -> Option<&str> {
+    [
+        "/data/watchdog/agent_visible/message",
+        "/data/watchdog/message",
+        "/error/message",
+        "/data/reason",
+    ]
+    .into_iter()
+    .find_map(|pointer| v.pointer(pointer).and_then(Value::as_str))
 }
 
 fn parse_agents(value: &Value) -> Vec<AgentRow> {
@@ -454,4 +535,54 @@ fn parse_event_line(raw: &str) -> Option<EventRow> {
         subject,
         created_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::response_health_issue;
+
+    #[test]
+    fn read_only_watchdog_timeout_is_an_actionable_error() {
+        let value = json!({
+            "ok": false,
+            "product": "rally",
+            "command": "watchdog",
+            "schema": "agent-rally.command.watchdog.v1",
+            "data": {
+                "watchdog_timeout": true,
+                "reason": "command did not complete before the watchdog deadline; coordination failed open",
+                "elapsed_ms": 3001
+            }
+        });
+
+        let issue = response_health_issue(&value).expect("watchdog error should be classified");
+        assert_eq!(issue.health, "error");
+        assert!(issue.reason.contains("Retry this room refresh"));
+        assert!(issue.reason.contains("rally doctor --reap-stale"));
+    }
+
+    #[test]
+    fn normal_response_has_no_health_issue() {
+        let value = json!({
+            "command": "room",
+            "data": {"room": {"max_seq": 42}},
+            "ok": true,
+            "product": "rally",
+            "schema": "agent-rally.command.room.v1"
+        });
+
+        assert_eq!(response_health_issue(&value), None);
+    }
+
+    #[test]
+    fn legacy_watchdog_stub_is_actionably_degraded() {
+        let value = json!({"ok": true, "product": "rally"});
+
+        let issue = response_health_issue(&value).expect("legacy stub should be classified");
+        assert_eq!(issue.health, "degraded");
+        assert!(issue.reason.contains("without room data"));
+        assert!(issue.reason.contains("Retry this room refresh"));
+    }
 }

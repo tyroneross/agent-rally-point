@@ -31,11 +31,10 @@ on:
         description: "Existing tag to stage and publish (e.g. v0.2.5). Published releases cannot be overwritten."
         required: true
 
-permissions:
-  actions: read        # download the complete build matrix before publication
-  contents: write       # upload release assets
-  id-token: write       # provenance attestation (sigstore OIDC)
-  attestations: write   # write the attestation
+# Start every job with no token capabilities. Each job receives only the
+# permissions needed for its own phase, so validation containers never inherit
+# release-write or provenance-signing authority.
+permissions: {}
 
 # Serialize retries for a tag. A failed run can safely resume its draft, but a
 # separate run must never publish or mutate the same release concurrently.
@@ -44,17 +43,87 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Resolve the version tag exactly once. Every source-consuming job checks out
+  # this immutable commit SHA, and publication revalidates the tag immediately
+  # before the draft becomes public.
+  resolve:
+    name: Resolve immutable release commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - name: Validate trigger and resolve tag commit
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          case "$GITHUB_EVENT_NAME" in
+            workflow_dispatch)
+              expected_ref="refs/heads/${DEFAULT_BRANCH}"
+              if [ "$GITHUB_REF" != "$expected_ref" ]; then
+                echo "manual releases must be dispatched from ${expected_ref}" >&2
+                exit 1
+              fi
+              tag="$INPUT_TAG"
+              ;;
+            push)
+              if [[ "$GITHUB_REF" != refs/tags/* ]]; then
+                echo "release push is not a tag: $GITHUB_REF" >&2
+                exit 1
+              fi
+              tag="${GITHUB_REF#refs/tags/}"
+              ;;
+            *)
+              echo "unsupported release event: $GITHUB_EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            printf 'release tag must be strict vX.Y.Z without leading zeroes: %q\n' "$tag" >&2
+            exit 1
+          fi
+
+          sha="$(
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/${GITHUB_REPOSITORY}/commits/refs%2Ftags%2F${tag}" \
+              --jq '.sha'
+          )"
+          if [[ ! "$sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            printf 'tag did not resolve to a commit SHA: %q\n' "$sha" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$sha" != "$GITHUB_SHA" ]; then
+            echo "tag moved after push event: event=$GITHUB_SHA current=$sha" >&2
+            exit 1
+          fi
+
+          printf 'tag=%s\nsha=%s\n' "$tag" "$sha" >> "$GITHUB_OUTPUT"
+
   # A tag push does not run the branch-only CI workflow. Re-run the same
   # pinned acceptance gate here so a parity-clean but unformatted, unlinted,
   # or failing tag cannot publish release assets.
   quality:
     name: Release quality
+    needs: resolve
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout release source
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       # Keep this exact pin in lockstep with rust-toolchain.toml, CI, and
       # scripts/run-quality-gate.sh. A moving stable toolchain makes the
@@ -73,6 +142,23 @@ jobs:
       - name: Quality gate (scripts/run-quality-gate.sh)
         run: ./scripts/run-quality-gate.sh
 
+      - name: Release-readiness contract tests
+        run: |
+          python3 tests/scripts/test_release_readiness.py
+          python3 tests/scripts/test_run_release_auxiliary_gate.py
+          python3 tests/scripts/test_release_workflow_contract.py
+
+      - name: Install Node.js (pinned)
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.22.0'
+
+      - name: Release auxiliary gate
+        run: ./scripts/run-release-auxiliary-gate.sh
+
+      - name: Workflow syntax (Actionlint 1.7.12)
+        uses: docker://rhysd/actionlint:1.7.12
+
   # Gates the whole build matrix on release-version parity: the canonical CLI
   # version (crates/rally-cli/Cargo.toml) must agree with every plugin
   # manifest AND the bundled Codex artifact must not be stale. A
@@ -80,25 +166,34 @@ jobs:
   # release — fail fast here, before spending the 4-triple build matrix.
   parity:
     name: Release parity
+    needs: resolve
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Release parity (scripts/check-release-parity.sh)
         env:
           # The tag must be both the release name and the exact version encoded
           # in the checked-out CLI/package surfaces. This also rejects a manual
           # dispatch that names a missing tag or checks out a different commit.
-          RALLY_RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RALLY_RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: ./scripts/check-release-parity.sh
 
   build:
     name: Build ${{ matrix.triple }}
-    needs: [quality, parity]
+    needs: [resolve, quality, parity]
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -143,7 +238,8 @@ jobs:
           # release matches its tag, not whatever main HEAD happens to be. The
           # workflow DEFINITION still comes from the dispatch ref (main), so CI
           # fixes like the macos-14 Intel cross-compile apply to old tags too.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - name: Install Rust toolchain (pinned)
         uses: dtolnay/rust-toolchain@1.95.0
@@ -200,8 +296,11 @@ jobs:
 
   publish:
     name: Publish complete release
-    needs: [quality, parity, build]
+    needs: [resolve, quality, parity, build]
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
     steps:
       - name: Download complete build matrix
         uses: actions/download-artifact@v4
@@ -231,12 +330,23 @@ jobs:
       # A failed upload may leave some assets on GitHub. Keep that incomplete
       # state invisible in a draft; only the final API call makes it public.
       # A retry may resume a draft, but must never overwrite a public release.
-      - name: Require a fresh or draft release
+      - name: Require immutable tag and a fresh or draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.resolve.outputs.sha }}
         run: |
           set -euo pipefail
+          current_sha="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/commits/refs%2Ftags%2F${TAG}" \
+              --jq '.sha'
+          )"
+          if [ "$current_sha" != "$EXPECTED_SHA" ]; then
+            echo "tag moved before draft staging: expected=$EXPECTED_SHA current=$current_sha" >&2
+            exit 1
+          fi
+
           if draft="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .draft 2>&1)"; then
             if [ "$draft" != "true" ]; then
               echo "refusing to mutate published release $TAG" >&2
@@ -255,19 +365,72 @@ jobs:
         id: upload_draft
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          target_commitish: ${{ needs.resolve.outputs.sha }}
           draft: true
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: release-assets/*
 
-      - name: Publish the complete staged release as latest
+      - name: Verify draft assets and publish as latest
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.resolve.outputs.sha }}
           RELEASE_ID: ${{ steps.upload_draft.outputs.id }}
         run: |
           set -euo pipefail
-          test -n "$RELEASE_ID"
+          if [[ ! "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+            printf 'invalid release id: %q\n' "$RELEASE_ID" >&2
+            exit 1
+          fi
+
+          release_state="$(
+            gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+              --jq '[.draft, .tag_name] | @tsv'
+          )"
+          IFS=$'\t' read -r draft release_tag extra <<< "$release_state"
+          if [ "$draft" != "true" ] || [ "$release_tag" != "$TAG" ] || [ -n "${extra:-}" ]; then
+            echo "release id $RELEASE_ID is not the expected draft for $TAG" >&2
+            exit 1
+          fi
+
+          expected_assets="$(mktemp)"
+          actual_assets="$(mktemp)"
+          trap 'rm -f "$expected_assets" "$actual_assets"' EXIT
+          printf '%s\n' \
+            rally-aarch64-apple-darwin \
+            rally-aarch64-apple-darwin.sha256 \
+            rally-aarch64-unknown-linux-gnu \
+            rally-aarch64-unknown-linux-gnu.sha256 \
+            rally-x86_64-apple-darwin \
+            rally-x86_64-apple-darwin.sha256 \
+            rally-x86_64-unknown-linux-gnu \
+            rally-x86_64-unknown-linux-gnu.sha256 \
+            | while IFS= read -r asset; do
+                printf '%s\tuploaded\n' "$asset"
+              done > "$expected_assets"
+          gh api --method GET --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" \
+            --jq '.[] | [.name, .state] | @tsv' \
+            | sort > "$actual_assets"
+          if ! cmp -s "$expected_assets" "$actual_assets"; then
+            echo "draft release assets differ from the exact uploaded set" >&2
+            diff -u "$expected_assets" "$actual_assets" >&2 || true
+            exit 1
+          fi
+
+          current_sha="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/commits/refs%2Ftags%2F${TAG}" \
+              --jq '.sha'
+          )"
+          if [ "$current_sha" != "$EXPECTED_SHA" ]; then
+            echo "tag moved before publication: expected=$EXPECTED_SHA current=$current_sha" >&2
+            exit 1
+          fi
+
           gh api --method PATCH \
             "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
             -F draft=false \

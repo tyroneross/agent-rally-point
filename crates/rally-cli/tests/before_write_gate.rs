@@ -57,6 +57,7 @@ impl Workspace {
         Command::new(env!("CARGO_BIN_EXE_rally"))
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
+            .env("RALLY_OBSERVER_PID", std::process::id().to_string())
             .args(args)
             .output()
             .unwrap()

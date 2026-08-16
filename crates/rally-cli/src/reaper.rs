@@ -450,11 +450,11 @@ impl ReapBudgetClock {
         }
     }
 
-    fn elapsed(&self, attempted_actions: usize) -> std::time::Duration {
+    fn elapsed(&self, _attempted_actions: usize) -> std::time::Duration {
         #[cfg(debug_assertions)]
         if let Some(step_ms) = self.logical_step_ms {
             return std::time::Duration::from_millis(
-                step_ms.saturating_mul(attempted_actions as u64),
+                step_ms.saturating_mul(_attempted_actions as u64),
             );
         }
         self.started.elapsed()

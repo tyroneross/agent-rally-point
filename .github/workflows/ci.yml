@@ -88,24 +88,22 @@ jobs:
       - name: Release parity (scripts/check-release-parity.sh)
         run: ./scripts/check-release-parity.sh
 
-      # The pre-push suites drive .githooks/pre-push end to end, and that hook
-      # invokes run-quality-gate.sh and check-release-parity.sh. Running them
-      # inside either gate recurses and races on shared detached worktrees, so
-      # the gates skip them by name. CI is the one place nothing re-enters them.
-      # test_prepush_pinned_gate.sh is the adversarial control for RC-018: it
-      # asserts a pushed commit's modified gate script does NOT execute.
-      - name: Pre-push hook suites (RC-018 adversarial control)
+      - name: Release-readiness contract tests
         run: |
-          set -euo pipefail
-          found=0
-          for t in tests/hooks/test_prepush_*.sh; do
-            [ -f "$t" ] || continue
-            found=$((found + 1))
-            echo "::group::$t"
-            "$t"
-            echo "::endgroup::"
-          done
-          if [ "$found" -eq 0 ]; then
-            echo "no tests/hooks/test_prepush_*.sh found — refusing to pass vacuously" >&2
-            exit 1
-          fi
+          python3 tests/scripts/test_release_readiness.py
+          python3 tests/scripts/test_run_release_auxiliary_gate.py
+          python3 tests/scripts/test_release_workflow_contract.py
+
+      - name: Install Node.js (pinned)
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.22.0'
+
+      # One shared gate builds the current release binary, requires the
+      # packaged Node suite to execute with zero skips, and runs every pre-push
+      # contract suite without duplicating that logic in workflow YAML.
+      - name: Release auxiliary gate
+        run: ./scripts/run-release-auxiliary-gate.sh
+
+      - name: Workflow syntax (Actionlint 1.7.12)
+        uses: docker://rhysd/actionlint:1.7.12

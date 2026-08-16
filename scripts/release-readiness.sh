@@ -79,6 +79,64 @@ fi
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
+capture_candidate_snapshot() {
+  python3 - "$repo_root" <<'PY'
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+
+repo_root = os.fsencode(sys.argv[1])
+digest = hashlib.sha256()
+
+
+def add_field(label: bytes, value: bytes) -> None:
+    digest.update(len(label).to_bytes(4, "big"))
+    digest.update(label)
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
+def git_bytes(*args: str) -> bytes:
+    return subprocess.check_output(["git", *args], cwd=repo_root)
+
+
+# Preserve porcelain state for status-level changes, then add the index and
+# filesystem content so an already-dirty path cannot change invisibly.
+add_field(b"status", git_bytes("status", "--porcelain=v1", "--untracked-files=all", "-z"))
+add_field(b"index", git_bytes("ls-files", "--stage", "-z"))
+
+listed_paths = git_bytes(
+    "ls-files", "--cached", "--others", "--exclude-standard", "-z"
+).split(b"\0")
+for relative_path in sorted(path for path in listed_paths if path):
+    add_field(b"path", relative_path)
+    absolute_path = os.path.join(repo_root, relative_path)
+    try:
+        metadata = os.lstat(absolute_path)
+    except FileNotFoundError:
+        add_field(b"kind", b"missing")
+        continue
+
+    add_field(b"mode", str(stat.S_IMODE(metadata.st_mode)).encode("ascii"))
+    if stat.S_ISREG(metadata.st_mode):
+        content = hashlib.sha256()
+        with open(absolute_path, "rb") as candidate_file:
+            for chunk in iter(lambda: candidate_file.read(1024 * 1024), b""):
+                content.update(chunk)
+        add_field(b"kind", b"file")
+        add_field(b"content", content.digest())
+    elif stat.S_ISLNK(metadata.st_mode):
+        add_field(b"kind", b"symlink")
+        add_field(b"target", os.readlink(absolute_path))
+    else:
+        add_field(b"kind", b"other")
+
+print(digest.hexdigest())
+PY
+}
+
 if [ -n "$release_tag" ] && [ -n "$(git status --porcelain --untracked-files=all)" ]; then
   echo "release-readiness: --tag requires a pristine checkout so the verified source is exactly the tagged commit" >&2
   exit 1
@@ -90,12 +148,12 @@ if [ "$fix_generated" -eq 1 ]; then
 fi
 
 candidate_head=""
-candidate_tree=""
+candidate_snapshot=""
 if [ "$full" -eq 1 ]; then
   # A shared checkout may change while long Rust or hook suites run. Record
   # the complete candidate state and reject a mixed-tree verdict at the end.
   candidate_head=$(git rev-parse HEAD)
-  candidate_tree=$(git status --porcelain=v1 --untracked-files=all)
+  candidate_snapshot=$(capture_candidate_snapshot)
 fi
 
 if [ -n "$release_tag" ]; then
@@ -138,12 +196,12 @@ fi
 
 assert_candidate_unchanged() {
   current_head=$(git rev-parse HEAD)
-  current_tree=$(git status --porcelain=v1 --untracked-files=all)
+  current_snapshot=$(capture_candidate_snapshot)
   if [ "$current_head" != "$candidate_head" ]; then
     echo "release-readiness: candidate HEAD changed during --full; rerun from one frozen checkout" >&2
     return 1
   fi
-  if [ "$current_tree" != "$candidate_tree" ]; then
+  if [ "$current_snapshot" != "$candidate_snapshot" ]; then
     echo "release-readiness: candidate worktree changed during --full; rerun from one frozen checkout" >&2
     return 1
   fi
@@ -161,29 +219,12 @@ else
   CARGO_TARGET_DIR="$quality_target" ./scripts/run-quality-gate.sh
 fi
 
-echo "release-readiness: pre-push hook suites" >&2
-prepush_suites=0
-for suite in tests/hooks/test_prepush_*.sh; do
-  [ -f "$suite" ] || continue
-  prepush_suites=$((prepush_suites + 1))
-  echo "release-readiness: $suite" >&2
-  "$suite"
-done
-if [ "$prepush_suites" -eq 0 ]; then
-  echo "release-readiness: no tests/hooks/test_prepush_*.sh found" >&2
-  exit 1
+echo "release-readiness: auxiliary release gates" >&2
+if [ -n "${CARGO_TARGET_DIR+x}" ]; then
+  ./scripts/run-release-auxiliary-gate.sh
+else
+  CARGO_TARGET_DIR="$quality_target" ./scripts/run-release-auxiliary-gate.sh
 fi
-
-if [ ! -f dynamic-workflows/package.json ]; then
-  echo "release-readiness: dynamic-workflows/package.json is missing" >&2
-  exit 1
-fi
-if ! command -v npm >/dev/null 2>&1; then
-  echo "release-readiness: npm is required for packaged workflow tests" >&2
-  exit 1
-fi
-echo "release-readiness: packaged workflow tests" >&2
-npm --prefix dynamic-workflows test
 
 if ! command -v actionlint >/dev/null 2>&1; then
   echo "release-readiness: actionlint is required for --full (install: go install github.com/rhysd/actionlint/cmd/actionlint@<version>)" >&2
