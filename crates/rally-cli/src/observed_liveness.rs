@@ -67,6 +67,7 @@ struct ObservationStamp {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ObservationIndex {
     by_session: BTreeMap<(String, String), ObservedLiveness>,
+    by_session_reported_at: BTreeMap<(String, String), DateTime<Utc>>,
     by_tool: BTreeMap<String, ObservedLiveness>,
 }
 
@@ -90,6 +91,32 @@ impl ObservationIndex {
                 .get(tool)
                 .copied()
                 .unwrap_or(ObservedLiveness::Unknown),
+        }
+    }
+
+    /// A live process observation predating the claim's effective lease expiry
+    /// cannot prove that the owner renewed work past that boundary. This keeps
+    /// an ancient/recycled PID from vetoing writer-stamped expiry forever.
+    pub(crate) fn for_claim_since(
+        &self,
+        tool: Option<&str>,
+        from_session_id: Option<&str>,
+        not_before: Option<DateTime<Utc>>,
+    ) -> ObservedLiveness {
+        let verdict = self.for_claim(tool, from_session_id);
+        let (Some(tool), Some(session_id), Some(not_before)) = (tool, from_session_id, not_before)
+        else {
+            return verdict;
+        };
+        if verdict == ObservedLiveness::Live
+            && self
+                .by_session_reported_at
+                .get(&(tool.to_string(), session_id.to_string()))
+                .is_some_and(|reported_at| *reported_at < not_before)
+        {
+            ObservedLiveness::Unknown
+        } else {
+            verdict
         }
     }
 }
@@ -364,6 +391,7 @@ pub(crate) fn observe_sessions(room_repo_root: &Path, facts: &[Fact]) -> Observa
 
     let mut worktrees: BTreeMap<PathBuf, WorktreeProbe> = BTreeMap::new();
     let mut by_session = BTreeMap::new();
+    let mut by_session_reported_at = BTreeMap::new();
     let mut per_tool: BTreeMap<String, Vec<ObservedLiveness>> = BTreeMap::new();
     for stamp in latest.into_values() {
         let worktree = worktrees
@@ -374,7 +402,9 @@ pub(crate) fn observe_sessions(room_repo_root: &Path, facts: &[Fact]) -> Observa
             pid_alive: stamp.observer_pid.and_then(process_alive),
         };
         let verdict = grade_observation(&stamp, &sample);
-        by_session.insert((stamp.tool.clone(), stamp.session_key.clone()), verdict);
+        let session_key = (stamp.tool.clone(), stamp.session_key.clone());
+        by_session.insert(session_key.clone(), verdict);
+        by_session_reported_at.insert(session_key, stamp.reported_at);
         per_tool
             .entry(stamp.tool.clone())
             .or_default()
@@ -386,6 +416,7 @@ pub(crate) fn observe_sessions(room_repo_root: &Path, facts: &[Fact]) -> Observa
         .collect();
     ObservationIndex {
         by_session,
+        by_session_reported_at,
         by_tool,
     }
 }
@@ -484,6 +515,7 @@ mod tests {
                     ObservedLiveness::Live,
                 ),
             ]),
+            by_session_reported_at: BTreeMap::new(),
             by_tool: BTreeMap::from([("agent".to_string(), ObservedLiveness::Live)]),
         };
 
@@ -501,6 +533,25 @@ mod tests {
             index.for_claim(Some("agent"), None),
             ObservedLiveness::Live,
             "only a sessionless legacy claim may use the tool aggregate"
+        );
+    }
+
+    #[test]
+    fn live_pid_observation_before_lease_expiry_is_not_fresh_renewal_evidence() {
+        let key = ("agent".to_string(), "owner-session".to_string());
+        let reported_at = Utc::now() - chrono::Duration::hours(3);
+        let index = ObservationIndex {
+            by_session: BTreeMap::from([(key.clone(), ObservedLiveness::Live)]),
+            by_session_reported_at: BTreeMap::from([(key, reported_at)]),
+            by_tool: BTreeMap::new(),
+        };
+        assert_eq!(
+            index.for_claim_since(
+                Some("agent"),
+                Some("owner-session"),
+                Some(reported_at + chrono::Duration::hours(1)),
+            ),
+            ObservedLiveness::Unknown
         );
     }
 

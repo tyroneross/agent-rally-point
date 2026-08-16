@@ -3173,8 +3173,7 @@ claim and asks the implementation whether it is true. See
 
 ### RC-073 — the Rust integration tests race the CLI's own 3s watchdog under a parallel test runner, and the fail-open envelope makes the race look like a backend bug
 
-- **State:** `mechanism` — cause established and reproduced; the fix is NOT landed, because it
-  spans a file another agent currently holds a claim on. Escalated rather than half-applied.
+- **State:** `controlled` by RC-074 — the mechanism remains here as the original incident record.
 - **Symptom:** `scripts/run-quality-gate.sh` fails intermittently with assertions that read like
   real product defects. Two examples from one run:
   `daemon_inject_routing.rs:890` — `auto with no live rally socket must select tmux; got null`,
@@ -3202,12 +3201,69 @@ claim and asks the implementation whether it is true. See
   well above plausible contention via ONE shared test helper, rather than patching call sites as
   they flake. A per-site patch is this defect repeated N times, and the count is already ≥4 across
   ≥2 files.
-- **Why it is not fixed here:** `crates/rally-cli/tests/daemon_inject_routing.rs` is claimed by
-  another agent in the room, and applying the helper to only the unclaimed half would leave the
-  class open while looking closed. A prepared 12-line patch for that file's
-  `backend_auto_without_live_socket_uses_tmux` exists uncommitted in the working tree for the
-  claim owner to take.
-- **Consequence, stated plainly:** until this is fixed, `run-quality-gate.sh` is a flaky gate, and
-  a flaky gate does not merely miss defects — it **certifies** them, because the next red run gets
-  read as noise.
+- **Resolution:** RC-074 makes the transport timeout a named result and makes affected harnesses
+  reject it directly; the tests retain explicit wider budgets only where they test a longer
+  operation rather than the watchdog.
+- **Consequence before RC-074:** `run-quality-gate.sh` was a flaky gate, and a flaky gate does not
+  merely miss defects — it **certifies** them, because the next red run gets read as noise.
 - **First seen:** 2026-08-15.
+
+### RC-074 — fail-open watchdog expiry returned a successful neutral envelope
+
+- **State:** `controlled` — forced timeout tests fail against the old payload and pass with the
+  named envelope.
+- **Mechanism:** `crates/rally-cli/src/lib.rs::emit_timeout_fail_open` returned exit 0 and
+  `{"ok":true,"product":"rally"}`. Exit 0 is required by the never-gate charter, but `ok:true`
+  claimed the command completed and omitted every discriminator. Parallel integration tests then
+  interpreted missing command data as product behavior.
+- **Fix:** the same exit-0 path now emits `ok:false`, command/schema identity,
+  `data.watchdog_timeout:true`, a reason, and measured elapsed milliseconds. The racing test
+  harnesses assert that flag. `reaper_scale.rs` now injects its budget clock, removing host load
+  from pass partitioning.
+- **Control:** `watchdog_timeout::hook_that_blocks_fails_open_within_budget`, the lib payload unit,
+  and the deterministic reaper scale partition tests.
+
+### RC-075 — stale-owner presentation and old PID observations made expired claims immortal
+
+- **State:** `controlled` — the reported three-path, 11-hour-old lease is reaped in a hermetic
+  ledger regression, and targeted handoffs do not reset owner silence.
+- **Mechanism:** `RoomSnapshot::claim_reclaim_eligible` read only `squads`, but adaptive decay
+  deliberately removes provably stale squads from that presentation list. Destructive reclaim
+  therefore lost its last-authored timestamp and failed closed. Separately,
+  `ObservationIndex::for_claim` treated one live numeric PID stamp as an unlimited veto even
+  after the claim's effective lease expiry. Facts addressed to an owner were not authored activity;
+  the misleading silence verdict came from the missing squad, not `target` handling.
+- **Fix:** snapshots retain the newest authored ledger timestamp separately from the decay-pruned
+  squad presentation. Lease cleanup accepts live-process evidence only
+  when observed at or after the effective lease boundary, so a recycled PID cannot make an old
+  observation current.
+- **Control:**
+  `reaper_write_integrity::expired_multi_path_claim_is_reaped_when_observer_pid_was_reused`,
+  `decay_pruned_owner_still_reclaims_from_authored_ledger_activity`,
+  `fact_targeted_at_owner_does_not_reset_owner_silence`, and the observed-liveness lease-boundary
+  unit.
+
+### RC-076 — a retracted claim remained in raw conflict detection
+
+- **State:** `controlled` on this branch before this report; the reported symptom does not
+  reproduce against the current base, and a CLI regression now preserves that result.
+- **Mechanism:** the room projection applied `resolve_retractions`, while
+  `claim_authority::detect_conflict` formerly indexed raw claim facts. Retraction returned success
+  and disappeared from room output, but conflict detection still treated the target as active.
+- **Fix:** conflict indexing reuses `resolve_retractions`, including second-order retraction of a
+  release. No additional production change was needed in this worktree.
+- **Control:** `claim_takeover_authz::owner_retraction_unblocks_the_scope_for_a_later_claim` plus
+  the existing lib first- and second-order retraction tests.
+
+### RC-077 — host auto-claims conflicted with orchestrators in the same session
+
+- **State:** `controlled` — the new unit fails with the old identity predicate and passes after the
+  principal rule change; CLI coverage exercises both tool spellings.
+- **Mechanism:** `claim_authority::same_session_owner` required exact tool-id equality before it
+  compared `from_session_id`. A hook's `claude_code:<uuid>` auto-claim and its orchestrator's claim
+  therefore conflicted despite sharing one host session.
+- **Fix:** equal nonblank protocol session ids plus equal tool families are one claim principal;
+  descriptive suffixes may differ. Unrelated families sharing one terminal remain distinct.
+  Both-sessionless legacy facts still require exact nonblank tool ids.
+- **Control:** `host_and_orchestrator_tool_ids_in_one_session_are_one_claim_principal` and
+  `claim_takeover_authz::one_host_session_does_not_conflict_with_its_orchestrator_tool_id`.

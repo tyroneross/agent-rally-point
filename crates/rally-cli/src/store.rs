@@ -1258,9 +1258,14 @@ pub(crate) struct RoomSnapshot {
     /// differently — design audit D1.
     #[serde(skip)]
     pub(crate) stale_authors: BTreeSet<String>,
+    /// Newest authored ledger timestamp per tool. This is authority evidence,
+    /// not presentation state: adaptive decay may remove a squad without
+    /// erasing the timestamp destructive reclaim must inspect.
+    #[serde(skip)]
+    pub(crate) author_last_seen: BTreeMap<String, String>,
 }
 
-/// The four `#[serde(skip)]` projections on [`RoomSnapshot`], carried across the
+/// The `#[serde(skip)]` projections on [`RoomSnapshot`], carried across the
 /// daemon wire beside the snapshot.
 ///
 /// # The two questions `#[serde(skip)]` was answering at once
@@ -1308,6 +1313,8 @@ pub(crate) struct SnapshotInternals {
     pub(crate) pending_wakes: Vec<Fact>,
     #[serde(default)]
     pub(crate) stale_authors: BTreeSet<String>,
+    #[serde(default)]
+    pub(crate) author_last_seen: BTreeMap<String, String>,
 }
 
 /// Hard, fail-loud bounds for the daemon-only snapshot side-channel.
@@ -1336,6 +1343,7 @@ impl RoomSnapshot {
             last_activity_ts: self.last_activity_ts.clone(),
             pending_wakes: self.pending_wakes.clone(),
             stale_authors: self.stale_authors.clone(),
+            author_last_seen: self.author_last_seen.clone(),
         }
     }
 
@@ -1345,6 +1353,7 @@ impl RoomSnapshot {
         self.last_activity_ts = internals.last_activity_ts;
         self.pending_wakes = internals.pending_wakes;
         self.stale_authors = internals.stale_authors;
+        self.author_last_seen = internals.author_last_seen;
     }
 }
 
@@ -1461,9 +1470,9 @@ impl RoomSnapshot {
     /// (default 30m); a multi-file / directory / repo / task claim only after
     /// the LARGE timeout (default 2h, == the historical `TAKEOVER_STALE_SECS`).
     ///
-    /// Fail-closed: an owner whose `last_seen_ts` is unknown or unparseable is
-    /// NEVER reclaimable (matches `takeover_eligible_owners`). The owner's age
-    /// is taken from the squad projection (last authored/presence fact).
+    /// Fail-closed: an owner whose authored activity cannot be established is
+    /// NEVER reclaimable. The owner's age normally comes from the squad
+    /// projection; a decay-pruned squad still retains its authored timestamp.
     /// Returns `(eligible, work_size)` so the caller can record the size in the
     /// reclaim provenance.
     pub(crate) fn claim_reclaim_eligible(
@@ -1489,17 +1498,24 @@ impl RoomSnapshot {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        // Owner age from the squad projection; fail-closed on missing/bad ts.
-        let eligible = self
-            .squads
-            .iter()
-            .find(|sq| sq.tool == owner)
-            .and_then(|sq| {
-                chrono::DateTime::parse_from_rfc3339(&sq.last_seen_ts)
-                    .ok()
-                    .map(|dt| now_secs - dt.timestamp() > timeout)
-            })
-            .unwrap_or(false);
+        // Read durable authored activity, not the presentation-only squad
+        // list. Adaptive decay can remove a provably stale squad, while facts
+        // merely TARGETED at the owner must not become owner activity.
+        let owner_last_seen = self
+            .author_last_seen
+            .get(owner)
+            .map(String::as_str)
+            .or_else(|| {
+                // Compatibility for programmatic snapshots constructed before
+                // authored timestamps became a separate internal projection.
+                self.squads
+                    .iter()
+                    .find(|squad| squad.tool == owner)
+                    .map(|squad| squad.last_seen_ts.as_str())
+            });
+        let eligible = owner_last_seen
+            .and_then(|last_seen| chrono::DateTime::parse_from_rfc3339(last_seen).ok())
+            .is_some_and(|dt| now_secs - dt.timestamp() > timeout);
         (eligible, size)
     }
 
@@ -1539,6 +1555,7 @@ impl RoomSnapshot {
             totals: self.totals,
             composition: self.composition,
             stale_authors: self.stale_authors,
+            author_last_seen: self.author_last_seen,
         };
         filtered.totals = RoomTotals {
             active_claims: filtered.active_claims.len(),
@@ -3722,6 +3739,15 @@ impl DirectRoomStore {
                 }
                 let observed_sessions =
                     crate::observed_liveness::observe_sessions(&self.repo_root, &facts);
+                let lease_boundary = active_claim
+                    .and_then(|claim| {
+                        claim
+                            .evidence
+                            .iter()
+                            .find_map(|item| item.strip_prefix("lease_expires_at:"))
+                    })
+                    .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                    .map(|time| time.with_timezone(&chrono::Utc));
                 let owner_still_stale = owner_reason
                     && active_claim.is_some_and(|claim| {
                         if claim.from_session_id.is_some() {
@@ -3742,8 +3768,16 @@ impl DirectRoomStore {
                             .is_some_and(|expires| expires <= chrono::Utc::now())
                     });
                 let observation_still_permits_cleanup = active_claim.is_some_and(|claim| {
-                    let current = observed_sessions
-                        .for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref());
+                    let current = if lease_reason {
+                        observed_sessions.for_claim_since(
+                            claim.tool.as_deref(),
+                            claim.from_session_id.as_deref(),
+                            lease_boundary,
+                        )
+                    } else {
+                        observed_sessions
+                            .for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref())
+                    };
                     match Self::reaper_marker(&fact.evidence, "observed") {
                         Some("stale") => {
                             current == crate::observed_liveness::ObservedLiveness::Stale
@@ -4762,6 +4796,7 @@ impl DirectRoomStore {
                 snapshot_from_facts_with_policy(&engagement_facts, &coord, include_archived);
             snapshot.squads = engagement_snapshot.squads;
             snapshot.stale_authors = engagement_snapshot.stale_authors;
+            snapshot.author_last_seen = engagement_snapshot.author_last_seen;
         } else {
             let contributors = scoped_contributor_tools(&scoped_facts);
             snapshot
@@ -4770,6 +4805,9 @@ impl DirectRoomStore {
             snapshot
                 .stale_authors
                 .retain(|tool| contributors.contains(tool));
+            snapshot
+                .author_last_seen
+                .retain(|tool, _| contributors.contains(tool));
         }
 
         if let Some(path) = normalized_path.as_deref() {
@@ -6182,6 +6220,10 @@ fn snapshot_from_facts_with_policy_at(
             }
         }
     }
+    let author_last_seen = tool_last
+        .iter()
+        .map(|(tool, (_, timestamp))| (tool.clone(), timestamp.clone()))
+        .collect::<BTreeMap<_, _>>();
     // `now_secs` already computed at the top of this function.
     let acked = acknowledged_tools(facts);
     // Adaptive-liveness signal sources (all PURE over `facts`):
@@ -6377,6 +6419,7 @@ fn snapshot_from_facts_with_policy_at(
         totals,
         composition: None,
         stale_authors,
+        author_last_seen,
     }
 }
 
@@ -12719,6 +12762,7 @@ mod ledger_tests {
             "last_activity_ts",
             "pending_wakes",
             "stale_authors",
+            "author_last_seen",
         ] {
             assert!(!keys.contains(private), "private key leaked: {private}");
         }
@@ -16607,6 +16651,7 @@ mod decay_reclaim_tests {
         sq.last_seen_ts = "garbage".to_string(); // unparseable
         let snap = RoomSnapshot {
             squads: vec![sq],
+            author_last_seen: BTreeMap::from([("ghost".to_string(), "garbage".to_string())]),
             ..Default::default()
         };
         let (eligible, _) = snap.claim_reclaim_eligible(&claim, &coord);
@@ -16626,6 +16671,54 @@ mod decay_reclaim_tests {
         };
         let (eligible, _) = snap.claim_reclaim_eligible(&claim, &coord);
         assert!(!eligible, "fail-closed: no squad entry for owner");
+    }
+
+    #[test]
+    fn decay_pruned_owner_still_reclaims_from_authored_ledger_activity() {
+        let coord = CoordinationConfig::default();
+        let mut claim = aged_fact("claim-pruned-owner", FactKind::Claim, 9 * 60 * 60);
+        claim.tool = Some("ghost".to_string());
+        claim.scope = vec!["file:a.rs".to_string(), "file:b.rs".to_string()];
+
+        // The presentation projection removed this provably-stale squad. That
+        // must not erase the timestamp the destructive authority decision uses.
+        let snapshot = RoomSnapshot {
+            stale_authors: BTreeSet::from(["ghost".to_string()]),
+            author_last_seen: BTreeMap::from([("ghost".to_string(), claim.created_at.clone())]),
+            ..Default::default()
+        };
+        let (eligible, size) = snapshot.claim_reclaim_eligible(&claim, &coord);
+        assert!(
+            eligible,
+            "a decay-pruned owner with nine hours of authored silence is past the two-hour bar"
+        );
+        assert_eq!(size, WorkSize::Large);
+    }
+
+    #[test]
+    fn fact_targeted_at_owner_does_not_reset_owner_silence() {
+        let coord = CoordinationConfig::default();
+        let mut claim = aged_fact("claim-targeted-owner", FactKind::Claim, 9 * 60 * 60);
+        claim.seq = 1;
+        claim.tool = Some("ghost".to_string());
+        claim.scope = vec!["file:a.rs".to_string(), "file:b.rs".to_string()];
+
+        let mut handoff = aged_fact("handoff-to-owner", FactKind::Handoff, 60);
+        handoff.seq = 2;
+        handoff.tool = Some("peer".to_string());
+        handoff.target = Some("ghost".to_string());
+
+        let snapshot = snapshot_from_facts_with_policy(&[claim.clone(), handoff], &coord, false);
+        let owner = snapshot
+            .squads
+            .iter()
+            .find(|squad| squad.tool == "ghost")
+            .expect("claim author remains projected");
+        assert_eq!(owner.last_seen_ts, claim.created_at);
+        assert!(
+            snapshot.claim_reclaim_eligible(&claim, &coord).0,
+            "a peer-authored handoff addressed to the owner is not owner activity"
+        );
     }
 
     #[test]

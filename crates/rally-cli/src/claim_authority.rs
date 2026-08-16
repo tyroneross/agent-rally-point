@@ -304,24 +304,38 @@ pub(crate) fn detect_conflict(facts: &[Fact], incoming: &Fact) -> Option<ClaimCo
 
 /// Whether two facts belong to the same lease owner.
 ///
-/// Session identity is authoritative when present. Tool-only equality is an
-/// explicit compatibility fallback only when both facts predate session
-/// stamping. A sessionful fact never aliases a sessionless fact, and sibling
-/// sessions of one tool never inherit each other's authority.
+/// Session identity plus tool family is authoritative when present. Exact
+/// tool equality is a compatibility fallback only when both facts predate
+/// session stamping. A sessionful fact never aliases a sessionless fact, and
+/// sibling sessions of one tool never inherit each other's authority.
 pub(crate) fn same_session_owner(
     left_tool: Option<&str>,
     left_session: Option<&str>,
     right_tool: Option<&str>,
     right_session: Option<&str>,
 ) -> bool {
-    if !same_nonblank_tool(left_tool, right_tool) {
-        return false;
-    }
     match (left_session, right_session) {
-        (Some(left), Some(right)) => left == right,
-        (None, None) => true,
+        // A protocol session plus tool family is the principal. Host hooks and
+        // orchestrated agents may use different suffixes inside one host
+        // session, while unrelated tool families sharing a terminal session
+        // remain distinct peers.
+        (Some(left), Some(right)) => {
+            !left.trim().is_empty() && left == right && same_tool_family(left_tool, right_tool)
+        }
+        (None, None) => same_nonblank_tool(left_tool, right_tool),
         _ => false,
     }
+}
+
+fn same_tool_family(left_tool: Option<&str>, right_tool: Option<&str>) -> bool {
+    fn family(tool: &str) -> &str {
+        tool.trim().split(':').next().unwrap_or_default()
+    }
+    matches!(
+        (left_tool, right_tool),
+        (Some(left), Some(right))
+            if !family(left).is_empty() && family(left) == family(right)
+    )
 }
 
 /// Whether two identities assert the same present, nonblank tool exactly.
@@ -655,6 +669,43 @@ mod tests {
         let conflict = detect_conflict(&[existing], &incoming).unwrap();
         assert_eq!(conflict.existing_claim_id, "claim-a");
         assert_eq!(conflict.scope, "file:src/lib.rs");
+    }
+
+    #[test]
+    fn host_and_orchestrator_tool_ids_in_one_session_are_one_claim_principal() {
+        let mut host = fact(
+            "claim-host",
+            "claude_code:5b130dd1-a78f-4658-b1d6-283a3898b437",
+            vec!["file:src/lib.rs"],
+        );
+        host.from_session_id = Some("sess:term:host:shared#live".to_string());
+        let mut orchestrator = fact(
+            "claim-orchestrator",
+            "claude_code:release-cleanup-c5f8ebd7",
+            vec!["file:src/lib.rs"],
+        );
+        orchestrator.from_session_id = Some("sess:term:host:shared#live".to_string());
+
+        assert!(
+            detect_conflict(std::slice::from_ref(&host), &orchestrator).is_none(),
+            "tool labels inside one host session must not conflict with their own auto-claim"
+        );
+
+        orchestrator.from_session_id = Some("sess:term:host:sibling#live".to_string());
+        assert!(
+            detect_conflict(&[host], &orchestrator).is_some(),
+            "a different host session must remain a distinct claim principal"
+        );
+    }
+
+    #[test]
+    fn unrelated_tool_families_in_one_terminal_session_remain_distinct() {
+        assert!(!same_session_owner(
+            Some("victim:01"),
+            Some("sess:term:shared#live"),
+            Some("codex:rogue"),
+            Some("sess:term:shared#live")
+        ));
     }
 
     /// A retraction exactly as `rally retract` writes it.

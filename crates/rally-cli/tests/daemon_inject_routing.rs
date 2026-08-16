@@ -32,6 +32,16 @@ use serde_json::Value;
 const RALLY_BIN: &str = env!("CARGO_BIN_EXE_rally");
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+fn assert_command_completed(value: &Value, context: &str) {
+    assert_ne!(
+        value["data"]["watchdog_timeout"],
+        Value::Bool(true),
+        "{context} hit the rally watchdog after {}ms: {}",
+        value["data"]["elapsed_ms"],
+        value["data"]["reason"]
+    );
+}
+
 fn unique(prefix: &str) -> String {
     let counter = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(
@@ -332,6 +342,7 @@ impl Sandbox {
             .args(args)
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
+            .env("RALLY_HOOK_TIMEOUT_MS", "20000")
             .env("PTYD_SOCKET_PATH", &self.socket)
             .env("RALLY_PTYD_SOCKET", &self.socket)
             .env_remove("PWD")
@@ -343,7 +354,9 @@ impl Sandbox {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
-        serde_json::from_slice(&out.stdout).unwrap()
+        let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_command_completed(&value, &format!("rally {args:?}"));
+        value
     }
 
     fn tmux_send_keys_count(&self) -> usize {
@@ -470,6 +483,7 @@ fn no_daemon_session_falls_back_to_framed_tmux() {
             .args(args)
             .current_dir(&cwd)
             .env("HOME", &home)
+            .env("RALLY_HOOK_TIMEOUT_MS", "20000")
             .env("PTYD_SOCKET_PATH", &dead_socket)
             .env_remove("PWD")
             .output()
@@ -878,9 +892,9 @@ fn backend_auto_without_live_socket_uses_tmux() {
             // parallel `cargo test` run competing for CPU with sibling
             // integration tests, a perfectly correct `rally run` can exceed
             // 3s wall-clock and hit the watchdog's fail-open path, which
-            // emits the neutral `{"ok": true, "product": "rally"}` envelope
-            // (no `data.run.session`) and exits 0 — indistinguishable from
-            // a real backend-selection bug from this test's assertion alone.
+            // emits a named `data.watchdog_timeout` envelope and exits 0.
+            // The shared assertion above now reports that timeout directly;
+            // this wider budget still keeps the test focused on routing.
             // Widen this test's budget well above plausible contention so
             // it asserts backend selection, not host scheduling latency.
             "--timeout-ms",
@@ -888,6 +902,7 @@ fn backend_auto_without_live_socket_uses_tmux() {
         ])
         .current_dir(&cwd)
         .env("HOME", &home)
+        .env("RALLY_HOOK_TIMEOUT_MS", "20000")
         .env("RALLY_PTYD_SOCKET", &dead_socket)
         .env_remove("PTYD_SOCKET_PATH")
         .env_remove("PWD")
@@ -899,6 +914,7 @@ fn backend_auto_without_live_socket_uses_tmux() {
         String::from_utf8_lossy(&out.stderr)
     );
     let run: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_command_completed(&run, "backend_auto_without_live_socket_uses_tmux");
     assert_eq!(
         run["data"]["run"]["session"]["backend"], "tmux",
         "auto with no live rally socket must select tmux; got {}",
@@ -1055,6 +1071,7 @@ fn real_ptyd_inject_actually_submits_and_is_received() {
             .args(args)
             .current_dir(&cwd)
             .env("HOME", &home)
+            .env("RALLY_HOOK_TIMEOUT_MS", "20000")
             .env("PATH", &path_env)
             .env("RALLY_PTYD_BIN", &ptyd_bin)
             .env("RALLY_PTYD_SOCKET", &socket)

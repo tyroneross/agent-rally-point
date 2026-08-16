@@ -411,6 +411,82 @@ fn exact_owner_session_can_release_live_claim_by_path() {
     ws.cleanup();
 }
 
+/// Defect B regression. Retraction is append-only, but the withdrawn claim
+/// must disappear from conflict detection as well as from `rally room`.
+#[test]
+fn owner_retraction_unblocks_the_scope_for_a_later_claim() {
+    let ws = Workspace::new("retract-unblocks-scope");
+    let claim = ws.claim_as_session("owner:01", "owner-session", "src/retracted.rs");
+
+    let retracted = ws.json_as_session(
+        "owner-session",
+        &[
+            "retract",
+            &claim,
+            "--tool",
+            "owner:01",
+            "--reason",
+            "claim posted in error",
+            "--json",
+        ],
+    );
+    assert_eq!(retracted["ok"], Value::Bool(true), "retract: {retracted}");
+
+    let replacement = ws.json_as_session(
+        "replacement-session",
+        &[
+            "say",
+            "claim",
+            "--tool",
+            "replacement:01",
+            "--path",
+            "src/retracted.rs",
+            "--subject",
+            "replacement claim",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        replacement["ok"],
+        Value::Bool(true),
+        "a retracted claim must not keep blocking its scope: {replacement}"
+    );
+    assert_eq!(ws.active_claim_owners(), vec!["replacement:01".to_string()]);
+    ws.cleanup();
+}
+
+/// Defect C end-to-end shape: the host hook and an orchestrator use different
+/// tool labels but carry the same protocol session principal.
+#[test]
+fn one_host_session_does_not_conflict_with_its_orchestrator_tool_id() {
+    let ws = Workspace::new("shared-host-principal");
+    ws.claim_as_session(
+        "claude_code:5b130dd1-a78f-4658-b1d6-283a3898b437",
+        "shared-host-session",
+        "src/shared.rs",
+    );
+    let orchestrator = ws.json_as_session(
+        "shared-host-session",
+        &[
+            "say",
+            "claim",
+            "--tool",
+            "claude_code:release-cleanup-c5f8ebd7",
+            "--path",
+            "src/shared.rs",
+            "--subject",
+            "orchestrator claim in host session",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        orchestrator["ok"],
+        Value::Bool(true),
+        "one protocol session must not refuse its own differently-labelled claim: {orchestrator}"
+    );
+    ws.cleanup();
+}
+
 /// Resolving a NON-claim (a blocker) by ref is unaffected — the gate applies
 /// only to refs that name an active claim.
 #[test]

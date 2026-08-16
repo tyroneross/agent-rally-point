@@ -430,6 +430,37 @@ fn reap_apply_budget() -> Option<std::time::Duration> {
     (ms > 0).then(|| std::time::Duration::from_millis(ms))
 }
 
+/// Budget clock for one reap pass. Production reads monotonic wall time. Debug
+/// integration tests may inject a logical millisecond step per attempted action
+/// so queue partitioning is deterministic on a loaded runner.
+struct ReapBudgetClock {
+    started: std::time::Instant,
+    #[cfg(debug_assertions)]
+    logical_step_ms: Option<u64>,
+}
+
+impl ReapBudgetClock {
+    fn start() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            #[cfg(debug_assertions)]
+            logical_step_ms: std::env::var("RALLY_TEST_REAP_CLOCK_STEP_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok()),
+        }
+    }
+
+    fn elapsed(&self, attempted_actions: usize) -> std::time::Duration {
+        #[cfg(debug_assertions)]
+        if let Some(step_ms) = self.logical_step_ms {
+            return std::time::Duration::from_millis(
+                step_ms.saturating_mul(attempted_actions as u64),
+            );
+        }
+        self.started.elapsed()
+    }
+}
+
 /// Inner implementation — takes an explicit `&RoomStore` so tests can inject a
 /// temp store without touching the process-global cwd.
 pub(crate) fn run_reap_stale_in_room(room: &RoomStore, apply: bool) -> Result<ReapReport> {
@@ -455,7 +486,7 @@ fn run_reap_stale_in_room_with_budget(
     // opening `snapshot()` is a full ledger read and is the same cost the
     // watchdog is measuring; a budget that ignored it would be a budget for the
     // cheap half of the pass.
-    let started = std::time::Instant::now();
+    let budget_clock = ReapBudgetClock::start();
     let snapshot = room.snapshot()?;
     let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
 
@@ -492,8 +523,21 @@ fn run_reap_stale_in_room_with_budget(
     for claim in &snapshot.active_claims {
         let (legacy_owner_eligible, _size) = snapshot.claim_reclaim_eligible(claim, &coord);
         let lease_eligible = lease_expired_ids.contains(&claim.event_id);
-        let observed =
-            observed_sessions.for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref());
+        let lease_boundary = claim
+            .evidence
+            .iter()
+            .find_map(|item| item.strip_prefix("lease_expires_at:"))
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+            .map(|time| time.with_timezone(&chrono::Utc));
+        let observed = if lease_eligible {
+            observed_sessions.for_claim_since(
+                claim.tool.as_deref(),
+                claim.from_session_id.as_deref(),
+                lease_boundary,
+            )
+        } else {
+            observed_sessions.for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref())
+        };
         // A sessionful claim never falls back to tool-wide activity. Exact
         // observed death is its owner-stale authority; Unknown stays closed.
         // Only legacy claims without a session id retain the historical squad
@@ -549,7 +593,7 @@ fn run_reap_stale_in_room_with_budget(
         // Automatic enter cleanup never starts a destructive action after its
         // budget is spent. A deliberate Full pass retains the historical
         // one-action progress floor so a slow ledger can still be drained.
-        if budget.is_some_and(|b| started.elapsed() >= b)
+        if budget.is_some_and(|b| budget_clock.elapsed(attempted_actions) >= b)
             && (mode == ReapMode::LeaseOnly || attempted_actions > 0)
         {
             remaining += 1;
@@ -709,7 +753,7 @@ fn run_reap_stale_in_room_with_budget(
                 remaining += 1;
                 continue;
             }
-            if budget.is_some_and(|b| started.elapsed() >= b)
+            if budget.is_some_and(|b| budget_clock.elapsed(attempted_actions) >= b)
                 && (mode == ReapMode::LeaseOnly || attempted_actions > 0)
             {
                 remaining += 1;
@@ -796,7 +840,7 @@ fn run_reap_stale_in_room_with_budget(
     // log, count as preserved, omit from the report.
     let lead_relinquished: Option<String> = if let Some(lead_tool) = &snapshot.lead {
         if stale_owners.contains(lead_tool.as_str()) {
-            let budget_spent = budget.is_some_and(|b| started.elapsed() >= b)
+            let budget_spent = budget.is_some_and(|b| budget_clock.elapsed(attempted_actions) >= b)
                 && (mode == ReapMode::LeaseOnly || attempted_actions > 0);
             if auto_candidate_limit_reached(mode, attempted_actions) || budget_spent {
                 remaining += 1;
