@@ -5,7 +5,9 @@
 
 All notable changes to Agent Rally Point are documented here.
 
-## Unreleased
+## v0.2.5 - 2026-08-15
+
+> Release date is set when the tag is cut; entries for the native before-write hook and RC-073 land under this heading before then.
 
 ### Fixed — every repo but this one committed rally's derived state (RC-072)
 
