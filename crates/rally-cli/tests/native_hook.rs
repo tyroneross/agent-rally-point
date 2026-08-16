@@ -908,7 +908,10 @@ fn deadline_miss_is_fail_loud_advisory() {
             &[
                 ("RALLY_BIN", BIN),
                 ("RALLY_SESSION_ID", "sess-slow-one"),
-                ("RALLY_TEST_BLOCK_MS", "1500"),
+                // Keep a full second between the assertion ceiling and the
+                // simulated stall so loaded CI runners cannot blur success
+                // (the watchdog fired) with failure (the stall completed).
+                ("RALLY_TEST_BLOCK_MS", "3000"),
                 ("RALLY_HOOK_TIMEOUT_MS", "300"),
             ],
         );
@@ -920,7 +923,7 @@ fn deadline_miss_is_fail_loud_advisory() {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(
-            elapsed < Duration::from_millis(1000),
+            elapsed < Duration::from_millis(2000),
             "T-07a elapsed {elapsed:?}"
         );
         let stdout = String::from_utf8_lossy(&out.stdout);
