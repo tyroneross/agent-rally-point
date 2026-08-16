@@ -1636,7 +1636,8 @@ install_stub "$noise_bin"
   repo="$tmpdir/noise-repo"
   mkdir -p "$repo/.rally"
   cd "$repo"
-  out=$(RALLY_BIN="$noise_bin" "$HOOK" start codex </dev/null 2>/dev/null)
+  # C6: this case grades the verbose roster (peer list + every claim scope).
+  out=$(RALLY_HOOK_ROOM_DETAIL=verbose RALLY_BIN="$noise_bin" "$HOOK" start codex </dev/null 2>/dev/null)
   rc=$?
   if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
   printf '%s' "$out" | grep -q "Visible peers: claude_code, unknown-peer" || { printf 'missing Rust-visible peers: %s\n' "$out" >&2; exit 1; }
@@ -1683,7 +1684,8 @@ install_stub "$status_prompt_bin"
   repo="$tmpdir/status-prompt-repo"
   mkdir -p "$repo/.rally"
   cd "$repo"
-  out=$(RALLY_BIN="$status_prompt_bin" RALLY_SESSION_ID="Status Terminal" RALLY_AGENT_ID="observer" "$HOOK" start codex </dev/null 2>/dev/null)
+  # C6: this case grades the verbose status roster and its wake-after timestamps.
+  out=$(RALLY_HOOK_ROOM_DETAIL=verbose RALLY_BIN="$status_prompt_bin" RALLY_SESSION_ID="Status Terminal" RALLY_AGENT_ID="observer" "$HOOK" start codex </dev/null 2>/dev/null)
   rc=$?
   if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
   printf '%s' "$out" | grep -q "Agent status:" || { printf 'missing status header: %s\n' "$out" >&2; exit 1; }
@@ -1712,7 +1714,8 @@ T="UserPromptSubmit prompt includes peer status changes"
   mkdir -p "$repo/.rally/.hook-seen"
   cd "$repo"
   rm -f .rally/.hook-seen/status-peer-session.*.seen 2>/dev/null
-  out=$(RALLY_BIN="$status_prompt_bin" RALLY_SESSION_ID="status-peer-session" RALLY_AGENT_ID="observer" "$HOOK" idle codex </dev/null 2>/dev/null)
+  # C6: this case grades the verbose per-turn roster (`<id>: working on <file>`).
+  out=$(RALLY_HOOK_ROOM_DETAIL=verbose RALLY_BIN="$status_prompt_bin" RALLY_SESSION_ID="status-peer-session" RALLY_AGENT_ID="observer" "$HOOK" idle codex </dev/null 2>/dev/null)
   rc=$?
   if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
   printf '%s' "$out" | grep -q "UserPromptSubmit" || { printf 'missing UserPromptSubmit envelope: %s\n' "$out" >&2; exit 1; }
@@ -2072,7 +2075,7 @@ if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "two logical events must run exac
 T="idle phase: exit 0 + valid JSON + never deny/block (default)"
 (
   cd "$REPO_ROOT"
-  out=$(RALLY_BIN="$stub_bin" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  out=$(RALLY_HOOK_ROOM_DETAIL=verbose RALLY_BIN="$stub_bin" "$HOOK" idle claude_code </dev/null 2>/dev/null)
   rc=$?
   if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
   if ! printf '%s' "$out" | node -e 'try { JSON.parse(require("fs").readFileSync(0,"utf8")||"{}"); process.exit(0);} catch(_){process.exit(1);} ' 2>/dev/null; then
@@ -2094,7 +2097,7 @@ if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "idle must stay advisory"; fi
 T="after-write phase: exit 0 + valid JSON + never block (default)"
 (
   cd "$REPO_ROOT"
-  out=$(RALLY_BIN="$stub_bin" "$HOOK" after-write claude_code </dev/null 2>/dev/null)
+  out=$(RALLY_HOOK_ROOM_DETAIL=verbose RALLY_BIN="$stub_bin" "$HOOK" after-write claude_code </dev/null 2>/dev/null)
   rc=$?
   if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
   if ! printf '%s' "$out" | node -e 'try { JSON.parse(require("fs").readFileSync(0,"utf8")||"{}"); process.exit(0);} catch(_){process.exit(1);} ' 2>/dev/null; then
@@ -2106,6 +2109,60 @@ T="after-write phase: exit 0 + valid JSON + never block (default)"
   exit 0
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "Stop must stay advisory"; fi
+
+# ----------------------------------------------------------------------
+# Test 8b + 9b: the BRIEF twins of Tests 8 and 9.
+#
+# Tests 8 and 9 above are pinned to verbose because their stub emits
+# `check.agent_visible`, and the brief composer renders `next` instead of the
+# binary's agent_visible — under brief they would render `{}` and "never
+# deny/block" would hold against an empty envelope, which is a vacuous pass.
+# This twin drives a `next` stub with `requires_human: true`, the only input
+# that reaches the high-severity branch, and asserts the advisory IS surfaced
+# while nothing denies or blocks.
+# ----------------------------------------------------------------------
+T="brief default: high-severity next surfaces an advisory and never denies/blocks"
+brief_stop_bin="$tmpdir/rally_brief_stop"
+cat > "$brief_stop_bin" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "hooks" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"data":{"hooks":{"enabled":true,"prompt":"once"}}}'
+elif [ "$1" = "next" ]; then
+  cat <<'JSON'
+{"data":{"next":{"actionable":true,"action":"respond_to_handoff","requires_human":true,"fact":{"event_id":"fact_stop_18cc1f5f","tool":"codex:reviewer","subject":"needs a human call before anyone acts"},"suggested_commands":[]}}}
+JSON
+else
+  printf '%s\n' '{}'
+fi
+EOF
+install_stub "$brief_stop_bin"
+(
+  repo="$tmpdir/brief-stop-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+  for ph in idle after-write; do
+    out=$(RALLY_BIN="$brief_stop_bin" RALLY_SESSION_ID="brief-stop-$ph" "$HOOK" "$ph" claude_code </dev/null 2>/dev/null)
+    rc=$?
+    if [ "$rc" != "0" ]; then printf '%s: rc=%s\n' "$ph" "$rc" >&2; exit 1; fi
+    if ! printf '%s' "$out" | node -e 'try { JSON.parse(require("fs").readFileSync(0,"utf8")||"{}"); process.exit(0);} catch(_){process.exit(1);} ' 2>/dev/null; then
+      printf '%s: invalid JSON: %s\n' "$ph" "$out" >&2; exit 1
+    fi
+    if ! printf '%s' "$out" | grep -q "HIGH-SEVERITY coordination signal (advisory"; then
+      printf '%s: high-severity advisory missing (vacuous pass): %s\n' "$ph" "$out" >&2; exit 1
+    fi
+    if ! printf '%s' "$out" | grep -q "handed you a task"; then
+      printf '%s: brief composer did not render the next item: %s\n' "$ph" "$out" >&2; exit 1
+    fi
+    if printf '%s' "$out" | grep -q '"permissionDecision":"deny"'; then
+      printf '%s: must never deny: %s\n' "$ph" "$out" >&2; exit 1
+    fi
+    if printf '%s' "$out" | grep -q '"decision":"block"'; then
+      printf '%s: must never block: %s\n' "$ph" "$out" >&2; exit 1
+    fi
+  done
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "brief lifecycle phases must stay advisory AND still surface"; fi
 
 # ----------------------------------------------------------------------
 # Test 10: idle + after-write self-gate — no .rally/ → exit 0, empty stdout
@@ -2327,7 +2384,8 @@ fs.writeFileSync(process.argv[2], JSON.stringify({ data: { status_read: { states
 ' "$_ad/room.json" "$_ad/status.json"
   (
     cd "$_ad/repo" || exit 1
-    ROOM_JSON="$_ad/room.json" STATUS_JSON="$_ad/status.json" \
+    RALLY_HOOK_ROOM_DETAIL=verbose \
+      ROOM_JSON="$_ad/room.json" STATUS_JSON="$_ad/status.json" \
       RALLY_BIN="$adv_bin" RALLY_TOOL_ID="claude_code:self" \
       "$HOOK" start claude_code </dev/null 2>/dev/null
   ) | node -e '

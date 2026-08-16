@@ -211,6 +211,11 @@ impl Workspace {
             .env("RALLY_GLOBAL_INDEX", "1")
             .env("RALLY_HOOK_TIMEOUT_MS", "30000")
             .env("RALLY_HOOK_PROMPT", "always")
+            // C6: this test pins the VERBOSE roster projection (every active claim
+            // scope and both owners). The default room-detail is `brief`, which renders
+            // a short single-line message instead, so the pin must name the mode it
+            // grades. Not an expectation change — the assertions are untouched.
+            .env("RALLY_HOOK_ROOM_DETAIL", "verbose")
             .env("RALLY_SESSION_ID", "hook-projection-parity-session")
             .env("RALLY_HOOK_DEDUPE_DIR", &self.dedupe)
             .env_remove("RALLY_HOOKS")

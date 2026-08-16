@@ -26,6 +26,10 @@
 set -u
 # (deliberately not -e: we assert on exit codes)
 
+# C6: this suite grades the VERBOSE renderer, which is byte-identical to the
+# pre-C6 rendering. Brief-mode adversarial twins: tests/hooks/test_room_message_contract.sh
+export RALLY_HOOK_ROOM_DETAIL=verbose
+
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
 HOOK="$REPO_ROOT/hooks/rally-coordination-hook.sh"
 

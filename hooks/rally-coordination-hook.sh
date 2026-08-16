@@ -93,6 +93,11 @@
 #   RALLY_CHECKIN_SECS     — next status check-in window (default 300 seconds).
 #   RALLY_HOOKS            — "off" disables this hook for the current session.
 #   RALLY_HOOK_PROMPT      — startup prompt mode: once, always, or off.
+#   RALLY_HOOK_ROOM_DETAIL — room message detail: brief (default) or
+#                            verbose (the full roster this hook shipped
+#                            before v0.2.5). Overrides the persisted
+#                            `rally hooks room-detail` setting for one
+#                            session; any other value is ignored.
 #   RALLY_HOOK_STRICT      — "1" to enable deny/block on high-severity signals.
 #   RALLY_HOOK_DEDUPE_SECS — duplicate registration window (default 5 seconds).
 #   RALLY_HOOK_DEDUPE_DIR  — test/diagnostic override for event markers.
@@ -1280,6 +1285,10 @@ if [ "$phase" = "before-write" ] && \
 fi
 
 hook_prompt_mode="${RALLY_HOOK_PROMPT:-once}"
+# Config-side room detail. A binary without the `room_detail` key (an older
+# rally, or any test stub) falls back to brief here and again in the node
+# parser above, so the shell never depends on the key existing.
+hook_room_detail_cfg="brief"
 
 # Reuse the envelope read before repo/Rally resolution. Native before-write
 # classification owns path extraction; other phases only need a session id.
@@ -1460,13 +1469,15 @@ try {
   if (typeof hooks.enabled !== "boolean") throw new Error("missing enabled");
   const enabled = hooks.enabled === false ? "0" : "1";
   const prompt = ["once", "always", "off"].includes(hooks.prompt) ? hooks.prompt : "once";
-  process.stdout.write(enabled + "\n" + prompt + "\n1");
+  const roomDetail = ["brief", "verbose"].includes(hooks.room_detail) ? hooks.room_detail : "brief";
+  process.stdout.write(enabled + "\n" + prompt + "\n1\n" + roomDetail);
 } catch (_) {
-  process.stdout.write("1\nonce\n0");
+  process.stdout.write("1\nonce\n0\nbrief");
 }
 ' ; } 2>/dev/null)"
   hook_enabled="$(printf '%s\n' "$hooks_meta" | sed -n '1p')"
   hook_prompt_mode="$(printf '%s\n' "$hooks_meta" | sed -n '2p')"
+  hook_room_detail_cfg="$(printf '%s\n' "$hooks_meta" | sed -n '4p')"
   if [ "$phase" = "before-write" ] && { [ "$_rally_native_effect" = "mutation" ] || [ "$_rally_native_effect" = "legacy" ]; } && \
       [ "$hooks_status_rc" != "0" ]; then
     _rally_advise_mutation_abort "hook settings unavailable" "$_rally_native_root" "$(_rally_native_meta_field session)"
@@ -1478,6 +1489,22 @@ try {
   fi
 fi
 export RALLY_HOOK_PROMPT_MODE="$hook_prompt_mode"
+
+# Room-message detail. ENV FIRST, deliberately: the persisted setting is the
+# operator default and RALLY_HOOK_ROOM_DETAIL is the documented one-session
+# override, which is also what makes every stub-driven suite pinnable with a
+# single variable (a stub returns no room_detail at all). Anything that is not
+# exactly brief|verbose is ignored rather than guessed at.
+case "${RALLY_HOOK_ROOM_DETAIL:-}" in
+  brief|verbose) : ;;
+  *)
+    case "$hook_room_detail_cfg" in
+      brief|verbose) RALLY_HOOK_ROOM_DETAIL="$hook_room_detail_cfg" ;;
+      *) RALLY_HOOK_ROOM_DETAIL="brief" ;;
+    esac
+    ;;
+esac
+export RALLY_HOOK_ROOM_DETAIL
 
 # Dispatch on phase.
 rally_output=""
@@ -1766,6 +1793,38 @@ function stateSummary(s) {
   return `${who}: ${ident(s.state || "unknown", 20)}`;
 }
 const statusLines = states.map(stateSummary).filter(Boolean);
+// C6: a REDUCED, UNSANITIZED view of the room for the final renderer, which
+// composes the brief message and sanitizes at render time -- exactly as it
+// already does for RALLY_STATUS_JSON. None of these raw values is emitted by
+// THIS renderer; the verbose `msg` above is byte-unchanged, and an older final
+// renderer simply ignores the extra key.
+function briefLease(c) {
+  const ev = Array.isArray(c.evidence) ? c.evidence : [];
+  for (const e of ev) {
+    const v = String(e == null ? "" : e);
+    if (v.indexOf("lease_expires_at:") === 0) return v.slice(17);
+  }
+  return "";
+}
+const allClaims = Array.isArray(R.active_claims) ? R.active_claims : [];
+const briefData = {
+  peer_claims: allClaims.filter(c => c && c.tool !== tool).slice(0, 24).map(c => ({
+    tool: c.tool || "",
+    scope: Array.isArray(c.scope) ? c.scope.slice(0, 24) : [],
+    event_id: c.event_id || c.id || "",
+    lease_expires_at: briefLease(c)
+  })),
+  my_claims: allClaims.filter(c => c && c.tool === tool).slice(0, 24).map(c => ({
+    scope: Array.isArray(c.scope) ? c.scope.slice(0, 24) : []
+  })),
+  handoffs_for_me: activeHandoffs.filter(h => h.target === tool).slice(0, 8).map(h => ({
+    event_id: h.event_id || "", tool: h.tool || "", subject: h.subject || ""
+  })),
+  handoffs_other: activeHandoffs.filter(h => h.target !== tool).slice(0, 8).map(h => ({
+    event_id: h.event_id || "", tool: h.tool || "", target: h.target || ""
+  })),
+  peers: peers.slice(0, 24)
+};
 const promptMode = process.env.RALLY_HOOK_PROMPT_MODE || "once";
 const showPrompt = promptMode !== "off";
 if (!showPrompt && peers.length === 0 && claims.length === 0 && handoffs === 0 && statusLines.length === 0) { process.stdout.write("{}"); process.exit(0); }
@@ -1799,7 +1858,7 @@ if (handoffs) {
 }
 if (nextAction) msg += `Suggested next: ${nextAction}. `;
 msg += "Provably stale peers, inactive claims, and non-actionable waits are omitted from this prompt; use `rally room` for full history. Before editing, check `rally room` / `rally next` and deconflict — do not edit a path covered by an active claim owned by another agent (rally auto-checks before each write).";
-process.stdout.write(JSON.stringify({ agent_visible: { present: true, severity: "warn", message: msg }, ledger_data: ledgerData }));
+process.stdout.write(JSON.stringify({ agent_visible: { present: true, severity: "warn", message: msg }, ledger_data: ledgerData, brief: briefData }));
 ' ; } 2>/dev/null)"
   fi
 elif [ "$phase" = "before-write" ]; then
@@ -1913,7 +1972,7 @@ fi
 strict="${RALLY_HOOK_STRICT:-0}"
 
 rally_root="$(find_rally_root 2>/dev/null || pwd)"
-printf '%s' "$rally_output" | RALLY_HOOK_STRICT="$strict" RALLY_HOOK_ROOT="$rally_root" RALLY_HOOK_SESSION="$session" RALLY_STATUS_JSON="${status_json:-}" node -e '
+printf '%s' "$rally_output" | RALLY_HOOK_STRICT="$strict" RALLY_HOOK_ROOT="$rally_root" RALLY_HOOK_SESSION="$session" RALLY_STATUS_JSON="${status_json:-}" RALLY_NEXT_JSON="${next_json:-}" node -e '
 const fs = require("fs");
 const raw = fs.readFileSync(0, "utf8");
 const phase = process.argv[1] || "idle";
@@ -2152,6 +2211,501 @@ let hasLedgerData = startRendererAuthored
       hook?.agent_visible || judgment?.agent_visible || check?.agent_visible || parsed?.agent_visible || next?.agent_visible
     );
 
+
+// ---- C6 brief room message (composer) ----------------------------------
+// The SessionStart / UserPromptSubmit / Stop room message is ONE sanitized
+// string:  <Big Idea> · Why: … · Next: …  (<=420 chars; Big Idea <=140 with
+// exactly one em-dash clause and never a guillemet, so peer prose can only ever
+// reach the reader inside «…» (untrusted)). RALLY_HOOK_ROOM_DETAIL=verbose (or
+// `rally hooks room-detail --verbose`) restores the legacy roster path below,
+// which is why every pre-C6 expectation still grades unedited text.
+//
+// PLACEMENT. This lives OUTSIDE the ARP-004 boundary block on purpose. That
+// block is duplicated in two renderers and byte-pinned by
+// test_sanitizer_block_parity.sh, so anything added inside it must be added
+// twice and can drift. Nothing here is a new sanitizer: the composer only
+// CONSUMES ident/prose/line/scrub/isBareShape/hostId from the block above, and
+// taint() runs last over the finished body.
+//
+// before-write is excluded in BOTH modes: that envelope is frozen (C1) and is
+// also the one phase the native Rust path renders.
+//
+// NOTE ON QUOTING: this whole program is a single-quoted shell argument, so an
+// ASCII apostrophe cannot appear anywhere in it -- not in a string, not in a
+// comment. Every apostrophe in a rendered string below is written as the
+// JS escape backslash-u-0027, which node turns back into a normal apostrophe.
+const roomDetail = process.env.RALLY_HOOK_ROOM_DETAIL === "verbose" ? "verbose" : "brief";
+const briefMode = roomDetail !== "verbose" && phase !== "before-write";
+
+const BRIEF_MAX = 420;
+const BRIEF_PROSE = 100;
+const BRIEF_PROSE_SHORT = 60;
+const BRIEF_BANNER = "Agent Rally Point is active in this repo";
+const BRIEF_SELF = hostId(tool, 60);
+// `rally next --tool <you> --json` WRITES ledger facts (docs/COMMAND-SEMANTICS.md);
+// only --audit does not. A message that calls itself advisory may not suggest a
+// fact-writing command as the next step, so the fallback always carries --audit.
+const BRIEF_READ_ONLY = "rally next --tool " + BRIEF_SELF + " --audit --json";
+const TEMPLATE_ACTIONS = [
+  "respond_to_handoff", "clarify_handoff", "review_artifact",
+  "update_plan_status", "continue_or_release_claim", "resolve_owned_blocker"
+];
+
+// The per-span trust tag. prose() and ident() emit «…»; this stamps
+// " (untrusted)" after EVERY closing guillemet, so the reader never has to infer
+// which span was quoted. It runs ONCE, on the finished body, AFTER the
+// truncation ladder -- a ladder step that re-renders prose would otherwise leave
+// a fresh untagged », and a character-slicing step could cut a tag off entirely.
+// The ladder therefore drops whole clauses and never slices (see briefLadder).
+function taint(body) { return String(body).replace(/»(?! \(untrusted\))/g, "» (untrusted)"); }
+
+// codex:release-cleanup-c5f8ebd7 -> codex:c5f8 ; claude_code:<uuid> ->
+// claude_code:6c02 ; agent_audit_003 -> unchanged (no colon). Full ids survive
+// only inside commands, where they are copy-pasteable.
+function shortActor(raw) {
+  const s = String(raw == null ? "" : raw);
+  const i = s.indexOf(":");
+  if (i < 0) return s;
+  const host = s.slice(0, i);
+  const seg = s.slice(i + 1);
+  const short = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-/.test(seg)
+    ? seg.slice(0, 4)
+    : String(seg.split("-").pop()).slice(0, 4);
+  return host + ":" + short;
+}
+// An id POSITION (Why, notification clauses): ident() quotes anything that is
+// not identifier-shaped, exactly as the roster does today.
+function actorRef(raw) { return ident(shortActor(raw), 40); }
+
+// The Big Idea is the one span the preamble promises is hook narration, and the
+// peer chooses BOTH halves of its own id. A host-shaped regex alone is looser
+// than the sanitizer allowlist gate and admits authority spoofs -- human:HALT,
+// sudo:EXEC, operator:STOP, do_not_run_ci:NOW. Three controls, together:
+//   1. the token must be scrub()-clean and match a LOWERCASE host:short shape
+//      (a real short id is lowercase hex or alnum; an imperative is not),
+//   2. BOTH halves must pass isBareShape() -- the same gate ident() uses,
+//   3. and every template prefixes the hook-authored literal "peer ", so the
+//      sentence ATTRIBUTES rather than commands even for a token that clears
+//      1 and 2.
+// Anything that fails is "a peer"; the full id still reaches the reader in Why
+// through actorRef(), quoted if it is not identifier-shaped.
+const ACTOR_L1_RE = /^([a-z][a-z0-9_]{0,15}):([a-z0-9]{1,4})$/;
+function actorL1(raw) {
+  const short = shortActor(raw);
+  if (!short || scrub(short) !== short) return "";
+  const m = ACTOR_L1_RE.exec(short);
+  if (!m) return "";
+  if (!isBareShape(m[1]) || !isBareShape(m[2])) return "";
+  return short;
+}
+function actorBig(raw, capital) {
+  const t = actorL1(raw);
+  if (t) return (capital ? "Peer " : "peer ") + t;
+  return capital ? "A peer" : "a peer";
+}
+
+// Fixed, next.rs-authored double-quoted literals. They are stripped by exact
+// substring BEFORE tokenising, because a space-separated split cannot see
+// "responded to handoff" as one token -- without this every real command is
+// rejected and the fallback always fires.
+const BRIEF_FIXED_QUOTED = [
+  "\"responded to handoff\"", "\"resolved blocker\"", "\"done\"",
+  "\"reviewed artifact\"", "\"clarify handoff\"", "\"<verification>\"",
+  "\"<needed context>\"", "\"<next checkpoint>\"", "\"act on next\""
+];
+// CLI vocabulary next.rs emits as a constant, never from a fact. in_progress
+// carries a 2-character word and would otherwise fail isBareShape().
+const BRIEF_FIXED_VALUES = ["in_progress"];
+const BRIEF_HOLE = "__RALLY_FIXED_LITERAL__";
+
+// shell_quote() is shlex::try_quote, which leaves a value UNQUOTED whenever
+// every byte is in + - . / : @ ] _ 0-9 A-Z a-z. So a peer-controlled
+// --ref <event_id>, --target <fact.target> or --id <backlog id> reaches this
+// string bare, with no length bound and no shape gate -- and the composer
+// renders Next OUTSIDE guillemets and outside the (untrusted) tag. Every value
+// token therefore has to clear the same gate ident() applies to an identifier,
+// and the --tool value has to be THIS agent own id. Any rejection falls back to
+// the read-only command.
+function safeCommand(s) {
+  if (typeof s !== "string" || !s) return false;
+  if (s.indexOf("rally say claim") === 0) return false;      // never advise takeover
+  if (line(s, 4000) !== s) return false;                     // control chars / folded runs
+  if (s.indexOf(BRIEF_HOLE) !== -1) return false;
+  if (s.indexOf("--tool " + BRIEF_SELF) === -1) return false;
+  let rest = s;
+  BRIEF_FIXED_QUOTED.forEach(q => { rest = rest.split(q).join(BRIEF_HOLE); });
+  if (rest.indexOf("\"") !== -1) return false;
+  if (rest.indexOf(String.fromCharCode(39)) !== -1) return false;   // shlex-quoted value
+  const toks = rest.split(" ");
+  if (toks.length < 2 || toks[0] !== "rally") return false;
+  for (let i = 1; i < toks.length; i++) {
+    const t = toks[i];
+    if (t === BRIEF_HOLE) continue;
+    if (!t) return false;
+    if (t.indexOf("--") === 0) { if (!/^--[a-z-]+$/.test(t)) return false; continue; }
+    if (toks[i - 1] === "--tool") { if (t !== BRIEF_SELF) return false; continue; }
+    if (t.length > IDENT_MAX_LEN) return false;
+    if (BRIEF_FIXED_VALUES.indexOf(t) !== -1) continue;
+    if (scrub(t) !== t || !isBareShape(t)) return false;
+  }
+  return true;
+}
+
+// suggested_commands is ordered [check before-write per scope..., <completion>].
+// Taking [0] would advise a CHECK where the reader needs the COMPLETION, so the
+// entry is selected by the completion prefix for the action, then validated.
+const ACTION_CMD_PREFIX = {
+  respond_to_handoff: "rally say resolve",
+  resolve_owned_blocker: "rally say resolve",
+  continue_or_release_claim: "rally say release",
+  review_artifact: "rally say resolve",
+  clarify_handoff: "rally say handoff",
+  update_plan_status: "rally backlog update"
+};
+function pickCommand(action, bnext) {
+  const prefix = ACTION_CMD_PREFIX[action];
+  const list = Array.isArray(bnext.suggested_commands) ? bnext.suggested_commands : [];
+  if (prefix) {
+    for (const c of list) {
+      if (typeof c === "string" && c.indexOf(prefix + " ") === 0 && safeCommand(c)) {
+        return { cmd: c, fell_back: false };
+      }
+    }
+  }
+  return { cmd: BRIEF_READ_ONLY, fell_back: true };
+}
+
+function briefNext() {
+  if (phase !== "start") return next || {};
+  let envNext = {};
+  try { envNext = JSON.parse(process.env.RALLY_NEXT_JSON || "{}"); } catch (_) {}
+  return (envNext && envNext.data && envNext.data.next) || {};
+}
+function briefRoom() { return (phase === "start" && parsed && parsed.brief) || {}; }
+function briefStates() {
+  let st = {};
+  try { st = JSON.parse(process.env.RALLY_STATUS_JSON || "{}"); } catch (_) {}
+  const arr = (st && st.data && st.data.status_read && Array.isArray(st.data.status_read.states))
+    ? st.data.status_read.states : [];
+  return arr.filter(s => s && s.tool && s.tool !== "rally" && !s.stale);
+}
+function briefScope(v) {
+  const s = String(v == null ? "" : v);
+  return s.indexOf("file:") === 0 ? s.slice(5) : s;
+}
+// Exactly ONE conflict detector per phase, over data the phase already read: no
+// extra rally call anywhere. Start compares claim scopes as exact strings, so
+// file:src/ versus file:src/x.rs is NOT detected -- a stated v1 limit.
+function briefConflict(states, broom) {
+  if (phase === "start") {
+    const mine = {};
+    (Array.isArray(broom.my_claims) ? broom.my_claims : []).forEach(c => {
+      (Array.isArray(c.scope) ? c.scope : []).forEach(s => { mine[briefScope(s)] = true; });
+    });
+    const peerClaims = Array.isArray(broom.peer_claims) ? broom.peer_claims : [];
+    for (const c of peerClaims) {
+      for (const s of (Array.isArray(c.scope) ? c.scope : [])) {
+        if (mine[briefScope(s)] === true) {
+          return { tool: c.tool, scope: s, path: briefScope(s), event_id: c.event_id, lease: c.lease_expires_at };
+        }
+      }
+    }
+    return null;
+  }
+  const self = states.find(s => s.tool === tool && s.state === "working" && s.file);
+  if (!self) return null;
+  const peer = states.find(s => s.tool !== tool && s.state === "working" && s.file === self.file);
+  return peer ? { tool: peer.tool, scope: String(self.file), path: String(self.file) } : null;
+}
+function briefLeaseMins(v) {
+  const t = Date.parse(String(v || ""));
+  if (!Number.isFinite(t)) return null;
+  const m = Math.round((t - Date.now()) / 60000);
+  return (m > 0 && m < 100000) ? m : null;
+}
+// Notification clauses. Order working > blocked > claims > handoffs > done >
+// idle; inside a group, next.peer_targets.ranked order (freshest first) when the
+// binary supplied it, else input order. Self and stale peers are excluded.
+function briefClauses(states, bnext, broom) {
+  const ranked = [];
+  const pt = (bnext && bnext.peer_targets && Array.isArray(bnext.peer_targets.ranked))
+    ? bnext.peer_targets.ranked : [];
+  pt.forEach(p => { if (p && p.tool) ranked.push(String(p.tool)); });
+  const rank = t => { const i = ranked.indexOf(String(t)); return i < 0 ? 9999 : i; };
+  const g = { working: [], blocked: [], claims: [], handoffs: [], done: [], idle: [] };
+  states.forEach(s => {
+    if (s.tool === tool) return;
+    const who = actorRef(s.tool);
+    if (s.state === "working") g.working.push({ t: s.tool, text: who + " is working on " + ident(s.file || "?", 60) });
+    else if (s.state === "blocked") g.blocked.push({ t: s.tool, text: who + " is blocked on " + ident(s.ref || s.ref_id || "?", 60) });
+    else if (s.state === "done") g.done.push({ t: s.tool, text: who + " is done" });
+    else if (s.state === "idle") g.idle.push({ t: s.tool, text: who + " is idle" });
+  });
+  if (phase === "start") {
+    const tally = {};
+    const seenOrder = [];
+    (Array.isArray(broom.peer_claims) ? broom.peer_claims : []).forEach(c => {
+      const k = String(c.tool == null ? "?" : c.tool);
+      if (tally[k] === undefined) { tally[k] = 0; seenOrder.push(k); }
+      tally[k] += 1;
+    });
+    seenOrder.forEach(k => {
+      const n = tally[k];
+      g.claims.push({ t: k, text: actorRef(k) + " holds " + n + " claim" + (n === 1 ? "" : "s") });
+    });
+    (Array.isArray(broom.handoffs_other) ? broom.handoffs_other : []).forEach(h => {
+      g.handoffs.push({
+        t: h.tool,
+        text: actorRef(h.tool) + " handed off " + ident(h.event_id || "?", 60) + " to " + actorRef(h.target || "?")
+      });
+    });
+  }
+  const out = [];
+  ["working", "blocked", "claims", "handoffs", "done", "idle"].forEach(k => {
+    g[k].slice().sort((a, b) => rank(a.t) - rank(b.t)).forEach(c => out.push(c.text));
+  });
+  return out;
+}
+
+function composeBrief() {
+  const promptModeBrief = process.env.RALLY_HOOK_PROMPT_MODE || "once";
+  const bnext = briefNext();
+  const broom = briefRoom();
+  const states = briefStates();
+  const clauses = briefClauses(states, bnext, broom);
+  const conflict = briefConflict(states, broom);
+  const fact = (bnext && bnext.fact) || {};
+  const factId = String(fact.event_id || fact.id || "");
+  const action = String(bnext.action || "");
+  const roomHandoffs = Array.isArray(broom.handoffs_for_me) ? broom.handoffs_for_me : [];
+
+  // next is the ranking authority: the hook renders the rally verdict, it never
+  // re-ranks. Room-derived situations only fill in where next said nothing.
+  let sit = "";
+  if (bnext.actionable === true) sit = TEMPLATE_ACTIONS.indexOf(action) >= 0 ? action : "generic";
+  else if (phase === "start" && roomHandoffs.length) sit = "handoff_from_room";
+  if (!sit && conflict) sit = "before_write_conflict";
+  if (!sit && action === "wait") sit = "wait";
+  if (!sit) sit = clauses.length ? "notification" : "nothing";
+
+  if (sit === "nothing") {
+    if (phase === "start" && promptModeBrief !== "off") {
+      return {
+        present: true, severity: "info", ledger: false,
+        body: BRIEF_BANNER + " — you\u0027re the only agent here right now · turn off for this session: RALLY_HOOKS=off · repo: rally hooks off --scope repo"
+      };
+    }
+    if (phase === "idle" && promptModeBrief === "always") {
+      return {
+        present: true, severity: "info", ledger: false,
+        body: BRIEF_BANNER + " — nothing needs you · turn off for this session: RALLY_HOOKS=off"
+      };
+    }
+    return { present: false };
+  }
+
+  const banner = (phase === "start" && promptModeBrief !== "off") ? BRIEF_BANNER : "";
+
+  // The notification segment is a clause LIST, not a Big Idea: it is exempt from
+  // the no-guillemet / one-em-dash / 140 caps by construction, because a peer id
+  // that is not identifier-shaped still has to render quoted.
+  if (sit === "notification") {
+    const shown = clauses.slice(0, 3).join("; ");
+    const more = clauses.length > 3 ? "; +" + (clauses.length - 3) + " more" : "";
+    const seg = shown + more + " — nothing needs you · → rally room";
+    return {
+      present: true, severity: "info", ledger: true,
+      body: (banner ? banner + " · " : "") + seg
+    };
+  }
+
+  const picked = pickCommand(sit, bnext);
+  const cmdSpan = "`" + picked.cmd + "`";
+  let big = "";
+  let act = "";
+  let waitBranch = "";
+  let escalate = "";
+  let why = function () { return ""; };
+
+  if (sit === "respond_to_handoff" || sit === "handoff_from_room") {
+    let sender = fact.tool, subject = fact.subject, fid = factId, extra = 0;
+    if (sit === "handoff_from_room") {
+      const h = roomHandoffs[0] || {};
+      sender = h.tool; subject = h.subject; fid = String(h.event_id || "");
+      extra = roomHandoffs.length - 1;
+    }
+    big = actorBig(sender, true) + " handed you a task"
+      + (extra > 0 ? " (+" + extra + " more waiting)" : "")
+      + " — it sits with you until you answer or hand it back";
+    why = cap => {
+      const p = [];
+      if (subject) p.push(prose(subject, cap));
+      if (fid) p.push(ident(fid, 60) + (sender ? " from " + actorRef(sender) : ""));
+      return p.join(" · ");
+    };
+    act = cmdSpan + (picked.fell_back ? " for the details" : " when it\u0027s done");
+    if (sender) waitBranch = "not yours? hand it back to " + actorRef(sender);
+    escalate = "unclear → ask the human";
+  } else if (sit === "clarify_handoff") {
+    big = "Your handoff to " + actorBig(fact.target || fact.tool, false)
+      + " is too thin to act on — they\u0027ll guess or stall until you add context";
+    why = cap => {
+      const p = [];
+      if (factId) p.push(ident(factId, 60));
+      if (fact.subject) p.push(prose(fact.subject, cap));
+      return p.join(" · ");
+    };
+    act = cmdSpan + (picked.fell_back ? " for the details" : " with what they need");
+    waitBranch = "they\u0027ve already replied? wait, then resolve";
+  } else if (sit === "review_artifact") {
+    big = actorBig(fact.tool, true)
+      + " posted something for review — it stays unverified until someone reads it";
+    why = cap => {
+      const p = [];
+      if (fact.subject) p.push(prose(fact.subject, cap));
+      if (factId) p.push(ident(factId, 60) + (fact.tool ? " from " + actorRef(fact.tool) : ""));
+      return p.join(" · ");
+    };
+    act = cmdSpan + (picked.fell_back ? " for the details" : " after you\u0027ve read it");
+    waitBranch = "not your area? leave it and say so";
+  } else if (sit === "update_plan_status") {
+    const summary = String(fact.summary == null ? "" : fact.summary);
+    const bid = summary.indexOf("id:") === 0 ? String(summary.slice(3).split("\n")[0]).trim() : "";
+    big = "A plan item assigned to you has no fresh status — the board can\u0027t tell if it\u0027s moving";
+    why = cap => {
+      const p = [];
+      if (fact.subject) p.push(prose(fact.subject, cap));
+      const idPart = bid ? "backlog " + ident(bid, 60) : (factId ? ident(factId, 60) : "");
+      if (idPart) p.push(idPart + (fact.tool ? " from " + actorRef(fact.tool) : ""));
+      return p.join(" · ");
+    };
+    act = cmdSpan + (picked.fell_back ? " for the details" : " with the real status and a checkpoint");
+    waitBranch = "not yours? say so in the room";
+  } else if (sit === "continue_or_release_claim") {
+    const scopes = Array.isArray(fact.scope) ? fact.scope : [];
+    const n = scopes.length;
+    big = n > 0
+      ? "You still hold a claim on " + n + " path" + (n === 1 ? "" : "s")
+        + " — peers can\u0027t edit " + (n === 1 ? "it" : "them") + " until you release it"
+      : "You still hold a claim — peers can\u0027t edit those paths until you release it";
+    const stated = String(bnext.reason == null ? "" : bnext.reason);
+    why = cap => {
+      if (!factId) return stated ? "rally next says " + prose(stated, cap) : "";
+      if (!n) return ident(factId, 60);
+      return ident(factId, 60) + " covers " + ident(scopes[0], 60) + (n > 1 ? " +" + (n - 1) + " more" : "");
+    };
+    act = cmdSpan + (picked.fell_back ? " for the details" : " if you\u0027re finished there");
+    waitBranch = "still working there? keep it";
+  } else if (sit === "resolve_owned_blocker") {
+    big = "You raised a blocker that\u0027s still open — everything behind it stays stuck until you close it";
+    why = cap => {
+      let s = factId ? ident(factId, 60) : "";
+      if (fact.subject) s = (s ? s + ": " : "") + prose(fact.subject, cap);
+      if (fact.target) s = s + (s ? " · " : "") + "waiting on " + actorRef(fact.target);
+      return s;
+    };
+    act = cmdSpan + (picked.fell_back ? " for the details" : " once it\u0027s cleared");
+    waitBranch = "still blocked? leave it open and say what would unblock you";
+    escalate = "needs a human call → escalate";
+  } else if (sit === "wait") {
+    const w = (Array.isArray(bnext.waiting_on) && bnext.waiting_on[0]) || {};
+    big = "You\u0027re waiting on " + actorBig(w.target || "", false)
+      + " — nothing else in the room needs you right now";
+    const kind = String(w.kind || fact.kind || "");
+    const wid = String(w.event_id || w.id || factId || "");
+    why = () => wid ? "your " + (kind ? ident(kind, 20) + " " : "") + ident(wid, 60) + " is still open" : "";
+    act = "`" + BRIEF_READ_ONLY + "` to re-check";
+    waitBranch = "meanwhile take only unclaimed work";
+    escalate = "they\u0027ve gone quiet? ask the human";
+  } else if (sit === "before_write_conflict") {
+    const who = conflict.tool;
+    big = actorBig(who, true) + (phase === "start"
+      ? " holds a claim that overlaps yours — edits there will collide"
+      : " is working in the same file as you — edits there will collide");
+    const mins = briefLeaseMins(conflict.lease);
+    why = () => phase === "start"
+      ? "their claim " + ident(conflict.event_id || "?", 60) + " covers " + ident(conflict.scope, 60)
+        + (mins ? " · lease ends in " + mins + " min" : "")
+      : "both of you report working on " + ident(conflict.scope, 80);
+    // The path is interpolated BARE into a copy-pasteable command, so it has to
+    // clear the identifier gate. Most real file paths do NOT (a 2-character
+    // extension fails the >=3-char word rule), and those fall back to a command
+    // that needs no argument rather than rendering an unvetted value bare.
+    const p = String(conflict.path || "");
+    const pathOk = p !== "" && p.length <= IDENT_MAX_LEN && scrub(p) === p && isBareShape(p);
+    const chk = pathOk
+      ? "rally check before-write --tool " + BRIEF_SELF + " --path " + p + " --strict --json"
+      : "rally room --json";
+    act = "`" + chk + "` before you touch it";
+    waitBranch = "wait for " + actorRef(who) + " to release";
+    escalate = "or agree a split with them";
+  } else {
+    // generic: actionable, but an action this renderer does not know (a newer
+    // binary, or a hostile action string). next.action is NEVER rendered as text.
+    big = "Rally has an item for you — it won\u0027t clear until you look";
+    why = cap => {
+      const p = [];
+      if (factId) p.push(ident(factId, 60));
+      if (fact.subject) p.push(prose(fact.subject, cap));
+      const s = p.join(" · ");
+      return s ? s + (fact.tool ? " from " + actorRef(fact.tool) : "") : "";
+    };
+    act = "`" + BRIEF_READ_ONLY + "` for the details";
+  }
+
+  // A conflict that lost the situation race is still the thing most likely to
+  // cost the reader work, so it rides along as its own segment -- and the ladder
+  // never drops it. (Dropped heads-up plus the content digest would suppress the
+  // same conflict for as long as the unrelated actionable item persists.)
+  let headsUp = "";
+  if (sit !== "before_write_conflict" && conflict) {
+    headsUp = "heads-up: " + actorRef(conflict.tool) + " also "
+      + (phase === "start" ? "claims " : "works in ") + ident(conflict.scope, 60);
+  }
+
+  // Truncation ladder. STRUCTURAL ONLY: each step drops a whole clause or
+  // re-renders Why at a shorter prose cap. Nothing is ever character-sliced,
+  // because a slice can cut inside a «…» span and strip the " (untrusted)" tag
+  // that makes it quoted data. Step 4 is terminal: Why goes entirely, so the
+  // ladder always converges. The act command and the heads-up clause are never
+  // dropped.
+  function briefLadder(step) {
+    const segs = [];
+    if (banner) segs.push(banner);
+    segs.push(big);
+    if (step < 4) {
+      const w = why(step >= 3 ? BRIEF_PROSE_SHORT : BRIEF_PROSE);
+      if (w) segs.push("Why: " + w);
+    }
+    if (headsUp) segs.push(headsUp);
+    const nx = [];
+    if (act) nx.push(act);
+    if (waitBranch && step < 2) nx.push(waitBranch);
+    if (escalate && step < 1) nx.push(escalate);
+    if (nx.length) segs.push("Next: " + nx.join(" · "));
+    return segs.join(" · ");
+  }
+  // The budget is measured on the TAINTED body, because " (untrusted)" is 12
+  // chars per span and is part of what the reader receives. taint() itself still
+  // runs once, at the single application point below, over the final body.
+  let body = "";
+  for (let step = 0; step <= 4; step++) {
+    body = briefLadder(step);
+    if (taint(body).length <= BRIEF_MAX) break;
+  }
+  return { present: true, severity: bnext.requires_human ? "stop" : "warn", ledger: true, body: body };
+}
+
+if (briefMode) {
+  const composed = composeBrief();
+  // SEC-004 provenance, never content: the flag records WHICH SITUATION fired,
+  // and every situation except the empty-room banner consumed a ledger value.
+  hasLedgerData = composed.present === true && composed.ledger === true;
+  visible = composed.present === true
+    ? { present: true, severity: composed.severity, message: taint(composed.body) }
+    : { present: false };
+}
+
 function statusSummaryLines(selfTool) {
   let status = {};
   try { status = JSON.parse(process.env.RALLY_STATUS_JSON || "{}"); } catch (_) {}
@@ -2175,7 +2729,7 @@ function statusSummaryLines(selfTool) {
 
 const peerStatusLines = phase === "start" ? [] : statusSummaryLines(tool);
 
-if ((!visible || !visible.present) && next?.actionable) {
+if (!briefMode && (!visible || !visible.present) && next?.actionable) {
   // next.fact.subject is peer-authored prose straight out of the ledger. Lead
   // with the opaque fact id so the agent can open the item itself, and quote
   // the excerpt.
@@ -2211,7 +2765,7 @@ function rosterLine(lines) {
   return `${shown}${lines.length > 8 ? ` (+${lines.length - 8} more)` : ""}`;
 }
 
-if (visible?.present) {
+if (!briefMode && visible?.present) {
   const roster = rosterLine(peerStatusLines);
   const nextCmd = `rally next --tool ${ident(tool || "<you>", 60)}`;
   const parts = [visible.message];
@@ -2219,7 +2773,7 @@ if (visible?.present) {
   parts.push(`  Next: ${nextCmd}${roster ? ` · ${roster}` : ""}`);
   visible = { ...visible, message: parts.join("\n") };
   if (peerStatusLines.length) hasLedgerData = true;
-} else if (peerStatusLines.length) {
+} else if (!briefMode && peerStatusLines.length) {
   visible = {
     present: true,
     severity: "info",
@@ -2229,7 +2783,7 @@ if (visible?.present) {
 }
 
 const promptMode = process.env.RALLY_HOOK_PROMPT_MODE || "once";
-if ((!visible || !visible.present) && promptMode === "always" && phase === "idle") {
+if (!briefMode && (!visible || !visible.present) && promptMode === "always" && phase === "idle") {
   visible = {
     present: true,
     severity: "info",
