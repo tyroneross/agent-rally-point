@@ -1,8 +1,8 @@
 # Agent Rally Point
 
-**Rally Point solves multi-agent coordination in local repos. Every agent shares who it is, what it is working on, and its status on one shared ledger per repo, so any agent from any LLM can talk to any other agent in that repo.**
+**Rally Point solves multi-agent coordination in local repos. Every agent shares who it is, what it is working on, and its status on one shared ledger per repo, so agents using any coding harness can exchange durable coordination facts in that repo.**
 
-Rally Point works across terminals and LLMs, so multiple Claude and Codex agents can collaborate or work independently on the same repo and the same file. The ledger and the protocol work with any LLM and any coding harness, including local models, Cursor, Herdr, and Ghostty.
+Rally Point works across terminals and LLMs, so multiple Claude and Codex agents can work independently in one repo and coordinate access to the same file. Claims serialize conflicting writes; Rally does not make simultaneous edits to one file safe. The ledger and protocol work with any coding harness that can invoke the CLI, including local models, Cursor, Herdr, and Ghostty.
 
 ## The problem
 
@@ -18,7 +18,7 @@ Each rally also has a lead, usually the first frontier agent to join. The lead r
 
 - **A claim covers more than a file.** It can name the dev database, a port, a branch, or a task.
 - **The check runs automatically before an edit.** It warns by default; three opt-in switches make it block instead.
-- **The ledger commits with your code**, so an agent that restarts reads back what was already decided instead of asking you.
+- **The ledger is append-only and repo-local.** A project can deliberately commit it, but Rally's own release repo keeps live coordination history local so fresh clones begin with an empty room.
 - **Agents that leave don't hold the repo hostage.** Claims decay on a lease, and leftover work is isolated in its own worktree.
 
 Agents also hand work to each other, and a handoff is complete only when the receiving agent writes its own acknowledgement.
@@ -38,6 +38,7 @@ Agents also hand work to each other, and a handoff is complete only when the rec
 ```bash
 git clone https://github.com/tyroneross/agent-rally-point.git
 cd agent-rally-point
+RALLY_SOURCE="$(pwd)"
 ./scripts/install-rally.sh          # --dry-run prints the plan and writes nothing
 ```
 
@@ -55,10 +56,22 @@ rally init
 That creates `.rally/` and writes a pointer into your `CLAUDE.md` and `AGENTS.md`, so any
 agent that opens the repo knows how to join.
 
-**3. Wire your host, so agents join and deconflict without being told.**
+**3. Optionally wire a host for automatic hooks.**
+
+The CLI is enough for a manual pilot. Automatic hooks run code at session start and before edits; Rally assumes one trusted operator on one machine and does not sandbox same-UID agents. Read the [trust model](docs/security/TRUST-MODEL.md) before enabling them.
+
+| Host | Supported setup today |
+|------|-----------------------|
+| Claude Code | Install the plugin below, or opt into the global hook install from the Rally clone. |
+| Codex | Install the plugin for Rally skills. Automatic hooks in another repo require merged project configuration plus the hook script. |
+| Cursor | Merge the project hook configuration plus the hook script; path-specific enforcement remains best-effort pending live-host validation. |
+| Gemini and other hosts | Use the CLI loop manually. No automatic-hook integration is published today. |
+
+To inspect and then opt into the Claude Code global install, run these from any directory after step 1. They change only `~/.claude/settings.json` and reference the source checkout; they do not copy hook configuration into `your-repo`.
 
 ```bash
-./scripts/install_rally_hooks.sh --global
+"$RALLY_SOURCE/scripts/install_rally_hooks.sh" --global --dry-run
+"$RALLY_SOURCE/scripts/install_rally_hooks.sh" --global
 ```
 
 Claude Code users can install the plugin instead, which brings the same hooks plus three
@@ -69,15 +82,15 @@ claude plugin marketplace add tyroneross/agent-rally-point
 claude plugin install agent-rally-point@agent-rally-point
 ```
 
-Codex, Cursor, and Gemini read the hook registrations this repo already commits, at
-`.codex/hooks.json`, `.cursor/hooks.json`, and `hooks/hooks.json`. Any other agent that can
-run a shell command participates through the `rally` CLI, with no hooks at all.
+For Codex skills, run `codex plugin add agent-rally-point@agent-rally-point --json` and restart Codex. The bundled `.claude/settings.json`, `.codex/hooks.json`, and `.cursor/hooks.json` configure this repository; `rally init` does not copy them—or `hooks/rally-coordination-hook.sh`—into an adopting repository. Merge the configuration you need and copy that hook script into the target before expecting automatic hooks. The exact consumer-repo setup and host limits are in [Auto-Coordination Hooks](docs/AUTO-COORDINATION-HOOKS.md). Any host that can run a shell command can participate through the `rally` CLI with no hooks at all.
 
 **Check it:**
 
 ```bash
-rally whoami --json
+rally whoami --tool codex:pilot-01 --json
 ```
+
+Use a distinct `--tool` value for every concurrent session, such as `codex:parser-01` and `claude_code:reviewer-01`; do not copy a bare `codex` identifier into multiple terminals.
 
 ## Optional tools
 
@@ -117,26 +130,62 @@ What the hooks do and what Rally does not defend: [`docs/security/TRUST-MODEL.md
 
 ## How to use it
 
-Each agent runs the same short loop every turn: join, ask what to do next, claim what it will touch, work, then record what it produced.
+Each agent runs the same short loop every turn: join, ask what to do next, claim what it will touch, verify the boundary, work, record the outcome, then release the claim when the resource is free.
 
-```text
-whoami → enter → ack → next → (if actionable) claim → check before-write → edit
-       → verify → say artifact|handoff|resolve|release → next
+### The turn loop
+
+```mermaid
+flowchart LR
+  whoami["whoami\nself-locate"] --> enter["enter\npresence"] --> ack["ack\nstartup contract"] --> next["next\nask what is actionable"]
+  next -->|actionable| claim["claim\nreserve the scope"] --> check["check before-write\ninspect the boundary"] --> edit["edit\nhost-owned"] --> verify["verify\nhost-owned"] --> say["say\nartifact, handoff, resolve, release"] --> next
+  next -->|wait or requires human| stop([stop and wait or ask])
+
+  ledger[(".rally/log/&lt;engagement&gt;.jsonl\ncanonical append-only record")]
+  enter -->|presence| ledger
+  ack -->|acknowledgement| ledger
+  claim -->|claim| ledger
+  say -->|outcome| ledger
+  ledger -. room .-> whoami
+  ledger -. next action .-> next
+  ledger -. claims .-> check
 ```
 
+Rally records and reads coordination facts; the host owns the edit and the verification. A
+handoff is complete only when the receiving agent writes its own acknowledgement.
+
+<details>
+<summary>What each step reads or writes</summary>
+
+| Step | Coordination effect |
+|------|---------------------|
+| `whoami` | Confirms the host, room, lead, mission, and acknowledgement state before work. It does not append a durable coordination fact. |
+| `enter` and `ack` | Write presence and acknowledgement so peers can tell this session has joined under the room's rules. |
+| `next` | Reads the room for an actionable recommendation and records the wake intent that makes the next check visible. |
+| `claim` | Reserves a file or other resource before shared work begins. Save its returned event ID so it can be released when the lane finishes. |
+| `check before-write` | Reads overlapping file claims. It warns by default; `--strict` returns a non-zero exit on a stop finding. |
+| `edit` and `verify` | Belong to the coding host. Rally does not perform either action. |
+| `say` | Appends a durable outcome: normally an `artifact`, `handoff`, or `resolve`; release the claim after the resource is no longer needed. |
+
+</details>
+
+For command-level behavior, failure modes, and the boundaries between the CLI and the host, read the [turn-loop contract](docs/TURN-LOOP.md).
+
 ```bash
-rally enter --tool codex --json
-rally ack   --tool codex
-rally next  --tool codex --json
-rally check before-write --tool codex --path crates/rally-cli/src/main.rs --strict --json
-rally say claim    --tool codex --subject "edit parser" --path crates/rally-cli/src/main.rs --json
-rally say artifact --tool codex --subject "parser hardened" --uri crates/rally-cli/src/main.rs --evidence "cargo test" --json
-rally say handoff  --tool codex --target claude_code --subject "review docs" --json
-rally say resolve  --tool codex --ref <blocker-id> --subject "resolved" --json
+rally whoami --tool codex:parser-01 --json
+rally enter --tool codex:parser-01 --json
+rally ack   --tool codex:parser-01
+rally next  --tool codex:parser-01 --json
+# Save the claim response's event_id as <claim-id>.
+rally say claim --tool codex:parser-01 --subject "edit parser" --path crates/rally-cli/src/main.rs --json
+rally check before-write --tool codex:parser-01 --path crates/rally-cli/src/main.rs --strict --json
+rally say artifact --tool codex:parser-01 --subject "parser hardened" --uri crates/rally-cli/src/main.rs --evidence "cargo test" --json
+rally say release  --tool codex:parser-01 --ref <claim-id> --subject "parser lane complete" --json
+rally say handoff  --tool codex:parser-01 --target claude_code:docs-reviewer-01 --subject "review docs" --json
+rally say resolve  --tool codex:parser-01 --ref <blocker-id> --subject "resolved" --json
 rally room --json
 ```
 
-The `--strict` on `check before-write` above is one of the three blocking switches: it exits 4 when a stop finding is present, so a harness that reads the exit code aborts the write. Drop `--strict` to get the warning without the non-zero exit.
+The `--strict` on `check before-write` above is one of the three blocking switches: it exits 4 when a stop finding is present, so a harness that reads the exit code aborts the write. If it stops the edit, do not edit; coordinate with the holder or release `<claim-id>` before changing lanes. Do not automatically release a claim for an unrelated command failure—diagnose that failure first. Drop `--strict` to get the warning without the non-zero exit.
 
 `rally next` returns `actionable`, `requires_human`, `stop_reason`, `suggested_claims`, `suggested_commands`, and `completion` — enough for a harness to act on its own without turning Rally into a scheduler. Every command takes `--json`.
 
@@ -177,12 +226,31 @@ rally run claude --backend <auto|tmux|cmux|ptyd>  # auto = ptyd if live, else tm
 rally inject <session|name|tool> --handoff <event-id> --json
 ```
 
+### Five-minute two-agent pilot
+
+From an initialized target repository, inspect the launch plan first. `rally run` gives each managed agent a unique tool id and a dedicated linked worktree by default.
+
+```bash
+rally run claude --name ui-review --dry-run --json
+rally run codex  --name parser --dry-run --json
+```
+
+Check `data.run.session.tool` and `worktree_path` in each response, then launch only the agents you intend to use:
+
+```bash
+rally run claude --name ui-review
+rally run codex  --name parser
+rally sessions --json
+```
+
+Use `--shared` or `--no-worktree` only when you deliberately want a shared checkout. Agents still claim and check files before editing, and a receiver's own ACK—not a successful `rally inject` exit code—proves a handoff was received.
+
 **`rally inject` returns `ok: true` when a message is enqueued, which is not the same as delivered.** The receive side has no resident owner yet (RC-001 in the register). Treat the target's own ACK as proof, not the inject's exit code.
 
 ## Where the record lives
 
 - **One repo, one rally point.** Coordination lives at `<repo_root>/.rally/`, never co-mingled across repos. Linked git worktrees share one room through the git common dir.
-- **`.rally/log/<engagement>.jsonl` is canonical** — append-only, committed, `merge=union`. `.rally/facts.db` is a derived SQLite cache, rebuilt by replaying the log when it is missing or behind.
+- **`.rally/log/<engagement>.jsonl` is canonical local history** — append-only and replayable. This release repo ignores live logs and commits only `.rally/manifest.json`, so a fresh clone begins with an empty room. If your project chooses to commit logs, review them as agent-steering content and configure their merge policy deliberately. `.rally/facts.db` is a derived SQLite cache, rebuilt by replaying the local log when it is missing or behind.
 - **Room state is derived on demand**, so no live server state can be lost.
 - **Network transport is out of scope.** Files, Git, rsync, or a shared folder move the facts; Rally defines what the bytes mean.
 
@@ -198,7 +266,7 @@ Three decisions shape everything above, and each cost something. [`docs/DESIGN-T
 
 Rally assumes **one operator, on one machine, running agents you started yourself.** Every agent runs as your UID, so Rally coordinates them and cannot sandbox them — a coordination layer cannot be a privilege boundary between processes that all hold your privileges.
 
-If a second contributor can land commits in your repo, read the trust model first. `.rally/log/*.jsonl` is committed content that replays on clone, and facts carry no signature, so review those diffs the way you review code — they steer agents.
+If a second contributor can land commits in your repo, read the trust model first. If you choose to commit `.rally/log/*.jsonl`, those facts replay on clone and carry no signature, so review them as agent-steering content just as you review code. Rally's own release repo keeps live logs local; fresh clones start with its manifest and an empty room.
 
 An independent audit (issue #52) produced seven findings in August 2026: three Critical, one High, two Medium, one Low. Six are closed with tests that fail when the fix is reverted. One — Cockpit's approval gate, which observes tool calls but does not stop them — has a documented fail-safe and an open redesign. Per-finding disposition: [`docs/security/AUDIT-2026-08-02-issue-52-triage.md`](docs/security/AUDIT-2026-08-02-issue-52-triage.md). Known open defects live in [`docs/ROOT-CAUSE-REGISTER.md`](docs/ROOT-CAUSE-REGISTER.md), where an entry closes only once an adversarial test proves the control fires.
 
@@ -224,6 +292,8 @@ python3 scripts/sync_host_integrations.py --apply --json  # reconcile installed 
 ```
 
 The reconciler requires exactly one enabled provider per host. It removes stale duplicates, updates from the canonical marketplace, and reports when Claude Code or Codex must restart to load new content. It changes nothing without `--apply`.
+
+The public `v0.2.1` release remains immutable; `v0.2.5` is prepared as its replacement release. The [release playbook](docs/RELEASING.md) separates GitHub Release assets, generated host marketplace surfaces, and any legacy GitHub Package that needs a separate update.
 
 ## Verification
 

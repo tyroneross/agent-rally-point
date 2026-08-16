@@ -24,9 +24,14 @@ rally room --json
 Then, before touching a shared file:
 
 ```bash
-rally check before-write --tool <stable-tool-id> --path <path> --strict --json
+# Save the claim response's event_id as <claim-id>.
 rally say claim --tool <stable-tool-id> --subject "<work lane>" --path <path> --json
+rally check before-write --tool <stable-tool-id> --path <path> --strict --json
 ```
+
+If the strict check returns exit 4, do not edit. Coordinate with the holder or
+release `<claim-id>` before switching work; do not automatically release a
+claim for an unrelated command failure.
 
 When work finishes:
 
