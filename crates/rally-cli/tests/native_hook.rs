@@ -316,6 +316,42 @@ fn write_executable(path: &Path, content: &str) {
 /// The probe-marker assertion requires C3's shell exec/probe branch, which
 /// had not landed in this worktree when this test was authored; see the
 /// implementer report for its observed status.
+/// The probe marker is two lines: the verdict, then the binary's identity
+/// (`size:fractional-mtime`) that the verdict was computed against. The
+/// identity line is what invalidates the cache when the binary changes — bash
+/// 3.2's `-nt` compares whole seconds and could not see a same-second rebuild.
+/// Tests care about the verdict, so read line one.
+fn probe_verdict(path: &std::path::Path) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Write a probe marker the shell will actually treat as a cache HIT: the
+/// verdict plus the current identity of `bin`. Seeding only the verdict makes
+/// the shell re-probe, which is exactly what T-07a must not do.
+fn seed_probe_marker(path: &std::path::Path, bin: &str, verdict: &str) {
+    let id = std::process::Command::new("stat")
+        .args(["-f", "%z:%Fm", bin])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .or_else(|| {
+            std::process::Command::new("stat")
+                .args(["-c", "%s:%.9Y", bin])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        })
+        .unwrap_or_default();
+    fs::write(path, format!("{verdict}\n{id}\n")).unwrap();
+}
+
 #[test]
 fn claude_unclaimed_allows_and_autoclaims() {
     warm_up();
@@ -382,9 +418,8 @@ fn claude_unclaimed_allows_and_autoclaims() {
     );
 
     let probe = fx.marker_path(&format!("native-probe.{}.seen", sanitize_bin_path(BIN)));
-    let probe_content = fs::read_to_string(&probe).unwrap_or_default();
     assert_eq!(
-        probe_content.trim(),
+        probe_verdict(&probe),
         "native",
         "probe marker missing/mismatched at {probe:?} (requires C3's shell probe/exec branch)"
     );
@@ -861,7 +896,7 @@ fn deadline_miss_is_fail_loud_advisory() {
         let fx = Fixture::new("t07a");
         let probe = fx.marker_path(&format!("native-probe.{}.seen", sanitize_bin_path(BIN)));
         fs::create_dir_all(probe.parent().unwrap()).unwrap();
-        fs::write(&probe, "native").unwrap();
+        seed_probe_marker(&probe, BIN, "native");
 
         let stdin =
             json!({"tool_name":"Write","tool_input":{"file_path":"src/slow.rs"}}).to_string();
@@ -902,7 +937,7 @@ fn deadline_miss_is_fail_loud_advisory() {
             "T-07a body: {trimmed}"
         );
         assert_eq!(
-            fs::read_to_string(&probe).unwrap_or_default().trim(),
+            probe_verdict(&probe),
             "native",
             "T-07a probe marker must still read native afterward"
         );
@@ -1168,7 +1203,7 @@ fn malformed_no_rally_or_old_binary_fail_open() {
             sanitize_bin_path(stub_path.to_str().unwrap())
         ));
         assert_eq!(
-            fs::read_to_string(&probe).unwrap_or_default().trim(),
+            probe_verdict(&probe),
             "fallback",
             "probe marker at {probe:?}"
         );
