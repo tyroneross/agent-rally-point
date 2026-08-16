@@ -12,15 +12,14 @@
 //! reaped. The cleanup that would have shrunk the working set was blocked by the
 //! size of the working set (design audit D10 / RC-058).
 //!
-//! # The criterion, and why it is the watchdog rather than a stopwatch
+//! # The criterion, and why the budget clock is injected
 //!
 //! A wall-clock threshold in a test is a machine-speed assertion: it fails on a
-//! loaded CI box and passes on a fast laptop regardless of the code. The binding
-//! bound here is the one the product already enforces — the DEFAULT mutation
-//! watchdog. These tests pass no `--timeout-ms`, so a pass that would have
-//! blocked a real operator fails the test for the same reason it would have
-//! failed them. A loose wall-clock ceiling is asserted as well, to catch a
-//! regression that somehow evades the watchdog.
+//! loaded CI box and passes on a fast laptop regardless of the code. These tests
+//! inject the reaper's debug-only logical budget clock, while giving the outer
+//! process watchdog generous headroom. One logical step crosses the production
+//! 2s reap budget after a known number of writes, so pass partitioning is exact
+//! and independent of host scheduling.
 //!
 //! # What these tests do NOT cover
 //!
@@ -40,7 +39,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Facts in the synthetic ledger. Chosen to match the measured size of this
 /// repo's own room (6,442 live records on 2026-08-04) — the expensive dimension,
@@ -51,11 +50,6 @@ const LEDGER_FACTS: usize = 6_500;
 /// bound test runtime: the per-pass cost is set by `LEDGER_FACTS`, and the claim
 /// count only decides how many passes a drain takes.
 const EXPIRED_CLAIMS: usize = 24;
-
-/// Wall-clock ceiling per pass. Deliberately loose — the watchdog is the real
-/// criterion (see the module docs). This exists to catch a regression that
-/// somehow returns success while taking far longer than a human would wait.
-const PASS_CEILING: Duration = Duration::from_secs(20);
 
 /// Passes allowed before a drain is declared stuck. Generous: the point is to
 /// prove the queue SHRINKS to zero, not how quickly.
@@ -185,9 +179,7 @@ impl Room {
         Room { cwd, home }
     }
 
-    /// Run a command with NO `--timeout-ms`: the default mutation watchdog is
-    /// the criterion these tests are about.
-    fn json(&self, args: &[&str], extra_env: &[(&str, &str)]) -> (Value, Duration) {
+    fn json(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Value {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
         cmd.current_dir(&self.cwd)
             .env("HOME", &self.home)
@@ -196,26 +188,23 @@ impl Room {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        let started = Instant::now();
         let out = cmd.output().unwrap();
-        let elapsed = started.elapsed();
         let body = if out.stdout.is_empty() {
             &out.stderr
         } else {
             &out.stdout
         };
-        let value = serde_json::from_slice(body).unwrap_or_else(|e| {
+        serde_json::from_slice(body).unwrap_or_else(|e| {
             panic!(
                 "cmd {args:?} did not emit JSON ({e})\nstdout: {}\nstderr: {}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr),
             )
-        });
-        (value, elapsed)
+        })
     }
 
     fn active_claim_count(&self) -> usize {
-        let (v, _) = self.json(&["room", "--json", "--timeout-ms", "60000"], &[]);
+        let v = self.json(&["room", "--json", "--timeout-ms", "60000"], &[]);
         v["data"]["room"]["active_claims"]
             .as_array()
             .map(Vec::len)
@@ -230,19 +219,15 @@ impl Drop for Room {
     }
 }
 
-fn is_watchdog_timeout(v: &Value) -> bool {
-    v["error"]["code"] == "watchdog-timeout-uncommitted-mutation"
-}
-
 /// THE control. A repo-sized ledger with `EXPIRED_CLAIMS` eligible claims must
-/// drain to zero, every pass finishing inside the DEFAULT mutation watchdog.
+/// drain to zero under deterministic one-write budget slices.
 #[test]
-fn a_repo_sized_ledger_drains_within_the_default_watchdog() {
+fn a_repo_sized_ledger_drains_under_an_injected_budget_clock() {
     let room = Room::seeded("drain");
 
     // Vacuity: without this, a broken fixture that seeds no eligible claim would
     // "drain" on pass one and prove nothing.
-    let (dry, _) = room.json(
+    let dry = room.json(
         &["doctor", "--reap-stale", "--json", "--timeout-ms", "60000"],
         &[],
     );
@@ -264,16 +249,16 @@ fn a_repo_sized_ledger_drains_within_the_default_watchdog() {
             "drain did not finish in {MAX_PASSES} passes; reaped {reaped_total} of {EXPIRED_CLAIMS}"
         );
 
-        let (report, elapsed) = room.json(&["doctor", "--reap-stale", "--apply", "--json"], &[]);
-        assert!(
-            !is_watchdog_timeout(&report),
-            "pass {passes} tripped the DEFAULT mutation watchdog after {elapsed:?}. \
-             That is the failure this bound exists to prevent: the operator sees \
-             an error and nothing is reaped. {report}"
-        );
-        assert!(
-            elapsed < PASS_CEILING,
-            "pass {passes} took {elapsed:?}, past the {PASS_CEILING:?} ceiling"
+        let report = room.json(
+            &[
+                "doctor",
+                "--reap-stale",
+                "--apply",
+                "--json",
+                "--timeout-ms",
+                "60000",
+            ],
+            &[("RALLY_TEST_REAP_CLOCK_STEP_MS", "2001")],
         );
 
         let doctor = &report["data"]["doctor"];
@@ -282,6 +267,10 @@ fn a_repo_sized_ledger_drains_within_the_default_watchdog() {
             .map(Vec::len)
             .unwrap_or(0);
         let remaining = doctor["remaining"].as_u64().unwrap_or(0);
+        assert_eq!(
+            reaped, 1,
+            "one 2001ms logical step must admit exactly one write per 2000ms pass: {report}"
+        );
         assert_eq!(
             doctor["write_failures"], 0,
             "pass {passes} had durable write failures: {report}"
@@ -313,33 +302,33 @@ fn a_repo_sized_ledger_drains_within_the_default_watchdog() {
     );
 }
 
-/// MUTATION of the fix, through its own supported knob. `RALLY_REAP_BUDGET_MS=0`
-/// restores the unbounded pass this run replaced. On a repo-sized ledger that
-/// pass must trip the default watchdog — which is what an operator hit 3 out of
-/// 3 times before the budget existed.
-///
-/// The assertion is one-sided on purpose: a fast enough machine could in
-/// principle finish unbounded, and failing the suite for that would be a
-/// machine-speed test. So a completion is reported, not failed — the test still
-/// documents what it measured.
+/// A smaller logical step admits exactly two actions before the third observes
+/// the 2000ms budget as spent. This pins the injected clock itself so the drain
+/// test cannot turn green because the seam was ignored.
 #[test]
-fn an_unbounded_pass_is_what_the_budget_replaced() {
-    let room = Room::seeded("unbounded");
-    let (report, elapsed) = room.json(
-        &["doctor", "--reap-stale", "--apply", "--json"],
-        &[("RALLY_REAP_BUDGET_MS", "0")],
-    );
-    if is_watchdog_timeout(&report) {
-        // The expected outcome, and the reason the budget exists.
-        return;
-    }
-    eprintln!(
-        "NOTE: an unbounded pass completed in {elapsed:?} on this machine. The \
-         budget still bounds the pass; this run simply did not need it. \
-         report={report}"
+fn injected_clock_controls_exact_pass_partition() {
+    let room = Room::seeded("logical-partition");
+    let report = room.json(
+        &[
+            "doctor",
+            "--reap-stale",
+            "--apply",
+            "--json",
+            "--timeout-ms",
+            "60000",
+        ],
+        &[("RALLY_TEST_REAP_CLOCK_STEP_MS", "1001")],
     );
     assert_eq!(
-        report["data"]["doctor"]["remaining"], 0,
-        "an unbounded pass that completes must leave nothing remaining"
+        report["data"]["doctor"]["claims_reaped"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "two 1001ms logical steps cross the 2000ms budget: {report}"
     );
+    assert_eq!(
+        report["data"]["doctor"]["remaining"],
+        (EXPIRED_CLAIMS - 2) as u64
+    );
+    assert_eq!(report["data"]["doctor"]["complete"], false);
 }

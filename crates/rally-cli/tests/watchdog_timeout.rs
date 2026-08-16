@@ -3,7 +3,7 @@
 
 //! Wall-clock watchdog: a `rally` invocation whose command body blocks longer
 //! than the budget MUST fail open — return within the budget, exit 0, emit the
-//! neutral JSON envelope, and leave no surviving child process.
+//! named timeout JSON envelope, and leave no surviving child process.
 //!
 //! Regression for the 2026-05-30 leak where four `before-write` hooks sat in
 //! uninterruptible (`UE`) kernel wait for 7h45m. The fix bounds every command
@@ -79,8 +79,61 @@ fn temp_path(name: &str) -> PathBuf {
     ))
 }
 
+fn assert_matches_schema(schema_name: &str, value: &serde_json::Value) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/schemas")
+        .join(schema_name);
+    let schema: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    validate_schema(&schema, value, "$");
+}
+
+fn validate_schema(schema: &serde_json::Value, value: &serde_json::Value, path: &str) {
+    if let Some(expected) = schema.get("const") {
+        assert_eq!(expected, value, "schema const mismatch at {path}");
+    }
+    if let Some(type_schema) = schema.get("type") {
+        assert!(
+            type_matches(type_schema, value),
+            "schema type mismatch at {path}: {value}"
+        );
+    }
+    if let Some(required) = schema.get("required").and_then(serde_json::Value::as_array) {
+        let object = value
+            .as_object()
+            .unwrap_or_else(|| panic!("schema required used on non-object at {path}"));
+        for key in required.iter().filter_map(serde_json::Value::as_str) {
+            assert!(
+                object.contains_key(key),
+                "schema missing required key {path}.{key}"
+            );
+        }
+    }
+    if let (Some(properties), Some(object)) = (
+        schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object),
+        value.as_object(),
+    ) {
+        for (key, property_schema) in properties {
+            if let Some(child) = object.get(key) {
+                validate_schema(property_schema, child, &format!("{path}.{key}"));
+            }
+        }
+    }
+}
+
+fn type_matches(type_schema: &serde_json::Value, value: &serde_json::Value) -> bool {
+    match type_schema.as_str().unwrap() {
+        "object" => value.is_object(),
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        other => panic!("unsupported schema type {other}"),
+    }
+}
+
 /// The command body sleeps 30s but the budget is 300ms → must return fast,
-/// exit 0, and print the neutral envelope, not hang.
+/// exit 0, and print a named fail-open timeout envelope, not hang.
 #[test]
 fn hook_that_blocks_fails_open_within_budget() {
     let room = TempRoom::new("blocks-fails-open");
@@ -118,35 +171,54 @@ fn hook_that_blocks_fails_open_within_budget() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // 3. Emitted the neutral JSON envelope on stdout that the hook wrappers
-    //    parse as "nothing to do" (no `agent_visible.present`).
+    // 3. Emitted a distinguishable timeout envelope. Exit 0 preserves the
+    //    never-gate charter; ok:false says the command itself did not finish.
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON on timeout");
-    assert_eq!(parsed["ok"], serde_json::Value::Bool(true));
+    assert_matches_schema("agent-rally.command.watchdog.v1.json", &parsed);
+    assert_eq!(parsed["ok"], serde_json::Value::Bool(false));
     assert_eq!(parsed["product"], "rally");
+    assert_eq!(parsed["command"], "watchdog");
+    assert_eq!(parsed["schema"], "agent-rally.command.watchdog.v1");
+    assert_eq!(
+        parsed["data"]["watchdog_timeout"],
+        serde_json::Value::Bool(true)
+    );
+    assert!(
+        parsed["data"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("did not complete")),
+        "timeout reason must name the incomplete command: {parsed}"
+    );
+    assert!(
+        parsed["data"]["elapsed_ms"]
+            .as_u64()
+            .is_some_and(|ms| ms >= budget_ms),
+        "timeout envelope must report measured elapsed_ms: {parsed}"
+    );
     assert!(
         parsed.get("agent_visible").is_none()
             || parsed["agent_visible"]["present"] != serde_json::Value::Bool(true),
-        "neutral envelope must not assert an agent-visible obligation: {parsed}"
+        "fail-open envelope must not assert an agent-visible obligation: {parsed}"
     );
 
     // 4. No surviving rally child: once the process exits, the kernel reaps any
     //    fd/lock/child the abandoned worker held. Confirm no rally worker
     //    process lingers shortly after exit.
-    let ps = Command::new("ps")
-        .args(["-axww", "-o", "command"])
-        .output()
-        .expect("ps");
-    let listing = String::from_utf8_lossy(&ps.stdout);
-    let survivors = listing
-        .lines()
-        .filter(|l| l.contains("RALLY_TEST_BLOCK_MS") || l.contains("rally-command"))
-        .count();
-    assert_eq!(
-        survivors, 0,
-        "watchdog left a surviving rally worker process behind"
-    );
+    if let Ok(ps) = Command::new("ps").args(["-axww", "-o", "command"]).output()
+        && ps.status.success()
+    {
+        let listing = String::from_utf8_lossy(&ps.stdout);
+        let survivors = listing
+            .lines()
+            .filter(|l| l.contains("RALLY_TEST_BLOCK_MS") || l.contains("rally-command"))
+            .count();
+        assert_eq!(
+            survivors, 0,
+            "watchdog left a surviving rally worker process behind"
+        );
+    }
 }
 
 /// `--timeout-ms` argument takes effect and is honored just like the env var.

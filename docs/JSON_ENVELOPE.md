@@ -14,12 +14,36 @@ Every `rally <cmd> --json` response has the shape:
 
 **Rule:** `data[command]` always holds the command's primary result object. The key matches the `command` field exactly — kebab preserved (e.g. `data["wake-due"]`, `data["check-ci"]`). Shared/contextual payloads (`room`, `verified`, `warnings`) appear as sibling keys in `data` where noted.
 
+The watchdog fail-open response is the one transport-level exception. Rally still exits 0 so a
+host hook is never gated, but `ok` is false because the requested command did not complete:
+
+```json
+{
+  "ok": false,
+  "product": "rally",
+  "command": "watchdog",
+  "schema": "agent-rally.command.watchdog.v1",
+  "data": {
+    "watchdog_timeout": true,
+    "reason": "command did not complete before the watchdog deadline; coordination failed open",
+    "elapsed_ms": 3001
+  }
+}
+```
+
+Callers must test `data.watchdog_timeout` before reading `data[command]`. The elapsed value is
+measured wall time, not the configured budget. This replaces the former neutral
+`{"ok":true,"product":"rally"}` response, which made a watchdog timeout indistinguishable from a
+successful command with missing data.
+
 ## How to parse safely
 
 ```python
 import json, subprocess
 out = subprocess.check_output(["rally", "<cmd>", "--json"])
 envelope = json.loads(out)
+if envelope.get("data", {}).get("watchdog_timeout"):
+    raise RuntimeError(envelope["data"]["reason"])
 result = envelope["data"][envelope["command"]]  # always works
 ```
 
@@ -27,6 +51,8 @@ result = envelope["data"][envelope["command"]]  # always works
 rally <cmd> --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
+if d.get('data', {}).get('watchdog_timeout'):
+    raise SystemExit(d['data']['reason'])
 print(d['data'][d['command']])
 "
 ```
@@ -41,6 +67,7 @@ print(d['data'][d['command']])
 | `room` | `room: RoomSnapshot` | `query`, `readers?`, `mission?` |
 | `next` | `next: NextResult` | `tool`, `role`, `paths`, `wake_intent?`, `room` |
 | `check` | `check: { phase, tool, path?, allow, mode, findings, agent_visible }` | — |
+| `watchdog` | transport exception: `{ watchdog_timeout: true, reason, elapsed_ms }` | — |
 | `locate` | `locate: { event_id, located?, warnings }` | — |
 | `recent` | `recent: { all, limit, rows, warnings }` | — |
 | `retrospective` | `retrospective: { output_path, action, engagements, total_facts, total_engagements }` | — |

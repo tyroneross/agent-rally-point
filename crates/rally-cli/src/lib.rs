@@ -677,8 +677,7 @@ const DAEMON_START_WATCHDOG_TIMEOUT_MS: u64 = 45_000;
 /// `--timeout-seconds` (1–600s). The 3s-default / 60s-max hook watchdog exists
 /// to stop a write-hook wedged on stuck I/O — it must not pre-empt inject's
 /// legitimate ACK wait, which it otherwise always does (firing first and
-/// emitting the neutral fail-open envelope, which looks exactly like the
-/// "bare `{ok:true}`, no InjectData" symptom). First positional, dash-skipping,
+/// emitting the fail-open timeout envelope before inject can answer). First positional, dash-skipping,
 /// matching the `resolve_watchdog_posture` subcommand gate.
 fn first_positional_is_inject(args: &[String]) -> bool {
     args.iter()
@@ -864,8 +863,9 @@ pub fn main() -> ExitCode {
 /// The command body executes on a worker thread; the main thread waits for it
 /// with a deadline. If the worker finishes in time, we print its output and
 /// return its exit code exactly as before. If the deadline elapses first, we
-/// **fail open**: emit the neutral envelope the hook wrapper expects and exit
-/// `0` immediately, abandoning the (possibly syscall-blocked) worker thread.
+/// **fail open**: emit a named timeout envelope and exit `0` immediately,
+/// abandoning the (possibly syscall-blocked) worker thread. `ok:false` records
+/// that the command did not complete; exit 0 preserves the never-gate charter.
 ///
 /// Abandoning the worker is safe and is the whole point: `std::process::exit`
 /// tears down the entire process, so any file descriptor, advisory lock, or
@@ -913,8 +913,9 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
 
     let wants_json = args.iter().any(|arg| arg == "--json");
     // `--fail-open` (passed by the hook wrappers) means "never block the host
-    // tool on a rally problem". On timeout we honor it by emitting a neutral
-    // allow-everything envelope. Without it we still exit 0 (rally is an
+    // tool on a rally problem". On timeout we honor it by returning exit 0,
+    // while ok:false names that rally itself did not complete. Without it we
+    // still exit 0 (rally is an
     // advisory coordinator — hanging the agent is strictly worse than skipping
     // one advisory), but we surface a timeout note on stderr for visibility.
 
@@ -926,7 +927,8 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
     // thread-spawn latency and it can only shorten the retry budget, never
     // extend it past the watchdog — the safe direction. Anchoring inside the
     // worker would invert that and let a loop outlive the watchdog.
-    let deadline = Instant::now() + timeout;
+    let watchdog_started = Instant::now();
+    let deadline = watchdog_started + timeout;
     let worker = thread::Builder::new()
         .name("rally-command".to_string())
         .spawn(move || {
@@ -971,13 +973,13 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
         return run_inline(env::args().skip(1).collect());
     }
 
-    match rx.recv_timeout(timeout) {
-        Ok(result) => {
+    match receive_with_watchdog(&rx, timeout, watchdog_started) {
+        WatchdogReceive::Completed(result) => {
             let exit_code = result.exit_code;
             result.print();
             ExitCode::from(exit_code)
         }
-        Err(_) => {
+        WatchdogReceive::TimedOut(elapsed) => {
             // Deadline elapsed (or the worker panicked without sending). The
             // posture decides whether to fail open (default) or fail closed
             // (opt-in, before-write only — see `resolve_watchdog_posture`).
@@ -985,7 +987,7 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
             // the kernel reaps any fd/lock/child it held.
             match posture {
                 WatchdogPosture::Open => {
-                    emit_timeout_fail_open(wants_json, fail_open, timeout);
+                    emit_timeout_fail_open(wants_json, fail_open, timeout, elapsed);
                     std::process::exit(0);
                 }
                 WatchdogPosture::HookAdvisory => {
@@ -1052,6 +1054,22 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
                 }
             }
         }
+    }
+}
+
+enum WatchdogReceive<T> {
+    Completed(T),
+    TimedOut(Duration),
+}
+
+fn receive_with_watchdog<T>(
+    receiver: &std::sync::mpsc::Receiver<T>,
+    timeout: Duration,
+    started: Instant,
+) -> WatchdogReceive<T> {
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => WatchdogReceive::Completed(result),
+        Err(_) => WatchdogReceive::TimedOut(started.elapsed()),
     }
 }
 
@@ -1199,17 +1217,28 @@ fn run_inline(args: Vec<String>) -> ExitCode {
     }
 }
 
-/// On watchdog timeout, print the neutral fail-open payload and return. For
-/// `--json` callers this is the empty/neutral envelope every hook wrapper
-/// already treats as "nothing to do" (`{}` → wrapper emits no agent-visible
-/// message). For human callers we print nothing to stdout and a single
-/// stderr note so the timeout is observable without polluting stdout.
-fn emit_timeout_fail_open(wants_json: bool, fail_open: bool, timeout: Duration) {
+fn timeout_fail_open_payload(elapsed: Duration) -> Value {
+    json!({
+        "ok": false,
+        "product": "rally",
+        "command": "watchdog",
+        "schema": "agent-rally.command.watchdog.v1",
+        "data": {
+            "watchdog_timeout": true,
+            "reason": "command did not complete before the watchdog deadline; coordination failed open",
+            "elapsed_ms": elapsed.as_millis(),
+        }
+    })
+}
+
+/// On watchdog timeout, print a distinguishable fail-open payload and return.
+/// JSON callers can name the timeout instead of mistaking the old neutral
+/// `ok:true` envelope for a completed command. Human callers still receive the
+/// single stderr note; stdout remains clean unless `--json` was requested.
+fn emit_timeout_fail_open(wants_json: bool, fail_open: bool, timeout: Duration, elapsed: Duration) {
     if wants_json {
-        // Neutral envelope: the codex/claude/gemini wrappers parse this and,
-        // finding no `agent_visible.present`, emit `{}` — i.e. allow the write.
         crate::output::write_line_or_exit_on_broken_pipe(
-            &json!({ "ok": true, "product": "rally" }).to_string(),
+            &timeout_fail_open_payload(elapsed).to_string(),
         );
     }
     let _ = fail_open; // semantics identical either way; kept for clarity/logging
@@ -9735,6 +9764,35 @@ mod tests {
                 "{cmd:?} must remain fail open"
             );
         }
+    }
+
+    #[test]
+    fn watchdog_fail_open_payload_names_the_forced_timeout() {
+        let (sender, receiver) = std::sync::mpsc::channel::<WatchdogResult>();
+        let started = Instant::now();
+        let elapsed = match receive_with_watchdog(&receiver, Duration::from_millis(1), started) {
+            WatchdogReceive::TimedOut(elapsed) => elapsed,
+            WatchdogReceive::Completed(_) => {
+                panic!("empty watchdog channel unexpectedly completed")
+            }
+        };
+        drop(sender);
+        let payload = timeout_fail_open_payload(elapsed);
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["product"], "rally");
+        assert_eq!(payload["command"], "watchdog");
+        assert_eq!(payload["schema"], "agent-rally.command.watchdog.v1");
+        assert_eq!(payload["data"]["watchdog_timeout"], true);
+        assert!(
+            payload["data"]["elapsed_ms"]
+                .as_u64()
+                .is_some_and(|ms| ms >= 1)
+        );
+        assert!(
+            payload["data"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("did not complete"))
+        );
     }
 
     fn unique_root(label: &str) -> PathBuf {

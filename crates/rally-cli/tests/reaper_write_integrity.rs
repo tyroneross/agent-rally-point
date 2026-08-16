@@ -173,6 +173,9 @@ impl TempRoom {
     fn backdate_ledger(&self, hours: i64) {
         let stamp = (chrono::Utc::now() - chrono::Duration::hours(hours))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let lease_stamp = (chrono::Utc::now() - chrono::Duration::hours(hours)
+            + chrono::Duration::hours(2))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         let mut rewritten = 0usize;
         for entry in fs::read_dir(self.log_dir()).expect("read log dir") {
@@ -189,6 +192,16 @@ impl TempRoom {
                 let mut record: Value = serde_json::from_str(line).expect("segment line is JSON");
                 record["occurred_at"] = Value::String(stamp.clone());
                 record["payload"]["created_at"] = Value::String(stamp.clone());
+                if let Some(evidence) = record["payload"]["evidence"].as_array_mut() {
+                    for item in evidence {
+                        if item
+                            .as_str()
+                            .is_some_and(|text| text.starts_with("lease_expires_at:"))
+                        {
+                            *item = Value::String(format!("lease_expires_at:{lease_stamp}"));
+                        }
+                    }
+                }
                 out.push_str(&serde_json::to_string(&record).expect("re-encode segment line"));
                 out.push('\n');
                 rewritten += 1;
@@ -521,6 +534,82 @@ fn failed_claim_expiry_write_is_not_reported_as_reaped() {
         room.active_claim_subjects(),
         vec!["claim-frozen".to_string()],
         "the claim is still live — the report must agree"
+    );
+}
+
+/// A PID is not a process identity. The live main-repo incident carried an
+/// 11-hour-old observer PID that had been reused; `kill -0` therefore reported
+/// "alive" and vetoed an otherwise-expired claim. This fixture backdates the
+/// current test process as that old observer, deterministically creating the
+/// same reuse shape without depending on the OS to recycle a particular PID.
+#[test]
+fn expired_multi_path_claim_is_reaped_when_observer_pid_was_reused() {
+    let room = TempRoom::new("reused-observer-pid");
+    room.init_observed_worktree();
+    let observer_pid = std::process::id().to_string();
+
+    let enter = room
+        .rally()
+        .env("RALLY_SESSION_ID", "expired-owner-session")
+        .env("RALLY_OBSERVER_PID", &observer_pid)
+        .args([
+            "enter",
+            "--tool",
+            "expired-owner:01",
+            "--json",
+            "--timeout-ms",
+            TIMEOUT_MS,
+        ])
+        .output()
+        .expect("spawn owner enter");
+    assert!(
+        enter.status.success(),
+        "owner enter failed: {}",
+        String::from_utf8_lossy(&enter.stderr)
+    );
+
+    let claim = room
+        .rally()
+        .env("RALLY_SESSION_ID", "expired-owner-session")
+        .env("RALLY_OBSERVER_PID", &observer_pid)
+        .args([
+            "say",
+            "claim",
+            "--tool",
+            "expired-owner:01",
+            "--subject",
+            "expired three-file claim",
+            "--path",
+            "README.md",
+            "--path",
+            "docs/JSON_ENVELOPE.md",
+            "--path",
+            "src/lib.rs",
+            "--evidence",
+            "lease_expires_at:2000-01-01T00:00:00Z",
+            "--json",
+            "--timeout-ms",
+            TIMEOUT_MS,
+        ])
+        .output()
+        .expect("spawn claim");
+    assert!(
+        claim.status.success(),
+        "claim failed: {}",
+        String::from_utf8_lossy(&claim.stderr)
+    );
+
+    room.backdate_ledger(11);
+    let (report, stderr) = room.reap(true);
+    assert_eq!(
+        report["claims_reaped"].as_array().map(Vec::len),
+        Some(1),
+        "expired claim was preserved because a reused PID looked live: {report}; stderr={stderr}"
+    );
+    assert_eq!(report["complete"], Value::Bool(true));
+    assert!(
+        room.active_claim_subjects().is_empty(),
+        "the completed reaper pass must actually unblock all three paths"
     );
 }
 

@@ -111,6 +111,24 @@ human-line tally, ranking, warning present on a stale target and absent on a
 fresh or broadcast one) plus unit goldens for the ranking key
 (`store::squad_freshness_tests`, `next::tests::peer_targets_rank_fresh_first_and_cap_the_shortlist`)
 and the advisory text (`stale_target_warning_tests`).
+### Fixed — watchdog timeouts are named instead of impersonating success (RC-074)
+
+Fail-open watchdog expiry still exits 0, preserving Rally's never-gate charter, but now returns
+`ok:false` with `data.watchdog_timeout`, a reason, and measured elapsed milliseconds. Integration
+harnesses name this failure, and reaper scale tests use an injected budget clock instead of runner
+wall time.
+
+### Fixed — expired claims survive neither stale projection nor recycled PID evidence (RC-075)
+
+Doctor reaping now retains the newest authored-activity timestamp when decay removes an old
+owner from presentation, ignores peer facts merely addressed to that owner, and refuses to let a
+PID observation older than lease expiry veto cleanup forever.
+
+### Fixed — one host session is one claim principal (RC-077)
+
+Host auto-claims and orchestrator claims carrying the same nonblank protocol session and tool
+family now share claim authority even when their descriptive suffixes differ. Unrelated tool
+families in one terminal session remain distinct; sessionless legacy claims keep exact matching.
 
 ### Fixed — every repo but this one committed rally's derived state (RC-072)
 
