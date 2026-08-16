@@ -191,6 +191,43 @@ The `--strict` on `check before-write` above is one of the three blocking switch
 
 Resolve handoff targets from live room state (`rally whoami`, `rally lead show`, `rally room --json`), never from examples or old logs.
 
+### Rally Flow for multi-agent workstreams
+
+The turn loop above is the unit of execution. Rally Flow wraps many of those loops in a linted, dependency-aware workstream whose state can be reconstructed from Rally after a crash or handoff. Rally coordinates the work; the host still launches agents, edits files, and runs verification.
+
+```mermaid
+flowchart TD
+  define["1. Define the workstream\nintent, owners, dependencies, validation"] --> lint["2. Lint the descriptor\nstructure, determinism, boundaries"]
+  lint --> status["3. Derive status from Rally\ndone · claimed · active · pending"]
+  status --> ready{"Dependency-ready tasks?"}
+  ready -->|yes| route["4. Route to a host\nhost-native or cross-host"]
+  route --> task{"5. Run each task loop"}
+  task -->|write| write["claim → before-write → work\nverify → artifact → release"]
+  task -->|read-only| read["presence → work → verify → artifact"]
+  write --> checkpoint["6. Checkpoint in Rally"]
+  read --> checkpoint
+  checkpoint --> status
+  ready -->|all artifacts verified| complete(["7. Complete the workstream"])
+  ready -->|blocked or requires human| stop(["Stop and ask"])
+```
+
+<details>
+<summary>What each Rally Flow stage uses</summary>
+
+| Stage | Implemented behavior |
+|-------|----------------------|
+| Define | A workstream descriptor names task intent, ownership boundaries, dependencies, and validation. |
+| Lint | `workstream-lint.mjs` checks structure, deterministic fields, non-overlapping boundaries, dependency integrity, and command safety. |
+| Derive | `workstream-status.mjs` reads Rally state and classifies each task as `done`, `claimed`, `active`, or `pending`; dependency-ready tasks become `to_dispatch`. |
+| Route | The host uses its native agent launcher by default, or `rally run` plus `rally inject` for cross-host work. Rally records the coordination facts but does not execute the task. |
+| Run | Each task follows the write or read-only lifecycle defined by the protocol. The write path uses the turn loop shown above. |
+| Checkpoint | Claims, presence, handoffs, and evidence-bearing artifacts make progress durable and reconstructable. |
+| Resume or complete | On resume, dispatch only `to_dispatch` tasks and skip tasks with completion artifacts. The coordinator verifies every task's evidence before declaring the workstream complete. |
+
+</details>
+
+The implementation lives in [`dynamic-workflows/`](dynamic-workflows/README.md). See the [Rally Flow protocol](dynamic-workflows/PROTOCOL.md) for lifecycle and resume rules, and the [host-neutral workflow skill](skills/rally-workflows/SKILL.md) for the command mapping.
+
 ## What a claim can cover
 
 A claim scope is `type:identifier` with an optional access prefix. Eleven resource types: `workspace`, `repo`, `file`, `dir`, `branch`, `commit`, `port`, `process`, `service`, `task`, `cross-repo`. Four access modes: `exclusive`, `shared_read`, `advisory`, `namespace` — `exclusive` is the default for most types; `dir`, `repo`, and `workspace` default to `namespace` (source: `crates/rally-cli/src/resource_scope.rs`). So an agent about to reset the shared database claims the service, not a file:
