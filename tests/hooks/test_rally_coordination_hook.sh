@@ -1143,10 +1143,18 @@ process.stdout.write(JSON.stringify({
   # The abort must be VISIBLE on stdout, not a bare `{}` that reads as
   # "checked, no conflict", and must still carry no permission decision --
   # rally neither gates nor grants.
+  # `grep` alone would also pass if a regression emitted the advisory ALONGSIDE
+  # a conflict render, or emitted it twice, so assert exactly one top-level key
+  # and valid JSON as well.
+  one_key=$(printf '%s' "$out" | node -e '
+const o=JSON.parse(require("fs").readFileSync(0,"utf8"));
+process.stdout.write(String(Object.keys(o).length));
+' 2>/dev/null || printf 'BAD')
   if ! printf '%s' "$out" | grep -q 'rally coordination skipped' || \
      printf '%s' "$out" | grep -q 'permissionDecision' || \
+     [ "$one_key" != "1" ] || \
      [ "$claim_count" != "0" ] || [ "$check_count" != "3" ]; then
-    printf 'out=[%s] checks=%s claims=%s calls=[%s]\n' "$out" "$check_count" "$claim_count" "$(cat "$timeout_calls")" >&2
+    printf 'out=[%s] top_level_keys=%s checks=%s claims=%s calls=[%s]\n' "$out" "$one_key" "$check_count" "$claim_count" "$(cat "$timeout_calls")" >&2
     exit 1
   fi
   grep -q 'mutation coordination aborted' "$tmpdir/o33a-timeout.err" || {
@@ -1389,6 +1397,13 @@ EOF
   }
   ! printf '%s' "$out" | grep -q 'permissionDecision' || {
     printf 'abort advisory must neither gate nor grant: [%s]\n' "$out" >&2
+    exit 1
+  }
+  printf '%s' "$out" | node -e '
+const o=JSON.parse(require("fs").readFileSync(0,"utf8"));
+if (Object.keys(o).length !== 1) process.exit(1);
+' || {
+    printf 'degrade emitted more than one top-level key: [%s]\n' "$out" >&2
     exit 1
   }
   [ ! -s "$no_watchdog_calls" ] || {
@@ -2549,8 +2564,34 @@ EOF
   printf '%s' "$out" | node -e 'JSON.parse(require("fs").readFileSync(0,"utf8"))' || {
     printf 'abort advisory is not valid JSON: [%s]\n' "$out" >&2; exit 1
   }
+  # Per-host envelope shapes. The abort is only useful if it lands in the sink
+  # the host actually reads, and only charter-compliant if the permission field
+  # appears on exactly one host -- Cursor, whose schema forces it.
+  for host_case in "claude_code:systemMessage:no" "codex:systemMessage:no" "gemini:additionalContext:no" "cursor:agent_message:yes"; do
+    host="${host_case%%:*}"; rest="${host_case#*:}"
+    sink="${rest%%:*}"; wants_perm="${rest##*:}"
+    hout=$(RALLY_BIN="$slow_bin" "$HOOK" before-write "$host" <<<"$envelope" 2>/dev/null)
+    printf '%s' "$hout" | grep -q "$sink" || {
+      printf '%s: advisory did not use the %s sink: [%s]\n' "$host" "$sink" "$hout" >&2; exit 1
+    }
+    printf '%s' "$hout" | grep -q 'rally coordination skipped' || {
+      printf '%s: advisory text missing: [%s]\n' "$host" "$hout" >&2; exit 1
+    }
+    printf '%s' "$hout" | node -e 'JSON.parse(require("fs").readFileSync(0,"utf8"))' || {
+      printf '%s: advisory is not valid JSON: [%s]\n' "$host" "$hout" >&2; exit 1
+    }
+    if [ "$wants_perm" = "no" ]; then
+      printf '%s' "$hout" | grep -qE '"permission"|permissionDecision' && {
+        printf '%s: abort must neither gate nor grant on this host: [%s]\n' "$host" "$hout" >&2; exit 1
+      }
+    else
+      printf '%s' "$hout" | grep -q '"permission":"allow"' || {
+        printf '%s: cursor schema requires the permission field: [%s]\n' "$host" "$hout" >&2; exit 1
+      }
+    fi
+  done
   exit 0
-); then ok "$T"; else bad "$T" "a coordination outage must be visible on stdout, and must not gate or grant"; fi
+); then ok "$T"; else bad "$T" "a coordination outage must be visible on stdout, in the sink each host reads, and must not gate or grant"; fi
 
 # Summary
 # ----------------------------------------------------------------------

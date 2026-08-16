@@ -3148,3 +3148,25 @@ claim and asks the implementation whether it is true. See
   allowlist's "hook-authored" claim ungradable. The local was renamed to `abort_advisory` and
   the reason for the name is recorded at the definition. The guard found a real problem for
   the wrong reason, and its shell-emitter gap is still open.
+- **Corrections from the independent audit of the landed commits (verdict `approve_with_findings`,
+  no blocker), recorded because an entry that overstates is worth less than one that does not:**
+  - *"carries no permission field at all" was false on one host.* Cursor's preToolUse schema
+    requires a `permission`, so that branch emits `"allow"` — a grant by this entry's own
+    definition. Omitting it would drop the message and restore the silence the fix removes, so
+    the code stands, but the claim is now stated as: no permission field on Claude, Codex and
+    Gemini; Cursor forced to `allow`, named rather than glossed.
+  - *The clamp did not do what its comment claimed.* Probed directly: `08` was read as octal and
+    errored, and a value past the shell's integer range overflowed to a **negative** budget. Both
+    degraded to a visible abort rather than a silent one, so neither was off-charter, but "anything
+    else 1" was untrue. The clamp now accepts only a bare `1..16` and everything else falls back
+    to the production default of 1.
+  - *The scale was documented as an operator dial and should not have been.* The budget proof
+    spends ≤6200ms at scale 1 beneath a 10s host timeout; scale 2 alone reaches 12.4s, at which
+    point the HOST kills the hook mid-transaction and the agent gets **no envelope at all** —
+    strictly worse than the `{}` this entry set out to remove. It is now documented as a harness
+    seam.
+  - *Gemini was being written to the wrong sink.* The abort emitted `systemMessage` while this
+    repo's own Gemini `BeforeTool` advisory uses `hookSpecificOutput.additionalContext`. Fixed,
+    and all four host shapes are now asserted by the fail-loud test rather than assumed.
+  - *Still unproven and labelled as such:* whether `systemMessage` reaches the MODEL on Claude
+    rests on an in-repo note dated 2026-06 that was not re-verified this run.

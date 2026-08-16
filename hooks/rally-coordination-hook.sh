@@ -780,10 +780,22 @@ fi
 # racing the host scheduler; an operator on a heavily loaded or slow machine
 # can do the same. Raising it never hides a failure: it moves the point at
 # which the hook reports one.
+# TEST HARNESS ONLY -- DO NOT RAISE THIS IN PRODUCTION. The budget proof in
+# the `check_budget_ms` comment below spends at most 6200ms of Rally wall time
+# at scale 1, beneath the 10s host timeout the generated hooks.json declares,
+# leaving ~3.8s for shell and node orchestration. Scale 2 already puts the
+# worst case at 12.4s, so the HOST would kill the hook mid-transaction and the
+# agent would receive NO envelope at all -- not even the abort advisory this
+# file exists to guarantee. That is strictly worse than the silent `{}` this
+# change removed, which is why this is a harness seam and not a tuning dial.
+#
+# The clamp accepts only a bare 1..16. A leading zero would be read as octal by
+# the arithmetic below (`08` is an ERROR, not 8) and a value beyond the shell's
+# integer range overflows to a NEGATIVE budget; both were reachable before.
 _rally_ms_scale="${RALLY_HOOK_MS_BUDGET_SCALE:-1}"
 case "$_rally_ms_scale" in
-  ''|*[!0-9]*|0) _rally_ms_scale=1 ;;
-  *) [ "$_rally_ms_scale" -gt 16 ] && _rally_ms_scale=16 ;;
+  [1-9]|1[0-6]) ;;
+  *) _rally_ms_scale=1 ;;
 esac
 
 # Millisecond guard for the bounded multi-target transaction. The CLI receives
@@ -999,7 +1011,13 @@ _rally_advise_mutation_abort() {
 # outlives the session, so a repeat abort was silent on BOTH channels.
 #
 # This emits the same fact on stdout, as an ADVISORY. It deliberately carries
-# NO `permissionDecision`: `deny` would gate the edit, and `allow` would GRANT
+# NO permission field ON CLAUDE, CODEX AND GEMINI. Cursor is the one exception
+# and a FORCED one: its preToolUse schema requires a `permission`, so omitting
+# it drops the message entirely and restores exactly the silence this function
+# exists to remove. A forced grant that delivers the warning beats a clean
+# abstention nobody sees -- but it IS a grant, and it is named here, not
+# glossed. Elsewhere the rule holds without exception:
+# `deny` would gate the edit, and `allow` would GRANT
 # it — the charter says rally never gates and never grants. An abort is not a
 # judgment about the edit at all; it is a report that no judgment was made.
 #
@@ -1018,6 +1036,12 @@ _rally_abort_envelope() {
   safe_tool="$(printf '%s' "${tool:-the agent}" | tr -c 'A-Za-z0-9_.:-' '_' | cut -c1-80)"
   abort_advisory="rally coordination skipped ($safe_reason): this edit is proceeding UNCLAIMED. No claim was created, so peers will not see this path as yours. This is not a block - rally never gates an edit. Re-check with: rally check before-write --tool $safe_tool --path <path>"
   case "${tool:-}" in
+    gemini|gemini*)
+      # Gemini reads BeforeTool advisories from additionalContext, not from
+      # systemMessage; the wrong sink would emit the advisory and never
+      # surface it, which is the failure this whole function removes.
+      printf '{"hookSpecificOutput":{"hookEventName":"BeforeTool","additionalContext":"%s"}}' "$abort_advisory"
+      ;;
     cursor|cursor:*)
       # Cursor's preToolUse schema has no "no opinion" option; the permission
       # field is required. "allow" here is the schema's neutral value and
