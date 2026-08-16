@@ -1,0 +1,210 @@
+{
+  "as_of": "2026-08-16T03:33:40.757679+00:00",
+  "build_id": "0.2.1+39b27c1",
+  "rally_bin": "/Users/tyroneross/dev/git-folder/agent-rally-point/.build-loop/worktrees/native-hook-20260815/target/release/rally",
+  "hook_path": "/Users/tyroneross/dev/git-folder/agent-rally-point/.build-loop/worktrees/native-hook-20260815/hooks/rally-coordination-hook.sh",
+  "hook_sha256": "6104700cc5faac422cc85671adf1003261cfcfe35982f2623b31e7a0062fc2c6",
+  "repeat": 20,
+  "load_burners": 0,
+  "loadavg_harness_start": [
+    5.9169921875,
+    10.794921875,
+    10.23583984375
+  ],
+  "loadavg_harness_end": [
+    14.91357421875,
+    12.56787109375,
+    10.908203125
+  ],
+  "unit_startup_costs_ms": {
+    "node_e_empty_ms": 34.469,
+    "perl_e_1_ms": 7.142,
+    "bash_c_colon_ms": 5.287,
+    "rally_version_json_ms": 7.905,
+    "reps": 5
+  },
+  "xtrace_method": "stderr_fallback",
+  "scenarios": {
+    "claude_1path": {
+      "n": 20,
+      "p50_ms": 89.328,
+      "p95_ms": 3968.463,
+      "min_ms": 76.852,
+      "max_ms": 4142.585,
+      "mean_ms": 1172.391,
+      "stdev_ms": 1571.094,
+      "loadavg": {
+        "at_start": [
+          5.9169921875,
+          10.794921875,
+          10.23583984375
+        ],
+        "at_end": [
+          12.11328125,
+          11.9306640625,
+          10.658203125
+        ]
+      },
+      "spawns": {
+        "method": "stderr_fallback",
+        "reason": "system bash does not honor BASH_XTRACEFD from the environment (probe failed; this feature requires bash>=4.1, macOS system /bin/bash is 3.2) -- xtrace was captured from its default stderr target instead",
+        "node_e_count": 0,
+        "perl_dash_count": 0,
+        "rally_bin_literal_occurrences": 18,
+        "plus_prefixed_lines_total": 70,
+        "subshell_approx_doubleplus_lines": 15,
+        "estimated_spawn_overhead_ms": 0.0,
+        "trace_bytes": 5547
+      },
+      "warm_up": {
+        "elapsed_ms": 117.569,
+        "stdout": "{}",
+        "ledger_delta": 3
+      },
+      "raw_samples_ms": [
+        88.905,
+        89.75,
+        87.34,
+        84.145,
+        86.875,
+        86.664,
+        84.065,
+        81.249,
+        80.534,
+        76.852,
+        80.802,
+        300.836,
+        139.845,
+        1357.607,
+        3528.589,
+        3959.299,
+        3623.202,
+        4142.585,
+        3587.708,
+        1880.97
+      ],
+      "build_id": "0.2.1+39b27c1"
+    },
+    "codex_4path": {
+      "n": 20,
+      "p50_ms": 379.976,
+      "p95_ms": 1526.873,
+      "min_ms": 135.501,
+      "max_ms": 1615.511,
+      "mean_ms": 573.671,
+      "stdev_ms": 474.191,
+      "loadavg": {
+        "at_start": [
+          12.11328125,
+          11.9306640625,
+          10.658203125
+        ],
+        "at_end": [
+          14.91357421875,
+          12.56787109375,
+          10.908203125
+        ]
+      },
+      "spawns": {
+        "method": "stderr_fallback",
+        "reason": "system bash does not honor BASH_XTRACEFD from the environment (probe failed; this feature requires bash>=4.1, macOS system /bin/bash is 3.2) -- xtrace was captured from its default stderr target instead",
+        "node_e_count": 0,
+        "perl_dash_count": 0,
+        "rally_bin_literal_occurrences": 18,
+        "plus_prefixed_lines_total": 70,
+        "subshell_approx_doubleplus_lines": 15,
+        "estimated_spawn_overhead_ms": 0.0,
+        "trace_bytes": 5535
+      },
+      "warm_up": {
+        "elapsed_ms": 1135.231,
+        "stdout": "{}",
+        "ledger_delta": 3
+      },
+      "raw_samples_ms": [
+        322.76,
+        330.576,
+        799.37,
+        1522.208,
+        1615.511,
+        1384.557,
+        676.244,
+        429.376,
+        171.289,
+        135.501,
+        161.389,
+        522.414,
+        136.547,
+        144.083,
+        139.199,
+        147.139,
+        819.02,
+        234.539,
+        911.893,
+        869.805
+      ],
+      "build_id": "0.2.1+39b27c1"
+    },
+    "claude_pure_read": {
+      "n": 20,
+      "p50_ms": 47.622,
+      "p95_ms": 63.776,
+      "min_ms": 42.339,
+      "max_ms": 66.834,
+      "mean_ms": 49.538,
+      "stdev_ms": 6.644,
+      "loadavg": {
+        "at_start": [
+          14.91357421875,
+          12.56787109375,
+          10.908203125
+        ],
+        "at_end": [
+          14.91357421875,
+          12.56787109375,
+          10.908203125
+        ]
+      },
+      "spawns": {
+        "method": "stderr_fallback",
+        "reason": "system bash does not honor BASH_XTRACEFD from the environment (probe failed; this feature requires bash>=4.1, macOS system /bin/bash is 3.2) -- xtrace was captured from its default stderr target instead",
+        "node_e_count": 0,
+        "perl_dash_count": 0,
+        "rally_bin_literal_occurrences": 18,
+        "plus_prefixed_lines_total": 70,
+        "subshell_approx_doubleplus_lines": 15,
+        "estimated_spawn_overhead_ms": 0.0,
+        "trace_bytes": 5547
+      },
+      "warm_up": {
+        "elapsed_ms": 43.932,
+        "stdout": "{}",
+        "ledger_delta": 0
+      },
+      "raw_samples_ms": [
+        46.84,
+        45.693,
+        48.2,
+        47.043,
+        55.714,
+        54.49,
+        63.615,
+        66.834,
+        56.718,
+        45.461,
+        44.045,
+        48.954,
+        49.079,
+        51.836,
+        45.627,
+        43.812,
+        42.339,
+        42.851,
+        48.645,
+        42.964
+      ],
+      "build_id": "0.2.1+39b27c1"
+    }
+  },
+  "note": "Absolute latency thresholds referenced in docs/plans are reference points, not pass conditions (CLAUDE.md 'Performance claims'; .build-loop/goal.md criteria 12-14). This artifact reports what was measured, not a verdict. spawns/*.plus_prefixed_lines_total and node_e_count are approximate (per the plan's own C0 spec) -- xtrace marks the START of a traced command, not every line of a multi-line quoted argument."
+}

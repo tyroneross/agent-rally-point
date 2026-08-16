@@ -7,6 +7,54 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Changed — before-write coordination runs inside the rally binary
+
+`rally hook before-write` now owns the whole before-write transaction: it parses
+the host envelope (Claude, Codex, Cursor, Gemini), classifies the tool effect
+against the O33-A tables, resolves hooks-status, publishes working state, checks
+every target against one snapshot, filters paths it already owns, appends one
+idempotent claim, dedupes repeated events, and renders the host reply — in one
+process, under one deadline. The shell wrapper shrank to opt-out, SEC-001
+containment, a cached capability probe, and `exec`. A binary without the
+subcommand keeps the existing Node path, so older installs are unaffected.
+
+Nine `node` spawns and one perl watchdog per edit became zero. Median wall time
+fell from 608 ms to 89 ms for a single-path Claude edit.
+
+The tail moved the other way and that is not yet fixed: p95 rose from 752 ms to
+3969 ms, because `renew_owned_claim_leases` takes its own full snapshot and
+appends one renewal per claim the session owns, on every fire. On a store where
+the tool held ~35 claims, the native path measured 1875 ms against the Node
+fallback's 709 ms — both completing the claim. Details, traces and the next
+lever are in `docs/perf/2026-08-15-before-write-hook-latency.md`.
+
+Host envelopes are unchanged, verified by running both paths side by side and
+diffing bytes. Codex still never receives a `permissionDecision`. Every abort
+still returns the fail-loud "coordination skipped, proceeding UNCLAIMED"
+advisory on stdout rather than a bare `{}`, and still carries no
+`permissionDecision` at all — a deny would gate the edit and an allow would
+grant it, and rally does neither. `RALLY_NATIVE_HOOK=off` forces the Node path;
+`RALLY_HOOK_TRACE=1` emits one line of per-stage timings.
+
+A pure read now costs 48 ms rather than 28 ms: the native branch runs before the
+envelope is read, so it resolves the binary and consults the cached probe before
+reaching the short-circuit.
+
+### Fixed — the hook could execute a `rally` it had just refused (SEC-001)
+
+The containment cascade refused a `$PATH` candidate resolving inside the repo
+being scanned, then fell back to the bare string `RALLY_BIN="rally"` when
+`~/.local/bin/rally` was absent. The next check re-resolved that bare name
+through the same `$PATH` and handed back the refused binary. Confirmed by
+execution: the hook printed its SEC-001 refusal and then ran the in-repo binary
+three times, passing it the session id and the edited path. Any machine with
+`~/.local/bin/rally` present — every dev machine — masked it.
+
+A refused or absent candidate now leaves `RALLY_BIN` empty, which both call
+sites already treat as "not installed", and the capability probe only ever
+executes an absolute path that passed the containment check.
+
+
 ### Fixed — retraction and release could close a claim through spellings the write gate did not check
 
 One defect wearing five names (R1–R5): the write-authority gate asserted a correct rule
