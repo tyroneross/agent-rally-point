@@ -1027,7 +1027,7 @@ fn fact_schema() -> String {
 /// `status` is "active" if `last_seen_ts` is within the last 15 minutes,
 /// "idle" otherwise.  The 15-minute threshold is intentionally generous so
 /// agents that are doing long computes don't flicker out of the squad view.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub(crate) struct Squad {
     pub(crate) tool: String,
     pub(crate) last_seen_seq: i64,
@@ -1058,6 +1058,24 @@ pub(crate) struct Squad {
     /// [`RoomSnapshot::ranked_peers`], [`RoomSnapshot::freshness_counts`].
     #[serde(default = "default_freshness")]
     pub(crate) freshness: String,
+}
+
+/// Hand-written so a `..Squad::default()` carries the documented tri-state
+/// (`unknown`), not `""` — `#[serde(default = ...)]` shapes deserialization
+/// only and would not have reached a derived `Default`.
+impl Default for Squad {
+    fn default() -> Self {
+        Self {
+            tool: String::new(),
+            last_seen_seq: 0,
+            last_seen_ts: String::new(),
+            status: String::new(),
+            acknowledged: false,
+            age_secs: None,
+            window_secs: 0,
+            freshness: FRESHNESS_UNKNOWN.to_string(),
+        }
+    }
 }
 
 pub(crate) const FRESHNESS_FRESH: &str = "fresh";
@@ -17667,5 +17685,7 @@ mod squad_freshness_tests {
         assert_eq!(sq.freshness, FRESHNESS_UNKNOWN);
         assert_eq!(sq.age_secs, None);
         assert_eq!(squad_freshness_rank(&sq), 1);
+        // And a Rust-side `Default` agrees with the serde default.
+        assert_eq!(Squad::default().freshness, FRESHNESS_UNKNOWN);
     }
 }

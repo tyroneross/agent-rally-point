@@ -38,7 +38,24 @@
           "type": "object",
           "required": ["active_claims", "active_blockers", "open_handoffs", "current_decisions", "current_risks", "recent_artifacts", "unconsumed_artifacts", "stale_facts", "squads", "lead"],
           "properties": {
-            "squads": { "type": "array" },
+            "squads": {
+              "type": "array",
+              "description": "Distinct tools that have entered or authored facts. Each row carries freshness (fresh = heartbeat inside its adaptive presence window, stale = past it, unknown = unparseable last_seen_ts) with age_secs and window_secs. Advisory: a stale row is still visible and still a legal handoff target.",
+              "items": {
+                "type": "object",
+                "required": ["tool", "last_seen_seq", "last_seen_ts", "status", "acknowledged", "window_secs", "freshness"],
+                "properties": {
+                  "tool": { "type": "string" },
+                  "last_seen_seq": { "type": "integer" },
+                  "last_seen_ts": { "type": "string" },
+                  "status": { "type": "string", "enum": ["active", "idle"] },
+                  "acknowledged": { "type": "boolean" },
+                  "age_secs": { "type": "integer" },
+                  "window_secs": { "type": "integer" },
+                  "freshness": { "type": "string", "enum": ["fresh", "stale", "unknown"] }
+                }
+              }
+            },
             "lead": { "type": ["string", "null"] },
             "system_health": {
               "type": "array",

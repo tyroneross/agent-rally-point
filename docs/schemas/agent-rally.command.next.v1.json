@@ -106,6 +106,33 @@
             },
             "alternatives": {
               "type": "array"
+            },
+            "peer_targets": {
+              "type": "object",
+              "description": "Visible peers ranked freshest-first (fresh -> unknown -> stale, youngest age first, self excluded) for choosing a handoff target. Advisory: a stale peer is still a legal --target. Counts cover the whole room; ranked is a capped shortlist and truncated says how many were cut.",
+              "required": ["fresh", "stale", "unknown", "ranked", "truncated"],
+              "properties": {
+                "fresh": { "type": "integer" },
+                "stale": { "type": "integer" },
+                "unknown": { "type": "integer" },
+                "truncated": { "type": "integer" },
+                "ranked": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["tool", "freshness", "window_secs", "last_seen_ts", "status", "acknowledged"],
+                    "properties": {
+                      "tool": { "type": "string" },
+                      "freshness": { "type": "string", "enum": ["fresh", "stale", "unknown"] },
+                      "age_secs": { "type": "integer" },
+                      "window_secs": { "type": "integer" },
+                      "last_seen_ts": { "type": "string" },
+                      "status": { "type": "string" },
+                      "acknowledged": { "type": "boolean" }
+                    }
+                  }
+                }
+              }
             }
           }
         },
