@@ -1091,7 +1091,7 @@ fn deadline_miss_is_fail_loud_advisory() {
 }
 
 // ---------------------------------------------------------------------------
-// T-08 (R5: sub-case (d) added)
+// T-08 (R5: sub-case (d) added; F-2/SEC-001: sub-case (e) added)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1247,6 +1247,72 @@ fn malformed_no_rally_or_old_binary_fail_open() {
             before,
             "disabled hooks must not write the ledger"
         );
+        fx.cleanup();
+    }
+
+    // (e) F-2 / SEC-001: a REPO-controlled normalize failure is NOT the
+    // (a) malformed-envelope case and must NOT share its `{}`.
+    //
+    // The vector: a hostile repo commits a symlink at an ancestor of a path
+    // the victim will edit (`escape/` -> outside the root), so
+    // `normalize_targets` refuses the target mid-transaction. `{}` on stdout
+    // is byte-identical to sub-case T-01's "checked, no conflict", and stderr
+    // is not surfaced to the model on exit 0 -- the agent would edit an
+    // unclaimed contested path believing rally had deconflicted it. Assert the
+    // fail-loud advisory instead, and assert it still carries NO permission
+    // verdict, because advising is not gating.
+    {
+        let fx = Fixture::new("t08e");
+        let outside = std::env::temp_dir().join(format!(
+            "native-hook-t08e-outside-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(outside.join("src")).unwrap();
+        std::os::unix::fs::symlink(&outside, fx.repo.join("escape")).unwrap();
+
+        let before = fx.ledger_lines();
+        let stdin =
+            json!({"tool_name":"Write","tool_input":{"file_path":"escape/src/x.rs"}}).to_string();
+        let out = fx.run_bin_stdin(
+            &[
+                "hook",
+                "before-write",
+                "--tool",
+                "claude_code:sec-one",
+                "--repo-root",
+                fx.repo.to_str().unwrap(),
+            ],
+            &stdin,
+            &[],
+        );
+        assert!(out.status.success(), "T-08e exit {:?}", out.status.code());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let trimmed = stdout.trim_end();
+        assert_ne!(
+            trimmed, "{}",
+            "T-08e: a symlink-crossing target must not answer with the \
+             same `{{}}` a clean deconflicted fire answers with (SEC-001)"
+        );
+        let body: Value = serde_json::from_str(trimmed)
+            .unwrap_or_else(|e| panic!("T-08e not JSON: {e}: {stdout}"));
+        assert!(
+            body.get("permissionDecision").is_none() && body.get("decision").is_none(),
+            "T-08e must carry no permission verdict: {body:#}"
+        );
+        assert!(
+            trimmed.contains("rally coordination skipped") && trimmed.contains("UNCLAIMED"),
+            "T-08e body: {trimmed}"
+        );
+        assert_eq!(
+            fx.ledger_lines(),
+            before,
+            "a refused target must not write the ledger"
+        );
+        let _ = fs::remove_dir_all(&outside);
         fx.cleanup();
     }
 }

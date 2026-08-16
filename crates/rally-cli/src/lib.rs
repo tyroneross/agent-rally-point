@@ -702,6 +702,33 @@ fn first_two_positionals_are_daemon_serve(args: &[String]) -> bool {
     matches!(first_positionals(args), (Some("daemon"), Some("serve")))
 }
 
+/// True iff the leading two positionals are `hook before-write`.
+///
+/// F-4: `command_hook`'s contract is "the exit code is ALWAYS 0" -- the phase
+/// is a PreToolUse hook, and Claude Code reads a non-zero exit from one as a
+/// BLOCKING hook error. That is a gate, which the charter forbids rally from
+/// ever being. `command_hook` itself honours the contract, but it is only
+/// reached AFTER argv parses: a bpaf failure is `RallyError::Usage`, which
+/// `RallyError::exit_code` maps to 2 before any hook code runs. The shell
+/// wrapper fixes argv, so this is not attacker-reachable today; it is closed
+/// anyway because "the wrapper happens to pass the right flags" is not a
+/// charter guarantee.
+fn first_two_positionals_are_hook_before_write(args: &[String]) -> bool {
+    matches!(
+        first_positionals(args),
+        (Some("hook"), Some("before-write"))
+    )
+}
+
+/// The advisory `hook before-write` emits when its own argv will not parse.
+/// Same envelope as every other abort: an advisory with no `permissionDecision`
+/// and no `decision`, rendered on stdout, exit 0.
+fn hook_before_write_parse_abort(args: &[String]) -> Output {
+    let rendered = hook_runtime::abort_envelope_from_args(args, "argument error");
+    let body: Value = serde_json::from_str(&rendered).unwrap_or_else(|_| json!({}));
+    Output::new(false, rendered, body)
+}
+
 /// True iff the leading two positionals are `daemon start`. R3: `start`
 /// blocks until `.rally/rallyd.sock.addr` exists AND a `Ping` round-trips,
 /// which during a cold reconcile (segment replay on a large room) can take
@@ -1412,11 +1439,28 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
     let normalized = crate::cli::normalize_flag_alias(args);
     let args: &[String] = normalized.as_deref().unwrap_or(args);
 
-    reject_unknown_command(args)?;
+    // F-4: a parse failure on THIS subcommand must still leave the host with
+    // an advisory and exit 0, never the exit-2 usage error a PreToolUse hook
+    // reads as a block. Both entry points (`run_with_watchdog`'s worker and
+    // the inline fallback) funnel through here, so one guard covers both.
+    let hook_before_write = first_two_positionals_are_hook_before_write(args);
 
-    let command = match parse_cli(args)? {
-        CliParse::Command(command) => *command,
-        CliParse::Help(text) => return Ok(Output::new(false, text, json!({}))),
+    if let Err(error) = reject_unknown_command(args) {
+        if hook_before_write {
+            return Ok(hook_before_write_parse_abort(args));
+        }
+        return Err(error);
+    }
+
+    let command = match parse_cli(args) {
+        Ok(CliParse::Command(command)) => *command,
+        Ok(CliParse::Help(text)) => return Ok(Output::new(false, text, json!({}))),
+        Err(error) => {
+            if hook_before_write {
+                return Ok(hook_before_write_parse_abort(args));
+            }
+            return Err(error);
+        }
     };
 
     match command {
@@ -2287,13 +2331,31 @@ fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
 /// self-report must not claim renewal when the durable ledger did not advance.
 fn renew_owned_claim_leases(room: &RoomStore, tool: &str) -> Result<usize> {
     let snapshot = room.snapshot()?;
+    renew_owned_claim_leases_from(room, tool, &snapshot.active_claims)
+}
+
+/// The same renewal, driven by claims the CALLER already snapshotted.
+///
+/// F-1: `renew_owned_claim_leases` takes its own full `room.snapshot()`. On
+/// the before-write hot path the transaction has already captured one, and
+/// paying for a second turned the hook into O(claims x ledger): measured on a
+/// 30-owned-claim room, the stage the renewal was billed to went from 59.5 ms
+/// to 1578.2 ms. Callers holding a snapshot pass `&snapshot.active_claims`
+/// here instead; the per-claim ledger work in `renew_claim_lease` is
+/// unchanged, so the renewal SEMANTICS are byte-identical -- only the
+/// redundant scan is gone.
+fn renew_owned_claim_leases_from(
+    room: &RoomStore,
+    tool: &str,
+    active_claims: &[Fact],
+) -> Result<usize> {
     let from_session_id = current_protocol_session(Some(tool))
         .from_session_id()
         .to_string();
     let coord = hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
     let now = chrono::Utc::now();
     let mut renewed = 0;
-    for claim in snapshot.active_claims.iter().filter(|claim| {
+    for claim in active_claims.iter().filter(|claim| {
         claim_authority::claim_owner_matches_caller(
             claim.tool.as_deref(),
             claim.from_session_id.as_deref(),

@@ -294,23 +294,31 @@ _rally_native_capable() {  # $1=root $2=absolute resolved binary path
       return $?
     fi
   fi
-  out="$("$bin" hook capabilities --json 2>/dev/null || true)"
+  # `</dev/null`: the probe must NOT inherit the host's stdin. This function
+  # runs before the envelope is read, and `hook capabilities` happening not to
+  # read stdin today is an accident of that subcommand, not a contract -- a
+  # foreign binary on $RALLY_BIN, or a future capabilities that consults the
+  # envelope, would drain the pipe and leave the exec'd transaction reading an
+  # empty one (which classifies as malformed and coordinates nothing).
+  out="$("$bin" hook capabilities --json </dev/null 2>/dev/null || true)"
   case "$out" in
     *'"before-write"'*) verdict="native" ;;
     *)                  verdict="fallback" ;;
   esac
-  # A marker-write failure treats THIS fire as fallback (never wedge on a
-  # read-only .rally/); the next fire retries the probe since no marker
-  # landed.
-  mkdir -p "$marker_dir" 2>/dev/null || return 1
-  tmp="$(mktemp "$marker.XXXXXX" 2>/dev/null)" || return 1
-  if ! printf '%s\n%s\n' "$verdict" "$bin_id" > "$tmp" 2>/dev/null; then
-    rm -f "$tmp" 2>/dev/null || true
-    return 1
-  fi
-  if ! mv -f "$tmp" "$marker" 2>/dev/null; then
-    rm -f "$tmp" 2>/dev/null || true
-    return 1
+  # PERSISTENCE IS BEST-EFFORT; THE VERDICT IS NOT. An unwritable `.rally/`
+  # (read-only checkout, wrong owner, full disk) must not discard a verdict
+  # this function already computed correctly -- returning 1 here used to mean
+  # the native path was NEVER taken on such a repo, and since this branch runs
+  # in front of classification, every fire including a pure read paid a probe
+  # spawn PLUS the whole Node path. Only the CACHE is lost: no marker lands,
+  # so the next fire re-probes.
+  if mkdir -p "$marker_dir" 2>/dev/null &&
+     tmp="$(mktemp "$marker.XXXXXX" 2>/dev/null)"; then
+    if printf '%s\n%s\n' "$verdict" "$bin_id" > "$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$marker" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    else
+      rm -f "$tmp" 2>/dev/null || true
+    fi
   fi
   [ "$verdict" = "native" ]
 }
