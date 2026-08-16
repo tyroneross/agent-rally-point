@@ -67,6 +67,7 @@ print(d['data'][d['command']])
 | `room` | `room: RoomSnapshot` | `query`, `readers?`, `mission?` |
 | `next` | `next: NextResult` | `tool`, `role`, `paths`, `wake_intent?`, `room` |
 | `check` | `check: { phase, tool, path?, allow, mode, findings, agent_visible }` | — |
+| `watchdog` | transport exception: `{ watchdog_timeout: true, reason, elapsed_ms }` | — |
 | `locate` | `locate: { event_id, located?, warnings }` | — |
 | `recent` | `recent: { all, limit, rows, warnings }` | — |
 | `retrospective` | `retrospective: { output_path, action, engagements, total_facts, total_engagements }` | — |

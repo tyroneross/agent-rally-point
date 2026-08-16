@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally:command:watchdog:v1",
+  "title": "Rally Watchdog Command",
+  "type": "object",
+  "required": ["ok", "product", "command", "schema", "data"],
+  "properties": {
+    "ok": { "const": false },
+    "product": { "const": "rally" },
+    "command": { "const": "watchdog" },
+    "schema": { "const": "agent-rally.command.watchdog.v1" },
+    "data": {
+      "type": "object",
+      "required": ["watchdog_timeout", "reason", "elapsed_ms"],
+      "properties": {
+        "watchdog_timeout": { "const": true },
+        "reason": { "type": "string" },
+        "elapsed_ms": { "type": "integer" }
+      }
+    }
+  }
+}
