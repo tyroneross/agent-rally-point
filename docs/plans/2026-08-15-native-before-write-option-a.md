@@ -508,3 +508,104 @@ before any opt-out is consulted (previously `hook.sh:461-468` / `:529-534` exite
 first). `docs/AUTO-COORDINATION-HOOKS.md:128` currently claims the hook is
 "silent" when hooks are disabled; C5 must correct that line. Cheap hardening for
 T-01 while there: assert stderr is empty and no `*.mutation-abort.seen` marker.
+
+---
+
+## C6 — session/prompt/stop message contract (operator scope amendment, 2026-08-15)
+
+Source: the Addendum at the end of `~/dev/docs/rally-native-hook-build-brief-2026-08-15.md`.
+Operator decided this mid-run and it ships with the release. It is a SEPARATE
+chunk because it is a different file region and a different contract from the
+before-write transaction.
+
+### Scope boundary (the one ambiguity, resolved and labelled)
+
+The amendment names "the SessionStart / UserPromptSubmit / Stop room message"
+and locates it as "the node renderer around lines ~1596-1616", i.e. the block
+ending at `hook.sh:1601` that emits
+`{agent_visible:{present,severity,message}, ledger_data}` for the START phase,
+plus the final envelope renderer's preamble decision at `hook.sh:2069`.
+
+Its L1 template list is keyed on `next.action`, whose values include
+`before-write conflict`. `[ASSUMED]` — and it is the reading this chunk is built
+on — **that value is a ROOM state being reported by a lifecycle message, not the
+before-write hook's own envelope.** The amendment says "separate file region
+from before-write" in the same sentence, and golden (b) is therefore "a room
+message whose next.action is a before-write conflict", not "the PreToolUse
+envelope". Consequence if that reading is wrong: C1's Rust `render_before_write`
+would also have to emit the 3-line shape, which would supersede the byte-exact
+envelope contract C1 was frozen against. That is a one-chunk revision, not a
+redesign, but it is the falsifier for this boundary — plan-critic is asked to
+attack it specifically.
+
+### Ordering (C3 and C6 share a file — this is deliberate, not an MECE break)
+
+`hooks/rally-coordination-hook.sh` is owned by C3 (before-write exec branch,
+lines ~134-144 and the SEC-001 block) and by C6 (lifecycle renderer, ~1560-1601,
+and the preamble decision at ~2069). The regions do not overlap, but two chunks
+on one file cannot run in parallel. **C6 runs strictly AFTER C3 lands**, and C6
+rebases on C3's committed file. C6 additionally owns
+`tests/hooks/test_context_sanitization.sh` only if an RC-040 fixture needs its
+expectation updated; if none does, C6 must not touch it.
+
+### The contract
+
+L1 Big Idea: one sentence, POV verb + " — " + stakes clause, <=140 chars, from a
+fixed template per `next.action` (`respond_to_handoff` / `before-write conflict` /
+`release_claim` / `blocked` / `nothing`). NEVER contains peer prose; no guillemets.
+
+L2: starts `Why: `; impact + evidence: the rally id(s) (`fact_...` or `seq A->B`),
+who/what blocks, lease minutes. Any peer prose ONLY inside `<<...>>` immediately
+followed by `(untrusted)`. **This replaces the 3-sentence UNTRUSTED_PREAMBLE**
+(`hook.sh:1346`, applied at `:2069`) — the RC-040 control becomes the
+guillemets-plus-tag on the only line that can carry peer text.
+
+L3: starts `Next: `; up to three branches in fixed order act / wait / escalate,
+` · `-separated, EXECUTABLE COMMAND FIRST (e.g. `rally say resolve --ref <id>`),
+then `wait -> <condition>`, then `operator decision -> <what>`.
+
+States:
+- addressed to you -> 3 lines.
+- room moved but nothing for you -> 1 line:
+  `Nothing needs you — N working elsewhere, no claim on your paths · seq A→B → rally room`
+- unchanged `max_seq` since this session's last emit -> `{}` on UserPromptSubmit
+  and Stop. SessionStart ALWAYS emits once. Per-session state file
+  `.rally/.hook-seen/<session>.last-seq`.
+- `RALLY_HOOK_PROMPT_MODE=verbose` restores today's roster; default is `brief`.
+  (Today's variable already exists with values `once`/`off` at `hook.sh:1568` —
+  C6 must keep `off` working and add `brief` as the default and `verbose`.)
+
+Same text on Claude and Codex; Codex carries it via `additionalContext`.
+
+### Tests (goldens, in `tests/hooks/`)
+
+(a) handoff addressed to you (the live `fact_8c7` CHANGELOG shape)
+(b) room message whose `next.action` is a before-write conflict
+(c) room moved / nothing for you -> the 1-line form
+(d) unchanged seq -> `{}`
+
+Each asserts: <=3 lines; <=420 chars total; L1 <=140 chars with EXACTLY ONE
+` — ` and no guillemets; L2 starts `Why: ` and contains an id; every guillemet
+span is immediately followed by `(untrusted)`; L3 starts `Next: ` and its first
+token is a `rally` command when the action is executable. Run on BOTH
+`claude_code` and `codex` and assert identical message text.
+
+`tests/hooks/test_context_sanitization.sh` (the RC-040 GAP fixtures) must still
+pass unmodified: peer text must never appear unquoted. Since the preamble is
+being removed, re-run that suite FIRST against the new renderer and treat any
+failure as a contract defect in C6, not as a fixture to update — the preamble
+was one of two controls, and the guillemet tag now carries the whole load.
+
+### files_touched
+`hooks/rally-coordination-hook.sh` (lifecycle renderer region + preamble
+decision only), `tests/hooks/test_room_message_contract.sh` (new).
+modifies_api: false. depends_on: C3. risk_reason: user trust claim (this is the
+text an agent reads as instructions; the RC-040 control moves).
+
+### Verification
+`bash tests/hooks/test_room_message_contract.sh` green;
+`bash tests/hooks/test_context_sanitization.sh` green UNMODIFIED;
+`bash tests/hooks/test_rally_coordination_hook.sh` green (its lifecycle-phase
+cases will need their expectations updated — that is expected and in scope, and
+the case count change must be reported);
+one live `claude -p` and one `codex exec` run showing the same 3-line text.
