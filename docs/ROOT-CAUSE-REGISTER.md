@@ -3170,3 +3170,44 @@ claim and asks the implementation whether it is true. See
     and all four host shapes are now asserted by the fail-loud test rather than assumed.
   - *Still unproven and labelled as such:* whether `systemMessage` reaches the MODEL on Claude
     rests on an in-repo note dated 2026-06 that was not re-verified this run.
+
+### RC-073 — the Rust integration tests race the CLI's own 3s watchdog under a parallel test runner, and the fail-open envelope makes the race look like a backend bug
+
+- **State:** `mechanism` — cause established and reproduced; the fix is NOT landed, because it
+  spans a file another agent currently holds a claim on. Escalated rather than half-applied.
+- **Symptom:** `scripts/run-quality-gate.sh` fails intermittently with assertions that read like
+  real product defects. Two examples from one run:
+  `daemon_inject_routing.rs:890` — `auto with no live rally socket must select tmux; got null`,
+  and `user_journey.rs:2885` — `left: Null, right: "agent-rally.command.run.v1"`.
+- **Mechanism:** `crates/rally-cli/src/lib.rs` wraps every invocation in `run_with_watchdog`, a
+  hard wall-clock deadline (`DEFAULT_WATCHDOG_TIMEOUT_MS = 3000`). On expiry the fail-open path
+  prints `{"ok": true, "product": "rally"}` and exits **0**. That envelope is well-formed and
+  successful but carries no `data` and no `schema`, so `run["data"]["run"]["session"]` is `Null`
+  — which is exactly what a genuine backend-selection bug would produce. **A correct binary,
+  starved of CPU, is indistinguishable from a broken one from the assertion's point of view.**
+- **Evidence that it is contention and not a defect:**
+  - `cargo test -p rally-cli --test user_journey` **in isolation: 77 passed, 0 failed**. The same
+    two tests failed inside the full gate, where the suites run in parallel.
+  - The same signature appeared in a THIRD test, `daemon_inject_routing.rs`, and a stress loop of
+    that file measured **5 failures in 40 runs (12.5%)** across four distinct tests, all reaching
+    the same watchdog.
+  - Forcing the documented override `RALLY_HOOK_TIMEOUT_MS=50` reproduces the failure class
+    deterministically without touching any product code.
+- **Same family as RC-072, from the other side.** RC-072 was a wall-clock budget being consumed by
+  something that was not the code under test (macOS first-exec evaluation); this is a wall-clock
+  budget being consumed by a sibling test runner. In both cases the budget is a property of the
+  HOST, not of rally, and in both cases the timeout path emitted something that looked like a
+  clean answer.
+- **Recommended fix (systemic, not per-test):** give test invocations an explicit `--timeout-ms`
+  well above plausible contention via ONE shared test helper, rather than patching call sites as
+  they flake. A per-site patch is this defect repeated N times, and the count is already ≥4 across
+  ≥2 files.
+- **Why it is not fixed here:** `crates/rally-cli/tests/daemon_inject_routing.rs` is claimed by
+  another agent in the room, and applying the helper to only the unclaimed half would leave the
+  class open while looking closed. A prepared 12-line patch for that file's
+  `backend_auto_without_live_socket_uses_tmux` exists uncommitted in the working tree for the
+  claim owner to take.
+- **Consequence, stated plainly:** until this is fixed, `run-quality-gate.sh` is a flaky gate, and
+  a flaky gate does not merely miss defects — it **certifies** them, because the next red run gets
+  read as noise.
+- **First seen:** 2026-08-15.
