@@ -23,6 +23,14 @@ Each rally also has a lead, usually the first frontier agent to join. The lead r
 
 Agents also hand work to each other, and a handoff is complete only when the receiving agent writes its own acknowledgement.
 
+### The turn loop
+
+[![The Rally turn loop: nine steps around one shared append-only record](docs/assets/rally-turn-loop.svg)](docs/assets/rally-turn-loop.svg)
+
+Select the diagram to open it full size, or read the [command-level turn-loop contract](docs/TURN-LOOP.md).
+
+Solid arrows write durable coordination facts; dashed arrows read the shared record. The host owns the edit and verification steps.
+
 ## What people use it for
 
 - Run Claude on the UI and Codex on the database at the same time, with more agents reviewing the work and fixing bugs behind them.
@@ -31,14 +39,29 @@ Agents also hand work to each other, and a handoff is complete only when the rec
 - Assign work by model capability: one model judges, one orchestrates, others write the code.
 - Split a feature across models, frontend on one and backend on another, then let them integrate and flag the decisions that need you.
 
-## Install
-
-### Recommended: ask your AI coding agent to install it
+## Install with a coding agent (recommended)
 
 The portable baseline is the `rally` CLI plus `rally init`; automatic hooks are host-specific. Paste the prompt below into Claude Code, Codex, Cursor, Gemini, a local model, or any other coding agent that can run shell commands.
 
+**Copy this prompt into your coding agent:**
+
+```text
+Install Agent Rally Point from https://github.com/tyroneross/agent-rally-point
+for the repository I currently have open.
+
+Follow the repository's AI-agent installation path. Before changing anything,
+confirm the target repo and active AI host, run scripts/install-rally.sh --dry-run,
+preserve existing CLAUDE.md, AGENTS.md, and host settings, and do not change
+user-global configuration without my approval. Then install the CLI, run rally init
+only in the target repo, enable only a documented host integration, and verify with
+rally doctor --json, rally hooks status, and rally whoami using a unique tool ID.
+Report every file changed, every remaining manual step, and any failed validation.
+```
+
+The agent should read the [trust model](docs/security/TRUST-MODEL.md) and [host integration guide](docs/AUTO-COORDINATION-HOOKS.md) before enabling hooks. The CLI protocol works across LLMs; automatic edit interception works only where the host exposes and loads a supported hook interface.
+
 <details>
-<summary>Copy the AI-first installation prompt</summary>
+<summary><strong>Full security-conscious installation prompt</strong></summary>
 
 ```text
 Install Agent Rally Point from https://github.com/tyroneross/agent-rally-point
@@ -78,7 +101,8 @@ Verification and handoff:
 
 </details>
 
-The agent should read the [trust model](docs/security/TRUST-MODEL.md) and [host integration guide](docs/AUTO-COORDINATION-HOOKS.md) before enabling hooks. The CLI protocol works across LLMs; automatic edit interception works only where the host exposes and loads a supported hook interface.
+<details>
+<summary><strong>Manual installation and advanced host setup</strong></summary>
 
 **1. Get the CLI.**
 
@@ -139,57 +163,44 @@ rally whoami --tool codex:pilot-01 --json
 
 Use a distinct `--tool` value for every concurrent session, such as `codex:parser-01` and `claude_code:reviewer-01`; do not copy a bare `codex` identifier into multiple terminals.
 
+</details>
+
+## Direct agent-to-agent communication
+
+Rally can launch and message managed coding-agent sessions across supported hosts:
+
+- **`rally run`** launches Claude, Codex, OpenCode, or Gemini through a managed backend. It assigns a unique Rally identity and creates a dedicated linked worktree by default, so the session can be listed, captured, attached to, and stopped predictably.
+- **`rally inject`** queues a prompt or recorded handoff for an existing managed session. It does not target arbitrary terminals. A successful inject means the message was enqueued; the receiving agent's own acknowledgement proves receipt.
+
+Inspect the launch plan before starting the session:
+
+```bash
+rally run codex --name parser --dry-run --json
+rally run codex --name parser --json
+rally inject parser --text "Review the parser and report findings." --json
+```
+
+Longer handoffs should remain durable in the Rally ledger or a committed handoff document; injection is the focused delivery path. See [Handoffs and Launching Agents](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md) for backend and acknowledgement details.
+
 ## Optional tools
 
 Rally needs `git`. Everything else is per-feature.
 
 | Tool | Needed for | Without it |
 |------|------------|------------|
-| `tmux` | `rally run` and `rally inject`, which launch and message managed sessions | Agents still coordinate through the ledger; you launch them yourself |
+| `tmux` | Local fallback backend for managed `run`, `inject`, `attach`, `capture`, and `stop` commands | Use `ptyd` or `cmux` when available; otherwise launch agents yourself and coordinate through the ledger |
 | `node` | Rendering the hooks' warning text | Hooks still register presence and claims, and print a one-line notice instead |
 | `gh` | `scripts/install-rally.sh`, which verifies the build attestation | Use `cargo install` instead |
 | `python3` | Host-surface drift checks for contributors | Nothing user-facing |
-
-## Opening this repo runs its hooks
-
-This repo commits hook registrations for four hosts: `.claude/settings.json`, `.codex/hooks.json`, `.cursor/hooks.json`, and `hooks/hooks.json`. **Opening the repo in one of those hosts and trusting it loads those hooks.** That is the intended design and the reason coordination needs no setup step. It is also a trust decision, so here is what runs.
-
-| Event | What the hook does |
-|-------|--------------------|
-| SessionStart | Registers presence, reads room state, prints a sanitized summary. Names the install command when `rally` is missing. |
-| PreToolUse (edits) | Checks whether another live agent claimed the path. Advisory. |
-| UserPromptSubmit | Refreshes idle status. |
-| Stop | Records that the write finished. |
-
-The hooks **do not download, build, `chmod`, or install anything**. Provisioning was removed from every lifecycle hook after an external security audit (finding ARP-001). They self-gate on a missing `.rally/`, so they no-op in unrelated repos, and they exit 0 even when Rally is broken.
-
-**Turning them off:**
-
-| Scope | Command |
-|-------|---------|
-| This session | `RALLY_HOOKS=off` |
-| This repo | `rally hooks off --scope repo` |
-| Check current state | `rally hooks status` |
-
-Rally **advises by default; three opt-in switches make it block.** In the default posture a failing hook still lets your edit through — PreToolUse returns `permissionDecision: "allow"` with a warning, and every hook exits 0 even when Rally is broken. Setting `RALLY_HOOK_STRICT=1` turns a high-severity collision into a hard deny, `rally check before-write --strict` exits 4 on a stop finding, and `RALLY_BEFORE_WRITE_FAILCLOSED=1` makes that same check exit 4 when it times out. Each is off unless you turn it on.
-
-What the hooks do and what Rally does not defend: [`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md).
 
 ## How to use it
 
 Each agent runs the same short loop every turn: join, ask what to do next, claim what it will touch, verify the boundary, work, record the outcome, then release the claim when the resource is free.
 
-### The turn loop
-
-[![The Rally turn loop: nine steps around one shared append-only record](docs/assets/rally-turn-loop.svg)](docs/assets/rally-turn-loop.svg)
-
-Select the diagram to open it full size, or read the [command-level turn-loop contract](docs/TURN-LOOP.md).
-
-Rally records and reads coordination facts; the host owns the edit and the verification. A
-handoff is complete only when the receiving agent writes its own acknowledgement.
-
 <details>
-<summary>What each step reads or writes</summary>
+<summary><strong>Manual turn-loop commands and step reference</strong></summary>
+
+**What each step reads or writes**
 
 | Step | Coordination effect |
 |------|---------------------|
@@ -200,8 +211,6 @@ handoff is complete only when the receiving agent writes its own acknowledgement
 | `check before-write` | Reads overlapping file claims. It warns by default; `--strict` returns a non-zero exit on a stop finding. |
 | `edit` and `verify` | Belong to the coding host. Rally does not perform either action. |
 | `say` | Appends a durable outcome: normally an `artifact`, `handoff`, or `resolve`; release the claim after the resource is no longer needed. |
-
-</details>
 
 For command-level behavior, failure modes, and the boundaries between the CLI and the host, read the [turn-loop contract](docs/TURN-LOOP.md).
 
@@ -225,6 +234,8 @@ The `--strict` on `check before-write` above is one of the three blocking switch
 `rally next` returns `actionable`, `requires_human`, `stop_reason`, `suggested_claims`, `suggested_commands`, and `completion` — enough for a harness to act on its own without turning Rally into a scheduler. Every command takes `--json`.
 
 Resolve handoff targets from live room state (`rally whoami`, `rally lead show`, `rally room --json`), never from examples or old logs.
+
+</details>
 
 ### Rally Flow for multi-agent workstreams
 
@@ -262,6 +273,31 @@ flowchart TD
 </details>
 
 The implementation lives in [`dynamic-workflows/`](dynamic-workflows/README.md). See the [Rally Flow protocol](dynamic-workflows/PROTOCOL.md) for lifecycle and resume rules, and the [host-neutral workflow skill](skills/rally-workflows/SKILL.md) for the command mapping.
+
+## Security and host hooks
+
+This repo commits hook registrations for four hosts: `.claude/settings.json`, `.codex/hooks.json`, `.cursor/hooks.json`, and `hooks/hooks.json`. **Opening the repo in one of those hosts and trusting it loads those hooks.** That is the intended design and the reason coordination needs no setup step. It is also a trust decision, so here is what runs.
+
+| Event | What the hook does |
+|-------|--------------------|
+| SessionStart | Registers presence, reads room state, prints a sanitized summary. Names the install command when `rally` is missing. |
+| PreToolUse (edits) | Checks whether another live agent claimed the path. Advisory. |
+| UserPromptSubmit | Refreshes idle status. |
+| Stop | Records that the write finished. |
+
+The hooks **do not download, build, `chmod`, or install anything**. Provisioning was removed from every lifecycle hook after an external security audit (finding ARP-001). They self-gate on a missing `.rally/`, so they no-op in unrelated repos, and they exit 0 even when Rally is broken.
+
+**Turning them off:**
+
+| Scope | Command |
+|-------|---------|
+| This session | `RALLY_HOOKS=off` |
+| This repo | `rally hooks off --scope repo` |
+| Check current state | `rally hooks status` |
+
+Rally **advises by default; three opt-in switches make it block.** In the default posture a failing hook still lets your edit through — PreToolUse returns `permissionDecision: "allow"` with a warning, and every hook exits 0 even when Rally is broken. Setting `RALLY_HOOK_STRICT=1` turns a high-severity collision into a hard deny, `rally check before-write --strict` exits 4 on a stop finding, and `RALLY_BEFORE_WRITE_FAILCLOSED=1` makes that same check exit 4 when it times out. Each is off unless you turn it on.
+
+What the hooks do and what Rally does not defend: [`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md).
 
 ## What a claim can cover
 
