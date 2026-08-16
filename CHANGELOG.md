@@ -9,6 +9,53 @@ All notable changes to Agent Rally Point are documented here.
 
 > Release date is set when the tag is cut; entries for the native before-write hook and RC-073 land under this heading before then.
 
+### Changed — the room message is one short attributed line
+
+SessionStart, UserPromptSubmit and Stop rendered about 1,300 characters of
+roster, open claims and handoffs, and buried the one thing the reading agent
+actually had to do. The message is now a single line:
+
+```
+Peer codex:c5f8 handed you a task — it sits with you until you answer or hand it back · Why: «CHANGELOG entry for 0.2.5» (untrusted) · fact_8c7_18cc1f5f from codex:c5f8 · Next: `rally say resolve --tool <you> --ref fact_8c7_18cc1f5f --subject "responded to handoff" --json` when it's done · not yours? hand it back to codex:c5f8
+```
+
+Measured 161-415 characters across the four states, against roughly 1,300
+before. Every fact names its actor as `host:short-id`, so you can tell which of
+four `claude_code` sessions filed a thing without reading a uuid. Peer-authored
+text appears only inside guillemets and every closing guillemet is followed by
+`(untrusted)`.
+
+`rally hooks room-detail --brief|--verbose` (new, persisted per repo or user,
+overridable for one session with `RALLY_HOOK_ROOM_DETAIL`) selects between this
+and the previous rendering. `verbose` reproduces the old output byte for byte —
+the legacy path is wrapped in a conditional rather than rewritten, which is why
+no existing expectation changed.
+
+The message now renders `next.suggested_commands`, which the hook never did
+before, so a peer-controlled `--ref`, `--target` or `--id` reaches a string that
+is deliberately not guillemet-wrapped because it has to stay copy-pasteable.
+Three controls close that:
+
+- the act command is matched to the action's completion prefix rather than taken
+  from the head of the list, because the head is the `rally check before-write`
+  probe; every value token must satisfy both `scrub(tok) === tok` and the
+  identifier-shape gate, and anything else falls back to a read-only
+  `rally next --tool <you> --audit --json` (plain `rally next` writes facts);
+- the headline names an actor only when it matches a host pattern with a
+  lowercase short id, and always behind the hook-authored word `peer`, because
+  the identifier-shape gate alone admits `human:HALT` and `sudo:EXEC`;
+- truncation drops whole clauses and never slices characters, since a character
+  cut lands inside a quoted span and strips its `(untrusted)` tag.
+
+`tests/hooks/test_room_message_contract.sh` is new: 26 cases, both hosts,
+asserting identical text. Run it with `RALLY_HOOK_ROOM_DETAIL=verbose` and 24 of
+26 fail — a suite that passed in both modes would be testing nothing.
+
+Known limit: the identifier-shape gate rejects any two-character word, so a file
+extension fails it and most real paths render quoted. The headline therefore
+names the actor and the situation rather than the file, and for a path like
+`CHANGELOG.md` the conflict command degrades to `rally room --json`.
+
 ### Added — squads say how fresh they are, and handoff targets rank by it
 
 This repo's room lists ~380 squads. Most are sessions that ended weeks ago, and

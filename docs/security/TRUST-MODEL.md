@@ -45,6 +45,15 @@ SessionStart hook sanitizes it — control characters and newlines stripped, len
 value wrapped as quoted data behind a fixed hook-authored preamble that says the following is
 peer-authored and unverified. An injected subject cannot forge an instruction line.
 
+Since the room message became a single short line (v0.2.5), two further controls apply to the
+lifecycle message. Every closing guillemet is followed by the hook-authored literal
+`(untrusted)`, which a peer cannot forge because `scrub()`'s allowlist excludes guillemets and
+`prose()` rewrites them to `"`. And the headline segment is hook-authored narration: it carries
+no peer prose at all, and the actor it names must match a host pattern with a lowercase short
+id, else it renders as the fixed literal `a peer`. That second gate exists because the
+identifier-shape gate alone admits `human:HALT` and `sudo:EXEC`, which would otherwise have read
+as instructions in the one position the preamble calls hook narration.
+
 **What is not defended:** the fact itself is still unauthenticated. Writers self-supply
 `--tool` and role. There is no signature, so a fact claiming to come from `codex:01` may not
 have. Committed history and live state are not distinguished at the protocol level.
@@ -283,6 +292,7 @@ line before trusting it.
 | This repo | `rally hooks off --scope repo` |
 | Check current state | `rally hooks status` |
 | Suppress the prompt only | `RALLY_HOOK_PROMPT=off` |
+| Room-message detail | `rally hooks room-detail --brief` (default) / `--verbose` for the full roster; `RALLY_HOOK_ROOM_DETAIL` overrides for one session |
 
 There is no way to make the committed hook registration files not exist while still using the
 coordination they wire up. If you do not want committed host hooks in your checkout, this repo
