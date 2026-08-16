@@ -85,6 +85,28 @@ print(vm.group(1))
 
 echo "check-release-parity: canonical CLI version = $cli_version ($cli_cargo_toml)" >&2
 
+# A tag is part of the release identity, not only a trigger. The release
+# workflow supplies RALLY_RELEASE_TAG; normal CI and local pre-push leave it
+# unset, so they continue to check internal parity only. Refuse a manual run
+# that names a non-existent tag or checks out a different commit from it.
+if [ -n "${RALLY_RELEASE_TAG:-}" ]; then
+  expected_tag="v$cli_version"
+  if [ "$RALLY_RELEASE_TAG" != "$expected_tag" ]; then
+    echo "check-release-parity: RELEASE TAG MISMATCH — expected $expected_tag, found $RALLY_RELEASE_TAG" >&2
+    exit 1
+  fi
+  if ! tag_commit=$(git rev-parse --verify --quiet "refs/tags/$expected_tag^{commit}"); then
+    echo "check-release-parity: RELEASE TAG MISSING — expected existing tag $expected_tag" >&2
+    exit 1
+  fi
+  checked_out_commit=$(git rev-parse HEAD)
+  if [ "$tag_commit" != "$checked_out_commit" ]; then
+    echo "check-release-parity: RELEASE TAG REF MISMATCH — $expected_tag resolves to $tag_commit, checkout is $checked_out_commit" >&2
+    exit 1
+  fi
+  echo "check-release-parity: release tag $expected_tag matches the checked-out source" >&2
+fi
+
 check_json_version() {
   path="$1"
   # "optional" = an ABSENT version key is compliant; a PRESENT one must match.

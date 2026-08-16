@@ -28,15 +28,51 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build + attach assets to (e.g. v0.1.2). Required for manual runs."
+        description: "Existing tag to stage and publish (e.g. v0.2.5). Published releases cannot be overwritten."
         required: true
 
 permissions:
+  actions: read        # download the complete build matrix before publication
   contents: write       # upload release assets
   id-token: write       # provenance attestation (sigstore OIDC)
   attestations: write   # write the attestation
 
+# Serialize retries for a tag. A failed run can safely resume its draft, but a
+# separate run must never publish or mutate the same release concurrently.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
+  # A tag push does not run the branch-only CI workflow. Re-run the same
+  # pinned acceptance gate here so a parity-clean but unformatted, unlinted,
+  # or failing tag cannot publish release assets.
+  quality:
+    name: Release quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # Keep this exact pin in lockstep with rust-toolchain.toml, CI, and
+      # scripts/run-quality-gate.sh. A moving stable toolchain makes the
+      # release quality verdict different from the one contributors see.
+      - name: Install Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
+
+      - name: Install cargo-audit + cargo-deny
+        run: cargo install cargo-audit cargo-deny --locked
+
+      - name: Quality gate (scripts/run-quality-gate.sh)
+        run: ./scripts/run-quality-gate.sh
+
   # Gates the whole build matrix on release-version parity: the canonical CLI
   # version (crates/rally-cli/Cargo.toml) must agree with every plugin
   # manifest AND the bundled Codex artifact must not be stale. A
@@ -52,11 +88,16 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Release parity (scripts/check-release-parity.sh)
+        env:
+          # The tag must be both the release name and the exact version encoded
+          # in the checked-out CLI/package surfaces. This also rejects a manual
+          # dispatch that names a missing tag or checks out a different commit.
+          RALLY_RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: ./scripts/check-release-parity.sh
 
   build:
     name: Build ${{ matrix.triple }}
-    needs: parity
+    needs: [quality, parity]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -104,8 +145,8 @@ jobs:
           # fixes like the macos-14 Intel cross-compile apply to old tags too.
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - name: Install Rust toolchain (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: ${{ matrix.target }}
 
@@ -145,14 +186,90 @@ jobs:
         with:
           subject-path: rally-${{ matrix.triple }}
 
-      - name: Upload to GitHub Release
-        # Only attach assets for an actual tag (push-tag, or a workflow_dispatch
-        # that names an existing tag). Prevents the upload step from erroring on
-        # a tagless manual run after four full builds.
-        if: ${{ startsWith(github.ref, 'refs/tags/') || github.event.inputs.tag != '' }}
+      # Matrix jobs must never publish directly: another platform can still
+      # fail after this one succeeds. Store the complete platform pair for a
+      # single publisher job that runs only after the whole matrix is green.
+      - name: Upload release assets for publication
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.triple }}
+          if-no-files-found: error
+          path: |
+            rally-${{ matrix.triple }}
+            rally-${{ matrix.triple }}.sha256
+
+  publish:
+    name: Publish complete release
+    needs: [quality, parity, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download complete build matrix
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Verify every target produced its binary and SHA256 sidecar
+        run: |
+          set -euo pipefail
+          for triple in \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu; do
+            for suffix in "" .sha256; do
+              asset="release-assets/rally-${triple}${suffix}"
+              if [ ! -f "$asset" ]; then
+                echo "missing required release asset: $asset" >&2
+                exit 1
+              fi
+            done
+          done
+          find release-assets -maxdepth 1 -type f -print | sort
+
+      # A failed upload may leave some assets on GitHub. Keep that incomplete
+      # state invisible in a draft; only the final API call makes it public.
+      # A retry may resume a draft, but must never overwrite a public release.
+      - name: Require a fresh or draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if draft="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .draft 2>&1)"; then
+            if [ "$draft" != "true" ]; then
+              echo "refusing to mutate published release $TAG" >&2
+              exit 1
+            fi
+            echo "resuming draft release $TAG"
+          elif printf '%s\n' "$draft" | grep -q 'HTTP 404'; then
+            echo "creating draft release $TAG"
+          else
+            printf '%s\n' "$draft" >&2
+            echo "could not determine release state for $TAG; refusing publication" >&2
+            exit 1
+          fi
+
+      - name: Stage all release assets in a draft
+        id: upload_draft
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: |
-            rally-${{ matrix.triple }}
-            rally-${{ matrix.triple }}.sha256
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/*
+
+      - name: Publish the complete staged release as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.upload_draft.outputs.id }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_ID"
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false \
+            -f make_latest=true \
+            --silent

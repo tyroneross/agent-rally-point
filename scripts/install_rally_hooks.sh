@@ -135,7 +135,6 @@ case "${RALLY_INSTALL_JSON_ENGINE:-auto}" in
 esac
 
 # --- read existing settings -----------------------------------------------
-mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
 OLD_JSON=""
 if [ -f "$CLAUDE_SETTINGS" ]; then
   OLD_JSON="$(cat "$CLAUDE_SETTINGS")"
@@ -342,6 +341,7 @@ if [ "$CLAUDE_CHANGED" = "1" ]; then
     say "    (dry-run — settings.json NOT written)"
   else
     # Atomic write via temp file.
+    mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
     tmp="$(mktemp "${CLAUDE_SETTINGS}.XXXXXX")"
     printf '%s\n' "$NEW_JSON" > "$tmp"
     mv "$tmp" "$CLAUDE_SETTINGS"
@@ -356,7 +356,6 @@ fi
 CODEX_CHANGED=0
 if [ "$REPOINT_CODEX" = "1" ]; then
   if [ "$ACTION" = "install" ]; then
-    mkdir -p "$(dirname "$CODEX_HOOK")"
     SHIM_CONTENT="#!/usr/bin/env bash
 # Auto-installed by $REPO_ROOT/scripts/install_rally_hooks.sh
 # Delegates to the version-controlled hook so it cannot desync from the CLI.
@@ -370,6 +369,7 @@ exec \"$HOOK_PATH\" \"\$@\"
       if [ "$DRY_RUN" = "1" ]; then
         say "    (dry-run — shim NOT written)"
       else
+        mkdir -p "$(dirname "$CODEX_HOOK")"
         if [ -f "$CODEX_HOOK" ] && [ ! -f "${CODEX_HOOK}.bak" ]; then
           cp "$CODEX_HOOK" "${CODEX_HOOK}.bak"
           say "    backed up existing codex hook to ${CODEX_HOOK}.bak"

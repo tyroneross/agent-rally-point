@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # Auto-Coordination Hooks
 
 Make Rally presence and mutation deconfliction **automatic** for coding
-agents (Claude Code, Codex, Gemini) without serializing parallel reads. Other agents can
+agents (Claude Code, Codex, Cursor) without serializing parallel reads. Other agents can
 still participate manually through the same Rally contract; see
 [`ANY-AGENT-ONBOARDING.md`](ANY-AGENT-ONBOARDING.md). Closes backlog
 **B19-(a)** ("Claude PreToolUse hook — land separately") and the recurrence
@@ -98,10 +98,14 @@ boundary. `scripts/check-release-parity.sh` also runs the generator/reconciler,
 hook, global-installer, and first-session provisioner suites in CI, pre-push,
 and release jobs.
 
-> **Other repos that adopt rally:** copy `.claude/settings.json` + `.codex/hooks.json`
-> into that repo, pointing the command at a `rally`-resolvable hook. The universal
-> zero-bundle mechanism (a `rally hook` binary subcommand so a one-line committed
-> config calls `rally hook …` with no script path) is tracked as a backlog item.
+> **Other repos that adopt Rally:** treat the project wiring as a bundle. Copy
+> `hooks/rally-coordination-hook.sh` (executable) into the target, then merge the
+> needed generated hooks from `.claude/settings.json`, `.codex/hooks.json`, and/or
+> `.cursor/hooks.json` into the target's corresponding host file—do not overwrite
+> existing host settings wholesale. Each command resolves the target project root
+> and requires a `rally` CLI on `PATH`. The universal zero-bundle mechanism (a
+> `rally hook` binary subcommand so a one-line committed config calls `rally hook …`
+> with no script path) is tracked as a backlog item.
 >
 > **Cursor:** delivered as the project hook `.cursor/hooks.json` (Cursor has no
 > plugin marketplace, so it is not a plugin install like Claude Code / Codex).
@@ -112,7 +116,7 @@ and release jobs.
 > not yet validated against a live Cursor session — treat path-specific claims as
 > best-effort until confirmed.
 >
-> **Other hosts:** Qwen, Gemma, Aider, IDE plugins, and custom CLIs do not get
+> **Other hosts:** Gemini, Qwen, Gemma, Aider, IDE plugins, and custom CLIs do not get
 > automatic hooks from this file today. Give them the any-agent bootstrap prompt,
 > or wrap/adopt them into a managed backend before relying on direct injection.
 

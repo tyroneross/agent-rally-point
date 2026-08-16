@@ -352,6 +352,20 @@ fi
 rm -rf "$H"
 
 # ----------------------------------------------------------------------
+# Test 6a: --dry-run creates no host config directories from an empty HOME
+# ----------------------------------------------------------------------
+T="--dry-run creates no Claude or Codex config directories"
+H="$(mktemp -d)"
+HOME="$H" "$INSTALLER" --global --repoint-codex --dry-run --quiet >/dev/null 2>&1
+rc=$?
+if [ "$rc" = "0" ] && [ ! -e "$H/.claude" ] && [ ! -e "$H/.codex" ]; then
+  ok "$T"
+else
+  bad "$T" "rc=$rc; .claude exists: $([ -e "$H/.claude" ] && echo yes || echo no); .codex exists: $([ -e "$H/.codex" ] && echo yes || echo no)"
+fi
+rm -rf "$H"
+
+# ----------------------------------------------------------------------
 # Test 7: --repoint-codex creates a delegating shim with .bak backup
 # ----------------------------------------------------------------------
 T="--repoint-codex installs shim and backs up existing codex hook"
