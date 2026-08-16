@@ -373,6 +373,60 @@ T="SEC-001: RALLY_BIN inside the scanned repo is refused; outside still works"
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "RALLY_BIN must be absolute and outside the scanned repo"; fi
 
+# ---------------------------------------------------------------------------
+# 11 (SEC-001, R1). Bare-name fallback: the refused-$PATH-candidate cascade
+#    used to leave RALLY_BIN set to the literal string "rally" when neither
+#    the (refused) $PATH candidate nor ~/.local/bin/rally was usable. The very
+#    next check re-resolved that bare name via `command -v "$RALLY_BIN"`
+#    through the SAME $PATH — handing back the exact in-repo binary that was
+#    just refused, and every later exec/rally_timeout ran it.
+#
+#    METHOD (the operator's repro, reproduced by execution): a git repo with
+#    .rally/, an executable bin/rally INSIDE the repo that appends its argv
+#    to an absolute log file and writes a CANARY file, PATH = <repo>/bin
+#    first (then a hermetic mirror plus node so hook rendering still works),
+#    HOME pointed at an EMPTY dir so ~/.local/bin/rally does not exist, and
+#    RALLY_BIN unset. The canary must never appear and the argv log must stay
+#    empty across every phase, including before-write (the phase most likely
+#    to exec the resolved binary).
+# ---------------------------------------------------------------------------
+T="SEC-001 (R1): refused \$PATH candidate with no ~/.local/bin/rally never falls back to a bare-name re-resolve"
+(
+  sb="$TMPDIR_ROOT/bare-name-fallback"
+  mkdir -p "$sb/home" "$sb/repo/.rally" "$sb/repo/bin"
+  _make_recorders "$sb"
+  canary="$sb/CANARY"
+  argv_log="$sb/argv.log"
+  cat > "$sb/repo/bin/rally" <<EOF
+#!/usr/bin/env bash
+printf 'x' > "$canary"
+printf '%s\n' "\$*" >> "$argv_log"
+printf '%s' '{}'
+exit 0
+EOF
+  chmod +x "$sb/repo/bin/rally"
+  ( cd "$sb/repo" && git init -q )
+  cd "$sb/repo" || exit 1
+  # HOME is a freshly-made empty dir: ~/.local/bin/rally provably does not
+  # exist (no need to hide a real one — there is nothing under $sb/home).
+  for phase in start before-write after-write idle; do
+    printf '{"tool_name":"Write","tool_input":{"file_path":"src/a.rs"}}' | \
+      HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" \
+      PATH="$sb/repo/bin:${NODE_DIR:+$NODE_DIR:}/usr/bin:/bin" \
+      RALLY_SESSION_ID="r1-repro" \
+      "$HOOK" "$phase" claude_code >/dev/null 2>"$sb/err.$phase"
+    rc=$?
+    [ "$rc" = "0" ] || { printf '%s exited %s\n' "$phase" "$rc" >&2; exit 1; }
+    [ ! -e "$canary" ] || { printf 'the %s phase EXECUTED the in-repo bin/rally via bare-name re-resolve\n' "$phase" >&2; exit 1; }
+    printf '%s' "$(cat "$sb/err.$phase" 2>/dev/null)" | grep -q "SEC-001" \
+      || { printf '%s: no SEC-001 refusal printed: %s\n' "$phase" "$(cat "$sb/err.$phase" 2>/dev/null)" >&2; exit 1; }
+  done
+  [ ! -e "$argv_log" ] || { printf 'the planted binary recorded an argv call: %s\n' "$(cat "$argv_log")" >&2; exit 1; }
+  reason="$(_assert_no_provisioning "$sb")" || { printf '%s\n' "$reason" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "a refused \$PATH candidate with no ~/.local/bin/rally must leave RALLY_BIN empty, never a bare name re-resolved through \$PATH"; fi
+
 echo ""
 echo "Passed: $PASS / Failed: $FAIL"
 if [ "$FAIL" -gt 0 ]; then

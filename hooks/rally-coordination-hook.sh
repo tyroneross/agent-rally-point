@@ -48,12 +48,26 @@
 #     .rally/ (subjects, evidence, intents, tool ids, paths, scopes) is
 #     sanitized and quoted before it reaches the host's model context. See the
 #     "UNTRUSTED-DATA BOUNDARY" block in each node renderer below.
-#   - NODE REQUIRED FOR HOOK OUTPUT. Every rendered advisory (room awareness,
-#     PreToolUse deconfliction warnings) is built by parsing rally's JSON in
-#     node. Without node on PATH, native before-write applies the repo self-
-#     gate, warns once per session, returns `{}`, and makes zero Rally calls;
-#     it cannot classify or safely claim the mutation. Lifecycle phases retain
-#     their fail-open enter/status behavior but cannot render model context.
+#   - NODE REQUIRED FOR HOOK OUTPUT (fallback path only). Every rendered
+#     advisory (room awareness, PreToolUse deconfliction warnings) on the
+#     Node/perl path is built by parsing rally's JSON in node. Without node
+#     on PATH, that path applies the repo self-gate, warns once per session,
+#     returns `{}`, and makes zero Rally calls; it cannot classify or safely
+#     claim the mutation. Lifecycle phases retain their fail-open enter/status
+#     behavior but cannot render model context.
+#   - NATIVE BEFORE-WRITE EXECUTION (RALLY_NATIVE_HOOK). Before any of the
+#     above, a before-write fire tries to `exec` the resolved `rally` binary
+#     directly: `rally hook before-write` owns the whole classify/check/claim/
+#     render transaction in one process — no node, no perl. Whether a
+#     resolved binary supports this is cached per (repo, binary) after one
+#     `rally hook capabilities --json` probe, in
+#     `.rally/.hook-seen/native-probe.<sanitized-bin>.seen` (revalidated when
+#     the binary is newer than the marker). RALLY_NATIVE_HOOK in
+#     {0,off,false,no,disabled} forces the legacy Node/perl path below
+#     unconditionally (used by the fallback-mode test suites, which pin Node
+#     behavior on stub binaries); default is native-when-capable. The probe
+#     only ever runs a binary that has already cleared SEC-001 containment —
+#     never a repo-relative or bare-name candidate.
 #   - Advisory only (default): emits `additionalContext` / `systemMessage`,
 #     never `permissionDecision: "deny"` / `decision: "block"`.
 #   - Strict mode (opt-in, RALLY_HOOK_STRICT=1): high-severity coordination
@@ -82,6 +96,12 @@
 #   RALLY_HOOK_STRICT      — "1" to enable deny/block on high-severity signals.
 #   RALLY_HOOK_DEDUPE_SECS — duplicate registration window (default 5 seconds).
 #   RALLY_HOOK_DEDUPE_DIR  — test/diagnostic override for event markers.
+#   RALLY_NATIVE_HOOK      — before-write native-exec switch. "0", "off",
+#                            "false", "no", or "disabled" forces the legacy
+#                            Node/perl classify-check-claim-render path;
+#                            anything else (default: unset) tries the native
+#                            `rally hook before-write` transaction first, per
+#                            a cached per-binary capabilities probe.
 #
 # Exit code: 0 always (fail-open). Output goes on stdout per host hook contract.
 
@@ -104,6 +124,8 @@ export RALLY_OBSERVER_PID="${RALLY_OBSERVER_PID:-$PPID}"
 _RALLY_INSTALL_HINT='`scripts/install-rally.sh` in a checkout of tyroneross/agent-rally-point (checksum- and attestation-verified release download), or `cargo install --path crates/rally-cli` in that same checkout (build from source)'
 
 # --- Self-gate: walk up from $PWD to find .rally/; exit 0 if absent --------
+# ${dir%/*} instead of a `dirname` subshell per level: behaviour identical
+# (walk to /, keep pwd -P for the starting point), no fork per directory.
 find_rally_root() {
   local dir
   dir="$(pwd -P 2>/dev/null || pwd)"
@@ -112,9 +134,193 @@ find_rally_root() {
       printf '%s\n' "$dir"
       return 0
     fi
-    dir="$(dirname "$dir")"
+    dir="${dir%/*}"
+    [ -z "$dir" ] && dir="/"
   done
   return 1
+}
+
+# --- SEC-001: where the rally binary may come from -------------------------
+# $PATH and $HOME/.local/bin. Nothing else. The old code preferred
+# ./target/debug/rally, which is CWD-relative and therefore attacker-supplied:
+# a repo can commit .rally/log/*.jsonl (committed by design, so the .rally
+# self-gate is not a mitigation) plus an executable target/debug/rally, and
+# opening the repo executes it. RALLY_BIN survives as a dev override but is
+# validated first.
+#
+# Hoisted into a function (was inline, further down) so both the native-exec
+# probe (below, before stdin is read) and the legacy Node/perl call site can
+# resolve the same binary through the same containment check exactly once.
+# Guarded by _rally_bin_resolved so a second call is a no-op.
+#
+# R1 SECURITY FIX (2026-08-15): the old cascade fell back to the BARE STRING
+# `RALLY_BIN="rally"` when neither an in-repo $PATH candidate nor
+# ~/.local/bin/rally was usable. The next check then ran
+# `command -v "$RALLY_BIN"`, which re-resolved that bare name through the
+# SAME $PATH — handing back the in-repo binary this function had just
+# refused. Fixed by deleting that arm: a refused/absent candidate leaves
+# RALLY_BIN empty, and both call sites already handle "binary missing" as a
+# fail-open (advisory + exit 0 at the not-installed check below).
+_rally_bin_resolved=0
+_rally_resolve_bin() {
+  [ "$_rally_bin_resolved" = "1" ] && return 0
+  _rally_bin_resolved=1
+
+  # _rally_path_escapes_repo PATH → 0 when PATH resolves inside the scanned
+  # repo. Resolves the directory physically (`cd … && pwd -P`) and follows a
+  # bounded chain of symlinks on the final component, so a symlink into the
+  # repo cannot launder the check. A path we cannot resolve is compared
+  # literally.
+  #
+  # Reuse the native branch's root when it already walked cwd for us (same
+  # cwd, same answer) — saves a redundant find_rally_root fork on the
+  # before-write fast path. Falls back to a fresh walk for every other
+  # caller (lifecycle phases, RALLY_NATIVE_HOOK=off, non-rally cwd).
+  _rally_repo_root="${_rally_native_root:-}"
+  [ -n "$_rally_repo_root" ] || _rally_repo_root="$(find_rally_root 2>/dev/null || true)"
+  _rally_resolve_path() {
+    local p="$1" hops=0 target dir
+    while [ -L "$p" ] && [ "$hops" -lt 10 ]; do
+      target="$(readlink "$p" 2>/dev/null || true)"
+      [ -n "$target" ] || break
+      case "$target" in
+        /*) p="$target" ;;
+        *)  p="$(dirname "$p")/$target" ;;
+      esac
+      hops=$((hops + 1))
+    done
+    dir="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P 2>/dev/null || true)"
+    if [ -n "$dir" ]; then
+      printf '%s/%s' "${dir%/}" "$(basename "$p")"
+    else
+      printf '%s' "$p"
+    fi
+  }
+  _rally_path_inside_repo() {
+    local resolved
+    [ -n "$_rally_repo_root" ] || return 1
+    resolved="$(_rally_resolve_path "$1")"
+    case "$resolved" in
+      "$_rally_repo_root"|"$_rally_repo_root"/*) return 0 ;;
+    esac
+    return 1
+  }
+
+  if [ -n "${RALLY_BIN:-}" ]; then
+    _rally_bin_reject=""
+    case "$RALLY_BIN" in
+      /*) ;;
+      *)  _rally_bin_reject="it is not an absolute path" ;;
+    esac
+    if [ -z "$_rally_bin_reject" ] && _rally_path_inside_repo "$RALLY_BIN"; then
+      _rally_bin_reject="it resolves inside the repo being scanned ($_rally_repo_root)"
+    fi
+    if [ -n "$_rally_bin_reject" ]; then
+      printf 'rally-hook: refusing RALLY_BIN=%s — %s. A repo must never choose the binary this hook executes (SEC-001). Falling back to $PATH / $HOME/.local/bin.\n' \
+        "$RALLY_BIN" "$_rally_bin_reject" >&2
+      unset RALLY_BIN
+    fi
+  fi
+
+  if [ -z "${RALLY_BIN:-}" ]; then
+    # A PATH entry can also point into the repo (`.` or `./target/debug` on
+    # PATH), so the $PATH branch gets the same containment check as
+    # RALLY_BIN. Only the resolution changes; nothing is executed to decide
+    # this.
+    _rally_on_path="$(command -v rally 2>/dev/null || true)"
+    if [ -n "$_rally_on_path" ] && _rally_path_inside_repo "$_rally_on_path"; then
+      printf 'rally-hook: ignoring `rally` at %s — it resolves inside the repo being scanned (SEC-001).\n' \
+        "$_rally_on_path" >&2
+      _rally_on_path=""
+    fi
+    if [ -n "$_rally_on_path" ]; then
+      # Bind the resolved path, not the bare name: the containment check
+      # above then describes exactly what gets executed.
+      RALLY_BIN="$_rally_on_path"
+    elif [ -x "$HOME/.local/bin/rally" ]; then
+      # Where scripts/install-rally.sh puts the CLI. ~/.local/bin is NOT on
+      # the default non-login hook PATH, so without this branch a freshly
+      # installed binary stays invisible and the hook no-ops forever.
+      # Resolving a path is not provisioning: this branch reads a mode bit
+      # and nothing else.
+      RALLY_BIN="$HOME/.local/bin/rally"
+    else
+      # R1: no bare-name fallback. A refused/absent candidate leaves
+      # RALLY_BIN empty (never a bare string re-resolved through $PATH) —
+      # `set -u` is active, so this must still be an explicit assignment.
+      RALLY_BIN=""
+    fi
+  fi
+}
+
+# --- Native execution: `rally hook before-write` owns the whole transaction
+# When the installed binary reports "before-write" in its capabilities, exec
+# it directly and skip the legacy Node/perl classify-check-claim-render
+# pipeline entirely (Option A). Gated on phase only — the RALLY_HOOKS
+# opt-out above already applies to every phase, including this one.
+# RALLY_NATIVE_HOOK in {0,off,false,no,disabled} forces the historical
+# path; the fallback-mode test suites export it so their stubs (which pin
+# Node behaviour) stay exercised.
+#
+# CACHE FRESHNESS IS BY RECORDED IDENTITY, NOT BY `-nt`. The obvious
+# implementation -- write the marker, then trust it while `[ "$marker" -nt
+# "$bin" ]` -- silently never caches here. macOS ships bash 3.2.57 as
+# /bin/bash, and its `-nt` compares whole-second mtimes; the probe writes its
+# marker in the same second the binary was installed often enough that the
+# comparison ties and returns false, so every fire re-probed. Measured on this
+# machine while the R6 case was failing:
+#   bin_mtime=1786848777.082970865  marker_mtime=1786848777.748299517  -nt=no
+# The marker instead records the binary's size and FRACTIONAL mtime next to
+# the verdict, and any mismatch invalidates it. Whole seconds are not enough
+# for the same reason `-nt` was not: a rebuild inside one second leaves %m
+# unchanged and the stale verdict would survive. `stat -f '%z:%Fm'` (BSD) and
+# `stat -c '%s:%.9Y'` (GNU) both carry nanoseconds; if neither is available
+# the id is empty, which re-probes every fire -- slower, never wrong.
+_rally_native_capable() {  # $1=root $2=absolute resolved binary path
+  local root="$1" bin="$2" marker_dir marker safe_bin verdict out tmp
+  local bin_id cached_verdict cached_id
+  safe_bin="${bin//[^A-Za-z0-9._-]/_}"
+  marker_dir="$root/.rally/.hook-seen"
+  marker="$marker_dir/native-probe.$safe_bin.seen"
+  # BSD stat (macOS) and GNU stat (Linux) disagree on flags; try both and fall
+  # back to an empty id, which simply forces a re-probe rather than wedging.
+  bin_id="$(stat -f '%z:%Fm' "$bin" 2>/dev/null || stat -c '%s:%.9Y' "$bin" 2>/dev/null || true)"
+  if [ -f "$marker" ] && [ -n "$bin_id" ]; then
+    cached_verdict=""
+    cached_id=""
+    { read -r cached_verdict; read -r cached_id; } < "$marker" 2>/dev/null || true
+    if [ "$cached_id" = "$bin_id" ]; then
+      [ "$cached_verdict" = "native" ]
+      return $?
+    fi
+  fi
+  # `</dev/null`: the probe must NOT inherit the host's stdin. This function
+  # runs before the envelope is read, and `hook capabilities` happening not to
+  # read stdin today is an accident of that subcommand, not a contract -- a
+  # foreign binary on $RALLY_BIN, or a future capabilities that consults the
+  # envelope, would drain the pipe and leave the exec'd transaction reading an
+  # empty one (which classifies as malformed and coordinates nothing).
+  out="$("$bin" hook capabilities --json </dev/null 2>/dev/null || true)"
+  case "$out" in
+    *'"before-write"'*) verdict="native" ;;
+    *)                  verdict="fallback" ;;
+  esac
+  # PERSISTENCE IS BEST-EFFORT; THE VERDICT IS NOT. An unwritable `.rally/`
+  # (read-only checkout, wrong owner, full disk) must not discard a verdict
+  # this function already computed correctly -- returning 1 here used to mean
+  # the native path was NEVER taken on such a repo, and since this branch runs
+  # in front of classification, every fire including a pure read paid a probe
+  # spawn PLUS the whole Node path. Only the CACHE is lost: no marker lands,
+  # so the next fire re-probes.
+  if mkdir -p "$marker_dir" 2>/dev/null &&
+     tmp="$(mktemp "$marker.XXXXXX" 2>/dev/null)"; then
+    if printf '%s\n%s\n' "$verdict" "$bin_id" > "$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$marker" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    else
+      rm -f "$tmp" 2>/dev/null || true
+    fi
+  fi
+  [ "$verdict" = "native" ]
 }
 
 # O33-A native effect registry. Host matchers are an optimization only; this
@@ -134,6 +340,51 @@ tool="${2:-claude_code}"
 case "$(printf '%s' "${RALLY_HOOKS:-}" | tr '[:upper:]' '[:lower:]')" in
   0|off|false|no|disabled) exit 0 ;;
 esac
+
+# Native execution branch. Must run BEFORE stdin is consumed below — the
+# binary reads the host envelope itself. A `case`, not a `tr` spawn: this
+# runs on every before-write fire, so the opt-out check itself must not add
+# a process.
+#
+# KNOWN BEHAVIOUR CHANGE: because this runs ahead of envelope classification,
+# a pure-read tool call and a repo with hooks disabled via .rally/config.json
+# now resolve the binary, run the (cached) capabilities probe, and — on the
+# first fire per binary — write a probe marker, before either of those
+# opt-outs is consulted. Previously both paths exited earlier with zero
+# Rally/filesystem work. The exec'd binary still applies both checks
+# (PureRead/OpaqueShell -> {} with no store open; hooks disabled -> {}) and
+# returns the same host-valid `{}`, so the observable result is unchanged —
+# only the mechanism (one rally spawn) is new.
+_rally_native_hook_disabled=0
+case "${RALLY_NATIVE_HOOK:-}" in
+  0|off|false|no|disabled) _rally_native_hook_disabled=1 ;;
+esac
+if [ "$phase" = "before-write" ] && [ "$_rally_native_hook_disabled" = "0" ]; then
+  _rally_native_root="$(find_rally_root 2>/dev/null || true)"
+  if [ -n "$_rally_native_root" ]; then
+    _rally_resolve_bin
+    _rally_native_resolved_bin=""
+    if [ -n "${RALLY_BIN:-}" ]; then
+      # Bind `command -v`'s output; never probe or exec the bare name.
+      # _rally_resolve_bin already guarantees RALLY_BIN is either empty or an
+      # absolute, SEC-001-cleared path — this re-check exists so the probe
+      # and the exec below run the exact binary that was just resolved, not
+      # a fresh PATH lookup of a name.
+      _rally_native_resolved_bin="$(command -v "$RALLY_BIN" 2>/dev/null || true)"
+      if [ -z "$_rally_native_resolved_bin" ] && [ -x "$RALLY_BIN" ]; then
+        _rally_native_resolved_bin="$RALLY_BIN"
+      fi
+    fi
+    if [ -n "$_rally_native_resolved_bin" ] && _rally_native_capable "$_rally_native_root" "$_rally_native_resolved_bin"; then
+      # stdin is untouched: the binary reads the host envelope itself.
+      # RALLY_OBSERVER_PID is already exported above. No --fail-open: hook
+      # advises, so a deadline miss must stay fail-loud, never fail-silent.
+      exec "$_rally_native_resolved_bin" hook before-write --tool "$tool" \
+        --repo-root "$_rally_native_root" \
+        --timeout-ms "${RALLY_HOOK_TIMEOUT_MS:-3000}"
+    fi
+  fi
+fi
 
 # Read the native envelope once. Classification happens before walking the repo
 # or resolving/running the Rally binary, so a known read pays only JSON parsing
@@ -589,87 +840,13 @@ _rally_budget_ms="${RALLY_HOOK_TIMEOUT_MS:-5000}"
 _rally_budget_s=$(( (_rally_budget_ms + 999) / 1000 ))
 [ "$_rally_budget_s" -lt 1 ] && _rally_budget_s=1
 
-# --- SEC-001: where the rally binary may come from ------------------------
-# $PATH and $HOME/.local/bin. Nothing else. The old code preferred
-# ./target/debug/rally, which is CWD-relative and therefore attacker-supplied:
-# a repo can commit .rally/log/*.jsonl (committed by design, so the .rally
-# self-gate is not a mitigation) plus an executable target/debug/rally, and
-# opening the repo executes it. RALLY_BIN survives as a dev override but is
-# validated first.
-#
-# _rally_path_escapes_repo PATH → 0 when PATH resolves inside the scanned repo.
-# Resolves the directory physically (`cd … && pwd -P`) and follows a bounded
-# chain of symlinks on the final component, so a symlink into the repo cannot
-# launder the check. A path we cannot resolve is compared literally.
-_rally_repo_root="$(find_rally_root 2>/dev/null || true)"
-_rally_resolve_path() {
-  local p="$1" hops=0 target dir
-  while [ -L "$p" ] && [ "$hops" -lt 10 ]; do
-    target="$(readlink "$p" 2>/dev/null || true)"
-    [ -n "$target" ] || break
-    case "$target" in
-      /*) p="$target" ;;
-      *)  p="$(dirname "$p")/$target" ;;
-    esac
-    hops=$((hops + 1))
-  done
-  dir="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P 2>/dev/null || true)"
-  if [ -n "$dir" ]; then
-    printf '%s/%s' "${dir%/}" "$(basename "$p")"
-  else
-    printf '%s' "$p"
-  fi
-}
-_rally_path_inside_repo() {
-  local resolved
-  [ -n "$_rally_repo_root" ] || return 1
-  resolved="$(_rally_resolve_path "$1")"
-  case "$resolved" in
-    "$_rally_repo_root"|"$_rally_repo_root"/*) return 0 ;;
-  esac
-  return 1
-}
-
-if [ -n "${RALLY_BIN:-}" ]; then
-  _rally_bin_reject=""
-  case "$RALLY_BIN" in
-    /*) ;;
-    *)  _rally_bin_reject="it is not an absolute path" ;;
-  esac
-  if [ -z "$_rally_bin_reject" ] && _rally_path_inside_repo "$RALLY_BIN"; then
-    _rally_bin_reject="it resolves inside the repo being scanned ($_rally_repo_root)"
-  fi
-  if [ -n "$_rally_bin_reject" ]; then
-    printf 'rally-hook: refusing RALLY_BIN=%s — %s. A repo must never choose the binary this hook executes (SEC-001). Falling back to $PATH / $HOME/.local/bin.\n' \
-      "$RALLY_BIN" "$_rally_bin_reject" >&2
-    unset RALLY_BIN
-  fi
-fi
-
-if [ -z "${RALLY_BIN:-}" ]; then
-  # A PATH entry can also point into the repo (`.` or `./target/debug` on PATH),
-  # so the $PATH branch gets the same containment check as RALLY_BIN. Only the
-  # resolution changes; nothing is executed to decide this.
-  _rally_on_path="$(command -v rally 2>/dev/null || true)"
-  if [ -n "$_rally_on_path" ] && _rally_path_inside_repo "$_rally_on_path"; then
-    printf 'rally-hook: ignoring `rally` at %s — it resolves inside the repo being scanned (SEC-001).\n' \
-      "$_rally_on_path" >&2
-    _rally_on_path=""
-  fi
-  if [ -n "$_rally_on_path" ]; then
-    # Bind the resolved path, not the bare name: the containment check above
-    # then describes exactly what gets executed.
-    RALLY_BIN="$_rally_on_path"
-  elif [ -x "$HOME/.local/bin/rally" ]; then
-    # Where scripts/install-rally.sh puts the CLI. ~/.local/bin is NOT on the
-    # default non-login hook PATH, so without this branch a freshly installed
-    # binary stays invisible and the hook no-ops forever. Resolving a path is
-    # not provisioning: this branch reads a mode bit and nothing else.
-    RALLY_BIN="$HOME/.local/bin/rally"
-  else
-    RALLY_BIN="rally"
-  fi
-fi
+# --- SEC-001: resolve the rally binary --------------------------------------
+# The containment logic (RALLY_BIN validation, $PATH containment,
+# ~/.local/bin fallback) lives in _rally_resolve_bin(), defined near
+# find_rally_root() above, so the native-exec probe (before stdin is even
+# read) and this legacy call site resolve the same binary through the same
+# check exactly once (guarded by _rally_bin_resolved).
+_rally_resolve_bin
 
 # If the binary truly is missing, fail-open immediately rather than emit shell
 # errors. We test once up front so the watchdog branches stay clean.

@@ -37,6 +37,7 @@ const SCHEMA_LOCATE: &str = "agent-rally.command.locate.v1";
 const SCHEMA_RECENT: &str = "agent-rally.command.recent.v1";
 const SCHEMA_RETRACT: &str = "agent-rally.command.retract.v1";
 const SCHEMA_CHECK: &str = "agent-rally.command.check.v1";
+const SCHEMA_HOOK: &str = "agent-rally.command.hook.v1";
 const SCHEMA_RUN: &str = "agent-rally.command.run.v1";
 const SCHEMA_SESSIONS: &str = "agent-rally.command.sessions.v1";
 const SCHEMA_INJECT: &str = "agent-rally.command.inject.v1";
@@ -126,6 +127,7 @@ mod discovery;
 mod doctor;
 mod error;
 mod event_envelope;
+mod hook_runtime;
 mod hooks_config;
 mod init;
 mod liveness;
@@ -700,6 +702,33 @@ fn first_two_positionals_are_daemon_serve(args: &[String]) -> bool {
     matches!(first_positionals(args), (Some("daemon"), Some("serve")))
 }
 
+/// True iff the leading two positionals are `hook before-write`.
+///
+/// F-4: `command_hook`'s contract is "the exit code is ALWAYS 0" -- the phase
+/// is a PreToolUse hook, and Claude Code reads a non-zero exit from one as a
+/// BLOCKING hook error. That is a gate, which the charter forbids rally from
+/// ever being. `command_hook` itself honours the contract, but it is only
+/// reached AFTER argv parses: a bpaf failure is `RallyError::Usage`, which
+/// `RallyError::exit_code` maps to 2 before any hook code runs. The shell
+/// wrapper fixes argv, so this is not attacker-reachable today; it is closed
+/// anyway because "the wrapper happens to pass the right flags" is not a
+/// charter guarantee.
+fn first_two_positionals_are_hook_before_write(args: &[String]) -> bool {
+    matches!(
+        first_positionals(args),
+        (Some("hook"), Some("before-write"))
+    )
+}
+
+/// The advisory `hook before-write` emits when its own argv will not parse.
+/// Same envelope as every other abort: an advisory with no `permissionDecision`
+/// and no `decision`, rendered on stdout, exit 0.
+fn hook_before_write_parse_abort(args: &[String]) -> Output {
+    let rendered = hook_runtime::abort_envelope_from_args(args, "argument error");
+    let body: Value = serde_json::from_str(&rendered).unwrap_or_else(|_| json!({}));
+    Output::new(false, rendered, body)
+}
+
 /// True iff the leading two positionals are `daemon start`. R3: `start`
 /// blocks until `.rally/rallyd.sock.addr` exists AND a `Ping` round-trips,
 /// which during a cold reconcile (segment replay on a large room) can take
@@ -878,6 +907,9 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
     // global fail-closed would wedge agents on a stalled `rally room` poll.
     let posture = resolve_watchdog_posture(&args, fail_open);
     let args = strip_timeout_flag(args);
+    // `args` moves into the worker thread; the timeout arm still needs argv to
+    // derive the host + tool for the abort advisory.
+    let posture_args = args.clone();
 
     let wants_json = args.iter().any(|arg| arg == "--json");
     // `--fail-open` (passed by the hook wrappers) means "never block the host
@@ -956,6 +988,19 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
                     emit_timeout_fail_open(wants_json, fail_open, timeout);
                     std::process::exit(0);
                 }
+                WatchdogPosture::HookAdvisory => {
+                    crate::output::write_line_or_exit_on_broken_pipe(
+                        &hook_runtime::abort_envelope_from_args(
+                            &posture_args,
+                            "coordination budget exceeded",
+                        ),
+                    );
+                    eprintln!(
+                        "rally-hook: mutation coordination aborted (coordination budget exceeded after {}ms); no automatic claim was created and the edit is proceeding unclaimed.",
+                        timeout.as_millis()
+                    );
+                    std::process::exit(0);
+                }
                 WatchdogPosture::ClosedBeforeWrite => {
                     emit_timeout_fail_closed_before_write(wants_json, timeout);
                     // Exit code mirrors `--strict` mode in the normal
@@ -1021,6 +1066,11 @@ enum WatchdogPosture {
     Open,
     ClosedBeforeWrite,
     ClosedMutation,
+    /// `rally hook before-write` only. On timeout the OUTER watchdog must emit
+    /// the SAME fail-loud abort advisory the inner stage checks emit — the
+    /// fail-open path's `{"ok":true,"product":"rally"}` is not a host envelope,
+    /// so a deadline miss would be silent on the one channel the host reads.
+    HookAdvisory,
 }
 
 /// Resolve the watchdog posture for THIS invocation.
@@ -1036,10 +1086,21 @@ enum WatchdogPosture {
 /// reasserts the default and disables fail-closed even when the env var is
 /// set, so operators can override per-call without unsetting the env var.
 fn resolve_watchdog_posture(args: &[String], fail_open: bool) -> WatchdogPosture {
+    let stripped = strip_timeout_flag(args.to_vec());
+    // Resolved FIRST, before the `--fail-open` early return: a wrapper that
+    // appends `--fail-open` out of habit must not turn a deadline miss back
+    // into the silent `{"ok":true}` envelope. `hook before-write` has no
+    // fail-closed mode to opt into, so there is nothing for `--fail-open` to
+    // override.
+    if matches!(
+        first_positionals(&stripped),
+        (Some("hook"), Some("before-write"))
+    ) {
+        return WatchdogPosture::HookAdvisory;
+    }
     if fail_open {
         return WatchdogPosture::Open;
     }
-    let stripped = strip_timeout_flag(args.to_vec());
     let env_opt_in = env::var("RALLY_BEFORE_WRITE_FAILCLOSED")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
         .unwrap_or(false);
@@ -1378,11 +1439,28 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
     let normalized = crate::cli::normalize_flag_alias(args);
     let args: &[String] = normalized.as_deref().unwrap_or(args);
 
-    reject_unknown_command(args)?;
+    // F-4: a parse failure on THIS subcommand must still leave the host with
+    // an advisory and exit 0, never the exit-2 usage error a PreToolUse hook
+    // reads as a block. Both entry points (`run_with_watchdog`'s worker and
+    // the inline fallback) funnel through here, so one guard covers both.
+    let hook_before_write = first_two_positionals_are_hook_before_write(args);
 
-    let command = match parse_cli(args)? {
-        CliParse::Command(command) => *command,
-        CliParse::Help(text) => return Ok(Output::new(false, text, json!({}))),
+    if let Err(error) = reject_unknown_command(args) {
+        if hook_before_write {
+            return Ok(hook_before_write_parse_abort(args));
+        }
+        return Err(error);
+    }
+
+    let command = match parse_cli(args) {
+        Ok(CliParse::Command(command)) => *command,
+        Ok(CliParse::Help(text)) => return Ok(Output::new(false, text, json!({}))),
+        Err(error) => {
+            if hook_before_write {
+                return Ok(hook_before_write_parse_abort(args));
+            }
+            return Err(error);
+        }
     };
 
     match command {
@@ -1395,6 +1473,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::Locate(args) => command_locate(args),
         CliCommand::Recent(args) => command_recent(args),
         CliCommand::Check(args) => command_check(args),
+        CliCommand::Hook(args) => command_hook(args),
         CliCommand::Run(args) => command_run(args),
         CliCommand::Sessions(args) => command_sessions(args),
         CliCommand::Inject(args) => command_inject(args),
@@ -2252,13 +2331,31 @@ fn ensure_presence(room: &RoomStore, tool: &str) -> Result<()> {
 /// self-report must not claim renewal when the durable ledger did not advance.
 fn renew_owned_claim_leases(room: &RoomStore, tool: &str) -> Result<usize> {
     let snapshot = room.snapshot()?;
+    renew_owned_claim_leases_from(room, tool, &snapshot.active_claims)
+}
+
+/// The same renewal, driven by claims the CALLER already snapshotted.
+///
+/// F-1: `renew_owned_claim_leases` takes its own full `room.snapshot()`. On
+/// the before-write hot path the transaction has already captured one, and
+/// paying for a second turned the hook into O(claims x ledger): measured on a
+/// 30-owned-claim room, the stage the renewal was billed to went from 59.5 ms
+/// to 1578.2 ms. Callers holding a snapshot pass `&snapshot.active_claims`
+/// here instead; the per-claim ledger work in `renew_claim_lease` is
+/// unchanged, so the renewal SEMANTICS are byte-identical -- only the
+/// redundant scan is gone.
+fn renew_owned_claim_leases_from(
+    room: &RoomStore,
+    tool: &str,
+    active_claims: &[Fact],
+) -> Result<usize> {
     let from_session_id = current_protocol_session(Some(tool))
         .from_session_id()
         .to_string();
     let coord = hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
     let now = chrono::Utc::now();
     let mut renewed = 0;
-    for claim in snapshot.active_claims.iter().filter(|claim| {
+    for claim in active_claims.iter().filter(|claim| {
         claim_authority::claim_owner_matches_caller(
             claim.tool.as_deref(),
             claim.from_session_id.as_deref(),
@@ -5840,6 +5937,56 @@ fn command_check(args: CheckArgs) -> Result<Output> {
     Ok(Output::new(args.json, text, body).with_exit_code(check.exit_code))
 }
 
+/// `rally hook <phase>` — the native host-hook entrypoint.
+///
+/// Two output contracts live behind one command, deliberately. `before-write`
+/// writes the HOST envelope on stdout, because the host parses it directly and
+/// `docs/JSON_ENVELOPE.md`'s standard envelope would be rejected. `capabilities`
+/// writes the standard envelope, because it is a normal rally read that the
+/// wrapper probes with `--json`.
+///
+/// The exit code is ALWAYS 0. A hook that fails a host is worse than a hook
+/// that skips one advisory.
+fn command_hook(args: HookArgs) -> Result<Output> {
+    match args.subcommand {
+        cli::HookSubcommand::Capabilities => {
+            let body = envelope_value(
+                "hook",
+                SCHEMA_HOOK,
+                json!({"hook": hook_runtime::capabilities()}),
+            )?;
+            let text = format!(
+                "hook contract={} phases={}",
+                hook_runtime::HOOK_CONTRACT_VERSION,
+                hook_runtime::HOOK_PHASES.join(",")
+            );
+            Ok(Output::new(args.json, text, body))
+        }
+        cli::HookSubcommand::BeforeWrite(before_write) => {
+            use std::io::Read as _;
+            let mut stdin = String::new();
+            // Hook stdin may be empty or unreadable. Either is an empty
+            // envelope, not a failure: the transaction stays fail-open.
+            let _ = std::io::stdin().read_to_string(&mut stdin);
+            let strict = before_write.strict || env::var("RALLY_HOOK_STRICT").as_deref() == Ok("1");
+            let host_envelope = hook_runtime::run_before_write(hook_runtime::HookRequest {
+                tool_arg: before_write.tool,
+                session_arg: before_write.session_id,
+                repo_root: before_write.repo_root,
+                strict,
+                stdin,
+            });
+            // `json: false` on purpose. The `--json` render path pretty-prints
+            // (`output::json_string`), and the host contract is ONE compact
+            // line — the shell renderer's `JSON.stringify`. Carrying the
+            // compact text in `text` renders it verbatim. The body is kept for
+            // in-process callers; it has no `data` key, so
+            // `attach_pending_append_outcomes` cannot decorate it.
+            Ok(Output::new(false, host_envelope.to_string(), host_envelope))
+        }
+    }
+}
+
 fn command_run(args: RunArgs) -> Result<Output> {
     let RunArgs {
         json,
@@ -9037,9 +9184,15 @@ mod tests {
             .iter()
             .copied()
             .filter(|command| {
-                !help
-                    .lines()
-                    .any(|line| line.trim_start().starts_with(&format!("rally {command}")))
+                // `starts_with("rally {command}")` alone is satisfied by a
+                // LONGER command's line: `rally hooks status ...` answers for
+                // `hook`, and `rally check-ci ...` for `check`. Require a
+                // word boundary so a missing line is actually caught.
+                !help.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with(&format!("rally {command} "))
+                        || line == format!("rally {command}")
+                })
             })
             .collect();
         assert!(
@@ -16132,6 +16285,8 @@ fn help_text() -> String {
         "  rally migrate-legacy [--json]  # one-shot replay of legacy ~/.agent-rally-point/apps/<slug>/changes.jsonl into this repo ledger",
         "  rally ack --tool <tool> [--json]  # acknowledge rules/guardrails/lead/mission (coordination-mandate C1)",
         "  rally check before-write --tool <tool> --path <path> [--strict] [--json]",
+        "  rally hook before-write --tool <tool> [--session-id <id>] [--repo-root <dir>] [--strict]  # native host hook: host envelope on stdin -> host envelope on stdout; always exits 0",
+        "  rally hook capabilities [--json]  # contract version, served phases, and effect tables (the wrapper's native-vs-fallback probe)",
         "  rally check before-complete --tool <tool> [--strict] [--json]",
         "  rally check tier-fit --role <role> [--proposed-tier <tier>] [--json]  # advisory: does this role's tier fit",
         "  rally check liveness [--tool <tool>] [--enforce] [--json]  # conflicted-out squads; --enforce releases their claims, never blocks",

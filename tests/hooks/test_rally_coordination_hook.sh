@@ -37,6 +37,21 @@ fi
 RALLY_HOOK_MS_BUDGET_SCALE="${RALLY_HOOK_MS_BUDGET_SCALE:-8}"
 export RALLY_HOOK_MS_BUDGET_SCALE
 
+# This suite drives bash STUB `rally` binaries that log argv and assert an
+# empty CALLS log on pure reads / opt-outs / disabled hooks. The native
+# before-write branch (hooks/rally-coordination-hook.sh) execs a real `rally
+# hook capabilities --json` probe ahead of that classification, which would
+# make every one of those "zero Rally calls" assertions false regardless of
+# what the stub does. This suite therefore pins the historical Node/perl
+# FALLBACK path deliberately; it is not testing (and must not accidentally
+# start testing) the native exec branch. That branch has its own direct
+# falsifier below (the "native branch" case, R6) plus the ten Rust goldens in
+# crates/rally-cli/tests/native_hook.rs, seven of which drive this same shell
+# hook end to end against the real debug binary. A caller may still override
+# this to exercise native mode locally; the suite's own default is off.
+RALLY_NATIVE_HOOK="${RALLY_NATIVE_HOOK:-off}"
+export RALLY_NATIVE_HOOK
+
 PASS=0
 FAIL=0
 FAILS=()
@@ -2592,6 +2607,102 @@ EOF
   done
   exit 0
 ); then ok "$T"; else bad "$T" "a coordination outage must be visible on stdout, in the sink each host reads, and must not gate or grant"; fi
+
+# ----------------------------------------------------------------------
+# R6: the native exec branch (RALLY_NATIVE_HOOK on, the production default)
+# has no direct falsifier anywhere else in this suite — every other case
+# above pins RALLY_NATIVE_HOOK=off. Nothing else here asserts the exec argv
+# shape, the capabilities-probe marker cache, or the touch/re-probe
+# invalidation. This case overrides the suite header for its own subshell
+# only.
+# ----------------------------------------------------------------------
+T="native branch: exec argv shape, capabilities probed once per two fires, re-probed after touch (R6)"
+if (
+  repo="$tmpdir/native-branch-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo" || exit 1
+  # The hook resolves the root with `pwd -P`, so on macOS $tmpdir's /var
+  # becomes /private/var. Compare against the PHYSICAL path or this asserts
+  # that the hook failed to canonicalise, which is the opposite of the
+  # contract.
+  repo="$(pwd -P)"
+  native_bin="$tmpdir/rally_native_branch"
+  native_calls="$tmpdir/rally_native_branch.calls"
+  : > "$native_calls"
+  cat > "$native_bin" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${CALLS:?}"
+if [ "$1" = "hook" ] && [ "$2" = "capabilities" ]; then
+  printf '%s\n' '{"data":{"hook":{"phases":["before-write"]}}}'
+  exit 0
+fi
+printf '%s\n' '{}'
+exit 0
+EOF
+  install_stub "$native_bin"
+
+  # Fire 1: cold marker -> probe once, then exec before-write once.
+  out1=$(CALLS="$native_calls" RALLY_NATIVE_HOOK=on RALLY_BIN="$native_bin" \
+    "$HOOK" before-write claude_code </dev/null 2>/dev/null)
+  rc1=$?
+  # Fire 2: warm marker (still newer than the binary) -> no second probe.
+  out2=$(CALLS="$native_calls" RALLY_NATIVE_HOOK=on RALLY_BIN="$native_bin" \
+    "$HOOK" before-write claude_code </dev/null 2>/dev/null)
+  rc2=$?
+  if [ "$rc1" != "0" ] || [ "$rc2" != "0" ]; then
+    printf 'rc1=%s out1=[%s] rc2=%s out2=[%s]\n' "$rc1" "$out1" "$rc2" "$out2" >&2
+    exit 1
+  fi
+
+  cap_count=$(grep -c '^hook capabilities' "$native_calls")
+  if [ "$cap_count" != "1" ]; then
+    printf 'capabilities probed %s times across two fires with an unchanged binary, want 1: [%s]\n' \
+      "$cap_count" "$(cat "$native_calls")" >&2
+    exit 1
+  fi
+
+  bw_lines="$(grep '^hook before-write' "$native_calls")"
+  bw_count=$(printf '%s\n' "$bw_lines" | grep -c '^hook before-write')
+  if [ "$bw_count" != "2" ]; then
+    printf 'expected exactly two before-write execs (one per fire), got %s: [%s]\n' \
+      "$bw_count" "$(cat "$native_calls")" >&2
+    exit 1
+  fi
+  first_bw="$(printf '%s\n' "$bw_lines" | head -n1)"
+  case "$first_bw" in
+    "hook before-write --tool claude_code --repo-root $repo --timeout-ms "[0-9]*)
+      ;;
+    *)
+      printf 'unexpected exec argv (want --tool, --repo-root %s, --timeout-ms, in that order, nothing else): [%s]\n' \
+        "$repo" "$first_bw" >&2
+      exit 1
+      ;;
+  esac
+  if printf '%s' "$first_bw" | grep -q -- '--fail-open'; then
+    printf 'exec argv must never carry --fail-open (hook advises, never fail-open on a deadline miss): [%s]\n' \
+      "$first_bw" >&2
+    exit 1
+  fi
+
+  # Marker invalidation: touching the stub (mtime newer than the marker)
+  # must force a re-probe on the very next fire.
+  : > "$native_calls"
+  touch "$native_bin"
+  out3=$(CALLS="$native_calls" RALLY_NATIVE_HOOK=on RALLY_BIN="$native_bin" \
+    "$HOOK" before-write claude_code </dev/null 2>/dev/null)
+  rc3=$?
+  if [ "$rc3" != "0" ]; then
+    printf 'rc3=%s out3=[%s]\n' "$rc3" "$out3" >&2
+    exit 1
+  fi
+  cap_count3=$(grep -c '^hook capabilities' "$native_calls")
+  if [ "$cap_count3" != "1" ]; then
+    printf 'touching the stub did not force a re-probe: capabilities invoked %s times: [%s]\n' \
+      "$cap_count3" "$(cat "$native_calls")" >&2
+    exit 1
+  fi
+  exit 0
+); then ok "$T"; else bad "$T" "the native exec branch (production default) has no falsifier without this case"; fi
 
 # Summary
 # ----------------------------------------------------------------------

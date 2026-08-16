@@ -67,6 +67,45 @@ class GenerateHostSurfacesTests(unittest.TestCase):
             self.assertTrue(seen.isdisjoint(lowered), f"overlapping effect tools: {effect}")
             seen.update(lowered)
 
+        # Rust owns the native classification; pin its consts to the same
+        # registry so the shell arrays above and hook_runtime.rs cannot
+        # silently diverge (build plan 2026-08-15, chunk C4).
+        rust_names = {
+            "pure_read": "PURE_READ_TOOLS",
+            "opaque_shell": "OPAQUE_SHELL_TOOLS",
+            "mutation": "MUTATION_TOOLS",
+        }
+        hook_runtime = (
+            ROOT / "crates/rally-cli/src/hook_runtime.rs"
+        ).read_text(encoding="utf-8")
+        for effect, const_name in rust_names.items():
+            match = re.search(
+                r"^pub\(crate\) const "
+                rf"(?:{const_name}): &\[&str\] = &\[(.*)\];$",
+                hook_runtime,
+                flags=re.MULTILINE,
+            )
+            self.assertIsNotNone(
+                match, f"hook_runtime.rs is missing {const_name}"
+            )
+            rust_tools = json.loads(f"[{match.group(1)}]")
+            self.assertEqual(
+                rust_tools,
+                registry[effect],
+                f"hook_runtime.rs {const_name} diverges from "
+                "config/host-integrations.json",
+            )
+
+        max_targets_match = re.search(
+            r"^pub\(crate\) const MAX_TARGETS: usize = (\d+);$",
+            hook_runtime,
+            flags=re.MULTILINE,
+        )
+        self.assertIsNotNone(
+            max_targets_match, "hook_runtime.rs is missing MAX_TARGETS"
+        )
+        self.assertEqual(max_targets_match.group(1), "16")
+
     def test_codex_before_write_uses_wrapper_until_native_matcher_is_proven(self) -> None:
         config = GEN.load_config(ROOT)
         codex = json.loads(GEN.render_hook_surfaces(config)[Path(".codex/hooks.json")])

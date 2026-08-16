@@ -88,4 +88,9 @@ An ack-timeout response is **`ok: true` / exit 0** — the inject *succeeded* (m
 - `say` output: `data.say.fact` holds the written `Fact`. `data.room` and `data.verified` are shared contextual payloads.
 - `enter` output: `data.enter` holds the enter result (tool, cursor, entry, attention, warnings, mission). `data.room` is the room summary sibling.
 - Session actions (`attach`, `capture`, `stop`) share the schema `agent-rally.command.session-action.v1` but each nests under its own action name.
-- The contract test `tests/json_envelope_contract.rs` drives off the `COMMANDS` list and asserts `data[command]` exists for every subcommand.
+- `hook` output: `hook capabilities --json` is a standard envelope with `data.hook` holding the
+  contract version, supported phases, effect registry, and target ceiling. **`hook <phase>` is
+  the one deliberate exception in this document**: its stdout is the HOST's envelope (Claude's
+  `hookSpecificOutput`, Codex's `systemMessage`, and so on), not rally's, because the host
+  parses it directly. It carries no `ok`/`data` and `--json` on it is accepted and ignored.
+- The contract test `tests/json_envelope_contract.rs` drives off the `COMMANDS` list and asserts `data[command]` exists for every subcommand. In practice it is a hand-enumerated list rather than a loop over `COMMANDS` (which is `pub(crate)` and not visible to an integration test), so a new command needs its own `envelope_<cmd>` test added — it will not be covered automatically.
