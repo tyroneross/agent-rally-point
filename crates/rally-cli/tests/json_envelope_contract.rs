@@ -132,6 +132,8 @@ fn envelope_hooks() {
     assert_eq!(body["schema"], "agent-rally.command.hooks.v1");
     assert_eq!(body["data"]["hooks"]["enabled"], true);
     assert_eq!(body["data"]["hooks"]["prompt"], "once");
+    assert_eq!(body["data"]["hooks"]["room_detail"], "brief");
+    assert_eq!(body["data"]["hooks"]["room_detail_source"], "default");
     ws.cleanup();
 }
 

@@ -56,6 +56,7 @@ Definitions:
 | `rally hooks status` | no | no | no | yes | Shows effective hook policy after session, repo, user, and default resolution. |
 | `rally hooks on/off` | no | no | no | no | Writes `.rally/config.json` or `~/.config/rally/config.json`; hook runtime reads it before room work. |
 | `rally hooks prompt` | no | no | no | no | Writes startup prompt mode (`once`, `always`, `off`) for repo or user scope. |
+| `rally hooks room-detail` | no | no | no | no | Writes room-detail level (`brief`, `verbose`) for repo or user scope; default `brief`, one-session override via `RALLY_HOOK_ROOM_DETAIL`. |
 | `rally board` | no | yes | no | yes | Projects in-flight claims and backlog from facts. |
 | `rally dag` | no | yes | no | yes | Read-only causation view for a run id. |
 | `rally wake-due` | no | yes | no | yes | Read-only standby projection; emits suggested commands, never executes them. |

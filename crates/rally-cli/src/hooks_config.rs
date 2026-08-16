@@ -50,10 +50,34 @@ impl PromptMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoomDetail {
+    Brief,
+    Verbose,
+}
+
+impl RoomDetail {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "brief" => Some(Self::Brief),
+            "verbose" => Some(Self::Verbose),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Brief => "brief",
+            Self::Verbose => "verbose",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct HookSettings {
     enabled: Option<bool>,
     prompt: Option<PromptMode>,
+    room_detail: Option<RoomDetail>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -66,6 +90,9 @@ pub(crate) struct HooksEffective {
     pub(crate) user_config_path: Option<String>,
     pub(crate) session_hooks_override: Option<String>,
     pub(crate) session_prompt_override: Option<String>,
+    pub(crate) room_detail: String,
+    pub(crate) room_detail_source: String,
+    pub(crate) session_room_detail_override: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -75,6 +102,7 @@ pub(crate) struct ConfigWriteOutcome {
     pub(crate) path: String,
     pub(crate) enabled: Option<bool>,
     pub(crate) prompt: Option<String>,
+    pub(crate) room_detail: Option<String>,
 }
 
 pub(crate) fn resolve(repo_root: &Path) -> Result<HooksEffective> {
@@ -127,6 +155,26 @@ pub(crate) fn resolve(repo_root: &Path) -> Result<HooksEffective> {
         prompt_source = "env:RALLY_HOOK_PROMPT".to_string();
     }
 
+    let mut room_detail = RoomDetail::Brief;
+    let mut room_detail_source = "default".to_string();
+    if let Some(value) = user_settings.room_detail {
+        room_detail = value;
+        room_detail_source = "user".to_string();
+    }
+    if let Some(value) = repo_settings.room_detail {
+        room_detail = value;
+        room_detail_source = "repo".to_string();
+    }
+
+    let session_room_detail_override = env::var("RALLY_HOOK_ROOM_DETAIL").ok();
+    if let Some(value) = session_room_detail_override
+        .as_deref()
+        .and_then(RoomDetail::parse)
+    {
+        room_detail = value;
+        room_detail_source = "env:RALLY_HOOK_ROOM_DETAIL".to_string();
+    }
+
     Ok(HooksEffective {
         enabled,
         prompt: prompt.as_str().to_string(),
@@ -136,6 +184,9 @@ pub(crate) fn resolve(repo_root: &Path) -> Result<HooksEffective> {
         user_config_path: user_path.map(|path| path.to_string_lossy().to_string()),
         session_hooks_override,
         session_prompt_override,
+        room_detail: room_detail.as_str().to_string(),
+        room_detail_source,
+        session_room_detail_override,
     })
 }
 
@@ -154,6 +205,7 @@ pub(crate) fn set_enabled(
         path: path.to_string_lossy().to_string(),
         enabled: Some(enabled),
         prompt: None,
+        room_detail: None,
     })
 }
 
@@ -172,6 +224,26 @@ pub(crate) fn set_prompt(
         path: path.to_string_lossy().to_string(),
         enabled: None,
         prompt: Some(prompt.as_str().to_string()),
+        room_detail: None,
+    })
+}
+
+pub(crate) fn set_room_detail(
+    repo_root: &Path,
+    scope: ConfigScope,
+    room_detail: RoomDetail,
+) -> Result<ConfigWriteOutcome> {
+    let path = config_path(repo_root, scope)?;
+    let mut value = read_config_value(&path)?;
+    set_hook_field(&mut value, "room_detail", json!(room_detail.as_str()));
+    write_config_value(&path, &value)?;
+    Ok(ConfigWriteOutcome {
+        action: "set-room-detail".to_string(),
+        scope: scope.as_str().to_string(),
+        path: path.to_string_lossy().to_string(),
+        enabled: None,
+        prompt: None,
+        room_detail: Some(room_detail.as_str().to_string()),
     })
 }
 
@@ -236,6 +308,10 @@ fn settings_from_value(value: &Value) -> HookSettings {
             .get("prompt")
             .and_then(Value::as_str)
             .and_then(PromptMode::parse),
+        room_detail: hooks
+            .get("room_detail")
+            .and_then(Value::as_str)
+            .and_then(RoomDetail::parse),
     }
 }
 
@@ -535,6 +611,81 @@ fn coord_env_i64_allow_zero(name: &str, slot: &mut i64) {
         && v >= 0
     {
         *slot = v;
+    }
+}
+
+#[cfg(test)]
+mod hooks_tests {
+    use super::*;
+    use std::fs;
+
+    /// Isolated HOME so `resolve()`'s user-config read never sees the real
+    /// developer's `~/.config/rally/config.json`. Mirrors the crate-wide
+    /// HOME-override pattern used elsewhere (see `lib.rs`'s ptyd-detect
+    /// tests): RAII guard restores the prior HOME on drop, even on panic.
+    struct HomeGuard {
+        prev: Option<String>,
+    }
+    impl HomeGuard {
+        fn set(home: &Path) -> Self {
+            let prev = env::var("HOME").ok();
+            unsafe { env::set_var("HOME", home) };
+            Self { prev }
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => env::set_var("HOME", v),
+                    None => env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    /// Precedence: repo config sets `room_detail=brief`; `RALLY_HOOK_ROOM_DETAIL`
+    /// overrides it to `verbose` for the session, mirroring the existing
+    /// `RALLY_HOOK_PROMPT` precedent this module has no standalone unit test
+    /// for (it's covered via the `hooks_config::resolve` env branch above).
+    #[test]
+    fn room_detail_env_override_beats_repo_config() {
+        let _g = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        unsafe { env::remove_var("RALLY_HOOK_ROOM_DETAIL") };
+
+        let dir =
+            std::env::temp_dir().join(format!("rally-hooks-room-detail-{}", std::process::id()));
+        let home = dir.join("home");
+        let _ = fs::create_dir_all(dir.join(".rally"));
+        let _ = fs::create_dir_all(&home);
+        let _home_guard = HomeGuard::set(&home);
+        fs::write(
+            dir.join(".rally").join("config.json"),
+            r#"{"hooks":{"room_detail":"brief"}}"#,
+        )
+        .unwrap();
+
+        let effective = resolve(&dir).unwrap();
+        assert_eq!(effective.room_detail, "brief");
+        assert_eq!(effective.room_detail_source, "repo");
+        assert_eq!(effective.session_room_detail_override, None);
+
+        unsafe { env::set_var("RALLY_HOOK_ROOM_DETAIL", "verbose") };
+        let effective_env = resolve(&dir).unwrap();
+        assert_eq!(effective_env.room_detail, "verbose");
+        assert_eq!(
+            effective_env.room_detail_source,
+            "env:RALLY_HOOK_ROOM_DETAIL"
+        );
+        assert_eq!(
+            effective_env.session_room_detail_override,
+            Some("verbose".to_string())
+        );
+
+        unsafe { env::remove_var("RALLY_HOOK_ROOM_DETAIL") };
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 

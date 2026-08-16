@@ -106,12 +106,25 @@ pub(crate) struct HooksPromptArgs {
     pub(crate) mode: HooksPromptModeArg,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HooksRoomDetailArg {
+    Brief,
+    Verbose,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HooksRoomDetailArgs {
+    pub(crate) scope: HooksScopeArg,
+    pub(crate) detail: HooksRoomDetailArg,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum HooksSubcommand {
     Status,
     On(HooksSetArgs),
     Off(HooksSetArgs),
     Prompt(HooksPromptArgs),
+    RoomDetail(HooksRoomDetailArgs),
 }
 
 #[derive(Clone, Debug)]
@@ -1318,8 +1331,13 @@ fn hooks_parser() -> impl Parser<HooksArgs> {
         .to_options()
         .descr("Set startup prompt mode: --once, --always, or --off.")
         .command("prompt");
+    let room_detail = construct!(hooks_scope_parser(), hooks_room_detail_parser())
+        .map(|(scope, detail)| HooksSubcommand::RoomDetail(HooksRoomDetailArgs { scope, detail }))
+        .to_options()
+        .descr("Set room-detail level: --brief or --verbose.")
+        .command("room-detail");
     let json = json_flag();
-    let subcommand = construct!([status, on, off, prompt]);
+    let subcommand = construct!([status, on, off, prompt, room_detail]);
     construct!(json, subcommand).map(|(json, subcommand)| HooksArgs { json, subcommand })
 }
 
@@ -2084,6 +2102,24 @@ fn hooks_prompt_mode_parser() -> impl Parser<HooksPromptModeArg> {
             )),
             _ => Err(RallyError::Usage(
                 "rally hooks prompt accepts only one of --once, --always, or --off".to_string(),
+            )),
+        }
+    })
+}
+
+fn hooks_room_detail_parser() -> impl Parser<HooksRoomDetailArg> {
+    let brief = long("brief").switch();
+    let verbose = long("verbose").switch();
+    construct!(brief, verbose).parse(|(brief, verbose)| {
+        let selected = [brief, verbose].into_iter().filter(|value| *value).count();
+        match (selected, brief, verbose) {
+            (1, true, false) => Ok(HooksRoomDetailArg::Brief),
+            (1, false, true) => Ok(HooksRoomDetailArg::Verbose),
+            (0, _, _) => Err(RallyError::Usage(
+                "rally hooks room-detail requires one of --brief or --verbose".to_string(),
+            )),
+            _ => Err(RallyError::Usage(
+                "rally hooks room-detail accepts only one of --brief or --verbose".to_string(),
             )),
         }
     })

@@ -2290,6 +2290,22 @@ fn command_hooks(args: HooksArgs) -> Result<Output> {
                 serde_json::to_value(&outcome).map_err(RallyError::json("render hooks prompt"))?;
             (text, payload)
         }
+        HooksSubcommand::RoomDetail(room_detail) => {
+            let outcome = hooks_config::set_room_detail(
+                &repo,
+                hooks_scope(room_detail.scope),
+                hooks_room_detail(room_detail.detail),
+            )?;
+            let text = format!(
+                "hooks room_detail={} --scope {} ({})",
+                outcome.room_detail.as_deref().unwrap_or("unknown"),
+                outcome.scope,
+                outcome.path
+            );
+            let payload = serde_json::to_value(&outcome)
+                .map_err(RallyError::json("render hooks room-detail"))?;
+            (text, payload)
+        }
     };
     let body = envelope_value("hooks", SCHEMA_HOOKS, json!({ "hooks": payload }))?;
     Ok(Output::new(args.json, text, body))
@@ -2307,6 +2323,13 @@ fn hooks_prompt_mode(mode: HooksPromptModeArg) -> hooks_config::PromptMode {
         HooksPromptModeArg::Once => hooks_config::PromptMode::Once,
         HooksPromptModeArg::Always => hooks_config::PromptMode::Always,
         HooksPromptModeArg::Off => hooks_config::PromptMode::Off,
+    }
+}
+
+fn hooks_room_detail(detail: HooksRoomDetailArg) -> hooks_config::RoomDetail {
+    match detail {
+        HooksRoomDetailArg::Brief => hooks_config::RoomDetail::Brief,
+        HooksRoomDetailArg::Verbose => hooks_config::RoomDetail::Verbose,
     }
 }
 

@@ -234,12 +234,13 @@ fn top_level_help_and_docs_advertise_ptyd_backend() {
 }
 
 #[test]
-fn hooks_command_toggles_repo_config_and_prompt_mode() {
+fn hooks_command_toggles_repo_config_prompt_mode_and_room_detail() {
     let workspace = Workspace::new("rally-hooks-config");
 
     let initial = workspace.json(&["hooks", "status", "--json"]);
     assert_eq!(initial["data"]["hooks"]["enabled"], true);
     assert_eq!(initial["data"]["hooks"]["prompt"], "once");
+    assert_eq!(initial["data"]["hooks"]["room_detail"], "brief");
 
     let off = workspace.json(&["hooks", "off", "--scope", "repo", "--json"]);
     assert_eq!(off["data"]["hooks"]["scope"], "repo");
@@ -259,6 +260,24 @@ fn hooks_command_toggles_repo_config_and_prompt_mode() {
     assert!(
         config.contains("\"enabled\": false") && config.contains("\"prompt\": \"off\""),
         "repo hook config did not persist expected fields:\n{config}"
+    );
+
+    let room_detail = workspace.json(&["hooks", "room-detail", "--verbose", "--json"]);
+    assert_eq!(room_detail["data"]["hooks"]["scope"], "repo");
+    assert_eq!(room_detail["data"]["hooks"]["room_detail"], "verbose");
+
+    let after_room_detail = workspace.json(&["hooks", "status", "--json"]);
+    assert_eq!(after_room_detail["data"]["hooks"]["room_detail"], "verbose");
+    assert_eq!(
+        after_room_detail["data"]["hooks"]["room_detail_source"],
+        "repo"
+    );
+
+    let config_after_room_detail =
+        fs::read_to_string(workspace.cwd.join(".rally/config.json")).unwrap();
+    assert!(
+        config_after_room_detail.contains("\"room_detail\": \"verbose\""),
+        "repo hook config did not persist room_detail field:\n{config_after_room_detail}"
     );
 
     workspace.cleanup();

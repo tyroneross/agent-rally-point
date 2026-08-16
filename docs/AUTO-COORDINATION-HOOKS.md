@@ -256,10 +256,11 @@ want hard gates.
 
 Hooks are default-on for repos with `.rally/`, then resolved in this order:
 
-1. Session env: `RALLY_HOOKS=off|on` and `RALLY_HOOK_PROMPT=once|always|off`.
+1. Session env: `RALLY_HOOKS=off|on`, `RALLY_HOOK_PROMPT=once|always|off`, and
+   `RALLY_HOOK_ROOM_DETAIL=brief|verbose`.
 2. Repo config: `.rally/config.json`.
 3. User config: `~/.config/rally/config.json`.
-4. Built-in default: hooks enabled, prompt once.
+4. Built-in default: hooks enabled, prompt once, room detail brief.
 
 Commands:
 
@@ -271,6 +272,8 @@ rally hooks off --scope user
 rally hooks prompt --once --scope repo
 rally hooks prompt --always --scope repo
 rally hooks prompt --off --scope repo
+rally hooks room-detail --brief --scope repo
+rally hooks room-detail --verbose --scope repo
 ```
 
 One-session opt-out:
