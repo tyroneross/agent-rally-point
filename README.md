@@ -33,6 +33,53 @@ Agents also hand work to each other, and a handoff is complete only when the rec
 
 ## Install
 
+### Recommended: ask your AI coding agent to install it
+
+The portable baseline is the `rally` CLI plus `rally init`; automatic hooks are host-specific. Paste the prompt below into Claude Code, Codex, Cursor, Gemini, a local model, or any other coding agent that can run shell commands.
+
+<details>
+<summary>Copy the AI-first installation prompt</summary>
+
+```text
+Install Agent Rally Point from https://github.com/tyroneross/agent-rally-point
+for the repository I am currently working in.
+
+Before changing anything:
+1. Confirm the target repository, operating system, CPU architecture, active AI host,
+   and whether rally, git, gh, cargo, and ~/.local/bin are available. Do not guess if
+   the host or target repository is ambiguous.
+2. Inspect existing CLAUDE.md, AGENTS.md, and host hook/plugin configuration. Preserve
+   unrelated settings and show me which project-local and user-global files would change.
+3. Separate the work into three decisions: install the CLI, initialize this repository,
+   and optionally enable host-specific automatic hooks. Prefer project-local configuration;
+   do not change user-global host configuration without my explicit approval.
+
+Installation rules:
+4. Use an existing trusted Rally checkout, or clone the official repository into a stable,
+   user-approved location. Run scripts/install-rally.sh --dry-run before installing.
+5. Prefer the verified release path, which checks both SHA256 and GitHub build provenance.
+   If that cannot run, stop and explain why. Offer scripts/install-rally.sh --source only
+   as an explicit alternative; never silently downgrade to an unverified download.
+6. Run rally init only in the confirmed target repository. Review its diff. Do not stage,
+   commit, or publish the generated Rally files unless I ask.
+7. Choose host wiring only from the repository's current documentation. Claude Code,
+   Codex, and Cursor have different setup paths; other hosts should use the manual CLI
+   loop unless a documented integration exists. Never claim that automatic hooks are
+   universal, and never let a lifecycle hook download, build, chmod, or install software.
+
+Verification and handoff:
+8. Confirm the installed binary path and version, then run rally doctor --json,
+   rally hooks status, and rally whoami --tool <host>:install-check-01 --json from the target repository.
+   Use a unique tool ID for every concurrent session.
+9. Report: what changed, what stayed manual, whether hooks are advisory or blocking,
+   how to disable or uninstall them, any restart required, and any validation that failed.
+   Leave unresolved failures visible; do not describe a partial installation as complete.
+```
+
+</details>
+
+The agent should read the [trust model](docs/security/TRUST-MODEL.md) and [host integration guide](docs/AUTO-COORDINATION-HOOKS.md) before enabling hooks. The CLI protocol works across LLMs; automatic edit interception works only where the host exposes and loads a supported hook interface.
+
 **1. Get the CLI.**
 
 ```bash
