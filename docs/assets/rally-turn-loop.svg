@@ -1,0 +1,143 @@
+<!--
+SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+SPDX-License-Identifier: Apache-2.0
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 410" role="img" aria-labelledby="title description">
+  <title id="title">Rally turn loop</title>
+  <desc id="description">Nine steps run left to right: whoami, enter, ack, next, claim, check before-write, edit, verify, and say. Enter, ack, claim, and say write facts to the append-only Rally log. Whoami, next, and check before-write read that record. Edit and verify are host-owned work that Rally never enters. Say loops back to next while work remains actionable.</desc>
+  <defs>
+    <style>
+      .canvas { fill: #ffffff; stroke: #d0d7de; }
+      .panel { fill: #f6f8fa; stroke: #24292f; }
+      .host { fill: #dceff1; stroke: #087d84; }
+      .ledger { fill: #dceff1; stroke: #087d84; }
+      .ink { fill: #24292f; }
+      .muted { fill: #57606a; }
+      .accent { fill: #087d84; }
+      .flow { fill: none; stroke: #24292f; stroke-width: 2; }
+      .read { fill: none; stroke: #57606a; stroke-width: 2; stroke-dasharray: 7 6; }
+      .write { fill: none; stroke: #087d84; stroke-width: 2.5; }
+      .flow-head { fill: #24292f; }
+      .read-head { fill: #57606a; }
+      .write-head { fill: #087d84; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+      @media (prefers-color-scheme: dark) {
+        .canvas { fill: #0d1117; stroke: #30363d; }
+        .panel { fill: #161b22; stroke: #c9d1d9; }
+        .host, .ledger { fill: #12383c; stroke: #39c5cf; }
+        .ink { fill: #c9d1d9; }
+        .muted { fill: #8b949e; }
+        .accent { fill: #56d4dc; }
+        .flow { stroke: #c9d1d9; }
+        .read { stroke: #8b949e; }
+        .write { stroke: #56d4dc; }
+        .flow-head { fill: #c9d1d9; }
+        .read-head { fill: #8b949e; }
+        .write-head { fill: #56d4dc; }
+      }
+    </style>
+    <marker id="arrow-flow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="flow-head" d="M 0 0 L 10 5 L 0 10 z"/>
+    </marker>
+    <marker id="arrow-read" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="read-head" d="M 0 0 L 10 5 L 0 10 z"/>
+    </marker>
+    <marker id="arrow-write" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="write-head" d="M 0 0 L 10 5 L 0 10 z"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" x="1" y="1" width="1198" height="408" rx="6"/>
+
+  <text class="mono ink" x="600" y="34" font-size="17" text-anchor="middle">loop while next says actionable</text>
+  <path class="read" d="M 1104 84 C 1104 48, 430 48, 430 84" marker-end="url(#arrow-read)"/>
+
+  <g class="mono" font-size="17" text-anchor="middle">
+    <g>
+      <rect class="panel" x="24" y="90" width="108" height="64" rx="4"/>
+      <text class="ink" x="78" y="128">whoami</text>
+    </g>
+    <g>
+      <rect class="panel" x="154" y="90" width="108" height="64" rx="4"/>
+      <text class="ink" x="208" y="128">enter</text>
+    </g>
+    <g>
+      <rect class="panel" x="284" y="90" width="108" height="64" rx="4"/>
+      <text class="ink" x="338" y="128">ack</text>
+    </g>
+    <g>
+      <rect class="panel" x="414" y="90" width="108" height="64" rx="4"/>
+      <text class="ink" x="468" y="128">next</text>
+    </g>
+    <g>
+      <rect class="panel" x="544" y="90" width="108" height="64" rx="4"/>
+      <text class="ink" x="598" y="128">claim</text>
+    </g>
+    <g>
+      <rect class="panel" x="674" y="90" width="108" height="64" rx="4"/>
+      <text class="ink" x="728" y="117">check</text>
+      <text class="ink" x="728" y="137" font-size="14">before-write</text>
+    </g>
+    <g>
+      <rect class="host" x="804" y="90" width="108" height="64" rx="4" stroke-width="2"/>
+      <text class="accent" x="858" y="117" font-weight="600">edit</text>
+      <text class="accent" x="858" y="137" font-size="13">host-owned</text>
+    </g>
+    <g>
+      <rect class="host" x="934" y="90" width="108" height="64" rx="4" stroke-width="2"/>
+      <text class="accent" x="988" y="117" font-weight="600">verify</text>
+      <text class="accent" x="988" y="137" font-size="13">host-owned</text>
+    </g>
+    <g>
+      <rect class="panel" x="1064" y="90" width="108" height="64" rx="4"/>
+      <text class="ink" x="1118" y="128">say</text>
+    </g>
+  </g>
+
+  <g class="flow" marker-end="url(#arrow-flow)">
+    <line x1="132" y1="122" x2="150" y2="122"/>
+    <line x1="262" y1="122" x2="280" y2="122"/>
+    <line x1="392" y1="122" x2="410" y2="122"/>
+    <line x1="522" y1="122" x2="540" y2="122"/>
+    <line x1="652" y1="122" x2="670" y2="122"/>
+    <line x1="782" y1="122" x2="800" y2="122"/>
+    <line x1="912" y1="122" x2="930" y2="122"/>
+    <line x1="1042" y1="122" x2="1060" y2="122"/>
+  </g>
+
+  <rect class="ledger" x="24" y="270" width="1148" height="78" rx="4" stroke-width="2"/>
+  <text class="mono accent" x="48" y="303" font-size="18" font-weight="600">.rally/log/&lt;engagement&gt;.jsonl</text>
+  <text class="mono accent" x="48" y="329" font-size="15">append-only · one fact per line · committed with the code · merge=union</text>
+  <text class="mono accent" x="1148" y="316" font-size="15" text-anchor="end">canonical</text>
+
+  <g class="write" marker-end="url(#arrow-write)">
+    <line x1="208" y1="158" x2="208" y2="266"/>
+    <line x1="338" y1="158" x2="338" y2="266"/>
+    <line x1="598" y1="158" x2="598" y2="266"/>
+    <line x1="1118" y1="158" x2="1118" y2="266"/>
+  </g>
+  <g class="read" marker-end="url(#arrow-read)">
+    <line x1="78" y1="266" x2="78" y2="158"/>
+    <line x1="468" y1="266" x2="468" y2="158"/>
+    <line x1="728" y1="266" x2="728" y2="158"/>
+  </g>
+
+  <g class="mono" font-size="14">
+    <text class="muted" x="90" y="217">reads room</text>
+    <text class="accent" x="220" y="217">presence</text>
+    <text class="accent" x="350" y="217">ack</text>
+    <text class="muted" x="480" y="217">reads wake</text>
+    <text class="accent" x="610" y="217">claim</text>
+    <text class="muted" x="740" y="217">reads claims</text>
+    <text class="accent" x="1098" y="217" text-anchor="end">artifact · handoff</text>
+  </g>
+
+  <g class="mono" font-size="14">
+    <line class="write" x1="42" y1="381" x2="84" y2="381"/>
+    <text class="accent" x="94" y="386">writes a fact</text>
+    <line class="read" x1="250" y1="381" x2="292" y2="381"/>
+    <text class="muted" x="302" y="386">reads the record back</text>
+    <rect class="host" x="522" y="370" width="25" height="20" rx="2"/>
+    <text class="accent" x="558" y="386">host-owned work — Rally never enters it</text>
+  </g>
+</svg>

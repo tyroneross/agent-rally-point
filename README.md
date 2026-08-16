@@ -181,21 +181,9 @@ Each agent runs the same short loop every turn: join, ask what to do next, claim
 
 ### The turn loop
 
-```mermaid
-flowchart LR
-  whoami["whoami\nself-locate"] --> enter["enter\npresence"] --> ack["ack\nstartup contract"] --> next["next\nask what is actionable"]
-  next -->|actionable| claim["claim\nreserve the scope"] --> check["check before-write\ninspect the boundary"] --> edit["edit\nhost-owned"] --> verify["verify\nhost-owned"] --> say["say\nartifact, handoff, resolve, release"] --> next
-  next -->|wait or requires human| stop([stop and wait or ask])
+[![The Rally turn loop: nine steps around one shared append-only record](docs/assets/rally-turn-loop.svg)](docs/assets/rally-turn-loop.svg)
 
-  ledger[(".rally/log/&lt;engagement&gt;.jsonl\ncanonical append-only record")]
-  enter -->|presence| ledger
-  ack -->|acknowledgement| ledger
-  claim -->|claim| ledger
-  say -->|outcome| ledger
-  ledger -. room .-> whoami
-  ledger -. next action .-> next
-  ledger -. claims .-> check
-```
+Select the diagram to open it full size, or read the [command-level turn-loop contract](docs/TURN-LOOP.md).
 
 Rally records and reads coordination facts; the host owns the edit and the verification. A
 handoff is complete only when the receiving agent writes its own acknowledgement.
