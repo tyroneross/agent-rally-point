@@ -14,6 +14,7 @@ pub(crate) enum CliCommand {
     Room(RoomArgs),
     Next(NextArgs),
     Check(CheckArgs),
+    Hook(HookArgs),
     Run(RunArgs),
     Sessions(SessionsArgs),
     Inject(InjectArgs),
@@ -362,6 +363,35 @@ pub(crate) struct CheckArgs {
     pub(crate) enforce: bool,
     /// C3 coordination merge-gate: changed files (from `git diff --name-only`).
     pub(crate) changed: Vec<String>,
+}
+
+/// `rally hook <phase>` — the native host-hook entrypoint. Stdout is the HOST
+/// envelope (not the standard `ok/product/command/data` one), so a wrapper
+/// needs neither Node nor several child `rally` invocations. `--json` is
+/// accepted and ignored on `before-write` so wrappers that append it out of
+/// habit do not break.
+#[derive(Clone, Debug)]
+pub(crate) struct HookArgs {
+    pub(crate) json: bool,
+    pub(crate) subcommand: HookSubcommand,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum HookSubcommand {
+    BeforeWrite(HookBeforeWriteArgs),
+    /// The probe sentinel. A wrapper reads `data.hook.phases` to decide
+    /// whether this binary serves the phase natively or it must fall back.
+    Capabilities,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HookBeforeWriteArgs {
+    pub(crate) tool: String,
+    pub(crate) session_id: Option<String>,
+    /// The SEC-001-validated Rally root the wrapper already resolved. Absent
+    /// means walk up from cwd for `.rally`.
+    pub(crate) repo_root: Option<std::path::PathBuf>,
+    pub(crate) strict: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -798,6 +828,7 @@ pub(crate) const COMMANDS: &[&str] = &[
     "room",
     "next",
     "check",
+    "hook",
     "run",
     "sessions",
     "inject",
@@ -951,6 +982,13 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("check")
         .map(CliCommand::Check);
+    let hook = hook_parser()
+        .to_options()
+        .descr(
+            "Native host hook: read the host envelope on stdin, run the whole coordination transaction, and emit the host envelope on stdout. Exits 0 always.",
+        )
+        .command("hook")
+        .map(CliCommand::Hook);
     let run = run_parser()
         .to_options()
         .command("run")
@@ -1150,6 +1188,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
         locate,
         recent,
         check,
+        hook,
         run,
         sessions,
         inject,
@@ -1661,6 +1700,35 @@ fn check_parser() -> impl Parser<CheckArgs> {
             changed,
         },
     )
+}
+
+fn hook_parser() -> impl Parser<HookArgs> {
+    let tool = string_arg("tool", "TOOL");
+    let session_id = optional_string_arg("session-id", "SESSION_ID");
+    let repo_root = optional_string_arg("repo-root", "DIR").map(|value| value.map(Into::into));
+    let strict = long("strict")
+        .help("Emit the host blocking response for stop-severity findings.")
+        .switch();
+    let before_write = construct!(tool, session_id, repo_root, strict)
+        .map(
+            |(tool, session_id, repo_root, strict)| HookBeforeWriteArgs {
+                tool,
+                session_id,
+                repo_root,
+                strict,
+            },
+        )
+        .to_options()
+        .descr("Run the whole before-write coordination transaction and emit the host envelope.")
+        .command("before-write")
+        .map(HookSubcommand::BeforeWrite);
+    let capabilities = bpaf::pure(HookSubcommand::Capabilities)
+        .to_options()
+        .descr("Report the hook contract version, served phases, and effect tables.")
+        .command("capabilities");
+    let json = json_flag();
+    let subcommand = construct!([before_write, capabilities]);
+    construct!(json, subcommand).map(|(json, subcommand)| HookArgs { json, subcommand })
 }
 
 fn run_parser() -> impl Parser<RunArgs> {
