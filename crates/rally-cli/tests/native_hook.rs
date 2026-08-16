@@ -330,28 +330,6 @@ fn probe_verdict(path: &std::path::Path) -> String {
         .to_string()
 }
 
-/// Write a probe marker the shell will actually treat as a cache HIT: the
-/// verdict plus the current identity of `bin`. Seeding only the verdict makes
-/// the shell re-probe, which is exactly what T-07a must not do.
-fn seed_probe_marker(path: &std::path::Path, bin: &str, verdict: &str) {
-    let id = std::process::Command::new("stat")
-        .args(["-f", "%z:%Fm", bin])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .or_else(|| {
-            std::process::Command::new("stat")
-                .args(["-c", "%s:%.9Y", bin])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        })
-        .unwrap_or_default();
-    fs::write(path, format!("{verdict}\n{id}\n")).unwrap();
-}
-
 #[test]
 fn claude_unclaimed_allows_and_autoclaims() {
     warm_up();
@@ -886,17 +864,34 @@ fn opaque_shell_and_target_cap() {
 fn deadline_miss_is_fail_loud_advisory() {
     warm_up();
 
-    // (a) shell path. Pre-seed the probe marker to `native` BEFORE exporting
+    // (a) shell path. Prime the real shell probe BEFORE exporting
     // RALLY_TEST_BLOCK_MS (which delays EVERY rally spawn, including the
-    // shell's own `hook capabilities` probe) so a probe that times out and
-    // caches `fallback` cannot silently make this sub-case pass without the
-    // HookAdvisory posture ever running. Requires C3's exec/probe branch to
-    // genuinely exercise the native path; see report.
+    // shell's own `hook capabilities` probe). Using the production probe to
+    // create the marker avoids duplicating BSD/GNU stat semantics in the test
+    // harness and proves the timed fire consumes an actual cache hit.
     {
         let fx = Fixture::new("t07a");
         let probe = fx.marker_path(&format!("native-probe.{}.seen", sanitize_bin_path(BIN)));
-        fs::create_dir_all(probe.parent().unwrap()).unwrap();
-        seed_probe_marker(&probe, BIN, "native");
+        let prime_stdin =
+            json!({"tool_name":"Read","tool_input":{"file_path":"src/slow.rs"}}).to_string();
+        let prime = fx.run_shell(
+            "before-write",
+            "claude_code",
+            &prime_stdin,
+            &[("RALLY_BIN", BIN), ("RALLY_SESSION_ID", "sess-slow-one")],
+        );
+        assert!(
+            prime.status.success(),
+            "T-07a probe exit {:?}\nstderr={}",
+            prime.status.code(),
+            String::from_utf8_lossy(&prime.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&prime.stdout).trim_end(), "{}");
+        assert_eq!(
+            probe_verdict(&probe),
+            "native",
+            "T-07a setup must establish a real native cache hit"
+        );
 
         let stdin =
             json!({"tool_name":"Write","tool_input":{"file_path":"src/slow.rs"}}).to_string();
