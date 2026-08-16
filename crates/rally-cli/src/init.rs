@@ -3,7 +3,7 @@
 
 //! `rally init` — make the rally point a **findable, self-describing front door**.
 //!
-//! Two artifacts:
+//! Three artifacts:
 //!
 //! 1. A fenced, idempotent pointer block injected into the repo's `CLAUDE.md`
 //!    and `AGENTS.md` (created if absent, updated in place between stable
@@ -14,8 +14,10 @@
 //!    un-gitignored) that the rally point exposes: schema, repo, doc
 //!    pointers, ledger location, room command. Pointers are real
 //!    repo-relative paths verified to exist at init time.
+//! 3. `.rally/.gitignore` — ignore rules for the derived / lock / cache state
+//!    rally writes beside the ledger. See [`IGNORE_ENTRIES`].
 //!
-//! Both writes are idempotent: re-running `rally init` updates content
+//! All three writes are idempotent: re-running `rally init` updates content
 //! between the markers (or rewrites manifest.json) without duplicating
 //! anything. Returns a JSON envelope describing what was created or updated.
 
@@ -36,6 +38,93 @@ pub(crate) const POINTER_START: &str = "<!-- rally:start -->";
 pub(crate) const POINTER_END: &str = "<!-- rally:end -->";
 
 const POINTER_DOC_TARGETS: &[&str] = &["CLAUDE.md", "AGENTS.md"];
+
+/// `.rally/.gitignore` — scoped to `.rally/`, so it can never reach across
+/// into rules the repo owns. The consumer's own root `.gitignore` is never
+/// read or written by rally (RC-072).
+pub(crate) const IGNORE_FILENAME: &str = ".gitignore";
+
+/// Fence markers for the generated ignore rules. `#`-comments, so the file
+/// stays a valid gitignore whether or not anything ever regenerates it.
+pub(crate) const IGNORE_START: &str = "# rally:ignore:start";
+pub(crate) const IGNORE_END: &str = "# rally:ignore:end";
+
+/// The ignore rules `rally init` writes into `.rally/.gitignore`, grouped by
+/// what the entries are and why they must not be committed.
+///
+/// # What is and is not listed
+/// Everything here is **derived** (rebuilt from `.rally/log/` on the next
+/// open), a **lock** (kernel-scoped to one host), or a **cache**. Three paths
+/// are deliberately absent because RALLY.md's "Where State Lives" contract
+/// says they travel with the repo: `log/` (the canonical append-only ledger),
+/// `archive/` (rotated segments, still replayable), and `manifest.json` (the
+/// self-description an agent landing in a fresh clone reads first).
+///
+/// Sibling forms are listed alongside the artifact they belong to — a
+/// `facts.db` rule that misses `facts.db-wal` still lets a committed WAL
+/// carry frames the ledger never saw, which is the failure this closes, not
+/// a cosmetic omission.
+///
+/// # Chosen shape — a denylist, not a `*` + `!` whitelist
+/// The alternative is what agent-rally-point's OWN root `.gitignore` does:
+/// `.rally/*` plus `!.rally/manifest.json`. That is strictly more robust
+/// against a *future* derived file (anything new is ignored by default), and
+/// it was the first candidate. Rejected here for two reasons. (a) Blast
+/// radius: a whitelist silently ignores every `.rally/` path this list does
+/// not name — including `RETROSPECTIVE.md`, `active-engagement`, and anything
+/// a consumer repo deliberately put there — which is a policy decision about
+/// someone else's repository that `rally init` has no standing to make.
+/// (b) Re-including under an excluded parent needs `!log/` **and** `!log/**`
+/// to work at all (git will not re-include a file whose parent directory is
+/// excluded), and the failure mode when that is gotten subtly wrong is a
+/// silently un-committed ledger — worse than the defect being fixed. The
+/// residual risk of a denylist is real and named: a derived artifact added to
+/// rally later must be added here too, which is why the test asserts the
+/// list against the artifacts an exercised room actually produces.
+const IGNORE_ENTRIES: &[(&str, &[&str])] = &[
+    (
+        "Derived SQLite projection of the ledger, plus the WAL/SHM sidecars\n\
+         sqlite writes beside it and any copy `rally doctor` quarantines.\n\
+         Rebuilt by replay on the next open.",
+        &[
+            "facts.db",
+            "facts.db-shm",
+            "facts.db-wal",
+            "facts.db.corrupt.*",
+        ],
+    ),
+    (
+        "Advisory lock files. A kernel flock is scoped to the host that took\n\
+         it, so a committed lock names a machine nobody else has.",
+        &["mutation.lock", "session-reservation.lock", "*.owner.lock"],
+    ),
+    (
+        "rallyd runtime: its Unix socket, the address sidecar peers resolve\n\
+         it through, the pidfile, and the daemon log.",
+        &[
+            "rallyd.sock",
+            "rallyd.sock.addr",
+            "rallyd.pid",
+            "rallyd.log",
+        ],
+    ),
+    (
+        "Derived caches and per-tool read cursors — local reading position\n\
+         and fold results, never history.",
+        &[
+            "cursors.json",
+            "watch-cursor.json",
+            "claim-index.json",
+            ".reconcile-cache.json",
+            "snapshot.cache.json",
+        ],
+    ),
+    (
+        "Scratch from the write-to-temp-then-rename path; only ever present\n\
+         after a crash mid-write.",
+        &["*.tmp-*"],
+    ),
+];
 
 const DOC_GUIDE: &str = "RALLY.md";
 const DOC_DOCTRINE: &str = "dynamic-workflows/COORDINATION.md";
@@ -87,6 +176,9 @@ pub(crate) struct ManifestOutcome {
 pub(crate) struct InitOutcome {
     pub(crate) repo_root: String,
     pub(crate) manifest: ManifestOutcome,
+    /// `.rally/.gitignore` (RC-072) — same `created/updated/unchanged` shape
+    /// as the manifest, so a caller can tell a first init from a re-run.
+    pub(crate) ignore: ManifestOutcome,
     pub(crate) pointers: Vec<PointerOutcome>,
     pub(crate) docs: ManifestDocs,
     pub(crate) ledger_dir: String,
@@ -216,45 +308,51 @@ fn atomic_write(target: &Path, content: &str) -> Result<()> {
     })
 }
 
-/// Inject (or refresh) the rally pointer block in the given doc.
+/// Idempotently place one marker-fenced block in `target`.
 ///
-/// * File absent → create with the seeded body containing one pointer block.
-/// * File present, no markers → append the pointer block at the end with a
-///   leading blank line; the rest of the file is untouched.
+/// * File absent → create with `fresh_body` (which already contains the block).
+/// * File present, no markers → append the block at the end with a leading
+///   blank line; the rest of the file is untouched.
 /// * File present, markers present → replace the content **between** the
 ///   markers in-place (no duplication, no growth on re-run).
-fn upsert_pointer_in_doc(
-    repo_root: &Path,
-    filename: &str,
-    docs: &ManifestDocs,
-) -> Result<PointerOutcome> {
-    let target = repo_root.join(filename);
-    let block = pointer_block(docs);
-
+///
+/// Returns `"created" | "updated" | "unchanged"`.
+///
+/// `block` must end with the end marker plus exactly one newline — both
+/// callers' renderers ([`pointer_block`], [`ignore_block`]) own that tail, and
+/// the splice below re-adds precisely one newline so re-runs cannot
+/// accumulate blank lines.
+///
+/// Shared by the `CLAUDE.md`/`AGENTS.md` pointer block and `.rally/.gitignore`
+/// (RC-072). One splice implementation, so the "does a re-run duplicate the
+/// block" question has one answer for every file `rally init` writes.
+fn upsert_fenced_block(
+    target: &Path,
+    start_marker: &str,
+    end_marker: &str,
+    block: &str,
+    fresh_body: &str,
+) -> Result<&'static str> {
     if !target.exists() {
-        let body = fresh_doc_body(filename, docs);
-        atomic_write(&target, &body)?;
-        return Ok(PointerOutcome {
-            path: filename.to_string(),
-            action: "created",
-        });
+        atomic_write(target, fresh_body)?;
+        return Ok("created");
     }
 
-    let existing = fs::read_to_string(&target)
-        .map_err(RallyError::io(format!("read {}", target.display())))?;
+    let existing =
+        fs::read_to_string(target).map_err(RallyError::io(format!("read {}", target.display())))?;
 
     // Try to find existing markers and rewrite between them.
     if let (Some(start_idx), Some(end_idx)) =
-        (existing.find(POINTER_START), existing.find(POINTER_END))
+        (existing.find(start_marker), existing.find(end_marker))
         && start_idx < end_idx
     {
         // Replace [start_idx .. end_idx + len(end_marker)] with the new block.
         let mut new_doc = String::with_capacity(existing.len() + block.len());
         new_doc.push_str(&existing[..start_idx]);
-        // pointer_block() already ends with the end marker + newline; the
-        // existing tail picks up after the end marker.
+        // `block` already ends with the end marker + newline; the existing
+        // tail picks up after the end marker.
         new_doc.push_str(block.trim_end_matches('\n'));
-        let after_end = end_idx + POINTER_END.len();
+        let after_end = end_idx + end_marker.len();
         // Skip exactly one trailing newline if present so we don't keep
         // accumulating blank lines on re-run.
         let tail = if existing[after_end..].starts_with('\n') {
@@ -262,21 +360,15 @@ fn upsert_pointer_in_doc(
         } else {
             &existing[after_end..]
         };
-        // Re-add the newline that pointer_block() owns at its tail.
+        // Re-add the newline that the renderer owns at its tail.
         new_doc.push('\n');
         new_doc.push_str(tail);
 
         if new_doc == existing {
-            return Ok(PointerOutcome {
-                path: filename.to_string(),
-                action: "unchanged",
-            });
+            return Ok("unchanged");
         }
-        atomic_write(&target, &new_doc)?;
-        return Ok(PointerOutcome {
-            path: filename.to_string(),
-            action: "updated",
-        });
+        atomic_write(target, &new_doc)?;
+        return Ok("updated");
     }
 
     // No markers (or malformed order) → append block with one separating blank line.
@@ -285,12 +377,106 @@ fn upsert_pointer_in_doc(
         new_doc.push('\n');
     }
     new_doc.push('\n');
-    new_doc.push_str(&block);
-    atomic_write(&target, &new_doc)?;
+    new_doc.push_str(block);
+    atomic_write(target, &new_doc)?;
+    Ok("updated")
+}
+
+/// Inject (or refresh) the rally pointer block in the given doc.
+fn upsert_pointer_in_doc(
+    repo_root: &Path,
+    filename: &str,
+    docs: &ManifestDocs,
+) -> Result<PointerOutcome> {
+    let target = repo_root.join(filename);
+    let block = pointer_block(docs);
+    let fresh = fresh_doc_body(filename, docs);
+    let action = upsert_fenced_block(&target, POINTER_START, POINTER_END, &block, &fresh)?;
     Ok(PointerOutcome {
         path: filename.to_string(),
-        action: "updated",
+        action,
     })
+}
+
+/// Render the fenced ignore block written into `.rally/.gitignore`.
+///
+/// Entry comments ride *inside* the block so the reasoning travels with the
+/// rules into every consumer repo: someone reading a stranger's `.rally/`
+/// needs to know why `facts.db` is absent from their clone without going and
+/// finding RALLY.md.
+fn ignore_block() -> String {
+    let mut s = String::new();
+    s.push_str(IGNORE_START);
+    s.push('\n');
+    s.push_str(
+        "# Generated by `rally init`. Lines between these markers are\n\
+         # regenerated on every run — put your own rules OUTSIDE them.\n\
+         #\n\
+         # Every entry below is derived, a lock, or a cache: rally rebuilds it\n\
+         # from `.rally/log/` on the next open. The canonical ledger (`log/`,\n\
+         # `archive/`) and the self-description (`manifest.json`) are\n\
+         # deliberately NOT listed — those are meant to be committed.\n",
+    );
+    for (why, entries) in IGNORE_ENTRIES {
+        s.push('\n');
+        for line in why.lines() {
+            s.push_str("# ");
+            s.push_str(line);
+            s.push('\n');
+        }
+        for entry in *entries {
+            s.push_str(entry);
+            s.push('\n');
+        }
+    }
+    s.push_str(IGNORE_END);
+    s.push('\n');
+    s
+}
+
+/// Body for a freshly-created `.rally/.gitignore`.
+fn fresh_ignore_body() -> String {
+    ignore_block()
+}
+
+/// Write (or refresh) `.rally/.gitignore`.
+///
+/// Scoped to `.rally/` on purpose: the consumer's root `.gitignore` is theirs,
+/// and a tool that edits it is a tool that eventually clobbers a rule it did
+/// not write. A nested `.gitignore` needs no cooperation from the repo owner
+/// and takes effect the moment it lands.
+pub(crate) fn upsert_ignore(rally_dir: &Path) -> Result<ManifestOutcome> {
+    let target = rally_dir.join(IGNORE_FILENAME);
+    let block = ignore_block();
+    let fresh = fresh_ignore_body();
+    let action = upsert_fenced_block(&target, IGNORE_START, IGNORE_END, &block, &fresh)?;
+    Ok(ManifestOutcome {
+        path: format!(".rally/{IGNORE_FILENAME}"),
+        action,
+    })
+}
+
+/// First-open auto-init: create `.rally/.gitignore` **only if it is absent**.
+///
+/// Called from every path that creates `.rally/` (store open, daemon serve),
+/// so a room that was never explicitly `rally init`-ed still ignores its own
+/// derived state — which is the common case, since `rally enter` creates the
+/// room.
+///
+/// Deliberately *not* the full [`upsert_ignore`]: this runs on a hot path, and
+/// a stat that finds the file is the whole cost. Refreshing a stale managed
+/// block is `rally init`'s job, not something to pay for on every command.
+///
+/// Best-effort by contract — the caller discards the result. A read-only
+/// checkout, a `.rally/` on a filesystem that refuses the write, or a repo
+/// with no git at all must not turn a working `rally enter` into a failure
+/// over an ignore file.
+pub(crate) fn ensure_ignore_present(rally_dir: &Path) {
+    let target = rally_dir.join(IGNORE_FILENAME);
+    if target.exists() {
+        return;
+    }
+    let _ = atomic_write(&target, &fresh_ignore_body());
 }
 
 /// Build the manifest JSON value. Pointer docs are **optional**: a consumer
@@ -420,6 +606,11 @@ pub(crate) fn run_init(repo_root: PathBuf, worktree_root: PathBuf) -> Result<Ini
             .map_err(RallyError::io(format!("create {}", rally_dir.display())))?;
 
         let (manifest, docs) = write_manifest(&repo_root, &worktree_root)?;
+        // RC-072: written next to the manifest, in the same `.rally/` the
+        // rollback below removes on failure. Ordered after the manifest so a
+        // repo that cannot be written at all fails on the artifact that
+        // matters, not on the ignore file.
+        let ignore = upsert_ignore(&rally_dir)?;
 
         let mut pointers = Vec::with_capacity(POINTER_DOC_TARGETS.len());
         for filename in POINTER_DOC_TARGETS {
@@ -429,6 +620,7 @@ pub(crate) fn run_init(repo_root: PathBuf, worktree_root: PathBuf) -> Result<Ini
         Ok(InitOutcome {
             repo_root: repo_root.display().to_string(),
             manifest,
+            ignore,
             pointers,
             docs,
             ledger_dir: format!(".rally/{LOG_DIRNAME}/"),

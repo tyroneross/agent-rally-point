@@ -291,8 +291,9 @@ surface.
 .rally/ledger.jsonl             legacy monolith — migrated into log/ on first open (R1)
 .rally/archive/                 rotated old segments, still replayable (R7)
 .rally/manifest.json            self-describing pointers (R4; committed)
+.rally/.gitignore               the ignore rules below, written by rally itself (committed)
 .rally/facts.db                 derived sqlite cache — rebuilt by replay (gitignored; owned by rallyd when the daemon runs)
-.rally/cursors.json             per-tool read cursors
+.rally/cursors.json             per-tool read cursors (gitignored)
 .rally/rallyd.sock              rallyd's Unix socket when the daemon runs (gitignored)
 .rally/rallyd.owner.lock        kernel file lock guarding the daemon/direct-writer handover (gitignored)
 ```
@@ -303,6 +304,21 @@ main checkout and its worktrees coordinate through one `.rally/` store. The
 committed, durable across clone/machine. `facts.db` is a pure cache that
 `rally` rebuilds from the ledger on first open. Managed session lifecycle
 facts ride the same ledger.
+
+**Rally writes the ignore rules itself.** `rally init` — and first-open
+auto-init, which is how `.rally/` appears in most rooms — writes
+`.rally/.gitignore` covering every derived, lock, and cache artifact above
+(`facts.db` and its WAL/SHM sidecars, `cursors.json`, `claim-index.json`,
+`.reconcile-cache.json`, `snapshot.cache.json`, `watch-cursor.json`, the
+`rallyd.*` runtime files, `mutation.lock` and the `*.owner.lock` family, and
+write-then-rename scratch). `log/`, `archive/`, `manifest.json`, and the
+`.gitignore` itself stay committable. Regenerating is idempotent and touches
+only the fenced `# rally:ignore:start` … `# rally:ignore:end` block, so rules
+you add outside it survive. **Your repo's root `.gitignore` is never read or
+written by rally** — a nested ignore file needs no cooperation from the repo
+owner, and a tool that edits the root file eventually clobbers a rule it did
+not write. Until RC-072 these lines said "gitignored" while nothing in the
+product wrote an ignore; every repo but this one committed its own `facts.db`.
 
 ## What `rally room` Gives You
 

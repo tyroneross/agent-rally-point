@@ -3280,6 +3280,11 @@ impl DirectRoomStore {
         ensure_no_db_only_migration_recovery(&root)?;
         let dir = root.join(".rally");
         fs::create_dir_all(&dir).map_err(RallyError::io("create .rally"))?;
+        // RC-072 first-open auto-init: `rally enter` creates the room far more
+        // often than anyone runs `rally init`, so the ignore rules have to
+        // land here too or the common path commits its own facts.db. Costs one
+        // stat when the file is already there; never fails the open.
+        crate::init::ensure_ignore_present(&dir);
         let _guard = acquire_room_mutation_lock(&dir)?;
         let _ = fs::remove_file(dir.join("room.db"));
         let fact_store_path = dir.join("facts.db");

@@ -21,11 +21,23 @@
 //! unconditional, so every one of them was a dead link in a consumer repo
 //! that (correctly) carries none of agent-rally-point's own doctrine docs.
 //!
+//! RC-072 closed a third defect on the same surface: RALLY.md's "Where State
+//! Lives" contract calls `facts.db`, `rallyd.sock`, and the `*.owner.lock`
+//! family gitignored, but nothing in the product ever wrote an ignore rule.
+//! agent-rally-point's own root `.gitignore` carried one by hand, so the
+//! defect was invisible in this repo and universal everywhere else: measured
+//! at 56a6e39, `rally init` in a scratch repo left `git check-ignore
+//! .rally/facts.db` at exit 1 (not ignored) for all eight documented paths.
+//! `rally init` — and first-open auto-init, which is how `.rally/` actually
+//! appears for most rooms — now writes `.rally/.gitignore`. The consumer's own
+//! root `.gitignore` is never read or written.
+//!
 //! These tests prove: pointer docs are optional and selectively recorded, a
 //! genuine init failure leaves no `.rally/` directory behind, the
-//! `rally room --json` pointer always carries the untrusted-data caveat, and
+//! `rally room --json` pointer always carries the untrusted-data caveat,
 //! every "Deeper docs" link in the generated block resolves on disk (or is an
-//! absolute URL) — never a dead link.
+//! absolute URL) — never a dead link — and every derived/lock/cache artifact
+//! a live room writes is ignored while the canonical ledger stays committable.
 //!
 //! # Conventions
 //! Mirrors `worktree_gc.rs`'s `tmp_dir`/`init_repo` helpers and
@@ -40,7 +52,7 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
-use common::test_git_fixture::fixture_git;
+use common::test_git_fixture::{fixture_git, fixture_git_command};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -133,9 +145,338 @@ fn markdown_links(block: &str) -> Vec<(String, String)> {
     out
 }
 
+/// `git check-ignore <rel>` against the fixture repo. True ⇒ some rule
+/// ignores that path. Uses [`fixture_git_command`] rather than `fixture_git`
+/// because exit 1 here means "not ignored", a legitimate answer this test
+/// asks for on purpose — not a failed git invocation.
+///
+/// `git check-ignore` matches on the pathname, so the file does not need to
+/// exist. That is what lets these tests name artifacts (`rallyd.sock`, a
+/// crash-scratch tempfile) that only a running daemon or a crash produces.
+fn is_ignored(root: &Path, rel: &str) -> bool {
+    let out = fixture_git_command(root)
+        .args(["check-ignore", "-q", rel])
+        .output()
+        .expect("git check-ignore invocation");
+    match out.status.code() {
+        Some(0) => true,
+        Some(1) => false,
+        other => panic!(
+            "git check-ignore {rel} errored (exit {other:?}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    }
+}
+
+/// Every path RALLY.md's "Where State Lives" section documents as gitignored,
+/// plus the sibling forms of the same artifacts. The siblings are not padding:
+/// a `facts.db` rule that misses `facts.db-wal` still lets a committed WAL
+/// carry frames the ledger never saw.
+const MUST_BE_IGNORED: &[&str] = &[
+    // Documented in RALLY.md.
+    ".rally/facts.db",
+    ".rally/rallyd.sock",
+    ".rally/rallyd.owner.lock",
+    ".rally/mutation.lock",
+    ".rally/cursors.json",
+    ".rally/.reconcile-cache.json",
+    ".rally/snapshot.cache.json",
+    ".rally/claim-index.json",
+    // Same artifacts, sibling forms.
+    ".rally/facts.db-wal",
+    ".rally/facts.db-shm",
+    ".rally/facts.db.corrupt.1786158756577960000",
+    ".rally/direct.owner.lock",
+    ".rally/session-reservation.lock",
+    ".rally/rallyd.sock.addr",
+    ".rally/rallyd.pid",
+    ".rally/rallyd.log",
+    ".rally/watch-cursor.json",
+    // Crash scratch from the write-temp-then-rename path in `init.rs`.
+    ".rally/manifest.json.tmp-a1b2c3",
+];
+
+/// The `.rally/` paths that MUST stay committable. `log/` and `archive/` are
+/// the canonical append-only record; `manifest.json` is what an agent landing
+/// in a fresh clone reads to find the rally point; `.gitignore` is the rules
+/// file itself, which has to travel with the clone to be worth writing.
+const MUST_STAY_COMMITTABLE: &[&str] = &[
+    ".rally/manifest.json",
+    ".rally/.gitignore",
+    ".rally/log/2026-08-15.jsonl",
+    ".rally/log/index.json",
+    ".rally/archive/2026-01-01.jsonl",
+];
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// RC-072: `rally init` must leave every documented derived/lock/cache path
+/// ignored. Measured against 56a6e39 this fails on all eight documented
+/// paths — nothing in the product wrote an ignore rule at all.
+#[test]
+fn init_ignores_every_derived_lock_and_cache_path() {
+    let root = tmp_dir("ignore-derived");
+    init_repo(&root);
+
+    let out = run_rally(&root, &["init", "--json"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        root.join(".rally").join(".gitignore").exists(),
+        "rally init must write .rally/.gitignore"
+    );
+
+    for rel in MUST_BE_IGNORED {
+        assert!(
+            is_ignored(&root, rel),
+            "{rel} is derived/lock/cache state and must be gitignored after `rally init`;\
+             \n.rally/.gitignore:\n{}",
+            fs::read_to_string(root.join(".rally").join(".gitignore")).unwrap_or_default()
+        );
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The negative control for the rule above: an over-broad ignore that also
+/// swallowed the ledger would pass every assertion in
+/// `init_ignores_every_derived_lock_and_cache_path` while silently making the
+/// canonical record uncommittable — the worse of the two failures.
+#[test]
+fn init_leaves_the_canonical_ledger_committable() {
+    let root = tmp_dir("ignore-canonical");
+    init_repo(&root);
+
+    let out = run_rally(&root, &["init", "--json"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for rel in MUST_STAY_COMMITTABLE {
+        assert!(
+            !is_ignored(&root, rel),
+            "{rel} is canonical (or the rules file itself) and must stay committable;\
+             \n.rally/.gitignore:\n{}",
+            fs::read_to_string(root.join(".rally").join(".gitignore")).unwrap_or_default()
+        );
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The durable control against the residual risk of the denylist shape
+/// documented on `IGNORE_ENTRIES`: a derived artifact added to rally later
+/// that nobody remembers to add to the list.
+///
+/// Rather than re-asserting a hardcoded list, this exercises a room the way an
+/// agent does and then sweeps what actually landed on disk: every file under
+/// `.rally/` that is not canonical must be ignored. A new cache file lands
+/// here as a failing test, not as a surprise in someone's `git status`.
+#[test]
+fn every_artifact_a_live_room_writes_is_ignored_or_canonical() {
+    let root = tmp_dir("ignore-sweep");
+    init_repo(&root);
+
+    // Exercise the paths that write to `.rally/`: enter the room, append a
+    // fact, take a claim, run the before-write gate, and read the room back.
+    for args in [
+        vec!["init", "--json"],
+        vec!["enter", "--tool", "claude_code:01", "--json"],
+        vec![
+            "say",
+            "artifact",
+            "--tool",
+            "claude_code:01",
+            "--subject",
+            "rc-072 sweep probe",
+            "--json",
+        ],
+        vec![
+            "say",
+            "claim",
+            "--tool",
+            "claude_code:01",
+            "--subject",
+            "rc-072 sweep probe",
+            "--path",
+            "README.md",
+            "--json",
+        ],
+        vec![
+            "check",
+            "before-write",
+            "--tool",
+            "claude_code:01",
+            "--path",
+            "README.md",
+            "--json",
+        ],
+        vec!["room", "--json"],
+        vec!["next", "--tool", "claude_code:01", "--json"],
+    ] {
+        run_rally(&root, &args);
+    }
+
+    // Canonical by directory (contents travel with the repo) or by name.
+    const CANONICAL_DIRS: &[&str] = &["log", "archive"];
+    const CANONICAL_FILES: &[&str] = &[
+        "manifest.json",
+        ".gitignore",
+        // Legacy R1 monolith: canonical while it exists, migrated into
+        // `log/` on first open.
+        "ledger.jsonl",
+    ];
+
+    let rally_dir = root.join(".rally");
+    let mut swept = 0usize;
+    let mut unignored = Vec::new();
+    for entry in fs::read_dir(&rally_dir).expect("read .rally") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name().to_string_lossy().to_string();
+        if entry.path().is_dir() {
+            assert!(
+                CANONICAL_DIRS.contains(&name.as_str()),
+                "unexpected directory .rally/{name} — classify it as canonical or add it to \
+                 IGNORE_ENTRIES in src/init.rs"
+            );
+            continue;
+        }
+        if CANONICAL_FILES.contains(&name.as_str()) {
+            continue;
+        }
+        swept += 1;
+        if !is_ignored(&root, &format!(".rally/{name}")) {
+            unignored.push(name);
+        }
+    }
+
+    assert!(
+        swept > 0,
+        "the sweep found no non-canonical files under .rally/ — the exercise steps \
+         above stopped producing derived state, so this test is no longer proving anything"
+    );
+    assert!(
+        unignored.is_empty(),
+        "derived state left committable after a live room session: {unignored:?}\n\
+         Add each to IGNORE_ENTRIES in src/init.rs (or classify it as canonical here).\n\
+         .rally/.gitignore:\n{}",
+        fs::read_to_string(rally_dir.join(".gitignore")).unwrap_or_default()
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// First-open auto-init: `rally enter` creates `.rally/` far more often than
+/// anyone runs `rally init`, so the ignore rules have to land on that path
+/// too. Without this, the common case still commits its own `facts.db`.
+#[test]
+fn first_open_auto_init_writes_the_ignore_without_rally_init() {
+    let root = tmp_dir("ignore-autoinit");
+    init_repo(&root);
+
+    // Deliberately never runs `rally init`.
+    let out = run_rally(&root, &["enter", "--tool", "claude_code:01", "--json"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        root.join(".rally").join(".gitignore").exists(),
+        "first-open auto-init must write .rally/.gitignore"
+    );
+    for rel in MUST_BE_IGNORED {
+        assert!(
+            is_ignored(&root, rel),
+            "{rel} must be ignored after first-open auto-init (no `rally init` run)"
+        );
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Re-running `rally init` must leave `.rally/.gitignore` byte-identical, and
+/// rules a human added outside the managed markers must survive. A generator
+/// that clobbers hand-written rules gets turned off by its users.
+#[test]
+fn ignore_file_is_idempotent_and_preserves_rules_outside_the_markers() {
+    let root = tmp_dir("ignore-idempotent");
+    init_repo(&root);
+    run_rally(&root, &["init", "--json"]);
+
+    let ignore_path = root.join(".rally").join(".gitignore");
+    let first = fs::read_to_string(&ignore_path).unwrap();
+
+    run_rally(&root, &["init", "--json"]);
+    assert_eq!(
+        first,
+        fs::read_to_string(&ignore_path).unwrap(),
+        "a second `rally init` must leave .rally/.gitignore byte-identical"
+    );
+
+    // A human adds their own rule below the managed block.
+    fs::write(&ignore_path, format!("{first}\n# mine\nlocal-scratch/\n")).unwrap();
+    run_rally(&root, &["init", "--json"]);
+    let after = fs::read_to_string(&ignore_path).unwrap();
+    assert!(
+        after.contains("local-scratch/"),
+        "rules outside the managed markers must survive a re-run:\n{after}"
+    );
+    assert_eq!(
+        after.matches("# rally:ignore:start").count(),
+        1,
+        "exactly one managed block after a re-run:\n{after}"
+    );
+    assert_eq!(
+        after.matches("# rally:ignore:end").count(),
+        1,
+        "exactly one managed block after a re-run:\n{after}"
+    );
+    // The managed rules still work with a user rule appended.
+    assert!(is_ignored(&root, ".rally/facts.db"));
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Scope boundary: the consumer's root `.gitignore` belongs to the consumer.
+/// rally writes a nested `.rally/.gitignore`, which needs no cooperation from
+/// the repo owner, and must never create or edit the root file.
+#[test]
+fn rally_never_touches_the_repo_root_gitignore() {
+    let root = tmp_dir("ignore-root-untouched");
+    init_repo(&root);
+
+    // (a) No root .gitignore to begin with — rally must not create one.
+    run_rally(&root, &["init", "--json"]);
+    run_rally(&root, &["enter", "--tool", "claude_code:01", "--json"]);
+    assert!(
+        !root.join(".gitignore").exists(),
+        "rally must not create the consumer's root .gitignore"
+    );
+
+    // (b) A root .gitignore that already exists must come back byte-identical.
+    let root_ignore = root.join(".gitignore");
+    let original = "# the consumer's own rules\nnode_modules/\ndist/\n";
+    fs::write(&root_ignore, original).unwrap();
+    run_rally(&root, &["init", "--json"]);
+    run_rally(&root, &["room", "--json"]);
+    assert_eq!(
+        original,
+        fs::read_to_string(&root_ignore).unwrap(),
+        "rally must not edit the consumer's root .gitignore"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
 
 /// `rally init` in a repo with NONE of agent-rally-point's five pointer docs
 /// must exit 0 and produce a usable `.rally/manifest.json`. Before the fix

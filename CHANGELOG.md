@@ -7,6 +7,36 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Fixed — every repo but this one committed rally's derived state (RC-072)
+
+RALLY.md's "Where State Lives" table called `facts.db`, `rallyd.sock`, and the
+`*.owner.lock` family gitignored. Nothing in the product ever wrote an ignore rule.
+agent-rally-point's own root `.gitignore` carried one by hand, so the gap was invisible
+here and universal everywhere else: measured at `56a6e39`, `rally init` in a scratch
+repo left `git check-ignore .rally/facts.db` at exit 1 — not ignored — for all eight
+documented paths, alongside `cursors.json`, `claim-index.json`, `.reconcile-cache.json`,
+and `snapshot.cache.json`. A consumer following the docs committed a SQLite cache, a
+host-scoped flock, and a socket path naming the machine they were cut on.
+
+`rally init` now writes `.rally/.gitignore` covering the derived, lock, and cache
+artifacts — including the WAL/SHM sidecars a `facts.db`-only rule would miss, which is
+how a committed WAL carries frames the ledger never saw. **First-open auto-init writes
+it too**, on both the direct-open and daemon cold-start paths: `rally enter` creates
+`.rally/` far more often than anyone runs `rally init`, so an init-only fix would have
+left the common case exactly as broken. `log/`, `archive/`, `manifest.json`, and the
+`.gitignore` itself stay committable. Regeneration is idempotent and touches only the
+fenced `# rally:ignore:start` … `# rally:ignore:end` block, so rules you add outside it
+survive.
+
+**Your repo's root `.gitignore` is never read or written.** A nested ignore file needs no
+cooperation from the repo owner, and a tool that edits the root file eventually clobbers
+a rule it did not write.
+
+The list is a denylist, which carries one named risk: a derived artifact added to rally
+later must be added to it. The control is a test that exercises a live room and then
+sweeps `.rally/` — any non-canonical file left committable fails the build, so a new
+cache lands as a red test rather than a surprise in someone's `git status`.
+
 ### Fixed — retraction and release could close a claim through spellings the write gate did not check
 
 One defect wearing five names (R1–R5): the write-authority gate asserted a correct rule

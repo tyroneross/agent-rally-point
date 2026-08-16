@@ -1117,6 +1117,10 @@ mod imp {
         let rally_dir = repo_root.join(".rally");
         std::fs::create_dir_all(&rally_dir)
             .map_err(|e| ServeError::new(format!("create {}: {e}", rally_dir.display())))?;
+        // RC-072: a daemon cold-starting into a repo nobody ran `rally init`
+        // in is the other way `.rally/` first appears. Same best-effort
+        // contract as the direct-open path in `store.rs`.
+        crate::init::ensure_ignore_present(&rally_dir);
 
         // (1) Owner lock EXCLUSIVE, blocking (ADR-01/L1). Held for the whole
         // serving lifetime; the kernel releases it on any death.
