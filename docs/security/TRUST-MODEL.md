@@ -54,6 +54,17 @@ id, else it renders as the fixed literal `a peer`. That second gate exists becau
 identifier-shape gate alone admits `human:HALT` and `sudo:EXEC`, which would otherwise have read
 as instructions in the one position the preamble calls hook narration.
 
+The same change added a third surface that the two controls above do not cover. The message now
+renders a `rally ...` command, and that command is deliberately NOT wrapped in guillemets, because it
+has to stay copy-pasteable. Its `--ref`, `--target` and `--id` values are peer-influenced: they come
+from a ledger fact. `safeCommand()` is the whole defence there. It forces every value token through
+the same `isBareShape()` + `scrub()` gate that `ident()` uses, requires the `--tool` argument to equal
+the reading agent's own id (which arrives on argv, never from the ledger), constrains flags to
+`--[a-z-]+`, rejects any residual quote character, and rejects `rally say claim` outright so no
+message can advise a claim takeover. Any rejection falls back to `rally next --tool <you> --audit
+--json`. If you weaken `safeCommand()`, you are removing a shipped defence, not tidying a helper:
+`test_room_message_contract.sh` cases G-p and G-k fail when it is reverted.
+
 **What is not defended:** the fact itself is still unauthenticated. Writers self-supply
 `--tool` and role. There is no signature, so a fact claiming to come from `codex:01` may not
 have. Committed history and live state are not distinguished at the protocol level.
