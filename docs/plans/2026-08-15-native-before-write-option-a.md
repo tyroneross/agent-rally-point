@@ -609,3 +609,196 @@ text an agent reads as instructions; the RC-040 control moves).
 cases will need their expectations updated — that is expected and in scope, and
 the case count change must be reported);
 one live `claude -p` and one `codex exec` run showing the same 3-line text.
+
+---
+
+## C6 revised (plan-critic round 2 + operator Addendum 2) — SUPERSEDES the C6 section above
+
+Two things changed C6 after it was first written: a second plan-critic pass found
+eleven defects, three of them impossibilities rather than nits, and the operator
+landed Addendum 2 (actor attribution). This section supersedes the previous one
+wherever they differ.
+
+### Correction to my own citation (my error, not the advisor's)
+
+The C6 section above quotes the operator as saying "separate file region from
+before-write" and "the node renderer around lines ~1596-1616". **Neither phrase
+is in the brief.** They came from the dispatch message that relayed the
+amendment, and I wrote them as if they were the source document. The scope
+reading they were offered to support is nonetheless CORRECT, on better evidence:
+
+- brief Addendum:37 scopes it to "the SessionStart / UserPromptSubmit / Stop room
+  message";
+- brief Addendum:44 lists states for only those three events;
+- brief Addendum:46 says Codex carries it via `additionalContext` — and Codex
+  lifecycle events emit `additionalContext` (`hook.sh:2118-2119`) while Codex
+  **PreToolUse emits `systemMessage`** (`hook.sh:2124`). The operator's own
+  carrier statement therefore excludes PreToolUse.
+
+**C1 is NOT superseded.** The before-write envelope contract stands as built.
+
+### D1 — `next.action` does not have the values the amendment names
+
+Real values (`crates/rally-cli/src/next.rs:403,413,423,439,449,460,522,533`):
+`respond_to_handoff | resolve_owned_blocker | continue_or_release_claim |
+review_artifact | clarify_handoff | update_plan_status | wait | proceed_solo`.
+The operator's five names are message SITUATIONS, not enum values. Required
+mapping table:
+
+| Template | Trigger |
+|---|---|
+| respond_to_handoff | `next.action == respond_to_handoff` |
+| release_claim | `next.action == continue_or_release_claim` |
+| blocked | `next.action == resolve_owned_blocker` or `wait` |
+| nothing | `next.action == proceed_solo` |
+| before-write conflict | peer `active_claims` INTERSECT own working paths/claims |
+
+The last row needs data the idle/after-write phases do not fetch today
+(`hook.sh:1692-1699` calls only `status read` + `next`). C6 must add a `rally
+room` fetch on those phases and budget it — that is a new per-turn cost on a path
+that currently has none.
+
+### D2 — the preamble line is NOT lifecycle-only (blocking)
+
+`hook.sh:2069` also labels the before-write **Node fallback** envelope.
+Removing it unconditionally breaks native/fallback parity and turns C2's T-02
+red, plus `test_context_sanitization.sh:311-345` and `:476-507`.
+**Gate the removal on `phase !== "before-write"`.**
+
+### D3 — "3 lines" is not producible today (needs an operator decision)
+
+`hook.sh:2047` runs `line(visible.message, 4000)`, the ARP-004 last gate, which
+collapses every control character including `\n` to a space; sanitization
+`test_context_sanitization.sh:84-87` fails any message containing one. Today's
+"Why:"/"Next:" already arrive as one flat string. Two options, and the second
+changes a security control:
+
+- **(a) label-delimited flat string** — `L1 — Why: ... Next: ...` in one line.
+  Per-line assertions parse on the `Why: `/`Next: ` labels; "<=3 lines" is
+  dropped as vacuous. No security-control change. **This is the default this
+  plan takes** `[ASSUMED]`, because it delivers the whole information contract
+  and the brevity budget without touching ARP-004.
+- (b) insert exactly two hook-authored `\n` after per-segment `line()` calls.
+  Changes the ARP-004 last gate, sanitization :84-87, and
+  `docs/security/TRUST-MODEL.md:43-46`. That is a deliberate weakening of a
+  newline-injection control and needs an explicit operator go.
+
+### D4 — `{}` on unchanged `max_seq` is unreachable as specified
+
+`_rally_status_idle` (`hook.sh:1694-1696`) appends a Presence fact before every
+idle/after-write render (`lib.rs:5119-5144`), and `RoomSnapshot.max_seq`
+(`store.rs:1152`) counts every fact — so the seq ALWAYS advances. `max_seq` is
+also not available on those phases (no `rally room` call; `NextResult` carries no
+seq). It further conflicts with the existing message-hash suppressor
+(`hook.sh:2077-2091`), which Test 11 (`test_rally_coordination_hook.sh:1905-1934`)
+pins: changed-message/same-seq must SURFACE.
+
+Resolution: define "unchanged" as the highest seq of facts that are neither
+Presence nor authored by this tool. Keep the existing message-hash dedup as the
+suppression MECHANISM and feed the filtered seq into the displayed `seq A→B`, so
+peer heartbeats stop churning the one-liner every turn. Golden (d) must run
+twice against a real `rally init` scratch ledger — a stub with a frozen seq
+passes against a dead implementation.
+
+### D5 — `RALLY_HOOK_PROMPT_MODE` is the wrong knob
+
+It is INTERNAL: `hook.sh:1279` exports it from `rally hooks status` and clobbers
+any user value. Its values are `once|always|off` (`hooks_config.rs:28-42`), not
+`once|off`. The USER knob is `RALLY_HOOK_PROMPT` / `rally hooks prompt
+--once|--always|--off`. Default `once` is pinned in five places
+(`json_envelope_contract.rs:134`, `cli_guardrails.rs:242`,
+`COMMAND-SEMANTICS.md:58`, `AUTO-COORDINATION-HOOKS.md:254,266-268`,
+`TRUST-MODEL.md:285`), and `always` has live semantics at `hook.sh:2031`.
+
+`brief`/`verbose` is a VERBOSITY axis, orthogonal to the once/always/off banner
+axis. Decision: introduce it as a SEPARATE setting `RALLY_HOOK_ROOM_DETAIL`
+(`brief` default, `verbose` restores the roster) rather than overloading
+`PromptMode`. This keeps `modifies_api: false` and leaves all five pins intact.
+`[ASSUMED]` — the operator wrote `RALLY_HOOK_PROMPT_MODE=verbose`; if they want
+that exact spelling it becomes `modifies_api: true` and pulls in
+`hooks_config.rs`, `cli.rs`, three docs and two Rust tests.
+
+### D6 — unlisted consumers (add to files_touched)
+
+`crates/rally-cli/tests/hook_projection_parity.rs:315-337` is a cargo gate that
+pins the SessionStart prompt containing every active claim scope and both owners
+— a brief SessionStart fails it. ARP-R-08 cases 2/3/4
+(`test_rally_coordination_hook.sh:2363-2487`) need the roster to render, so run
+them explicitly under verbose; cases 1/1b (`:2316-2350`) would pass VACUOUSLY
+under brief, which is worse than failing. `docs/security/TRUST-MODEL.md:43-46`
+documents the preamble as the shipped defense.
+
+### D7 — sanitization suite: which assertions may move
+
+"Green unmodified" is impossible — `_check` asserts the preamble on every case.
+Split them:
+- **Payload invariants that must pass UNMODIFIED** (`:174-186`, `:249-259`,
+  `:292-300`, `:530-552`, `:636-648`) — peer text never appears unquoted.
+- **Control-presence assertions to be re-pointed at the new control**
+  (`:92-95`, `:432-441`, `:761-766`) — assert every `»` is followed by
+  `(untrusted)`. This is un-forgeable because `prose()` strips guillemets, so a
+  peer cannot emit a fake `»(untrusted)`.
+Add `tests/hooks/test_context_sanitization.sh` to files_touched, and state the
+fate of `stripLabel`/`PREAMBLE_MARK_RE` (`hook.sh:1345-1347`) given
+`test_sanitizer_block_parity.sh` requires both renderer blocks byte-identical.
+
+### D8 — assertion holes in the goldens
+
+- "every «» followed by (untrusted)" must be per-CLOSING-guillemet
+  (`/»(?! ?\(untrusted\))/`) plus balanced counts, else `«a»«b» (untrusted)`
+  passes.
+- "L1 has no «»" misses a bare `ident()` value interpolated into L1. Add: L1 must
+  match the fixed per-template regex whose only variable parts are `\d+` and
+  `hostId`, and hostile payload markers must not appear anywhere in L1.
+- "contains an id" -> `/fact_[A-Za-z0-9_]+|seq \d+→\d+/`.
+- L3's first token must EQUAL an entry of `next.suggested_commands`
+  (`next.rs:616-672`), not merely "start with rally". This is also the charter
+  guard: pinning to the suggested set means no template — notably "before-write
+  conflict" — can advise a takeover of a peer's claim.
+- 420 chars measured on the emitted `additionalContext`/`systemMessage` STRING.
+- Codex Stop emits `systemMessage` (`hook.sh:2125-2126`), so "identical text on
+  Claude and Codex" compares the extracted string, not the envelope.
+
+### D9 — real region list (C3/C6 ordering depends on it)
+
+Lifecycle composition `hook.sh:1954-2037`; start renderer `~1560-1601`; dedup
+`2077-2091`; prompt allowlist/export `1261`/`1279`; room fetch `1692-1699`;
+preamble decision `2069` (SHARED with before-write fallback — see D2).
+
+### Addendum 2 — actor attribution
+
+Every fact referenced on any line names its actor as `<host>:<short-id>`:
+registered host token (`claude_code`/`codex`/`cursor`/`gemini`/other) + the first
+4 chars of the session/uuid segment. When the tool id has no uuid segment, use
+the LAST 4 chars of its final dash-segment. Full ids stay in `rally room` and in
+the executable command on L3 (commands use the FULL id).
+
+- Addressed-to-you: L1 names the sender when the action is a handoff
+  ("codex:c5f8 handed it to you — ..."); L2 names sender + blocker/holder with
+  the id.
+- Notification (room moved, nothing for you): ONE line of up to 3 clauses
+  `<actor> <verb> <kind> <short-id>` joined by `; ` (verbs by kind: resolved /
+  claimed / released / handed off / posted / retracted / entered), then
+  ` — nothing needs you · seq A→B → rally room`.
+- Before-write conflict template: L1 names the holder; L2 the claim id + holder
+  + minutes left.
+
+Tests: for every `fact_...` id on L1/L2 there is an actor token matching
+`^[a-z_]+:[A-Za-z0-9-]{4,}` on the SAME line; the notification line has >=1 actor
+clause when any new fact arrived; and a UNIT test on the shortener:
+`codex:release-cleanup-c5f8ebd7` -> `codex:c5f8`;
+`claude_code:6c021b53-...` -> `claude_code:6c02`;
+`agent_audit_003` -> `agent_audit_003` unchanged when there is no segment.
+
+Note the shortener interacts with `ident()`: a 4-char short-id is >= the
+IDENT_MIN_WORD_LEN of 3, so short-ids render bare rather than guillemet-wrapped
+— which is the point, since an actor token wrapped in «» would read as untrusted
+peer prose. Assert that explicitly.
+
+### C6 status
+
+NOT IMPLEMENTED in this run. D3 and D5 each carry a labelled default that a
+reasonable operator might overturn, and D3's alternative (b) would weaken a
+newline-injection security control. The chunk is specified to the point where it
+can be executed directly; it is sequenced after C3-C5 because it edits the same
+shell file and because option A is the release blocker.
