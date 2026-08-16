@@ -171,9 +171,23 @@ absent — in the room you are about to post to. Before setting `--target`, read
 the live roster **of that room**:
 
 ```bash
-rally room --json      # squads[]: who is here, last_seen_ts, status
+rally room --json      # squads[]: who is here, last_seen_ts, status, freshness, age_secs
+rally next --tool "$TOOL" --json   # next.peer_targets: visible peers ranked freshest-first
 rally status read --json
 ```
+
+Each squad row carries `freshness` (`fresh` = heartbeat inside its adaptive
+presence window, `stale` = past it, `unknown` = unparseable timestamp) with
+`age_secs` and `window_secs`; the `room` human line tallies `squads=N fresh=X
+stale=Y`. `next.peer_targets` ranks every visible peer fresh → unknown → stale,
+youngest first, self excluded (`fresh`/`stale`/`unknown` counts cover the whole
+room; `ranked` is a shortlist, `truncated` says how many were cut). Prefer a
+fresh peer when several could take the work.
+
+A stale peer is still a legal target: `rally say ... --target <stale-peer>`
+commits and delivers, and attaches a `stale-target` entry in `warnings[]` naming
+the freshest alternatives. Rally advises and ranks; the choice stays with you —
+a returning session or a scheduled agent may be exactly who you mean.
 
 Target the session that is actually working the paths in question — an active
 claim on the file under discussion is stronger evidence of the right peer than

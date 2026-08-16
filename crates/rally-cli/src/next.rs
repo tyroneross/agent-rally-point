@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 
 use crate::backlog::BacklogItem;
-use crate::store::{Fact, FactKind, RoomSnapshot};
+use crate::store::{Fact, FactKind, RoomSnapshot, Squad};
 use crate::{FACT_SCHEMA, normalize_path, path_matches_scope, shell_quote};
 
 /// Default window after which an unanswered handoff stops counting as an active
@@ -77,6 +77,75 @@ pub(crate) struct NextResult {
     /// `rally say claim` to take the work.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) suggested_backlog_items: Vec<SuggestedBacklogItem>,
+    /// Visible peers ranked freshest-first, for choosing a handoff target.
+    /// ADVISORY: a stale peer is still a legal `--target`; this only tells the
+    /// sender who was seen recently so it does not hand work to a ghost by
+    /// default. See [`PeerTargets`].
+    pub(crate) peer_targets: PeerTargets,
+}
+
+/// How many ranked peers `next` lists inline. The counts cover the whole
+/// room; the list is a shortlist so a 380-squad room does not print 380 rows.
+pub(crate) const PEER_TARGETS_LIMIT: usize = 8;
+
+/// Freshness-ranked handoff-target shortlist (see [`RoomSnapshot::ranked_peers`]).
+#[derive(Clone, Debug, Default, JsonSchema, Serialize)]
+pub(crate) struct PeerTargets {
+    /// Room-wide tally over visible peers (self excluded).
+    pub(crate) fresh: usize,
+    pub(crate) stale: usize,
+    pub(crate) unknown: usize,
+    /// Freshest first: fresh → unknown → stale, then youngest `age_secs`.
+    pub(crate) ranked: Vec<PeerTarget>,
+    /// Peers not shown because the shortlist is capped at
+    /// [`PEER_TARGETS_LIMIT`]. `rally room --json` lists every squad.
+    pub(crate) truncated: usize,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct PeerTarget {
+    pub(crate) tool: String,
+    pub(crate) freshness: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) age_secs: Option<i64>,
+    pub(crate) window_secs: i64,
+    pub(crate) last_seen_ts: String,
+    pub(crate) status: String,
+    pub(crate) acknowledged: bool,
+}
+
+impl PeerTarget {
+    fn from_squad(squad: &Squad) -> Self {
+        Self {
+            tool: squad.tool.clone(),
+            freshness: squad.freshness.clone(),
+            age_secs: squad.age_secs,
+            window_secs: squad.window_secs,
+            last_seen_ts: squad.last_seen_ts.clone(),
+            status: squad.status.clone(),
+            acknowledged: squad.acknowledged,
+        }
+    }
+}
+
+/// Rank every visible peer of `tool` by freshness and cut the shortlist.
+pub(crate) fn peer_targets(snapshot: &RoomSnapshot, tool: &str, limit: usize) -> PeerTargets {
+    let ranked = snapshot.ranked_peers(Some(tool));
+    let mut out = PeerTargets::default();
+    for sq in &ranked {
+        match sq.freshness.as_str() {
+            crate::store::FRESHNESS_FRESH => out.fresh += 1,
+            crate::store::FRESHNESS_STALE => out.stale += 1,
+            _ => out.unknown += 1,
+        }
+    }
+    out.ranked = ranked
+        .iter()
+        .take(limit)
+        .map(|sq| PeerTarget::from_squad(sq))
+        .collect();
+    out.truncated = ranked.len().saturating_sub(out.ranked.len());
+    out
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -364,6 +433,7 @@ pub(crate) fn build_next(
         waiting_on,
         alternatives,
         suggested_backlog_items,
+        peer_targets: peer_targets(snapshot, tool, PEER_TARGETS_LIMIT),
     }
 }
 
@@ -950,6 +1020,7 @@ mod tests {
             last_seen_ts: last_seen_ts.to_string(),
             status: status.to_string(),
             acknowledged: true,
+            ..Default::default()
         }
     }
 
@@ -1095,5 +1166,83 @@ mod tests {
         );
         assert_eq!(result.completion.record_kind, "backlog_update");
         assert!(!result.completion.release_claims);
+    }
+
+    fn ranked_squad(tool: &str, freshness: &str, age_secs: Option<i64>) -> Squad {
+        Squad {
+            tool: tool.to_string(),
+            last_seen_seq: 1,
+            last_seen_ts: "2026-08-15T00:00:00Z".to_string(),
+            status: "idle".to_string(),
+            acknowledged: false,
+            age_secs,
+            window_secs: 1860,
+            freshness: freshness.to_string(),
+        }
+    }
+
+    /// GOLDEN: `next.peer_targets` ranks visible peers freshest-first, excludes
+    /// the caller, tallies the whole room, and caps the inline list — the
+    /// counts still cover every peer, and `truncated` says how many were cut.
+    #[test]
+    fn peer_targets_rank_fresh_first_and_cap_the_shortlist() {
+        let snapshot = RoomSnapshot {
+            squads: vec![
+                ranked_squad("stale-a", crate::store::FRESHNESS_STALE, Some(80_000)),
+                ranked_squad("fresh-slow", crate::store::FRESHNESS_FRESH, Some(900)),
+                ranked_squad("codex", crate::store::FRESHNESS_FRESH, Some(1)),
+                ranked_squad("fresh-quick", crate::store::FRESHNESS_FRESH, Some(30)),
+                ranked_squad("mystery", crate::store::FRESHNESS_UNKNOWN, None),
+                ranked_squad("stale-b", crate::store::FRESHNESS_STALE, Some(4_000)),
+            ],
+            ..RoomSnapshot::default()
+        };
+
+        let all = peer_targets(&snapshot, "codex", PEER_TARGETS_LIMIT);
+        assert_eq!((all.fresh, all.stale, all.unknown), (2, 2, 1));
+        assert_eq!(all.truncated, 0);
+        assert_eq!(
+            all.ranked
+                .iter()
+                .map(|p| p.tool.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh-quick", "fresh-slow", "mystery", "stale-b", "stale-a"]
+        );
+        assert!(
+            all.ranked.iter().all(|p| p.tool != "codex"),
+            "the caller is never its own handoff target"
+        );
+
+        let capped = peer_targets(&snapshot, "codex", 2);
+        assert_eq!(
+            capped
+                .ranked
+                .iter()
+                .map(|p| p.tool.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh-quick", "fresh-slow"]
+        );
+        assert_eq!(
+            capped.truncated, 3,
+            "cut rows are counted, not silently dropped"
+        );
+        assert_eq!(
+            (capped.fresh, capped.stale, capped.unknown),
+            (2, 2, 1),
+            "tallies cover the whole room regardless of the cap"
+        );
+
+        // And it rides along in the full `next` result.
+        let result = build_next(
+            &snapshot,
+            "codex",
+            None,
+            &[],
+            10,
+            Vec::new(),
+            DEFAULT_STALE_WAIT_SECS,
+        );
+        assert_eq!(result.peer_targets.ranked[0].tool, "fresh-quick");
+        assert_eq!(result.peer_targets.stale, 2);
     }
 }

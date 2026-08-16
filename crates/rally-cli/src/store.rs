@@ -1037,6 +1037,54 @@ pub(crate) struct Squad {
     /// Coordination-mandate (C1): has this squad recorded a `coordination:ack`
     /// fact? Acknowledged squads have ingested the rules/guardrails/lead/mission.
     pub(crate) acknowledged: bool,
+    /// Seconds since `last_seen_ts` at projection time. `None` when the
+    /// timestamp does not parse (the squad is then `freshness == "unknown"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) age_secs: Option<i64>,
+    /// The adaptive presence window this squad is judged against, in seconds:
+    /// its declared `planned_heartbeat_secs` (or the configured default cadence)
+    /// × missed-beat multiplier + grace. `age_secs > window_secs` is stale.
+    #[serde(default)]
+    pub(crate) window_secs: i64,
+    /// `"fresh"` (heartbeat inside its adaptive window), `"stale"` (heartbeat
+    /// past it), or `"unknown"` (unparseable `last_seen_ts`).
+    ///
+    /// ADVISORY. This is the same heartbeat-only verdict that feeds
+    /// [`RoomSnapshot::stale_authors`] and relevance ranking — NOT the
+    /// four-signal `Liveness` verdict that drops a squad or reaps a claim. It
+    /// exists so a sender can see at a glance which peers are current before
+    /// choosing a handoff target; it never gates a write, a target, or a
+    /// takeover. Ranking helpers: [`squad_freshness_rank`],
+    /// [`RoomSnapshot::ranked_peers`], [`RoomSnapshot::freshness_counts`].
+    #[serde(default = "default_freshness")]
+    pub(crate) freshness: String,
+}
+
+pub(crate) const FRESHNESS_FRESH: &str = "fresh";
+pub(crate) const FRESHNESS_STALE: &str = "stale";
+pub(crate) const FRESHNESS_UNKNOWN: &str = "unknown";
+
+fn default_freshness() -> String {
+    FRESHNESS_UNKNOWN.to_string()
+}
+
+/// Sort key for freshness ranking: fresh (0) before unknown (1) before stale
+/// (2). Unknown sits in the middle on purpose — an unparseable timestamp is not
+/// evidence of absence, but it is not a positive sighting either.
+pub(crate) fn squad_freshness_rank(squad: &Squad) -> u8 {
+    match squad.freshness.as_str() {
+        FRESHNESS_FRESH => 0,
+        FRESHNESS_STALE => 2,
+        _ => 1,
+    }
+}
+
+/// Per-room freshness tally over the visible squads.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, JsonSchema, Serialize)]
+pub(crate) struct FreshnessCounts {
+    pub(crate) fresh: usize,
+    pub(crate) stale: usize,
+    pub(crate) unknown: usize,
 }
 
 /// Seconds of inactivity after which a squad member is marked "idle".
@@ -1425,6 +1473,51 @@ impl RoomSnapshot {
             .filter(|sq| sq.status == "idle")
             .map(|sq| sq.tool.clone())
             .collect()
+    }
+
+    /// Fresh / stale / unknown tally over the visible squads (see
+    /// [`Squad::freshness`]). Advisory — feeds the `room` human line and the
+    /// `next` peer ranking; it never gates anything.
+    pub(crate) fn freshness_counts(&self) -> FreshnessCounts {
+        let mut counts = FreshnessCounts::default();
+        for sq in &self.squads {
+            match sq.freshness.as_str() {
+                FRESHNESS_FRESH => counts.fresh += 1,
+                FRESHNESS_STALE => counts.stale += 1,
+                _ => counts.unknown += 1,
+            }
+        }
+        counts
+    }
+
+    /// Visible squads other than `exclude`, ranked freshest-first: fresh before
+    /// unknown before stale, then youngest `age_secs` first (missing age last),
+    /// then tool id for a stable order. This is the ranking `next` offers as
+    /// candidate handoff targets and `say --target` uses to name fresh
+    /// alternatives. It RANKS; the caller keeps the choice.
+    pub(crate) fn ranked_peers(&self, exclude: Option<&str>) -> Vec<&Squad> {
+        let mut peers: Vec<&Squad> = self
+            .squads
+            .iter()
+            .filter(|sq| exclude.is_none_or(|me| sq.tool != me))
+            .collect();
+        peers.sort_by(|a, b| {
+            squad_freshness_rank(a)
+                .cmp(&squad_freshness_rank(b))
+                .then_with(|| match (a.age_secs, b.age_secs) {
+                    (Some(x), Some(y)) => x.cmp(&y),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                })
+                .then_with(|| a.tool.cmp(&b.tool))
+        });
+        peers
+    }
+
+    /// The visible squad row for `tool`, if it has one.
+    pub(crate) fn squad_for(&self, tool: &str) -> Option<&Squad> {
+        self.squads.iter().find(|sq| sq.tool == tool)
     }
 
     /// DESTRUCTIVE tier — tools whose latest presence is older than
@@ -6233,9 +6326,10 @@ fn snapshot_from_facts_with_policy_at(
         .filter_map(|(tool, (seq, ts))| {
             // Parse ISO-8601 ts to epoch secs for idle check; fall back to
             // treating the tool as active if parsing fails.
-            let seen_secs = chrono::DateTime::parse_from_rfc3339(&ts)
+            let parsed_seen_secs = chrono::DateTime::parse_from_rfc3339(&ts)
                 .map(|dt| dt.timestamp())
-                .unwrap_or(now_secs);
+                .ok();
+            let seen_secs = parsed_seen_secs.unwrap_or(now_secs);
             let heartbeat_age = now_secs - seen_secs;
             // The 15-min idle label is preserved for the existing surfaces that
             // read `Squad.status`; it is independent of the drop decision.
@@ -6291,12 +6385,29 @@ fn snapshot_from_facts_with_policy_at(
                 return None;
             }
 
+            // Per-squad freshness is the SAME heartbeat-vs-window measurement
+            // as `stale_authors` above, surfaced on the row so a reader of
+            // `room`/`next` can tell a current peer from a long-gone one
+            // without re-deriving the window. Unparseable ts → "unknown"
+            // (the idle/stale_authors fallbacks above treat it as age 0; the
+            // row says so honestly instead).
+            let (age_secs, freshness) = match parsed_seen_secs {
+                Some(_) if heartbeat_age > window => {
+                    (Some(heartbeat_age), FRESHNESS_STALE.to_string())
+                }
+                Some(_) => (Some(heartbeat_age), FRESHNESS_FRESH.to_string()),
+                None => (None, FRESHNESS_UNKNOWN.to_string()),
+            };
+
             Some(Squad {
                 tool,
                 last_seen_seq: seq,
                 last_seen_ts: ts,
                 status,
                 acknowledged,
+                age_secs,
+                window_secs: window,
+                freshness,
             })
         })
         .collect::<Vec<_>>();
@@ -9722,6 +9833,7 @@ mod ledger_tests {
                 last_seen_ts: now_string(),
                 status: "active".to_string(),
                 acknowledged: false,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -9836,6 +9948,7 @@ mod ledger_tests {
                 last_seen_ts: now_string(),
                 status: "active".to_string(),
                 acknowledged: false,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -16487,6 +16600,7 @@ mod decay_reclaim_tests {
             last_seen_ts: iso_ago(last_seen_age_secs),
             status: "idle".to_string(),
             acknowledged: false,
+            ..Default::default()
         }
     }
 
@@ -17376,5 +17490,182 @@ mod squad_decay_tests {
         let facts = seqd(vec![fact(FactKind::Presence, "live", 30)]);
         let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
         assert!(has_squad(&snap, "live"));
+    }
+}
+
+#[cfg(test)]
+mod squad_freshness_tests {
+    //! Per-squad freshness (task 842733db): the row carries the SAME
+    //! heartbeat-vs-window verdict `stale_authors` uses, so a reader of `room`
+    //! or `next` can tell a current peer from a long-gone one at a glance, and
+    //! handoff-target ranking is freshest-first. Advisory only — nothing here
+    //! gates a write, a target, or a takeover.
+    use super::*;
+    use crate::hooks_config::CoordinationConfig;
+
+    fn iso_ago(secs: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::seconds(secs.max(0)))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    fn presence(seq: i64, tool: &str, created_at: String) -> Fact {
+        Fact {
+            from_session_id: None,
+            schema: fact_schema(),
+            event_id: format!("evt-{seq}"),
+            seq,
+            thread_id: format!("room-{seq}"),
+            kind: FactKind::Presence,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("agent presence: {tool}"),
+            scope: Vec::new(),
+            created_at,
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        }
+    }
+
+    fn squad_row(tool: &str, freshness: &str, age_secs: Option<i64>) -> Squad {
+        Squad {
+            tool: tool.to_string(),
+            last_seen_seq: 1,
+            last_seen_ts: "2026-08-15T00:00:00Z".to_string(),
+            status: "idle".to_string(),
+            acknowledged: false,
+            age_secs,
+            window_secs: 1860,
+            freshness: freshness.to_string(),
+        }
+    }
+
+    /// The projection stamps `age_secs`, `window_secs`, and `freshness` from
+    /// the heartbeat age against the adaptive window; the freshness verdict
+    /// agrees with `stale_authors` by construction.
+    #[test]
+    fn projection_stamps_freshness_from_heartbeat_vs_window() {
+        let coord = CoordinationConfig::default();
+        let window = crate::liveness::adaptive_window_secs(
+            coord.default_cadence_secs,
+            coord.default_cadence_secs,
+            coord.miss_multiplier,
+            coord.grace_secs,
+        );
+        let facts = vec![
+            presence(1, "current", iso_ago(60)),
+            presence(2, "gone", iso_ago(3 * 60 * 60)),
+            presence(3, "garbled", "not-a-timestamp".to_string()),
+        ];
+        let snap = snapshot_from_facts_with_policy(&facts, &coord, false);
+
+        let current = snap.squad_for("current").expect("current squad visible");
+        assert_eq!(current.freshness, FRESHNESS_FRESH);
+        assert_eq!(current.window_secs, window);
+        assert!(
+            current.age_secs.is_some_and(|a| (0..=window).contains(&a)),
+            "fresh age must be inside the window; got {:?}",
+            current.age_secs
+        );
+        assert!(!snap.stale_authors.contains("current"));
+
+        let gone = snap.squad_for("gone").expect(
+            "a heartbeat-only stale squad stays VISIBLE (four-signal drop needs unanimity)",
+        );
+        assert_eq!(gone.freshness, FRESHNESS_STALE);
+        assert!(gone.age_secs.is_some_and(|a| a > window));
+        assert!(
+            snap.stale_authors.contains("gone"),
+            "row freshness and stale_authors are one verdict"
+        );
+
+        let garbled = snap
+            .squad_for("garbled")
+            .expect("unparseable ts is fail-open visible");
+        assert_eq!(garbled.freshness, FRESHNESS_UNKNOWN);
+        assert_eq!(garbled.age_secs, None);
+
+        assert_eq!(
+            snap.freshness_counts(),
+            FreshnessCounts {
+                fresh: 1,
+                stale: 1,
+                unknown: 1
+            }
+        );
+    }
+
+    /// A declared cadence widens the window: 5-hour heartbeat cadence keeps a
+    /// 3-hour-quiet squad FRESH, where the 5-minute default would call it stale.
+    #[test]
+    fn declared_cadence_widens_the_freshness_window() {
+        let coord = CoordinationConfig::default();
+        let mut slow = presence(1, "slow-beat", iso_ago(3 * 60 * 60));
+        slow.evidence = vec!["planned_heartbeat_secs:18000".to_string()];
+        let snap = snapshot_from_facts_with_policy(&[slow], &coord, false);
+        let sq = snap.squad_for("slow-beat").unwrap();
+        assert_eq!(
+            sq.window_secs,
+            18000 * coord.miss_multiplier + coord.grace_secs
+        );
+        assert_eq!(sq.freshness, FRESHNESS_FRESH);
+    }
+
+    /// GOLDEN ranking: fresh before unknown before stale; within a tier the
+    /// youngest age first, missing age last; ties broken by tool id. Self is
+    /// excluded. Pinned as an explicit expected order so any reordering of the
+    /// key shows up as a diff here, not as a surprising `next` suggestion.
+    #[test]
+    fn ranked_peers_golden_order() {
+        let snap = RoomSnapshot {
+            squads: vec![
+                squad_row("stale-old", FRESHNESS_STALE, Some(90_000)),
+                squad_row("fresh-b", FRESHNESS_FRESH, Some(120)),
+                squad_row("me", FRESHNESS_FRESH, Some(1)),
+                squad_row("unknown-x", FRESHNESS_UNKNOWN, None),
+                squad_row("fresh-a", FRESHNESS_FRESH, Some(120)),
+                squad_row("stale-young", FRESHNESS_STALE, Some(2_000)),
+                squad_row("fresh-newest", FRESHNESS_FRESH, Some(5)),
+                squad_row("fresh-no-age", FRESHNESS_FRESH, None),
+            ],
+            ..RoomSnapshot::default()
+        };
+        let got: Vec<&str> = snap
+            .ranked_peers(Some("me"))
+            .into_iter()
+            .map(|sq| sq.tool.as_str())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "fresh-newest", // fresh, 5s
+                "fresh-a",      // fresh, 120s (tie → tool id)
+                "fresh-b",      // fresh, 120s
+                "fresh-no-age", // fresh, age missing → last within tier
+                "unknown-x",    // unknown tier
+                "stale-young",  // stale, 2000s
+                "stale-old",    // stale, 90000s
+            ]
+        );
+        // No exclusion → self is ranked too, by the same key.
+        assert_eq!(snap.ranked_peers(None)[0].tool, "me");
+    }
+
+    /// Older public/persisted squad payloads (no freshness fields) still
+    /// deserialize, defaulting to `unknown` — no age is not a stale verdict.
+    #[test]
+    fn legacy_squad_payload_deserializes_as_unknown() {
+        let sq: Squad = serde_json::from_str(
+            r#"{"tool":"old","last_seen_seq":1,"last_seen_ts":"2026-01-01T00:00:00Z","status":"idle","acknowledged":false}"#,
+        )
+        .unwrap();
+        assert_eq!(sq.freshness, FRESHNESS_UNKNOWN);
+        assert_eq!(sq.age_secs, None);
+        assert_eq!(squad_freshness_rank(&sq), 1);
     }
 }

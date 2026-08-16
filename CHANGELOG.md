@@ -9,6 +9,45 @@ All notable changes to Agent Rally Point are documented here.
 
 > Release date is set when the tag is cut; entries for the native before-write hook and RC-073 land under this heading before then.
 
+### Added — squads say how fresh they are, and handoff targets rank by it
+
+This repo's room lists ~380 squads. Most are sessions that ended weeks ago, and
+nothing in `room`, `next`, or the SessionStart prompt told them apart from the
+three that were live: every row had a `last_seen_ts` and a 15-minute
+`active|idle` label, so a sender picking a `--target` was choosing from a roster
+where "idle" covered both a peer in a long build and a peer that had been dead
+since June. `next` had a `stale_wait_secs` window for *incoming* handoffs and
+a 2-hour takeover bar for *claims*, but no view of peer freshness a sender
+could rank on, and `rally say --target <ghost>` said nothing.
+
+Every squad row now carries `age_secs`, `window_secs`, and `freshness`
+(`fresh` / `stale` / `unknown`), judged by the same heartbeat-vs-adaptive-window
+rule that already feeds `stale_authors` and relevance ranking — one verdict,
+not a second definition of stale. The window is the squad's declared
+`planned_heartbeat_secs` (or the configured default cadence) × missed-beat
+multiplier + grace, so a 5-hour-cadence agent quiet for 3 hours is still fresh
+and a 5-minute one is not. `rally room` prints `squads=N fresh=X stale=Y` on its
+human line; `rally next` prints `peers_fresh=X peers_stale=Y` and its JSON gains
+`next.peer_targets`: every visible peer ranked fresh → unknown → stale, youngest
+first, self excluded, with room-wide counts and a capped `ranked` shortlist
+(`truncated` reports what the cap dropped). `rally say ... --target <peer>` on a
+stale peer commits and delivers exactly as asked and attaches a `stale-target`
+entry in `warnings[]` that names the freshest alternatives.
+
+Charter: advise and rank, never gate. Nothing here refuses a target, hides a
+squad, or reclaims a claim — the four-signal `Liveness` drop and the size-scaled
+takeover bar are unchanged and remain the only destructive tiers. A stale peer
+may be exactly the one you mean; rally tells you it is stale and leaves the
+call with you. Older public/persisted squad payloads without the new fields
+deserialize as `unknown`, and `unknown` ranks between fresh and stale on purpose:
+no timestamp is not a sighting, and it is not an absence either.
+
+Pinned by `crates/rally-cli/tests/squad_freshness.rs` (CLI-level: row fields,
+human-line tally, ranking, warning present on a stale target and absent on a
+fresh or broadcast one) plus unit goldens for the ranking key
+(`store::squad_freshness_tests`, `next::tests::peer_targets_rank_fresh_first_and_cap_the_shortlist`)
+and the advisory text (`stale_target_warning_tests`).
+
 ### Fixed — every repo but this one committed rally's derived state (RC-072)
 
 RALLY.md's "Where State Lives" table called `facts.db`, `rallyd.sock`, and the

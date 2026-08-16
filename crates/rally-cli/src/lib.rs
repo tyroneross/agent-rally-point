@@ -3255,6 +3255,13 @@ fn command_say(args: SayArgs) -> Result<Output> {
             RoomSnapshot::default()
         }
     };
+    // Stale-target advisory. The fact is already committed — this ranks and
+    // warns, it never gates: a stale peer may be exactly who the sender means
+    // (a returning session, a scheduled agent). It names the freshest peers so
+    // the sender can re-target with one command if it did not mean the ghost.
+    if let Some(warning) = stale_target_warning(&snapshot, &args.tool, fact.target.as_deref()) {
+        say_warnings.push(warning);
+    }
     // R9-readback: capture verified {room, seq} from the confirmed fact.
     let verified = SayVerified {
         room: room.room_id().to_string(),
@@ -3739,15 +3746,26 @@ fn command_room(args: RoomArgs) -> Result<Output> {
             .unwrap_or(usize::MAX);
         debug_assert_eq!(composition.emitted_bytes, actual_bytes);
     }
+    // Squad freshness on the human line: a room with 380 squads where most are
+    // long-gone reads as 380 peers unless the line says how many are current.
+    let freshness = snapshot.freshness_counts();
     let text = format!(
-        "room claims={} blockers={} handoffs={} decisions={} risks={} artifacts={} system_health={}",
+        "room claims={} blockers={} handoffs={} decisions={} risks={} artifacts={} system_health={} squads={} fresh={} stale={}{}",
         snapshot.active_claims.len(),
         snapshot.active_blockers.len(),
         snapshot.open_handoffs.len(),
         snapshot.current_decisions.len(),
         snapshot.current_risks.len(),
         snapshot.recent_artifacts.len(),
-        snapshot.system_health.len()
+        snapshot.system_health.len(),
+        snapshot.squads.len(),
+        freshness.fresh,
+        freshness.stale,
+        if freshness.unknown > 0 {
+            format!(" unknown={}", freshness.unknown)
+        } else {
+            String::new()
+        }
     );
     Ok(Output::new(json_output, text, body))
 }
@@ -3810,6 +3828,7 @@ fn command_next(args: NextArgs) -> Result<Output> {
         );
     }
     let lead_context = build_lead_context(&snapshot, Some(&tool), role.as_deref());
+    let (peers_fresh, peers_stale) = (next.peer_targets.fresh, next.peer_targets.stale);
     let body = envelope(
         "next",
         SCHEMA_NEXT,
@@ -3823,7 +3842,10 @@ fn command_next(args: NextArgs) -> Result<Output> {
             lead_context,
         },
     )?;
-    let text = format!("next action={action} target={target_event_id}");
+    let text = format!(
+        "next action={action} target={target_event_id} peers_fresh={} peers_stale={}",
+        peers_fresh, peers_stale
+    );
     Ok(Output::new(args.json, text, body))
 }
 
@@ -14864,6 +14886,192 @@ struct AckPayload {
     tool: String,
     acknowledged: bool,
     fact: Fact,
+}
+
+/// Advisory code on `rally say --target <peer>` when that peer's presence is
+/// past its adaptive window. The say still commits and still targets the peer.
+const SAY_WARNING_STALE_TARGET: &str = "stale-target";
+
+/// How many fresh alternatives a stale-target advisory names.
+const STALE_TARGET_ALTERNATIVES: usize = 3;
+
+/// Build the `stale-target` advisory for a `say` addressed to `target`, or
+/// `None` when the target is absent, a broadcast, the sender itself, not a
+/// visible squad, or fresh/unknown. Pure over the snapshot so it is testable
+/// without a store; the caller decides only WHETHER to attach it, never
+/// whether to deliver.
+fn stale_target_warning(
+    snapshot: &RoomSnapshot,
+    sender: &str,
+    target: Option<&str>,
+) -> Option<SayWarning> {
+    let target = target?;
+    if target == "all" || target == sender {
+        return None;
+    }
+    let squad = snapshot.squad_for(target)?;
+    if squad.freshness != store::FRESHNESS_STALE {
+        return None;
+    }
+    let age = squad
+        .age_secs
+        .map(format_age_short)
+        .unwrap_or_else(|| "unknown".to_string());
+    let alternatives: Vec<String> = snapshot
+        .ranked_peers(Some(sender))
+        .into_iter()
+        .filter(|sq| sq.freshness == store::FRESHNESS_FRESH)
+        .take(STALE_TARGET_ALTERNATIVES)
+        .map(|sq| {
+            format!(
+                "{} (seen {} ago)",
+                sq.tool,
+                sq.age_secs
+                    .map(format_age_short)
+                    .unwrap_or_else(|| "?".to_string())
+            )
+        })
+        .collect();
+    let alt_text = if alternatives.is_empty() {
+        "no fresh peer is visible right now".to_string()
+    } else {
+        format!("fresher peers: {}", alternatives.join(", "))
+    };
+    Some(SayWarning {
+        code: SAY_WARNING_STALE_TARGET.to_string(),
+        message: format!(
+            "target {target} was last seen {age} ago (last_seen_ts {}), past its {} presence window — it may not pick this up; {alt_text}. Delivered anyway; re-target with `rally say handoff --tool {sender} --target <peer> --ref <this event>` if you meant someone current.",
+            squad.last_seen_ts,
+            format_age_short(squad.window_secs),
+        ),
+    })
+}
+
+/// `90s`, `14m`, `3h`, `2d` — coarse, for advisories.
+fn format_age_short(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 120 {
+        format!("{secs}s")
+    } else if secs < 2 * 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 2 * 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod stale_target_warning_tests {
+    //! `rally say --target <peer>` on a stale peer: WARN, name fresher peers,
+    //! deliver anyway. Present on a stale target; absent on fresh, unknown,
+    //! broadcast, self, or a target with no squad row (task 842733db).
+    use super::*;
+
+    fn squad(tool: &str, freshness: &str, age_secs: Option<i64>) -> store::Squad {
+        store::Squad {
+            tool: tool.to_string(),
+            last_seen_seq: 1,
+            last_seen_ts: "2026-08-14T17:13:44Z".to_string(),
+            status: "idle".to_string(),
+            acknowledged: true,
+            age_secs,
+            window_secs: 1860,
+            freshness: freshness.to_string(),
+        }
+    }
+
+    fn room() -> RoomSnapshot {
+        RoomSnapshot {
+            squads: vec![
+                squad("me", store::FRESHNESS_FRESH, Some(2)),
+                squad("ghost", store::FRESHNESS_STALE, Some(31 * 3600)),
+                squad("live-b", store::FRESHNESS_FRESH, Some(300)),
+                squad("live-a", store::FRESHNESS_FRESH, Some(40)),
+                squad("odd", store::FRESHNESS_UNKNOWN, None),
+                squad("live-c", store::FRESHNESS_FRESH, Some(700)),
+                squad("live-d", store::FRESHNESS_FRESH, Some(900)),
+            ],
+            ..RoomSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn stale_target_gets_a_warning_naming_fresh_alternatives() {
+        let w = stale_target_warning(&room(), "me", Some("ghost"))
+            .expect("stale target must produce an advisory");
+        assert_eq!(w.code, SAY_WARNING_STALE_TARGET);
+        assert!(
+            w.message.contains("target ghost was last seen 31h ago"),
+            "{}",
+            w.message
+        );
+        assert!(w.message.contains("2026-08-14T17:13:44Z"), "{}", w.message);
+        // Freshest three, youngest first, self excluded, stale/unknown excluded.
+        assert!(
+            w.message.contains(
+                "fresher peers: live-a (seen 40s ago), live-b (seen 5m ago), live-c (seen 11m ago)"
+            ),
+            "{}",
+            w.message
+        );
+        assert!(
+            !w.message.contains("live-d"),
+            "capped at three alternatives: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("Delivered anyway"),
+            "advisory, never a gate: {}",
+            w.message
+        );
+    }
+
+    #[test]
+    fn stale_target_with_no_fresh_peer_says_so() {
+        let snap = RoomSnapshot {
+            squads: vec![
+                squad("me", store::FRESHNESS_FRESH, Some(2)),
+                squad("ghost", store::FRESHNESS_STALE, Some(90_000)),
+            ],
+            ..RoomSnapshot::default()
+        };
+        let w = stale_target_warning(&snap, "me", Some("ghost")).unwrap();
+        assert!(
+            w.message.contains("no fresh peer is visible right now"),
+            "{}",
+            w.message
+        );
+    }
+
+    #[test]
+    fn no_warning_for_fresh_unknown_broadcast_self_or_absent_targets() {
+        let snap = room();
+        for target in [
+            Some("live-a"),
+            Some("odd"),
+            Some("all"),
+            Some("me"),
+            Some("never-entered"),
+            None,
+        ] {
+            assert!(
+                stale_target_warning(&snap, "me", target).is_none(),
+                "target {target:?} must not warn"
+            );
+        }
+    }
+
+    #[test]
+    fn age_formatting_is_coarse_and_monotonic() {
+        assert_eq!(format_age_short(-5), "0s");
+        assert_eq!(format_age_short(119), "119s");
+        assert_eq!(format_age_short(120), "2m");
+        assert_eq!(format_age_short(7199), "119m");
+        assert_eq!(format_age_short(7200), "2h");
+        assert_eq!(format_age_short(31 * 3600), "31h");
+        assert_eq!(format_age_short(2 * 86_400), "2d");
+    }
 }
 
 /// Non-blocking advisory emitted by `rally say` when an external-intake

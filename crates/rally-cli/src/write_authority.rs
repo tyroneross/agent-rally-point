@@ -716,6 +716,7 @@ mod tests {
             last_seen_ts: iso_ago(silent_secs),
             status: "idle".to_string(),
             acknowledged: false,
+            ..Default::default()
         }
     }
 
