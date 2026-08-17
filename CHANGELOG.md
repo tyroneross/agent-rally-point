@@ -5,6 +5,43 @@
 
 All notable changes to Agent Rally Point are documented here.
 
+## Unreleased
+
+### Changed — Tier-1 fan-out resolves a width instead of obeying a hardcoded 4
+
+The Tier-1 cap was the prose string `Hard cap: **≤4 parallel**` in
+`skills/rally-workflows/SKILL.md`. A constant cannot report why it stopped you,
+so every host inherited the most conservative machine's answer and had no way to
+distinguish "the host capped us at 4" from "there were only 4 ready tasks".
+
+`dynamic-workflows/core/fanout.mjs` (new) resolves `effective_max` as the minimum
+of named caps — `requested_or_config`, `hard_ceiling`, a host-supplied `host`,
+and `ready_tasks` — and returns the `limiting_factors` that tied for it. Default
+width is **10**, hard ceiling **12**.
+
+Rally never spawns, so it has no model, token ledger, or CPU picture; the host
+passes its own ceiling as `hostCap` and Rally owns only the structural limits
+every host shares. That is the one deliberate divergence from build-loop's
+`scripts/parallelism.py`, whose equivalent resolver is token-led because it can
+read a cost ledger. The min-of-named-caps shape and the `limiting_factors`
+reporting are the same; the resource inputs are not. A host with no resource
+picture omits `hostCap` and takes the default.
+
+The ceiling guards coordination overhead — each hook fire writes ledger lines
+back into the ledger (O39) — and not write safety. Write safety is
+`workstream-lint.mjs`'s disjoint-`owns` proof, which runs before dispatch and
+holds at any N, so raising the width does not weaken the boundary guarantee.
+
+`tests/fanout.test.mjs` covers it with 10 cases including a limiter integration
+asserting peak in-flight equals the resolved width. Both mutations fail the
+suite: restoring `DEFAULT_MAX = 4` fails 1, dropping the hard ceiling from the
+caps map fails 2.
+
+The `≤4` language is removed from `SKILL.md`, `COORDINATION.md`, `PROTOCOL.md`,
+`README.md`, `docs/FEATURE-dynamic-workflows.md`, and
+`docs/ANY-AGENT-ONBOARDING.md`; the Codex host surface is regenerated from the
+canonical skill via `scripts/build-codex-artifact.sh`.
+
 ## v0.2.5 - 2026-08-15
 
 > Release date is set when the tag is cut; entries for the native before-write hook and RC-073 land under this heading before then.

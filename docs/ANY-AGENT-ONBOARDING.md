@@ -63,6 +63,12 @@ prompt per task with `node dynamic-workflows/core/packet.mjs <descriptor>.json
 turning a vague goal into that descriptor. Rally records and lints the fan-out;
 your host's own spawn mechanism runs the agents.
 
+Resolve how many to run at once with `resolveFanout()` from
+`dynamic-workflows/core/fanout.mjs` rather than picking a number — it returns the
+width (default 10, hard ceiling 12) alongside the `limiting_factors` that produced
+it. Pass your own resource ceiling as `hostCap`; Rally never spawns, so it has no
+model, token, or CPU picture of its own.
+
 ## Tool Ids
 
 Use a stable id that names the runtime and, when needed, the lane:

@@ -211,7 +211,9 @@ done
 
 This is the piece pi structurally cannot have: **state lives in Rally, not a parent's RAM**, so a
 multi-hour / multi-session / multi-host workstream survives a crash and resumes exactly where it
-stopped. Bounded concurrency (`core/limiter.mjs`, lifted from pi) still caps in-flight fan-out.
+stopped. Bounded concurrency (`core/limiter.mjs`, lifted from pi) still caps in-flight fan-out;
+`core/fanout.mjs` supplies the width and names the constraint that set it (default 10, hard
+ceiling 12).
 
 **Lineage from the .mjs path.** `core/route.mjs` owns concurrency/ordering only — it does **not**
 shell out to `rally`; the host supplies each task body as a thunk. So the lineage markers
