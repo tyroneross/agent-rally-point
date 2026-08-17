@@ -399,9 +399,23 @@ exit 97
         self.assertNotIn("attestations: write", publish)
 
         contract_command = "python3 tests/scripts/test_release_workflow_contract.py"
-        self.assertIn(contract_command, job_block("quality"))
+        release_quality = job_block("quality")
+        for strict_release_control in (
+            "cargo install cargo-nextest --locked",
+            "cargo install cargo-audit cargo-deny --locked",
+            "python3 tests/scripts/test_release_readiness.py",
+            "python3 tests/scripts/test_run_release_auxiliary_gate.py",
+            contract_command,
+            "run: ./scripts/run-release-auxiliary-gate.sh\n",
+        ):
+            self.assertIn(strict_release_control, release_quality)
+        self.assertNotIn("run-release-auxiliary-gate.sh --product-only", release_quality)
         ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn(contract_command, ci)
+        self.assertIn("./scripts/run-release-auxiliary-gate.sh --product-only", ci)
+        self.assertNotIn("cargo install cargo-nextest", ci)
+        self.assertNotIn("cargo install cargo-audit", ci)
+        self.assertNotIn("test_release_readiness.py", ci)
 
         stage = step_block("Stage all release assets in a draft")
         for setting in (

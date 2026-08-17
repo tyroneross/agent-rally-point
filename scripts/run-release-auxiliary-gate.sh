@@ -2,9 +2,20 @@
 # SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 # SPDX-License-Identifier: Apache-2.0
 #
-# Build the current Rally CLI, run the packaged workflow suite against that
-# exact executable, and exercise every pre-push integration suite.
+# Build the current Rally CLI and run product-level acceptance against that
+# exact executable. The default release mode also exercises maintainer-only
+# pre-push integration suites; --product-only omits those duplicate internals.
 set -euo pipefail
+
+product_only=0
+if [ "${1:-}" = "--product-only" ]; then
+  product_only=1
+  shift
+fi
+if [ "$#" -ne 0 ]; then
+  echo "usage: $0 [--product-only]" >&2
+  exit 64
+fi
 
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
@@ -91,6 +102,15 @@ skipped_tests=$(printf '%s\n' "$npm_output" | awk '/^# skipped [0-9][0-9]*$/ { p
 if ! [[ "$skipped_tests" =~ ^0$ ]]; then
   echo "release-auxiliary-gate: packaged workflow suite must report exactly zero skipped tests" >&2
   exit 1
+fi
+
+echo "release-auxiliary-gate: 2/4/6-agent local-repo acceptance" >&2
+RALLY_BIN="$rally_binary" ./scripts/scale_reliability_test.sh \
+  --mode both --scales 2,4,6 --max-wall-s 20
+
+if [ "$product_only" -eq 1 ]; then
+  echo "release-auxiliary-gate: product acceptance green" >&2
+  exit 0
 fi
 
 echo "release-auxiliary-gate: pre-push hook suites" >&2

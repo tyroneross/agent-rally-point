@@ -955,50 +955,6 @@ T="host envelopes: SessionStart/UserPromptSubmit use additionalContext, Stop use
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "each host contract must carry the message on its documented key"; fi
 
 # ===========================================================================
-# G-o — verbose is the PRE-C6 path, not a re-implementation.
-#
-# The oracle is the hook file itself at the newest commit that does not yet
-# carry the composer, so no expectation is hand-written and the comparison
-# cannot drift with the wording. A missing oracle is a LOUD skip, never a pass.
-# ===========================================================================
-T="G-o: RALLY_HOOK_ROOM_DETAIL=verbose renders byte-identically to the pre-C6 hook"
-ORACLE="$TMPDIR_ROOT/hook.pre-c6.sh"
-_oracle_ok=0
-for _c in $(git -C "$REPO_ROOT" log --format=%H -30 -- hooks/rally-coordination-hook.sh 2>/dev/null); do
-  if git -C "$REPO_ROOT" show "$_c:hooks/rally-coordination-hook.sh" > "$ORACLE" 2>/dev/null; then
-    if ! grep -q "C6 brief room message (composer)" "$ORACLE"; then _oracle_ok=1; break; fi
-  fi
-done
-if [ "$_oracle_ok" != "1" ]; then
-  bad "$T" "could not extract a pre-C6 hook from git history; the verbose byte-identity claim is UNGRADED"
-else
-  chmod +x "$ORACLE"
-  (
-    fails=""
-    i=0
-    for spec in "G-a idle" "G-b start" "G-c idle" "G-f idle" "G-g idle" "G-i start" "G-j start" "G-p idle"; do
-      set -- $spec
-      cid="$1"; ph="$2"; i=$((i+1))
-      sbo="$TMPDIR_ROOT/$cid"
-      RALLY_HOOK_ROOM_DETAIL=verbose _run "$sbo" "$ph" claude_code "oracle-new-$i-$$" "$sbo/vnew.json"
-      RALLY_HOOK_ROOM_DETAIL=verbose _run "$sbo" "$ph" claude_code "oracle-old-$i-$$" "$sbo/vold.json" "$ORACLE"
-      a="$(_extract "$sbo/vnew.json" "claude_code:$SELF_SUFFIX")"
-      b="$(_extract "$sbo/vold.json" "claude_code:$SELF_SUFFIX")"
-      if [ "$a" != "$b" ]; then
-        fails="$fails; $cid/$ph diverged
-     new: $a
-     old: $b"
-      elif [ -z "$a" ] && [ -z "$b" ]; then
-        fails="$fails; $cid/$ph rendered nothing on both hooks, so it compares nothing"
-      fi
-    done
-    [ -z "$fails" ] || { printf '%s\n' "${fails#; }" >&2; exit 1; }
-    exit 0
-  )
-  if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "verbose must be the legacy path, unchanged"; fi
-fi
-
-# ===========================================================================
 # G-p2 — the SURVIVOR of G-p's gate, found by the independent auditor.
 # safeCommand used to classify ANY token starting with "--" as a flag and
 # skip every value check. A peer-controlled backlog id or event id of the

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Hard scale/reliability gate. Every reported success must exist exactly once
-# in the canonical ledger; expected shared-path claim conflicts are the only
-# accepted operation failures.
+# Small-team reliability gate. It models persistent local agent sessions in one
+# repo after the optional daemon is ready. Every reported success must exist
+# exactly once in the canonical ledger; shared-path claim conflicts are the
+# only accepted operation failures.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -10,18 +11,20 @@ SOURCE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 source "$SCRIPT_DIR/disposable-repo-guard.sh"
 
 MODE="both"
-SCALES="4,8,16,32"
+SCALES="2,4,6"
+MAX_WALL_S="0"
 SELF_TEST=0
 INTERNAL_MUTANT="${RALLY_SCALE_MUTANT:-}"
 
 usage() {
-  echo "usage: RALLY_BIN=/path/to/rally $0 [--mode direct|daemon|both] [--scales 4,8,16,32] [--self-test]" >&2
+  echo "usage: RALLY_BIN=/path/to/rally $0 [--mode direct|daemon|both] [--scales 2,4,6] [--max-wall-s seconds] [--self-test]" >&2
 }
 
 while (($#)); do
   case "$1" in
     --mode) MODE="${2:-}"; shift 2 ;;
     --scales) SCALES="${2:-}"; shift 2 ;;
+    --max-wall-s) MAX_WALL_S="${2:-}"; shift 2 ;;
     --self-test) SELF_TEST=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 64 ;;
@@ -29,6 +32,10 @@ while (($#)); do
 done
 
 case "$MODE" in direct|daemon|both) ;; *) usage; exit 64 ;; esac
+if ! [[ "$MAX_WALL_S" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]]; then
+  echo "GATE_FAIL max wall: --max-wall-s must be a non-negative number" >&2
+  exit 64
+fi
 RALLY="${RALLY_BIN:-}"
 if [[ -z "$RALLY" || ! -x "$RALLY" ]]; then
   echo "GATE_FAIL binary: RALLY_BIN must name an executable rally binary" >&2
@@ -51,7 +58,7 @@ run_case() {
   capture() {
     local index="$1" op="$2"
     shift 2
-    "$RALLY" "$@" >"$results/$index.$op.json" 2>"$results/$index.$op.err"
+    env -u GITHUB_ACTIONS -u GITHUB_RUN_ID "$RALLY" "$@" >"$results/$index.$op.json" 2>"$results/$index.$op.err"
     printf '%s\n' "$?" >"$results/$index.$op.rc"
   }
 
@@ -59,7 +66,7 @@ run_case() {
     (
       cd "$repo" || exit 1
       rally_assert_disposable_repo "$repo" "$tmp" "$SOURCE_ROOT" || exit 70
-      HOME="$tmp/home" "$RALLY" enter --tool lead:seed --session-id seed --json --timeout-ms 60000
+      HOME="$tmp/home" RALLY_SESSION_ID=seed env -u GITHUB_ACTIONS -u GITHUB_RUN_ID "$RALLY" enter --tool lead:seed --json --timeout-ms 60000
     ) >"$results/seed.json" 2>"$results/seed.err"
     if [[ $? -ne 0 ]]; then
       echo "GATE_FAIL mode=$mode scale=$n daemon seed failed" >&2
@@ -68,14 +75,14 @@ run_case() {
     (
       cd "$repo" || exit 1
       rally_assert_disposable_repo "$repo" "$tmp" "$SOURCE_ROOT" || exit 70
-      HOME="$tmp/home" "$RALLY" daemon serve --idle-exit-secs 180
+      HOME="$tmp/home" env -u GITHUB_ACTIONS -u GITHUB_RUN_ID "$RALLY" daemon serve --idle-exit-secs 180
     ) >"$results/daemon.out" 2>"$results/daemon.err" &
     daemon_pid=$!
     local ready=0
     for _ in {1..300}; do
       if (
         cd "$repo" || exit 1
-        HOME="$tmp/home" "$RALLY" daemon status --json
+        HOME="$tmp/home" env -u GITHUB_ACTIONS -u GITHUB_RUN_ID "$RALLY" daemon status --json
       ) >"$results/status.json" 2>"$results/status.err" &&
         python3 - "$results/status.json" <<'PY'
 import json,sys
@@ -108,7 +115,8 @@ PY
       cd "$repo" || exit 1
       rally_assert_disposable_repo "$repo" "$tmp" "$SOURCE_ROOT" || exit 70
       export HOME="$tmp/home"
-      capture "$i" enter enter --tool "$tool" --session-id "scale-$i" --json --timeout-ms 60000
+      export RALLY_SESSION_ID="scale-$i"
+      capture "$i" enter enter --tool "$tool" --json --timeout-ms 60000
       capture "$i" next next --tool "$tool" --json --timeout-ms 60000
       capture "$i" check check before-write --tool "$tool" --path "$path" --strict --json --timeout-ms 60000
       capture "$i" claim say claim --tool "$tool" --path "$path" --subject "scale-$mode-$n-claim-$i" --json --timeout-ms 60000
@@ -147,9 +155,9 @@ for path in glob.glob(os.path.join(repo,".rally","log","*.jsonl")):
 PY
   fi
 
-  python3 - "$mode" "$n" "$repo" "$results" "$start" "$end" "$INTERNAL_MUTANT" <<'PY'
+  python3 - "$mode" "$n" "$repo" "$results" "$start" "$end" "$INTERNAL_MUTANT" "$MAX_WALL_S" <<'PY'
 import glob,json,os,sqlite3,sys
-mode,n,repo,res,start,end,mutant=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4],float(sys.argv[5]),float(sys.argv[6]),sys.argv[7]
+mode,n,repo,res,start,end,mutant,max_wall_s=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4],float(sys.argv[5]),float(sys.argv[6]),sys.argv[7],float(sys.argv[8])
 failures=[]
 docs={}
 def load(i,op):
@@ -179,6 +187,23 @@ for i in range(n):
         elif i % 2:
             if rc != 0 or doc.get("ok") is not True:
                 failures.append(f"unique claim failed {i}: rc={rc} ok={doc.get('ok')}")
+
+session_ids=[]
+for i in range(n):
+    def fact_session(op, kind):
+        outcomes=docs[(i,op)].get("data",{}).get("append_outcomes",[])
+        matches=[row.get("fact",{}).get("from_session_id") for row in outcomes
+                 if row.get("committed") and row.get("fact",{}).get("kind")==kind]
+        return matches[0] if len(matches)==1 else None
+    entered=fact_session("enter","presence")
+    artifact=fact_session("artifact","artifact")
+    if not entered or not entered.startswith("sess:managed:"):
+        failures.append(f"agent {i} did not use managed local identity: {entered}")
+    elif artifact != entered:
+        failures.append(f"agent {i} identity changed between turns: enter={entered} artifact={artifact}")
+    session_ids.append(entered)
+if len(set(session_ids)) != n:
+    failures.append(f"agents did not receive {n} distinct sessions: {session_ids}")
 
 shared_success=[]
 for i in range(0,n,2):
@@ -215,7 +240,10 @@ try:
     if check != "ok": failures.append(f"integrity failure: {check}")
 except Exception as exc: failures.append(f"integrity check failed: {exc}")
 
-summary={"mode":mode,"scale":n,"wall_s":round(end-start,2),"shared_claim_winner":shared_success,"failures":failures}
+wall_s=end-start
+if max_wall_s and wall_s > max_wall_s:
+    failures.append(f"wall time {wall_s:.2f}s exceeded {max_wall_s:.2f}s")
+summary={"mode":mode,"scale":n,"wall_s":round(wall_s,2),"max_wall_s":max_wall_s or None,"shared_claim_winner":shared_success,"failures":failures}
 print(json.dumps(summary,sort_keys=True))
 raise SystemExit(1 if failures else 0)
 PY
@@ -229,19 +257,25 @@ PY
 }
 
 run_self_test() {
-  local failures=0 rc
+  local failures=0 rc threshold_output
   set +e
   RALLY_SCALE_MUTANT=op-failure RALLY_BIN="$RALLY" "$0" --mode direct --scales 2 >/dev/null 2>&1
   rc=$?; [[ $rc -ne 0 ]] || { echo "SELF_TEST_FAIL forced operation failure passed" >&2; failures=$((failures+1)); }
   RALLY_SCALE_MUTANT=silent-loss RALLY_BIN="$RALLY" "$0" --mode direct --scales 2 >/dev/null 2>&1
   rc=$?; [[ $rc -ne 0 ]] || { echo "SELF_TEST_FAIL forced silent loss passed" >&2; failures=$((failures+1)); }
+  threshold_output=$(RALLY_BIN="$RALLY" "$0" --mode direct --scales 2 --max-wall-s 0.000001 2>&1)
+  rc=$?
+  if [[ $rc -eq 0 || "$threshold_output" != *"wall time "*" exceeded "* ]]; then
+    echo "SELF_TEST_FAIL impossible wall threshold did not fail for the expected reason" >&2
+    failures=$((failures+1))
+  fi
   RALLY_BIN="/definitely/missing/rally" "$0" --mode direct --scales 2 >/dev/null 2>&1
   rc=$?; [[ $rc -ne 0 ]] || { echo "SELF_TEST_FAIL missing binary passed" >&2; failures=$((failures+1)); }
   RALLY_BIN="/usr/bin/true" "$0" --mode direct --scales 2 >/dev/null 2>&1
   rc=$?; [[ $rc -ne 0 ]] || { echo "SELF_TEST_FAIL wrong binary passed" >&2; failures=$((failures+1)); }
   set -e
   if [[ $failures -eq 0 ]]; then
-    echo '{"self_test":"pass","mutants_rejected":["operation-failure","silent-loss","missing-binary","wrong-binary"]}'
+    echo '{"self_test":"pass","mutants_rejected":["operation-failure","silent-loss","wall-threshold","missing-binary","wrong-binary"]}'
     return 0
   fi
   return 1

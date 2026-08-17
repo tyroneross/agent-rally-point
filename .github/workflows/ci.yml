@@ -1,10 +1,9 @@
 # SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 # SPDX-License-Identifier: Apache-2.0
 #
-# CI: runs the SAME quality gate as local pre-push (scripts/run-quality-gate.sh
-# — one shared definition, see .githooks/pre-push) plus the release-version
-# parity check (scripts/check-release-parity.sh), on every pull request and on
-# push to main/codex/**/bl/**.
+# CI: validates source quality, current release parity, packaged workflows, and
+# a representative 2/4/6-agent local-repo workload. Maintainer-only pre-push
+# contracts and supply-chain publication checks remain in the release workflow.
 #
 # For the pull_request trigger we check out the PR HEAD SHA EXPLICITLY
 # (github.event.pull_request.head.sha) rather than relying on the default
@@ -70,40 +69,24 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
-
-      # SEC-002: run-quality-gate.sh's dep-changed cargo-audit/cargo-deny
-      # steps are fail-soft (print "not installed — SKIPPED" and continue)
-      # so a change to a Cargo.lock-affecting dependency never actually gets
-      # scanned in CI without these installed. Local pre-push stays
-      # fail-soft by design (no forced install there); CI is where the
-      # supply-chain gate must actually run.
-      - name: Install cargo-audit + cargo-deny
-        run: cargo install cargo-audit cargo-deny --locked
-
       - name: Quality gate (scripts/run-quality-gate.sh — same gate as local pre-push)
         run: ./scripts/run-quality-gate.sh
 
       - name: Release parity (scripts/check-release-parity.sh)
         run: ./scripts/check-release-parity.sh
 
-      - name: Release-readiness contract tests
-        run: |
-          python3 tests/scripts/test_release_readiness.py
-          python3 tests/scripts/test_run_release_auxiliary_gate.py
-          python3 tests/scripts/test_release_workflow_contract.py
+      - name: CI and release workflow contract
+        run: python3 tests/scripts/test_release_workflow_contract.py
 
       - name: Install Node.js (pinned)
         uses: actions/setup-node@v6
         with:
           node-version: '22.22.0'
 
-      # One shared gate builds the current release binary, requires the
-      # packaged Node suite to execute with zero skips, and runs every pre-push
-      # contract suite without duplicating that logic in workflow YAML.
-      - name: Release auxiliary gate
-        run: ./scripts/run-release-auxiliary-gate.sh
+      # Build the exact release binary, run packaged workflow acceptance, then
+      # model individuals/small teams coordinating 2, 4, and 6 local agents.
+      - name: Product acceptance gate
+        run: ./scripts/run-release-auxiliary-gate.sh --product-only
 
       - name: Workflow syntax (Actionlint 1.7.12)
         uses: docker://rhysd/actionlint:1.7.12

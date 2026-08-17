@@ -76,6 +76,19 @@ exit "${AUX_NPM_EXIT:-0}"
 """,
         )
         make_executable(
+            self.root / "scripts/scale_reliability_test.sh",
+            """#!/usr/bin/env bash
+set -euo pipefail
+printf 'scale:%s\n' "$*" >> "$AUX_LOG"
+printf 'scale-binary:%s\n' "${RALLY_BIN:-}" >> "$AUX_LOG"
+if [ "${RALLY_BIN:-}" != "$AUX_BUILT_BINARY" ]; then
+  printf 'wrong scale binary: %s\n' "${RALLY_BIN:-}" >&2
+  exit 92
+fi
+exit "${AUX_SCALE_EXIT:-0}"
+""",
+        )
+        make_executable(
             self.root / "tests/hooks/test_prepush_alpha.sh",
             "#!/usr/bin/env bash\nprintf 'prepush:alpha\\n' >> \"$AUX_LOG\"\n",
         )
@@ -96,7 +109,11 @@ exit "${AUX_NPM_EXIT:-0}"
             encoding="utf-8",
         )
 
-    def run_gate(self, *, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def run_gate(
+        self,
+        *args: str,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         env = {
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "AUX_ROOT": str(self.root),
@@ -107,7 +124,7 @@ exit "${AUX_NPM_EXIT:-0}"
         if extra_env:
             env.update(extra_env)
         return subprocess.run(
-            ["bash", "scripts/run-release-auxiliary-gate.sh"],
+            ["bash", "scripts/run-release-auxiliary-gate.sh", *args],
             cwd=self.root,
             env=env,
             text=True,
@@ -129,12 +146,31 @@ exit "${AUX_NPM_EXIT:-0}"
                 "cargo:build --release -p rally-cli --bin rally --message-format=json-render-diagnostics",
                 "npm:--prefix dynamic-workflows test",
                 f"npm-binary:{self.built_binary}",
+                "scale:--mode both --scales 2,4,6 --max-wall-s 20",
+                f"scale-binary:{self.built_binary}",
                 "prepush:alpha",
                 "prepush:beta",
             ],
         )
         self.assertIn("# tests 3", result.stdout)
         self.assertIn("# skipped 0", result.stdout)
+
+    def test_product_only_runs_user_acceptance_without_maintainer_suites(self) -> None:
+        result = self.run_gate("--product-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "scale:--mode both --scales 2,4,6 --max-wall-s 20",
+            self.commands(),
+        )
+        self.assertNotIn("prepush:alpha", self.commands())
+        self.assertIn("product acceptance green", result.stderr)
+
+    def test_scale_failure_blocks_product_acceptance(self) -> None:
+        result = self.run_gate(
+            "--product-only", extra_env={"AUX_SCALE_EXIT": "17"}
+        )
+        self.assertEqual(result.returncode, 17)
+        self.assertNotIn("prepush:alpha", self.commands())
 
     def test_missing_current_binary_does_not_fall_back_to_stale_default(self) -> None:
         result = self.run_gate(extra_env={"AUX_CREATE_BINARY": "0"})
