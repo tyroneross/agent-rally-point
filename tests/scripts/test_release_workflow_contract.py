@@ -425,13 +425,13 @@ exit 97
             "id: upload_draft",
             "uses: softprops/action-gh-release@v3",
             "tag_name: ${{ needs.resolve.outputs.tag }}",
-            "target_commitish: ${{ needs.resolve.outputs.sha }}",
             "draft: true",
             "generate_release_notes: true",
             "fail_on_unmatched_files: true",
             "files: release-assets/*",
         ):
             self.assertIn(setting, stage)
+        self.assertNotIn("target_commitish:", stage)
 
         publish_steps = job_steps("publish")
         self.assertEqual(
