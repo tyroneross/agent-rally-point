@@ -79,15 +79,25 @@ its `owns`, `validation`, and `output` only — minimal context.
 constraint that produced it, so a host nowhere near its ceiling can say so:
 
 ```js
-import { resolveFanout } from "./dynamic-workflows/core/fanout.mjs";
+import { resolveFanout, liveAgentsFromRoom } from "./dynamic-workflows/core/fanout.mjs";
 import { createLimiter } from "./dynamic-workflows/core/limiter.mjs";
+
+// `rally room --json` — peers already working hold capacity you cannot use.
+const live = liveAgentsFromRoom(roomSnapshot, { excludeTools: [myTool, ...myTaskTools] });
 
 const { effective_max, limiting_factors } = resolveFanout({
   hostCap: <your CPU- or token-derived ceiling>,  // omit if you have no resource picture
   readyTasks: tasks.filter(dispatchable).length,
+  liveAgents: live.count,
 });
 const run = createLimiter(effective_max);
 ```
+
+`liveAgentsFromRoom` counts squads that are `fresh` **and** `active` — a stale squad is a session
+that ended without stopping, and an idle one holds nothing. **Pass your own tool ids in
+`excludeTools`**: the orchestrator and every id it fans out under are fresh+active squads too, so
+omitting them makes a fan-out subtract itself. This is the one input the host cannot supply — your
+process cannot see the two peers another terminal started ten minutes ago.
 
 Default width is **10**, hard ceiling **12** — the ceiling exists for coordination overhead (each
 hook fire writes ledger lines back into the ledger), not for write safety. Write safety comes from

@@ -32,7 +32,31 @@ back into the ledger (O39) — and not write safety. Write safety is
 `workstream-lint.mjs`'s disjoint-`owns` proof, which runs before dispatch and
 holds at any N, so raising the width does not weaken the boundary guarantee.
 
-`tests/fanout.test.mjs` covers it with 10 cases including a limiter integration
+### Added — fan-out width accounts for peers already working
+
+A width resolved against an empty machine over-subscribes a busy one. Rally is
+the only party that can see this: a host sees its own process, not the two peers
+another terminal started ten minutes ago. `liveAgentsFromRoom()` reads a
+`rally room --json` snapshot and counts squads that are `freshness: "fresh"` AND
+`status: "active"` — a stale squad is a session that ended without stopping, and
+an idle one holds no capacity. That count becomes a `room_headroom` cap.
+
+Callers pass their own tool ids as `excludeTools`; the orchestrator and every id
+it fans out under are fresh+active squads too, so omitting them makes a fan-out
+subtract itself. A saturated room floors the width at 1 rather than deadlocking
+the workstream.
+
+Still host-supplied and unchanged: the resource ceiling (`hostCap`). Rally does
+not model agent capability — see the note below on per-task model tier, which is
+NOT yet expressible in a descriptor.
+
+**Not built:** weighting a task by the model tier that will run it, so ten
+`Fast` scanners and ten `Frontier` judges stop counting the same. The descriptor
+has no model-tier field today (`tier` already means the spawn tier,
+`host-native | cross-host`), so this needs a protocol field plus a linter rule,
+not a resolver change.
+
+`tests/fanout.test.mjs` covers it with 17 cases including a limiter integration
 asserting peak in-flight equals the resolved width. Both mutations fail the
 suite: restoring `DEFAULT_MAX = 4` fails 1, dropping the hard ceiling from the
 caps map fails 2.

@@ -3,8 +3,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveFanout, DEFAULT_MAX, HARD_CEILING } from "../core/fanout.mjs";
+import { resolveFanout, liveAgentsFromRoom, DEFAULT_MAX, HARD_CEILING } from "../core/fanout.mjs";
 import { createLimiter } from "../core/limiter.mjs";
+
+const squad = (tool, freshness, status) => ({ tool, freshness, status });
+const roomWith = (...squads) => ({ data: { room: { squads } } });
 
 test("defaults to DEFAULT_MAX when nothing is supplied", () => {
   const r = resolveFanout();
@@ -60,6 +63,67 @@ test("floors at 1 for zero, negative, and non-integer inputs", () => {
     assert.ok(r.effective_max >= 1, `expected >= 1 for input ${String(bad)}`);
   }
   assert.equal(resolveFanout({ configMax: 10, hostCap: 0 }).effective_max, 10);
+});
+
+test("counts only fresh AND active squads as live agents", () => {
+  const live = liveAgentsFromRoom(
+    roomWith(
+      squad("a:1", "fresh", "active"),
+      squad("a:2", "fresh", "idle"), // present but holding nothing
+      squad("a:3", "stale", "active"), // ended without stopping
+      squad("a:4", "stale", "idle"),
+    ),
+  );
+  assert.equal(live.count, 1);
+  assert.deepEqual(live.tools, ["a:1"]);
+});
+
+test("excludes your own tool ids so a fan-out does not subtract itself", () => {
+  const room = roomWith(
+    squad("orchestrator", "fresh", "active"),
+    squad("orchestrator:p01", "fresh", "active"),
+    squad("peer:other", "fresh", "active"),
+  );
+  assert.equal(liveAgentsFromRoom(room).count, 3);
+  const live = liveAgentsFromRoom(room, { excludeTools: ["orchestrator", "orchestrator:p01"] });
+  assert.equal(live.count, 1);
+  assert.deepEqual(live.tools, ["peer:other"]);
+});
+
+test("accepts every room envelope shape and tolerates a missing squads list", () => {
+  const squads = [squad("a:1", "fresh", "active")];
+  assert.equal(liveAgentsFromRoom({ data: { room: { squads } } }).count, 1);
+  assert.equal(liveAgentsFromRoom({ room: { squads } }).count, 1);
+  assert.equal(liveAgentsFromRoom({ squads }).count, 1);
+  assert.equal(liveAgentsFromRoom({}).count, 0);
+  assert.equal(liveAgentsFromRoom(null).count, 0);
+});
+
+test("live peers consume headroom out of the config max", () => {
+  const r = resolveFanout({ configMax: 10, liveAgents: 4 });
+  assert.equal(r.effective_max, 6);
+  assert.deepEqual(r.limiting_factors, ["room_headroom"]);
+  assert.equal(r.live_agents, 4);
+});
+
+test("a saturated room floors at 1 rather than deadlocking the workstream", () => {
+  const r = resolveFanout({ configMax: 10, liveAgents: 50 });
+  assert.equal(r.effective_max, 1);
+  assert.deepEqual(r.limiting_factors, ["room_headroom"]);
+});
+
+test("an empty room adds no headroom constraint at all", () => {
+  const r = resolveFanout({ configMax: 8, liveAgents: 0 });
+  assert.ok(!("room_headroom" in r.caps), "no live peers should not create a cap");
+  assert.equal(r.effective_max, 8);
+});
+
+test("room headroom composes with the other caps", () => {
+  // config 10 - 2 live = 8 headroom, but only 3 tasks are ready.
+  const r = resolveFanout({ configMax: 10, liveAgents: 2, readyTasks: 3 });
+  assert.equal(r.effective_max, 3);
+  assert.deepEqual(r.limiting_factors, ["ready_tasks"]);
+  assert.equal(r.caps.room_headroom, 8);
 });
 
 test("the resolved width actually bounds a limiter's in-flight count", async () => {

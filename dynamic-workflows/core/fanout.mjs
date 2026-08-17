@@ -23,6 +23,8 @@
 // lines back into the ledger, so cost grows with agent count. That, not write
 // safety, is what HARD_CEILING guards.
 
+import { extractRoom } from "./workstream-status.mjs";
+
 /** Never exceed, on any host — coordination / ledger overhead. */
 export const HARD_CEILING = 12;
 
@@ -31,6 +33,33 @@ export const DEFAULT_MAX = 10;
 
 function positiveInt(value) {
   return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+/**
+ * Count agents already working in the room, so a fan-out sizes to the headroom
+ * that is left rather than to an empty machine.
+ *
+ * This is the one input the HOST cannot supply and Rally can: a host sees its
+ * own process, not the two peers a different terminal started ten minutes ago.
+ * "Working" is `freshness: "fresh"` AND `status: "active"` — a stale squad is a
+ * session that ended without stopping, and an idle one holds no capacity.
+ *
+ * @param {object}   raw               `rally room --json` envelope, `{room}`, or a bare room.
+ * @param {object}   [opts]
+ * @param {string[]} [opts.excludeTools]  Tool ids that are YOU. The orchestrator and
+ *                                        every id it fans out under are fresh+active
+ *                                        squads too; counting them subtracts yourself.
+ * @returns {{count: number, tools: string[]}}
+ */
+export function liveAgentsFromRoom(raw, { excludeTools = [] } = {}) {
+  const room = extractRoom(raw) ?? {};
+  const squads = Array.isArray(room.squads) ? room.squads : [];
+  const excluded = new Set(excludeTools);
+  const tools = squads
+    .filter((s) => s?.freshness === "fresh" && s?.status === "active" && !excluded.has(s?.tool))
+    .map((s) => s.tool)
+    .sort();
+  return { count: tools.length, tools };
 }
 
 /**
@@ -46,15 +75,18 @@ function positiveInt(value) {
  *                                    Omit when the host has no resource picture.
  * @param {number}  [opts.readyTasks] Dispatchable tasks right now. Never spawn
  *                                    more agents than there is work for.
+ * @param {number}  [opts.liveAgents] Peers already working (see liveAgentsFromRoom).
+ *                                    Consumes headroom out of the config max.
  * @returns {{effective_max: number, limiting_factors: string[], caps: Record<string, number>,
  *            requested: number|null, config_max: number, host_cap: number|null,
- *            ready_tasks: number|null, hard_ceiling: number}}
+ *            ready_tasks: number|null, live_agents: number, hard_ceiling: number}}
  */
 export function resolveFanout(opts = {}) {
   const requested = positiveInt(opts.requested);
   const configMax = positiveInt(opts.configMax) ?? DEFAULT_MAX;
   const hostCap = positiveInt(opts.hostCap);
   const readyTasks = positiveInt(opts.readyTasks);
+  const liveAgents = positiveInt(opts.liveAgents) ?? 0;
 
   const caps = {
     requested_or_config: requested ?? configMax,
@@ -62,6 +94,9 @@ export function resolveFanout(opts = {}) {
   };
   if (hostCap !== null) caps.host = hostCap;
   if (readyTasks !== null) caps.ready_tasks = readyTasks;
+  // Room headroom: peers already working hold capacity this fan-out cannot use.
+  // Floors at 1 — a busy room slows a workstream down, it never deadlocks it.
+  if (liveAgents > 0) caps.room_headroom = Math.max(1, (requested ?? configMax) - liveAgents);
 
   const effective = Math.max(1, Math.min(...Object.values(caps)));
 
@@ -75,6 +110,7 @@ export function resolveFanout(opts = {}) {
     config_max: configMax,
     host_cap: hostCap,
     ready_tasks: readyTasks,
+    live_agents: liveAgents,
     hard_ceiling: HARD_CEILING,
   };
 }
