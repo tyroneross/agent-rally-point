@@ -872,13 +872,36 @@ fn deadline_miss_is_fail_loud_advisory() {
     {
         let fx = Fixture::new("t07a");
         let probe = fx.marker_path(&format!("native-probe.{}.seen", sanitize_bin_path(BIN)));
+        let stat_dir = fx.home.join("stat-bin");
+        let stat_calls = fx.home.join("stat-calls.log");
+        write_executable(
+            &stat_dir.join("stat"),
+            "#!/usr/bin/env bash\n\
+printf '%s\\n' \"$1\" >> \"$STAT_CALLS\"\n\
+case \"$1\" in\n\
+  -c) printf '%s\\n' 'stable-file-id' ;;\n\
+  -f) printf 'fs-%s\\n' \"$(wc -l < \"$STAT_CALLS\")\" ;;\n\
+  *) exit 2 ;;\n\
+esac\n",
+        );
+        let path_env = format!(
+            "{}:{}",
+            stat_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let stat_calls_env = stat_calls.to_string_lossy().into_owned();
         let prime_stdin =
             json!({"tool_name":"Read","tool_input":{"file_path":"src/slow.rs"}}).to_string();
         let prime = fx.run_shell(
             "before-write",
             "claude_code",
             &prime_stdin,
-            &[("RALLY_BIN", BIN), ("RALLY_SESSION_ID", "sess-slow-one")],
+            &[
+                ("RALLY_BIN", BIN),
+                ("RALLY_SESSION_ID", "sess-slow-one"),
+                ("PATH", &path_env),
+                ("STAT_CALLS", &stat_calls_env),
+            ],
         );
         assert!(
             prime.status.success(),
@@ -903,6 +926,8 @@ fn deadline_miss_is_fail_loud_advisory() {
             &[
                 ("RALLY_BIN", BIN),
                 ("RALLY_SESSION_ID", "sess-slow-one"),
+                ("PATH", &path_env),
+                ("STAT_CALLS", &stat_calls_env),
                 // Keep a full second between the assertion ceiling and the
                 // simulated stall so loaded CI runners cannot blur success
                 // (the watchdog fired) with failure (the stall completed).
@@ -938,6 +963,11 @@ fn deadline_miss_is_fail_loud_advisory() {
             probe_verdict(&probe),
             "native",
             "T-07a probe marker must still read native afterward"
+        );
+        assert_eq!(
+            fs::read_to_string(&stat_calls).unwrap_or_default(),
+            "-c\n-c\n",
+            "T-07a must use stable GNU file identity, never GNU filesystem status"
         );
         assert!(
             !fx.active_claims()

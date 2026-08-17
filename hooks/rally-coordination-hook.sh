@@ -285,9 +285,11 @@ _rally_native_capable() {  # $1=root $2=absolute resolved binary path
   safe_bin="${bin//[^A-Za-z0-9._-]/_}"
   marker_dir="$root/.rally/.hook-seen"
   marker="$marker_dir/native-probe.$safe_bin.seen"
-  # BSD stat (macOS) and GNU stat (Linux) disagree on flags; try both and fall
-  # back to an empty id, which simply forces a re-probe rather than wedging.
-  bin_id="$(stat -f '%z:%Fm' "$bin" 2>/dev/null || stat -c '%s:%.9Y' "$bin" 2>/dev/null || true)"
+  # GNU stat accepts `-f` too, but there it selects mutable filesystem status
+  # instead of BSD's format string. Try GNU's file format first (BSD rejects
+  # `-c`), then BSD, and fall back to an empty id so we re-probe rather than
+  # cache against the wrong object.
+  bin_id="$(stat -c '%s:%.9Y' "$bin" 2>/dev/null || stat -f '%z:%Fm' "$bin" 2>/dev/null || true)"
   if [ -f "$marker" ] && [ -n "$bin_id" ]; then
     cached_verdict=""
     cached_id=""
