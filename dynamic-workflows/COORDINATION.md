@@ -121,7 +121,7 @@ A receiver that has all 11 fields never needs to ask "what next?".
 | 11 | **stop** | `blocker \| requires-human \| core-decision \| budget` |
 
 Example (`--summary`): `ref:B9 fix · P1 · owns:crates/rally-cli/src/lib.rs no-touch:next.rs,store.rs ·
-authority:edit+commit · base:own-worktree off main · mode:fix · tier:executing fan-out:≤4 ·
+authority:edit+commit · base:own-worktree off main · mode:fix · tier:executing fan-out:resolved(6/10,host) ·
 exec:verify-loop · validate:cargo test → evidence in artifact · done:rally say artifact then resolve ·
 stop:requires-human|core-decision`. (The `exec:` token names *whichever* plan→execute→review→verify
 loop the squad uses — e.g. `exec:verify-loop` for the rally-minimum, `exec:build-loop` if that plugin

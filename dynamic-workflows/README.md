@@ -33,6 +33,7 @@ in full.
 | `core/workstream-status.mjs` | **Resume helper** — derives done/claimed/read-active/pending + the `to_dispatch` set from a `rally room` snapshot without treating nonexclusive reads as claims |
 | `core/route.mjs` | **Deterministic routing** (ported host-neutral from pi): `parallel`/`pipeline`/`budget` + onError/abort failure-visibility |
 | `core/limiter.mjs` | Bounded-concurrency helper hosts can use to cap their own Tier-1 fan-out |
+| `core/fanout.mjs` | **Fan-out resolver** — `resolveFanout()` returns the width *and* the constraint that bound it (default 10, hard ceiling 12). Feed its `effective_max` to `createLimiter` |
 | [`../skills/rally-workflows/SKILL.md`](../skills/rally-workflows/SKILL.md) | Host-neutral Rally Flow skill (moved out of this module) mapping a workstream onto rally primitives; references `PROTOCOL.md` |
 | `examples/*.workstream.json` | One valid + two invalid descriptors (linter demos) |
 | `tests/*.test.mjs` | Tests across lint / packet / status / route / limiter (Node built-in runner) — run `npm test`. `tests/injection.test.mjs` is the adversarial suite: every test is an attack on the linter or the renderer |

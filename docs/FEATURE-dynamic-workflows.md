@@ -68,8 +68,9 @@ The host-neutral skill that runs the whole arc. Four moves:
    (drop-in context), and a non-empty `tasks[]` where each task carries `id`, `intent`, `owns`,
    `validation`, `output` (+ optional `depends_on`, `tier`, `commands`).
 2. **Lint** — run `workstream-lint.mjs`; do not dispatch until it exits 0.
-3. **Fan out** — Tier 1 (default) host-native subagents, ≤4 parallel; Tier 2 cross-host via
-   `rally run` + `rally inject` when work spans hosts/terminals/machines.
+3. **Fan out** — Tier 1 (default) host-native subagents, width from `resolveFanout()` (default 10,
+   hard ceiling 12); Tier 2 cross-host via `rally run` + `rally inject` when work spans
+   hosts/terminals/machines.
 4. **Per-task rally loop** — each agent: `enter → claim → check before-write → do work → artifact →
    release → next`, stamping `--run`/`--step`/`--parent-step` on every fact so the batch stays
    observable. Idle/blocked → `standby` (dormant), not `blocker` (hard stop).
@@ -85,7 +86,8 @@ Host-side scaffolding the skill leans on. Drop-in, no `npm install`.
 |------|------|
 | `core/workstream-lint.mjs` | **Lint** — source of truth for descriptor validity. Enforces four rules: structural completeness, **MECE** write boundaries (no two write-tasks `own` overlapping paths, prefix-aware), **determinism** (rejects `Date.now()` / `Math.random()` / `new Date()` in declared commands), and dependency integrity (`depends_on` resolves, no cycles). Exit `0` valid · `1` violations · `2` parse error. |
 | `core/route.mjs` | **Route** — host-neutral `parallel()` / `pipeline()` + budget accounting with `onError`/abort failure-visibility. Owns concurrency/ordering only; the host supplies the actual agent-spawn thunks. Adapted from pi-dynamic-workflows (MIT). |
-| `core/limiter.mjs` | **Limiter** — `createLimiter(n)`: bounded-concurrency helper so a host caps its own Tier-1 fan-out (the ≤4 rule) without a concurrency library. Imported only from `./limiter.mjs` (one canonical path). |
+| `core/limiter.mjs` | **Limiter** — `createLimiter(n)`: bounded-concurrency helper so a host caps its own Tier-1 fan-out without a concurrency library. Imported only from `./limiter.mjs` (one canonical path). |
+| `core/fanout.mjs` | **Fan-out resolver** — `resolveFanout()`: returns `effective_max` as the min of named caps (`requested_or_config`, `hard_ceiling`, host-supplied `host`, `ready_tasks`) plus the `limiting_factors` that produced it. Replaces the former hardcoded ≤4. Default 10, hard ceiling 12; the ceiling guards coordination overhead, not write safety — write safety is the linter's disjoint-`owns` proof, which holds at any N. |
 | `core/workstream-status.mjs` | **Status / resume** — the durable counterpart to pi's in-memory `RuntimeState`. Given a descriptor + a `rally room --json` snapshot, classifies each task `done | claimed | pending` and computes the `to_dispatch` set (pending tasks whose deps are all done). Exit `0` complete · `3` work remains · `2` usage/parse error. Convention: a task is *done* when an `artifact`'s subject names its id, *claimed* when an active claim names the id or overlaps its `owns`. **Reads and derives only.** |
 
 `PROTOCOL.md` is the canonical wire spec; `COORDINATION.md` covers multi-autonomous-agent doctrine;

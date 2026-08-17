@@ -12,7 +12,8 @@
     "./lint": "./core/workstream-lint.mjs",
     "./status": "./core/workstream-status.mjs",
     "./route": "./core/route.mjs",
-    "./limiter": "./core/limiter.mjs"
+    "./limiter": "./core/limiter.mjs",
+    "./fanout": "./core/fanout.mjs"
   },
   "scripts": {
     "lint:example": "node core/workstream-lint.mjs examples/audit-repo.workstream.json",

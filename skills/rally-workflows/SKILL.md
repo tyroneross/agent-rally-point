@@ -25,6 +25,7 @@ This skill names no specific agent. Before running, resolve three host values:
 | `<TOOL>` | Your host's rally tool id — the value you pass to `rally enter --tool …`. Use one stable id per terminal/role, e.g. `<host>:<role>:<n>`. The model belongs in the id, not in a separate registration. |
 | Fan-out authorization | Tier-1 in-process fan-out is allowed when the work is parallelizable **and** the descriptor lints clean — **unless your host requires explicit user authorization before spawning subagents/delegating**. If it does, gate Tier-1 on that explicit request; otherwise fan out by default. The rally loop is always active either way; only fan-out is conditional. |
 | Flag conventions | If your host parses structured output, pass `--json` on every `rally` command. Add `--severity` on `rally say blocker` when your host distinguishes severities. |
+| Fan-out width | Your own resource ceiling, passed to `resolveFanout({ hostCap })` (§2). Rally has no model, token, or CPU picture — it never spawns — so it owns only the hard ceiling and the ready-task count. A host with no resource picture omits `hostCap` and takes the default. |
 
 Do not hard-code another agent's identity in a descriptor or command — each host supplies its own
 `<TOOL>` at runtime. Substitute `<TOOL>` wherever it appears below.
@@ -71,8 +72,28 @@ Do not dispatch agents until the linter exits 0.
 
 ## 2 · Tier 1 (default) — host-native fan-out
 
-Use the host's native subagent/delegation tool. Hard cap: **≤4 parallel**. One agent per task
-packet. Prompt each subagent with its `owns`, `validation`, and `output` only — minimal context.
+Use the host's native subagent/delegation tool. One agent per task packet. Prompt each subagent with
+its `owns`, `validation`, and `output` only — minimal context.
+
+**Resolve the width; do not assume a number.** `core/fanout.mjs` returns both the count and the
+constraint that produced it, so a host nowhere near its ceiling can say so:
+
+```js
+import { resolveFanout } from "./dynamic-workflows/core/fanout.mjs";
+import { createLimiter } from "./dynamic-workflows/core/limiter.mjs";
+
+const { effective_max, limiting_factors } = resolveFanout({
+  hostCap: <your CPU- or token-derived ceiling>,  // omit if you have no resource picture
+  readyTasks: tasks.filter(dispatchable).length,
+});
+const run = createLimiter(effective_max);
+```
+
+Default width is **10**, hard ceiling **12** — the ceiling exists for coordination overhead (each
+hook fire writes ledger lines back into the ledger), not for write safety. Write safety comes from
+disjoint `owns`, which the linter proves before dispatch at any N. Report `limiting_factors`
+alongside the count when you log a fan-out; "we ran 4 because the host capped us" and "we ran 4
+because there were only 4 tasks" are different facts.
 
 **Subagent prompt discipline:** the subagent's final action is ONE structured result:
 
