@@ -178,6 +178,8 @@ impl Workspace {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
         cmd.current_dir(&self.cwd)
             .env("HOME", &self.home)
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
             .env("RALLY_SESSION_ID", session_id);
         if self.global_index {
             cmd.env("RALLY_GLOBAL_INDEX", "1");
@@ -4472,6 +4474,8 @@ fn same_tool_sibling_session_cannot_claim_owned_path() {
             .current_dir(&workspace.cwd)
             .env("HOME", &workspace.home)
             .env("RALLY_NO_WORKTREE", "1")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
             .env("RALLY_SESSION_ID", session)
             .args([
                 "say",

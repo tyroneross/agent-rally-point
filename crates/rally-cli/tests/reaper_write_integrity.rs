@@ -550,6 +550,8 @@ fn expired_multi_path_claim_is_reaped_when_observer_pid_was_reused() {
 
     let enter = room
         .rally()
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GITHUB_RUN_ID")
         .env("RALLY_SESSION_ID", "expired-owner-session")
         .env("RALLY_OBSERVER_PID", &observer_pid)
         .args([
@@ -570,6 +572,8 @@ fn expired_multi_path_claim_is_reaped_when_observer_pid_was_reused() {
 
     let claim = room
         .rally()
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GITHUB_RUN_ID")
         .env("RALLY_SESSION_ID", "expired-owner-session")
         .env("RALLY_OBSERVER_PID", &observer_pid)
         .args([
@@ -626,6 +630,8 @@ fn auto_reap_interval_gate_holds_between_completed_enters() {
     room.init_observed_worktree();
     let owner_enter = room
         .rally()
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GITHUB_RUN_ID")
         .env("RALLY_SESSION_ID", "owner-session")
         .env("RALLY_OBSERVER_PID", "2000000000")
         .args([
@@ -646,6 +652,8 @@ fn auto_reap_interval_gate_holds_between_completed_enters() {
     let seed_claim = |subject: &str, path: &str| {
         let out = room
             .rally()
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
             .env("RALLY_SESSION_ID", "owner-session")
             .args([
                 "say",

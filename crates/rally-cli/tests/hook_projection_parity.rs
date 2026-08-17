@@ -56,6 +56,8 @@ impl Workspace {
             .env("HOME", &self.home)
             .env("RALLY_GLOBAL_INDEX", "1")
             .env("RALLY_HOOK_TIMEOUT_MS", "30000")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
             .env("RALLY_SESSION_ID", "hook-projection-parity-session")
             .args(args)
             .output()
@@ -216,6 +218,8 @@ impl Workspace {
             // a short single-line message instead, so the pin must name the mode it
             // grades. Not an expectation change — the assertions are untouched.
             .env("RALLY_HOOK_ROOM_DETAIL", "verbose")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
             .env("RALLY_SESSION_ID", "hook-projection-parity-session")
             .env("RALLY_HOOK_DEDUPE_DIR", &self.dedupe)
             .env_remove("RALLY_HOOKS")

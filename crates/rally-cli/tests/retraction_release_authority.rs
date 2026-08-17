@@ -56,6 +56,10 @@ impl Workspace {
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env("RALLY_HOOKS", "off")
+            // The fixture is explicitly managed; an ambient CI identity must
+            // not outrank the session under test.
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
             .env("RALLY_SESSION_ID", session_id)
             .args(args)
             .output()

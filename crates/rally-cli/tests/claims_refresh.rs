@@ -40,6 +40,8 @@ impl Workspace {
         Command::new(env!("CARGO_BIN_EXE_rally"))
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
             .env("RALLY_SESSION_ID", "claims-refresh-test-session")
             .args(args)
             .output()

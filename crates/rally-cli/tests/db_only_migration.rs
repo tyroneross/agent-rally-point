@@ -57,6 +57,8 @@ impl Room {
             .env("HOME", &self.home)
             .env("RALLY_HOOKS", "off")
             .env("RALLY_GLOBAL_INDEX", "0")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
             .env("RALLY_SESSION_ID", &self.session_id)
             .env("RALLY_ENGAGEMENT", "seed")
             .args(args);
