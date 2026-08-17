@@ -133,13 +133,17 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
-
       - name: Install cargo-audit + cargo-deny
         run: cargo install cargo-audit cargo-deny --locked
 
+      # Match the local and branch-CI execution model. cargo-nextest runs every
+      # individual test binary concurrently; that creates machine-wide SQLite
+      # contention that target users do not generate and can exhaust a test's
+      # bounded connection retry budget. Force serialization explicitly so a
+      # future runner image cannot silently change the release execution model.
       - name: Quality gate (scripts/run-quality-gate.sh)
+        env:
+          RALLY_QG_TEST_MODE: serial
         run: ./scripts/run-quality-gate.sh
 
       - name: Release-readiness contract tests

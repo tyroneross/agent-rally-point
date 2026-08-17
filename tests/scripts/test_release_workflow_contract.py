@@ -401,7 +401,6 @@ exit 97
         contract_command = "python3 tests/scripts/test_release_workflow_contract.py"
         release_quality = job_block("quality")
         for strict_release_control in (
-            "cargo install cargo-nextest --locked",
             "cargo install cargo-audit cargo-deny --locked",
             "python3 tests/scripts/test_release_readiness.py",
             "python3 tests/scripts/test_run_release_auxiliary_gate.py",
@@ -409,6 +408,10 @@ exit 97
             "run: ./scripts/run-release-auxiliary-gate.sh\n",
         ):
             self.assertIn(strict_release_control, release_quality)
+        self.assertNotIn("cargo install cargo-nextest", release_quality)
+        release_gate = step_block("Quality gate (scripts/run-quality-gate.sh)")
+        self.assertIn("RALLY_QG_TEST_MODE: serial", release_gate)
+        self.assertIn("run: ./scripts/run-quality-gate.sh", release_gate)
         self.assertNotIn("run-release-auxiliary-gate.sh --product-only", release_quality)
         ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn(contract_command, ci)
@@ -449,6 +452,48 @@ exit 97
             "source ",
         ):
             self.assertNotIn(forbidden, publish)
+
+    def test_release_serial_mode_ignores_an_ambient_nextest(self) -> None:
+        cargo_log = self.root / "cargo.log"
+        make_executable(
+            self.bin / "git",
+            f"""#!/bin/sh
+if [ "$1 $2" = "rev-parse --show-toplevel" ]; then
+  printf '%s\\n' {str(ROOT)!r}
+  exit 0
+fi
+exit 1
+""",
+        )
+        make_executable(
+            self.bin / "cargo",
+            f"""#!/bin/sh
+printf '%s\\n' "$*" >> {str(cargo_log)!r}
+""",
+        )
+        make_executable(self.bin / "cargo-nextest", "#!/bin/sh\nexit 99\n")
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": str(self.bin),
+                "RALLY_QG_TEST_MODE": "serial",
+                "RALLY_QG_TOOLCHAIN": "fixture-toolchain-not-installed",
+            }
+        )
+        result = subprocess.run(
+            ["/bin/bash", str(ROOT / "scripts/run-quality-gate.sh")],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cargo_calls = cargo_log.read_text(encoding="utf-8").splitlines()
+        self.assertIn("test --workspace -- --test-threads=1", cargo_calls)
+        self.assertFalse(any("nextest" in call for call in cargo_calls))
 
     def test_pre_upload_guard_rejects_a_moved_tag_or_unknown_release_state(self) -> None:
         script = step_script("Require immutable tag and a fresh or draft release")

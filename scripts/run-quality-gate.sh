@@ -26,6 +26,15 @@ set -euo pipefail
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
+test_mode="${RALLY_QG_TEST_MODE:-auto}"
+case "$test_mode" in
+  auto|serial) ;;
+  *)
+    printf 'quality-gate: RALLY_QG_TEST_MODE must be auto or serial, found %q\n' "$test_mode" >&2
+    exit 2
+    ;;
+esac
+
 TC="${RALLY_QG_TOOLCHAIN:-1.95.0}"
 if [ -n "$TC" ] && command -v rustup >/dev/null 2>&1 && rustup toolchain list 2>/dev/null | grep -q "^$TC"; then
   CARGO="rustup run $TC cargo"
@@ -44,7 +53,11 @@ echo "quality-gate: clippy (-D warnings)…" >&2
 # shellcheck disable=SC2086
 $CARGO clippy --workspace --all-targets -- -D warnings
 
-if command -v cargo-nextest >/dev/null 2>&1; then
+if [ "$test_mode" = "serial" ]; then
+  echo "quality-gate: tests (serialized cargo test; RALLY_QG_TEST_MODE=serial)…" >&2
+  # shellcheck disable=SC2086
+  $CARGO test --workspace -- --test-threads=1
+elif command -v cargo-nextest >/dev/null 2>&1; then
   echo "quality-gate: tests (cargo nextest)…" >&2
   # shellcheck disable=SC2086
   $CARGO nextest run --workspace
