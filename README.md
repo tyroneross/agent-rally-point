@@ -25,7 +25,7 @@ Agents also hand work to each other, and a handoff is complete only when the rec
 
 ### The turn loop
 
-[![The Rally turn loop: nine steps around one shared append-only record](docs/assets/rally-turn-loop.svg)](docs/assets/rally-turn-loop.svg)
+[![The Rally turn loop: nine steps around one shared append-only record](docs/assets/rally-turn-loop.png)](docs/assets/rally-turn-loop.png)
 
 Select the diagram to open it full size, or read the [command-level turn-loop contract](docs/TURN-LOOP.md).
 
