@@ -25,9 +25,9 @@ Agents also hand work to each other, and a handoff is complete only when the rec
 
 ### The turn loop
 
-[![The Rally turn loop: nine steps around one shared append-only record](docs/assets/rally-turn-loop.png)](docs/assets/rally-turn-loop.png)
+![The Rally turn loop: nine steps around one shared append-only record](docs/assets/rally-turn-loop.png)
 
-Select the diagram to open it full size, or read the [command-level turn-loop contract](docs/TURN-LOOP.md).
+For exact command behavior, jump to the [command-level turn-loop reference](#turn-loop-command-reference) below.
 
 Solid arrows write durable coordination facts; dashed arrows read the shared record. The host owns the edit and verification steps.
 
@@ -197,6 +197,8 @@ Rally needs `git`. Everything else is per-feature.
 
 Each agent runs the same short loop every turn: join, ask what to do next, claim what it will touch, verify the boundary, work, record the outcome, then release the claim when the resource is free.
 
+<a id="turn-loop-command-reference"></a>
+
 <details>
 <summary><strong>Manual turn-loop commands and step reference</strong></summary>
 
@@ -212,7 +214,7 @@ Each agent runs the same short loop every turn: join, ask what to do next, claim
 | `edit` and `verify` | Belong to the coding host. Rally does not perform either action. |
 | `say` | Appends a durable outcome: normally an `artifact`, `handoff`, or `resolve`; release the claim after the resource is no longer needed. |
 
-For command-level behavior, failure modes, and the boundaries between the CLI and the host, read the [turn-loop contract](docs/TURN-LOOP.md).
+This reference covers command-level behavior, failure modes, and the boundaries between the CLI and the host.
 
 ```bash
 rally whoami --tool codex:parser-01 --json
