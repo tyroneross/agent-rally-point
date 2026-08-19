@@ -3,7 +3,8 @@
   "description": "Agent Rally Point coordination skills (agent-rally-point, rally-workflows, mini-loop) for Codex. Repo-local coordination via the rally CLI: claims, write-boundary checks, handoffs, dynamic-workflow task packets.",
   "author": {
     "name": "Tyrone Ross",
-    "email": "tyrone@rosslabs.ai"
+    "email": "tyrone@rosslabs.ai",
+    "url": "https://github.com/tyroneross"
   },
   "repository": "https://github.com/tyroneross/agent-rally-point",
   "license": "Apache-2.0",
@@ -33,5 +34,6 @@
       "Coordinate this repo with Rally.",
       "Run a dynamic workflow through Rally."
     ]
-  }
+  },
+  "homepage": "https://github.com/tyroneross/agent-rally-point"
 }
