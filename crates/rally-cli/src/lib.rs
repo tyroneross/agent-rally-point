@@ -172,7 +172,7 @@ use rallyd_core::ServeConfig;
 use route_findings::{Finding, RoutingSummary, route_findings};
 use store::{
     AckPollingStore, ConditionalAppendOutcome, Fact, FactKind, ReadReceipt, RoomQuery,
-    RoomSnapshot, RoomStore, RoomSummary,
+    RoomSnapshot, RoomStore, RoomSummary, SYSTEM_TOOL,
 };
 // Envelope wrapper types from backends module.
 use backends::{
@@ -2610,7 +2610,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // eligibility math had been right and unused for the room's whole life.
     // Rate-limited and fail-open inside `maybe_reap_on_enter`; it never fails
     // `enter`.
-    if let Some(report) = reaper::maybe_reap_on_enter(&room) {
+    if let Some(report) = reaper::maybe_reap_on_enter(&room, &tool) {
         if !report.claims_reaped.is_empty() || !report.handoffs_expired.is_empty() {
             eprintln!(
                 "rally: auto-reap closed {} stale claim(s) and {} expired handoff(s) \
@@ -2928,6 +2928,38 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
 }
 
 fn command_say(args: SayArgs) -> Result<Output> {
+    // `--tool rally` and `--role system` are reserved AUTHORITY markers, not
+    // free-text labels. Between them they are what authorizes the reaper to
+    // close an expired lease (`write_authority::is_typed_reaper_lease_expiry`)
+    // and to expire an unanswered handoff (`store::is_reaper_handoff_expiry`).
+    // A caller who can set either by hand can mint both authorities by hand.
+    //
+    // Reserving them is what makes attributing the reaper a net TIGHTENING
+    // rather than a lateral move. The authority the role marker replaced was
+    // keyed on `--tool rally`, which `say` has always accepted from anyone; had
+    // only the role been reserved, the gate would be exactly as forgeable as
+    // before. After this, neither spelling is mintable outside `SystemActor`.
+    //
+    // Measured on this repo's room before reserving either: zero of 12,746
+    // facts carry any `role` at all, and all 976 facts authored as `rally` are
+    // wake / claim.expired / resolve / decision — the four kinds the automatic
+    // writers produce. Nothing in `hooks/`, `scripts/`, or the docs passes
+    // `--tool rally`. No caller loses a capability it was using.
+    if args.role.as_deref() == Some(SYSTEM_ROLE) {
+        return Err(RallyError::Usage(format!(
+            "--role {SYSTEM_ROLE} is reserved for rally's own machine-initiated writes \
+             (wake intents, reaper closes) and carries their authority, so it cannot be set \
+             by hand. Use a descriptive role instead, or let the reaper write the fact."
+        )));
+    }
+    if args.tool == SYSTEM_TOOL {
+        return Err(RallyError::Usage(format!(
+            "--tool {SYSTEM_TOOL} is the reserved author for rally's own machine-initiated \
+             writes (wake intents, reaper closes) and carries their authority, so it cannot \
+             be used by hand. Pass your own agent id instead (e.g. `--tool claude_code:01`). \
+             To close a stale claim, run `rally doctor --reap-stale --apply`."
+        )));
+    }
     let kind = args.kind;
     let subject = args
         .subject
@@ -4755,6 +4787,108 @@ fn current_protocol_session(tool: Option<&str>) -> session_identity::ProtocolSes
         _ => (raw_tool, None),
     };
     session_identity::ProtocolSessionIdentity::mint(&endpoint, tool_type, "live", actor, None)
+}
+
+/// Marker written to `Fact.role` for a machine-initiated durable write.
+///
+/// This is the field that answers "was a human/agent in the loop?". It is
+/// deliberately NOT the same field that answers "who did it" — see
+/// [`SystemActor`].
+pub(crate) const SYSTEM_ROLE: &str = "system";
+
+/// The actor credited with a machine-initiated write (wake intents, reaper
+/// closes), plus the live session lease it ran under.
+///
+/// # Why this exists
+///
+/// System-initiated facts used to be authored as the literal tool `"rally"`
+/// with `from_session_id: None`. That collapsed two independent questions into
+/// one field and answered only the easier of them:
+///
+/// * "Was this automatic?" — answerable (`tool == "rally"`).
+/// * "Who did it?" — **unanswerable**, for every such fact ever written.
+///
+/// Measured on this repo's own room (12,746 facts): 100% of `wake` facts and
+/// 98.6% of `claim.expired` facts carried no actor. The cost is not cosmetic.
+/// An unresolved wake could not be routed back to the agent that requested it,
+/// so 620 pending wakes could be counted but not diagnosed or reassigned. A
+/// reaped claim could not name the process that reaped it, so the claim-
+/// takeover audit trail — the record a contested-ownership dispute is decided
+/// on — said only "rally".
+///
+/// Both questions now have separate, permanent homes:
+///
+/// * `tool` + `from_session_id` carry the **actor**.
+/// * `role: "system"` carries the **machine-initiated** fact.
+///
+/// Consumers that must exclude system authors from agent-facing projections
+/// (squads, liveness, contributor sets) filter on the role via
+/// [`crate::store::is_system_authored`], not on a magic tool name. That
+/// predicate still recognises the legacy `"rally"` author, so the 12,746 facts
+/// already on disk project exactly as they did before.
+#[derive(Clone, Debug)]
+pub(crate) struct SystemActor {
+    /// The agent identity credited with the action (`claude_code:03`), or
+    /// `"rally"` when the CLI itself acted with no agent identity supplied.
+    pub(crate) tool: String,
+    /// The live session lease the action ran under. `Some` for every path that
+    /// can derive one, which is every path today; `None` stays representable so
+    /// a future caller without an endpoint is not forced to invent one.
+    pub(crate) from_session_id: Option<String>,
+}
+
+impl SystemActor {
+    /// The actor is a named agent (e.g. the tool running `rally next`, or the
+    /// agent whose `rally enter` triggered an auto-reap). The session lease is
+    /// minted from the same endpoint derivation `say` uses to stamp
+    /// `from_session_id`, so a wake and a claim written by one agent in one
+    /// terminal share a session id.
+    pub(crate) fn for_tool(tool: &str) -> Self {
+        Self {
+            tool: tool.to_string(),
+            from_session_id: Some(
+                current_protocol_session(Some(tool))
+                    .from_session_id()
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// The actor is the invoking `rally` process itself — an operator or CI job
+    /// running `rally doctor --reap-stale --apply`, where no agent identity was
+    /// supplied and inventing one would be a lie.
+    ///
+    /// `tool` stays `"rally"` (honest: no agent claimed this), but the session
+    /// lease is real, so two operators reaping the same room from two terminals
+    /// are now distinguishable — which is the whole point of the audit trail
+    /// and is exactly what the old `from_session_id: None` destroyed.
+    pub(crate) fn invoking_process() -> Self {
+        Self {
+            tool: SYSTEM_TOOL.to_string(),
+            from_session_id: Some(
+                current_protocol_session(Some(SYSTEM_TOOL))
+                    .from_session_id()
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// `Fact.tool` value for a write by this actor.
+    pub(crate) fn tool_field(&self) -> Option<String> {
+        Some(self.tool.clone())
+    }
+
+    /// `Fact.from_session_id` value for a write by this actor.
+    pub(crate) fn session_field(&self) -> Option<String> {
+        self.from_session_id.clone()
+    }
+
+    /// `Fact.role` value for a write by this actor. Always the system marker:
+    /// every write that goes through `SystemActor` is machine-initiated by
+    /// construction.
+    pub(crate) fn role_field(&self) -> Option<String> {
+        Some(SYSTEM_ROLE.to_string())
+    }
 }
 
 /// Map a ledger [`store::FactKind`] to the north-star protocol event vocabulary
@@ -7681,6 +7815,7 @@ fn command_inject_managed(
 
     let wake_intent = inject_wake_intent_with_room(
         room.as_ref(),
+        &sender_tool,
         Some(&session),
         &session.tool,
         handoff.as_deref(),
@@ -7852,6 +7987,7 @@ fn command_inject_ledger(
 
     let wake_intent = inject_wake_intent_with_room(
         room.as_ref(),
+        &sender_tool,
         None,
         &agent_id,
         handoff.as_deref(),
@@ -8467,6 +8603,11 @@ fn append_next_wake_intent(
     paths: &[String],
     next: &NextResult,
 ) -> Result<Option<Fact>> {
+    // `tool` is BOTH the actor and the target here: `rally next --tool X` is X
+    // asking Rally what to do, and the resulting wake intent is addressed back
+    // to X. The actor half was already in scope and was simply never passed to
+    // `wake_fact` — which is why every wake this path wrote was unattributed.
+    let actor = SystemActor::for_tool(tool);
     if matches!(next.action, "wait" | "proceed_solo") {
         return Ok(None);
     }
@@ -8483,6 +8624,7 @@ fn append_next_wake_intent(
         next.action
     );
     let fact = wake_fact(
+        &actor,
         tool,
         &subject,
         paths.to_vec(),
@@ -8641,8 +8783,13 @@ fn inject_content_fact_dry_run(sender_tool: &str, recipient_tool: &str, text: &s
 /// `target_tool` is the logical id the Directive landed on (mirrors the
 /// `directive_to` field of `InjectData`). For managed sessions this is
 /// `session.tool`; for ledger-only it is the validated agent-id.
+/// One over the lint's threshold, and every argument is a distinct fact about
+/// the send that the fact must record. Bundling them into a struct would move
+/// the same list one level down without making any call site clearer.
+#[allow(clippy::too_many_arguments)]
 fn inject_wake_intent_with_room(
     room: Option<&RoomStore>,
+    sender_tool: &str,
     session: Option<&ManagedSession>,
     target_tool: &str,
     handoff: Option<&str>,
@@ -8650,6 +8797,11 @@ fn inject_wake_intent_with_room(
     dry_run: bool,
     delivery_state: &'static str,
 ) -> Result<Option<Fact>> {
+    // The sender is the actor. Both `command_inject_managed` and
+    // `command_inject_ledger` already hold a validated `sender_tool`; this
+    // function just never received it, so an inject's wake intent recorded who
+    // was woken and not who woke them.
+    let actor = SystemActor::for_tool(sender_tool);
     let status = if dry_run { "planned" } else { delivery_state };
     let subject = format!("wake intent {status} to {target_tool}");
     let summary = Some(match session {
@@ -8661,6 +8813,7 @@ fn inject_wake_intent_with_room(
     });
     let evidence = commands.iter().map(|command| command.join(" ")).collect();
     let fact = wake_fact(
+        &actor,
         target_tool,
         &subject,
         Vec::new(),
@@ -8738,7 +8891,22 @@ fn inject_via_ledger(
     })
 }
 
+/// Build a `wake` fact.
+///
+/// `actor` is the agent that CAUSED this wake — the tool that ran `rally next`
+/// or `rally inject`, not the tool being woken (`target_tool` is that). Both
+/// are recorded, because "who asked" and "who was asked" are different
+/// questions and a wake that answers only the second one cannot be routed back
+/// to its originator.
+///
+/// Before attribution existed this function hardcoded `tool: "rally"`,
+/// `from_session_id: None`, `role: None`, so NO code path could produce an
+/// attributed wake and all 645 wake facts in this repo own room were
+/// unattributed. `role: "system"` preserves the "this was machine-initiated"
+/// signal that the `"rally"` author used to carry alone; see [`SystemActor`].
+#[allow(clippy::too_many_arguments)]
 fn wake_fact(
+    actor: &SystemActor,
     target_tool: &str,
     subject: &str,
     scope: Vec<String>,
@@ -8748,14 +8916,14 @@ fn wake_fact(
     status: Option<String>,
 ) -> Fact {
     Fact {
-        from_session_id: None,
+        from_session_id: actor.session_field(),
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("wake"),
         seq: 0,
         thread_id: format!("wake-{}", sanitize_id(target_tool)),
         kind: FactKind::Wake,
-        tool: Some("rally".to_string()),
-        role: None,
+        tool: actor.tool_field(),
+        role: actor.role_field(),
         subject: subject.to_string(),
         scope,
         created_at: now_string(),

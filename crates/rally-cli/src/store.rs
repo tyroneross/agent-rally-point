@@ -826,6 +826,37 @@ mod fact_kind_say_surface_tests {
     }
 }
 
+/// Reserved author for machine-initiated writes made before actor attribution
+/// existed (every `wake` fact and nearly every `claim.expired` fact on disk).
+///
+/// It is still written today by [`crate::SystemActor::invoking_process`] — a
+/// bare `rally doctor --reap-stale` genuinely has no agent identity, and
+/// inventing one would be worse than naming the CLI. What changed is that such
+/// a write now also carries a real `from_session_id`, so two operators reaping
+/// the same room are distinguishable.
+pub(crate) const SYSTEM_TOOL: &str = "rally";
+
+/// True when a fact was authored by the system rather than by a participating
+/// agent, and must therefore be excluded from agent-facing projections
+/// (`squads[]`, liveness ages, contributor sets).
+///
+/// Two accepted signals, in order of preference:
+///
+/// 1. `role == "system"` — the durable marker written by
+///    [`crate::SystemActor`]. This is what lets a system-initiated fact carry
+///    the REAL actor in `tool` (so "who reaped this claim" is answerable)
+///    without that actor leaking into the squad roster.
+/// 2. `tool == "rally"` — the legacy signal. Kept unconditionally: 12,746
+///    facts already on disk carry it and no `role`, and they must keep
+///    projecting exactly as they did before this predicate existed.
+///
+/// Callers previously inlined check (2) in five places. Centralising both
+/// checks here is what makes attribution safe to add: a new site that forgets
+/// the role check would silently enrol the reaper's actor as an agent.
+pub(crate) fn is_system_authored(fact: &Fact) -> bool {
+    fact.role.as_deref() == Some(crate::SYSTEM_ROLE) || fact.tool.as_deref() == Some(SYSTEM_TOOL)
+}
+
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 pub(crate) struct Fact {
     #[serde(default = "fact_schema")]
@@ -5475,8 +5506,8 @@ fn scoped_contributor_tools(facts: &[Fact]) -> BTreeSet<String> {
                 FactKind::Presence | FactKind::Session | FactKind::Read | FactKind::ClaimRenewed
             )
         })
+        .filter(|fact| !is_system_authored(fact))
         .filter_map(|fact| fact.tool.clone())
-        .filter(|tool| tool != "rally")
         .collect()
 }
 
@@ -5855,6 +5886,21 @@ fn facts_from_engagement_segments(
 }
 
 fn handoff_closer_matches_target(handoff: &Fact, closer: &Fact) -> bool {
+    // Expiring an unanswered handoff is CLEANUP, not answering it. The reaper
+    // is never the handoff's target and cannot become it, so target correlation
+    // is the wrong question to ask of a reaper close.
+    //
+    // Until attribution landed this was never noticed, because the reaper's
+    // Resolve carried no `from_session_id` and fell through the legacy arm
+    // below. That is: the reaper's authority here was an accident of its
+    // anonymity. Giving it a real session id — the correct change — is exactly
+    // what would have revoked it. Stating the arm explicitly means the
+    // authority now rests on a typed, checkable claim rather than on a missing
+    // field.
+    if is_reaper_handoff_expiry(handoff, closer) {
+        return true;
+    }
+
     // Legacy rows predate session identity and used artifact/resolve refs as
     // broad completion markers. Keep replay stable for those ledgers while
     // applying target correlation to session-era durable writes.
@@ -5866,6 +5912,31 @@ fn handoff_closer_matches_target(handoff: &Fact, closer: &Fact) -> bool {
         Some("all") | None => true,
         Some(target) => closer.tool.as_deref() == Some(target),
     }
+}
+
+/// Is `closer` the reaper's typed expiry of THIS handoff?
+///
+/// Deliberately narrow, and narrow in the same shape as
+/// `write_authority::is_typed_reaper_lease_expiry`: a system-authored `Resolve`
+/// that names this exact handoff in a `reaper:ref_id=` marker and declares the
+/// `handoff-expired` reason. A system-authored Resolve that does not name this
+/// handoff, or names it without the reason, gets no authority from this arm and
+/// falls through to the ordinary target correlation below.
+fn is_reaper_handoff_expiry(handoff: &Fact, closer: &Fact) -> bool {
+    if closer.kind != FactKind::Resolve || !is_system_authored(closer) {
+        return false;
+    }
+    let marker = |key: &str| {
+        let prefix = format!("reaper:{key}=");
+        closer
+            .evidence
+            .iter()
+            .find_map(|item| item.strip_prefix(&prefix))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    marker("ref_id") == Some(handoff.event_id.as_str())
+        && marker("reason") == Some("handoff-expired")
 }
 
 fn fact_closes_handoff(handoff: &Fact, closer: &Fact) -> bool {
@@ -6000,8 +6071,14 @@ fn newest_fact_age_per_tool(
     };
     for f in facts.iter().filter(|f| kinds.contains(&f.kind.as_str())) {
         let age = fact_age_secs(f, now_secs);
+        // A system-initiated write is not evidence that its ACTOR is alive: an
+        // auto-reap fires from `rally enter` before the agent does any work,
+        // and a wake intent is written on the agent's behalf. Counting it as a
+        // liveness signal would let the machine keep an absent agent looking
+        // fresh. The TARGET age below is unaffected — that is a different
+        // signal and it was already correct.
         if let Some(t) = &f.tool
-            && t != "rally"
+            && !is_system_authored(f)
         {
             note(t, age, &mut out);
         }
@@ -6034,7 +6111,7 @@ fn code_progress_age_per_tool(facts: &[Fact], now_secs: i64) -> BTreeMap<String,
         let Some(tool) = f.tool.as_deref() else {
             continue;
         };
-        if tool == "rally" {
+        if is_system_authored(f) {
             continue;
         }
         let Some(sha) = f.evidence.iter().find_map(|e| {
@@ -6317,12 +6394,16 @@ fn snapshot_from_facts_with_policy_at(
     // --- Presence projection ---
     // Collect the highest-seq fact per tool (any kind counts; presence is
     // the primary signal but a claim or artifact also proves presence).
-    // "rally" is the reserved system author (used by wake_fact); it is not
-    // a participating agent and must not appear in squads[].
+    // System-initiated facts do not enrol their actor as a participating
+    // agent. This used to be spelled `tool == "rally"`, which worked only
+    // because such facts had no real actor to enrol. Now that a wake or a reap
+    // names the agent that caused it, the exclusion has to key on the `role`
+    // marker instead, or an agent's first `rally enter` would silently add
+    // every stale-claim owner it reaped to the squad roster.
     let mut tool_last: BTreeMap<String, (i64, String)> = BTreeMap::new();
     for fact in facts {
         if let Some(tool) = &fact.tool {
-            if tool == "rally" {
+            if is_system_authored(fact) {
                 continue;
             }
             let entry = tool_last.entry(tool.clone()).or_insert((0, String::new()));

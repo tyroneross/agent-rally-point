@@ -210,7 +210,11 @@ fn record_reaper_result(
 /// lead is stale.
 pub(crate) fn run_reap_stale(apply: bool) -> Result<ReapReport> {
     let room = RoomStore::open()?;
-    run_reap_stale_in_room(&room, apply)
+    // `rally doctor --reap-stale` has no entering agent, so the honest actor is
+    // the invoking `rally` process. It keeps `tool: "rally"` but now carries a
+    // real session lease, so two operators reaping one room are distinguishable
+    // in the audit trail.
+    run_reap_stale_in_room_as(&room, apply, &crate::SystemActor::invoking_process())
 }
 
 /// Default auto-reap interval: **0 — OFF**. Opt in with
@@ -296,7 +300,7 @@ fn try_auto_reap_flight(room: &RoomStore) -> Option<crate::store::OwnerGuard> {
 /// - **Opt-out.** `RALLY_NO_AUTO_REAP=1`, or `auto_reap_interval_secs: 0`.
 ///
 /// Returns the report when a reap ran, `None` when it was skipped.
-pub(crate) fn maybe_reap_on_enter(room: &RoomStore) -> Option<ReapReport> {
+pub(crate) fn maybe_reap_on_enter(room: &RoomStore, entering_tool: &str) -> Option<ReapReport> {
     if std::env::var("RALLY_NO_AUTO_REAP").is_ok_and(|v| v == "1") {
         return None;
     }
@@ -342,7 +346,16 @@ pub(crate) fn maybe_reap_on_enter(room: &RoomStore) -> Option<ReapReport> {
         );
     }
 
-    match run_reap_stale_in_room_with_mode(room, true, ReapMode::LeaseOnly) {
+    // The agent whose `rally enter` triggered this pass is the actor. It is
+    // the party that benefits from the reap and the party a reaped claim's
+    // former owner would need to contact, so it is the party the ledger must
+    // name.
+    match run_reap_stale_in_room_with_mode_as(
+        room,
+        true,
+        ReapMode::LeaseOnly,
+        &crate::SystemActor::for_tool(entering_tool),
+    ) {
         Ok(report) => Some(report),
         Err(err) => {
             eprintln!("rally: auto-reap skipped ({err})");
@@ -463,17 +476,47 @@ impl ReapBudgetClock {
 
 /// Inner implementation — takes an explicit `&RoomStore` so tests can inject a
 /// temp store without touching the process-global cwd.
+/// Test-only shim: reap with the invoking process as the actor.
+///
+/// `#[cfg(test)]` is the guardrail, not an artefact of dead-code warnings. Every
+/// production entry point must name its actor, because the one that did not —
+/// `maybe_reap_on_enter`, which had the entering agent in its caller and never
+/// asked for it — is precisely how the claim-takeover audit trail ended up
+/// unable to say who reaped a claim. A new production caller that wants the
+/// implicit actor now has to fail to compile first.
+#[cfg(test)]
 pub(crate) fn run_reap_stale_in_room(room: &RoomStore, apply: bool) -> Result<ReapReport> {
-    run_reap_stale_in_room_with_mode(room, apply, ReapMode::Full)
+    run_reap_stale_in_room_as(room, apply, &crate::SystemActor::invoking_process())
 }
 
+/// As [`run_reap_stale_in_room`], with the acting identity supplied by the
+/// caller. Every reaper fact this pass writes is attributed to `actor`.
+pub(crate) fn run_reap_stale_in_room_as(
+    room: &RoomStore,
+    apply: bool,
+    actor: &crate::SystemActor,
+) -> Result<ReapReport> {
+    run_reap_stale_in_room_with_mode_as(room, apply, ReapMode::Full, actor)
+}
+
+/// Test-only shim. See [`run_reap_stale_in_room`] for why this is gated.
+#[cfg(test)]
 pub(crate) fn run_reap_stale_in_room_with_mode(
     room: &RoomStore,
     apply: bool,
     mode: ReapMode,
 ) -> Result<ReapReport> {
+    run_reap_stale_in_room_with_mode_as(room, apply, mode, &crate::SystemActor::invoking_process())
+}
+
+pub(crate) fn run_reap_stale_in_room_with_mode_as(
+    room: &RoomStore,
+    apply: bool,
+    mode: ReapMode,
+    actor: &crate::SystemActor,
+) -> Result<ReapReport> {
     let budget = apply.then(reap_apply_budget).flatten();
-    run_reap_stale_in_room_with_budget(room, apply, mode, budget)
+    run_reap_stale_in_room_with_budget(room, apply, mode, budget, actor)
 }
 
 fn run_reap_stale_in_room_with_budget(
@@ -481,6 +524,7 @@ fn run_reap_stale_in_room_with_budget(
     apply: bool,
     mode: ReapMode,
     budget: Option<std::time::Duration>,
+    actor: &crate::SystemActor,
 ) -> Result<ReapReport> {
     // The clock starts BEFORE the projection, not before the append loop. The
     // opening `snapshot()` is a full ledger read and is the same cost the
@@ -633,14 +677,20 @@ fn run_reap_stale_in_room_with_budget(
             // already handles duplicate ClaimExpired via ref_id dedup).
             let action_target = claim.event_id.as_str();
             let expired_fact = Fact {
-                from_session_id: None,
+                // This is the claim-takeover audit trail. Naming the reaper is
+                // the whole point of it: 98.6% of `claim.expired` facts on disk
+                // say only "rally", which is unusable in a contested-ownership
+                // dispute. The claim's FORMER owner is already recorded in
+                // `evidence` (`reaper:owner=` / `reaper:owner_session=`); this
+                // records the party that closed it.
+                from_session_id: actor.session_field(),
                 schema: FACT_SCHEMA.to_string(),
                 event_id: stable_reaper_event_id("claim-expired", action_target),
                 seq: 0,
                 thread_id: stable_reaper_event_id("claim-thread", action_target),
                 kind: FactKind::ClaimExpired,
-                tool: Some("rally".to_string()),
-                role: None,
+                tool: actor.tool_field(),
+                role: actor.role_field(),
                 subject: format!(
                     "reaper: claim {} expired (reason={}, owner: {})",
                     claim.event_id,
@@ -772,14 +822,14 @@ fn run_reap_stale_in_room_with_budget(
             if apply {
                 let action_target = handoff.event_id.as_str();
                 let expiry_fact = Fact {
-                    from_session_id: None,
+                    from_session_id: actor.session_field(),
                     schema: FACT_SCHEMA.to_string(),
                     event_id: stable_reaper_event_id("handoff-expired", action_target),
                     seq: 0,
                     thread_id: stable_reaper_event_id("handoff-thread", action_target),
                     kind: FactKind::Resolve,
-                    tool: Some("rally".to_string()),
-                    role: None,
+                    tool: actor.tool_field(),
+                    role: actor.role_field(),
                     subject: format!(
                         "reaper: handoff {} expired unanswered after {} days (from: {}, to: {})",
                         handoff.event_id,
@@ -852,14 +902,18 @@ fn run_reap_stale_in_room_with_budget(
                     let lead_epoch = snapshot.lead_epoch.unwrap_or_default();
                     let action_target = format!("{lead_tool}:{lead_epoch}");
                     let relinquish_fact = Fact {
-                        from_session_id: None,
+                        // A lead seat changing hands with no named party is the
+                        // least diagnosable event in the room. The stale lead is
+                        // in `evidence`; the actor that took the seat away is
+                        // here.
+                        from_session_id: actor.session_field(),
                         schema: FACT_SCHEMA.to_string(),
                         event_id: stable_reaper_event_id("lead-relinquished", &action_target),
                         seq: 0,
                         thread_id: stable_reaper_event_id("lead-thread", &action_target),
                         kind: FactKind::Decision,
-                        tool: Some("rally".to_string()),
-                        role: None,
+                        tool: actor.tool_field(),
+                        role: actor.role_field(),
                         subject: "role:lead:relinquished".to_string(),
                         scope: Vec::new(),
                         created_at: now_string(),
@@ -937,6 +991,13 @@ fn run_reap_stale_in_room_with_budget(
 
 #[cfg(test)]
 mod tests {
+    /// The acting identity these unit tests reap as. Named rather than
+    /// defaulted so a test asserting attribution reads against a value it can
+    /// see, and so the production paths keep their required-actor contract.
+    fn test_actor() -> crate::SystemActor {
+        crate::SystemActor::invoking_process()
+    }
+
     use super::*;
     use crate::store::RoomStore;
     use std::collections::BTreeSet;
@@ -1282,6 +1343,7 @@ mod tests {
             true,
             ReapMode::Full,
             Some(std::time::Duration::ZERO),
+            &test_actor(),
         )
         .unwrap();
         assert_eq!(first.handoffs_expired.len(), 1);
@@ -1295,6 +1357,7 @@ mod tests {
             true,
             ReapMode::Full,
             Some(std::time::Duration::ZERO),
+            &test_actor(),
         )
         .unwrap();
         assert_eq!(second.handoffs_expired.len(), 1);
@@ -1309,6 +1372,7 @@ mod tests {
             true,
             ReapMode::Full,
             Some(std::time::Duration::ZERO),
+            &test_actor(),
         )
         .unwrap();
         assert_eq!(no_op.attempted_writes, 0);
@@ -1341,6 +1405,7 @@ mod tests {
             true,
             ReapMode::Full,
             Some(std::time::Duration::ZERO),
+            &test_actor(),
         )
         .unwrap();
         assert_eq!(first.claims_reaped.len(), 1);
@@ -1355,6 +1420,7 @@ mod tests {
             true,
             ReapMode::Full,
             Some(std::time::Duration::ZERO),
+            &test_actor(),
         )
         .unwrap();
         assert_eq!(second.handoffs_expired.len(), 1);
@@ -1367,6 +1433,7 @@ mod tests {
             true,
             ReapMode::Full,
             Some(std::time::Duration::ZERO),
+            &test_actor(),
         )
         .unwrap();
         assert_eq!(third.lead_relinquished.as_deref(), Some("stale-owner"));
@@ -1393,6 +1460,7 @@ mod tests {
             true,
             ReapMode::Full,
             Some(std::time::Duration::ZERO),
+            &test_actor(),
         )
         .unwrap();
         assert_eq!(report.lead_relinquished.as_deref(), Some("stale-lead"));
@@ -1431,14 +1499,14 @@ mod tests {
         append_observed_presence(&room, "owner", &root, 2_000_000_000);
         append_claim_with_lease(&room, "claim-leased", "owner", &past_ts(60 * 60));
 
-        let first = maybe_reap_on_enter(&room).expect("first enter must reap");
+        let first = maybe_reap_on_enter(&room, "test-agent").expect("first enter must reap");
         assert_eq!(first.claims_reaped.len(), 1);
 
         // Second call inside the interval is skipped entirely — ten agents
         // entering at once must not each run a reap pass.
         append_claim_with_lease(&room, "claim-leased-2", "owner", &past_ts(60 * 60));
         assert!(
-            maybe_reap_on_enter(&room).is_none(),
+            maybe_reap_on_enter(&room, "test-agent").is_none(),
             "a second enter inside the interval must not reap again"
         );
 
@@ -1523,6 +1591,7 @@ mod tests {
             true,
             ReapMode::LeaseOnly,
             Some(std::time::Duration::ZERO),
+            &test_actor(),
         )
         .unwrap();
         assert_eq!(report.attempted_writes, 0);
@@ -1968,7 +2037,7 @@ mod tests {
             "auto-reap must stay opt-in until concurrent enter is bounded and the operator flips the destructive default"
         );
         assert!(
-            maybe_reap_on_enter(&room).is_none(),
+            maybe_reap_on_enter(&room, "test-agent").is_none(),
             "the default configuration must not reap on enter"
         );
         assert_eq!(
@@ -1993,7 +2062,7 @@ mod tests {
         append_claim(&room, "claim-stale", "stale-tool");
 
         unsafe { std::env::set_var("RALLY_NO_AUTO_REAP", "1") };
-        let result = maybe_reap_on_enter(&room);
+        let result = maybe_reap_on_enter(&room, "test-agent");
         unsafe { std::env::remove_var("RALLY_NO_AUTO_REAP") };
 
         assert!(result.is_none(), "RALLY_NO_AUTO_REAP=1 must skip the reap");

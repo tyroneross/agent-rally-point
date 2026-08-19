@@ -400,7 +400,25 @@ fn reaper_marker<'a>(fact: &'a Fact, key: &str) -> Option<&'a str> {
 /// Does this fact carry the typed evidence that routes lease expiry through
 /// the store's under-lock reaper checks?
 fn is_typed_reaper_lease_expiry(fact: &Fact, claim: &Fact) -> bool {
-    if fact.kind != FactKind::ClaimExpired || fact.tool.as_deref() != Some("rally") {
+    // This arm used to require `tool == "rally"`, which made the reaper's
+    // authority to close an expired lease inseparable from its inability to say
+    // who it was. Attributing the reaper would therefore have silently REVOKED
+    // that authority — `rally enter`'s auto-reap fails closed here with "X is
+    // not the owner" the moment the fact names X.
+    //
+    // The authority now rides the `role: "system"` marker, which is what the
+    // magic tool name was really standing in for. `is_system_authored` still
+    // accepts the legacy `"rally"` author, so historical facts and
+    // `SystemActor::invoking_process` are unaffected.
+    //
+    // This is NOT a widening. The substantive gate is, and always was, the
+    // typed evidence below — ref, reason, owner, owner session, and observed
+    // verdict, every one of which the store revalidates under the mutation
+    // lock against the live claim. The label alone never authorized anything.
+    // `command_say` additionally refuses a caller-supplied `--role system`, so
+    // the marker is mintable only by `SystemActor` — strictly narrower than the
+    // `--tool rally` spelling it replaces, which any caller could pass.
+    if fact.kind != FactKind::ClaimExpired || !crate::store::is_system_authored(fact) {
         return false;
     }
     let Some(ref_id) = fact.ref_id.as_deref() else {

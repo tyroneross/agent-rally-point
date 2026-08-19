@@ -184,7 +184,8 @@ pub(crate) fn project_presence_to_state(fact: &Fact) -> Option<AgentState> {
 ///
 /// Algorithm:
 /// 1. Filter to `FactKind::Presence` facts only — keep the projection narrow.
-/// 2. Group by `tool` (exclude `"rally"` — reserved system author).
+/// 2. Group by `tool` (exclude system-authored facts — see
+///    [`crate::store::is_system_authored`]).
 /// 3. Keep the highest-`seq` presence per tool.
 /// 4. Project to `AgentState` via [`project_presence_to_state`]; missing
 ///    marker → `Idle{wake_after: None}`.
@@ -199,7 +200,7 @@ pub(crate) fn project_agent_states(facts: &[Fact], now_ts: &str) -> Vec<AgentSta
         let Some(tool) = fact.tool.as_deref() else {
             continue;
         };
-        if tool == "rally" {
+        if crate::store::is_system_authored(fact) {
             continue;
         }
         let entry = latest.entry(tool.to_string()).or_insert(fact);
