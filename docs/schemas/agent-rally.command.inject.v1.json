@@ -1,77 +1,199 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:agent-rally:command:inject:v1",
-  "title": "Rally Inject Command",
-  "type": "object",
-  "required": ["ok", "product", "command", "schema", "data"],
-  "properties": {
-    "ok": { "const": true },
-    "product": { "const": "rally" },
-    "command": { "const": "inject" },
-    "schema": { "const": "agent-rally.command.inject.v1" },
-    "data": {
-      "type": "object",
-      "required": ["inject"],
-      "properties": {
-        "inject": {
-          "type": "object",
-          "required": [
-            "mode",
-            "session",
-            "target_kind",
-            "handoff",
-            "require_ack",
-            "ack",
-            "verified_received",
-            "ack_state",
-            "fallback_plan",
-            "wake_intent",
-            "commands",
-            "sender_tool",
-            "content_fact",
-            "delivered",
-            "delivery_state",
-            "directive_seq",
-            "directive_to"
-          ],
-          "properties": {
-            "mode": { "type": "string" },
-            "session": { "type": ["object", "null"] },
-            "target_kind": {
-              "type": "string",
-              "enum": ["managed_session", "ledger_agent"]
-            },
-            "handoff": { "type": ["string", "null"] },
-            "require_ack": { "type": "boolean" },
-            "ack": { "type": ["object", "null"] },
-            "verified_received": { "type": "boolean" },
-            "ack_state": {
-              "type": "string",
-              "enum": ["not_required", "planned", "acked", "blocked", "timeout", "pending"]
-            },
-            "fallback_plan": { "type": ["object", "null"] },
-            "wake_intent": { "type": ["object", "null"] },
-            "commands": { "type": "array" },
-            "sender_tool": { "type": "string" },
-            "content_fact": { "type": ["object", "null"] },
-            "delivered": { "type": "boolean" },
-            "delivery_state": { "type": "string" },
-            "directive_seq": { "type": ["integer", "null"] },
-            "directive_to": { "type": ["string", "null"] },
-            "target_injectability": {
-              "description": "Pre-wait injectability diagnosis, resolved at inject time (RCA 2026-07-09). Present on the ledger_agent path; omitted for managed sessions. Advisory only - the ACK wait is never short-circuited.",
-              "type": "object",
-              "required": ["injectable", "status"],
-              "properties": {
-                "injectable": { "type": "boolean" },
-                "status": { "type": "string" },
-                "via": { "type": "string" },
-                "reason": { "type": "string" }
-              }
-            }
-          }
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "urn:agent-rally:command:inject:v1",
+ "title": "Rally Inject Command",
+ "type": "object",
+ "required": [
+  "ok",
+  "product",
+  "command",
+  "schema",
+  "data"
+ ],
+ "properties": {
+  "ok": {
+   "const": true
+  },
+  "product": {
+   "const": "rally"
+  },
+  "command": {
+   "const": "inject"
+  },
+  "schema": {
+   "const": "agent-rally.command.inject.v1"
+  },
+  "data": {
+   "type": "object",
+   "required": [
+    "inject"
+   ],
+   "properties": {
+    "inject": {
+     "type": "object",
+     "required": [
+      "mode",
+      "session",
+      "target_kind",
+      "handoff",
+      "require_ack",
+      "ack",
+      "verified_received",
+      "ack_state",
+      "fallback_plan",
+      "wake_intent",
+      "commands",
+      "sender_tool",
+      "content_fact",
+      "delivered",
+      "delivery_state",
+      "delivery_reason",
+      "delivery_detail",
+      "reached_target",
+      "queued",
+      "directive_seq",
+      "directive_to"
+     ],
+     "properties": {
+      "mode": {
+       "type": "string"
+      },
+      "session": {
+       "type": [
+        "object",
+        "null"
+       ]
+      },
+      "target_kind": {
+       "type": "string",
+       "enum": [
+        "managed_session",
+        "ledger_agent"
+       ]
+      },
+      "handoff": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "require_ack": {
+       "type": "boolean"
+      },
+      "ack": {
+       "type": [
+        "object",
+        "null"
+       ]
+      },
+      "verified_received": {
+       "type": "boolean"
+      },
+      "ack_state": {
+       "type": "string",
+       "enum": [
+        "not_required",
+        "planned",
+        "acked",
+        "blocked",
+        "timeout",
+        "pending"
+       ]
+      },
+      "fallback_plan": {
+       "type": [
+        "object",
+        "null"
+       ]
+      },
+      "wake_intent": {
+       "type": [
+        "object",
+        "null"
+       ]
+      },
+      "commands": {
+       "type": "array"
+      },
+      "sender_tool": {
+       "type": "string"
+      },
+      "content_fact": {
+       "type": [
+        "object",
+        "null"
+       ]
+      },
+      "delivered": {
+       "type": "boolean"
+      },
+      "delivery_state": {
+       "type": "string"
+      },
+      "delivery_reason": {
+       "description": "WHY the send is in `delivery_state`. `delivery_state` reports the receipt; this reports the cause, which a single `pending` could not distinguish: a directive queued against a target that has a session and has not consumed it, a target with no managed session and therefore no live address, or an outright failure. Callers routing stale work branch on this.",
+       "type": "string",
+       "enum": [
+        "delivered",
+        "sent_unverified",
+        "queued_awaiting_receipt",
+        "queued_no_managed_session",
+        "queued_awaiting_poll",
+        "failed_ledger_write",
+        "failed_backend_inject",
+        "failed_daemon_send",
+        "planned_dry_run"
+       ]
+      },
+      "delivery_detail": {
+       "description": "One sentence naming what the caller should do about `delivery_reason`. Previously this existed only on stderr, which no programmatic caller reads.",
+       "type": "string"
+      },
+      "reached_target": {
+       "description": "Whether the message actually reached the target. Distinct from `delivered` (a compatibility field tied to the synchronous backend write) and from the envelope's `ok` (which reports whether the COMMAND succeeded \u2014 recording intent for an absent agent is a successful command AND an undelivered message).",
+       "type": "boolean"
+      },
+      "queued": {
+       "description": "Whether the message is still durably queued and reachable later. Separates 'not yet' from 'never'. An absent target is queued, not failed: the ledger's value is that an agent which is not running now finds its work later via `rally next`.",
+       "type": "boolean"
+      },
+      "directive_seq": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "directive_to": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "target_injectability": {
+       "description": "Pre-wait injectability diagnosis, resolved at inject time (RCA 2026-07-09). Present on the ledger_agent path; omitted for managed sessions. Advisory only - the ACK wait is never short-circuited.",
+       "type": "object",
+       "required": [
+        "injectable",
+        "status"
+       ],
+       "properties": {
+        "injectable": {
+         "type": "boolean"
+        },
+        "status": {
+         "type": "string"
+        },
+        "via": {
+         "type": "string"
+        },
+        "reason": {
+         "type": "string"
         }
+       }
       }
+     }
     }
+   }
   }
+ }
 }

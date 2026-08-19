@@ -7813,6 +7813,28 @@ fn command_inject_managed(
             delivery_state_initial
         };
 
+    // WHY the send is in `delivery_state`. Ordered failures-first so a
+    // partially-failed send is never reported by its more optimistic half.
+    let disposition = if dry_run {
+        DeliveryDisposition::PlannedDryRun
+    } else if ledger_failed {
+        DeliveryDisposition::FailedLedgerWrite
+    } else if daemon_delivery_failed {
+        DeliveryDisposition::FailedDaemonSend
+    } else if legacy_tmux_cmux_failed {
+        DeliveryDisposition::FailedBackendInject
+    } else if delivered {
+        DeliveryDisposition::Delivered
+    } else if legacy_sent_unverified {
+        DeliveryDisposition::SentUnverified
+    } else {
+        // A managed session HAS a transport, so a still-pending directive is
+        // waiting on a receipt, not missing an address. This is the 403-class:
+        // the message is queued and reachable; what is unproven is that
+        // anything consumed it.
+        DeliveryDisposition::QueuedAwaitingReceipt
+    };
+    let delivery_detail = disposition.guidance(&session.tool);
     let wake_intent = inject_wake_intent_with_room(
         room.as_ref(),
         &sender_tool,
@@ -7821,7 +7843,7 @@ fn command_inject_managed(
         handoff.as_deref(),
         &commands,
         dry_run,
-        delivery_state,
+        disposition,
     )?;
     let ack = if effective_require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
@@ -7877,6 +7899,10 @@ fn command_inject_managed(
         // assigned sequence so downstream callers can look up the matching
         // Receipt via `rally status` once rally-termd (P3) is live.
         delivery_state,
+        delivery_reason: disposition.as_str(),
+        delivery_detail,
+        reached_target: disposition.reached_target(),
+        queued: disposition.is_queued(),
         directive_seq,
         directive_to,
         delivery_path,
@@ -7985,6 +8011,18 @@ fn command_inject_ledger(
     // No backend commands on the ledger-only path; surface an empty plan.
     let commands: Vec<Vec<String>> = Vec::new();
 
+    // A `LedgerAgent` target has NO managed session by construction
+    // (`resolve_inject_target` arm 2), so a pending directive here means "no
+    // live address", not "waiting on a runner". This is the 217-class, and
+    // separating it from the managed-session case above is the whole point:
+    // a supervision pass re-addresses one and waits on the other.
+    let disposition = if dry_run {
+        DeliveryDisposition::PlannedDryRun
+    } else if delivery_state == "failed" {
+        DeliveryDisposition::FailedLedgerWrite
+    } else {
+        DeliveryDisposition::QueuedNoManagedSession
+    };
     let wake_intent = inject_wake_intent_with_room(
         room.as_ref(),
         &sender_tool,
@@ -7993,7 +8031,7 @@ fn command_inject_ledger(
         handoff.as_deref(),
         &commands,
         dry_run,
-        delivery_state,
+        disposition,
     )?;
     // RCA 2026-07-09 follow-up: a LedgerAgent target by definition has no
     // ACTIVE managed session (`resolve_inject_target` arm 2), so pane delivery
@@ -8089,6 +8127,14 @@ fn command_inject_ledger(
         // a Receipt to flip it to `delivered`/`seen`/`acted` out-of-band).
         delivered: false,
         delivery_state,
+        // The reason `delivered` is false. Without it a caller reading
+        // `ok: true, delivered: false` cannot tell a durably-queued message
+        // for an absent agent (normal, and the point of the ledger) from a
+        // write that failed (not normal). O08 is that confusion, observed live.
+        delivery_reason: disposition.as_str(),
+        delivery_detail: disposition.guidance(&agent_id),
+        reached_target: disposition.reached_target(),
+        queued: disposition.is_queued(),
         directive_seq,
         directive_to,
         // A LedgerAgent target is an externally-registered ptyd pane: the
@@ -8631,7 +8677,13 @@ fn append_next_wake_intent(
         Some(summary),
         vec!["rally next --tool <tool> --json".to_string()],
         next.target_event_id.clone(),
-        Some("pending".to_string()),
+        // No transport is involved in a `next` wake intent and none is
+        // expected; it is a note for `tool` to find when it next polls. Saying
+        // so is what stops it reading as a delivery that never happened.
+        WakeDelivery {
+            status: Some("pending".to_string()),
+            disposition: DeliveryDisposition::QueuedAwaitingPoll,
+        },
     );
     room.append_fact(&fact)
         .map(store::AppendOutcome::into_fact_reporting)
@@ -8795,21 +8847,43 @@ fn inject_wake_intent_with_room(
     handoff: Option<&str>,
     commands: &[Vec<String>],
     dry_run: bool,
-    delivery_state: &'static str,
+    disposition: DeliveryDisposition,
 ) -> Result<Option<Fact>> {
     // The sender is the actor. Both `command_inject_managed` and
     // `command_inject_ledger` already hold a validated `sender_tool`; this
     // function just never received it, so an inject's wake intent recorded who
     // was woken and not who woke them.
     let actor = SystemActor::for_tool(sender_tool);
-    let status = if dry_run { "planned" } else { delivery_state };
+    let status = if dry_run {
+        "planned"
+    } else {
+        // The receipt-state vocabulary the envelope already publishes. Kept
+        // verbatim so existing readers of `wake_intent.status` are unaffected;
+        // the cause travels alongside it in evidence.
+        match disposition {
+            DeliveryDisposition::Delivered => "delivered",
+            DeliveryDisposition::SentUnverified => "sent_unverified",
+            DeliveryDisposition::FailedLedgerWrite
+            | DeliveryDisposition::FailedBackendInject
+            | DeliveryDisposition::FailedDaemonSend => "failed",
+            DeliveryDisposition::QueuedAwaitingReceipt
+            | DeliveryDisposition::QueuedNoManagedSession
+            | DeliveryDisposition::QueuedAwaitingPoll
+            | DeliveryDisposition::PlannedDryRun => "pending",
+        }
+    };
     let subject = format!("wake intent {status} to {target_tool}");
     let summary = Some(match session {
         Some(s) => format!(
-            "rally inject {status} for managed session {} via {}",
-            s.name, s.backend
+            "rally inject {status} for managed session {} via {}: {}",
+            s.name,
+            s.backend,
+            disposition.guidance(target_tool)
         ),
-        None => format!("rally inject {status} via ledger for agent {target_tool}"),
+        None => format!(
+            "rally inject {status} via ledger for agent {target_tool}: {}",
+            disposition.guidance(target_tool)
+        ),
     });
     let evidence = commands.iter().map(|command| command.join(" ")).collect();
     let fact = wake_fact(
@@ -8820,7 +8894,14 @@ fn inject_wake_intent_with_room(
         summary,
         evidence,
         handoff.map(str::to_string),
-        Some(status.to_string()),
+        WakeDelivery {
+            status: Some(status.to_string()),
+            disposition: if dry_run {
+                DeliveryDisposition::PlannedDryRun
+            } else {
+                disposition
+            },
+        },
     );
     if dry_run {
         Ok(Some(fact))
@@ -8904,6 +8985,37 @@ fn inject_via_ledger(
 /// attributed wake and all 645 wake facts in this repo own room were
 /// unattributed. `role: "system"` preserves the "this was machine-initiated"
 /// signal that the `"rally"` author used to carry alone; see [`SystemActor`].
+/// The outcome of a send, as the wake fact will record it.
+///
+/// `status` and `disposition` are deliberately separate. `status` stays the
+/// REAL receipt state in the existing vocabulary — the discipline established
+/// for `ptyd_receipt_fact`, where a fabricated "delivered" was the defect.
+/// `disposition` adds why it holds that value, which is what a pending wake
+/// could not previously say: 620 unresolved wakes on this repo's room are all
+/// spelled `pending` with no recorded cause, so the 217 that had no live
+/// address are indistinguishable from the 403 nobody consumed.
+pub(crate) struct WakeDelivery {
+    /// Real receipt state; `None` leaves the fact's status unset.
+    pub(crate) status: Option<String>,
+    /// Why the send is in that state.
+    pub(crate) disposition: DeliveryDisposition,
+}
+
+impl WakeDelivery {
+    /// Evidence markers a reader can recover the cause from. Plain
+    /// `key:value` strings in the existing `evidence` array — no new field, no
+    /// schema bump, and `#[serde(default)]` means older readers ignore them.
+    fn evidence_markers(&self, target_tool: &str) -> Vec<String> {
+        vec![
+            format!("delivery_reason:{}", self.disposition.as_str()),
+            format!(
+                "delivery_guidance:{}",
+                self.disposition.guidance(target_tool)
+            ),
+        ]
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn wake_fact(
     actor: &SystemActor,
@@ -8913,8 +9025,13 @@ fn wake_fact(
     summary: Option<String>,
     evidence: Vec<String>,
     ref_id: Option<String>,
-    status: Option<String>,
+    delivery: WakeDelivery,
 ) -> Fact {
+    // The cause rides in `evidence` ahead of the caller's own entries so it is
+    // the first thing a reader sees on a wake that never resolved.
+    let mut evidence_with_cause = delivery.evidence_markers(target_tool);
+    evidence_with_cause.extend(evidence);
+    let status = delivery.status;
     Fact {
         from_session_id: actor.session_field(),
         schema: FACT_SCHEMA.to_string(),
@@ -8928,7 +9045,7 @@ fn wake_fact(
         scope,
         created_at: now_string(),
         summary,
-        evidence,
+        evidence: evidence_with_cause,
         target: Some(target_tool.to_string()),
         ref_id,
         status,

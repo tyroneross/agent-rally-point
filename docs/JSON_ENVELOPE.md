@@ -79,7 +79,7 @@ print(d['data'][d['command']])
 | `whoami` | `whoami: { tool?, repo_root, repo_id, room_id, worktree, build_id, cwd }` | `repo_id` is stable repo identity; `room_id` is the active engagement label |
 | `sessions` | `sessions: { sessions: [...] }` | — |
 | `run` | `run: { mode, session, commands }` | — |
-| `inject` | `inject: { mode, session, handoff?, require_ack, ack?, wake_intent?, commands, sender_tool, content_fact?, delivered }` | — |
+| `inject` | `inject: { mode, session, handoff?, require_ack, ack?, wake_intent?, commands, sender_tool, content_fact?, delivered, delivery_state, delivery_reason, delivery_detail, reached_target, queued }` | — |
 
 **`inject.ack` shapes** (only present when `--require-ack` is passed):
 
@@ -88,7 +88,24 @@ print(d['data'][d['command']])
 | Resolve fact arrived in time | `{ "resolved": true, "event_id": "...", "tool": "...", "subject": "..." }` |
 | Timed out before resolve fact | `{ "resolved": false, "timed_out": true, "waited_seconds": N, "after_seq": N }` |
 
-An ack-timeout response is **`ok: true` / exit 0** — the inject *succeeded* (message was delivered to the backend and, for `--text` injects, durably recorded as a content fact via `content_fact`). Only the optional downstream acknowledgement did not arrive within the timeout window. Callers must check `ack.resolved`, not `ok`, to determine whether the peer acknowledged. **Do NOT re-inject on an ack-timeout** — the message is already in the channel.
+**`ok` reports the command, not the delivery.** `ok: true` / exit 0 means the send was durably RECORDED. It does not mean the target received it, and for a target with no live session it usually has not. Recording intent for an absent agent is a successful command and an undelivered message at the same time; both facts are reported, in different fields.
+
+This is deliberate. An agent that is not running now may return and find its work through `rally next`, and that durability is what the ledger is for — refusing to record intent because the recipient is asleep would destroy it. Most agents are not running most of the time, so the contract is record-first, deliver-opportunistically, report honestly.
+
+Branch on these, in this order:
+
+| Field | Question it answers |
+|-------|--------------------|
+| `reached_target` | Did the message actually arrive? Only `true` means yes. |
+| `queued` | If not, is it still coming? `true` = durably queued and reachable later; `false` = it is not coming. |
+| `delivery_reason` | Why — typed. See the enum in `docs/schemas/agent-rally.command.inject.v1.json`. |
+| `delivery_detail` | What to do about it, in one sentence. |
+| `delivery_state` | The raw receipt state (`pending`/`delivered`/`seen`/`acted`/`failed`). |
+| `delivered` | Compatibility only: the synchronous backend write. Prefer `reached_target`. |
+
+The two queued reasons are not interchangeable. `queued_awaiting_receipt` means the target has a session and nothing consumed the directive — check the runner. `queued_no_managed_session` means there is no live pane to write to — check the address, or `rally adopt <agent> --tmux <target>`.
+
+An ack-timeout response is also **`ok: true` / exit 0**: the message is in the channel and only the optional downstream acknowledgement did not arrive in the window. Check `ack.resolved`, not `ok`, for acknowledgement. **Do NOT re-inject on an ack-timeout** — the message is already in the channel.
 | `attach` | `attach: { mode, action, session, output?, commands }` | — |
 | `capture` | `capture: { mode, action, session, output?, commands }` | — |
 | `stop` | `stop: { mode, action, session, output?, commands }` | — |

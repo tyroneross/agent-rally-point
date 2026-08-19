@@ -199,6 +199,127 @@ pub(crate) struct TargetInjectability {
     pub(crate) reason: Option<String>,
 }
 
+/// WHY a send is in the state it is in — the field a caller branches on.
+///
+/// # Why `delivery_state` was not enough
+///
+/// `delivery_state` already told the truth about the RECEIPT (`pending` means
+/// no receipt has arrived). What it could not say is why not, and the two
+/// reasons a wake sits `pending` need different handling by whatever routes
+/// stale work:
+///
+/// * **Nobody was listening.** The target has a session and a transport; the
+///   directive is durably queued and no runner has consumed it. Measured on
+///   this repo's room: 403 of 620 unresolved wakes.
+/// * **No live address.** The target resolved to an agent id with no managed
+///   session at all. Delivery depends on an externally-registered rally-termd
+///   pane or on the agent polling `rally next`. Measured: 217 of 620.
+///
+/// Both were spelled `pending`, so the ledger could not tell them apart and a
+/// supervision pass could not decide whether to wait, re-route, or re-address.
+///
+/// # Why absence is not a failure
+///
+/// None of the `Queued*` variants is an error, and none of them refuses the
+/// write. A coordination ledger's value is that an agent which is not running
+/// now can find its work later via `rally next`; refusing to RECORD intent
+/// because the recipient is asleep destroys exactly that. At scale absence is
+/// the normal state — most agents are not running most of the time — so the
+/// contract is record-first, deliver-opportunistically, and report honestly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeliveryDisposition {
+    /// A receipt or a synchronous backend write confirmed arrival.
+    Delivered,
+    /// The legacy backend reported a write it cannot confirm was received.
+    SentUnverified,
+    /// Durably queued for a target that HAS a session; awaiting a receipt.
+    /// "Nobody was listening (yet)."
+    QueuedAwaitingReceipt,
+    /// Durably queued for an agent id with NO managed session. "No live
+    /// address" — an external pane or the agent's next poll may still take it.
+    QueuedNoManagedSession,
+    /// A `rally next` wake intent. There is no transport and none is expected:
+    /// it is a note for the target to find when it next polls.
+    QueuedAwaitingPoll,
+    /// The ledger write itself failed. Nothing is queued and nothing will
+    /// arrive.
+    FailedLedgerWrite,
+    /// The ledger write landed but the synchronous tmux/cmux write failed.
+    FailedBackendInject,
+    /// A daemon-routed send hit an RPC error or a pane mismatch. The directive
+    /// stays queued; this attempt did not deliver.
+    FailedDaemonSend,
+    /// `--dry-run`: nothing was written and nothing was sent.
+    PlannedDryRun,
+}
+
+impl DeliveryDisposition {
+    /// Stable wire spelling. Snake_case to match `delivery_state`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::SentUnverified => "sent_unverified",
+            Self::QueuedAwaitingReceipt => "queued_awaiting_receipt",
+            Self::QueuedNoManagedSession => "queued_no_managed_session",
+            Self::QueuedAwaitingPoll => "queued_awaiting_poll",
+            Self::FailedLedgerWrite => "failed_ledger_write",
+            Self::FailedBackendInject => "failed_backend_inject",
+            Self::FailedDaemonSend => "failed_daemon_send",
+            Self::PlannedDryRun => "planned_dry_run",
+        }
+    }
+
+    /// Did the message actually reach the target?
+    ///
+    /// Only `Delivered` answers yes. `SentUnverified` deliberately does not:
+    /// an unconfirmed backend write is the case this whole enum exists to stop
+    /// reporting as success.
+    pub(crate) fn reached_target(self) -> bool {
+        matches!(self, Self::Delivered)
+    }
+
+    /// Is the message still durably queued and reachable later?
+    pub(crate) fn is_queued(self) -> bool {
+        matches!(
+            self,
+            Self::QueuedAwaitingReceipt | Self::QueuedNoManagedSession | Self::QueuedAwaitingPoll
+        )
+    }
+
+    /// What a caller should do about it, in one sentence. Present for EVERY
+    /// variant including the successful one, so a consumer never has to infer
+    /// the next step from an absent field.
+    pub(crate) fn guidance(self, target: &str) -> String {
+        match self {
+            Self::Delivered => format!("{target} received it."),
+            Self::SentUnverified => format!(
+                "written to {target}'s pane but not confirmed received; treat as unverified and check for a reply before assuming it was read."
+            ),
+            Self::QueuedAwaitingReceipt => format!(
+                "durably queued for {target}, which has a session but has not consumed it. Nothing is lost; it is picked up on {target}'s next poll or by its runner. If it stays queued, the runner is the thing to check, not the address."
+            ),
+            Self::QueuedNoManagedSession => format!(
+                "durably queued for {target}, which has no managed session, so there is no live pane to write to. It is delivered if {target} polls `rally next` or an external rally-termd pane is registered for it. For synchronous delivery, adopt a pane: `rally adopt {target} --tmux <target>`."
+            ),
+            Self::QueuedAwaitingPoll => format!(
+                "recorded for {target} to find on its next `rally next`. No transport is involved and none is expected."
+            ),
+            Self::FailedLedgerWrite => format!(
+                "the ledger write failed, so nothing is queued for {target} and nothing will arrive. Retry the send."
+            ),
+            Self::FailedBackendInject => format!(
+                "queued on the ledger but the synchronous write to {target}'s pane failed. Check the pane is alive (`rally sessions`); the queued copy still stands."
+            ),
+            Self::FailedDaemonSend => format!(
+                "the daemon refused or failed the send to {target} (RPC error or pane mismatch). The directive stays queued; no keystrokes were written."
+            ),
+            Self::PlannedDryRun => {
+                format!("dry run — nothing was written and nothing was sent to {target}.")
+            }
+        }
+    }
+}
+
 #[derive(JsonSchema, Serialize)]
 pub(crate) struct InjectData {
     pub(crate) mode: &'static str,
@@ -283,6 +404,30 @@ pub(crate) struct InjectData {
     /// the CLI does NOT fall back to tmux keystrokes for a ptyd pane.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) daemon_delivery_error: Option<String>,
+    /// **Honest delivery status.** WHY the send is in `delivery_state`, from
+    /// the [`DeliveryDisposition`] vocabulary. `delivery_state` says a receipt
+    /// has not arrived; this says whether that is because nobody has consumed
+    /// a queued directive, because the target has no live address at all, or
+    /// because something failed outright — three cases the single word
+    /// `pending` used to collapse.
+    ///
+    /// ALWAYS present, including on success, so a caller branches on one field
+    /// instead of reconstructing intent from `delivered` + `delivery_state` +
+    /// `target_kind` + `fallback_plan`.
+    pub(crate) delivery_reason: &'static str,
+    /// One sentence naming what a caller should do about `delivery_reason`.
+    /// Previously this information existed only on stderr, which is not a
+    /// status channel and which no programmatic caller reads.
+    pub(crate) delivery_detail: String,
+    /// Whether the message actually reached the target. Distinct from
+    /// `delivered`, which is a compatibility field tied to the backend write,
+    /// and from `ok`, which reports whether the COMMAND succeeded — recording
+    /// intent for an absent agent is a successful command and an undelivered
+    /// message at the same time.
+    pub(crate) reached_target: bool,
+    /// Whether the message is still durably queued and reachable later. The
+    /// field that separates "not yet" from "never".
+    pub(crate) queued: bool,
     /// Pre-wait injectability diagnosis (see [`TargetInjectability`]).
     /// Populated on the `ledger_agent` path, where delivery is asynchronous
     /// and the caller would otherwise learn the target had no live pane only
