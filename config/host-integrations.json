@@ -87,7 +87,7 @@
   "skills": {
     "agent-rally-point": {
       "name": "agent-rally-point",
-      "description": "Use when working in a repository that uses Rally/Agent Rally Point for cross-agent coordination, especially at session start, before editing files, when deciding what to do next, handing work to another agent, recording facts/artifacts/decisions, resolving blockers, or coordinating with other coding agents through the `rally` CLI.",
+      "description": "Use when working in a repository that uses Rally/Agent Rally Point for cross-agent coordination — at session start, before editing files, when deciding what to do next, handing work to another agent, recording facts/artifacts/decisions, or resolving blockers through the `rally` CLI. NOT for authoring or fanning out a multi-agent workstream (use `rally-workflows`), and NOT the per-task quality gate (use `mini-loop`). This skill covers ONE session's own participation in a room.",
       "overlays": {
         "claude_code": {},
         "codex": {}
@@ -103,7 +103,7 @@
     },
     "rally-workflows": {
       "name": "rally-workflows",
-      "description": "Use when fanning out work across multiple agents, running a dynamic workflow, coordinating parallel subagents, or splitting a workstream across hosts, terminals, or machines through Agent Rally Point. Defines the workstream descriptor + task-packet protocol and the per-task rally coordination loop. Host-neutral — works for any coding agent.",
+      "description": "Use when fanning out work across multiple agents, running a dynamic workflow, or splitting a workstream across hosts, terminals, or machines through Agent Rally Point. NOT for one session's own coordination loop (use `agent-rally-point`), and NOT the per-task quality gate (use `mini-loop`). Defines the workstream descriptor + task-packet protocol and the per-task rally coordination loop; host-neutral.",
       "overlays": {
         "claude_code": {},
         "codex": {}

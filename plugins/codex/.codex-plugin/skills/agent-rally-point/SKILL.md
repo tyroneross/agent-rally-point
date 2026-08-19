@@ -1,6 +1,6 @@
 ---
 name: agent-rally-point
-description: Use when working in a repository that uses Rally/Agent Rally Point for cross-agent coordination, especially at session start, before editing files, when deciding what to do next, handing work to another agent, recording facts/artifacts/decisions, resolving blockers, or coordinating with other coding agents through the `rally` CLI.
+description: Use when working in a repository that uses Rally/Agent Rally Point for cross-agent coordination — at session start, before editing files, when deciding what to do next, handing work to another agent, recording facts/artifacts/decisions, or resolving blockers through the `rally` CLI. NOT for authoring or fanning out a multi-agent workstream (use `rally-workflows`), and NOT the per-task quality gate (use `mini-loop`). This skill covers ONE session's own participation in a room.
 ---
 
 # Agent Rally Point
