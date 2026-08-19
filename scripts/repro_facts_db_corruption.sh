@@ -40,10 +40,13 @@ total_fail=0
 total_quarantine=0
 total_bad_integrity=0
 rounds_dirty=0
+daemon_rounds=0
 
 printf 'RC-044 repro: %s trials x %s-way concurrent mutation (%s ops/worker)\n' \
   "$TRIALS" "$WAYS" "$OPS"
-printf 'binary: %s\n\n' "$RALLY_BIN"
+printf 'binary: %s\n' "$RALLY_BIN"
+printf 'arm   : %s\n\n' \
+  "$([[ "${RC044_DAEMON:-0}" == "1" ]] && echo 'rallyd single-writer (RC044_DAEMON=1)' || echo 'direct store (default)')"
 
 for ((trial = 1; trial <= TRIALS; trial++)); do
   room="$WORK/room-$trial"
@@ -61,6 +64,24 @@ for ((trial = 1; trial <= TRIALS; trial++)); do
       --subject "seed fact $s" --json) >/dev/null 2>&1
   done
 
+  # --- optional arm: route every worker through the single-writer daemon.
+  # RC-044's open question is whether serializing store access closes the fault.
+  # `rally daemon start` returns only after the socket is bound and a ping
+  # round-trips, so the storm below cannot race the daemon's cold start.
+  # A treatment arm that silently fell back to the direct store would look like
+  # a clean result and mean nothing, so liveness is ASSERTED, not assumed.
+  daemon_up=0
+  if [[ "${RC044_DAEMON:-0}" == "1" ]]; then
+    (cd "$room" && "$RALLY_BIN" daemon start --json) >/dev/null 2>&1
+    if (cd "$room" && "$RALLY_BIN" daemon status --json) 2>/dev/null \
+      | grep -q '"live": *true'; then
+      daemon_up=1
+      daemon_rounds=$((daemon_rounds + 1))
+    else
+      printf 'trial %3d: daemon NOT LIVE — this round is not a daemon arm\n' "$trial"
+    fi
+  fi
+
   # --- N-way concurrent mixed read/write storm
   pids=()
   for ((w = 1; w <= WAYS; w++)); do
@@ -76,6 +97,12 @@ for ((trial = 1; trial <= TRIALS; trial++)); do
     pids+=("$!")
   done
   for pid in "${pids[@]}"; do wait "$pid"; done
+
+  # Stop before measuring: the daemon holds the store open, and quarantine +
+  # integrity_check must read a settled database, not a live one.
+  if ((daemon_up == 1)); then
+    (cd "$room" && "$RALLY_BIN" daemon stop --json) >/dev/null 2>&1
+  fi
 
   # Hard failures only: expected coordination refusals (lead seat, claim
   # conflict, ack gating) are the product working, not the defect under test.
@@ -120,6 +147,9 @@ printf 'dirty rounds        : %d / %d\n' "$rounds_dirty" "$TRIALS"
 printf 'hard failures       : %d\n' "$total_fail"
 printf 'quarantine files    : %d\n' "$total_quarantine"
 printf 'bad integrity_check : %d\n' "$total_bad_integrity"
+if [[ "${RC044_DAEMON:-0}" == "1" ]]; then
+  printf 'daemon-live rounds  : %d / %d  (arm validity)\n' "$daemon_rounds" "$TRIALS"
+fi
 
 if ((rounds_dirty > 0)); then
   printf '\nfirst dirty round preserved at: %s\n' "$WORK/first-dirty-rally"
