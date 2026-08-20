@@ -512,7 +512,11 @@ fn urgent_addition_skips_daemon_send_and_reports_policy_rejection() {
     assert_eq!(data["wake_intent"]["status"], "failed");
     let detail = data["delivery_detail"].as_str().unwrap_or("");
     assert!(detail.contains("intentionally skipped by SEC-009 policy"));
-    assert!(detail.contains("resend without `--urgent`"));
+    assert!(detail.contains("existing directive") && detail.contains("target runner"));
+    assert!(
+        !detail.contains("resend") && !detail.contains("retry"),
+        "a queued policy rejection must not recommend a duplicate send: {data}"
+    );
 
     assert_eq!(
         count_method(&sb.log, "agent.send"),
