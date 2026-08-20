@@ -592,10 +592,10 @@ fn a_system_write_does_not_enrol_its_actor_as_a_participating_agent() {
 ///
 /// # What this proves, and what it does not
 ///
-/// Mutation-checked, so the limit is measured rather than assumed. Neutering
-/// the marker arm of `write_authority::is_typed_reaper_lease_expiry` (the
-/// `is_system_authored` call) leaves this test — and the entire `rally-cli`
-/// suite — GREEN. So this is NOT a test of that arm.
+/// Mutation-checking originally exposed an important limit: neutering the
+/// marker arm of `write_authority::is_typed_reaper_lease_expiry` (the
+/// `is_system_authored` call) leaves THIS integration test green. So this is
+/// still not the test of that arm.
 ///
 /// The reason is that the refusal arrives earlier, from the store's under-lock
 /// re-checks: a forged `reaper:owner_session=` is rejected with "owner session
@@ -611,10 +611,12 @@ fn a_system_write_does_not_enrol_its_actor_as_a_participating_agent() {
 /// without the arm being re-based, which is exactly what happened while this
 /// change was being written.
 ///
-/// The arm's negative direction is uncovered here and was equally uncovered
-/// when it read `tool == "rally"`; this change neither closed nor widened that
-/// gap. Recorded rather than implied, so the next reader does not mistake a
-/// green suite for coverage it does not have.
+/// The arm's negative direction is now locked by the narrow unit test
+/// `write_authority::tests::an_ordinary_actor_cannot_use_an_otherwise_valid_typed_expiry`.
+/// That test holds every typed marker and the expired lease constant, accepts
+/// the system-authored form, then removes only the system role and requires a
+/// refusal. This integration test remains valuable for the command/store
+/// boundary without pretending to isolate authority it cannot reach.
 #[test]
 fn a_forged_reaper_close_without_the_system_marker_is_refused() {
     let room = TempRoom::new("forged-reaper-close");

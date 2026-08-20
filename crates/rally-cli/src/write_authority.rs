@@ -873,6 +873,59 @@ mod tests {
         );
     }
 
+    /// Arm 3's negative control. Every typed reaper marker and the expired
+    /// lease match the live claim; only the durable system-author marker
+    /// differs. Removing the `is_system_authored` arm therefore makes this
+    /// ordinary actor authorized and turns the test red.
+    #[test]
+    fn an_ordinary_actor_cannot_use_an_otherwise_valid_typed_expiry() {
+        let (mut claim, mut snapshot) = room_with_claim("victim:01", 60);
+        claim
+            .evidence
+            .push("lease_expires_at:2000-01-01T00:00:00Z".to_string());
+        snapshot.active_claims = vec![claim.clone()];
+
+        let mut expiry = Fact {
+            event_id: "expiry-1".to_string(),
+            kind: FactKind::ClaimExpired,
+            tool: Some("reaper-agent:01".to_string()),
+            role: Some(crate::SYSTEM_ROLE.to_string()),
+            from_session_id: Some("sess:reaper-agent:01".to_string()),
+            ref_id: Some(claim.event_id.clone()),
+            subject: "typed lease expiry".to_string(),
+            evidence: vec![
+                format!("reaper:ref_id={}", claim.event_id),
+                "reaper:reason=lease-expired".to_string(),
+                "reaper:owner=victim:01".to_string(),
+                "reaper:owner_session=sess:victim:01".to_string(),
+                "reaper:observed=unknown".to_string(),
+            ],
+            created_at: iso_ago(0),
+            ..Fact::default()
+        };
+
+        assert!(
+            claim_lease_expired(&claim),
+            "the fixture lease must be expired"
+        );
+        assert!(
+            is_typed_reaper_lease_expiry(&expiry, &claim),
+            "the complete typed evidence must authorize a system-authored expiry"
+        );
+        authorized(&expiry, &snapshot);
+
+        expiry.role = None;
+        assert!(
+            !is_typed_reaper_lease_expiry(&expiry, &claim),
+            "the same typed evidence must not authorize an ordinary actor"
+        );
+        let err = refusal(&expiry, &snapshot);
+        assert!(
+            err.contains("not the owner") && err.contains("typed ClaimExpired cleanup"),
+            "the refusal must identify the missing authority, not malformed evidence; got: {err}"
+        );
+    }
+
     /// Two live claims on different paths: `victim:01` owns the victim path,
     /// `codex:rogue` owns its own. `owner_silent_secs` ages ONLY the victim.
     fn room_with_two_claims(owner_silent_secs: i64) -> RoomSnapshot {
