@@ -242,8 +242,8 @@ pub(crate) enum DeliveryDisposition {
     /// A `rally next` wake intent. There is no transport and none is expected:
     /// it is a note for the target to find when it next polls.
     QueuedAwaitingPoll,
-    /// The ledger write itself failed. Nothing is queued and nothing will
-    /// arrive.
+    /// The ledger append did not report durable success. The write outcome is
+    /// ambiguous because bytes may have landed before a later sync failed.
     FailedLedgerWrite,
     /// SEC-009 intentionally skipped synchronous transport for an urgent
     /// `Deliver + Addition`. The directive remains durably queued.
@@ -283,7 +283,8 @@ impl DeliveryDisposition {
         matches!(self, Self::Delivered)
     }
 
-    /// Is the message still durably queued and reachable later?
+    /// Did this command confirm a durable queued copy that remains reachable?
+    /// `false` does not prove absence when the ledger append itself failed.
     pub(crate) fn is_queued(self) -> bool {
         matches!(
             self,
@@ -295,15 +296,6 @@ impl DeliveryDisposition {
                 | Self::FailedBackendInject
                 | Self::FailedDaemonSend
         )
-    }
-
-    /// May a sender safely retry after an ACK timeout without risking a
-    /// duplicate durable directive?
-    ///
-    /// Only a failed ledger write qualifies: it is not queued, did not reach
-    /// the target, and its typed guidance explicitly says to retry.
-    pub(crate) fn retry_allowed_after_timeout(self) -> bool {
-        matches!(self, Self::FailedLedgerWrite)
     }
 
     /// Reconcile the attempt-time disposition with target-authored receipt
@@ -341,7 +333,7 @@ impl DeliveryDisposition {
                 "recorded for {target} to find on its next `rally next`. No transport is involved and none is expected."
             ),
             Self::FailedLedgerWrite => format!(
-                "the ledger write failed, so nothing is queued for {target} and nothing will arrive. Retry the send."
+                "the ledger append for {target} did not report durable success, but it may have written the directive before a later sync failed. `queued: false` means no durable copy was confirmed, not that the inbox is empty. Inspect and reconcile {target}'s existing inbox before taking any further delivery action."
             ),
             Self::PolicyRejectedUrgentAddition => format!(
                 "synchronous delivery to {target} was intentionally skipped by SEC-009 policy because urgent Deliver + Addition is not allowed on that transport. The directive remains durably queued; follow that existing directive and inspect the target runner until target-authored evidence arrives."
@@ -2281,7 +2273,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn delivery_queue_flag_tracks_whether_a_durable_copy_remains() {
+    fn delivery_queue_flag_tracks_whether_a_durable_copy_was_confirmed() {
         for disposition in [
             DeliveryDisposition::SentUnverified,
             DeliveryDisposition::QueuedAwaitingReceipt,
@@ -2304,7 +2296,26 @@ mod tests {
         ] {
             assert!(
                 !disposition.is_queued(),
-                "{disposition:?} does not leave a durable queued copy"
+                "{disposition:?} does not confirm a durable queued copy"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_ledger_write_guidance_preserves_post_write_ambiguity() {
+        let guidance = DeliveryDisposition::FailedLedgerWrite
+            .guidance("claude_code:target")
+            .to_ascii_lowercase();
+        assert!(
+            guidance.contains("may have written the directive")
+                && guidance.contains("existing inbox")
+                && guidance.contains("reconcile"),
+            "failed append guidance must preserve the post-write ambiguity: {guidance}"
+        );
+        for forbidden in ["retry", "re-inject", "resend"] {
+            assert!(
+                !guidance.contains(forbidden),
+                "failed append guidance must not automate duplicate delivery ({forbidden:?}): {guidance}"
             );
         }
     }

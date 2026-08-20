@@ -9507,7 +9507,10 @@ fn ack_timeout_fallback_plan(
     let delivery_detail = disposition.guidance(expected_tool);
     let reached_target = disposition.reached_target();
     let queued = disposition.is_queued();
-    let retry_allowed = disposition.retry_allowed_after_timeout();
+    // An append error is not proof that nothing was written: `write_all` may
+    // have succeeded before `sync_data` or parent-directory sync failed.
+    // ACK-timeout automation therefore never authorizes another delivery.
+    let retry_allowed = false;
     let (delivery_truth, checks, fallbacks): (&str, Vec<String>, Vec<String>) = if reached_target {
         (
                 "target_reached_ack_missing",
@@ -9548,24 +9551,24 @@ fn ack_timeout_fallback_plan(
                     "escalate to the human when queue ownership or runner state remains unclear".to_string(),
                 ],
             )
-    } else if retry_allowed {
+    } else if disposition == DeliveryDisposition::FailedLedgerWrite {
         (
-                "not_queued_retryable",
-                vec![
-                    "inspect the ledger error and correct permissions, corruption, or storage availability".to_string(),
-                    format!(
-                        "confirm no durable directive exists for {expected_tool} before sending again"
-                    ),
-                    "confirm the next successful send returns a directive_seq".to_string(),
-                    "escalate if the ledger remains unwritable".to_string(),
-                ],
-                vec![
-                    format!("retry once after correcting the ledger failure: {delivery_detail}"),
-                    "verify the new attempt creates exactly one durable directive".to_string(),
-                    "inspect the target runner only after the ledger accepts the directive".to_string(),
-                    "escalate to the human if durable recording cannot be restored".to_string(),
-                ],
-            )
+            "ledger_write_outcome_ambiguous",
+            vec![
+                format!(
+                    "inspect {expected_tool}'s existing inbox for handoff {handoff} or a matching directive"
+                ),
+                "rally recent --limit 50 --json; look for target-authored evidence on the existing handoff".to_string(),
+                "repair the reported ledger or sync failure without assuming the append was absent".to_string(),
+                "reconcile the inbox and handoff state before taking any further delivery action".to_string(),
+            ],
+            vec![
+                "treat the append outcome as unknown; `queued: false` means unconfirmed, not absent".to_string(),
+                "continue only after inbox inspection establishes whether the directive exists".to_string(),
+                "restore ledger durability and follow the existing directive when one is present".to_string(),
+                "escalate when the inbox state or durable write outcome cannot be established".to_string(),
+            ],
+        )
     } else {
         (
             "not_queued_no_retry",
@@ -9694,30 +9697,39 @@ mod tests {
         );
     }
 
-    /// Mutation guard for ACK-timeout advice: changing either final-truth arm
-    /// back to the old generic retry plan must fail this test. A retry is safe
-    /// only when the ledger write failed before creating a durable directive.
     #[test]
-    fn ack_timeout_advice_retries_only_when_final_truth_is_not_queued_or_reached() {
-        let cases = [
-            (
-                DeliveryDisposition::Delivered,
-                "target_reached_ack_missing",
-                false,
+    fn inject_help_preserves_delivery_truth_when_target_ack_is_missing() {
+        let help = help_text();
+        assert!(
+            help.contains(
+                "without that evidence, branch on reached_target, queued, and fallback_plan"
             ),
+            "inject help must route missing-ACK decisions through final delivery truth"
+        );
+        assert!(
+            !help.contains("no ACK means assume not received"),
+            "missing target-authored evidence must not erase reached or queued delivery truth"
+        );
+    }
+
+    /// Mutation guard for ACK-timeout advice: reached, queued, and ambiguous
+    /// append outcomes must all reject duplicate delivery advice. A failed
+    /// append is ambiguous because a later sync can fail after bytes land.
+    #[test]
+    fn ack_timeout_advice_never_duplicates_reached_queued_or_ambiguous_writes() {
+        let cases = [
+            (DeliveryDisposition::Delivered, "target_reached_ack_missing"),
             (
                 DeliveryDisposition::QueuedNoManagedSession,
                 "durably_queued_ack_missing",
-                false,
             ),
             (
                 DeliveryDisposition::FailedLedgerWrite,
-                "not_queued_retryable",
-                true,
+                "ledger_write_outcome_ambiguous",
             ),
         ];
 
-        for (disposition, expected_truth, expected_retry) in cases {
+        for (disposition, expected_truth) in cases {
             let plan = ack_timeout_fallback_plan(
                 "handoff-timeout-mutation-guard",
                 "claude_code:target",
@@ -9731,29 +9743,47 @@ mod tests {
             );
             assert_eq!(
                 plan["retry_allowed"].as_bool(),
-                Some(expected_retry),
+                Some(false),
                 "retry contract changed for {disposition:?}: {plan}"
             );
 
-            let rendered = serde_json::to_string(&plan)
-                .expect("serialize timeout fallback")
-                .to_ascii_lowercase();
-            assert_eq!(
-                rendered.contains("retry once"),
-                expected_retry,
-                "human advice must agree with typed retry_allowed for {disposition:?}: {plan}"
-            );
+            let mut human_advice = plan["delivery_detail"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            for field in ["checks", "fallbacks"] {
+                for item in plan[field].as_array().expect("advice array") {
+                    human_advice.push(' ');
+                    human_advice.push_str(item.as_str().expect("advice string"));
+                }
+            }
+            let human_advice = human_advice.to_ascii_lowercase();
+            for forbidden in ["retry", "re-inject", "resend"] {
+                assert!(
+                    !human_advice.contains(forbidden),
+                    "{disposition:?} advice must not suggest another delivery ({forbidden:?}): {plan}"
+                );
+            }
             if disposition.is_queued() {
                 assert!(
-                    rendered.contains("existing durable directive") && rendered.contains("runner"),
+                    human_advice.contains("existing durable directive")
+                        && human_advice.contains("runner"),
                     "queued advice must follow the existing directive and runner: {plan}"
                 );
             }
             if disposition.reached_target() {
                 assert!(
-                    rendered.contains("target was reached")
-                        && rendered.contains("do not create a duplicate"),
+                    human_advice.contains("target was reached")
+                        && human_advice.contains("do not create a duplicate"),
                     "reached advice must preserve delivery truth without retrying: {plan}"
+                );
+            }
+            if disposition == DeliveryDisposition::FailedLedgerWrite {
+                assert!(
+                    human_advice.contains("may have written")
+                        && human_advice.contains("existing inbox")
+                        && human_advice.contains("reconcile"),
+                    "failed append advice must surface and reconcile the ambiguous write: {plan}"
                 );
             }
         }
@@ -17080,7 +17110,7 @@ fn help_text() -> String {
         "    managed run ids auto-number active agents, e.g. claude-01 / claude_code:01",
         "  rally sessions [--reap] [--json] [--tmux-bin <path>] [--cmux-bin <path>]",
         "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--timeout-seconds <n>] [--json]",
-        "    --handoff waits for target-authored Rally ACK by default; no ACK means assume not received and follow fallback_plan",
+        "    --handoff waits for target-authored Rally ACK by default; without that evidence, branch on reached_target, queued, and fallback_plan",
         "  rally attach <session|name|tool> [--dry-run] [--json]",
         "  rally capture <session|name|tool> [--lines <n>] [--dry-run] [--json]",
         "  rally stop <session|name|tool> [--dry-run] [--json]",

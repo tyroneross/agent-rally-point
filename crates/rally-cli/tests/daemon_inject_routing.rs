@@ -464,7 +464,8 @@ fn daemon_registered_session_injects_ledger_only_zero_send_keys() {
 
 /// SEC-009 is an intentional policy skip on the daemon route, not an
 /// `agent.send` failure. The Directive remains queued and the response gives
-/// the caller a policy-specific retry instead of RPC/pane repair guidance.
+/// the caller policy-specific guidance to follow the existing directive and
+/// runner instead of duplicating delivery or attempting RPC/pane repair.
 #[test]
 fn urgent_addition_skips_daemon_send_and_reports_policy_rejection() {
     let sb = Sandbox::new();

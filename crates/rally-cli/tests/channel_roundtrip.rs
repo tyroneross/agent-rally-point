@@ -97,12 +97,20 @@ fn assert_non_retrying_timeout_plan(inject: &serde_json::Value, delivery_truth: 
     assert_eq!(plan["delivery_truth"].as_str(), Some(delivery_truth));
     assert_eq!(plan["retry_allowed"].as_bool(), Some(false));
     assert_eq!(inject["ack"]["fallback_plan"], *plan);
-    let rendered = serde_json::to_string(plan)
-        .expect("serialize timeout plan")
-        .to_ascii_lowercase();
-    for forbidden in ["retry once", "re-inject", "resend without"] {
+    let mut human_advice = plan["delivery_detail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    for field in ["checks", "fallbacks"] {
+        for item in plan[field].as_array().expect("advice array") {
+            human_advice.push(' ');
+            human_advice.push_str(item.as_str().expect("advice string"));
+        }
+    }
+    let human_advice = human_advice.to_ascii_lowercase();
+    for forbidden in ["retry", "re-inject", "resend"] {
         assert!(
-            !rendered.contains(forbidden),
+            !human_advice.contains(forbidden),
             "final delivery truth forbids duplicate-send advice containing {forbidden:?}: {plan}"
         );
     }
@@ -692,7 +700,7 @@ fn inject_ledger_ack_timeout_carries_pre_wait_injectability_diagnosis() {
 }
 
 #[test]
-fn failed_ledger_write_timeout_allows_one_typed_retry_because_nothing_is_queued() {
+fn failed_ledger_write_timeout_reports_ambiguous_append_without_retry_advice() {
     let sandbox = ChannelSandbox::spawn();
     let agent = "failed-ledger-timeout-agent";
     let inbox_dir = sandbox.rally_dir().join("inbox");
@@ -727,27 +735,22 @@ fn failed_ledger_write_timeout_allows_one_typed_retry_because_nothing_is_queued(
     assert_eq!(inject["directive_seq"], serde_json::Value::Null);
     assert_eq!(inject["reached_target"].as_bool(), Some(false));
     assert_eq!(inject["queued"].as_bool(), Some(false));
-    assert_eq!(
-        plan["delivery_truth"].as_str(),
-        Some("not_queued_retryable")
-    );
+    assert_non_retrying_timeout_plan(inject, "ledger_write_outcome_ambiguous");
     assert_eq!(
         plan["delivery_reason"].as_str(),
         Some("failed_ledger_write")
     );
-    assert_eq!(plan["retry_allowed"].as_bool(), Some(true));
-    assert_eq!(inject["ack"]["fallback_plan"], *plan);
     assert!(
         plan["delivery_detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("Retry the send")),
-        "typed detail must be the authority for retry advice: {inject}"
+            .is_some_and(|detail| detail.contains("may have written the directive")
+                && detail.contains("existing inbox")),
+        "typed detail must surface the post-write ambiguity: {inject}"
     );
+    let rendered = serde_json::to_string(plan).expect("serialize failed-ledger fallback plan");
     assert!(
-        serde_json::to_string(plan)
-            .expect("serialize failed-ledger fallback plan")
-            .contains("retry once"),
-        "a failed ledger write leaves no queued copy, so one retry is safe: {inject}"
+        rendered.contains("append outcome as unknown") && rendered.contains("reconcile"),
+        "an ambiguous append must be inspected and reconciled before further action: {inject}"
     );
 }
 
