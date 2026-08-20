@@ -12,8 +12,8 @@ plugin's support channel.
 
 1. Ask what went wrong, if the user has not already said. One question, not a form.
 2. Gather the context that makes a report actionable, without interrogating the user:
-   - plugin version from `.codex-plugin/plugin.json`
-   - `codex --version`
+   - plugin version from `.claude-plugin/plugin.json`
+   - `claude --version`
    - `uname -sm`
    - which command or skill misbehaved, and what it did instead
 3. Show the user the exact title and body you intend to file. Their report, their words.
