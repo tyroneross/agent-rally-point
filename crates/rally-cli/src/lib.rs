@@ -7834,7 +7834,6 @@ fn command_inject_managed(
         // anything consumed it.
         DeliveryDisposition::QueuedAwaitingReceipt
     };
-    let delivery_detail = disposition.guidance(&session.tool);
     let wake_intent = inject_wake_intent_with_room(
         room.as_ref(),
         &sender_tool,
@@ -7864,6 +7863,8 @@ fn command_inject_managed(
     };
     let ack_state = inject_ack_state(effective_require_ack, dry_run, ack.as_ref());
     let verified_received = inject_verified_received(ack.as_ref());
+    let final_disposition = disposition.after_target_ack(verified_received);
+    let delivery_detail = final_disposition.guidance(&session.tool);
     let fallback_plan = inject_fallback_plan(
         effective_require_ack,
         dry_run,
@@ -7895,14 +7896,15 @@ fn command_inject_managed(
         sender_tool,
         content_fact,
         delivered,
-        // Plan F: surface the truthful delivery state + the Directive's
-        // assigned sequence so downstream callers can look up the matching
-        // Receipt via `rally status` once rally-termd (P3) is live.
+        // Compatibility contract: these two fields retain the immediate
+        // synchronous transport attempt. The additive delivery truth fields
+        // below reconcile stronger target-authored ACK evidence collected
+        // during the wait.
         delivery_state,
-        delivery_reason: disposition.as_str(),
+        delivery_reason: final_disposition.as_str(),
         delivery_detail,
-        reached_target: disposition.reached_target(),
-        queued: disposition.is_queued(),
+        reached_target: final_disposition.reached_target(),
+        queued: final_disposition.is_queued(),
         directive_seq,
         directive_to,
         delivery_path,
@@ -8075,6 +8077,7 @@ fn command_inject_ledger(
     };
     let ack_state = inject_ack_state(effective_require_ack, dry_run, ack.as_ref());
     let verified_received = inject_verified_received(ack.as_ref());
+    let final_disposition = disposition.after_target_ack(verified_received);
     // Sender observability: prefer an ack-timeout plan when --require-ack is set;
     // otherwise (plain inject on the ledger_only path) still surface the async
     // delivery contract so `ok:true` + `delivered:false` is not misread as a live
@@ -8087,7 +8090,7 @@ fn command_inject_ledger(
         ack.as_ref(),
     )
     .or_else(|| {
-        if dry_run || delivery_state != "pending" {
+        if verified_received || dry_run || delivery_state != "pending" {
             None
         } else {
             Some(ledger_async_fallback_plan(&agent_id))
@@ -8120,21 +8123,17 @@ fn command_inject_ledger(
         commands: command_plan_json(&commands),
         sender_tool,
         content_fact,
-        // `delivered` is the legacy bool gated to the synchronous backend
-        // outcome. The ledger-only path never runs a backend, so `delivered`
-        // is always false here — consumers should branch on `delivery_state`
-        // (which is `pending` on a successful ledger write; rally-termd posts
-        // a Receipt to flip it to `delivered`/`seen`/`acted` out-of-band).
+        // Compatibility contract: the ledger-only path never runs a
+        // synchronous backend, so `delivered` stays false and
+        // `delivery_state` retains the attempt-time ledger state. The additive
+        // fields below reconcile a target-authored ACK observed during this
+        // command and therefore may truthfully report reached/not-queued.
         delivered: false,
         delivery_state,
-        // The reason `delivered` is false. Without it a caller reading
-        // `ok: true, delivered: false` cannot tell a durably-queued message
-        // for an absent agent (normal, and the point of the ledger) from a
-        // write that failed (not normal). O08 is that confusion, observed live.
-        delivery_reason: disposition.as_str(),
-        delivery_detail: disposition.guidance(&agent_id),
-        reached_target: disposition.reached_target(),
-        queued: disposition.is_queued(),
+        delivery_reason: final_disposition.as_str(),
+        delivery_detail: final_disposition.guidance(&agent_id),
+        reached_target: final_disposition.reached_target(),
+        queued: final_disposition.is_queued(),
         directive_seq,
         directive_to,
         // A LedgerAgent target is an externally-registered ptyd pane: the

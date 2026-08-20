@@ -114,6 +114,31 @@ impl ChannelSandbox {
         &self.cwd
     }
 
+    /// Isolated HOME used by rally subprocesses in this sandbox.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// Build a tmux test double that reports `managed_name` as live, accepts
+    /// writes, and returns unrelated nonempty pane content. The last behavior
+    /// deterministically exercises `SentUnverified`: send succeeded, but the
+    /// payload's verification needle did not appear in capture output.
+    pub fn tmux_unverified_stub(&self, managed_name: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = self.root.join(format!("tmux-unverified-{managed_name}.sh"));
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  list-panes) printf '%s\\n%s\\n%s\\n' 'rally-claude-{managed_name}' '@1' '%1' ;;\n  capture-pane) printf '%s\\n' 'unrelated pane content' ;;\nesac\nexit 0\n"
+        );
+        fs::write(&path, body).expect("write unverified tmux stub");
+        let mut permissions = fs::metadata(&path)
+            .expect("stat unverified tmux stub")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod unverified tmux stub");
+        path.to_string_lossy().into_owned()
+    }
+
     /// The `.rally` directory (populated by `rally run` on first invocation).
     pub fn rally_dir(&self) -> PathBuf {
         self.cwd.join(".rally")
