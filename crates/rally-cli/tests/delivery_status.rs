@@ -230,12 +230,14 @@ fn a_queued_send_distinguishes_no_address_from_no_listener() {
         "sender:01",
     ]);
 
-    // A managed session exists, so there IS an address. `/usr/bin/true` makes
-    // every tmux subcommand succeed without doing anything, which both keeps
-    // the session's liveness probe healthy and lets the backend write "succeed"
-    // against a pane nothing is reading.
+    // A managed session exists, so there IS an address. The tmux double makes
+    // the send succeed and the capture return unrelated, nonempty output. That
+    // exercises the real sent-but-unverified path: the pane write is not proof
+    // of receipt, while the Directive already appended to the ledger remains
+    // durably queued.
     let name = unique_name("listener");
     let target = sandbox.add_tmux_session(&name);
+    let tmux_stub = sandbox.tmux_unverified_stub(&target);
     let present = sandbox.rally_json(&[
         "inject",
         &target,
@@ -245,7 +247,7 @@ fn a_queued_send_distinguishes_no_address_from_no_listener() {
         "--tool",
         "sender:01",
         "--tmux-bin",
-        "/usr/bin/true",
+        tmux_stub.as_str(),
     ]);
 
     let absent_reason = absent["data"]["inject"]["delivery_reason"]
@@ -256,15 +258,30 @@ fn a_queued_send_distinguishes_no_address_from_no_listener() {
         .unwrap_or("");
 
     assert_eq!(absent_reason, "queued_no_managed_session");
-    assert_ne!(
-        absent_reason, present_reason,
-        "a target with a session and a target without one must not report the \
-         same reason; telling them apart is the point. absent={absent_reason} \
-         present={present_reason}"
+    assert_eq!(
+        present_reason, "sent_unverified",
+        "a successful pane write without landing evidence must stay unverified: {present}"
+    );
+    assert_eq!(
+        present["data"]["inject"]["delivery_state"].as_str(),
+        Some("sent_unverified"),
+        "the compatibility state must retain the unverified attempt: {present}"
+    );
+    assert_eq!(
+        present["data"]["inject"]["reached_target"].as_bool(),
+        Some(false),
+        "the pane write alone is not receipt evidence: {present}"
+    );
+    assert_eq!(
+        present["data"]["inject"]["queued"].as_bool(),
+        Some(true),
+        "the Directive was durably appended before the unverified pane write: {present}"
     );
     assert!(
-        !present_reason.is_empty(),
-        "a managed-session send must also carry a typed reason: {present}"
+        present["data"]["inject"]["delivery_detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("durable queued copy")),
+        "guidance must say the queued copy remains reachable: {present}"
     );
 }
 

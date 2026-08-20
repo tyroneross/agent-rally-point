@@ -47,10 +47,6 @@
       "content_fact",
       "delivered",
       "delivery_state",
-      "delivery_reason",
-      "delivery_detail",
-      "reached_target",
-      "queued",
       "directive_seq",
       "directive_to"
      ],
@@ -131,7 +127,7 @@
        "type": "string"
       },
       "delivery_reason": {
-       "description": "WHY the send is in `delivery_state`. `delivery_state` reports the receipt; this reports the cause, which a single `pending` could not distinguish: a directive queued against a target that has a session and has not consumed it, a target with no managed session and therefore no live address, or an outright failure. Callers routing stale work branch on this.",
+       "description": "Final delivery truth after any required ACK wait. Current writers always emit it, but it remains optional in v1 so envelopes written before this additive field was introduced stay valid. `delivered` and `delivery_state` preserve the immediate transport-attempt compatibility contract; target-authored receipt evidence can therefore make this field `delivered` even when those compatibility fields retain an earlier attempt state.",
        "type": "string",
        "enum": [
         "delivered",
@@ -146,15 +142,15 @@
        ]
       },
       "delivery_detail": {
-       "description": "One sentence naming what the caller should do about `delivery_reason`. Previously this existed only on stderr, which no programmatic caller reads.",
+       "description": "One sentence naming what the caller should do about the final `delivery_reason`. Current writers always emit it; the field remains optional for pre-field v1 envelopes.",
        "type": "string"
       },
       "reached_target": {
-       "description": "Whether the message actually reached the target. Distinct from `delivered` (a compatibility field tied to the synchronous backend write) and from the envelope's `ok` (which reports whether the COMMAND succeeded \u2014 recording intent for an absent agent is a successful command AND an undelivered message).",
+       "description": "Whether immediate delivery or later target-authored ACK evidence proves the message reached the target. Distinct from `delivered`, which preserves the synchronous backend-attempt compatibility contract. Current writers always emit it; the field remains optional for pre-field v1 envelopes.",
        "type": "boolean"
       },
       "queued": {
-       "description": "Whether the message is still durably queued and reachable later. Separates 'not yet' from 'never'. An absent target is queued, not failed: the ledger's value is that an agent which is not running now finds its work later via `rally next`.",
+       "description": "Whether the message remains durably queued after any required ACK wait. Sent-unverified and failed transport attempts remain queued when their Directive landed; target-authored ACK evidence clears the flag. Current writers always emit it; the field remains optional for pre-field v1 envelopes.",
        "type": "boolean"
       },
       "directive_seq": {

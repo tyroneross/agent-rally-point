@@ -231,6 +231,7 @@ pub(crate) enum DeliveryDisposition {
     /// A receipt or a synchronous backend write confirmed arrival.
     Delivered,
     /// The legacy backend reported a write it cannot confirm was received.
+    /// The Directive was already durably appended and remains queued.
     SentUnverified,
     /// Durably queued for a target that HAS a session; awaiting a receipt.
     /// "Nobody was listening (yet)."
@@ -282,12 +283,29 @@ impl DeliveryDisposition {
     pub(crate) fn is_queued(self) -> bool {
         matches!(
             self,
-            Self::QueuedAwaitingReceipt
+            Self::SentUnverified
+                | Self::QueuedAwaitingReceipt
                 | Self::QueuedNoManagedSession
                 | Self::QueuedAwaitingPoll
                 | Self::FailedBackendInject
                 | Self::FailedDaemonSend
         )
+    }
+
+    /// Reconcile the attempt-time disposition with target-authored receipt
+    /// evidence collected while `inject --require-ack` waits.
+    ///
+    /// The compatibility fields retain the immediate transport attempt, but
+    /// these additive truth fields must prefer stronger target evidence: once
+    /// the target ACKs, the message reached it and is no longer pending in the
+    /// durable queue, regardless of whether the original pane write was only
+    /// unverified or reported a transport failure.
+    pub(crate) fn after_target_ack(self, verified_received: bool) -> Self {
+        if verified_received {
+            Self::Delivered
+        } else {
+            self
+        }
     }
 
     /// What a caller should do about it, in one sentence. Present for EVERY
@@ -297,7 +315,7 @@ impl DeliveryDisposition {
         match self {
             Self::Delivered => format!("{target} received it."),
             Self::SentUnverified => format!(
-                "written to {target}'s pane but not confirmed received; treat as unverified and check for a reply before assuming it was read."
+                "written to {target}'s pane but not confirmed received; the durable queued copy remains available. Check for a target-authored reply before assuming it was read."
             ),
             Self::QueuedAwaitingReceipt => format!(
                 "durably queued for {target}, which has a session but has not consumed it. Nothing is lost; it is picked up on {target}'s next poll or by its runner. If it stays queued, the runner is the thing to check, not the address."
@@ -363,16 +381,17 @@ pub(crate) struct InjectData {
     /// **Compatibility field.** Whether the synchronous backend delivery
     /// succeeded. Becomes `true` ONLY when `delivery_state in
     /// {Delivered, Seen, Acted}`; `false` covers BOTH `Pending` (in-flight)
-    /// AND `Failed` outcomes. Prefer `delivery_state` for new code; this
-    /// field is preserved for downstream tools that scrape the existing JSON
-    /// envelope.
+    /// AND `Failed` outcomes. This field is preserved for downstream tools
+    /// that scrape the existing JSON envelope; callers that need final truth
+    /// after an ACK wait use `reached_target` and `queued`.
     pub(crate) delivered: bool,
-    /// **Plan F.** The truthful delivery state, mirroring
-    /// `rally_protocol::DeliveryStatus`. `Pending` means the Directive has
-    /// been durably appended to the ledger but no Receipt has arrived yet
-    /// (the daemon is the canonical receipt-poster; absent it, a cooperating
-    /// agent self-acks). Wire shape: snake_case (`pending|delivered|seen|
-    /// acted|failed`).
+    /// **Compatibility field.** Attempt-time delivery state, mirroring
+    /// `rally_protocol::DeliveryStatus` before any blocking target-ACK wait.
+    /// `Pending` means the Directive was durably appended but no receipt was
+    /// known at that point. A later target-authored ACK updates the four
+    /// additive truth fields while this value stays stable for v1 consumers.
+    /// Wire shape: snake_case
+    /// (`pending|delivered|seen|acted|failed|sent_unverified`).
     pub(crate) delivery_state: &'static str,
     /// **Plan F.** The assigned per-inbox sequence of the Directive this
     /// inject wrote. `None` in dry-run or when the inject was a no-op.
@@ -408,29 +427,31 @@ pub(crate) struct InjectData {
     /// the CLI does NOT fall back to tmux keystrokes for a ptyd pane.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) daemon_delivery_error: Option<String>,
-    /// **Honest delivery status.** WHY the send is in `delivery_state`, from
-    /// the [`DeliveryDisposition`] vocabulary. `delivery_state` says a receipt
-    /// has not arrived; this says whether that is because nobody has consumed
-    /// a queued directive, because the target has no live address at all, or
-    /// because something failed outright — three cases the single word
-    /// `pending` used to collapse.
+    /// **Final delivery truth.** WHY the send is reachable after any required
+    /// ACK wait, from the [`DeliveryDisposition`] vocabulary. `delivered` and
+    /// `delivery_state` intentionally preserve the immediate transport-attempt
+    /// compatibility contract; when `verified_received` is true, these four
+    /// additive fields instead reflect the stronger target-authored evidence.
     ///
-    /// ALWAYS present, including on success, so a caller branches on one field
-    /// instead of reconstructing intent from `delivered` + `delivery_state` +
-    /// `target_kind` + `fallback_plan`.
+    /// Current writers ALWAYS emit this field, including on success. It stays
+    /// optional in the v1 schema so envelopes written before the field was
+    /// added remain valid.
+    #[schemars(default)]
     pub(crate) delivery_reason: &'static str,
-    /// One sentence naming what a caller should do about `delivery_reason`.
-    /// Previously this information existed only on stderr, which is not a
-    /// status channel and which no programmatic caller reads.
+    /// One sentence naming what a caller should do about the final
+    /// `delivery_reason`. Current writers always emit it; the v1 schema keeps
+    /// it optional for compatibility with pre-field envelopes.
+    #[schemars(default)]
     pub(crate) delivery_detail: String,
-    /// Whether the message actually reached the target. Distinct from
-    /// `delivered`, which is a compatibility field tied to the backend write,
-    /// and from `ok`, which reports whether the COMMAND succeeded — recording
-    /// intent for an absent agent is a successful command and an undelivered
-    /// message at the same time.
+    /// Whether immediate delivery OR later target-authored ACK evidence proves
+    /// the message reached the target. Distinct from `delivered`, which stays a
+    /// compatibility field tied to the synchronous backend attempt. Current
+    /// writers always emit it; the v1 schema keeps it optional.
+    #[schemars(default)]
     pub(crate) reached_target: bool,
-    /// Whether the message is still durably queued and reachable later. The
-    /// field that separates "not yet" from "never".
+    /// Whether the message is still durably queued after any required ACK
+    /// wait. Current writers always emit it; the v1 schema keeps it optional.
+    #[schemars(default)]
     pub(crate) queued: bool,
     /// Pre-wait injectability diagnosis (see [`TargetInjectability`]).
     /// Populated on the `ledger_agent` path, where delivery is asynchronous
@@ -2243,6 +2264,7 @@ mod tests {
     #[test]
     fn delivery_queue_flag_tracks_whether_a_durable_copy_remains() {
         for disposition in [
+            DeliveryDisposition::SentUnverified,
             DeliveryDisposition::QueuedAwaitingReceipt,
             DeliveryDisposition::QueuedNoManagedSession,
             DeliveryDisposition::QueuedAwaitingPoll,
@@ -2257,13 +2279,38 @@ mod tests {
 
         for disposition in [
             DeliveryDisposition::Delivered,
-            DeliveryDisposition::SentUnverified,
             DeliveryDisposition::FailedLedgerWrite,
             DeliveryDisposition::PlannedDryRun,
         ] {
             assert!(
                 !disposition.is_queued(),
                 "{disposition:?} does not leave a durable queued copy"
+            );
+        }
+    }
+
+    #[test]
+    fn target_ack_reconciles_every_attempt_disposition_to_delivered() {
+        for disposition in [
+            DeliveryDisposition::Delivered,
+            DeliveryDisposition::SentUnverified,
+            DeliveryDisposition::QueuedAwaitingReceipt,
+            DeliveryDisposition::QueuedNoManagedSession,
+            DeliveryDisposition::QueuedAwaitingPoll,
+            DeliveryDisposition::FailedLedgerWrite,
+            DeliveryDisposition::FailedBackendInject,
+            DeliveryDisposition::FailedDaemonSend,
+            DeliveryDisposition::PlannedDryRun,
+        ] {
+            assert_eq!(
+                disposition.after_target_ack(true),
+                DeliveryDisposition::Delivered,
+                "target-authored receipt is stronger than {disposition:?} attempt state"
+            );
+            assert_eq!(
+                disposition.after_target_ack(false),
+                disposition,
+                "without target evidence the attempt state must remain unchanged"
             );
         }
     }
@@ -2831,6 +2878,33 @@ mod tests {
             serde_json::to_value(schema_for!(Envelope<SessionActionData>)).unwrap(),
         ];
         assert!(schemas.iter().all(|schema| schema.is_object()));
+    }
+
+    #[test]
+    fn inject_delivery_truth_fields_are_additive_in_the_v1_schema() {
+        let schema = serde_json::to_value(schema_for!(InjectData)).unwrap();
+        let required = schema["required"]
+            .as_array()
+            .expect("InjectData schema required array");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("InjectData schema properties object");
+
+        for field in [
+            "delivery_reason",
+            "delivery_detail",
+            "reached_target",
+            "queued",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "current writers must publish the additive {field} schema"
+            );
+            assert!(
+                !required.iter().any(|name| name.as_str() == Some(field)),
+                "v1 readers must still accept pre-{field} envelopes"
+            );
+        }
     }
 
     // ---- orphan-tmux classifier (R4) ----

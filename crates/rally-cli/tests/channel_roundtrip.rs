@@ -20,6 +20,9 @@
 mod support;
 
 use rally_protocol::{DeliveryStatus, DirectiveKind, InterruptType, Receipt, now_ts};
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
 use support::channel_sandbox::ChannelSandbox;
 
 /// `--tmux-bin /usr/bin/true` makes tmux subcommands succeed without doing
@@ -29,6 +32,94 @@ fn unique_name(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     format!("{prefix}-{}", N.fetch_add(1, Ordering::Relaxed))
+}
+
+fn post_target_ack_after_delay(
+    sandbox: &ChannelSandbox,
+    target_tool: &str,
+    handoff_id: &str,
+) -> thread::JoinHandle<()> {
+    let cwd = sandbox.cwd().to_path_buf();
+    let home = sandbox.home().to_path_buf();
+    let target_tool = target_tool.to_string();
+    let handoff_id = handoff_id.to_string();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+            .current_dir(cwd)
+            .env("HOME", home)
+            .env_remove("PWD")
+            .args([
+                "say",
+                "resolve",
+                "--json",
+                "--tool",
+                target_tool.as_str(),
+                "--ref",
+                handoff_id.as_str(),
+                "--subject",
+                "target received the injected handoff",
+            ])
+            .output()
+            .expect("spawn target ACK");
+        assert!(
+            output.status.success(),
+            "target ACK failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    })
+}
+
+fn assert_final_ack_truth(inject: &serde_json::Value) {
+    assert_eq!(inject["ack"]["received"].as_bool(), Some(true));
+    assert_eq!(inject["verified_received"].as_bool(), Some(true));
+    assert_eq!(inject["ack_state"].as_str(), Some("acked"));
+    assert_eq!(inject["delivery_reason"].as_str(), Some("delivered"));
+    assert!(
+        inject["delivery_detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("received it")),
+        "final guidance must reflect the target ACK: {inject}"
+    );
+    assert_eq!(inject["reached_target"].as_bool(), Some(true));
+    assert_eq!(inject["queued"].as_bool(), Some(false));
+    assert!(
+        inject["fallback_plan"].is_null(),
+        "verified receipt must not retain a queued-delivery fallback: {inject}"
+    );
+}
+
+#[test]
+fn published_inject_v1_keeps_additive_delivery_truth_fields_optional() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/schemas/agent-rally.command.inject.v1.json");
+    let schema: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("read published inject schema"))
+            .expect("parse published inject schema");
+    let inject_schema = &schema["properties"]["data"]["properties"]["inject"];
+    let required = inject_schema["required"]
+        .as_array()
+        .expect("published inject required array");
+    let properties = inject_schema["properties"]
+        .as_object()
+        .expect("published inject properties object");
+
+    for field in [
+        "delivery_reason",
+        "delivery_detail",
+        "reached_target",
+        "queued",
+    ] {
+        assert!(
+            properties.contains_key(field),
+            "current v1 schema must describe additive field {field}"
+        );
+        assert!(
+            !required.iter().any(|name| name.as_str() == Some(field)),
+            "legacy v1 envelopes that predate {field} must remain valid"
+        );
+    }
 }
 
 #[test]
@@ -132,6 +223,121 @@ fn receipt_roundtrip_simulating_self_ack_or_daemon() {
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].ref_seq, seq);
     assert_eq!(receipts[0].status, DeliveryStatus::Delivered);
+}
+
+#[test]
+fn target_ack_reconciles_managed_sent_unverified_to_final_delivery_truth() {
+    let sandbox = ChannelSandbox::spawn();
+    let name = unique_name("ack-managed");
+    let target = sandbox.add_tmux_session(&name);
+    let target_tool = format!("claude_code:{target}");
+    let handoff = sandbox.rally_json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "sender:01",
+        "--target",
+        &target_tool,
+        "--subject",
+        "managed ACK reconciliation",
+    ]);
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .expect("handoff event_id");
+    let resolver = post_target_ack_after_delay(&sandbox, &target_tool, handoff_id);
+    let tmux_stub = sandbox.tmux_unverified_stub(&target);
+
+    // The tmux double reports the registered pane live and makes the pane write
+    // succeed while capture returns unrelated nonempty output, producing a
+    // real SentUnverified attempt before the target-authored Rally ACK arrives.
+    let envelope = sandbox.rally_json(&[
+        "inject",
+        &target,
+        "--json",
+        "--handoff",
+        handoff_id,
+        "--require-ack",
+        "--timeout-seconds",
+        "3",
+        "--tool",
+        "sender:01",
+        "--tmux-bin",
+        tmux_stub.as_str(),
+    ]);
+    resolver.join().expect("target ACK thread");
+    let inject = &envelope["data"]["inject"];
+
+    assert_eq!(
+        inject["delivered"].as_bool(),
+        Some(false),
+        "compatibility bool retains the unverified synchronous attempt: {inject}"
+    );
+    assert_eq!(
+        inject["delivery_state"].as_str(),
+        Some("sent_unverified"),
+        "compatibility state retains the attempt-time result: {inject}"
+    );
+    assert_eq!(
+        inject["wake_intent"]["status"].as_str(),
+        Some("sent_unverified"),
+        "durable wake records the original transport attempt: {inject}"
+    );
+    assert_final_ack_truth(inject);
+}
+
+#[test]
+fn target_ack_reconciles_ledger_queue_to_final_delivery_truth() {
+    let sandbox = ChannelSandbox::spawn();
+    let target = "ledger-ack-agent";
+    let handoff = sandbox.rally_json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "sender:01",
+        "--target",
+        target,
+        "--subject",
+        "ledger ACK reconciliation",
+    ]);
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .expect("handoff event_id");
+    let resolver = post_target_ack_after_delay(&sandbox, target, handoff_id);
+
+    let envelope = sandbox.rally_json(&[
+        "inject",
+        target,
+        "--json",
+        "--handoff",
+        handoff_id,
+        "--require-ack",
+        "--timeout-seconds",
+        "3",
+        "--tool",
+        "sender:01",
+    ]);
+    resolver.join().expect("target ACK thread");
+    let inject = &envelope["data"]["inject"];
+
+    assert_eq!(inject["target_kind"].as_str(), Some("ledger_agent"));
+    assert_eq!(
+        inject["delivered"].as_bool(),
+        Some(false),
+        "ledger-only compatibility bool stays tied to synchronous transport: {inject}"
+    );
+    assert_eq!(
+        inject["delivery_state"].as_str(),
+        Some("pending"),
+        "ledger compatibility state retains the append-time result: {inject}"
+    );
+    assert_eq!(
+        inject["wake_intent"]["status"].as_str(),
+        Some("pending"),
+        "durable wake records the original ledger append state: {inject}"
+    );
+    assert_final_ack_truth(inject);
 }
 
 #[test]
