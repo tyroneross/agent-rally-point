@@ -19,9 +19,17 @@
 # non-deletion `local_sha` git is about to push (computed by
 # scripts/prepush-ref-updates.sh from the ref-update tuples git supplies on
 # stdin), this hook checks out a clean DETACHED worktree at that exact SHA
-# so the gate exercises the pushed CONTENT. Detached worktrees are always
-# torn down via a trap — success, gate failure, or interrupt — so a blocked
-# push never leaves stray worktrees.
+# so the gate exercises the pushed CONTENT. Detached worktrees are torn down
+# via a trap on success, gate failure, SIGINT and SIGTERM, and each sha's
+# worktree is removed as soon as it passes rather than at final exit.
+#
+# The trap does NOT cover SIGKILL, power loss, or a second kill landing during
+# teardown — no shell trap can, SIGKILL is not deliverable to a handler. A
+# caller that wraps `git push` in a wall-clock timeout WILL kill this gate
+# mid-build: on 2026-08-19 three such runs were found abandoned on one machine
+# holding 5.9G. Recovery is the REAPER's job, not the trap's — each run records
+# its owner pid and start time under <git-common-dir>/rally-prepush/, and the
+# next hook run reaps any run whose owner is dead AND past the grace period.
 #
 # ARP-006 (2026-08 third-party security audit, GitHub issue #52): the gate
 # scripts THEMSELVES are not trusted just because they came from the pushed
@@ -180,32 +188,167 @@ cd "$repo_root"
 # per line on stdin (see `git help githooks`, PRE-PUSH). Capture it once to a
 # scratch file: scripts/prepush-ref-updates.sh needs to read it, and stdin
 # can only be consumed once.
-stdin_capture=$(mktemp "${TMPDIR:-/tmp}/rally-prepush-stdin.XXXXXX")
-cat > "$stdin_capture"
+# --- ARP-R-06: scratch lifecycle -----------------------------------------
+# Everything this run allocates lives under ONE run directory, inside the
+# repository's own git common dir rather than a flat set of five unrelated
+# ${TMPDIR}/rally-prepush-* names. Two properties follow, and both matter:
+#
+#   1. A reaper can attribute a leftover run to THIS repository and to a
+#      specific owner pid. The old flat layout could not: every mktemp drew an
+#      independent suffix, so a stale rally-prepush-wt.* could not be tied to
+#      the rally-prepush-pin.* from the same run, nor to the clone that made it.
+#   2. `run_dir` is defined and the trap armed BEFORE the first allocation.
+#      Previously stdin_capture (and four more paths) were created above an
+#      `trap ... EXIT INT TERM` installed ~25 lines later, so a failure in that
+#      window leaked with no signal involved.
+#
+# WHAT THE TRAP CANNOT DO. It covers normal exit, a gate failure under `set -e`,
+# SIGINT and SIGTERM. It cannot cover SIGKILL, a power loss, or a second kill
+# landing during a slow teardown — no shell trap can, SIGKILL is not deliverable
+# to a handler. That is not a hypothetical: three abandoned run directories
+# totalling 5.9G were recovered from this machine on 2026-08-19, every one of
+# them a gate killed by a caller's wall-clock timeout mid-cargo-build. The
+# reaper below, not the trap, is what makes those recoverable.
+git_common_dir=$(git rev-parse --git-common-dir 2>/dev/null || echo ".git")
+case "$git_common_dir" in
+  /*) : ;;
+  *) git_common_dir="$(git rev-parse --show-toplevel)/$git_common_dir" ;;
+esac
+scratch_root="$git_common_dir/rally-prepush"
 
-sha_file=$(mktemp "${TMPDIR:-/tmp}/rally-prepush-shas.XXXXXX")
-# ARP-R-05b: every pinned-vs-pushed VERDICT is appended here as it is decided,
-# and the whole file is printed once at the end. The affirmative pin statement
-# therefore cannot be emitted before the comparisons it describes.
-pin_summary=$(mktemp "${TMPDIR:-/tmp}/rally-prepush-pinsummary.XXXXXX")
-worktree_base=$(mktemp -d "${TMPDIR:-/tmp}/rally-prepush-wt.XXXXXX")
-pin_dir=$(mktemp -d "${TMPDIR:-/tmp}/rally-prepush-pin.XXXXXX")
-cleanup() {
-  # Runs on EVERY exit path (normal completion, a gate failure under `set -e`,
-  # or an interrupt) — the single place worktrees + the pin scratch dir get
-  # torn down, so a failed push never leaves one behind.
-  if [ -d "$worktree_base" ]; then
-    for d in "$worktree_base"/*; do
+# --- ARP-R-06: reap abandoned runs from previous invocations --------------
+# Liveness first, age second. A run is reaped only when BOTH hold: its recorded
+# owner pid is gone, AND the directory is older than the grace period. Age alone
+# would delete the live worktree of a concurrent push that simply runs long —
+# this gate compiles Rust per pushed sha, so "older than an hour" is a normal
+# healthy state, not evidence of abandonment.
+#
+# A reused pid produces the SAFE failure: the run is kept and retried next time.
+# The unsafe direction (deleting a live checkout) needs both a dead owner and an
+# expired grace, so an orphaned cargo child still writing into a checkout whose
+# parent died is bounded by the grace period rather than raced.
+#
+# `flock` is absent on Darwin, so a kernel lease is not available here without a
+# new portable dependency; a lockfile would need this same pid/staleness logic
+# to survive a kill. Deliberate shell-only compromise, stated so the next reader
+# does not mistake it for an oversight.
+reap_grace_secs="${RALLY_PREPUSH_REAP_GRACE_SECS:-7200}"
+# Validate ONCE, up front. `[ x -lt "$reap_grace_secs" ]` with a non-numeric or
+# negative value does not abort under `set -e` — it is the left side of a `&&`,
+# so the failed test just falls through to the reap. A typo'd env var would then
+# DELETE fresh orphans whose child processes may still be writing, which is the
+# precise outcome the liveness+age pair exists to prevent. Fail closed to the
+# default instead of silently reaping.
+case "$reap_grace_secs" in
+  ''|*[!0-9]*)
+    echo "pre-push: RALLY_PREPUSH_REAP_GRACE_SECS='$reap_grace_secs' is not a nonnegative integer — using 7200" >&2
+    reap_grace_secs=7200
+    ;;
+esac
+reap_abandoned_runs() {
+  [ -d "$scratch_root" ] || return 0
+  now=$(date +%s)
+  for run in "$scratch_root"/run-*; do
+    [ -d "$run" ] || continue
+    [ "$run" = "${run_dir:-}" ] && continue
+    owner=""
+    [ -f "$run/owner.pid" ] && owner=$(cat "$run/owner.pid" 2>/dev/null || true)
+    # Live owner — leave it alone no matter how old it is.
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+      continue
+    fi
+    started=""
+    [ -f "$run/started.at" ] && started=$(cat "$run/started.at" 2>/dev/null || true)
+    case "$started" in
+      ''|*[!0-9]*) started=0 ;;
+    esac
+    # No timestamp, or still inside the grace window — keep and retry later.
+    [ "$started" -eq 0 ] && continue
+    [ $((now - started)) -lt "$reap_grace_secs" ] && continue
+    for d in "$run"/wt/*; do
       [ -d "$d" ] || continue
       git worktree remove --force "$d" >/dev/null 2>&1 || rm -rf "$d"
     done
-    rm -rf "$worktree_base"
-  fi
+    if rm -rf "$run" 2>/dev/null && [ ! -d "$run" ]; then
+      echo "pre-push: reaped abandoned run $(basename "$run") (owner ${owner:-unknown} gone)" >&2
+    else
+      echo "pre-push: could not fully reap $(basename "$run") — leaving it for the next run" >&2
+    fi
+  done
   git worktree prune >/dev/null 2>&1 || true
-  rm -rf "$pin_dir" 2>/dev/null || true
-  rm -f "$sha_file" "$stdin_capture" "$pin_summary"
 }
-trap cleanup EXIT INT TERM
+
+run_dir=""
+cleanup() {
+  # Runs on normal completion, a gate failure under `set -e`, SIGINT and
+  # SIGTERM. See the SIGKILL note above for what it deliberately does not cover.
+  [ -n "$run_dir" ] || return 0
+  if [ -d "$run_dir/wt" ]; then
+    for d in "$run_dir/wt"/*; do
+      [ -d "$d" ] || continue
+      git worktree remove --force "$d" >/dev/null 2>&1 || rm -rf "$d"
+    done
+  fi
+  rm -rf "$run_dir" 2>/dev/null || true
+  git worktree prune >/dev/null 2>&1 || true
+}
+# Armed BEFORE the first allocation, with run_dir still empty, so an early
+# failure is a no-op rather than an unguarded leak.
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+reap_abandoned_runs
+
+mkdir -p "$scratch_root"
+run_dir=$(mktemp -d "$scratch_root/run-XXXXXX")
+mkdir -p "$run_dir/wt" "$run_dir/pin"
+printf '%s\n' "$$" > "$run_dir/owner.pid"
+date +%s > "$run_dir/started.at"
+
+# --- ARP-R-06: keep cargo's target OUT of the throwaway checkout ----------
+# Without this, `cargo test` builds a full target/ INSIDE each per-sha worktree,
+# which is what turned the three abandoned runs into 1.4G, 2.6G and 1.9G. The
+# pushed source tree is ~21M; the other ~99% was build output. Pointing the
+# target at a persistent per-repo, per-toolchain cache does two things: an
+# abandoned run is now megabytes, and consecutive pushes build warm instead of
+# from scratch.
+#
+# NOT the developer's own target/ — a concurrent local build would contend with
+# the gate. NOT shared with release-readiness.sh either: this cache is written
+# by unsandboxed code from the PUSHED tree (test bodies, build.rs, proc macros),
+# so it is untrusted cache state and must not seed a higher-trust verification.
+# An explicit caller-supplied CARGO_TARGET_DIR still wins.
+if [ -z "${CARGO_TARGET_DIR:-}" ]; then
+  # Key on the toolchain the gate will actually run, not the default rustc:
+  # run-quality-gate.sh uses `rustup run "$RALLY_QG_TOOLCHAIN" cargo` when that
+  # is set, so keying on plain `rustc -V` would let two different toolchains
+  # share one cache. Guard the empty case explicitly — `rustc -V` failing still
+  # leaves `tr` exiting 0, so `|| echo unknown` never fires on its own.
+  if [ -n "${RALLY_QG_TOOLCHAIN:-}" ]; then
+    rustc_id=$(printf '%s' "$RALLY_QG_TOOLCHAIN" | tr -c 'A-Za-z0-9._-' '-')
+  else
+    rustc_id=$(rustc -V 2>/dev/null | tr -c 'A-Za-z0-9._-' '-')
+  fi
+  [ -n "$rustc_id" ] || rustc_id=unknown
+  CARGO_TARGET_DIR="$scratch_root/cargo-target/${rustc_id}"
+  mkdir -p "$CARGO_TARGET_DIR"
+  export CARGO_TARGET_DIR
+  echo "pre-push: cargo target -> $CARGO_TARGET_DIR (persistent, outside the worktree)" >&2
+fi
+
+stdin_capture="$run_dir/stdin"
+cat > "$stdin_capture"
+
+sha_file="$run_dir/shas"
+: > "$sha_file"
+# ARP-R-05b: every pinned-vs-pushed VERDICT is appended here as it is decided,
+# and the whole file is printed once at the end. The affirmative pin statement
+# therefore cannot be emitted before the comparisons it describes.
+pin_summary="$run_dir/pin-summary"
+: > "$pin_summary"
+worktree_base="$run_dir/wt"
+pin_dir="$run_dir/pin"
 
 # --- ARP-006: resolve the pinned (trusted) copy of each gate script -------
 # Pinned once per hook run (not per pushed SHA) — the pin ref does not move
@@ -598,6 +741,11 @@ while IFS= read -r sha; do
   # worktree it runs in.
   run_gated_script scripts/check-release-parity.sh "$wt"
   echo "pre-push: $sha ✅ gate + parity passed" >&2
+  # ARP-R-06: drop this checkout NOW rather than at final exit. A push carrying
+  # several distinct shas used to hold every worktree until the whole hook
+  # finished, so peak disk scaled with sha count; it is now one checkout at a
+  # time. The trap still covers the sha currently under test.
+  git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
 done < "$sha_file"
 
 # --- ARP-R-05b: the affirmative pin statement, AFTER the last comparison ----
