@@ -239,9 +239,18 @@ reap_grace_secs="${RALLY_PREPUSH_REAP_GRACE_SECS:-7200}"
 # DELETE fresh orphans whose child processes may still be writing, which is the
 # precise outcome the liveness+age pair exists to prevent. Fail closed to the
 # default instead of silently reaping.
+# The charset check alone is not enough: an all-digit value above the shell's
+# integer range (e.g. 9223372036854775808) still makes `[ x -lt "$g" ]` error
+# and fall through to the reap, which is the same bypass. Bound the LENGTH too:
+# 11+ digits, NOT 10+ — unix seconds are 10 digits until year 2286, so a 10-digit
+# bound rejects every legitimate timestamp and silently disables reaping.
 case "$reap_grace_secs" in
   ''|*[!0-9]*)
     echo "pre-push: RALLY_PREPUSH_REAP_GRACE_SECS='$reap_grace_secs' is not a nonnegative integer — using 7200" >&2
+    reap_grace_secs=7200
+    ;;
+  ???????????*)
+    echo "pre-push: RALLY_PREPUSH_REAP_GRACE_SECS='$reap_grace_secs' exceeds the supported range — using 7200" >&2
     reap_grace_secs=7200
     ;;
 esac
@@ -259,15 +268,25 @@ reap_abandoned_runs() {
     fi
     started=""
     [ -f "$run/started.at" ] && started=$(cat "$run/started.at" 2>/dev/null || true)
+    # started.at is written by this hook but lives on disk that previously
+    # executed pushed code could reach, so treat it as untrusted input rather
+    # than as our own value. Same length bound as the grace: an oversized
+    # timestamp makes dash abort during arithmetic expansion, which would block
+    # the NEXT push rather than just skipping one stale run. Anything unparseable
+    # means "cannot prove abandonment" -> keep the run.
     case "$started" in
-      ''|*[!0-9]*) started=0 ;;
+      ''|*[!0-9]*|???????????*) started=0 ;;
     esac
     # No timestamp, or still inside the grace window — keep and retry later.
     [ "$started" -eq 0 ] && continue
     [ $((now - started)) -lt "$reap_grace_secs" ] && continue
     for d in "$run"/wt/*; do
       [ -d "$d" ] || continue
-      git worktree remove --force "$d" >/dev/null 2>&1 || rm -rf "$d"
+      # `a || b` with BOTH failing is a failed compound command, which under
+      # `set -e` would abort THIS push over a stale directory we merely could
+      # not tidy. Housekeeping must never block a push: swallow it and retry
+      # on the next run.
+      git worktree remove --force "$d" >/dev/null 2>&1 || rm -rf "$d" || true
     done
     if rm -rf "$run" 2>/dev/null && [ ! -d "$run" ]; then
       echo "pre-push: reaped abandoned run $(basename "$run") (owner ${owner:-unknown} gone)" >&2
@@ -306,35 +325,35 @@ mkdir -p "$run_dir/wt" "$run_dir/pin"
 printf '%s\n' "$$" > "$run_dir/owner.pid"
 date +%s > "$run_dir/started.at"
 
-# --- ARP-R-06: keep cargo's target OUT of the throwaway checkout ----------
-# Without this, `cargo test` builds a full target/ INSIDE each per-sha worktree,
-# which is what turned the three abandoned runs into 1.4G, 2.6G and 1.9G. The
-# pushed source tree is ~21M; the other ~99% was build output. Pointing the
-# target at a persistent per-repo, per-toolchain cache does two things: an
-# abandoned run is now megabytes, and consecutive pushes build warm instead of
-# from scratch.
+# --- ARP-R-06: cargo target is per-RUN, inside the reaped run directory ---
+# Two properties have to hold at once, and only this placement gives both.
 #
-# NOT the developer's own target/ — a concurrent local build would contend with
-# the gate. NOT shared with release-readiness.sh either: this cache is written
-# by unsandboxed code from the PUSHED tree (test bodies, build.rs, proc macros),
-# so it is untrusted cache state and must not seed a higher-trust verification.
-# An explicit caller-supplied CARGO_TARGET_DIR still wins.
+# ISOLATION. This gate exists to distrust the pushed tree: ARP-006 pins the
+# dispatcher scripts precisely because a pushed branch may be hostile, and the
+# code cargo compiles here — test bodies, build.rs, proc macros — is that same
+# untrusted tree, executed unsandboxed. A target directory REUSED across runs is
+# therefore attacker-writable state that a later run reads back: pushed code can
+# overwrite a compiled test executable under debug/deps while leaving its
+# .fingerprint intact, and the next gate re-executes the replacement instead of
+# rebuilding. A shared cache was measured at 2.7G holding 254 such executables.
+# Partitioning that cache per toolchain prevents accidental collisions; it does
+# not make an attacker-writable cache trustworthy. So: fresh target per run.
+#
+# RECOVERABILITY. Keeping it under "$run_dir" (not inside the checkout, and not
+# in a shared location) means the reaper reclaims it exactly like everything
+# else this run allocates. That is what the original layout got wrong: cargo
+# built INSIDE each per-sha worktree, so a SIGKILLed run stranded 1.4-2.6G that
+# nothing could attribute or reclaim. Same bytes now, but recoverable.
+#
+# The cost is a cold build per push. That is the pre-existing behaviour, so this
+# is not a regression, and it is the correct side of an isolation-vs-speed
+# trade in a security gate. A caller that explicitly sets CARGO_TARGET_DIR is
+# opting out and is left alone.
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-  # Key on the toolchain the gate will actually run, not the default rustc:
-  # run-quality-gate.sh uses `rustup run "$RALLY_QG_TOOLCHAIN" cargo` when that
-  # is set, so keying on plain `rustc -V` would let two different toolchains
-  # share one cache. Guard the empty case explicitly — `rustc -V` failing still
-  # leaves `tr` exiting 0, so `|| echo unknown` never fires on its own.
-  if [ -n "${RALLY_QG_TOOLCHAIN:-}" ]; then
-    rustc_id=$(printf '%s' "$RALLY_QG_TOOLCHAIN" | tr -c 'A-Za-z0-9._-' '-')
-  else
-    rustc_id=$(rustc -V 2>/dev/null | tr -c 'A-Za-z0-9._-' '-')
-  fi
-  [ -n "$rustc_id" ] || rustc_id=unknown
-  CARGO_TARGET_DIR="$scratch_root/cargo-target/${rustc_id}"
+  CARGO_TARGET_DIR="$run_dir/cargo-target"
   mkdir -p "$CARGO_TARGET_DIR"
   export CARGO_TARGET_DIR
-  echo "pre-push: cargo target -> $CARGO_TARGET_DIR (persistent, outside the worktree)" >&2
+  echo "pre-push: cargo target -> \$run_dir/cargo-target (per-run, reaped with the run)" >&2
 fi
 
 stdin_capture="$run_dir/stdin"
