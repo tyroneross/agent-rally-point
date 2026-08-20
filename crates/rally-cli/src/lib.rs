@@ -172,7 +172,7 @@ use rallyd_core::ServeConfig;
 use route_findings::{Finding, RoutingSummary, route_findings};
 use store::{
     AckPollingStore, ConditionalAppendOutcome, Fact, FactKind, ReadReceipt, RoomQuery,
-    RoomSnapshot, RoomStore, RoomSummary,
+    RoomSnapshot, RoomStore, RoomSummary, SYSTEM_TOOL,
 };
 // Envelope wrapper types from backends module.
 use backends::{
@@ -2610,7 +2610,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // eligibility math had been right and unused for the room's whole life.
     // Rate-limited and fail-open inside `maybe_reap_on_enter`; it never fails
     // `enter`.
-    if let Some(report) = reaper::maybe_reap_on_enter(&room) {
+    if let Some(report) = reaper::maybe_reap_on_enter(&room, &tool) {
         if !report.claims_reaped.is_empty() || !report.handoffs_expired.is_empty() {
             eprintln!(
                 "rally: auto-reap closed {} stale claim(s) and {} expired handoff(s) \
@@ -2928,6 +2928,38 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
 }
 
 fn command_say(args: SayArgs) -> Result<Output> {
+    // `--tool rally` and `--role system` are reserved AUTHORITY markers, not
+    // free-text labels. Between them they are what authorizes the reaper to
+    // close an expired lease (`write_authority::is_typed_reaper_lease_expiry`)
+    // and to expire an unanswered handoff (`store::is_reaper_handoff_expiry`).
+    // A caller who can set either by hand can mint both authorities by hand.
+    //
+    // Reserving them is what makes attributing the reaper a net TIGHTENING
+    // rather than a lateral move. The authority the role marker replaced was
+    // keyed on `--tool rally`, which `say` has always accepted from anyone; had
+    // only the role been reserved, the gate would be exactly as forgeable as
+    // before. After this, neither spelling is mintable outside `SystemActor`.
+    //
+    // Measured on this repo's room before reserving either: zero of 12,746
+    // facts carry any `role` at all, and all 976 facts authored as `rally` are
+    // wake / claim.expired / resolve / decision — the four kinds the automatic
+    // writers produce. Nothing in `hooks/`, `scripts/`, or the docs passes
+    // `--tool rally`. No caller loses a capability it was using.
+    if args.role.as_deref() == Some(SYSTEM_ROLE) {
+        return Err(RallyError::Usage(format!(
+            "--role {SYSTEM_ROLE} is reserved for rally's own machine-initiated writes \
+             (wake intents, reaper closes) and carries their authority, so it cannot be set \
+             by hand. Use a descriptive role instead, or let the reaper write the fact."
+        )));
+    }
+    if args.tool == SYSTEM_TOOL {
+        return Err(RallyError::Usage(format!(
+            "--tool {SYSTEM_TOOL} is the reserved author for rally's own machine-initiated \
+             writes (wake intents, reaper closes) and carries their authority, so it cannot \
+             be used by hand. Pass your own agent id instead (e.g. `--tool claude_code:01`). \
+             To close a stale claim, run `rally doctor --reap-stale --apply`."
+        )));
+    }
     let kind = args.kind;
     let subject = args
         .subject
@@ -4755,6 +4787,108 @@ fn current_protocol_session(tool: Option<&str>) -> session_identity::ProtocolSes
         _ => (raw_tool, None),
     };
     session_identity::ProtocolSessionIdentity::mint(&endpoint, tool_type, "live", actor, None)
+}
+
+/// Marker written to `Fact.role` for a machine-initiated durable write.
+///
+/// This is the field that answers "was a human/agent in the loop?". It is
+/// deliberately NOT the same field that answers "who did it" — see
+/// [`SystemActor`].
+pub(crate) const SYSTEM_ROLE: &str = "system";
+
+/// The actor credited with a machine-initiated write (wake intents, reaper
+/// closes), plus the live session lease it ran under.
+///
+/// # Why this exists
+///
+/// System-initiated facts used to be authored as the literal tool `"rally"`
+/// with `from_session_id: None`. That collapsed two independent questions into
+/// one field and answered only the easier of them:
+///
+/// * "Was this automatic?" — answerable (`tool == "rally"`).
+/// * "Who did it?" — **unanswerable**, for every such fact ever written.
+///
+/// Measured on this repo's own room (12,746 facts): 100% of `wake` facts and
+/// 98.6% of `claim.expired` facts carried no actor. The cost is not cosmetic.
+/// An unresolved wake could not be routed back to the agent that requested it,
+/// so 620 pending wakes could be counted but not diagnosed or reassigned. A
+/// reaped claim could not name the process that reaped it, so the claim-
+/// takeover audit trail — the record a contested-ownership dispute is decided
+/// on — said only "rally".
+///
+/// Both questions now have separate, permanent homes:
+///
+/// * `tool` + `from_session_id` carry the **actor**.
+/// * `role: "system"` carries the **machine-initiated** fact.
+///
+/// Consumers that must exclude system authors from agent-facing projections
+/// (squads, liveness, contributor sets) filter on the role via
+/// [`crate::store::is_system_authored`], not on a magic tool name. That
+/// predicate still recognises the legacy `"rally"` author, so the 12,746 facts
+/// already on disk project exactly as they did before.
+#[derive(Clone, Debug)]
+pub(crate) struct SystemActor {
+    /// The agent identity credited with the action (`claude_code:03`), or
+    /// `"rally"` when the CLI itself acted with no agent identity supplied.
+    pub(crate) tool: String,
+    /// The live session lease the action ran under. `Some` for every path that
+    /// can derive one, which is every path today; `None` stays representable so
+    /// a future caller without an endpoint is not forced to invent one.
+    pub(crate) from_session_id: Option<String>,
+}
+
+impl SystemActor {
+    /// The actor is a named agent (e.g. the tool running `rally next`, or the
+    /// agent whose `rally enter` triggered an auto-reap). The session lease is
+    /// minted from the same endpoint derivation `say` uses to stamp
+    /// `from_session_id`, so a wake and a claim written by one agent in one
+    /// terminal share a session id.
+    pub(crate) fn for_tool(tool: &str) -> Self {
+        Self {
+            tool: tool.to_string(),
+            from_session_id: Some(
+                current_protocol_session(Some(tool))
+                    .from_session_id()
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// The actor is the invoking `rally` process itself — an operator or CI job
+    /// running `rally doctor --reap-stale --apply`, where no agent identity was
+    /// supplied and inventing one would be a lie.
+    ///
+    /// `tool` stays `"rally"` (honest: no agent claimed this), but the session
+    /// lease is real, so two operators reaping the same room from two terminals
+    /// are now distinguishable — which is the whole point of the audit trail
+    /// and is exactly what the old `from_session_id: None` destroyed.
+    pub(crate) fn invoking_process() -> Self {
+        Self {
+            tool: SYSTEM_TOOL.to_string(),
+            from_session_id: Some(
+                current_protocol_session(Some(SYSTEM_TOOL))
+                    .from_session_id()
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// `Fact.tool` value for a write by this actor.
+    pub(crate) fn tool_field(&self) -> Option<String> {
+        Some(self.tool.clone())
+    }
+
+    /// `Fact.from_session_id` value for a write by this actor.
+    pub(crate) fn session_field(&self) -> Option<String> {
+        self.from_session_id.clone()
+    }
+
+    /// `Fact.role` value for a write by this actor. Always the system marker:
+    /// every write that goes through `SystemActor` is machine-initiated by
+    /// construction.
+    pub(crate) fn role_field(&self) -> Option<String> {
+        Some(SYSTEM_ROLE.to_string())
+    }
 }
 
 /// Map a ledger [`store::FactKind`] to the north-star protocol event vocabulary
@@ -7679,14 +7813,37 @@ fn command_inject_managed(
             delivery_state_initial
         };
 
+    // WHY the send is in `delivery_state`. Ordered failures-first so a
+    // partially-failed send is never reported by its more optimistic half.
+    let disposition = if dry_run {
+        DeliveryDisposition::PlannedDryRun
+    } else if ledger_failed {
+        DeliveryDisposition::FailedLedgerWrite
+    } else if daemon_delivery_failed {
+        DeliveryDisposition::FailedDaemonSend
+    } else if legacy_tmux_cmux_failed {
+        DeliveryDisposition::FailedBackendInject
+    } else if delivered {
+        DeliveryDisposition::Delivered
+    } else if legacy_sent_unverified {
+        DeliveryDisposition::SentUnverified
+    } else {
+        // A managed session HAS a transport, so a still-pending directive is
+        // waiting on a receipt, not missing an address. This is the 403-class:
+        // the message is queued and reachable; what is unproven is that
+        // anything consumed it.
+        DeliveryDisposition::QueuedAwaitingReceipt
+    };
+    let delivery_detail = disposition.guidance(&session.tool);
     let wake_intent = inject_wake_intent_with_room(
         room.as_ref(),
+        &sender_tool,
         Some(&session),
         &session.tool,
         handoff.as_deref(),
         &commands,
         dry_run,
-        delivery_state,
+        disposition,
     )?;
     let ack = if effective_require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
@@ -7742,6 +7899,10 @@ fn command_inject_managed(
         // assigned sequence so downstream callers can look up the matching
         // Receipt via `rally status` once rally-termd (P3) is live.
         delivery_state,
+        delivery_reason: disposition.as_str(),
+        delivery_detail,
+        reached_target: disposition.reached_target(),
+        queued: disposition.is_queued(),
         directive_seq,
         directive_to,
         delivery_path,
@@ -7850,14 +8011,27 @@ fn command_inject_ledger(
     // No backend commands on the ledger-only path; surface an empty plan.
     let commands: Vec<Vec<String>> = Vec::new();
 
+    // A `LedgerAgent` target has NO managed session by construction
+    // (`resolve_inject_target` arm 2), so a pending directive here means "no
+    // live address", not "waiting on a runner". This is the 217-class, and
+    // separating it from the managed-session case above is the whole point:
+    // a supervision pass re-addresses one and waits on the other.
+    let disposition = if dry_run {
+        DeliveryDisposition::PlannedDryRun
+    } else if delivery_state == "failed" {
+        DeliveryDisposition::FailedLedgerWrite
+    } else {
+        DeliveryDisposition::QueuedNoManagedSession
+    };
     let wake_intent = inject_wake_intent_with_room(
         room.as_ref(),
+        &sender_tool,
         None,
         &agent_id,
         handoff.as_deref(),
         &commands,
         dry_run,
-        delivery_state,
+        disposition,
     )?;
     // RCA 2026-07-09 follow-up: a LedgerAgent target by definition has no
     // ACTIVE managed session (`resolve_inject_target` arm 2), so pane delivery
@@ -7953,6 +8127,14 @@ fn command_inject_ledger(
         // a Receipt to flip it to `delivered`/`seen`/`acted` out-of-band).
         delivered: false,
         delivery_state,
+        // The reason `delivered` is false. Without it a caller reading
+        // `ok: true, delivered: false` cannot tell a durably-queued message
+        // for an absent agent (normal, and the point of the ledger) from a
+        // write that failed (not normal). O08 is that confusion, observed live.
+        delivery_reason: disposition.as_str(),
+        delivery_detail: disposition.guidance(&agent_id),
+        reached_target: disposition.reached_target(),
+        queued: disposition.is_queued(),
         directive_seq,
         directive_to,
         // A LedgerAgent target is an externally-registered ptyd pane: the
@@ -8467,6 +8649,11 @@ fn append_next_wake_intent(
     paths: &[String],
     next: &NextResult,
 ) -> Result<Option<Fact>> {
+    // `tool` is BOTH the actor and the target here: `rally next --tool X` is X
+    // asking Rally what to do, and the resulting wake intent is addressed back
+    // to X. The actor half was already in scope and was simply never passed to
+    // `wake_fact` — which is why every wake this path wrote was unattributed.
+    let actor = SystemActor::for_tool(tool);
     if matches!(next.action, "wait" | "proceed_solo") {
         return Ok(None);
     }
@@ -8483,13 +8670,20 @@ fn append_next_wake_intent(
         next.action
     );
     let fact = wake_fact(
+        &actor,
         tool,
         &subject,
         paths.to_vec(),
         Some(summary),
         vec!["rally next --tool <tool> --json".to_string()],
         next.target_event_id.clone(),
-        Some("pending".to_string()),
+        // No transport is involved in a `next` wake intent and none is
+        // expected; it is a note for `tool` to find when it next polls. Saying
+        // so is what stops it reading as a delivery that never happened.
+        WakeDelivery {
+            status: Some("pending".to_string()),
+            disposition: DeliveryDisposition::QueuedAwaitingPoll,
+        },
     );
     room.append_fact(&fact)
         .map(store::AppendOutcome::into_fact_reporting)
@@ -8641,33 +8835,73 @@ fn inject_content_fact_dry_run(sender_tool: &str, recipient_tool: &str, text: &s
 /// `target_tool` is the logical id the Directive landed on (mirrors the
 /// `directive_to` field of `InjectData`). For managed sessions this is
 /// `session.tool`; for ledger-only it is the validated agent-id.
+/// One over the lint's threshold, and every argument is a distinct fact about
+/// the send that the fact must record. Bundling them into a struct would move
+/// the same list one level down without making any call site clearer.
+#[allow(clippy::too_many_arguments)]
 fn inject_wake_intent_with_room(
     room: Option<&RoomStore>,
+    sender_tool: &str,
     session: Option<&ManagedSession>,
     target_tool: &str,
     handoff: Option<&str>,
     commands: &[Vec<String>],
     dry_run: bool,
-    delivery_state: &'static str,
+    disposition: DeliveryDisposition,
 ) -> Result<Option<Fact>> {
-    let status = if dry_run { "planned" } else { delivery_state };
+    // The sender is the actor. Both `command_inject_managed` and
+    // `command_inject_ledger` already hold a validated `sender_tool`; this
+    // function just never received it, so an inject's wake intent recorded who
+    // was woken and not who woke them.
+    let actor = SystemActor::for_tool(sender_tool);
+    let status = if dry_run {
+        "planned"
+    } else {
+        // The receipt-state vocabulary the envelope already publishes. Kept
+        // verbatim so existing readers of `wake_intent.status` are unaffected;
+        // the cause travels alongside it in evidence.
+        match disposition {
+            DeliveryDisposition::Delivered => "delivered",
+            DeliveryDisposition::SentUnverified => "sent_unverified",
+            DeliveryDisposition::FailedLedgerWrite
+            | DeliveryDisposition::FailedBackendInject
+            | DeliveryDisposition::FailedDaemonSend => "failed",
+            DeliveryDisposition::QueuedAwaitingReceipt
+            | DeliveryDisposition::QueuedNoManagedSession
+            | DeliveryDisposition::QueuedAwaitingPoll
+            | DeliveryDisposition::PlannedDryRun => "pending",
+        }
+    };
     let subject = format!("wake intent {status} to {target_tool}");
     let summary = Some(match session {
         Some(s) => format!(
-            "rally inject {status} for managed session {} via {}",
-            s.name, s.backend
+            "rally inject {status} for managed session {} via {}: {}",
+            s.name,
+            s.backend,
+            disposition.guidance(target_tool)
         ),
-        None => format!("rally inject {status} via ledger for agent {target_tool}"),
+        None => format!(
+            "rally inject {status} via ledger for agent {target_tool}: {}",
+            disposition.guidance(target_tool)
+        ),
     });
     let evidence = commands.iter().map(|command| command.join(" ")).collect();
     let fact = wake_fact(
+        &actor,
         target_tool,
         &subject,
         Vec::new(),
         summary,
         evidence,
         handoff.map(str::to_string),
-        Some(status.to_string()),
+        WakeDelivery {
+            status: Some(status.to_string()),
+            disposition: if dry_run {
+                DeliveryDisposition::PlannedDryRun
+            } else {
+                disposition
+            },
+        },
     );
     if dry_run {
         Ok(Some(fact))
@@ -8738,29 +8972,80 @@ fn inject_via_ledger(
     })
 }
 
+/// Build a `wake` fact.
+///
+/// `actor` is the agent that CAUSED this wake — the tool that ran `rally next`
+/// or `rally inject`, not the tool being woken (`target_tool` is that). Both
+/// are recorded, because "who asked" and "who was asked" are different
+/// questions and a wake that answers only the second one cannot be routed back
+/// to its originator.
+///
+/// Before attribution existed this function hardcoded `tool: "rally"`,
+/// `from_session_id: None`, `role: None`, so NO code path could produce an
+/// attributed wake and all 645 wake facts in this repo own room were
+/// unattributed. `role: "system"` preserves the "this was machine-initiated"
+/// signal that the `"rally"` author used to carry alone; see [`SystemActor`].
+/// The outcome of a send, as the wake fact will record it.
+///
+/// `status` and `disposition` are deliberately separate. `status` stays the
+/// REAL receipt state in the existing vocabulary — the discipline established
+/// for `ptyd_receipt_fact`, where a fabricated "delivered" was the defect.
+/// `disposition` adds why it holds that value, which is what a pending wake
+/// could not previously say: 620 unresolved wakes on this repo's room are all
+/// spelled `pending` with no recorded cause, so the 217 that had no live
+/// address are indistinguishable from the 403 nobody consumed.
+pub(crate) struct WakeDelivery {
+    /// Real receipt state; `None` leaves the fact's status unset.
+    pub(crate) status: Option<String>,
+    /// Why the send is in that state.
+    pub(crate) disposition: DeliveryDisposition,
+}
+
+impl WakeDelivery {
+    /// Evidence markers a reader can recover the cause from. Plain
+    /// `key:value` strings in the existing `evidence` array — no new field, no
+    /// schema bump, and `#[serde(default)]` means older readers ignore them.
+    fn evidence_markers(&self, target_tool: &str) -> Vec<String> {
+        vec![
+            format!("delivery_reason:{}", self.disposition.as_str()),
+            format!(
+                "delivery_guidance:{}",
+                self.disposition.guidance(target_tool)
+            ),
+        ]
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn wake_fact(
+    actor: &SystemActor,
     target_tool: &str,
     subject: &str,
     scope: Vec<String>,
     summary: Option<String>,
     evidence: Vec<String>,
     ref_id: Option<String>,
-    status: Option<String>,
+    delivery: WakeDelivery,
 ) -> Fact {
+    // The cause rides in `evidence` ahead of the caller's own entries so it is
+    // the first thing a reader sees on a wake that never resolved.
+    let mut evidence_with_cause = delivery.evidence_markers(target_tool);
+    evidence_with_cause.extend(evidence);
+    let status = delivery.status;
     Fact {
-        from_session_id: None,
+        from_session_id: actor.session_field(),
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("wake"),
         seq: 0,
         thread_id: format!("wake-{}", sanitize_id(target_tool)),
         kind: FactKind::Wake,
-        tool: Some("rally".to_string()),
-        role: None,
+        tool: actor.tool_field(),
+        role: actor.role_field(),
         subject: subject.to_string(),
         scope,
         created_at: now_string(),
         summary,
-        evidence,
+        evidence: evidence_with_cause,
         target: Some(target_tool.to_string()),
         ref_id,
         status,

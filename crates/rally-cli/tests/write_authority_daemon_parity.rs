@@ -310,6 +310,74 @@ fn claim_close_authorization_is_identical_in_direct_and_routed_mode() {
     });
 }
 
+/// The reaper's expired-lease authority, on both store modes.
+///
+/// This case is not covered by `claim_close_authorization_...` above, which
+/// grades a rogue being REFUSED. This one grades the reaper being ALLOWED, and
+/// the two can diverge independently: the arm that authorizes it
+/// (`write_authority::is_typed_reaper_lease_expiry`) moved from keying on
+/// `tool == "rally"` to keying on the `role: "system"` marker, and `role`
+/// travels to the daemon as a serialized payload field rather than being
+/// re-derived there. A gate that read an actor label the client computed but
+/// the wire dropped would authorize in one mode and refuse in the other — the
+/// exact shape this file exists to catch.
+///
+/// Both halves are compared: the verdict AND whether the claim actually left
+/// the room. An "authorized" that does not close is not parity.
+#[test]
+fn reaper_lease_expiry_authorization_is_identical_in_direct_and_routed_mode() {
+    assert_parity("reaper-lease-expiry", |room| {
+        // A claim whose lease has already run out, owned by someone else.
+        let cid = room.json(&[
+            "say",
+            "claim",
+            "--tool",
+            "victim",
+            "--path",
+            "src/lib.rs",
+            "--subject",
+            "owns it",
+            "--evidence",
+            "lease_expires_at:2000-01-01T00:00:00Z",
+            "--json",
+        ])["data"]["say"]["fact"]["event_id"]
+            .as_str()
+            .expect("claim event_id")
+            .to_string();
+
+        // A hand-built ClaimExpired carrying the typed reaper evidence but NO
+        // system role. It must be refused in both modes: the evidence set is
+        // forgeable, the role marker is not (`say` reserves it), and that is
+        // the whole reason the authority was moved onto the marker.
+        let forged = room.ok(&[
+            "say",
+            "claim.expired",
+            "--tool",
+            "rogue",
+            "--ref",
+            &cid,
+            "--subject",
+            "forged reaper close",
+            "--evidence",
+            &format!("reaper:ref_id={cid}"),
+            "--evidence",
+            "reaper:reason=lease-expired",
+            "--evidence",
+            "reaper:observed=stale",
+            "--evidence",
+            "reaper:owner=victim",
+            "--evidence",
+            "reaper:owner_session=legacy",
+            "--json",
+        ]);
+
+        // The genuine operator reaper, which mints the system role internally.
+        let reaped = room.ok(&["doctor", "--reap-stale", "--apply", "--json"]);
+
+        (forged, reaped, room.active_claim_count())
+    });
+}
+
 /// ARP-R-01 on both store modes.
 #[test]
 fn lead_seat_authorization_is_identical_in_direct_and_routed_mode() {
