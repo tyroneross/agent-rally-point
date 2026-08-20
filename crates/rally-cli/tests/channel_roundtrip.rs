@@ -90,6 +90,24 @@ fn assert_final_ack_truth(inject: &serde_json::Value) {
     );
 }
 
+fn assert_non_retrying_timeout_plan(inject: &serde_json::Value, delivery_truth: &str) {
+    assert_eq!(inject["ack_state"].as_str(), Some("timeout"));
+    let plan = &inject["fallback_plan"];
+    assert_eq!(plan["trigger"].as_str(), Some("ack_timeout"));
+    assert_eq!(plan["delivery_truth"].as_str(), Some(delivery_truth));
+    assert_eq!(plan["retry_allowed"].as_bool(), Some(false));
+    assert_eq!(inject["ack"]["fallback_plan"], *plan);
+    let rendered = serde_json::to_string(plan)
+        .expect("serialize timeout plan")
+        .to_ascii_lowercase();
+    for forbidden in ["retry once", "re-inject", "resend without"] {
+        assert!(
+            !rendered.contains(forbidden),
+            "final delivery truth forbids duplicate-send advice containing {forbidden:?}: {plan}"
+        );
+    }
+}
+
 #[test]
 fn published_inject_v1_keeps_additive_delivery_truth_fields_optional() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -338,6 +356,57 @@ fn target_ack_reconciles_ledger_queue_to_final_delivery_truth() {
         "durable wake records the original ledger append state: {inject}"
     );
     assert_final_ack_truth(inject);
+}
+
+#[test]
+fn ack_timeout_after_confirmed_managed_delivery_never_recommends_another_send() {
+    let sandbox = ChannelSandbox::spawn();
+    let name = unique_name("timeout-reached");
+    let target = sandbox.add_tmux_session(&name);
+    let target_tool = format!("claude_code:{target}");
+    let handoff = sandbox.rally_json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "sender:01",
+        "--target",
+        &target_tool,
+        "--subject",
+        "managed delivery without target ACK",
+    ]);
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .expect("handoff event_id");
+
+    let envelope = sandbox.rally_json(&[
+        "inject",
+        &target,
+        "--json",
+        "--handoff",
+        handoff_id,
+        "--timeout-seconds",
+        "1",
+        "--tool",
+        "sender:01",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    let inject = &envelope["data"]["inject"];
+
+    assert_eq!(inject["delivery_reason"].as_str(), Some("delivered"));
+    assert_eq!(inject["reached_target"].as_bool(), Some(true));
+    assert_eq!(inject["queued"].as_bool(), Some(false));
+    assert_non_retrying_timeout_plan(inject, "target_reached_ack_missing");
+    assert!(
+        inject["fallback_plan"]["fallbacks"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| {
+                item.as_str()
+                    .is_some_and(|text| text.contains("do not create a duplicate"))
+            })),
+        "reached-target timeout must preserve delivery and await evidence: {inject}"
+    );
 }
 
 #[test]
@@ -606,6 +675,79 @@ fn inject_ledger_ack_timeout_carries_pre_wait_injectability_diagnosis() {
     assert!(
         pre_diagnosis.contains("presence-only"),
         "pre_diagnosis must name the t=0 cause; got {pre_diagnosis}",
+    );
+    assert_eq!(
+        inject["delivery_reason"].as_str(),
+        Some("queued_no_managed_session")
+    );
+    assert_eq!(inject["reached_target"].as_bool(), Some(false));
+    assert_eq!(inject["queued"].as_bool(), Some(true));
+    assert_non_retrying_timeout_plan(inject, "durably_queued_ack_missing");
+    let rendered =
+        serde_json::to_string(&inject["fallback_plan"]).expect("serialize queued fallback plan");
+    assert!(
+        rendered.contains("existing durable directive") && rendered.contains("runner"),
+        "queued timeout must advise following the existing directive and runner: {inject}"
+    );
+}
+
+#[test]
+fn failed_ledger_write_timeout_allows_one_typed_retry_because_nothing_is_queued() {
+    let sandbox = ChannelSandbox::spawn();
+    let agent = "failed-ledger-timeout-agent";
+    let inbox_dir = sandbox.rally_dir().join("inbox");
+    std::fs::create_dir_all(&inbox_dir).expect("create corrupt inbox fixture directory");
+    std::fs::write(
+        inbox_dir.join(format!("{agent}.jsonl")),
+        "malformed durable directive\n",
+    )
+    .expect("write corrupt inbox fixture");
+
+    let envelope = sandbox.rally_json(&[
+        "inject",
+        agent,
+        "--json",
+        "--handoff",
+        "handoff-failed-ledger-timeout",
+        "--require-ack",
+        "--timeout-seconds",
+        "1",
+        "--tool",
+        "sender:01",
+    ]);
+    let inject = &envelope["data"]["inject"];
+    let plan = &inject["fallback_plan"];
+
+    assert_eq!(inject["ack_state"].as_str(), Some("timeout"));
+    assert_eq!(inject["delivery_state"].as_str(), Some("failed"));
+    assert_eq!(
+        inject["delivery_reason"].as_str(),
+        Some("failed_ledger_write")
+    );
+    assert_eq!(inject["directive_seq"], serde_json::Value::Null);
+    assert_eq!(inject["reached_target"].as_bool(), Some(false));
+    assert_eq!(inject["queued"].as_bool(), Some(false));
+    assert_eq!(
+        plan["delivery_truth"].as_str(),
+        Some("not_queued_retryable")
+    );
+    assert_eq!(
+        plan["delivery_reason"].as_str(),
+        Some("failed_ledger_write")
+    );
+    assert_eq!(plan["retry_allowed"].as_bool(), Some(true));
+    assert_eq!(inject["ack"]["fallback_plan"], *plan);
+    assert!(
+        plan["delivery_detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Retry the send")),
+        "typed detail must be the authority for retry advice: {inject}"
+    );
+    assert!(
+        serde_json::to_string(plan)
+            .expect("serialize failed-ledger fallback plan")
+            .contains("retry once"),
+        "a failed ledger write leaves no queued copy, so one retry is safe: {inject}"
     );
 }
 

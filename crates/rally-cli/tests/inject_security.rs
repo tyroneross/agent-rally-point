@@ -303,8 +303,12 @@ fn sec009_urgent_addition_is_not_delivered_by_any_backend() {
         "policy guidance must explain the intentional skip: {outcome}"
     );
     assert!(
-        detail.contains("resend without `--urgent`"),
-        "policy guidance must give the safe retry: {outcome}"
+        detail.contains("existing directive") && detail.contains("target runner"),
+        "policy guidance must follow the durable queued copy: {outcome}"
+    );
+    assert!(
+        !detail.contains("resend") && !detail.contains("retry"),
+        "a queued policy rejection must not recommend a duplicate send: {outcome}"
     );
 
     let tmux_calls = fs::read_to_string(&tmux_log).unwrap_or_default();

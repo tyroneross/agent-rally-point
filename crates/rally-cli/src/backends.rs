@@ -297,6 +297,15 @@ impl DeliveryDisposition {
         )
     }
 
+    /// May a sender safely retry after an ACK timeout without risking a
+    /// duplicate durable directive?
+    ///
+    /// Only a failed ledger write qualifies: it is not queued, did not reach
+    /// the target, and its typed guidance explicitly says to retry.
+    pub(crate) fn retry_allowed_after_timeout(self) -> bool {
+        matches!(self, Self::FailedLedgerWrite)
+    }
+
     /// Reconcile the attempt-time disposition with target-authored receipt
     /// evidence collected while `inject --require-ack` waits.
     ///
@@ -335,7 +344,7 @@ impl DeliveryDisposition {
                 "the ledger write failed, so nothing is queued for {target} and nothing will arrive. Retry the send."
             ),
             Self::PolicyRejectedUrgentAddition => format!(
-                "synchronous delivery to {target} was intentionally skipped by SEC-009 policy because urgent Deliver + Addition is not allowed on that transport. The directive remains durably queued; resend without `--urgent` if synchronous delivery is intended."
+                "synchronous delivery to {target} was intentionally skipped by SEC-009 policy because urgent Deliver + Addition is not allowed on that transport. The directive remains durably queued; follow that existing directive and inspect the target runner until target-authored evidence arrives."
             ),
             Self::FailedBackendInject => format!(
                 "queued on the ledger but the synchronous write to {target}'s pane failed. Check the pane is alive (`rally sessions`); the queued copy still stands."

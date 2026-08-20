@@ -654,7 +654,8 @@ const MAX_WATCHDOG_TIMEOUT_MS: u64 = 60_000;
 /// it sets the watchdog. The inner ACK poll sleeps in 250ms ticks and does a
 /// final ledger scan + envelope build after the deadline; this margin keeps the
 /// outer watchdog from racing the inner poll's own timeout (which is the path
-/// that correctly emits `ack_state: "timeout"` + a populated `fallback_plan`).
+/// that correctly emits `ack_state: "timeout"` plus disposition-aware
+/// follow-up advice).
 const INJECT_WATCHDOG_HEADROOM_MS: u64 = 5_000;
 /// Absolute ceiling for the `inject` watchdog. The CLI caps `--timeout-seconds`
 /// at 600 (`bounded_i64_arg`), so 600s + headroom is the worst case; this is a
@@ -7857,7 +7858,7 @@ fn command_inject_managed(
         dry_run,
         disposition,
     )?;
-    let ack = if effective_require_ack && !dry_run {
+    let mut ack = if effective_require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
         // room is always Some here (require_ack && !dry_run guards this branch).
         let ack_room = room
@@ -7884,7 +7885,9 @@ fn command_inject_managed(
         handoff.as_deref(),
         &session.tool,
         ack.as_ref(),
+        final_disposition,
     );
+    set_ack_timeout_fallback(&mut ack, fallback_plan.as_ref());
     // Surface the daemon Receipt state / failure reason honestly.
     let (daemon_receipt_state, daemon_delivery_error) = match &ptyd_delivery {
         PtydDelivery::Sent { state } => (Some(state.clone()), None),
@@ -8072,7 +8075,7 @@ fn command_inject_ledger(
             "rally: inject target {agent_id} is not synchronously injectable (presence-only; no active managed session). Waiting up to {timeout}s for an async ACK anyway — a polling agent or a rally-termd-registered pane can still resolve. Size any outer timeout accordingly."
         );
     }
-    let ack = if effective_require_ack && !dry_run {
+    let mut ack = if effective_require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
         let ack_room = room
             .take()
@@ -8101,6 +8104,7 @@ fn command_inject_ledger(
         handoff.as_deref(),
         &agent_id,
         ack.as_ref(),
+        final_disposition,
     )
     .or_else(|| {
         if verified_received || dry_run || delivery_state != "pending" {
@@ -8122,6 +8126,7 @@ fn command_inject_ledger(
         }
         plan
     });
+    set_ack_timeout_fallback(&mut ack, fallback_plan.as_ref());
     let inject_payload = InjectData {
         mode: if dry_run { "dry-run" } else { "inject" },
         session: None,
@@ -9365,7 +9370,6 @@ fn wait_for_resolution(
         }
         thread::sleep(remaining.min(Duration::from_millis(250)));
     }
-    let fallback_plan = ack_timeout_fallback_plan(handoff, expected_tool, timeout_seconds);
     Ok(json!({
         "received": false,
         "resolved": false,
@@ -9376,7 +9380,10 @@ fn wait_for_resolution(
         "expected_tool": expected_tool,
         "ignored_resolves": ignored_target_responses.len(),
         "ignored_target_responses": ignored_target_responses.len(),
-        "fallback_plan": fallback_plan
+        // The ACK waiter does not know final delivery truth. The inject arm
+        // replaces this placeholder only after it reconciles target receipt,
+        // durable-queue state, and the typed delivery disposition.
+        "fallback_plan": Value::Null
     }))
 }
 
@@ -9421,14 +9428,41 @@ fn inject_fallback_plan(
     handoff: Option<&str>,
     expected_tool: &str,
     ack: Option<&Value>,
+    final_disposition: DeliveryDisposition,
 ) -> Option<Value> {
     if !require_ack || dry_run || inject_verified_received(ack) {
         return None;
     }
-    if let Some(plan) = ack.and_then(|ack| ack.get("fallback_plan")).cloned() {
-        return Some(plan);
+    if ack
+        .and_then(|ack| ack.get("timed_out"))
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return None;
     }
-    handoff.map(|handoff| ack_timeout_fallback_plan(handoff, expected_tool, 0))
+    let timeout_seconds = ack
+        .and_then(|ack| ack.get("waited_seconds"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    handoff.map(|handoff| {
+        ack_timeout_fallback_plan(handoff, expected_tool, timeout_seconds, final_disposition)
+    })
+}
+
+/// Keep the nested ACK diagnostic and the top-level inject advice identical.
+/// This prevents an old generic `ack.fallback_plan` from recommending a
+/// duplicate send while `data.inject` correctly reports reached or queued.
+fn set_ack_timeout_fallback(ack: &mut Option<Value>, fallback_plan: Option<&Value>) {
+    let Some(ack) = ack.as_mut() else { return };
+    if ack.get("timed_out").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    if let Some(obj) = ack.as_object_mut() {
+        obj.insert(
+            "fallback_plan".to_string(),
+            fallback_plan.cloned().unwrap_or(Value::Null),
+        );
+    }
 }
 
 /// Sender-observability plan for the `ledger_only` inject path (any tool id;
@@ -9463,25 +9497,110 @@ fn ledger_async_fallback_plan(agent_id: &str) -> Value {
     })
 }
 
-fn ack_timeout_fallback_plan(handoff: &str, expected_tool: &str, timeout_seconds: u64) -> Value {
+fn ack_timeout_fallback_plan(
+    handoff: &str,
+    expected_tool: &str,
+    timeout_seconds: u64,
+    disposition: DeliveryDisposition,
+) -> Value {
+    let delivery_reason = disposition.as_str();
+    let delivery_detail = disposition.guidance(expected_tool);
+    let reached_target = disposition.reached_target();
+    let queued = disposition.is_queued();
+    let retry_allowed = disposition.retry_allowed_after_timeout();
+    let (delivery_truth, checks, fallbacks): (&str, Vec<String>, Vec<String>) = if reached_target {
+        (
+                "target_reached_ack_missing",
+                vec![
+                    format!(
+                        "rally recent --limit 50 --json; inspect target-authored evidence for handoff {handoff}"
+                    ),
+                    format!(
+                        "inspect the {expected_tool} runner/session to learn why it did not post an ACK"
+                    ),
+                    format!("rally room --json; follow the existing handoff {handoff}"),
+                    "check whether assigned files or claims moved before escalating".to_string(),
+                ],
+                vec![
+                    "do not create a duplicate delivery; final delivery truth already says the target was reached".to_string(),
+                    "wait for target-authored resolve/artifact/blocker evidence on the existing handoff".to_string(),
+                    "inspect or restore the existing target runner if ACK posting is unhealthy".to_string(),
+                    "escalate to the human when ownership or target state remains unclear".to_string(),
+                ],
+            )
+    } else if queued {
+        (
+                "durably_queued_ack_missing",
+                vec![
+                    format!(
+                        "rally next --tool {expected_tool} --json; inspect and follow the existing durable directive for handoff {handoff}"
+                    ),
+                    format!(
+                        "rally sessions --json; inspect the {expected_tool} runner responsible for consuming the queued directive"
+                    ),
+                    "rally recent --limit 50 --json; look for target-authored resolve/artifact/blocker".to_string(),
+                    "confirm the existing directive remains queued before changing ownership".to_string(),
+                ],
+                vec![
+                    "follow the existing durable directive; do not create a duplicate while it remains queued".to_string(),
+                    "inspect or restore the existing target runner so it can consume the queued directive".to_string(),
+                    "continue observing the existing handoff for target-authored evidence".to_string(),
+                    "escalate to the human when queue ownership or runner state remains unclear".to_string(),
+                ],
+            )
+    } else if retry_allowed {
+        (
+                "not_queued_retryable",
+                vec![
+                    "inspect the ledger error and correct permissions, corruption, or storage availability".to_string(),
+                    format!(
+                        "confirm no durable directive exists for {expected_tool} before sending again"
+                    ),
+                    "confirm the next successful send returns a directive_seq".to_string(),
+                    "escalate if the ledger remains unwritable".to_string(),
+                ],
+                vec![
+                    format!("retry once after correcting the ledger failure: {delivery_detail}"),
+                    "verify the new attempt creates exactly one durable directive".to_string(),
+                    "inspect the target runner only after the ledger accepts the directive".to_string(),
+                    "escalate to the human if durable recording cannot be restored".to_string(),
+                ],
+            )
+    } else {
+        (
+            "not_queued_no_retry",
+            vec![
+                format!("inspect the typed delivery result: {delivery_detail}"),
+                format!("rally room --json; follow handoff {handoff} without duplicating it"),
+                "inspect target-authored evidence and ownership state".to_string(),
+                "escalate when the typed result offers no safe automated action".to_string(),
+            ],
+            vec![
+                "do not create another delivery from this timeout alone".to_string(),
+                "follow the existing handoff and typed delivery result".to_string(),
+                "inspect target and ownership state before taking action".to_string(),
+                "escalate to the human when no safe action is established".to_string(),
+            ],
+        )
+    };
+
     json!({
         "trigger": "ack_timeout",
+        // Compatibility spelling: means no target-authored ACK was observed,
+        // not that transport/queue truth is unknown. New consumers use the
+        // explicit final-truth fields below.
         "assumption": "not_received",
         "handoff": handoff,
         "expected_tool": expected_tool,
         "timeout_seconds": timeout_seconds,
-        "checks": [
-            format!("rally room --json; confirm handoff {handoff} is still open"),
-            format!("rally next --tool {expected_tool} --json; confirm the target still sees the handoff"),
-            "rally recent --limit 50 --json; look for target-authored resolve/artifact/blocker",
-            "check whether assigned files changed or claims moved before retrying"
-        ],
-        "fallbacks": [
-            "retry once with a short doorbell only",
-            "move the work to a separate worktree if ownership is safe",
-            "handoff to another live agent when the target stays silent",
-            "escalate to the human when file ownership or risk is unclear"
-        ]
+        "delivery_truth": delivery_truth,
+        "delivery_reason": delivery_reason,
+        "delivery_detail": delivery_detail,
+        "reached_target": reached_target,
+        "queued": queued,
+        "retry_allowed": retry_allowed,
+        "checks": checks,
+        "fallbacks": fallbacks
     })
 }
 
@@ -9573,6 +9692,71 @@ mod tests {
              help_text() for each — a command users cannot discover is a command they \
              will not use."
         );
+    }
+
+    /// Mutation guard for ACK-timeout advice: changing either final-truth arm
+    /// back to the old generic retry plan must fail this test. A retry is safe
+    /// only when the ledger write failed before creating a durable directive.
+    #[test]
+    fn ack_timeout_advice_retries_only_when_final_truth_is_not_queued_or_reached() {
+        let cases = [
+            (
+                DeliveryDisposition::Delivered,
+                "target_reached_ack_missing",
+                false,
+            ),
+            (
+                DeliveryDisposition::QueuedNoManagedSession,
+                "durably_queued_ack_missing",
+                false,
+            ),
+            (
+                DeliveryDisposition::FailedLedgerWrite,
+                "not_queued_retryable",
+                true,
+            ),
+        ];
+
+        for (disposition, expected_truth, expected_retry) in cases {
+            let plan = ack_timeout_fallback_plan(
+                "handoff-timeout-mutation-guard",
+                "claude_code:target",
+                7,
+                disposition,
+            );
+            assert_eq!(
+                plan["delivery_truth"].as_str(),
+                Some(expected_truth),
+                "wrong timeout branch for {disposition:?}: {plan}"
+            );
+            assert_eq!(
+                plan["retry_allowed"].as_bool(),
+                Some(expected_retry),
+                "retry contract changed for {disposition:?}: {plan}"
+            );
+
+            let rendered = serde_json::to_string(&plan)
+                .expect("serialize timeout fallback")
+                .to_ascii_lowercase();
+            assert_eq!(
+                rendered.contains("retry once"),
+                expected_retry,
+                "human advice must agree with typed retry_allowed for {disposition:?}: {plan}"
+            );
+            if disposition.is_queued() {
+                assert!(
+                    rendered.contains("existing durable directive") && rendered.contains("runner"),
+                    "queued advice must follow the existing directive and runner: {plan}"
+                );
+            }
+            if disposition.reached_target() {
+                assert!(
+                    rendered.contains("target was reached")
+                        && rendered.contains("do not create a duplicate"),
+                    "reached advice must preserve delivery truth without retrying: {plan}"
+                );
+            }
+        }
     }
 
     // ---- rally retract — guardrails + read-side resolution ----------------
