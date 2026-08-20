@@ -116,7 +116,9 @@ After any required ACK wait, branch on the final fields in this order:
 
 Queued inject outcomes include `sent_unverified`, `queued_awaiting_receipt`, `queued_no_managed_session`, `policy_rejected_urgent_addition`, `failed_backend_inject`, and `failed_daemon_send`. `sent_unverified` means a pane write occurred without verified receipt, so the durable directive remains queued. `policy_rejected_urgent_addition` means SEC-009 intentionally skipped synchronous transport while leaving the durable directive queued; do not re-inject it.
 
-An ACK timeout is also **`ok: true` / exit 0**: optional target evidence did not arrive in the window. Check `ack.received` for acknowledgement and `ack.resolved`, `ack.blocked`, or `ack.decision` for its outcome. Then apply the final truth fields: if `reached_target` is `true`, the message arrived; if `queued` is `true`, inspect the existing durable directive or runner and do not re-inject; if both are `false`, follow `delivery_reason` and `delivery_detail`, retrying only when that typed guidance directs a retry.
+`queued: false` means Rally did not confirm a durable queued copy; it does not prove that no bytes were written. In particular, `failed_ledger_write` can represent a failure while syncing data that was already appended. Treat that result as ambiguous: inspect the existing directive and target evidence, and do not re-inject unless absence is independently established.
+
+An ACK timeout is also **`ok: true` / exit 0**: optional target evidence did not arrive in the window. Check `ack.received` for acknowledgement and `ack.resolved`, `ack.blocked`, or `ack.decision` for its outcome. Then apply the final truth fields: if `reached_target` is `true`, the message arrived; if `queued` is `true`, inspect the existing durable directive or runner and do not re-inject; if both are `false`, follow `delivery_reason` and `delivery_detail` without inferring that a retry is safe from the booleans alone.
 
 **`doctor --compact-log` `entries[]` shapes** (internally tagged by `entry`):
 
