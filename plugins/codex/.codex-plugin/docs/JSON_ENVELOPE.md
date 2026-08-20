@@ -101,14 +101,14 @@ print(d['data'][d['command']])
 | Decision arrived | `{ "received": true, "resolved": false, "handoff_closed": false, "blocked": false, "decision": true, "event_id": "...", "tool": "...", "expected_tool": "...", "kind": "decision", "subject": "..." }` |
 | Timed out before target evidence | `{ "received": false, "resolved": false, "assume_received": false, "timed_out": true, "waited_seconds": N, "after_seq": N, "expected_tool": "...", "ignored_resolves": N, "ignored_target_responses": N, "fallback_plan": { ... } }` |
 
-**`ok` reports command execution, not persistence or delivery.** `ok: true` / exit 0 means Rally produced a valid command result. A dry run writes nothing, and a ledger-write failure is represented inside a successful envelope. For inject, use `reached_target` to determine arrival and `queued` to determine whether a durable copy remains.
+**`ok` reports command execution, not persistence or delivery.** `ok: true` / exit 0 means Rally produced a valid command result. A dry run writes nothing, and a ledger-write failure is represented inside a successful envelope. For inject, only `reached_target: true` proves arrival and only `queued: true` proves that a durable queued copy remains; use `delivery_reason` and `delivery_detail` when either field is false.
 
 After any required ACK wait, branch on the final fields in this order:
 
 | Field | Question it answers |
 |-------|--------------------|
 | `reached_target` | Did the message actually arrive? Only `true` means yes. |
-| `queued` | If not, is it still reachable later? `true` means a durable copy remains queued. |
+| `queued` | Did Rally confirm a durable queued copy? Only `true` proves one remains. |
 | `delivery_reason` | Why — typed. See the enum in [the inject v1 schema](schemas/agent-rally.command.inject.v1.json). |
 | `delivery_detail` | What to do about it, in one sentence. |
 

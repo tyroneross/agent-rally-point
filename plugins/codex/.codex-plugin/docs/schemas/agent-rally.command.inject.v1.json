@@ -151,7 +151,7 @@
        "type": "boolean"
       },
       "queued": {
-       "description": "Whether the message remains durably queued after any required ACK wait. Sent-unverified, policy-rejected synchronous delivery, and failed transport attempts remain queued when their Directive landed; target-authored ACK evidence clears the flag. Current writers always emit it; the field remains optional for pre-field v1 envelopes.",
+       "description": "Whether Rally confirmed a durable queued copy after any required ACK wait. Sent-unverified, policy-rejected synchronous delivery, and failed transport attempts remain queued when their Directive landed; target-authored ACK evidence clears the flag. False means no queued copy was confirmed; for failed_ledger_write, it does not prove the inbox is empty. Current writers always emit it; the field remains optional for pre-field v1 envelopes.",
        "type": "boolean"
       },
       "directive_seq": {

@@ -460,8 +460,10 @@ pub(crate) struct InjectData {
     /// writers always emit it; the v1 schema keeps it optional.
     #[schemars(default)]
     pub(crate) reached_target: bool,
-    /// Whether the message is still durably queued after any required ACK
-    /// wait. Current writers always emit it; the v1 schema keeps it optional.
+    /// Whether Rally confirmed a durable queued copy after any required ACK
+    /// wait. `false` means no queued copy was confirmed; for
+    /// `failed_ledger_write`, it does not prove the inbox is empty. Current
+    /// writers always emit it; the v1 schema keeps it optional.
     #[schemars(default)]
     pub(crate) queued: bool,
     /// Pre-wait injectability diagnosis (see [`TargetInjectability`]).
