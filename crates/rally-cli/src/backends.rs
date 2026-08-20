@@ -245,6 +245,9 @@ pub(crate) enum DeliveryDisposition {
     /// The ledger write itself failed. Nothing is queued and nothing will
     /// arrive.
     FailedLedgerWrite,
+    /// SEC-009 intentionally skipped synchronous transport for an urgent
+    /// `Deliver + Addition`. The directive remains durably queued.
+    PolicyRejectedUrgentAddition,
     /// The ledger write landed but the synchronous tmux/cmux write failed.
     FailedBackendInject,
     /// A daemon-routed send hit an RPC error or a pane mismatch. The directive
@@ -264,6 +267,7 @@ impl DeliveryDisposition {
             Self::QueuedNoManagedSession => "queued_no_managed_session",
             Self::QueuedAwaitingPoll => "queued_awaiting_poll",
             Self::FailedLedgerWrite => "failed_ledger_write",
+            Self::PolicyRejectedUrgentAddition => "policy_rejected_urgent_addition",
             Self::FailedBackendInject => "failed_backend_inject",
             Self::FailedDaemonSend => "failed_daemon_send",
             Self::PlannedDryRun => "planned_dry_run",
@@ -287,6 +291,7 @@ impl DeliveryDisposition {
                 | Self::QueuedAwaitingReceipt
                 | Self::QueuedNoManagedSession
                 | Self::QueuedAwaitingPoll
+                | Self::PolicyRejectedUrgentAddition
                 | Self::FailedBackendInject
                 | Self::FailedDaemonSend
         )
@@ -328,6 +333,9 @@ impl DeliveryDisposition {
             ),
             Self::FailedLedgerWrite => format!(
                 "the ledger write failed, so nothing is queued for {target} and nothing will arrive. Retry the send."
+            ),
+            Self::PolicyRejectedUrgentAddition => format!(
+                "synchronous delivery to {target} was intentionally skipped by SEC-009 policy because urgent Deliver + Addition is not allowed on that transport. The directive remains durably queued; resend without `--urgent` if synchronous delivery is intended."
             ),
             Self::FailedBackendInject => format!(
                 "queued on the ledger but the synchronous write to {target}'s pane failed. Check the pane is alive (`rally sessions`); the queued copy still stands."
@@ -405,14 +413,16 @@ pub(crate) struct InjectData {
     /// **Daemon-first inject routing (move 2).** Which delivery tier carried
     /// this inject:
     ///   - `"daemon"` — the session is daemon-registered; ONLY the ledger
-    ///     Directive was written and the rally-termd daemon owns the PTY-write
-    ///     (NO tmux/cmux keystrokes fired). This is the north-star path.
-    ///   - `"tmux_framed_fallback"` — no daemon binding; the CLI performed the
-    ///     framed `send-keys` write (the degraded-but-correct fallback).
+    ///     Directive and daemon RPC may carry delivery; tmux/cmux keystrokes
+    ///     never fire. This is the north-star path.
+    ///   - `"tmux_framed_fallback"` — no daemon binding; absent a policy
+    ///     rejection, the CLI performs the framed `send-keys` write.
     ///   - `"ledger_only"` — a `LedgerAgent` target (externally-registered
     ///     ptyd pane with no managed session); already daemon-delivered.
     ///
-    /// Consumers branch on this to know whether a keystroke write happened.
+    /// This selects the transport tier, not proof a write happened. Consumers
+    /// pair it with `delivery_reason`; SEC-009 policy rejection skips the
+    /// selected synchronous transport intentionally.
     pub(crate) delivery_path: &'static str,
     /// ptyd pane-ownership flip: the `state` of the daemon's `agent.send`
     /// Receipt (`sent|seen|acted`) when `delivery_path == "daemon"` and the send
@@ -2268,6 +2278,7 @@ mod tests {
             DeliveryDisposition::QueuedAwaitingReceipt,
             DeliveryDisposition::QueuedNoManagedSession,
             DeliveryDisposition::QueuedAwaitingPoll,
+            DeliveryDisposition::PolicyRejectedUrgentAddition,
             DeliveryDisposition::FailedBackendInject,
             DeliveryDisposition::FailedDaemonSend,
         ] {
@@ -2298,6 +2309,7 @@ mod tests {
             DeliveryDisposition::QueuedNoManagedSession,
             DeliveryDisposition::QueuedAwaitingPoll,
             DeliveryDisposition::FailedLedgerWrite,
+            DeliveryDisposition::PolicyRejectedUrgentAddition,
             DeliveryDisposition::FailedBackendInject,
             DeliveryDisposition::FailedDaemonSend,
             DeliveryDisposition::PlannedDryRun,

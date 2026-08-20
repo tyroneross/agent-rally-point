@@ -21,6 +21,9 @@
 
 mod support;
 
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+
 use support::channel_sandbox::ChannelSandbox;
 
 /// Marker of the inject provenance label (`backends.rs::INJECT_LABEL_MARK`).
@@ -103,6 +106,27 @@ fn unique_name(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     format!("{prefix}-{}", N.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A live-target tmux double that records every invocation. The SEC-009 test
+/// uses the log to distinguish an intentional no-send from a failed send.
+fn recording_tmux_stub(
+    sandbox: &ChannelSandbox,
+    managed_name: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let bin = sandbox.root().join("tmux-sec009-spy.sh");
+    let log = sandbox.root().join("tmux-sec009-spy.log");
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n  list-panes) printf '%s\\n%s\\n%s\\n' 'rally-claude-{managed_name}' '@1' '%1' ;;\n  capture-pane) printf '%s\\n' 'unrelated pane content' ;;\nesac\nexit 0\n",
+        log.display()
+    );
+    fs::write(&bin, body).expect("write SEC-009 tmux spy");
+    let mut permissions = fs::metadata(&bin)
+        .expect("stat SEC-009 tmux spy")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&bin, permissions).expect("chmod SEC-009 tmux spy");
+    (bin, log)
 }
 
 // ---------------------------------------------------------------------------
@@ -242,19 +266,66 @@ fn sec009_urgent_addition_is_not_delivered_by_any_backend() {
     let sandbox = ChannelSandbox::spawn();
     let name = unique_name("sec009");
     let target = sandbox.add_tmux_session(&name);
+    let (tmux_spy, tmux_log) = recording_tmux_stub(&sandbox, &target);
 
     // `--urgent` => urgent Addition (the only itype the CLI emits). The legacy
-    // tmux/cmux synchronous inject MUST be gated off (split-enforcement guard),
-    // so `delivered` is false and the state is not "delivered".
-    let outcome =
-        sandbox.inject_with_flags(&target, "claude_code:test-sender", "URGENT do X", true);
-    assert!(
-        !outcome.delivered,
-        "urgent Addition must NOT be delivered by the legacy backend; outcome={outcome:?}"
+    // tmux/cmux synchronous inject MUST be gated off (split-enforcement guard).
+    // The live spy proves no send was attempted; the envelope separately says
+    // this is a policy rejection with a durable queued copy.
+    let envelope = sandbox.rally_json(&[
+        "inject",
+        &target,
+        "--json",
+        "--text",
+        "URGENT do X",
+        "--tool",
+        "claude_code:test-sender",
+        "--tmux-bin",
+        tmux_spy.to_str().expect("UTF-8 tmux spy path"),
+        "--urgent",
+    ]);
+    let outcome = &envelope["data"]["inject"];
+
+    assert_eq!(outcome["delivered"], false);
+    assert_eq!(outcome["delivery_state"], "failed");
+    assert_eq!(
+        outcome["delivery_reason"],
+        "policy_rejected_urgent_addition"
     );
-    assert_ne!(
-        outcome.delivery_state, "delivered",
-        "urgent Addition delivery_state must not be 'delivered'; outcome={outcome:?}"
+    assert_eq!(outcome["reached_target"], false);
+    assert_eq!(outcome["queued"], true);
+    assert!(outcome["directive_seq"].is_u64());
+    assert_eq!(outcome["daemon_delivery_error"], serde_json::Value::Null);
+    assert_eq!(outcome["wake_intent"]["status"], "failed");
+    let detail = outcome["delivery_detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("intentionally skipped by SEC-009 policy"),
+        "policy guidance must explain the intentional skip: {outcome}"
+    );
+    assert!(
+        detail.contains("resend without `--urgent`"),
+        "policy guidance must give the safe retry: {outcome}"
+    );
+
+    let tmux_calls = fs::read_to_string(&tmux_log).unwrap_or_default();
+    assert!(
+        !tmux_calls.lines().any(|line| line.contains("send-keys")),
+        "SEC-009 must skip the backend operation, not attempt and fail it: {tmux_calls}"
+    );
+
+    let schema_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/schemas/agent-rally.command.inject.v1.json");
+    let schema: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(schema_path).expect("read published inject v1 schema"),
+    )
+    .expect("parse published inject v1 schema");
+    let allowed_reasons = schema
+        .pointer("/properties/data/properties/inject/properties/delivery_reason/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("published delivery_reason enum");
+    assert!(
+        allowed_reasons.contains(&outcome["delivery_reason"]),
+        "the current writer's policy disposition must validate against inject v1"
     );
 
     // A NON-urgent inject of the same shape still reports a normal state — proves

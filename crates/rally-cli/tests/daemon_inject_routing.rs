@@ -462,6 +462,70 @@ fn daemon_registered_session_injects_ledger_only_zero_send_keys() {
     );
 }
 
+/// SEC-009 is an intentional policy skip on the daemon route, not an
+/// `agent.send` failure. The Directive remains queued and the response gives
+/// the caller a policy-specific retry instead of RPC/pane repair guidance.
+#[test]
+fn urgent_addition_skips_daemon_send_and_reports_policy_rejection() {
+    let sb = Sandbox::new();
+    let run = sb.rally(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "daemon-sec009",
+        "--shared",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        sb.tmux_spy.to_str().unwrap(),
+    ]);
+    let target = run["data"]["run"]["session"]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(count_method(&sb.log, "agent.send"), 0);
+
+    let inject = sb.rally(&[
+        "inject",
+        &target,
+        "--json",
+        "--text",
+        "urgent Addition",
+        "--urgent",
+        "--tool",
+        "claude_code:01",
+        "--tmux-bin",
+        sb.tmux_spy.to_str().unwrap(),
+    ]);
+    let data = &inject["data"]["inject"];
+
+    assert_eq!(data["delivery_path"], "daemon");
+    assert_eq!(data["delivered"], false);
+    assert_eq!(data["delivery_state"], "failed");
+    assert_eq!(data["delivery_reason"], "policy_rejected_urgent_addition");
+    assert_eq!(data["reached_target"], false);
+    assert_eq!(data["queued"], true);
+    assert!(data["directive_seq"].is_u64());
+    assert_eq!(data["daemon_receipt_state"], Value::Null);
+    assert_eq!(data["daemon_delivery_error"], Value::Null);
+    assert_eq!(data["wake_intent"]["status"], "failed");
+    let detail = data["delivery_detail"].as_str().unwrap_or("");
+    assert!(detail.contains("intentionally skipped by SEC-009 policy"));
+    assert!(detail.contains("resend without `--urgent`"));
+
+    assert_eq!(
+        count_method(&sb.log, "agent.send"),
+        0,
+        "SEC-009 must prevent the daemon RPC from being attempted"
+    );
+    assert_eq!(
+        sb.tmux_send_keys_count(),
+        0,
+        "daemon ownership plus SEC-009 must prevent every transport send"
+    );
+}
+
 /// Fallback contract (criterion 3): with NO daemon reachable, the same inject
 /// falls back to the framed tmux write and reports
 /// `delivery_path: "tmux_framed_fallback"` (and DOES use send-keys).

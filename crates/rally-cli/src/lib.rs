@@ -7683,6 +7683,11 @@ fn command_inject_managed(
         "tmux_framed_fallback"
     };
     let daemon_routed = session.daemon_registered;
+    let ledger_failed = delivery_state_initial == "failed";
+    // SEC-009 rejects the transport operation, not the durable record. Keep
+    // this separate from real backend/RPC failures so the envelope cannot
+    // prescribe pane or daemon repair for an intentional policy decision.
+    let policy_rejected_urgent_addition = !dry_run && !ledger_failed && urgent;
 
     // ----- ptyd daemon delivery arm (design-4) -----
     // For a daemon-registered session, perform the real `agent.send` RPC here:
@@ -7695,24 +7700,24 @@ fn command_inject_managed(
     // so `inject`'s ACK wait resolves on it.
     enum PtydDelivery {
         NotDaemon,
+        PolicyRejectedUrgentAddition,
         Sent { state: String },
         Mismatch { reason: String },
         Failed { reason: String },
     }
     let ptyd_delivery = if dry_run || !daemon_routed {
         PtydDelivery::NotDaemon
-    } else if delivery_state_initial == "failed" {
+    } else if ledger_failed {
         // Ledger write failed — do not attempt the daemon send (we have no
         // directive seq to reference and delivery is already a failure).
         PtydDelivery::Failed {
             reason: "ledger directive write failed".to_string(),
         }
-    } else if urgent {
+    } else if policy_rejected_urgent_addition {
         // Same SEC-009 split-enforcement posture as the tmux path: an urgent
         // Addition is delivered by NO transport (the daemon would reject it).
-        PtydDelivery::Failed {
-            reason: "urgent Addition is not delivered synchronously (SEC-009)".to_string(),
-        }
+        // This is an intentional policy skip, not an RPC failure.
+        PtydDelivery::PolicyRejectedUrgentAddition
     } else {
         let expect_pane = session.daemon_pane.clone().unwrap_or_default();
         match backend_runner.ptyd_inject(&session.tool, &text, &expect_pane) {
@@ -7755,11 +7760,11 @@ fn command_inject_managed(
         // RPC failure leaves it false (and surfaces as a failed delivery_state
         // below). NO tmux keystroke is ever written for a ptyd session.
         matches!(ptyd_delivery, PtydDelivery::Sent { .. })
-    } else if delivery_state_initial == "failed" {
+    } else if ledger_failed {
         // Ledger write failed — do not attempt backend inject. The content
         // fact is already recorded.
         false
-    } else if urgent {
+    } else if policy_rejected_urgent_addition {
         // SEC-009: split-enforcement guard. `rally inject` only ever emits
         // `Deliver + Addition` semantics (see inject_via_ledger), and the
         // daemon restricts `urgent=true` to Stop/Retraction (it rejects an
@@ -7792,9 +7797,12 @@ fn command_inject_managed(
     //      so a missed legacy delivery is a real failure.
     // Plan F functional core (Chunk 3): the herdr backend is removed;
     // the only inject paths left are tmux + cmux + the ledger write.
-    let ledger_failed = delivery_state_initial == "failed";
-    let legacy_tmux_cmux_failed =
-        !dry_run && !daemon_routed && !delivered && !ledger_failed && !legacy_sent_unverified;
+    let legacy_tmux_cmux_failed = !dry_run
+        && !daemon_routed
+        && !delivered
+        && !ledger_failed
+        && !policy_rejected_urgent_addition
+        && !legacy_sent_unverified;
     // F4 + RPC honesty: a daemon-routed send that hit a pane mismatch or an RPC
     // error is a REAL failure (the directive stays Pending on the ledger, but
     // this inject did not deliver). A successful Receipt is `delivered`.
@@ -7802,16 +7810,19 @@ fn command_inject_managed(
         ptyd_delivery,
         PtydDelivery::Mismatch { .. } | PtydDelivery::Failed { .. }
     );
-    let delivery_state: &'static str =
-        if ledger_failed || legacy_tmux_cmux_failed || daemon_delivery_failed {
-            "failed"
-        } else if delivered {
-            "delivered"
-        } else if legacy_sent_unverified {
-            "sent_unverified"
-        } else {
-            delivery_state_initial
-        };
+    let delivery_state: &'static str = if ledger_failed
+        || policy_rejected_urgent_addition
+        || legacy_tmux_cmux_failed
+        || daemon_delivery_failed
+    {
+        "failed"
+    } else if delivered {
+        "delivered"
+    } else if legacy_sent_unverified {
+        "sent_unverified"
+    } else {
+        delivery_state_initial
+    };
 
     // WHY the send is in `delivery_state`. Ordered failures-first so a
     // partially-failed send is never reported by its more optimistic half.
@@ -7819,6 +7830,8 @@ fn command_inject_managed(
         DeliveryDisposition::PlannedDryRun
     } else if ledger_failed {
         DeliveryDisposition::FailedLedgerWrite
+    } else if policy_rejected_urgent_addition {
+        DeliveryDisposition::PolicyRejectedUrgentAddition
     } else if daemon_delivery_failed {
         DeliveryDisposition::FailedDaemonSend
     } else if legacy_tmux_cmux_failed {
@@ -7878,7 +7891,7 @@ fn command_inject_managed(
         PtydDelivery::Mismatch { reason } | PtydDelivery::Failed { reason } => {
             (None, Some(reason.clone()))
         }
-        PtydDelivery::NotDaemon => (None, None),
+        PtydDelivery::NotDaemon | PtydDelivery::PolicyRejectedUrgentAddition => (None, None),
     };
     let session_id_for_text = session.session_id.clone();
     let inject_payload = InjectData {
@@ -8863,6 +8876,7 @@ fn inject_wake_intent_with_room(
             DeliveryDisposition::Delivered => "delivered",
             DeliveryDisposition::SentUnverified => "sent_unverified",
             DeliveryDisposition::FailedLedgerWrite
+            | DeliveryDisposition::PolicyRejectedUrgentAddition
             | DeliveryDisposition::FailedBackendInject
             | DeliveryDisposition::FailedDaemonSend => "failed",
             DeliveryDisposition::QueuedAwaitingReceipt
