@@ -179,6 +179,21 @@ class GenerateHostSurfacesTests(unittest.TestCase):
                         / filename
                     ).read_bytes(),
                 )
+            self.assertEqual(
+                (artifact / GEN.CODEX_WORKFLOW_NOTICE_DEST).read_bytes(),
+                (ROOT / GEN.CODEX_WORKFLOW_NOTICE_SOURCE).read_bytes(),
+            )
+            skill_text = (
+                artifact / "skills/rally-workflows/SKILL.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn(
+                'node "$RALLY_FLOW_CORE/workstream-lint.mjs"',
+                skill_text,
+            )
+            self.assertIn(
+                'node "$RALLY_FLOW_CORE/packet.mjs"',
+                skill_text,
+            )
             self.assertFalse(any(path.is_symlink() for path in artifact.rglob("*")))
 
             fanout_url = (runtime / "fanout.mjs").resolve().as_uri()
@@ -208,6 +223,72 @@ class GenerateHostSurfacesTests(unittest.TestCase):
             self.assertEqual(result["effective_max"], 1)
             self.assertEqual(result["limiting_factors"], ["room_output_pressure"])
             self.assertEqual(imported_result["limited"], "packaged-runtime-ok")
+
+    def test_packaged_workflow_commands_run_from_empty_consumer_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "generated"
+            GEN.generate(ROOT, dest)
+            runtime = (
+                dest
+                / GEN.CODEX_ARTIFACT
+                / GEN.CODEX_WORKFLOW_RUNTIME_DEST
+            ).resolve()
+
+            consumer = Path(tmp) / "consumer"
+            consumer.mkdir()
+            subprocess.run(
+                ["git", "init", "--quiet"],
+                cwd=consumer,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            descriptor = consumer / "workstream.json"
+            descriptor.write_text(
+                json.dumps(
+                    {
+                        "workstream": "packaged-smoke",
+                        "description": "prove package commands ignore consumer cwd",
+                        "tasks": [
+                            {
+                                "id": "p01",
+                                "intent": "verify packaged workflow tools",
+                                "owns": "read-only",
+                                "validation": "Confirm the rendered packet is present.",
+                                "validation_recipe": "none",
+                                "output": "one rendered task packet",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            linted = subprocess.run(
+                ["node", str(runtime / "workstream-lint.mjs"), str(descriptor)],
+                cwd=consumer,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("workstream descriptor is valid", linted.stdout)
+
+            packet = subprocess.run(
+                [
+                    "node",
+                    str(runtime / "packet.mjs"),
+                    str(descriptor),
+                    "--run",
+                    "packaged-smoke",
+                    "--task",
+                    "p01",
+                ],
+                cwd=consumer,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("# Task packet — p01", packet.stdout)
 
     def test_codex_manifest_paths_resolve_from_marketplace_plugin_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

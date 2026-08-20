@@ -30,6 +30,15 @@ This skill names no specific agent. Before running, resolve three host values:
 Do not hard-code another agent's identity in a descriptor or command — each host supplies its own
 `<TOOL>` at runtime. Substitute `<TOOL>` wherever it appears below.
 
+Resolve the Rally Flow module directory once, before running any command in this skill, and export
+its absolute path as `RALLY_FLOW_CORE`:
+
+- Repository checkout: `<repo-root>/dynamic-workflows/core`.
+- Generated Codex plugin: `<directory-containing-this-SKILL.md>/core`. Resolve this from the
+  loaded skill file, not from the consumer repository's current working directory.
+
+The linter, fan-out resolver, limiter, and packet generator below all use that same absolute path.
+
 ## 1 · Decompose — author the descriptor
 
 Write a JSON workstream descriptor per `../../dynamic-workflows/PROTOCOL.md` (§1). Required
@@ -64,7 +73,7 @@ at fan-out time and threaded through the loop below.
 dependency integrity):
 
 ```bash
-node dynamic-workflows/core/workstream-lint.mjs my.workstream.json
+node "$RALLY_FLOW_CORE/workstream-lint.mjs" my.workstream.json
 # exit 0 → valid · 1 → violations · 2 → parse error
 ```
 
@@ -76,14 +85,8 @@ Use the host's native subagent/delegation tool. One agent per task packet. Promp
 its `owns`, `validation`, and `output` only — minimal context.
 
 **Resolve the width; do not assume a number.** `fanout.mjs` returns both the count and the
-constraint that produced it, so a host nowhere near its ceiling can say so. Resolve the module
-directory before importing it:
-
-- Repository checkout: `<repo-root>/dynamic-workflows/core`.
-- Generated Codex plugin: `<directory-containing-this-SKILL.md>/core`. This is a real copied
-  directory, not a symlink; resolve it from the loaded skill path, not the consumer repo's cwd.
-
-Set `RALLY_FLOW_CORE` to that absolute directory. These imports then execute in either layout:
+constraint that produced it, so a host nowhere near its ceiling can say so. With the absolute
+`RALLY_FLOW_CORE` resolved above, these imports execute in either layout:
 
 ```js
 import { pathToFileURL } from "node:url";
@@ -139,9 +142,9 @@ Don't hand-write each subagent prompt. Once the descriptor lints clean, render o
 mechanically:
 
 ```bash
-node dynamic-workflows/core/packet.mjs my.workstream.json --run <run_id>            # all tasks → stdout
-node dynamic-workflows/core/packet.mjs my.workstream.json --run <run_id> --task p01 # one task
-node dynamic-workflows/core/packet.mjs my.workstream.json --run <run_id> --out ./packets --tool-prefix <prefix>
+node "$RALLY_FLOW_CORE/packet.mjs" my.workstream.json --run <run_id>            # all tasks → stdout
+node "$RALLY_FLOW_CORE/packet.mjs" my.workstream.json --run <run_id> --task p01 # one task
+node "$RALLY_FLOW_CORE/packet.mjs" my.workstream.json --run <run_id> --out ./packets --tool-prefix <prefix>
 ```
 
 Each packet embeds the task intent, its `owns` boundary, the per-task rally loop with

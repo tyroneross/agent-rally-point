@@ -36,10 +36,14 @@ CODEX_ARTIFACT = Path("plugins/codex/.codex-plugin")
 CODEX_WORKFLOW_RUNTIME_FILES = (
     "fanout.mjs",
     "limiter.mjs",
+    "packet.mjs",
+    "workstream-lint.mjs",
     "workstream-status.mjs",
 )
 CODEX_WORKFLOW_RUNTIME_SOURCE = Path("dynamic-workflows/core")
 CODEX_WORKFLOW_RUNTIME_DEST = Path("skills/rally-workflows/core")
+CODEX_WORKFLOW_NOTICE_SOURCE = Path("dynamic-workflows/NOTICE")
+CODEX_WORKFLOW_NOTICE_DEST = Path("skills/rally-workflows/NOTICE")
 
 
 class GenerationError(RuntimeError):
@@ -485,6 +489,9 @@ def copy_codex_artifact(
             target = dest / CODEX_WORKFLOW_RUNTIME_DEST / filename
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
+        notice_target = dest / CODEX_WORKFLOW_NOTICE_DEST
+        notice_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_root / CODEX_WORKFLOW_NOTICE_SOURCE, notice_target)
     validate_codex_package_paths(dest.parent)
     return dest
 
