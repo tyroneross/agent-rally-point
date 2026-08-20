@@ -49,6 +49,8 @@ CODEX_PACKAGED_REFERENCE_FILES = (
     Path("dynamic-workflows/COORDINATION.md"),
     Path("dynamic-workflows/MODEL-TIERS.md"),
     Path("docs/ORCHESTRATOR_SEAM.md"),
+    Path("docs/SPEC-lead-agent.md"),
+    Path("docs/JSON_ENVELOPE.md"),
     Path("docs/security/TRUST-MODEL.md"),
 )
 CODEX_REFERENCE_SKILLS = {"agent-rally-point", "rally-workflows"}

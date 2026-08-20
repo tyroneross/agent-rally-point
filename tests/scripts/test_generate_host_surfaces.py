@@ -243,33 +243,49 @@ class GenerateHostSurfacesTests(unittest.TestCase):
             self.assertEqual(result["limiting_factors"], ["room_output_pressure"])
             self.assertEqual(imported_result["limited"], "packaged-runtime-ok")
 
-    def test_all_packaged_skill_markdown_links_resolve_inside_artifact(self) -> None:
+    def test_all_reachable_packaged_markdown_links_resolve_inside_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp)
             GEN.generate(ROOT, dest)
             artifact = (dest / GEN.CODEX_ARTIFACT).resolve()
             unresolved = []
-            for skill in sorted((artifact / "skills").glob("*/SKILL.md")):
-                markdown = skill.read_text(encoding="utf-8")
+            pending = [
+                skill.resolve()
+                for skill in sorted((artifact / "skills").glob("*/SKILL.md"))
+            ]
+            visited: set[Path] = set()
+            local_edges = 0
+            while pending:
+                document = pending.pop(0)
+                if document in visited:
+                    continue
+                visited.add(document)
+                markdown = document.read_text(encoding="utf-8")
                 for target in local_markdown_links(markdown):
+                    local_edges += 1
                     if not target:
                         unresolved.append(
-                            f"{skill.relative_to(artifact)} -> empty local target"
+                            f"{document.relative_to(artifact)} -> empty local target"
                         )
                         continue
-                    resolved = (skill.parent / target).resolve()
+                    resolved = (document.parent / target).resolve()
                     try:
                         relative = resolved.relative_to(artifact)
                     except ValueError:
                         unresolved.append(
-                            f"{skill.relative_to(artifact)} -> {target} escapes artifact"
+                            f"{document.relative_to(artifact)} -> {target} escapes artifact"
                         )
                         continue
                     if not resolved.exists():
                         unresolved.append(
-                            f"{skill.relative_to(artifact)} -> {relative} is missing"
+                            f"{document.relative_to(artifact)} -> {relative} is missing"
                         )
+                        continue
+                    if resolved.suffix.lower() == ".md" and resolved not in visited:
+                        pending.append(resolved)
             self.assertEqual(unresolved, [])
+            self.assertEqual(len(visited), 11)
+            self.assertEqual(local_edges, 17)
 
     def test_packaged_workflow_commands_run_from_empty_consumer_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
