@@ -136,6 +136,7 @@
         "queued_no_managed_session",
         "queued_awaiting_poll",
         "failed_ledger_write",
+        "policy_rejected_urgent_addition",
         "failed_backend_inject",
         "failed_daemon_send",
         "planned_dry_run"
@@ -150,7 +151,7 @@
        "type": "boolean"
       },
       "queued": {
-       "description": "Whether the message remains durably queued after any required ACK wait. Sent-unverified and failed transport attempts remain queued when their Directive landed; target-authored ACK evidence clears the flag. Current writers always emit it; the field remains optional for pre-field v1 envelopes.",
+       "description": "Whether the message remains durably queued after any required ACK wait. Sent-unverified, policy-rejected synchronous delivery, and failed transport attempts remain queued when their Directive landed; target-authored ACK evidence clears the flag. Current writers always emit it; the field remains optional for pre-field v1 envelopes.",
        "type": "boolean"
       },
       "directive_seq": {
