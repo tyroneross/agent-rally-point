@@ -114,7 +114,7 @@ After any required ACK wait, branch on the final fields in this order:
 
 `delivered` and `delivery_state` are attempt-time compatibility fields. `delivery_state` uses `pending`, `delivered`, `seen`, `acted`, `failed`, or `sent_unverified`. A later target ACK can therefore make `reached_target: true` and `queued: false` while those attempt-time fields remain unchanged.
 
-Queued outcomes include `sent_unverified`, `queued_awaiting_receipt`, `queued_no_managed_session`, `queued_awaiting_poll`, `failed_backend_inject`, and `failed_daemon_send`. In particular, `SentUnverified` means a pane write occurred without verified receipt, so the durable directive remains queued.
+Queued outcomes include `sent_unverified`, `queued_awaiting_receipt`, `queued_no_managed_session`, `queued_awaiting_poll`, `policy_rejected_urgent_addition`, `failed_backend_inject`, and `failed_daemon_send`. `sent_unverified` means a pane write occurred without verified receipt, so the durable directive remains queued. `policy_rejected_urgent_addition` means SEC-009 intentionally skipped synchronous transport; resend without `--urgent` if delivery is intended.
 
 An ACK timeout is also **`ok: true` / exit 0**: the message is in the channel and only the optional target evidence did not arrive in the window. Check `ack.received` for acknowledgement and `ack.resolved`, `ack.blocked`, or `ack.decision` for its outcome. **Do not re-inject after an ACK timeout** — the message is already in the channel.
 
