@@ -99,6 +99,16 @@ test("accepts every room envelope shape and tolerates a missing squads list", ()
   assert.equal(liveAgentsFromRoom(null).count, 0);
 });
 
+test("exposes only the typed room over-budget signal", () => {
+  const envelope = (over_budget) => ({
+    data: { room: { squads: [], composition: { over_budget } } },
+  });
+  assert.equal(liveAgentsFromRoom(envelope(true)).over_budget, true);
+  assert.equal(liveAgentsFromRoom(envelope(false)).over_budget, false);
+  assert.equal(liveAgentsFromRoom({ data: { room: { squads: [] } } }).over_budget, false);
+  assert.equal(liveAgentsFromRoom(envelope("true")).over_budget, false);
+});
+
 test("live peers consume headroom out of the config max", () => {
   const r = resolveFanout({ configMax: 10, liveAgents: 4 });
   assert.equal(r.effective_max, 6);
@@ -124,6 +134,24 @@ test("room headroom composes with the other caps", () => {
   assert.equal(r.effective_max, 3);
   assert.deepEqual(r.limiting_factors, ["ready_tasks"]);
   assert.equal(r.caps.room_headroom, 8);
+});
+
+test("an over-budget room serializes fan-out with an observable factor", () => {
+  const r = resolveFanout({ configMax: 10, readyTasks: 8, roomOverBudget: true });
+  assert.equal(r.effective_max, 1);
+  assert.deepEqual(r.limiting_factors, ["room_output_pressure"]);
+  assert.equal(r.caps.room_output_pressure, 1);
+  assert.equal(r.room_over_budget, true);
+});
+
+test("false, absent, and malformed room pressure fail open", () => {
+  const baseline = resolveFanout({ configMax: 8 });
+  for (const roomOverBudget of [false, undefined, null, "true", 1]) {
+    const r = resolveFanout({ configMax: 8, roomOverBudget });
+    assert.equal(r.effective_max, baseline.effective_max);
+    assert.ok(!("room_output_pressure" in r.caps));
+    assert.equal(r.room_over_budget, false);
+  }
 });
 
 test("the resolved width actually bounds a limiter's in-flight count", async () => {

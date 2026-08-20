@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -164,7 +165,49 @@ class GenerateHostSurfacesTests(unittest.TestCase):
             self.assertTrue(
                 (artifact / "skills/rally-workflows/references/decomposition.md").is_file()
             )
+            runtime = artifact / GEN.CODEX_WORKFLOW_RUNTIME_DEST
+            self.assertEqual(
+                {path.name for path in runtime.iterdir() if path.is_file()},
+                set(GEN.CODEX_WORKFLOW_RUNTIME_FILES),
+            )
+            for filename in GEN.CODEX_WORKFLOW_RUNTIME_FILES:
+                self.assertEqual(
+                    (runtime / filename).read_bytes(),
+                    (
+                        ROOT
+                        / GEN.CODEX_WORKFLOW_RUNTIME_SOURCE
+                        / filename
+                    ).read_bytes(),
+                )
             self.assertFalse(any(path.is_symlink() for path in artifact.rglob("*")))
+
+            fanout_url = (runtime / "fanout.mjs").resolve().as_uri()
+            limiter_url = (runtime / "limiter.mjs").resolve().as_uri()
+            script = f"""
+                import {{ liveAgentsFromRoom, resolveFanout }} from {json.dumps(fanout_url)};
+                import {{ createLimiter }} from {json.dumps(limiter_url)};
+                const live = liveAgentsFromRoom({{
+                  data: {{ room: {{ squads: [], composition: {{ over_budget: true }} }} }},
+                }});
+                const result = resolveFanout({{
+                  readyTasks: 8,
+                  roomOverBudget: live.over_budget,
+                }});
+                const run = createLimiter(result.effective_max);
+                const limited = await run(async () => "packaged-runtime-ok");
+                process.stdout.write(JSON.stringify({{ result, limited }}));
+            """
+            imported = subprocess.run(
+                ["node", "--input-type=module", "--eval", script],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            imported_result = json.loads(imported.stdout)
+            result = imported_result["result"]
+            self.assertEqual(result["effective_max"], 1)
+            self.assertEqual(result["limiting_factors"], ["room_output_pressure"])
+            self.assertEqual(imported_result["limited"], "packaged-runtime-ok")
 
     def test_codex_manifest_paths_resolve_from_marketplace_plugin_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -75,12 +75,25 @@ Do not dispatch agents until the linter exits 0.
 Use the host's native subagent/delegation tool. One agent per task packet. Prompt each subagent with
 its `owns`, `validation`, and `output` only — minimal context.
 
-**Resolve the width; do not assume a number.** `core/fanout.mjs` returns both the count and the
-constraint that produced it, so a host nowhere near its ceiling can say so:
+**Resolve the width; do not assume a number.** `fanout.mjs` returns both the count and the
+constraint that produced it, so a host nowhere near its ceiling can say so. Resolve the module
+directory before importing it:
+
+- Repository checkout: `<repo-root>/dynamic-workflows/core`.
+- Generated Codex plugin: `<directory-containing-this-SKILL.md>/core`. This is a real copied
+  directory, not a symlink; resolve it from the loaded skill path, not the consumer repo's cwd.
+
+Set `RALLY_FLOW_CORE` to that absolute directory. These imports then execute in either layout:
 
 ```js
-import { resolveFanout, liveAgentsFromRoom } from "./dynamic-workflows/core/fanout.mjs";
-import { createLimiter } from "./dynamic-workflows/core/limiter.mjs";
+import { pathToFileURL } from "node:url";
+
+const flowCore = process.env.RALLY_FLOW_CORE;
+if (!flowCore) throw new Error("RALLY_FLOW_CORE must name the Rally Flow core directory");
+const { resolveFanout, liveAgentsFromRoom } = await import(
+  pathToFileURL(`${flowCore}/fanout.mjs`).href,
+);
+const { createLimiter } = await import(pathToFileURL(`${flowCore}/limiter.mjs`).href);
 
 // `rally room --json` — peers already working hold capacity you cannot use.
 const live = liveAgentsFromRoom(roomSnapshot, { excludeTools: [myTool, ...myTaskTools] });
@@ -89,6 +102,7 @@ const { effective_max, limiting_factors } = resolveFanout({
   hostCap: <your CPU- or token-derived ceiling>,  // omit if you have no resource picture
   readyTasks: tasks.filter(dispatchable).length,
   liveAgents: live.count,
+  roomOverBudget: live.over_budget,
 });
 const run = createLimiter(effective_max);
 ```
@@ -98,6 +112,11 @@ that ended without stopping, and an idle one holds nothing. **Pass your own tool
 `excludeTools`**: the orchestrator and every id it fans out under are fresh+active squads too, so
 omitting them makes a fan-out subtract itself. This is the one input the host cannot supply — your
 process cannot see the two peers another terminal started ten minutes ago.
+
+`live.over_budget` is true only when the typed `room.composition.over_budget` boolean is true. In
+that state the resolver adds the `room_output_pressure` limiting factor and serializes new work at
+one task until the pressure clears. Missing, false, or malformed pressure data fails open to the
+other caps, so older room envelopes retain their previous behavior.
 
 Default width is **10**, hard ceiling **12** — the ceiling exists for coordination overhead (each
 hook fire writes ledger lines back into the ledger), not for write safety. Write safety comes from

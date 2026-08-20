@@ -33,6 +33,13 @@ JSON_SURFACES = (
 GENERATED_DIRS = (Path("plugins/codex/.codex-plugin"),)
 SKILL_ROOT = Path("skills")
 CODEX_ARTIFACT = Path("plugins/codex/.codex-plugin")
+CODEX_WORKFLOW_RUNTIME_FILES = (
+    "fanout.mjs",
+    "limiter.mjs",
+    "workstream-status.mjs",
+)
+CODEX_WORKFLOW_RUNTIME_SOURCE = Path("dynamic-workflows/core")
+CODEX_WORKFLOW_RUNTIME_DEST = Path("skills/rally-workflows/core")
 
 
 class GenerationError(RuntimeError):
@@ -472,6 +479,12 @@ def copy_codex_artifact(
             dest / "skills" / skill_id / "SKILL.md",
             render_skill(source_root, config, skill_id, "codex"),
         )
+    if "rally-workflows" in config["skills"]:
+        for filename in CODEX_WORKFLOW_RUNTIME_FILES:
+            source = source_root / CODEX_WORKFLOW_RUNTIME_SOURCE / filename
+            target = dest / CODEX_WORKFLOW_RUNTIME_DEST / filename
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
     validate_codex_package_paths(dest.parent)
     return dest
 
