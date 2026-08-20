@@ -1,0 +1,196 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "urn:agent-rally:command:inject:v1",
+ "title": "Rally Inject Command",
+ "type": "object",
+ "required": [
+  "ok",
+  "product",
+  "command",
+  "schema",
+  "data"
+ ],
+ "properties": {
+  "ok": {
+   "const": true
+  },
+  "product": {
+   "const": "rally"
+  },
+  "command": {
+   "const": "inject"
+  },
+  "schema": {
+   "const": "agent-rally.command.inject.v1"
+  },
+  "data": {
+   "type": "object",
+   "required": [
+    "inject"
+   ],
+   "properties": {
+    "inject": {
+     "type": "object",
+     "required": [
+      "mode",
+      "session",
+      "target_kind",
+      "handoff",
+      "require_ack",
+      "ack",
+      "verified_received",
+      "ack_state",
+      "fallback_plan",
+      "wake_intent",
+      "commands",
+      "sender_tool",
+      "content_fact",
+      "delivered",
+      "delivery_state",
+      "directive_seq",
+      "directive_to"
+     ],
+     "properties": {
+      "mode": {
+       "type": "string"
+      },
+      "session": {
+       "type": [
+        "object",
+        "null"
+       ]
+      },
+      "target_kind": {
+       "type": "string",
+       "enum": [
+        "managed_session",
+        "ledger_agent"
+       ]
+      },
+      "handoff": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "require_ack": {
+       "type": "boolean"
+      },
+      "ack": {
+       "type": [
+        "object",
+        "null"
+       ]
+      },
+      "verified_received": {
+       "type": "boolean"
+      },
+      "ack_state": {
+       "type": "string",
+       "enum": [
+        "not_required",
+        "planned",
+        "acked",
+        "blocked",
+        "timeout",
+        "pending"
+       ]
+      },
+      "fallback_plan": {
+       "type": [
+        "object",
+        "null"
+       ]
+      },
+      "wake_intent": {
+       "type": [
+        "object",
+        "null"
+       ]
+      },
+      "commands": {
+       "type": "array"
+      },
+      "sender_tool": {
+       "type": "string"
+      },
+      "content_fact": {
+       "type": [
+        "object",
+        "null"
+       ]
+      },
+      "delivered": {
+       "type": "boolean"
+      },
+      "delivery_state": {
+       "type": "string"
+      },
+      "delivery_reason": {
+       "description": "Final delivery truth after any required ACK wait. Current writers always emit it, but it remains optional in v1 so envelopes written before this additive field was introduced stay valid. `delivered` and `delivery_state` preserve the immediate transport-attempt compatibility contract; target-authored receipt evidence can therefore make this field `delivered` even when those compatibility fields retain an earlier attempt state.",
+       "type": "string",
+       "enum": [
+        "delivered",
+        "sent_unverified",
+        "queued_awaiting_receipt",
+        "queued_no_managed_session",
+        "queued_awaiting_poll",
+        "failed_ledger_write",
+        "policy_rejected_urgent_addition",
+        "failed_backend_inject",
+        "failed_daemon_send",
+        "planned_dry_run"
+       ]
+      },
+      "delivery_detail": {
+       "description": "One sentence naming what the caller should do about the final `delivery_reason`. Current writers always emit it; the field remains optional for pre-field v1 envelopes.",
+       "type": "string"
+      },
+      "reached_target": {
+       "description": "Whether immediate delivery or later target-authored ACK evidence proves the message reached the target. Distinct from `delivered`, which preserves the synchronous backend-attempt compatibility contract. Current writers always emit it; the field remains optional for pre-field v1 envelopes.",
+       "type": "boolean"
+      },
+      "queued": {
+       "description": "Whether the message remains durably queued after any required ACK wait. Sent-unverified, policy-rejected synchronous delivery, and failed transport attempts remain queued when their Directive landed; target-authored ACK evidence clears the flag. Current writers always emit it; the field remains optional for pre-field v1 envelopes.",
+       "type": "boolean"
+      },
+      "directive_seq": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "directive_to": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "target_injectability": {
+       "description": "Pre-wait injectability diagnosis, resolved at inject time (RCA 2026-07-09). Present on the ledger_agent path; omitted for managed sessions. Advisory only - the ACK wait is never short-circuited.",
+       "type": "object",
+       "required": [
+        "injectable",
+        "status"
+       ],
+       "properties": {
+        "injectable": {
+         "type": "boolean"
+        },
+        "status": {
+         "type": "string"
+        },
+        "via": {
+         "type": "string"
+        },
+        "reason": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  }
+ }
+}

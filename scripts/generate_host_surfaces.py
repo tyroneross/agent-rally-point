@@ -51,6 +51,7 @@ CODEX_PACKAGED_REFERENCE_FILES = (
     Path("docs/ORCHESTRATOR_SEAM.md"),
     Path("docs/SPEC-lead-agent.md"),
     Path("docs/JSON_ENVELOPE.md"),
+    Path("docs/schemas/agent-rally.command.inject.v1.json"),
     Path("docs/security/TRUST-MODEL.md"),
 )
 CODEX_REFERENCE_SKILLS = {"agent-rally-point", "rally-workflows"}

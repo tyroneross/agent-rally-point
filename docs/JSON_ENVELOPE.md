@@ -79,7 +79,7 @@ print(d['data'][d['command']])
 | `whoami` | `whoami: { tool?, repo_root, repo_id, room_id, worktree, build_id, cwd }` | `repo_id` is stable repo identity; `room_id` is the active engagement label |
 | `sessions` | `sessions: { sessions: [...] }` | — |
 | `run` | `run: { mode, session, commands }` | — |
-| `inject` | `inject: { mode, session, handoff?, require_ack, ack?, wake_intent?, commands, sender_tool, content_fact?, delivered, delivery_state, delivery_reason, delivery_detail, reached_target, queued }` | — |
+| `inject` | `inject: { mode, session, target_kind, handoff, require_ack, ack, verified_received, ack_state, fallback_plan, wake_intent, commands, sender_tool, content_fact, delivered, delivery_state, directive_seq, directive_to, delivery_path, daemon_receipt_state?, daemon_delivery_error?, delivery_reason, delivery_detail, reached_target, queued, target_injectability? }` | — |
 | `attach` | `attach: { mode, action, session, output?, commands }` | — |
 | `capture` | `capture: { mode, action, session, output?, commands }` | — |
 | `stop` | `stop: { mode, action, session, output?, commands }` | — |
@@ -109,14 +109,14 @@ After any required ACK wait, branch on the final fields in this order:
 |-------|--------------------|
 | `reached_target` | Did the message actually arrive? Only `true` means yes. |
 | `queued` | If not, is it still reachable later? `true` means a durable copy remains queued. |
-| `delivery_reason` | Why — typed. See the enum in `docs/schemas/agent-rally.command.inject.v1.json`. |
+| `delivery_reason` | Why — typed. See the enum in [the inject v1 schema](schemas/agent-rally.command.inject.v1.json). |
 | `delivery_detail` | What to do about it, in one sentence. |
 
 `delivered` and `delivery_state` are attempt-time compatibility fields. `delivery_state` uses `pending`, `delivered`, `seen`, `acted`, `failed`, or `sent_unverified`. A later target ACK can therefore make `reached_target: true` and `queued: false` while those attempt-time fields remain unchanged.
 
-Queued outcomes include `sent_unverified`, `queued_awaiting_receipt`, `queued_no_managed_session`, `queued_awaiting_poll`, `policy_rejected_urgent_addition`, `failed_backend_inject`, and `failed_daemon_send`. `sent_unverified` means a pane write occurred without verified receipt, so the durable directive remains queued. `policy_rejected_urgent_addition` means SEC-009 intentionally skipped synchronous transport; resend without `--urgent` if delivery is intended.
+Queued inject outcomes include `sent_unverified`, `queued_awaiting_receipt`, `queued_no_managed_session`, `policy_rejected_urgent_addition`, `failed_backend_inject`, and `failed_daemon_send`. `sent_unverified` means a pane write occurred without verified receipt, so the durable directive remains queued. `policy_rejected_urgent_addition` means SEC-009 intentionally skipped synchronous transport while leaving the durable directive queued; do not re-inject it.
 
-An ACK timeout is also **`ok: true` / exit 0**: the message is in the channel and only the optional target evidence did not arrive in the window. Check `ack.received` for acknowledgement and `ack.resolved`, `ack.blocked`, or `ack.decision` for its outcome. **Do not re-inject after an ACK timeout** — the message is already in the channel.
+An ACK timeout is also **`ok: true` / exit 0**: optional target evidence did not arrive in the window. Check `ack.received` for acknowledgement and `ack.resolved`, `ack.blocked`, or `ack.decision` for its outcome. Then apply the final truth fields: if `reached_target` is `true`, the message arrived; if `queued` is `true`, inspect the existing durable directive or runner and do not re-inject; if both are `false`, follow `delivery_reason` and `delivery_detail`, retrying only when that typed guidance directs a retry.
 
 **`doctor --compact-log` `entries[]` shapes** (internally tagged by `entry`):
 
