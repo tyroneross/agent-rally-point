@@ -282,7 +282,11 @@ impl DeliveryDisposition {
     pub(crate) fn is_queued(self) -> bool {
         matches!(
             self,
-            Self::QueuedAwaitingReceipt | Self::QueuedNoManagedSession | Self::QueuedAwaitingPoll
+            Self::QueuedAwaitingReceipt
+                | Self::QueuedNoManagedSession
+                | Self::QueuedAwaitingPoll
+                | Self::FailedBackendInject
+                | Self::FailedDaemonSend
         )
     }
 
@@ -2218,7 +2222,7 @@ fn shell_words(words: &[String]) -> Result<String> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{InjectData, RunData, SessionActionData, SessionsData};
+    use super::{DeliveryDisposition, InjectData, RunData, SessionActionData, SessionsData};
     // Plan F functional core (Chunk 3): herdr_command, parse_herdr_agents_tab,
     // and resolve_agent_pane_from_list removed with the Backend::Herdr arm.
     use super::{Backend, BackendRunner, verify_needle};
@@ -2235,6 +2239,34 @@ mod tests {
     use crate::{EnterData, Envelope, NextData, RoomData, SayData};
     use schemars::schema_for;
     use std::path::PathBuf;
+
+    #[test]
+    fn delivery_queue_flag_tracks_whether_a_durable_copy_remains() {
+        for disposition in [
+            DeliveryDisposition::QueuedAwaitingReceipt,
+            DeliveryDisposition::QueuedNoManagedSession,
+            DeliveryDisposition::QueuedAwaitingPoll,
+            DeliveryDisposition::FailedBackendInject,
+            DeliveryDisposition::FailedDaemonSend,
+        ] {
+            assert!(
+                disposition.is_queued(),
+                "{disposition:?} leaves a durable queued copy"
+            );
+        }
+
+        for disposition in [
+            DeliveryDisposition::Delivered,
+            DeliveryDisposition::SentUnverified,
+            DeliveryDisposition::FailedLedgerWrite,
+            DeliveryDisposition::PlannedDryRun,
+        ] {
+            assert!(
+                !disposition.is_queued(),
+                "{disposition:?} does not leave a durable queued copy"
+            );
+        }
+    }
 
     // ---- P1a: legacy tmux/cmux inject landing-verify -----------------------
 

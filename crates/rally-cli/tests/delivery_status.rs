@@ -269,14 +269,14 @@ fn a_queued_send_distinguishes_no_address_from_no_listener() {
 }
 
 // =============================================================================
-// failure is not queued
+// a failed transport attempt remains queued
 // =============================================================================
 
-/// A failed backend write reports a FAILURE reason, not a queued one. The
-/// `queued` flag is what separates "not yet" from "never", so it must go false
-/// exactly when the message is not coming.
+/// A failed backend write reports a FAILURE reason while preserving the
+/// durable queue truth. The transport attempt failed, but the ledger write
+/// already landed, so the target can still consume the queued copy later.
 #[test]
-fn a_failed_backend_write_is_reported_as_failure_not_as_queued() {
+fn a_failed_backend_write_is_reported_as_failed_and_still_queued() {
     let sandbox = ChannelSandbox::spawn();
     let name = unique_name("broken");
     let target = sandbox.add_tmux_session(&name);
@@ -306,11 +306,15 @@ fn a_failed_backend_write_is_reported_as_failure_not_as_queued() {
         Some(false),
         "a failed write reached nobody: {inject}"
     );
-    assert!(
-        inject["delivery_reason"]
-            .as_str()
-            .is_some_and(|r| r.starts_with("failed_")),
-        "a failure must report a failure reason, not a queued one: {inject}"
+    assert_eq!(
+        inject["delivery_reason"].as_str(),
+        Some("failed_backend_inject"),
+        "the failed transport must retain its typed failure reason: {inject}"
+    );
+    assert_eq!(
+        inject["queued"].as_bool(),
+        Some(true),
+        "the ledger write landed, so the durable copy remains queued: {inject}"
     );
     assert_eq!(
         inject["wake_intent"]["status"].as_str(),
