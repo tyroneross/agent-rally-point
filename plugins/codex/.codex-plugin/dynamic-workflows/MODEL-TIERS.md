@@ -1,0 +1,60 @@
+<!--
+SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Model tiers (host-neutral)
+
+Three capability/cost tiers. Each host maps its **own** model family into them — the tier is the
+stable abstraction; the model names are the mutable mapping (verify current names before relying).
+Coordination rule: **pick the cheapest tier sufficient for the task**, chosen by each agent in its
+own family (COORDINATION.md rule 5 — never dictate a Claude tier to a GPT host or vice-versa).
+
+## The tiers
+
+| Tier | Use for | Claude *(runtime: 4.x)* | OpenAI / Codex *(GPT-5.4, 2026-03)* |
+|------|---------|--------------------------|--------------------------------------|
+| **Frontier** | Lead / orchestration, planning & spec, architecture, novel/ambiguous reasoning, adversarial judgment, cross-lane rulings | **Opus** (4.8) | **GPT-5.4 Pro / Thinking** |
+| **Executing** | Defined implementation, code edits, bounded multi-step work, structured extraction, the workhorse | **Sonnet** (4.6) | **GPT-5.4 Mini** |
+| **Fast** | Mechanical / classification / ranking, high-volume cheap checks, idle-poll & heartbeat, large fan-out of clearly-defined sub-tasks | **Haiku** (4.5) | **GPT-5.4 Nano** |
+
+*Names mutable — verify per-squad. The GPT names above were from a 2026-03 search (GPT-5.4 family);
+**GPT-5.5 is now observed in a live Codex squad** (5.5 > 5.4 — the generation moved). The **tier** is the
+stable abstraction; the **specific model is squad-declared at `enter`** (B11), never lead-inferred. Other
+hosts (Gemini, etc.) map their own families into the same three tiers. **Don't pin a model name from
+inference — read the squad's declaration.**
+
+## Task → tier (defaults)
+
+- **Frontier**: steering the run, writing a plan/spec, architectural decisions, judging another agent's
+  output, resolving cross-lane/boundary conflicts, anything ambiguous where a wrong call is expensive.
+- **Executing**: applying a written plan, mechanical-but-multi-step refactors, single-file edits,
+  schema/structured extraction, the bulk of implementation. *(This session's audit-fix fan-out was here.)*
+- **Fast**: residual-scan / lint, classification, idle heartbeats, big read-only fan-outs of *clearly
+  defined* checks where each unit is simple and volume is the point.
+
+The boundary that matters most: **defined task → don't pay frontier prices.** A clearly-scoped
+assessment or implementation runs at Executing (or Fast for trivial high-volume units); Frontier is
+for steering and judgment, not throughput.
+
+## Empirical calibration (A/B)
+
+We A/B the tier boundary instead of guessing. Run `ab-sonnet-vs-opus-assessment` (workflow): the
+*same* code assessment by an Executing arm vs a Frontier arm over identical files, then a delta
+synthesis (`premium_justified: yes|no|marginal`). Result feeds whether "code assessment" sits at
+Executing (expected) or warrants Frontier. Re-run per task class; record the verdict here.
+
+### A/B verdict — code assessment (`wjh0kr38l`, 2026-05-29)
+
+Same 3-file assessment, Executing (Sonnet) vs Frontier (Opus) arm. **`premium_justified: marginal`.**
+- **Sonnet (Executing): higher recall** — 14 findings, broader surface; caught 2 real items Opus missed.
+  But shipped **~1 false positive + 1 over-rated severity + 1 speculative** per batch.
+- **Opus (Frontier): higher precision** — 9–10 findings (9 raw per-file; synthesis counted 10),
+  **0 false positives**, calibrated severity, and caught the single highest-value correctness bug
+  Sonnet's coarser flag walked past.
+
+**Calibration (binding default):** routine bounded **code assessment runs at Executing (Sonnet/Mini),
+gated by a verification pass** — never act on raw Executing-tier findings (expect ~1 FP/batch). Reserve
+**Frontier for correctness-critical audits** where a missed truncation/semantic bug or a false-positive-
+driven *wrong fix* is expensive: the premium buys precision + severity calibration, **not** raw count.
+This is the empirical basis for the adversarial-verify step in the workflow patterns.

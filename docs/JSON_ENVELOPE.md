@@ -80,32 +80,6 @@ print(d['data'][d['command']])
 | `sessions` | `sessions: { sessions: [...] }` | — |
 | `run` | `run: { mode, session, commands }` | — |
 | `inject` | `inject: { mode, session, handoff?, require_ack, ack?, wake_intent?, commands, sender_tool, content_fact?, delivered, delivery_state, delivery_reason, delivery_detail, reached_target, queued }` | — |
-
-**`inject.ack` shapes** (only present when `--require-ack` is passed):
-
-| Scenario | `ack` value |
-|----------|-------------|
-| Resolve fact arrived in time | `{ "resolved": true, "event_id": "...", "tool": "...", "subject": "..." }` |
-| Timed out before resolve fact | `{ "resolved": false, "timed_out": true, "waited_seconds": N, "after_seq": N }` |
-
-**`ok` reports the command, not the delivery.** `ok: true` / exit 0 means the send was durably RECORDED. It does not mean the target received it, and for a target with no live session it usually has not. Recording intent for an absent agent is a successful command and an undelivered message at the same time; both facts are reported, in different fields.
-
-This is deliberate. An agent that is not running now may return and find its work through `rally next`, and that durability is what the ledger is for — refusing to record intent because the recipient is asleep would destroy it. Most agents are not running most of the time, so the contract is record-first, deliver-opportunistically, report honestly.
-
-Branch on these, in this order:
-
-| Field | Question it answers |
-|-------|--------------------|
-| `reached_target` | Did the message actually arrive? Only `true` means yes. |
-| `queued` | If not, is it still coming? `true` = durably queued and reachable later; `false` = it is not coming. |
-| `delivery_reason` | Why — typed. See the enum in `docs/schemas/agent-rally.command.inject.v1.json`. |
-| `delivery_detail` | What to do about it, in one sentence. |
-| `delivery_state` | The raw receipt state (`pending`/`delivered`/`seen`/`acted`/`failed`). |
-| `delivered` | Compatibility only: the synchronous backend write. Prefer `reached_target`. |
-
-The two queued reasons are not interchangeable. `queued_awaiting_receipt` means the target has a session and nothing consumed the directive — check the runner. `queued_no_managed_session` means there is no live pane to write to — check the address, or `rally adopt <agent> --tmux <target>`.
-
-An ack-timeout response is also **`ok: true` / exit 0**: the message is in the channel and only the optional downstream acknowledgement did not arrive in the window. Check `ack.resolved`, not `ok`, for acknowledgement. **Do NOT re-inject on an ack-timeout** — the message is already in the channel.
 | `attach` | `attach: { mode, action, session, output?, commands }` | — |
 | `capture` | `capture: { mode, action, session, output?, commands }` | — |
 | `stop` | `stop: { mode, action, session, output?, commands }` | — |
@@ -117,6 +91,32 @@ An ack-timeout response is also **`ok: true` / exit 0**: the message is in the c
 | `wake-due` | `wake-due: { due: [...] }` | — |
 | `mission` (GET) | `mission: { text?, set_by?, set_at?, envelopes }` | — |
 | `mission` (SET) | `mission: { action, fact }` | — |
+
+**`inject.ack` shapes** (only present when `--require-ack` is passed):
+
+| Scenario | `ack` value |
+|----------|-------------|
+| Resolve, receipt, or artifact arrived | `{ "received": true, "resolved": true, "handoff_closed": true, "blocked": false, "decision": false, "event_id": "...", "tool": "...", "expected_tool": "...", "kind": "...", "subject": "..." }` |
+| Blocker arrived | `{ "received": true, "resolved": false, "handoff_closed": false, "blocked": true, "decision": false, "event_id": "...", "tool": "...", "expected_tool": "...", "kind": "blocker", "subject": "..." }` |
+| Decision arrived | `{ "received": true, "resolved": false, "handoff_closed": false, "blocked": false, "decision": true, "event_id": "...", "tool": "...", "expected_tool": "...", "kind": "decision", "subject": "..." }` |
+| Timed out before target evidence | `{ "received": false, "resolved": false, "assume_received": false, "timed_out": true, "waited_seconds": N, "after_seq": N, "expected_tool": "...", "ignored_resolves": N, "ignored_target_responses": N, "fallback_plan": { ... } }` |
+
+**`ok` reports the command, not the delivery.** `ok: true` / exit 0 means the send was durably recorded. It does not mean the target received it. Recording intent for an absent agent is a successful command and an undelivered message at the same time.
+
+After any required ACK wait, branch on the final fields in this order:
+
+| Field | Question it answers |
+|-------|--------------------|
+| `reached_target` | Did the message actually arrive? Only `true` means yes. |
+| `queued` | If not, is it still reachable later? `true` means a durable copy remains queued. |
+| `delivery_reason` | Why — typed. See the enum in `docs/schemas/agent-rally.command.inject.v1.json`. |
+| `delivery_detail` | What to do about it, in one sentence. |
+
+`delivered` and `delivery_state` are attempt-time compatibility fields. `delivery_state` uses `pending`, `delivered`, `seen`, `acted`, `failed`, or `sent_unverified`. A later target ACK can therefore make `reached_target: true` and `queued: false` while those attempt-time fields remain unchanged.
+
+Queued outcomes include `sent_unverified`, `queued_awaiting_receipt`, `queued_no_managed_session`, `queued_awaiting_poll`, `failed_backend_inject`, and `failed_daemon_send`. In particular, `SentUnverified` means a pane write occurred without verified receipt, so the durable directive remains queued.
+
+An ACK timeout is also **`ok: true` / exit 0**: the message is in the channel and only the optional target evidence did not arrive in the window. Check `ack.received` for acknowledgement and `ack.resolved`, `ack.blocked`, or `ack.decision` for its outcome. **Do not re-inject after an ACK timeout** — the message is already in the channel.
 
 **`doctor --compact-log` `entries[]` shapes** (internally tagged by `entry`):
 

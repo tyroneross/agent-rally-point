@@ -44,6 +44,14 @@ CODEX_WORKFLOW_RUNTIME_SOURCE = Path("dynamic-workflows/core")
 CODEX_WORKFLOW_RUNTIME_DEST = Path("skills/rally-workflows/core")
 CODEX_WORKFLOW_NOTICE_SOURCE = Path("dynamic-workflows/NOTICE")
 CODEX_WORKFLOW_NOTICE_DEST = Path("skills/rally-workflows/NOTICE")
+CODEX_PACKAGED_REFERENCE_FILES = (
+    Path("dynamic-workflows/PROTOCOL.md"),
+    Path("dynamic-workflows/COORDINATION.md"),
+    Path("dynamic-workflows/MODEL-TIERS.md"),
+    Path("docs/ORCHESTRATOR_SEAM.md"),
+    Path("docs/security/TRUST-MODEL.md"),
+)
+CODEX_REFERENCE_SKILLS = {"agent-rally-point", "rally-workflows"}
 
 
 class GenerationError(RuntimeError):
@@ -492,6 +500,12 @@ def copy_codex_artifact(
         notice_target = dest / CODEX_WORKFLOW_NOTICE_DEST
         notice_target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_root / CODEX_WORKFLOW_NOTICE_SOURCE, notice_target)
+    if CODEX_REFERENCE_SKILLS.intersection(config["skills"]):
+        for relative in CODEX_PACKAGED_REFERENCE_FILES:
+            source = source_root / relative
+            target = dest / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
     validate_codex_package_paths(dest.parent)
     return dest
 

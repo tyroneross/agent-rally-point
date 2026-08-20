@@ -29,6 +29,20 @@ def snapshot(root: Path) -> dict[str, bytes]:
     }
 
 
+def local_markdown_links(markdown: str) -> list[str]:
+    links: list[str] = []
+    for match in re.finditer(r"!?\[[^\]]*\]\(([^)]+)\)", markdown):
+        target = match.group(1).strip()
+        if target.startswith("<") and ">" in target:
+            target = target[1 : target.index(">")]
+        else:
+            target = target.split(maxsplit=1)[0]
+        if target.startswith(("#", "http://", "https://", "mailto:")):
+            continue
+        links.append(target.split("#", 1)[0])
+    return links
+
+
 class GenerateHostSurfacesTests(unittest.TestCase):
     def test_cargo_version_ignores_brackets_inside_package_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -183,6 +197,11 @@ class GenerateHostSurfacesTests(unittest.TestCase):
                 (artifact / GEN.CODEX_WORKFLOW_NOTICE_DEST).read_bytes(),
                 (ROOT / GEN.CODEX_WORKFLOW_NOTICE_SOURCE).read_bytes(),
             )
+            for relative in GEN.CODEX_PACKAGED_REFERENCE_FILES:
+                self.assertEqual(
+                    (artifact / relative).read_bytes(),
+                    (ROOT / relative).read_bytes(),
+                )
             skill_text = (
                 artifact / "skills/rally-workflows/SKILL.md"
             ).read_text(encoding="utf-8")
@@ -223,6 +242,34 @@ class GenerateHostSurfacesTests(unittest.TestCase):
             self.assertEqual(result["effective_max"], 1)
             self.assertEqual(result["limiting_factors"], ["room_output_pressure"])
             self.assertEqual(imported_result["limited"], "packaged-runtime-ok")
+
+    def test_all_packaged_skill_markdown_links_resolve_inside_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            GEN.generate(ROOT, dest)
+            artifact = (dest / GEN.CODEX_ARTIFACT).resolve()
+            unresolved = []
+            for skill in sorted((artifact / "skills").glob("*/SKILL.md")):
+                markdown = skill.read_text(encoding="utf-8")
+                for target in local_markdown_links(markdown):
+                    if not target:
+                        unresolved.append(
+                            f"{skill.relative_to(artifact)} -> empty local target"
+                        )
+                        continue
+                    resolved = (skill.parent / target).resolve()
+                    try:
+                        relative = resolved.relative_to(artifact)
+                    except ValueError:
+                        unresolved.append(
+                            f"{skill.relative_to(artifact)} -> {target} escapes artifact"
+                        )
+                        continue
+                    if not resolved.exists():
+                        unresolved.append(
+                            f"{skill.relative_to(artifact)} -> {relative} is missing"
+                        )
+            self.assertEqual(unresolved, [])
 
     def test_packaged_workflow_commands_run_from_empty_consumer_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
