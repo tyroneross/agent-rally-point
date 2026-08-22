@@ -109,6 +109,34 @@ rally next --tool "$TOOL" --json
 Continue only while the next action is actionable, safe, and inside the user's
 scope.
 
+## Sending a Handoff Document
+
+When the work produces a handoff **document** rather than a task packet, the document's
+location is the payload. A handoff nobody can find has not been sent.
+
+**Post the path, not the prose.** The document already carries the detail; the rally event
+carries where to get it.
+
+```bash
+rally say fact --tool "$TOOL" \
+  --subject "handoff: <one line, what state the work is in>" \
+  --evidence "file:<ABSOLUTE path>" --json
+```
+
+Absolute, always. A receiver is in a different working directory and often a different
+repo, so a relative path resolves to nothing or, worse, to the wrong file.
+
+**Say it in the terminal too.** The human running the session is a receiver as well, and
+they are reading a terminal, not the ledger. End the reply with the full path.
+
+**Retrospectives follow the same rule and need it more.** They are written to the memory
+store rather than the repo, so nothing in the working directory points at them. Post the
+path or it is lost to everyone who was not in the session.
+
+**What this prevents.** The usual failure is not a thin handoff. It is a thorough one that
+the next agent never located, so the work is redone from scratch while the document sits
+committed three directories away.
+
 ## Receiving a Handoff
 
 Everything above is written from the sender's side. This section is the
