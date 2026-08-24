@@ -9337,7 +9337,7 @@ pub(crate) fn prune_corrupt_quarantine(dir: &Path, base: &str) -> Result<PruneSt
     // Numeric, newest-first. Today's stamps are same-width 19-digit nanos so
     // this agrees with a lexicographic sort, but that is coincidence, not a
     // guarantee — sort the parsed `u128`, never the path string.
-    groups.sort_by(|a, b| b.stamp.cmp(&a.stamp));
+    groups.sort_by_key(|g| std::cmp::Reverse(g.stamp));
 
     let groups_before = groups.len();
     let mut groups_kept = 0usize;

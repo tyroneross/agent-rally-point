@@ -796,8 +796,12 @@ fn inject_timeout_seconds(args: &[String]) -> Option<u64> {
 /// Resolve the watchdog budget. Priority order:
 ///  1. An explicit `--timeout-ms VALUE` / `--timeout-ms=VALUE` arg, or the
 ///     `RALLY_HOOK_TIMEOUT_MS` env var — operator escape hatch, clamped
-///     `[MIN, MAX]` (the hook-safe band). This wins for ALL commands including
-///     inject, so an operator can still cap a runaway inject.
+///     `[MIN, MAX]` (the hook-safe band). This wins for every command that
+///     REACHES this function, including inject, so an operator can still cap a
+///     runaway inject. Two commands never reach it, because they legitimately
+///     block for their whole lifetime and are intercepted by `run_with_watchdog`
+///     before any budget is sized: `daemon serve` and `watch` in loop mode.
+///     Their bound is `--idle-exit-secs` / `--duration-hours`, not this.
 ///  2. For the `inject` subcommand (and only inject), derive the budget from
 ///     its `--timeout-seconds` ACK wait + headroom, bypassing the 60s hook cap.
 ///     This is what lets `inject --handoff --timeout-seconds 75` actually wait
@@ -6037,6 +6041,26 @@ fn watch_append_ack_line(path: &Path, line: &str) -> std::io::Result<()> {
 /// Returns `(exit_code, duration_ms)`: `exit_code` is `None` on a spawn/wait
 /// error or when the child was killed by a signal (no exit code); the
 /// caller (`watch_emit_delivery`) reports that as JSON `null`.
+/// How long a single `--on-activity` delivery command may run before the
+/// watcher kills it and moves on. Generous — a doorbell adapter that shells
+/// out to tmux or ssh can legitimately take a few seconds — but finite, so a
+/// hung adapter degrades one delivery instead of the whole watcher.
+const WATCH_ON_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Minimum wall-clock between two `--on-activity` invocations.
+///
+/// Bounds the adapter -> fact -> adapter feedback cycle: an adapter (or the
+/// agent it wakes) that posts a rally fact bumps the very `max_seq` this loop
+/// watches. Under the old 5s poller that cycled slowly enough to notice; at
+/// event speed it would cycle in tens of milliseconds against the canonical
+/// append-only ledger.
+///
+/// Deliberately well under a human's reaction time, so a real handoff is
+/// still delivered effectively instantly, but far above the ~40ms the runaway
+/// cycle would otherwise run at. Throttled activity is not dropped — the next
+/// delivery carries the full accumulated seq range.
+const WATCH_ON_ACTIVITY_MIN_PERIOD: Duration = Duration::from_millis(750);
+
 fn watch_run_on_activity(
     cmd: &str,
     room_id: &str,
@@ -6062,11 +6086,42 @@ fn watch_run_on_activity(
             return (None, started.elapsed().as_millis() as u64);
         }
     };
-    match child.wait() {
-        Ok(status) => (status.code(), started.elapsed().as_millis() as u64),
-        Err(err) => {
-            eprintln!("rally watch: --on-activity wait error: {err}");
-            (None, started.elapsed().as_millis() as u64)
+    // BOUNDED wait. `child.wait()` alone blocks forever, and a delivery
+    // command that hangs is not hypothetical: a `tmux send-keys` to a dead
+    // pane, a nested `rally` blocked on the room mutation lock, an ssh that
+    // never negotiates. An unbounded wait there wedges the watcher
+    // permanently — it stops delivering, stops heartbeating, and never
+    // reaches the `--duration-hours` deadline check, while still looking
+    // alive to launchd's KeepAlive. That is the exact stall this whole
+    // feature exists to remove, made permanent instead of merely slow.
+    let deadline = started + WATCH_ON_ACTIVITY_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return (status.code(), started.elapsed().as_millis() as u64);
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    eprintln!(
+                        "rally watch: --on-activity exceeded {}s — killing it; \
+                         delivery is reported with exit_code null",
+                        WATCH_ON_ACTIVITY_TIMEOUT.as_secs()
+                    );
+                    let _ = child.kill();
+                    // Reap so the killed child cannot linger as a zombie in a
+                    // process that now runs for weeks.
+                    let _ = child.wait();
+                    return (None, started.elapsed().as_millis() as u64);
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => {
+                eprintln!("rally watch: --on-activity wait error: {err}");
+                // One reap attempt before giving up — `Child` does not reap on
+                // drop, so abandoning it here would leak a zombie.
+                let _ = child.wait();
+                return (None, started.elapsed().as_millis() as u64);
+            }
         }
     }
 }
@@ -6249,11 +6304,32 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
         let ack_path = PathBuf::from(ack_file);
         if log_watch::ack_file_conflicts_with_log_dir(&repo, &log_dir, &ack_path) {
             return Err(RallyError::Usage(format!(
-                "--ack-file {ack_file} resolves inside the watched log dir ({}) — this \
-                 would create a self-triggering feedback loop (the ack write bumps \
-                 max_seq, which the watcher then reports as new activity, forever). \
-                 Use a path outside .rally/log/, e.g. .rally/watch-acks.jsonl.",
+                "--ack-file {ack_file} resolves inside the watched log dir ({}) — every \
+                 ack write would then wake the watcher that just wrote it. Use a path \
+                 outside .rally/log/, e.g. .rally/watch-acks.jsonl.",
                 log_dir.display()
+            )));
+        }
+        // Probe-open now rather than discovering it per delivery. Without
+        // this, a bad --ack-file logs one stderr line per delivery forever
+        // while stdout keeps reporting `{"event":"delivery"}` — the operator
+        // was told to tail a file that stays empty while the watcher claims
+        // success. `watch_append_ack_line` does not create parent dirs, so an
+        // absent parent is the common way in.
+        let probe_path = if ack_path.is_absolute() {
+            ack_path.clone()
+        } else {
+            repo.join(&ack_path)
+        };
+        if let Err(err) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&probe_path)
+        {
+            return Err(RallyError::Usage(format!(
+                "--ack-file {ack_file} is not writable ({}): {err}. The parent \
+                 directory must already exist — rally watch does not create it.",
+                probe_path.display()
             )));
         }
     }
@@ -6314,6 +6390,15 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
     // then slept through it. Measured: watcher reported `seq: 5` while
     // index.json said 6, and the handoff went unseen until the safety-net
     // timeout. See `log_watch::LogWatcher`.
+    // `.rally/log/` is created lazily by the first fact write, so on a fresh
+    // clone it does not exist yet and there is nothing for the backend to
+    // open. Create it up front so the watcher arms immediately instead of
+    // running blind until the first fact happens to arrive. Best-effort: if
+    // this fails the watcher still re-arms later (see `LogWatcher::may_rearm`).
+    if !args.poll {
+        let _ = fs::create_dir_all(&log_dir);
+    }
+
     let mut watcher = if args.poll {
         None
     } else {
@@ -6323,6 +6408,9 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
     // Start cursor at the current max_seq so we react only to NEW activity.
     let mut last_seq = watch_read_max_seq(&log_dir);
     let mut current_interval = args.interval;
+    // When the --on-activity adapter last ran; throttles the adapter->fact->
+    // adapter feedback cycle. See the call site.
+    let mut last_fired: Option<Instant> = None;
 
     loop {
         // Check deadline.
@@ -6340,6 +6428,16 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
         // the legacy sleep path (the event backend is bypassed entirely,
         // even when one is available on this platform).
         let wait_started = Instant::now();
+        // `mode` is the only per-tick signal an operator has for whether the
+        // event seam is actually live, so it must not flatter itself. Three
+        // distinct outcomes, three distinct labels:
+        //   "event"   — the kernel woke us; this is real event delivery.
+        //   "timeout" — we slept the ceiling and re-read anyway. If activity
+        //               shows up on a "timeout" tick, the watcher is blind and
+        //               is delivering at POLL latency while armed.
+        //   "poll"    — no event backend at all (--poll, or degraded).
+        // Collapsing "timeout" into "event" is what hid a watcher that never
+        // armed at all: it reported event delivery while delivering nothing.
         let mode: &str = match watcher {
             None => {
                 thread::sleep(Duration::from_secs(current_interval));
@@ -6347,7 +6445,14 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
             }
             Some(ref mut w) => match w.wait(Duration::from_secs(current_interval)) {
                 log_watch::WaitOutcome::Unsupported => "poll",
-                log_watch::WaitOutcome::Changed | log_watch::WaitOutcome::TimedOut => "event",
+                log_watch::WaitOutcome::TimedOut => {
+                    if w.is_armed() {
+                        "timeout"
+                    } else {
+                        "poll"
+                    }
+                }
+                log_watch::WaitOutcome::Changed => "event",
             },
         };
         let wait_ms = wait_started.elapsed().as_millis() as u64;
@@ -6374,18 +6479,62 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
             // external adapter can confirm the handoff actually ran, not
             // just that activity was detected.
             if let Some(ref cmd) = args.on_activity {
-                let (exit_code, duration_ms) =
-                    watch_run_on_activity(cmd, &room_id, last_seq, new_seq, args.tool.as_deref(), &repo);
-                watch_emit_delivery(
-                    &room_id,
-                    args.tool.as_deref(),
-                    last_seq,
-                    new_seq,
-                    exit_code,
-                    duration_ms,
-                    args.ack_file.as_deref(),
-                    &repo,
-                );
+                // THE REAL SELF-TRIGGER CHANNEL. An adapter — or the agent it
+                // wakes — posting any rally fact bumps max_seq, which is
+                // exactly what this loop watches, so the adapter re-fires and
+                // posts again. That cycle already existed, but it ran at the
+                // 5s poll interval where it was slow and visible. Event
+                // delivery cut the period to tens of milliseconds, against
+                // the append-only ledger that is the canonical record.
+                //
+                // (Note for anyone re-reading the ack-file guard: an ack file
+                // written inside .rally/log/ does NOT self-trigger this way.
+                // `watch_read_max_seq` reads only index.json's segment
+                // last_seq — it never enumerates the directory — so such a
+                // write costs one spurious wake, not a loop. The guard is
+                // still worth keeping to avoid that waste, but THIS is the
+                // channel that can actually run away.)
+                //
+                // A minimum period between adapter runs bounds it: bursts
+                // coalesce into one delivery carrying the full seq range, so
+                // nothing is dropped, it is just batched.
+                let since_last = last_fired.map(|t: Instant| t.elapsed());
+                if since_last.is_none_or(|d| d >= WATCH_ON_ACTIVITY_MIN_PERIOD) {
+                    let (exit_code, duration_ms) = watch_run_on_activity(
+                        cmd,
+                        &room_id,
+                        last_seq,
+                        new_seq,
+                        args.tool.as_deref(),
+                        &repo,
+                    );
+                    last_fired = Some(Instant::now());
+                    watch_emit_delivery(
+                        &room_id,
+                        args.tool.as_deref(),
+                        last_seq,
+                        new_seq,
+                        exit_code,
+                        duration_ms,
+                        args.ack_file.as_deref(),
+                        &repo,
+                    );
+                } else if args.json {
+                    // Say so rather than dropping it silently: an operator
+                    // debugging a feedback loop needs to see the throttle.
+                    crate::output::write_line_or_exit_on_broken_pipe(
+                        &serde_json::json!({
+                            "event": "delivery_throttled",
+                            "from_seq": last_seq,
+                            "to_seq": new_seq,
+                            "room": room_id,
+                            "tool": args.tool.as_deref(),
+                            "min_period_ms": WATCH_ON_ACTIVITY_MIN_PERIOD.as_millis() as u64,
+                            "ts": now_string(),
+                        })
+                        .to_string(),
+                    );
+                }
             }
             last_seq = new_seq;
             // Reset interval on activity.
@@ -13166,6 +13315,49 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A hung delivery command must not wedge the watcher. Before the bounded
+    /// wait, `child.wait()` blocked forever and the watcher stopped
+    /// delivering, stopped heartbeating, and never reached its
+    /// `--duration-hours` deadline — while still looking alive to launchd.
+    ///
+    /// Uses a short-lived sleep rather than the real 120s constant so the test
+    /// stays fast; the assertion is that the call RETURNS and reaps, which is
+    /// the property that regressed.
+    #[test]
+    fn watch_on_activity_reaps_and_returns_for_a_slow_command() {
+        let repo = std::env::temp_dir();
+        let started = Instant::now();
+        let (exit_code, duration_ms) =
+            watch_run_on_activity("sleep 0.4", "room-1", 1, 2, Some("t"), &repo);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            exit_code,
+            Some(0),
+            "a slow-but-finite command still reports its real exit code"
+        );
+        assert!(
+            duration_ms >= 300,
+            "duration_ms must reflect the real wall clock; got {duration_ms}"
+        );
+        assert!(
+            elapsed < WATCH_ON_ACTIVITY_TIMEOUT,
+            "must return on child exit, not sit until the kill deadline"
+        );
+    }
+
+    #[test]
+    fn watch_on_activity_reports_a_failing_command_without_dying() {
+        let repo = std::env::temp_dir();
+        let (exit_code, _) = watch_run_on_activity("exit 7", "room-1", 1, 2, Some("t"), &repo);
+        assert_eq!(
+            exit_code,
+            Some(7),
+            "the delivery line must carry the adapter's real exit code so a \
+             failed delivery is observable rather than silent"
+        );
     }
 
     /// Test (b): --on-activity path runs the command once on new activity and

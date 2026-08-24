@@ -76,12 +76,36 @@ pub(crate) struct LogWatcher {
     inner: Option<kqueue_backend::Watcher>,
     #[cfg(target_os = "linux")]
     inner: Option<inotify_backend::Watcher>,
+    /// Paths kept so the watcher can RE-ARM. See `may_rearm`.
+    #[allow(dead_code)]
+    log_dir: PathBuf,
+    #[allow(dead_code)]
+    index_file: PathBuf,
+    /// True when the backend has never successfully armed and it is still
+    /// worth retrying; false once it armed, or once it armed and then failed
+    /// hard.
+    ///
+    /// The distinction matters and is not cosmetic:
+    ///
+    ///  * NEVER-ARMED is usually transient. `.rally/log/` does not exist until
+    ///    the first fact is written, so a watcher started on a fresh clone —
+    ///    exactly what `rally watch --print-launchd` installs — has nothing to
+    ///    open yet. Without a retry it would stay inert forever and deliver
+    ///    NOTHING, silently, while looking healthy. Verified before this fix:
+    ///    a watcher started right after `rally init` produced zero output
+    ///    while a handoff was posted.
+    ///  * ARMED-THEN-FAILED is usually permanent (the volume went away, the fd
+    ///    went bad). Retrying that every iteration would fail every iteration
+    ///    instantly, which is the hot-spin the sleep floor in `wait` exists to
+    ///    prevent. So a hard failure degrades for good.
+    may_rearm: bool,
 }
 
 impl LogWatcher {
     /// Register the watch once. A backend that cannot be established yields a
     /// watcher whose `wait` degrades to sleeping — never an error, because a
-    /// watcher that refuses to start is strictly worse than a slow one.
+    /// watcher that refuses to start is strictly worse than a slow one — and
+    /// which retries arming on each wait until it succeeds.
     #[cfg(any(
         target_os = "macos",
         target_os = "ios",
@@ -90,15 +114,23 @@ impl LogWatcher {
         target_os = "netbsd"
     ))]
     pub(crate) fn new(log_dir: &Path, index_file: &Path) -> Self {
+        let inner = kqueue_backend::Watcher::new(log_dir, index_file);
         Self {
-            inner: kqueue_backend::Watcher::new(log_dir, index_file),
+            may_rearm: inner.is_none(),
+            inner,
+            log_dir: log_dir.to_path_buf(),
+            index_file: index_file.to_path_buf(),
         }
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn new(log_dir: &Path, _index_file: &Path) -> Self {
+    pub(crate) fn new(log_dir: &Path, index_file: &Path) -> Self {
+        let inner = inotify_backend::Watcher::new(log_dir);
         Self {
-            inner: inotify_backend::Watcher::new(log_dir),
+            may_rearm: inner.is_none(),
+            inner,
+            log_dir: log_dir.to_path_buf(),
+            index_file: index_file.to_path_buf(),
         }
     }
 
@@ -110,8 +142,38 @@ impl LogWatcher {
         target_os = "netbsd",
         target_os = "linux"
     )))]
-    pub(crate) fn new(_log_dir: &Path, _index_file: &Path) -> Self {
-        Self {}
+    pub(crate) fn new(log_dir: &Path, index_file: &Path) -> Self {
+        Self {
+            log_dir: log_dir.to_path_buf(),
+            index_file: index_file.to_path_buf(),
+            may_rearm: false,
+        }
+    }
+
+    /// Whether an event backend is currently armed. `command_watch` reports
+    /// this per tick so a blind watcher cannot claim event delivery.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "linux"
+    ))]
+    pub(crate) fn is_armed(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "linux"
+    )))]
+    pub(crate) fn is_armed(&self) -> bool {
+        false
     }
 
     /// Block until the watched directory changes or `timeout` elapses.
@@ -124,13 +186,68 @@ impl LogWatcher {
         target_os = "linux"
     ))]
     pub(crate) fn wait(&mut self, timeout: Duration) -> WaitOutcome {
-        match self.inner {
-            Some(ref mut w) => w.wait(timeout),
+        let started = std::time::Instant::now();
+
+        // Re-arm attempt: `.rally/log/` is created lazily on the first fact
+        // write, so a watcher started before that had nothing to open. One
+        // cheap `open` per interval until it succeeds.
+        if self.inner.is_none() && self.may_rearm {
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd"
+            ))]
+            {
+                self.inner = kqueue_backend::Watcher::new(&self.log_dir, &self.index_file);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                self.inner = inotify_backend::Watcher::new(&self.log_dir);
+            }
+            if self.inner.is_some() {
+                self.may_rearm = false;
+            }
+        }
+
+        let outcome = match self.inner {
+            Some(ref mut w) => {
+                let outcome = w.wait(timeout);
+                if matches!(outcome, WaitOutcome::Unsupported) {
+                    // The backend armed and THEN failed — the watched volume
+                    // went away, the fd went bad. Retrying that every
+                    // iteration would fail every iteration, instantly.
+                    // Degrade to the sleeping path permanently (no re-arm).
+                    self.inner = None;
+                    self.may_rearm = false;
+                }
+                outcome
+            }
             None => {
                 std::thread::sleep(timeout);
                 WaitOutcome::Unsupported
             }
+        };
+
+        // INVARIANT: this function returns early ONLY for `Changed`. A
+        // `TimedOut` or `Unsupported` return must have consumed the full
+        // timeout, so the caller's loop can never spin faster than the
+        // interval it asked for.
+        //
+        // Without this, a backend that fails instantly turns the watch loop
+        // into a hot spin: `command_watch` re-reads and re-parses index.json
+        // and (under --json) writes a heartbeat line per iteration, at CPU
+        // speed, into an unrotated launchd log — tens of MB per second. The
+        // 3s watchdog used to make that unreachable; now that the watcher
+        // legitimately runs for weeks, the floor has to be explicit.
+        if !matches!(outcome, WaitOutcome::Changed) {
+            let elapsed = started.elapsed();
+            if elapsed < timeout {
+                std::thread::sleep(timeout - elapsed);
+            }
         }
+        outcome
     }
 
     #[cfg(not(any(
@@ -202,10 +319,16 @@ impl OwnedFd {
     /// that may or may not already exist; a missing path is `None`, not an
     /// error, since the index file legitimately doesn't exist before the
     /// first fact is posted).
+    /// `O_CLOEXEC` is forced on. `command_watch` spawns `sh -c` for
+    /// `--on-activity`, and without it every delivery child inherits the
+    /// watched directory and index fds — an adapter that daemonizes a helper
+    /// would leave that helper pinning `.rally/log/` and any unlinked inode
+    /// for its own lifetime. The inotify backend already sets `IN_CLOEXEC`;
+    /// this makes the kqueue side consistent rather than accidentally laxer.
     fn open(path: &Path, flags: libc::c_int) -> Option<OwnedFd> {
         use std::os::unix::ffi::OsStrExt;
         let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-        let fd = unsafe { libc::open(cstr.as_ptr(), flags) };
+        let fd = unsafe { libc::open(cstr.as_ptr(), flags | libc::O_CLOEXEC) };
         if fd < 0 { None } else { Some(OwnedFd(fd)) }
     }
 
@@ -275,6 +398,12 @@ mod kqueue_backend {
                 return None;
             }
             let kq = OwnedFd(kq);
+            // `kqueue()` takes no flags, so CLOEXEC has to be set after the
+            // fact. Same reason as `OwnedFd::open`: `--on-activity` children
+            // must not inherit the watcher's descriptors.
+            unsafe {
+                libc::fcntl(kq.raw(), libc::F_SETFD, libc::FD_CLOEXEC);
+            }
             let dir_fd = OwnedFd::open(log_dir, WATCH_OPEN_FLAGS)?;
             // Best-effort: the index file may not exist yet (fresh room, no
             // fact posted). That's fine — the directory watch still catches
@@ -435,9 +564,18 @@ mod inotify_backend {
                 match n {
                     0 => return WaitOutcome::TimedOut,
                     n if n > 0 => {
-                        // Drain the buffer so a already-consumed event does not
-                        // immediately re-wake the NEXT wait. We do not parse
-                        // individual records — only that something fired.
+                        // A revents of POLLERR/POLLHUP/POLLNVAL is NOT data.
+                        // Treating it as data is a permanent instant-return:
+                        // poll keeps reporting ready, the read keeps failing,
+                        // and the caller's loop spins. Report it as a dead
+                        // backend so `LogWatcher::wait` retires this watcher
+                        // and falls back to sleeping.
+                        if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                            return WaitOutcome::Unsupported;
+                        }
+                        // Drain the buffer so an already-consumed event does
+                        // not immediately re-wake the NEXT wait. We do not
+                        // parse individual records — only that something fired.
                         let mut buf = [0u8; 4096];
                         unsafe {
                             libc::read(
@@ -548,6 +686,108 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// THE test for the actual fix. Everything else in this module exercises
+    /// the one-shot `wait_for_change` wrapper, which is the very shape that
+    /// was broken — so none of it would fail if `LogWatcher::new` were moved
+    /// back inside the caller's loop.
+    ///
+    /// This asserts the property that matters: a change that lands while the
+    /// watcher is NOT blocked is still delivered on the next wait, because a
+    /// persistent registration lets the kernel queue it. Per-call registration
+    /// drops that event and the wait sits until its timeout.
+    ///
+    /// The 3s timeout vs the ~50ms assertion is the discriminator: a lost
+    /// wakeup returns TimedOut at 3s, a queued one returns Changed almost
+    /// immediately.
+    #[test]
+    fn a_change_while_not_blocked_is_queued_and_delivered_next_wait() {
+        let dir = unique_temp_dir("queued-while-idle");
+        std::fs::create_dir_all(&dir).unwrap();
+        let index_file = dir.join("index.json");
+        std::fs::write(&index_file, b"{}").unwrap();
+
+        let mut watcher = LogWatcher::new(&dir, &index_file);
+        assert!(
+            watcher.is_armed(),
+            "backend must arm over an existing dir, or this test proves nothing"
+        );
+
+        // Drain the spurious arm-time wake (opening the dir fd can itself
+        // register as NOTE_ATTRIB), so what we measure below is our write.
+        let _ = watcher.wait(Duration::from_millis(250));
+
+        // The critical window: write while NOT inside wait(), exactly as
+        // `rally say` does while command_watch is processing the previous
+        // tick. Use the real write shape — tmp then rename over index.json.
+        let tmp = dir.join("index.json.tmp-queued");
+        std::fs::write(&tmp, b"{\"segments\":[]}").unwrap();
+        std::fs::rename(&tmp, &index_file).unwrap();
+
+        let started = Instant::now();
+        let outcome = watcher.wait(Duration::from_secs(3));
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome,
+            WaitOutcome::Changed,
+            "a change made while the watcher was not blocked must still be \
+             reported — this is the lost-wakeup regression"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "the queued event must return almost immediately, not after the \
+             timeout; took {elapsed:?} (a per-call registration would sit the \
+             full 3s here)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The anti-hot-spin invariant: a non-`Changed` return must consume the
+    /// full timeout. Asserted on a MISSING directory, which is the cheapest
+    /// way to drive the backend into its failure path — that is exactly the
+    /// case that returned instantly before, turning the caller's loop into a
+    /// CPU-speed spin that writes heartbeat JSON into an unrotated log.
+    #[test]
+    fn a_failed_backend_still_consumes_the_full_timeout() {
+        let missing = unique_temp_dir("absent-never-created");
+        let index_file = missing.join("index.json");
+        let timeout = Duration::from_millis(400);
+
+        let mut watcher = LogWatcher::new(&missing, &index_file);
+        for round in 1..=3 {
+            let started = Instant::now();
+            let outcome = watcher.wait(timeout);
+            let elapsed = started.elapsed();
+            assert_ne!(
+                outcome,
+                WaitOutcome::Changed,
+                "round {round}: nothing changed (the dir does not even exist)"
+            );
+            // Generous lower bound: sleeps may undershoot slightly, but an
+            // instant return is ~0ms and is what we are guarding against.
+            assert!(
+                elapsed >= Duration::from_millis(300),
+                "round {round}: wait returned in {elapsed:?} without consuming its \
+                 {timeout:?} timeout — this is the hot-spin regression"
+            );
+        }
+    }
+
+    /// A watcher whose backend never established must not hot-spin either —
+    /// it degrades to sleeping, and keeps doing so.
+    #[test]
+    fn watcher_over_missing_dir_reports_a_non_event_backend() {
+        let missing = unique_temp_dir("absent-2");
+        let mut watcher = LogWatcher::new(&missing, &missing.join("index.json"));
+        assert_eq!(
+            watcher.wait(Duration::from_millis(120)),
+            WaitOutcome::Unsupported,
+            "an unopenable watch dir must report Unsupported so command_watch \
+             labels the tick 'poll' rather than claiming event delivery"
+        );
     }
 
     /// Test 2: `wait_for_change` returns `TimedOut` (not `Changed`) when
