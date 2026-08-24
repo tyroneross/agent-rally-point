@@ -9102,10 +9102,18 @@ fn is_malformed_db_error(err: &impl std::fmt::Display) -> bool {
 /// (`-shm`, `-wal`) is missing — which is normal for a non-WAL-mode db or a
 /// clean shutdown — that slot is simply skipped. Idempotent: a second call
 /// after a successful quarantine finds the source files absent and returns
-/// Ok(()) immediately.
+/// Ok(()) immediately — no prune, no counter bump.
 ///
 /// The timestamp suffix is monotonic to nanosecond resolution; even back-to-back
 /// quarantines from the same process produce distinct paths.
+///
+/// After a successful quarantine (never on the early-return no-op path
+/// above), this also bumps the persisted [`CorruptionCounter`] and runs
+/// [`prune_corrupt_quarantine`] to bound forensic retention. Both are
+/// best-effort: a failure in either is logged to stderr and swallowed, never
+/// propagated into this function's `Result`, because the caller is mid
+/// corruption-recovery and needs `Ok(())` to proceed to the rebuild — see
+/// each helper's own doc comment for why it cannot fail its caller.
 fn quarantine_corrupt_db(facts_db_path: &Path) -> Result<()> {
     if !facts_db_path.exists() {
         // Nothing to quarantine — already healed, or never present. The next
@@ -9139,7 +9147,356 @@ fn quarantine_corrupt_db(facts_db_path: &Path) -> Result<()> {
             let _ = fs::rename(&sibling, &quarantine_sibling);
         }
     }
+    // Telemetry: record that a quarantine happened at all, so recurrence
+    // after the vendored `factstr-sqlite` WAL-checkpoint patch (see
+    // vendor/factstr-sqlite/…/UPSTREAM.md) is a visible, tracked signal
+    // instead of silent forensic accumulation.
+    record_corruption_event(parent, stamp);
+    // Bound retention now that this quarantine's own group exists on disk —
+    // `prune_corrupt_quarantine` always keeps the newest group (this one), so
+    // ordering the prune after the renames above is safe.
+    let _ = prune_corrupt_quarantine(parent, base);
     Ok(())
+}
+
+/// One retained-or-deleted quarantine GROUP: the main `facts.db.corrupt.<stamp>`
+/// file plus its optional `-db-shm` / `-db-wal` siblings. Grouped so pruning
+/// never orphans a WAL/SHM file from the snapshot it belongs to.
+struct QuarantineGroup {
+    /// Parsed numerically (not compared as text) — see `scan_corrupt_quarantine_groups`.
+    stamp: u128,
+    main: PathBuf,
+    shm: Option<PathBuf>,
+    wal: Option<PathBuf>,
+}
+
+impl QuarantineGroup {
+    /// Sum of the sizes of every file this group owns. A `stat` failure on
+    /// any one file (e.g. removed by a concurrent process) counts as 0 for
+    /// that file rather than failing the whole group — best-effort, matching
+    /// the rest of this quarantine-handling module.
+    fn total_bytes(&self) -> u64 {
+        let mut total = fs::metadata(&self.main).map(|m| m.len()).unwrap_or(0);
+        if let Some(shm) = &self.shm {
+            total += fs::metadata(shm).map(|m| m.len()).unwrap_or(0);
+        }
+        if let Some(wal) = &self.wal {
+            total += fs::metadata(wal).map(|m| m.len()).unwrap_or(0);
+        }
+        total
+    }
+
+    /// Every file belonging to this group, main first.
+    fn paths(&self) -> Vec<&Path> {
+        let mut out = vec![self.main.as_path()];
+        if let Some(shm) = &self.shm {
+            out.push(shm.as_path());
+        }
+        if let Some(wal) = &self.wal {
+            out.push(wal.as_path());
+        }
+        out
+    }
+}
+
+/// Group every `{base}.corrupt.<stamp>[-db-shm|-db-wal]` file in `dir` into
+/// whole [`QuarantineGroup`]s keyed by numeric stamp.
+///
+/// Read-only and best-effort: an unreadable `dir` yields an empty list rather
+/// than an error (mirrors `quarantine_corrupt_db`'s own no-op-on-absent
+/// stance), and a filename whose stamp segment does not parse as `u128` is
+/// skipped as foreign debris rather than crashing the scan. A `-db-shm` /
+/// `-db-wal` sibling with no matching main file (a narrow window mid-rename)
+/// is silently dropped — it is not one of ours to prune yet.
+///
+/// Shared by both `prune_corrupt_quarantine` (which deletes from this list)
+/// and `count_corrupt_quarantine_groups` (which only counts it) so the
+/// pruning policy and `rally doctor`'s report can never disagree about what
+/// counts as "one group".
+fn scan_corrupt_quarantine_groups(dir: &Path, base: &str) -> Vec<QuarantineGroup> {
+    let prefix = format!("{base}.corrupt.");
+    let mut mains: BTreeMap<u128, PathBuf> = BTreeMap::new();
+    let mut shms: BTreeMap<u128, PathBuf> = BTreeMap::new();
+    let mut wals: BTreeMap<u128, PathBuf> = BTreeMap::new();
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if let Some(stamp_str) = rest.strip_suffix("-db-shm") {
+            if let Ok(stamp) = stamp_str.parse::<u128>() {
+                shms.insert(stamp, path);
+            }
+        } else if let Some(stamp_str) = rest.strip_suffix("-db-wal") {
+            if let Ok(stamp) = stamp_str.parse::<u128>() {
+                wals.insert(stamp, path);
+            }
+        } else if let Ok(stamp) = rest.parse::<u128>() {
+            mains.insert(stamp, path);
+        }
+        // else: a `.corrupt.`-prefixed name with an unrecognized suffix —
+        // not one of ours (or from a future format); skip it.
+    }
+
+    mains
+        .into_iter()
+        .map(|(stamp, main)| QuarantineGroup {
+            stamp,
+            main,
+            shm: shms.remove(&stamp),
+            wal: wals.remove(&stamp),
+        })
+        .collect()
+}
+
+/// Cap on retained `facts.db.corrupt.*` quarantine GROUPS (main db + its
+/// `-db-shm`/`-db-wal` siblings count as one group). Ported from the shape of
+/// the vendored fallback's `_CORRUPT_TAIL_MAX_FILES` retention policy
+/// (`build-loop/scripts/rally_point/fact_v1.py:60`, applied at
+/// `_prune_corrupt_tail_quarantine`, lines ~344-360).
+pub(crate) const CORRUPT_QUARANTINE_MAX_GROUPS: usize = 8;
+
+/// Byte budget across all retained quarantine groups.
+///
+/// The vendored Python policy this is ported from uses 1 MiB
+/// (`_CORRUPT_TAIL_MAX_BYTES`) because it retains JSONL torn-tail FRAGMENTS —
+/// small partial-write remnants of an interrupted append. This module
+/// quarantines whole SQLite snapshots instead (~4 MB each, measured in this
+/// repo's `.rally/` at the time this was written), so a literal 1 MiB port
+/// would retain ZERO groups — silently defeating the forensic-retention
+/// purpose the budget exists to serve. 32 MiB is the size-proportionate
+/// budget for THIS artifact class: it lands at roughly the same effective
+/// cap as the 8-group limit above (8 groups * ~4 MB/group ~= 32 MB), so the
+/// two limits reinforce each other rather than one silently overriding the
+/// other. Do not "fix" this back to 1 MiB — it was deliberately rescaled to
+/// the artifact class it governs, not left over from a copy-paste.
+pub(crate) const CORRUPT_QUARANTINE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Outcome of one `prune_corrupt_quarantine` pass, for callers (currently
+/// `quarantine_corrupt_db`, best-effort) and tests that want to assert on it.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct PruneStats {
+    pub(crate) groups_before: usize,
+    pub(crate) groups_kept: usize,
+    /// Groups MOVED to `.rally/archive/swept/<stamp>/`. Never deleted — the
+    /// bytes stay on disk, they just leave the live quarantine set.
+    pub(crate) groups_archived: usize,
+    pub(crate) bytes_kept: u64,
+}
+
+/// Bound forensic retention of `{base}.corrupt.*` quarantine groups under
+/// `dir`: keep at most [`CORRUPT_QUARANTINE_MAX_GROUPS`] groups within
+/// [`CORRUPT_QUARANTINE_MAX_BYTES`] total, newest first by NUMERIC stamp
+/// (never lexicographic — a future width change to the nanosecond stamp
+/// would silently invert lexicographic order and delete the newest snapshot
+/// instead of the oldest).
+///
+/// The newest group is ALWAYS retained regardless of its size — a floor, not
+/// a suggestion. This function exists to preserve forensic evidence of
+/// corruption; a byte budget that deletes the snapshot just written would
+/// defeat that purpose on the exact event that most needs to be kept.
+///
+/// ARCHIVES, NEVER DELETES. Over-budget groups are MOVED to
+/// `.rally/archive/swept/<stamp>/`, the same destination
+/// `doctor::sweep_corrupt_in_dir` uses — see its comment: "a quarantined
+/// `facts.db.corrupt.*` snapshot is the forensic record of a corruption
+/// event — the single most valuable artifact to still have when diagnosing
+/// why a store broke." Deciding a snapshot is finally disposable is a human
+/// call, made somewhere else. An earlier draft of this function called
+/// `fs::remove_file` here; that would have silently destroyed exactly the
+/// evidence the quarantine mechanism exists to preserve, on the automatic
+/// path where nobody would see it happen.
+///
+/// This therefore bounds the LIVE quarantine working set, not `.rally/` total
+/// size — archived bytes stay on disk under `.rally/archive/`. Reclaiming
+/// them is a separate, deliberate human decision.
+///
+/// Two retention policies coexist deliberately, sharing one destination:
+/// this automatic path (8 groups / 32 MiB, runs on every quarantine event)
+/// and `rally doctor --sweep-corrupt` (keep=1 / 7 days, manual deep clean).
+/// The automatic one is deliberately the looser of the two — an unattended
+/// path should bound growth, not aggressively prune evidence.
+///
+/// Archiving is whole-group: a group's main db and its `-db-shm`/`-db-wal`
+/// siblings always move together, never leaving an orphaned sibling.
+///
+/// Best-effort throughout: an individual move failure is logged to stderr and
+/// that one group is skipped (left in place) rather than aborting the pass;
+/// the function itself never returns `Err` for a move failure, and its result
+/// must never propagate into a caller's corruption-recovery path
+/// (`quarantine_corrupt_db` discards it via `let _ =`).
+pub(crate) fn prune_corrupt_quarantine(dir: &Path, base: &str) -> Result<PruneStats> {
+    let mut groups = scan_corrupt_quarantine_groups(dir, base);
+    // Numeric, newest-first. Today's stamps are same-width 19-digit nanos so
+    // this agrees with a lexicographic sort, but that is coincidence, not a
+    // guarantee — sort the parsed `u128`, never the path string.
+    groups.sort_by(|a, b| b.stamp.cmp(&a.stamp));
+
+    let groups_before = groups.len();
+    let mut groups_kept = 0usize;
+    let mut bytes_kept: u64 = 0;
+    let mut groups_archived = 0usize;
+
+    let archive_root = dir
+        .join(ARCHIVE_DIRNAME)
+        .join(crate::doctor::SWEPT_SUBDIR);
+
+    for (idx, group) in groups.iter().enumerate() {
+        let size = group.total_bytes();
+        let newest = idx == 0;
+        let fits_budget = groups_kept < CORRUPT_QUARANTINE_MAX_GROUPS
+            && bytes_kept.saturating_add(size) <= CORRUPT_QUARANTINE_MAX_BYTES;
+        if newest || fits_budget {
+            groups_kept += 1;
+            bytes_kept = bytes_kept.saturating_add(size);
+            continue;
+        }
+
+        // Archive, never delete. Create the per-stamp destination first; if we
+        // cannot, leave the group exactly where it is — an un-pruned snapshot
+        // costs disk, a destroyed one costs the investigation.
+        let dest_dir = archive_root.join(group.stamp.to_string());
+        if let Err(err) = fs::create_dir_all(&dest_dir) {
+            eprintln!(
+                "rally: warning: cannot create quarantine archive {}: {err}",
+                dest_dir.display()
+            );
+            groups_kept += 1;
+            bytes_kept = bytes_kept.saturating_add(size);
+            continue;
+        }
+
+        let mut moved_all = true;
+        for path in group.paths() {
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let dest = dest_dir.join(name);
+            // Same filesystem in the normal case. Fall back to copy+remove only
+            // when rename cannot cross a boundary, and only AFTER the copy
+            // succeeded, so no path can lose the file.
+            let moved = match fs::rename(path, &dest) {
+                Ok(()) => true,
+                Err(_) => match fs::copy(path, &dest) {
+                    Ok(_) => fs::remove_file(path).is_ok(),
+                    Err(err) => {
+                        eprintln!(
+                            "rally: warning: cannot archive quarantine file {} to {}: {err}",
+                            path.display(),
+                            dest.display()
+                        );
+                        false
+                    }
+                },
+            };
+            moved_all &= moved;
+        }
+
+        if moved_all {
+            groups_archived += 1;
+        } else {
+            // Partially-moved group: count it as retained so the stats never
+            // overstate what was cleared from the live set.
+            groups_kept += 1;
+            bytes_kept = bytes_kept.saturating_add(size);
+        }
+    }
+
+    Ok(PruneStats {
+        groups_before,
+        groups_kept,
+        groups_archived,
+        bytes_kept,
+    })
+}
+
+/// Read-only count of retained `facts.db.corrupt.*` quarantine groups under
+/// `dir`, for reporting (`rally doctor`) without mutating anything. Shares
+/// `scan_corrupt_quarantine_groups` with `prune_corrupt_quarantine` so the
+/// two can never disagree about what counts as "one group".
+pub(crate) fn count_corrupt_quarantine_groups(dir: &Path, base: &str) -> usize {
+    scan_corrupt_quarantine_groups(dir, base).len()
+}
+
+/// Filename of the persisted corruption-recurrence counter.
+///
+/// Deliberately a SIBLING of `.rally/log/` (`LOG_DIRNAME`), never a file
+/// written inside it: `rally watch` polls the segment index under `log/` for
+/// its `max_seq`, so a write inside that directory would bump the index and
+/// self-trigger the watcher on every quarantine event — the same class of
+/// self-triggering hazard documented on `is_malformed_db_error` above, just
+/// via the log-index path instead of an error-message substring.
+pub(crate) const CORRUPTION_COUNTER_FILENAME: &str = "corruption-count.json";
+
+/// Persisted, monotonically-incrementing record of how many times this
+/// room's `facts.db` has been quarantined for corruption. Telemetry only —
+/// never load-bearing for recovery.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct CorruptionCounter {
+    pub(crate) count: u64,
+    pub(crate) first_at: String,
+    pub(crate) last_at: String,
+    pub(crate) last_stamp: String,
+}
+
+/// Read `.rally/corruption-count.json`, tolerating a missing or malformed
+/// file as "no corruption recorded yet" (`None`) rather than erroring — this
+/// file is telemetry, not a source of truth for anything load-bearing.
+pub(crate) fn read_corruption_counter(rally_dir: &Path) -> Option<CorruptionCounter> {
+    let path = rally_dir.join(CORRUPTION_COUNTER_FILENAME);
+    let text = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Best-effort read-modify-write increment of the corruption counter at
+/// `rally_dir`. Atomic per write (temp file + `fs::rename`, matching the
+/// convention `write_cursor_at` above uses for `cursors.json`). Never
+/// returns anything for the caller to check — any failure (serialize,
+/// write, rename) is logged to stderr and swallowed, because a counter write
+/// must never interrupt `quarantine_corrupt_db`'s load-bearing recovery
+/// path: the counter is telemetry, the recovery it rides alongside is not.
+fn record_corruption_event(rally_dir: &Path, stamp: u128) {
+    let now = now_string();
+    let mut counter = read_corruption_counter(rally_dir).unwrap_or_else(|| CorruptionCounter {
+        count: 0,
+        first_at: now.clone(),
+        last_at: now.clone(),
+        last_stamp: stamp.to_string(),
+    });
+    counter.count = counter.count.saturating_add(1);
+    counter.last_at = now;
+    counter.last_stamp = stamp.to_string();
+
+    let content = match serde_json::to_string_pretty(&counter) {
+        Ok(s) => format!("{s}\n"),
+        Err(err) => {
+            eprintln!("rally: warning: failed to serialize corruption counter: {err}");
+            return;
+        }
+    };
+    let path = rally_dir.join(CORRUPTION_COUNTER_FILENAME);
+    let temp_path = rally_dir.join(format!("{CORRUPTION_COUNTER_FILENAME}.tmp-{}", short_id()));
+    if let Err(err) = fs::write(&temp_path, content) {
+        eprintln!(
+            "rally: warning: failed to write corruption counter temp file {}: {err}",
+            temp_path.display()
+        );
+        return;
+    }
+    if let Err(err) = fs::rename(&temp_path, &path) {
+        eprintln!(
+            "rally: warning: failed to persist corruption counter at {}: {err}",
+            path.display()
+        );
+        let _ = fs::remove_file(&temp_path);
+    }
 }
 
 /// Rebuild the derived sqlite cache by replaying the canonical segment fold in
@@ -12738,16 +13095,297 @@ mod ledger_tests {
         let rally = root.join(".rally");
         fs::create_dir_all(&rally).unwrap();
         let facts_db = rally.join("facts.db");
-        // No file → noop, returns Ok.
+        // No file → noop, returns Ok. The early-return path must not bump
+        // the corruption counter or run a prune pass.
         quarantine_corrupt_db(&facts_db).unwrap();
         assert!(!facts_db.exists());
+        assert!(
+            read_corruption_counter(&rally).is_none(),
+            "no-op quarantine call must not write a corruption counter"
+        );
 
         // After a real quarantine, a second call still returns Ok and does
-        // not error (the source file is gone).
+        // not error (the source file is gone) — and does not double-count.
         fs::write(&facts_db, b"corrupt").unwrap();
         quarantine_corrupt_db(&facts_db).unwrap();
+        let counter_after_real_quarantine = read_corruption_counter(&rally)
+            .expect("real quarantine writes the counter");
+        assert_eq!(counter_after_real_quarantine.count, 1);
         quarantine_corrupt_db(&facts_db).unwrap();
         assert!(!facts_db.exists());
+        assert_eq!(
+            read_corruption_counter(&rally).unwrap().count,
+            1,
+            "the second, no-op call must not bump the counter again"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Write a synthetic `{base}.corrupt.<stamp>` quarantine group (main +
+    /// `-db-shm` + `-db-wal` siblings) directly to disk, bypassing
+    /// `quarantine_corrupt_db`, so pruning tests can control stamp values and
+    /// group sizes precisely.
+    fn write_quarantine_group(rally: &Path, base: &str, stamp: u128, main_bytes: usize) {
+        fs::write(
+            rally.join(format!("{base}.corrupt.{stamp}")),
+            vec![b'x'; main_bytes],
+        )
+        .unwrap();
+        fs::write(rally.join(format!("{base}.corrupt.{stamp}-db-shm")), b"shm").unwrap();
+        fs::write(rally.join(format!("{base}.corrupt.{stamp}-db-wal")), b"wal").unwrap();
+    }
+
+    /// The regression that matters most here: an over-budget group must be
+    /// MOVED to `.rally/archive/swept/<stamp>/`, never unlinked. A corrupt
+    /// snapshot is the forensic record of a corruption event, and this is the
+    /// unattended path — if it deletes, nobody is watching when the evidence
+    /// disappears. `doctor::sweep_corrupt_in_dir` made this call deliberately
+    /// ("Doctor ARCHIVES; it never deletes"); the automatic path must not
+    /// quietly contradict it.
+    #[test]
+    fn prune_corrupt_quarantine_archives_never_deletes() {
+        let root = unique_root("prune-archives");
+        let rally = root.join(".rally");
+        fs::create_dir_all(&rally).unwrap();
+        let base = "facts.db";
+        // 10 groups; the 2 oldest fall outside the 8-group cap.
+        let stamps: Vec<u128> = (0..10u128).map(|i| 2_000_000_000_000_000_000 + i).collect();
+        for &stamp in &stamps {
+            write_quarantine_group(&rally, base, stamp, 100);
+        }
+
+        let stats = prune_corrupt_quarantine(&rally, base).unwrap();
+        assert_eq!(stats.groups_archived, 2);
+
+        let swept = rally.join(ARCHIVE_DIRNAME).join(crate::doctor::SWEPT_SUBDIR);
+        for &stamp in &stamps[..2] {
+            let dest = swept.join(stamp.to_string());
+            for suffix in ["", "-db-shm", "-db-wal"] {
+                let landed = dest.join(format!("{base}.corrupt.{stamp}{suffix}"));
+                assert!(
+                    landed.exists(),
+                    "over-budget quarantine file must be archived, not deleted; \
+                     missing {}",
+                    landed.display()
+                );
+            }
+            // and it must be gone from the LIVE quarantine set
+            assert!(
+                !rally.join(format!("{base}.corrupt.{stamp}")).exists(),
+                "archived group must leave the live set"
+            );
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prune_corrupt_quarantine_keeps_max_groups_newest_first() {
+        let root = unique_root("prune-count-cap");
+        let rally = root.join(".rally");
+        fs::create_dir_all(&rally).unwrap();
+        let base = "facts.db";
+        // 12 groups, small enough that the byte budget never binds — only the
+        // 8-group count cap should limit retention.
+        let stamps: Vec<u128> = (0..12u128).map(|i| 1_000_000_000_000_000_000 + i).collect();
+        for &stamp in &stamps {
+            write_quarantine_group(&rally, base, stamp, 100);
+        }
+
+        let stats = prune_corrupt_quarantine(&rally, base).unwrap();
+        assert_eq!(stats.groups_before, 12);
+        assert_eq!(stats.groups_kept, CORRUPT_QUARANTINE_MAX_GROUPS);
+        assert_eq!(stats.groups_archived, 4);
+
+        let mut remaining: Vec<u128> = scan_corrupt_quarantine_groups(&rally, base)
+            .into_iter()
+            .map(|g| g.stamp)
+            .collect();
+        remaining.sort_unstable();
+        let mut expected_survivors = stamps[4..].to_vec(); // the 8 highest stamps
+        expected_survivors.sort_unstable();
+        assert_eq!(
+            remaining, expected_survivors,
+            "the 8 NEWEST groups by stamp survive, not the 8 first-scanned"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prune_corrupt_quarantine_never_orphans_siblings() {
+        let root = unique_root("prune-siblings");
+        let rally = root.join(".rally");
+        fs::create_dir_all(&rally).unwrap();
+        let base = "facts.db";
+        let stamps: Vec<u128> = (0..12u128).map(|i| 2_000_000_000_000_000_000 + i).collect();
+        for &stamp in &stamps {
+            write_quarantine_group(&rally, base, stamp, 100);
+        }
+
+        prune_corrupt_quarantine(&rally, base).unwrap();
+
+        let remaining = scan_corrupt_quarantine_groups(&rally, base);
+        assert_eq!(remaining.len(), CORRUPT_QUARANTINE_MAX_GROUPS);
+        for group in &remaining {
+            assert!(
+                group.shm.is_some(),
+                "surviving group {} keeps its -db-shm sibling",
+                group.stamp
+            );
+            assert!(
+                group.wal.is_some(),
+                "surviving group {} keeps its -db-wal sibling",
+                group.stamp
+            );
+        }
+
+        // No deleted group leaves an orphan sibling on disk: every remaining
+        // file's stamp belongs to a surviving group.
+        let prefix = format!("{base}.corrupt.");
+        for entry in fs::read_dir(&rally).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let stamp_str = rest
+                .strip_suffix("-db-shm")
+                .or_else(|| rest.strip_suffix("-db-wal"))
+                .unwrap_or(rest);
+            let stamp: u128 = stamp_str.parse().unwrap();
+            assert!(
+                remaining.iter().any(|g| g.stamp == stamp),
+                "file {name} belongs to deleted stamp {stamp} but was not removed"
+            );
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prune_corrupt_quarantine_byte_cap_binds_before_count_cap() {
+        let root = unique_root("prune-byte-cap");
+        let rally = root.join(".rally");
+        fs::create_dir_all(&rally).unwrap();
+        let base = "facts.db";
+        // 5 groups, well under the 8-group count cap, but 8 MiB each — the 32
+        // MiB byte budget bites at the 4th group, before the count cap ever
+        // would.
+        let group_bytes = 8 * 1024 * 1024;
+        let stamps: Vec<u128> = (0..5u128).map(|i| 4_000_000_000_000_000_000 + i).collect();
+        for &stamp in &stamps {
+            write_quarantine_group(&rally, base, stamp, group_bytes);
+        }
+
+        let stats = prune_corrupt_quarantine(&rally, base).unwrap();
+        assert!(
+            stats.groups_kept < CORRUPT_QUARANTINE_MAX_GROUPS,
+            "byte budget must limit retention below the 8-group count cap, got {}",
+            stats.groups_kept
+        );
+        assert!(stats.groups_kept < stats.groups_before);
+        assert!(stats.bytes_kept <= CORRUPT_QUARANTINE_MAX_BYTES);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prune_corrupt_quarantine_always_keeps_newest_regardless_of_size() {
+        let root = unique_root("prune-newest-floor");
+        let rally = root.join(".rally");
+        fs::create_dir_all(&rally).unwrap();
+        let base = "facts.db";
+        let stamp = 5_000_000_000_000_000_000u128;
+        // Larger than the whole byte budget by itself — the regression this
+        // guards against is a literal port of the byte-budget check (with no
+        // floor) that would delete the snapshot just written.
+        let oversized = (CORRUPT_QUARANTINE_MAX_BYTES + 1024 * 1024) as usize;
+        write_quarantine_group(&rally, base, stamp, oversized);
+
+        let stats = prune_corrupt_quarantine(&rally, base).unwrap();
+        assert_eq!(stats.groups_kept, 1);
+        assert_eq!(stats.groups_archived, 0);
+        assert!(stats.bytes_kept > CORRUPT_QUARANTINE_MAX_BYTES);
+
+        let remaining = scan_corrupt_quarantine_groups(&rally, base);
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the sole (newest) group survives even though it alone exceeds the byte budget"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prune_corrupt_quarantine_sorts_by_numeric_stamp_not_lexicographic() {
+        let root = unique_root("prune-numeric-sort");
+        let rally = root.join(".rally");
+        fs::create_dir_all(&rally).unwrap();
+        let base = "facts.db";
+        // Lexicographically "10" < "9" (ASCII '1' < '9'), but 10 > 9
+        // numerically. A lexicographic sort would treat stamp 9 as newest;
+        // the correct numeric sort treats stamp 10 as newest. Force a delete
+        // via the byte budget so the wrong sort order is observable in which
+        // group survives.
+        let big = 20 * 1024 * 1024; // two of these exceed the 32 MiB cap
+        write_quarantine_group(&rally, base, 10, big);
+        write_quarantine_group(&rally, base, 9, big);
+
+        let stats = prune_corrupt_quarantine(&rally, base).unwrap();
+        assert_eq!(stats.groups_kept, 1);
+        assert_eq!(stats.groups_archived, 1);
+
+        let remaining = scan_corrupt_quarantine_groups(&rally, base);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].stamp, 10,
+            "numerically newest stamp (10) must survive, not the lexicographically-\
+             greatest (9)"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn corruption_counter_increments_and_preserves_first_at() {
+        let root = unique_root("corruption-counter");
+        let rally = root.join(".rally");
+        fs::create_dir_all(&rally).unwrap();
+        let facts_db = rally.join("facts.db");
+
+        assert!(
+            read_corruption_counter(&rally).is_none(),
+            "no counter before any quarantine has happened"
+        );
+
+        fs::write(&facts_db, b"corrupt-1").unwrap();
+        quarantine_corrupt_db(&facts_db).unwrap();
+        let after_first =
+            read_corruption_counter(&rally).expect("counter written after first quarantine");
+        assert_eq!(after_first.count, 1);
+        assert_eq!(after_first.first_at, after_first.last_at);
+
+        // The counter file lives beside `.rally/log/`, never inside it — a
+        // write inside `log/` would bump the segment index `max_seq` that
+        // `rally watch` polls and self-trigger the watcher.
+        assert!(rally.join(CORRUPTION_COUNTER_FILENAME).is_file());
+        assert!(!rally.join(LOG_DIRNAME).join(CORRUPTION_COUNTER_FILENAME).exists());
+
+        fs::write(&facts_db, b"corrupt-2").unwrap();
+        quarantine_corrupt_db(&facts_db).unwrap();
+        let after_second = read_corruption_counter(&rally)
+            .expect("counter still present after second quarantine");
+        assert_eq!(after_second.count, 2);
+        assert_eq!(
+            after_second.first_at, after_first.first_at,
+            "first_at stays fixed across events"
+        );
+        assert_ne!(
+            after_second.last_stamp, after_first.last_stamp,
+            "last_stamp advances to the new quarantine's nanosecond stamp"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
