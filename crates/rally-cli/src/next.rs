@@ -731,8 +731,7 @@ fn suggested_commands(tool: &str, candidate: &NextCandidate) -> Vec<String> {
             tool = tool_arg
         )),
         "clarify_handoff" => commands.push(format!(
-            "rally say handoff --tool {tool} --target {} --ref {} --subject \"clarify handoff\" --summary \"<needed context>\" --json",
-            shell_quote(fact.target.as_deref().unwrap_or("<target-tool>")),
+            "rally say handoff --tool {tool} --ref {} --handoff-state rejected --subject \"clarify handoff\" --summary \"<needed context>\" --json",
             event_arg,
             tool = tool_arg
         )),
@@ -1119,6 +1118,17 @@ mod tests {
             !stale_targeted_handoff(&malformed, "codex", DEFAULT_STALE_WAIT_SECS),
             "malformed timestamps must remain actionable"
         );
+    }
+
+    #[test]
+    fn clarify_handoff_command_auto_binds_the_original_author() {
+        let fact = handoff("bound-handoff", "receiver", "2999-01-01T00:00:00Z");
+        let candidate = NextCandidate::from_fact("clarify_handoff", "weak_handoff", 1, &fact);
+        let commands = suggested_commands("receiver", &candidate);
+        let command = commands.last().expect("clarification command");
+        assert!(command.contains("say handoff --tool receiver --ref bound-handoff"));
+        assert!(command.contains("--handoff-state rejected"));
+        assert!(!command.contains("--target receiver"));
     }
 
     #[test]

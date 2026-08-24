@@ -2987,11 +2987,18 @@ fn command_say(args: SayArgs) -> Result<Output> {
     }
 
     let room = RoomStore::open()?;
-    // Component B: auto-register presence for the calling tool before writing.
-    ensure_presence(&room, &args.tool)?;
+    let target_policy = args.target_policy.clone();
+    let requested_handoff_state = args.handoff_state.clone();
+    let requested_idempotency_key = args.idempotency_key.clone();
+    let mut fact_thread_id = args.thread_id.clone();
 
     // B13: encode --produces / --depends as markers in evidence (self-describing claim).
     let mut evidence = args.evidence;
+    if kind == FactKind::Handoff && evidence.iter().any(|entry| entry.starts_with("protocol:")) {
+        return Err(RallyError::Usage(
+            "handoff_protocol_evidence_reserved: evidence entries beginning with `protocol:` are written by Rally; remove the caller-supplied marker and retry".to_string(),
+        ));
+    }
     for p in &args.produces {
         evidence.push(format!("produces:{p}"));
     }
@@ -3106,6 +3113,75 @@ fn command_say(args: SayArgs) -> Result<Output> {
 
     // ref_standby (--ref-standby) takes precedence over --ref for wake facts.
     let ref_id = args.ref_standby.or(args.ref_id);
+    let mut target = args.target;
+
+    if kind == FactKind::Handoff && ref_id.is_some() {
+        let caller_session = current_protocol_session(Some(&args.tool))
+            .from_session_id()
+            .to_string();
+        let binding = resolve_referenced_handoff_binding(
+            &room,
+            &args.tool,
+            &caller_session,
+            ref_id.as_deref().expect("checked"),
+            target.as_deref(),
+            target_policy.as_deref(),
+            requested_handoff_state.as_deref(),
+        )?;
+        if let Some(requested_thread) = fact_thread_id.as_deref()
+            && requested_thread != binding.correlation_id
+        {
+            return Err(RallyError::Usage(format!(
+                "handoff_correlation_mismatch: --thread {requested_thread} conflicts with inherited correlation {}",
+                binding.correlation_id
+            )));
+        }
+        fact_thread_id = Some(binding.correlation_id.clone());
+        target = Some(binding.target_tool.clone());
+        evidence.extend(binding.markers);
+        // This is a logical operation id, not the referenced event id. Include
+        // every caller-controlled semantic field so ACK, acceptance, rework,
+        // and other replies cannot collapse into one retry identity.
+        let semantic_operation = serde_json::json!({
+            "ref": ref_id,
+            "tool": args.tool,
+            "from_session_id": caller_session,
+            "thread_id": fact_thread_id,
+            "target": target,
+            "to_session_id": binding.target_session,
+            "subject": subject,
+            "scope": scope,
+            "summary": summary,
+            "evidence": evidence,
+            "status": args.status,
+            "severity": args.severity,
+            "uri": args.uri,
+        })
+        .to_string();
+        let default_retry_key = rally_protocol::delivery::stable_delivery_dedupe_key(
+            &semantic_operation,
+            room.room_id(),
+            &binding.target_session,
+        );
+        let retry_key = requested_idempotency_key.unwrap_or(default_retry_key);
+        if retry_key.trim().is_empty() {
+            return Err(RallyError::Usage(
+                "handoff_idempotency_key_empty: --idempotency-key must not be empty; omit it to use Rally's stable ref/session key".to_string(),
+            ));
+        }
+        evidence.push(format!("protocol:idempotency_key={retry_key}"));
+    } else if target_policy.is_some()
+        || requested_handoff_state.is_some()
+        || requested_idempotency_key.is_some()
+    {
+        return Err(RallyError::Usage(
+            "handoff_target_policy_requires_ref: --target-policy, --handoff-state, and --idempotency-key require `say handoff --ref <event-id>`".to_string(),
+        ));
+    }
+
+    // Register presence only after all fail-closed handoff validation. A
+    // rejected target must not create any durable side effect.
+    ensure_presence(&room, &args.tool)?;
 
     // Path-only release fix (C4):
     //
@@ -3161,7 +3237,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
             subject,
             summary,
             evidence,
-            args.target,
+            target.clone(),
             args.status,
             args.severity,
             args.uri,
@@ -3180,7 +3256,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("fact"),
         seq: 0,
-        thread_id: args.thread_id.unwrap_or_else(|| new_id("room")),
+        thread_id: fact_thread_id.unwrap_or_else(|| new_id("room")),
         kind: kind.clone(),
         tool: Some(args.tool.clone()),
         role: args.role,
@@ -3189,7 +3265,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
         created_at: now_string(),
         summary,
         evidence,
-        target: args.target,
+        target,
         ref_id,
         status: args.status,
         severity: args.severity,
@@ -3375,6 +3451,261 @@ fn command_say(args: SayArgs) -> Result<Output> {
         fact.seq
     );
     Ok(Output::new(args.json, text, body))
+}
+
+struct ReferencedHandoffBinding {
+    target_tool: String,
+    target_session: String,
+    correlation_id: String,
+    markers: Vec<String>,
+}
+
+fn managed_protocol_session_id(raw_session_id: &str, tool: &str) -> String {
+    let inputs = session_identity::EndpointInputs {
+        managed_session_id: Some(raw_session_id.to_string()),
+        ..Default::default()
+    };
+    let endpoint = session_identity::derive_endpoint(&inputs);
+    let (tool_type, actor) = tool
+        .split_once(':')
+        .map_or((tool, None), |(kind, actor)| (kind, Some(actor)));
+    session_identity::ProtocolSessionIdentity::mint(&endpoint, tool_type, "live", actor, None)
+        .from_session_id()
+        .to_string()
+}
+
+fn require_live_managed_target(
+    room: &RoomStore,
+    target_tool: &str,
+    target_session: &str,
+) -> Result<()> {
+    if !target_session.starts_with("sess:managed:") {
+        // Direct CLI/terminal sessions are exact immutable identities but do
+        // not have a managed-runtime probe. They remain routable by identity,
+        // never by an ambiguous alias.
+        return Ok(());
+    }
+    let matches = active_session_views(room, BackendBins::default())?
+        .into_iter()
+        .filter(|(_, view)| {
+            view.liveness == SessionLiveness::Live
+                && view.session.tool == target_tool
+                && managed_protocol_session_id(&view.session.session_id, &view.session.tool)
+                    == target_session
+        })
+        .count();
+    if matches != 1 {
+        return Err(RallyError::Usage(format!(
+            "handoff_target_stale_or_unknown: {target_tool}/{target_session} is not one live managed session; run `rally sessions --json` and reroute explicitly"
+        )));
+    }
+    Ok(())
+}
+
+fn protocol_evidence<'a>(fact: &'a Fact, name: &str) -> Option<&'a str> {
+    let prefix = format!("protocol:{name}=");
+    fact.evidence
+        .iter()
+        .find_map(|entry| entry.strip_prefix(&prefix))
+}
+
+fn resolve_referenced_handoff_binding(
+    room: &RoomStore,
+    tool: &str,
+    caller_session: &str,
+    ref_id: &str,
+    requested_target: Option<&str>,
+    requested_policy: Option<&str>,
+    requested_state: Option<&str>,
+) -> Result<ReferencedHandoffBinding> {
+    let facts = room.facts()?;
+    let referenced = facts
+        .iter()
+        .find(|fact| fact.event_id == ref_id)
+        .ok_or_else(|| {
+            RallyError::Usage(format!(
+                "handoff_target_ref_not_found: ref {ref_id} does not name a canonical fact; run `rally locate {ref_id} --json` and retry"
+            ))
+        })?;
+    let policy = requested_policy.unwrap_or("ref-author");
+    if !matches!(policy, "ref-author" | "third-party") {
+        return Err(RallyError::Usage(format!(
+            "handoff_target_policy_invalid: {policy}; use --target-policy ref-author or --target-policy third-party"
+        )));
+    }
+    if policy == "third-party" && referenced.kind == FactKind::Handoff {
+        return Err(RallyError::Usage(format!(
+            "handoff_third_party_reply_forbidden: ref {ref_id} is a handoff bound to one receiver; that exact receiver must reply. For review or reroute, cite the original artifact/request in a new handoff."
+        )));
+    }
+
+    let (event_kind, event_kind_marker) = match (referenced.kind.clone(), requested_state) {
+        (FactKind::Handoff, Some("acked")) => (
+            rally_protocol::delivery::ProtocolEventKind::HandoffAcked,
+            "handoff.acked",
+        ),
+        (FactKind::Handoff, Some("accepted")) => (
+            rally_protocol::delivery::ProtocolEventKind::HandoffAccepted,
+            "handoff.accepted",
+        ),
+        (FactKind::Handoff, Some("rejected")) => (
+            rally_protocol::delivery::ProtocolEventKind::HandoffRejected,
+            "handoff.rejected",
+        ),
+        (FactKind::Handoff, None) => {
+            return Err(RallyError::Usage(format!(
+                "handoff_reply_state_required: reply to {ref_id} must pass --handoff-state acked, accepted, or rejected"
+            )));
+        }
+        (FactKind::Handoff, Some(other)) => {
+            return Err(RallyError::Usage(format!(
+                "handoff_reply_state_invalid: {other}; use --handoff-state acked, accepted, or rejected"
+            )));
+        }
+        (_, None | Some("requested")) => (
+            rally_protocol::delivery::ProtocolEventKind::HandoffRequested,
+            "handoff.requested",
+        ),
+        (_, Some(other)) => {
+            return Err(RallyError::Usage(format!(
+                "handoff_request_state_invalid: {other}; a handoff against an artifact/request must use --handoff-state requested"
+            )));
+        }
+    };
+
+    let (target_tool, target_session, handoff_id) = if policy == "third-party" {
+        let requested = requested_target.ok_or_else(|| {
+            RallyError::Usage(
+                "handoff_target_zero_match: third-party routing requires --target <managed-session|name|tool>; run `rally sessions --json`".to_string(),
+            )
+        })?;
+        let matches = active_session_views(room, BackendBins::default())?
+            .into_iter()
+            .filter(|(_, view)| {
+                view.liveness == SessionLiveness::Live
+                    && (view.session.session_id == requested
+                        || view.session.name == requested
+                        || view.session.tool == requested)
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(RallyError::Usage(format!(
+                "handoff_target_{}_match: target {requested} resolved to {} active managed sessions; run `rally sessions --json` and pass one exact session_id",
+                if matches.is_empty() { "zero" } else { "multi" },
+                matches.len()
+            )));
+        }
+        let session = &matches[0].1.session;
+        (
+            session.tool.clone(),
+            managed_protocol_session_id(&session.session_id, &session.tool),
+            ref_id.to_string(),
+        )
+    } else if referenced.kind == FactKind::Handoff {
+        let expected_tool = referenced.target.as_deref().ok_or_else(|| {
+            RallyError::Usage(format!(
+                "handoff_reply_unbound_legacy: handoff {ref_id} has no target; use --target-policy third-party with one exact managed session"
+            ))
+        })?;
+        let expected_session = protocol_evidence(referenced, "to_session_id").ok_or_else(|| {
+            RallyError::Usage(format!(
+                "handoff_reply_unbound_legacy: handoff {ref_id} has no exact to_session_id; use --target-policy third-party with one exact managed session"
+            ))
+        })?;
+        if tool != expected_tool || caller_session != expected_session {
+            return Err(RallyError::Usage(format!(
+                "handoff_reply_author_mismatch: ref {ref_id} is bound to {expected_tool}/{expected_session}; caller is {tool}/{caller_session}. The bound receiver must author the reply."
+            )));
+        }
+        let author_tool = referenced.tool.clone().ok_or_else(|| {
+            RallyError::Usage(format!(
+                "handoff_target_ref_no_author: ref {ref_id} has no author tool"
+            ))
+        })?;
+        let author_session = referenced.from_session_id.clone().ok_or_else(|| {
+            RallyError::Usage(format!("handoff_target_ref_no_session: ref {ref_id} has no author session; use --target-policy third-party"))
+        })?;
+        if requested_target.is_some_and(|target| target != author_tool) {
+            return Err(RallyError::Usage(format!(
+                "handoff_target_mismatch: reply to {ref_id} must target {author_tool}; omit --target or pass the exact author tool"
+            )));
+        }
+        (
+            author_tool,
+            author_session,
+            protocol_evidence(referenced, "handoff_id")
+                .unwrap_or(ref_id)
+                .to_string(),
+        )
+    } else {
+        let author_tool = referenced.tool.clone().ok_or_else(|| {
+            RallyError::Usage(format!(
+                "handoff_target_ref_no_author: ref {ref_id} has no author tool"
+            ))
+        })?;
+        let author_session = referenced.from_session_id.clone().ok_or_else(|| {
+            RallyError::Usage(format!("handoff_target_ref_no_session: ref {ref_id} has no author session; use --target-policy third-party"))
+        })?;
+        if let Some(wrong_target) = requested_target.filter(|target| *target != author_tool) {
+            return Err(RallyError::Usage(format!(
+                "handoff_target_mismatch: ref {ref_id} was authored by {author_tool}/{author_session}, not {wrong_target}; omit --target to bind automatically or use --target-policy third-party with one exact managed session"
+            )));
+        }
+        require_live_managed_target(room, &author_tool, &author_session)?;
+        let handoff_id = rally_protocol::delivery::stable_delivery_dedupe_key(
+            ref_id,
+            room.room_id(),
+            &author_session,
+        );
+        (author_tool, author_session, handoff_id)
+    };
+
+    let correlation_id = protocol_evidence(referenced, "correlation_id")
+        .unwrap_or(&referenced.thread_id)
+        .to_string();
+    let event_envelope = rally_protocol::delivery::EventEnvelope {
+        causation_id: Some(ref_id.to_string()),
+        correlation_id: Some(correlation_id.clone()),
+        ref_event_id: Some(ref_id.to_string()),
+        handoff_id: Some(handoff_id),
+        from_session_id: Some(caller_session.to_string()),
+        ..Default::default()
+    };
+    if let Err(errors) = event_kind.validate(
+        &event_envelope,
+        rally_protocol::delivery::CompatMode::Strict,
+    ) {
+        return Err(RallyError::Usage(format!(
+            "handoff_protocol_envelope_invalid: {errors:?}"
+        )));
+    }
+    Ok(ReferencedHandoffBinding {
+        target_tool,
+        target_session: target_session.clone(),
+        correlation_id,
+        markers: vec![
+            "protocol:bridge_version=fact-v1".to_string(),
+            format!("protocol:event_kind={event_kind_marker}"),
+            format!("protocol:target_policy={policy}"),
+            format!("protocol:to_session_id={target_session}"),
+            format!(
+                "protocol:ref_event_id={}",
+                event_envelope.ref_event_id.as_deref().expect("validated")
+            ),
+            format!(
+                "protocol:causation_id={}",
+                event_envelope.causation_id.as_deref().expect("validated")
+            ),
+            format!(
+                "protocol:correlation_id={}",
+                event_envelope.correlation_id.as_deref().expect("validated")
+            ),
+            format!(
+                "protocol:handoff_id={}",
+                event_envelope.handoff_id.as_deref().expect("validated")
+            ),
+        ],
+    })
 }
 
 /// Path-only release: resolve to the calling tool's currently-active claims
@@ -3752,6 +4083,7 @@ fn command_room(args: RoomArgs) -> Result<Output> {
     let room = RoomStore::open()?;
     let json_output = args.json;
     let budget_override = args.budget_bytes;
+    let actionable = args.actionable;
     let query = RoomQuery::from(args);
     // R10: use snapshot_with_readers when --readers is passed so that
     // ReadReceipt projection happens; otherwise use the cheaper default path.
@@ -3761,6 +4093,11 @@ fn command_room(args: RoomArgs) -> Result<Output> {
     } else {
         room.snapshot_with_archived(query.include_archived)?
             .filtered(&query)
+    };
+    let projected = if actionable {
+        projected.into_actionable()
+    } else {
+        projected
     };
     // Composition is an OUTPUT concern and runs only here — the projection
     // above is a write-path authority (`append_state_transition_verified`
@@ -4619,6 +4956,9 @@ fn claim_say_args(tool: &str, lane: &str, path: &str, json: bool) -> SayArgs {
         paths: vec![path.to_string()],
         evidence: vec![format!("lane:{lane}")],
         target: None,
+        target_policy: None,
+        handoff_state: None,
+        idempotency_key: None,
         ref_id: None,
         status: None,
         severity: None,
@@ -14807,6 +15147,9 @@ mod tests {
             paths: Vec::new(),
             evidence: Vec::new(),
             target: None,
+            target_policy: None,
+            handoff_state: None,
+            idempotency_key: None,
             ref_id: None,
             status: None,
             severity: None,
@@ -15587,7 +15930,7 @@ fn stale_target_warning(
     Some(SayWarning {
         code: SAY_WARNING_STALE_TARGET.to_string(),
         message: format!(
-            "target {target} was last seen {age} ago (last_seen_ts {}), past its {} presence window — it may not pick this up; {alt_text}. Delivered anyway; re-target with `rally say handoff --tool {sender} --target <peer> --ref <this event>` if you meant someone current.",
+            "target {target} was last seen {age} ago (last_seen_ts {}), past its {} presence window — it may not pick this up; {alt_text}. Delivered anyway; for an intentional review/reroute, create a new handoff that cites the original artifact/request (not this handoff) and pass `--target-policy third-party --target <exact-session-id>`.",
             squad.last_seen_ts,
             format_age_short(squad.window_secs),
         ),

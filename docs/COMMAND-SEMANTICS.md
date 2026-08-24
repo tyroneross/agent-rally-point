@@ -30,11 +30,55 @@ Definitions:
 | `rally ack` | yes | yes | no | no | Records that the tool ingested current rules, guardrails, lead, and mission. |
 | `rally next` | yes | yes | no | no | Projects actionable work and records wake/read state for the calling tool. |
 | `rally next --audit` | no | no | no | no | Projects the same actionable work without presence, wake, or read-checkpoint facts; derived caches may still rebuild. |
-| `rally room` | no | yes | no | yes | Projects current room state from the ledger; use for ownership/blocker inspection. |
+| `rally room` | no | yes | no | yes | Projects current room state from the ledger; use for ownership/blocker inspection. `--actionable` removes stale roster and closed artifact inventory from this output only, while retaining current system-health alerts. The canonical ledger, default room view, and `locate` history remain unchanged. |
 | `rally check before-write` | no | yes | no | yes | Evaluates claim/decision/risk state; hooks may pair it with a separate claim write. |
 | `rally check before-complete` | no | yes | no | yes | Reports only claims owned by the exact `--tool` plus current session; a sibling session sharing the tool label is not the owner. Manual CLI workflows must export one stable `RALLY_SESSION_ID` before claiming. The check rejects an invocation whose only identity is its short-lived Rally process, so an unpinned lifecycle cannot silently pass with a stranded claim. |
 | `rally check liveness` | optional | yes | no | conditional | Advisory mode may scan all conflicted squads or filter one exact `--tool`. `--enforce` requires both `--tool <exact-target>` and `--actor <release-author>` and can release only that selected target's takeover-eligible claims. |
 | `rally say <kind>` | yes | yes | no | no | Appends durable coordination facts: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, standby, wake, backlog-item, mission. |
+
+### Referenced handoff targeting
+
+`rally say handoff --ref <event-id>` uses a fail-closed target contract before
+it appends presence or the handoff:
+
+- A referenced artifact or request targets its exact author tool and
+  `from_session_id`. Omit `--target`; an explicit different target is rejected.
+  Exact unmanaged CLI/terminal identities remain addressable because no runtime
+  registry can probe them. A managed identity must resolve to exactly one live
+  runtime; stale or unknown managed liveness fails closed.
+- A handoff reply must be authored by the exact tool and session bound as the
+  original receiver. It targets the original author automatically and must pass
+  `--handoff-state acked`, `accepted`, or `rejected`. Delivery,
+  receiver-authored ACK, acceptance, rework, and resolution remain separate
+  facts; a successful pane or daemon write is not semantic ACK.
+  Rework is recorded as `handoff.rejected` with the change evidence, followed
+  by a new `handoff.requested`; Rally does not infer it from subject prose.
+- An intentional review or reroute of an artifact/request must pass
+  `--target-policy third-party` and
+  `--target <exact-session-id>`. A tool or name alias is accepted only when it
+  resolves to one live managed session. Zero, multiple, stale, and unknown matches
+  fail before append with a stable `handoff_target_*` error prefix and a
+  corrective `rally sessions --json` command.
+  This compatibility policy cannot reply to an existing handoff; only its exact
+  bound receiver can do so. A reroute cites the original artifact/request in a
+  new handoff.
+
+Fact v1 persists the routing bridge in Rally-owned evidence keys:
+`protocol:bridge_version=fact-v1`, `protocol:event_kind`,
+`protocol:target_policy`, `protocol:to_session_id`,
+`protocol:ref_event_id`, `protocol:causation_id`,
+`protocol:correlation_id`, `protocol:handoff_id`, and
+`protocol:idempotency_key`. Caller-supplied `protocol:*` evidence and duplicate
+keys are rejected. The storage boundary requires every key on each new
+referenced handoff. Existing markerless facts still replay unchanged.
+
+Retries use a logical operation id derived from the complete semantic request,
+including the author session, target session, state/subject, payload, evidence,
+and causal identifiers. `--idempotency-key <key>` may supply that operation id.
+The same key with the same semantic payload returns the first canonical fact;
+the same key with any different semantic field fails with
+`handoff_idempotency_conflict`. Distinct ACK, accept, reject, or rework facts
+therefore receive distinct operation identities.
 
 ## Managed Sessions
 

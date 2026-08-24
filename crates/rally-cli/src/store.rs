@@ -926,6 +926,286 @@ impl Fact {
     }
 }
 
+fn protocol_marker<'a>(fact: &'a Fact, name: &str) -> Option<&'a str> {
+    let prefix = format!("protocol:{name}=");
+    fact.evidence
+        .iter()
+        .find_map(|entry| entry.strip_prefix(&prefix))
+}
+
+fn is_fact_v1_handoff_bridge(fact: &Fact) -> bool {
+    fact.kind == FactKind::Handoff
+        && fact.ref_id.is_some()
+        && protocol_marker(fact, "bridge_version") == Some("fact-v1")
+        && validate_handoff_protocol_namespace(fact).is_ok()
+}
+
+fn handoff_is_protocol_request(fact: &Fact) -> bool {
+    !is_fact_v1_handoff_bridge(fact)
+        || protocol_marker(fact, "event_kind") == Some("handoff.requested")
+}
+
+fn strict_handoff_target_session(fact: &Fact) -> Option<&str> {
+    (is_fact_v1_handoff_bridge(fact)
+        && protocol_marker(fact, "event_kind") == Some("handoff.requested"))
+    .then(|| protocol_marker(fact, "to_session_id"))
+    .flatten()
+}
+
+const REFERENCED_HANDOFF_PROTOCOL_KEYS: &[&str] = &[
+    "bridge_version",
+    "event_kind",
+    "target_policy",
+    "to_session_id",
+    "ref_event_id",
+    "causation_id",
+    "correlation_id",
+    "handoff_id",
+    "idempotency_key",
+];
+
+fn validate_handoff_protocol_namespace(fact: &Fact) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for entry in fact
+        .evidence
+        .iter()
+        .filter(|entry| entry.starts_with("protocol:"))
+    {
+        let Some((key, value)) = entry["protocol:".len()..].split_once('=') else {
+            return Err(RallyError::Usage(format!(
+                "handoff_protocol_marker_invalid: {entry:?} must use protocol:key=value"
+            )));
+        };
+        if !REFERENCED_HANDOFF_PROTOCOL_KEYS.contains(&key) {
+            return Err(RallyError::Usage(format!(
+                "handoff_protocol_marker_unknown: protocol:{key} is not part of the referenced-handoff contract"
+            )));
+        }
+        if value.trim().is_empty() {
+            return Err(RallyError::Usage(format!(
+                "handoff_protocol_marker_empty: protocol:{key} must not be empty"
+            )));
+        }
+        if !seen.insert(key) {
+            return Err(RallyError::Usage(format!(
+                "handoff_protocol_marker_duplicate: protocol:{key} appears more than once"
+            )));
+        }
+    }
+    for required in REFERENCED_HANDOFF_PROTOCOL_KEYS {
+        if !seen.contains(required) {
+            return Err(RallyError::Usage(format!(
+                "handoff_protocol_marker_missing: referenced handoff requires protocol:{required}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn same_handoff_semantics(existing: &Fact, proposed: &Fact) -> bool {
+    existing.schema == proposed.schema
+        && existing.kind == proposed.kind
+        && existing.thread_id == proposed.thread_id
+        && existing.tool == proposed.tool
+        && existing.role == proposed.role
+        && existing.subject == proposed.subject
+        && existing.scope == proposed.scope
+        && existing.summary == proposed.summary
+        && existing.evidence == proposed.evidence
+        && existing.target == proposed.target
+        && existing.ref_id == proposed.ref_id
+        && existing.status == proposed.status
+        && existing.severity == proposed.severity
+        && existing.uri == proposed.uri
+        && serde_json::to_value(&existing.session).ok()
+            == serde_json::to_value(&proposed.session).ok()
+        && existing.from_session_id == proposed.from_session_id
+}
+
+fn validate_referenced_handoff(fact: &Fact, facts: &[Fact]) -> Result<()> {
+    if fact.kind != FactKind::Handoff {
+        return Ok(());
+    }
+    if fact.ref_id.is_none() {
+        if fact
+            .evidence
+            .iter()
+            .any(|entry| entry.starts_with("protocol:"))
+        {
+            return Err(RallyError::Usage(
+                "handoff_protocol_marker_requires_ref: protocol:* evidence is Rally-owned and requires a referenced handoff"
+                    .to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    // Existing legacy rows remain readable because replay never calls this
+    // append-only gate. Every genuinely new referenced handoff must use the
+    // explicit bridge contract, including the compatibility route.
+    validate_handoff_protocol_namespace(fact)?;
+    if protocol_marker(fact, "bridge_version") != Some("fact-v1") {
+        return Err(RallyError::Usage(
+            "handoff_protocol_bridge_version_invalid: expected protocol:bridge_version=fact-v1"
+                .to_string(),
+        ));
+    }
+    let policy = protocol_marker(fact, "target_policy").expect("validated");
+    let ref_id = fact.ref_id.as_deref().ok_or_else(|| {
+        RallyError::Usage("handoff_binding_missing_ref: strict handoff has no ref".to_string())
+    })?;
+    let referenced = facts
+        .iter()
+        .find(|candidate| candidate.event_id == ref_id)
+        .ok_or_else(|| {
+            RallyError::Usage(format!(
+                "handoff_target_ref_not_found: ref {ref_id} does not name a canonical fact"
+            ))
+        })?;
+    let event_envelope = rally_protocol::delivery::EventEnvelope {
+        idempotency_key: protocol_marker(fact, "idempotency_key").map(str::to_string),
+        causation_id: protocol_marker(fact, "causation_id").map(str::to_string),
+        correlation_id: protocol_marker(fact, "correlation_id").map(str::to_string),
+        ref_event_id: protocol_marker(fact, "ref_event_id").map(str::to_string),
+        handoff_id: protocol_marker(fact, "handoff_id").map(str::to_string),
+        from_session_id: fact.from_session_id.clone(),
+        ..Default::default()
+    };
+    let event_kind_marker = protocol_marker(fact, "event_kind").expect("validated");
+    let protocol_kind = match event_kind_marker {
+        "handoff.requested" => rally_protocol::delivery::ProtocolEventKind::HandoffRequested,
+        "handoff.acked" => rally_protocol::delivery::ProtocolEventKind::HandoffAcked,
+        "handoff.accepted" => rally_protocol::delivery::ProtocolEventKind::HandoffAccepted,
+        "handoff.rejected" => rally_protocol::delivery::ProtocolEventKind::HandoffRejected,
+        other => {
+            return Err(RallyError::Usage(format!(
+                "handoff_protocol_event_kind_invalid: {other}"
+            )));
+        }
+    };
+    if referenced.kind == FactKind::Handoff
+        && protocol_kind == rally_protocol::delivery::ProtocolEventKind::HandoffRequested
+    {
+        return Err(RallyError::Usage(
+            "handoff_reply_state_invalid: a reply must be handoff.acked, handoff.accepted, or handoff.rejected".to_string(),
+        ));
+    }
+    if referenced.kind != FactKind::Handoff
+        && protocol_kind != rally_protocol::delivery::ProtocolEventKind::HandoffRequested
+    {
+        return Err(RallyError::Usage(
+            "handoff_request_state_invalid: a handoff against an artifact/request must be handoff.requested".to_string(),
+        ));
+    }
+    if let Err(errors) = protocol_kind.validate(
+        &event_envelope,
+        rally_protocol::delivery::CompatMode::Strict,
+    ) {
+        return Err(RallyError::Usage(format!(
+            "handoff_protocol_envelope_invalid: {errors:?}"
+        )));
+    }
+    let to_session = protocol_marker(fact, "to_session_id").ok_or_else(|| {
+        RallyError::Usage(
+            "handoff_binding_missing_session: strict handoff has no to_session_id".to_string(),
+        )
+    })?;
+    if protocol_marker(fact, "ref_event_id") != Some(ref_id)
+        || protocol_marker(fact, "causation_id") != Some(ref_id)
+    {
+        return Err(RallyError::Usage(
+            "handoff_binding_causality_mismatch: ref_event_id and causation_id must equal ref"
+                .to_string(),
+        ));
+    }
+    if protocol_marker(fact, "correlation_id").is_none()
+        || protocol_marker(fact, "handoff_id").is_none()
+    {
+        return Err(RallyError::Usage(
+            "handoff_binding_causality_missing: correlation_id and handoff_id are required"
+                .to_string(),
+        ));
+    }
+    if protocol_marker(fact, "correlation_id") != Some(fact.thread_id.as_str()) {
+        return Err(RallyError::Usage(
+            "handoff_correlation_mismatch: Fact.thread_id must equal protocol:correlation_id"
+                .to_string(),
+        ));
+    }
+    if policy == "third-party" {
+        if referenced.kind == FactKind::Handoff {
+            return Err(RallyError::Usage(format!(
+                "handoff_third_party_reply_forbidden: ref {ref_id} is a handoff bound to one receiver; that exact receiver must reply"
+            )));
+        }
+        let target = fact.target.as_deref().unwrap_or_default();
+        let mut active = BTreeMap::<String, ManagedSession>::new();
+        let mut ordered = facts.to_vec();
+        ordered.sort_by_key(|candidate| candidate.seq);
+        for candidate in ordered
+            .into_iter()
+            .filter(|candidate| candidate.kind == FactKind::Session)
+        {
+            if let Some(session) = candidate.session {
+                if candidate.status.as_deref() == Some("stopped") {
+                    active.remove(&session.session_id);
+                } else {
+                    active.insert(session.session_id.clone(), session);
+                }
+            }
+        }
+        let exact = active
+            .values()
+            .filter(|session| {
+                let inputs = crate::session_identity::EndpointInputs {
+                    managed_session_id: Some(session.session_id.clone()),
+                    ..Default::default()
+                };
+                let endpoint = crate::session_identity::derive_endpoint(&inputs);
+                let canonical = crate::session_identity::ProtocolSessionIdentity::mint(
+                    &endpoint,
+                    session.tool.split(':').next().unwrap_or(&session.tool),
+                    "live",
+                    session.tool.split_once(':').map(|(_, actor)| actor),
+                    None,
+                );
+                canonical.from_session_id() == to_session && session.tool == target
+            })
+            .count();
+        if exact != 1 {
+            return Err(RallyError::Usage(format!(
+                "handoff_target_session_not_active: {target}/{to_session} is not one exact active managed session; run `rally sessions --json`"
+            )));
+        }
+        return Ok(());
+    }
+    if policy != "ref-author" {
+        return Err(RallyError::Usage(format!(
+            "handoff_target_policy_invalid: {policy}"
+        )));
+    }
+    if referenced.kind == FactKind::Handoff {
+        let expected_reply_tool = referenced.target.as_deref().unwrap_or_default();
+        let expected_reply_session =
+            protocol_marker(referenced, "to_session_id").unwrap_or_default();
+        if fact.tool.as_deref() != Some(expected_reply_tool)
+            || fact.from_session_id.as_deref() != Some(expected_reply_session)
+            || fact.target != referenced.tool
+            || Some(to_session) != referenced.from_session_id.as_deref()
+        {
+            return Err(RallyError::Usage(format!(
+                "handoff_reply_author_mismatch: ref {ref_id} reply does not match its exact bound receiver/author sessions"
+            )));
+        }
+    } else if fact.target != referenced.tool
+        || Some(to_session) != referenced.from_session_id.as_deref()
+    {
+        return Err(RallyError::Usage(format!(
+            "handoff_target_mismatch: ref {ref_id} must bind its author tool and session"
+        )));
+    }
+    Ok(())
+}
+
 /// A typed degradation that happened only after the canonical JSONL fact was
 /// synced and read back exactly. Callers must surface these warnings, but must
 /// not retry the mutation: `committed` is already true.
@@ -1433,6 +1713,42 @@ pub(crate) const MAX_WIRE_SNAPSHOT_INTERNALS_BYTES: usize = 512 * 1_024;
 pub(crate) const WIRE_INTERNALS_KEY: &str = "__internals";
 
 impl RoomSnapshot {
+    /// Return an operational projection without mutating or deleting ledger
+    /// history. It keeps action-bearing buckets and only fresh or participating
+    /// actors; `room` without `--actionable` remains the complete projection.
+    pub(crate) fn into_actionable(mut self) -> Self {
+        let mut participants = BTreeSet::new();
+        for fact in self
+            .active_claims
+            .iter()
+            .chain(self.active_blockers.iter())
+            .chain(self.open_handoffs.iter())
+            .chain(self.unconsumed_artifacts.iter())
+        {
+            if let Some(tool) = &fact.tool {
+                participants.insert(tool.clone());
+            }
+            if let Some(target) = &fact.target {
+                participants.insert(target.clone());
+            }
+        }
+        self.squads.retain(|squad| {
+            squad.freshness == FRESHNESS_FRESH || participants.contains(&squad.tool)
+        });
+        let pending = self
+            .unconsumed_artifacts
+            .iter()
+            .map(|fact| fact.event_id.as_str())
+            .collect::<BTreeSet<_>>();
+        self.recent_artifacts
+            .retain(|fact| pending.contains(fact.event_id.as_str()));
+        // Current Andon/Jidoka alerts are already bounded and deduplicated by
+        // health class in the canonical projection. Keep them actionable.
+        self.stale_facts.clear();
+        refresh_snapshot_totals(&mut self);
+        self
+    }
+
     /// Lift the skipped projections out for the wire.
     pub(crate) fn internals(&self) -> SnapshotInternals {
         SnapshotInternals {
@@ -3797,6 +4113,27 @@ impl DirectRoomStore {
             crate::mark_watchdog_append_outcome(&outcome);
             return Ok(outcome);
         }
+        if fact.kind == FactKind::Handoff {
+            let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+            validate_referenced_handoff(&fact, &facts)?;
+            if let Some(key) = protocol_marker(&fact, "idempotency_key")
+                && let Some(existing) = facts.iter().find(|candidate| {
+                    is_fact_v1_handoff_bridge(candidate)
+                        && protocol_marker(candidate, "idempotency_key") == Some(key)
+                })
+            {
+                if !same_handoff_semantics(existing, &fact) {
+                    return Err(RallyError::Usage(format!(
+                        "handoff_idempotency_conflict: key {key} already belongs to event {}; reuse the original semantics or choose a new key",
+                        existing.event_id
+                    )));
+                }
+                let mut outcome = AppendOutcome::committed(existing.clone(), Vec::new());
+                outcome.warnings = self.project_canonical_fact(existing);
+                outcome.projection_complete = outcome.warnings.is_empty();
+                return Ok(outcome);
+            }
+        }
         // SEC-001 close: a takeover Release authorizes reclaiming a stale peer's
         // claim. Eligibility was judged on an UNLOCKED snapshot in
         // `command_release_by_path`; an owner could revive in the gap before we
@@ -5901,9 +6238,15 @@ fn handoff_closer_matches_target(handoff: &Fact, closer: &Fact) -> bool {
         return true;
     }
 
-    // Legacy rows predate session identity and used artifact/resolve refs as
-    // broad completion markers. Keep replay stable for those ledgers while
-    // applying target correlation to session-era durable writes.
+    // Strict referenced handoffs bind both the logical tool and the exact
+    // receiver session. A same-tool sibling must not manufacture completion.
+    if let Some(expected_session) = strict_handoff_target_session(handoff) {
+        return handoff.target.as_deref() == closer.tool.as_deref()
+            && closer.from_session_id.as_deref() == Some(expected_session);
+    }
+
+    // Legacy rows predate the protocol session binding and used
+    // artifact/resolve refs as broad completion markers. Keep their behavior.
     if closer.from_session_id.is_none() {
         return true;
     }
@@ -6279,6 +6622,7 @@ fn snapshot_from_facts_with_policy_at(
     let open_handoffs = facts
         .iter()
         .filter(|f| f.kind == "handoff")
+        .filter(|f| handoff_is_protocol_request(f))
         .filter(|f| !handoff_is_closed(f, facts))
         // B18: exclude external-intake facts from repo-local backlog.
         .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
@@ -9857,6 +10201,194 @@ mod ledger_tests {
             uri: None,
             session: None,
         }
+    }
+
+    #[test]
+    fn new_markerless_referenced_handoff_is_rejected_but_legacy_row_replays() {
+        let root = unique_root("referenced-handoff-legacy-replay");
+        let store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        let artifact = make_fact("artifact-a", FactKind::Artifact, "src/a.rs", "artifact");
+        store.append_fact(&artifact).unwrap();
+
+        let mut markerless = make_fact(
+            "new-markerless-handoff",
+            FactKind::Handoff,
+            "src/a.rs",
+            "handoff",
+        );
+        markerless.tool = Some("reviewer:r".to_string());
+        markerless.target = Some("test".to_string());
+        markerless.ref_id = Some(artifact.event_id.clone());
+        markerless.from_session_id = Some("session-reviewer".to_string());
+        let error = store.append_fact(&markerless).unwrap_err().to_string();
+        assert!(
+            error.contains("handoff_protocol_marker_missing"),
+            "new weak append must fail before mutation: {error}"
+        );
+        assert_eq!(store.facts().unwrap().len(), 1);
+
+        let legacy_root = unique_root("legacy-markerless-handoff-replay");
+        let legacy_store = DirectRoomStore::open_direct_at_with_engagement(
+            legacy_root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        let mut legacy = markerless;
+        legacy.event_id = "legacy-markerless-handoff".to_string();
+        legacy.seq = 1;
+        legacy.from_session_id = None;
+        let line = LedgerLine {
+            seq: 1,
+            occurred_at: legacy.created_at.clone(),
+            event_type: "handoff".to_string(),
+            payload: serde_json::to_value(&legacy).unwrap(),
+            engagement: Some("engagement-alpha".to_string()),
+        };
+        fs::create_dir_all(legacy_store.active_segment_path().parent().unwrap()).unwrap();
+        fs::write(
+            legacy_store.active_segment_path(),
+            format!("{}\n", serde_json::to_string(&line).unwrap()),
+        )
+        .unwrap();
+        let replayed = legacy_store.facts().unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].event_id, "legacy-markerless-handoff");
+        assert!(replayed[0].evidence.is_empty());
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(legacy_root).ok();
+    }
+
+    #[test]
+    fn raw_referenced_handoff_rejects_duplicate_protocol_markers() {
+        let root = unique_root("referenced-handoff-duplicate-marker");
+        let store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        let artifact = make_fact("artifact-a", FactKind::Artifact, "src/a.rs", "artifact");
+        store.append_fact(&artifact).unwrap();
+        let mut handoff = make_fact("strict-handoff", FactKind::Handoff, "src/a.rs", "handoff");
+        handoff.tool = Some("reviewer:r".to_string());
+        handoff.target = artifact.tool.clone();
+        handoff.ref_id = Some(artifact.event_id.clone());
+        handoff.from_session_id = Some("session-reviewer".to_string());
+        handoff.evidence = vec![
+            "protocol:target_policy=ref-author".to_string(),
+            "protocol:to_session_id=session-author".to_string(),
+            "protocol:to_session_id=forged".to_string(),
+            "protocol:ref_event_id=artifact-a".to_string(),
+            "protocol:causation_id=artifact-a".to_string(),
+            "protocol:correlation_id=thread-a".to_string(),
+            "protocol:handoff_id=handoff-a".to_string(),
+            "protocol:idempotency_key=operation-a".to_string(),
+        ];
+        let error = store.append_fact(&handoff).unwrap_err().to_string();
+        assert!(error.contains("handoff_protocol_marker_duplicate"));
+        assert_eq!(store.facts().unwrap().len(), 1);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn raw_unreferenced_handoff_cannot_forge_protocol_namespace() {
+        let root = unique_root("unreferenced-handoff-protocol-forgery");
+        let store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        let mut forged = make_fact("forged-handoff", FactKind::Handoff, "src/a.rs", "forged");
+        forged.target = Some("author:a".to_string());
+        forged.evidence = vec!["protocol:to_session_id=forged".to_string()];
+        let error = store.append_fact(&forged).unwrap_err().to_string();
+        assert!(
+            error.contains("handoff_protocol_marker_requires_ref"),
+            "{error}"
+        );
+        assert!(store.facts().unwrap().is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn prebridge_to_session_marker_keeps_legacy_closure_projection() {
+        let mut handoff = make_fact("legacy-handoff", FactKind::Handoff, "src/a.rs", "legacy");
+        handoff.seq = 1;
+        handoff.target = Some("author:a".to_string());
+        handoff.evidence = vec!["protocol:to_session_id=old-advisory-value".to_string()];
+        let mut closer = make_fact("legacy-closer", FactKind::Receipt, "src/a.rs", "done");
+        closer.seq = 2;
+        closer.tool = Some("author:a".to_string());
+        closer.from_session_id = Some("different-session-era-value".to_string());
+        closer.ref_id = Some(handoff.event_id.clone());
+
+        assert!(handoff_closer_matches_target(&handoff, &closer));
+        let snapshot = snapshot_from_facts_with_policy(
+            &[handoff, closer],
+            &crate::hooks_config::CoordinationConfig::default(),
+            false,
+        );
+        assert!(snapshot.open_handoffs.is_empty());
+    }
+
+    #[test]
+    fn raw_third_party_append_cannot_bypass_strict_handoff_receiver() {
+        let root = unique_root("referenced-handoff-third-party-bypass");
+        let store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        let mut artifact = make_fact("artifact-a", FactKind::Artifact, "src/a.rs", "artifact");
+        artifact.from_session_id = Some("session-author".to_string());
+        store.append_fact(&artifact).unwrap();
+
+        let mut strict = make_fact("strict-handoff", FactKind::Handoff, "src/a.rs", "handoff");
+        strict.tool = Some("reviewer:r".to_string());
+        strict.target = artifact.tool.clone();
+        strict.ref_id = Some(artifact.event_id.clone());
+        strict.from_session_id = Some("session-reviewer".to_string());
+        strict.thread_id = artifact.thread_id.clone();
+        strict.evidence = vec![
+            "protocol:bridge_version=fact-v1".to_string(),
+            "protocol:event_kind=handoff.requested".to_string(),
+            "protocol:target_policy=ref-author".to_string(),
+            "protocol:to_session_id=session-author".to_string(),
+            "protocol:ref_event_id=artifact-a".to_string(),
+            "protocol:causation_id=artifact-a".to_string(),
+            format!("protocol:correlation_id={}", artifact.thread_id),
+            "protocol:handoff_id=handoff-a".to_string(),
+            "protocol:idempotency_key=operation-a".to_string(),
+        ];
+        store.append_fact(&strict).unwrap();
+
+        let mut bypass = make_fact("forged-ack", FactKind::Handoff, "src/a.rs", "forged");
+        bypass.tool = Some("attacker:x".to_string());
+        bypass.target = Some("reviewer:r".to_string());
+        bypass.ref_id = Some(strict.event_id.clone());
+        bypass.from_session_id = Some("session-attacker".to_string());
+        bypass.thread_id = artifact.thread_id.clone();
+        bypass.evidence = vec![
+            "protocol:bridge_version=fact-v1".to_string(),
+            "protocol:event_kind=handoff.acked".to_string(),
+            "protocol:target_policy=third-party".to_string(),
+            "protocol:to_session_id=session-attacker".to_string(),
+            "protocol:ref_event_id=strict-handoff".to_string(),
+            "protocol:causation_id=strict-handoff".to_string(),
+            format!("protocol:correlation_id={}", artifact.thread_id),
+            "protocol:handoff_id=handoff-a".to_string(),
+            "protocol:idempotency_key=operation-b".to_string(),
+        ];
+        let error = store.append_fact(&bypass).unwrap_err().to_string();
+        assert!(
+            error.contains("handoff_third_party_reply_forbidden"),
+            "{error}"
+        );
+        assert_eq!(store.facts().unwrap().len(), 2);
+        fs::remove_dir_all(root).ok();
     }
 
     fn scoped_presence(event_id: &str, tool: &str) -> Fact {
@@ -16745,6 +17277,34 @@ mod decay_reclaim_tests {
             acknowledged: false,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn actionable_projection_excludes_stale_noise_without_mutating_source() {
+        let mut fresh = squad("fresh", 5);
+        fresh.freshness = FRESHNESS_FRESH.to_string();
+        let mut stale = squad("stale", 86_400);
+        stale.freshness = FRESHNESS_STALE.to_string();
+        let stale_fact = aged_fact("stale-fact", FactKind::Read, 86_400);
+        let mut health = aged_fact("health-now", FactKind::Risk, 5);
+        health.subject = "duplicate-active-squad-id: reviewer".to_string();
+        let snapshot = RoomSnapshot {
+            max_seq: 7,
+            squads: vec![fresh, stale],
+            stale_facts: vec![stale_fact.clone()],
+            system_health: vec![health],
+            ..Default::default()
+        };
+        let canonical = snapshot.clone();
+        let actionable = snapshot.into_actionable();
+        assert_eq!(actionable.squads.len(), 1);
+        assert_eq!(actionable.squads[0].tool, "fresh");
+        assert!(actionable.stale_facts.is_empty());
+        assert_eq!(actionable.system_health.len(), 1);
+        assert_eq!(actionable.system_health[0].event_id, "health-now");
+        assert_eq!(canonical.squads.len(), 2);
+        assert_eq!(canonical.stale_facts.len(), 1);
+        assert_eq!(canonical.max_seq, actionable.max_seq);
     }
 
     fn claim_with(tool: &str, scopes: &[&str], owner_age_secs: i64) -> (Fact, RoomSnapshot) {

@@ -186,6 +186,14 @@ pub(crate) struct SayArgs {
     pub(crate) paths: Vec<String>,
     pub(crate) evidence: Vec<String>,
     pub(crate) target: Option<String>,
+    /// Referenced handoff routing policy. `ref-author` is fail-closed; the
+    /// explicit `third-party` compatibility path requires one managed session.
+    pub(crate) target_policy: Option<String>,
+    /// Durable protocol state for a referenced handoff. Initial requests
+    /// default to `requested`; replies must declare acked/accepted/rejected.
+    pub(crate) handoff_state: Option<String>,
+    /// Stable writer retry key for idempotent handoff/reply appends.
+    pub(crate) idempotency_key: Option<String>,
     pub(crate) ref_id: Option<String>,
     pub(crate) status: Option<String>,
     pub(crate) severity: Option<String>,
@@ -250,6 +258,8 @@ pub(crate) struct RoomArgs {
     /// `room_budget_fraction x consumer_context_bytes`. `0` disables the
     /// ceiling for this call.
     pub(crate) budget_bytes: Option<usize>,
+    /// Project only current action-bearing work and fresh/participating actors.
+    pub(crate) actionable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1399,6 +1409,9 @@ fn say_parser() -> impl Parser<SayArgs> {
     let paths = many_string_arg("path", "PATH");
     let evidence = many_string_arg("evidence", "EVIDENCE");
     let target = target_arg();
+    let target_policy = optional_string_arg("target-policy", "POLICY");
+    let handoff_state = optional_string_arg("handoff-state", "STATE");
+    let idempotency_key = optional_string_arg("idempotency-key", "KEY");
     let ref_id = optional_string_arg("ref", "EVENT_ID");
     let status = optional_string_arg("status", "STATUS");
     let severity = optional_string_arg("severity", "SEVERITY");
@@ -1437,6 +1450,9 @@ fn say_parser() -> impl Parser<SayArgs> {
         paths,
         evidence,
         target,
+        target_policy,
+        handoff_state,
+        idempotency_key,
         ref_id,
         status,
         severity,
@@ -1464,6 +1480,9 @@ fn say_parser() -> impl Parser<SayArgs> {
             paths,
             evidence,
             target,
+            target_policy,
+            handoff_state,
+            idempotency_key,
             ref_id,
             status,
             severity,
@@ -1490,6 +1509,9 @@ fn say_parser() -> impl Parser<SayArgs> {
             paths,
             evidence,
             target,
+            target_policy,
+            handoff_state,
+            idempotency_key,
             ref_id,
             status,
             severity,
@@ -1531,6 +1553,9 @@ fn room_parser() -> impl Parser<RoomArgs> {
         )
         .argument::<usize>("BYTES")
         .optional();
+    let actionable = long("actionable")
+        .help("show current action-bearing work and fresh/participating actors; raw history is unchanged")
+        .switch();
     construct!(RoomArgs {
         json,
         tool,
@@ -1541,7 +1566,8 @@ fn room_parser() -> impl Parser<RoomArgs> {
         since,
         readers,
         include_archived,
-        budget_bytes
+        budget_bytes,
+        actionable
     })
 }
 

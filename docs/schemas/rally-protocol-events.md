@@ -88,9 +88,13 @@ a warning; hardened rooms turn it into a hard reject ("warnings over hard locks"
 `event_id`. First sighting → append; duplicate retry → skip. Prevents a
 double-delivered write from creating two durable facts.
 
-## Integration note
+## Fact v1 integration bridge
 
-This module is delivered isolated (branch `claude/session-identity`). In
-`integration-wiring` its fields fold into `store::Fact`, `validate`/`authorize`
-are called at the `say` write-path, and `Deduper` backs append-dedup. The staged
-`#![allow(dead_code)]` is removed then.
+Referenced handoffs use the typed `ProtocolEventKind` and `EventEnvelope`
+validators before append. Until the next Fact schema revision adds dedicated
+envelope fields, the append-only Fact v1 row serializes that contract as one
+Rally-owned marker per field in `evidence`. The required discriminator is
+`protocol:bridge_version=fact-v1`; the controlled state marker is
+`protocol:event_kind=handoff.requested|handoff.acked|handoff.accepted|handoff.rejected`.
+The write boundary rejects missing, duplicate, unknown, or caller-supplied
+`protocol:*` markers. Legacy rows replay without retroactive validation.
