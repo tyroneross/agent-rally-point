@@ -551,15 +551,20 @@ mod inotify_backend {
                 if elapsed >= timeout {
                     return WaitOutcome::TimedOut;
                 }
-                let remaining_ms =
-                    (timeout - elapsed).as_millis().min(i64::from(i32::MAX) as u128) as i32;
+                let remaining_ms = (timeout - elapsed)
+                    .as_millis()
+                    .min(i64::from(i32::MAX) as u128) as i32;
                 let mut pfd = libc::pollfd {
                     fd: self.fd.raw(),
                     events: libc::POLLIN,
                     revents: 0,
                 };
                 let n = unsafe {
-                    libc::poll(&mut pfd as *mut libc::pollfd, 1 as libc::nfds_t, remaining_ms)
+                    libc::poll(
+                        &mut pfd as *mut libc::pollfd,
+                        1 as libc::nfds_t,
+                        remaining_ms,
+                    )
                 };
                 match n {
                     0 => return WaitOutcome::TimedOut,
@@ -631,7 +636,11 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 /// `log_dir` is expected already-absolute (as `command_watch` builds it),
 /// but `Path::join` with an absolute RHS replaces the LHS entirely, so this
 /// is correct either way.
-pub(crate) fn ack_file_conflicts_with_log_dir(repo: &Path, log_dir: &Path, ack_file: &Path) -> bool {
+pub(crate) fn ack_file_conflicts_with_log_dir(
+    repo: &Path,
+    log_dir: &Path,
+    ack_file: &Path,
+) -> bool {
     let log_dir_norm = lexical_normalize(&repo.join(log_dir));
     let ack_norm = lexical_normalize(&repo.join(ack_file));
     ack_norm == log_dir_norm || ack_norm.starts_with(&log_dir_norm)
@@ -864,7 +873,11 @@ mod tests {
         let log_dir = repo.join(".rally").join("log");
 
         assert!(
-            ack_file_conflicts_with_log_dir(&repo, &log_dir, &PathBuf::from(".rally/log/watch-acks.jsonl")),
+            ack_file_conflicts_with_log_dir(
+                &repo,
+                &log_dir,
+                &PathBuf::from(".rally/log/watch-acks.jsonl")
+            ),
             "a relative ack-file nested under the log dir must be refused"
         );
         assert!(
@@ -880,11 +893,19 @@ mod tests {
             "an ack-file that IS the log dir itself must be refused"
         );
         assert!(
-            !ack_file_conflicts_with_log_dir(&repo, &log_dir, &PathBuf::from(".rally/watch-acks.jsonl")),
+            !ack_file_conflicts_with_log_dir(
+                &repo,
+                &log_dir,
+                &PathBuf::from(".rally/watch-acks.jsonl")
+            ),
             "the documented sibling path .rally/watch-acks.jsonl must be allowed"
         );
         assert!(
-            !ack_file_conflicts_with_log_dir(&repo, &log_dir, &PathBuf::from(".rally/log-archive/acks.jsonl")),
+            !ack_file_conflicts_with_log_dir(
+                &repo,
+                &log_dir,
+                &PathBuf::from(".rally/log-archive/acks.jsonl")
+            ),
             "a directory that merely shares the `log` PREFIX (log-archive) must not be \
              treated as nested under log/ — this pins the guard to path components, not \
              a string prefix check"

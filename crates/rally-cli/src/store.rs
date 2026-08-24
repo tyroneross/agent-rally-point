@@ -9344,9 +9344,7 @@ pub(crate) fn prune_corrupt_quarantine(dir: &Path, base: &str) -> Result<PruneSt
     let mut bytes_kept: u64 = 0;
     let mut groups_archived = 0usize;
 
-    let archive_root = dir
-        .join(ARCHIVE_DIRNAME)
-        .join(crate::doctor::SWEPT_SUBDIR);
+    let archive_root = dir.join(ARCHIVE_DIRNAME).join(crate::doctor::SWEPT_SUBDIR);
 
     for (idx, group) in groups.iter().enumerate() {
         let size = group.total_bytes();
@@ -13108,8 +13106,8 @@ mod ledger_tests {
         // not error (the source file is gone) — and does not double-count.
         fs::write(&facts_db, b"corrupt").unwrap();
         quarantine_corrupt_db(&facts_db).unwrap();
-        let counter_after_real_quarantine = read_corruption_counter(&rally)
-            .expect("real quarantine writes the counter");
+        let counter_after_real_quarantine =
+            read_corruption_counter(&rally).expect("real quarantine writes the counter");
         assert_eq!(counter_after_real_quarantine.count, 1);
         quarantine_corrupt_db(&facts_db).unwrap();
         assert!(!facts_db.exists());
@@ -13158,7 +13156,9 @@ mod ledger_tests {
         let stats = prune_corrupt_quarantine(&rally, base).unwrap();
         assert_eq!(stats.groups_archived, 2);
 
-        let swept = rally.join(ARCHIVE_DIRNAME).join(crate::doctor::SWEPT_SUBDIR);
+        let swept = rally
+            .join(ARCHIVE_DIRNAME)
+            .join(crate::doctor::SWEPT_SUBDIR);
         for &stamp in &stamps[..2] {
             let dest = swept.join(stamp.to_string());
             for suffix in ["", "-db-shm", "-db-wal"] {
@@ -13371,12 +13371,17 @@ mod ledger_tests {
         // write inside `log/` would bump the segment index `max_seq` that
         // `rally watch` polls and self-trigger the watcher.
         assert!(rally.join(CORRUPTION_COUNTER_FILENAME).is_file());
-        assert!(!rally.join(LOG_DIRNAME).join(CORRUPTION_COUNTER_FILENAME).exists());
+        assert!(
+            !rally
+                .join(LOG_DIRNAME)
+                .join(CORRUPTION_COUNTER_FILENAME)
+                .exists()
+        );
 
         fs::write(&facts_db, b"corrupt-2").unwrap();
         quarantine_corrupt_db(&facts_db).unwrap();
-        let after_second = read_corruption_counter(&rally)
-            .expect("counter still present after second quarantine");
+        let after_second =
+            read_corruption_counter(&rally).expect("counter still present after second quarantine");
         assert_eq!(after_second.count, 2);
         assert_eq!(
             after_second.first_at, after_first.first_at,

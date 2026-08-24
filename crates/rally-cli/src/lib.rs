@@ -5962,7 +5962,13 @@ fn watch_emit_activity(
 }
 
 /// Emit one JSONL heartbeat line (idle tick, only under --json).
-fn watch_emit_heartbeat(room_id: &str, tool: Option<&str>, current_seq: i64, interval: u64, mode: &str) {
+fn watch_emit_heartbeat(
+    room_id: &str,
+    tool: Option<&str>,
+    current_seq: i64,
+    interval: u64,
+    mode: &str,
+) {
     let line = serde_json::json!({
         "event": "heartbeat",
         "seq": current_seq,
@@ -6357,7 +6363,15 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
         let cursor = watch_read_once_cursor(&rally_dir);
         let current_seq = watch_read_max_seq(&log_dir);
         if current_seq > cursor {
-            watch_emit_activity(true, cursor, current_seq, &room_id, args.tool.as_deref(), "poll", 0);
+            watch_emit_activity(
+                true,
+                cursor,
+                current_seq,
+                &room_id,
+                args.tool.as_deref(),
+                "poll",
+                0,
+            );
             watch_write_once_cursor(&rally_dir, current_seq);
         } else {
             // Persist updated cursor even when unchanged (ensures cursor tracks reality).
@@ -6542,7 +6556,13 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
         } else {
             // Idle: emit heartbeat under --json, then back off.
             if args.json {
-                watch_emit_heartbeat(&room_id, args.tool.as_deref(), last_seq, current_interval, mode);
+                watch_emit_heartbeat(
+                    &room_id,
+                    args.tool.as_deref(),
+                    last_seq,
+                    current_interval,
+                    mode,
+                );
             }
             // Adaptive back-off: multiply by 1.5, cap at max_interval. Under
             // the event backend this growing number is now just the
