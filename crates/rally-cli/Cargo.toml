@@ -20,6 +20,13 @@ bpaf.workspace = true
 chrono.workspace = true
 factstr.workspace = true
 factstr-sqlite.workspace = true
+# kqueue (macOS/BSD)/inotify (Linux) FFI backing `log_watch` — event-driven
+# `rally watch`. `libc 0.2.186` is already in Cargo.lock as a transitive dep
+# (via rusqlite et al.), so this adds ZERO new crates to the build graph.
+# Deliberately NOT the `notify` crate — it pulls a large dependency tree,
+# which conflicts with this crate's minimal-dependency discipline (see the
+# H4 architectural lint in `tests/arch_no_herdr_dep.rs`).
+libc.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -131,6 +131,7 @@ mod hook_runtime;
 mod hooks_config;
 mod init;
 mod liveness;
+mod log_watch;
 mod next;
 mod observed_liveness;
 mod output;
@@ -702,6 +703,41 @@ fn first_two_positionals_are_daemon_serve(args: &[String]) -> bool {
     matches!(first_positionals(args), (Some("daemon"), Some("serve")))
 }
 
+/// True iff this invocation is `rally watch` in its LONG-RUNNING loop mode.
+///
+/// Same failure shape as [`first_two_positionals_are_daemon_serve`], found the
+/// same way — by running the binary rather than reading it. `rally watch` (loop
+/// mode) blocks for the watcher's entire lifetime, but it was never exempted
+/// from the 3s hook-safety watchdog, so it fell through
+/// `resolve_watchdog_timeout`'s case (3) and was killed at
+/// `DEFAULT_WATCHDOG_TIMEOUT_MS`. Observed live before this fix: one heartbeat
+/// line, then a `watchdog_timeout: true` envelope at 3005ms — and, because the
+/// fail-open path calls `std::process::exit(0)`, it LOOKED like clean success.
+///
+/// That made the watcher useless as a notification seam at any `--interval`:
+/// under a `Restart=always` unit it churned every ~3s, and each restart
+/// re-seeds `last_seq` from the CURRENT max, so every fact posted while it was
+/// down was silently skipped. A five-minute-stale watcher was the visible
+/// symptom; a three-second-lived one was the cause.
+///
+/// Scope is deliberately narrow — only the blocking loop bypasses:
+///   * `--once` is a bounded point-in-time check and is exactly the hook-safe
+///     shape the watchdog exists to protect, so it KEEPS its deadline.
+///   * `--print-launchd` / `--print-systemd` render text and exit immediately.
+fn first_positional_is_long_running_watch(args: &[String]) -> bool {
+    if args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        != Some("watch")
+    {
+        return false;
+    }
+    !args
+        .iter()
+        .any(|a| a == "--once" || a == "--print-launchd" || a == "--print-systemd")
+}
+
 /// True iff the leading two positionals are `hook before-write`.
 ///
 /// F-4: `command_hook`'s contract is "the exit code is ALWAYS 0" -- the phase
@@ -885,6 +921,14 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
     // stray `--timeout-ms`/`--fail-open` on the invocation can't reach the
     // `daemon` subcommand parser (which doesn't know about them).
     if first_two_positionals_are_daemon_serve(&args) {
+        return run_inline(strip_timeout_flag(args));
+    }
+
+    // Same bypass, same reason, for `rally watch`'s blocking loop mode — it
+    // outlives any finite hook budget by design. See
+    // `first_positional_is_long_running_watch`. `watch --once` deliberately
+    // does NOT take this path and keeps its watchdog.
+    if first_positional_is_long_running_watch(&args) {
         return run_inline(strip_timeout_flag(args));
     }
 
@@ -5879,12 +5923,23 @@ fn watch_write_once_cursor(rally_dir: &Path, seq: i64) {
 }
 
 /// Emit one JSONL activity event to stdout.
+///
+/// `mode` is `"event"` when this activity was detected via a kernel change
+/// notification (kqueue/inotify), or `"poll"` when it came from `--poll`,
+/// the `--once` single-check path, or a backend fallback (no watch
+/// support). `wait_ms` is the measured wall-clock the watcher was blocked
+/// in `log_watch::wait_for_change` (or `thread::sleep` under `--poll`)
+/// before this activity fired — the real delivery-latency number a run
+/// reports, not the configured `--interval`.
+#[allow(clippy::too_many_arguments)]
 fn watch_emit_activity(
     json: bool,
     from_seq: i64,
     to_seq: i64,
     room_id: &str,
     tool_last: Option<&str>,
+    mode: &str,
+    wait_ms: u64,
 ) {
     if json || from_seq != to_seq {
         let line = serde_json::json!({
@@ -5893,6 +5948,9 @@ fn watch_emit_activity(
             "to_seq": to_seq,
             "room": room_id,
             "tool_last": tool_last,
+            "mode": mode,
+            "wait_ms": wait_ms,
+            "backend": log_watch::backend_name(),
             "ts": now_string(),
         });
         crate::output::write_line_or_exit_on_broken_pipe(&line.to_string());
@@ -5900,21 +5958,85 @@ fn watch_emit_activity(
 }
 
 /// Emit one JSONL heartbeat line (idle tick, only under --json).
-fn watch_emit_heartbeat(room_id: &str, tool: Option<&str>, current_seq: i64, interval: u64) {
+fn watch_emit_heartbeat(room_id: &str, tool: Option<&str>, current_seq: i64, interval: u64, mode: &str) {
     let line = serde_json::json!({
         "event": "heartbeat",
         "seq": current_seq,
         "room": room_id,
         "tool": tool,
         "interval": interval,
+        "mode": mode,
+        "backend": log_watch::backend_name(),
         "ts": now_string(),
     });
     crate::output::write_line_or_exit_on_broken_pipe(&line.to_string());
 }
 
+/// Emit one JSONL `delivery` event to stdout after `--on-activity` returns
+/// (detection is not delivery — this is the ack an external adapter, e.g. a
+/// tmux doorbell, can tail to confirm the handoff was actually run, not
+/// just noticed). When `--ack-file` is set, the same line is additionally
+/// appended to that file; a write error there is logged to stderr and
+/// ignored — never fatal to the watch loop.
+#[allow(clippy::too_many_arguments)]
+fn watch_emit_delivery(
+    room_id: &str,
+    tool: Option<&str>,
+    from_seq: i64,
+    to_seq: i64,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    ack_file: Option<&str>,
+    repo: &Path,
+) {
+    let line = serde_json::json!({
+        "event": "delivery",
+        "from_seq": from_seq,
+        "to_seq": to_seq,
+        "exit_code": exit_code,
+        "duration_ms": duration_ms,
+        "room": room_id,
+        "tool": tool,
+        "ts": now_string(),
+    });
+    let text = line.to_string();
+    crate::output::write_line_or_exit_on_broken_pipe(&text);
+    if let Some(ack_file) = ack_file {
+        let path = if Path::new(ack_file).is_absolute() {
+            PathBuf::from(ack_file)
+        } else {
+            repo.join(ack_file)
+        };
+        if let Err(err) = watch_append_ack_line(&path, &text) {
+            eprintln!(
+                "rally watch: --ack-file append error ({}): {err}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Append one line to `path`, creating the file if it does not already
+/// exist. Append-only; never truncates. The parent directory (typically the
+/// repo's `.rally/`) is expected to already exist — this does not create
+/// directories, matching the "best-effort, never fatal" contract at the
+/// call site.
+fn watch_append_ack_line(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")
+}
+
 /// Run `--on-activity <cmd>` via the shell with the context env vars.
 /// Blocks until the child exits (one in-flight at a time). Errors are logged
 /// and ignored — the watcher must not die on a transient subprocess error.
+///
+/// Returns `(exit_code, duration_ms)`: `exit_code` is `None` on a spawn/wait
+/// error or when the child was killed by a signal (no exit code); the
+/// caller (`watch_emit_delivery`) reports that as JSON `null`.
 fn watch_run_on_activity(
     cmd: &str,
     room_id: &str,
@@ -5922,7 +6044,8 @@ fn watch_run_on_activity(
     to_seq: i64,
     tool: Option<&str>,
     repo: &Path,
-) {
+) -> (Option<i32>, u64) {
+    let started = Instant::now();
     let mut child = match std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
@@ -5936,20 +6059,46 @@ fn watch_run_on_activity(
         Ok(c) => c,
         Err(err) => {
             eprintln!("rally watch: --on-activity spawn error: {err}");
-            return;
+            return (None, started.elapsed().as_millis() as u64);
         }
     };
-    if let Err(err) = child.wait() {
-        eprintln!("rally watch: --on-activity wait error: {err}");
+    match child.wait() {
+        Ok(status) => (status.code(), started.elapsed().as_millis() as u64),
+        Err(err) => {
+            eprintln!("rally watch: --on-activity wait error: {err}");
+            (None, started.elapsed().as_millis() as u64)
+        }
     }
 }
 
 /// Render a launchd plist referencing this binary + the current working dir.
 /// Pure (returns the plist string) so it is unit-testable without spawning a
 /// live binary; takes only the `WatchArgs` fields it needs.
+///
+/// Convenience wrapper preserving the original 4-arg signature — still
+/// exercised directly (unchanged) by
+/// `watch_print_launchd_contains_watch_and_repo_path`. Forwards to
+/// [`render_launchd_plist_full`] with `poll=false, ack_file=None`; the real
+/// entry point (`watch_print_launchd`) calls the full renderer directly, so
+/// this wrapper is now test-only.
+#[cfg(test)]
 fn render_launchd_plist(
     interval: u64,
     on_activity: Option<&str>,
+    exe: &Path,
+    repo: &Path,
+) -> String {
+    render_launchd_plist_full(interval, on_activity, false, None, exe, repo)
+}
+
+/// Full launchd plist renderer — propagates `--poll` and `--ack-file`
+/// alongside the existing `--interval`/`--on-activity` handling.
+#[allow(clippy::too_many_arguments)]
+fn render_launchd_plist_full(
+    interval: u64,
+    on_activity: Option<&str>,
+    poll: bool,
+    ack_file: Option<&str>,
     exe: &Path,
     repo: &Path,
 ) -> String {
@@ -5971,6 +6120,17 @@ fn render_launchd_plist(
             .replace('<', "&lt;")
             .replace('>', "&gt;");
         program_args.push("  <string>--on-activity</string>".to_string());
+        program_args.push(format!("  <string>{escaped}</string>"));
+    }
+    if poll {
+        program_args.push("  <string>--poll</string>".to_string());
+    }
+    if let Some(ack) = ack_file {
+        let escaped = ack
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        program_args.push("  <string>--ack-file</string>".to_string());
         program_args.push(format!("  <string>{escaped}</string>"));
     }
     let args_xml = program_args.join("\n");
@@ -6005,7 +6165,14 @@ fn render_launchd_plist(
 fn watch_print_launchd(args: &WatchArgs, exe: &Path, repo: &Path) {
     println!(
         "{}",
-        render_launchd_plist(args.interval, args.on_activity.as_deref(), exe, repo)
+        render_launchd_plist_full(
+            args.interval,
+            args.on_activity.as_deref(),
+            args.poll,
+            args.ack_file.as_deref(),
+            exe,
+            repo
+        )
     );
 }
 
@@ -6030,6 +6197,17 @@ fn watch_print_systemd(args: &WatchArgs, exe: &Path, repo: &Path) {
             .unwrap_or(std::borrow::Cow::Borrowed(cmd.as_str()))
             .replace('%', "%%");
         exec_args.push_str(&format!(" --on-activity {shell_quoted}"));
+    }
+    if args.poll {
+        exec_args.push_str(" --poll");
+    }
+    if let Some(ref ack_file) = args.ack_file {
+        // Same tokeniser hazard as --on-activity above: shell-quote, then
+        // escape '%' so systemd doesn't expand it as a unit specifier.
+        let shell_quoted = shlex::try_quote(ack_file)
+            .unwrap_or(std::borrow::Cow::Borrowed(ack_file.as_str()))
+            .replace('%', "%%");
+        exec_args.push_str(&format!(" --ack-file {shell_quoted}"));
     }
     let unit_name = format!(
         "rally-watch-{}",
@@ -6060,6 +6238,26 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
     let rally_dir = repo.join(".rally");
     let log_dir = rally_dir.join(store::LOG_DIRNAME);
 
+    // --ack-file loop-hazard guard (B17-adjacent, checked before ANY other
+    // branch — including the print-* early exits, so a misconfigured
+    // --ack-file is caught even when only rendering a unit file, not just
+    // when actually watching). Writing the ack file inside .rally/log/
+    // would bump the very max_seq the watcher polls, so the watcher would
+    // report its own delivery ack as new activity — a feedback loop that
+    // never settles.
+    if let Some(ref ack_file) = args.ack_file {
+        let ack_path = PathBuf::from(ack_file);
+        if log_watch::ack_file_conflicts_with_log_dir(&repo, &log_dir, &ack_path) {
+            return Err(RallyError::Usage(format!(
+                "--ack-file {ack_file} resolves inside the watched log dir ({}) — this \
+                 would create a self-triggering feedback loop (the ack write bumps \
+                 max_seq, which the watcher then reports as new activity, forever). \
+                 Use a path outside .rally/log/, e.g. .rally/watch-acks.jsonl.",
+                log_dir.display()
+            )));
+        }
+    }
+
     // --print-launchd / --print-systemd: emit the unit and exit immediately.
     if args.print_launchd || args.print_systemd {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rally"));
@@ -6076,11 +6274,14 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
     let room_id = store::resolve_active_engagement_pub(&rally_dir);
 
     // --once mode: single check, emit if advanced, persist cursor, exit.
+    // There is no wait here (it's a single check, not a loop), so this is
+    // definitionally a "poll" — a cron/launchd-cadence caller IS the
+    // interval.
     if args.once {
         let cursor = watch_read_once_cursor(&rally_dir);
         let current_seq = watch_read_max_seq(&log_dir);
         if current_seq > cursor {
-            watch_emit_activity(true, cursor, current_seq, &room_id, args.tool.as_deref());
+            watch_emit_activity(true, cursor, current_seq, &room_id, args.tool.as_deref(), "poll", 0);
             watch_write_once_cursor(&rally_dir, current_seq);
         } else {
             // Persist updated cursor even when unchanged (ensures cursor tracks reality).
@@ -6093,6 +6294,31 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
     let deadline: Option<std::time::Instant> = args
         .duration_hours
         .map(|h| std::time::Instant::now() + Duration::from_secs_f64(h * 3600.0));
+
+    // Path checked on every wait — computed once, outside the loop, since
+    // it never changes for the lifetime of this process.
+    let index_file = log_dir.join(store::LOG_INDEX_FILENAME);
+
+    // Register the watch ONCE, before the first max_seq read, and hold it for
+    // the whole loop. Both halves of that matter:
+    //
+    //  * Registering before the first read means a fact posted between the
+    //    read and the first wait is already queued, not lost.
+    //  * Holding it across iterations means events that land while we are
+    //    processing (not blocked) are queued by the kernel, so the next wait
+    //    returns immediately.
+    //
+    // Re-registering per wait looks equivalent and is not: `rally say` writes
+    // the index tmp-then-rename, so the watcher woke on the tmp-create, read
+    // the still-old index, and re-registered AFTER the rename had landed —
+    // then slept through it. Measured: watcher reported `seq: 5` while
+    // index.json said 6, and the handoff went unseen until the safety-net
+    // timeout. See `log_watch::LogWatcher`.
+    let mut watcher = if args.poll {
+        None
+    } else {
+        Some(log_watch::LogWatcher::new(&log_dir, &index_file))
+    };
 
     // Start cursor at the current max_seq so we react only to NEW activity.
     let mut last_seq = watch_read_max_seq(&log_dir);
@@ -6109,22 +6335,55 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
             break;
         }
 
-        thread::sleep(Duration::from_secs(current_interval));
+        // Block until the kernel reports a change under log_dir/index_file,
+        // or current_interval elapses as a safety-net ceiling. --poll forces
+        // the legacy sleep path (the event backend is bypassed entirely,
+        // even when one is available on this platform).
+        let wait_started = Instant::now();
+        let mode: &str = match watcher {
+            None => {
+                thread::sleep(Duration::from_secs(current_interval));
+                "poll"
+            }
+            Some(ref mut w) => match w.wait(Duration::from_secs(current_interval)) {
+                log_watch::WaitOutcome::Unsupported => "poll",
+                log_watch::WaitOutcome::Changed | log_watch::WaitOutcome::TimedOut => "event",
+            },
+        };
+        let wait_ms = wait_started.elapsed().as_millis() as u64;
 
-        // Re-read max_seq (log-and-continue on error).
+        // Re-read on EVERY wait outcome (Changed, TimedOut, and Unsupported)
+        // — never only on Changed. A spurious wake that finds no advance is
+        // cheap; a real change that is only visible on the next tick is the
+        // whole defect this loop exists to avoid.
         let new_seq = watch_read_max_seq(&log_dir);
 
         if new_seq > last_seq {
             // Activity detected.
-            watch_emit_activity(args.json, last_seq, new_seq, &room_id, args.tool.as_deref());
-            // Run --on-activity command if set (one in-flight; blocks here).
+            watch_emit_activity(
+                args.json,
+                last_seq,
+                new_seq,
+                &room_id,
+                args.tool.as_deref(),
+                mode,
+                wait_ms,
+            );
+            // Run --on-activity command if set (one in-flight; blocks here),
+            // then emit a delivery ack (stdout + optional --ack-file) so an
+            // external adapter can confirm the handoff actually ran, not
+            // just that activity was detected.
             if let Some(ref cmd) = args.on_activity {
-                watch_run_on_activity(
-                    cmd,
+                let (exit_code, duration_ms) =
+                    watch_run_on_activity(cmd, &room_id, last_seq, new_seq, args.tool.as_deref(), &repo);
+                watch_emit_delivery(
                     &room_id,
+                    args.tool.as_deref(),
                     last_seq,
                     new_seq,
-                    args.tool.as_deref(),
+                    exit_code,
+                    duration_ms,
+                    args.ack_file.as_deref(),
                     &repo,
                 );
             }
@@ -6134,9 +6393,15 @@ fn command_watch(args: WatchArgs) -> Result<Output> {
         } else {
             // Idle: emit heartbeat under --json, then back off.
             if args.json {
-                watch_emit_heartbeat(&room_id, args.tool.as_deref(), last_seq, current_interval);
+                watch_emit_heartbeat(&room_id, args.tool.as_deref(), last_seq, current_interval, mode);
             }
-            // Adaptive back-off: multiply by 1.5, cap at max_interval.
+            // Adaptive back-off: multiply by 1.5, cap at max_interval. Under
+            // the event backend this growing number is now just the
+            // safety-net wake period — harmless, since a real change still
+            // wakes wait_for_change immediately regardless of its value.
+            // Under --poll (or a per-tick "poll" degrade when the backend
+            // reports Unsupported) it preserves today's sleep-based
+            // behavior byte-for-byte.
             let next = ((current_interval as f64) * 1.5) as u64;
             current_interval = next.min(args.max_interval);
         }
@@ -10492,6 +10757,62 @@ mod tests {
         );
     }
 
+    // ---- watch watchdog bypass -------------------------------------------
+
+    #[test]
+    fn long_running_watch_bypasses_the_watchdog() {
+        // Loop mode blocks for the watcher's lifetime. Before this, it fell
+        // through to the 3s hook default and was killed mid-watch while
+        // exiting 0 — success-shaped failure.
+        for a in [
+            argv(&["watch"]),
+            argv(&["watch", "--json"]),
+            argv(&["watch", "--tool", "claude_code:01", "--interval", "5"]),
+            argv(&["--fail-open", "watch", "--json"]),
+        ] {
+            assert!(
+                first_positional_is_long_running_watch(&a),
+                "loop-mode watch must bypass the watchdog: {a:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_watch_modes_keep_their_watchdog() {
+        // `--once` is exactly the bounded, hook-safe shape the watchdog exists
+        // to protect; the print modes render and exit. None may bypass.
+        for a in [
+            argv(&["watch", "--once"]),
+            argv(&["watch", "--once", "--json"]),
+            argv(&["watch", "--print-launchd"]),
+            argv(&["watch", "--print-systemd"]),
+        ] {
+            assert!(
+                !first_positional_is_long_running_watch(&a),
+                "bounded watch mode must KEEP its watchdog: {a:?}"
+            );
+        }
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["watch", "--once"])),
+            Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS),
+            "watch --once stays on the hook-safe default budget"
+        );
+    }
+
+    #[test]
+    fn watch_bypass_does_not_capture_other_subcommands() {
+        for a in [
+            argv(&["room"]),
+            argv(&["next", "--tool", "watch"]),
+            argv(&["say", "artifact", "--subject", "watch"]),
+        ] {
+            assert!(
+                !first_positional_is_long_running_watch(&a),
+                "only the `watch` subcommand itself may bypass: {a:?}"
+            );
+        }
+    }
+
     // ---- inject watchdog budget (Chunk 2 root-cause fix) -----------------
 
     #[test]
@@ -13022,6 +13343,40 @@ mod tests {
         assert!(
             !log_dir_str.contains(".agent-rally-point"),
             "watch must NOT reference the legacy global apps dir; got: {log_dir_str}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Test (e): --ack-file resolving inside the watched `.rally/log/` dir
+    /// is refused (the loop-hazard guard `command_watch` calls at startup,
+    /// before doing anything else). This is the same guard predicate
+    /// `command_watch` uses to decide whether to return
+    /// `RallyError::Usage` — exercised here directly (as the other watch
+    /// tests exercise `command_watch`'s helper functions directly) rather
+    /// than by mutating process cwd to drive `repo_root()` through the full
+    /// command, which would be flaky under parallel test execution.
+    #[test]
+    fn watch_ack_file_inside_log_dir_is_refused_at_startup() {
+        let (root, rally_dir) = watch_temp_room("watch-ack-file-guard");
+        let log_dir = rally_dir.join(store::LOG_DIRNAME);
+
+        let inside = PathBuf::from(".rally/log/watch-acks.jsonl");
+        assert!(
+            log_watch::ack_file_conflicts_with_log_dir(&root, &log_dir, &inside),
+            "a relative --ack-file nested under the log dir must be refused"
+        );
+
+        let inside_abs = log_dir.join("watch-acks.jsonl");
+        assert!(
+            log_watch::ack_file_conflicts_with_log_dir(&root, &log_dir, &inside_abs),
+            "an absolute --ack-file nested under the log dir must be refused"
+        );
+
+        let outside = PathBuf::from(".rally/watch-acks.jsonl");
+        assert!(
+            !log_watch::ack_file_conflicts_with_log_dir(&root, &log_dir, &outside),
+            "the documented convention .rally/watch-acks.jsonl (a sibling of log/) must be allowed"
         );
 
         std::fs::remove_dir_all(&root).ok();
@@ -17517,6 +17872,10 @@ fn help_text() -> String {
         "  rally status --global [--json]",
         "  rally watch [--tool <id>] [--interval <secs=5>] [--max-interval <secs=300>] [--on-activity <cmd>]",
         "              [--once] [--duration-hours <h>] [--json] [--print-launchd] [--print-systemd]",
+        "              [--poll] [--ack-file <path>]",
+        "    event-driven by default (kqueue/inotify): --interval is a safety-net ceiling, not the delivery",
+        "    latency; --poll forces the legacy sleep loop; --ack-file appends delivery-ack JSONL (must be",
+        "    outside .rally/log/ — refused at startup otherwise, e.g. use .rally/watch-acks.jsonl)",
         "  rally version [--json]  # print build-id (version + git hash); exits 0",
         "  rally whoami [--tool <id>] [--json]  # repo_root, repo_id, worktree, build_id, cwd; exits 0",
         "  rally owners --dirty [--json] [--tmux-bin <path>] [--cmux-bin <path>]  # map dirty git paths to claim owners + session liveness",

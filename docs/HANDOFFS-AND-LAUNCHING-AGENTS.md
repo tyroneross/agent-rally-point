@@ -35,9 +35,37 @@ rally inject claude-foo-01 --text "Read docs/HANDOFF.md and continue …"
 
 - `--require-ack` requires `--handoff <event-id>` or `--ref` — it does **not** work with free `--text`. For a plain steer, omit it.
 - `delivered=true ack=false` is normal for a `--text` inject (no ack channel).
-- Inject only works against a **`rally run`-managed** session. Fact-only / externally-launched agents are not injectable — hand those off via a committed doc instead.
+- Inject only works against a **`rally run`-managed** session. Fact-only / externally-launched agents are not injectable via `rally inject` — but see "Delivering to a non-managed agent" below for the watch-based path.
 - Capture before the first real inject if the host can show startup prompts. Codex may stop on an update/trust prompt; clear that deliberately before injecting work so the handoff lands at the agent prompt, not in the startup menu.
 - If `rally capture` shows the prompt pasted but not acted on, wait briefly and send one bounded backend-specific Enter as troubleshooting. That is a fallback, not the normal contract.
+
+### Delivering to a non-managed agent
+
+`rally inject` requires a `rally run`-managed session. A fact-only or
+externally-launched agent (unmanaged tmux pane, a human's own terminal, an
+ET/ptyd-hosted session not adopted into Rally) has no inject channel — but it
+can still be **notified** the moment new activity lands, via `rally watch`:
+
+```bash
+rally watch --on-activity '<adapter command>' --ack-file .rally/watch-acks.jsonl
+```
+
+- `rally watch` is event-driven (kqueue on macOS/BSD, inotify on Linux): it
+  wakes on the filesystem change, not on a fixed poll interval — `--interval`
+  becomes a safety-net ceiling, not the delivery latency. Install it as a
+  background service with `rally watch --print-launchd` (macOS) or
+  `--print-systemd` (Linux).
+- `--ack-file` appends a `{"event":"delivery",...}` JSONL line per
+  `--on-activity` run, so you (or a monitor) can confirm delivery, not just
+  detection. Keep it outside `.rally/log/` — `.rally/watch-acks.jsonl` is the
+  documented convention; a path inside the watched log dir is refused at
+  startup (it would self-trigger the watcher).
+- `scripts/rally_wake.py` is the reference tmux-doorbell adapter; `rally-termd`
+  is the ptyd/Easy Terminal adapter (subscribes to the same `.rally` ledger
+  Directives `rally inject` writes for managed sessions).
+- Keep the framing honest: the watcher NOTIFIES (observes the ledger and
+  invokes your adapter); the adapter is what actually DELIVERS the text into
+  the target session. `rally watch` never types into anything itself.
 
 ## 3. The handoff itself — Rally is the source of truth
 
@@ -90,7 +118,7 @@ Rally facts, and do not assume `rally inject` is available unless
 - `rally room [--since <seq>]` — coordination posts (`rally say`/handoffs).
 - `rally capture <session> --lines N` — one-shot screen snapshot (or `tmux capture-pane -t <target> -p`).
 - `rally attach <session>` — live attach.
-- `rally watch [--tool <id>] [--on-activity <cmd>]` — continuous room watcher (supports `--print-launchd`/`--print-systemd` for a background service).
+- `rally watch [--tool <id>] [--on-activity <cmd>] [--ack-file <path>]` — continuous, event-driven room watcher (kqueue/inotify; `--poll` forces the legacy sleep loop). Supports `--print-launchd`/`--print-systemd` for a background service. See "Delivering to a non-managed agent" above.
 - `rally roster` — who's live, where, doing what.
 
 ## 7. Shared-working-tree hazard
