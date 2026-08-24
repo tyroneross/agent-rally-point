@@ -24,6 +24,11 @@ bpaf = "0.9.26"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 factstr = "0.5.2"
 factstr-sqlite = "0.5.2"
+# kqueue/inotify FFI for rally-cli's log_watch module (event-driven `rally
+# watch`). Already present in Cargo.lock as a transitive dependency of
+# several other crates, so pinning it as a direct dep here pulls in ZERO new
+# crates into the build graph.
+libc = "0.2"
 schemars = { version = "1", features = ["uuid1", "chrono04"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

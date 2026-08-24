@@ -1411,6 +1411,7 @@ dependencies = [
  "chrono",
  "factstr",
  "factstr-sqlite",
+ "libc",
  "rally-protocol",
  "rusqlite",
  "schemars",

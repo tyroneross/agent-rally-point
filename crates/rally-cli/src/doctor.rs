@@ -57,10 +57,11 @@ use crate::discovery::{
 };
 use crate::error::{RallyError, Result};
 use crate::store::{
-    ARCHIVE_DIRNAME, DB_ONLY_MIGRATION_MARKER_FILENAME, DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME,
-    DbOnlyMigrationSegment, DbOnlyMigrationSourceRow, LEDGER_FILENAME, LOG_DIRNAME, RoomStore,
-    acquire_offline_migration_authority, canonical_repo_root_string, ensure_new_mutation_can_start,
-    is_reserved_fixture_engagement, observe_offline_migration_authority,
+    ARCHIVE_DIRNAME, CORRUPT_QUARANTINE_MAX_GROUPS, DB_ONLY_MIGRATION_MARKER_FILENAME,
+    DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME, DbOnlyMigrationSegment, DbOnlyMigrationSourceRow,
+    LEDGER_FILENAME, LOG_DIRNAME, RoomStore, acquire_offline_migration_authority,
+    canonical_repo_root_string, count_corrupt_quarantine_groups, ensure_new_mutation_can_start,
+    is_reserved_fixture_engagement, observe_offline_migration_authority, read_corruption_counter,
     render_db_only_migration_segment, sync_directory, validate_scoped_engagement,
     verify_db_only_migration_extension, verify_db_only_migration_segment,
 };
@@ -75,7 +76,7 @@ const CORRUPT_PREFIX: &str = "facts.db.corrupt.";
 /// Subdirectory of `.rally/archive/` where doctor parks anything it takes out of
 /// the live store. Doctor ARCHIVES; it never deletes. Whatever lands here stays
 /// until a human decides otherwise.
-const SWEPT_SUBDIR: &str = "swept";
+pub(crate) const SWEPT_SUBDIR: &str = "swept";
 
 /// seq -> the full serialized row that claimed it. Full-line equality is the
 /// store's own rule for whether a repeated seq is benign.
@@ -2477,6 +2478,50 @@ pub(crate) fn ledger_health_in_dir(rally_dir: &Path) -> LedgerHealthReport {
             ),
         });
     }
+    // Recurrence signal: how many times this room's facts.db has ever been
+    // quarantined, and how many quarantine groups the bounded-retention
+    // pruner is currently holding onto. Purely diagnostic — never fails
+    // `doctor` — but a nonzero recurring count is the visible sign that the
+    // corruption race predating the vendored factstr-sqlite WAL-checkpoint
+    // patch is still open, which raw "N quarantined snapshots" cannot show
+    // once pruning starts capping that number at CORRUPT_QUARANTINE_MAX_GROUPS.
+    if rally_dir_exists {
+        let retained_groups = count_corrupt_quarantine_groups(rally_dir, "facts.db");
+        let counter = read_corruption_counter(rally_dir);
+        let count = counter.as_ref().map_or(0, |c| c.count);
+        // Somewhat arbitrary but readable: 0 is "nothing to report"; single-
+        // digit recurrence is "happened, worth knowing"; double digits is
+        // "worth chasing". Never escalates doctor's own exit code.
+        let severity = if count >= 10 { "warn" } else { "info" };
+        let message = match &counter {
+            Some(c) => format!(
+                "facts.db has been quarantined for corruption {} time(s) (first {}, most \
+                 recent {}); {retained_groups} quarantine group(s) retained under the \
+                 {CORRUPT_QUARANTINE_MAX_GROUPS}-group bounded-retention cap",
+                c.count, c.first_at, c.last_at
+            ),
+            None => format!(
+                "facts.db has never been quarantined for corruption; {retained_groups} \
+                 quarantine group(s) retained under the {CORRUPT_QUARANTINE_MAX_GROUPS}-group \
+                 bounded-retention cap"
+            ),
+        };
+        findings.push(LedgerFinding {
+            code: "corruption_recurrence".to_string(),
+            severity: severity.to_string(),
+            message,
+            remedy: if count >= 10 {
+                Some(
+                    "recurring corruption suggests an open race rather than a one-off event — \
+                     file an issue with the .rally/corruption-count.json contents"
+                        .to_string(),
+                )
+            } else {
+                None
+            },
+        });
+    }
+
     if !derived_db_present && rally_dir_exists {
         findings.push(LedgerFinding {
             code: "no_derived_db".to_string(),

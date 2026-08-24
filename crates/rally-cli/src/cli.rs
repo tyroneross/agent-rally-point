@@ -565,6 +565,18 @@ pub(crate) struct WatchArgs {
     pub(crate) print_launchd: bool,
     /// Print a ready systemd unit to stdout then exit.
     pub(crate) print_systemd: bool,
+    /// Force the legacy interval-sleep backend even when a kernel event
+    /// watcher (kqueue/inotify) is available on this platform. Every
+    /// activity/heartbeat line reports `"mode":"poll"` while this is set.
+    pub(crate) poll: bool,
+    /// Append one JSONL delivery-ack line per `--on-activity` invocation to
+    /// this file (in addition to stdout), so an external adapter can tail
+    /// confirmed deliveries. MUST NOT resolve inside the watched
+    /// `.rally/log/` dir — `rally watch` refuses at startup if it does
+    /// (writing there would bump the very `max_seq` the watcher polls,
+    /// self-triggering forever). Defaults to unset (stdout only); the
+    /// documented convention is `.rally/watch-acks.jsonl`.
+    pub(crate) ack_file: Option<String>,
 }
 
 // ─── Work surface args (appended — do not reorder above) ─────────────────────
@@ -1966,6 +1978,8 @@ fn watch_parser() -> impl Parser<WatchArgs> {
     let json = json_flag();
     let print_launchd = long("print-launchd").switch();
     let print_systemd = long("print-systemd").switch();
+    let poll = long("poll").switch();
+    let ack_file = optional_string_arg("ack-file", "PATH");
     construct!(
         tool,
         interval,
@@ -1975,7 +1989,9 @@ fn watch_parser() -> impl Parser<WatchArgs> {
         duration_hours,
         json,
         print_launchd,
-        print_systemd
+        print_systemd,
+        poll,
+        ack_file
     )
     .map(
         |(
@@ -1988,6 +2004,8 @@ fn watch_parser() -> impl Parser<WatchArgs> {
             json,
             print_launchd,
             print_systemd,
+            poll,
+            ack_file,
         )| WatchArgs {
             tool,
             interval,
@@ -1998,6 +2016,8 @@ fn watch_parser() -> impl Parser<WatchArgs> {
             json,
             print_launchd,
             print_systemd,
+            poll,
+            ack_file,
         },
     )
 }
