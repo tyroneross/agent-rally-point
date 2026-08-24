@@ -56,6 +56,23 @@ impl Workspace {
         })
     }
 
+    fn run_without_stable_session(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_rally"))
+            .current_dir(&self.cwd)
+            .env("HOME", &self.home)
+            .env("RALLY_HOOKS", "off")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
+            .env_remove("RALLY_SESSION_ID")
+            .env_remove("RALLY_OBSERVER_PID")
+            .env_remove("TERM_SESSION_ID")
+            .env_remove("TMUX_PANE")
+            .env_remove("TTY")
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
     fn claim(&self, tool: &str, session_id: &str, path: &str) -> String {
         let value = self.json_as_session(
             session_id,
@@ -149,10 +166,19 @@ fn stable_session_owns_and_releases_claim_across_processes() {
     let session = "stable-session";
     workspace.claim(tool, session, "src/stable.rs");
 
-    let before = workspace.json_as_session(
+    let before_output = workspace.run_as_session(
         session,
-        &["check", "before-complete", "--tool", tool, "--json"],
+        &[
+            "check",
+            "before-complete",
+            "--tool",
+            tool,
+            "--strict",
+            "--json",
+        ],
     );
+    assert_eq!(before_output.status.code(), Some(4));
+    let before: Value = serde_json::from_slice(&before_output.stdout).unwrap();
     assert!(finding_codes(&before).contains(&"owned-active-claim"));
 
     let release = workspace.json_as_session(
@@ -175,6 +201,53 @@ fn stable_session_owns_and_releases_claim_across_processes() {
     );
     assert!(workspace.active_claim_tools().is_empty());
     workspace.cleanup();
+}
+
+#[test]
+fn unpinned_process_lifecycle_fails_closed_instead_of_hiding_a_stranded_claim() {
+    let workspace = Workspace::new("unpinned-process");
+    let tool = "codex:unpinned";
+    let claim = workspace.run_without_stable_session(&[
+        "say",
+        "claim",
+        "--tool",
+        tool,
+        "--path",
+        "src/unpinned.rs",
+        "--subject",
+        "owns it",
+        "--json",
+    ]);
+    assert!(claim.status.success(), "claim setup failed: {claim:?}");
+
+    let before = workspace.run_without_stable_session(&[
+        "check",
+        "before-complete",
+        "--tool",
+        tool,
+        "--strict",
+        "--json",
+    ]);
+    assert!(!before.status.success(), "unpinned check must fail closed");
+    let error: Value = serde_json::from_slice(&before.stderr).unwrap();
+    assert_eq!(error["ok"], false);
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("RALLY_SESSION_ID")),
+        "refusal must explain the stable-session remedy: {error}"
+    );
+    assert_eq!(workspace.active_claim_tools(), vec![tool.to_string()]);
+    workspace.cleanup();
+}
+
+#[test]
+fn manual_skill_exports_one_session_for_claim_check_and_release_children() {
+    let skill = include_str!("../../../skills/agent-rally-point/SKILL.md");
+    assert!(skill.contains("export RALLY_SESSION_ID"));
+    assert!(
+        skill.contains("rally enter --tool \"$TOOL\" --session-id \"$RALLY_SESSION_ID\" --json")
+    );
 }
 
 #[test]
@@ -242,6 +315,24 @@ fn liveness_enforce_requires_an_explicit_actor_and_exact_target() {
         ],
     );
     assert_eq!(missing_actor["ok"], false, "missing actor must fail closed");
+
+    let whitespace_actor = workspace.json_as_session(
+        "operator-session",
+        &[
+            "check",
+            "liveness",
+            "--tool",
+            "peer:a",
+            "--actor",
+            "   ",
+            "--enforce",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        whitespace_actor["ok"], false,
+        "whitespace-only actor must fail closed"
+    );
 
     let missing_target = workspace.json_as_session(
         "operator-session",

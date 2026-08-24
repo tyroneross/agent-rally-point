@@ -5923,7 +5923,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
                 "check liveness --enforce requires --tool <exact-target>; enforcement never scans and releases every conflicted peer".to_string(),
             ));
         }
-        if args.enforce && actor.as_deref().is_none_or(str::is_empty) {
+        if args.enforce && actor.as_deref().is_none_or(|value| value.trim().is_empty()) {
             return Err(RallyError::Usage(
                 "check liveness --enforce requires --actor <release-author>; --tool is the exact target filter, not the actor".to_string(),
             ));
@@ -6133,6 +6133,22 @@ fn command_check(args: CheckArgs) -> Result<Output> {
         None => "unknown".to_string(),
     };
     let path = args.path.map(normalize_path);
+    let caller_session = if phase == "before-complete" {
+        let identity = current_protocol_session(Some(&tool));
+        let observer_pid_is_stable = env::var("RALLY_OBSERVER_PID")
+            .ok()
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .is_some_and(|pid| pid > 1);
+        if identity.endpoint_id.starts_with("proc:") && !observer_pid_is_stable {
+            return Err(RallyError::Usage(
+                "check before-complete requires a stable session identity; export RALLY_SESSION_ID once in the parent shell before claiming so claim, check, and release use the same session"
+                    .to_string(),
+            ));
+        }
+        Some(identity.from_session_id().to_string())
+    } else {
+        None
+    };
 
     // B-perf fast path: when the snapshot cache is fresh AND already records
     // our tool's presence, project the check from the cached `RoomSnapshot`
@@ -6148,13 +6164,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
         let check = build_check(
             phase.clone(),
             tool.clone(),
-            (phase == "before-complete")
-                .then(|| {
-                    current_protocol_session(Some(&tool))
-                        .from_session_id()
-                        .to_string()
-                })
-                .as_deref(),
+            caller_session.as_deref(),
             path.clone(),
             args.strict,
             &cached,
@@ -6177,11 +6187,6 @@ fn command_check(args: CheckArgs) -> Result<Output> {
         crate::store::write_snapshot_cache_for(&repo_root_path, &capture);
     }
     let snapshot = capture.snapshot;
-    let caller_session = (phase == "before-complete").then(|| {
-        current_protocol_session(Some(&tool))
-            .from_session_id()
-            .to_string()
-    });
     let check = build_check(
         phase,
         tool,

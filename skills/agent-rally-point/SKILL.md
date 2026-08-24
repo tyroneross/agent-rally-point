@@ -23,15 +23,27 @@ if [ -z "${RALLY_AGENT_ID:-}" ]; then
   RALLY_AGENT_ID="$(printf '%s' "$RALLY_AGENT_ID" | tr '[:upper:]' '[:lower:]')"
   export RALLY_AGENT_ID
 fi
+if [ -z "${RALLY_SESSION_ID:-}" ]; then
+  RALLY_SESSION_ID="$(uuidgen 2>/dev/null || printf 'session-%s' "$$")"
+  RALLY_SESSION_ID="$(printf '%s' "$RALLY_SESSION_ID" | tr '[:upper:]' '[:lower:]')"
+fi
+export RALLY_SESSION_ID
 TOOL="${RALLY_TOOL_ID:-$HOST:$RALLY_AGENT_ID}"
-rally enter --tool "$TOOL" --json
+rally enter --tool "$TOOL" --session-id "$RALLY_SESSION_ID" --json
 rally next --tool "$TOOL" --json
 ```
+
+Keep this export in the parent shell for the whole Rally lifecycle. Every
+separate `rally` process inherits the same session identity, so a claim created
+by this terminal is visible to strict `before-complete` and releasable by this
+terminal. A bare process-id fallback changes on every CLI invocation and is not
+a valid manual claim lifecycle.
 
 If `rally enter` warns `duplicate-active-squad-id`, stop using that tool id in
 this terminal and re-enter with a distinct `RALLY_AGENT_ID` / `--tool`. If you
 spawn another agent or worker that will post Rally facts, give it a separate
-agent id; do not let it reuse the parent terminal's id.
+agent id and `RALLY_SESSION_ID`; do not let it reuse the parent terminal's
+identity.
 
 ## Live Agent Status
 
