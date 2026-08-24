@@ -22,7 +22,10 @@ minimal rule-set at the merge boundary" while preserving never-block-at-work.
 - **C2 · Liveness conflict-out.** A checkpoint (`rally check liveness` + room
   projection) flips a non-coordinating or unacknowledged squad to `verified: false`
   (status `conflicted`), **releases its open claims** (paths freed), and records a
-  durable `risk` alert for the lead + user. **Never blocks editing.** *Verify:*
+  durable `risk` alert for the lead + user. Advisory mode may scan the room;
+  enforcement requires one exact `--tool <target>` and a separate explicit
+  `--actor <release-author>`, so selecting one stale squad cannot release another.
+  **Never blocks editing.** *Verify:*
   `cargo test -p rally-cli conflict`.
 - **C3 · Merge gate (the teeth).** A real `rally check ci` evaluates the coordination
   predicate against `git diff`: committer has **presence + ack**, and **every changed

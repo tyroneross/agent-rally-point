@@ -5912,13 +5912,25 @@ fn command_check(args: CheckArgs) -> Result<Output> {
 
     // Coordination-mandate C2: liveness conflict-out. Reports squads that are
     // unacknowledged + idle + holding >=1 open claim ("grabbed paths, never
-    // coordinated, went quiet"). With --enforce: releases their claims (paths
-    // freed) + records a risk alert for the lead/user. NEVER blocks editing.
+    // coordinated, went quiet"). Advisory mode may scan all squads. Enforce
+    // requires one exact --tool target plus a separate --actor, releases only
+    // that target's eligible claims, and records a risk alert. NEVER blocks editing.
     if phase == "liveness" {
+        let target_tool = args.tool.clone();
+        let actor = args.actor.clone();
+        if args.enforce && target_tool.as_deref().is_none_or(str::is_empty) {
+            return Err(RallyError::Usage(
+                "check liveness --enforce requires --tool <exact-target>; enforcement never scans and releases every conflicted peer".to_string(),
+            ));
+        }
+        if args.enforce && actor.as_deref().is_none_or(str::is_empty) {
+            return Err(RallyError::Usage(
+                "check liveness --enforce requires --actor <release-author>; --tool is the exact target filter, not the actor".to_string(),
+            ));
+        }
         let room = RoomStore::open()?;
         let snapshot = room.snapshot()?;
-        let actor = args
-            .tool
+        let release_actor = actor
             .clone()
             .unwrap_or_else(|| "rally:liveness".to_string());
 
@@ -5933,6 +5945,8 @@ fn command_check(args: CheckArgs) -> Result<Output> {
             phase: &'static str,
             advisory: bool,
             enforced: bool,
+            target_tool: Option<String>,
+            actor: Option<String>,
             conflicted: Vec<ConflictedSquad>,
         }
         #[derive(schemars::JsonSchema, serde::Serialize)]
@@ -5949,7 +5963,15 @@ fn command_check(args: CheckArgs) -> Result<Output> {
         // not yet >2h silent is reported as conflicted but NOT released.
         let takeover_owners = snapshot.takeover_eligible_owners();
         let mut conflicted: Vec<ConflictedSquad> = Vec::new();
-        for (sq_tool, held_ids) in liveness_conflicted(&snapshot) {
+        for (sq_tool, held_ids) in
+            liveness_conflicted(&snapshot)
+                .into_iter()
+                .filter(|(sq_tool, _)| {
+                    target_tool
+                        .as_deref()
+                        .is_none_or(|target| target == sq_tool)
+                })
+        {
             let held: Vec<&Fact> = snapshot
                 .active_claims
                 .iter()
@@ -5961,13 +5983,17 @@ fn command_check(args: CheckArgs) -> Result<Output> {
                 let _commit_guard = arm_watchdog_command_commit();
                 for claim in &held {
                     let release = Fact {
-                        from_session_id: None,
+                        from_session_id: Some(
+                            current_protocol_session(Some(&release_actor))
+                                .from_session_id()
+                                .to_string(),
+                        ),
                         schema: FACT_SCHEMA.to_string(),
                         event_id: new_id("fact"),
                         seq: 0,
                         thread_id: new_id("room"),
                         kind: FactKind::Release,
-                        tool: Some(actor.clone()),
+                        tool: Some(release_actor.clone()),
                         role: None,
                         subject: format!("liveness conflict-out: release {} claim", sq_tool),
                         scope: claim.scope.clone(),
@@ -5988,7 +6014,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
                     released.push(claim.event_id.clone());
                 }
                 let alert = build_risk_fact(
-                    &actor,
+                    &release_actor,
                     format!(
                         "conflicted-out: {} (unacknowledged + idle, holding claims)",
                         sq_tool
@@ -6019,7 +6045,9 @@ fn command_check(args: CheckArgs) -> Result<Output> {
             });
         }
         let text = format!(
-            "check liveness enforced={} conflicted={}",
+            "check liveness target={} actor={} enforced={} conflicted={}",
+            target_tool.as_deref().unwrap_or("<all-advisory>"),
+            actor.as_deref().unwrap_or("<none>"),
             args.enforce,
             conflicted.len()
         );
@@ -6031,6 +6059,8 @@ fn command_check(args: CheckArgs) -> Result<Output> {
                     phase: "liveness",
                     advisory: !args.enforce,
                     enforced: args.enforce,
+                    target_tool,
+                    actor,
                     conflicted,
                 },
             },
@@ -6118,6 +6148,13 @@ fn command_check(args: CheckArgs) -> Result<Output> {
         let check = build_check(
             phase.clone(),
             tool.clone(),
+            (phase == "before-complete")
+                .then(|| {
+                    current_protocol_session(Some(&tool))
+                        .from_session_id()
+                        .to_string()
+                })
+                .as_deref(),
             path.clone(),
             args.strict,
             &cached,
@@ -6140,7 +6177,19 @@ fn command_check(args: CheckArgs) -> Result<Output> {
         crate::store::write_snapshot_cache_for(&repo_root_path, &capture);
     }
     let snapshot = capture.snapshot;
-    let check = build_check(phase, tool, path, args.strict, &snapshot)?;
+    let caller_session = (phase == "before-complete").then(|| {
+        current_protocol_session(Some(&tool))
+            .from_session_id()
+            .to_string()
+    });
+    let check = build_check(
+        phase,
+        tool,
+        caller_session.as_deref(),
+        path,
+        args.strict,
+        &snapshot,
+    )?;
     let body = envelope("check", SCHEMA_CHECK, check.data)?;
     let text = format!("check findings={}", check.finding_count);
     Ok(Output::new(args.json, text, body).with_exit_code(check.exit_code))
@@ -17090,7 +17139,7 @@ fn help_text() -> String {
         "  rally hook capabilities [--json]  # contract version, served phases, and effect tables (the wrapper's native-vs-fallback probe)",
         "  rally check before-complete --tool <tool> [--strict] [--json]",
         "  rally check tier-fit --role <role> [--proposed-tier <tier>] [--json]  # advisory: does this role's tier fit",
-        "  rally check liveness [--tool <tool>] [--enforce] [--json]  # conflicted-out squads; --enforce releases their claims, never blocks",
+        "  rally check liveness [--tool <exact-target>] [--actor <release-author> --enforce] [--json]  # advisory may scan all; enforce requires one exact target and explicit actor",
         "  rally check coordination --tool <committer> [--changed <path>]... [--json]",
         "",
         "  Room projections (read-only slices of `rally room`):",

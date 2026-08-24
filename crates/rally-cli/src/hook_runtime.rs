@@ -1863,6 +1863,7 @@ fn judge_path(
     let outcome = build_check(
         "before-write".to_string(),
         tool.to_string(),
+        None,
         path.map(str::to_string),
         strict,
         snapshot,

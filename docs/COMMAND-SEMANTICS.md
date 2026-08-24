@@ -32,6 +32,8 @@ Definitions:
 | `rally next --audit` | no | no | no | no | Projects the same actionable work without presence, wake, or read-checkpoint facts; derived caches may still rebuild. |
 | `rally room` | no | yes | no | yes | Projects current room state from the ledger; use for ownership/blocker inspection. |
 | `rally check before-write` | no | yes | no | yes | Evaluates claim/decision/risk state; hooks may pair it with a separate claim write. |
+| `rally check before-complete` | no | yes | no | yes | Reports only claims owned by the exact `--tool` plus current session; a sibling process sharing the tool label is not the owner. |
+| `rally check liveness` | optional | yes | no | conditional | Advisory mode may scan all conflicted squads or filter one exact `--tool`. `--enforce` requires both `--tool <exact-target>` and `--actor <release-author>` and can release only that selected target's takeover-eligible claims. |
 | `rally say <kind>` | yes | yes | no | no | Appends durable coordination facts: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, standby, wake, backlog-item, mission. |
 
 ## Managed Sessions

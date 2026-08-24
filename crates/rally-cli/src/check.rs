@@ -53,6 +53,7 @@ pub(crate) struct CheckOutcome {
 pub(crate) fn build_check(
     phase: String,
     tool: String,
+    caller_session: Option<&str>,
     path: Option<String>,
     strict: bool,
     snapshot: &RoomSnapshot,
@@ -60,7 +61,7 @@ pub(crate) fn build_check(
     let mut findings = Vec::new();
     match phase.as_str() {
         "before-write" => check_before_write(snapshot, &tool, path.as_deref(), &mut findings),
-        "before-complete" => check_before_complete(snapshot, &tool, &mut findings),
+        "before-complete" => check_before_complete(snapshot, &tool, caller_session, &mut findings),
         other => {
             return Err(RallyError::Usage(format!(
                 "unsupported check phase {other}"
@@ -313,9 +314,19 @@ fn check_before_write(
     }
 }
 
-fn check_before_complete(snapshot: &RoomSnapshot, tool: &str, findings: &mut Vec<CheckFinding>) {
+fn check_before_complete(
+    snapshot: &RoomSnapshot,
+    tool: &str,
+    caller_session: Option<&str>,
+    findings: &mut Vec<CheckFinding>,
+) {
     for claim in &snapshot.active_claims {
-        if claim.tool.as_deref() == Some(tool) {
+        if crate::claim_authority::claim_owner_matches_caller(
+            claim.tool.as_deref(),
+            claim.from_session_id.as_deref(),
+            Some(tool),
+            caller_session,
+        ) {
             findings.push(CheckFinding {
                 code: "owned-active-claim",
                 severity: "stop",

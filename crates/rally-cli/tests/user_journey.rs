@@ -203,6 +203,18 @@ impl Workspace {
         (value, output)
     }
 
+    fn json_with_status_and_session(&self, session_id: &str, args: &[&str]) -> (Value, Output) {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
+        cmd.current_dir(&self.cwd)
+            .env("HOME", &self.home)
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
+            .env("RALLY_SESSION_ID", session_id);
+        let output = cmd.args(args).output().unwrap();
+        let value = serde_json::from_slice(&output.stdout).unwrap();
+        (value, output)
+    }
+
     fn output(&self, args: &[&str]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
         cmd.current_dir(&self.cwd).env("HOME", &self.home);
@@ -3160,26 +3172,33 @@ fn rally_rejects_unknown_flags() {
 #[test]
 fn rally_check_covers_completion_boundaries() {
     let workspace = Workspace::new("rally-check-phases");
-    workspace.json(&[
-        "say",
-        "claim",
-        "--json",
-        "--tool",
-        "codex",
-        "--path",
-        "src/lib.rs",
-        "--subject",
-        "finish lib",
-    ]);
+    let session = "rally-check-phases-session";
+    workspace.json_with_session(
+        session,
+        &[
+            "say",
+            "claim",
+            "--json",
+            "--tool",
+            "codex",
+            "--path",
+            "src/lib.rs",
+            "--subject",
+            "finish lib",
+        ],
+    );
 
-    let (before_complete, before_complete_output) = workspace.json_with_status(&[
-        "check",
-        "before-complete",
-        "--json",
-        "--tool",
-        "codex",
-        "--strict",
-    ]);
+    let (before_complete, before_complete_output) = workspace.json_with_status_and_session(
+        session,
+        &[
+            "check",
+            "before-complete",
+            "--json",
+            "--tool",
+            "codex",
+            "--strict",
+        ],
+    );
     assert_eq!(before_complete_output.status.code(), Some(4));
     assert_eq!(before_complete["data"]["check"]["allow"], false);
     assert!(

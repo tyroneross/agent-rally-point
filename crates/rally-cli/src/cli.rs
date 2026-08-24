@@ -367,6 +367,9 @@ pub(crate) struct CheckArgs {
     pub(crate) json: bool,
     pub(crate) phase: String,
     pub(crate) tool: Option<String>,
+    /// Liveness only: the identity authoring an enforced release. `--tool`
+    /// selects the exact squad being checked; it is never the release actor.
+    pub(crate) actor: Option<String>,
     pub(crate) path: Option<String>,
     pub(crate) strict: bool,
     // #9 tier-fit advisory fields (None for non-tier-fit phases)
@@ -1682,6 +1685,7 @@ fn claims_refresh_parser() -> impl Parser<ClaimsRefreshArgs> {
 fn check_parser() -> impl Parser<CheckArgs> {
     let json = json_flag();
     let tool = optional_string_arg("tool", "TOOL");
+    let actor = optional_string_arg("actor", "ACTOR");
     let path = optional_string_arg("path", "PATH");
     let strict = long("strict").switch();
     // #9 tier-fit advisory args (ignored for non-tier-fit phases)
@@ -1697,6 +1701,7 @@ fn check_parser() -> impl Parser<CheckArgs> {
     construct!(
         json,
         tool,
+        actor,
         path,
         strict,
         role,
@@ -1706,16 +1711,19 @@ fn check_parser() -> impl Parser<CheckArgs> {
         phase
     )
     .map(
-        |(json, tool, path, strict, role, proposed_tier, enforce, changed, phase)| CheckArgs {
-            json,
-            phase,
-            tool,
-            path,
-            strict,
-            role,
-            proposed_tier,
-            enforce,
-            changed,
+        |(json, tool, actor, path, strict, role, proposed_tier, enforce, changed, phase)| {
+            CheckArgs {
+                json,
+                phase,
+                tool,
+                actor,
+                path,
+                strict,
+                role,
+                proposed_tier,
+                enforce,
+                changed,
+            }
         },
     )
 }
