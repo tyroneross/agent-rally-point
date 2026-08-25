@@ -200,9 +200,7 @@ fn check_with(key: &str, path: &Path, depth_override: Option<&str>) -> ConsentVe
             return ConsentVerdict {
                 allowed: false,
                 reason_code: ReasonCode::NoRecord,
-                reason: format!(
-                    "no consent recorded for {key_s}; the operator has not been asked"
-                ),
+                reason: format!("no consent recorded for {key_s}; the operator has not been asked"),
                 key: key_s,
             };
         }
@@ -255,14 +253,16 @@ fn store_path() -> PathBuf {
         return PathBuf::from(over);
     }
     match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => {
-            Path::new(&home).join(".agent-consent").join("cli-dispatch-consent.json")
-        }
+        Ok(home) if !home.is_empty() => Path::new(&home)
+            .join(".agent-consent")
+            .join("cli-dispatch-consent.json"),
         _ => {
             // No legitimate HOME to read from. Point at a path that cannot
             // exist rather than falling back to a relative/cwd-based guess
             // that could accidentally resolve to something readable.
-            PathBuf::from("/nonexistent-agent-consent-home-is-unset/.agent-consent/cli-dispatch-consent.json")
+            PathBuf::from(
+                "/nonexistent-agent-consent-home-is-unset/.agent-consent/cli-dispatch-consent.json",
+            )
         }
     }
 }
@@ -355,10 +355,7 @@ fn verify_chain(store: &ConsentStore) -> ChainResult {
         if !seq_matches {
             return ChainResult {
                 ok: false,
-                reason: format!(
-                    "entry {i} has seq {:?}, expected {i}",
-                    obj.get("seq")
-                ),
+                reason: format!("entry {i} has seq {:?}, expected {i}", obj.get("seq")),
             };
         }
 
@@ -370,7 +367,10 @@ fn verify_chain(store: &ConsentStore) -> ChainResult {
         if prev_field != expected_prev {
             return ChainResult {
                 ok: false,
-                reason: format!("entry {i} prev_sha256 does not match entry {}", i as i64 - 1),
+                reason: format!(
+                    "entry {i} prev_sha256 does not match entry {}",
+                    i as i64 - 1
+                ),
             };
         }
 
@@ -468,8 +468,8 @@ fn depth_status(depth_override: Option<&str>) -> DepthStatus {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
     use super::*;
+    use serde_json::json;
 
     // ── test helpers ─────────────────────────────────────────────────────────
 
@@ -659,7 +659,11 @@ mod tests {
 
         let v = check_with("rally-point:codex", &path, Some("0"));
         assert!(!v.allowed);
-        assert_eq!(v.reason_code, ReasonCode::NoRecord, "malformed JSON loads as an empty store");
+        assert_eq!(
+            v.reason_code,
+            ReasonCode::NoRecord,
+            "malformed JSON loads as an empty store"
+        );
     }
 
     #[test]
@@ -717,9 +721,21 @@ mod tests {
     fn broken_prev_link_breaks_chain() {
         let path = temp_store_path("chain-prev-broken");
         let _tmp = TempFile(path.clone());
-        let e0 = make_entry(0, "rally-point:codex", "denied", "2026-08-21T00:00:00Z", None);
+        let e0 = make_entry(
+            0,
+            "rally-point:codex",
+            "denied",
+            "2026-08-21T00:00:00Z",
+            None,
+        );
         // e1's prev_sha256 should be e0's entry_sha256, but points at garbage.
-        let e1 = make_entry(1, "rally-point:codex", "auto", "2026-08-21T00:00:01Z", Some("not-the-real-prev-hash"));
+        let e1 = make_entry(
+            1,
+            "rally-point:codex",
+            "auto",
+            "2026-08-21T00:00:01Z",
+            Some("not-the-real-prev-hash"),
+        );
         write_store(&path, vec![e0, e1]);
 
         let v = check_with("rally-point:codex", &path, Some("0"));
@@ -746,7 +762,13 @@ mod tests {
         let _tmp = TempFile(path.clone());
         let e0 = make_entry(0, "rally-point:codex", "auto", "2026-08-21T00:00:00Z", None);
         let h0 = e0["entry_sha256"].as_str().unwrap().to_string();
-        let e1 = make_entry(1, "rally-point:codex", "denied", "2026-08-21T00:00:01Z", Some(&h0));
+        let e1 = make_entry(
+            1,
+            "rally-point:codex",
+            "denied",
+            "2026-08-21T00:00:01Z",
+            Some(&h0),
+        );
         write_store(&path, vec![e0, e1]);
 
         // Last entry (denied) wins over the earlier auto grant.
@@ -780,7 +802,11 @@ mod tests {
         for bad_depth in ["3", "-1", "abc", "4"] {
             let v = check_with("rally-point:codex", &path, Some(bad_depth));
             assert!(!v.allowed, "depth {bad_depth:?} should refuse: {v:?}");
-            assert_eq!(v.reason_code, ReasonCode::DepthExceeded, "depth {bad_depth:?}");
+            assert_eq!(
+                v.reason_code,
+                ReasonCode::DepthExceeded,
+                "depth {bad_depth:?}"
+            );
         }
     }
 
@@ -792,7 +818,10 @@ mod tests {
         write_store(&path, vec![e0]);
 
         let v = check_with("rally-point:codex", &path, Some("5"));
-        assert!(!v.allowed, "a recorded auto must not override the depth cap");
+        assert!(
+            !v.allowed,
+            "a recorded auto must not override the depth cap"
+        );
         assert_eq!(v.reason_code, ReasonCode::DepthExceeded);
     }
 
@@ -806,14 +835,24 @@ mod tests {
         for agent_type in ["gemini", "cursor", "ollama", "", "Claude", "CODEX"] {
             let v = check_for_agent_type(agent_type);
             assert!(!v.allowed, "agent_type {agent_type:?} should refuse: {v:?}");
-            assert_eq!(v.reason_code, ReasonCode::UnknownAgentType, "agent_type {agent_type:?}");
+            assert_eq!(
+                v.reason_code,
+                ReasonCode::UnknownAgentType,
+                "agent_type {agent_type:?}"
+            );
         }
     }
 
     #[test]
     fn recognized_agent_types_map_to_expected_keys() {
-        assert_eq!(key_for_agent_type("claude").as_deref(), Some("rally-point:claude"));
-        assert_eq!(key_for_agent_type("codex").as_deref(), Some("rally-point:codex"));
+        assert_eq!(
+            key_for_agent_type("claude").as_deref(),
+            Some("rally-point:claude")
+        );
+        assert_eq!(
+            key_for_agent_type("codex").as_deref(),
+            Some("rally-point:codex")
+        );
         assert_eq!(key_for_agent_type("gemini"), None);
     }
 }

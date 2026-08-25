@@ -35,7 +35,6 @@ use uuid::Uuid;
 
 const TEST_TOKEN: &str = "e2e-test-token-cockpit";
 
-
 // ── cli-dispatch-consent scaffolding ─────────────────────────────────────────
 //
 // The supervisor gates every vendor-CLI spawn on a recorded consent grant
@@ -87,8 +86,11 @@ fn ensure_consent_granted() {
         let h1 = entry_hash(&e1);
         e1["entry_sha256"] = json!(h1);
 
-        std::fs::write(&path, serde_json::to_vec(&json!({"version": 2, "log": [e0, e1]})).unwrap())
-            .expect("write e2e consent store");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"version": 2, "log": [e0, e1]})).unwrap(),
+        )
+        .expect("write e2e consent store");
 
         unsafe {
             std::env::set_var("AGENT_CONSENT_SELFTEST", "1");
