@@ -60,6 +60,31 @@
 //! zero are misreported as setup defects, so the screen does not swallow the
 //! divergence it sits in front of.
 //!
+//! Re-validated 2026-08-25, and the second pass corrects an inference the
+//! paragraph above invites. Those three tests are `lead-seat`,
+//! `lead-seat-retract` and `claim-close`. `reaper-lease-expiry` — the case whose
+//! flakiness prompted the fix — is NOT among them, and it stays green when
+//! `assert_write_authorized` is stripped from the routed path. That is not
+//! insensitivity in the test; the reaper write is refused by THREE independent
+//! store-side guards, and removing any one or two of them leaves the other(s)
+//! refusing:
+//!
+//! 1. `append_fact_under_lock`'s reaper owner-session check (`store.rs`,
+//!    "owner session does not match the reaper evidence"),
+//! 2. the same function's under-lock eligibility re-check ("no longer eligible
+//!    under the mutation lock (owner revived or lease renewed)"),
+//! 3. `assert_write_authorized` itself, via `needs_authority_check`.
+//!
+//! All three had to be stripped from the routed path at once before
+//! `reaper-lease-expiry` reported the divergence — which it then did, on a
+//! genuine parity assertion (`left: (false, true, 0)` vs `right: (true, true,
+//! 0)`: direct refused the forged reaper, routed accepted it), with zero setup
+//! defects, 5/5 under load average climbing 40 → 321 on 16 cores. So the screen
+//! does not mask a real divergence on this case either, under load or at rest.
+//! Anyone shortening this to "the reaper case is mutation-covered by stripping
+//! the authority gate" will measure the wrong thing and conclude the test is
+//! blind when it is layered.
+//!
 //! # Why the field-bound payload is 8 KiB
 //!
 //! `field_bounds_are_identical_in_direct_and_routed_mode` uses an 8 KiB
