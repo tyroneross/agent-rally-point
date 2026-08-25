@@ -35,3 +35,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 dryoc = { workspace = true }
 rand = { workspace = true }
+# cli-dispatch-consent gate (consent.rs): SHA-256 for the tamper-evident hash
+# chain. Same version rally-cli already pins for its own SHA-256 use
+# (crates/rally-cli/src/doctor.rs) — zero new major-version surface.
+sha2 = "0.10"

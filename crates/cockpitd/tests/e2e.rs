@@ -35,6 +35,69 @@ use uuid::Uuid;
 
 const TEST_TOKEN: &str = "e2e-test-token-cockpit";
 
+
+// ── cli-dispatch-consent scaffolding ─────────────────────────────────────────
+//
+// The supervisor gates every vendor-CLI spawn on a recorded consent grant
+// (crates/cockpitd/src/consent.rs). These tests drive REAL session launches, so
+// without a grant every launch is refused and the test hangs at `recv timeout`
+// rather than failing with a readable reason — which is exactly how this
+// regression presented: 27 passing e2e tests became 10 passing and 17 timeouts.
+//
+// The grant is written ONCE per test binary and the env is set once and never
+// changed, so parallel tests cannot observe a half-applied redirect. This is
+// test scaffolding for a real gate, NOT a way to disable it: the store below is
+// a genuine, hash-chained document that the production code path verifies
+// normally. A malformed one would fail these tests, which is the point.
+fn ensure_consent_granted() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        fn entry_hash(entry: &Value) -> String {
+            use sha2::{Digest, Sha256};
+            let mut sorted: std::collections::BTreeMap<String, Value> =
+                std::collections::BTreeMap::new();
+            if let Some(obj) = entry.as_object() {
+                for (k, v) in obj {
+                    if k != "entry_sha256" {
+                        sorted.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            format!("{:x}", Sha256::digest(serde_json::to_vec(&sorted).unwrap()))
+        }
+
+        let mut path = std::env::temp_dir();
+        path.push("cockpitd-e2e-consent-granted.json");
+
+        let mut e0 = json!({
+            "seq": 0, "key": "rally-point:claude", "mode": "auto",
+            "decided_at": "2026-08-21T00:00:00Z", "decided_by": "test",
+            "decided_via": "e2e-test", "decided_in_repo": "/tmp/test-repo",
+            "prev_sha256": null
+        });
+        let h0 = entry_hash(&e0);
+        e0["entry_sha256"] = json!(h0);
+
+        let mut e1 = json!({
+            "seq": 1, "key": "rally-point:codex", "mode": "auto",
+            "decided_at": "2026-08-21T00:00:01Z", "decided_by": "test",
+            "decided_via": "e2e-test", "decided_in_repo": "/tmp/test-repo",
+            "prev_sha256": h0
+        });
+        let h1 = entry_hash(&e1);
+        e1["entry_sha256"] = json!(h1);
+
+        std::fs::write(&path, serde_json::to_vec(&json!({"version": 2, "log": [e0, e1]})).unwrap())
+            .expect("write e2e consent store");
+
+        unsafe {
+            std::env::set_var("AGENT_CONSENT_SELFTEST", "1");
+            std::env::set_var("AGENT_CONSENT_STORE_PATH", path.to_str().unwrap());
+            std::env::set_var("AGENT_DISPATCH_DEPTH", "0");
+        }
+    });
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn mock_claude_path() -> PathBuf {
@@ -96,6 +159,7 @@ async fn start_daemon() -> SocketAddr {
     let state = build_state(supervisor, audit);
 
     // Spawn the server.
+    ensure_consent_granted();
     tokio::spawn(async move {
         cockpitd::transport::ws::serve_on(listener, state)
             .await
@@ -531,6 +595,7 @@ async fn start_daemon_codex() -> SocketAddr {
     let audit = AuditLog::open_in_memory(SystemClock).unwrap();
     let state = build_state(supervisor, audit);
 
+    ensure_consent_granted();
     tokio::spawn(async move {
         cockpitd::transport::ws::serve_on(listener, state)
             .await
@@ -788,6 +853,7 @@ async fn start_daemon_gated() -> SocketAddr {
     let audit = AuditLog::open_in_memory(SystemClock).unwrap();
     let state = build_state(supervisor, audit);
 
+    ensure_consent_granted();
     tokio::spawn(async move {
         cockpitd::transport::ws::serve_on(listener, state)
             .await
@@ -826,6 +892,7 @@ async fn start_daemon_multiblock() -> SocketAddr {
     let audit = AuditLog::open_in_memory(SystemClock).unwrap();
     let state = build_state(supervisor, audit);
 
+    ensure_consent_granted();
     tokio::spawn(async move {
         cockpitd::transport::ws::serve_on(listener, state)
             .await
@@ -1310,6 +1377,7 @@ async fn start_daemon_codex_gated() -> SocketAddr {
     let audit = AuditLog::open_in_memory(SystemClock).unwrap();
     let state = build_state(supervisor, audit);
 
+    ensure_consent_granted();
     tokio::spawn(async move {
         cockpitd::transport::ws::serve_on(listener, state)
             .await

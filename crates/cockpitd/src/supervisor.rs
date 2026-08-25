@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::{
     clock::Clock,
+    consent,
     model::{Event, Session, SessionStatus},
     store::Store,
 };
@@ -117,6 +118,20 @@ impl<C: Clock> Supervisor<C> {
         prompt: Option<&str>,
         owner_id: &str,
     ) -> Result<Uuid> {
+        // cli-dispatch-consent gate: checked BEFORE any session row exists, so
+        // a refusal never leaves a half-created session behind. Rally Point
+        // has no ask surface, so `allowed: false` always means "do not
+        // dispatch" — see consent.rs and
+        // references/cli-dispatch-consent-contract.md.
+        let verdict = consent::check_for_agent_type(agent_type);
+        if !verdict.allowed {
+            bail!(
+                "cli dispatch consent refused for agent_type {agent_type:?} (key {}): {}",
+                verdict.key,
+                verdict.reason
+            );
+        }
+
         let id = Uuid::new_v4();
         let now = self.clock.now();
 
@@ -170,6 +185,17 @@ impl<C: Clock> Supervisor<C> {
         owner_id: &str,
         event_tx: broadcast::Sender<Event>,
     ) -> Result<Uuid> {
+        // cli-dispatch-consent gate — same check as launch_session, before
+        // any session row exists. See consent.rs.
+        let verdict = consent::check_for_agent_type(agent_type);
+        if !verdict.allowed {
+            bail!(
+                "cli dispatch consent refused for agent_type {agent_type:?} (key {}): {}",
+                verdict.key,
+                verdict.reason
+            );
+        }
+
         let _ = event_tx; // stored in AppState; passed to the pump by ws.rs
         let id = Uuid::new_v4();
         let now = self.clock.now();
@@ -223,7 +249,30 @@ impl<C: Clock> Supervisor<C> {
     }
 
     /// Send a prompt to a running session via the adapter.
+    ///
+    /// cli-dispatch-consent gate: this is the ONLY path to `Adapter::send`
+    /// inside cockpitd (verified: grep found no other `self.adapter.send` /
+    /// `adapter_send` call site — the transport layer's `ws.rs` calls
+    /// `adapter_send`, never the trait method directly). Gating here covers
+    /// `codex.rs`'s `send`, which spawns `codex exec resume` with
+    /// `Stdio::null()` on all three streams — an ungated spawn there would be
+    /// completely silent. The check is re-run on every call, not cached from
+    /// launch time, so a consent record revoked mid-session is honored on the
+    /// next send rather than only at launch.
     pub fn adapter_send(&mut self, session_id: Uuid, text: &str) -> Result<()> {
+        let agent_type = self
+            .store
+            .get_session(session_id)?
+            .map(|s| s.agent_type)
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+        let verdict = consent::check_for_agent_type(&agent_type);
+        if !verdict.allowed {
+            bail!(
+                "cli dispatch consent refused for agent_type {agent_type:?} (key {}): {}",
+                verdict.key,
+                verdict.reason
+            );
+        }
         self.adapter.send(session_id, text)
     }
 
@@ -398,6 +447,104 @@ mod tests {
     use crate::clock::FakeClock;
     use crate::store::Store;
 
+    // ── cli-dispatch-consent test scaffolding ───────────────────────────────
+    //
+    // launch_session / launch_session_async / adapter_send now gate through
+    // consent::check_for_agent_type, which (for recognized agent_types) reads
+    // the operator's real ~/.agent-consent UNLESS AGENT_CONSENT_SELFTEST +
+    // AGENT_CONSENT_STORE_PATH redirect it — the same test-runner handshake
+    // the contract specifies for the Python reference implementation. These
+    // are process-wide env vars shared by every test in this binary, so every
+    // test that touches them serializes on CONSENT_TEST_LOCK; tests that
+    // launch an unrecognized agent_type (refused before store_path() is ever
+    // called) don't need the lock at all.
+
+    static CONSENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn canonical_entry_hash(entry: &serde_json::Value) -> String {
+        use sha2::{Digest, Sha256};
+        let mut sorted: std::collections::BTreeMap<String, serde_json::Value> =
+            std::collections::BTreeMap::new();
+        if let Some(obj) = entry.as_object() {
+            for (k, v) in obj {
+                if k != "entry_sha256" {
+                    sorted.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let bytes = serde_json::to_vec(&sorted).unwrap();
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    /// A valid two-entry chain granting `rally-point:claude` and
+    /// `rally-point:codex` `auto`, written once to a fixed temp path.
+    fn ensure_granted_consent_store() -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push("cockpitd-supervisor-test-consent-granted.json");
+
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let mut e0 = serde_json::json!({
+                "seq": 0,
+                "key": "rally-point:claude",
+                "mode": "auto",
+                "decided_at": "2026-08-21T00:00:00Z",
+                "decided_by": "test",
+                "decided_via": "supervisor-unit-test",
+                "decided_in_repo": "/tmp/test-repo",
+                "prev_sha256": null,
+            });
+            let h0 = canonical_entry_hash(&e0);
+            e0["entry_sha256"] = serde_json::json!(h0);
+
+            let mut e1 = serde_json::json!({
+                "seq": 1,
+                "key": "rally-point:codex",
+                "mode": "auto",
+                "decided_at": "2026-08-21T00:00:01Z",
+                "decided_by": "test",
+                "decided_via": "supervisor-unit-test",
+                "decided_in_repo": "/tmp/test-repo",
+                "prev_sha256": h0,
+            });
+            let h1 = canonical_entry_hash(&e1);
+            e1["entry_sha256"] = serde_json::json!(h1);
+
+            let doc = serde_json::json!({ "version": 2, "log": [e0, e1] });
+            std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        });
+        path
+    }
+
+    /// Run `f` with the consent gate pointed at the granted store above and
+    /// depth reset to 0, holding `CONSENT_TEST_LOCK` for the duration so no
+    /// concurrently-running test observes a different redirected path.
+    fn with_granted_consent<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = CONSENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = ensure_granted_consent_store();
+        unsafe {
+            std::env::set_var("AGENT_CONSENT_SELFTEST", "1");
+            std::env::set_var("AGENT_CONSENT_STORE_PATH", path.to_str().unwrap());
+            std::env::set_var("AGENT_DISPATCH_DEPTH", "0");
+        }
+        f()
+    }
+
+    /// Run `f` with the consent gate pointed at a store with NO recorded
+    /// entries, proving the gate actually refuses by default.
+    fn with_no_consent<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = CONSENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut path = std::env::temp_dir();
+        path.push("cockpitd-supervisor-test-consent-none.json");
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::set_var("AGENT_CONSENT_SELFTEST", "1");
+            std::env::set_var("AGENT_CONSENT_STORE_PATH", path.to_str().unwrap());
+            std::env::set_var("AGENT_DISPATCH_DEPTH", "0");
+        }
+        f()
+    }
+
     fn open_supervisor(script: Vec<AdapterEvent>) -> Supervisor<FakeClock> {
         let store = Store::open_in_memory().unwrap();
         let clock = FakeClock::at_epoch();
@@ -422,51 +569,55 @@ mod tests {
 
     #[test]
     fn launch_records_events_with_monotonic_seq_and_completes() {
-        let placeholder = Uuid::nil(); // supervisor assigns the real ID
-        let script = vec![
-            make_event(placeholder, "line 1"),
-            make_event(placeholder, "line 2"),
-            make_event(placeholder, "line 3"),
-            AdapterEvent::Completed,
-        ];
-        let mut sup = open_supervisor(script);
-        let sid = sup
-            .launch_session("claude", "/tmp/repo", Some("do work"), "local")
-            .unwrap();
+        with_granted_consent(|| {
+            let placeholder = Uuid::nil(); // supervisor assigns the real ID
+            let script = vec![
+                make_event(placeholder, "line 1"),
+                make_event(placeholder, "line 2"),
+                make_event(placeholder, "line 3"),
+                AdapterEvent::Completed,
+            ];
+            let mut sup = open_supervisor(script);
+            let sid = sup
+                .launch_session("claude", "/tmp/repo", Some("do work"), "local")
+                .unwrap();
 
-        let events = sup.store.replay_from(sid, 0).unwrap();
-        assert_eq!(events.len(), 3, "3 events stored");
-        assert_eq!(events[0].seq, 1);
-        assert_eq!(events[1].seq, 2);
-        assert_eq!(events[2].seq, 3);
-        assert_eq!(events[0].content, "line 1");
+            let events = sup.store.replay_from(sid, 0).unwrap();
+            assert_eq!(events.len(), 3, "3 events stored");
+            assert_eq!(events[0].seq, 1);
+            assert_eq!(events[1].seq, 2);
+            assert_eq!(events[2].seq, 3);
+            assert_eq!(events[0].content, "line 1");
 
-        let _status = sup.status(sid);
-        // Session removed from live map after terminal; check store
-        let stored_status = sup.store.get_session(sid).unwrap().unwrap().status;
-        assert!(
-            matches!(stored_status, SessionStatus::Completed),
-            "expected Completed, got {stored_status:?}"
-        );
+            let _status = sup.status(sid);
+            // Session removed from live map after terminal; check store
+            let stored_status = sup.store.get_session(sid).unwrap().unwrap().status;
+            assert!(
+                matches!(stored_status, SessionStatus::Completed),
+                "expected Completed, got {stored_status:?}"
+            );
+        });
     }
 
     // ── A3-2: last_seq updated in store ───────────────────────────────────────
 
     #[test]
     fn last_seq_updated_after_events() {
-        let placeholder = Uuid::nil();
-        let script = vec![
-            make_event(placeholder, "a"),
-            make_event(placeholder, "b"),
-            AdapterEvent::Completed,
-        ];
-        let mut sup = open_supervisor(script);
-        let sid = sup
-            .launch_session("codex", "/tmp/r", None, "local")
-            .unwrap();
+        with_granted_consent(|| {
+            let placeholder = Uuid::nil();
+            let script = vec![
+                make_event(placeholder, "a"),
+                make_event(placeholder, "b"),
+                AdapterEvent::Completed,
+            ];
+            let mut sup = open_supervisor(script);
+            let sid = sup
+                .launch_session("codex", "/tmp/r", None, "local")
+                .unwrap();
 
-        let session = sup.store.get_session(sid).unwrap().unwrap();
-        assert_eq!(session.last_seq, 2);
+            let session = sup.store.get_session(sid).unwrap().unwrap();
+            assert_eq!(session.last_seq, 2);
+        });
     }
 
     // ── A3-3: kill transitions to Killed ──────────────────────────────────────
@@ -527,33 +678,106 @@ mod tests {
 
     #[test]
     fn disconnected_when_channel_closes_without_terminal() {
-        // Empty script → FakeAdapter drops tx immediately.
-        let script = vec![];
-        let mut sup = open_supervisor(script);
-        let sid = sup
-            .launch_session("claude", "/tmp/r", None, "local")
-            .unwrap();
+        with_granted_consent(|| {
+            // Empty script → FakeAdapter drops tx immediately.
+            let script = vec![];
+            let mut sup = open_supervisor(script);
+            let sid = sup
+                .launch_session("claude", "/tmp/r", None, "local")
+                .unwrap();
 
-        let stored = sup.store.get_session(sid).unwrap().unwrap();
+            let stored = sup.store.get_session(sid).unwrap().unwrap();
+            assert!(
+                matches!(stored.status, SessionStatus::Disconnected),
+                "expected Disconnected, got {:?}",
+                stored.status
+            );
+        });
+    }
+
+    // ── A3-5 (superseded by the consent gate): an unrecognized agent_type is
+    // now REFUSED, not silently launched. Before the cli-dispatch-consent
+    // gate, the supervisor accepted any open string as agent_type (this test
+    // used to prove "gemini" survived a full launch cycle). The contract
+    // requires an unmapped agent_type to refuse rather than default to allow
+    // (rally-point maps only "claude" and "codex" — see consent.rs), so that
+    // is now the behavior under test. No consent-store redirection is needed:
+    // an unrecognized agent_type is refused before consent::check() ever
+    // calls store_path(), so this is safe to run without the lock.
+
+    #[test]
+    fn unrecognized_agent_type_is_refused_before_launch() {
+        let script = vec![AdapterEvent::Completed];
+        let mut sup = open_supervisor(script);
+        let result = sup.launch_session("gemini", "/tmp/repo", None, "local");
         assert!(
-            matches!(stored.status, SessionStatus::Disconnected),
-            "expected Disconnected, got {:?}",
-            stored.status
+            result.is_err(),
+            "unrecognized agent_type must be refused by the consent gate, not silently launched"
         );
     }
 
-    // ── A3-5: open string agent_type survives full launch cycle ───────────────
+    // ── cli-dispatch-consent wiring: launch_session refuses without a record ──
 
     #[test]
-    fn open_agent_type_survives_launch() {
-        let _placeholder = Uuid::nil();
-        let script = vec![AdapterEvent::Completed];
-        let mut sup = open_supervisor(script);
-        let sid = sup
-            .launch_session("gemini", "/tmp/repo", None, "local")
-            .unwrap();
+    fn launch_refuses_without_recorded_consent() {
+        with_no_consent(|| {
+            let mut sup = open_supervisor(vec![AdapterEvent::Completed]);
+            let result = sup.launch_session("claude", "/tmp/repo", None, "local");
+            assert!(
+                result.is_err(),
+                "launch must be refused when no consent record exists for rally-point:claude"
+            );
+        });
+    }
 
-        let stored = sup.store.get_session(sid).unwrap().unwrap();
-        assert_eq!(stored.agent_type, "gemini");
+    #[test]
+    fn launch_session_async_refuses_without_recorded_consent() {
+        with_no_consent(|| {
+            let mut sup = open_supervisor(vec![]);
+            let (tx, _rx) = broadcast::channel(4);
+            let result = sup.launch_session_async("codex", "/tmp/repo", None, "local", tx);
+            assert!(
+                result.is_err(),
+                "async launch must be refused when no consent record exists for rally-point:codex"
+            );
+        });
+    }
+
+    // ── cli-dispatch-consent wiring: adapter_send re-checks, not just launch ──
+
+    #[test]
+    fn adapter_send_refuses_when_consent_missing_for_recorded_session() {
+        let _guard = CONSENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let granted = ensure_granted_consent_store();
+        unsafe {
+            std::env::set_var("AGENT_CONSENT_SELFTEST", "1");
+            std::env::set_var("AGENT_CONSENT_STORE_PATH", granted.to_str().unwrap());
+            std::env::set_var("AGENT_DISPATCH_DEPTH", "0");
+        }
+        let mut sup = open_supervisor(vec![AdapterEvent::Completed]);
+        let sid = sup
+            .launch_session("claude", "/tmp/repo", None, "local")
+            .expect("launch should succeed while consent is granted");
+
+        // Session row persists in the store after completion; point the gate
+        // at a store with no record and confirm adapter_send re-checks rather
+        // than relying on the grant it saw at launch time.
+        let mut no_consent = std::env::temp_dir();
+        no_consent.push("cockpitd-supervisor-test-consent-none-for-send.json");
+        let _ = std::fs::remove_file(&no_consent);
+        unsafe {
+            std::env::set_var("AGENT_CONSENT_STORE_PATH", no_consent.to_str().unwrap());
+        }
+        let result = sup.adapter_send(sid, "hello");
+        assert!(
+            result.is_err(),
+            "adapter_send must re-check consent, not rely on launch-time approval"
+        );
+
+        // Restore the granted store so any other test still holding a stale
+        // reference to this process-wide env sees a consistent value.
+        unsafe {
+            std::env::set_var("AGENT_CONSENT_STORE_PATH", granted.to_str().unwrap());
+        }
     }
 }

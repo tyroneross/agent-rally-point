@@ -54,6 +54,9 @@ pub mod crypto;
 // ── ARP-005 (security audit) ──────────────────────────────────────────────────
 pub mod policy;
 
+// ── cli-dispatch-consent gate ─────────────────────────────────────────────────
+pub mod consent;
+
 #[cfg(test)]
 mod smoke {
     #[test]
