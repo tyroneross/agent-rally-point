@@ -46,6 +46,15 @@ impl Room {
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env("RALLY_HOOKS", "off")
+            // Strip the ambient CI identity. `derive_endpoint` ranks
+            // cloud job ABOVE managed pane, so under GitHub Actions every
+            // simulated session in this file collapses to the same
+            // `cloud:github-actions:<run-id>` — one run id shared by all
+            // children — and receiver binding can no longer tell two
+            // sessions apart. Locally these vars are unset, which is why
+            // this only ever failed on the runner.
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
             .env("TERM_SESSION_ID", session)
             .env("PATH", format!("{}:{inherited}", self.bin.display()))
             .args(args)
@@ -59,6 +68,8 @@ impl Room {
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env("RALLY_HOOKS", "off")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
             .env("RALLY_SESSION_ID", session)
             .env("PATH", format!("{}:{inherited}", self.bin.display()))
             .args(args)
@@ -160,6 +171,8 @@ impl Daemon {
             .current_dir(&room.cwd)
             .env("HOME", &room.home)
             .env("RALLY_HOOKS", "off")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
             .env("PATH", format!("{}:{inherited}", room.bin.display()))
             .args(["daemon", "serve", "--idle-exit-secs", "180"])
             .stdout(Stdio::null())
