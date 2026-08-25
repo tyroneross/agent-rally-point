@@ -325,6 +325,16 @@ impl OwnedFd {
     /// would leave that helper pinning `.rally/log/` and any unlinked inode
     /// for its own lifetime. The inotify backend already sets `IN_CLOEXEC`;
     /// this makes the kqueue side consistent rather than accidentally laxer.
+    /// Gated to the same platforms as `kqueue_backend`, its only caller. The
+    /// inotify backend builds its `OwnedFd` straight from `inotify_init1`, so
+    /// on Linux this would be dead code.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
     fn open(path: &Path, flags: libc::c_int) -> Option<OwnedFd> {
         use std::os::unix::ffi::OsStrExt;
         let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -531,12 +541,12 @@ mod inotify_backend {
             }
             let fd = OwnedFd(fd);
             let dir_cstr = path_to_cstring(log_dir)?;
-            let mask = (libc::IN_CREATE
+            let mask = libc::IN_CREATE
                 | libc::IN_MODIFY
                 | libc::IN_MOVED_TO
                 | libc::IN_CLOSE_WRITE
                 | libc::IN_DELETE
-                | libc::IN_MOVED_FROM) as u32;
+                | libc::IN_MOVED_FROM;
             let watch_id = unsafe { libc::inotify_add_watch(fd.raw(), dir_cstr.as_ptr(), mask) };
             if watch_id < 0 {
                 return None;
