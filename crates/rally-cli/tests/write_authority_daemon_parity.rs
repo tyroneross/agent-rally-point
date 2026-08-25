@@ -37,6 +37,29 @@
 //! question is answered by the other suite, and reading only one of them is how
 //! a reviewer concludes more than the evidence supports.
 //!
+//! # What this file refuses to grade
+//!
+//! An authorization verdict and a lost race are different facts, and until
+//! 2026-08-24 this file scored them the same way. Rally answers a refused write
+//! and a write that never committed with the SAME envelope shape —
+//! `{"ok": false, "command": "partial_commit"}` — so `ok()` returning `false`
+//! meant either "the gate said no" or "the host was too busy for the write to
+//! happen". Under the pre-push gate's parallel workspace build the second case
+//! fired routinely, and the suite reported it as the first: an
+//! authorization-parity failure, in the file whose entire purpose is to be
+//! believed about exactly that. A blocking gate that fails for a reason its own
+//! message disclaims is training to retry until green, which is the state in
+//! which a real regression gets waved through.
+//!
+//! So the timing budget is now separated from the observation window
+//! ([`WATCHDOG_BUDGET_MS`]), and every envelope is screened before it is scored
+//! ([`timing_defect`]). A run that loses the race aborts as a TEST SETUP DEFECT
+//! naming the resource condition, and never reaches the parity comparison.
+//! Mutation-validated 2026-08-24: with the authority gate stripped from the
+//! routed path only, three tests still fail on genuine parity assertions and
+//! zero are misreported as setup defects, so the screen does not swallow the
+//! divergence it sits in front of.
+//!
 //! # Why the field-bound payload is 8 KiB
 //!
 //! `field_bounds_are_identical_in_direct_and_routed_mode` uses an 8 KiB
@@ -62,6 +85,133 @@ const SIGTERM: i32 = 15;
 
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
+}
+
+/// The wall-clock budget handed to every `rally` command this file runs.
+///
+/// # Why this exists, and why it is not a widened sleep
+///
+/// Rally bounds EVERY command with a hook-safety watchdog that fails CLOSED at
+/// `DEFAULT_WATCHDOG_TIMEOUT_MS` (3s, `rally-cli/src/lib.rs`). That budget is a
+/// property of the PRODUCT — it stops an agent write-hook from wedging on stuck
+/// I/O — and it already has its own suites: `watchdog_timeout.rs`,
+/// `retry_budget_watchdog.rs`, `watchdog_write_durability.rs`.
+///
+/// This file grades a different question: does an authority gate return the SAME
+/// verdict through the CLI and through rallyd. Leaving a 3s wall-clock budget
+/// inside that observation makes host load a hidden input to an authorization
+/// verdict. Measured 2026-08-24 on a 16-core host: run this binary alone and it
+/// passes 6/6 in ~4.6s; run it under the pre-push gate's parallel workspace
+/// build (load average ~280) and it fails 4/4 — `say claim` comes back
+/// `partial_commit` with `mutation-not-started: deadline elapsed before
+/// acquiring …/mutation.lock`, and `doctor --reap-stale` comes back
+/// `watchdog-timeout-uncommitted-mutation`. Neither is an authorization result.
+/// Both were being scored as one.
+///
+/// 60_000 is `MAX_WATCHDOG_TIMEOUT_MS`, the ceiling rally clamps the override
+/// to. Raising it costs nothing in wall-clock: nothing in this file sleeps on
+/// this value and no test waits for it to elapse. It only stops a contended host
+/// from converting a slow write into a fake refusal. The budget is separated
+/// from the observation window, not widened inside it.
+const WATCHDOG_BUDGET_MS: &str = "60000";
+
+/// Stable markers for "this command lost a race with the host and never reached
+/// an authority decision".
+///
+/// Every entry is a literal from rally's resource/timing paths, never from an
+/// authority path:
+///
+/// * `watchdog-timeout` — the prefix shared by all four fail-closed watchdog
+///   error codes (`lib.rs`: `…-fail-closed`, `…-uncommitted-mutation`,
+///   `…-outcome-unknown`, `…-db-only-migration-outcome-unknown`).
+/// * `mutation-not-started:` — `store.rs` / `store_client.rs` / `rallyd_core.rs`
+///   emit this when a deadline elapsed before any durable mutation began.
+/// * `mutation-outcome-unknown:` — `error.rs`, the ambiguous sibling.
+/// * `retry budget exhausted` — `store.rs`, the contended-database retry ceiling.
+/// * `pool timed out …` — `store.rs`, sqlx connection-pool starvation.
+///
+/// This set is deliberately CONSERVATIVE, and the asymmetry matters. A neutered
+/// gate answers `ok: true`, which carries no marker at all, so nothing added
+/// here can ever hide a missing gate — but anything added here that is NOT
+/// purely a timing condition would start discarding real refusals. When in
+/// doubt, leave a marker out and let the verdict be graded.
+const TIMING_MARKERS: [&str; 5] = [
+    "watchdog-timeout",
+    "mutation-not-started:",
+    "mutation-outcome-unknown:",
+    "retry budget exhausted",
+    "pool timed out while waiting for an open connection",
+];
+
+/// Collect every diagnostic string in a rally envelope: the values of `code` and
+/// `message` keys, at any depth.
+///
+/// Keyed rather than scanning the whole serialized envelope on purpose. This
+/// file deliberately feeds rally hostile payloads — an 8 KiB subject, a tool id
+/// carrying `\n## FORGED HEADING` — and those land under `subject` / `tool`. A
+/// blind substring search over the envelope would let a caller-supplied string
+/// decide whether the run counts as a setup defect.
+fn collect_diagnostics(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(map) => {
+            for (key, val) in map {
+                if (key == "code" || key == "message")
+                    && let Some(s) = val.as_str()
+                {
+                    out.push(s.to_string());
+                }
+                collect_diagnostics(val, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_diagnostics(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `Some(diagnostic)` when this envelope is a resource/timing outcome rather
+/// than an authority verdict.
+///
+/// This is the discriminator the file was missing. A genuine refusal and a
+/// watchdog expiry are INDISTINGUISHABLE at the top level — both answer
+/// `{"ok": false, "command": "partial_commit"}`. The refusal says
+/// `reap refused: … owner session does not match the reaper evidence`; the
+/// expiry says `mutation-not-started: deadline elapsed …`. Only the diagnostic
+/// text separates them, so only the diagnostic text can be trusted to.
+fn timing_defect(v: &Value) -> Option<String> {
+    let mut diagnostics = Vec::new();
+    collect_diagnostics(v, &mut diagnostics);
+    diagnostics
+        .into_iter()
+        .find(|d| TIMING_MARKERS.iter().any(|marker| d.contains(marker)))
+}
+
+/// Abort with the diagnosis the failure actually has.
+///
+/// The whole point of this function is the first line of its message. A failure
+/// here is a broken PRECONDITION — the write under test never happened — and
+/// reporting it under a test named `…authorization_is_identical…` is how a
+/// saturated CI host teaches a reviewer to retry until green, which is how a
+/// real regression eventually gets waved through.
+fn setup_defect(args: &[&str], reason: &str, envelope: &Value) -> ! {
+    panic!(
+        "TEST SETUP DEFECT — this is NOT an authorization-parity failure.\n\
+         `rally {}` never reached an authority decision. It returned a \
+         resource/timing outcome:\n    {reason}\n\
+         This file grades whether a gate answers the same through the CLI and \
+         through rallyd. It cannot grade a write that never committed, so the \
+         run is reported as a broken precondition instead of being scored as a \
+         refusal.\n\
+         The command budget is already {WATCHDOG_BUDGET_MS}ms — rally's own \
+         ceiling — so reaching this means the host is saturated far past what \
+         this suite is meant to tolerate, or a genuine contention regression \
+         exists. Do NOT widen a sleep and do NOT retry until green.\n\
+         full envelope: {envelope}",
+        args.join(" "),
+    )
 }
 
 struct Room {
@@ -94,11 +244,20 @@ impl Room {
             .env("HOME", &self.home)
             .env("RALLY_HOOKS", "off")
             .env("RALLY_SESSION_ID", &self.session_id)
+            // Take the product's 3s wall-clock budget out of the observation
+            // window. See `WATCHDOG_BUDGET_MS`.
+            .env("RALLY_HOOK_TIMEOUT_MS", WATCHDOG_BUDGET_MS)
             .args(args)
             .output()
             .unwrap()
     }
 
+    /// Run `args` and return the envelope, having first screened it for
+    /// resource/timing failure.
+    ///
+    /// The screen lives HERE, at the single door every observation in this file
+    /// passes through, so no future call site can accidentally score a
+    /// never-committed write as a verdict.
     fn json(&self, args: &[&str]) -> Value {
         let out = self.run(args);
         let body = if out.stdout.is_empty() {
@@ -106,21 +265,33 @@ impl Room {
         } else {
             &out.stdout
         };
-        serde_json::from_slice(body).unwrap_or_else(|e| {
+        let v: Value = serde_json::from_slice(body).unwrap_or_else(|e| {
             panic!(
                 "cmd {args:?} did not emit JSON ({e})\nstderr: {}\nstdout: {}",
                 String::from_utf8_lossy(&out.stderr),
                 String::from_utf8_lossy(&out.stdout),
             )
-        })
+        });
+        if let Some(reason) = timing_defect(&v) {
+            setup_defect(args, &reason, &v);
+        }
+        v
     }
 
     fn ok(&self, args: &[&str]) -> bool {
         self.json(args)["ok"] == Value::Bool(true)
     }
 
-    fn claim(&self, tool: &str, path: &str) -> String {
-        let v = self.json(&[
+    /// Mint a claim owned by `tool` over `path`, carrying any extra `evidence`.
+    ///
+    /// Both halves of the precondition are asserted here — the command
+    /// succeeded, AND it handed back an event id — because every caller needs
+    /// the claim to exist before the behaviour under test begins. The reaper
+    /// case used to inline this and read `…["event_id"].as_str().expect("claim
+    /// event_id")`, so a claim that never committed surfaced as a three-word
+    /// panic inside a test whose name promises a statement about authorization.
+    fn claim_with(&self, tool: &str, path: &str, evidence: &[&str]) -> String {
+        let mut args = vec![
             "say",
             "claim",
             "--tool",
@@ -129,20 +300,58 @@ impl Room {
             path,
             "--subject",
             "owns it",
-            "--json",
-        ]);
-        assert_eq!(v["ok"], Value::Bool(true), "claim: {v}");
+        ];
+        for item in evidence {
+            args.push("--evidence");
+            args.push(item);
+        }
+        args.push("--json");
+
+        let v = self.json(&args);
+        assert_eq!(
+            v["ok"],
+            Value::Bool(true),
+            "TEST SETUP DEFECT: the claim this scenario is built on was refused, so nothing \
+             downstream grades authorization parity: {v}"
+        );
         v["data"]["say"]["fact"]["event_id"]
             .as_str()
-            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "TEST SETUP DEFECT: `say claim` reported success but projected no \
+                     event_id, so the scenario has no claim to act on: {v}"
+                )
+            })
             .to_string()
     }
 
+    fn claim(&self, tool: &str, path: &str) -> String {
+        self.claim_with(tool, path, &[])
+    }
+
+    /// How many claims are standing, or a setup defect if the room did not
+    /// project an answer.
+    ///
+    /// The absent case is NOT zero. This read used to end in `.unwrap_or(0)`,
+    /// which silently reported a room that failed to project as a room holding
+    /// no claims — and since this count is compared across the two store modes,
+    /// a single degraded read surfaced as `left: (false, false, 0)` vs
+    /// `right: (false, false, 1)`: a direct-vs-routed divergence that never
+    /// happened, reported in the file whose entire job is to be believed about
+    /// exactly that.
     fn active_claim_count(&self) -> usize {
-        self.json(&["room", "--json"])["data"]["room"]["active_claims"]
+        let v = self.json(&["room", "--json"]);
+        v["data"]["room"]["active_claims"]
             .as_array()
             .map(Vec::len)
-            .unwrap_or(0)
+            .unwrap_or_else(|| {
+                setup_defect(
+                    &["room", "--json"],
+                    "the room projected no `active_claims` array, so the claim count is \
+                     unknown — which is not the same as zero",
+                    &v,
+                )
+            })
     }
 
     fn lead(&self) -> Option<String> {
@@ -161,7 +370,10 @@ impl Room {
             .filter(|d| d["subject"].as_str() == Some("role:lead"))
             .max_by_key(|d| d["seq"].as_i64().unwrap_or(0))
             .and_then(|d| d["event_id"].as_str())
-            .expect("the room must carry a seated lead decision")
+            .expect(
+                "TEST SETUP DEFECT: the room carries no seated lead decision, so the retraction \
+                 scenario has no seat to aim at",
+            )
             .to_string()
     }
 }
@@ -328,22 +540,11 @@ fn claim_close_authorization_is_identical_in_direct_and_routed_mode() {
 fn reaper_lease_expiry_authorization_is_identical_in_direct_and_routed_mode() {
     assert_parity("reaper-lease-expiry", |room| {
         // A claim whose lease has already run out, owned by someone else.
-        let cid = room.json(&[
-            "say",
-            "claim",
-            "--tool",
+        let cid = room.claim_with(
             "victim",
-            "--path",
             "src/lib.rs",
-            "--subject",
-            "owns it",
-            "--evidence",
-            "lease_expires_at:2000-01-01T00:00:00Z",
-            "--json",
-        ])["data"]["say"]["fact"]["event_id"]
-            .as_str()
-            .expect("claim event_id")
-            .to_string();
+            &["lease_expires_at:2000-01-01T00:00:00Z"],
+        );
 
         // A hand-built ClaimExpired carrying the typed reaper evidence but NO
         // system role. It must be refused in both modes: the evidence set is
