@@ -39,6 +39,7 @@ trap cleanup EXIT
 total_fail=0
 total_quarantine=0
 total_bad_integrity=0
+total_counter_drift=0
 rounds_dirty=0
 daemon_rounds=0
 
@@ -122,14 +123,34 @@ for ((trial = 1; trial <= TRIALS; trial++)); do
   bad_integrity=0
   [[ "$integrity" != "ok" && "$integrity" != "absent" ]] && bad_integrity=1
 
+  # Canary check: a real quarantine (not a synthetic unit-test fixture) must
+  # also bump .rally/corruption-count.json to at least the number of
+  # quarantine files this round produced. The counter's read-modify-write
+  # logic already has unit coverage against a hand-written garbage file
+  # (`corruption_counter_increments_and_preserves_first_at`); that proves the
+  # bookkeeping is correct but not that it is wired to the real recovery path
+  # this script exercises. An unseeded counter is not evidence — this is the
+  # seed.
+  counter_count=0
+  counter_file="$room/.rally/corruption-count.json"
+  if [[ -f "$counter_file" ]]; then
+    counter_count=$(jq -r '.count // 0' "$counter_file" 2>/dev/null || echo 0)
+  fi
+  counter_drift=0
+  if ((quarantines > 0)) && ((counter_count < quarantines)); then
+    counter_drift=1
+  fi
+
   total_fail=$((total_fail + fails))
   total_quarantine=$((total_quarantine + quarantines))
   total_bad_integrity=$((total_bad_integrity + bad_integrity))
+  total_counter_drift=$((total_counter_drift + counter_drift))
 
   if ((fails > 0 || quarantines > 0 || bad_integrity > 0)); then
     rounds_dirty=$((rounds_dirty + 1))
-    printf 'trial %3d: DIRTY  hard_fails=%d quarantines=%d integrity=%s\n' \
-      "$trial" "$fails" "$quarantines" "$integrity"
+    printf 'trial %3d: DIRTY  hard_fails=%d quarantines=%d integrity=%s counter=%d%s\n' \
+      "$trial" "$fails" "$quarantines" "$integrity" "$counter_count" \
+      "$([[ $counter_drift == 1 ]] && echo ' [CANARY FAIL: counter did not track quarantines]' || echo '')"
     if ((rounds_dirty == 1)); then
       cp -R "$room/.rally" "$WORK/first-dirty-rally" 2>/dev/null || true
       grep -h '"ok":false' "$room"/.w*.err 2>/dev/null \
@@ -149,6 +170,19 @@ printf 'quarantine files    : %d\n' "$total_quarantine"
 printf 'bad integrity_check : %d\n' "$total_bad_integrity"
 if [[ "${RC044_DAEMON:-0}" == "1" ]]; then
   printf 'daemon-live rounds  : %d / %d  (arm validity)\n' "$daemon_rounds" "$TRIALS"
+fi
+if ((total_quarantine > 0)); then
+  printf 'counter canary      : %s (%d round(s) with quarantines; %d counter-blind)\n' \
+    "$([[ $total_counter_drift == 0 ]] && echo 'PASS — counter tracked every quarantine' || echo 'FAIL')" \
+    "$rounds_dirty" "$total_counter_drift"
+else
+  printf 'counter canary      : not seeded — no quarantine occurred this run\n'
+fi
+
+if ((total_counter_drift > 0)); then
+  printf '\nCANARY FAILURE: a real quarantine fired but corruption-count.json did not\n'
+  printf 'track it. The counter is not reliable evidence for the next production\n'
+  printf 'corruption event; treat CorruptionCounter as broken until this is fixed.\n'
 fi
 
 if ((rounds_dirty > 0)); then
