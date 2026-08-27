@@ -81,7 +81,10 @@ fn main() -> ExitCode {
             "key": verdict.key,
             "exit": exit,
         });
-        println!("{}", serde_json::to_string(&out).expect("verdict always serializes"));
+        println!(
+            "{}",
+            serde_json::to_string(&out).expect("verdict always serializes")
+        );
     } else {
         println!("{}: {}", verdict.key, verdict.reason);
     }
