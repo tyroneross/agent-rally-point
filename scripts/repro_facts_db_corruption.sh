@@ -20,6 +20,35 @@
 # Usage: repro_facts_db_corruption.sh [TRIALS] [WAYS] [OPS_PER_WORKER]
 set -uo pipefail
 
+count_quarantine_groups() {
+  local rally_dir="$1"
+  {
+    find "$rally_dir" -maxdepth 1 -type f -name 'facts.db.corrupt.*' 2>/dev/null || true
+    if [[ -d "$rally_dir/archive/swept" ]]; then
+      find "$rally_dir/archive/swept" -mindepth 2 -maxdepth 2 -type f \
+        -name 'facts.db.corrupt.*' 2>/dev/null || true
+    fi
+  } \
+    | sed -E 's#^.*/facts\.db\.corrupt\.([0-9]+)$#\1#' \
+    | awk '/^[0-9]+$/' \
+    | sort -u \
+    | wc -l \
+    | tr -d ' '
+}
+
+counter_tracks_quarantines() {
+  local counter_count="$1"
+  local quarantine_count="$2"
+  ((quarantine_count == 0 || counter_count >= quarantine_count))
+}
+
+daemon_arm_is_valid() {
+  local live_rounds="$1"
+  local expected_rounds="$2"
+  ((live_rounds == expected_rounds))
+}
+
+main() {
 TRIALS="${1:-10}"
 WAYS="${2:-6}"
 OPS="${3:-12}"
@@ -71,12 +100,10 @@ for ((trial = 1; trial <= TRIALS; trial++)); do
   # round-trips, so the storm below cannot race the daemon's cold start.
   # A treatment arm that silently fell back to the direct store would look like
   # a clean result and mean nothing, so liveness is ASSERTED, not assumed.
-  daemon_up=0
   if [[ "${RC044_DAEMON:-0}" == "1" ]]; then
     (cd "$room" && "$RALLY_BIN" daemon start --json) >/dev/null 2>&1
     if (cd "$room" && "$RALLY_BIN" daemon status --json) 2>/dev/null \
       | grep -q '"live": *true'; then
-      daemon_up=1
       daemon_rounds=$((daemon_rounds + 1))
     else
       printf 'trial %3d: daemon NOT LIVE — this round is not a daemon arm\n' "$trial"
@@ -101,7 +128,7 @@ for ((trial = 1; trial <= TRIALS; trial++)); do
 
   # Stop before measuring: the daemon holds the store open, and quarantine +
   # integrity_check must read a settled database, not a live one.
-  if ((daemon_up == 1)); then
+  if [[ "${RC044_DAEMON:-0}" == "1" ]]; then
     (cd "$room" && "$RALLY_BIN" daemon stop --json) >/dev/null 2>&1
   fi
 
@@ -112,8 +139,11 @@ for ((trial = 1; trial <= TRIALS; trial++)); do
     || true)
   fails=${fails:-0}
 
-  quarantines=$(find "$room/.rally" -maxdepth 1 -name 'facts.db.corrupt.*' \
-    ! -name '*-db-wal' ! -name '*-db-shm' 2>/dev/null | wc -l | tr -d ' ')
+  # Count every quarantine group created in this fresh trial, including groups
+  # moved by retention into archive/swept. Counting only the live max-depth-one
+  # files can understate a burst once the eight-group/32 MiB retention cap
+  # archives older evidence.
+  quarantines=$(count_quarantine_groups "$room/.rally")
 
   integrity="absent"
   if [[ -f "$room/.rally/facts.db" ]]; then
@@ -137,7 +167,7 @@ for ((trial = 1; trial <= TRIALS; trial++)); do
     counter_count=$(jq -r '.count // 0' "$counter_file" 2>/dev/null || echo 0)
   fi
   counter_drift=0
-  if ((quarantines > 0)) && ((counter_count < quarantines)); then
+  if ! counter_tracks_quarantines "$counter_count" "$quarantines"; then
     counter_drift=1
   fi
 
@@ -185,6 +215,16 @@ if ((total_counter_drift > 0)); then
   printf 'corruption event; treat CorruptionCounter as broken until this is fixed.\n'
 fi
 
+if [[ "${RC044_DAEMON:-0}" == "1" ]] \
+  && ! daemon_arm_is_valid "$daemon_rounds" "$TRIALS"; then
+  printf '\nDAEMON ARM INVALID: only %d / %d rounds used a live daemon.\n' \
+    "$daemon_rounds" "$TRIALS"
+  printf 'The treatment arm cannot fall back to direct-store execution.\n'
+  trap - EXIT
+  printf '(work dir NOT cleaned: %s)\n' "$WORK"
+  exit 1
+fi
+
 if ((rounds_dirty > 0)); then
   printf '\nfirst dirty round preserved at: %s\n' "$WORK/first-dirty-rally"
   trap - EXIT
@@ -192,3 +232,8 @@ if ((rounds_dirty > 0)); then
   exit 1
 fi
 exit 0
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
