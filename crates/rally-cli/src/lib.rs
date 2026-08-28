@@ -33,6 +33,7 @@ const SCHEMA_ENTER: &str = "agent-rally.command.enter.v1";
 const SCHEMA_SAY: &str = "agent-rally.command.say.v1";
 const SCHEMA_ROOM: &str = "agent-rally.command.room.v1";
 const SCHEMA_NEXT: &str = "agent-rally.command.next.v1";
+const SCHEMA_INBOX: &str = "agent-rally.command.inbox.v1";
 const SCHEMA_LOCATE: &str = "agent-rally.command.locate.v1";
 const SCHEMA_RECENT: &str = "agent-rally.command.recent.v1";
 const SCHEMA_RETRACT: &str = "agent-rally.command.retract.v1";
@@ -133,6 +134,7 @@ mod init;
 mod liveness;
 mod log_watch;
 mod next;
+mod obligations;
 mod observed_liveness;
 mod output;
 pub mod rallyd_core;
@@ -167,7 +169,11 @@ use check_ci::build_check_ci;
 use cli::*;
 use dag::{DagOutput, WakeDueEntry, build_dag, project_wake_due, resolve_wake_after};
 use error::{RallyError, Result};
-use next::{AttentionItem, EntryData, NextResult, build_attention, build_entry, build_next};
+use next::{
+    AttentionItem, EntryData, NextResult, StaleTargetedPolicy, build_attention, build_entry,
+    build_next,
+};
+use obligations::{InboxResult, build_inbox};
 use output::{CliError, Output, RenderedOutput};
 use rallyd_core::ServeConfig;
 use route_findings::{Finding, RoutingSummary, route_findings};
@@ -1548,6 +1554,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::Say(args) => command_say(args),
         CliCommand::Room(args) => command_room(args),
         CliCommand::Next(args) => command_next(args),
+        CliCommand::Inbox(args) => command_inbox(args),
         CliCommand::Locate(args) => command_locate(args),
         CliCommand::Recent(args) => command_recent(args),
         CliCommand::Check(args) => command_check(args),
@@ -1640,6 +1647,10 @@ fn command_self_exit_check(args: cli::SelfExitCheckArgs) -> Result<Output> {
     // next_actionable: does rally next surface addressed work?
     let backlog_items = list_backlog_items(&room).unwrap_or_default();
     let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    // `Ignore`: this caller asks "may this session stop existing?". An obligation
+    // that stays actionable forever would make `empty_cycle` unreachable and this
+    // session unkillable, so the pre-existing age drop is preserved HERE and only
+    // here. The item is not lost — `rally inbox` and `next.inbox` still carry it.
     let next = build_next(
         &snapshot,
         &tool,
@@ -1648,6 +1659,7 @@ fn command_self_exit_check(args: cli::SelfExitCheckArgs) -> Result<Output> {
         1,
         backlog_items,
         coord.stale_wait_secs,
+        StaleTargetedPolicy::Ignore,
     );
     let next_actionable = next.actionable;
 
@@ -4257,6 +4269,8 @@ fn command_next(args: NextArgs) -> Result<Output> {
     // #7: always read the backlog store and surface ready items in next output.
     let backlog_items = list_backlog_items(&room).unwrap_or_default();
     let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    // `Surface`: this caller asks "what should I do?". A handoff addressed to this
+    // agent is still owed at any age, so `next` no longer drops it at 24h.
     let next = build_next(
         &snapshot,
         &tool,
@@ -4265,6 +4279,7 @@ fn command_next(args: NextArgs) -> Result<Output> {
         limit,
         backlog_items,
         coord.stale_wait_secs,
+        StaleTargetedPolicy::Surface,
     );
     let action = next.action;
     let target_event_id = next
@@ -4316,6 +4331,71 @@ fn command_next(args: NextArgs) -> Result<Output> {
         "next action={action} target={target_event_id} peers_fresh={} peers_stale={}",
         peers_fresh, peers_stale
     );
+    Ok(Output::new(args.json, text, body))
+}
+
+/// Wrapper: `inbox` result under `data.inbox`.
+#[derive(JsonSchema, Serialize)]
+struct InboxData {
+    tool: String,
+    inbox: InboxResult,
+}
+
+/// `rally inbox --tool <id>` — the pull-based obligation inbox.
+///
+/// STRICTLY READ-ONLY, and that is a contract rather than an implementation
+/// detail. Every write a read command might plausibly perform is a way for the
+/// act of LOOKING at an obligation to change whether it is still surfaced:
+///
+/// * no `ensure_presence` — no presence fact, so checking the inbox does not
+///   masquerade as agent activity;
+/// * no `set_cursor` and no `maybe_append_read_checkpoint` — advancing a read
+///   position on inspection is exactly how `rally enter` lost track of unanswered
+///   obligations (intent.md defect #2);
+/// * no wake intent.
+///
+/// The only thing that empties this list is an ack the RECEIVER authored.
+fn command_inbox(args: cli::InboxArgs) -> Result<Output> {
+    let room = RoomStore::open()?;
+    let snapshot = room.snapshot()?;
+    let inbox = build_inbox(&snapshot, &args.tool, args.limit.max(0) as usize);
+
+    let text = if inbox.count == 0 {
+        format!("inbox {} — nothing owed", args.tool)
+    } else {
+        let mut lines = vec![format!(
+            "inbox {} — {} open ({} handoff, {} artifact); each clears only when {} acks it",
+            args.tool, inbox.count, inbox.handoffs, inbox.artifacts, args.tool
+        )];
+        for item in &inbox.items {
+            lines.push(format!(
+                "  {} [{}] from={} age={}s{}\n    {}\n    ack: {}",
+                item.event_id,
+                item.kind.as_str(),
+                item.from,
+                item.age_secs,
+                if item.stale { " (stale)" } else { "" },
+                item.subject,
+                item.ack_command,
+            ));
+        }
+        if inbox.count > inbox.items.len() {
+            lines.push(format!(
+                "  ... {} more; raise --limit to see them",
+                inbox.count - inbox.items.len()
+            ));
+        }
+        lines.join("\n")
+    };
+
+    let body = envelope(
+        "inbox",
+        SCHEMA_INBOX,
+        InboxData {
+            tool: args.tool,
+            inbox,
+        },
+    )?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -18045,6 +18125,9 @@ fn help_text() -> String {
         "    append-only withdrawal: room/next/recent stop surfacing the fact; the retraction itself stays visible and auditable",
         "  rally room [--tool <tool>] [--role <role>] [--path <path>] [--since <seq>] [--json]",
         "  rally next --tool <tool> [--path <path>] [--role <role>] [--limit <n>] [--json]",
+        "  rally inbox --tool <tool> [--limit <n>] [--json]",
+        "    open obligations addressed to <tool>; read-only, and cleared only by an ack <tool> itself authors",
+        "    (`rally say receipt --ref <id>`). Age, cursor, decay, and reaper expiry never remove one.",
         "  rally locate <event-id> [--json]",
         "  rally recent [--all] [--limit <n>] [--json]",
         "  rally migrate-legacy [--json]  # one-shot replay of legacy ~/.agent-rally-point/apps/<slug>/changes.jsonl into this repo ledger",

@@ -1550,6 +1550,19 @@ pub(crate) struct RoomSnapshot {
     /// the daemon wire in [`SnapshotInternals`].
     #[serde(skip)]
     pub(crate) pending_wakes: Vec<Fact>,
+    /// Open ADDRESSED obligations: targeted handoffs and targeted
+    /// `requires_ack` artifacts that no receiver-authored ack has closed.
+    /// See [`project_open_obligations`] for the closing rule and for the four
+    /// erasure mechanisms this bucket deliberately does not implement.
+    ///
+    /// `#[serde(skip)]` is load-bearing, not incidental. Serializing it would
+    /// add an unbudgeted array to every `rally room --json`, which is the
+    /// payload growth RC-054 is open about (one call returned 208k tokens).
+    /// It rides the daemon wire in [`SnapshotInternals`] instead — read that
+    /// type's doc comment for what silently breaks when a skipped field does
+    /// NOT ride the side channel.
+    #[serde(skip)]
+    pub(crate) open_obligations: Vec<Fact>,
     pub(crate) current_decisions: Vec<Fact>,
     pub(crate) current_risks: Vec<Fact>,
     /// System-generated health/telemetry facts (`external-intake`,
@@ -1689,6 +1702,8 @@ pub(crate) struct SnapshotInternals {
     #[serde(default)]
     pub(crate) pending_wakes: Vec<Fact>,
     #[serde(default)]
+    pub(crate) open_obligations: Vec<Fact>,
+    #[serde(default)]
     pub(crate) stale_authors: BTreeSet<String>,
     #[serde(default)]
     pub(crate) author_last_seen: BTreeMap<String, String>,
@@ -1702,6 +1717,11 @@ pub(crate) struct SnapshotInternals {
 /// is deliberately much smaller than the 8 MiB frame limit: other public
 /// snapshot fields still need room inside that frame.
 pub(crate) const MAX_WIRE_PENDING_WAKES: usize = 1_024;
+/// Same fail-loud contract as [`MAX_WIRE_PENDING_WAKES`]. Rally does not
+/// authenticate `--tool`, so any peer can address unlimited obligations to one
+/// id; truncating here would silently empty an inbox that exists precisely so
+/// nothing can silently empty it. Crossing the bound is a structured error.
+pub(crate) const MAX_WIRE_OPEN_OBLIGATIONS: usize = 1_024;
 pub(crate) const MAX_WIRE_STALE_AUTHORS: usize = 4_096;
 pub(crate) const MAX_WIRE_SNAPSHOT_INTERNALS_BYTES: usize = 512 * 1_024;
 
@@ -1745,6 +1765,13 @@ impl RoomSnapshot {
         // Current Andon/Jidoka alerts are already bounded and deduplicated by
         // health class in the canonical projection. Keep them actionable.
         self.stale_facts.clear();
+        // `open_obligations` survives untouched, and that is the correct answer
+        // rather than an omission: this projection keeps ACTION-BEARING buckets,
+        // and an open obligation is action-bearing by definition — it is work
+        // addressed to a named agent that no receiver-authored ack has closed.
+        // Filtering it here would reintroduce a reader-side erasure of a
+        // sender-side obligation, which is the whole defect class the bucket
+        // exists to remove.
         refresh_snapshot_totals(&mut self);
         self
     }
@@ -1755,6 +1782,7 @@ impl RoomSnapshot {
             content_max_seq: self.content_max_seq,
             last_activity_ts: self.last_activity_ts.clone(),
             pending_wakes: self.pending_wakes.clone(),
+            open_obligations: self.open_obligations.clone(),
             stale_authors: self.stale_authors.clone(),
             author_last_seen: self.author_last_seen.clone(),
         }
@@ -1765,6 +1793,7 @@ impl RoomSnapshot {
         self.content_max_seq = internals.content_max_seq;
         self.last_activity_ts = internals.last_activity_ts;
         self.pending_wakes = internals.pending_wakes;
+        self.open_obligations = internals.open_obligations;
         self.stale_authors = internals.stale_authors;
         self.author_last_seen = internals.author_last_seen;
     }
@@ -1786,6 +1815,13 @@ pub(crate) fn snapshot_to_wire_value(
             "snapshot internals exceed pending-wake bound: {} > {}",
             internals.pending_wakes.len(),
             MAX_WIRE_PENDING_WAKES
+        ))));
+    }
+    if internals.open_obligations.len() > MAX_WIRE_OPEN_OBLIGATIONS {
+        return Err(serde_json::Error::io(std::io::Error::other(format!(
+            "snapshot internals exceed open-obligation bound: {} > {}",
+            internals.open_obligations.len(),
+            MAX_WIRE_OPEN_OBLIGATIONS
         ))));
     }
     if internals.stale_authors.len() > MAX_WIRE_STALE_AUTHORS {
@@ -1996,6 +2032,12 @@ impl RoomSnapshot {
             active_blockers: filter_facts(self.active_blockers, query),
             open_handoffs: filter_facts(self.open_handoffs, query),
             pending_wakes: self.pending_wakes,
+            // Carried through UNFILTERED, like `pending_wakes`. An obligation is
+            // scoped by its ADDRESSEE, not by the caller's `--path` / `--tool`
+            // query, and `build_inbox` does that scoping. Running a path filter
+            // over it would let a query argument decide an obligation is gone —
+            // one more reader-side erasure of the kind this bucket removes.
+            open_obligations: self.open_obligations,
             current_decisions: filter_facts(self.current_decisions, query),
             current_risks: filter_facts(self.current_risks, query),
             recent_artifacts: filter_facts(self.recent_artifacts, query),
@@ -6297,6 +6339,173 @@ fn handoff_is_closed(handoff: &Fact, facts: &[Fact]) -> bool {
         .any(|closer| fact_closes_handoff(handoff, closer))
 }
 
+// =============================================================================
+// Addressed-obligation projection (`RoomSnapshot::open_obligations`)
+// =============================================================================
+//
+// This answers a DIFFERENT question from `open_handoffs` above, which is why it
+// is a separate predicate rather than a reinterpretation of `fact_closes_handoff`.
+//
+//   `open_handoffs`      — "what handoffs are still live in this room?"
+//   `open_obligations`   — "what does agent X still owe an answer to?"
+//
+// Four mechanisms can independently erase an addressed obligation from a reader's
+// view today: `next.rs`'s 24h age drop, `build_attention`'s read cursor, decay's
+// archive floor, and the reaper's typed handoff expiry. Each is a READER-side
+// erasure of a SENDER-side obligation. This projection implements none of them,
+// and every absence below is deliberate and named, because the next reader added
+// to this file must be able to tell "not implemented yet" from "must never be
+// implemented here".
+//
+// `fact_closes_handoff` / `handoff_is_closed` / `handoff_closer_matches_target`
+// are NOT reused and NOT modified. Their reaper arm and their legacy
+// `from_session_id.is_none()` arm are correct for the liveness question and wrong
+// for this one; they are also pinned by `tests/referenced_handoff_targeting.rs`
+// and `tests/user_journey.rs`. Leaving them untouched is the blast-radius
+// reduction that makes this bucket safe to add.
+
+/// Does `evidence` assert that the carrying fact needs an explicit ack?
+///
+/// Moved here from `next.rs` (where it was private) so that the projection and
+/// the `next` ranking read ONE definition of "requires ack". Two copies of this
+/// predicate is the ARP-R-01 defect shape: the ranking would surface an item the
+/// projection did not consider an obligation, or vice versa.
+pub(crate) fn evidence_requires_ack(evidence: &str) -> bool {
+    let trimmed = evidence.trim();
+    if trimmed.eq_ignore_ascii_case("requires_ack")
+        || trimmed.eq_ignore_ascii_case("requires_ack:true")
+        || trimmed.eq_ignore_ascii_case("ack_required")
+        || trimmed.eq_ignore_ascii_case("ack_required:true")
+    {
+        return true;
+    }
+
+    serde_json::from_str::<Value>(trimmed).is_ok_and(|value| json_requires_ack(&value))
+}
+
+fn json_requires_ack(value: &Value) -> bool {
+    value
+        .get("requires_ack")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || value.get("payload").is_some_and(json_requires_ack)
+}
+
+/// Does any evidence entry on `fact` mark it as requiring an ack?
+pub(crate) fn fact_requires_ack(fact: &Fact) -> bool {
+    fact.evidence
+        .iter()
+        .any(|evidence| evidence_requires_ack(evidence))
+}
+
+/// Is `fact` an obligation ADDRESSED to a specific agent?
+///
+/// Both forms demand a real addressee. `target: None` and `target: "all"` are
+/// excluded because ack state for a broadcast is PER-READER, and this bucket's
+/// carrier (`Vec<Fact>`) cannot hold per-reader state — one agent acking must not
+/// clear the item for everyone. Broadcast `requires_ack` artifacts keep today's
+/// behaviour in `next.rs`'s `broadcast_peer_artifact_requires_ack` class.
+///
+/// `external-intake` is excluded for the same reason `open_handoffs` excludes it
+/// (B18): those facts are not repo-local coordination work.
+fn fact_is_addressed_obligation(fact: &Fact) -> bool {
+    let Some(target) = fact.target.as_deref() else {
+        return false;
+    };
+    if target == "all" {
+        return false;
+    }
+    if fact.scope.iter().any(|scope| scope == "external-intake") {
+        return false;
+    }
+    match fact.kind {
+        FactKind::Handoff => handoff_is_protocol_request(fact),
+        FactKind::Artifact => fact_requires_ack(fact),
+        _ => false,
+    }
+}
+
+/// Is `closer` an ack of `obligation` AUTHORED BY THE RECEIVER?
+///
+/// Every condition is a falsifier for a way the obligation could otherwise be
+/// closed by someone other than the agent that owes the answer.
+fn receiver_ack_closes_obligation(obligation: &Fact, closer: &Fact) -> bool {
+    // Same closing kinds as `fact_closes_handoff`: a resolve, a receipt, or a
+    // referencing artifact are the three ways an agent records "I handled this".
+    if !matches!(
+        closer.kind,
+        FactKind::Resolve | FactKind::Receipt | FactKind::Artifact
+    ) {
+        return false;
+    }
+    // The ledger is append-only; a closer cannot precede what it closes.
+    if closer.seq <= obligation.seq {
+        return false;
+    }
+    if closer.ref_id.as_deref() != Some(obligation.event_id.as_str()) {
+        return false;
+    }
+    // THE receiver-authored condition. goal.md C3's falsifier is the SENDER
+    // resolving its own targeted artifact: that must not clear the receiver's
+    // inbox, so authorship is compared against the obligation's `target`, never
+    // against the room or the referenced fact.
+    if closer.tool.as_deref() != obligation.target.as_deref() {
+        return false;
+    }
+    // No reaper arm. `is_reaper_handoff_expiry` is what lets `open_handoffs` drop
+    // a 30-day-old handoff, and `reaper::DEFAULT_HANDOFF_EXPIRY_SECS` is 30 days
+    // — exactly the age in this feature's C2 falsifier. Reaper expiry is
+    // age-based CLEANUP; age consuming an obligation is the defect being closed
+    // here. Excluding every system-authored closer is the general form of that:
+    // no non-agent writer can answer for an agent.
+    if is_system_authored(closer) {
+        return false;
+    }
+    // No `from_session_id.is_none() => true` arm. `handoff_closer_matches_target`
+    // has one (it is correct there: legacy rows predate session binding and used
+    // broad completion markers), but it is AUTHOR-AGNOSTIC — any closer lacking a
+    // session id closes anything. For a legacy row here the rule is plain tool
+    // equality above, which is the strongest attribution a legacy row supports.
+    //
+    // When the obligation DOES carry a strict `to_session_id`, keep
+    // `strict_handoff_target_session`'s guarantee that a same-tool sibling
+    // session cannot manufacture completion.
+    if let Some(expected_session) = strict_handoff_target_session(obligation)
+        && closer.from_session_id.as_deref() != Some(expected_session)
+    {
+        return false;
+    }
+    true
+}
+
+fn obligation_is_acked(obligation: &Fact, facts: &[Fact]) -> bool {
+    facts
+        .iter()
+        .any(|closer| receiver_ack_closes_obligation(obligation, closer))
+}
+
+/// Open addressed obligations, oldest first.
+///
+/// Pure over the already-loaded fact slice — no extra I/O and no clock read, so
+/// nothing here can vary between two projections of the same ledger.
+///
+/// Absent on purpose, each for a stated reason:
+/// * **No decay / `is_archived` filter.** An archive floor is an age heuristic.
+/// * **No cursor.** A read position records what an agent SAW, not what it ANSWERED.
+/// * **No reaper arm** — see `receiver_ack_closes_obligation`.
+/// * **No count cap.** `MAX_WIRE_OPEN_OBLIGATIONS` fails loud on the daemon wire
+///   and `rally inbox --limit` bounds the render; neither silently drops a row.
+fn project_open_obligations(facts: &[Fact]) -> Vec<Fact> {
+    let mut open = facts
+        .iter()
+        .filter(|fact| fact_is_addressed_obligation(fact))
+        .filter(|fact| !obligation_is_acked(fact, facts))
+        .cloned()
+        .collect::<Vec<_>>();
+    open.sort_by_key(|fact| fact.seq);
+    open
+}
+
 // NOTE (orphaned doc block): the items these paragraphs documented were
 // moved out of this file (the RoomSnapshot projection was inlined back into
 // its callers; the claim-close gate moved to
@@ -6628,6 +6837,18 @@ fn snapshot_from_facts_with_policy_at(
         .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
         .cloned()
         .collect::<Vec<_>>();
+    // Addressed obligations. Computed from the SAME already-loaded slice as every
+    // bucket above — no extra store read, which is what lets `rally next` embed
+    // the inbox without the hook paying an extra process spawn per fire (the
+    // repo's performance agreement counts spawns as an attributed cost).
+    let open_obligations = project_open_obligations(facts);
+    // Artifact ids the decay filter below must NOT archive. See the exemption
+    // site for why this is a correctness rule and not a presentation one.
+    let unacked_obligation_ids = open_obligations
+        .iter()
+        .filter(|fact| fact.kind == FactKind::Artifact)
+        .map(|fact| fact.event_id.as_str())
+        .collect::<BTreeSet<_>>();
     let pending_wakes = facts
         .iter()
         .filter(|fact| fact.kind == "wake")
@@ -6714,7 +6935,24 @@ fn snapshot_from_facts_with_policy_at(
         // B18: exclude external-intake facts from repo-local backlog.
         .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
         .filter(|f| {
-            if is_archived(f) {
+            // Decay must not archive an artifact the receiver still has to ack.
+            //
+            // This is NOT cosmetic. `unconsumed_artifacts` — derived from this
+            // bucket two statements down — is a WRITE-PATH AUTHORITY:
+            // `append_state_transition_verified` refuses a `resolve` whose ref is
+            // not in `active_blockers | active_claims | open_handoffs |
+            // current_risks | system_health | unconsumed_artifacts` (see the
+            // "Output-path room composition" banner below, which states the
+            // property). An archived artifact therefore cannot be
+            // `rally say resolve --ref`'d AT ALL. Without this exemption the
+            // product tells the receiver to ack an item and then refuses the ack.
+            //
+            // The exemption is tight on purpose: `unacked_obligation_ids` holds
+            // only artifacts that are TARGETED at a named agent (not `None`, not
+            // `"all"`), carry a `requires_ack` marker, and have no
+            // receiver-authored ack. An acked, broadcast, or untargeted artifact
+            // decays exactly as it did before.
+            if is_archived(f) && !unacked_obligation_ids.contains(f.event_id.as_str()) {
                 stale_facts.push((*f).clone());
                 false
             } else {
@@ -6958,6 +7196,7 @@ fn snapshot_from_facts_with_policy_at(
         active_blockers,
         open_handoffs,
         pending_wakes,
+        open_obligations,
         current_decisions,
         current_risks,
         system_health,
@@ -7002,6 +7241,11 @@ fn snapshot_from_facts_with_policy_at(
 ///   the next enter, so cutting it is a ledger-growth bug.
 /// * `open_handoffs` — budgeted ONLY for handoffs not assigned to the caller;
 ///   assigned ones are pulled out and reserved before anything competes.
+/// * `open_obligations` — absent from this list on purpose, matching the other
+///   write-path-authority buckets. It is `#[serde(skip)]`, so it contributes no
+///   bytes to the composed room in the first place, and budget-cutting a row
+///   would be one more way for a reader to decide an unanswered obligation is
+///   gone. It is bounded fail-loud instead (`MAX_WIRE_OPEN_OBLIGATIONS`).
 const BUDGETED_BUCKETS: &[&str] = &[
     "current_decisions",
     "recent_artifacts",
@@ -19064,5 +19308,304 @@ mod squad_freshness_tests {
         assert_eq!(squad_freshness_rank(&sq), 1);
         // And a Rust-side `Default` agrees with the serde default.
         assert_eq!(Squad::default().freshness, FRESHNESS_UNKNOWN);
+    }
+}
+
+// =============================================================================
+// Addressed-obligation projection tests
+// =============================================================================
+//
+// These are written against `snapshot_from_facts_with_policy`, the real
+// projection, rather than against `project_open_obligations` in isolation. A
+// test that called the predicate directly would stay green if the projection
+// stopped calling it — the control-not-on-the-path failure this repo's
+// root-cause register names.
+
+#[cfg(test)]
+mod obligation_projection_tests {
+    use super::*;
+
+    /// 30 days, matching `reaper::DEFAULT_HANDOFF_EXPIRY_SECS`. goal.md's C2
+    /// falsifier is stated at exactly this age on purpose: it is the age at which
+    /// the reaper's typed expiry removes a handoff from `open_handoffs`.
+    const THIRTY_DAYS_SECS: i64 = 30 * 24 * 60 * 60;
+
+    fn secs_ago(secs: i64) -> String {
+        let now = chrono::Utc::now();
+        (now - chrono::Duration::seconds(secs)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    fn fact(event_id: &str, seq: i64, kind: FactKind, tool: &str) -> Fact {
+        Fact {
+            schema: fact_schema(),
+            event_id: event_id.to_string(),
+            seq,
+            thread_id: format!("t-{event_id}"),
+            kind,
+            tool: Some(tool.to_string()),
+            subject: format!("subject-{event_id}"),
+            created_at: now_string(),
+            ..Fact::default()
+        }
+    }
+
+    /// A handoff from `claude_code` addressed to `codex`, dated `age_secs` ago.
+    fn aged_handoff(event_id: &str, seq: i64, target: &str, age_secs: i64) -> Fact {
+        let mut handoff = fact(event_id, seq, FactKind::Handoff, "claude_code");
+        handoff.target = Some(target.to_string());
+        handoff.created_at = secs_ago(age_secs);
+        handoff
+    }
+
+    /// A `requires_ack` artifact addressed to `target`, dated `age_secs` ago.
+    fn aged_requires_ack_artifact(event_id: &str, seq: i64, target: &str, age_secs: i64) -> Fact {
+        let mut artifact = fact(event_id, seq, FactKind::Artifact, "claude_code");
+        artifact.target = Some(target.to_string());
+        artifact.evidence = vec!["requires_ack".to_string()];
+        artifact.created_at = secs_ago(age_secs);
+        artifact
+    }
+
+    fn closer(event_id: &str, seq: i64, kind: FactKind, tool: &str, ref_id: &str) -> Fact {
+        let mut closer = fact(event_id, seq, kind, tool);
+        closer.ref_id = Some(ref_id.to_string());
+        closer
+    }
+
+    /// The reaper's typed handoff expiry, in the exact shape
+    /// `is_reaper_handoff_expiry` accepts.
+    fn reaper_expiry(event_id: &str, seq: i64, ref_id: &str) -> Fact {
+        let mut expiry = fact(event_id, seq, FactKind::Resolve, "rally");
+        expiry.role = Some(crate::SYSTEM_ROLE.to_string());
+        expiry.ref_id = Some(ref_id.to_string());
+        expiry.evidence = vec![
+            format!("reaper:ref_id={ref_id}"),
+            "reaper:reason=handoff-expired".to_string(),
+        ];
+        expiry
+    }
+
+    fn project(facts: &[Fact]) -> RoomSnapshot {
+        snapshot_from_facts_with_policy(
+            facts,
+            &crate::hooks_config::CoordinationConfig::default(),
+            false,
+        )
+    }
+
+    fn ids(facts: &[Fact]) -> Vec<&str> {
+        facts.iter().map(|f| f.event_id.as_str()).collect()
+    }
+
+    /// goal.md C2. Age alone never empties the inbox.
+    #[test]
+    fn thirty_day_old_targeted_handoff_is_still_an_open_obligation() {
+        let handoff = aged_handoff("old-handoff", 1, "codex", THIRTY_DAYS_SECS);
+        let snapshot = project(&[handoff]);
+        assert_eq!(ids(&snapshot.open_obligations), vec!["old-handoff"]);
+    }
+
+    /// THE test that killed plan rev 1.
+    ///
+    /// Rev 1 sourced the inbox from `snapshot.open_handoffs`. The reaper's typed
+    /// expiry (`is_reaper_handoff_expiry`, closing a handoff at
+    /// `reaper::DEFAULT_HANDOFF_EXPIRY_SECS` = 30 days) removes a handoff from
+    /// that bucket, so goal.md's own C2 falsifier would have vanished from the
+    /// inbox — the defect, relocated. `open_obligations` ignores every
+    /// system-authored closer, so it survives while `open_handoffs` correctly
+    /// does not.
+    #[test]
+    fn reaper_expiry_closes_the_handoff_but_not_the_obligation() {
+        let handoff = aged_handoff("reaped-handoff", 1, "codex", THIRTY_DAYS_SECS);
+        let expiry = reaper_expiry("reap-1", 2, "reaped-handoff");
+
+        // Premise: the reaper's fact really does close the handoff. If this
+        // assertion ever fails, the test below is passing vacuously.
+        assert!(
+            fact_closes_handoff(&handoff, &expiry),
+            "premise: reaper expiry closes a handoff for the liveness question"
+        );
+
+        let snapshot = project(&[handoff, expiry]);
+        assert!(
+            snapshot.open_handoffs.is_empty(),
+            "open_handoffs must still drop a reaper-expired handoff"
+        );
+        assert_eq!(
+            ids(&snapshot.open_obligations),
+            vec!["reaped-handoff"],
+            "age-based cleanup must not answer for the receiver"
+        );
+    }
+
+    /// goal.md C3. A receipt from the TARGET clears it.
+    #[test]
+    fn receiver_authored_receipt_closes_the_obligation() {
+        let handoff = aged_handoff("owed", 1, "codex", THIRTY_DAYS_SECS);
+        let ack = closer("ack", 2, FactKind::Receipt, "codex", "owed");
+        let snapshot = project(&[handoff, ack]);
+        assert!(snapshot.open_obligations.is_empty());
+    }
+
+    /// goal.md C3's falsifier. The SENDER resolving its own targeted artifact
+    /// must NOT clear the receiver's obligation.
+    #[test]
+    fn sender_authored_resolve_does_not_close_the_obligation() {
+        let artifact = aged_requires_ack_artifact("owed-artifact", 1, "codex", 60);
+        let self_resolve = closer(
+            "sender-resolve",
+            2,
+            FactKind::Resolve,
+            "claude_code",
+            "owed-artifact",
+        );
+        let snapshot = project(&[artifact, self_resolve]);
+        assert_eq!(ids(&snapshot.open_obligations), vec!["owed-artifact"]);
+    }
+
+    /// A same-tool SIBLING SESSION cannot manufacture completion for a strict
+    /// referenced handoff. This is `strict_handoff_target_session`'s guarantee,
+    /// carried into the obligation rule rather than re-derived.
+    #[test]
+    fn strict_session_binding_rejects_a_same_tool_different_session_closer() {
+        let mut handoff = aged_handoff("strict-handoff", 1, "codex", 60);
+        handoff.ref_id = Some("upstream-artifact".to_string());
+        handoff.evidence = vec![
+            "protocol:bridge_version=fact-v1".to_string(),
+            "protocol:event_kind=handoff.requested".to_string(),
+            "protocol:target_policy=ref-author".to_string(),
+            "protocol:to_session_id=session-codex-a".to_string(),
+            "protocol:ref_event_id=upstream-artifact".to_string(),
+            "protocol:causation_id=upstream-artifact".to_string(),
+            format!("protocol:correlation_id={}", handoff.thread_id),
+            "protocol:handoff_id=handoff-a".to_string(),
+            "protocol:idempotency_key=operation-a".to_string(),
+        ];
+        assert_eq!(
+            strict_handoff_target_session(&handoff),
+            Some("session-codex-a"),
+            "premise: this handoff really is session-bound"
+        );
+
+        let mut sibling = closer(
+            "sibling-ack",
+            2,
+            FactKind::Receipt,
+            "codex",
+            "strict-handoff",
+        );
+        sibling.from_session_id = Some("session-codex-b".to_string());
+        assert_eq!(
+            ids(&project(&[handoff.clone(), sibling]).open_obligations),
+            vec!["strict-handoff"],
+            "a sibling session must not answer for the bound receiver"
+        );
+
+        let mut bound = closer("bound-ack", 2, FactKind::Receipt, "codex", "strict-handoff");
+        bound.from_session_id = Some("session-codex-a".to_string());
+        assert!(
+            project(&[handoff, bound]).open_obligations.is_empty(),
+            "the bound session's ack does close it"
+        );
+    }
+
+    /// Broadcasts are out of scope for v1 and that boundary is asserted, not
+    /// assumed: ack state for `target: "all"` is PER-READER and `Vec<Fact>`
+    /// cannot carry per-reader state.
+    #[test]
+    fn broadcast_and_untargeted_facts_are_not_obligations() {
+        let broadcast = aged_requires_ack_artifact("broadcast", 1, "all", 60);
+        let mut untargeted = aged_requires_ack_artifact("untargeted", 2, "codex", 60);
+        untargeted.target = None;
+        let snapshot = project(&[broadcast, untargeted]);
+        assert!(snapshot.open_obligations.is_empty());
+    }
+
+    /// An artifact requires an explicit ack marker to be an obligation; a plain
+    /// targeted artifact is ordinary room content.
+    #[test]
+    fn a_targeted_artifact_without_requires_ack_is_not_an_obligation() {
+        let mut plain = aged_requires_ack_artifact("plain", 1, "codex", 60);
+        plain.evidence.clear();
+        assert!(project(&[plain]).open_obligations.is_empty());
+    }
+
+    /// goal.md C2's decay leg, and the write-path consequence of it.
+    ///
+    /// `unconsumed_artifacts` gates `rally say resolve --ref` in
+    /// `append_state_transition_verified`. If decay archived an unacked targeted
+    /// obligation, the product would tell the receiver to ack an item and then
+    /// refuse the ack. An ACKED or UNTARGETED artifact of the same age still
+    /// archives exactly as before.
+    #[test]
+    fn decay_exempts_an_unacked_targeted_obligation_but_nothing_else() {
+        let owed = aged_requires_ack_artifact("owed-artifact", 1, "codex", THIRTY_DAYS_SECS);
+        let acked = aged_requires_ack_artifact("acked-artifact", 2, "codex", THIRTY_DAYS_SECS);
+        let ack = closer("ack", 3, FactKind::Receipt, "codex", "acked-artifact");
+        let mut untargeted =
+            aged_requires_ack_artifact("untargeted-artifact", 4, "codex", THIRTY_DAYS_SECS);
+        untargeted.target = None;
+
+        let snapshot = project(&[owed, acked, ack, untargeted]);
+
+        assert!(
+            snapshot
+                .unconsumed_artifacts
+                .iter()
+                .any(|f| f.event_id == "owed-artifact"),
+            "an unacked targeted obligation must stay resolvable"
+        );
+        let archived = ids(&snapshot.stale_facts);
+        assert!(
+            archived.contains(&"acked-artifact"),
+            "an acked artifact decays as before: {archived:?}"
+        );
+        assert!(
+            archived.contains(&"untargeted-artifact"),
+            "an untargeted artifact decays as before: {archived:?}"
+        );
+        assert!(
+            !archived.contains(&"owed-artifact"),
+            "the open obligation must not be archived: {archived:?}"
+        );
+    }
+
+    /// Oldest first, so a render that caps rows shows the longest-owed work.
+    #[test]
+    fn obligations_are_ordered_oldest_first() {
+        let newer = aged_handoff("newer", 9, "codex", 60);
+        let older = aged_handoff("older", 2, "codex", THIRTY_DAYS_SECS);
+        let snapshot = project(&[newer, older]);
+        assert_eq!(ids(&snapshot.open_obligations), vec!["older", "newer"]);
+    }
+
+    /// The bucket rides the daemon side-channel and is bounded FAIL-LOUD, never
+    /// truncated: silently dropping rows is the failure the inbox exists to
+    /// prevent.
+    #[test]
+    fn open_obligations_ride_the_wire_and_fail_loud_past_the_bound() {
+        let owed = aged_handoff("owed", 1, "codex", THIRTY_DAYS_SECS);
+        let snapshot = RoomSnapshot {
+            open_obligations: vec![owed],
+            ..RoomSnapshot::default()
+        };
+
+        let wire = snapshot_to_wire_value(&snapshot).unwrap();
+        assert!(
+            wire.get("open_obligations").is_none(),
+            "the public room shape must be byte-identical"
+        );
+        let restored = snapshot_from_wire_value(wire).unwrap();
+        assert_eq!(ids(&restored.open_obligations), vec!["owed"]);
+
+        let flooded = RoomSnapshot {
+            open_obligations: vec![
+                aged_handoff("flood", 1, "codex", 60);
+                MAX_WIRE_OPEN_OBLIGATIONS + 1
+            ],
+            ..RoomSnapshot::default()
+        };
+        let error = snapshot_to_wire_value(&flooded).unwrap_err().to_string();
+        assert!(error.contains("open-obligation bound"), "{error}");
     }
 }

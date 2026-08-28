@@ -1,6 +1,5 @@
 use schemars::JsonSchema;
 use serde::Serialize;
-use serde_json::Value;
 use std::collections::BTreeSet;
 
 use crate::backlog::BacklogItem;
@@ -13,6 +12,34 @@ use crate::{FACT_SCHEMA, normalize_path, path_matches_scope, shell_quote};
 /// resolved by the caller and threaded in, so this module stays pure and the
 /// window can flex per repo instead of being pinned at one day for everyone.
 pub(crate) const DEFAULT_STALE_WAIT_SECS: i64 = 24 * 60 * 60;
+
+/// What `build_next` does with an INBOUND targeted handoff older than the stale
+/// window.
+///
+/// The two callers of `build_next` ask genuinely different questions, and one
+/// answer cannot serve both:
+///
+/// * `command_next` asks **"what should I do?"** — and an obligation addressed to
+///   this agent is still owed at any age. Dropping it at 24h is a reader-side
+///   erasure of a sender-side obligation (intent.md defect #1), so this caller
+///   passes [`StaleTargetedPolicy::Surface`].
+/// * `command_self_exit_check` asks **"may this session stop existing?"** — it
+///   reads `next.actionable` to compute `empty_cycle` (`lib.rs`), which drives the
+///   tmux self-kill. If an ancient handoff made `actionable` permanently true, a
+///   session holding one could NEVER self-exit. So that caller passes
+///   [`StaleTargetedPolicy::Ignore`], preserving the pre-existing age drop.
+///
+/// The ancient handoff is not lost under `Ignore`: it is still in
+/// `snapshot.open_obligations` and still rendered by `rally inbox` and by
+/// `next.inbox`, neither of which age out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StaleTargetedPolicy {
+    /// Keep an inbound targeted handoff as a `next` candidate at any age.
+    Surface,
+    /// Drop an inbound targeted handoff past the stale window (pre-existing
+    /// behaviour; required so a session can reach `empty_cycle` and self-exit).
+    Ignore,
+}
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub(crate) struct EntryData {
@@ -82,7 +109,28 @@ pub(crate) struct NextResult {
     /// sender who was seen recently so it does not hand work to a ghost by
     /// default. See [`PeerTargets`].
     pub(crate) peer_targets: PeerTargets,
+    /// Open obligations addressed to this tool, from
+    /// `snapshot.open_obligations`.
+    ///
+    /// EMBEDDED rather than fetched: the coordination hook renders this on every
+    /// `start` / `idle` / `after-write` fire, and a separate `rally inbox` call
+    /// would add one process spawn per fire. Spawn count is an explicitly
+    /// attributed cost component in this repo (O39/O36), so the projection is
+    /// built from the snapshot `build_next` already holds — zero extra store
+    /// read.
+    ///
+    /// Additive: `NextResult` is `pub(crate)` + `Serialize` with no `Deserialize`
+    /// and no exhaustive external match, and the published `next` schema does not
+    /// set `additionalProperties: false`.
+    pub(crate) inbox: crate::obligations::InboxResult,
 }
+
+/// How many inbox items ride inline in `next.inbox.items`.
+///
+/// The hook renders COUNTS, not items, so a short list is enough for a human
+/// reading `rally next --json` directly. `inbox.count` stays exact regardless;
+/// `rally inbox --tool <id>` is the full view.
+pub(crate) const NEXT_INBOX_ITEMS_LIMIT: usize = 5;
 
 /// How many ranked peers `next` lists inline. The counts cover the whole
 /// room; the list is a shortlist so a 380-squad room does not print 380 rows.
@@ -326,6 +374,10 @@ impl NextCandidate {
     }
 }
 
+// One more parameter than clippy's default threshold, for the same reason
+// `next_candidates` below carries the allow: a params struct here would exist
+// only to satisfy a lint on a crate-private function with two call sites.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_next(
     snapshot: &RoomSnapshot,
     tool: &str,
@@ -334,6 +386,7 @@ pub(crate) fn build_next(
     limit: usize,
     backlog_items: Vec<BacklogItem>,
     stale_wait_secs: i64,
+    stale_targeted: StaleTargetedPolicy,
 ) -> NextResult {
     let waiting_on = waiting_on_facts(snapshot, tool, stale_wait_secs);
     let waiting = !waiting_on.is_empty();
@@ -384,6 +437,7 @@ pub(crate) fn build_next(
         &waiting_on,
         &backlog_items,
         stale_wait_secs,
+        stale_targeted,
     );
     candidates.sort_by(compare_next_candidates);
 
@@ -434,6 +488,7 @@ pub(crate) fn build_next(
         alternatives,
         suggested_backlog_items,
         peer_targets: peer_targets(snapshot, tool, PEER_TARGETS_LIMIT),
+        inbox: crate::obligations::build_inbox(snapshot, tool, NEXT_INBOX_ITEMS_LIMIT),
     }
 }
 
@@ -462,13 +517,18 @@ fn next_candidates(
     waiting_on: &[Fact],
     backlog_items: &[BacklogItem],
     stale_wait_secs: i64,
+    stale_targeted: StaleTargetedPolicy,
 ) -> Vec<NextCandidate> {
     let mut candidates = Vec::new();
 
     for handoff in &snapshot.open_handoffs {
-        if assigned_to_tool(handoff, tool)
-            && !stale_targeted_handoff(handoff, tool, stale_wait_secs)
-        {
+        // Under `Surface`, age is not a reason to stop offering an obligation
+        // addressed to this agent. Under `Ignore`, the pre-existing drop stands
+        // so `command_self_exit_check` can still reach a non-actionable cycle —
+        // see [`StaleTargetedPolicy`].
+        let aged_out = stale_targeted == StaleTargetedPolicy::Ignore
+            && stale_targeted_handoff(handoff, tool, stale_wait_secs);
+        if assigned_to_tool(handoff, tool) && !aged_out {
             candidates.push(NextCandidate::from_fact(
                 "respond_to_handoff",
                 "open_handoff_targeted_to_this_tool",
@@ -847,46 +907,22 @@ fn fact_is_weak(fact: &Fact) -> bool {
 
 fn artifact_review_priority(artifact: &Fact, tool: &str, waiting: bool) -> (&'static str, i64) {
     let directly_targeted = artifact.target.as_deref() == Some(tool);
-    if directly_targeted && artifact_requires_ack(artifact) {
+    // `fact_requires_ack` lives in `store.rs` beside the obligation projection so
+    // ranking and projection share ONE definition of "requires ack". Two copies
+    // would let `next` rank an item the inbox does not hold, or the reverse.
+    if directly_targeted && crate::store::fact_requires_ack(artifact) {
         return ("targeted_peer_artifact_requires_ack", 110);
     }
     if directly_targeted {
         return ("targeted_peer_artifact_requires_attention", 100);
     }
-    if artifact.target.as_deref() == Some("all") && artifact_requires_ack(artifact) {
+    if artifact.target.as_deref() == Some("all") && crate::store::fact_requires_ack(artifact) {
         return ("broadcast_peer_artifact_requires_ack", 90);
     }
     (
         "unconsumed_peer_artifact_can_be_checked_while_waiting",
         if waiting { 80 } else { 65 },
     )
-}
-
-fn artifact_requires_ack(fact: &Fact) -> bool {
-    fact.evidence
-        .iter()
-        .any(|evidence| evidence_requires_ack(evidence))
-}
-
-fn evidence_requires_ack(evidence: &str) -> bool {
-    let trimmed = evidence.trim();
-    if trimmed.eq_ignore_ascii_case("requires_ack")
-        || trimmed.eq_ignore_ascii_case("requires_ack:true")
-        || trimmed.eq_ignore_ascii_case("ack_required")
-        || trimmed.eq_ignore_ascii_case("ack_required:true")
-    {
-        return true;
-    }
-
-    serde_json::from_str::<Value>(trimmed).is_ok_and(|value| json_requires_ack(&value))
-}
-
-fn json_requires_ack(value: &Value) -> bool {
-    value
-        .get("requires_ack")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || value.get("payload").is_some_and(json_requires_ack)
 }
 
 fn boost_artifact_review_score(
@@ -916,6 +952,18 @@ fn boost_score(base: i64, fact: &Fact, role: Option<&str>, paths: &[String]) -> 
     (base + role_boost + path_boost).min(100)
 }
 
+/// Attention block for `rally enter`.
+///
+/// Two windows, on purpose:
+///
+/// * **Cursor-gated** (`fact.seq > cursor_before`) for claims, decisions, risks,
+///   and unconsumed artifacts. Those genuinely are "new since you last looked",
+///   and re-showing them on every enter is the spam this gate exists to prevent.
+/// * **Never gated** for an open obligation addressed to this tool.
+///   `command_enter` sets the cursor to `snapshot.max_seq` after building this
+///   block, so under the cursor rule an obligation seen ONCE is never surfaced by
+///   `enter` again, however long it goes unanswered (intent.md defect #2). A read
+///   position records what an agent SAW, not what it ANSWERED.
 pub(crate) fn build_attention(
     snapshot: &RoomSnapshot,
     tool: &str,
@@ -923,49 +971,74 @@ pub(crate) fn build_attention(
     paths: &[String],
 ) -> Vec<AttentionItem> {
     let mut items = Vec::new();
-    let mut push_fact = |reason: &'static str, fact: &Fact| {
-        if fact.seq > cursor_before {
-            items.push(AttentionItem {
-                reason,
-                event_id: fact.event_id.clone(),
-                seq: fact.seq,
-                kind: fact.kind.clone(),
-                subject: fact.subject.clone(),
-                scope: fact.scope.clone(),
-                tool: fact.tool.clone(),
-                target: fact.target.clone(),
-            });
-        }
+    let attention_item = |reason: &'static str, fact: &Fact| AttentionItem {
+        reason,
+        event_id: fact.event_id.clone(),
+        seq: fact.seq,
+        kind: fact.kind.clone(),
+        subject: fact.subject.clone(),
+        scope: fact.scope.clone(),
+        tool: fact.tool.clone(),
+        target: fact.target.clone(),
     };
-    for handoff in &snapshot.open_handoffs {
-        if handoff
-            .target
-            .as_deref()
-            .is_none_or(|target| target == tool || target == "all")
-        {
-            push_fact("handoff_assigned", handoff);
-        }
-    }
-    for claim in &snapshot.active_claims {
-        if claim.tool.as_deref() != Some(tool)
-            && (paths.is_empty()
-                || paths.iter().any(|path| {
-                    claim
-                        .scope
-                        .iter()
-                        .any(|scope| path_matches_scope(scope, path))
-                }))
-        {
-            push_fact("claimed_scope", claim);
-        }
-    }
-    for fact in snapshot
-        .current_decisions
-        .iter()
-        .chain(snapshot.current_risks.iter())
-        .chain(snapshot.unconsumed_artifacts.iter())
+    // Scoped so `push_fact`'s mutable borrow of `items` ends before the
+    // cursor-independent pass below reads `items` back.
     {
-        push_fact("new_room_fact", fact);
+        let mut push_fact = |reason: &'static str, fact: &Fact| {
+            if fact.seq > cursor_before {
+                items.push(attention_item(reason, fact));
+            }
+        };
+        for handoff in &snapshot.open_handoffs {
+            if handoff
+                .target
+                .as_deref()
+                .is_none_or(|target| target == tool || target == "all")
+            {
+                push_fact("handoff_assigned", handoff);
+            }
+        }
+        for claim in &snapshot.active_claims {
+            if claim.tool.as_deref() != Some(tool)
+                && (paths.is_empty()
+                    || paths.iter().any(|path| {
+                        claim
+                            .scope
+                            .iter()
+                            .any(|scope| path_matches_scope(scope, path))
+                    }))
+            {
+                push_fact("claimed_scope", claim);
+            }
+        }
+        for fact in snapshot
+            .current_decisions
+            .iter()
+            .chain(snapshot.current_risks.iter())
+            .chain(snapshot.unconsumed_artifacts.iter())
+        {
+            push_fact("new_room_fact", fact);
+        }
+    }
+
+    // Obligations addressed to this tool, cursor-independent. A distinct reason
+    // so a caller can tell a FRESH item (`handoff_assigned` / `new_room_fact`,
+    // both cursor-gated) from a PERSISTENT unanswered one.
+    //
+    // De-duplicated against what the loops above already pushed: an open handoff
+    // newer than the cursor is both an `open_handoff` and an `open_obligation`,
+    // and listing it twice would make `attention.len()` — which `enter` reports
+    // as `attention_count` — overstate the work.
+    let already_listed = items
+        .iter()
+        .map(|item| item.event_id.clone())
+        .collect::<BTreeSet<_>>();
+    for obligation in &snapshot.open_obligations {
+        if obligation.target.as_deref() == Some(tool)
+            && !already_listed.contains(&obligation.event_id)
+        {
+            items.push(attention_item("open_obligation", obligation));
+        }
     }
     items
 }
@@ -1043,6 +1116,7 @@ mod tests {
             10,
             Vec::new(),
             DEFAULT_STALE_WAIT_SECS,
+            StaleTargetedPolicy::Surface,
         );
 
         assert_eq!(result.action, "proceed_solo");
@@ -1074,14 +1148,21 @@ mod tests {
             10,
             Vec::new(),
             DEFAULT_STALE_WAIT_SECS,
+            StaleTargetedPolicy::Surface,
         );
 
         assert_eq!(result.action, "wait");
         assert_eq!(result.waiting_on.len(), 1);
     }
 
+    /// `Surface` — the `rally next` path. A targeted handoff older than the
+    /// stale window is STILL work this agent owes an answer to.
+    ///
+    /// This replaces `stale_targeted_handoff_is_not_actionable`, which asserted
+    /// the defect: it pinned "an inbound targeted handoff stops being actionable
+    /// at 24h", which is the reader-side erasure goal.md C4 removes.
     #[test]
-    fn stale_targeted_handoff_is_not_actionable() {
+    fn surface_policy_keeps_an_ancient_targeted_handoff_actionable() {
         let mut snapshot = RoomSnapshot::default();
         snapshot.open_handoffs.push(handoff(
             "old-targeted-handoff",
@@ -1097,13 +1178,51 @@ mod tests {
             10,
             Vec::new(),
             DEFAULT_STALE_WAIT_SECS,
+            StaleTargetedPolicy::Surface,
         );
-        assert_eq!(result.action, "proceed_solo");
-        assert!(!result.actionable);
+        assert_eq!(result.action, "respond_to_handoff");
+        assert!(result.actionable, "age is not a reason to stop offering it");
+        assert_eq!(
+            result.target_event_id.as_deref(),
+            Some("old-targeted-handoff")
+        );
     }
 
+    /// `Ignore` — the `command_self_exit_check` path. The drop is preserved
+    /// there and ONLY there: without it an ancient handoff makes `actionable`
+    /// permanently true, `empty_cycle` never holds, and a session holding one can
+    /// never self-exit.
     #[test]
-    fn targeted_handoff_ttl_is_strict_and_bad_timestamps_fail_open() {
+    fn ignore_policy_still_drops_an_ancient_targeted_handoff() {
+        let mut snapshot = RoomSnapshot::default();
+        snapshot.open_handoffs.push(handoff(
+            "old-targeted-handoff",
+            "codex",
+            "2000-01-01T00:00:00Z",
+        ));
+
+        let result = build_next(
+            &snapshot,
+            "codex",
+            None,
+            &[],
+            10,
+            Vec::new(),
+            DEFAULT_STALE_WAIT_SECS,
+            StaleTargetedPolicy::Ignore,
+        );
+        assert_eq!(result.action, "proceed_solo");
+        assert!(
+            !result.actionable,
+            "self-exit must still be able to reach an empty cycle"
+        );
+    }
+
+    /// The TTL arithmetic itself, independent of which policy consumes it.
+    /// `stale_wait_age` still backs the OUTBOUND `stale_wait_obligation` path,
+    /// which is unchanged by this work.
+    #[test]
+    fn stale_wait_ttl_is_strict_at_the_window() {
         assert!(!stale_wait_age(
             DEFAULT_STALE_WAIT_SECS,
             DEFAULT_STALE_WAIT_SECS
@@ -1112,12 +1231,106 @@ mod tests {
             DEFAULT_STALE_WAIT_SECS + 1,
             DEFAULT_STALE_WAIT_SECS
         ));
+    }
 
+    /// A malformed `created_at` fails OPEN in the age predicate: unparseable is
+    /// never a reason to drop an addressed handoff, under either policy.
+    #[test]
+    fn bad_timestamps_fail_open_under_both_policies() {
         let malformed = handoff("bad-time", "codex", "not-a-timestamp");
         assert!(
             !stale_targeted_handoff(&malformed, "codex", DEFAULT_STALE_WAIT_SECS),
             "malformed timestamps must remain actionable"
         );
+
+        let mut snapshot = RoomSnapshot::default();
+        snapshot.open_handoffs.push(malformed);
+        for policy in [StaleTargetedPolicy::Surface, StaleTargetedPolicy::Ignore] {
+            let result = build_next(
+                &snapshot,
+                "codex",
+                None,
+                &[],
+                10,
+                Vec::new(),
+                DEFAULT_STALE_WAIT_SECS,
+                policy,
+            );
+            assert_eq!(result.action, "respond_to_handoff", "policy={policy:?}");
+        }
+    }
+
+    /// goal.md C4, second half: `enter`'s attention block still lists a targeted
+    /// open obligation after the cursor has passed it, while every other class
+    /// keeps the cursor window.
+    #[test]
+    fn attention_surfaces_an_obligation_past_the_cursor_but_still_gates_other_facts() {
+        let mut obligation = handoff("owed", "codex", "2000-01-01T00:00:00Z");
+        obligation.seq = 3;
+        let mut decision = handoff("seen-decision", "codex", "2000-01-01T00:00:00Z");
+        decision.kind = FactKind::Decision;
+        decision.seq = 4;
+
+        let snapshot = RoomSnapshot {
+            open_obligations: vec![obligation.clone()],
+            current_decisions: vec![decision],
+            ..RoomSnapshot::default()
+        };
+
+        // Cursor well past both facts — the "entered the room again" case.
+        let items = build_attention(&snapshot, "codex", 99, &[]);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.reason, item.event_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("open_obligation", "owed")],
+            "only the obligation bypasses the cursor gate"
+        );
+    }
+
+    /// One obligation must never be listed twice. An open handoff newer than the
+    /// cursor is both `handoff_assigned` and `open_obligation`; `enter` reports
+    /// `attention.len()` as `attention_count`, so a duplicate would overstate the
+    /// work owed.
+    #[test]
+    fn attention_does_not_list_one_obligation_twice() {
+        let mut owed = handoff("owed", "codex", "2999-01-01T00:00:00Z");
+        owed.seq = 7;
+        let snapshot = RoomSnapshot {
+            open_handoffs: vec![owed.clone()],
+            open_obligations: vec![owed],
+            ..RoomSnapshot::default()
+        };
+
+        let items = build_attention(&snapshot, "codex", 0, &[]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].reason, "handoff_assigned");
+    }
+
+    /// `next.inbox` rides along on the same snapshot read the ranking used.
+    #[test]
+    fn next_embeds_the_inbox_for_the_calling_tool() {
+        let mut owed = handoff("owed", "codex", "2000-01-01T00:00:00Z");
+        owed.seq = 2;
+        let snapshot = RoomSnapshot {
+            open_obligations: vec![owed],
+            ..RoomSnapshot::default()
+        };
+
+        let result = build_next(
+            &snapshot,
+            "codex",
+            None,
+            &[],
+            10,
+            Vec::new(),
+            DEFAULT_STALE_WAIT_SECS,
+            StaleTargetedPolicy::Surface,
+        );
+        assert_eq!(result.inbox.count, 1);
+        assert_eq!(result.inbox.handoffs, 1);
+        assert_eq!(result.inbox.items[0].event_id, "owed");
     }
 
     #[test]
@@ -1156,6 +1369,7 @@ mod tests {
             10,
             vec![item],
             DEFAULT_STALE_WAIT_SECS,
+            StaleTargetedPolicy::Surface,
         );
 
         assert_eq!(result.action, "update_plan_status");
@@ -1251,6 +1465,7 @@ mod tests {
             10,
             Vec::new(),
             DEFAULT_STALE_WAIT_SECS,
+            StaleTargetedPolicy::Surface,
         );
         assert_eq!(result.peer_targets.ranked[0].tool, "fresh-quick");
         assert_eq!(result.peer_targets.stale, 2);

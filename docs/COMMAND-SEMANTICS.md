@@ -98,6 +98,7 @@ therefore receive distinct operation identities.
 |---|---:|---:|---:|---:|---|
 | `rally recent` | no | yes | no | yes | Reads recent room facts; `--all` remains scoped by global-index settings. |
 | `rally locate` | no | yes | no | yes | Locates an event id in known room segments. |
+| `rally inbox` | no | yes | no | yes | Open obligations addressed to the tool: targeted handoffs and targeted `requires_ack` artifacts. Cleared only by a receiver-authored ack (`say receipt`/`resolve`/`artifact` referencing the item). Unaffected by age, read cursor, recency decay, or reaper expiry — a reaper-expired handoff leaves `open_handoffs` but stays here, annotated `stale`. `--limit` caps rendered rows only; `count` is exact. |
 | `rally status --global` | no | yes | no | yes | Workspace-scoped overview of indexed rooms; does not write facts. |
 | `rally hooks status` | no | no | no | yes | Shows effective hook policy after session, repo, user, and default resolution. |
 | `rally hooks on/off` | no | no | no | no | Writes `.rally/config.json` or `~/.config/rally/config.json`; hook runtime reads it before room work. |

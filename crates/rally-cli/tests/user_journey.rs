@@ -5471,3 +5471,298 @@ fn rally_run_dry_run_reports_planned_worktree_without_touching_disk() {
 
     workspace.cleanup();
 }
+
+// =============================================================================
+// Pull-based obligation inbox (`rally inbox`)
+// =============================================================================
+
+/// Backdate every ledger fact by `age_secs` and drop the derived caches so the
+/// next read reprojects from the segments.
+///
+/// `DirectRoomStore::facts` reconciles segments into `facts.db` by event id and
+/// skips ids it already holds, so editing a segment line in place does NOT change
+/// what a read returns until the derived files are removed. That removal is the
+/// product's own recovery path.
+fn backdate_all_facts(cwd: &Path, age_secs: i64) {
+    let stamp = {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let secs = now.as_secs() as i64 - age_secs;
+        DateTime::from_timestamp(secs, 0)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let log_dir = cwd.join(".rally/log");
+    for entry in fs::read_dir(&log_dir).unwrap().filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        let mut rewritten = String::with_capacity(text.len());
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let mut row: Value = match serde_json::from_str(line) {
+                Ok(row) => row,
+                Err(_) => {
+                    rewritten.push_str(line);
+                    rewritten.push('\n');
+                    continue;
+                }
+            };
+            row["payload"]["created_at"] = Value::String(stamp.clone());
+            rewritten.push_str(&serde_json::to_string(&row).unwrap());
+            rewritten.push('\n');
+        }
+        fs::write(&path, rewritten).unwrap();
+    }
+    let rally = cwd.join(".rally");
+    for name in [
+        "facts.db",
+        "facts.db-wal",
+        "facts.db-shm",
+        ".reconcile-cache.json",
+        "snapshot.cache.json",
+    ] {
+        fs::remove_file(rally.join(name)).ok();
+    }
+}
+
+fn inbox_ids(workspace: &Workspace, tool: &str) -> Vec<String> {
+    let value = workspace.json(&["inbox", "--tool", tool, "--json"]);
+    assert_matches_schema("agent-rally.command.inbox.v1.json", &value);
+    value["data"]["inbox"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["event_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// goal.md C1 + C2 + C3, end to end through the real CLI.
+///
+/// One handoff addressed to `codex`, aged 30 days — the same age at which
+/// `reaper::DEFAULT_HANDOFF_EXPIRY_SECS` expires a handoff — with the room
+/// entered twice so the read cursor is past it. Neither age nor cursor may empty
+/// the inbox, and only a receiver-authored ack may.
+#[test]
+fn rally_inbox_survives_age_and_cursor_and_clears_only_on_receiver_ack() {
+    let workspace = Workspace::new("rally-inbox-age-cursor-ack");
+
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "claude_code:01",
+        "--target",
+        "codex",
+        "--subject",
+        "please review the transport demotion",
+    ]);
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Enter twice: `command_enter` sets the cursor to `snapshot.max_seq`, so
+    // after the second enter the obligation is well behind the read position.
+    workspace.json(&["enter", "--tool", "codex", "--json"]);
+    workspace.json(&["enter", "--tool", "codex", "--json"]);
+
+    // 30 days old, matching goal.md's C2 falsifier.
+    backdate_all_facts(&workspace.cwd, 30 * 24 * 60 * 60);
+
+    assert_eq!(
+        inbox_ids(&workspace, "codex"),
+        vec![handoff_id.clone()],
+        "neither 30 days of age nor two cursor advances may empty the inbox"
+    );
+
+    // `enter` must still SURFACE it, with the reason that distinguishes a
+    // persistent unanswered obligation from a fresh item.
+    let entered = workspace.json(&["enter", "--tool", "codex", "--json"]);
+    let attention = entered["data"]["enter"]["attention"].as_array().unwrap();
+    assert!(
+        attention.iter().any(|item| {
+            item["event_id"].as_str() == Some(handoff_id.as_str())
+                && item["reason"].as_str() == Some("open_obligation")
+        }),
+        "enter must re-surface an unanswered obligation past the cursor: {attention:?}"
+    );
+
+    // A SENDER-authored artifact referencing it does not clear the receiver's
+    // obligation (goal.md C3's falsifier).
+    workspace.json(&[
+        "say",
+        "artifact",
+        "--json",
+        "--tool",
+        "claude_code:01",
+        "--subject",
+        "sender commentary",
+        "--ref",
+        &handoff_id,
+        "--evidence",
+        "still waiting",
+    ]);
+    assert_eq!(
+        inbox_ids(&workspace, "codex"),
+        vec![handoff_id.clone()],
+        "only the receiver can answer for the receiver"
+    );
+
+    // The receiver's own receipt clears exactly that item.
+    workspace.json(&[
+        "say",
+        "receipt",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "acked",
+        "--ref",
+        &handoff_id,
+    ]);
+    assert!(
+        inbox_ids(&workspace, "codex").is_empty(),
+        "a receiver-authored receipt empties the inbox"
+    );
+
+    workspace.cleanup();
+}
+
+/// `rally inbox` is READ-ONLY: it writes no fact and advances no cursor. If it
+/// did either, the act of looking would change what is surfaced next — which is
+/// the erasure class this whole feature removes.
+#[test]
+fn rally_inbox_is_read_only() {
+    let workspace = Workspace::new("rally-inbox-read-only");
+
+    workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "claude_code:01",
+        "--target",
+        "codex",
+        "--subject",
+        "read-only check",
+    ]);
+    let before = workspace.json(&["room", "--json"])["data"]["room"]["max_seq"]
+        .as_i64()
+        .unwrap();
+
+    for _ in 0..3 {
+        workspace.json(&["inbox", "--tool", "codex", "--json"]);
+    }
+
+    let after = workspace.json(&["room", "--json"])["data"]["room"]["max_seq"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(before, after, "rally inbox must append no fact");
+
+    workspace.cleanup();
+}
+
+/// `next.inbox` rides along on the `next` result, so the coordination hook can
+/// render the count without spawning a second `rally` process per fire.
+#[test]
+fn rally_next_embeds_the_inbox_without_a_second_command() {
+    let workspace = Workspace::new("rally-next-embeds-inbox");
+
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "claude_code:01",
+        "--target",
+        "codex",
+        "--subject",
+        "embedded inbox check",
+    ]);
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let next = workspace.json(&["next", "--tool", "codex", "--json"]);
+    assert_matches_schema("agent-rally.command.next.v1.json", &next);
+    let inbox = &next["data"]["next"]["inbox"];
+    assert_eq!(inbox["count"].as_u64(), Some(1));
+    assert_eq!(inbox["handoffs"].as_u64(), Some(1));
+    assert_eq!(inbox["artifacts"].as_u64(), Some(0));
+    assert_eq!(
+        inbox["items"][0]["event_id"].as_str(),
+        Some(handoff_id.as_str())
+    );
+    assert!(
+        inbox["items"][0]["ack_command"]
+            .as_str()
+            .unwrap()
+            .contains("--ref"),
+        "each item carries the command that clears it"
+    );
+
+    workspace.cleanup();
+}
+
+/// The `Ignore` half of [`next::StaleTargetedPolicy`], end to end.
+///
+/// `command_self_exit_check` must still reach a non-actionable cycle with an
+/// ancient targeted handoff present. Without the policy split, `rally next`'s new
+/// age-independence would make `next_actionable` permanently true and a session
+/// holding one unanswered handoff could never self-exit — a real regression, not
+/// a hypothetical.
+#[test]
+fn self_exit_check_still_reaches_an_empty_cycle_with_an_ancient_handoff() {
+    let workspace = Workspace::new("self-exit-ancient-handoff");
+
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "claude_code:01",
+        "--target",
+        "codex",
+        "--subject",
+        "ancient unanswered work",
+    ]);
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    backdate_all_facts(&workspace.cwd, 30 * 24 * 60 * 60);
+
+    // The obligation is still owed — it has not been erased, only de-prioritised
+    // for the self-exit question.
+    assert_eq!(inbox_ids(&workspace, "codex"), vec![handoff_id.clone()]);
+
+    let check = workspace.json(&["self-exit-check", "--tool", "codex", "--json"]);
+    assert_eq!(
+        check["data"]["self_exit_check"]["next_actionable"].as_bool(),
+        Some(false),
+        "an ancient handoff must not pin next_actionable true for self-exit"
+    );
+    assert_eq!(
+        check["data"]["self_exit_check"]["empty_cycle"].as_bool(),
+        Some(true),
+        "the session must still be able to reach an empty cycle"
+    );
+
+    // And `rally next` — the other caller — DOES still surface it.
+    let next = workspace.json(&["next", "--tool", "codex", "--json"]);
+    assert_eq!(
+        next["data"]["next"]["action"].as_str(),
+        Some("respond_to_handoff"),
+        "rally next surfaces the same handoff self-exit ignores"
+    );
+    assert_eq!(
+        next["data"]["next"]["target_event_id"].as_str(),
+        Some(handoff_id.as_str())
+    );
+
+    workspace.cleanup();
+}

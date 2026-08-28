@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-rally.command.inbox.v1",
+  "title": "rally inbox response",
+  "description": "Open obligations addressed to one tool: targeted handoffs and targeted requires_ack artifacts that no receiver-authored ack has closed. Read-only — the command writes no fact and advances no cursor. An item is removed by exactly one thing: a resolve, receipt, or referencing artifact authored by the target. Age, read-cursor position, recency decay, and reaper expiry never remove one.",
+  "type": "object",
+  "properties": {
+    "ok": { "type": "boolean" },
+    "product": { "type": "string", "const": "rally" },
+    "command": { "type": "string", "const": "inbox" },
+    "schema": { "type": "string", "const": "agent-rally.command.inbox.v1" },
+    "data": {
+      "type": "object",
+      "required": ["inbox"],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "description": "The tool id these obligations are addressed to."
+        },
+        "inbox": {
+          "type": "object",
+          "required": ["count", "handoffs", "artifacts", "oldest_age_secs", "items"],
+          "properties": {
+            "count": {
+              "type": "integer",
+              "description": "Exact number of open obligations. Never capped, even when items is."
+            },
+            "handoffs": { "type": "integer" },
+            "artifacts": { "type": "integer" },
+            "oldest_age_secs": {
+              "type": "integer",
+              "description": "Age of the oldest open obligation; 0 when the inbox is empty."
+            },
+            "items": {
+              "type": "array",
+              "description": "Oldest first. Capped by --limit; count above stays exact so a truncated render can never understate what is owed.",
+              "items": {
+                "type": "object",
+                "required": ["event_id", "kind", "subject", "from", "age_secs", "stale", "ack_command"],
+                "properties": {
+                  "event_id": { "type": "string" },
+                  "kind": { "type": "string", "enum": ["handoff", "artifact"] },
+                  "subject": { "type": "string" },
+                  "from": {
+                    "type": "string",
+                    "description": "Tool that addressed this obligation to the caller; empty for a legacy row with no author."
+                  },
+                  "age_secs": {
+                    "type": "integer",
+                    "description": "Seconds since created_at; 0 when the timestamp is unparseable (fails open, so a corrupt timestamp cannot mark an item stale)."
+                  },
+                  "stale": {
+                    "type": "boolean",
+                    "description": "ADVISORY ONLY — older than the stale window. Consumers must not filter on it; age deciding an obligation is finished is the defect this projection exists to remove."
+                  },
+                  "ack_command": {
+                    "type": "string",
+                    "description": "The receiver-authored ack that clears this row."
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "required": ["ok", "command", "schema", "data"]
+}

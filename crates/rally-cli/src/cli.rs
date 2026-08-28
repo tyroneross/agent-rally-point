@@ -13,6 +13,9 @@ pub(crate) enum CliCommand {
     Say(SayArgs),
     Room(RoomArgs),
     Next(NextArgs),
+    /// Pull-based obligation inbox: what this tool still owes an answer to.
+    /// Read-only, and cleared only by a receiver-authored ack.
+    Inbox(InboxArgs),
     Check(CheckArgs),
     Hook(HookArgs),
     Run(RunArgs),
@@ -271,6 +274,16 @@ pub(crate) struct NextArgs {
     pub(crate) tool: String,
     pub(crate) role: Option<String>,
     pub(crate) paths: Vec<String>,
+    pub(crate) limit: i64,
+}
+
+/// `rally inbox --tool <id> [--json] [--limit N]`.
+#[derive(Clone, Debug)]
+pub(crate) struct InboxArgs {
+    pub(crate) json: bool,
+    pub(crate) tool: String,
+    /// Caps the rendered rows only. The reported `count` is always exact, so a
+    /// small limit can never make the inbox look emptier than it is.
     pub(crate) limit: i64,
 }
 
@@ -865,6 +878,8 @@ pub(crate) const COMMANDS: &[&str] = &[
     "say",
     "room",
     "next",
+    // Pull-based obligation inbox (read-only)
+    "inbox",
     "check",
     "hook",
     "run",
@@ -1003,6 +1018,17 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("next")
         .map(CliCommand::Next);
+    let inbox = inbox_parser()
+        .to_options()
+        .descr(
+            "Open obligations addressed to this tool: targeted handoffs and targeted \
+             requires-ack artifacts. Read-only — writes no fact, advances no cursor. An item \
+             stays listed until the RECEIVER acks it (`rally say receipt|resolve --ref <id>`); \
+             neither age, nor entering the room again, nor recency decay, nor reaper expiry \
+             removes it. `--limit` caps the rows shown, never the reported count.",
+        )
+        .command("inbox")
+        .map(CliCommand::Inbox);
     let locate = locate_parser()
         .to_options()
         .command("locate")
@@ -1223,6 +1249,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
         say,
         room,
         next,
+        inbox,
         locate,
         recent,
         check,
@@ -1600,6 +1627,13 @@ fn next_parser() -> impl Parser<NextArgs> {
         paths,
         limit
     })
+}
+
+fn inbox_parser() -> impl Parser<InboxArgs> {
+    let json = json_flag();
+    let tool = string_arg("tool", "TOOL");
+    let limit = bounded_i64_arg("limit", "N", 20, 1, 200);
+    construct!(InboxArgs { json, tool, limit })
 }
 
 fn retract_parser() -> impl Parser<RetractArgs> {
