@@ -2507,6 +2507,21 @@ function composeBrief() {
   if (!sit && action === "wait") sit = "wait";
   if (!sit) sit = clauses.length ? "notification" : "nothing";
 
+  // inbox.count is deliberately immune to age and cursor advancement -- an
+  // obligation addressed to this tool stays open until a receiver-authored ack
+  // closes it, never because a poll moved on or a session aged out. Without
+  // this override the ladder above could still land on "nothing"/"notification"/
+  // "wait" and render "nothing needs you" while real unanswered items sit in
+  // the room -- exactly the false-empty this clause exists to close. It never
+  // fires ahead of a situation the ladder already resolved to something more
+  // specific (respond_to_handoff, clarify_handoff, review_artifact,
+  // update_plan_status, continue_or_release_claim, resolve_owned_blocker,
+  // before_write_conflict): those already tell the reader exactly what to do,
+  // and stacking an inbox clause on top would only be noise.
+  const inbox = (bnext && bnext.inbox) || {};
+  const inboxCount = Number.isFinite(Number(inbox.count)) ? Math.max(0, Math.trunc(Number(inbox.count))) : 0;
+  if (inboxCount > 0 && (sit === "nothing" || sit === "notification" || sit === "wait")) sit = "inbox";
+
   if (sit === "nothing") {
     if (phase === "start" && promptModeBrief !== "off") {
       return {
@@ -2658,6 +2673,32 @@ function composeBrief() {
     act = "`" + chk + "` before you touch it";
     waitBranch = "wait for " + actorRef(who) + " to release";
     escalate = "or agree a split with them";
+  } else if (sit === "inbox") {
+    // Integers and vocabulary this hook itself defines ONLY -- no prose(), no ident(),
+    // no actorRef() on anything under inbox. inbox.items[].from and event_id are
+    // peer-authored spans this clause never reads, so there is nothing here to
+    // quote and nothing to mislabel: that is also why `ledger` is false below.
+    const handoffs = Number.isFinite(Number(inbox.handoffs)) ? Math.max(0, Math.trunc(Number(inbox.handoffs))) : 0;
+    const artifacts = Number.isFinite(Number(inbox.artifacts)) ? Math.max(0, Math.trunc(Number(inbox.artifacts))) : 0;
+    const oldestSecs = Number.isFinite(Number(inbox.oldest_age_secs)) ? Math.max(0, Math.trunc(Number(inbox.oldest_age_secs))) : 0;
+    big = "You have " + inboxCount + " unanswered item" + (inboxCount === 1 ? "" : "s")
+      + " addressed to you — they stay open until you answer, no matter how old they get";
+    why = () => {
+      const p = [];
+      if (handoffs > 0 || artifacts > 0) {
+        p.push(handoffs + " handoff" + (handoffs === 1 ? "" : "s") + ", " + artifacts + " artifact" + (artifacts === 1 ? "" : "s"));
+      }
+      if (oldestSecs > 0) {
+        const days = Math.floor(oldestSecs / 86400);
+        p.push(days >= 1
+          ? "oldest is " + days + " day" + (days === 1 ? "" : "s") + " old"
+          : "oldest is " + Math.floor(oldestSecs / 3600) + " hour" + (Math.floor(oldestSecs / 3600) === 1 ? "" : "s") + " old");
+      }
+      return p.join(" · ");
+    };
+    act = "`rally inbox --tool " + BRIEF_SELF + " --json`" + " to read them";
+    waitBranch = "already handled? post the receipt so it clears";
+    escalate = "not yours? hand it back and say why";
   } else {
     // generic: actionable, but an action this renderer does not know (a newer
     // binary, or a hostile action string). next.action is NEVER rendered as text.
@@ -2712,7 +2753,13 @@ function composeBrief() {
     body = briefLadder(step);
     if (taint(body).length <= BRIEF_MAX) break;
   }
-  return { present: true, severity: bnext.requires_human ? "stop" : "warn", ledger: true, body: body };
+  // ledger is false only for `inbox`: no peer-authored span (subject, evidence,
+  // tool id, scope, path) is ever rendered in that clause, only integers and
+  // vocabulary this hook itself defines, so there is nothing to quote and
+  // nothing that could be mislabeled as trusted. Every other situation quotes
+  // at least one peer-authored field via prose()/ident()/actorRef() and keeps
+  // the SEC-004 ledger flag at true.
+  return { present: true, severity: bnext.requires_human ? "stop" : "warn", ledger: sit !== "inbox", body: body };
 }
 
 if (briefMode) {
@@ -2842,12 +2889,17 @@ const decorated = highSeverity
 // The label goes OUTSIDE the severity wrapper, so it leads the message.
 const message = hasLedgerData ? UNTRUSTED_PREAMBLE + decorated : decorated;
 
-// Anti-spam: surface-on-change, not on-poll. On the per-turn phases
-// (idle -> UserPromptSubmit, after-write -> Stop) suppress an identical
-// surface already shown this session — emit {} (a valid empty hook result)
-// so smooth turns stay quiet and only a CHANGED room nudges again. Not
-// applied to `start` (fires once/session) or `before-write` (edit-scoped +
-// conflict-specific — repetition there is intentional).
+// Anti-spam: surface-on-change, capped at a bounded reminder cadence — never
+// on indefinite dedup. On the per-turn phases (idle -> UserPromptSubmit,
+// after-write -> Stop) an identical surface is suppressed only for
+// remindSecs; once the window elapses it surfaces again even with nothing
+// changed. The old behavior (suppress forever after the first showing) meant
+// a real, still-open obligation was rendered exactly once per session and
+// then silently dropped for the rest of that session -- a false-empty as
+// damaging as never rendering it, because nothing then prompts the reader to
+// re-check `rally next` on their own. Not applied to `start` (fires
+// once/session) or `before-write` (edit-scoped + conflict-specific —
+// repetition there is intentional).
 if (phase === "idle" || phase === "after-write") {
   try {
     const root = process.env.RALLY_HOOK_ROOT || process.cwd();
@@ -2857,10 +2909,56 @@ if (phase === "idle" || phase === "after-write") {
     const key = event + "|" + severity + "|" + rawMessage;
     let h = 5381; for (let i = 0; i < key.length; i++) { h = ((h * 33) ^ key.charCodeAt(i)) >>> 0; }
     const sig = String(h);
-    let prev = "";
-    try { prev = fs.readFileSync(file, "utf8"); } catch (_) {}
-    if (prev === sig) { output({}); process.exit(0); }
-    try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(file, sig); } catch (_) {}
+    // remindSecs: how long an unchanged signature stays silent before it is
+    // allowed to surface again. "off" (or any negative value) opts back into
+    // the pre-cadence forever-silent behavior for anyone who wants it; 0 or a
+    // non-numeric value is not a meaningful window, so both fall back to the
+    // 900s default rather than being read as "always resurface" or crashing.
+    const rawRemind = String(process.env.RALLY_HOOK_REMIND_SECS || "").trim().toLowerCase();
+    let remindSecs = 900;
+    if (rawRemind === "off") {
+      remindSecs = -1;
+    } else if (rawRemind !== "") {
+      const n = parseInt(rawRemind, 10);
+      if (Number.isFinite(n) && n > 0) remindSecs = n;
+      else if (Number.isFinite(n) && n < 0) remindSecs = -1;
+    }
+    const nowSecs = Math.floor(Date.now() / 1000);
+    let prevSig = "", prevTs = 0, prevCount = 0;
+    try {
+      const raw = fs.readFileSync(file, "utf8");
+      // A seen file written before this change is a BARE hash string, not
+      // JSON -- JSON.parse on it throws, and that must never propagate.
+      // Treated as {sig: raw, last_ts: 0, count: 1}: last_ts:0 means the
+      // window has already elapsed, so the first read after upgrade
+      // resurfaces once (matching what a fresh window boundary would do) and
+      // then settles into the normal cadence, instead of either crashing or
+      // silently inheriting an indefinite suppression nobody asked for.
+      let parsedSeen = null;
+      try { parsedSeen = JSON.parse(raw); } catch (_) { parsedSeen = null; }
+      if (parsedSeen && typeof parsedSeen === "object" && parsedSeen.sig) {
+        prevSig = String(parsedSeen.sig);
+        prevTs = Number.isFinite(Number(parsedSeen.last_ts)) ? Number(parsedSeen.last_ts) : 0;
+        prevCount = Number.isFinite(Number(parsedSeen.count)) ? Number(parsedSeen.count) : 1;
+      } else if (raw) {
+        prevSig = raw;
+        prevTs = 0;
+        prevCount = 1;
+      }
+    } catch (_) {}
+    if (prevSig === sig) {
+      const withinWindow = remindSecs < 0 ? true : (nowSecs - prevTs) < remindSecs;
+      if (withinWindow) { output({}); process.exit(0); }
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(file, JSON.stringify({ sig: sig, last_ts: nowSecs, count: prevCount + 1 }));
+      } catch (_) {}
+    } else {
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(file, JSON.stringify({ sig: sig, last_ts: nowSecs, count: 1 }));
+      } catch (_) {}
+    }
   } catch (_) { /* dedup is best-effort; never block surfacing on an FS error */ }
 }
 

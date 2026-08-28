@@ -1967,6 +1967,126 @@ SID="test-dedup-$$"
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "dedup must suppress repeats, surface changes"; fi
 
 # ----------------------------------------------------------------------
+# Test 11f: the anti-spam window is a CADENCE, not an indefinite mute
+# ----------------------------------------------------------------------
+# Test 11 above proves an unchanged surface is suppressed. It cannot prove the
+# suppression ever ends, and for most of this hook's life it did not: an
+# identical signature was silenced for the remainder of the session. A still-open
+# obligation was therefore rendered exactly once and then dropped, which reads to
+# the agent as "handled" — the same false-empty as never rendering it, because
+# nothing afterwards prompts a re-check. This test is that falsifier: same stub,
+# same message, past the window, must speak again.
+T="anti-spam: an unchanged surface resurfaces once the reminder window elapses"
+cadence_bin="$tmpdir/rally_cadence"
+cat > "$cadence_bin" <<'EOF'
+#!/usr/bin/env bash
+cat <<JSON
+{"data":{"next":{"actionable":true,"action":"continue_or_release_claim","reason":"held claim"}}}
+JSON
+EOF
+install_stub "$cadence_bin"
+SID_C="test-cadence-$$"
+(
+  cd "$REPO_ROOT"
+  rm -f ".rally/.hook-seen/${SID_C}."*".seen" 2>/dev/null
+  # The window is read fresh on every fire and compared against the stamp the
+  # LAST SURFACING call wrote, so the two halves can be driven independently:
+  # a wide window proves suppression, a narrow one proves expiry against the
+  # same stamp. Driving both from one narrow window would race the hook's own
+  # runtime — a fire costs on the order of a second here, so a 1s window is
+  # already elapsed by the time the second call reads it, and the test would
+  # fail for a reason that has nothing to do with the cadence.
+  c1=$(RALLY_HOOK_REMIND_SECS=3600 RALLY_BIN="$cadence_bin" RALLY_SESSION_ID="$SID_C" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  # Same signature, hour-wide window -> silent, and the stamp is left untouched.
+  c2=$(RALLY_HOOK_REMIND_SECS=3600 RALLY_BIN="$cadence_bin" RALLY_SESSION_ID="$SID_C" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  sleep 2
+  # Same stamp, now measured against a 1s window that it is provably past.
+  # Message byte-identical -> must speak again. FAILS on the pre-cadence
+  # implementation, which compared hashes and never re-armed.
+  c3=$(RALLY_HOOK_REMIND_SECS=1 RALLY_BIN="$cadence_bin" RALLY_SESSION_ID="$SID_C" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  # Opt-out preserves the historical forever-silent behavior for anyone who
+  # relied on it, so the change adds a cadence without removing a choice.
+  c4=$(RALLY_HOOK_REMIND_SECS=off RALLY_BIN="$cadence_bin" RALLY_SESSION_ID="$SID_C" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  rm -f ".rally/.hook-seen/${SID_C}."*".seen" 2>/dev/null
+  if ! printf '%s' "$c1" | grep -q "additionalContext"; then printf '1st call should surface: [%s]\n' "$c1" >&2; exit 1; fi
+  if [ "$c2" != "{}" ]; then printf '2nd call inside the window should be silent, got: [%s]\n' "$c2" >&2; exit 1; fi
+  if ! printf '%s' "$c3" | grep -q "additionalContext"; then printf '3rd call after the window should resurface: [%s]\n' "$c3" >&2; exit 1; fi
+  if [ "$c4" != "{}" ]; then printf 'RALLY_HOOK_REMIND_SECS=off should stay silent, got: [%s]\n' "$c4" >&2; exit 1; fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "the reminder window must expire and re-surface, and =off must opt out"; fi
+
+# ----------------------------------------------------------------------
+# Test 11g: a pre-cadence seen file (bare hash, not JSON) upgrades cleanly
+# ----------------------------------------------------------------------
+# The old format wrote the raw hash. JSON.parse throws on it, and a throw inside
+# the anti-spam block would take the whole hook down a path the reader never
+# asked for. The upgrade reads a bare body as a zero timestamp, so the first
+# post-upgrade fire resurfaces once and then settles into the cadence rather than
+# inheriting an indefinite mute nobody chose.
+T="anti-spam: a legacy bare-hash seen file resurfaces once, then follows the cadence"
+SID_L="test-legacy-seen-$$"
+(
+  cd "$REPO_ROOT"
+  seen_dir="$REPO_ROOT/.rally/.hook-seen"
+  rm -f "$seen_dir/${SID_L}."*".seen" 2>/dev/null
+  # Produce a real seen file, then downgrade it to the pre-cadence format by
+  # keeping only its signature. This is the exact on-disk state an installed
+  # session carries across a binary upgrade.
+  RALLY_BIN="$cadence_bin" RALLY_SESSION_ID="$SID_L" "$HOOK" idle claude_code </dev/null >/dev/null 2>&1
+  seen_file="$(ls "$seen_dir/${SID_L}."*".seen" 2>/dev/null | head -1)"
+  if [ -z "$seen_file" ]; then printf 'no seen file was written\n' >&2; exit 1; fi
+  sig="$(sed -n 's/.*"sig":"\([^"]*\)".*/\1/p' "$seen_file")"
+  if [ -z "$sig" ]; then printf 'seen file is not the JSON format: [%s]\n' "$(cat "$seen_file")" >&2; exit 1; fi
+  printf '%s' "$sig" > "$seen_file"
+  # Same signature, legacy body: must surface (last_ts reads as 0 = window past)
+  # rather than throwing or staying muted, and must leave JSON behind.
+  l1=$(RALLY_BIN="$cadence_bin" RALLY_SESSION_ID="$SID_L" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  after="$(cat "$seen_file" 2>/dev/null)"
+  # Now inside a fresh default window -> silent again.
+  l2=$(RALLY_BIN="$cadence_bin" RALLY_SESSION_ID="$SID_L" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  rm -f "$seen_dir/${SID_L}."*".seen" 2>/dev/null
+  if ! printf '%s' "$l1" | grep -q "additionalContext"; then printf 'legacy seen file should resurface once: [%s]\n' "$l1" >&2; exit 1; fi
+  case "$after" in *'"sig"'*) : ;; *) printf 'legacy file should be rewritten as JSON, got: [%s]\n' "$after" >&2; exit 1 ;; esac
+  if [ "$l2" != "{}" ]; then printf 'after upgrade the cadence should mute again, got: [%s]\n' "$l2" >&2; exit 1; fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "legacy bare-hash seen files must upgrade without throwing or muting"; fi
+
+# ----------------------------------------------------------------------
+# Test 11h: the inbox clause renders counts and a command, never peer prose
+# ----------------------------------------------------------------------
+# The clause exists because `next` can be non-actionable while obligations
+# addressed to this tool are still open — the room says "nothing needs you" and
+# it is false. It renders ONLY integers and this hook's own vocabulary: no
+# subject, no event id, no peer tool id. That is what lets it carry no untrusted
+# label, so the absence of peer text is a security property, not a style choice.
+T="inbox clause: counts + rally inbox command surface; peer prose never does"
+inbox_bin="$tmpdir/rally_inbox_clause"
+cat > "$inbox_bin" <<'EOF'
+#!/usr/bin/env bash
+cat <<JSON
+{"data":{"next":{"actionable":false,"action":"proceed_solo","reason":"nothing","inbox":{"count":3,"handoffs":2,"artifacts":1,"oldest_age_secs":273600,"items":[{"event_id":"fact_dead_beef","kind":"handoff","subject":"SENTINELSUBJECT","from":"codex","age_secs":273600,"stale":true}]}}}}
+JSON
+EOF
+install_stub "$inbox_bin"
+SID_I="test-inbox-clause-$$"
+(
+  cd "$REPO_ROOT"
+  rm -f ".rally/.hook-seen/${SID_I}."*".seen" 2>/dev/null
+  out=$(RALLY_BIN="$inbox_bin" RALLY_SESSION_ID="$SID_I" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  rm -f ".rally/.hook-seen/${SID_I}."*".seen" 2>/dev/null
+  if [ "$out" = "{}" ] || [ -z "$out" ]; then printf 'a non-empty inbox must surface even when next is not actionable: [%s]\n' "$out" >&2; exit 1; fi
+  if ! printf '%s' "$out" | grep -q "3 unanswered items"; then printf 'the count must be rendered: [%s]\n' "$out" >&2; exit 1; fi
+  if ! printf '%s' "$out" | grep -q "rally inbox --tool"; then printf 'the pull command must be rendered: [%s]\n' "$out" >&2; exit 1; fi
+  if printf '%s' "$out" | grep -q "SENTINELSUBJECT"; then printf 'peer subject text must NEVER reach the clause: [%s]\n' "$out" >&2; exit 1; fi
+  if printf '%s' "$out" | grep -q "fact_dead_beef"; then printf 'peer event ids must NEVER reach the clause: [%s]\n' "$out" >&2; exit 1; fi
+  if printf '%s' "$out" | grep -q "UNTRUSTED LEDGER DATA FOLLOWS"; then printf 'a clause with no peer span must not carry the untrusted label: [%s]\n' "$out" >&2; exit 1; fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "inbox clause must show counts + command and never peer-authored text"; fi
+
+# ----------------------------------------------------------------------
 # Test 11b: installed-plugin + project hook registration must execute one
 # logical event once, including Rally side effects (not only message output).
 # ----------------------------------------------------------------------
