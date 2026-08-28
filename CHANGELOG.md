@@ -7,6 +7,20 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Added — release gate fails on documented commands the binary rejects
+
+`scripts/check_command_conformance.py` runs inside
+`scripts/run-release-auxiliary-gate.sh` against the exact built binary: every
+`rally <cmd>` string in command position across `skills/`, `docs/`, `hooks/`,
+and `config/host-integrations.json` must name a command in the parser's
+dispatch table (`cli::COMMANDS`), and every table command must appear in
+`rally --help`. Deliberately documented future commands carry a same-line
+`conformance:planned` waiver. The first run caught and fixed three drifted
+references: `rally roster` (now `rally sessions`), plus prose casing in the
+coordination hook. Hermetic suite:
+`tests/scripts/test_check_command_conformance.py` (wired into
+`check-release-parity.sh`).
+
 ### Changed — Tier-1 fan-out resolves a width instead of obeying a hardcoded 4
 
 The Tier-1 cap was the prose string `Hard cap: **≤4 parallel**` in

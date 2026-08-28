@@ -81,6 +81,9 @@ if [ ! -x "$rally_binary" ]; then
   exit 1
 fi
 
+echo "release-auxiliary-gate: command-surface conformance using $rally_binary" >&2
+python3 scripts/check_command_conformance.py --binary "$rally_binary"
+
 echo "release-auxiliary-gate: packaged workflow tests using $rally_binary" >&2
 set +e
 npm_output=$(RALLY_PACKET_EMPIRICAL_BIN="$rally_binary" npm --prefix dynamic-workflows test 2>&1)

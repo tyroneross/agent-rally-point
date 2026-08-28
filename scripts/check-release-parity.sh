@@ -169,7 +169,8 @@ fi
 echo "check-release-parity: host integration tests" >&2
 if ! python3 -m unittest \
   tests/scripts/test_generate_host_surfaces.py \
-  tests/scripts/test_sync_host_integrations.py >&2; then
+  tests/scripts/test_sync_host_integrations.py \
+  tests/scripts/test_check_command_conformance.py >&2; then
   echo "check-release-parity: HOST GENERATOR/RECONCILER TESTS FAILED" >&2
   fail=1
 fi

@@ -232,10 +232,10 @@ agent: `ack`, `resolve`, `artifact`, `blocker`, or another targeted response.
 
 These are product backlog items, not assumptions agents should rely on today:
 
-- `rally onboarding --tool <id> --json|--text` to emit this contract as a
-  machine-readable bootstrap packet.
-- `rally runtime-contract --json` to expose the coordination/injection contract
-  to host apps.
+- `rally onboarding --tool <id> --json|--text` <!-- conformance:planned -->
+  to emit this contract as a machine-readable bootstrap packet.
+- `rally runtime-contract --json` <!-- conformance:planned -->
+  to expose the coordination/injection contract to host apps.
 - `rally run custom --tool <id> --cmd <command>` or equivalent adoption support
   for Cursor/Qwen/Gemma/Aider-style CLIs.
 - Easy Terminal "Agent Bootstrap" UI for copying/injecting the generic prompt

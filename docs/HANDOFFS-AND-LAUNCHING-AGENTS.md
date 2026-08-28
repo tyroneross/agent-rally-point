@@ -119,7 +119,7 @@ Rally facts, and do not assume `rally inject` is available unless
 - `rally capture <session> --lines N` — one-shot screen snapshot (or `tmux capture-pane -t <target> -p`).
 - `rally attach <session>` — live attach.
 - `rally watch [--tool <id>] [--on-activity <cmd>] [--ack-file <path>]` — continuous, event-driven room watcher (kqueue/inotify; `--poll` forces the legacy sleep loop). Supports `--print-launchd`/`--print-systemd` for a background service. See "Delivering to a non-managed agent" above.
-- `rally roster` — who's live, where, doing what.
+- `rally sessions [--json]` — who's live and where (managed-session ledger + liveness).
 
 ## 7. Shared-working-tree hazard
 

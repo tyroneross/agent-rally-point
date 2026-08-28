@@ -1216,7 +1216,7 @@ _rally_abort_envelope() {
   local raw_reason="$1" safe_reason safe_tool abort_advisory
   safe_reason="$(printf '%s' "$raw_reason" | tr -c 'A-Za-z0-9 ._:-' '_' | cut -c1-120)"
   safe_tool="$(printf '%s' "${tool:-the agent}" | tr -c 'A-Za-z0-9_.:-' '_' | cut -c1-80)"
-  abort_advisory="rally coordination skipped ($safe_reason): this edit is proceeding UNCLAIMED. No claim was created, so peers will not see this path as yours. This is not a block - rally never gates an edit. Re-check with: rally check before-write --tool $safe_tool --path <path>"
+  abort_advisory="Rally coordination skipped ($safe_reason): this edit is proceeding UNCLAIMED. No claim was created, so peers will not see this path as yours. This is not a block - rally never gates an edit. Re-check with: rally check before-write --tool $safe_tool --path <path>"
   case "${tool:-}" in
     gemini|gemini*)
       # Gemini reads BeforeTool advisories from additionalContext, not from
@@ -1857,7 +1857,7 @@ if (handoffs) {
   if (others) msg += `${others} other open handoff(s) (not addressed to you). `;
 }
 if (nextAction) msg += `Suggested next: ${nextAction}. `;
-msg += "Provably stale peers, inactive claims, and non-actionable waits are omitted from this prompt; use `rally room` for full history. Before editing, check `rally room` / `rally next` and deconflict — do not edit a path covered by an active claim owned by another agent (rally auto-checks before each write).";
+msg += "Provably stale peers, inactive claims, and non-actionable waits are omitted from this prompt; use `rally room` for full history. Before editing, check `rally room` / `rally next` and deconflict — do not edit a path covered by an active claim owned by another agent (Rally auto-checks before each write).";
 process.stdout.write(JSON.stringify({ agent_visible: { present: true, severity: "warn", message: msg }, ledger_data: ledgerData, brief: briefData }));
 ' ; } 2>/dev/null)"
   fi
@@ -2833,7 +2833,7 @@ const stop = strict && highSeverity;
 const decorated = highSeverity
   ? (stop
       ? `⚠️ HIGH-SEVERITY coordination signal (STRICT MODE — BLOCKING): ${rawMessage}`
-      : `⚠️ HIGH-SEVERITY coordination signal (advisory — not blocking; rally never enforces): ${rawMessage}`)
+      : `⚠️ HIGH-SEVERITY coordination signal (advisory — not blocking; Rally never enforces): ${rawMessage}`)
   : rawMessage;
 // SEC-004: this is the ONLY place the trust label is added, and the decision
 // reads `hasLedgerData` — provenance — never the message text. Every untrusted

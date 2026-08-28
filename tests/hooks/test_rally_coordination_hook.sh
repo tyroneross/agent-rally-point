@@ -1165,7 +1165,7 @@ process.stdout.write(JSON.stringify({
 const o=JSON.parse(require("fs").readFileSync(0,"utf8"));
 process.stdout.write(String(Object.keys(o).length));
 ' 2>/dev/null || printf 'BAD')
-  if ! printf '%s' "$out" | grep -q 'rally coordination skipped' || \
+  if ! printf '%s' "$out" | grep -q 'Rally coordination skipped' || \
      printf '%s' "$out" | grep -q 'permissionDecision' || \
      [ "$one_key" != "1" ] || \
      [ "$claim_count" != "0" ] || [ "$check_count" != "3" ]; then
@@ -1406,7 +1406,7 @@ EOF
   }))')
   out=$(PATH="$toolbox" CALLS="$no_watchdog_calls" RALLY_BIN="$no_watchdog_bin" \
     /bin/bash "$HOOK" before-write claude_code <<<"$envelope" 2>"$tmpdir/o33a-no-ms-watchdog.err")
-  printf '%s' "$out" | grep -q 'rally coordination skipped' || {
+  printf '%s' "$out" | grep -q 'Rally coordination skipped' || {
     printf 'degrade was silent on stdout (host cannot see it): [%s]\n' "$out" >&2
     exit 1
   }
@@ -2618,7 +2618,7 @@ EOF
     printf 'abort was byte-identical to a clean check -- host cannot tell them apart\n' >&2
     exit 1
   }
-  printf '%s' "$out" | grep -q 'rally coordination skipped' || {
+  printf '%s' "$out" | grep -q 'Rally coordination skipped' || {
     printf 'missing stdout advisory: [%s]\n' "$out" >&2; exit 1
   }
   printf '%s' "$out" | grep -q 'UNCLAIMED' || {
@@ -2647,7 +2647,7 @@ EOF
     printf '%s' "$hout" | grep -q "$sink" || {
       printf '%s: advisory did not use the %s sink: [%s]\n' "$host" "$sink" "$hout" >&2; exit 1
     }
-    printf '%s' "$hout" | grep -q 'rally coordination skipped' || {
+    printf '%s' "$hout" | grep -q 'Rally coordination skipped' || {
       printf '%s: advisory text missing: [%s]\n' "$host" "$hout" >&2; exit 1
     }
     printf '%s' "$hout" | node -e 'JSON.parse(require("fs").readFileSync(0,"utf8"))' || {
